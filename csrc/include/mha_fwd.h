@@ -66,12 +66,15 @@ struct mha_batch_prefill_traits : public fmha_batch_prefill_traits
                              bool has_sink,
                              ck_tile::BlockAttentionKVCacheMemoryLayoutEnum kv_memory_layout,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
-                             int page_size)
+                             int page_size,
+                             // false only for the decode-aligned VEC_K_COL_V_LAYOUT
+                             // (V is 4D ColumnMajor [Pages, Heads, HeadDim, PageSize]).
+                             bool is_v_rowmajor = true)
         : fmha_batch_prefill_traits{head_size_q,
                                     head_size_v,
                                     dtype,
                                     is_group_mode,
-                                    true, // is_v_rowmajor
+                                    is_v_rowmajor,
                                     has_logits_soft_cap,
                                     mask_type,
                                     bias_type,

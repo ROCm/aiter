@@ -195,6 +195,31 @@ def check_layout_skip_conditions(
         ):
             return True
 
+    if kvcache_layout == "vec_k_col_v":
+        # Decode-aligned col-V kernels are only generated for the non-quant
+        # bf16/fp16 path (and the separate fp8bf16 PER_TOKEN_HEAD path). The
+        # in-test fp8 pertensor path has no col-V kernel, so skip it here.
+        if skip_test_if(
+            is_input_fp8,
+            "vec_k_col_v has no in-test FP8 pertensor kernel (bf16/fp16 only)",
+        ):
+            return True
+        # The ColumnMajor V is loaded as a single merged (D, TotalSeqK) view, so a
+        # V tile must stay within one physical page. Small pages let a tile cross
+        # page boundaries and read wrong data (same kernel limitation the FP8
+        # PER_TOKEN_HEAD path guards). Supported page sizes match: (64, 1024).
+        if skip_test_if(
+            page_size not in (64, 1024),
+            f"vec_k_col_v only supports page_size in (64, 1024), got {page_size}",
+        ):
+            return True
+        # K is 5D vectorized, so it shares the vectorized layout's constraints.
+        if skip_test_if(
+            page_size % k_vector_size != 0 or head_dim % k_vector_size != 0,
+            "vec_k_col_v layout requires page/head dim divisible by vector size",
+        ):
+            return True
+
     return False
 
 
@@ -283,7 +308,27 @@ def construct_local_mask(
         )
 
 
-def ref_masked_attention(
+def _local_mask_rows(q_start, q_end, seqlen_q, seqlen_k, window_size, device):
+    """
+    Row-slice of construct_local_mask covering global Q indices [q_start, q_end).
+
+    This reproduces construct_local_mask semantics with key_padding_mask=None
+    and query_padding_mask=None (the only path the batch_prefill reference uses)
+    but only materializes [q_end - q_start, seqlen_k] booleans instead of the
+    full [seqlen_q, seqlen_k] mask, which would OOM at long sequences.
+    """
+    row_idx = torch.arange(q_start, q_end, device=device, dtype=torch.long).view(-1, 1)
+    col_idx = torch.arange(seqlen_k, device=device, dtype=torch.long)
+    if window_size[0] < 0:
+        return col_idx > row_idx + seqlen_k - seqlen_q + window_size[1]
+    sk_t = torch.full_like(col_idx, seqlen_k)
+    return torch.logical_or(
+        col_idx > torch.minimum(row_idx + seqlen_k - seqlen_q + window_size[1], sk_t),
+        col_idx < row_idx + seqlen_k - seqlen_q - window_size[0],
+    )
+
+
+def _ref_masked_attention_unchunked(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -293,20 +338,10 @@ def ref_masked_attention(
     return_lse: bool = False,
 ) -> torch.Tensor:
     """
-    Reference implementation of masked attention.
-
-    Args:
-        query: [seqlen_q, num_heads, head_dim]
-        key: [seqlen_k, num_heads, head_dim]
-        value: [seqlen_k, num_heads, head_dim]
-        causal: whether to use causal mask
-        window_left: left window size for sliding window attention
-        logits_soft_cap: soft cap for logits (0.0 = disabled)
-        return_lse: whether to return log-sum-exp values
-
-    Returns:
-        If return_lse=False: output [seqlen_q, num_heads, head_dim]
-        If return_lse=True: (output, lse) where lse is [num_heads, seqlen_q]
+    Canonical (pre-chunking) reference implementation, kept verbatim as the
+    semantic anchor for the chunked path. Used by the equivalence test only;
+    do not call from production paths — peak memory is H * Q * K * 4 bytes
+    which OOMs at long sequences (e.g. 137 GB at H=8, Q=K=65536).
     """
     if causal:
         window_size = (window_left, 0)
@@ -318,7 +353,6 @@ def ref_masked_attention(
     seqlen_k = key.shape[0]
     scale = 1.0 / math.sqrt(head_dim)
 
-    # Compute scaled attention scores: [num_heads, seqlen_q, seqlen_k]
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
     if 0 < logits_soft_cap:
@@ -339,11 +373,8 @@ def ref_masked_attention(
         )
         attn_weights.masked_fill_(local_mask, float("-inf"))
 
-    # Compute LSE before softmax using torch.logsumexp
-    # This correctly handles fully-masked rows (all -inf) by returning -inf instead of nan
     if return_lse:
-        # attn_weights: [num_heads, seqlen_q, seqlen_k]
-        lse = torch.logsumexp(attn_weights, dim=-1)  # [H, Q]
+        lse = torch.logsumexp(attn_weights, dim=-1)
 
     attn_weights = torch.softmax(attn_weights, dim=-1)
     if window_size[0] >= 0 or window_size[1] >= 0:
@@ -353,6 +384,131 @@ def ref_masked_attention(
     out = torch.einsum("hqk,khd->qhd", attn_weights, value.float())
 
     if return_lse:
+        return out.to(query), lse.float()
+    return out.to(query)
+
+
+def ref_masked_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    causal: bool = False,
+    window_left: int = -1,
+    logits_soft_cap: float = 0.0,
+    return_lse: bool = False,
+    q_chunk_size: int = None,
+) -> torch.Tensor:
+    """
+    Reference implementation of masked attention with Q-dimension chunking.
+
+    Args:
+        query: [seqlen_q, num_heads, head_dim]
+        key: [seqlen_k, num_heads, head_dim]
+        value: [seqlen_k, num_heads, head_dim]
+        causal: whether to use causal mask
+        window_left: left window size for sliding window attention
+        logits_soft_cap: soft cap for logits (0.0 = disabled)
+        return_lse: whether to return log-sum-exp values
+        q_chunk_size: rows of Q processed per iteration. Default reads
+            BENCH_REF_Q_CHUNK env var (fallback 1024). Set <= 0 to disable
+            chunking (single shot over the entire Q dim).
+
+    Returns:
+        If return_lse=False: output [seqlen_q, num_heads, head_dim]
+        If return_lse=True: (output, lse) where lse is [num_heads, seqlen_q]
+
+    Memory notes:
+        Peak intermediate is the per-chunk attention matrix [H, Q_chunk, K] in
+        fp32. For H=8, K=131072, Q_chunk=1024 that's ~4 GB — fits on a 192 GB
+        MI308X with plenty of headroom. The unchunked version peaks at
+        H * seqlen_q * seqlen_k * 4 bytes which OOMs at seq=65536+ on long
+        contexts (137 GB at H=8, Q=K=65536; ~550 GB at Q=K=131072).
+    """
+    if causal:
+        window_size = (window_left, 0)
+    else:
+        window_size = (-1, -1)
+
+    head_dim = query.shape[2]
+    seqlen_q = query.shape[0]
+    seqlen_k = key.shape[0]
+    num_heads = query.shape[1]
+    scale = 1.0 / math.sqrt(head_dim)
+    device = query.device
+
+    has_local_mask = window_size[0] >= 0 or window_size[1] >= 0
+
+    # Empty-query fast path: preserve the shape behavior of the original.
+    if seqlen_q == 0:
+        out = torch.empty(0, num_heads, head_dim, device=device, dtype=query.dtype)
+        if return_lse:
+            lse = torch.empty(num_heads, 0, device=device, dtype=torch.float32)
+            return out, lse
+        return out
+
+    if q_chunk_size is None:
+        q_chunk = int(os.environ.get("BENCH_REF_Q_CHUNK", "1024"))
+    else:
+        q_chunk = int(q_chunk_size)
+    if q_chunk <= 0 or q_chunk > seqlen_q:
+        q_chunk = seqlen_q
+
+    # Materialize fp32 K/V once and reuse across all Q chunks. For H=8,
+    # K=131072, D=128 that's ~537 MB per tensor in fp32, well within budget.
+    key_f32 = key.float()
+    value_f32 = value.float()
+
+    out_chunks = []
+    lse_chunks = [] if return_lse else None
+
+    for q_start in range(0, seqlen_q, q_chunk):
+        q_end = min(q_start + q_chunk, seqlen_q)
+        q_block = query[q_start:q_end].float()
+
+        # [num_heads, q_chunk, seqlen_k]
+        attn = scale * torch.einsum("qhd,khd->hqk", q_block, key_f32)
+
+        if 0 < logits_soft_cap:
+            mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
+            if mode == 0:
+                attn = logits_soft_cap * torch.tanh(attn / logits_soft_cap)
+            else:
+                attn = attn / (1.0 + torch.abs(attn / logits_soft_cap))
+
+        local_mask = None
+        if has_local_mask:
+            # Construct only the rows we need. Uses global Q indices so the
+            # causal/window boundary stays consistent with the unchunked path.
+            local_mask = _local_mask_rows(
+                q_start, q_end, seqlen_q, seqlen_k, window_size, device
+            )
+            attn.masked_fill_(local_mask, float("-inf"))
+
+        # LSE is computed on the post-mask, pre-softmax logits — matches the
+        # unchunked implementation. logsumexp of an all -inf row is -inf, which
+        # propagates cleanly through downstream consumers.
+        if return_lse:
+            lse_chunks.append(torch.logsumexp(attn, dim=-1))
+
+        attn = torch.softmax(attn, dim=-1)
+        if has_local_mask:
+            # Zero out fully-masked rows so softmax(all -inf) = nan becomes 0.
+            attn = attn.masked_fill(
+                torch.all(local_mask, dim=-1, keepdim=True), 0.0
+            )
+
+        # [q_chunk, num_heads, head_dim]
+        out_chunks.append(torch.einsum("hqk,khd->qhd", attn, value_f32))
+
+        # Drop chunk-local refs so the caching allocator can reuse the slot for
+        # the next iteration's [H, Q_chunk, K] tensor.
+        del attn
+        if local_mask is not None:
+            del local_mask
+
+    out = torch.cat(out_chunks, dim=0)
+    if return_lse:
+        lse = torch.cat(lse_chunks, dim=1)
         return out.to(query), lse.float()
     return out.to(query)
 
@@ -459,6 +615,25 @@ def split_kv_pages(kv_data):
     return k_cache_ref, v_cache_ref
 
 
+def vec_k_col_v_kv_cache(
+    k_cache, v_cache, num_kv_heads, head_dim, page_size, k_vector_size
+):
+    """Decode-aligned VEC_K_COL_V layout: K is 5D vectorized (same as VECTORIZED),
+    V is 4D ColumnMajor [Pages, Heads, HeadDim, PageSize]."""
+    k_cache = k_cache.contiguous()
+    v_cache = v_cache.contiguous()
+    k_cache = (
+        k_cache.view(
+            -1, page_size, num_kv_heads, head_dim // k_vector_size, k_vector_size
+        )
+        .permute(0, 2, 3, 1, 4)
+        .contiguous()
+    )
+    # v_cache_ref shape: [Pages, PageSize, Heads, HeadDim] -> [Pages, Heads, HeadDim, PageSize]
+    v_cache = v_cache.permute(0, 2, 3, 1).contiguous()
+    return k_cache, v_cache
+
+
 def apply_kv_layout(
     k_cache_ref,
     v_cache_ref,
@@ -470,6 +645,15 @@ def apply_kv_layout(
 ):
     if layout == "vectorized":
         return vectorize_kv_cache(
+            k_cache_ref,
+            v_cache_ref,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
+    if layout == "vec_k_col_v":
+        return vec_k_col_v_kv_cache(
             k_cache_ref,
             v_cache_ref,
             num_kv_heads,
@@ -610,6 +794,89 @@ def assert_lse_matches_reference(
         rtol=rtol,
         atol=atol,
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("q_chunk_size", [256, 1000, 1024])
+@pytest.mark.parametrize("input_dtype", [torch.float32, torch.bfloat16])
+def test_ref_masked_attention_chunking_equivalence(
+    causal, logits_soft_cap, return_lse, q_chunk_size, input_dtype
+):
+    """
+    Guard against silent semantic drift between the chunked
+    ref_masked_attention and the canonical unchunked implementation.
+
+    Runs at qlen=klen=4096, nhq=8, hd=128 — fits in either path. Exercises
+    causal/non-causal, soft_cap on/off, return_lse on/off, plus a couple of
+    chunk sizes including one (1000) that does not evenly divide seqlen_q so
+    the final partial chunk gets covered too.
+
+    Tolerances:
+        - fp32 input: 1e-5 (true fp32 round-off scale; chunking and unchunked
+          differ only because cuBLAS routes shape-dependent einsum kernels
+          with different reduction order in the head_dim sum).
+        - bf16 input: 1e-3 (~1 bf16 ULP at output magnitudes near 0.1, set by
+          the final out.to(query) cast back to bf16). The pre-cast fp32 math
+          is bit-identical to the fp32-input case.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA/HIP device for fp32 attention")
+
+    torch.manual_seed(0)
+    seqlen_q = seqlen_k = 4096
+    num_heads = 8
+    head_dim = 128
+    device = "cuda"
+
+    q = torch.randn(seqlen_q, num_heads, head_dim, device=device, dtype=input_dtype)
+    k = torch.randn(seqlen_k, num_heads, head_dim, device=device, dtype=input_dtype)
+    v = torch.randn(seqlen_k, num_heads, head_dim, device=device, dtype=input_dtype)
+
+    unchunked = _ref_masked_attention_unchunked(
+        q, k, v,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        return_lse=return_lse,
+    )
+    chunked = ref_masked_attention(
+        q, k, v,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        return_lse=return_lse,
+        q_chunk_size=q_chunk_size,
+    )
+
+    out_atol = 1e-5 if input_dtype == torch.float32 else 1e-3
+    # LSE is always fp32 in both paths (no output cast); use the fp32 bound.
+    lse_atol = 1e-5
+
+    if return_lse:
+        out_u, lse_u = unchunked
+        out_c, lse_c = chunked
+        out_diff = (out_u.float() - out_c.float()).abs().max().item()
+        lse_diff = (lse_u - lse_c).abs().max().item()
+        assert out_diff <= out_atol, (
+            f"chunked output diverged from unchunked: max-abs={out_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
+        assert lse_diff <= lse_atol, (
+            f"chunked LSE diverged from unchunked: max-abs={lse_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
+    else:
+        out_diff = (unchunked.float() - chunked.float()).abs().max().item()
+        assert out_diff <= out_atol, (
+            f"chunked output diverged from unchunked: max-abs={out_diff} "
+            f"(dtype={input_dtype}, causal={causal}, "
+            f"soft_cap={logits_soft_cap}, return_lse={return_lse}, "
+            f"q_chunk_size={q_chunk_size})"
+        )
 
 
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
@@ -873,7 +1140,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
             assert_lse_matches_reference(lse_kernel, lse_ref)
 
 
-@pytest.mark.parametrize("kvcache_layout", ["linear", "vectorized"])
+@pytest.mark.parametrize("kvcache_layout", ["linear", "vectorized", "vec_k_col_v"])
 @pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
 @pytest.mark.parametrize("input_dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("batch_size", [1, 3, 7])
@@ -1229,9 +1496,14 @@ def run_ck(
     k_descale=None,
     v_descale=None,
     kv_block_descale=None,
+    q_descale_per_token=None,
+    k_descale_per_token=None,
+    v_descale_per_head=None,
     kv_last_page_lens=None,
     block_table=None,
     seqlen_k=None,
+    p_scale=None,
+    p_scale_inv=None,
     profile=False,
     return_lse=False,
 ):
@@ -1261,9 +1533,14 @@ def run_ck(
         k_descale=k_descale,
         v_descale=v_descale,
         kv_block_descale=kv_block_descale,
+        q_descale_per_token=q_descale_per_token,
+        k_descale_per_token=k_descale_per_token,
+        v_descale_per_head=v_descale_per_head,
         kv_last_page_lens=kv_last_page_lens,
         block_table=block_table,
         seqlen_k=seqlen_k,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
         return_lse=return_lse,
     )
 
@@ -1584,6 +1861,65 @@ def per_page_quant(tensor, page_size, quant_dtype):
     descales_broadcast = descales.unsqueeze(1).unsqueeze(-1)
     quantized = (tensor / descales_broadcast).to(quant_dtype)
 
+    return quantized, descales
+
+
+def per_token_per_head_quant_q(tensor, quant_dtype):
+    """
+    Quantize Q with per-token-per-head scale (PER_TOKEN_HEAD mode).
+
+    Args:
+        tensor: [total_q, num_heads, head_dim]
+        quant_dtype: target quantization dtype (fp8)
+
+    Returns:
+        quantized: [total_q, num_heads, head_dim]
+        descales:  [total_q, num_heads] fp32 per-token-per-head descale
+    """
+    fp8_max = torch.finfo(quant_dtype).max
+    abs_max = tensor.abs().amax(dim=-1).clamp(min=1e-12)  # [total_q, num_heads]
+    descales = (abs_max / fp8_max).float()
+    quantized = (tensor / descales.unsqueeze(-1)).to(quant_dtype)
+    return quantized, descales
+
+
+def per_token_per_head_quant_k_paged(tensor, quant_dtype):
+    """
+    Quantize paged K with per-token-per-head scale (PER_TOKEN_HEAD mode).
+
+    Args:
+        tensor: [num_pages, page_size, num_kv_heads, head_dim]
+        quant_dtype: target quantization dtype (fp8)
+
+    Returns:
+        quantized: [num_pages, page_size, num_kv_heads, head_dim]
+        descales:  [num_pages, page_size, num_kv_heads] fp32
+    """
+    fp8_max = torch.finfo(quant_dtype).max
+    abs_max = tensor.abs().amax(dim=-1).clamp(min=1e-12)
+    descales = (abs_max / fp8_max).float()
+    quantized = (tensor / descales.unsqueeze(-1)).to(quant_dtype)
+    return quantized, descales
+
+
+def per_head_quant_v_paged(tensor, quant_dtype):
+    """
+    Quantize paged V with per-head scale (PER_TOKEN_HEAD mode V scaling).
+
+    Args:
+        tensor: [num_pages, page_size, num_kv_heads, head_dim]
+        quant_dtype: target quantization dtype (fp8)
+
+    Returns:
+        quantized: [num_pages, page_size, num_kv_heads, head_dim]
+        descales:  [num_kv_heads] fp32
+    """
+    fp8_max = torch.finfo(quant_dtype).max
+    # Max over (num_pages, page_size, head_dim) -> [num_kv_heads]
+    abs_max = tensor.abs().amax(dim=(0, 1, 3)).clamp(min=1e-12)
+    descales = (abs_max / fp8_max).float()
+    # Broadcast: [1, 1, num_kv_heads, 1]
+    quantized = (tensor / descales.view(1, 1, -1, 1)).to(quant_dtype)
     return quantized, descales
 
 
@@ -2335,6 +2671,7 @@ def run_batch_prefill_kv_blockscale(
     contiguous_kv,
     seed,
     profile=False,
+    skip_reference=False,
 ):
     """
     Test FP8 batch prefill with per-page KV descale (KV_BLOCKSCALE mode).
@@ -2410,19 +2747,22 @@ def run_batch_prefill_kv_blockscale(
     q_indptr_cpu = convert_lens_to_indptr(qo_lens)
 
     # Build FP32 reference output (same as pertensor test)
-    o_ref = build_reference_output(
-        q,
-        q_indptr_cpu,
-        kv_data_fp32,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len_cpu,
-        num_kv_heads,
-        head_dim,
-        dtype,
-        causal,
-        logits_soft_cap,
-    )
+    if skip_reference:
+        o_ref = None
+    else:
+        o_ref = build_reference_output(
+            q,
+            q_indptr_cpu,
+            kv_data_fp32,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len_cpu,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            causal,
+            logits_soft_cap,
+        )
 
     # Quantize K/V with per-page scale
     # k_paged_ref is [num_pages, page_size, num_kv_heads, head_dim]
@@ -2509,6 +2849,8 @@ def run_batch_prefill_kv_blockscale(
         out_fp8 = run_result
 
     # Run BF16 reference kernel (no quantization) - no profiling for reference
+    if skip_reference:
+        return profile_result
     out_bf16 = run_ck(
         batch_size,
         num_kv_heads,
@@ -2537,6 +2879,453 @@ def run_batch_prefill_kv_blockscale(
     verify_fp8_output(out_fp8, o_ref)
 
     # Compare BF16 kernel vs FP32 reference (same as pertensor test)
+    rtol, atol = get_tolerances(dtype, is_fp8=False)
+    torch.testing.assert_close(out_bf16, o_ref, rtol=rtol, atol=atol)
+
+    return profile_result
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 16)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("qo_len,kv_len", [(128, 1024), (512, 2048), (1024, 4096)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("table_layout", ["sglang", "vllm"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    qo_len,
+    kv_len,
+    causal,
+    table_layout,
+    logits_soft_cap,
+    page_size,
+):
+    """Pytest wrapper for PER_TOKEN_HEAD FP8 batch prefill test.
+
+    Q/K: per-token-per-head fp32 descale. V: per-head fp32 descale.
+    """
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout=table_layout,
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
+# Small-seqlen regression for the PER_TOKEN_HEAD q_descale coredump. When
+# qo_len <= kM0 (128), the query tile is mostly padding rows; before the fix the
+# kernel read q_descale_per_token for those padding rows (past the [total_q]
+# tensor) and faulted. Exercises both supported page sizes; the q_descale
+# staging is layout-independent so "linear" coverage guards the crash.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("qo_len,kv_len", [(1, 1), (4, 4), (16, 16), (16, 64)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_small_seqlen_pytest(
+    batch_size,
+    qo_len,
+    kv_len,
+    causal,
+    page_size,
+):
+    """Regression: PER_TOKEN_HEAD must not OOB-read q_descale on padding rows
+    when the query tile (kM0=128) is larger than the valid sequence length."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, 0.0),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=32,
+        num_kv_heads=8,
+        head_dim=128,
+        causal=causal,
+        logits_soft_cap=0.0,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
+# Decode-aligned VEC_K_COL_V_LAYOUT pytest. Codegen only emits this variant for
+# fp8bf16 PER_TOKEN_HEAD with the sglang lookup table (see fmha_batch_prefill.py).
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8), (16, 16)])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("qo_len,kv_len", [(512, 2048), (1024, 4096)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("page_size", [64, 1024])
+def test_batch_prefill_per_token_head_vec_k_col_v_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    qo_len,
+    kv_len,
+    causal,
+    logits_soft_cap,
+    page_size,
+):
+    """Pytest wrapper for PER_TOKEN_HEAD FP8 batch prefill on the decode-aligned
+    VEC_K_COL_V layout (5D vectorized K + 4D ColumnMajor V)."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="vec_k_col_v",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+    )
+
+
+# Caller-supplied softmax-P scale variants for PER_TOKEN_HEAD.
+# p_scale is per-q-head fp32 multiplier folded into the exp2 shift before fp8 P
+# quantization; it cancels mathematically in the final output, so the FP32
+# reference comparison must hold regardless of the value. Values kept <= 1.0 to
+# stay clear of FP8 e4m3 saturation (internal P quantization scale is 256).
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(32, 8)])
+@pytest.mark.parametrize("qo_len,kv_len", [(512, 2048)])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "p_scale_mode", ["none", "ones", "half", "per_head_random"]
+)
+def test_batch_prefill_per_token_head_p_scale_pytest(
+    batch_size,
+    num_qo_heads,
+    num_kv_heads,
+    qo_len,
+    kv_len,
+    causal,
+    p_scale_mode,
+):
+    """PER_TOKEN_HEAD FP8 batch prefill with caller-supplied softmax-P scale."""
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, 0.0),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return
+
+    if p_scale_mode == "none":
+        p_scale = None
+    elif p_scale_mode == "ones":
+        p_scale = torch.ones(num_qo_heads, dtype=torch.float32, device="cuda")
+    elif p_scale_mode == "half":
+        p_scale = torch.full(
+            (num_qo_heads,), 0.5, dtype=torch.float32, device="cuda"
+        )
+    else:  # per_head_random in [0.25, 1.0]
+        g = torch.Generator(device="cuda").manual_seed(123)
+        p_scale = (
+            0.25
+            + 0.75
+            * torch.rand(
+                num_qo_heads, dtype=torch.float32, device="cuda", generator=g
+            )
+        )
+
+    run_batch_prefill_per_token_head(
+        kvcache_layout="linear",
+        table_layout="sglang",
+        batch_size=batch_size,
+        qo_len=qo_len,
+        kv_len=kv_len,
+        page_size=64,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        causal=causal,
+        logits_soft_cap=0.0,
+        dtype=torch.bfloat16,
+        contiguous_kv=True,
+        seed=42,
+        p_scale=p_scale,
+    )
+
+
+def run_batch_prefill_per_token_head(
+    kvcache_layout,
+    table_layout,
+    batch_size,
+    qo_len,
+    kv_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    causal,
+    logits_soft_cap,
+    dtype,
+    contiguous_kv,
+    seed,
+    profile=False,
+    skip_reference=False,
+    p_scale=None,
+    p_scale_inv=None,
+):
+    """
+    FP8 batch prefill with PER_TOKEN_HEAD quantization:
+      Q descale: [total_q, nhead_q] fp32
+      K descale: [num_total_pages, page_block_size, nhead_k] fp32
+      V descale: [nhead_k] fp32
+
+    p_scale (optional, [num_qo_heads] fp32 on device): folded into the softmax
+    exp2 shift before fp8 P quantization. p_scale cancels in the final output,
+    so the FP32 reference comparison is unaffected.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    quant_dtype = dtypes.fp8
+    SUPPORTED_PAGE_SIZES = (16, 64, 1024)
+    if page_size not in SUPPORTED_PAGE_SIZES:
+        if skip_test_if(
+            True,
+            f"PER_TOKEN_HEAD only supports page_size in {SUPPORTED_PAGE_SIZES}, got {page_size}",
+        ):
+            return {"status": "skipped"}
+
+    k_vector_size = get_vector_size(quant_dtype)
+
+    if skip_test_if(
+        should_skip_rocm72_issue(causal, logits_soft_cap),
+        "ROCm 7.2 + gfx950 compiler issue with causal=True + logits_soft_cap=0.0",
+    ):
+        return {"status": "skipped"}
+
+    qo_lens = build_qo_lens(batch_size, qo_len, randomize=batch_size > 1)
+    kv_lens = build_kv_lens(batch_size, kv_len, qo_lens, randomize=batch_size > 1)
+    max_qo_len = qo_lens.max().item()
+    max_kv_len = kv_lens.max().item()
+
+    q = build_q_tensor_for_test(
+        qo_lens,
+        batch_size,
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        dtype,
+        None,
+        None,
+        is_input_fp8=True,
+    )
+
+    kv_cache = build_paged_kv_cache(
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_lens,
+        None,
+        None,
+        dtype,
+        use_uniform=True,
+        contiguous_kv=contiguous_kv,
+    )
+
+    kv_data_fp32 = kv_cache["kv_data_fp32"]
+    kv_data = kv_cache["kv_data"]
+    kv_indptr = kv_cache["kv_indptr_cpu"]
+    kv_indices = kv_cache["kv_indices_cpu"]
+    kv_last_page_len_cpu = kv_cache["kv_last_page_len_cpu"]
+
+    k_paged_ref, v_paged_ref = split_kv_pages(kv_data)
+
+    cu_seqlens_q = convert_lens_to_indptr(qo_lens).cuda()
+    q_indptr_cpu = convert_lens_to_indptr(qo_lens)
+
+    # FP32 reference (bf16 ground truth)
+    if skip_reference:
+        o_ref = None
+    else:
+        o_ref = build_reference_output(
+            q,
+            q_indptr_cpu,
+            kv_data_fp32,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len_cpu,
+            num_kv_heads,
+            head_dim,
+            dtype,
+            causal,
+            logits_soft_cap,
+        )
+
+    # PER_TOKEN_HEAD quantization
+    q_fp8, q_descale_per_token = per_token_per_head_quant_q(q, quant_dtype)
+    q_descale_per_token = q_descale_per_token.cuda()
+
+    k_paged_fp8, k_descale_per_token = per_token_per_head_quant_k_paged(
+        k_paged_ref, quant_dtype
+    )
+    k_descale_per_token = k_descale_per_token.cuda()
+
+    v_paged_fp8, v_descale_per_head = per_head_quant_v_paged(v_paged_ref, quant_dtype)
+    v_descale_per_head = v_descale_per_head.cuda()
+
+    if kvcache_layout == "vectorized":
+        k_for_vec = k_paged_fp8.view(-1, num_kv_heads, head_dim)
+        v_for_vec = v_paged_fp8.view(-1, num_kv_heads, head_dim)
+        k_paged, v_paged = vectorize_kv_cache(
+            k_for_vec,
+            v_for_vec,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
+    elif kvcache_layout == "vec_k_col_v":
+        # k_paged_fp8 / v_paged_fp8 currently have shape [Pages, PageSize, Heads, HeadDim].
+        # vec_k_col_v_kv_cache expects the same layout, so feed them directly without flattening.
+        k_paged, v_paged = vec_k_col_v_kv_cache(
+            k_paged_fp8,
+            v_paged_fp8,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size,
+        )
+    else:
+        k_paged = k_paged_fp8
+        v_paged = v_paged_fp8
+
+    k_vector_size_bf16 = get_vector_size(dtype)
+    if kvcache_layout == "vectorized":
+        k_for_vec_bf16 = k_paged_ref.view(-1, num_kv_heads, head_dim)
+        v_for_vec_bf16 = v_paged_ref.view(-1, num_kv_heads, head_dim)
+        k_cache_bf16, v_cache_bf16 = vectorize_kv_cache(
+            k_for_vec_bf16,
+            v_for_vec_bf16,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            k_vector_size_bf16,
+        )
+    elif kvcache_layout == "vec_k_col_v":
+        # bf16 reference also runs through the prefill kernel for correctness; bf16 has no
+        # PER_TOKEN_HEAD codegen variant for vec_k_col_v, so we keep the bf16 reference
+        # in plain linear layout (the prefill bf16 path supports linear K/V natively).
+        k_cache_bf16 = k_paged_ref
+        v_cache_bf16 = v_paged_ref
+    else:
+        k_cache_bf16 = k_paged_ref
+        v_cache_bf16 = v_paged_ref
+
+    max_num_pages_per_seq = (max_kv_len + page_size - 1) // page_size
+    block_table_cpu = torch.zeros(
+        (batch_size, max_num_pages_per_seq), dtype=torch.int32
+    )
+    for i in range(batch_size):
+        start, end = kv_indptr[i].item(), kv_indptr[i + 1].item()
+        block_table_cpu[i, : (end - start)] = kv_indices[start:end]
+    block_table_gpu = block_table_cpu.cuda()
+
+    kv_last_page_len_gpu = ((kv_lens - 1) % page_size + 1).int().cuda()
+    seqlen_k_gpu = kv_lens.cuda().int()
+
+    profile_result = {"status": "passed"}
+    run_result = run_ck(
+        batch_size,
+        num_kv_heads,
+        q_fp8,
+        k_paged,
+        v_paged,
+        cu_seqlens_q,
+        kv_indptr.cuda(),
+        kv_indices.cuda(),
+        max_qo_len,
+        max_kv_len,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        q_descale_per_token=q_descale_per_token,
+        k_descale_per_token=k_descale_per_token,
+        v_descale_per_head=v_descale_per_head,
+        kv_last_page_lens=kv_last_page_len_gpu,
+        block_table=block_table_gpu,
+        seqlen_k=seqlen_k_gpu,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
+        profile=profile,
+    )
+    if profile:
+        out_fp8, time_us, tflops = run_result
+        profile_result = {"status": "passed", "time_us": time_us, "tflops": tflops}
+    else:
+        out_fp8 = run_result
+
+    if skip_reference:
+        return profile_result
+
+    out_bf16 = run_ck(
+        batch_size,
+        num_kv_heads,
+        q.cuda(),
+        k_cache_bf16.cuda(),
+        v_cache_bf16.cuda(),
+        cu_seqlens_q,
+        kv_indptr.cuda(),
+        kv_indices.cuda(),
+        max_qo_len,
+        max_kv_len,
+        causal=causal,
+        logits_soft_cap=logits_soft_cap,
+        kv_last_page_lens=kv_last_page_len_gpu,
+        block_table=block_table_gpu,
+        seqlen_k=seqlen_k_gpu,
+        profile=False,
+    )
+
+    assert out_fp8.abs().max().item() > 1e-6, "FP8 kernel output is all zeros!"
+    assert out_bf16.abs().max().item() > 1e-6, "BF16 kernel output is all zeros!"
+    assert o_ref.abs().max().item() > 1e-6, "FP32 reference output is all zeros!"
+
+    verify_fp8_output(out_fp8, o_ref)
+
     rtol, atol = get_tolerances(dtype, is_fp8=False)
     torch.testing.assert_close(out_bf16, o_ref, rtol=rtol, atol=atol)
 
@@ -3035,7 +3824,7 @@ def run_batch_prefill_sink(
 # (the bisect family that isolated the bug to total cache size, i.e. the page
 # table is read past the valid region).
 #
-# Crash shape from Tencent Hunyuan / MI-308X:
+# Crash shape (prefill paged-KV out-of-bounds page-table read):
 #   prefill (q=2042, kv=2042), 10 q-heads, 1 kv-head, head_dim=128,
 #   page_size=16, bf16, causal=True
 #

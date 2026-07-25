@@ -34,11 +34,22 @@ mha_batch_prefill(at::Tensor& q,                  // [total_q, hq, d]
                   // Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
                   // Mutually exclusive with k_descale/v_descale
                   std::optional<const at::Tensor> kv_block_descale, // [num_block, num_kv_head, 2]
+                  // PER_TOKEN_HEAD mode descales (Q/K per-token per-head, V per-head).
+                  // Mutually exclusive with q/k/v_descale and kv_block_descale.
+                  std::optional<const at::Tensor> q_descale_per_token,
+                  std::optional<const at::Tensor> k_descale_per_token,
+                  std::optional<const at::Tensor> v_descale_per_head,
                   std::optional<const at::Tensor> kv_last_page_lens,
                   std::optional<const at::Tensor> block_table,
                   std::optional<const at::Tensor> seqlen_k,
                   std::optional<const at::Tensor> sink_ptr_, // [hq];
-                  std::optional<at::Generator> gen_);
+                  std::optional<at::Generator> gen_,
+                  // PER_TOKEN_HEAD optional per-q-head P scale [num_head_q]
+                  // fp32. ``p_scale_inv`` is accepted for API parity with
+                  // explicit-multiply implementations but unused internally;
+                  // the kernel folds log2(p_scale) into the exp2 row-max shift.
+                  std::optional<const at::Tensor> p_scale = std::nullopt,
+                  std::optional<const at::Tensor> p_scale_inv = std::nullopt);
 
 } // namespace torch_itfs
 } // namespace aiter

@@ -17,7 +17,8 @@ get_mha_batch_prefill_traits(int head_size_q,
                              ck_tile::BlockAttentionKVCacheLookupTableEnum kv_lookup_table,
                              int page_size,
                              bool skip_min_seqlen_q = false,
-                             bool has_sink         = false)
+                             bool has_sink         = false,
+                             bool is_v_rowmajor    = true)
 {
     return mha_batch_prefill_traits(head_size_q,
                                     head_size_v,
@@ -33,7 +34,8 @@ get_mha_batch_prefill_traits(int head_size_q,
                                     has_sink,
                                     kv_memory_layout,
                                     kv_lookup_table,
-                                    page_size);
+                                    page_size,
+                                    is_v_rowmajor);
 }
 
 float mha_batch_prefill(mha_batch_prefill_args args,
@@ -56,6 +58,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
     // dispatcher in fmha_batch_prefill_api.cpp, where each arm knows its own
     // compile-time bn0 and dtype element size. The wrapper just forwards args;
     // no runtime trait field for it.
+    // The wrapper sets args.is_v_rowmajor=false only for the decode-aligned
+    // VEC_K_COL_V_LAYOUT path; all other paths keep V as RowMajor.
     auto traits      = get_mha_batch_prefill_traits(head_size_q,
                                                head_size_v,
                                                q_dtype_str,
@@ -70,7 +74,8 @@ float mha_batch_prefill(mha_batch_prefill_args args,
                                                args.kv_lookup_table,
                                                args.page_block_size,
                                                /*skip_min_seqlen_q=*/false,
-                                               has_sink);
+                                               has_sink,
+                                               args.is_v_rowmajor);
     return fmha_batch_prefill(traits, args, stream_config);
 }
 

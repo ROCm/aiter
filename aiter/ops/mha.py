@@ -1420,11 +1420,19 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales (mutually exclusive with above)
+    q_descale_per_token: Optional[Tensor] = None,  # [total_q, nhead_q] fp32
+    k_descale_per_token: Optional[Tensor] = None,  # [num_total_pages, page_block_size, nhead_k] fp32
+    v_descale_per_head: Optional[Tensor] = None,   # [nhead_k] fp32
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
+    # PER_TOKEN_HEAD caller P scale: not part of the kernel cache key (handled
+    # at runtime), declared here only for positional-forwarding compatibility.
+    p_scale: Optional[Tensor] = None,
+    p_scale_inv: Optional[Tensor] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -1482,6 +1490,10 @@ def cmdGenFunc_mha_batch_prefill(
         # KV_BLOCKSCALE: Q per-tensor, K/V per-page
         md_name += "_kv_blockscale"
         filter_fwd += "_kv_blockscale*"
+    elif q_descale_per_token is not None:
+        # PER_TOKEN_HEAD mode
+        md_name += "_per_token_head"
+        filter_fwd += "_per_token_head*"
     elif q_descale is None or k_descale is None or v_descale is None:
         md_name += "_nqscale"
         filter_fwd += "_nqscale*"
@@ -3704,6 +3716,10 @@ def mha_batch_prefill_fake_tensors(
     v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
     kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
@@ -3789,11 +3805,20 @@ def mha_batch_prefill(
     v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
     kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
+    # PER_TOKEN_HEAD mode descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
     gen: Optional[Generator] = None,
+    # PER_TOKEN_HEAD optional per-q-head P scale [num_head_q] fp32.
+    # p_scale_inv is accepted for API parity but unused (the kernel folds
+    # log2(p_scale) into the exp2 row-max shift instead of dividing).
+    p_scale: Optional[torch.Tensor] = None,
+    p_scale_inv: Optional[torch.Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
@@ -3828,7 +3853,12 @@ def _mha_batch_prefill(
     kv_block_descale: Optional[
         torch.Tensor
     ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
+    q_descale_per_token: Optional[torch.Tensor] = None,
+    k_descale_per_token: Optional[torch.Tensor] = None,
+    v_descale_per_head: Optional[torch.Tensor] = None,
     sink_ptr: Optional[Tensor] = None,
+    p_scale: Optional[torch.Tensor] = None,
+    p_scale_inv: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
@@ -3857,11 +3887,16 @@ def _mha_batch_prefill(
         k_descale,
         v_descale,
         kv_block_descale,
+        q_descale_per_token,
+        k_descale_per_token,
+        v_descale_per_head,
         kv_last_page_lens,
         block_table,
         seqlen_k,
         sink_ptr,
         None,
+        p_scale,
+        p_scale_inv,
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -3892,8 +3927,15 @@ def mha_batch_prefill_func(
     k_descale=None,
     v_descale=None,
     kv_block_descale=None,  # [num_block, num_kv_head, 2] per-page K/V descales
+    q_descale_per_token=None,  # [total_q, nhead_q] fp32 (PER_TOKEN_HEAD mode)
+    k_descale_per_token=None,  # [num_total_pages, page_block_size, nhead_k] fp32
+    v_descale_per_head=None,   # [nhead_k] fp32
     sink_ptr=None,
     sink_size: int = 0,
+    # PER_TOKEN_HEAD optional per-q-head P scale [num_head_q] fp32; p_scale_inv
+    # accepted for API parity but unused (folded via exp2-shift, see kernel).
+    p_scale=None,
+    p_scale_inv=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -3906,13 +3948,22 @@ def mha_batch_prefill_func(
     # 16 bytes = 128-bit (dwordx4) vector width assumed by CK kernels.
     k_vector_size = 16 // k.element_size()
     is_vectorized = k.dim() == 5 and v.dim() == 5
+    # Decode-aligned VEC_K_COL_V layout: K is 5D vectorized, V is 4D ColumnMajor
+    # [Pages, NumHeads, HeadDim, PageSize].
+    is_vec_k_col_v = k.dim() == 5 and v.dim() == 4
     is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
-    if not (is_vectorized or is_linear):
+    if not (is_vectorized or is_vec_k_col_v or is_linear):
         raise ValueError(
-            "Batch prefill requires 5D vectorized, 4D linear, or 3D linear (page_size=1) K/V"
-            " tensors"
+            "Batch prefill requires 5D vectorized, 4D linear, 3D linear (page_size=1), or"
+            " VEC_K_COL_V (5D K + 4D V) K/V tensors"
         )
-    head_size_v_og = v.size(-2) if is_vectorized else v.size(-1)
+    if is_vectorized:
+        head_size_v_og = v.size(-2)
+    elif is_vec_k_col_v:
+        # V layout [Pages, NumHeads, HeadDim, PageSize] -> head_dim is dim -2
+        head_size_v_og = v.size(-2)
+    else:
+        head_size_v_og = v.size(-1)
     if head_size_q_og % k_vector_size != 0 or head_size_v_og % k_vector_size != 0:
         raise ValueError("Batch prefill requires head size divisible by vector size")
     if is_vectorized:
@@ -3924,6 +3975,25 @@ def mha_batch_prefill_func(
             )
         if v.size(-1) != k_vector_size:
             raise ValueError("Vectorized KV requires last dim equal to vector size")
+    elif is_vec_k_col_v:
+        # K constraints identical to is_vectorized branch above.
+        if k.size(-3) * k_vector_size != head_size_q_og:
+            raise ValueError("K vectorized layout does not match Q head size")
+        if k.size(-2) % k_vector_size != 0:
+            raise ValueError(
+                "VEC_K_COL_V requires K page size divisible by vector size"
+            )
+        # V is [Pages, NumHeads, HeadDim, PageSize]; PageSize must match K's page size,
+        # head count must match, and the contiguous (PageSize) dim must match.
+        page_size_k = k.size(-2)
+        if v.size(0) != k.size(0):
+            raise ValueError("VEC_K_COL_V V/K num_blocks mismatch")
+        if v.size(1) != k.size(1):
+            raise ValueError("VEC_K_COL_V V/K num_heads mismatch")
+        if v.size(-1) != page_size_k:
+            raise ValueError(
+                "VEC_K_COL_V V innermost (PageSize) dim must equal K page size"
+            )
     else:
         if k.size(-1) != head_size_q_og:
             raise ValueError("K linear layout does not match Q head size")
@@ -3958,7 +4028,12 @@ def mha_batch_prefill_func(
         k_descale=k_descale,
         v_descale=v_descale,
         kv_block_descale=kv_block_descale,
+        q_descale_per_token=q_descale_per_token,
+        k_descale_per_token=k_descale_per_token,
+        v_descale_per_head=v_descale_per_head,
         sink_ptr=sink_ptr,
+        p_scale=p_scale,
+        p_scale_inv=p_scale_inv,
     )
     out = out_padded[..., :head_size_v_og]
 
