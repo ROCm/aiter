@@ -125,6 +125,9 @@ compute-unit count.
 
 AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
 
+FlyDSL is not installed or AOT-compiled on Windows; the experimental native
+Windows build uses Composable Kernel instead.
+
 To install it manually:
 
 ```bash

@@ -1764,9 +1764,7 @@ def _write_ninja_file_to_build_library(
     if IS_WINDOWS:
         common_cflags += [f"-I{include}" for include in user_includes + system_includes]
         cflags = common_cflags + ["/std:c++20"] + extra_cflags
-        cflags += COMMON_MSVC_FLAGS + (
-            COMMON_HIP_FLAGS if IS_HIP_EXTENSION else []
-        )
+        cflags += COMMON_MSVC_FLAGS
         cflags = _nt_quote_args(cflags)
     else:
         common_cflags += [f"-I{shlex.quote(include)}" for include in user_includes]

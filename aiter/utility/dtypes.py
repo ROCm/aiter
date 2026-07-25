@@ -17,15 +17,15 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    if sys.platform == "win32":
-        try:
+    try:
+        if sys.platform == "win32":
             gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
-        except Exception:
-            gfx = "unknown"
-    else:
-        from ..jit.utils.chip_info import get_gfx_runtime
+        else:
+            from ..jit.utils.chip_info import get_gfx_runtime
 
-        gfx = get_gfx_runtime()
+            gfx = get_gfx_runtime()
+    except Exception:
+        gfx = "unknown"
     return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 
