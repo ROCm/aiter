@@ -329,6 +329,40 @@ def test_biased_grouped_topk(
     ret["err_aiter"] = err
     # return {"err": err, "us": us_aiter}
 
+    # row-strided logits (e.g. the K3 fused MoE-front router slice) must give
+    # the same result as the dense copy
+    pad = 8
+    backing = torch.empty((token, expert + pad), dtype=dtype)
+    gating_strided = backing[:, pad : pad + expert]
+    gating_strided.copy_(gating_output)
+    assert gating_strided.stride(0) == expert + pad
+    assert not gating_strided.is_contiguous()
+    w_strided = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
+    id_strided = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
+    aiter.biased_grouped_topk_hip(
+        gating_strided,
+        correction_bias,
+        w_strided,
+        id_strided,
+        group,
+        topk_group,
+        need_renorm,
+        scale_factor,
+    )
+    _s = id_strided.argsort(dim=-1)
+    _a = id_aiter.argsort(dim=-1)
+    checkAllclose(
+        id_aiter.gather(1, _a),
+        id_strided.gather(1, _s),
+        msg="topk_ids     [dense vs strided]",
+    )
+    err = checkAllclose(
+        w_aiter.gather(1, _a),
+        w_strided.gather(1, _s),
+        msg="topk_weights [dense vs strided]",
+    )
+    ret["err_strided"] = err
+
     if expert // group <= 32:
         w_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
         id_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
