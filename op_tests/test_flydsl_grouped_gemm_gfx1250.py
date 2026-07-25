@@ -141,6 +141,8 @@ def _torch_moe_ref(
     data_format: str,
     activation: ActivationType,
     swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
     if data_format not in ("a4w4", "a8w4"):
@@ -191,6 +193,8 @@ def _torch_moe_ref(
         # FlyDSL epilogue now applies it in either branch, so the reference
         # passes it through unconditionally to stay in sync.
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     if data_format == "a4w4":
         # Match the grouped a4w4 path again: stage2 input is MXFP4.
@@ -314,6 +318,8 @@ def _run_grouped_via_fused_moe(
     layout: str = "gguu",  # "gguu" -> SEPARATED | "gugu" -> INTERLEAVE
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     use_bias: bool = True,
     bench: bool = False,
     kernel_bench: bool = False,
@@ -436,6 +442,8 @@ def _run_grouped_via_fused_moe(
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
         )
 
     torch.cuda.synchronize()
@@ -491,6 +499,8 @@ def _run_grouped_via_fused_moe(
         data_format=data_format,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     ).to(out.dtype)
     return out, ref, us, kernel_us
 
@@ -529,6 +539,8 @@ def run_moe(
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
@@ -548,7 +560,11 @@ def run_moe(
     for reference only.  Returns a metrics dict (with ``us`` when benched).
     """
     _require_gfx1250()
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    act = {
+        ActivationType.Silu: "silu",
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.Situv2: "situv2",
+    }[activation]
     tag = f"{data_format} {layout} {act}"
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
@@ -564,6 +580,8 @@ def run_moe(
             layout=layout,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             use_bias=use_bias,
             bench=bench,
             kernel_bench=kernel_bench,
@@ -641,6 +659,43 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
         "a4w4",
         layout=layout,
         activation=ActivationType.Swiglu,
+        model_dim=512,
+        inter_dim=512,
+    )
+
+
+def test_situv2_activation_matches_torch():
+    from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
+        _apply_gate_up,
+    )
+
+    torch.manual_seed(0)
+    gate = torch.randn(4, 32)
+    up = torch.randn(4, 32)
+    beta, linear_beta = 4.0, 25.0
+    expected = (
+        beta
+        * torch.tanh(gate / beta)
+        * torch.sigmoid(gate)
+        * linear_beta
+        * torch.tanh(up / linear_beta)
+    )
+    actual = _apply_gate_up(
+        gate,
+        up,
+        "situv2",
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a4w4_situv2_matches_torch_ref(layout):
+    run_moe(
+        "a4w4",
+        layout=layout,
+        activation=ActivationType.Situv2,
         model_dim=512,
         inter_dim=512,
     )
