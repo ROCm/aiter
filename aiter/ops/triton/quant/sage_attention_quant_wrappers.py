@@ -105,70 +105,36 @@ def fused_sage_quant_mxfp4(
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
-def sage_quant_mxfp4(
-    q,
-    k,
-    v,
-    FP8_TYPE,
-    FP8_MAX,
-    BLKQ,
-    BLKK,
-    sm_scale=None,
-    q_smoothing=False,
-    layout="bshd",
-    USE_RNE=False,
-    R=None,
-    BLOCK_R=32,
-):
+def _pack_v_fp8_perchannel(v, FP8_TYPE=None, FP8_MAX=None, BLKK=64, layout="bhsd"):
+    """Per-channel fp8 (E4M3) V quant -- the V half of ``sage_quant_mxfp4``. Shared by
+    ``sage_quant_mxfp4`` (fresh Q/K/V quant) and the mxfp4-comms attention path (where
+    Q/K arrive already fp4-packed, so only V is quantized post-gather).
+
+    v: float V in ``layout`` order -- bshd [b, sk, h_kv, d] or bhsd [b, h_kv, sk, d].
+    Returns (v_fp8 [same layout/strides as v], v_scale [b, h_kv, d]); v_scale is the
+    per-channel amax over the sequence / FP8_MAX. FP8_TYPE/FP8_MAX default to aiter's fp8."""
+    if FP8_TYPE is None:
+        FP8_TYPE = aiter.dtypes.fp8
+    if FP8_MAX is None:
+        FP8_MAX = torch.finfo(FP8_TYPE).max
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
-
-    if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = v.shape
-
+    if layout == "bshd":  # v: [b, sk, h_kv, d]
+        b, kv_len, h_kv, head_dim = v.shape
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            v.stride(3),
+            v.stride(0), v.stride(2), v.stride(1), v.stride(3),
         )
-
-    elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = v.shape
-
+        amax_axis = 1
+    elif layout == "bhsd":  # v: [b, h_kv, sk, d]
+        b, h_kv, kv_len, head_dim = v.shape
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0),
-            v.stride(2),
-            v.stride(1),
-            v.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         )
+        amax_axis = 2
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
     K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
-
-    # Apply K tensor smoothing following SageAttention approach
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
-
-    v_task_count = b * h_kv * K_NUM_BLKS
-    grid = (v_task_count,)
-
-    # padded_head_dim = max(16, 1 << (head_dim - 1).bit_length())
-
-    if sm_scale is None:
-        sm_scale = head_dim**-0.5
-
-    q, k, delta_s = rotation_smooth_qk(
-        q,
-        k,
-        BLKQ,
-        R=R,
-        BLOCK_R=BLOCK_R,
-        q_smoothing=q_smoothing,
-        layout=layout,
-        sm_scale=(sm_scale * 1.4426950408889634),
-    )
-
+    v_scale = v.abs().amax(dim=amax_axis).to(torch.float32) / FP8_MAX  # [b, h_kv, d]
+    grid = (b * h_kv * K_NUM_BLKS,)
     sage_quant_v_kernel[grid](
         v,
         v_fp8,
@@ -188,12 +154,44 @@ def sage_quant_mxfp4(
         num_stages=3,
         num_warps=8,
     )
+    return v_fp8, v_scale
 
-    downcast_func = downcast_to_mxfp
 
-    q_fp4, q_scale = downcast_func(q, torch.uint8, axis=-1)
-    k_fp4, k_scale = downcast_func(k, torch.uint8, axis=-1)
+def sage_quant_mxfp4(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
+):
+    head_dim = q.shape[-1]
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
 
+    # Q/K: hadamard rotation + smoothing -> mxfp4.
+    q, k, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+    q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
+    k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
+
+    # V: per-channel fp8 quant (shared with the mxfp4-comms path).
+    v_fp8, v_scale = _pack_v_fp8_perchannel(v, FP8_TYPE, FP8_MAX, BLKK, layout)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
 
 
@@ -215,6 +213,71 @@ def _f4f4_v_kperm(device):
         kp = kperm.to(torch.int32).contiguous()
         _F4F4_V_KPERM_CACHE[device] = kp
     return kp
+
+
+def _pack_v_fp4_colmajor(v_bshd):
+    """Per-channel fp4 (E2M1) col-major LDS V pack -- the V half of the f4f4 quantizer.
+
+    Shared by ``sage_quant_f4f4`` (fresh Q/K/V quant) and by the mxfp4-comms attention
+    path (where Q/K arrive already fp4-packed, so only V is (re)packed post-gather).
+
+    v_bshd: bf16/float [b, sk, h_kv, 128] (arbitrary sk; non-contiguous ok -- only its
+    strides are read). Returns (v_fp4_view, v_descale) where v_fp4_view is a strided
+    [b, kv_pad, h_kv, 128] uint8 view (kv_pad = sk rounded up to 128) over a
+    [b, h_kv, nT*8192] + 64 B backing buffer (seq stride 64). The f4f4 kernel consumes it
+    directly -- do NOT call .contiguous() on it (that drops the col-major LDS layout).
+    descale is f32 per-channel amax over kv / 6 (E2M1 max).
+
+    The f4f4 kernel only supports a 128-multiple KV length, so the view is returned at the
+    PADDED length kv_pad (the tail tokens are zero); the caller pads Q/K to match and
+    slices the attention output back to the true sk. The 128-rounding is done *inside* the
+    pack kernel (it masks tokens >= kv_len -> 0 and writes a full 128-rounded buffer), so
+    V is never pre-padded: no bf16 torch.cat copy, and the per-channel amax runs on the
+    true (unpadded) V. Accepts the input dtype directly (bf16 typical) -- only the amax is
+    promoted to float32; the pack kernel reads v's dtype (no fp32 upcast)."""
+    b, kv_len, h_kv, head_dim = v_bshd.shape
+    assert head_dim == 128, head_dim
+    tile = 128
+    kv_pad = ((kv_len + tile - 1) // tile) * tile  # round up to a full 128-token tile
+    nT = kv_pad // tile
+    v_tok = v_bshd.permute(0, 2, 1, 3)  # [b, h_kv, kv_len, 128] (true length; kernel masks the tail)
+    amax = v_tok.abs().amax(dim=-2).to(torch.float32)  # [b, h_kv, d]
+    # descale = amax/6 (E2M1 max), clamped off 0 to avoid 0/0 in the pack (zero channels
+    # decode to 0 regardless of the scale). clamp+div is a plain epilogue that fuses into
+    # the amax reduction, so there's no separate descale kernel.
+    v_descale = (amax.clamp(min=1e-8) / 6.0).contiguous()
+    kperm = _f4f4_v_kperm(v_bshd.device)
+    # Allocate the packed buffer with 64 B of trailing slack up front (avoids a
+    # full-buffer torch.cat copy): the strided view's last-token window (seq stride
+    # 64 < 128) must stay in storage bounds. packed is a view of the leading bytes.
+    numel = b * h_kv * nT * 8192
+    buf = torch.empty(numel + 64, dtype=torch.uint8, device=v_bshd.device)
+    buf[numel:].zero_()
+    packed = buf[:numel].view(b, h_kv, nT * 8192)
+    grid = (b * h_kv * nT,)  # one program per 128-kv tile (packs all 8 u-blocks)
+    sage_quant_v_fp4_colmajor_kernel[grid](
+        v_tok,
+        packed,
+        v_descale,
+        kperm,
+        v_tok.stride(0),
+        v_tok.stride(1),
+        v_tok.stride(2),
+        v_tok.stride(3),
+        packed.stride(0),
+        packed.stride(1),
+        v_descale.stride(0),
+        v_descale.stride(1),
+        h_kv,
+        nT,
+        kv_len,  # true seqlen; the kernel masks tokens >= kv_len (writes 0) to 128-round
+        num_warps=1,  # 1 warp/tile (64 threads ~ the 64-token block) benchmarks fastest
+        num_stages=1,
+    )
+    v_fp4_view = torch.as_strided(
+        buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
+    )
+    return v_fp4_view, v_descale
 
 
 def sage_quant_f4f4(
@@ -249,20 +312,15 @@ def sage_quant_f4f4(
     if layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
-        v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, d] (strided view; kernel reads strides)
+        v_bshd = v  # [b, sk, h_kv, d]
     elif layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
-        v_tok = v  # [b, h_kv, sk, d]
+        v_bshd = v.permute(0, 2, 1, 3)  # [b, sk, h_kv, d] (strided view; the packer reads strides)
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
-    tile = 128
     assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
-    assert (
-        kv_len % tile == 0
-    ), f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
-    nT = kv_len // tile
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -281,38 +339,8 @@ def sage_quant_f4f4(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    # V: per-channel fp4 (E2M1) col-major LDS pack. descale = per-channel amax over kv / 6
-    # (E2M1 max), computed in torch like the fp8 sage_quant_v path (scale-outside).
-    amax = v_tok.abs().amax(dim=-2).to(torch.float32)  # [b, h_kv, d]
-    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
-    kperm = _f4f4_v_kperm(v.device)
-    packed = torch.empty((b, h_kv, nT * 8192), dtype=torch.uint8, device=v.device)
-    grid = (b * h_kv * nT * 8,)
-    sage_quant_v_fp4_colmajor_kernel[grid](
-        v_tok,
-        packed,
-        v_descale,
-        kperm,
-        v_tok.stride(0),
-        v_tok.stride(1),
-        v_tok.stride(2),
-        v_tok.stride(3),
-        packed.stride(0),
-        packed.stride(1),
-        v_descale.stride(0),
-        v_descale.stride(1),
-        h_kv,
-        nT,
-        kv_len,
-    )
-    # +64 B slack so the strided view's last-token window (seq stride 64 < 128) stays in
-    # storage bounds (kernel reads are separately bounds-checked by num_records).
-    buf = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
-    v_fp4_view = torch.as_strided(
-        buf,
-        (b, kv_len, h_kv, 128),
-        (h_kv * kv_len * 64, 64, kv_len * 64, 1),
-    )
+    # V: per-channel fp4 (E2M1) col-major LDS pack (shared with the mxfp4-comms path).
+    v_fp4_view, v_descale = _pack_v_fp4_colmajor(v_bshd)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 

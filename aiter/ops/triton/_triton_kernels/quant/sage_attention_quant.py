@@ -209,43 +209,55 @@ def sage_quant_v_fp4_colmajor_kernel(
     """Pack per-channel fp4 (E2M1) V into the f4f4 kernel's col-major LDS operand layout:
     per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
     64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
-    chan -> high nibble). One program packs one 1024 B block. Cosine-equivalent to the numpy
+    chan -> high nibble). ONE program packs a whole 128-kv tile (all 8 u-blocks, static
+    loop) -- 8x fewer, larger programs than the per-block grid, so launch/scheduling
+    overhead drops and the 8 blocks' loads pipeline. Cosine-equivalent to the numpy
     packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral)."""
     pid = tl.program_id(0)
-    u = pid % 8
-    t = (pid // 8) % nT
-    bh = pid // (8 * nT)
+    t = pid % nT
+    bh = pid // nT
     bb = bh // h_kv
     hh = bh % h_kv
-    n = u // 2  # head-dim 32-block
-    k = u % 2  # kv 64-half
 
     kk = tl.arange(0, 64)
     tok_in_half = tl.load(kperm_ptr + kk)  # [64]
-    token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
     jj = tl.arange(0, 16)
-    chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
-    chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
-
+    ooff = kk[:, None] * 16 + jj[None, :]
     vbase = v_ptr + bb * stride_vb + hh * stride_vh
     dbase = desc_ptr + bb * stride_db + hh * stride_dh
-    row = token[:, None] * stride_vs  # [64,1]
+    obase0 = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192
+    # Ragged S: only the final 128-tile can run past the real seqlen, so predicate the
+    # V loads on just that tile (a uniform per-program branch) -- all earlier tiles use
+    # plain unmasked loads. Lets the caller skip pre-padding V to a 128-multiple with no
+    # per-load mask cost on the common case. (S multiple of 128 -> last tile all-valid.)
+    is_last = t == nT - 1
+    for u in tl.static_range(8):
+        n = u // 2  # head-dim 32-block
+        k = u % 2   # kv 64-half
+        token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
+        chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
+        chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
+        row = token[:, None] * stride_vs  # [64,1]
+        a_lo = vbase + row + chan_lo[None, :] * stride_vd
+        a_hi = vbase + row + chan_hi[None, :] * stride_vd
+        if is_last:
+            tok_mask = (token < S)[:, None]  # [64,1]
+            v_lo = tl.load(a_lo, mask=tok_mask, other=0.0).to(tl.float32)
+            v_hi = tl.load(a_hi, mask=tok_mask, other=0.0).to(tl.float32)
+        else:
+            v_lo = tl.load(a_lo).to(tl.float32)
+            v_hi = tl.load(a_hi).to(tl.float32)
+        d_lo = tl.load(dbase + chan_lo)  # [16]
+        d_hi = tl.load(dbase + chan_hi)
 
-    v_lo = tl.load(vbase + row + chan_lo[None, :] * stride_vd).to(tl.float32)
-    v_hi = tl.load(vbase + row + chan_hi[None, :] * stride_vd).to(tl.float32)
-    d_lo = tl.load(dbase + chan_lo)  # [16]
-    d_hi = tl.load(dbase + chan_hi)
+        y_lo = v_lo / d_lo[None, :]
+        y_hi = v_hi / d_hi[None, :]
 
-    y_lo = v_lo / d_lo[None, :]
-    y_hi = v_hi / d_hi[None, :]
+        code_lo = _e2m1_code(y_lo)
+        code_hi = _e2m1_code(y_hi)
+        byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
 
-    code_lo = _e2m1_code(y_lo)
-    code_hi = _e2m1_code(y_hi)
-    byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
-
-    obase = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192 + u * 1024
-    ooff = kk[:, None] * 16 + jj[None, :]
-    tl.store(obase + ooff, byte)
+        tl.store(obase0 + u * 1024 + ooff, byte)
 
 
 @triton.jit
