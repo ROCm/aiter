@@ -1947,9 +1947,7 @@ def compile_mxscale_gemm(
                 tanh_abs = (one - e) * llvm.call_intrinsic(
                     T.f32, "llvm.amdgcn.rcp.f32", [one + e], [], []
                 )
-                return (x > arith.constant(0.0, type=T.f32)).select(
-                    tanh_abs, -tanh_abs
-                )
+                return (x > arith.constant(0.0, type=T.f32)).select(tanh_abs, -tanh_abs)
 
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)

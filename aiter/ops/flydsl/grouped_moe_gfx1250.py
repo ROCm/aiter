@@ -1008,9 +1008,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _fused_topids_to_rows = (
             None
             if effective_grouped_contiguous_m
-            else topids_to_rows
-            if _route_rows < _capacity_rows
-            else None
+            else topids_to_rows if _route_rows < _capacity_rows else None
         )
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,

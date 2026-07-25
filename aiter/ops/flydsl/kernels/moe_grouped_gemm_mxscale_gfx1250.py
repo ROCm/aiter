@@ -98,9 +98,7 @@ def _validate_common(cfg: _GroupedA8W4Config) -> None:
     if cfg.split_k < 1:
         raise ValueError(f"split_k must be >= 1, got {cfg.split_k}")
     if cfg.act not in ("silu", "swiglu", "situv2"):
-        raise ValueError(
-            f"act must be 'silu', 'swiglu', or 'situv2', got {cfg.act!r}"
-        )
+        raise ValueError(f"act must be 'silu', 'swiglu', or 'situv2', got {cfg.act!r}")
     if cfg.act == "situv2":
         if cfg.situ_beta <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {cfg.situ_beta!r}")
@@ -365,13 +363,9 @@ def _apply_gate_up(
         return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
     if act == "situv2":
         situ_gate = (
-            float(situ_beta)
-            * torch.tanh(gate / float(situ_beta))
-            * torch.sigmoid(gate)
+            float(situ_beta) * torch.tanh(gate / float(situ_beta)) * torch.sigmoid(gate)
         )
-        up_scaled = float(situ_linear_beta) * torch.tanh(
-            up / float(situ_linear_beta)
-        )
+        up_scaled = float(situ_linear_beta) * torch.tanh(up / float(situ_linear_beta))
         return situ_gate * up_scaled
     if swiglu_limit is not None:
         gate = gate.clamp(max=_lim)
