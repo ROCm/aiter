@@ -1783,7 +1783,10 @@ def _flash_attn_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -1804,8 +1807,11 @@ def _flash_attn_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
@@ -1921,17 +1927,28 @@ def _flash_attn_forward(
         return ret
 
     def _can_impl_fmha_fwd_hd128_bf16_opus():
-        # OPUS gfx950 dense D=128 bf16 forward. Env-gated (OFF by default) so it only
-        # supersedes v3/CK when enabled. Kernel requires seqlen_q == seqlen_k.
         if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
             return False
-        return (hdim_q == 128 and hdim_v == 128) and (seqlen_q == seqlen_k)
+        if not (hdim_q == 128 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
+        # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
+        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
+            return False
+        return True
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
         if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
             return False
-        return hdim_q == 192 and hdim_v == 128
+        if not (hdim_q == 192 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
+        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
+            return False
+        if seqlen_k * v.stride(1) * v.element_size() >= (1 << 32):
+            return False
+        return True
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2796,7 +2813,10 @@ def _flash_attn_varlen_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2818,8 +2838,11 @@ def _flash_attn_varlen_forward(
         ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
