@@ -394,9 +394,6 @@ def unified_attention(
         use_gluon_2d = is_2d_gluon_available(
             q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
-        # Gluon uses the logical head size as a block shape. Non-power-of-two
-        # Kimi heads must use the Triton path, which pads the block internally.
-        use_gluon_2d = use_gluon_2d and (head_size & (head_size - 1) == 0)
         if use_gluon_2d:
             _gfx1250_unified_attention_2d(
                 q,
@@ -669,7 +666,6 @@ def unified_attention(
         head_size_padded = triton.next_power_of_2(head_size)
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
         gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
-        gluon_heads_per_warp = num_query_heads // gluon_num_warps
         use_gluon_reduce = (
             IS_DEVICE_ARCH_GFX12
             and _reduce_segments_gluon is not None
@@ -677,8 +673,6 @@ def unified_attention(
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
             and head_size_padded % 32 == 0
             and num_query_heads % gluon_num_warps == 0
-            and (gluon_heads_per_warp & (gluon_heads_per_warp - 1) == 0)
-            and (NUM_SEGMENTS & (NUM_SEGMENTS - 1) == 0)
         )
         if use_gluon_reduce:
             _reduce_segments_gluon[(q.shape[0],)](
