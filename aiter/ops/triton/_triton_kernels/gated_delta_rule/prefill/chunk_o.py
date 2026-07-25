@@ -866,6 +866,7 @@ def chunk_fwd_kernel_o_opt_vk(
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     INDEX_STRIDE: tl.constexpr,
+    H_IS_FP32: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -921,9 +922,9 @@ def chunk_fwd_kernel_o_opt_vk(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        # FP32 state is narrowed in registers for the BF16 MFMA. This does not
-        # materialize a cast tensor or launch a separate conversion kernel.
-        b_o = tl.dot(b_q, tl.trans(b_h.to(b_q.dtype)), acc=b_o)
+        if H_IS_FP32:
+            b_h = b_h.to(b_q.dtype)
+        b_o = tl.dot(b_q, tl.trans(b_h), acc=b_o)
         b_A = tl.dot(b_q, b_k, acc=b_A)
 
     if USE_G:
@@ -1054,6 +1055,7 @@ def chunk_fwd_o_opt_vk(
         V=V,
         BT=BT,
         INDEX_STRIDE=index_stride,
+        H_IS_FP32=h.dtype == torch.float32,
         USE_EXP2=use_exp2,
     )
     return o

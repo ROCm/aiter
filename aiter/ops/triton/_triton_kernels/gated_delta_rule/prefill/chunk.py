@@ -230,6 +230,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
+    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
@@ -263,6 +264,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
         use_exp2: bool — use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by K6). If None, a fresh buffer is allocated.
@@ -367,6 +370,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
             prefill_metadata=prefill_metadata,
@@ -376,6 +380,11 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             inplace_final_state=inplace_final_state,
         )
     elif use_chunk_flydsl:
+        if snapshot_dtype is not None and snapshot_dtype != k.dtype:
+            raise ValueError(
+                "FlyDSL K5 does not support overriding `snapshot_dtype`; "
+                "omit it or pass `k.dtype`."
+            )
         # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
         # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
         # mirrors the HIP g-layout contract (default token-major), so pass
@@ -412,6 +421,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             cu_seqlens=cu_seqlens,
             use_exp2=use_exp2,
             state_dtype=state_dtype,
+            snapshot_dtype=snapshot_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             initial_state_indices=initial_state_indices,
