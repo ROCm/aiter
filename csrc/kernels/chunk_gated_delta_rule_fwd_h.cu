@@ -846,7 +846,7 @@ __device__ __forceinline__ void coalesced_vk_store_from_transpose(
     }
 }
 
-template <int BV_P, bool STATE_BF16>
+template <int BV_P, bool SNAPSHOT_BF16>
 __device__ __forceinline__ void store_chunk_hstate(
     int chunk_idx, int H, int i_h, int global_v_base,
     int wave_id, int lane_id, int v_idx,
@@ -855,7 +855,7 @@ __device__ __forceinline__ void store_chunk_hstate(
     const bf16_t* __restrict__ h_transpose_buf,
     void* __restrict__ h_state_out)
 {
-    if constexpr (STATE_BF16) {
+    if constexpr (SNAPSHOT_BF16) {
         coalesced_vk_store_from_transpose<BV_P>(
             chunk_idx, H, i_h, global_v_base,
             wave_id, lane_id, h_transpose_buf,
@@ -870,7 +870,7 @@ __device__ __forceinline__ void store_chunk_hstate(
     }
 }
 
-template <int BV_P, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool HAS_GK = false, bool G_HEAD_MAJOR = false, bool STATE_BF16 = true>
+template <int BV_P, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool HAS_GK = false, bool G_HEAD_MAJOR = false, bool SNAPSHOT_BF16 = true>
 __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     int token_base, int global_token_base, int actual_bt, int chunk_idx,
     int T_flat, int H, int Hg, int i_n, int i_h, int i_hg,
@@ -912,7 +912,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
             wave_id, lane_id, v_idx,
             h_reg, h_state_panel0, h_state_panel1, h_transpose_buf);
 
-        store_chunk_hstate<BV_P, STATE_BF16>(
+        store_chunk_hstate<BV_P, SNAPSHOT_BF16>(
             chunk_idx, H, i_h, global_v_base,
             wave_id, lane_id, v_idx, h_row_base_lo, h_row_base_hi,
             h_reg, h_transpose_buf, h_state_out);
@@ -1034,7 +1034,7 @@ __device__ __forceinline__ void process_tail_chunk_bvp_vk_lds_v(
     }
 }
 
-template <int BV_P, bool USE_INITIAL_STATE, bool STORE_FINAL_STATE, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool USE_EXP2, bool HAS_GK, bool G_HEAD_MAJOR, bool STATE_BF16>
+template <int BV_P, bool USE_INITIAL_STATE, bool STORE_FINAL_STATE, bool SAVE_NEW_VALUE, bool IS_VARLEN, bool USE_EXP2, bool HAS_GK, bool G_HEAD_MAJOR, bool STATE_BF16, bool SNAPSHOT_BF16>
 __global__ __launch_bounds__(BLOCK_THREADS)
 void chunk_gated_delta_rule_fwd_h_hip_kernel(
     const hip_bfloat16* __restrict__ k,
@@ -1174,7 +1174,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
             has_next_full, w_next_chunk, k_next_chunk,
             w_next_data, k_next_data, USE_EXP2, k_stride_t, g_stride_b, g_stride_h, g_stride_t);
 
-        store_chunk_hstate<BV_P, STATE_BF16>(
+        store_chunk_hstate<BV_P, SNAPSHOT_BF16>(
             chunk_idx, H, i_h, global_v_base,
             wave_id, lane_id, v_idx, h_row_base_lo, h_row_base_hi,
             h_reg, h_transpose_buf, h_state_out);
@@ -1202,7 +1202,7 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         } else {
             tail_token_base = tail_token_base_local;
         }
-        process_tail_chunk_bvp_vk_lds_v<BV_P, SAVE_NEW_VALUE, IS_VARLEN, HAS_GK, G_HEAD_MAJOR, STATE_BF16>(
+        process_tail_chunk_bvp_vk_lds_v<BV_P, SAVE_NEW_VALUE, IS_VARLEN, HAS_GK, G_HEAD_MAJOR, SNAPSHOT_BF16>(
             tail_token_base, tail_global_token_base, tail_bt, chunk_base + full_chunks,
             T_flat, H, Hg, i_n, i_h, i_hg, global_v_base,
             lane_id, wave_id,
@@ -1222,8 +1222,8 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     }
 }
 
-#define LAUNCH_HIP_KERNEL(BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T)                \
-    hipLaunchKernelGGL((chunk_gated_delta_rule_fwd_h_hip_kernel<BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T>), \
+#define LAUNCH_HIP_KERNEL(BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T) \
+    hipLaunchKernelGGL((chunk_gated_delta_rule_fwd_h_hip_kernel<BV_P, USE_INIT, STORE_FINAL, SAVE_NEW, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T>), \
         dim3(V_DIM / (BV_P), N * H),                                                                                                 \
         dim3(BLOCK_THREADS),                                                                                                          \
         0,                                                                                                                            \
@@ -1249,57 +1249,58 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
         g_stride_h,                                                                                                                   \
         g_stride_t)
 
-#define DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T)               \
+#define DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T) \
     if (has_initial_state) {                                                                                   \
         if (output_final_state) {                                                                              \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }    \
-            else                { LAUNCH_HIP_KERNEL(BV_P, true, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }   \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }    \
+            else                { LAUNCH_HIP_KERNEL(BV_P, true, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }   \
         } else {                                                                                               \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }   \
-            else                { LAUNCH_HIP_KERNEL(BV_P, true, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }  \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, true, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }   \
+            else                { LAUNCH_HIP_KERNEL(BV_P, true, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }  \
         }                                                                                                      \
     } else {                                                                                                   \
         if (output_final_state) {                                                                              \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }   \
-            else                { LAUNCH_HIP_KERNEL(BV_P, false, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }  \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, true, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }   \
+            else                { LAUNCH_HIP_KERNEL(BV_P, false, true, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }  \
         } else {                                                                                               \
-            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); }  \
-            else                { LAUNCH_HIP_KERNEL(BV_P, false, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T); } \
+            if (save_new_value) { LAUNCH_HIP_KERNEL(BV_P, false, false, true, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); }  \
+            else                { LAUNCH_HIP_KERNEL(BV_P, false, false, false, IS_VARLEN_T, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T); } \
         }                                                                                                      \
     }
 
-#define DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T)  \
+#define DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T) \
     if (is_varlen) {                                                               \
-        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, true, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T);   \
+        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, true, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T);   \
     } else {                                                                       \
-        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, false, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T);  \
+        DISPATCH_HIP_KERNEL_WITH_VARLEN(BV_P, false, USE_EXP2_T, HAS_GK_T, G_HEAD_MAJOR_T, STATE_BF16_T, SNAPSHOT_BF16_T);  \
     }
 
-#define DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, USE_EXP2_T, HAS_GK_T, STATE_BF16_T)  \
+#define DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, USE_EXP2_T, HAS_GK_T, STATE_BF16_T, SNAPSHOT_BF16_T) \
     if (g_head_major) {                                                               \
-        DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, true, STATE_BF16_T);   \
+        DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, true, STATE_BF16_T, SNAPSHOT_BF16_T);   \
     } else {                                                                          \
-        DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, false, STATE_BF16_T);  \
+        DISPATCH_HIP_KERNEL_WITH_EXP2(BV_P, USE_EXP2_T, HAS_GK_T, false, STATE_BF16_T, SNAPSHOT_BF16_T);  \
     }
 
-#define DISPATCH_HIP_KERNEL(BV_P)                                  \
+#define DISPATCH_HIP_KERNEL_WITH_DTYPES(BV_P, STATE_BF16_T, SNAPSHOT_BF16_T) \
+    do {                                                                         \
+        if (use_exp2) {                                                          \
+            if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, true, STATE_BF16_T, SNAPSHOT_BF16_T); }   \
+            else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, false, STATE_BF16_T, SNAPSHOT_BF16_T); }  \
+        } else {                                                                 \
+            if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, true, STATE_BF16_T, SNAPSHOT_BF16_T); }  \
+            else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, false, STATE_BF16_T, SNAPSHOT_BF16_T); } \
+        }                                                                        \
+    } while (0)
+
+#define DISPATCH_HIP_KERNEL(BV_P)                                                \
     do {                                                                         \
         if (state_is_bf16) {                                                     \
-            if (use_exp2) {                                                      \
-                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, true, true); }   \
-                else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, false, true); }  \
-            } else {                                                             \
-                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, true, true); }  \
-                else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, false, true); } \
-            }                                                                    \
+            if (snapshot_is_bf16) { DISPATCH_HIP_KERNEL_WITH_DTYPES(BV_P, true, true); }   \
+            else                    { DISPATCH_HIP_KERNEL_WITH_DTYPES(BV_P, true, false); }  \
         } else {                                                                 \
-            if (use_exp2) {                                                      \
-                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, true, false); }  \
-                else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, true, false, false); } \
-            } else {                                                             \
-                if (has_gk) { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, true, false); } \
-                else        { DISPATCH_HIP_KERNEL_WITH_G_LAYOUT(BV_P, false, false, false); }\
-            }                                                                    \
+            if (snapshot_is_bf16) { DISPATCH_HIP_KERNEL_WITH_DTYPES(BV_P, false, true); }  \
+            else                    { DISPATCH_HIP_KERNEL_WITH_DTYPES(BV_P, false, false); } \
         }                                                                        \
     } while (0)
 
@@ -1413,9 +1414,7 @@ void chunk_gated_delta_rule_fwd_h_hip_impl(
         state_dtype == AITER_DTYPE_fp32 || state_dtype == AITER_DTYPE_bf16,
         "`initial_state` must be float32 or bfloat16, got ", AiterDtype_to_str(state_dtype));
     const bool state_is_bf16 = state_dtype == AITER_DTYPE_bf16;
-    AITER_CHECK(h.dtype() == state_dtype,
-                "`h` dtype must match `initial_state`, got ",
-                AiterDtype_to_str(h.dtype()));
+    const bool snapshot_is_bf16 = h.dtype() == AITER_DTYPE_bf16;
 
     if (has_initial_state) {
         AITER_CHECK(initial_state.is_gpu(), "`initial_state` must be a CUDA/HIP tensor.");

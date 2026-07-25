@@ -695,6 +695,13 @@ def test_chunk_opt(
         pytest.param(torch.bfloat16, id="state_bf16"),
     ],
 )
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
 @pytest.mark.skipif(
     _is_gfx12_runtime(),
@@ -711,6 +718,7 @@ def test_chunk_opt_hip(
     use_qk_l2norm_in_kernel: bool,
     dtype: torch.dtype,
     state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
 ):
     torch.manual_seed(42)
     if D != 128 or dtype != torch.bfloat16:
@@ -749,6 +757,7 @@ def test_chunk_opt_hip(
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_chunk_hip=True,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
     )
 
     ref, ref_ht = recurrent_gated_delta_rule_ref(
@@ -979,6 +988,13 @@ def test_chunk_opt_varlen_hip(
         pytest.param(torch.bfloat16, id="state_bf16"),
     ],
 )
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
 @pytest.mark.skipif(
     os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
     reason="Skipping test_chunk_opt_vk_indice because SKIP_TEST_CHUNK_VARLEN is set",
@@ -990,6 +1006,7 @@ def test_chunk_opt_vk_indice(
     mask_p: float,
     cu_seqlens: list[int],
     state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
 ):
     """Functional test for the indexed state-pool fwd_h on both backends.
 
@@ -1041,9 +1058,11 @@ def test_chunk_opt_vk_indice(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         **extra_kwargs,
     )
-    assert h_ref.dtype == state_dtype
+    assert h_ref.dtype == snapshot_dtype
+    assert ht_ref.dtype == state_dtype
 
     # --- indexed pool: scatter the N states into a larger pool at unique,
     # non-identity slots to prove the gather honours initial_state_indices ---
@@ -1066,9 +1085,10 @@ def test_chunk_opt_vk_indice(
         output_final_state=True,
         cu_seqlens=cu_seqlens,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         **extra_kwargs,
     )
-    assert h_idx.dtype == state_dtype
+    assert h_idx.dtype == snapshot_dtype
     assert ht_idx is pool  # in-place: final state aliases the pool buffer
 
     # 1. snapshots + recomputed values are bit-identical to the dense path
@@ -1087,6 +1107,110 @@ def test_chunk_opt_vk_indice(
     assert torch.equal(
         pool[untouched], pool_before[untouched]
     ), "non-indexed pool slots were modified by the kernel"
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+def test_chunk_snapshot_dtype_defaults_to_k_dtype(backend: str):
+    """FP32 persistent state must not change the default BF16 snapshot policy."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    h, _, final_state = fwd_h(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        initial_state=initial_state,
+        output_final_state=True,
+        state_dtype=torch.float32,
+        **extra_kwargs,
+    )
+
+    assert h.dtype == k.dtype == torch.bfloat16
+    assert final_state.dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "snapshot_dtype",
+    [
+        pytest.param(torch.bfloat16, id="snapshot_bf16"),
+        pytest.param(torch.float32, id="snapshot_fp32"),
+    ],
+)
+def test_chunk_opt_vk_snapshot_dtype(snapshot_dtype: torch.dtype):
+    """Exercise Triton K5 and K6 with independently selected snapshot dtype."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 128, 2, 128
+    q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    beta = torch.rand(B, T, H, dtype=torch.bfloat16, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref.transpose(-1, -2).contiguous(),
+        output_final_state=True,
+        state_dtype=torch.float32,
+        snapshot_dtype=snapshot_dtype,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    assert final_state.dtype == torch.float32
+    assert_close("o", ref.float(), out.float(), 0.005)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        0.005,
+    )
 
 
 @pytest.mark.parametrize(

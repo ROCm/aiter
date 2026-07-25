@@ -155,6 +155,15 @@ def _prepare_state_args(
     )
 
 
+def _resolve_snapshot_dtype(
+    snapshot_dtype: Optional[torch.dtype], input_dtype: torch.dtype
+) -> torch.dtype:
+    dtype = input_dtype if snapshot_dtype is None else snapshot_dtype
+    if dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"`snapshot_dtype` must be fp32 or bf16, got {dtype}.")
+    return dtype
+
+
 def _normalize_g_tensor(
     g: Tensor | None,
     *,
@@ -201,6 +210,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     cu_seqlens: Tensor | None = None,
     selected_bv: int | None = None,
     state_dtype: torch.dtype | None = None,
+    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
     initial_state_indices: Tensor | None = None,
@@ -211,12 +221,14 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     num_decode_tokens: int = 0,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """
-    HIP hidden-state forward with h layout [V, K] (K=128, V=128, bf16), always
+    HIP hidden-state forward with h layout [V, K] (K=128, V=128), always
     returning ``(h, v_new, final_state)``.
 
     w, u: [B, H, T, K/V] head-major contiguous.
     h snapshots: [B, NT, H, V, K]; v_new output: [B, H, T_flat, V].
     `g` is a 3-D tensor, token-major [B, T, H] or head-major [B, H, T].
+    ``state_dtype`` controls initial/final persistent state. ``snapshot_dtype``
+    independently controls temporary chunk snapshots and defaults to ``k.dtype``.
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     In varlen mode, pass ``prefill_metadata`` (preferred for reuse) or
     ``seq_lens_cpu`` to avoid reading chunk scheduling values back from the GPU.
@@ -375,10 +387,11 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         has_initial_state = state.has_initial_state
         resolved_state_dtype = state_tensor.dtype
 
+    resolved_snapshot_dtype = _resolve_snapshot_dtype(snapshot_dtype, k.dtype)
     h = torch.empty(
         (1, total_chunks, H, V, K) if is_varlen else (B, NT, H, V, K),
         device=k.device,
-        dtype=resolved_state_dtype,
+        dtype=resolved_snapshot_dtype,
     )
 
     if not output_final_state:

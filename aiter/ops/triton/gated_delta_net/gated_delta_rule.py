@@ -458,6 +458,7 @@ def chunk_gated_delta_rule_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
+    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
@@ -495,6 +496,8 @@ def chunk_gated_delta_rule_opt_vk(
             Mutually exclusive with ``use_chunk_hip``.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
+        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
+            (`fp32` or `bf16`). Defaults to `k.dtype`.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
         num_decodes (int): number of leading decode-only sequences to skip in
             ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
@@ -556,6 +559,7 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
         state_dtype=state_dtype,
+        snapshot_dtype=snapshot_dtype,
         use_exp2=use_exp2,
         o=o,
         num_decodes=num_decodes,

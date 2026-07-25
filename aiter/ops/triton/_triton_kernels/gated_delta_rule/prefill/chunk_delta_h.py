@@ -1302,6 +1302,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = True,
     state_dtype: torch.dtype | None = None,
+    snapshot_dtype: torch.dtype | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     initial_state_indices: torch.Tensor | None = None,
@@ -1318,7 +1319,9 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     `g` is expected in head-major layout [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
     state_dtype selects the initial/final hidden-state dtype (`fp32` or `bf16`);
-    defaults to fp32. The kernel accumulates in fp32 and casts on store.
+    defaults to fp32. snapshot_dtype independently selects the temporary chunk
+    snapshot dtype and defaults to k.dtype. The kernel accumulates in fp32 and
+    casts each output according to its own dtype policy.
     num_decodes / num_decode_tokens skip a leading decode-only prefix in the
     ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
     rebased internally via the cached prologue helpers so the chunk-index /
@@ -1386,6 +1389,14 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     if state_dtype is not None and state_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(f"`state_dtype` must be fp32 or bf16, got {state_dtype}.")
     _state_dtype = state_dtype if state_dtype is not None else torch.float32
+    if snapshot_dtype is not None and snapshot_dtype not in (
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError(
+            f"`snapshot_dtype` must be fp32 or bf16, got {snapshot_dtype}."
+        )
+    _snapshot_dtype = k.dtype if snapshot_dtype is None else snapshot_dtype
     if (
         state_dtype is not None
         and initial_state is not None
@@ -1419,7 +1430,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             # gk is expressed in natural-log space, so pre-scale it for exp2 kernels.
             gk = gk * RCP_LN2
 
-    h = k.new_empty(B, NT, H, V, K)
+    h = k.new_empty(B, NT, H, V, K, dtype=_snapshot_dtype)
     if not output_final_state:
         final_state = None
     elif inplace:
