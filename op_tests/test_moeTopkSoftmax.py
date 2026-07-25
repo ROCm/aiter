@@ -267,7 +267,16 @@ def test_biased_grouped_topk(
     num_warmup=2,
 ):
     ret = {}
-    gating_output = torch.randn((token, expert), dtype=dtype)
+    # logits may be a row-strided slice of a wider fused buffer (e.g. the K3
+    # fused MoE-front router); exercise that layout instead of a dense tensor
+    pad = 8
+    backing = torch.empty((token, expert + pad), dtype=dtype)
+    gating_output = backing[:, pad : pad + expert]
+    # keep the randn stream identical to the dense layout so later tests in
+    # this file see the same random inputs
+    gating_output.copy_(torch.randn((token, expert), dtype=dtype))
+    assert gating_output.stride(0) == expert + pad
+    assert not gating_output.is_contiguous()
     correction_bias = torch.randn((expert,), dtype=dtype)
 
     (w_ref, id_ref, score_ref), us_ref = run_perftest(
@@ -329,46 +338,12 @@ def test_biased_grouped_topk(
     ret["err_aiter"] = err
     # return {"err": err, "us": us_aiter}
 
-    # row-strided logits (e.g. the K3 fused MoE-front router slice) must give
-    # the same result as the dense copy
-    pad = 8
-    backing = torch.empty((token, expert + pad), dtype=dtype)
-    gating_strided = backing[:, pad : pad + expert]
-    gating_strided.copy_(gating_output)
-    assert gating_strided.stride(0) == expert + pad
-    assert not gating_strided.is_contiguous()
-    w_strided = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
-    id_strided = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
-    aiter.biased_grouped_topk_hip(
-        gating_strided,
-        correction_bias,
-        w_strided,
-        id_strided,
-        group,
-        topk_group,
-        need_renorm,
-        scale_factor,
-    )
-    _s = id_strided.argsort(dim=-1)
-    _a = id_aiter.argsort(dim=-1)
-    checkAllclose(
-        id_aiter.gather(1, _a),
-        id_strided.gather(1, _s),
-        msg="topk_ids     [dense vs strided]",
-    )
-    err = checkAllclose(
-        w_aiter.gather(1, _a),
-        w_strided.gather(1, _s),
-        msg="topk_weights [dense vs strided]",
-    )
-    ret["err_strided"] = err
-
     if expert // group <= 32:
         w_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
         id_sglang = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
         _, us_sglang = run_perftest(
             aiter.moe_fused_gate,
-            gating_output,
+            gating_output.contiguous(),  # moe_fused_gate takes dense input only
             correction_bias,
             w_sglang,
             id_sglang,
