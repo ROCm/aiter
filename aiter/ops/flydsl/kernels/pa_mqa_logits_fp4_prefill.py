@@ -55,8 +55,14 @@ def compute_prefill_schedule(
     block_k,
     parallel_unit_num,
     max_seq_len,
+    cta_info_out=None,
 ):
-    """Compute the persistent-grid schedule for ragged-prefill MQA logits."""
+    """Compute the persistent-grid schedule for ragged-prefill MQA logits.
+
+    Pass `cta_info_out` (a fixed [parallel_unit_num, CTA_INFO_WIDTH] int32 buffer)
+    to write the schedule into a stable address (CUDAGraph decode: the captured
+    kernel replays from this pointer while `build()` refreshes its contents).
+    """
     device = local_ends.device
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
@@ -94,7 +100,10 @@ def compute_prefill_schedule(
 
     # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
     # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
-    cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    if cta_info_out is None:
+        cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    else:
+        cta_info = cta_info_out
     safe_i32 = safe.reshape(1).to(torch.int32)
     total_splits_i32 = total_splits.reshape(1).to(torch.int32)
     BLOCK_P = 256
@@ -792,21 +801,36 @@ def _varqlen_windows_kernel(
     n = r - cu_b
     qlen = cu_b1 - cu_b
     le = tl.maximum(ctx_b - qlen + n + 1, 0)
+    # Rows beyond the real total Σ (cu[B]) are FLAT tail-padding — force an empty
+    # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
+    # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
+    real_total = tl.load(cu_ptr + B)
+    le = tl.where(r < real_total, le, tl.zeros([BLOCK], tl.int32))
 
     tl.store(row_to_batch_ptr + r, b, mask=rmask)
     tl.store(local_starts_ptr + r, tl.zeros([BLOCK], tl.int32), mask=rmask)
     tl.store(local_ends_ptr + r, le, mask=rmask)
 
 
-def compute_varqlen_windows(cu_seq_q, context_lens, total_q):
-    """Build ragged-row metadata for per-batch variable query length (MTP)."""
+def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
+    """Build ragged-row metadata for per-batch variable query length (MTP).
+
+    Pass `out=(row_to_batch, local_starts, local_ends)` (fixed int32 buffers each
+    >= total_q long) to write into stable addresses — the CUDAGraph decode path
+    scores all padded rows, so top_k replays from these window pointers while
+    `build()` refreshes their contents. Rows past the real total (cu[B]) get an
+    empty window (local_ends == 0) so they are skipped.
+    """
     dev = cu_seq_q.device
     cu = cu_seq_q.to(torch.int32).contiguous()
     ctx = context_lens.to(torch.int32).contiguous()
     B = ctx.shape[0]
-    row_to_batch = torch.empty(total_q, dtype=torch.int32, device=dev)
-    local_starts = torch.empty(total_q, dtype=torch.int32, device=dev)
-    local_ends = torch.empty(total_q, dtype=torch.int32, device=dev)
+    if out is None:
+        row_to_batch = torch.empty(total_q, dtype=torch.int32, device=dev)
+        local_starts = torch.empty(total_q, dtype=torch.int32, device=dev)
+        local_ends = torch.empty(total_q, dtype=torch.int32, device=dev)
+    else:
+        row_to_batch, local_starts, local_ends = out
     if total_q > 0:
         BLOCK = 256
         grid = (triton.cdiv(total_q, BLOCK),)
