@@ -30,7 +30,6 @@ def flydsl_moe_sorting_fwd(
     num_local_tokens=None,
     *,
     compile_context=None,
-    launch_context=None,
 ):
     from .aot_backend import create_runtime_compile_context
     from .kernels.moe_sorting_kernel import (
@@ -38,10 +37,9 @@ def flydsl_moe_sorting_fwd(
         moe_sorting_flydsl,
         resolve_moe_sorting_specialization,
     )
-    from .launch_context import LaunchContext
-    from .moe_compile_plan import (
+    from .moe_compile_requests import (
         MoeSortingCompileCase,
-        resolve_moe_sorting_compile_plan,
+        sorting_compile_request,
     )
 
     max_tokens = int(topk_ids.shape[0])
@@ -52,8 +50,6 @@ def flydsl_moe_sorting_fwd(
     )
     if compile_context is None:
         compile_context = create_runtime_compile_context(device)
-    if launch_context is None:
-        launch_context = LaunchContext(torch.cuda.current_stream(device))
 
     case = MoeSortingCompileCase(
         max_tokens=max_tokens,
@@ -74,18 +70,14 @@ def flydsl_moe_sorting_fwd(
         path=case.path,
         k4_block=case.k4_block,
     )
-    plan = resolve_moe_sorting_compile_plan(
+    request = sorting_compile_request(
         case,
-        context=compile_context,
+        compile_context.target,
         specialization=specialization,
+        registry=compile_context.registry,
     )
-    if len(plan.units) != 1:
-        raise RuntimeError(
-            f"sorting CompilePlan must contain one unit, got {len(plan.units)}"
-        )
-    unit = plan.units[0]
     artifact = compile_context.backend.resolve_aot(
-        unit,
+        request,
         context=compile_context,
     )
     launcher = getattr(artifact, "launcher", artifact)
@@ -120,5 +112,4 @@ def flydsl_moe_sorting_fwd(
         launcher=launcher,
         specialization=specialization,
         cu_count=compile_context.target.cu_count,
-        launch_context=launch_context,
     )

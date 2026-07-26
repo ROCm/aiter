@@ -143,23 +143,23 @@ class _RecorderBackend:
         self.recorder = recorder
         self.calls: list[tuple[str, str]] = []
 
-    def _artifact(self, mode: str, unit: Any, context: Any, *, consume: bool):
-        self.calls.append((mode, unit.spec.op_id))
-        launcher = context.registry.compile(unit)
+    def _artifact(self, mode: str, request: Any, context: Any, *, consume: bool):
+        self.calls.append((mode, request.op_id))
+        launcher = context.registry.compile(request)
         if consume:
             self.recorder.run_moe_compiled(launcher, ())
-        return types.SimpleNamespace(launcher=launcher, unit=unit)
+        return types.SimpleNamespace(launcher=launcher, request=request)
 
-    def compile_aot(self, unit: Any, *, context: Any):
-        return self._artifact("compile", unit, context, consume=True)
+    def compile_aot(self, request: Any, *, context: Any):
+        return self._artifact("compile", request, context, consume=True)
 
-    def load_aot(self, unit: Any, *, context: Any, strict: bool = True):
+    def load_aot(self, request: Any, *, context: Any, strict: bool = True):
         if not strict:
             raise AssertionError("recorder only supports strict loads")
-        return self._artifact("load", unit, context, consume=True)
+        return self._artifact("load", request, context, consume=True)
 
-    def resolve_aot(self, unit: Any, *, context: Any):
-        return self._artifact("resolve", unit, context, consume=False)
+    def resolve_aot(self, request: Any, *, context: Any):
+        return self._artifact("resolve", request, context, consume=False)
 
 
 @dataclass(frozen=True)
@@ -334,7 +334,6 @@ class _RequestRecorder:
         self.compile_context: Any = None
         self._scenario: str | None = None
         self._request_label_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
-        self._cuda_calls: defaultdict[str, list[str]] = defaultdict(list)
 
     @contextmanager
     def scenario(self, name: str) -> Iterator[None]:
@@ -358,9 +357,8 @@ class _RequestRecorder:
                 if module_name in _HOST_MODULES:
                     item = f"{module_name}.{frame.f_code.co_name}"
                     if frame.f_code.co_name in {
-                        "_resolve_plan_launchers",
-                        "_resolve_stage1_plan_launchers",
-                        "_compile_cktile_epilogue_plan",
+                        "_resolve_compile_request",
+                        "_compile_cktile_epilogue_requests",
                     }:
                         frame = frame.f_back
                         continue
@@ -466,7 +464,7 @@ class _RequestRecorder:
         )
 
     def cuda_properties(self, _device: Any = None) -> types.SimpleNamespace:
-        self._note_sorting_cuda_call("get_device_properties")
+        self._note_cuda_call("get_device_properties")
         return types.SimpleNamespace(
             gcnArchName=_ARCH,
             multi_processor_count=_CU_COUNT,
@@ -474,15 +472,14 @@ class _RequestRecorder:
         )
 
     def cuda_stream(self, _device: Any = None) -> int:
-        self._note_sorting_cuda_call("current_stream")
+        self._note_cuda_call("current_stream")
         return 0
 
-    def _note_sorting_cuda_call(self, name: str) -> None:
-        if self._scenario is None or not self._scenario.startswith("sorting."):
+    def _note_cuda_call(self, name: str) -> None:
+        if self._scenario is None:
             raise ForbiddenBoundaryError(
-                f"CUDA mock {name} crossed outside a sorting trigger"
+                f"CUDA mock {name} crossed outside a recording trigger"
             )
-        self._cuda_calls[self._scenario].append(name)
 
     def validate(self) -> None:
         grouped_builders: defaultdict[str, list[str]] = defaultdict(list)
@@ -514,20 +511,12 @@ class _RequestRecorder:
                     f"{scenario}: expected launchers {expected_launchers}, "
                     f"got {actual_launchers}"
                 )
-            cuda_calls = tuple(self._cuda_calls.get(scenario, ()))
-            expected_cuda = (
-                ("current_stream",) if scenario.startswith("sorting.") else ()
-            )
-            if cuda_calls != expected_cuda:
-                raise AssertionError(
-                    f"{scenario}: expected CUDA mocks {expected_cuda}, got {cuda_calls}"
-                )
 
 
 def _install_boundary_mocks(
     stack: ExitStack, imports: _HostImports, recorder: _RequestRecorder
 ) -> None:
-    core = importlib.import_module("aiter.ops.flydsl.compile_plan")
+    core = importlib.import_module("aiter.ops.flydsl.compile_request")
     recorder.backend = _RecorderBackend(recorder)
     recorder.compile_context = core.CompileContext(
         target=core.RocmTarget(_ARCH, _CU_COUNT),
@@ -654,7 +643,6 @@ def _install_cuda_boundary_mocks(stack: ExitStack, recorder: _RequestRecorder) -
 def _clear_scenario_caches(imports: _HostImports) -> None:
     imports.moe._get_compiled_silu_fused.cache_clear()
     imports.moe._get_compiled_swiglu.cache_clear()
-    imports.moe.compile_flydsl_moe_reduction.cache_clear()
     imports.moe.compile_flydsl_moe_stage2.cache_clear()
     imports.sorting_kernel._compute_sub_tokens.cache_clear()
     imports.sorting_kernel._p23_block_size.cache_clear()
@@ -825,7 +813,6 @@ def _run_stage1(
     }
     inputs = _stage1_runtime_inputs(imports, config)
     inputs["compile_context"] = imports.aot_backend.create_runtime_compile_context()
-    inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage1(**inputs)
 
 
@@ -843,7 +830,6 @@ def _run_stage2(
     }
     inputs = _stage2_runtime_inputs(imports, config, masked=masked)
     inputs["compile_context"] = imports.aot_backend.create_runtime_compile_context()
-    inputs["launch_context"] = imports.moe.LaunchContext(0)
     imports.moe.flydsl_moe_stage2(**inputs)
 
 

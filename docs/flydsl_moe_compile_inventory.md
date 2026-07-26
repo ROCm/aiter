@@ -4,7 +4,7 @@
 
 This document records the standard host path and its CPU-only compile-request
 resolver on `zhimding/refactor_aot`. It is a behavioral baseline and
-CompilePlan inventory. It is **not** a Manifest, persistence format, global
+compile-request inventory. It is **not** a Manifest, persistence format, global
 deduplication policy, or packaged-artifact design.
 
 The inventory covers the standard
@@ -44,8 +44,8 @@ fused_moe
    ├─ moe_sorting
    │  ├─ _flydsl_moe_sorting         # opt-in and gate-compatible only
    │  │  └─ flydsl_moe_sorting_fwd
-   │  │     ├─ resolve_moe_sorting_compile_plan
-   │  │     ├─ AotBackend.resolve_aot(selected concrete unit)
+   │  │     ├─ sorting_compile_request
+   │  │     ├─ AotBackend.resolve_aot(selected concrete request)
    │  │     └─ moe_sorting_flydsl
    │  │        └─ tensor_shim._run_compiled -> strict-load/JIT selected launcher
    │  ├─ _moe_sorting_impl -> Opus or CK sorting
@@ -78,8 +78,8 @@ fused_moe
          └─ CK, CK-Tile, Opus, or assembly stage2
 ```
 
-Builder construction and artifact compilation are distinct. Sorting now emits
-one concrete `CompileUnit` for the selected launcher: oneshot, combined
+Builder construction and artifact compilation are distinct. Sorting emits one
+concrete `CompileRequest` for the selected launcher: oneshot, combined
 P0v2+P23, or combined ClearWS+P0+P1+P23. The private multiphase factory still
 constructs its internal launcher tuple, but the registered compile operation
 returns exactly the launcher passed to FlyDSL compile/cache/load. The CPU
@@ -162,7 +162,7 @@ conservative fallback.
 Multiphase requests use `k4_block=256` for `E <= 256`; for
 `256 < E <= 512` they use 512 through `T=8192` and 256 above it; larger
 expert counts use 256. The other static request fields are `E`, `topk`,
-sorting `unit_size`/block-M, and `has_mask`. The provider requires an explicit
+sorting `unit_size`/block-M, and `has_mask`. The factory requires an explicit
 `RocmTarget`; gfx94, gfx95, and supported RDNA-family LDS capacities and wave
 size are resolved by kernel-owned pure helpers. Missing or unsupported
 architecture metadata is an error.
@@ -352,17 +352,16 @@ and FlyDSL sorting is an independent opt-in.
 
 ## ABI-driven AOT route and baseline contract
 
-[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) constructs the same
-explicit sorting, Stage1, and Stage2 `OperationCase` values as runtime and
-compiles each operation plan's `CompileUnit` projection:
+[`aiter/aot/flydsl/moe.py`](../aiter/aot/flydsl/moe.py) calls the same explicit
+sorting, Stage1, Stage2, and CK-Tile epilogue request factories as runtime:
 
 1. It enumerates CSV rows and resolves `flydsl_` kernel names through the
    current registry. It also emits CK-Tile epilogue jobs and both supported
    bias-presence variants for eligible fp4-weight rows.
 2. It derives an explicit `RocmTarget` from `cu_num` and creates the shared
    Aiter `AotBackend`.
-3. Stage1 and Stage2 providers bind existing compile-wrapper signatures and
-   defaults. Each unit carries a stable versioned op ID and exact launch ABI.
+3. Stage1 and Stage2 factories bind existing compile-wrapper signatures and
+   defaults. Each request carries a stable versioned op ID and exact launch ABI.
 4. `compile_moe_sorting_case()` accepts explicit token bucket, global expert
    count, top-k, unit size, mask state, and optional path/k4 assertions. It does
    not infer sorting from ordinary tuned rows.
@@ -374,19 +373,15 @@ Stage2's kernel-owned persistence helper accepts either the real runtime
 routing-block count or the AOT token bucket and standard routing capacity.
 Both paths therefore share the automatic threshold and fp8 override rather
 than mirroring the `m_blocks > 256` decision. CSV reduce rows emit the plain
-reduction unit. Masked EP reduction remains an explicit provider operation
-case requiring top-k-ID semantics and a positive global expert count.
-
-`MoeOperationCase` composes explicitly optional sorting, Stage1, and
-Stage2/reduction nodes with ordered dependencies. `MoeCompilePlanCase` remains
-a compatibility projection. Neither is a Manifest, persistence format, global
-deduplication policy, or packaged artifact source.
+reduction request. Masked EP reduction requires explicit top-k-ID semantics and
+a positive global expert count. There is no aggregate operation object or
+runtime plan interpreter.
 
 The CPU baseline recorder enters the runtime stage and sorting hosts with
 test-owned fake inputs while mocking compile/launch/CUDA boundaries. It
 normalizes complete public builder kwargs plus a stable trigger ID and compares
-the exact request set with the checked-in gfx950 golden. Separate provider
-tests compare ordered Stage2 units, op IDs, bound builder requests, and ABIs
+the exact request set with the checked-in gfx950 golden. Separate factory tests
+compare ordered Stage2 requests, op IDs, bound builder requests, and ABIs
 against the same golden. Neither test snapshots FlyDSL-private cache keys.
 
 ### Checked-in trigger matrix

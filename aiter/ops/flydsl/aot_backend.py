@@ -19,14 +19,13 @@ import functools
 import inspect
 import os
 from pathlib import Path
-from threading import RLock
 from typing import Any, Iterator
 
-from .compile_plan import (
+from .compile_request import (
     ArgumentKind,
     CompileContext,
     CompileOpRegistry,
-    CompileUnit,
+    CompileRequest,
     DEFAULT_COMPILE_OP_REGISTRY,
     KernelSignature,
     RocmTarget,
@@ -46,19 +45,19 @@ __all__ = [
 
 
 class AotBackendError(RuntimeError):
-    """Base error carrying the unit and target that failed."""
+    """Base error carrying the request and target that failed."""
 
     def __init__(
         self,
         operation: str,
-        unit: CompileUnit,
+        request: CompileRequest,
         context: CompileContext[Any],
         detail: str,
     ) -> None:
         self.operation = operation
-        self.op_id = unit.spec.op_id
+        self.op_id = request.op_id
         self.target = context.target
-        self.signature = unit.signature
+        self.signature = request.signature
         self.cache_dir = _cache_dir()
         super().__init__(
             f"{operation} failed for op_id={self.op_id!r}, "
@@ -75,7 +74,7 @@ class AotCacheMissError(AotBackendError):
 class AotArtifact:
     """Current FlyDSL launcher plus the ABI metadata used to compile/load it."""
 
-    unit: CompileUnit
+    request: CompileRequest
     launcher: Any
     compile_args: tuple[Any, ...]
     loaded: bool
@@ -107,9 +106,6 @@ class _TensorAbiValue:
         return 0
 
 
-_ENV_LOCK = RLock()
-
-
 def _cache_dir() -> str:
     return str(
         Path(
@@ -137,40 +133,41 @@ def _flydsl_environment(
         "FLYDSL_RUNTIME_ENABLE_CACHE": "1",
         "FLYDSL_RUNTIME_RUN_ONLY": "1" if run_only else "0",
     }
-    with _ENV_LOCK:
-        previous = {name: os.environ.get(name) for name in values}
-        os.environ.update(values)
-        try:
-            yield
-        finally:
-            for name, value in previous.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
+    previous = {name: os.environ.get(name) for name in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
-def _validate_unit_context(
-    unit: CompileUnit,
+def _validate_request_context(
+    request: CompileRequest,
     context: CompileContext[Any],
 ) -> None:
-    if not isinstance(unit, CompileUnit):
-        raise TypeError(f"unit must be a CompileUnit, got {type(unit).__name__}")
+    if not isinstance(request, CompileRequest):
+        raise TypeError(
+            f"request must be a CompileRequest, got {type(request).__name__}"
+        )
     if not isinstance(context, CompileContext):
         raise TypeError(
             f"context must be a CompileContext, got {type(context).__name__}"
         )
-    if unit.spec.target != context.target:
+    if request.target != context.target:
         raise ValueError(
-            f"{unit.spec.op_id}: unit target {unit.spec.target!r} does not match "
+            f"{request.op_id}: request target {request.target!r} does not match "
             f"context target {context.target!r}"
         )
 
 
-def _validate_signature(unit: CompileUnit) -> tuple[SignatureArg, ...]:
-    signature = unit.signature
+def _validate_signature(request: CompileRequest) -> tuple[SignatureArg, ...]:
+    signature = request.signature
     if not isinstance(signature, KernelSignature):
-        raise TypeError("unit signature must be a KernelSignature")
+        raise TypeError("request signature must be a KernelSignature")
     try:
         arguments = tuple(signature.arguments)
     except TypeError as error:
@@ -380,10 +377,10 @@ def _annotation_contract(annotation: Any) -> tuple[ArgumentKind | None, str | No
 
 
 def _materialize_compile_args(
-    unit: CompileUnit,
+    request: CompileRequest,
     launcher: Any,
 ) -> tuple[Any, ...]:
-    arguments = _validate_signature(unit)
+    arguments = _validate_signature(request)
     compiler_signature = _launcher_signature(launcher)
     parameters = tuple(compiler_signature.parameters.values())
     abi_names = tuple(argument.name for argument in arguments)
@@ -428,37 +425,36 @@ class AotBackend:
 
     def __init__(self, *, strict_runtime: bool = False) -> None:
         self.strict_runtime = bool(strict_runtime)
-        self._resolved_artifacts: dict[CompileUnit, AotArtifact] = {}
-        self._resolved_lock = RLock()
+        self._resolved_artifacts: dict[CompileRequest, AotArtifact] = {}
 
     def _prepare(
         self,
-        unit: CompileUnit,
+        request: CompileRequest,
         *,
         context: CompileContext[AotArtifact],
         load: bool,
     ) -> AotArtifact:
         operation = "load_aot" if load else "compile_aot"
         try:
-            _validate_unit_context(unit, context)
+            _validate_request_context(request, context)
             with _flydsl_environment(context.target, run_only=load):
-                launcher = context.registry.compile(unit)
-                compile_args = _materialize_compile_args(unit, launcher)
+                launcher = context.registry.compile(request)
+                compile_args = _materialize_compile_args(request, launcher)
                 # Direct @jit invocation under COMPILE_ONLY compiles or checks
                 # the disk cache without packing/launching runtime arguments.
                 launcher(*compile_args)
         except AotBackendError:
             raise
         except Exception as error:
-            if not isinstance(unit, CompileUnit) or not isinstance(
+            if not isinstance(request, CompileRequest) or not isinstance(
                 context, CompileContext
             ):
                 raise
             is_strict_miss = load and "FLYDSL_RUNTIME_RUN_ONLY=1" in str(error)
             error_type = AotCacheMissError if is_strict_miss else AotBackendError
-            raise error_type(operation, unit, context, str(error)) from error
+            raise error_type(operation, request, context, str(error)) from error
         return AotArtifact(
-            unit=unit,
+            request=request,
             launcher=launcher,
             compile_args=compile_args,
             loaded=load,
@@ -467,15 +463,15 @@ class AotBackend:
 
     def compile_aot(
         self,
-        unit: CompileUnit,
+        request: CompileRequest,
         *,
         context: CompileContext[AotArtifact],
     ) -> AotArtifact:
-        return self._prepare(unit, context=context, load=False)
+        return self._prepare(request, context=context, load=False)
 
     def load_aot(
         self,
-        unit: CompileUnit,
+        request: CompileRequest,
         *,
         context: CompileContext[AotArtifact],
         strict: bool = True,
@@ -485,24 +481,42 @@ class AotBackend:
                 "FlyDSL 0.2.x has no non-compiling load API; use compile_aot() "
                 "explicitly instead of requesting a fallback"
             )
-        return self._prepare(unit, context=context, load=True)
+        return self._prepare(request, context=context, load=True)
 
     def resolve_aot(
         self,
-        unit: CompileUnit,
+        request: CompileRequest,
         *,
         context: CompileContext[AotArtifact],
     ) -> AotArtifact:
-        with self._resolved_lock:
-            artifact = self._resolved_artifacts.get(unit)
-            if artifact is None:
-                artifact = (
-                    self.load_aot(unit, context=context, strict=True)
-                    if self.strict_runtime
-                    else self.compile_aot(unit, context=context)
+        artifact = self._resolved_artifacts.get(request)
+        if artifact is None:
+            if self.strict_runtime:
+                artifact = self.load_aot(request, context=context, strict=True)
+            else:
+                try:
+                    _validate_request_context(request, context)
+                    launcher = context.registry.compile(request)
+                except Exception as error:
+                    if not isinstance(request, CompileRequest) or not isinstance(
+                        context, CompileContext
+                    ):
+                        raise
+                    raise AotBackendError(
+                        "resolve_jit",
+                        request,
+                        context,
+                        str(error),
+                    ) from error
+                artifact = AotArtifact(
+                    request=request,
+                    launcher=launcher,
+                    compile_args=(),
+                    loaded=False,
+                    cache_dir=_cache_dir(),
                 )
-                self._resolved_artifacts[unit] = artifact
-            return artifact
+            self._resolved_artifacts[request] = artifact
+        return artifact
 
 
 def create_compile_context(
@@ -553,21 +567,21 @@ def create_runtime_compile_context(
 
 
 def compile_aot(
-    unit: CompileUnit,
+    request: CompileRequest,
     *,
     context: CompileContext[AotArtifact],
 ) -> AotArtifact:
     """Future-facing AOT compile entry point."""
 
-    return context.backend.compile_aot(unit, context=context)
+    return context.backend.compile_aot(request, context=context)
 
 
 def load_aot(
-    unit: CompileUnit,
+    request: CompileRequest,
     *,
     context: CompileContext[AotArtifact],
     strict: bool = True,
 ) -> AotArtifact:
     """Future-facing AOT cache-load entry point."""
 
-    return context.backend.load_aot(unit, context=context, strict=strict)
+    return context.backend.load_aot(request, context=context, strict=strict)
