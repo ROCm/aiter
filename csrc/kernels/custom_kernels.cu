@@ -30,6 +30,10 @@
 #define __HIP__MI350_MI300_MI250__
 #endif
 
+#if defined(__HIPCC__) && (defined(__gfx942__) || defined(__gfx950__))
+#define __HIP__FP8_MFMA__
+#endif
+
 #if defined(NDEBUG)
 #undef NDEBUG
 #include <assert.h>
@@ -1769,7 +1773,7 @@ void wvSplitK_(void* in_a,
     });
 }
 
-#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__FP8_MFMA__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1966,7 +1970,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_sml_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__FP8_MFMA__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -1988,9 +1992,9 @@ __global__ void wvSplitKQ_hf_sml_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__FP8_MFMA__) TODO: Add NAVI support
 
-#if defined(__HIP__MI350_MI300_MI250__) // TODO: Add NAVI support
+#if defined(__HIP__FP8_MFMA__) // TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2183,7 +2187,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS) wvSplitKQ_hf_(const int K,
         m += CuCount * _WvPrGrp * YTILE;
     }
 }
-#else  // !defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
+#else  // !defined(__HIP__FP8_MFMA__) TODO: Add NAVI support
 template <typename scalar_t,
           typename fp8_t,
           int THRDS,
@@ -2205,7 +2209,7 @@ __global__ void wvSplitKQ_hf_(const int K,
 {
     UNREACHABLE_CODE
 }
-#endif // defined(__HIP__MI350_MI300_MI250__) TODO: Add NAVI support
+#endif // defined(__HIP__FP8_MFMA__) TODO: Add NAVI support
 
 void wvSplitKQ_(void* in_a,
                 void* in_b,
