@@ -531,6 +531,10 @@ def mxfp4_moe_gemm2(
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
+    if BN <= 0 or BN % 128 != 0:
+        raise AssertionError(f"BN must be a positive multiple of 128, got {BN}")
+    if BK not in (128, 256):
+        raise AssertionError(f"BK must be one of (128, 256), got {BK}")
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
     if D_HIDDEN % BN != 0:
         raise AssertionError(

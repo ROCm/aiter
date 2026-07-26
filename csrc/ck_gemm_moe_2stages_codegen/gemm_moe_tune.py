@@ -71,7 +71,7 @@ if is_flydsl_available():
         from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
             gen as _v2_gen,
             build_v2_inputs as _v2_build_inputs,
-            populate_baseline_v2_intermediate as _v2_populate,
+            populate_v2_intermediate_from_ref as _v2_populate_stage2,
             v2_stage1_sorted_ref as _v2_stage1_ref,
         )
         from aiter.ops.flydsl.moe_kernels import (
@@ -819,11 +819,7 @@ class FmoeTuner(TunerCommon):
             activation=act_type,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
-        # Fixed baseline gemm1 producer params used only to fill the sorted-row isq intermediate the v2 gemm2 candidate consumes; not tuned and not timed.
-        prod_params = {"tile_m": blockM, "tile_n": 64 if adtype == "fp4" else 128,
-                       "tile_k": 256, "k_batch": 1, "waves_per_eu": 3,
-                       "b_nt": 2, "k_wave": 1}
-        _v2_populate(d, v, token, topk, prod_params, blockM, activation=act_type)
+        _v2_populate_stage2(d, v, token, topk, blockM)
         return {
             "isq": v["isq"], "iss": v["iss"], "w2u8": v["w2u8"], "w2sc": v["w2sc"],
             "sei": v["sei"], "cumsum": v["cumsum"], "sti": v["sti"], "swt": v["swt"],
@@ -854,6 +850,8 @@ class FmoeTuner(TunerCommon):
             cumsum_tensor=cumsum, sorted_token_ids=sti, sorted_weights=swt,
             out=gemm2_out, M_logical=token, max_sorted=max_sorted, NE=expert,
             D_HIDDEN=model_dim, D_INTER=inter_dim, topk=topk, BM=bm_s2,
+            BN=kparams["tile_n"],
+            BK=kparams["tile_k"],
             use_nt=kparams["use_nt"], a_dtype=kparams["a_dtype"], epilog=epilog,
             SBM=sbm, persist=kparams["persist"], n_sorted_padded=n,
             model_dim_pad=0, inter_dim_pad=0,
@@ -3394,7 +3392,9 @@ class FmoeTuner(TunerCommon):
                 ))
             # ---- v2 stage2 tasks ----
             for kn2, kp in get_flydsl_stage2_v2_kernels(
-                    adtype, "fp4", "bf16", blockM).items():
+                    adtype, "fp4", "bf16", blockM,
+                    model_dim=model_dim, inter_dim=inter_dim
+            ).items():
                 kp = {**kp, "a_dtype": adtype}
                 # flat=0, v2=1
                 tasks.append((
@@ -5351,7 +5351,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling
                 # (tile_m<bm) is not enabled. Selected e2e-fastest by _tune_one_shape.
                 for kn2v, kp in get_flydsl_stage2_v2_kernels(
-                    "fp4", "fp4", "bf16", bm
+                    "fp4", "fp4", "bf16", bm,
+                    model_dim=int(row["model_dim"]),
+                    inter_dim=int(row["inter_dim"]),
                 ).items():
                     if kp["tile_m"] != bm:
                         continue

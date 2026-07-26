@@ -23,10 +23,26 @@ def test_name_roundtrip():
     assert cfg["sort_block_m"] == 32
 
 
-def test_legacy_v2_name_rejected():
-    legacy_name = (
-        "flydsl" "v2_moe2_afp4_wfp4_bf16_t32x256x256_atomic_nt_sbm32"
+def test_name_roundtrip_nondefault_tiles():
+    name = build_flydslv2_gemm2_name(
+        "fp4",
+        "fp4",
+        "bf16",
+        tm=32,
+        tn=128,
+        tk=128,
+        epilog="atomic",
+        persist=False,
+        use_nt=True,
+        sbm=32,
     )
+    assert name == "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_nt_sbm32"
+    cfg = parse_flydsl_v2_gemm2_kernel(name)
+    assert (cfg["tile_m"], cfg["tile_n"], cfg["tile_k"]) == (32, 128, 128)
+
+
+def test_legacy_v2_name_rejected():
+    legacy_name = "flydsl" "v2_moe2_afp4_wfp4_bf16_t32x256x256_atomic_nt_sbm32"
     assert parse_flydsl_v2_gemm2_kernel(legacy_name) is None
 
 
@@ -44,3 +60,28 @@ def test_stage2_v2_kernels_fp8_no_persist():
     ks = get_flydsl_stage2_v2_kernels("fp8", "fp4", "bf16", block_m=32)
     persists = {parse_flydsl_v2_gemm2_kernel(k)["persist"] for k in ks}
     assert persists == {False}  # fp8-A persist is fail-fast
+
+
+def test_stage2_v2_kernels_tune_and_filter_nk():
+    full = get_flydsl_stage2_v2_kernels("fp4", "fp4", "bf16", block_m=32)
+    full_nk = {
+        (cfg["tile_n"], cfg["tile_k"])
+        for name in full
+        if (cfg := parse_flydsl_v2_gemm2_kernel(name))["tile_m"] == 32
+    }
+    assert full_nk == {(128, 128), (128, 256), (256, 128), (256, 256)}
+
+    filtered = get_flydsl_stage2_v2_kernels(
+        "fp4",
+        "fp4",
+        "bf16",
+        block_m=32,
+        model_dim=384,
+        inter_dim=256,
+    )
+    filtered_nk = {
+        (cfg["tile_n"], cfg["tile_k"])
+        for name in filtered
+        if (cfg := parse_flydsl_v2_gemm2_kernel(name))["tile_m"] == 32
+    }
+    assert filtered_nk == {(128, 128), (128, 256)}

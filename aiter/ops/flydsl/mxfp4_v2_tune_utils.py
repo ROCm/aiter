@@ -133,20 +133,12 @@ def _mxfp4_shuffle_weight_a16w4(x, gate_up, NLane=16, KPack=16):
 
 def _mxfp4_shuffle_scale_a16w4(src, E, gate_up):
     """CK a16w4 e8m0 scale preshuffle (is_guinterleave path)."""
-    n_experts, k_ = src.shape
-    n_ = n_experts // E
-    K_Pack, N_Pack, N_Lane = 2, 2, 16
-    K_Lane = 64 // N_Lane
-    K1 = k_ // K_Pack // K_Lane
-    N1 = n_ // N_Lane // N_Pack
-    if gate_up:
-        s = src.view(E, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane).permute(0, 2, 4, 6, 3, 5, 1)
-    else:
-        s = src.view(E, N1, N_Pack, N_Lane, K1, K_Pack, K_Lane).permute(0, 1, 4, 6, 3, 5, 2)
-    return s.contiguous().view(*src.shape).contiguous()
+    return shuffle_scale_a16w4(src, E, gate_up)
 
 
-def _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=256):
+def _mxfp4_a_scale_sorted_shuffled(
+    asc, sti, cumsum, max_sorted, H, BM=32, BK=256, source_topk=1
+):
     """Torch reconstruction of moe_sort_scales: sort + CK-shuffle the e8m0 A-scale
     by sorted row, exactly as gemm1 consumes it (opus gather: sti & 0xFFFFFF)."""
     device = asc.device
@@ -154,8 +146,20 @@ def _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
     CHUNK_ROWS = 32 if is_bm16 else BM
     MN_PACK = 2
     K_PACK = BK // 128
+    groups_per_chunk = 4 * K_PACK
+    k_groups = H // 32
+    k_groups_padded = (k_groups + groups_per_chunk - 1) // groups_per_chunk * groups_per_chunk
+    if asc.shape[1] != k_groups_padded:
+        asc_padded = torch.full(
+            (asc.shape[0], k_groups_padded),
+            0x7F,
+            dtype=asc.dtype,
+            device=asc.device,
+        )
+        asc_padded[:, : asc.shape[1]] = asc
+        asc = asc_padded
     C_M1 = CHUNK_ROWS // (16 * MN_PACK)
-    C_K1 = (H // 32) // (4 * K_PACK)
+    C_K1 = k_groups_padded // groups_per_chunk
     K_LANE, N_LANE = 4, 16
     DWORDS_PER_CHUNK = C_M1 * C_K1 * K_LANE * N_LANE
     block_rows = 16 if is_bm16 else BM
@@ -164,6 +168,7 @@ def _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
     actual_n_chunks = (actual_sorted + block_rows - 1) // block_rows
     total_work = n_chunks * DWORDS_PER_CHUNK
     sti_c = sti & 0x00FFFFFF
+    slot = (sti >> 24) & 0xFF
     out = torch.zeros((total_work, 4), dtype=torch.uint8, device=device)
     wid = torch.arange(total_work, device=device)
     r = wid.clone()
@@ -186,7 +191,8 @@ def _mxfp4_a_scale_sorted_shuffled(asc, sti, cumsum, max_sorted, H, BM=32, BK=25
             rowok = (sorted_row < actual_sorted) & valid_chunk
             srow = torch.clamp(sorted_row, max=max_sorted - 1)
             stiv = sti_c[srow]
-            tid = torch.where((stiv < M) & rowok, stiv, torch.zeros_like(stiv))
+            src_row = stiv * source_topk + slot[srow] if source_topk > 1 else stiv
+            tid = torch.where((src_row < M) & rowok, src_row, torch.zeros_like(src_row))
             k_idx = ku * K_PACK * 4 + ikxdl * 4 + k_lane
             byte = asc[tid.long(), k_idx.long()]
             out[:, ikxdl * MN_PACK + im_a] = torch.where(rowok, byte, torch.zeros_like(byte))
@@ -314,6 +320,44 @@ def build_v2_inputs(d, token, model_dim, inter_dim, E, topk, BM_S1):
         sei=sei, cumsum=cumsum, sti=sti, swt=swt,
         isq=isq, iss=iss, hidden=d["inp"], n=n, max_sorted=max_sorted,
     )
+
+
+def populate_v2_intermediate_from_ref(d, v, token, topk, BM_S1):
+    """Build GEMM2's sorted payload/scale inputs without executing GEMM1."""
+    ref1 = d["ref1"].contiguous()
+    inter_dim = ref1.shape[-1]
+    source_rows = token * topk
+    adtype = d.get("stage2_adtype", d.get("adtype", "fp8"))
+    payload, scale = quant_a(ref1.view(source_rows, inter_dim), adtype)
+
+    payload_u8 = payload.view(torch.uint8).view(source_rows, -1)
+    packed = v["sti"]
+    valid_pos = torch.arange(v["max_sorted"], device=packed.device) < v["n"]
+    packed_safe = torch.where(valid_pos, packed, torch.zeros_like(packed))
+    token_id = packed_safe & 0x00FFFFFF
+    slot = (packed_safe >> 24) & 0xFF
+    valid = valid_pos & (token_id < token) & (slot < topk)
+    source_row = token_id * topk + slot
+
+    sorted_payload = torch.zeros(
+        (v["max_sorted"], payload_u8.shape[1]),
+        dtype=torch.uint8,
+        device=payload.device,
+    )
+    sorted_payload[valid] = payload_u8[source_row[valid].long()]
+
+    scale_u8 = scale.view(torch.uint8).view(source_rows, inter_dim // 32)
+    sorted_scale = _mxfp4_a_scale_sorted_shuffled(
+        scale_u8,
+        packed,
+        v["cumsum"],
+        v["max_sorted"],
+        inter_dim,
+        BM=BM_S1,
+        source_topk=topk,
+    )
+    v["isq"] = sorted_payload
+    v["iss"] = sorted_scale
 
 
 def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):

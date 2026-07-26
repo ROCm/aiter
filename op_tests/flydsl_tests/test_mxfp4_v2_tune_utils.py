@@ -260,3 +260,59 @@ def test_v2_stage2_producer_uses_activation(monkeypatch):
     )
 
     assert called["act"] == "swiglu"
+
+
+@pytest.mark.parametrize(
+    ("model_dim", "inter_dim"),
+    [(384, 256), (256, 384)],
+)
+def test_v2_stage2_supports_384_dimensions(model_dim, inter_dim):
+    torch.set_default_device("cuda")
+    from aiter import ActivationType
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+    data = FmoeTuner.generate_v2_stage2_data(
+        4,
+        model_dim,
+        inter_dim,
+        2,
+        1,
+        32,
+        "fp4",
+        ActivationType.Silu,
+    )
+    params = {
+        "tile_m": 32,
+        "tile_n": 128,
+        "tile_k": 128,
+        "sort_block_m": 32,
+        "epilog": "atomic",
+        "use_nt": False,
+        "a_dtype": "fp4",
+        "persist": False,
+    }
+    out = FmoeTuner.run_flydsl_v2_stage2_out(
+        data["isq"],
+        data["iss"],
+        data["w2u8"],
+        data["w2sc"],
+        data["sei"],
+        data["cumsum"],
+        data["sti"],
+        data["swt"],
+        data["n"],
+        data["max_sorted"],
+        data["ref2"],
+        model_dim,
+        inter_dim,
+        2,
+        1,
+        params,
+    )
+    torch.cuda.synchronize()
+
+    cosine = torch.nn.functional.cosine_similarity(
+        out.float().reshape(1, -1),
+        data["ref2"].float().reshape(1, -1),
+    ).item()
+    assert cosine > 0.98
