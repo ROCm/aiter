@@ -105,9 +105,12 @@ def flat_buffer_view(
     """Flat buffer-tensor view over a RAW i64 addr; fold=True folds wave-uniform base to a VGPR voffset, fold=False keeps per-lane offset + num_records_bytes for OOB-zero."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
     if fold:
-        base = fx.rocdl.readfirstlane(T.i32, _raw(base_elems))
-        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(base)).result)
-        base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg) + off_i64 * fx.Int64(elem_bytes))
+        base = fx.Uint32(fx.rocdl.readfirstlane(T.i32, _raw(base_elems)))
+        off_i64 = fx.Uint64(base)
+        base_iter = fx.inttoptr(
+            ptr_ty,
+            fx.Uint64(arg) + off_i64 * fx.Uint64(elem_bytes),
+        )
     else:
         base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg))
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout((1, 1), (1, 1))))

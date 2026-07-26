@@ -4644,34 +4644,39 @@ def compile_mixed_moe_gemm2(
                     if const_expr(need_fp8_out):
                         # frag is vector<e_vec x f32>; e_vec==8 == one opus
                         # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.
-                        c0_i32_q = arith.constant(0, type=T.i32)
-                        c1_i32_q = arith.constant(1, type=T.i32)
-                        c7_i32_q = arith.constant(7, type=T.i32)
-                        c23_i32_q = arith.constant(23, type=T.i32)
-                        c254_i32_q = arith.constant(254, type=T.i32)
-                        c255_i32_q = arith.constant(0xFF, type=T.i32)
-                        c0_f32_q = arith.constant(0.0, type=T.f32)
+                        c0_i32_q = fx.Int32(0)
+                        c1_i32_q = fx.Int32(1)
+                        c7_i32_q = fx.Int32(7)
+                        c23_i32_q = fx.Int32(23)
+                        c254_i32_q = fx.Int32(254)
+                        c255_i32_q = fx.Int32(0xFF)
+                        c0_f32_q = fx.Float32(0.0)
+                        frag_vec = fx.Vector(frag)
                         frag_vals = []
                         for i in range_constexpr(e_vec):
-                            bf16_v = vector.extract(
-                                frag, static_position=[i], dynamic_position=[]
-                            )
-                            frag_vals.append(arith.extf(T.f32, bf16_v))
+                            frag_vals.append(frag_vec[i].to(fx.Float32))
                         local_max = c0_f32_q
                         for i in range_constexpr(e_vec):
-                            abs_v = llvm.call_intrinsic(
-                                f32, "llvm.fabs.f32", [frag_vals[i]], [], []
+                            abs_v = fx.Float32(
+                                llvm.call_intrinsic(
+                                    f32,
+                                    "llvm.fabs.f32",
+                                    [frag_vals[i].ir_value()],
+                                    [],
+                                    [],
+                                )
                             )
-                            local_max = arith.maximumf(local_max, abs_v)
+                            local_max = local_max.maximumf(abs_v)
                         # opus: E = bf16/f32 biased exp(amax) - 7, clamp E>=1,
                         # E=0 when amax==0. scale byte = E; dequant = fp8*2^(E-127).
-                        amax_bits = local_max.bitcast(T.i32)
+                        amax_bits = local_max.bitcast(fx.Int32)
                         ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
                         E = ax_e - c7_i32_q
-                        E = arith.maxsi(E, c1_i32_q)
-                        is_zero = arith.cmpi(CmpIPredicate.eq, amax_bits, c0_i32_q)
-                        E = arith.select(is_zero, c0_i32_q, E)
-                        quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(T.f32)
+                        E = (E > c1_i32_q).select(E, c1_i32_q)
+                        E = (amax_bits == c0_i32_q).select(c0_i32_q, E)
+                        quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(
+                            fx.Float32
+                        )
                         scaled_vals = []
                         for i in range_constexpr(e_vec):
                             scaled_vals.append(frag_vals[i] * quant_scale)
@@ -4706,10 +4711,7 @@ def compile_mixed_moe_gemm2(
                             + (col_g0 // arith.constant(8, index=True))
                         )
                         scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
-                        e8m0_i8 = arith.TruncIOp(T.i8, E)
-                        e8m0_raw = (
-                            e8m0_i8._value if hasattr(e8m0_i8, "_value") else e8m0_i8
-                        )
+                        e8m0_raw = fx.Int8(E).ir_value()
                         llvm.StoreOp(
                             e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
                         )

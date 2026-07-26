@@ -289,7 +289,7 @@ def gemm2_body_v2(
     mma_atoms = scale_mma_atoms(a_dtype)
 
     # A activation: global->LDS DMA (issue_a_load_lds), then LDS->reg ds-read (issue_a_ds_read).
-    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(fx.Int32(BM) * K_BYTES)
+    aq_num_records = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * K_BYTES)
     A_NDW = (
         8 if is_f8_a else 4
     )  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
@@ -394,7 +394,7 @@ def gemm2_body_v2(
                 ascale_views[sub][lane_div_16, lane_mod_16, chunk_kt, None],
                 saf,
             )
-            out.append(_raw(Vec(saf.load())[0]))
+            out.append(Vec(saf.load())[0])
         return out
 
     # B-weight + B-scale: global->register, streamed per K-tile (not LDS-staged).
@@ -468,7 +468,7 @@ def gemm2_body_v2(
         if const_expr(tilesPerScaleChunk == 1):
             return scale
         scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
-        return _raw(fx.Int32(scale).shrui(scale_shift))
+        return scale.shrui(scale_shift)
 
     def mfma_cluster(bqf, bsf, sa, kt_rt):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
@@ -476,7 +476,7 @@ def gemm2_body_v2(
             shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
         ]
         sb_words = [
-            shift_scale_word(_raw(Vec(bsf[mni].load())[0]), kt_rt)
+            shift_scale_word(Vec(bsf[mni].load())[0], kt_rt)
             for mni in range_constexpr(nPairs)
         ]
         for J in range_constexpr(numAccN):
@@ -622,7 +622,7 @@ def gemm2_body_v2(
             # A-scale vmem load(s) for K-tile kt_rt into the given (per-stage) fragment(s).
             sa = load_a_scale_tile(kt_rt)
             for sub in range_constexpr(kScaleSubBlocks):
-                saf[sub].store(sa[sub])
+                saf[sub].store(Vec.from_elements([sa[sub]], Int32))
 
         def load_carry():
             return load_c_carry() + load_b_carry()
@@ -675,7 +675,7 @@ def gemm2_body_v2(
             # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
             if const_expr(g2_ascale_pf):
                 sa = [
-                    _raw(Vec(cur_saf[sub].load())[0])
+                    Vec(cur_saf[sub].load())[0]
                     for sub in range_constexpr(kScaleSubBlocks)
                 ]
             else:
