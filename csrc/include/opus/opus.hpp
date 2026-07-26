@@ -1303,7 +1303,7 @@ template<> struct finfo<e8m0_t> {
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp32x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = {}) {
 #if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
-    static_assert(!std::is_same_v<S, S>, "packed FP8 conversion is not supported on this architecture");
+    __builtin_trap();
     return fp8x2_t{};
 #else
     int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, sel);
@@ -1313,7 +1313,7 @@ OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x2(const S& s, number<sel> = 
 template<typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x4(const S& s) {
 #if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
-    static_assert(!std::is_same_v<S, S>, "packed FP8 conversion is not supported on this architecture");
+    __builtin_trap();
     return fp8x4_t{};
 #else
     int w ; w = __builtin_amdgcn_cvt_pk_fp8_f32(s[0], s[1], w, 0); w = __builtin_amdgcn_cvt_pk_fp8_f32(s[2], s[3], w, 1);
@@ -1323,7 +1323,7 @@ OPUS_D constexpr decltype(auto) fp32_to_fp8_packed_x4(const S& s) {
 template<typename S, index_t sel = 0, std::enable_if_t<std::is_same_v<S, fp8x2_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x2(const S& s, number<sel> = {}) {
 #if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
-    static_assert(!std::is_same_v<S, S>, "packed FP8 conversion is not supported on this architecture");
+    __builtin_trap();
     return fp32x2_t{0.0f, 0.0f};
 #else
     union { int bitwise; S f8_packs[2]; } value; value.f8_packs[0] = s;
@@ -1333,7 +1333,7 @@ OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x2(const S& s, number<sel> = 
 template<typename S, std::enable_if_t<std::is_same_v<S, fp8x4_t>, bool> = true>
 OPUS_D constexpr decltype(auto) fp8_to_fp32_packed_x4(const S& s) {
 #if defined(__HIP_DEVICE_COMPILE__) && !(defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx1250__))
-    static_assert(!std::is_same_v<S, S>, "packed FP8 conversion is not supported on this architecture");
+    __builtin_trap();
     return fp32x4_t{0.0f, 0.0f, 0.0f, 0.0f};
 #else
     int bitwise = __builtin_bit_cast(int, s);
