@@ -11,7 +11,6 @@ from typing import Dict, Optional
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
-from aiter.ops.flydsl.launch_context import LaunchContext
 from aiter.ops.flydsl.moe_compile_decisions import (
     resolve_stage1_compile_decision,
     resolve_stage2_compile_decision,
@@ -24,12 +23,6 @@ def _get_dtypes():
     from aiter.utility import dtypes
 
     return dtypes
-
-
-def _runtime_launch_context(device=None) -> LaunchContext:
-    """Capture the current stream once at a public runtime boundary."""
-
-    return LaunchContext(torch.cuda.current_stream(device))
 
 
 _SUFFIX_RE = re.compile(
@@ -356,20 +349,14 @@ def _register_all_configs():
 _register_all_configs()
 
 
-def _resolve_plan_launchers(plan, compile_context):
-    """Resolve every CompileUnit once, keyed by its stable op ID."""
+def _resolve_compile_request(request, compile_context):
+    """Resolve one shared compile request to its runtime launcher."""
 
-    by_op_id = {}
-    for unit in plan.units:
-        op_id = unit.spec.op_id
-        if op_id in by_op_id:
-            raise RuntimeError(f"duplicate CompilePlan op_id: {op_id}")
-        artifact = compile_context.backend.resolve_aot(
-            unit,
-            context=compile_context,
-        )
-        by_op_id[op_id] = getattr(artifact, "launcher", artifact)
-    return by_op_id
+    artifact = compile_context.backend.resolve_aot(
+        request,
+        context=compile_context,
+    )
+    return getattr(artifact, "launcher", artifact)
 
 
 @functools.lru_cache(maxsize=None)
@@ -543,27 +530,6 @@ def compile_flydsl_moe_stage2(
         )
 
 
-@functools.lru_cache(maxsize=None)
-def compile_flydsl_moe_reduction(
-    topk: int,
-    model_dim: int,
-    dtype_str: str = "f16",
-    use_mask: bool = False,
-    num_experts: int = 0,
-):
-    """Compile a top-k reduction."""
-
-    from .kernels.moe_gemm_2stage import compile_moe_reduction
-
-    return compile_moe_reduction(
-        topk=topk,
-        model_dim=model_dim,
-        dtype_str=dtype_str,
-        use_mask=use_mask,
-        num_experts=num_experts,
-    )
-
-
 # Private helpers
 
 
@@ -608,12 +574,14 @@ def _s1_args_fp4(
     k_in,
     size_expert_ids_in,
     dev,
-    launch_context: LaunchContext,
     bias=None,
+    stream=None,
     swiglu_limit=float("inf"),
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         ptr_arg(out),
         ptr_arg(a),
@@ -631,7 +599,7 @@ def _s1_args_fp4(
         k_in,
         size_expert_ids_in,
         float(swiglu_limit),
-        launch_context.stream,
+        stream,
     )
 
 
@@ -649,8 +617,10 @@ def _s1_args_std(
     n_in,
     k_in,
     size_expert_ids_in,
-    launch_context: LaunchContext,
+    stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         ptr_arg(out),
         ptr_arg(a),
@@ -665,7 +635,7 @@ def _s1_args_std(
         n_in,
         k_in,
         size_expert_ids_in,
-        launch_context.stream,
+        stream,
     )
 
 
@@ -684,14 +654,16 @@ def _s2_args_fp4(
     k_in,
     blocks,
     dev,
-    launch_context: LaunchContext,
     bias=None,
+    stream=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -707,7 +679,7 @@ def _s2_args_fp4(
         n_in,
         k_in,
         blocks,
-        launch_context.stream,
+        stream,
     )
 
 
@@ -725,8 +697,10 @@ def _s2_args_std(
     n_in,
     k_in,
     blocks,
-    launch_context: LaunchContext,
+    stream=None,
 ):
+    if stream is None:
+        stream = torch.cuda.current_stream()
     return (
         ptr_arg(target),
         ptr_arg(a),
@@ -741,7 +715,7 @@ def _s2_args_std(
         n_in,
         k_in,
         blocks,
-        launch_context.stream,
+        stream,
     )
 
 
@@ -780,7 +754,7 @@ def _run_moe_reduction(
     model_dim,
     expert_mask=None,
     topk_ids=None,
-    launch_context: LaunchContext | None = None,
+    stream=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -798,8 +772,8 @@ def _run_moe_reduction(
         # Placeholders; kernel ignores them when use_mask=False.
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
-    if launch_context is None:
-        raise TypeError("launch_context is required for FlyDSL reduction")
+    if stream is None:
+        stream = torch.cuda.current_stream()
     _run_compiled(
         reduce_exe,
         (
@@ -808,7 +782,7 @@ def _run_moe_reduction(
             ptr_arg(em),
             ptr_arg(tk),
             token_num,
-            launch_context.stream,
+            stream,
         ),
     )
 
@@ -1050,25 +1024,25 @@ def _resolve_cktile_stage1_launcher(
     topk: int,
     act: str,
 ):
-    from .moe_compile_plan import resolve_cktile_stage1_compile_plan
+    from .moe_compile_requests import cktile_epilogue_compile_requests
 
-    plan = resolve_cktile_stage1_compile_plan(
-        context=compile_context,
-        inter_dim=inter_dim,
-        topk=topk,
-        split_k=2,
-        act=act,
-        post_activation_layout="interleaved",
+    requests = cktile_epilogue_compile_requests(
+        {
+            "inter_dim": inter_dim,
+            "topk": topk,
+            "split_k": 2,
+            "act": act,
+            "post_activation_layout": "interleaved",
+            "enable_bias": False,
+        },
+        compile_context.target,
+        registry=compile_context.registry,
     )
-    if len(plan.units) != 1:
+    if len(requests) != 1:
         raise RuntimeError(
-            f"CK-Tile {act} epilogue must resolve exactly one CompileUnit"
+            f"CK-Tile {act} epilogue must resolve exactly one CompileRequest"
         )
-    artifact = compile_context.backend.resolve_aot(
-        plan.units[0],
-        context=compile_context,
-    )
-    return getattr(artifact, "launcher", artifact)
+    return _resolve_compile_request(requests[0], compile_context)
 
 
 def flydsl_swiglu_and_mul_interleaved(
@@ -1076,7 +1050,6 @@ def flydsl_swiglu_and_mul_interleaved(
     out: torch.Tensor,
     *,
     compile_context=None,
-    launch_context: LaunchContext | None = None,
 ) -> None:
     """Fused swiglu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1089,8 +1062,6 @@ def flydsl_swiglu_and_mul_interleaved(
         from .aot_backend import create_runtime_compile_context
 
         compile_context = create_runtime_compile_context(input.device)
-    if launch_context is None:
-        launch_context = _runtime_launch_context(input.device)
     _swiglu_fn = _resolve_cktile_stage1_launcher(
         compile_context=compile_context,
         inter_dim=inter_dim,
@@ -1103,7 +1074,7 @@ def flydsl_swiglu_and_mul_interleaved(
             input,
             out,
             num_rows,
-            launch_context.stream,
+            torch.cuda.current_stream(input.device),
         ),
     )
 
@@ -1119,7 +1090,6 @@ def flydsl_silu_and_mul_interleaved(
     gui_layout: bool = True,
     *,
     compile_context=None,
-    launch_context: LaunchContext | None = None,
 ) -> None:
     """Fused silu activation for interleaved (gate/up block-interleaved) layout.
 
@@ -1136,8 +1106,6 @@ def flydsl_silu_and_mul_interleaved(
         from .aot_backend import create_runtime_compile_context
 
         compile_context = create_runtime_compile_context(input.device)
-    if launch_context is None:
-        launch_context = _runtime_launch_context(input.device)
     _silu_fn = _resolve_cktile_stage1_launcher(
         compile_context=compile_context,
         inter_dim=inter_dim,
@@ -1160,7 +1128,7 @@ def flydsl_silu_and_mul_interleaved(
             token_num,
             num_sorted_rows,
             float("inf"),
-            launch_context.stream,
+            torch.cuda.current_stream(input.device),
         ),
     )
 
@@ -1202,7 +1170,6 @@ def flydsl_moe_stage1(
     swiglu_limit: Optional[float] = None,
     k_wave: int = 1,
     compile_context=None,
-    launch_context: LaunchContext | None = None,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1228,8 +1195,6 @@ def flydsl_moe_stage1(
         from .aot_backend import create_runtime_compile_context
 
         compile_context = create_runtime_compile_context(a.device)
-    if launch_context is None:
-        launch_context = _runtime_launch_context(a.device)
 
     token_num = a.shape[0]
     E = w1.shape[0]
@@ -1368,7 +1333,6 @@ def flydsl_moe_stage1(
             _k_in,
             _grid_y,
             dev,
-            launch_context,
             bias=(
                 kernel_bias.view(-1)
                 if kernel_bias is not None
@@ -1391,37 +1355,17 @@ def flydsl_moe_stage1(
             _n_in,
             _k_in,
             _grid_y,
-            launch_context,
         )
 
-    from .moe_compile_plan import (
-        FQ_ACTIVATION_OP_ID,
-        INT4_STAGE1_GEMM_OP_ID,
-        MIXED_STAGE1_GEMM_OP_ID,
-        resolve_moe_stage1_compile_plan,
-    )
+    from .moe_compile_requests import stage1_compile_requests
 
-    plan = resolve_moe_stage1_compile_plan(
-        context=compile_context,
+    requests = stage1_compile_requests(
+        stage1_builder_kwargs,
+        compile_context.target,
         decision=decision,
-        **stage1_builder_kwargs,
+        registry=compile_context.registry,
     )
-    plan_launchers = _resolve_plan_launchers(plan, compile_context)
-
-    def take_plan_launcher(op_id):
-        try:
-            return plan_launchers.pop(op_id)
-        except KeyError as error:
-            raise RuntimeError(
-                f"Stage1 CompilePlan did not resolve required unit {op_id}"
-            ) from error
-
-    primary_op_id = (
-        MIXED_STAGE1_GEMM_OP_ID
-        if decision.primary_family == "mixed"
-        else INT4_STAGE1_GEMM_OP_ID
-    )
-    _run_compiled(take_plan_launcher(primary_op_id), args)
+    _run_compiled(_resolve_compile_request(requests[0], compile_context), args)
 
     use_splitk_bias = decision.split_k and bias is not None
     if use_splitk_bias and topk_ids is None:
@@ -1448,8 +1392,10 @@ def flydsl_moe_stage1(
     )
 
     if decision.postprocess_kind == "fq":
+        if len(requests) != 2:
+            raise RuntimeError("Stage1 FQ decision must emit two compile requests")
         _run_compiled(
-            take_plan_launcher(FQ_ACTIVATION_OP_ID),
+            _resolve_compile_request(requests[1], compile_context),
             (
                 ptr_arg(tmp_out.view(-1, inter_dim * 2)),
                 ptr_arg(out.view(-1).view(torch.uint8)),
@@ -1461,7 +1407,7 @@ def flydsl_moe_stage1(
                 token_num,
                 sorted_token_ids.shape[0],
                 _swiglu_limit_val,
-                launch_context.stream,
+                torch.cuda.current_stream(dev),
             ),
         )
     elif decision.postprocess_kind == "external":
@@ -1489,10 +1435,8 @@ def flydsl_moe_stage1(
                 )
             silu_and_mul(post_out, post_input)
 
-    if plan_launchers:
-        raise RuntimeError(
-            f"Stage1 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-        )
+    if decision.postprocess_kind != "fq" and len(requests) != 1:
+        raise RuntimeError("Stage1 non-FQ decision emitted extra compile requests")
 
     if _fuse_any_quant and _need_sort:
         from aiter.utility.dtypes import fp8_e8m0
@@ -1538,7 +1482,6 @@ def flydsl_moe_stage2(
     expert_mask: Optional[torch.Tensor] = None,
     topk_ids: Optional[torch.Tensor] = None,
     compile_context=None,
-    launch_context: LaunchContext | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -1565,8 +1508,6 @@ def flydsl_moe_stage2(
         from .aot_backend import create_runtime_compile_context
 
         compile_context = create_runtime_compile_context(inter_states.device)
-    if launch_context is None:
-        launch_context = _runtime_launch_context(inter_states.device)
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]
@@ -1690,7 +1631,6 @@ def flydsl_moe_stage2(
             _k_in,
             m_blocks,
             dev,
-            launch_context,
             bias=bias,
         )
     else:
@@ -1708,57 +1648,35 @@ def flydsl_moe_stage2(
             _n_in,
             _k_in,
             m_blocks,
-            launch_context,
         )
 
-    from .moe_compile_plan import (
-        INT4_STAGE2_GEMM_OP_ID,
-        MASKED_REDUCTION_OP_ID,
-        MIXED_STAGE2_GEMM_OP_ID,
-        PLAIN_REDUCTION_OP_ID,
-        resolve_moe_stage2_compile_plan,
-    )
+    from .moe_compile_requests import stage2_compile_requests
 
-    plan = resolve_moe_stage2_compile_plan(
-        context=compile_context,
-        mode=mode,
-        accumulate=decision.accumulate,
-        return_per_slot=return_per_slot,
-        persist=persist,
-        token_num=token_num,
-        routing_block_count=routing_block_count,
-        dtype_str=decision.reduction_dtype,
-        use_mask=use_mask,
-        topk_ids_available=topk_ids_available,
-        num_experts=num_experts,
+    requests = stage2_compile_requests(
+        stage2_builder_kwargs,
+        {
+            "mode": mode,
+            "accumulate": decision.accumulate,
+            "return_per_slot": return_per_slot,
+            "persist": persist,
+            "token_num": token_num,
+            "routing_block_count": routing_block_count,
+            "dtype_str": decision.reduction_dtype,
+            "use_mask": use_mask,
+            "topk_ids_available": topk_ids_available,
+            "num_experts": num_experts,
+        },
+        compile_context.target,
         decision=decision,
-        **stage2_builder_kwargs,
+        registry=compile_context.registry,
     )
-    plan_launchers = _resolve_plan_launchers(plan, compile_context)
-
-    def take_plan_launcher(op_id):
-        try:
-            return plan_launchers.pop(op_id)
-        except KeyError as error:
-            raise RuntimeError(
-                f"Stage2 CompilePlan did not resolve required unit {op_id}"
-            ) from error
-
-    primary_op_id = (
-        MIXED_STAGE2_GEMM_OP_ID
-        if decision.primary_family == "mixed"
-        else INT4_STAGE2_GEMM_OP_ID
-    )
-    _run_compiled(take_plan_launcher(primary_op_id), args)
+    _run_compiled(_resolve_compile_request(requests[0], compile_context), args)
 
     if decision.reduction_kind != "none":
-        reduction_op_id = (
-            MASKED_REDUCTION_OP_ID
-            if decision.reduction_kind == "masked"
-            else PLAIN_REDUCTION_OP_ID
-        )
+        if len(requests) != 2:
+            raise RuntimeError("Stage2 reduction decision must emit two requests")
         _run_moe_reduction(
-            take_plan_launcher(reduction_op_id),
+            _resolve_compile_request(requests[1], compile_context),
             target,
             out,
             token_num,
@@ -1766,12 +1684,9 @@ def flydsl_moe_stage2(
             model_dim,
             expert_mask,
             topk_ids,
-            launch_context,
         )
-    if plan_launchers:
-        raise RuntimeError(
-            f"Stage2 CompilePlan resolved unconsumed units: {tuple(plan_launchers)}"
-        )
+    elif len(requests) != 1:
+        raise RuntimeError("Stage2 non-reduction decision emitted extra requests")
     return out
 
 

@@ -5,11 +5,11 @@ FlyDSL kernels. Each module extracts every unique FlyDSL kernel name from aiter'
 tuned CSV configs and compiles them into the cache up front, so that at runtime
 the JIT path hits the cache instead of compiling again.
 
-MoE sorting, Stage1, Stage2, and Stage2 reduction resolve shared
-kernel-owned `OperationPlan` objects. AOT compiles their `CompilePlan`
-projection, while runtime executes the same ordered nodes through data-plane
-adapters. They do not construct FakeTensors or enter the full runtime hosts.
-Sorting is explicit:
+MoE sorting, Stage1, Stage2, and Stage2 reduction use small CPU-only
+`CompileRequest` factories. Runtime and AOT share those requests and pure
+compile decisions while runtime retains allocation, packing, grids, streams,
+and launch control. Direct AOT does not construct FakeTensors or enter the full
+runtime hosts. Sorting is explicit:
 call `compile_moe_sorting_case(MoeSortingCompileCase(...), context=...)`.
 Ordinary tuned Stage1/Stage2 CSV rows never infer sorting inclusion.
 
@@ -75,10 +75,10 @@ Use the recorder's direct script entry above. For pytest,
 test installs the CPU-only isolation.
 Review the semantic golden diff before committing.
 
-The sorting golden now records only the concrete launcher selected by each
-trigger. A multiphase factory may construct several Python launchers, but each
-sorting `CompileUnit` and AOT cache operation owns exactly one of oneshot,
-P0v2+P23, or ClearWS+P0+P1+P23.
+The sorting golden records only the concrete launcher selected by each trigger.
+A multiphase builder may construct several Python launchers, but each sorting
+request and AOT cache operation owns exactly one of oneshot, P0v2+P23, or
+ClearWS+P0+P1+P23.
 
 ## Explicit sorting smoke test
 
@@ -98,15 +98,15 @@ FLYDSL_RUNTIME_CACHE_DIR="$SORTING_CACHE" \
   python - <<'PY'
 from aiter.aot.flydsl.moe import compile_moe_sorting_case
 from aiter.ops.flydsl.aot_backend import create_compile_context
-from aiter.ops.flydsl.compile_plan import RocmTarget
-from aiter.ops.flydsl.moe_compile_plan import MoeSortingCompileCase
+from aiter.ops.flydsl.compile_request import RocmTarget
+from aiter.ops.flydsl.moe_compile_requests import MoeSortingCompileCase
 
 context = create_compile_context(RocmTarget("gfx950", 256))
 artifact, = compile_moe_sorting_case(
     MoeSortingCompileCase(8, 256, 8, False),
     context=context,
 )
-print("SORTING_AOT_COMPILE_PASS", artifact.unit.spec.op_id)
+print("SORTING_AOT_COMPILE_PASS", artifact.request.op_id)
 PY
 
 unset AITER_AOT_IMPORT COMPILE_ONLY ARCH FLYDSL_GPU_ARCH

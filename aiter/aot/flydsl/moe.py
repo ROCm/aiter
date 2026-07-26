@@ -38,7 +38,7 @@ from aiter.aot.flydsl.common import (
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.aot_backend import compile_aot, create_compile_context
-from aiter.ops.flydsl.compile_plan import RocmTarget
+from aiter.ops.flydsl.compile_request import RocmTarget
 from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
 # Keep the default AOT coverage aligned with runtime config resolution.
@@ -184,7 +184,7 @@ def parse_csv(csv_path: str):
                         )
                     else:
                         # This is the production Stage1 wrapper setting.  Keep
-                        # it in job metadata so direct plan resolution sees the
+                        # it in job metadata so direct request creation sees the
                         # same real compiler argument without entering the host.
                         job["use_async_copy"] = True
 
@@ -216,32 +216,44 @@ def _job_target(aot_arch: str, cu_num: int) -> RocmTarget:
     return RocmTarget(aot_arch, resolved_cu)
 
 
-def _compile_stage1_plan(cfg: dict, context) -> int:
-    from aiter.ops.flydsl.moe_compile_plan import (
-        resolve_moe_stage1_compile_plan,
-    )
+def _compile_stage1_requests(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_requests import stage1_compile_requests
 
-    plan = resolve_moe_stage1_compile_plan(
-        context=context,
-        **cfg,
+    requests = stage1_compile_requests(
+        cfg,
+        context.target,
+        registry=context.registry,
     )
-    for unit in plan.units:
-        compile_aot(unit, context=context)
-    return len(plan.units)
+    for request in requests:
+        compile_aot(request, context=context)
+    return len(requests)
 
 
-def _compile_stage2_plan(cfg: dict, context) -> int:
-    from aiter.ops.flydsl.moe_compile_plan import (
-        resolve_moe_stage2_compile_plan,
-    )
+def _compile_stage2_requests(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_requests import stage2_compile_requests
 
-    plan = resolve_moe_stage2_compile_plan(
-        context=context,
-        **cfg,
+    runtime_names = (
+        "mode",
+        "accumulate",
+        "return_per_slot",
+        "persist",
+        "token_num",
+        "routing_block_count",
+        "dtype_str",
+        "use_mask",
+        "topk_ids_available",
+        "num_experts",
     )
-    for unit in plan.units:
-        compile_aot(unit, context=context)
-    return len(plan.units)
+    runtime_metadata = {name: cfg[name] for name in runtime_names}
+    requests = stage2_compile_requests(
+        cfg,
+        runtime_metadata,
+        context.target,
+        registry=context.registry,
+    )
+    for request in requests:
+        compile_aot(request, context=context)
+    return len(requests)
 
 
 def compile_moe_sorting_case(case, *, context):
@@ -251,39 +263,36 @@ def compile_moe_sorting_case(case, *, context):
     remains explicit until tuning metadata and Manifest generation own it.
     """
 
-    from aiter.ops.flydsl.moe_compile_plan import (
+    from aiter.ops.flydsl.moe_compile_requests import (
         MoeSortingCompileCase,
-        resolve_moe_sorting_compile_plan,
+        sorting_compile_request,
     )
 
     if not isinstance(case, MoeSortingCompileCase):
         raise TypeError(
             f"case must be a MoeSortingCompileCase, got {type(case).__name__}"
         )
-    plan = resolve_moe_sorting_compile_plan(
+    request = sorting_compile_request(
         case,
-        context=context,
+        context.target,
+        registry=context.registry,
     )
-    return tuple(compile_aot(unit, context=context) for unit in plan.units)
+    return (compile_aot(request, context=context),)
 
 
-def _compile_cktile_epilogue_plan(cfg: dict, context) -> int:
-    from aiter.ops.flydsl.moe_compile_plan import (
-        resolve_cktile_stage1_compile_plan,
+def _compile_cktile_epilogue_requests(cfg: dict, context) -> int:
+    from aiter.ops.flydsl.moe_compile_requests import (
+        cktile_epilogue_compile_requests,
     )
 
-    plan = resolve_cktile_stage1_compile_plan(
-        context=context,
-        inter_dim=cfg["inter_dim"],
-        topk=cfg["topk"],
-        split_k=cfg["split_k"],
-        act=cfg["act"],
-        post_activation_layout=cfg["post_activation_layout"],
-        enable_bias=cfg["enable_bias"],
+    requests = cktile_epilogue_compile_requests(
+        cfg,
+        context.target,
+        registry=context.registry,
     )
-    for unit in plan.units:
-        compile_aot(unit, context=context)
-    return len(plan.units)
+    for request in requests:
+        compile_aot(request, context=context)
+    return len(requests)
 
 
 def _precompile_epilogue_to_cache(
@@ -295,7 +304,7 @@ def _precompile_epilogue_to_cache(
 ) -> int:
     """Resolve and directly compile one CK-Tile Stage1 FlyDSL epilogue."""
 
-    return _compile_cktile_epilogue_plan(
+    return _compile_cktile_epilogue_requests(
         {
             "act": act,
             "inter_dim": inter_dim,
@@ -320,7 +329,7 @@ def compile_one_config(
     """Compile one MoE kernel configuration and save to cache.
 
     Stage1, Stage2, reductions, and CK-Tile FlyDSL epilogues compile directly
-    from resolved ``CompileUnit.signature`` metadata. Sorting is deliberately
+    from resolved ``CompileRequest.signature`` metadata. Sorting is deliberately
     excluded; use ``compile_moe_sorting_case`` with explicit metadata.
 
     Returns a dict with timing info.
@@ -357,23 +366,23 @@ def compile_one_config(
         target = _job_target(aot_arch, cu_num)
         context = create_compile_context(target)
         if stage == 1:
-            unit_count = _compile_stage1_plan(cfg, context)
-            result["compile_units"] = unit_count
+            request_count = _compile_stage1_requests(cfg, context)
+            result["compile_requests"] = request_count
             result["direct_stage1_aot"] = True
         elif is_epilogue:
-            unit_count = _compile_cktile_epilogue_plan(cfg, context)
-            result["compile_units"] = unit_count
+            request_count = _compile_cktile_epilogue_requests(cfg, context)
+            result["compile_requests"] = request_count
             result["direct_stage1_aot"] = True
         elif stage == 2:
-            unit_count = _compile_stage2_plan(cfg, context)
-            result["compile_units"] = unit_count
+            request_count = _compile_stage2_requests(cfg, context)
+            result["compile_requests"] = request_count
             result["direct_stage2_aot"] = True
         else:
             raise ValueError(f"unsupported MoE AOT stage: {stage!r}")
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         direct_stage = "stage1" if result.get("direct_stage1_aot") else "stage2"
-        direct_label = f"  direct_{direct_stage}_units={result['compile_units']}"
+        direct_label = f"  direct_{direct_stage}_requests={result['compile_requests']}"
         print(
             f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  "
             f"arch={aot_arch}{direct_label}"

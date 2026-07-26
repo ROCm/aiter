@@ -2023,7 +2023,6 @@ def moe_sorting_flydsl(
     launcher,
     specialization,
     cu_count,
-    launch_context,
 ):
     """Pack runtime sorting arguments and launch one pre-resolved artifact.
 
@@ -2034,7 +2033,7 @@ def moe_sorting_flydsl(
                            num_experts, unit_size, expert_mask,
                            num_local_tokens, workspace,
                            launcher=..., specialization=...,
-                           cu_count=..., launch_context=...)
+                           cu_count=...)
 
     All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
     num_valid_ids, moe_buf) must be pre-allocated by the caller.
@@ -2046,8 +2045,6 @@ def moe_sorting_flydsl(
     if not isinstance(specialization, MoeSortingSpecialization):
         raise TypeError("specialization must be a MoeSortingSpecialization")
     _positive_int("cu_count", cu_count)
-    if launch_context is None or not hasattr(launch_context, "stream"):
-        raise TypeError("launch_context with an explicit stream is required")
 
     topk = int(topk_ids.shape[1])
     if num_local_tokens is not None:
@@ -2099,7 +2096,7 @@ def moe_sorting_flydsl(
         mask_tensor = expert_mask
 
     target_occupancy = 2
-    stream = fx.Stream(launch_context.stream)
+    stream = fx.Stream(torch.cuda.current_stream(device))
     if specialization.path == SORTING_PATH_ONESHOT:
         n_zero_blocks = min(
             (moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE,
