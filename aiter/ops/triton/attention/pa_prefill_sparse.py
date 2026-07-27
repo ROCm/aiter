@@ -92,13 +92,13 @@ def pa_prefill_sparse(
 
     if H >= 64:
         block_h = 64
-        block_k = 16
+        block_k = 32
         num_warps = 4
         waves_per_eu = 1
     elif H >= 32:
         block_h = 32
-        block_k = 16
-        num_warps = 4
+        block_k = 32
+        num_warps = 2
         waves_per_eu = 1
     else:
         block_h = max(triton.next_power_of_2(min(H, 16)), 16)
