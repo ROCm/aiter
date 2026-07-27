@@ -163,6 +163,64 @@ def test_runtime_wrapper_forwards_tiles_from_name(monkeypatch):
     assert (called["BN"], called["BK"]) == (128, 128)
 
 
+def test_stage2_fw_routes_v2_name_to_path_b(monkeypatch):
+    # _mxfp4_a4w4_stage2_fw picks path B purely from kernelName2's format; this
+    # pins the parameters it derives before handing off to the v2 gemm2.
+    from aiter import fused_moe
+    from aiter.ops.flydsl.kernels import mxmoe_dispatcher
+
+    called = {}
+    monkeypatch.setattr(
+        mxmoe_dispatcher,
+        "mxfp4_moe_gemm2",
+        lambda **kwargs: called.update(kwargs),
+    )
+    name = build_flydslv2_gemm2_name(
+        "fp4",
+        "fp4",
+        "bf16",
+        tm=32,
+        tn=128,
+        tk=128,
+        epilog="atomic",
+        persist=False,
+        use_nt=False,
+        sbm=32,
+    )
+    w1 = torch.empty((1, 256, 64), dtype=torch.uint8, device="cpu")
+    w2 = torch.empty((1, 256, 64), dtype=torch.uint8, device="cpu")
+    inter = torch.empty((32, 64), dtype=torch.uint8, device="cpu")
+    scale = torch.empty(1, dtype=torch.uint8, device="cpu")
+    ids = torch.empty(32, dtype=torch.int32, device="cpu")
+    weights = torch.empty(32, dtype=torch.float32, device="cpu")
+    moe_out = torch.empty((1, 256), dtype=torch.bfloat16, device="cpu")
+
+    ret = fused_moe._mxfp4_a4w4_stage2_fw(
+        inter,
+        w1,
+        w2,
+        ids,
+        ids,
+        ids,
+        moe_out,
+        1,
+        w2_scale=scale,
+        a2_scale=scale,
+        block_m=32,
+        sorted_weights=weights,
+        kernelName2=name,
+        reverse_sorted=ids,
+    )
+
+    assert ret is moe_out
+    assert called, "path B did not reach mxfp4_moe_gemm2"
+    assert (called["BM"], called["BN"], called["BK"]) == (32, 128, 128)
+    assert called["epilog"] == "atomic"
+    assert called["use_nt"] is False
+    assert (called["NE"], called["D_HIDDEN"], called["D_INTER"]) == (1, 256, 128)
+    assert called["max_sorted"] == 32
+
+
 def test_v2_aot_job_preserves_tiles(tmp_path):
     from aiter.aot.flydsl.mxfp4_moe import _job_key, parse_csv
 
