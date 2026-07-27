@@ -28,28 +28,29 @@ _REPO_ROOT = os.path.dirname(
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import pytest  # noqa: E402
-import torch  # noqa: E402
-import aiter  # noqa: E402
-from aiter import dtypes, QuantType, ActivationType  # noqa: E402
-from aiter.fused_moe import (  # noqa: E402
+import pytest
+import torch
+
+import aiter
+from aiter import ActivationType, QuantType, dtypes
+from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
-from aiter.ops.flydsl.utils import is_flydsl_available  # noqa: E402
-from aiter.ops.flydsl.moe_kernels import (  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.moe_kernels import (
     pick_flydsl_stage1_tile_n,
     pick_flydsl_stage2_tile_k,
 )
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4  # noqa: E402
-from aiter.ops.quant import (  # noqa: E402
+from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.quant import (
     mxfp4_moe_sort_fwd,
     per_1x32_f8_scale_f8_quant,
 )
-from aiter.utility.fp4_utils import e8m0_shuffle  # noqa: E402
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+from aiter.utility.fp4_utils import e8m0_shuffle
 
 _CUDA = torch.device("cuda")
 
@@ -109,7 +110,7 @@ def _generate_a16wfp4_data(
 
     _s1_extra = {}
     if activation == ActivationType.Situv2:
-        _s1_extra = dict(situ_beta=situ_beta, situ_linear_beta=situ_linear_beta)
+        _s1_extra = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
     ref1 = torch_moe_stage1(
         inp,
         w1_qt,
@@ -156,26 +157,26 @@ def _generate_a16wfp4_data(
     w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False)
     w2_scale_shuf = e8m0_shuffle(w2_scale)
 
-    return dict(
-        inter_pad=inter_pad,
-        ref_stage1=ref1,
-        ref_stage2=ref2,
-        inp=inp,
-        a2=a2,
-        w1_qt=w1_qt,
-        w1_scale=w1_scale,
-        topk_ids=topk_ids,
-        w1_qt_shuf=w1_qt_shuf,
-        w1_scale_shuf=w1_scale_shuf,
-        w2_qt_shuf=w2_qt_shuf,
-        w2_scale_shuf=w2_scale_shuf,
-        sorted_ids=sorted_ids,
-        sorted_weights_s1=sorted_weights_s1,
-        sorted_weights_s2=sorted_weights_s2,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        dtype=dtype,
-    )
+    return {
+        "inter_pad": inter_pad,
+        "ref_stage1": ref1,
+        "ref_stage2": ref2,
+        "inp": inp,
+        "a2": a2,
+        "w1_qt": w1_qt,
+        "w1_scale": w1_scale,
+        "topk_ids": topk_ids,
+        "w1_qt_shuf": w1_qt_shuf,
+        "w1_scale_shuf": w1_scale_shuf,
+        "w2_qt_shuf": w2_qt_shuf,
+        "w2_scale_shuf": w2_scale_shuf,
+        "sorted_ids": sorted_ids,
+        "sorted_weights_s1": sorted_weights_s1,
+        "sorted_weights_s2": sorted_weights_s2,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "dtype": dtype,
+    }
 
 
 def _check_result(ref_out, test_out, atol=1.0, rtol=0.05, pass_pct=95.0):
@@ -910,16 +911,16 @@ def _timing_kwargs(timing: str) -> dict:
     graph      : CUDA graph replay + device time (lowest host overhead).
     """
     if timing == "cuda_event":
-        return dict(use_cuda_event=True)
+        return {"use_cuda_event": True}
     if timing == "graph":
-        return dict(use_cuda_event=False, testGraph=True)
-    return dict(use_cuda_event=False)  # device
+        return {"use_cuda_event": False, "testGraph": True}
+    return {"use_cuda_event": False}  # device
 
 
 def _sweep_perf(args):
     """Correctness + perf sweep over (token x inter_dim), incl. non-256 cases."""
-    from aiter.test_common import run_perftest
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
+    from aiter.test_common import run_perftest
 
     activation = _ACT_MAP[args.activation]
     timing_kw = _timing_kwargs(args.timing)
@@ -1015,6 +1016,8 @@ def _sweep_perf(args):
                 s2_tflops = (2.0 * token * args.topk * inter_dim * args.model_dim) / (
                     s2_us * 1e6
                 )
+            # Perf sweep: one shape failing must not abort the sweep, so the
+            # blanket catch (report + continue) is intentional.
             except Exception as e:  # noqa: BLE001
                 all_ok = False
                 print(f"{token:>5} {inter_dim:>6}  ERROR: {type(e).__name__}: {e}")
@@ -1118,7 +1121,9 @@ def main():
                             rtol=args.rtol,
                         )
                         results.append((name, "PASS"))
-                    except Exception:
+                    # Sweep runner: one config failing must not abort the sweep,
+                    # so the blanket catch (print + record ERROR) is intentional.
+                    except Exception:  # noqa: BLE001
                         import traceback
 
                         traceback.print_exc()
@@ -1140,7 +1145,9 @@ def main():
                             rtol=args.rtol,
                         )
                         results.append((name, "PASS"))
-                    except Exception:
+                    # Sweep runner: one config failing must not abort the sweep,
+                    # so the blanket catch (print + record ERROR) is intentional.
+                    except Exception:  # noqa: BLE001
                         import traceback
 
                         traceback.print_exc()
@@ -1162,7 +1169,9 @@ def main():
                             rtol=args.rtol,
                         )
                         results.append((name, "PASS"))
-                    except Exception:
+                    # Sweep runner: one config failing must not abort the sweep,
+                    # so the blanket catch (print + record ERROR) is intentional.
+                    except Exception:  # noqa: BLE001
                         import traceback
 
                         traceback.print_exc()

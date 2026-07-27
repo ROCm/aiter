@@ -431,21 +431,21 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _fused_moe_kwargs = dict(
-        w1_scale=w1_scale_aiter,
-        w2_scale=w2_scale_aiter,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-        intermediate_pad=intermediate_pad,
-        hidden_pad=hidden_pad,
-        bias1=exp_bias1_aiter,
-        bias2=exp_bias2_aiter,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gateMode,
-    )
+    _fused_moe_kwargs = {
+        "w1_scale": w1_scale_aiter,
+        "w2_scale": w2_scale_aiter,
+        "quant_type": qType,
+        "activation": actType,
+        "doweight_stage1": doweight_stage1,
+        "intermediate_pad": intermediate_pad,
+        "hidden_pad": hidden_pad,
+        "bias1": exp_bias1_aiter,
+        "bias2": exp_bias2_aiter,
+        "swiglu_limit": swiglu_limit,
+        "beta": beta,
+        "linear_beta": linear_beta,
+        "gate_mode": gateMode,
+    }
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -902,7 +902,7 @@ def _situv2_beta_kwargs(act_type):
     """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
     for every other activation so silu/swiglu/gelu behavior is unchanged."""
     if act_type == aiter.ActivationType.Situv2:
-        return dict(beta=args.beta, linear_beta=args.linear_beta)
+        return {"beta": args.beta, "linear_beta": args.linear_beta}
     return {}
 
 
@@ -1110,26 +1110,26 @@ def _iter_situv2_default_cases():
     ]
     for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
         for m in tokens:
-            yield dict(
-                dtype=dtype,
-                token=m,
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                E=args.expert,
-                topk=args.topk,
-                actType=aiter.ActivationType.Situv2,
-                gateMode=_effective_gate_mode(aq_dtype, wq_dtype),
-                qType=quant_type,
-                AQDType=aq_dtype,
-                WQDType=wq_dtype,
-                use_g1u1=True,
-                doweight_stage1=False,
-                strict_accuracy=False,
-                check_aot_cache=False,
-                swiglu_limit=None,
-                beta=args.beta,
-                linear_beta=args.linear_beta,
-            ), extras
+            yield {
+                "dtype": dtype,
+                "token": m,
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "E": args.expert,
+                "topk": args.topk,
+                "actType": aiter.ActivationType.Situv2,
+                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
+                "qType": quant_type,
+                "AQDType": aq_dtype,
+                "WQDType": wq_dtype,
+                "use_g1u1": True,
+                "doweight_stage1": False,
+                "strict_accuracy": False,
+                "check_aot_cache": False,
+                "swiglu_limit": None,
+                "beta": args.beta,
+                "linear_beta": args.linear_beta,
+            }, extras
 
 
 # ---------------------------------------------------------------------------

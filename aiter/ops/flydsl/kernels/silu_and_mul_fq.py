@@ -292,11 +292,15 @@ def build_silu_and_mul_fq_module(
                     # never bakes the limit as a compile-time constant.
                     _neg_limit = -swiglu_limit_f
 
-                    def _fmin(x):
+                    # The helpers below are re-defined per unrolled ``iter_idx`` on
+                    # purpose: they close over SSA values emitted at this insertion
+                    # point.  Bind those values as defaults so each definition
+                    # captures *its own* iteration's values (also silences B023).
+                    def _fmin(x, _neg_limit=_neg_limit):
                         # min(x, lim) == -max(-x, -lim)
                         return -((-x).maximumf(_neg_limit))
 
-                    def _sigmoid_s(x):
+                    def _sigmoid_s(x, neg_log2e=neg_log2e):
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [x * neg_log2e], [], []
                         )
@@ -319,7 +323,14 @@ def build_silu_and_mul_fq_module(
                         1.0 / float(situ_linear_beta), type=f32
                     )
 
-                    def _situv2_elem(g, u):
+                    def _situv2_elem(
+                        g,
+                        u,
+                        _sv2_beta_f32=_sv2_beta_f32,
+                        _sv2_beta_rcp=_sv2_beta_rcp,
+                        _sv2_linbeta_f32=_sv2_linbeta_f32,
+                        _sv2_linbeta_rcp=_sv2_linbeta_rcp,
+                    ):
                         # beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
                         situ_g = (
                             _sv2_beta_f32 * _tanh_s(g * _sv2_beta_rcp) * _sigmoid_s(g)

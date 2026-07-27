@@ -18,7 +18,7 @@ import os
 import pytest
 import torch
 
-from aiter import dtypes, QuantType, ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.moe_kernels import (
@@ -31,9 +31,9 @@ from aiter.ops.quant import (
     per_1x32_f4_quant,
     per_1x32_f8_scale_f8_quant,
 )
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4
-from aiter.utility.fp4_utils import e8m0_shuffle
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
 from aiter.test_common import checkAllclose
+from aiter.utility.fp4_utils import e8m0_shuffle
 
 Q_TYPE = QuantType.per_1x32
 
@@ -146,27 +146,27 @@ def _generate_a8w4_gui_data(
         cols=inter_dim,
     )
 
-    return dict(
-        inter_pad=inter_pad,
-        topk=topk,
-        a_q=a_q,
-        a_scale_sort=a_scale_sort,
-        w1_shuf=w1_shuf,
-        w1_scale_shuf=w1_scale_shuf,
-        w2_shuf=w2_shuf,
-        w2_scale_shuf=w2_scale_shuf,
-        a2_q=a2_q,
-        a2_scale_sort=a2_scale_sort,
-        sorted_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        ref_stage1=ref_stage1,
-        ref_stage2=ref_stage2,
-        token=token,
-        inter_dim=inter_dim,
-        model_dim=model_dim,
-    )
+    return {
+        "inter_pad": inter_pad,
+        "topk": topk,
+        "a_q": a_q,
+        "a_scale_sort": a_scale_sort,
+        "w1_shuf": w1_shuf,
+        "w1_scale_shuf": w1_scale_shuf,
+        "w2_shuf": w2_shuf,
+        "w2_scale_shuf": w2_scale_shuf,
+        "a2_q": a2_q,
+        "a2_scale_sort": a2_scale_sort,
+        "sorted_ids": sorted_ids,
+        "sorted_weights": sorted_weights,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "ref_stage1": ref_stage1,
+        "ref_stage2": ref_stage2,
+        "token": token,
+        "inter_dim": inter_dim,
+        "model_dim": model_dim,
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -543,17 +543,17 @@ def _generate_a8w4_situv2_vec4_data(
     if gate_mode == "interleave":
         w1_q_shuf = shuffle_weight(w1_q, (16, 16), is_guinterleave=True, gate_up=True)
 
-    return dict(
-        ref_stage1=ref_stage1,
-        a_q=a_q,
-        a_scale_sort=a_scale_sort,
-        w1_q_shuf=w1_q_shuf,
-        w1_scale_shuf=e8m0_shuffle(w1_scale),
-        sorted_ids=sorted_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        topk=topk,
-    )
+    return {
+        "ref_stage1": ref_stage1,
+        "a_q": a_q,
+        "a_scale_sort": a_scale_sort,
+        "w1_q_shuf": w1_q_shuf,
+        "w1_scale_shuf": e8m0_shuffle(w1_scale),
+        "sorted_ids": sorted_ids,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "topk": topk,
+    }
 
 
 @pytest.mark.parametrize(
@@ -714,23 +714,23 @@ def _generate_a8w4_situv2_e2e_data(
     else:
         w1_shuf = shuffle_weight(w1_q, (16, 16))
         w1_scale_shuf = e8m0_shuffle(w1_scale)
-    return dict(
-        token=token,
-        inter_dim=inter_dim,
-        topk=topk,
-        a_q=a_q,
-        a_scale_sort=a_scale_sort,
-        w1_shuf=w1_shuf,
-        w1_scale_shuf=w1_scale_shuf,
-        w2_shuf=shuffle_weight_a16w4(w2_q, 16, False),
-        w2_scale_shuf=shuffle_scale_a16w4(w2_scale, E, False),
-        sorted_ids=sorted_ids,
-        sorted_weights=sorted_weights,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        ref_stage1=ref1,
-        ref_stage2=ref2,
-    )
+    return {
+        "token": token,
+        "inter_dim": inter_dim,
+        "topk": topk,
+        "a_q": a_q,
+        "a_scale_sort": a_scale_sort,
+        "w1_shuf": w1_shuf,
+        "w1_scale_shuf": w1_scale_shuf,
+        "w2_shuf": shuffle_weight_a16w4(w2_q, 16, False),
+        "w2_scale_shuf": shuffle_scale_a16w4(w2_scale, E, False),
+        "sorted_ids": sorted_ids,
+        "sorted_weights": sorted_weights,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "ref_stage1": ref1,
+        "ref_stage2": ref2,
+    }
 
 
 # Both gate_modes. Separated is the production/customer SiTUv2 path (fused_moe

@@ -30,7 +30,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
     """
     try:
         from aiter import logger
-    except Exception:  # pragma: no cover - logging must never break the kernel
+    except ImportError:  # pragma: no cover - logging must never break the kernel
         import logging
 
         logger = logging.getLogger("aiter")
@@ -138,7 +138,7 @@ def resolve_flydsl_stage1_tile_n(inter_dim: int, tile_n: int) -> int:
     return tile_n
 
 
-def get_flydsl_kernel_params(name: str) -> Optional[Dict]:
+def get_flydsl_kernel_params(name: str) -> dict | None:
     """Lookup kernel params by name.
 
     Strips ``_kw{N}`` / ``_fp4`` / ``_fp8`` / ``_sbm{N}`` suffixes transparently.
@@ -1276,13 +1276,13 @@ def flydsl_moe_stage1(
     act: str = "silu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    w1_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    sorted_weights: Optional[torch.Tensor] = None,
+    w1_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
     persist_m: int = 0,
     use_async_copy: bool = False,
     k_batch: int = 1,
-    k_batch_intra_block: Optional[int] = None,
+    k_batch_intra_block: int | None = None,
     waves_per_eu: int = 3,
     b_nt: int = 0,
     gate_mode: str = "separated",
