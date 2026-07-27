@@ -27,7 +27,6 @@ import csv
 import os
 import sys
 import time
-from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -214,7 +213,7 @@ def _precompile_to_cache(
     # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
     # production-variant ``_persist_async_w4_cumul3`` does), causing
     # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",

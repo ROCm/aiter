@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import torch
 
@@ -404,7 +403,7 @@ def moe_sorting(
 
 def get_topk_valid_mask(
     topk_ids: torch.Tensor,
-    expert_mask: Optional[torch.Tensor] = None,
+    expert_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build valid_mask [token_num, topk] for EP mode.
 
@@ -449,18 +448,18 @@ def fused_moe(
     w2,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight,
     topk_ids,
-    expert_mask: Optional[torch.Tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
     # following for quant
-    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
     # following for cktile support
@@ -470,7 +469,7 @@ def fused_moe(
     bias2=None,
     splitk=0,
     swiglu_limit=None,
-    gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    gate_mode: str | None = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -507,25 +506,25 @@ def fused_moe_fake(
     w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    expert_mask: Optional[torch.Tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
     # following for quant
-    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
-    bias1: Optional[torch.Tensor] = None,
-    bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[float] = None,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
@@ -543,25 +542,25 @@ def fused_moe_(
     w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    expert_mask: Optional[torch.Tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
     # following for quant
-    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
-    bias1: Optional[torch.Tensor] = None,
-    bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[float] = None,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -858,7 +857,7 @@ def fused_moe_1stage(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     M: int | None = None,
     device=None,
     doweight_stage1: bool | None = None,
@@ -1102,8 +1101,8 @@ def get_padded_M(M):
 
 @dataclass
 class MOEMetadata:
-    stage1: Optional[Callable]
-    stage2: Optional[Callable]
+    stage1: Callable | None
+    stage2: Callable | None
     block_m: int
     ksplit: int
     run_1stage: bool = False
@@ -1119,9 +1118,9 @@ class MOEMetadata:
     prequant: bool = True
     skip_inter_quant: bool = False
     route_bucket: str = ""
-    expected_sorted_blocks: Optional[int] = None
-    min_sorted_blocks: Optional[int] = None
-    max_sorted_blocks: Optional[int] = None
+    expected_sorted_blocks: int | None = None
+    min_sorted_blocks: int | None = None
+    max_sorted_blocks: int | None = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1129,8 +1128,8 @@ def _needs_swiglu_bias_support(dtype, quant_type):
 
 
 def _normalize_bias_for_kernel(
-    bias: Optional[torch.Tensor],
-) -> Optional[torch.Tensor]:
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
     if bias is None:
         return bias
     if bias.dtype != torch.float32:
@@ -1142,7 +1141,7 @@ def _normalize_bias_for_kernel(
 def _get_padding_for_flydsl(
     inter_dim_pad,
     model_dim_pad,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
 ):
     if bias is not None:
         return 0, 0
@@ -1167,10 +1166,10 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
-    out_dtype: Optional[str] = None,
+    out_dtype: str | None = None,
     v2_output_layout: bool = False,
     **_kwargs,
 ):
@@ -2573,7 +2572,7 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     # following for cktile support
     hidden_pad=0,
     intermediate_pad=0,
@@ -3033,7 +3032,7 @@ def torch_moe(
 
 
 # temp workaround for swiglu
-def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: Optional[float] = 7.0):
+def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float | None = 7.0):
     if limit is None:
         limit = 7.0
     # Clamp the input values
@@ -3535,8 +3534,8 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    topk_ids: Optional[torch.Tensor] = None,
-    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
