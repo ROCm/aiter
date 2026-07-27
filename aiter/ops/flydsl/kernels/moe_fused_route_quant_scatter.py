@@ -62,27 +62,35 @@ from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr, const_expr, rocdl, vector, gpu
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    ptrtoint,
+    range_constexpr,
+    rocdl,
+    vector,
+)
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
-
+from aiter.utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
+)
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtype,
-    MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
 )
 
 BLOCK_THREADS = 256
@@ -585,8 +593,8 @@ def build_moe_fused_route_quant_scatter_module(
         c_wave = arith.constant(wave_size, type=i32)
         c_topk = arith.constant(topk, type=i32)
         c_topk_shift = arith.constant(topk_shift, type=i32)
-        c_model_dim = arith.constant(model_dim, type=i32)
-        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        _c_model_dim = arith.constant(model_dim, type=i32)
+        _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
@@ -619,9 +627,7 @@ def build_moe_fused_route_quant_scatter_module(
             # Replaces the host cumsum/index/eq/where/masked_fill chain.
             if const_expr(use_g2l):
                 g2l_rsrc = ptr_rsrc(g2l_lut)
-                le = buffer_ops.buffer_load(
-                    g2l_rsrc, expert, vec_width=1, dtype=i32
-                )
+                le = buffer_ops.buffer_load(g2l_rsrc, expert, vec_width=1, dtype=i32)
                 is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
                 expert = ArithValue(arith.select(is_drop, c0_i32, le))
                 # Fused weight cast+mask (warp-uniform: every lane writes the same
@@ -630,13 +636,9 @@ def build_moe_fused_route_quant_scatter_module(
                 # folding the host topk_weight.to(bf16) copy + masked_fill.
                 wi_rsrc = ptr_rsrc(weight_in)
                 gather_w_rsrc = ptr_rsrc(gather_w)
-                w_f32 = buffer_ops.buffer_load(
-                    wi_rsrc, route, vec_width=1, dtype=f32
-                )
+                w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
                 w_cast = arith.trunc_f(wdt, w_f32)
-                w_out = arith.select(
-                    is_drop, arith.constant(0.0, type=wdt), w_cast
-                )
+                w_out = arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
                 buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
@@ -769,7 +771,7 @@ def build_moe_fused_route_quant_scatter_module(
         gather_w: fx.Pointer,
         n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -888,7 +890,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         c0_f32 = arith.constant(0.0, type=f32)
 
         c_wave = arith.constant(wave_size, type=i32)
-        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
@@ -1007,7 +1009,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(k_groups, type=T.i32))
@@ -1133,8 +1135,8 @@ def build_moe_fused_quant_preshuffle_module(
         c0_f32 = arith.constant(0.0, type=f32)
 
         c_wave = arith.constant(wave_size, type=i32)
-        c_feat_dim = arith.constant(feat_dim, type=i32)
-        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        _c_feat_dim = arith.constant(feat_dim, type=i32)
+        _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_scale_dwords_per_row = arith.constant(scale_dwords_per_row, type=i32)
@@ -1246,7 +1248,7 @@ def build_moe_fused_quant_preshuffle_module(
         n_rows: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_blocks)
         fused_kernel(
@@ -1348,8 +1350,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c0_f32 = arith.constant(0.0, type=f32)
 
         c_wave = arith.constant(wave_size, type=i32)
-        c_feat_dim = arith.constant(feat_dim, type=i32)
-        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        _c_feat_dim = arith.constant(feat_dim, type=i32)
+        _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
@@ -1490,12 +1492,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         numel: fx.Int32,
         num_valid_routes: fx.Pointer,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
-        grid_y = arith.index_cast(
-            T.index, arith.constant(_grid_y_dim, type=T.i32)
-        )
+        grid_y = arith.index_cast(T.index, arith.constant(_grid_y_dim, type=T.i32))
         fused_kernel(
             grouped_in,
             grouped_payload,
@@ -1648,8 +1648,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
         c_wave = arith.constant(wave_size, type=i32)
         c_warps_per_block = arith.constant(warps_per_block, type=i32)
         c_topk = arith.constant(topk, type=i32)
-        c_model_dim = arith.constant(model_dim, type=i32)
-        c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
+        _c_model_dim = arith.constant(model_dim, type=i32)
+        _c_payload_bytes_per_row = arith.constant(payload_bytes_per_row, type=i32)
         c_payload_bytes_per_block = arith.constant(payload_bytes_per_block, type=i32)
         c_payload_bytes_per_lane = arith.constant(payload_bytes_per_lane, type=i32)
         c_dst_scale_dwords_per_row = arith.constant(dst_scale_dwords_per_row, type=i32)
@@ -1915,7 +1915,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         tile_m: fx.Int32,
         num_workers: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

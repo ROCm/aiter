@@ -36,16 +36,21 @@ from __future__ import annotations
 
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith
-from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
+from flydsl.expr.typing import T
+
+from aiter.utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 
 # Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h). Same
 # numeric values as the pybind11 enum classes, but importing them is
 # JIT-free, which is required at FlyDSL AOT time.
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
+)
+from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _M,
-    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)
@@ -363,9 +368,7 @@ def emit_amax_e8m0_recip(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
 
     block_amax = arith.constant(0.0, type=T.f32)
     for v in all_vals:
-        abs_v = llvm.call_intrinsic(
-            T.f32, "llvm.fabs.f32", [_raw(v)], [], []
-        )
+        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
         block_amax = arith.maxnumf(block_amax, abs_v)
     block_amax = arith.minnumf(block_amax, c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
@@ -392,9 +395,7 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
 
     block_amax = arith.constant(0.0, type=T.f32)
     for v in all_vals:
-        abs_v = llvm.call_intrinsic(
-            T.f32, "llvm.fabs.f32", [_raw(v)], [], []
-        )
+        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
         block_amax = arith.maxnumf(block_amax, abs_v)
     block_amax = arith.minnumf(block_amax, c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
@@ -436,7 +437,9 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
     No bf16 round-trip — full f32 precision into the scaled conversion.
     """
     return rocdl.cvt_scalef32_pk8_fp8_f32(
-        v2i32_ty, _raw(src_v8f32), _raw(scale_f32),
+        v2i32_ty,
+        _raw(src_v8f32),
+        _raw(scale_f32),
     )
 
 

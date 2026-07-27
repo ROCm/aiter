@@ -6,18 +6,16 @@ Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
 """
 
-import os
 import csv
 import functools
-
-from typing import Optional
+import os
 
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_common import GateMode
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -77,7 +75,7 @@ def _load_grouped_config_rows():
             from aiter.jit.core import AITER_CONFIGS
 
             cfg_path = AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE
-        except Exception:
+        except Exception:  # noqa: BLE001
             cfg_path = ""
     cached = _GROUPED_CONFIG_CACHE.get(cfg_path)
     if cached is not None:
@@ -304,9 +302,9 @@ def _build_g2l_lut(
     expert_mask: torch.Tensor,
     E: int,
     device,
-    nvt: Optional[torch.Tensor] = None,
-    topk: Optional[int] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    nvt: torch.Tensor | None = None,
+    topk: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Build the EP global->local expert LUT (and zero the route counter).
 
     Returns ``(g2l_lut, counter, nvr)`` where ``counter`` is the zero-inited
@@ -339,7 +337,9 @@ def _build_g2l_lut(
     if os.environ.get("AITER_G2L_TORCH", "0") not in _TRUTHY_ENV and n <= _G2L_MAX_N:
         try:
             mask = (
-                expert_mask.to(device=device, dtype=torch.int32).reshape(-1).contiguous()
+                expert_mask.to(device=device, dtype=torch.int32)
+                .reshape(-1)
+                .contiguous()
             )
             lut = torch.empty(n, dtype=torch.int32, device=device)
             # The kernel also zero-inits this per-bucket route counter (folds the
@@ -367,7 +367,7 @@ def _build_g2l_lut(
                 stream=torch.cuda.current_stream(),
             )
             return lut, counter, (nvr if _want_nvr else None)
-        except Exception as exc:  # pragma: no cover - fallback on any kernel issue
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
             logger.debug(
                 "[grouped_a8w4] flydsl g2l build unavailable (%s); "
                 "falling back to torch",
@@ -401,16 +401,38 @@ def _tdm_align_up(x: int, a: int) -> int:
 
 
 def _grouped_a8w4_tdm_moe(
-    hidden_states, w1, w2, topk_weight, topk_ids, *,
-    E, model_dim, inter_dim, dtype, activation,
-    w1_scale, w2_scale, bias1, bias2, swiglu_limit,
-    stage1_weight_layout, doweight_stage1,
-    tile_m=64, tile_n=256, tile_k=256, num_buffers=3,
-    tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    *,
+    E,
+    model_dim,
+    inter_dim,
+    dtype,
+    activation,
+    w1_scale,
+    w2_scale,
+    bias1,
+    bias2,
+    swiglu_limit,
+    stage1_weight_layout,
+    doweight_stage1,
+    tile_m=64,
+    tile_n=256,
+    tile_k=256,
+    num_buffers=3,
+    tile_m2=None,
+    tile_n2=None,
+    tile_k2=None,
+    num_buffers2=None,
     data_format="a8w4",
-    expert_mask=None, num_local_tokens=None,
+    expert_mask=None,
+    num_local_tokens=None,
 ):
     import functools
+
     import torch
 
     from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
@@ -432,7 +454,9 @@ def _grouped_a8w4_tdm_moe(
     wmma_rep = tile_m // 16
     wmma_rep2 = tile_m2 // 16
     _align_m = max(tile_m, tile_m2)
-    contiguous_m = max(_align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m))
+    contiguous_m = max(
+        _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
+    )
     max_m = max(_align_m, _tdm_align_up(token_num * topk, _align_m))
 
     # Expert-Parallel (EP) wiring. ``topk_ids`` then carry GLOBAL expert ids; the
@@ -451,17 +475,17 @@ def _grouped_a8w4_tdm_moe(
     _ep_nvt = None
     if _is_ep:
         if num_local_tokens is not None:
-            _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
-                device=device, dtype=torch.int32
-            ).contiguous()
+            _ep_nvt = (
+                num_local_tokens.reshape(-1)[:1]
+                .to(device=device, dtype=torch.int32)
+                .contiguous()
+            )
         else:
             # torch.full builds directly on-device (fill kernel, no H2D copy), so
             # this stays legal under CUDA graph capture. torch.tensor([...],
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
-            _ep_nvt = torch.full(
-                (1,), int(token_num), dtype=torch.int32, device=device
-            )
+            _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
         _g2l_lut, _g2l_counter, _g2l_nvr = _build_g2l_lut(
             expert_mask, E, device, nvt=_ep_nvt, topk=int(topk)
         )
@@ -493,19 +517,33 @@ def _grouped_a8w4_tdm_moe(
     two_inter = 2 * inter_dim
     stage1_act = 2 if activation == ActivationType.Swiglu else 1
     sl = (
-        float(swiglu_limit) if swiglu_limit
+        float(swiglu_limit)
+        if swiglu_limit
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
-    _b1 = bias1.to(dtype).contiguous() if (bias1 is not None and bias1.numel() > 0) else None
-    _b2 = bias2.to(dtype).contiguous() if (bias2 is not None and bias2.numel() > 0) else None
+    _b1 = (
+        bias1.to(dtype).contiguous()
+        if (bias1 is not None and bias1.numel() > 0)
+        else None
+    )
+    _b2 = (
+        bias2.to(dtype).contiguous()
+        if (bias2 is not None and bias2.numel() > 0)
+        else None
+    )
     _is_fp4 = data_format == "fp4"
     _quant_mode = "fp4" if _is_fp4 else "fp8"
     _a_is_fp4 = 1 if _is_fp4 else 0
 
     a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
-        hidden_states.reshape(1, token_num, model_dim), 1, contiguous_m,
-        wmma_rep=wmma_rep, quant_mode=_quant_mode, masked_m=None,
-        topids_to_rows=topids_to_rows, source_topk=topk,
+        hidden_states.reshape(1, token_num, model_dim),
+        1,
+        contiguous_m,
+        wmma_rep=wmma_rep,
+        quant_mode=_quant_mode,
+        masked_m=None,
+        topids_to_rows=topids_to_rows,
+        source_topk=topk,
         num_valid_routes=_ep_nvr,
     )
 
@@ -521,77 +559,185 @@ def _grouped_a8w4_tdm_moe(
         # These are written directly by the kernel's fused quant epilogue.
         _Pb = inter_dim  # fp8: 1 byte per element
         _Ws = inter_dim // 32  # one e8m0 byte per 32-element MX block
-        a2_payload = torch.empty((1, contiguous_m, _Pb), dtype=torch.uint8, device=device)
+        a2_payload = torch.empty(
+            (1, contiguous_m, _Pb), dtype=torch.uint8, device=device
+        )
         a2_scale = torch.empty(
             (1, contiguous_m // wmma_rep2, _Ws * wmma_rep2),
-            dtype=torch.uint8, device=device,
+            dtype=torch.uint8,
+            device=device,
         )
         # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
         # quant_scale / arg_quant_scale).
         flydsl_grouped_gemm_a8w4_masked(
-            a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            a2_payload.view(torch.uint8),
+            a1_payload,
+            w1_u8,
+            a1_scale,
+            w1s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act,
+            bias=_b1,
+            swiglu_limit=sl,
             num_buffers=num_buffers,
-            stage1_quant_out=1, quant_scale=a2_scale,
+            stage1_quant_out=1,
+            quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
         y = torch.empty((1, contiguous_m, inter_dim), dtype=dtype, device=device)
         flydsl_grouped_gemm_a8w4_masked(
-            y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-            n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-            stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
+            y,
+            a1_payload,
+            w1_u8,
+            a1_scale,
+            w1s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act,
+            bias=_b1,
+            swiglu_limit=sl,
             num_buffers=num_buffers,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
-            y, 1, contiguous_m, wmma_rep=wmma_rep2, quant_mode=_quant_mode,
-            masked_m=None, topids_to_rows=None,
+            y,
+            1,
+            contiguous_m,
+            wmma_rep=wmma_rep2,
+            quant_mode=_quant_mode,
+            masked_m=None,
+            topids_to_rows=None,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     flydsl_grouped_gemm_a8w4_masked(
-        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum,
-        n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
-        tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
-        out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-        stage1_act=0, bias=_b2, num_buffers=num_buffers2,
+        grouped_out,
+        a2_payload,
+        w2_u8,
+        a2_scale,
+        w2s_i32,
+        psum,
+        n_experts=E,
+        contiguous_m=contiguous_m,
+        N=model_dim,
+        K=inter_dim,
+        tile_m=tile_m2,
+        tile_n=tile_n2,
+        tile_k=tile_k2,
+        out_is_f16=out_is_f16,
+        a_is_fp4=_a_is_fp4,
+        stage1_act=0,
+        bias=_b2,
+        num_buffers=num_buffers2,
     )
 
     if kernel_bench_callable is not None:
         if _fuse_quant:
-            kernel_bench_callable.append(("gemm1", functools.partial(
-                flydsl_grouped_gemm_a8w4_masked,
-                a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-                n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-                out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-                stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-                num_buffers=num_buffers,
-                stage1_quant_out=1, quant_scale=a2_scale,
-                quant_wmma_rep=wmma_rep2)))
+            kernel_bench_callable.append(
+                (
+                    "gemm1",
+                    functools.partial(
+                        flydsl_grouped_gemm_a8w4_masked,
+                        a2_payload.view(torch.uint8),
+                        a1_payload,
+                        w1_u8,
+                        a1_scale,
+                        w1s_i32,
+                        psum,
+                        n_experts=E,
+                        contiguous_m=contiguous_m,
+                        N=two_inter,
+                        K=model_dim,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        tile_k=tile_k,
+                        out_is_f16=out_is_f16,
+                        a_is_fp4=_a_is_fp4,
+                        stage1_act=stage1_act,
+                        bias=_b1,
+                        swiglu_limit=sl,
+                        num_buffers=num_buffers,
+                        stage1_quant_out=1,
+                        quant_scale=a2_scale,
+                        quant_wmma_rep=wmma_rep2,
+                    ),
+                )
+            )
         else:
-            kernel_bench_callable.append(("gemm1", functools.partial(
-                flydsl_grouped_gemm_a8w4_masked, y, a1_payload, w1_u8, a1_scale, w1s_i32, psum,
-                n_experts=E, contiguous_m=contiguous_m, N=two_inter, K=model_dim,
-                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-                out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-                stage1_act=stage1_act, bias=_b1, swiglu_limit=sl,
-                num_buffers=num_buffers)))
-        kernel_bench_callable.append(("gemm2", functools.partial(
-            flydsl_grouped_gemm_a8w4_masked, grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32,
-            psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
-            tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
-            out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-            stage1_act=0, bias=_b2, num_buffers=num_buffers2)))
+            kernel_bench_callable.append(
+                (
+                    "gemm1",
+                    functools.partial(
+                        flydsl_grouped_gemm_a8w4_masked,
+                        y,
+                        a1_payload,
+                        w1_u8,
+                        a1_scale,
+                        w1s_i32,
+                        psum,
+                        n_experts=E,
+                        contiguous_m=contiguous_m,
+                        N=two_inter,
+                        K=model_dim,
+                        tile_m=tile_m,
+                        tile_n=tile_n,
+                        tile_k=tile_k,
+                        out_is_f16=out_is_f16,
+                        a_is_fp4=_a_is_fp4,
+                        stage1_act=stage1_act,
+                        bias=_b1,
+                        swiglu_limit=sl,
+                        num_buffers=num_buffers,
+                    ),
+                )
+            )
+        kernel_bench_callable.append(
+            (
+                "gemm2",
+                functools.partial(
+                    flydsl_grouped_gemm_a8w4_masked,
+                    grouped_out,
+                    a2_payload,
+                    w2_u8,
+                    a2_scale,
+                    w2s_i32,
+                    psum,
+                    n_experts=E,
+                    contiguous_m=contiguous_m,
+                    N=model_dim,
+                    K=inter_dim,
+                    tile_m=tile_m2,
+                    tile_n=tile_n2,
+                    tile_k=tile_k2,
+                    out_is_f16=out_is_f16,
+                    a_is_fp4=_a_is_fp4,
+                    stage1_act=0,
+                    bias=_b2,
+                    num_buffers=num_buffers2,
+                ),
+            )
+        )
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if _is_ep:
@@ -605,7 +751,10 @@ def _grouped_a8w4_tdm_moe(
             else topk_weight.contiguous()
         )
     flydsl_moe_gather_reduce(
-        grouped_out, topids_to_rows, gather_w, out=moe_out,
+        grouped_out,
+        topids_to_rows,
+        gather_w,
+        out=moe_out,
         num_valid_tokens=(_ep_nvt if _is_ep else None),
     )
     os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
@@ -629,16 +778,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     q_dtype_w,
     isG1U1: bool,
     doweight_stage1: bool,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    expert_mask: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    expert_mask: torch.Tensor | None,
     hidden_pad: int,
     intermediate_pad: int,
-    bias1: Optional[torch.Tensor],
-    bias2: Optional[torch.Tensor],
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
     gate_mode: GateMode = GateMode.SEPARATED,
-    swiglu_limit: Optional[float] = None,
-    num_local_tokens: Optional[torch.Tensor] = None,
+    swiglu_limit: float | None = None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -767,19 +916,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
             compile_moe_grouped_gemm1_a8w4_masked,
-            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
+            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm2_mxfp4_masked,
         )
-    except Exception as vendored_exc:
+    except Exception as vendored_exc:  # noqa: BLE001
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
                 compile_moe_grouped_gemm1_a8w4_masked,
-                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
+                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm2_mxfp4_masked,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[grouped_a8w4] grouped FlyDSL import failed, fallback: "
                 f"vendored={vendored_exc}; flydsl={exc}"
@@ -892,11 +1041,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # wiring lives in _grouped_a8w4_tdm_moe. doweight_stage1 is not supported with
     # EP on this path (the route kernel owns the gather weights), so it falls back
     # to the grouped path.
-    _tdm_ep_ok = (expert_mask is not None) and _use_a8w4_tdm_ep() and (
-        not doweight_stage1
+    _tdm_ep_ok = (
+        (expert_mask is not None) and _use_a8w4_tdm_ep() and (not doweight_stage1)
     )
-    if _use_a8w4_tdm_path() and stage1_weight_layout == "gugu" and (
-        expert_mask is None or _tdm_ep_ok
+    if (
+        _use_a8w4_tdm_path()
+        and stage1_weight_layout == "gugu"
+        and (expert_mask is None or _tdm_ep_ok)
     ):
         _tdm_kw = {}
         if cfg_row is not None:
@@ -907,7 +1058,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _tdm_kw["tile_m2"] = _as_int(cfg_row.get("tile_m2"), _tdm_kw["tile_m"])
             _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
             _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
-            _tdm_kw["num_buffers2"] = _as_int(cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"])
+            _tdm_kw["num_buffers2"] = _as_int(
+                cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
+            )
+
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
         # AITER_TDM_TILE_M / _TILE_N / _TILE_K / _NUM_BUFFERS (+ *_M2/_N2/_K2/
@@ -915,6 +1069,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         def _tdm_env(name):
             v = os.environ.get(name)
             return int(v) if (v is not None and v != "") else None
+
         _ov_m = _tdm_env("AITER_TDM_TILE_M")
         _ov_n = _tdm_env("AITER_TDM_TILE_N")
         _ov_k = _tdm_env("AITER_TDM_TILE_K")
@@ -923,11 +1078,20 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _ov_n2 = _tdm_env("AITER_TDM_TILE_N2")
         _ov_k2 = _tdm_env("AITER_TDM_TILE_K2")
         _ov_nb2 = _tdm_env("AITER_TDM_NUM_BUFFERS2")
-        if any(v is not None for v in (_ov_m, _ov_n, _ov_k, _ov_nb, _ov_m2, _ov_n2, _ov_k2, _ov_nb2)):
+        if any(
+            v is not None
+            for v in (_ov_m, _ov_n, _ov_k, _ov_nb, _ov_m2, _ov_n2, _ov_k2, _ov_nb2)
+        ):
             _base_m = _ov_m if _ov_m is not None else _tdm_kw.get("tile_m", tile_m)
-            _base_n = _ov_n if _ov_n is not None else _tdm_kw.get("tile_n", int(n_warp) * 64)
+            _base_n = (
+                _ov_n if _ov_n is not None else _tdm_kw.get("tile_n", int(n_warp) * 64)
+            )
             _base_k = _ov_k if _ov_k is not None else _tdm_kw.get("tile_k", 256)
-            _base_nb = _ov_nb if _ov_nb is not None else _tdm_kw.get("num_buffers", num_buffers)
+            _base_nb = (
+                _ov_nb
+                if _ov_nb is not None
+                else _tdm_kw.get("num_buffers", num_buffers)
+            )
             _tdm_kw["tile_m"] = _base_m
             _tdm_kw["tile_n"] = _base_n
             _tdm_kw["tile_k"] = _base_k
@@ -940,10 +1104,21 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
             _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
         return _grouped_a8w4_tdm_moe(
-            hidden_states, w1, w2, topk_weight, topk_ids,
-            E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,
-            activation=activation, w1_scale=w1_scale, w2_scale=w2_scale,
-            bias1=bias1, bias2=bias2, swiglu_limit=swiglu_limit,
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=E,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            dtype=dtype,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
             stage1_weight_layout=stage1_weight_layout,
             doweight_stage1=doweight_stage1,
             data_format=data_format,
@@ -1040,9 +1215,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     )
     # EP dynamic-token scalar (total_recv); (1,) int32, capture-safe (no host sync).
     if _is_ep and num_local_tokens is not None:
-        _ep_nvt = num_local_tokens.reshape(-1)[:1].to(
-            device=device, dtype=torch.int32
-        ).contiguous()
+        _ep_nvt = (
+            num_local_tokens.reshape(-1)[:1]
+            .to(device=device, dtype=torch.int32)
+            .contiguous()
+        )
     else:
         _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
     if _is_ep and not _use_fused_route_g2l:
@@ -1059,9 +1236,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         # the fused kernels while remaining pure-torch for debugging.
         _g2l_full = _g2l_lut[topk_ids.reshape(-1).long()].view_as(topk_ids)
         _ep_drop = _g2l_full >= n_route_buckets
-        local_topk_ids = torch.where(
-            _ep_drop, torch.zeros_like(_g2l_full), _g2l_full
-        )
+        local_topk_ids = torch.where(_ep_drop, torch.zeros_like(_g2l_full), _g2l_full)
         gather_weight = topk_weight.clone()
         gather_weight[_ep_drop] = 0
     else:
@@ -1082,13 +1257,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg and not (_is_ep and not _use_naive):
-        # On the fused EP fast path ``flat_experts`` holds GLOBAL ids (remapped
-        # on-device), so the local-range invariant only applies to naive/non-EP.
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= n_route_buckets):
-            raise ValueError(
-                "grouped a8w4 path expects local expert ids in [0, n_route_buckets)"
-            )
+    # On the fused EP fast path ``flat_experts`` holds GLOBAL ids (remapped
+    # on-device), so the local-range invariant only applies to naive/non-EP.
+    if (
+        _grouped_sync_dbg
+        and not (_is_ep and not _use_naive)
+        and (torch.any(flat_experts < 0) or torch.any(flat_experts >= n_route_buckets))
+    ):
+        raise ValueError(
+            "grouped a8w4 path expects local expert ids in [0, n_route_buckets)"
+        )
     counts = None
 
     if grouped_contiguous_m:
@@ -1120,9 +1298,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # kernel (fused-route g2l, torch g2l fallback, or non-EP).
     if _is_ep and num_local_tokens is not None:
         _ep_nvr = (
-            _g2l_nvr
-            if _g2l_nvr is not None
-            else (_ep_nvt * int(topk)).contiguous()
+            _g2l_nvr if _g2l_nvr is not None else (_ep_nvt * int(topk)).contiguous()
         )
     else:
         _ep_nvr = (
@@ -1263,7 +1439,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             )
             _grouped_dbg("route done, start psum+remap")
             _starts_t, psum_t, _ = contiguous_psum_remap(
-                masked_m, topids_to_rows, n_route_buckets, max_m, tile_m,
+                masked_m,
+                topids_to_rows,
+                n_route_buckets,
+                max_m,
+                tile_m,
                 num_valid_routes=_ep_nvr,
             )
             m_tile_map = psum_t
@@ -1697,13 +1877,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             torch.ones((token_num, topk), dtype=topk_weight.dtype, device=device)
             if doweight_stage1
             else (
-                _gather_w_buf
-                if _gather_w_buf is not None
-                else gather_weight.to(dtype)
+                _gather_w_buf if _gather_w_buf is not None else gather_weight.to(dtype)
             )
         )
         flydsl_moe_gather_reduce(
-            grouped_out, topids_to_rows, gather_w, out=moe_out,
+            grouped_out,
+            topids_to_rows,
+            gather_w,
+            out=moe_out,
             num_valid_tokens=_ep_nvt,
         )
         _grouped_dbg("gather-reduce output done")
@@ -1873,7 +2054,7 @@ def contiguous_psum_remap(
     experts: int,
     route_max_m: int,
     tile_m: int,
-    num_valid_routes: Optional[torch.Tensor] = None,
+    num_valid_routes: torch.Tensor | None = None,
 ):
     """Tile-aligned psum and in-place masked-row -> contiguous-row remap."""
     device = masked_m.device
@@ -1890,9 +2071,11 @@ def contiguous_psum_remap(
             (1,), int(topids_flat.numel()), dtype=torch.int32, device=device
         )
     else:
-        num_valid_routes_i32 = num_valid_routes.reshape(-1)[:1].to(
-            device=device, dtype=torch.int32
-        ).contiguous()
+        num_valid_routes_i32 = (
+            num_valid_routes.reshape(-1)[:1]
+            .to(device=device, dtype=torch.int32)
+            .contiguous()
+        )
     launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
@@ -1940,8 +2123,10 @@ def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
     gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
-    out: Optional[torch.Tensor] = None,
-    num_valid_tokens: Optional[torch.Tensor] = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
+    out: torch.Tensor | None = None,
+    num_valid_tokens: (
+        torch.Tensor | None
+    ) = None,  # (1,) int32; skip output tokens >= this (EP dead-tail)
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -1990,9 +2175,11 @@ def flydsl_moe_gather_reduce(
             (1,), int(token_num), dtype=torch.int32, device=device
         )
     else:
-        num_valid_tokens_i32 = num_valid_tokens.reshape(-1)[:1].to(
-            device=device, dtype=torch.int32
-        ).contiguous()
+        num_valid_tokens_i32 = (
+            num_valid_tokens.reshape(-1)[:1]
+            .to(device=device, dtype=torch.int32)
+            .contiguous()
+        )
     launch(
         ptr_arg(grouped_out_flat),
         ptr_arg(topids_to_rows),
@@ -2021,12 +2208,12 @@ def _get_compiled_scatter_copy(row_bytes: int):
 
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,  # (token_num, Wp) uint8
-    a1_scale_token_u8: Optional[torch.Tensor],  # (token_num, Ws) uint8 or None
+    a1_scale_token_u8: torch.Tensor | None,  # (token_num, Ws) uint8 or None
     rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
     E: int,
     max_m: int,
-    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
-    a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
+    grouped_a1: torch.Tensor | None = None,  # (E, max_m, Wp) uint8 out
+    a1_scale_raw: torch.Tensor | None = None,  # (E, max_m, Ws) uint8 out
 ):
     """Copy token payload/scale into grouped layout via rows_to_tokens map.
 
@@ -2084,9 +2271,7 @@ def flydsl_moe_scatter_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    grouped_a1_scale: Optional[
-        torch.Tensor
-    ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    grouped_a1_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Fused route-gather + WMMA preshuffle for e8m0 scale rows. Returns grouped_a1_scale."""
     device = a1_scale_token_u8.device
@@ -2124,7 +2309,7 @@ def flydsl_moe_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    out: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Preshuffle grouped row-major e8m0 scale into WMMA layout. Returns out."""
     device = scale_grouped_u8.device

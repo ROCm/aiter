@@ -147,9 +147,18 @@ def flydsl_batched_gemm_mxfp4(
 
     if gfx == "gfx1250":
         return _run_gfx1250(
-            a, w, a_scales, w_scales, N, dtype,
-            a_dtype=a_dtype, layout=layout,
-            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, out=out,
+            a,
+            w,
+            a_scales,
+            w_scales,
+            N,
+            dtype,
+            a_dtype=a_dtype,
+            layout=layout,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            out=out,
         )
     if gfx != "gfx950":
         raise RuntimeError(
@@ -240,9 +249,13 @@ def _run_gfx1250(
     if tile_m % 32 != 0:
         tile_m = ((tile_m + 31) // 32) * 32
     if tile_n % 32 != 0:
-        raise RuntimeError(f"[FlyDSL gfx1250] tile_n ({tile_n}) must be a multiple of 32")
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] tile_n ({tile_n}) must be a multiple of 32"
+        )
     if N % tile_n != 0:
-        raise RuntimeError(f"[FlyDSL gfx1250] N ({N}) must be a multiple of tile_n ({tile_n})")
+        raise RuntimeError(
+            f"[FlyDSL gfx1250] N ({N}) must be a multiple of tile_n ({tile_n})"
+        )
     if K % WMMA_K_GFX1250 != 0:
         raise RuntimeError(f"[FlyDSL gfx1250] K ({K}) must be a multiple of 128")
 
@@ -253,7 +266,7 @@ def _run_gfx1250(
 
     try:
         _num_cu = torch.cuda.get_device_properties(a.device).multi_processor_count
-    except Exception:
+    except Exception:  # noqa: BLE001
         _num_cu = 256
     _n_bn = B * ((N + tile_n - 1) // tile_n)
     bw_bound = _n_bn >= 2 * _num_cu
@@ -367,8 +380,8 @@ def preshuffle_a8w4_weight_mbn(w_bf16: torch.Tensor):
           w_codes  : [B, N//16, (K//2)*16] uint8  (MXFP4 codes, WMMA-shuffled)
           w_scales : [B, N//32, (K//32)*32] uint8 (e8m0 n32k4)
     """
+    from aiter.ops.shuffle import shuffle_scale_n32k4, shuffle_weight_gfx1250
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.ops.shuffle import shuffle_weight_gfx1250, shuffle_scale_n32k4
 
     assert w_bf16.dim() == 3, f"expected [B,N,K], got {tuple(w_bf16.shape)}"
     B, N, K = w_bf16.shape
@@ -377,10 +390,10 @@ def preshuffle_a8w4_weight_mbn(w_bf16: torch.Tensor):
     codes, scales = [], []
     for b in range(B):
         c, s = dynamic_mxfp4_quant(w_bf16[b].contiguous())  # c:[N,K//2] s:[N,K//32]
-        codes.append(shuffle_weight_gfx1250(c))             # [N//16, (K//2)*16]
+        codes.append(shuffle_weight_gfx1250(c))  # [N//16, (K//2)*16]
         scales.append(s.view(torch.uint8))
     w_codes = torch.stack(codes, 0).contiguous()
-    w_scale_raw = torch.stack(scales, 0).contiguous()       # [B, N, K//32]
+    w_scale_raw = torch.stack(scales, 0).contiguous()  # [B, N, K//32]
     w_scales = shuffle_scale_n32k4(w_scale_raw, experts_cnt=B).contiguous()
     return w_codes, w_scales
 
@@ -471,7 +484,7 @@ def flydsl_batched_gemm_a8w4_v2(
 
     try:
         _num_cu = torch.cuda.get_device_properties(a.device).multi_processor_count
-    except Exception:
+    except Exception:  # noqa: BLE001
         _num_cu = 256
     _n_bn = B * ((N + tile_n - 1) // tile_n)
     bw_bound = _n_bn >= 2 * _num_cu
@@ -509,7 +522,9 @@ def flydsl_batched_gemm_a8w4_v2(
     out_is_f16 = 1 if dtype == torch.float16 else 0
     layout_mbn = 1 if layout == "mbn" else 0
     shape = (M, B, N) if layout == "mbn" else (B, M, N)
-    out_phys = out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
+    out_phys = (
+        out if out is not None else torch.empty(shape, dtype=dtype, device=a.device)
+    )
 
     a_c = a.contiguous()
     _launch_v2(

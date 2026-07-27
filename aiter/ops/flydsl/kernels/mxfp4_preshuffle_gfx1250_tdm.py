@@ -11,22 +11,24 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops, vector
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.utility.mx_types import MxDtypeInt as MxDtype
+
 from .gemm_common_gfx1250 import (
+    batched_silu_swiglu,
+    fused_silu_swiglu_elem,
     lds_load_b32_raw,
     lds_load_b128_raw,
     lds_store_b32_raw,
-    lds_store_b128_raw,
     lds_store_b64_raw,
+    lds_store_b128_raw,
     pipeline_fence,
     workgroup_barrier,
-    fused_silu_swiglu_elem,
-    batched_silu_swiglu,
 )
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
-from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 TDM_DESCRIPTOR_VERSION = 1
 
@@ -61,9 +63,21 @@ def launch_gemm_a8w4_tdm(
     arg_quant_scale: fx.Tensor = None,
 ):
     cache_tag = (
-        K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
-        a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
-        stage1_quant_out, quant_wmma_rep,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        out_is_f16,
+        num_buffers,
+        a_is_fp4,
+        n_experts,
+        stage1_act,
+        has_bias,
+        TDM_DESCRIPTOR_VERSION,
+        stage1_quant_out,
+        quant_wmma_rep,
     )
     _ = cache_tag
     WMMA_M = WMMA_N = 16
@@ -92,7 +106,7 @@ def launch_gemm_a8w4_tdm(
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
     SC_INNER = tile_k // 4
-    SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
+    _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
     AS_SUPERS = tile_m // wmma_m_rep
     AS_INNER = (tile_k // 128) * wmma_m_rep
     # AS_SUPERS*AS_INNER is the true A-scale footprint (SA_SUPERS*SC_INNER collapses for tile_m<32)
@@ -173,7 +187,9 @@ def launch_gemm_a8w4_tdm(
         n64 = fx.Int64(i32_n)
 
         # In-kernel bisect: find expert owning this M-tile via psum
-        i32_ptr = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
+        i32_ptr = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
+        )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
         lo, hi = blk_m * 0, blk_m * 0 + n_experts
         for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
@@ -191,7 +207,7 @@ def launch_gemm_a8w4_tdm(
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
-        # Per-expert A-data OOB: bound to the owning expert's valid-row 
+        # Per-expert A-data OOB: bound to the owning expert's valid-row
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
         base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
@@ -211,7 +227,9 @@ def launch_gemm_a8w4_tdm(
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
         def make_tdm_store(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(gt, [outer, None], strides=[stride, None], num_warps=num_waves)
+            return fx.rocdl.make_tdm_atom(
+                gt, [outer, None], strides=[stride, None], num_warps=num_waves
+            )
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -223,10 +241,19 @@ def launch_gemm_a8w4_tdm(
         WS8 = num_waves >= 8
         WAVE_SPEC = num_waves >= 4 and tile_m >= 64 and tile_n >= 64
         shared = fx.AddressSpace.Shared
-        p8_shared = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16)
-        p32_shared = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16)
+        p8_shared = fx.PointerType.get(
+            elem_ty=fx.Int8.ir_type, address_space=shared, alignment=16
+        )
+        p32_shared = fx.PointerType.get(
+            elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
+        )
         if const_expr(WAVE_SPEC):
-            waves = [(0, 1), (2, 3), (4, 5) if WS8 else (0, 1), (6, 7) if WS8 else (2, 3)]
+            waves = [
+                (0, 1),
+                (2, 3),
+                (4, 5) if WS8 else (0, 1),
+                (6, 7) if WS8 else (2, 3),
+            ]
             nw = 1
         else:
             waves, nw = [(None,)] * 4, num_waves
@@ -235,30 +262,112 @@ def launch_gemm_a8w4_tdm(
         Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
         jobs = []
 
-        def add_tdm_loads(g_base, g_off, g_stride, oob, inner, outer, *, on_i32, lds_off, lds_row, k_adv, wv, pad=None):
+        def add_tdm_loads(
+            g_base,
+            g_off,
+            g_stride,
+            oob,
+            inner,
+            outer,
+            *,
+            on_i32,
+            lds_off,
+            lds_row,
+            k_adv,
+            wv,
+            pad=None,
+        ):
             seg = outer // len(wv)
             for i in range_constexpr(len(wv)):
-                gt = global_view(g_base, g_off + fx.Int64(i * seg) * g_stride, (seg, inner), (inner, 1))
+                gt = global_view(
+                    g_base,
+                    g_off + fx.Int64(i * seg) * g_stride,
+                    (seg, inner),
+                    (inner, 1),
+                )
                 ext = None if oob is None else oob - i * seg
-                pad_kw = dict(pad_interval=pad[0], pad_amount=pad[1]) if pad else {}
-                atom = fx.rocdl.make_tdm_atom(gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw)
-                jobs.append(Job(atom, gt, on_i32, lds_off + i * seg * lds_row, lds_row, inner, seg, k_adv, wv[i]))
+                pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+                atom = fx.rocdl.make_tdm_atom(
+                    gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw
+                )
+                jobs.append(
+                    Job(
+                        atom,
+                        gt,
+                        on_i32,
+                        lds_off + i * seg * lds_row,
+                        lds_row,
+                        inner,
+                        seg,
+                        k_adv,
+                        wv[i],
+                    )
+                )
 
-        add_tdm_loads(gA_base, a_off0, A_KROW, mn_oob, A_ROW_B, tile_m,
-                      on_i32=False, lds_off=0, lds_row=A_LDS_ROW, k_adv=A_ROW_B, wv=waves[0], pad=(A_ROW_B, LDS_PAD_A))
-        add_tdm_loads(gB_base, b_off0, Kp16, None, PACK_TK * 16, tile_n // 16,
-                      on_i32=False, lds_off=STAGE_A, lds_row=B_LDS_ROW, k_adv=PACK_TK * 16, wv=waves[1])
-        add_tdm_loads(gSA_base, (blk_m64 // wmma_m_rep) * AS_ROW, AS_ROW, None, AS_INNER, AS_SUPERS,
-                      on_i32=True, lds_off=SA_OFF // 4, lds_row=AS_INNER, k_adv=AS_INNER * 4, wv=waves[2])
-        add_tdm_loads(gSB_base, sb_off0, SB_OUTER_STRIDE, None, SC_INNER, SB_SUPERS,
-                      on_i32=True, lds_off=SB_OFF // 4, lds_row=SC_INNER, k_adv=SC_INNER * 4, wv=waves[3])
+        add_tdm_loads(
+            gA_base,
+            a_off0,
+            A_KROW,
+            mn_oob,
+            A_ROW_B,
+            tile_m,
+            on_i32=False,
+            lds_off=0,
+            lds_row=A_LDS_ROW,
+            k_adv=A_ROW_B,
+            wv=waves[0],
+            pad=(A_ROW_B, LDS_PAD_A),
+        )
+        add_tdm_loads(
+            gB_base,
+            b_off0,
+            Kp16,
+            None,
+            PACK_TK * 16,
+            tile_n // 16,
+            on_i32=False,
+            lds_off=STAGE_A,
+            lds_row=B_LDS_ROW,
+            k_adv=PACK_TK * 16,
+            wv=waves[1],
+        )
+        add_tdm_loads(
+            gSA_base,
+            (blk_m64 // wmma_m_rep) * AS_ROW,
+            AS_ROW,
+            None,
+            AS_INNER,
+            AS_SUPERS,
+            on_i32=True,
+            lds_off=SA_OFF // 4,
+            lds_row=AS_INNER,
+            k_adv=AS_INNER * 4,
+            wv=waves[2],
+        )
+        add_tdm_loads(
+            gSB_base,
+            sb_off0,
+            SB_OUTER_STRIDE,
+            None,
+            SC_INNER,
+            SB_SUPERS,
+            on_i32=True,
+            lds_off=SB_OFF // 4,
+            lds_row=SC_INNER,
+            k_adv=SC_INNER * 4,
+            wv=waves[3],
+        )
 
         def issue(s, kt):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
             so4 = s * (PITCH // 4)
             for j in jobs:
                 base = base_i32 if j.on_i32 else pa
-                dst = lds_view(base + j.lds_off + (so4 if j.on_i32 else 0), (j.outer, j.inner), (j.lds_row, 1))
+                dst = lds_view(
+                    base + j.lds_off + (so4 if j.on_i32 else 0),
+                    (j.outer, j.inner),
+                    (j.lds_row, 1),
+                )
                 off = fx.Int64(kt * j.k_adv)
                 if const_expr(j.wave is None):
                     fx.copy(j.atom, j.gt, dst, imm_offset=off)
@@ -273,25 +382,46 @@ def launch_gemm_a8w4_tdm(
             row = wmb + wm * 16 + lane16
             b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128_raw(buf, b0)).shuffle(Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8)))
+                return Vec(lds_load_b128_raw(buf, b0)).shuffle(
+                    Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8))
+                )
             v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
-            return v[0].shuffle(v[1], list(range(8))).shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
+            return (
+                v[0]
+                .shuffle(v[1], list(range(8)))
+                .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
+            )
 
         def load_b(buf, wn, ksl):
-            b0 = STAGE_A + (wnb // 16 + wn) * B_LDS_ROW + ksl * 1024 + kgrp * 256 + lane16 * 16
-            return Vec(lds_load_b128_raw(buf, b0)).shuffle(Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8)))
+            b0 = (
+                STAGE_A
+                + (wnb // 16 + wn) * B_LDS_ROW
+                + ksl * 1024
+                + kgrp * 256
+                + lane16 * 16
+            )
+            return Vec(lds_load_b128_raw(buf, b0)).shuffle(
+                Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8))
+            )
 
         def load_sa(buf, wm, ksl):
             warp_lds_row = wmb // wmma_m_rep + lane16
-            byte = warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
+            byte = (
+                warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
+            )
             return lds_load_b32_raw(buf, SA_OFF + byte)
 
         def load_sb(buf, wn, ksl):
             col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32_raw(buf, SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4)
+            return lds_load_b32_raw(
+                buf,
+                SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4,
+            )
 
         wmma_atom = fx.make_mma_atom(
-            fx.rocdl.WMMAScale(WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32)
+            fx.rocdl.WMMAScale(
+                WMMA_M, WMMA_N, WMMA_K, fx.Float4E2M1FN, ACT_ELEM, fx.Float32
+            )
         )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
@@ -312,15 +442,24 @@ def launch_gemm_a8w4_tdm(
                 for wn_raw in range_constexpr(wmma_n_rep):
                     wn = (wmma_n_rep - 1 - wn_raw) if (wm % 2 == 1) else wn_raw
                     idx = wm * wmma_n_rep + wn
-                    fx.gemm(wmma_atom, c_frags[idx], wt[wn], act[i], c_frags[idx],
-                            scale_a=sb_k[wn], scale_b=sa_k[wm])
+                    fx.gemm(
+                        wmma_atom,
+                        c_frags[idx],
+                        wt[wn],
+                        act[i],
+                        c_frags[idx],
+                        scale_a=sb_k[wn],
+                        scale_b=sa_k[wm],
+                    )
 
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
         BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
 
         def load_b_and_scales(buf, ksl):
-            wt = [to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+            wt = [
+                to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)
+            ]
             sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
@@ -336,7 +475,11 @@ def launch_gemm_a8w4_tdm(
             if const_expr(len(BACK) > 0):
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
-            return load_b_and_scales(buf, nxt_ksl) if const_expr(nxt_ksl is not None) else None
+            return (
+                load_b_and_scales(buf, nxt_ksl)
+                if const_expr(nxt_ksl is not None)
+                else None
+            )
 
         def compute_ktile(buf, prefetch_kt):
             if const_expr(prefetch_kt is not None):
@@ -408,7 +551,11 @@ def launch_gemm_a8w4_tdm(
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused silu/swiglu -> fp8 quant; stage fp8 payload to LDS, scatter scale to global.
-                i32_ptr_g = fx.PointerType.get(elem_ty=fx.Int8.ir_type, address_space=fx.AddressSpace.Global, alignment=1)
+                i32_ptr_g = fx.PointerType.get(
+                    elem_ty=fx.Int8.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=1,
+                )
                 scale_ptr = fx.recast_iter(i32_ptr_g, fx.get_iter(arg_quant_scale))
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
@@ -417,7 +564,7 @@ def launch_gemm_a8w4_tdm(
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
                 # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
-                N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
+                _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     row_i32 = fx.Int32(blk_m + row_rel)
@@ -439,12 +586,19 @@ def launch_gemm_a8w4_tdm(
                                 pairs.append((acc[2 * p], acc[2 * p + 1]))
 
                         all_vals = batched_silu_swiglu(
-                            pairs, swiglu=is_swiglu,
-                            limit_f32=f32_swiglu_limit, neg_limit_f32=neg_limit,
-                            range_constexpr=range_constexpr)
+                            pairs,
+                            swiglu=is_swiglu,
+                            limit_f32=f32_swiglu_limit,
+                            neg_limit_f32=neg_limit,
+                            range_constexpr=range_constexpr,
+                        )
 
-                        scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3)
-                        mx_blk_i = fx.Int32(blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16) >> 6
+                        scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
+                            all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
+                        )
+                        mx_blk_i = (
+                            fx.Int32(blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16) >> 6
+                        )
                         e8m0_bytes.append(e8m0_byte)
                         mx_blk_is.append(mx_blk_i)
 
@@ -454,27 +608,38 @@ def launch_gemm_a8w4_tdm(
                                 fx.Float32,
                             ).ir_value()
                             packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                src_f32, scale_f32, v2i32_ty=v2i32_ty,
-                                rocdl=rocdl)
+                                src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                            )
                             for sub in range_constexpr(2):
                                 sub_wn = half * 2 + sub
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                packed_i32 = vector.extract(packed_v2i32, static_position=[sub], dynamic_position=[])
+                                packed_i32 = vector.extract(
+                                    packed_v2i32,
+                                    static_position=[sub],
+                                    dynamic_position=[],
+                                )
                                 col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                lds_store_b32_raw(stC_idx, row_rel * STORE_N + col_fp8, packed_i32)
+                                lds_store_b32_raw(
+                                    stC_idx, row_rel * STORE_N + col_fp8, packed_i32
+                                )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
-                    if row_rel < mn_oob:
-                        if is_kgrp0:
-                            for mx_blk in range_constexpr(N_MX_BLKS):
-                                scale_dw = mx_blk_is[mx_blk] >> 2
-                                byte_in_dw = mx_blk_is[mx_blk] & 3
-                                dst_byte = (out_row_scaled + scale_dw * quant_wmma_rep) * 4 + byte_in_dw
-                                fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
+                    if row_rel < mn_oob and is_kgrp0:
+                        for mx_blk in range_constexpr(N_MX_BLKS):
+                            scale_dw = mx_blk_is[mx_blk] >> 2
+                            byte_in_dw = mx_blk_is[mx_blk] & 3
+                            dst_byte = (
+                                out_row_scaled + scale_dw * quant_wmma_rep
+                            ) * 4 + byte_in_dw
+                            fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
                 if const_expr(has_bias):
-                    bias_ptr_type = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
+                    bias_ptr_type = fx.PointerType.get(
+                        elem_ty=out_elem,
+                        address_space=fx.AddressSpace.Global,
+                        alignment=2,
+                    )
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
@@ -482,13 +647,40 @@ def launch_gemm_a8w4_tdm(
                         col_rel = wnb + wn * 16 + kgrp * 8
                         acc = Vec(accs[wm * wmma_n_rep + wn])
                         if const_expr(has_bias):
-                            acc = acc + Vec(fx.ptr_load(bias_map + expert * i32_n + col_rel, result_type=T.vec(8, out_elem))).to(fx.Float32)
+                            acc = acc + Vec(
+                                fx.ptr_load(
+                                    bias_map + expert * i32_n + col_rel,
+                                    result_type=T.vec(8, out_elem),
+                                )
+                            ).to(fx.Float32)
                         if const_expr(stage1_act):
-                            hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=neg_limit) for p in range_constexpr(4)], fx.Float32).to(oc)
-                            lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
+                            hv = Vec.from_elements(
+                                [
+                                    fused_silu_swiglu_elem(
+                                        acc[2 * p],
+                                        acc[2 * p + 1],
+                                        swiglu=is_swiglu,
+                                        limit_f32=f32_swiglu_limit,
+                                        neg_limit_f32=neg_limit,
+                                    )
+                                    for p in range_constexpr(4)
+                                ],
+                                fx.Float32,
+                            ).to(oc)
+                            lds_store_b64_raw(
+                                stC_idx,
+                                (row_rel * STORE_N + col_rel // 2) * 2,
+                                hv.bitcast(fx.Int32).ir_value(),
+                            )
                         else:
-                            hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
-                            lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
+                            hv = Vec.from_elements(
+                                [acc[i] for i in range_constexpr(8)], fx.Float32
+                            ).to(oc)
+                            lds_store_b128_raw(
+                                stC_idx,
+                                (row_rel * STORE_N + col_rel) * 2,
+                                hv.bitcast(fx.Int32).ir_value(),
+                            )
 
             # -- Shared LDS -> TDM store to global --
             workgroup_barrier()
@@ -507,14 +699,30 @@ def launch_gemm_a8w4_tdm(
             c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
             gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
             atomC = make_tdm_store(gtC, mn_oob, out_stride)
-            fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
+            fx.copy(
+                atomC,
+                lds_view(
+                    fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)
+                ),
+                gtC,
+            )
             tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, f32_swiglu_limit).launch(
-        grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
-    )
+    kernel(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_m_tile_map,
+        arg_bias,
+        arg_quant_scale,
+        i32_m,
+        N,
+        f32_swiglu_limit,
+    ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {

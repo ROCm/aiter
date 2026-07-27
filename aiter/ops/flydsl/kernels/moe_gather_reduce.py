@@ -42,19 +42,17 @@ nothing and need no branch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr, vector
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, ptrtoint, range_constexpr, vector
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -121,7 +119,7 @@ def build_moe_gather_reduce_module(
     # batches (e.g. token=1 decode) and reduce per-CTA split_k/topk work.
     VEC = int(vec_dwords)
     out_dwords = model_dim // 2  # dwords per output row
-    row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
+    _row_dwords = model_dim // 2  # dwords per grouped_out_flat row (same)
     DWORDS_PER_ITER = BLOCK_THREADS * VEC  # dwords advanced per loop iter
     n_iters = (out_dwords + DWORDS_PER_ITER - 1) // DWORDS_PER_ITER
 
@@ -155,7 +153,7 @@ def build_moe_gather_reduce_module(
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
         vec_i32 = arith.constant(VEC, type=i32)
-        num_tokens_i32 = ArithValue(num_tokens)
+        _num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
 
@@ -328,7 +326,7 @@ def build_moe_gather_reduce_module(
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
         num_valid_tokens: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

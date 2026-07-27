@@ -28,10 +28,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-from contextlib import nullcontext
 import os
 import sys
-from typing import Optional
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -47,8 +46,7 @@ from aiter.fused_moe import (
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
-from aiter.utility import fp4_utils
-from aiter.utility import dtypes
+from aiter.utility import dtypes, fp4_utils
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.
@@ -98,7 +96,7 @@ def _require_gfx1250() -> None:
         return
     try:
         from flydsl.runtime.device import get_rocm_arch
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"FlyDSL not importable: {exc}")
     arch = get_rocm_arch()
     if "gfx1250" not in arch.lower():
@@ -113,7 +111,7 @@ def is_gfx1250() -> bool:
         from flydsl.runtime.device import get_rocm_arch
 
         return "gfx1250" in get_rocm_arch().lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -231,7 +229,7 @@ def _torch_moe_ref(
 # Mock data builders
 # ---------------------------------------------------------------------------
 def _pattern_packed(
-    experts: int, rows: int, k_pack: int, *, const_init: Optional[float] = None
+    experts: int, rows: int, k_pack: int, *, const_init: float | None = None
 ) -> torch.Tensor:
     """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
     if const_init is not None:
@@ -240,7 +238,7 @@ def _pattern_packed(
 
 
 def init_weight_scales(
-    experts: int, rows: int, n_blocks: int, *, const_init: Optional[float] = None
+    experts: int, rows: int, n_blocks: int, *, const_init: float | None = None
 ) -> torch.Tensor:
     """Per-block e8m0 weight scale: random small scales (drawn from the global
     RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
@@ -323,8 +321,8 @@ def _run_grouped_via_fused_moe(
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
-    const_init: Optional[float] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[dict]]:
+    const_init: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``layout`` selects the stage1 weight physical layout:
@@ -447,8 +445,8 @@ def _run_grouped_via_fused_moe(
         # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
         # populates the per-stage launch callables (and yields a correct ``out`` to
         # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
-        from aiter.test_common import run_perftest
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+        from aiter.test_common import run_perftest
 
         kernel_bench_callable: list = []
         _grouped.kernel_bench_callable = kernel_bench_callable
@@ -539,7 +537,7 @@ def run_moe(
     kernel_bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-    const_init: Optional[float] = None,
+    const_init: float | None = None,
     check_aot_cache: bool = True,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the

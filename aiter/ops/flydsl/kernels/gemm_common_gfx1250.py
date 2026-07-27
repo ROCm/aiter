@@ -319,24 +319,28 @@ LOG2E = _math.log2(_math.e)
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
     import flydsl.expr as _fx
+
     return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
 
 
 def fmax_f32(a, b):
     """Scalar f32 max (maps to v_max_num_f32)."""
     import flydsl.expr as _fx
+
     return _fx.Float32(arith.maxnumf(_raw(a), _raw(b)))
 
 
 def fclamp_f32(x, lo, hi):
     """Scalar f32 clamp via v_med3_num_f32."""
     import flydsl.expr as _fx
+
     return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
     """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
     import flydsl.expr as _fx
+
     _one = _fx.Float32(1.0)
     g = fmin_f32(g, limit_f32)
     u = fclamp_f32(u, neg_limit_f32, limit_f32)
@@ -364,6 +368,7 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
         list of activated f32 values, same length as *pairs*.
     """
     import flydsl.expr as _fx
+
     _one = _fx.Float32(1.0)
     nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
     N = len(pairs)
@@ -400,25 +405,25 @@ def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_conste
 
 
 __all__ = [
-    # LDS helpers
-    "get_lds_memref",
+    # Scalar math
+    "LOG2E",
+    "batched_silu_swiglu",
     # Raw LLVM path
     "extract_lds_base_idx",
+    "fmax_f32",
+    "fmin_f32",
+    "fused_silu_swiglu_elem",
+    # LDS helpers
+    "get_lds_memref",
+    "issue_tdm_loads",
     "lds_load_b128_raw",
     "lds_transpose_load_raw",
-    # Pipeline
-    "workgroup_barrier",
     "pipeline_fence",
     "pipeline_fence_signal",
     "pipeline_fence_wait",
-    "issue_tdm_loads",
+    "store_acc_vec8_to_buffer",
     # Epilogue
     "store_acc_vec8_to_lds",
-    "store_acc_vec8_to_buffer",
-    # Scalar math
-    "LOG2E",
-    "fmin_f32",
-    "fmax_f32",
-    "fused_silu_swiglu_elem",
-    "batched_silu_swiglu",
+    # Pipeline
+    "workgroup_barrier",
 ]

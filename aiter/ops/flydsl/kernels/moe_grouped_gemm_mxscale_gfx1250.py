@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -28,7 +27,8 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
-from flydsl.expr.arith import ArithValue, _to_raw as _raw
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
@@ -50,7 +50,7 @@ class _GroupedA8W4Config:
     m_warp: int
     n_warp: int
     num_buffers: int
-    waves_per_eu: Optional[int]
+    waves_per_eu: int | None
     out_dtype: str
     use_tdm_store: bool
     inst_prefetch: bool
@@ -63,7 +63,7 @@ class _GroupedA8W4Config:
     tdm_as_in_prologue: bool = False
     grouped_persistent_m: bool = True
     grouped_contiguous_m: bool = False
-    persistent_workers: Optional[int] = None
+    persistent_workers: int | None = None
     persistent_stride: bool = True
     data_format: str = "a8w4"
     act: str = "silu"
@@ -1860,7 +1860,7 @@ def compile_moe_grouped_gemm2_mxfp4_masked(**kwargs):
 
 __all__ = [
     "compile_moe_grouped_gemm1_a8w4_masked",
-    "compile_moe_grouped_gemm2_a8w4_masked",
     "compile_moe_grouped_gemm1_mxfp4_masked",
+    "compile_moe_grouped_gemm2_a8w4_masked",
     "compile_moe_grouped_gemm2_mxfp4_masked",
 ]

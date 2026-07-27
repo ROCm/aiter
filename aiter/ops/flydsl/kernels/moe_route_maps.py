@@ -9,22 +9,21 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    STensor,
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    STensor,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -94,7 +93,7 @@ def build_moe_route_maps_module():
         topk: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -166,7 +165,7 @@ def build_moe_topids_to_rows_module():
         numel: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)
@@ -201,6 +200,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     This replaces the host-side cumsum/index/eq/where/masked_fill chain with a
     single on-device pass, which is the dominant per-route launch cost at decode.
     """
+
     @flyc.kernel(name="moe_route_g2l")
     def route_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32 GLOBAL expert ids
@@ -285,7 +285,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         max_m: fx.Int32,
         n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_kernel(
@@ -367,9 +367,9 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         c0 = arith.constant(0, type=i32)
         c1 = arith.constant(1, type=i32)
         tid = ArithValue(fx.thread_idx.x)
-        route = ArithValue(fx.block_idx.x) * arith.constant(
-            BLOCK_THREADS, type=i32
-        ) + tid
+        route = (
+            ArithValue(fx.block_idx.x) * arith.constant(BLOCK_THREADS, type=i32) + tid
+        )
 
         lds_base = allocator.get_base()
         cnt_base_idx = buffer_ops.extract_base_index(lds_base)
@@ -515,7 +515,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         max_m: fx.Int32,
         n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -756,7 +756,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         numel: fx.Int32,
         max_m: fx.Int32,
         E: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()

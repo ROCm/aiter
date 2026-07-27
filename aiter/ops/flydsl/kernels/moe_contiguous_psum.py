@@ -10,21 +10,21 @@ torch.cumsum (avoids rocprim trampoline overhead for small E).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    STensor,
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    STensor,
+    ptr_rsrc,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
@@ -145,7 +145,7 @@ def build_moe_contiguous_psum_module():
         contiguous_m: fx.Pointer,
         experts: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -320,7 +320,7 @@ def build_moe_contiguous_psum_remap_module():
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
         num_valid_routes: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -533,7 +533,7 @@ def build_moe_route_psum_fused_module():
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()

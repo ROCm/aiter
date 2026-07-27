@@ -1,36 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import (
-    checkAllclose,
-    run_perftest,
-    perftest,
-)
-from aiter.fused_moe import (
-    fused_topk,
-    fused_moe,
-    torch_moe,
-)
-
-from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import (
-    shuffle_weight,
-    shuffle_weight_a16w4,
-    shuffle_scale_a16w4,
-    moe_shuffle_scale,
-    moe_shuffle_weight,
-)
-from aiter import ActivationType
-from aiter import QuantType
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter import pertoken_quant
-from aiter import dtypes
-from aiter import get_gfx
-from aiter.utility import fp4_utils
 import argparse
 import os
+
+import torch
+
+import aiter
+from aiter import ActivationType, QuantType, dtypes, get_gfx, pertoken_quant
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    torch_moe,
+)
+from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import (
+    moe_shuffle_scale,
+    moe_shuffle_weight,
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
+from aiter.test_common import (
+    checkAllclose,
+    perftest,
+    run_perftest,
+)
+from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -545,9 +542,7 @@ def test_fmoe_ep_mxfp4(
         fused_topk(input_, router_logits, topk, True, topk_ids, topk_weights)
 
         # Every row is valid; no padded tail to skip.
-        num_local_tokens = torch.tensor(
-            [total_recv], dtype=dtypes.i32, device="cuda"
-        )
+        num_local_tokens = torch.tensor([total_recv], dtype=dtypes.i32, device="cuda")
 
         # Reference sees exactly the same batch + routing.
         ref_input = input_
@@ -568,7 +563,9 @@ def test_fmoe_ep_mxfp4(
         # Step 1: generate the `n_src` *source* tokens (what all EP ranks hold
         #   before dispatch). Each token picks topk experts from ALL E experts via
         #   fused_topk (the router runs *before* dispatch on the source rank).
-        src_input = _randn_or_const((n_src, model_dim), const_init=const_init, dtype=dtype)
+        src_input = _randn_or_const(
+            (n_src, model_dim), const_init=const_init, dtype=dtype
+        )
         src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
         src_topk_ids = torch.empty(
             (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
@@ -605,7 +602,9 @@ def test_fmoe_ep_mxfp4(
         # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
         #   First total_recv rows = valid received tokens (from step 2).
         #   Rows [total_recv, trim_M) = dead padding (MORI arena tail).
-        input_ = _randn_or_const((trim_M, model_dim), const_init=const_init, dtype=dtype)
+        input_ = _randn_or_const(
+            (trim_M, model_dim), const_init=const_init, dtype=dtype
+        )
         input_[:total_recv] = recv_input
 
         total_topk_ids = torch.zeros(
@@ -677,7 +676,12 @@ def test_fmoe_ep_mxfp4(
         # (a8w4 -> q_dtype_a=fp8), per_1x32 mxfp4 weights.
         w1_u8 = w1_qt.view(torch.uint8)
         w2_u8 = w2_qt.view(torch.uint8)
-        _tdm_gugu = os.environ.get("AITER_EP_TDM_GUGU", "0") in ("1", "true", "True", "yes")
+        _tdm_gugu = os.environ.get("AITER_EP_TDM_GUGU", "0") in (
+            "1",
+            "true",
+            "True",
+            "yes",
+        )
         if _tdm_gugu:
             # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
             # felix TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
@@ -1154,7 +1158,7 @@ if summary_table:
         _df = pd.DataFrame(summary_table)
         print("\nmoe_ep_mxfp4 summary (markdown):")
         print(_df.to_markdown(index=False))
-    except Exception as _e:
+    except Exception as _e:  # noqa: BLE001
         print(f"[summary] pandas unavailable ({_e}); raw rows:")
         for _row in summary_table:
             print(_row)
