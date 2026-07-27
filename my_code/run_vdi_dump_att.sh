@@ -12,7 +12,7 @@ GEMM_TEST_CMD="${GEMM_TEST_CMD:-python op_tests/test_flydsl_grouped_gemm_gfx1250
 
 usage() {
     echo "Usage: ${SCRIPT_NAME} <output-dir-name> [--git] [--am]" >&2
-    echo "  --git  add/commit/push the final .tar.gz (disabled by default)" >&2
+    echo "  --git  only add/commit/push an existing .tar.gz; skip trace collection" >&2
     echo "  --am   amend the current commit; requires --git" >&2
 }
 
@@ -504,14 +504,33 @@ if [[ "${am_mode}" -eq 1 && "${git_mode}" -ne 1 ]]; then
     exit 1
 fi
 
-host_git_branch="not-requested"
-host_git_commit="not-requested"
 if [[ "${git_mode}" -eq 1 ]]; then
     export GIT_SSH_COMMAND='ssh -i /data/yanguahe/code/id_rsa.hyg -o IdentitiesOnly=yes'
-    host_git_branch="$(git -C "${REPO_ROOT}" branch --show-current || true)"
-    host_git_commit="$(git -C "${REPO_ROOT}" rev-parse HEAD || true)"
+    if [[ ! -f "${REPO_ROOT}/${output_archive}" ]]; then
+        echo "Missing expected output archive: ${REPO_ROOT}/${output_archive}" >&2
+        exit 1
+    fi
+
+    git -C "${REPO_ROOT}" add -f "${output_archive}"
+    if ! git -C "${REPO_ROOT}" diff --cached --quiet; then
+        if [[ "${am_mode}" -eq 1 ]]; then
+            git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
+                commit --amend --author="yanguahe <yanguahe@amd.com>" -m Update
+        else
+            git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
+                commit --author="yanguahe <yanguahe@amd.com>" -m Update
+        fi
+    fi
+    if [[ "${am_mode}" -eq 1 ]]; then
+        git -C "${REPO_ROOT}" push -f origin hyg_gfx1250_gemm
+    else
+        git -C "${REPO_ROOT}" push origin hyg_gfx1250_gemm
+    fi
+    exit 0
 fi
 
+host_git_branch="not-requested"
+host_git_commit="not-requested"
 docker_env=(
     -e workspace_dir="${workspace_dir}"
     -e REPO_ROOT="${REPO_ROOT}"
@@ -532,30 +551,7 @@ docker exec -i "${docker_env[@]}" "${CONTAINER_NAME}" \
 run_status=$?
 set -e
 
-if [[ "${git_mode}" -eq 1 ]]; then
-    if [[ -f "${REPO_ROOT}/${output_archive}" ]]; then
-        # Keep raw trace directories available under ./my_code for inspection,
-        # but only commit the final packaged artifact.
-        git -C "${REPO_ROOT}" add -f "${output_archive}"
-        if ! git -C "${REPO_ROOT}" diff --cached --quiet; then
-            if [[ "${am_mode}" -eq 1 ]]; then
-                git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
-                    commit --amend --author="yanguahe <yanguahe@amd.com>" -m Update
-            else
-                git -C "${REPO_ROOT}" -c user.name=yanguahe -c user.email=yanguahe@amd.com \
-                    commit --author="yanguahe <yanguahe@amd.com>" -m Update
-            fi
-        fi
-        if [[ "${am_mode}" -eq 1 ]]; then
-            git -C "${REPO_ROOT}" push -f origin hyg_gfx1250_gemm
-        else
-            git -C "${REPO_ROOT}" push origin hyg_gfx1250_gemm
-        fi
-    else
-        echo "Missing expected output archive: ${REPO_ROOT}/${output_archive}" >&2
-    fi
-else
-    echo "Git operations disabled; trace files remain under ${REPO_ROOT}/${TRACE_ROOT}"
-fi
+echo "Trace collection complete; Git operations were not requested."
+echo "Run '${SCRIPT_RELATIVE_PATH} ${output_dir_name} --git' separately to commit the archive."
 
 exit "${run_status}"
