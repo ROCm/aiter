@@ -1,6 +1,7 @@
 """MoE GEMM stage1/stage2 kernel builders (FLIR MFMA, mxfp4/mxfp8)."""
 
 import functools
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -2935,7 +2936,7 @@ def compile_mixed_moe_gemm2(
     inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
-    waves_per_eu: int | None = None,
+    waves_per_eu: Optional[int] = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
