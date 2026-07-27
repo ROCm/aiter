@@ -347,9 +347,7 @@ def routing(
             token_offs_raw,
             token_offs_pad,
             block_pid_map,
-        ) = sort_fn(
-            expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-        )
+        ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
         expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
         return (
             RoutingData(
@@ -428,9 +426,7 @@ def routing(
         token_offs_raw,
         token_offs_pad,
         block_pid_map,
-    ) = sort_fn(
-        expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-    )
+    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(
         block_m=block_m,
@@ -494,9 +490,7 @@ def routing_from_hash(
         token_offs_raw,
         token_offs_pad,
         block_pid_map,
-    ) = sort_fn(
-        expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-    )
+    ) = sort_fn(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M)
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
     routing_data = RoutingData(
         block_m=block_m,

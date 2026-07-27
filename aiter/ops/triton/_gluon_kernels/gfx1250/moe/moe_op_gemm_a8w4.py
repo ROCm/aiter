@@ -76,7 +76,7 @@ def unswizzle_mx_scale_gfx1250(
             (
                 BLOCK_N // PRESHUFFLE_FACTOR,
                 MX_SCALE_BLOCK_K // SCALE_KWIDTH,
-                    PRESHUFFLE_FACTOR,
+                PRESHUFFLE_FACTOR,
                 SCALE_KWIDTH,
             )
         )
@@ -1464,14 +1464,19 @@ def get_moe_a8w4_layouts(
 
     X_GATHER_IDX_LAYOUT = None
     if GatherIndx is not None:
-        assert GatherIndx.dtype in (torch.uint16, torch.int32), (
-            "Gather index datatype should be uint16 or int32"
-        )
+        assert GatherIndx.dtype in (
+            torch.uint16,
+            torch.int32,
+        ), "Gather index datatype should be uint16 or int32"
         gather_index_bitwidth = 16 if GatherIndx.dtype == torch.uint16 else 32
         X_GATHER_IDX_LAYOUT = gl.SliceLayout(
             0,
             gl.BlockedLayout(
-                [1, 256 // gather_index_bitwidth], [32, 1], [1, num_warps], [0, 1], cga_layout=CGA_A_T
+                [1, 256 // gather_index_bitwidth],
+                [32, 1],
+                [1, num_warps],
+                [0, 1],
+                cga_layout=CGA_A_T,
             ),
         )
 
