@@ -75,9 +75,9 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels ingest raw topk_ids/topk_weights through the
+# sorted_* kernarg slots, so moe_sorting is a pass-through. flat=1 uses the
+# one-token-per-TG grid; flat=2 performs embedded sorting on a persistent grid.
 
 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
@@ -104,8 +104,8 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
+    # Both modes read token_cnt from the scalar kernarg. The remaining metadata
+    # slots only need valid device pointers, so alias raw topk ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
@@ -367,7 +367,7 @@ def moe_sorting(
             num_local_tokens,
             accumulate=accumulate,
         )
-    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # FLAT modes: routing is handled in-kernel; pass through unsorted topk.
     if flat:
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
@@ -869,6 +869,7 @@ def fused_moe_1stage(
     quant_type=QuantType.No,
     xbf16=False,
     kernelName: str = "",
+    flat=0,
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
@@ -1009,6 +1010,7 @@ def fused_moe_1stage(
             kernelName,
             fc2_smooth_scale=None,
             activation=activation,
+            flat_mode=flat,
         )
     return moe_buf
 
@@ -1128,7 +1130,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    flat: bool = False
+    flat: int = 0
     # Feature flags:
     #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
@@ -1914,8 +1916,9 @@ def get_2stage_cfgs(
         kernelName2 = ""
         run_1stage = False
         run_1stage_xbf16 = False
-        # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = False
+        # No tuned config => default host moe_sort. Tuned flat modes bypass it:
+        # 1 uses the one-token-per-TG grid; 2 uses embedded sort + persistent grid.
+        cfg_flat = 0
         if (
             activation,
             q_type,
@@ -1980,9 +1983,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
-            cfg_flat = False
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2037,6 +2040,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
+                flat=cfg_flat,
             ),
             None,
             block_m,
