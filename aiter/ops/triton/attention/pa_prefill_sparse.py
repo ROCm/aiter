@@ -9,16 +9,14 @@ and BLOCK_H heads per CTA. Same grid as the decode kernel. No split-K:
 prefill fills the GPU via the token dimension.
 """
 
-from typing import Optional
-
 import torch
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -35,7 +33,7 @@ def pa_prefill_sparse(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    has_invalid: Optional[bool] = None,
+    has_invalid: bool | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources with sink.
 
