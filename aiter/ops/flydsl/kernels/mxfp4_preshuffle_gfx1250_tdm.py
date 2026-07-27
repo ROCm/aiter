@@ -598,16 +598,19 @@ def launch_gemm_a8w4_tdm(
                         store_valid = arith.andi(store_valid, _lane_ok)
                     origin_pe = dst_packed // ep_slot_stride
                     slot = dst_packed % ep_slot_stride
-                    # Bake the warp-uniform column origin (blk_n) into the descriptor
-                    # BASE so a row's lanes share ONE descriptor (no address
-                    # waterfall); the per-lane column rides in the VGPR byte offset.
-                    row_base = (
-                        fx.Int64(ep_win.lsa_ptr(origin_pe, ep_off_comb_inp))
-                        + fx.Int64(slot) * fx.Int64(ep_wire_nbytes)
-                        + blk_n64 * fx.Int64(elem_bytes)
-                    )
-                    _voff_bytes = arith.index_cast(
-                        T.i32, _chunk * arith.index(8 * elem_bytes)
+                    # Address the store WITHIN the peer's comb_inp region: descriptor
+                    # base = the peer's comb_inp base (origin_pe), num_records = the
+                    # region size, and the per-lane byte offset = slot row + column
+                    # tile + 8-bf16 chunk. This bounds every store to the region so a
+                    # stray (row/col) offset is HW-dropped instead of page-faulting;
+                    # a row's lanes share ONE descriptor (base) and only differ by the
+                    # chunk in the VGPR offset -> still coalesced.
+                    peer_base = fx.Int64(ep_win.lsa_ptr(origin_pe, ep_off_comb_inp))
+                    _chunk_i32 = arith.index_cast(T.i32, _chunk)
+                    _voff_bytes = (
+                        slot * ep_wire_nbytes
+                        + blk_n * elem_bytes
+                        + _chunk_i32 * (8 * elem_bytes)
                     )
                     _lds_byte = (
                         _row * arith.index(STORE_N) + _chunk * arith.index(8)
@@ -617,7 +620,10 @@ def launch_gemm_a8w4_tdm(
                         _v = lds_load_b128_raw(stC_idx, _lds_byte)
                         buffer_ops.buffer_store(
                             _v,
-                            buffer_ops.create_buffer_resource_from_addr(row_base),
+                            buffer_ops.create_buffer_resource_from_addr(
+                                peer_base,
+                                num_records_bytes=ep_slot_stride * ep_wire_nbytes,
+                            ),
                             _voff_bytes,
                             offset_is_bytes=True,
                         )
