@@ -49,6 +49,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
 
@@ -535,6 +536,9 @@ def _precompile_to_cache(
                     ),
                     stream=0,
                     swiglu_limit=runtime_swiglu_limit(None, act),
+                    pass_swiglu_limit=not (
+                        a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+                    ),
                 )
             else:
                 args = _s1_args_std(
@@ -615,6 +619,11 @@ def _precompile_to_cache(
                 )
 
         elif stage == 2:
+            # Match flydsl_moe_stage2 runtime dispatch: tuned tables may name a
+            # tile_k that does not divide this shape (for example 256 for
+            # inter_dim=384), in which case runtime compiles the legal fallback.
+            tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
+
             # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
             if a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)

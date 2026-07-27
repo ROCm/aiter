@@ -91,6 +91,8 @@ def test_fmoe(
     strict_accuracy=True,
     check_aot_cache=True,
     swiglu_limit=None,
+    beta=None,
+    linear_beta=None,
     kernel_bench=False,
     disable_stage2_bias=False,
     reference_intermediate_pad=0,
@@ -373,6 +375,11 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
+        # pr1 torch_moe_stage1 exposes situ_beta/situ_linear_beta (no None
+        # handling); mirror the kernel's None -> 1.0 mapping so the reference
+        # matches fused_moe for SiTUv2 (harmless for other activations).
+        situ_beta=1.0 if beta is None else float(beta),
+        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
 
     # ######################## stage 2 start ###########
@@ -424,19 +431,21 @@ def test_fmoe(
     )
 
     # ######################## stage 2 end ###########
-    _fused_moe_kwargs = dict(
-        w1_scale=w1_scale_aiter,
-        w2_scale=w2_scale_aiter,
-        quant_type=qType,
-        activation=actType,
-        doweight_stage1=doweight_stage1,
-        intermediate_pad=intermediate_pad,
-        hidden_pad=hidden_pad,
-        bias1=exp_bias1_aiter,
-        bias2=exp_bias2_aiter,
-        swiglu_limit=swiglu_limit,
-        gate_mode=gateMode,
-    )
+    _fused_moe_kwargs = {
+        "w1_scale": w1_scale_aiter,
+        "w2_scale": w2_scale_aiter,
+        "quant_type": qType,
+        "activation": actType,
+        "doweight_stage1": doweight_stage1,
+        "intermediate_pad": intermediate_pad,
+        "hidden_pad": hidden_pad,
+        "bias1": exp_bias1_aiter,
+        "bias2": exp_bias2_aiter,
+        "swiglu_limit": swiglu_limit,
+        "beta": beta,
+        "linear_beta": linear_beta,
+        "gate_mode": gateMode,
+    }
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -696,6 +705,24 @@ parser.add_argument(
     help="swiglu/silu clamp limit. Default None means the kernel default (7.0).",
 )
 parser.add_argument(
+    "--beta",
+    type=float,
+    default=None,
+    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
+)
+parser.add_argument(
+    "--linear-beta",
+    type=float,
+    default=None,
+    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
+    "Only affects SiTUv2.",
+)
+parser.add_argument(
+    "--no-situv2",
+    action="store_true",
+    help="Skip the default SiTUv2 (per_1x32 fp4/fp8) FlyDSL cases.",
+)
+parser.add_argument(
     "--kernel",
     action="store_true",
     help="""Time the stage1 / stage2 kernels in isolation (loop each launch
@@ -865,6 +892,19 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
+# SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8 activation
+# (a4w4 fp4 act, a8w4 fp8 act). Any other quant would silently fall off the
+# FlyDSL path, so SiTUv2 is skipped for those combos.
+_SITUV2_SUPPORTED_TRIPLES = (_PER1X32_FP8_FP4, _PER1X32_FP4_FP4)
+
+
+def _situv2_beta_kwargs(act_type):
+    """beta/linear_beta are only meaningful for SiTUv2; leave them unset (None)
+    for every other activation so silu/swiglu/gelu behavior is unchanged."""
+    if act_type == aiter.ActivationType.Situv2:
+        return {"beta": args.beta, "linear_beta": args.linear_beta}
+    return {}
+
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
     # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
@@ -982,6 +1022,7 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
@@ -1000,6 +1041,7 @@ def _iter_legacy_cases():
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
+                            **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_BF16_I4:
             for m in args.tokenNum:
@@ -1016,6 +1058,13 @@ def _iter_legacy_cases():
                 ), extras
         else:
             for act_type in args.act:
+                # SiTUv2 only routes to FlyDSL on per_1x32 + fp4/fp8; skip it for
+                # every other quant so we never compare an unsupported combo.
+                if (
+                    act_type == aiter.ActivationType.Situv2
+                    and triple not in _SITUV2_SUPPORTED_TRIPLES
+                ):
+                    continue
                 for m in args.tokenNum:
                     yield _kw(
                         dtype,
@@ -1027,7 +1076,60 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
+                        **_situv2_beta_kwargs(act_type),
                     ), extras
+
+
+def _iter_situv2_default_cases():
+    """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
+
+    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
+    hardcode the supported quant family instead of relying on the -a list:
+      * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
+    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
+    Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
+
+    Notes on cases intentionally kept out of this DEFAULT auto-run:
+      * The real DSV4 customer shape uses inter_dim=640, which is not 256-aligned.
+        shuffle_scale_a16w4 requires inter_dim % 256 == 0 on this branch; the
+        non-256 inter_dim fix lives on fix/shuffle-scale-a16w4-kdim. Verify the
+        640 shape once that branch is combined with this one. We default to a
+        256-aligned inter_dim (512) here so the a8w4 case runs on this branch.
+      * a4w4 (fp4 act, fp4 weight) full 2-stage is omitted because CK stage2
+        codegen (gen_instances.py) has no 'situv2' activation instance
+        (only silu/gelu), so the full a4w4 2-stage path can't be built here.
+        -a situv2 -q 4 remains reachable via explicit CLI.
+    """
+    extras = {"model": "situv2"}
+    dtype = args.dtype[0]
+    model_dim = 3072
+    tokens = [16, 128]
+    # ((quant_type, aq_dtype, wq_dtype), inter_dim)
+    situv2_cases = [
+        (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
+    ]
+    for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
+        for m in tokens:
+            yield {
+                "dtype": dtype,
+                "token": m,
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "E": args.expert,
+                "topk": args.topk,
+                "actType": aiter.ActivationType.Situv2,
+                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
+                "qType": quant_type,
+                "AQDType": aq_dtype,
+                "WQDType": wq_dtype,
+                "use_g1u1": True,
+                "doweight_stage1": False,
+                "strict_accuracy": False,
+                "check_aot_cache": False,
+                "swiglu_limit": None,
+                "beta": args.beta,
+                "linear_beta": args.linear_beta,
+            }, extras
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1140,10 @@ if not args.no_flydsl_csv:
     _case_iters.append(_iter_csv_cases())
 if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
+# SiTUv2 default coverage runs only in a full default sweep (no explicit -q),
+# so an explicit quant selection is never silently overridden.
+if not args.no_situv2 and args.quant is None:
+    _case_iters.append(_iter_situv2_default_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
