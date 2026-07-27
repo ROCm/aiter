@@ -12,10 +12,18 @@ by value. Consumers must not rely on slot order.
 
 import functools
 
-from flydsl._mlir.dialects import llvm
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    gpu,
+    range_constexpr,
+    rocdl,
+    vector,
+)
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
@@ -152,7 +160,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             ).result
 
         def ordered_key(val):
-            key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(c_zero_f32, val)
+            key_val = (ArithValue(val) == ArithValue(c_zero_f32)).select(
+                c_zero_f32, val
+            )
             bits = ArithValue(key_val).bitcast(T.i32)
             sign = ArithValue(bits).shrui(arith.constant(31, type=T.i32))
             neg_key = ~ArithValue(bits)
@@ -160,7 +170,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             return (ArithValue(sign) != ArithValue(c_zero)).select(neg_key, pos_key)
 
         def radix_bucket(val, shift, mask):
-            return ArithValue(ArithValue(ordered_key(val)).shrui(shift)) & ArithValue(mask)
+            return ArithValue(ArithValue(ordered_key(val)).shrui(shift)) & ArithValue(
+                mask
+            )
 
         def ordered_bucket(val):
             return ArithValue(ordered_key(val)).shrui(c_shift)
@@ -290,7 +302,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             out_col_i32 = arith.index_cast(T.i32, out_col)
             valid = ArithValue(out_col_i32) < row_len
             out_val = valid.select(out_col_i32, c_neg_one)
-            buffer_ops.buffer_store(out_val, indices_rsrc, row_out + ArithValue(out_col_i32))
+            buffer_ops.buffer_store(
+                out_val, indices_rsrc, row_out + ArithValue(out_col_i32)
+            )
 
         long_active = row_len > ArithValue(c_top_k)
         # Each active thread strides over LOAD_VEC-wide blocks; the block count
@@ -325,7 +339,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
             vec = load_row_vec(col_base)
             for j in range_constexpr(LOAD_VEC):
-                col_i32 = ArithValue(col_base) + ArithValue(arith.constant(j, type=T.i32))
+                col_i32 = ArithValue(col_base) + ArithValue(
+                    arith.constant(j, type=T.i32)
+                )
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
@@ -348,7 +364,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
             vec = load_row_vec(col_base)
             for j in range_constexpr(LOAD_VEC):
-                col_i32 = ArithValue(col_base) + ArithValue(arith.constant(j, type=T.i32))
+                col_i32 = ArithValue(col_base) + ArithValue(
+                    arith.constant(j, type=T.i32)
+                )
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
@@ -375,7 +393,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
             vec = load_row_vec(col_base)
             for j in range_constexpr(LOAD_VEC):
-                col_i32 = ArithValue(col_base) + ArithValue(arith.constant(j, type=T.i32))
+                col_i32 = ArithValue(col_base) + ArithValue(
+                    arith.constant(j, type=T.i32)
+                )
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
@@ -408,7 +428,9 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
             col_base = ArithValue(arith.index_cast(T.i32, vblk)) * ArithValue(c_vec)
             vec = load_row_vec(col_base)
             for j in range_constexpr(LOAD_VEC):
-                col_i32 = ArithValue(col_base) + ArithValue(arith.constant(j, type=T.i32))
+                col_i32 = ArithValue(col_base) + ArithValue(
+                    arith.constant(j, type=T.i32)
+                )
                 in_range = ArithValue(col_i32) < row_len
                 if in_range:
                     val = vector.extract(vec, static_position=[j], dynamic_position=[])
