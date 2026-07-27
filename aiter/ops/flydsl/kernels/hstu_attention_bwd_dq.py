@@ -32,14 +32,14 @@ from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.hstu_attention_bwd import (
-    WARP_SIZE,
-    NUM_GRID_GROUPS,
-    MFMA_M,
-    MFMA_N,
+    _LOG2E,
+    MFMA_ELEMS_PER_LANE,
     MFMA_K,
     MFMA_LANE_K,
-    MFMA_ELEMS_PER_LANE,
-    _LOG2E,
+    MFMA_M,
+    MFMA_N,
+    NUM_GRID_GROUPS,
+    WARP_SIZE,
     _arch_dma_params,
     _dtype_to_elem_type,
     _waitcnt_vm_n,
@@ -176,7 +176,7 @@ def build_hstu_attention_bwd_dq(
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+        wave_id, _lane, lane_div_16, lane_mod_16 = decode_lane(
             tid, NUM_WAVES, WARP_SIZE, MFMA_N
         )
 
@@ -526,7 +526,9 @@ def build_hstu_attention_bwd_dq(
                         cur = mfma_acc(k_packs[ks].ir_value(), q_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
-                    def keep_col(i):
+                    def keep_col(
+                        i, qg=qg, kv_ids=kv_ids, kv_raw=kv_raw, kv_in_seq=kv_in_seq
+                    ):
                         """mask for (owned query q_rows[qg], streamed key kv_raw[i]); same
                         predicate as the forward: causal/diagonal, window, contextual opener.
                         """

@@ -12,9 +12,9 @@ import torch
 
 import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
 from aiter.ops.flydsl.hstu_attention_kernels import (
-    flydsl_hstu_attention_bwd,
-    flydsl_hstu_attention,
     _validate_bwd_inputs,
+    flydsl_hstu_attention,
+    flydsl_hstu_attention_bwd,
 )
 
 # Reuse the forward test's self-contained input generator.
@@ -418,24 +418,24 @@ def test_flydsl_bwd_block_size_overrides(block_m, block_n, num_waves, waves_per_
 
 
 def _bwd_row(**overrides) -> dict:
-    row = dict(
-        arch=hstu_kernels._GPU_ARCH,
-        dtype="bf16",
-        num_heads=4,
-        head_dim=128,
-        hidden_dim=128,
-        batch=256,
-        max_seq_len=1024,
-        has_window="False",
-        has_contextual="False",
-        has_targets="False",
-        kernel="dvdk",
-        block_m=128,
-        block_n=64,
-        num_waves=4,
-        waves_per_eu=2,
-        duration=1.0,
-    )
+    row = {
+        "arch": hstu_kernels._GPU_ARCH,
+        "dtype": "bf16",
+        "num_heads": 4,
+        "head_dim": 128,
+        "hidden_dim": 128,
+        "batch": 256,
+        "max_seq_len": 1024,
+        "has_window": "False",
+        "has_contextual": "False",
+        "has_targets": "False",
+        "kernel": "dvdk",
+        "block_m": 128,
+        "block_n": 64,
+        "num_waves": 4,
+        "waves_per_eu": 2,
+        "duration": 1.0,
+    }
     row.update(overrides)
     return row
 
@@ -456,7 +456,7 @@ def test_bwd_tuned_csv_is_picked_up(tmp_path):
 
     assert len(config_map) == 1
     (config,) = config_map.values()
-    assert config == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
+    assert config == {"block_m": 128, "block_n": 64, "num_waves": 4, "waves_per_eu": 2}
 
 
 def test_bwd_tuned_csv_missing_file_returns_empty(tmp_path):
@@ -496,10 +496,18 @@ def test_bwd_tuned_csv_per_kernel_configs(tmp_path):
     assert len(config_map) == 2
     # Keys are (problem_key, kernel); pull each kernel's config.
     by_kernel = {kern: cfg for (_, kern), cfg in config_map.items()}
-    assert by_kernel["dvdk"] == dict(
-        block_m=96, block_n=16, num_waves=2, waves_per_eu=0
-    )
-    assert by_kernel["dq"] == dict(block_m=128, block_n=32, num_waves=4, waves_per_eu=2)
+    assert by_kernel["dvdk"] == {
+        "block_m": 96,
+        "block_n": 16,
+        "num_waves": 2,
+        "waves_per_eu": 0,
+    }
+    assert by_kernel["dq"] == {
+        "block_m": 128,
+        "block_n": 32,
+        "num_waves": 4,
+        "waves_per_eu": 2,
+    }
 
 
 # --------------------------------------------------------------------------- #

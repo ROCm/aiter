@@ -315,7 +315,7 @@ def build_hstu_attention_bwd_dvdk(
             return fly.mma_atom_call_ssa([v4f32_type], _mma_atom, a_pack, b_pack, c)
 
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+        wave_id, _lane, lane_div_16, lane_mod_16 = decode_lane(
             tid, NUM_WAVES, WARP_SIZE, MFMA_N
         )
 
@@ -663,7 +663,7 @@ def build_hstu_attention_bwd_dvdk(
                         cur = mfma_acc(q_packs[ks].ir_value(), k_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
-                    def keep_row(i):
+                    def keep_row(i, og=og, q_ids=q_ids, q_raw=q_raw, q_in_seq=q_in_seq):
                         dist = q_ids[i] - kv_owned_ids[og]
                         keep = (q_raw[i] == kv_rows[og]) | (dist > fx.Int32(0))
                         if has_window:
