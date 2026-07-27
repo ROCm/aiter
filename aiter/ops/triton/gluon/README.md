@@ -157,17 +157,25 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
-**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False)`
+**Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False, has_pe=True, attn_sink=None, num_kv_splits=None)`
 
 **Description:** Multi-head Latent Attention (DeepSeek MLA) kernel with split-KV. For MLA Decode, Q is split into compressed latent (`q_nope`, dim=kv_lora_rank) and rope positional encoding (`q_pe`, dim=qk_rope_head_dim). KV cache is a flat `[N, 576]` buffer (`kv_c`). For DSv4 Sparse Prefill, Q packs compressed latent and positional encoding into one contiguous row (448 NoPE + 64 RoPE, `q_nope` with shape `[nquery, nhead, 512]`), KV cache has aligned `head_dim=512`, `q_pe` and `k_pe` can be left as placeholders. Uses 3-stage async copy pipeline with double-buffered page numbers and KV tiles.
 
 The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
-- **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
-- **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
+- **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 3-D grid `(1, NUM_KV_SPLITS, qlen)` with token-bound `NUM_KV_SPLITS = max(1, min(256 // qlen, min_kv_seq_len))` — 256 for single-query long-context decode, reduced for larger query lengths or small KV so the automatic policy keeps every split non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1`. Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
+- **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 3-D grid `(batch_size, NUM_KV_SPLITS, qlen)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // (batch_size * qlen), cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch and query position over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
-All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, qlen, nhead]` (`qlen=1` for plain decode), so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
+
+By default, each regime derives `NUM_KV_SPLITS` from the static batch shape and
+`min_kv_seq_len`. Graph-captured callers that cannot provide a useful runtime
+minimum may pass an explicitly tuned `num_kv_splits` in `[1, 256]`. This is a
+caller-owned scheduling policy: the generic wrapper does not infer a model from
+its tensor shape. If the override creates empty leading splits for a short
+sequence, stage 1 skips them and stage 2 uses the runtime sequence length to
+reduce only initialized splits.
 
 Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py).
 
@@ -183,17 +191,17 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | BLOCK_H | 64 | 16 | 16 |
 | BLOCK_N | 64 | 128 | 64 |
 | MFMA | 16&times;16&times;32, warps=[4,1] | 16&times;16&times;32, warps=[1,4] | 16&times;16&times;32, warps=[1,4] |
-| Grid | 3-D XCD-aware | 2-D `(1, NUM_KV_SPLITS)` | 2-D `(batch, NUM_KV_SPLITS)` |
-| NUM_KV_SPLITS | auto &isin; {1, 2, 4} from (batch, nhead) | `max(1, min(256, min_kv_seq_len))` (token-bound; 256 for ctx &ge; 256) | `max(1, min(256 // batch_size, cdiv(min_kv_seq_len, 64)))` (block-bound; collapses to 1 for ctx &le; 64) |
+| Grid | 3-D XCD-aware | 3-D `(1, NUM_KV_SPLITS, qlen)` | 3-D `(batch, NUM_KV_SPLITS, qlen)` |
+| NUM_KV_SPLITS | auto &isin; {1, 2, 4} from (batch, nhead, qlen) | `max(1, min(256 // qlen, min_kv_seq_len))` (token-bound; 256 for qlen=1 and ctx &ge; 256) | `max(1, min(256 // (batch_size * qlen), cdiv(min_kv_seq_len, 64)))` (block-bound; collapses to 1 for ctx &le; 64) |
 | `kv_scale` | unused (pass 1.0) | dequant scale folded into `qk_scale` (applied before softmax for fp8 correctness) | unused (pass 1.0) |
-| Seq constraint | `min_kv_seq_len > NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)` (the `3` matches the kernel's `gl.assume(num_iter > 3)`) | `min_kv_seq_len &ge; 1` (small kv 1..256 supported; token-bound clamp keeps splits non-empty) | `min_kv_seq_len &ge; 1` (small kv 1..256 supported; block-bound clamp keeps splits non-empty) |
-| Stage-2 reduce | skipped when `NUM_KV_SPLITS == 1` | skipped when `NUM_KV_SPLITS == 1` (i.e. `min_kv_seq_len == 1`) | skipped when `NUM_KV_SPLITS == 1` |
+| Seq constraint | `min_kv_seq_len > NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)` (the `3` matches the kernel's `gl.assume(num_iter > 3)`) | `min_kv_seq_len &ge; 1` (automatic token-bound clamp keeps splits non-empty; explicit empty leading splits are supported) | `min_kv_seq_len &ge; 1` (automatic block-bound clamp keeps splits non-empty; explicit empty leading splits are supported) |
+| Stage-2 reduce | skipped when `NUM_KV_SPLITS == 1` | skipped when `NUM_KV_SPLITS == 1` | skipped when `NUM_KV_SPLITS == 1` |
 
-**Page table modes** (`use_2d_view`, both regimes):
+**Page table modes** (`use_2d_view`, all regimes):
 - `True`: `page_table = block_table [batch, max_seqlen]`, `seq_info = cache_seqlens [batch]`. Use for fixed-length or pre-padded variable-length sequences.
 - `False`: `page_table = kv_indices [total_kv]`, `seq_info = kv_indptr [batch+1]`. Use for variable-length sequences without block_table construction.
 
-**KV layout** (both regimes): By default `kv_c` is a flat `[N, 576]` buffer containing both the compressed latent (columns `[0, 512)`) and rope PE (columns `[512, 576)`). The kernel adds `kv_pe_offset` to k_pe column offsets — set to `kv_lora_rank` (512) when `k_pe` shares `kv_c` (default), or `0` when `k_pe` is a separate buffer. The kernel auto-selects the load instruction via `WITHIN_2GB`: `buffer_load_to_shared` (scalar base + 32-bit offsets) when KV caches &le; 2 GB, or `global_load_to_shared` (64-bit pointer tensors) when KV caches > 2 GB.
+**KV layout** (all regimes): By default `kv_c` is a flat `[N, 576]` buffer containing both the compressed latent (columns `[0, 512)`) and rope PE (columns `[512, 576)`). The kernel adds `kv_pe_offset` to k_pe column offsets — set to `kv_lora_rank` (512) when `k_pe` shares `kv_c` (default), or `0` when `k_pe` is a separate buffer. The kernel auto-selects the load instruction via `WITHIN_2GB`: `buffer_load_to_shared` (scalar base + 32-bit offsets) when KV caches &le; 2 GB, or `global_load_to_shared` (64-bit pointer tensors) when KV caches > 2 GB.
 
 **`bh64` perf** (MI350, ctx=16384, bf16 Q + bf16 KV; compute-bound):
 
