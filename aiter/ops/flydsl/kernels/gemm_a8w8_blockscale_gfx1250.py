@@ -16,8 +16,9 @@ Variant:
                       w_is_wave_uniform.
                     * X-scales: TDM-staged into LDS (num_buffers stages,
                       aligned with X+W tile stages), then ds_read_b32 into
+"""
+
 from types import SimpleNamespace
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
