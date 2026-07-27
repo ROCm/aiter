@@ -32,7 +32,6 @@ Two launch modes (mirrors the HIP kernel):
 import enum
 import functools
 import math
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -46,19 +45,11 @@ fm_fast = "fast"
 # Matches MlaReduceKernelV1Traits (reduce.cu:13)
 # NUM_THREADS may be 64, 128, or 256. It controls the block size and per-thread
 # accumulator width; it must divide Dv.
-NUM_THREADS = int(os.environ.get("MLA_NUM_THREADS", "256"))
+NUM_THREADS = 256
 WARP = 64
 OCC = 8
 MASSIVE_THR = 4  # kMassiveThreshold
 
-# GRP is the power-of-two pipeline depth for the M64 and M256/MLDS tiers.
-GRP_M256 = int(os.environ.get("MLA_GRP_M256", "16"))
-GRP_M64 = int(os.environ.get("MLA_GRP_M64", "8"))
-
-# A runtime M64 sub-split uses a deeper pipeline above the threshold without
-# changing CUDA-graph topology. Set the threshold to zero to disable it.
-M64_HI_THR = int(os.environ.get("MLA_M64_HI_THR", "8"))
-M64_HI_GRP = int(os.environ.get("MLA_M64_HI_GRP", "16"))
 # Persistent grid multiplier; the grid-stride loop covers all work items.
 PS_GRID_MULT = 1
 
@@ -101,16 +92,9 @@ def _pointer_buffer_resource(ptr, dtype, shape, stride):
     )
 
 
-def _exp(x, use_exp2=True):
+def _exp(x):
     """exp(x) via the hardware v_exp_f32 (exp2(x*log2e))."""
-    if fx.const_expr(use_exp2):
-        return fx.rocdl.exp2(T.f32, (x * _LOG2E).ir_value())
-    return fly_math.exp(x, fastmath=fm_fast)
-
-
-def _log(x):
-    """natural log; mlir math dialect lowers to the device log."""
-    return fly_math.log(x, fastmath=fm_fast)
+    return fx.rocdl.exp2(T.f32, (x * _LOG2E).ir_value())
 
 
 def _is_zero_or_nan(value):
@@ -179,10 +163,13 @@ def compile_mla_reduce(
     output_lse: bool = False,
     use_reduce_final_map: bool = True,
     waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
-    use_exp2: bool = True,
     disable_guards: bool = False,
     adaptive: bool = False,
     low_direct_pmap_thr: int = 0,
+    grp_m256: int = 16,
+    grp_m64: int = 8,
+    m64_hi_thr: int = 8,
+    m64_hi_grp: int = 16,
 ):
     """Compile an MLA reduce kernel for fixed (H, Dv, out_dtype, tier).
 
@@ -201,6 +188,13 @@ def compile_mla_reduce(
     disable_guards: test-only compile-time knob that skips gather/store bounds
     guards so the suite can run a pre-fix kernel in-process. The production
     wrapper (mla_reduce_kernels.py) never threads this (defaults False).
+
+    grp_m256 / grp_m64: power-of-two pipeline depth (loads-in-flight) for the
+    M256/MLDS and M64 tiers respectively.
+
+    m64_hi_thr / m64_hi_grp: a runtime M64 sub-split uses the deeper
+    ``m64_hi_grp`` pipeline once ``n_splits`` exceeds ``m64_hi_thr``, without
+    changing CUDA-graph topology. Set ``m64_hi_thr=0`` to disable it.
     """
     assert (
         Dv % NUM_THREADS == 0
@@ -461,7 +455,7 @@ def compile_mla_reduce(
             def store_lse(seq, max_lse, sum_e):
                 if fx.const_expr(output_lse):
                     bad = _is_zero_or_nan(sum_e)
-                    lse_val = _log(sum_e) + max_lse
+                    lse_val = fly_math.log(sum_e, fastmath=fm_fast) + max_lse
                     inf = fx.Float32(float("inf"))
                     final_lse_val = bad.select(inf, lse_val)
                     if tid == fx.Int32(0):
@@ -487,8 +481,8 @@ def compile_mla_reduce(
                     os = load_split_o(fx.Int32(s), local_seq, direct_pmap)
                     lse = load_split_lse(fx.Int32(s), local_seq, direct_pmap)
                     new_max = fx.Float32(max_lse).maximumf(lse)
-                    old = _exp(fx.Float32(max_lse) - new_max, use_exp2)
-                    new = _exp(lse - new_max, use_exp2)
+                    old = _exp(fx.Float32(max_lse) - new_max)
+                    new = _exp(lse - new_max)
                     new_regs = [
                         (fx.Float32(regs[i]) * old + os[i] * new).ir_value()
                         for i in fx.range_constexpr(VEC)
@@ -519,8 +513,8 @@ def compile_mla_reduce(
                 independent of the nlse-derived default, so the runtime M64
                 sub-split can give high-split M64 tiles a deeper pipeline
                 (GRP=16) while low-split tiles keep GRP=8 (fewer wasted masked
-                lanes) -- a per-shape choice the single GRP_M64 constant can't
-                make.
+                lanes) -- a per-shape choice the single ``grp_m64`` parameter
+                can't make.
                 """
                 neg_inf = fx.Float32(float("-inf"))
                 zero_f = fx.Float32(0.0)
@@ -542,7 +536,7 @@ def compile_mla_reduce(
                         max_lse = fx.Float32(max_lse).maximumf(peer)
                     sum_e = fx.Float32(0.0)
                     for j in fx.range_constexpr(nlse):
-                        sum_e = sum_e + _exp(local_lses[j] - max_lse, use_exp2)
+                        sum_e = sum_e + _exp(local_lses[j] - max_lse)
                     for off in [32, 16, 8, 4, 2, 1]:
                         peer = fx.Float32(sum_e).shuffle_xor(
                             fx.Int32(off), fx.Int32(WARP)
@@ -550,11 +544,13 @@ def compile_mla_reduce(
                         sum_e = sum_e + peer
                     bad = _is_zero_or_nan(sum_e)
                     inf = fx.Float32(float("inf"))
-                    global_lse = bad.select(inf, _log(sum_e) + max_lse)
+                    global_lse = bad.select(
+                        inf, fly_math.log(sum_e, fastmath=fm_fast) + max_lse
+                    )
                     for j in fx.range_constexpr(nlse):
                         split_idx = lane + fx.Int32(j * WARP)
                         in_rng = split_idx < n_splits
-                        sc = _exp(local_lses[j] - global_lse, use_exp2)
+                        sc = _exp(local_lses[j] - global_lse)
                         store_lse_scale(split_idx, in_rng.select(sc, zero_f))
                     if fx.const_expr(output_lse) and lane == fx.Int32(0):
                         store_lse_value(g_flse, seq_i32, head, global_lse)
@@ -565,7 +561,7 @@ def compile_mla_reduce(
                 if fx.const_expr(grp_override is not None):
                     GRP = grp_override
                 else:
-                    GRP = GRP_M256 if nlse >= 4 else GRP_M64
+                    GRP = grp_m256 if nlse >= 4 else grp_m64
                 _grp_shift = GRP.bit_length() - 1
 
                 def load_os_group(base_i32):
@@ -703,14 +699,14 @@ def compile_mla_reduce(
                     if n_splits < fx.Int32(MASSIVE_THR):
                         emit_simple_body(seq_i32, local_seq, direct_pmap)
                     elif n_splits <= fx.Int32(64):
-                        if fx.const_expr(M64_HI_THR > 0):
+                        if fx.const_expr(m64_hi_thr > 0):
                             # Runtime high-split M64 uses the deeper pipeline.
-                            if n_splits > fx.Int32(M64_HI_THR):
+                            if n_splits > fx.Int32(m64_hi_thr):
                                 emit_massive_body(
                                     seq_i32,
                                     local_seq,
                                     1,
-                                    grp_override=M64_HI_GRP,
+                                    grp_override=m64_hi_grp,
                                     direct_pmap=direct_pmap,
                                 )
                             else:
@@ -809,8 +805,7 @@ def compile_mla_reduce(
         idx_H = fx.Int32(H)
         idx_ntg = max_seqlen_q
         if fx.const_expr(persistent and not adaptive):
-            _ps_mult = int(os.environ.get("MLA_PS_GRID_MULT", PS_GRID_MULT))
-            ps_grid = max_splits * fx.Int32(_ps_mult)
+            ps_grid = max_splits * fx.Int32(PS_GRID_MULT)
             grid = (ps_grid, 1, 1)
         elif fx.const_expr(adaptive):
             # Grid-z covers only the active CSR prefix.
@@ -849,12 +844,17 @@ _SPLITK_MIN_SPLITS_DEFAULT = 64
 _SPLITK_MAX_ACTIVE_TILES_DEFAULT = 64
 
 
-def splitk_enabled() -> bool:
-    """Opt-in gate for the cooperative split-K reduction (default OFF)."""
-    return os.environ.get("AITER_MLA_REDUCE_SPLITK", "0") == "1"
-
-
-def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
+def plan_splitk(
+    *,
+    active_tiles,
+    H,
+    max_seqlen_q,
+    max_splits,
+    num_cu,
+    factor: int = _SPLITK_FACTOR_DEFAULT,
+    min_splits: int = _SPLITK_MIN_SPLITS_DEFAULT,
+    max_active_tiles: int = _SPLITK_MAX_ACTIVE_TILES_DEFAULT,
+):
     """Decide split-K engagement + factor from HOST-visible metadata only
     (capture-safe: no device read in the launch path).
 
@@ -862,20 +862,11 @@ def plan_splitk(*, active_tiles, H, max_seqlen_q, max_splits, num_cu):
     number of (tile, head) combine slots = ``active_tiles * H``; the partial
     kernel launches ``num_slots * K`` blocks, the combine ``num_slots``.
     """
-    if not splitk_enabled():
-        return False, 1, 0
-    factor = int(os.environ.get("MLA_SPLITK_FACTOR", _SPLITK_FACTOR_DEFAULT))
-    min_splits = int(
-        os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
-    )
-    max_active = int(
-        os.environ.get("MLA_SPLITK_MAX_ACTIVE_TILES", _SPLITK_MAX_ACTIVE_TILES_DEFAULT)
-    )
     if max_seqlen_q != 1:
         return False, 1, 0  # decode-only prototype (NTG == 1)
     if max_splits < min_splits:
         return False, 1, 0  # not enough splits to amortize the extra kernel
-    if active_tiles <= 0 or active_tiles > max_active:
+    if active_tiles <= 0 or active_tiles > max_active_tiles:
         return False, 1, 0
     base_blocks = active_tiles * H
     if base_blocks >= num_cu:
@@ -908,6 +899,8 @@ def plan_splitk_capture_safe(
     num_kv_splits,
     num_cu,
     actual_max_splits=None,
+    factor: int = _SPLITK_FACTOR_DEFAULT,
+    min_splits: int = _SPLITK_MIN_SPLITS_DEFAULT,
 ):
     """Capture-safe, DEFAULT-ABLE split-K plan from HOST-ONLY values.
 
@@ -940,13 +933,9 @@ def plan_splitk_capture_safe(
     contiguous chunk ``[j*ceil(n/K), ...)``; chunks past the end are empty and the
     combine weights them by ``exp(-inf)=0``. So the SAME captured (grid, K,
     scratch) stays correct across replays whose per-tile split counts differ
-    (fixed batch bucket, varying context) -- the capture-safety property the
-    opt-in ``plan_splitk`` cannot provide.
+    (fixed batch bucket, varying context) -- the capture-safety property
+    :func:`plan_splitk` cannot provide.
     """
-    factor = int(os.environ.get("MLA_SPLITK_FACTOR", _SPLITK_FACTOR_DEFAULT))
-    min_splits = int(
-        os.environ.get("MLA_SPLITK_MIN_SPLITS", _SPLITK_MIN_SPLITS_DEFAULT)
-    )
     if max_seqlen_q != 1:
         return False, 1, 0  # decode-only prototype (NTG == 1)
     engage_splits = (
@@ -1137,8 +1126,8 @@ def compile_mla_reduce_splitk(
             lse = g_pl[safe_row, head]
             lse = in_b.select(lse, neg_inf)
             new_m = fx.Float32(m).maximumf(lse)
-            c_old = _exp(fx.Float32(m) - new_m, use_exp2=True)
-            c_new = _exp(lse - new_m, use_exp2=True)
+            c_old = _exp(fx.Float32(m) - new_m)
+            c_new = _exp(lse - new_m)
             new_regs = [
                 (fx.Float32(regs[i]) * c_old + os[i] * c_new).ir_value()
                 for i in fx.range_constexpr(VEC)
@@ -1246,7 +1235,7 @@ def compile_mla_reduce_splitk(
                 prow = base + jj
                 mj = g_ml[prow, 0]
                 lj = g_ml[prow, 1]
-                wj = _exp(mj - M, use_exp2=True)
+                wj = _exp(mj - M)
                 accj = _f32_vec_load(sk_acc_rsrc, prow * Dv + col)
                 regs = [regs[i] + accj[i] * wj for i in fx.range_constexpr(VEC)]
                 den = den + lj * wj
@@ -1275,7 +1264,7 @@ def compile_mla_reduce_splitk(
                 if fx.const_expr(output_lse):
                     bad = _is_zero_or_nan(den)
                     inf = fx.Float32(float("inf"))
-                    lse_val = bad.select(inf, _log(den) + M)
+                    lse_val = bad.select(inf, fly_math.log(den, fastmath=fm_fast) + M)
                     if tid == fx.Int32(0):
                         store_combined_lse(g_flse, q_start, head, lse_val)
 

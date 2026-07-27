@@ -45,7 +45,6 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     plan_splitk,
     select_tier,
     should_use_persistent_launch,
-    splitk_enabled,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.flydsl.mla_reduce_kernels import _pointer_arg
@@ -662,6 +661,8 @@ def make_runner(
     num_partial_rows=None,
     num_final_rows=None,
     waves_per_eu=4,
+    use_splitk=False,
+    splitk_factor=None,
 ):
     """Precompile + bind args; return a zero-overhead closure for the timed loop.
 
@@ -678,20 +679,23 @@ def make_runner(
         num_partial_rows = int(po.size(0))
     if num_final_rows is None:
         num_final_rows = int(fout.size(0))
-    # Split-K (opt-in): cooperative multi-block reduction for the low-tile /
-    # high-split decode case. Metadata is inspected at setup (outside any
-    # CUDA-graph capture); the scratch is pre-allocated + reused, so the
-    # captured run() only launches the two kernels (capture-safe).
-    if splitk_enabled() and tier is None and not disable_guards:
+    # Split-K (opt-in via use_splitk): cooperative multi-block reduction for
+    # the low-tile / high-split decode case. Metadata is inspected at setup
+    # (outside any CUDA-graph capture); the scratch is pre-allocated +
+    # reused, so the captured run() only launches the two kernels
+    # (capture-safe).
+    if use_splitk and tier is None and not disable_guards:
         diffs = indptr[1:] - indptr[:-1]
         active_tiles = int((diffs > 1).sum().item())
         max_splits_val = int(diffs.max().item()) if diffs.numel() else 0
+        splitk_kwargs = {} if splitk_factor is None else {"factor": splitk_factor}
         engage, K, num_slots = plan_splitk(
             active_tiles=active_tiles,
             H=H,
             max_seqlen_q=M,
             max_splits=max_splits_val,
             num_cu=num_cu,
+            **splitk_kwargs,
         )
         if engage:
             lp, lc = compile_mla_reduce_splitk(
@@ -1240,107 +1244,127 @@ def test_splitk_b1_s128_vs_torch_ref(K):
     """Split-K partial+combine matches the gather-based torch reference for the
     low-tile/high-split decode case, across split factors K."""
     _require_cuda()
-    with _env(AITER_MLA_REDUCE_SPLITK="1", MLA_SPLITK_FACTOR=str(K)):
-        dt = "bf16"
-        out_dtype = _out_dtype(dt)
-        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-        _assert_splitk_engages(indptr)
-        fout.zero_()
-        flse.zero_()
-        run = make_runner(
-            po,
-            pl,
-            indptr,
-            pmap,
-            fmap,
-            fout,
-            flse,
-            _SPLITK_H,
-            _SPLITK_DV,
-            dt,
-            True,
-            tier=None,
-        )
-        run()
-        torch.cuda.synchronize()
-        ref_out, ref_lse = torch_ref_gather(
-            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-        )
-        _assert_close(fout, flse, ref_out, ref_lse, dt)
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
+        tier=None,
+        use_splitk=True,
+        splitk_factor=K,
+    )
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
 def test_splitk_b1_s128_vs_hip():
     """Split-K matches the production HIP kn_mla_reduce_v1 (Dv=512 template)."""
     _require_cuda()
-    with _env(AITER_MLA_REDUCE_SPLITK="1"):
-        dt = "bf16"
-        out_dtype = _out_dtype(dt)
-        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-        _assert_splitk_engages(indptr)
-        fout.zero_()
-        flse.zero_()
-        run = make_runner(
-            po,
-            pl,
-            indptr,
-            pmap,
-            fmap,
-            fout,
-            flse,
-            _SPLITK_H,
-            _SPLITK_DV,
-            dt,
-            True,
-            tier=None,
-        )
-        run()
-        torch.cuda.synchronize()
-        ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-        _assert_close(fout, flse, ref_out, ref_lse, dt)
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
+        tier=None,
+        use_splitk=True,
+    )
+    run()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
 def test_splitk_b1_s128_cudagraph_replay():
     """Split-K (2-kernel) stays correct under CUDA-graph capture + replay, with
     a pre-allocated scratch buffer."""
     _require_cuda()
-    with _env(AITER_MLA_REDUCE_SPLITK="1"):
-        dt = "bf16"
-        out_dtype = _out_dtype(dt)
-        po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-        _assert_splitk_engages(indptr)
-        fout.zero_()
-        flse.zero_()
-        run = make_runner(
-            po,
-            pl,
-            indptr,
-            pmap,
-            fmap,
-            fout,
-            flse,
-            _SPLITK_H,
-            _SPLITK_DV,
-            dt,
-            True,
-            tier=None,
-        )
-        run_cudagraph_replay(run)
-        ref_out, ref_lse = torch_ref_gather(
-            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-        )
-        _assert_close(fout, flse, ref_out, ref_lse, dt)
+    dt = "bf16"
+    out_dtype = _out_dtype(dt)
+    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(indptr)
+    fout.zero_()
+    flse.zero_()
+    run = make_runner(
+        po,
+        pl,
+        indptr,
+        pmap,
+        fmap,
+        fout,
+        flse,
+        _SPLITK_H,
+        _SPLITK_DV,
+        dt,
+        True,
+        tier=None,
+        use_splitk=True,
+    )
+    run_cudagraph_replay(run)
+    ref_out, ref_lse = torch_ref_gather(
+        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    )
+    _assert_close(fout, flse, ref_out, ref_lse, dt)
 
 
-def test_splitk_disabled_by_default():
-    """Without the env flag, plan_splitk never engages (default path untouched)."""
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk, splitk_enabled
+def test_splitk_engagement_boundaries():
+    """plan_splitk's real engagement boundaries, now that it is always live
+    (no env gate): too few splits to amortize, grid already saturated, and
+    prefill (max_seqlen_q != 1) all decline; the b1_s128 shape engages."""
+    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk
 
-    with _env(AITER_MLA_REDUCE_SPLITK=None):
-        assert not splitk_enabled()
-        engage, _, _ = plan_splitk(
-            active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
-        )
-        assert not engage
+    # Baseline: the b1_s128 shape engages (sanity, mirrors _assert_splitk_engages).
+    engage, _, _ = plan_splitk(
+        active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
+    )
+    assert engage, "expected split-K to engage for the b1_s128 shape"
+
+    # Too few splits to amortize the extra combine kernel.
+    engage, _, _ = plan_splitk(
+        active_tiles=1, H=16, max_seqlen_q=1, max_splits=8, num_cu=304
+    )
+    assert not engage, "split-K should not engage below min_splits"
+
+    # Grid already saturated (base_blocks = active_tiles * H >= num_cu).
+    engage, _, _ = plan_splitk(
+        active_tiles=20, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
+    )
+    assert not engage, "split-K should not engage once the grid is saturated"
+
+    # Prefill (max_seqlen_q != 1) is out of scope for this decode-only prototype.
+    engage, _, _ = plan_splitk(
+        active_tiles=1, H=16, max_seqlen_q=2, max_splits=128, num_cu=304
+    )
+    assert not engage, "split-K should not engage for max_seqlen_q != 1"
 
 
 # Device-adaptive, capture-safe split-K through the production wrapper.
@@ -2415,7 +2439,7 @@ def run_checks():
         _run(f"splitk_b1_s128_vs_torch_ref[K={K}]", test_splitk_b1_s128_vs_torch_ref, K)
     _run("splitk_b1_s128_vs_hip", test_splitk_b1_s128_vs_hip)
     _run("splitk_b1_s128_cudagraph_replay", test_splitk_b1_s128_cudagraph_replay)
-    _run("splitk_disabled_by_default", test_splitk_disabled_by_default)
+    _run("splitk_engagement_boundaries", test_splitk_engagement_boundaries)
     _run("da_splitk_no_engage_large_batch", test_da_splitk_no_engage_large_batch)
     _run("da_splitk_no_engage_low_splits", test_da_splitk_no_engage_low_splits)
     _run("da_splitk_wrapper_vs_hip", test_da_splitk_wrapper_vs_hip)
