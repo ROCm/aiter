@@ -175,7 +175,7 @@ def _worker(
             torch.cuda.synchronize()
             result["baseline_reduced"] = baseline_reduced.detach().to("cpu")
 
-        # CUDA-graph capture/replay of the route-B registered reduce.
+        # CUDA-graph capture/replay of the registered reduce.
         # `reg` still holds this rank's pre-reduce combined output (all_reduce is
         # out-of-place), and it is the address-stable registered IPC buffer, so
         # the registered-input reduce is graph-safe. Capture only the reduce (the
@@ -196,7 +196,7 @@ def _worker(
         except Exception as e:  # capture unsupported on this stack -> report
             result["graph_error"] = f"{type(e).__name__}: {e}"
 
-        # The concrete pass route B removes is the AR copy-in
+        # The concrete pass removes is the AR copy-in
         # (cudaMemcpy of the combined output into the registered pool). Time the
         # registered reduce (copy-in skipped) vs a copy-in reduce of the same
         # data, on this rank, and report per-call microseconds.
@@ -273,7 +273,7 @@ def run_case(tp_size, quant, E, model_dim, inter_dim, dtype, distributed_init_me
         err = checkAllclose(
             r["ref"].float(),
             r["reduced"].float(),
-            msg=f"route-B fused_moe_out_all_reduce (quant={quant}) rank={r['rank']}",
+            msg=f"fused_moe_out_all_reduce (quant={quant}) rank={r['rank']}",
             atol=atol,
             rtol=rtol,
         )
@@ -283,7 +283,7 @@ def run_case(tp_size, quant, E, model_dim, inter_dim, dtype, distributed_init_me
             e_pipe = checkAllclose(
                 r["baseline_reduced"].float(),
                 r["reduced"].float(),
-                msg=f"#3 route-B == sum-then-add-then-AR rank={r['rank']}",
+                msg=f"#3 == sum-then-add-then-AR rank={r['rank']}",
                 atol=atol,
                 rtol=rtol,
             )
@@ -325,7 +325,7 @@ def run_case(tp_size, quant, E, model_dim, inter_dim, dtype, distributed_init_me
     return out
 
 
-parser = argparse.ArgumentParser(description="SILO801 route B #3 TP validation")
+parser = argparse.ArgumentParser(description="#3 TP validation")
 parser.add_argument("-t", "--tp", type=int, default=4, help="tensor-parallel size")
 parser.add_argument(
     "-q", "--quant", choices=["bf16", "a4w4"], default="bf16", help="producer path"
@@ -366,7 +366,7 @@ if __name__ == "__main__":
     logger.info("Result: %s", ret)
     print("[aiter] Result:", ret)
     if ret.get("err") == ret.get("err") and "skipped" not in ret:  # not NaN
-        assert ret["err"] < 5e-2, f"route-B AR mismatch: {ret}"
+        assert ret["err"] < 5e-2, f"AR mismatch: {ret}"
         if "err_pipeline_#3" in ret:
             assert ret["err_pipeline_#3"] < 5e-2, f"#3 pipeline mismatch: {ret}"
         assert ret.get("graph_ok_#5", False), f"#5 graph capture failed: {ret}"

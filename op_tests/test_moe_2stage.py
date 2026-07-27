@@ -531,11 +531,11 @@ def test_fmoe(
         # residual (missing an O(out_rms) addend on every element) would push
         # this to O(0.1+). Gate well below that but above the atomic noise.
         assert fold_diff < 1e-2, (
-            f"route-B residual fold logits_diff too high: {fold_diff:.3e} "
+            f"Residual fold logits_diff too high: {fold_diff:.3e} "
             f"(quant:{AQDType}) -- residual likely dropped/double-counted"
         )
         print(
-            f"[aiter] route-B out=+residual fold OK (quant:{AQDType}) "
+            f"[aiter] out=+residual fold OK (quant:{AQDType}) "
             f"logits_diff={fold_diff:.3e}"
         )
     # Regression guard for aiter #3117 (MXFP4 fused-MoE stage2 EP-prefill):

@@ -1148,8 +1148,7 @@ class CustomAllreduce:
     # and run the cross-rank reduce. No dedicated kernel: the producer writes the
     # already-combined [tokens, hidden] straight into the registered input buffer
     # and we reduce it with the existing registered-input all-reduce (copy-in
-    # skipped). Contrast route A (custom_fused_moe_sum_all_reduce), which folds
-    # the topk moe_sum into the all-reduce copy and needs its own kernel.
+    # skipped).
 
     def moe_out_registered_buffer(
         self, num_tokens: int, hidden_dim: int, dtype: torch.dtype
@@ -1203,7 +1202,7 @@ class CustomAllreduce:
     def custom_fused_moe_out_all_reduce(
         self, moe_out: torch.Tensor, *, out: Optional[torch.Tensor] = None
     ) -> Optional[torch.Tensor]:
-        """Graph/disabled-aware entry for the route-B fused MoE epilogue reduce.
+        """Graph/disabled-aware entry for the fused MoE epilogue reduce.
 
         ``moe_out`` must be the buffer returned by
         :meth:`moe_out_registered_buffer` (already holding this rank's combined
