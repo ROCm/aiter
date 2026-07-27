@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import functools
 from collections.abc import Callable
+from math import gcd, lcm
 from pathlib import Path
 
 import flydsl.expr as fx
@@ -16,6 +17,9 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter import logger
 from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
+    MFMA_M,
+    WARP_SIZE,
+    _arch_dma_params,
     build_hstu_attention_fwd,
     validate_hstu_attention_fwd,
 )
@@ -188,6 +192,40 @@ def _get_tuned_config(
     return _tuned_config_map().get(problem_key, {})
 
 
+def _cdna4_safe_block_n(
+    *,
+    block_n: int,
+    num_waves: int,
+    head_dim: int,
+    hidden_dim: int,
+    arch: str | None,
+) -> int:
+    """Round ``block_n`` up so the K/V LDS tiles divide the CDNA4 DMA pass.
+
+    CDNA4 (gfx950) uses a ``dwordx4`` ``buffer_load_lds`` (16 B/lane), 4x wider than
+    CDNA3's ``dword``. A MI300X-derived ``block_n`` can therefore leave the K/V LDS
+    tiles indivisible by the wider DMA pass (see ``validate_hstu_attention_fwd``),
+    e.g. ``block_n=48`` with ``hidden_dim=64``. This bumps ``block_n`` to the nearest
+    multiple that keeps both tiles valid.
+
+    This is a strict no-op on non-gfx950 arches, so the MI300X-tuned block sizes are
+    preserved exactly.
+    """
+    if not (arch or "").startswith("gfx950"):
+        return block_n
+
+    _, dma_elems, _, _ = _arch_dma_params(arch)
+    elems_per_dma_pass = num_waves * WARP_SIZE * dma_elems
+    head_dim_k = ((head_dim + 63) // 64) * 64
+    # block_n must satisfy (block_n * tile_width) % elems_per_dma_pass == 0 for both the
+    # K tile (head_dim_k) and V tile (hidden_dim); solve for the smallest granularity.
+    req_k = elems_per_dma_pass // gcd(elems_per_dma_pass, head_dim_k)
+    req_v = elems_per_dma_pass // gcd(elems_per_dma_pass, hidden_dim)
+    # keep block_n a multiple of MFMA_M as the validator independently requires.
+    step = lcm(req_k, req_v, MFMA_M)
+    return ((block_n + step - 1) // step) * step
+
+
 def _get_default_config(
     *,
     batch: int,
@@ -196,6 +234,7 @@ def _get_default_config(
     num_heads: int,
     max_seq_len: int,
     max_attn_len: int,
+    arch: str | None = None,
 ) -> dict:
     """
     Heuristic config for when tuning is unavailable.
@@ -204,6 +243,10 @@ def _get_default_config(
     - block_m by occupancy
     - block_n by head/hidden dim (bounded by the LDS K+V tile)
     - waves_per_eu lifts residency only for tiny-dim tiles that benefit.
+
+    The block sizes below are MI300X (gfx942/CDNA3) values. On CDNA4 (gfx950) the DMA
+    pass is 4x wider, so ``block_n`` is rounded up by ``_cdna4_safe_block_n`` for that
+    arch only; the gfx942 path is returned unchanged.
     """
 
     def as_dict(
@@ -220,36 +263,47 @@ def _get_default_config(
             waves_per_eu=waves_per_eu,
         )
 
-    # hidden_dims 96/160/224 don't divide the K/V DMA pass with num_waves=4
-    # This map is so the kernel still runs for these values.
-    non_64_divisible_map = {
-        96: (96, 48, 3, 0),
-        160: (160, 80, 5, 0),
-        192: (96, 48, 3, 0),
-        224: (112, 112, 7, 0),
-    }
-    if hidden_dim in non_64_divisible_map:
-        return as_dict(*non_64_divisible_map[hidden_dim])
+    def _mi300x_config() -> dict:
+        # hidden_dims 96/160/224 don't divide the K/V DMA pass with num_waves=4
+        # This map is so the kernel still runs for these values.
+        non_64_divisible_map = {
+            96: (96, 48, 3, 0),
+            160: (160, 80, 5, 0),
+            192: (96, 48, 3, 0),
+            224: (112, 112, 7, 0),
+        }
+        if hidden_dim in non_64_divisible_map:
+            return as_dict(*non_64_divisible_map[hidden_dim])
 
-    grid = batch * num_heads * ((max_seq_len + 127) // 128)
-    dim = max(head_dim, hidden_dim)
+        grid = batch * num_heads * ((max_seq_len + 127) // 128)
+        dim = max(head_dim, hidden_dim)
 
-    if dim <= 64:
-        if max_attn_len:
-            return as_dict(128, 32, 4, 0)
+        if dim <= 64:
+            if max_attn_len:
+                return as_dict(128, 32, 4, 0)
 
-        if grid >= 6144:
-            return as_dict(256, 32, 4, 0)
+            if grid >= 6144:
+                return as_dict(256, 32, 4, 0)
+            if grid >= 768:
+                return as_dict(128, 32, 4, 2)
+            return as_dict(64, 32, 4, 2)
+
+        # dim > 64
+        if grid >= 2560 or max_seq_len >= 16384:
+            return as_dict(192, 48, 4, 0)
         if grid >= 768:
-            return as_dict(128, 32, 4, 2)
-        return as_dict(64, 32, 4, 2)
+            return as_dict(128, 64, 4, 2)
+        return as_dict(64, 64, 4, 2)
 
-    # dim > 64
-    if grid >= 2560 or max_seq_len >= 16384:
-        return as_dict(192, 48, 4, 0)
-    if grid >= 768:
-        return as_dict(128, 64, 4, 2)
-    return as_dict(64, 64, 4, 2)
+    config = _mi300x_config()
+    config["block_n"] = _cdna4_safe_block_n(
+        block_n=config["block_n"],
+        num_waves=config["num_waves"],
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        arch=arch if arch is not None else _GPU_ARCH,
+    )
+    return config
 
 
 @functools.lru_cache(maxsize=16384)
