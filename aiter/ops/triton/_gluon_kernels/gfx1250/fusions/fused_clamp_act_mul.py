@@ -117,13 +117,25 @@ def _fused_clamp_silu_mul_kernel(
         block_shape=[BLOCK_SIZE_N],
         layout=shared_tdm_layout,
     )
+    # TDM output store
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=out_ptr + pid * out_stride_m,
+        shape=[n_half],
+        strides=[out_stride_n],
+        block_shape=[BLOCK_SIZE_N],
+        layout=shared_tdm_layout,
+    )
+    out_smem = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
+    )
     gate_smem = gl.allocate_shared_memory(gate_desc.dtype, gate_desc.block_shape, shared_tdm_layout)
     up_smem = gl.allocate_shared_memory(up_desc.dtype, up_desc.block_shape, shared_tdm_layout)
     gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem)
     gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem)
-    gl.amd.gfx1250.tdm.async_wait(0)
-
+    
+    gl.amd.gfx1250.tdm.async_wait(1)
     gate = gate_smem.load(row_layout).to(gl.float32)
+    gl.amd.gfx1250.tdm.async_wait(0)
     up = up_smem.load(row_layout).to(gl.float32)
 
     # clamp
@@ -145,18 +157,6 @@ def _fused_clamp_silu_mul_kernel(
                 mask=mask, other=0.0, cache_modifier=cache_modifier,
             ).to(gl.float32)
             out = out * w
-
-    # TDM output store
-    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=out_ptr + pid * out_stride_m,
-        shape=[n_half],
-        strides=[out_stride_n],
-        block_shape=[BLOCK_SIZE_N],
-        layout=shared_tdm_layout,
-    )
-    out_smem = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
-    )
 
     # group quant and store
     if HAS_QUANT:
