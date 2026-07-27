@@ -253,74 +253,33 @@ small LDS "bounce" region.
 
 Critical sp3 / mfma instruction at each edge is annotated in parentheses.
 
-```
-                              Global VMEM
-              ┌───────────────────┬──────────────────────┐
-              │                   │                      │
-              ▼                   ▼                      ▼
-         ┌─────────┐         ┌──────────┐          ┌──────────┐
-         │   Q     │         │  K (fp8  │          │  V (fp8  │
-         │ (fp8 +  │         │  + bf16  │          │ NoPE) ─  │
-         │  bf16)  │         │   RoPE)  │          │ shares K │
-         └────┬────┘         └─────┬────┘          │ LDS slot │
-              │                    │               └────┬─────┘
-              │ buffer_load_lds   buffer_load_dwordx4   │
-              │ buffer_load_dwordx4 + cvt+scale         │
-              │   (Phase 1 + 2 of QMgr)                 │
-              ▼                    ▼                    │
-   ┌────────────────────┐  ┌──────────────────────┐     │
-   │  Q-LDS (prologue    │  │ KV-LDS, DOUBLE pong  │     │
-   │  staging only —     │  │ 64x512 bf16 = 64 KiB │◀────┘
-   │  Q lands in VGPR)   │  │ (two 32-row sub A/B) │
-   │  + KV raw-fp8 stage │  │ buf_A / buf_B swap   │
-   └─────────┬──────────┘  └──────────┬───────────┘
-             │                        │
-             │ prologue ds_read        │ ds_read_b128 (K side)
-             │                        │ ds_read_b64_tr_b16 (V side, transpose)
-             ▼                        ▼
-   ┌────────────────────┐  ┌──────────────────────┐
-   │ q_vgpr  v64-v127   │  │ k0/k1/k2  v36-v47    │
-   │ (FULL Q, 512 cols, │  │ (KV mfma operands,   │
-   │  read-only in loop)│  │  3 tiles for N=64)   │
-   └─────────┬──────────┘  └──────────┬───────────┘
-             │                        │
-             └─── v_mfma_f32_16x16x32_bf16 ───┘   ← QK (operands cvt fp8→bf16 first)
-                              │
-                              ▼
-                  ┌─────────────────────┐
-                  │ S tile (16x32 fp32) │   compiler scratch v0..~v40 (soft)
-                  └─────────┬───────────┘
-                            │ softmax (online)
-                            │   v_max3 / warp_reduce(Max)
-                            │   v_exp_f32 / warp_reduce(Add)
-                            │   (hi warps: de-packed softmax, no v_pk_*)
-                            ▼
-                  ┌─────────────────────┐
-                  │ p_comp  v48-v63     │  (fp32, 16xN/4, N/4 reg/lane)
-                  │ p_mfma  v48-v55     │  (bf16 overlay, low half)
-                  │   ↑ v_cvt_pk_bf16_f32 (pinned-DST)
-                  └─────────┬───────────┘
-                            │   ── reuses KV-LDS pong as V via transpose-read
-                            ▼
-              ── v_mfma_f32_16x16x32_bf16 ──   ← PV (same instr as QK)
-                            │   (interleaved with v_mul_f32 rescale)
-                            ▼
-                  ┌─────────────────────┐
-                  │ oaccu   v128-v255   │  (fp32, 16x512, all pinned)
-                  └─────────┬───────────┘
-                            │  epilogue:
-                            │   1) normalize by 1/row_sum_e:
-                            │      hi warps  → hk::mul_vgpr (v_pk_mul_f32)
-                            │      lo warps  → v_mul_f32_e32 sweep (de-packed)
-                            │   2) OMgr V3 / V3NoStage
-                            ▼
-                  ┌─────────────────────┐
-                  │ bounce LDS (per-warp│  ~2 KiB bf16 / ~4.5 KiB fp32
-                  │  ds_write)          │  with sb8 inverse-perm un-swizzle
-                  └─────────┬───────────┘
-                            │  buffer_store_dwordx4 (coalesced)
-                            ▼
-                       VRAM output
+```mermaid
+flowchart TD
+    VMEM([Global VMEM])
+    VMEM -->|"buffer_load_lds + cvt/scale (QMgr prologue)"| QLDS
+    VMEM -->|"buffer_load_dwordx4 + cvt/scale"| KVLDS
+    VMEM -.->|"V shares the K LDS slot"| KVLDS
+
+    QLDS["Q-LDS<br/>(prologue staging only —<br/>Q lands in VGPR;<br/>+ KV raw-fp8 stage)"]
+    KVLDS["KV-LDS, DOUBLE pong<br/>64×512 bf16 = 64 KiB<br/>(two 32-row sub A/B)<br/>buf_A / buf_B swap"]
+
+    QLDS -->|"prologue ds_read"| QVGPR["q_vgpr v64–v127<br/>(FULL Q, 512 cols,<br/>read-only in loop)"]
+    KVLDS -->|"ds_read_b128 (K) /<br/>ds_read_b64_tr_b16 (V, transpose)"| KTILES["k0/k1/k2 v36–v47<br/>(KV mfma operands,<br/>3 tiles for N=64)"]
+
+    QVGPR --> QK
+    KTILES --> QK
+    QK{{"QK — v_mfma_f32_16x16x32_bf16<br/>(operands cvt fp8-to-bf16 first)"}}
+    QK --> S["S tile (16×32 fp32)<br/>compiler scratch v0..~v40 (soft)"]
+
+    S -->|"softmax (online): v_max3 / v_exp_f32 / warp_reduce<br/>(hi warps de-packed, no v_pk ops)"| PCOMP["p_comp v48–v63 (fp32, N/4 reg/lane)<br/>p_mfma v48–v55 (bf16 overlay, low half)<br/>via v_cvt_pk_bf16_f32 (pinned-DST)"]
+
+    PCOMP --> PV
+    KVLDS -.->|"reuses pong as V via transpose-read"| PV
+    PV{{"PV — v_mfma_f32_16x16x32_bf16<br/>(same instr as QK; interleaved v_mul_f32 rescale)"}}
+    PV --> OACCU["oaccu v128–v255<br/>(fp32, 16×512, all pinned)"]
+
+    OACCU -->|"epilogue: normalize by 1/row_sum_e<br/>hi: hk::mul_vgpr (v_pk_mul_f32) / lo: v_mul_f32_e32 sweep<br/>then OMgr V3 / V3NoStage"| BOUNCE["bounce LDS (per-warp ds_write)<br/>~2 KiB bf16 / ~4.5 KiB fp32<br/>sb8 inverse-perm un-swizzle"]
+    BOUNCE -->|"buffer_store_dwordx4 (coalesced)"| OUT([VRAM output])
 ```
 
 Key sp3 ops to remember:
