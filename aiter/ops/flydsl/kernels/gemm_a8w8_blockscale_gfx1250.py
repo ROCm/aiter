@@ -16,14 +16,12 @@ Variant:
                       w_is_wave_uniform.
                     * X-scales: TDM-staged into LDS (num_buffers stages,
                       aligned with X+W tile stages), then ds_read_b32 into
-                      VGPRs in lane16 layout.
-"""
-
 from types import SimpleNamespace
-import torch
+from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import math as math_dialect
 from flydsl.compiler.kernel_function import CompilationContext
