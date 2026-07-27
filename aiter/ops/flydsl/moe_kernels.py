@@ -1805,7 +1805,9 @@ def flydsl_moe_topids_to_rows(
             * int(topk)
         ).contiguous()
     else:
-        num_valid_routes = torch.tensor([numel], dtype=torch.int32, device=device)
+        # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
+        # null as "no truncation".
+        num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
@@ -2355,11 +2357,10 @@ def flydsl_moe_fused_quant_preshuffle(
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
-        # not provided, pass numel so every route stays valid (no behavior change).
+        # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
         if num_valid_routes is None:
-            num_valid_routes_i32 = torch.tensor(
-                [numel], dtype=torch.int32, device=device
-            )
+            num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+            assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
         else:
             num_valid_routes_i32 = (
                 num_valid_routes.reshape(-1)[:1].to(device=device, dtype=torch.int32)
