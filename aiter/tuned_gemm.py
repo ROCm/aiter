@@ -431,9 +431,6 @@ def skinny_gemm(
     import aiter as ops
 
     assert not bpreshuffle, "bpreshuffle is not supported in skinny_gemm!"
-    if solidx == 2 and get_gfx() == "gfx1250":
-        # This split-K kernel is not compiled for gfx1250.
-        return F.linear(inp, weights, bias)
     if solidx == 0:
         out = torch.empty(
             inp.shape[0], weights.shape[0], dtype=inp.dtype, device=inp.device
