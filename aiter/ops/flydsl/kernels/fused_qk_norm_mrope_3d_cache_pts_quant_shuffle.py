@@ -40,7 +40,7 @@ per-token kernel can only ever write isolated ``x``-strided bytes (see
 Why two launches instead of one: Q's output is a plain contiguous
 ``[T, H_q, D]`` tensor with no write-amplification concern, so forcing it
 through the KV kernel's page-block grid would only add complexity with no
-HBM-traffic benefit. See ``op_tests/flydsl-best-practices.md`` S6.
+HBM-traffic benefit.
 """
 
 import math
