@@ -10,8 +10,8 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 
 from packaging.version import Version
 
-from .utils import is_flydsl_available
 from .moe_common import GateMode
+from .utils import is_flydsl_available
 
 _MIN_FLYDSL_VERSION = Version("0.2.4")
 
