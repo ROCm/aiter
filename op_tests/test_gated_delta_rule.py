@@ -19,6 +19,9 @@ from aiter.ops.triton.gated_delta_net import (
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
+from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+    chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+)
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
@@ -959,6 +962,19 @@ def test_chunk_opt_varlen_hip(
                 ),
             ],
         ),
+        pytest.param(
+            "flydsl",
+            id="flydsl",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="FlyDSL backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="FlyDSL mfma16_hip K5 kernel does not support gfx12!",
+                ),
+            ],
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1009,6 +1025,13 @@ def test_chunk_opt_vk_indice(
         if D != 128:
             pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
         extra_kwargs = {"g_head_major": True}
+    elif backend == "flydsl":
+        fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
+        # FlyDSL mfma16_hip is likewise specialized for K=V=128 / bf16 and takes
+        # head-major [B, H, T] gates directly (no g_head_major flag needed).
+        if D != 128:
+            pytest.skip(reason="FlyDSL mfma16_hip kernel requires D=128 and bfloat16")
+        extra_kwargs = {}
     else:
         fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
         extra_kwargs = {}

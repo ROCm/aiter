@@ -713,9 +713,9 @@ def _get_or_compile_mfma16_hip(
             f"ABI), but got `{getattr(flydsl, '__version__', 'unknown')}`."
         )
 
-        from .kernels.chunk_gated_delta_h_mfma16x16x16 import (
-            compile_chunk_gated_delta_h_mfma16_hip,
-        )
+    from .kernels.chunk_gated_delta_h_mfma16x16x16 import (
+        compile_chunk_gated_delta_h_mfma16_hip,
+    )
 
     return compile_chunk_gated_delta_h_mfma16_hip(
         K=K,
