@@ -1372,12 +1372,24 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # Dynamic EP token count (capture-safe, no host sync): grid is launched over
         # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
         # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
-        # When truncation is disabled the caller passes numel, so nothing is skipped.
-        nvr = ArithValue(
-            buffer_ops.buffer_load(
-                ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
-            )
+        # When truncation is disabled the caller passes a null pointer, which must
+        # not be dereferenced, so the load is predicated rather than unconditional.
+        nvr_addr = arith.index_cast(T.i64, ptrtoint(num_valid_routes))
+        nvr_is_null = arith.cmpi(
+            CmpIPredicate.eq, nvr_addr, arith.constant(0, type=T.i64)
         )
+        _if_nvr = scf.IfOp(nvr_is_null, results_=[i32], has_else=True)
+        with ir.InsertionPoint(_if_nvr.then_block):
+            scf.YieldOp([ArithValue(numel)])
+        with ir.InsertionPoint(_if_nvr.else_block):
+            scf.YieldOp(
+                [
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+                    )
+                ]
+            )
+        nvr = ArithValue(_if_nvr.results[0])
         route_in_range = arith.cmpi(CmpIPredicate.ult, route, nvr)
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
