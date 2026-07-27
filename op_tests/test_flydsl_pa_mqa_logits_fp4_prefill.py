@@ -495,8 +495,8 @@ def run_varqlen_case(
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
-        compute_varqlen_windows,
         compute_prefill_schedule,
+        compute_varqlen_windows,
     )
 
     torch.manual_seed(seed)
