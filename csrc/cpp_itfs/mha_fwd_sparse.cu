@@ -43,10 +43,11 @@ static constexpr const char* kDenseMxfp4KernelName =
     "_ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E";
 static constexpr const char* kDenseMxfp4CoName =
     "fmha_v3_fwd/fwd_hd128_mxfp4.co";
-// DENSE f4f4 sibling (fp4-packed Q/K + per-channel fp4 V). Reuses the SAME kernel
-// symbol as the dense mxfp4 kernel (kDenseMxfp4KernelName); only the .co differs.
-// Because both .co export the same symbol, the f4f4 dispatcher below keeps its own
-// kernel cache keyed by the .co name so it never aliases the mxfp4 slot.
+// DENSE f4f4 sibling (fp4-packed Q/K + per-channel fp4 V). Exports its own dedicated
+// kernel symbol (kDenseF4f4KernelName) and its own .co (kDenseF4f4CoName); the launch
+// contract (656-byte dense kernarg, grid, block) is otherwise identical to dense mxfp4.
+static constexpr const char* kDenseF4f4KernelName =
+    "_ZN5aiter26fmha_fwd_hd128_f4f4_gfx950E";
 static constexpr const char* kDenseF4f4CoName =
     "fmha_v3_fwd/fwd_hd128_f4f4.co";
 // fp8-quantized sibling (E4M3 Q/K/V). Same 704-byte kernarg layout and
@@ -384,12 +385,12 @@ float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 }
 
 // DENSE (non-sparse) f4f4 fmha. Byte-for-byte the same launch as fmha_fwd_v3_mxfp4
-// (same dense 656-byte kernarg via init_sparse_v3_args, same grid, same kernel
-// symbol) -- only the .co differs (fwd_hd128_f4f4.co). f4f4 packs V as per-channel
-// fp4 (uint8) instead of fp8; that only changes the V byte strides the caller passes
-// in (a.stride_v etc.), not the kernarg layout, so no host-side differences remain.
-// The kernel cache is keyed on the .co name so f4f4 and mxfp4 (identical symbol,
-// different .co) get independent AiterAsmKernel instances in the same process.
+// (same dense 656-byte kernarg via init_sparse_v3_args, same grid) -- but it now has its
+// own dedicated kernel symbol (kDenseF4f4KernelName) in its own .co (fwd_hd128_f4f4.co).
+// f4f4 packs V as per-channel fp4 (uint8) instead of fp8; that only changes the V byte
+// strides the caller passes in (a.stride_v etc.), not the kernarg layout, so no host-side
+// differences remain. The kernel cache is keyed on the .co name so f4f4 and mxfp4 get
+// independent AiterAsmKernel instances in the same process.
 float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
 {
     if(!a.use_asm_v3)
@@ -418,7 +419,7 @@ float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
     AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
         kDenseF4f4CoName,
-        [&]() { return AiterAsmKernel(kDenseMxfp4KernelName, kDenseF4f4CoName); });
+        [&]() { return AiterAsmKernel(kDenseF4f4KernelName, kDenseF4f4CoName); });
 
     fmha_fwd_v3_sparse_args args{};
     // Dense kernarg = the 656-byte dense prefix only (no LUT tail).

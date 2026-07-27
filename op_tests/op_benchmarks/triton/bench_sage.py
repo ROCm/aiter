@@ -590,7 +590,7 @@ def make_f4f4_runner(
     col-major LDS pack -- no dependency on the research host packer) and dispatches
     through the dedicated ``flash_attn_f4f4_pertensor_func`` ->
     ``aiter.ops.mha.fmha_v3_fwd_f4f4`` -> ``aiter::fmha_fwd_v3_f4f4`` -> .co launch
-    (``fwd_hd128_f4f4.co``, kernel symbol _ZN5aiter28fmha_fwd_hd128_mxfp4_gfx950E).
+    (``fwd_hd128_f4f4.co``, kernel symbol _ZN5aiter26fmha_fwd_hd128_f4f4_gfx950E).
     This is the first-class f4f4 launch path (mirrors ``flash_attn_mxfp4_pertensor_func``
     exactly); it does NOT go through the general ``fmha_v3_fwd`` op and needs no
     ``AITER_FMHA_F4F4`` env var -- f4f4 and mxfp4 coexist in one process (separate
