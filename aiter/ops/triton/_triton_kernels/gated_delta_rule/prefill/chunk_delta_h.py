@@ -1302,12 +1302,12 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_exp2: bool = True,
     state_dtype: torch.dtype | None = None,
-    snapshot_dtype: torch.dtype | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].

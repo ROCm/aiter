@@ -227,13 +227,13 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
-    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
     seq_lens_cpu: Sequence[int] | None = None,
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -259,8 +259,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
-        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
-            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
         use_exp2: bool — use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by K6). If None, a fresh buffer is allocated.
@@ -275,6 +273,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             shared K1--K6 schedule without device readback.
         prefill_metadata: Prebuilt reusable host/device schedule. This is the
             preferred path when multiple layers process the same batch.
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:

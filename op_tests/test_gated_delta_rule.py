@@ -1128,13 +1128,25 @@ def test_chunk_opt_vk_indice(
         ),
     ],
 )
-def test_chunk_snapshot_dtype_defaults_to_k_dtype(backend: str):
-    """FP32 persistent state must not change the default BF16 snapshot policy."""
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+def test_chunk_snapshot_dtype_defaults_to_k_dtype(
+    backend: str, input_dtype: torch.dtype
+):
+    """Persistent-state dtype must not change the default snapshot policy."""
+    if backend == "hip" and input_dtype != torch.bfloat16:
+        pytest.skip("HIP K5 supports only BF16 inputs")
+
     torch.manual_seed(42)
     B, T, H, D = 1, 128, 2, 128
-    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
-    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
-    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    w = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
+    u = torch.randn(B, H, T, D, dtype=input_dtype, device=device)
     g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
     initial_state = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
 
@@ -1156,10 +1168,24 @@ def test_chunk_snapshot_dtype_defaults_to_k_dtype(backend: str):
         **extra_kwargs,
     )
 
-    assert h.dtype == k.dtype == torch.bfloat16
+    assert h.dtype == k.dtype == input_dtype
     assert final_state.dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    "input_dtype",
+    [
+        pytest.param(torch.float16, id="input_fp16"),
+        pytest.param(torch.bfloat16, id="input_bf16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
 @pytest.mark.parametrize(
     "snapshot_dtype",
     [
@@ -1167,20 +1193,31 @@ def test_chunk_snapshot_dtype_defaults_to_k_dtype(backend: str):
         pytest.param(torch.float32, id="snapshot_fp32"),
     ],
 )
-def test_chunk_opt_vk_snapshot_dtype(snapshot_dtype: torch.dtype):
-    """Exercise Triton K5 and K6 with independently selected snapshot dtype."""
+def test_chunk_opt_vk_dtype_combinations(
+    input_dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    snapshot_dtype: torch.dtype,
+):
+    """Exercise Triton K5/K6 across independent input, state and snapshot dtypes."""
     torch.manual_seed(42)
     B, T, H, D = 1, 128, 2, 128
-    q = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    q = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
     k = F.normalize(
         torch.randn(B, T, H, D, dtype=torch.float32, device=device),
         p=2,
         dim=-1,
-    ).to(torch.bfloat16)
-    v = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
-    beta = torch.rand(B, T, H, dtype=torch.bfloat16, device=device).sigmoid()
+    ).to(input_dtype)
+    v = torch.randn(B, T, H, D, dtype=input_dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=input_dtype, device=device).sigmoid()
     g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
-    initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    # Quantize the reference initial state to the selected persistent dtype so
+    # comparisons isolate kernel behavior rather than input quantization.
+    initial_state_ref = (
+        torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+        .to(state_dtype)
+        .float()
+    )
+    initial_state = initial_state_ref.transpose(-1, -2).to(state_dtype).contiguous()
 
     out, final_state = chunk_gated_delta_rule_opt_vk(
         q=q,
@@ -1188,10 +1225,75 @@ def test_chunk_opt_vk_snapshot_dtype(snapshot_dtype: torch.dtype):
         v=v,
         g=g,
         beta=beta,
-        initial_state=initial_state_ref.transpose(-1, -2).contiguous(),
+        initial_state=initial_state,
         output_final_state=True,
-        state_dtype=torch.float32,
+        state_dtype=state_dtype,
         snapshot_dtype=snapshot_dtype,
+    )
+    ref, ref_final_state = recurrent_gated_delta_rule_ref(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=initial_state_ref,
+        output_final_state=True,
+    )
+
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert out.dtype == input_dtype
+    assert final_state.dtype == state_dtype
+    assert_close("o", ref.float(), out.float(), tol)
+    assert_close(
+        "ht",
+        ref_final_state.float(),
+        final_state.transpose(-1, -2).float(),
+        tol,
+    )
+
+
+def test_chunk_opt_vk_preserves_legacy_positional_optional_arguments():
+    """The pre-snapshot positional API must keep binding use_exp2 correctly."""
+    torch.manual_seed(42)
+    B, T, H, D = 1, 64, 1, 64
+    dtype = torch.bfloat16
+    q = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    k = F.normalize(
+        torch.randn(B, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(dtype)
+    v = torch.randn(B, T, H, D, dtype=dtype, device=device)
+    beta = torch.rand(B, T, H, dtype=dtype, device=device).sigmoid()
+    g = F.logsigmoid(torch.rand(B, T, H, dtype=torch.float32, device=device))
+    initial_state_ref = torch.randn(B, H, D, D, dtype=torch.float32, device=device)
+    initial_state = initial_state_ref.transpose(-1, -2).contiguous()
+
+    # Keep this call positional through num_decode_tokens. On the base API,
+    # False is use_exp2; inserting snapshot_dtype before it binds False to a
+    # dtype and raises ValueError.
+    out, final_state = chunk_gated_delta_rule_opt_vk(
+        q,
+        k,
+        v,
+        None,
+        g,
+        beta,
+        None,
+        initial_state,
+        True,
+        False,
+        None,
+        False,
+        False,
+        torch.float32,
+        False,
+        0,
+        0,
     )
     ref, ref_final_state = recurrent_gated_delta_rule_ref(
         q=q,

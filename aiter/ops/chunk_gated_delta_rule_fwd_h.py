@@ -156,7 +156,7 @@ def _prepare_state_args(
 
 
 def _resolve_snapshot_dtype(
-    snapshot_dtype: Optional[torch.dtype], input_dtype: torch.dtype
+    snapshot_dtype: torch.dtype | None, input_dtype: torch.dtype
 ) -> torch.dtype:
     dtype = input_dtype if snapshot_dtype is None else snapshot_dtype
     if dtype not in (torch.float32, torch.bfloat16):
@@ -210,7 +210,6 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     cu_seqlens: Tensor | None = None,
     selected_bv: int | None = None,
     state_dtype: torch.dtype | None = None,
-    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
     initial_state_indices: Tensor | None = None,
@@ -219,6 +218,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """
     HIP hidden-state forward with h layout [V, K] (K=128, V=128), always
