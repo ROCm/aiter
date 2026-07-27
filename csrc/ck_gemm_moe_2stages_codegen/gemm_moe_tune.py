@@ -31,8 +31,7 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
-    _parse_mxfp4_g2_kname,
-    parse_flydsl_v2_gemm2_kernel,
+    parse_g2_kname_any,
 )
 from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
 from aiter.ops.shuffle import (
@@ -5400,15 +5399,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     @staticmethod
     def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
-        # Path B: kn2 may be a flydsl_moe2_layout v2 gemm2 name (mxmoe g1 front-end
-        # + v2 gemm2). Parse BM/atomic from whichever format applies.
-        _v2 = parse_flydsl_v2_gemm2_kernel(kn2)
-        if _v2 is not None:
-            BM = _v2["tile_m"]
-            atomic = _v2["epilog"] == "atomic"
-        else:
-            BM = _parse_mxfp4_g2_kname(kn2)["BM"]
-            atomic = _parse_mxfp4_g2_kname(kn2)["atomic"]
+        # kn2 may name either gemm2 family (path B or native mxmoe).
+        _g2 = parse_g2_kname_any(kn2)
+        BM = _g2["BM"]
+        atomic = _g2["atomic"]
         BM1 = _parse_mxfp4_g1_kname(kn1)["BM"]
         M = data["input"].shape[0]
         sti, sw, sei, nvi, moe_buf, m_indices, reverse_sorted = moe_sorting(

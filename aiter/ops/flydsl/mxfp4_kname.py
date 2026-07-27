@@ -108,3 +108,30 @@ def parse_flydsl_v2_gemm2_kernel(name):
         "use_nt": bool(m.group("nt")),
         "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
     }
+
+
+def parse_g2_kname_any(kname) -> dict:
+    """Parse either gemm2 name family into the fields the stage2 dispatch needs.
+
+    ``v2`` tells path B (flydsl_moe2_layout gemm2 behind the mxmoe front-end)
+    apart from the native mxmoe gemm2; the other keys mean the same for both.
+    """
+    v2 = parse_flydsl_v2_gemm2_kernel(kname)
+    if v2 is not None:
+        return {
+            "v2": True,
+            "BM": v2["tile_m"],
+            "atomic": v2["epilog"] == "atomic",
+            "use_nt": v2["use_nt"],
+            "mxfp4out": False,
+            "cshuffle": False,
+        }
+    p2 = _parse_mxfp4_g2_kname(kname)
+    return {
+        "v2": False,
+        "BM": p2["BM"],
+        "atomic": p2["atomic"],
+        "use_nt": p2["use_nt"],
+        "mxfp4out": p2["mxfp4out"],
+        "cshuffle": p2["cshuffle"],
+    }
