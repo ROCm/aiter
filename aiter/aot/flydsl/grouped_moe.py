@@ -92,6 +92,12 @@ def _as_int(value, default: int | None = None) -> int | None:
     return int(value)
 
 
+def _as_float(value, default: float) -> float:
+    if value is None or str(value).strip() == "":
+        return float(default)
+    return float(value)
+
+
 def _scheduler_variants(row, base_job):
     # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe)
     # hardcodes grouped_persistent_m=False and expert_sched_mode=False; the only
@@ -142,6 +148,13 @@ def parse_csv(csv_path: str):
             topk = int(row.get("topk") or 1)
             raw_max_m = _as_int(row.get("max_m"), token_num)
             max_m = _align_max_m(raw_max_m, warp_tile_m)
+            act_type = row.get("act_type", "")
+            if "Situv2" in act_type:
+                act = "situv2"
+            elif "Swiglu" in act_type:
+                act = "swiglu"
+            else:
+                act = "silu"
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
                 "model_dim": int(row["model_dim"]),
@@ -161,7 +174,9 @@ def parse_csv(csv_path: str):
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
                 "stage1_weight_layout": row.get("stage1_weight_layout") or "gguu",
-                "act": "swiglu" if "Swiglu" in row.get("act_type", "") else "silu",
+                "act": act,
+                "situ_beta": _as_float(row.get("situ_beta"), 1.0),
+                "situ_linear_beta": _as_float(row.get("situ_linear_beta"), 1.0),
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
@@ -508,6 +523,8 @@ def compile_one_config(**job):
             )
             exe1 = compiler1(
                 act=job["act"],
+                situ_beta=job.get("situ_beta", 1.0),
+                situ_linear_beta=job.get("situ_linear_beta", 1.0),
                 stage1_weight_layout=job["stage1_weight_layout"],
                 split_k=job["split_k1"],
                 **common,
