@@ -242,8 +242,6 @@ def cal_diff(
     x, y = x.double(), y.double()
     # RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    # amax_diff = (x - y).abs().max().item()
-    # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
     else:
@@ -501,7 +499,7 @@ def torch_mla_extend_split_kv(
             and is_fp8_q
             and is_fp8_kvc
             and (
-                (nheads == 32 and max_seqlen_q == 4)
+                (nheads == 32 and max_seqlen_q >= 4)
                 or (nheads == 64)
                 or (nheads == 128)
             )

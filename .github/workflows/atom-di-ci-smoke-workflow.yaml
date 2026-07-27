@@ -64,7 +64,7 @@ permissions:
   contents: read
 
 env:
-  ATOM_REF_DEFAULT: 22577adb3ac909c3d0d8fe2209e64afe67b5c7bc
+  ATOM_REF_DEFAULT: main
   ATOMESH_IMAGE_DEFAULT: rocm/atom-dev:latest
   ATOMESH_MODEL_PATH_DEEPSEEK_V4_PRO_DEFAULT: /data/models2/DeepSeek-V4-Pro
   ATOMESH_MODEL_PATH_GLM_5_2_FP8_DEFAULT: /data/models2/GLM-5.2-FP8
@@ -293,7 +293,7 @@ jobs:
           def parse_int_list(value: str):
               return [int(item) for item in value.replace(",", " ").split() if item]
 
-          def build_matrix(model: str, conc: str, eval_conc: str, output: Path):
+          def build_matrix(model: str, case: str, conc: str, eval_conc: str, output: Path):
               subprocess.run(
                   [
                       "python3",
@@ -302,6 +302,8 @@ jobs:
                       "nightly",
                       "--model",
                       model,
+                      "--case",
+                      case,
                       "--image",
                       os.environ["ATOMESH_IMAGE"],
                       "--benchmark-concurrency",
@@ -318,6 +320,7 @@ jobs:
           requested = [
               {
                   "model": "DeepSeek-V4-Pro",
+                  "case": "ds-v4-1p1d-tp8",
                   "topology": "1p1d",
                   "osl": os.environ["OSL"],
                   "conc": os.environ["CONC_LIST"],
@@ -329,6 +332,7 @@ jobs:
               requested.append(
                   {
                       "model": "GLM-5.2-FP8",
+                      "case": "glm-5-2-fp8-1p1d-tp8",
                       "topology": "1p1d",
                       "osl": os.environ["GLM_OSL"],
                       "conc": os.environ["GLM_CONC_LIST"],
@@ -350,7 +354,7 @@ jobs:
 
           for index, cfg in enumerate(requested):
               matrix_path = Path(f"../atomesh-matrix-{index}.json")
-              matrix = build_matrix(cfg["model"], cfg["conc"], cfg["eval_conc"], matrix_path)
+              matrix = build_matrix(cfg["model"], cfg["case"], cfg["conc"], cfg["eval_conc"], matrix_path)
               combined_matrix["include"].extend(matrix.get("include", []))
               matches = [
                   cell

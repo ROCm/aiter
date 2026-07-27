@@ -231,6 +231,7 @@ def test_mla(
     out_dtype = torch.bfloat16
 
     us_aiter = None
+    prefill_ref_token_cap = 512 * 1024
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
@@ -238,6 +239,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
@@ -333,6 +335,7 @@ def test_mla(
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
+        and total_qo <= prefill_ref_token_cap
     ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
@@ -538,8 +541,19 @@ def test_mla(
         from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
         out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
-        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+        # MTP (decode_qlen>1): q is [total_q=batch*qlen, nhead, qk]; reshape to
+        # 4-D [batch, qlen, nhead, dim] so the kernel runs its causal tail path.
+        if decode_qlen > 1:
+            q4 = q.view(batch_size, decode_qlen, nhead, qk_head_dim)
+            q_nope = q4[..., :v_head_dim]
+            q_pe = q4[..., v_head_dim:]
+            o_arg = out_gluon.view(batch_size, decode_qlen, nhead, v_head_dim)
+        else:
+            q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+            q_pe = q[:, :, v_head_dim:].view(
+                batch_size, nhead, qk_head_dim - v_head_dim
+            )
+            o_arg = out_gluon.view(batch_size, nhead, v_head_dim)
 
         kv_c = kv_buffer.view(-1, qk_head_dim)
         if name == "bh16bn128":
@@ -559,7 +573,7 @@ def test_mla(
             q_nope,
             q_pe,
             kv_c,
-            out_gluon.view(batch_size, nhead, v_head_dim),
+            o_arg,
             page_table,
             seq_info,
             sm_scale,
@@ -585,16 +599,18 @@ def test_mla(
 
     err = None
     us_asm_decode = 1e12
+    # ASM/CK decode baseline only supports MTP up to qlen=4; skip it beyond that
+    # (gluon still validates against the torch reference).
+    asm_supports_mtp = decode_qlen <= 4
     # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse:
+    if return_lse or not asm_supports_mtp:
         pass
-    elif (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
-        8,
-        16,
-        32,
-        64,
-        128,
-    ]:
+    elif (
+        (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
+        and nhead in [8, 16, 32, 64, 128]
+        # ASM decode faults on nhead=64 with qlen>1; skip that combo.
+        and not (nhead == 64 and decode_qlen > 1)
+    ):
         err, us_asm_decode = test_absorb_decode_bf16()
     elif kvtype == dtypes.fp8 and nhead in [8, 16, 32, 128]:
         err, us_asm_decode = test_absorb_decode_fp8()
@@ -613,6 +629,10 @@ def test_mla(
     ret["decode:bytes"] = bytes
     ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
     ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
+    # Per-token throughput (Mtok/s = total_q / us, total_q = batch*qlen): the MTP
+    # figure-of-merit, implementation-agnostic unlike TB/s (under-counts qlen KV
+    # re-reads) and TFLOPS (over-counts via the decode_qlen factor).
+    ret["decode:Mtok/s"] = total_q / us_asm_decode
 
     # Gluon MLA decode test
     # Example: -c 16384 -b 64 128 -n 64,1 128,1 -d bf16 -kvd bf16
@@ -637,7 +657,7 @@ def test_mla(
         splits_needed = max(1, (256 + base_grid - 1) // base_grid)
         # Round up to a power of two: 1 << (n - 1).bit_length() for n >= 1.
         num_kv_splits = 1 << (splits_needed - 1).bit_length()
-        # PIPELINE_STAGES=3, BLOCK_N=64 → 192; mirror wrapper's bound.
+        # PIPELINE_STAGES=3, BLOCK_N=64 -> 192; mirror wrapper's bound.
         min_ctx_required = num_kv_splits * (192 + num_kv_splits)
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()
@@ -645,6 +665,8 @@ def test_mla(
             ret["decode:gluon_576"] = us_gluon_decode
             ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
             ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+            # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+            ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn128 decode test
     # Example: -c 10000000 -b 1 -n 16,1 -d bf16 -kvd fp8
@@ -665,6 +687,8 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     # Gluon MLA bh16bn64 decode test
     # Example: -c 10000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 [-lse]
@@ -673,7 +697,7 @@ def test_mla(
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
         and nhead <= 16
-        and decode_qlen == 1
+        and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
@@ -685,6 +709,8 @@ def test_mla(
         ret["decode:gluon_576"] = us_gluon_decode
         ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
         ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+        # Mtok/s: MTP figure-of-merit (see decode:Mtok/s above).
+        ret["decode:gluon_Mtok/s"] = total_q / us_gluon_decode
 
     return ret
 
@@ -777,22 +803,18 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[
-        (4, 1),
-        (8, 1),
-        (8, 2),
-        (12, 1),
-        (16, 1),
-        (16, 2),
-        (16, 4),
-        (32, 1),
-        (32, 2),
-        (32, 4),
-        (64, 1),
-        (128, 1),
-        (128, 2),
-        (128, 4),
-    ],
+    choices=(
+        [(nh, q) for nh in (4, 8, 12, 16) for q in range(1, 18)]
+        + [
+            (32, 1),
+            (32, 2),
+            (32, 4),
+            (64, 1),
+            (128, 1),
+            (128, 2),
+            (128, 4),
+        ]
+    ),
     nargs="*",
     const=None,
     default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],

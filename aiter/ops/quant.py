@@ -14,6 +14,7 @@ from torch import Tensor
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -23,7 +24,6 @@ from ..utility.mx_types import (
 )
 from . import triton
 from .enum import ActivationType, QuantType
-from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 # Type alias for round-mode parameters; Union keeps int interop without
 # triggering the JIT build that loading MxScaleRoundMode would cause.
@@ -443,14 +443,15 @@ def per_group_quant_hip(
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
-) -> Tuple[Tensor, Tensor]:
+    scale_type: torch.dtype = dtypes.fp32,
+) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
     if scale is None:
         scale = torch.empty(
-            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+            (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
         )
     else:
         raise ValueError("unsupported: static per token quant")
@@ -460,14 +461,25 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(
-        y,
-        x.view(-1, group_size),
-        scale,
-        shuffle_scale=transpose_scale,
-        num_rows=num_rows,
-        num_rows_factor=num_rows_factor,
-    )
+    if scale_type == dtypes.fp8_e8m0:
+        dynamic_per_group_scaled_quant(
+            y,
+            x,
+            scale,
+            group_size,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
+    else:
+        dynamic_per_token_scaled_quant(
+            y,
+            x.view(-1, group_size),
+            scale,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
     return y, scale
 
 
@@ -763,14 +775,20 @@ def dynamic_per_group_scaled_quant(
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
-    ``out.dtype`` selects the element format:
+    ``out.dtype`` selects the element format; ``scales.dtype`` selects the
+    scale format for fp8 output:
       * ``dtypes.fp4x2`` / ``torch.uint8`` -> MXFP4 (e8m0 byte scale)
-      * ``dtypes.fp8``                      -> MXFP8 (fp32 per-group scale today)
+      * ``dtypes.fp8``                      -> fp8, e8m0 or fp32 scale
+        depending on ``scales.dtype``
       * ``dtypes.i8``                       -> int8 per-group (fp32 scale)
+
+    For e8m0 scale output, ``shuffle_scale=True`` means the MX hardware
+    scale-load swizzle when ``group_size == 32``, and a plain transpose
+    (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
+    sizes.
 
     Only ``group_size`` in {32, 64, 128} is supported.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)

@@ -10,6 +10,7 @@ from torch import Tensor
 
 from ...jit.core import compile_ops
 from .moe_stage2_a8w4_meta import (
+    OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_BF16,
     OPUS_A8W4_OUT_MODE_FP8,
     opus_a8w4_best_atomic_kid,
@@ -18,7 +19,8 @@ from .moe_stage2_a8w4_meta import (
     opus_a8w4_kid_is_fp8,
     opus_a8w4_kid_name,
     opus_a8w4_kid_uses_route,
-    opus_a8w4_shape_family_for_shape,
+    opus_a8w4_effective_inter_dim,
+    opus_a8w4_scale_cols_for_effective_inter_dim,
 )
 
 _OPUS_MOE_STAGE2_ROUTE_REDUCE_AUTO_BLOCK_N = -1
@@ -30,6 +32,28 @@ def _contiguous(tensor: Tensor) -> Tensor:
 
 def _optional_contiguous(tensor: Optional[Tensor]) -> Optional[Tensor]:
     return None if tensor is None else _contiguous(tensor)
+
+
+def _pad_scale_cols(tensor: Tensor, cols: int) -> Tensor:
+    if tensor.shape[1] >= cols:
+        return tensor
+    padded = torch.empty(
+        (*tensor.shape[:-1], cols), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[..., : tensor.shape[-1]] = tensor
+    padded[..., tensor.shape[-1] :] = tensor[..., -1:]
+    return padded
+
+
+def _pad_scale_rows(tensor: Tensor, rows: int) -> Tensor:
+    if tensor.shape[0] >= rows:
+        return tensor
+    padded = torch.empty(
+        (rows, tensor.shape[1]), dtype=tensor.dtype, device=tensor.device
+    )
+    padded[: tensor.shape[0], :] = tensor
+    padded[tensor.shape[0] :, :] = tensor[-1:, :]
+    return padded
 
 
 def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
@@ -139,19 +163,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
     return_per_slot: bool = False,
     route_out_dtype: Optional[str] = None,
 ) -> Tensor:
-    # Output mode is encoded in the kid. Route-out kernels must be requested
-    # explicitly after they have been added to the metadata table.
-    shape_family = opus_a8w4_shape_family_for_shape(
-        model_dim=w2.shape[1],
-        inter_dim=inter_states.shape[2],
-        expert=w2.shape[0],
-        topk=inter_states.shape[1],
+    effective_inter_dim = opus_a8w4_effective_inter_dim(
+        inter_states.shape[2], inter_dim_pad
     )
-    shape_family_name = None if shape_family is None else shape_family.name
-    if kernel_id == -1 and shape_family_name is None:
+    if effective_inter_dim is None:
         raise ValueError(
-            "unsupported Opus A8W4 shape family for auto kid selection: "
-            f"inter_states={tuple(inter_states.shape)}, w2={tuple(w2.shape)}"
+            "Opus A8W4 stage2 requires 0 <= inter_dim_pad < logical inter_dim, "
+            f"got inter_states={tuple(inter_states.shape)}, inter_dim_pad={inter_dim_pad}"
         )
     if route_out_dtype is not None and not return_per_slot:
         raise ValueError("route_out_dtype requires return_per_slot=True")
@@ -159,12 +177,10 @@ def opus_moe_stage2_a8w4_decode_fwd(
         kernel_id = opus_a8w4_decode_kid(
             _route_out_mode_from_dtype(route_out_dtype),
             block_m,
-            shape_family=shape_family_name,
         )
     elif not return_per_slot and kernel_id == -1 and block_m == 32:
         kernel_id = opus_a8w4_best_atomic_kid(
             inter_states.shape[0],
-            shape_family=shape_family_name,
         )
         block_m = opus_a8w4_kid_block_m(kernel_id)
     route_out = bool(return_per_slot)
@@ -178,6 +194,16 @@ def opus_moe_stage2_a8w4_decode_fwd(
             )
         route_out = kid_route_out
         route_out_fp8 = opus_a8w4_kid_is_fp8(kernel_id)
+    scale_cols = opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim)
+    scale_row_pack = 2 * OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT.mfma_m
+    scale_rows = (
+        (int(sorted_token_ids.shape[0]) + scale_row_pack - 1)
+        // scale_row_pack
+        * scale_row_pack
+    )
+    a2_scale = _pad_scale_rows(a2_scale, scale_rows)
+    a2_scale = _pad_scale_cols(a2_scale, scale_cols)
+    w2_scale = _pad_scale_cols(w2_scale, scale_cols)
     md = w2.shape[1]
     if out is None:
         if route_out_fp8:
