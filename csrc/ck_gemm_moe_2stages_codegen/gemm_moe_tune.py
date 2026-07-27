@@ -145,7 +145,8 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
         else:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
-    return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
+    # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
+    return cos_diff
 
 
 def tensor_compare_diagnostics(
@@ -293,7 +294,8 @@ class FmoeTuner(TunerCommon):
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fmoe.csv",
-        "errRatio": 0.5,
+        # max accepted cosine_diff; 0.1 rejects broken kernels
+        "errRatio": 0.1,
         "batch": 100,
         "profile_file": "",  # for all results
         "config_env_name": "AITER_CONFIG_FMOE",
@@ -621,7 +623,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -1282,6 +1288,15 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        elif q_dtype_w == dtypes.fp4x2 and q_dtype_a in (dtypes.bf16, dtypes.fp16):
+            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): same wfp4 weight layout
+            # as a8w4 but separated gate (gate_up=False) and w2 scale via plain
+            # e8m0_shuffle (no act-scale interleave). Mirrors the reference
+            # op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py data prep.
+            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, False)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, False)
+            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
@@ -1427,6 +1442,16 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a16w4 mxfp4: the abf16 stage2 consumes the bf16 intermediate
+                # directly -- no inter-stage activation quant (a2_scale=None).
+                a2_qt = ref1
+                a2_scale = None
+                a2_scale_mxfp4_sort = None
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
                 # FlyDSL stage2 receives fp8 input
                 a2_qt = ref1.to(dtypes.fp8)
@@ -2925,7 +2950,11 @@ class FmoeTuner(TunerCommon):
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
-            dtypes.bf16: "fp16",
+            # a16w4: bf16 activation -> "bf16" so we enumerate the abf16_wfp4
+            # kernels the runtime actually selects (see fused_moe heuristic
+            # fallback kn1/kn2 = flydsl_moe{1,2}_abf16_wfp4_*). Mapping bf16 to
+            # "fp16" here would tune afp16_* kernels that never match at runtime.
+            dtypes.bf16: "bf16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
@@ -2966,6 +2995,13 @@ class FmoeTuner(TunerCommon):
                             (kname, nonfused_params, False, False),
                             (kname + "_fp8", fp8_params, False, True),
                         ]
+                elif a_dtype_str in ("bf16", "fp16"):
+                    # a16w4 (bf16/fp16 activation): stage1 emits a bf16
+                    # intermediate consumed directly by the abf16 stage2 (no
+                    # inter-stage fp4 quant). Only the bf16-output variant is
+                    # valid; a fp4-output stage1 would be mispaired with the
+                    # bf16-input stage2.
+                    s1_variants = [(kname, kparams, False, False)]
                 else:
                     fp4_params = {**kparams, "out_dtype": "fp4"}
                     if is_splitk:
@@ -4182,8 +4218,18 @@ class FmoeTuner(TunerCommon):
                 & (profileDF["us"] != -1)
                 & (profileDF["err"] <= args.errRatio)
             ]
-            profileDF = profileDF.sort_values("us").drop_duplicates(
-                ["stage", "block_m", "flat"], keep="first"
+            # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
+            # penalty below is applied only to non-fused, so dedup must not drop the
+            # fused kernel by raw us before that penalty runs.
+            profileDF["_is_fused"] = (
+                profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
+            )
+            profileDF = (
+                profileDF.sort_values("us")
+                .drop_duplicates(
+                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
+                )
+                .drop(columns=["_is_fused"])
             )
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]

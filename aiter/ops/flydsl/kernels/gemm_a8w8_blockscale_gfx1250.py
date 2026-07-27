@@ -26,6 +26,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import math as math_dialect
 from flydsl.compiler.kernel_function import CompilationContext
@@ -194,13 +195,13 @@ def compile_gemm_a8w8_blockscale(
     scale_block_k: int = 128,
     scale_block_n: int = 128,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     out_dtype: str = "bf16",
     variant: str = "compute_bound",
     N: int = 0,
     use_tdm_store: bool = False,
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     kernarg_preload: bool = False,
     split_k: int = 1,
 ):
@@ -1925,11 +1926,11 @@ def gemm_a8w8_blockscale(
     m_warp: int = 2,
     n_warp: int = 4,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     variant: str = "compute_bound",
     use_tdm_store: bool = False,
-    loop_carried_load_percent: Optional[int] = None,
+    loop_carried_load_percent: int | None = None,
     kernarg_preload: bool = False,
     split_k: int = 1,
 ):
