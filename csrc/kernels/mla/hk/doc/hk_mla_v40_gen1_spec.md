@@ -356,11 +356,8 @@ Why the KV split: it lets the vmem latency of Phase A overlap the barrier +
 QK, while Phase B's cvt+store overlaps softmax/PV. $Q$ is fully pinned, so
 the reduction-axis work is entirely on the KV side now.
 
-There is still no inter-warp swap of $Q$ ownership: each ptile keeps its own
-16 rows in its own VGPRs. The KV side is what's shared across ptiles.
-
 There is no inter-warp swap of $Q$ ownership: each ptile keeps its own 16
-rows in its own VGPRs/LDS. The KV side is what's shared across ptiles.
+rows in its own VGPRs. The KV side is what's shared across ptiles.
 
 ### 3.4 KV tile timing (one iter, m16x8 V2)
 
@@ -534,10 +531,11 @@ The whole map is generated from `HkMlaV40Regs<T>` in
 `hk_mla_v40_fwd_decode_gen1_common.cuh` (the single source of truth,
 parameterized by `kBlockN`); the kernel re-aliases the `k_*` constants
 locally. If (1) is missing, the compiler may emit a decimal operand ≥ N that
-silently overlaps hand-pinned data — corruption with no diagnostic. The audit
-`[[check-unpinned-reg-usage]]` scans the post-`--save-temps` `.s` for decimal
-`v ≥ N` and for `vgpr_spill_count > 0`. **Run it after every nontrivial
-change.**
+silently overlaps hand-pinned data — corruption with no diagnostic. **After
+every nontrivial change, audit the post-`--save-temps` `.s`**: scan each kernel
+body for a decimal `v ≥ N` overwriting a *live* pinned tile, and check
+`.vgpr_spill_count` in the `.amdgpu_metadata`. (Note the clang-format caveat in
+§5.4: `amdgpu_num_vgpr(\n N)` may wrap across two lines.)
 
 ### 5.2 The full map (m16x8, kBlockN=64)
 
@@ -566,7 +564,7 @@ for its own use during non-gemm windows (see note below). Hand-pinned: v36..v255
 > scratch reaches ~v40 (the low `k_0`/`k_1` tiles) during softmax — the window
 > between the QK and PV gemms — and at the prologue it stashes the kernarg ptr
 > into a `v36` lane via `v_writelane` (restored later via `v_readlane`). This is
-> **safe only because** each gemm asm block define-and-consumes its `k_*` tiles
+> **safe only because** each gemm asm block defines and consumes its `k_*` tiles
 > internally, so they hold no cross-block-live value; placing them at the lowest
 > pinned numbers is a **deliberate choice to hand the allocator a reclaimable
 > buffer zone**, not an accident of numbering.
@@ -660,8 +658,6 @@ runtime output, not by any flag. Re-check after touching:
 - inline asm clobber lists in the managers
 - `static_for` unroll factors in the kernel body
 - any new `sched_barrier(0)` (it widens live ranges)
-
-See `.claude/skills/check-unpinned-reg-usage/` for the script.
 
 ### 5.5 The `lane_idx` cse-break idiom
 
@@ -1225,9 +1221,10 @@ After Phase 2 completes (3 NoPE chunks + 1 RoPE chunk):
   which on the per-chunk data layout is equivalent to the sb8 perm
   applied identically to the D-axis).
 
-Both Q halves are ready for the main loop's QK Phase A (VGPR half) and
-Phase B (LDS half). The KV side will apply the matching sb8 perm on K's
-D-axis (Ch. 8) so QK accumulation is correct.
+After the prologue, all of Q (both halves, 512 cols) is resident in `q_vgpr`;
+the main loop's QK reads every col-tile from VGPR (there is no in-loop Q-LDS).
+The KV side applies the matching sb8 perm on K's D-axis (Ch. 8) so QK
+accumulation is correct.
 
 ## Chapter 8 — KvManager double-buffered pipeline
 
@@ -1501,11 +1498,10 @@ During iter $i$:
 
 1. **softmax → PV** on tile $i{-}1$'s data (still in `p_lds_kv_curr`
    from prev iter's perspective, now read for V).
-2. **QK Phase A** on tile $i$ (Q from `q_vgpr` × K from `p_lds_kv_curr`).
-   Interleaved with: `prefetch_kv_tile<…, kCheckBoundaryNext>` of tile
-   $i{+}2$ into `p_lds_kv_next`, and `cvt_kv_tile_step` /
-   `store_kv_tile_step` for tile $i{+}1$.
-3. **QK Phase B** on tile $i$ (Q from LDS × K from `p_lds_kv_curr`).
+2. **QK** on tile $i$ — all 16 col-tiles, Q from `q_vgpr` × K from
+   `p_lds_kv_curr`. Interleaved with: KV Phase A prefetch of tile $i{+}2$ into
+   the carriers/staging, and KV Phase B `cvt_kv_tile_step` /
+   `store_kv_tile_step` writing tile $i{+}1$ into `p_lds_kv_next`.
 
 At iter $i$ exit: swap `p_lds_kv_curr` and `p_lds_kv_next`.
 
@@ -2020,15 +2016,14 @@ budget is wasted.
 
 ### 10.7 setprio ladder (loop-wide context)
 
-Across one main-loop iter, the kernel issues `s_setprio` to a falling
-ladder `3 → 2 → 1 → 0`:
+Across one main-loop iter, the kernel issues `s_setprio` at three points
+(a falling ladder `3 → 2 → 1`):
 
-| Phase | setprio | Why |
+| Point | setprio | Why |
 |---|---:|---|
-| QK Phase A (mfma + KV prefetch interleave) | 3 (highest) | QK mfmas are the hot path; the KV writers (waves that converted+stored the *previous* tile) should yield |
-| QK Phase B (q from LDS) | 2 | Still mfma-heavy but the KV writers are catching up |
-| Softmax | 1 | exp/pk_add dominated; KV writers still need bandwidth |
-| PV gemm (canonical body) | 0 | Allow KV writers and any outstanding LDS traffic to drain freely |
+| pre-barrier / QK (after KV Phase A prefetch) | 3 (highest) | QK mfmas are the hot path; the KV writers (waves that converted+stored the *previous* tile) should yield |
+| KV Phase B (cvt+store the next tile after QK) | 2 | mfma/store overlap; KV writers are catching up |
+| Softmax | 1 | exp/add dominated; KV writers still need bandwidth |
 
 The ladder is set by `__builtin_amdgcn_s_setprio(N)` at phase boundaries.
 This is one of the "fine-tuned setprio" wins in commit `2daf7dd6d`.
@@ -2424,13 +2419,15 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 
 ### 13.5 Tools to reach for
 
-- `check-unpinned-reg-usage` skill (`.claude/skills/check-unpinned-reg-usage/`)
-  — scans the post-`--save-temps` `.s` file for decimal `v ≥ N` (the scratch
-  budget) and spill > 0. Run after every nontrivial change. Current state:
-  m16x8 budget=36 (scratch reaches ~v40 into dead `k_0`/`k_1`); m16x4 budget=44.
-  `.vgpr_spill_count` only flags >256-VGPR pressure, not the pinned/unpinned
-  overlap — verify overlap safety by ISA reading + correct output (§5.2, §5.4).
-- ISA inspection (`-save-temps` + read the `.s` file) is the only way
+- **VGPR audit** — dump the ISA with `--save-temps`, then per kernel body scan
+  for a decimal `v ≥ N` (the `amdgpu_num_vgpr(N)` budget) overwriting a *live*
+  pinned tile, and read `.vgpr_spill_count` from the `.amdgpu_metadata` YAML.
+  Current state: m16x8 budget=36 (scratch reaches ~v40 into dead `k_0`/`k_1`);
+  m16x4 budget=44. `.vgpr_spill_count` only flags >256-VGPR pressure, **not** the
+  pinned/unpinned overlap — verify overlap safety by ISA reading + correct
+  output (§5.2, §5.4). Watch the clang-format caveat: `amdgpu_num_vgpr(\n N)` can
+  wrap across two lines.
+- ISA inspection (`--save-temps` + read the `.s` file) is the only way
   to catch compiler-hoist / inline-asm hazards above. Standard
   printf-debugging will not find them.
 - `rocprofv3 --att` thread-trace dumps for cadence analysis — useful
@@ -2462,12 +2459,6 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 | `csrc/kernels/mla/reduce.cu` | Cross-WG reduction for split-O outputs (consumes the fp32 split tensor that V3 / V3NoStage produces). |
 | `aiter/jit/optCompilerConfig.json` | Per-module hipify input set + force-defines. V40 Gen.1's entry lists the 4 `.cuh` files in §14.1. Source of the `PROBE_*_ITER` macro gotcha in Ch. 13.1. |
 
-### 14.3 Tooling
-
-| Path | Purpose |
-|---|---|
-| `.claude/skills/check-unpinned-reg-usage/` | ISA audit script — scans the post-`--save-temps` `.s` for decimal `v ≥ N` (scratch budget) and `spill > 0`. Run after every nontrivial change. Budgets: m16x8 = 36, m16x4 = 44; spill 0. |
-
 ## Chapter 15 — Glossary & cross-refs
 
 ### 15.1 Glossary
@@ -2484,11 +2475,11 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 | **NoPE / RoPE** | Non-positional (fp8, scaled by E8M0) vs RoPE tail (bf16). The two halves of $D$ are loaded and laid out by different paths (Ch. 7, Ch. 8). |
 | **oaccu** | The fp32 output accumulator. 16 rows × 512 cols, lives entirely in pinned `v128..v255` (128 vgprs/lane). |
 | **p_comp / p_mfma** | Softmax output (m16x8): `p_comp` = fp32 (v48..v63, 16/lane), `p_mfma` = bf16 (v48..v55, 8/lane, overlay on p_comp's low half). |
-| **Phase A / Phase B** | A **D-axis split** of QK: Phase A reads Q from pinned VGPR (Q[:, 0:256]), Phase B reads Q from LDS (Q[:, 256:512]). Not a warp-role swap. |
+| **Phase A / Phase B** | The two halves of the **KV double-buffer pipeline** (§3.3): Phase A prefetches the next KV tile (VGPR carriers + raw-fp8 staging LDS); Phase B cvt+stores it into `p_lds_kv_next`. Not a Q-source split — all of Q is pinned in VGPR (`kQkGemmTiles=16`). (In V1 "Phase A/B" meant a Q-source split; that meaning is retired.) |
 | **pong** | One of two LDS slots holding a KV tile (m16x8: 64 KiB; m16x4: 32 KiB). Swap each iter. |
 | **prefetch chain** | The KvManager's `prefetch → cvt+store → wait` 3-routine split that lets vmem latency hide under QK mfma. |
 | **ptile** | One processing tile = one group's worth of work. Gen.1: ptile = 1 wave. The term is local to this doc; the AMD term "Compute Unit" means something different. |
-| **sb8 perm** | Sub-tile-of-8 permutation $[0,2,4,6,1,3,5,7]$ applied to a 64-col wave-tile's D-axis. Reorders 8 sub-tiles of 8 elements each; equivalent to swapping bits [3] and [5] of the col-element index. Eliminates the 2-way `ds_write_b128` writer-side bank conflict. Applied identically to Q and K (Ch. 7.2.4). |
+| **sb8 perm** | Sub-tile-of-8 permutation $[0,2,4,6,1,3,5,7]$ applied to a 64-col wave-tile's D-axis. Reorders 8 sub-tiles of 8 elements each; a **3-bit rotation of the [5:3] field** of the col-element index (bit 3→5, bit 4→3, bit 5→4 — see §7.2.2, `sb8_perm_col_elems`), not a plain bit-3↔bit-5 swap. Eliminates the 2-way `ds_write_b128` writer-side bank conflict. Applied identically to Q and K (Ch. 7.2.4). |
 | **setprio ladder** | $3 \to 2 \to 1 \to 0$ per-phase wave-priority drop within one main-loop iter. Lets the slower waves (KV writers) catch up while the faster waves (this one) are in compute-bound phases. |
 | **Site C** | The 2-way `ds_read_b128` bank conflict on the V40 QK reader. Mitigated by a row-conditional half-swap on the vmem-load side (Method 2 — Method 1 silently fails; see Ch. 13.1). |
 | **slim dispatch** | Compile-time flag (`MLA_SLIM_DISPATCH=1`) that always passes `kCheckBoundaryNext=true`, halving the `mla_main` template instantiations. Perf-neutral, 40 % smaller kernel image. (Ch. 12.4) |
