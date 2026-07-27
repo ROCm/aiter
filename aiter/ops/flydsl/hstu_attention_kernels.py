@@ -119,12 +119,12 @@ def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
             row["has_contextual"],
             row["has_targets"],
         )
-        kernel_config = dict(
-            block_m=int(row["block_m"]),
-            block_n=int(row["block_n"]),
-            num_waves=int(row["num_waves"]),
-            waves_per_eu=int(row["waves_per_eu"]),
-        )
+        kernel_config = {
+            "block_m": int(row["block_m"]),
+            "block_n": int(row["block_n"]),
+            "num_waves": int(row["num_waves"]),
+            "waves_per_eu": int(row["waves_per_eu"]),
+        }
         return (
             problem_key,
             duration,
@@ -256,12 +256,12 @@ def _get_default_config(
         waves_per_eu: int,
         /,
     ) -> dict:
-        return dict(
-            block_m=block_m,
-            block_n=block_n,
-            num_waves=num_waves,
-            waves_per_eu=waves_per_eu,
-        )
+        return {
+            "block_m": block_m,
+            "block_n": block_n,
+            "num_waves": num_waves,
+            "waves_per_eu": waves_per_eu,
+        }
 
     def _mi300x_config() -> dict:
         # hidden_dims 96/160/224 don't divide the K/V DMA pass with num_waves=4
@@ -326,12 +326,12 @@ def _compile_launcher(
     waves_per_eu: int | None,
 ) -> tuple[str, Callable]:
     #  Config overrides (if provided)
-    custom_config: dict = dict(
-        block_m=block_m,
-        block_n=block_n,
-        num_waves=num_waves,
-        waves_per_eu=waves_per_eu,
-    )
+    custom_config: dict = {
+        "block_m": block_m,
+        "block_n": block_n,
+        "num_waves": num_waves,
+        "waves_per_eu": waves_per_eu,
+    }
     custom_config = {k: v for k, v in custom_config.items() if v is not None}
 
     # Tuned config entry

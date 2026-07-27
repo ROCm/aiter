@@ -373,7 +373,7 @@ def build_hstu_attention_fwd(
 
         # ---- Thread / lane indices (layout-algebra decode) ----
         tid = fx.Int32(gpu.thread_idx.x)
-        wave_id, lane, lane_div_16, lane_mod_16 = decode_lane(
+        wave_id, _lane, lane_div_16, lane_mod_16 = decode_lane(
             tid, NUM_WAVES, WARP_SIZE, MFMA_N
         )
 

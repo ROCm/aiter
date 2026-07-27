@@ -23,6 +23,9 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 # same set, but gate the whole perf sweep here so it is a clean no-op elsewhere.
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 
+# Module-level singleton so it is not constructed in a function default (ruff B008).
+_DEFAULT_DEVICE = torch.device("cuda")
+
 
 # --------------------------------------------------------------------------- #
 # Input generation (shared with op_benchmarks/flydsl/bench_hstu_attn.py)
@@ -63,7 +66,7 @@ def generate_hstu_attn_inputs(
     hidden_dim: int,
     target_size: int,
     dtype: torch.dtype,
-    device: torch.device = torch.device("cuda"),
+    device: torch.device = _DEFAULT_DEVICE,
     seed: int = 1001,
 ):
     """Build (q, k, v, seq_offsets, num_targets) for an HSTU attention problem.
@@ -373,23 +376,23 @@ def test_validate_inputs_rejects_num_targets_length_mismatch():
 # Tuned CSV loading
 # --------------------------------------------------------------------------- #
 def _row(**overrides) -> dict:
-    row = dict(
-        arch=hstu_kernels._GPU_ARCH,
-        dtype="bf16",
-        num_heads=4,
-        head_dim=128,
-        hidden_dim=128,
-        batch=256,
-        max_seq_len=1024,
-        has_window="False",
-        has_contextual="False",
-        has_targets="False",
-        duration=1.0,
-        block_m=128,
-        block_n=64,
-        num_waves=4,
-        waves_per_eu=2,
-    )
+    row = {
+        "arch": hstu_kernels._GPU_ARCH,
+        "dtype": "bf16",
+        "num_heads": 4,
+        "head_dim": 128,
+        "hidden_dim": 128,
+        "batch": 256,
+        "max_seq_len": 1024,
+        "has_window": "False",
+        "has_contextual": "False",
+        "has_targets": "False",
+        "duration": 1.0,
+        "block_m": 128,
+        "block_n": 64,
+        "num_waves": 4,
+        "waves_per_eu": 2,
+    }
     row.update(overrides)
     return row
 
@@ -410,7 +413,12 @@ def test_tuned_csv_is_picked_up(tmp_path):
 
     assert len(config_map) == 1
     (config,) = config_map.values()
-    assert config == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
+    assert config == {
+        "block_m": 128,
+        "block_n": 64,
+        "num_waves": 4,
+        "waves_per_eu": 2,
+    }
 
 
 def test_tuned_csv_missing_file_returns_empty(tmp_path):

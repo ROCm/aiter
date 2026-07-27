@@ -69,10 +69,13 @@ class FwdShape:
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
+# Module-level singleton so it is not constructed in a function default (ruff B008).
+_DEFAULT_DEVICE = torch.device("cuda")
+
 
 def run_benchmark(
     shape: FwdShape,
-    device: torch.device = torch.device("cuda"),
+    device: torch.device = _DEFAULT_DEVICE,
     seed: int = 1001,
 ):
     torch.cuda.empty_cache()

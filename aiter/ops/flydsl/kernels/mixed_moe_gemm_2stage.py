@@ -2291,7 +2291,7 @@ def compile_mixed_moe_gemm1(
                 sk_n_offset = [0]
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base = row_ctx
+                    _fused, row_byte_base = row_ctx
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
@@ -4601,7 +4601,7 @@ def compile_mixed_moe_gemm2(
                     return llvm.inttoptr(ptr_ty, i64_raw)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    fused, row_byte_base, row_byte_off_i32 = row_ctx
+                    _fused, row_byte_base, row_byte_off_i32 = row_ctx
                     if const_expr(not bool(accumulate)):
                         col_idx = col_g0
                         byte_off_col = col_idx * arith.constant(
