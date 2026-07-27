@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from aiter.ops.flydsl import flydsl_hstu_attention_fwd
-from dataclasses import dataclass
 import argparse
-import triton
+from dataclasses import dataclass
+
 import torch
+import triton
+
+from aiter.ops.flydsl import flydsl_hstu_attention_fwd
 from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
     generate_hstu_attn_inputs,
 )

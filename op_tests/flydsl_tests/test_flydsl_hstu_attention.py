@@ -5,19 +5,19 @@ import argparse
 import csv
 import itertools
 
-import aiter
 import pandas as pd
 import pytest
 import torch
+
+import aiter
+import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, checkAllclose, run_perftest
-
-import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
 from aiter.ops.flydsl.hstu_attention_kernels import (
-    flydsl_hstu_attention_fwd,
     _validate_inputs,
+    flydsl_hstu_attention_fwd,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 # Every card this op is built/validated for; the kernel's validate() enforces the
 # same set, but gate the whole perf sweep here so it is a clean no-op elsewhere.

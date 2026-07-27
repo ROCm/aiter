@@ -4,20 +4,21 @@
 """High-level FlyDSL HSTU Attention Forward API."""
 
 from __future__ import annotations
-from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
-    validate_hstu_attention_fwd,
-    build_hstu_attention_fwd,
-)
+
 import csv
 import functools
-import torch
-import flydsl.expr as fx
-
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional, Callable
 
+import flydsl.expr as fx
+import torch
 from flydsl.runtime.device import get_rocm_arch
+
 from aiter import logger
+from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
+    build_hstu_attention_fwd,
+    validate_hstu_attention_fwd,
+)
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
@@ -94,7 +95,7 @@ def _problem_key(
     )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def _tuned_config_map(tuned_file: str | None = None) -> dict[tuple, dict]:
     def _parse_row(row: dict) -> tuple[tuple, float, dict]:
         if set(row.keys()) != set(_CSV_COLUMNS):
@@ -265,10 +266,10 @@ def _compile_launcher(
     max_attn_len: int,
     contextual_seq_len: int,
     dtype_str: str,
-    block_m: Optional[int],
-    block_n: Optional[int],
-    num_waves: Optional[int],
-    waves_per_eu: Optional[int],
+    block_m: int | None,
+    block_n: int | None,
+    num_waves: int | None,
+    waves_per_eu: int | None,
 ) -> tuple[str, Callable]:
     #  Config overrides (if provided)
     custom_config: dict = dict(
@@ -332,7 +333,7 @@ def _validate_inputs(
     k: torch.Tensor,
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
-    num_targets: Optional[torch.Tensor],
+    num_targets: torch.Tensor | None,
 ) -> tuple[int, int, int, int, str]:
     tensors: dict[str, torch.Tensor] = {
         "q": q,
@@ -402,15 +403,15 @@ def flydsl_hstu_attention_fwd(
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
     causal: bool,
-    num_targets: Optional[torch.Tensor],
+    num_targets: torch.Tensor | None,
     max_attn_len: int,
     contextual_seq_len: int,
     *,
-    block_m: Optional[int] = None,
-    block_n: Optional[int] = None,
-    num_waves: Optional[int] = None,
-    waves_per_eu: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    block_m: int | None = None,
+    block_n: int | None = None,
+    num_waves: int | None = None,
+    waves_per_eu: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     batch, num_heads, head_dim, hidden_dim, dtype_str = _validate_inputs(
         q=q,

@@ -703,7 +703,13 @@ def build_hstu_attention_fwd(
                         cur = mfma_acc(k_packs[ks].ir_value(), q_op, cur)
                     s_vals = [Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
 
-                    def keep_col(i):
+                    def keep_col(
+                        i,
+                        qg=qg,
+                        col_id=col_id,
+                        col_raw=col_raw,
+                        col_in_seq=col_in_seq,
+                    ):
                         """causal · window · contextual · target mask for (qg, col i)."""
                         dist = q_row_ids[qg] - col_id[i]
                         keep = (q_rows_i32[qg] == col_raw[i]) | (dist > fx.Int32(0))
