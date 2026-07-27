@@ -97,6 +97,7 @@ def test_fmoe(
     disable_stage2_bias=False,
     reference_intermediate_pad=0,
     ref_dtype="bf16",
+    shared=0,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -153,7 +154,36 @@ def test_fmoe(
     else:
         score = torch.randn((token, E), dtype=dtype)
 
-    topk_weights, topk_ids = fused_topk(input, score, topk, True)
+    if shared > 0:
+        # Shared/fused experts (mirrors poc_kl moe_topk_init): the last `shared`
+        # experts (ids E-shared..E-1) are appended to EVERY token's last topk
+        # slot(s) with weight 1.0. Routing selects the remaining topk-shared
+        # experts from the first E-shared experts only (shared experts are masked
+        # out of the gate). The shared experts are ordinary rows of w1/w2, so both
+        # the torch reference and the fused kernel treat them as normal experts
+        # that happen to be selected by all tokens with weight 1.0.
+        if shared >= topk or shared >= E:
+            raise ValueError(
+                f"shared={shared} must be < topk={topk} and < E={E}"
+            )
+        n_routed_experts = E - shared
+        n_routed_topk = topk - shared
+        topk_weights_r, topk_ids_r = fused_topk(
+            input, score[:, :n_routed_experts].contiguous(), n_routed_topk, True
+        )
+        shared_ids = (
+            torch.arange(n_routed_experts, E, device=topk_ids_r.device)
+            .to(topk_ids_r.dtype)
+            .unsqueeze(0)
+            .expand(token, shared)
+        )
+        shared_w = torch.ones(
+            (token, shared), dtype=topk_weights_r.dtype, device=topk_weights_r.device
+        )
+        topk_ids = torch.cat([topk_ids_r, shared_ids], dim=1).contiguous()
+        topk_weights = torch.cat([topk_weights_r, shared_w], dim=1).contiguous()
+    else:
+        topk_weights, topk_ids = fused_topk(input, score, topk, True)
 
     if qType == aiter.QuantType.per_Tensor:
         w1_qt, w1_scale = aiter.pertoken_quant(w1.view(E, -1), quant_dtype=WQDType)
@@ -662,6 +692,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--shared",
+    type=int,
+    default=0,
+    help="""Number of shared/fused experts (mirrors poc_kl). The last `shared`
+    experts (ids E-shared..E-1) are appended to every token's last topk slot(s)
+    with weight 1.0; routing picks topk-shared experts from the first E-shared.
+    E and topk are the totals (incl. shared). Default 0 (no shared expert).
+    e.g.: --shared 1   with -e 257 -k 9  => 256 routed experts + 1 shared.""",
+)
+
+parser.add_argument(
     "-p",
     "--preshuffle",
     type=dtypes.str2bool,
@@ -976,6 +1017,7 @@ def _iter_legacy_cases():
             doweight_stage1=doweight_stage1,
             strict_accuracy=False,
             check_aot_cache=False,
+            shared=args.shared,
             swiglu_limit=_effective_swiglu_limit(
                 quant_type, aq_dtype, wq_dtype, args.swiglu_limit
             ),

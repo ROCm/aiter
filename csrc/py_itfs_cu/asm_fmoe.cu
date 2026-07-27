@@ -76,26 +76,27 @@ class FMoeKernel
     bool is_int4                = false;
     uint32_t num_persistent_tgs = 0;
     const char* name            = nullptr;
-    //Kernel is processing 1 token per TG and does not require sorting.
-    bool is_flat_dispatch = false;
+    // 0: host-sorted, 1: one-token-per-TG FLAT grid, 2: embedded sort with
+    // the normal persistent grid. Modes 1 and 2 both consume raw topk inputs.
+    int flat_mode = 0;
 
     public:
     FMoeKernel(const char* name,
                const char* hsaco,
                uint32_t sub_GU             = 512,
                uint32_t num_persistent_tgs = 0,
-               bool is_flat_dispatch       = false) : kernel(name, hsaco)
+               int flat_mode               = 0) : kernel(name, hsaco)
     {
         this->sub_GU             = sub_GU;
         this->num_persistent_tgs = num_persistent_tgs;
         this->name               = name;
-        this->is_flat_dispatch   = is_flat_dispatch;
+        this->flat_mode           = flat_mode;
     };
 
     const char* get_name() const { return name; }
     int get_num_persistent_tgs() { return num_persistent_tgs; }
     int get_sub_GU() { return sub_GU; }
-    bool get_is_flat_dispatch() const { return is_flat_dispatch; }
+    int get_flat_mode() const { return flat_mode; }
     void set_4bit(bool is_4bit_) { is_int4 = is_4bit_; }
 
     template <int I_elemSize, int O_elemSize, bool switchGxy = false>
@@ -190,7 +191,7 @@ class FMoeKernel
         // FLAT (manifest flat): raw topk in sorted_* slots; no host moe_sort.
         // gdx=tiles, gdy=topk, gdz=tokens; switchGxy swaps gdx/gdy at launch.
         // One TG per (token, top-k slot); sub_X_cnt unused for grid sizing.
-        if(this->is_flat_dispatch)
+        if(this->flat_mode == 1)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
@@ -242,7 +243,13 @@ class FMoeKernel
 };
 
 FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
+    int inter_dim,
+    int sub_X_cnt,
+    CFG* cfgs,
+    int smf = 0,
+    std::string kernel_name = "",
+    int block_size_M = 32,
+    int flat_mode = 0)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -265,7 +272,8 @@ FMoeKernel* get_heuristic_kernel(
             if(el.first.find(arch_id) != 0)
                 continue;
             const auto& cfg = el.second;
-            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m)
+            if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
+               cfg.flat == flat_mode)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -307,14 +315,21 @@ FMoeKernel* get_heuristic_kernel(
         const auto& cfg     = it->second;
         const char* name    = cfg.knl_name.c_str();
         const char* co_name = cfg.co_name.c_str();
+        AITER_CHECK(cfg.flat == flat_mode,
+                    __func__,
+                    ": tuned flat mode ",
+                    flat_mode,
+                    " does not match kernel manifest mode ",
+                    cfg.flat,
+                    " for ",
+                    name);
         if(cfg.ps == 1)
             num_persistent_tgs = cfg.tg_num_perCU * num_cu;
         else
             num_persistent_tgs = 0;
 
-        const bool is_flat_dispatch = (cfg.flat != 0);
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
-            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, is_flat_dispatch);
+            return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
         });
     }
     else
@@ -543,8 +558,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     const char* kernel_name,
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
+    int flat_mode,
     hipStream_t stream),
-    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, stream))
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc2_smooth_scale, activation, flat_mode, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -608,7 +624,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr =
+            get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, flat_mode);
         impl_ptr->set_4bit(true);
     }
     else if((input->dtype() == AITER_DTYPE_bf16 || input->dtype() == AITER_DTYPE_fp16) &&
@@ -627,7 +644,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr =
+            get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, flat_mode);
         impl_ptr->set_4bit(true);
     }
     else if(input->dtype() == AITER_DTYPE_i8 || input->dtype() == AITER_DTYPE_u8) // int8
@@ -644,7 +662,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenInt8_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenInt8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr =
+            get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, flat_mode);
     }
     else if(input->dtype() == AITER_DTYPE_fp8) // fp8
     {
@@ -660,7 +679,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenFp8_g1u1_gelu;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenFp8_g1u1. ");
-        impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
+        impl_ptr =
+            get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str, 32, flat_mode);
     }
     else
     {
