@@ -25,12 +25,14 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import buffer_ops, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
