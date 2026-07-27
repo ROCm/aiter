@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
-
-import contextlib
 
 from aiter.ops.flydsl.utils import is_flydsl_available
 
@@ -17,7 +17,7 @@ if torch is None or not torch.cuda.is_available():
 if not is_flydsl_available():
     pytest.skip("FlyDSL is not available on this device.", allow_module_level=True)
 
-from aiter.ops.flydsl import flydsl_top_k_per_row_decode  # noqa: E402
+from aiter.ops.flydsl import flydsl_top_k_per_row_decode
 
 SUPPORTED_KS = (256, 512, 1024, 2048)
 DISTRIBUTIONS = ("random", "ties", "10LSBits")
@@ -122,9 +122,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     if row_len < k:
         pad = actual_row[row_len:k]
-        assert (pad == -1).all(), (
-            f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
-        )
+        assert (
+            pad == -1
+        ).all(), f"expected -1 padding, got {pad[pad != -1][:8].tolist()}"
 
     expected = torch.topk(logits_row[:row_len], valid).indices
     a_set, e_set = set(a.tolist()), set(expected.tolist())
@@ -133,9 +133,9 @@ def _assert_row_topk_set(logits_row, actual_row, k, row_len):
 
     a_only = sorted(a_set - e_set)
     e_only = sorted(e_set - a_set)
-    assert len(a_only) == len(e_only), (
-        f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
-    )
+    assert len(a_only) == len(
+        e_only
+    ), f"set size mismatch: {len(a_only)} extra vs {len(e_only)} missing"
 
     av = torch.tensor([logits_row[i].item() for i in a_only]).sort().values
     ev = torch.tensor([logits_row[i].item() for i in e_only]).sort().values
@@ -299,6 +299,7 @@ def _tier_override(mode):
     """Set FLYDSL_TOPK_TIERED_OVERRIDE and clear the config/launcher caches so the
     override actually takes effect (both are cached and otherwise ignore env)."""
     import os
+
     import aiter.ops.flydsl.topk_per_row_decode as m
 
     prev = os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE")

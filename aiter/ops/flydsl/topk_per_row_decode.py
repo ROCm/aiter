@@ -3,23 +3,24 @@
 """High-level FlyDSL decode TopK-per-row API."""
 
 from __future__ import annotations
+
 import functools
 import math
 import os
+
 import torch
+from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 from .kernels.tensor_shim import _run_compiled
+from .kernels.topk_per_row_decode_tiered import BLOCK_THREADS as _TIERED_BLOCK_THREADS
+from .kernels.topk_per_row_decode_tiered import LOAD_VEC as _TIERED_LOAD_VEC
+from .kernels.topk_per_row_decode_tiered import SCAN_STAGES as _TIERED_SCAN_STAGES
 from .kernels.topk_per_row_decode_tiered import (
-    BLOCK_THREADS as _TIERED_BLOCK_THREADS,
-    LOAD_VEC as _TIERED_LOAD_VEC,
-    SCAN_STAGES as _TIERED_SCAN_STAGES,
     create_topk_per_row_decode_tiered_kernel,
     needs_workspace_zero,
     topk_workspace_slots,
 )
-
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
 
 ##################################
 

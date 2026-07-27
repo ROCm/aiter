@@ -69,7 +69,7 @@ def add_flydsl_package_path() -> None:
 
 
 # Reuse the harness data generators for parity with the benchmark.
-from op_tests.benchmark_topk_per_row_decode import (  # noqa: E402
+from op_tests.benchmark_topk_per_row_decode import (
     make_logits,
     make_row_ends,
 )
