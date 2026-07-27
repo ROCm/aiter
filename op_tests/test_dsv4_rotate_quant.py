@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from aiter.test_common import (
-    checkAllclose,
-    benchmark,
-    run_perftest,
-)
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
 from aiter import dtypes, get_gfx
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 from aiter.utility.fp4_utils import f32_to_mxfp4, mxfp4_to_f32
-import argparse
-import pandas as pd
 
 torch.set_default_device("cuda")
 
@@ -154,7 +156,7 @@ def kv_fp4_preshuffle_layout(
     negative slot marks a padded token that is skipped. Matches the kernel's
     ``kv_fp4_preshuffle_offset`` / ``kv_scale_preshuffle_offset`` addressing.
     """
-    num_tokens, d_packed = kv_fp4_dense.shape
+    _num_tokens, d_packed = kv_fp4_dense.shape
     d = d_packed * 2
     k_tiles = d // 128
 

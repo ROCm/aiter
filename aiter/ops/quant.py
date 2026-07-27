@@ -1227,7 +1227,6 @@ def _rotate_activation_fp4quant(
     shuffle_scale: bool = True,
 ) -> None:
     """Hadamard-rotate activation, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
@@ -1236,14 +1235,13 @@ def _rotate_activation_bf16(
     input: torch.Tensor,
 ) -> None:
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
-    ...
 
 
 def rotate_activation(
     out: torch.Tensor,
     input: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-    group_size: Optional[int] = None,
+    scale: torch.Tensor | None = None,
+    group_size: int | None = None,
     shuffle_scale: bool = True,
 ) -> None:
     """Walsh-Hadamard transform along the last dim (1/sqrt(N) scaling),
@@ -1284,7 +1282,6 @@ def _rope_rotate_activation_fp4quant(
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
     Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
@@ -1298,7 +1295,6 @@ def _rope_rotate_activation_bf16(
     do_rotate_act: bool = True,
 ) -> None:
     """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
-    ...
 
 
 @compile_ops(
@@ -1319,7 +1315,6 @@ def _rope_rotate_activation_fp8quant(
     fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
     receives the per-(row, ``1 x group_size``) block scales ``scale = absMax / fp8_max``.
     """
-    ...
 
 
 def rope_rotate_activation(
@@ -1329,8 +1324,8 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
-    out_scale: Optional[torch.Tensor] = None,
-    group_size: Optional[int] = None,
+    out_scale: torch.Tensor | None = None,
+    group_size: int | None = None,
     shuffle_scale: bool = True,
     do_rotate_act: bool = True,
 ) -> None:
@@ -1407,4 +1402,3 @@ def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
     slot ``slot_mapping[token]`` (= physical_block * kv_block_size + offset); a
     negative entry marks a padded token whose write is skipped.
     """
-    ...

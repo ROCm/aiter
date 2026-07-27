@@ -72,29 +72,29 @@ previous-fwd. Caller MUST invoke BEFORE ``update_compressor_states``.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector, buffer_ops
-from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T, Int32, Stream
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import math as fmath
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.typing import Int32, Stream, T
 
-from .tensor_shim import _to_raw, _run_compiled
-from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtypeInt,
+)
+from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _MxRoundInt,
 )
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -2622,26 +2622,26 @@ def flydsl_fused_compress_attn(
     rms_eps: float,
     cos_cache: torch.Tensor,  # [max_pos, ..., RD/2] bf16
     sin_cache: torch.Tensor,
-    kv_cache: Optional[torch.Tensor],  # bf16 or fp8; None ? no scatter
-    block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] i32
+    kv_cache: torch.Tensor | None,  # bf16 or fp8; None ? no scatter
+    block_tables: torch.Tensor | None,  # [bs, max_blocks_per_seq] i32
     k_per_block: int,
     overlap: bool,
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
     quant: bool = False,
-    cache_scale: Optional[torch.Tensor] = None,  # fp32 [NB, k_per_block]
+    cache_scale: torch.Tensor | None = None,  # fp32 [NB, k_per_block]
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     # Master quant selector; overrides the legacy `quant` bool. Accepts:
     #   "none" | "fp8"/"per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main
     #   nm-asm) | "fp4". None -> derive from `quant` ("per_row_fp8" if quant).
-    quant_mode: Optional[str] = None,
-    k_split_num_waves: Optional[int] = None,
-    k_rope_cache: Optional[
-        torch.Tensor
-    ] = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
-    stream: Optional[torch.cuda.Stream] = None,
+    quant_mode: str | None = None,
+    k_split_num_waves: int | None = None,
+    k_rope_cache: (
+        torch.Tensor | None
+    ) = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """FlyDSL drop-in replacement for ``fused_compress_attn`` (Triton).
 

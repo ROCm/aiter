@@ -30,6 +30,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.fused_compress_attn import (
     csa_ksplit_num_waves,
     flydsl_fused_compress_attn,
@@ -39,7 +40,6 @@ from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 
@@ -102,7 +102,7 @@ def _build_inputs(shape, bs, mtp, mode):
     Both modes append SENTINEL_PAD trailing rows with position=-1 so the
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
-    label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    _label, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
     quant = quant_mode in ("fp8", "group_fp8", "fp4")
     if get_gfx() == "gfx1250":
         preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
@@ -215,32 +215,32 @@ def _build_inputs(shape, bs, mtp, mode):
         + D * kv_cache.element_size()  # compressed cache write (fp8=1B / bf16=2B)
     )
 
-    return dict(
-        nbytes=nbytes,
-        kv_in=kv_in,
-        score_in=score_in,
-        kv_state=kv_state,
-        score_state=score_state,
-        state_slot_mapping=state_slot_mapping,
-        ape=ape,
-        rms_weight=rms_weight,
-        cos_cache=cos_cache,
-        sin_cache=sin_cache,
-        plan_gpu=plan,
-        kv_cache=kv_cache,
-        cache_scale=cache_scale,
-        block_tables=block_tables,
-        k_per_block=K_PER_BLOCK,
-        head_dim=D,
-        rope_head_dim=RD,
-        ratio=ratio,
-        overlap=overlap,
-        quant=quant,
-        quant_mode=quant_mode,
-        use_ue8m0=ue8m0,
-        preshuffle=preshuffle,
-        rms_eps=RMS_EPS,
-    )
+    return {
+        "nbytes": nbytes,
+        "kv_in": kv_in,
+        "score_in": score_in,
+        "kv_state": kv_state,
+        "score_state": score_state,
+        "state_slot_mapping": state_slot_mapping,
+        "ape": ape,
+        "rms_weight": rms_weight,
+        "cos_cache": cos_cache,
+        "sin_cache": sin_cache,
+        "plan_gpu": plan,
+        "kv_cache": kv_cache,
+        "cache_scale": cache_scale,
+        "block_tables": block_tables,
+        "k_per_block": K_PER_BLOCK,
+        "head_dim": D,
+        "rope_head_dim": RD,
+        "ratio": ratio,
+        "overlap": overlap,
+        "quant": quant,
+        "quant_mode": quant_mode,
+        "use_ue8m0": ue8m0,
+        "preshuffle": preshuffle,
+        "rms_eps": RMS_EPS,
+    }
 
 
 def _run_kernel(inp, *, use_2kernel):
@@ -339,7 +339,7 @@ def _check_fp8_cache(out_cache, out_scale, ref_cache, ref_scale, msg):
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
-    _, D, RD, ratio, overlap, quant_mode, ue8m0, preshuffle = shape
+    _, D, RD, ratio, overlap, quant_mode, ue8m0, _preshuffle = shape
     quant = quant_mode in ("fp8", "fp4")
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
