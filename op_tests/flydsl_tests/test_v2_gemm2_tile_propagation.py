@@ -38,6 +38,37 @@ def test_v2_tuner_filters_stage2_tiles_for_shape():
     assert {cfg["tile_k"] for cfg in configs} == {128, 256}
 
 
+def test_v2_tuner_excludes_bm16_retiling():
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FmoeTuner
+
+    tuner = FmoeTuner.__new__(FmoeTuner)
+    info = (
+        "gfx950",
+        256,
+        16,
+        6144,
+        512,
+        257,
+        9,
+        ActivationType.Silu,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        QuantType.per_1x32,
+        True,
+        False,
+    )
+    tasks = tuner.gen_flydsl_v2_2stages_task(info, [16, 32, 64, 128])
+    configs = [
+        parse_flydsl_v2_gemm2_kernel(task[0][2])
+        for task in tasks
+        if task[0][1] == "stage2"
+    ]
+
+    assert configs
+    assert all(cfg["tile_m"] != 16 for cfg in configs)
+
+
 def test_v2_tuner_launch_forwards_tiles(monkeypatch):
     from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
     from aiter.ops.flydsl.kernels import mxmoe_dispatcher

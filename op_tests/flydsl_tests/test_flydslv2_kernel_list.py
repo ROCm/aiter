@@ -47,13 +47,24 @@ def test_legacy_v2_name_rejected():
 
 
 def test_stage2_v2_kernels_fp4_persist_only():
-    # fp4: persist in {False, True}; block_m=64 -> BM in {16,32,64}
+    # fp4: persist in {False, True}; block_m=64 -> BM in {32,64}
     ks = get_flydsl_stage2_v2_kernels("fp4", "fp4", "bf16", block_m=64)
     assert all(parse_flydsl_v2_gemm2_kernel(k) is not None for k in ks)
     bms = {parse_flydsl_v2_gemm2_kernel(k)["tile_m"] for k in ks}
     assert bms <= {16, 32, 64} and 64 in bms
     persists = {parse_flydsl_v2_gemm2_kernel(k)["persist"] for k in ks}
     assert persists == {False, True}
+
+
+def test_stage2_v2_kernels_tile_m16_requires_native_sbm16():
+    # tile_m=16 A-scale chunks are only valid at sbm==16, so a larger sort
+    # block must never be re-tiled down to 16.
+    ks = get_flydsl_stage2_v2_kernels("fp4", "fp4", "bf16", block_m=16)
+    assert {parse_flydsl_v2_gemm2_kernel(k)["tile_m"] for k in ks} == {16}
+    for block_m in (32, 64, 128):
+        ks = get_flydsl_stage2_v2_kernels("fp4", "fp4", "bf16", block_m=block_m)
+        tile_ms = {parse_flydsl_v2_gemm2_kernel(k)["tile_m"] for k in ks}
+        assert 16 not in tile_ms, f"block_m={block_m} offered tile_m=16: {tile_ms}"
 
 
 def test_stage2_v2_kernels_fp8_no_persist():
