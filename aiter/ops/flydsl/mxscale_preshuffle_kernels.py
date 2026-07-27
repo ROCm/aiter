@@ -88,11 +88,12 @@ def flydsl_mxscale_preshuffle_gemm(
     partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
     slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
 
-    blockscale=True: a_scale/b_scale are *compact coarse* E8M0 (a_scale
-    [rows, K//128] = 1x128 per-token; b_scale [N//128, K//128] = 128x128 per-block).
-    They are packed to the compact shuffled layout here and the kernel broadcasts
-    them to the 1x32 scaled-MFMA in the scale load address (no per-1x32 buffer is
-    materialized — saves scale memory/bandwidth). Default MX mode is unchanged.
+    blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
+    the caller built (once, on host) via _compact_blockscale_a/_b from the coarse
+    E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]). The op does NOT
+    repack here — symmetric with MX mode where the caller pre-shuffles. The kernel
+    broadcasts them to the 1x32 scaled-MFMA via the scale load address. Prepare the
+    static B-scale at weight-prep time to keep it off the per-call path.
     """
     if not is_flydsl_available():
         raise RuntimeError(
@@ -131,8 +132,8 @@ def flydsl_mxscale_preshuffle_gemm(
     if blockscale:
         if N % 128 != 0:
             raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
-        a_scale = _compact_blockscale_a(a_scale, K)
-        b_scale = _compact_blockscale_b(b_scale, N, K)
+        # a_scale/b_scale are already compact-shuffled by the caller
+        # (_compact_blockscale_a/_b, built once on host). No per-call repack here.
         bs_mode = "ab"
 
     st = stream if stream is not None else torch.cuda.current_stream()

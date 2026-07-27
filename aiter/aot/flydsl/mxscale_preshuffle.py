@@ -47,6 +47,8 @@ def _compile_to_cache(
     import torch
 
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
+        _compact_blockscale_a,
+        _compact_blockscale_b,
         flydsl_mxscale_preshuffle_gemm,
     )
 
@@ -58,11 +60,14 @@ def _compile_to_cache(
         A = torch.zeros((M, a_bytes), dtype=torch.uint8, device=dev)
         Bt = torch.zeros((N, b_bytes), dtype=torch.uint8, device=dev)
         if blockscale:
-            # compact coarse scales: A 1x128 (rows, K//128), B 128x128 (N//128, K//128)
-            a_scale = torch.zeros(
-                ((M + 31) // 32 * 32, K // 128), dtype=torch.uint8, device=dev
-            )
-            b_scale = torch.zeros((N // 128, K // 128), dtype=torch.uint8, device=dev)
+            # caller-prepared compact-shuffled scales (op no longer repacks); build
+            # from coarse A 1x128 (rows,K//128) / B 128x128 (N//128,K//128).
+            a_scale = _compact_blockscale_a(
+                torch.zeros((M + 31) // 32 * 32, K // 128, dtype=torch.uint8), K
+            ).to(dev)
+            b_scale = _compact_blockscale_b(
+                torch.zeros(N // 128, K // 128, dtype=torch.uint8), N, K
+            ).to(dev)
         else:
             a_scale = torch.zeros(
                 ((M + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev
