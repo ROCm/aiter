@@ -4593,7 +4593,11 @@ class FmoeTuner(TunerCommon):
                 # not end with _fp8 (those fuse the cast in stage1).
                 if q_dtype_a == dtypes.fp4x2:
                     from aiter.test_common import run_perftest
-                    from aiter.ops.triton.quant.fused_mxfp4_quant import (
+
+                    # Benchmark the same implementation fused_moe_ dispatches to
+                    # (aiter.ops.quant, HIP); the triton one is never executed at
+                    # runtime, so timing it skews the non-fused fairness penalty.
+                    from aiter.ops.quant import (
                         fused_dynamic_mxfp4_quant_moe_sort,
                     )
 
