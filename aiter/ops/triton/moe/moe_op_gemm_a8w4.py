@@ -283,7 +283,7 @@ def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_ctas = 4
+    num_ctas = 1
     ctas_per_cga = get_ctas_per_cga(num_ctas, is_prefill=m >= 1024)
     split_k = 1
 
