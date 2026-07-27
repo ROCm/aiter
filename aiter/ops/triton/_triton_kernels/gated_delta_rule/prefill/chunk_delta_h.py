@@ -1000,6 +1000,7 @@ def chunk_gated_delta_rule_fwd_h_opt(
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "USE_STATE_INDICES": lambda args: args["state_indices"] is not None,
     }
 )
 @triton.autotune(
@@ -1026,6 +1027,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     h,
     h0,
     ht,
+    state_indices,
     cu_seqlens,
     chunk_offsets,
     T,
@@ -1042,10 +1044,17 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_STATE_INDICES: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
+    # Indexed pool: each sequence's state slot is gathered from `state_indices`;
+    # otherwise the slot is the dense sequence index (slot == i_n).
+    if USE_STATE_INDICES:
+        i_ss = tl.load(state_indices + i_n).to(tl.int32)
+    else:
+        i_ss = i_n
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -1085,10 +1094,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
             v_new += (((i_n * H + i_h) * T_flat) * V).to(tl.int64)
     stride_h = H * V * K
     stride_k = Hg * K
+    # `i_ss * H + i_h` == `i_nh` on the dense path; the int64 cast happens before
+    # the `V * K` scale so pool offsets never overflow int32.
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * V * K
+        h0 = h0 + (i_ss * H + i_h).to(tl.int64) * V * K
     if STORE_FINAL_STATE:
-        ht = ht + i_nh * V * K
+        ht = ht + (i_ss * H + i_h).to(tl.int64) * V * K
 
     if USE_G:
         if IS_VARLEN:
@@ -1292,6 +1303,8 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     state_dtype: torch.dtype | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1308,6 +1321,16 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     ORIGINAL cu_seqlens (data tensors are expected pre-sliced); offsets are
     rebased internally via the cached prologue helpers so the chunk-index /
     offset build stays cache-warm across forward calls.
+
+    State handling:
+      * Dense (default): ``initial_state`` is ``[N, H, V, K]`` (slot == i_n) and
+        ``final_state`` is a freshly allocated ``[N, H, V, K]`` tensor.
+      * Indexed pool: pass ``initial_state`` as the pool ``[pool_size, H, V, K]``
+        plus ``initial_state_indices`` ``[N]``; each sequence's slot is gathered
+        from the index array.
+      * ``inplace_final_state`` (default: ``True`` when ``initial_state_indices``
+        is given) writes the final state back into ``initial_state`` in place and
+        returns that same buffer as ``final_state`` (no extra allocation).
     """
     B, T, Hg, K = k.shape
     BT = chunk_size
@@ -1352,6 +1375,23 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             f"`state_dtype` ({_state_dtype})."
         )
 
+    has_indices = initial_state_indices is not None
+    inplace = has_indices if inplace_final_state is None else inplace_final_state
+    if inplace and initial_state is None:
+        raise ValueError("`inplace_final_state` requires `initial_state`.")
+    # Indexed slots address the shared pool, so the final state must be written
+    # back into that pool in place; a dense `[N, ...]` buffer cannot hold them.
+    if has_indices and not inplace:
+        raise ValueError(
+            "`initial_state_indices` requires in-place update; "
+            "leave `inplace_final_state` unset or set it to True."
+        )
+    if inplace and not initial_state.is_contiguous():
+        raise ValueError("`initial_state` must be contiguous for in-place update.")
+    state_indices = (
+        initial_state_indices.to(torch.int32).contiguous() if has_indices else None
+    )
+
     if gk is not None:
         gk = gk.contiguous()
         if use_exp2:
@@ -1359,9 +1399,14 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
             gk = gk * RCP_LN2
 
     h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=_state_dtype) if output_final_state else None
-    )
+    if not output_final_state:
+        final_state = None
+    elif inplace:
+        # Alias the caller's pool: the kernel loads h0 fully before storing ht,
+        # so writing the final state back into `initial_state` is safe.
+        final_state = initial_state
+    else:
+        final_state = k.new_empty(N, H, V, K, dtype=_state_dtype)
     v_new = k.new_empty(B, H, T_flat, V, dtype=u.dtype) if save_new_value else None
 
     def grid(meta):
@@ -1377,6 +1422,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
         h=h,
         h0=initial_state,
         ht=final_state,
+        state_indices=state_indices,
         cu_seqlens=kernel_cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,

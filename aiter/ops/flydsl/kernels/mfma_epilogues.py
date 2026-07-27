@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+
 """Reusable epilogue helpers for MFMA 16x16-based kernels.
 
 This module provides:
@@ -19,6 +22,10 @@ This module provides:
     2) barrier
     3) remap threads into (MLane, NLane) = (8,32) and read half2 from LDS,
        then call `store_pair(...)` to emit the final global store/atomic.
+
+  When ``lds_out_split`` is provided, the epilogue runs in split-LDS mode:
+  waves are partitioned into two groups (group A uses ``lds_out``, group B
+  uses ``lds_out_split``), each handling half of the N dimension.
 
 These helpers are intentionally *dialect-agnostic*: callers pass the dialect
 modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.

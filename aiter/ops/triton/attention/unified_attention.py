@@ -230,6 +230,13 @@ def select_3d_config(
         ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
 
+    # gfx1151 (RDNA3.5) decode is memory-latency-bound at bs=1: the default 2
+    # warps/workgroup leave unified_attention at only ~31% of the LPDDR5X
+    # bandwidth roofline. 8 warps/workgroup reach ~59% (1.5-1.9x on bf16 decode)
+    # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
+    if DEVICE_ARCH == "gfx1151":
+        attn_warps = 8
+
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
         "NUM_SEGMENTS_PER_SEQ": num_segments,
