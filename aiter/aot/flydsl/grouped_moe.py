@@ -237,6 +237,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 1,
                 numel,
+                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
                 grid,
                 stream=0,
             )
@@ -292,6 +293,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             E,
             max_m,
             tile_m,
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
 
@@ -390,6 +392,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             ptr_arg(torch.empty(0, dtype=dtype, device=dev)),
             token_num,
             a2_out_e * a2_out_m * (model_dim // 2),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
             stream=0,
         )
 
