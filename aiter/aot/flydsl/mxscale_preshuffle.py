@@ -31,7 +31,19 @@ def _default_csvs() -> List[str]:
 
 
 def _compile_to_cache(
-    M, N, K, tile_m, tile_n, tile_k, a_dtype, b_dtype, out_dtype, waves_per_eu
+    M,
+    N,
+    K,
+    tile_m,
+    tile_n,
+    tile_k,
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    waves_per_eu,
+    xcd_swizzle=0,
+    split_k=1,
+    blockscale=False,
 ):
     import torch
 
@@ -46,12 +58,19 @@ def _compile_to_cache(
     with compile_only_env():
         A = torch.zeros((M, a_bytes), dtype=torch.uint8, device=dev)
         Bt = torch.zeros((N, b_bytes), dtype=torch.uint8, device=dev)
-        a_scale = torch.zeros(
-            ((M + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev
-        )
-        b_scale = torch.zeros(
-            ((N + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev
-        )
+        if blockscale:
+            # compact coarse scales: A 1x128 (rows, K//128), B 128x128 (N//128, K//128)
+            a_scale = torch.zeros(
+                ((M + 31) // 32 * 32, K // 128), dtype=torch.uint8, device=dev
+            )
+            b_scale = torch.zeros((N // 128, K // 128), dtype=torch.uint8, device=dev)
+        else:
+            a_scale = torch.zeros(
+                ((M + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev
+            )
+            b_scale = torch.zeros(
+                ((N + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev
+            )
         Out = torch.zeros((M, N), dtype=out_dt, device=dev)
         flydsl_mxscale_preshuffle_gemm(
             A,
@@ -65,6 +84,9 @@ def _compile_to_cache(
             tile_n=tile_n,
             tile_k=tile_k,
             waves_per_eu=waves_per_eu,
+            xcd_swizzle=xcd_swizzle,
+            split_k=split_k,
+            blockscale=blockscale,
         )
 
 
@@ -73,23 +95,37 @@ def parse_csv(csv_path: str) -> List[Dict]:
         return list(_csv.DictReader(f))
 
 
-def compile_one_config(row: Dict) -> bool:
+def compile_one_config(row: dict, blockscale: bool = False) -> bool:
     name = (row.get("kernelName") or "").strip()
     parsed = parse_kernel_name(name)
     if parsed is None:
         return False
-    _compile_to_cache(
-        M=int(row["M"]),
-        N=int(row["N"]),
-        K=int(row["K"]),
-        tile_m=parsed["tile_m"],
-        tile_n=parsed["tile_n"],
-        tile_k=parsed["tile_k"],
-        a_dtype=parsed["a_dtype"],
-        b_dtype=parsed["b_dtype"],
-        out_dtype=parsed["out_dtype"],
-        waves_per_eu=parsed["waves_per_eu"],
-    )
+    M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
+    cfg = {
+        "M": M,
+        "N": N,
+        "K": K,
+        "tile_m": parsed["tile_m"],
+        "tile_n": parsed["tile_n"],
+        "tile_k": parsed["tile_k"],
+        "a_dtype": parsed["a_dtype"],
+        "b_dtype": parsed["b_dtype"],
+        "out_dtype": parsed["out_dtype"],
+        "waves_per_eu": parsed["waves_per_eu"],
+        "xcd_swizzle": parsed["xcd_swizzle"],
+        "split_k": parsed["split_k"],
+    }
+    # MX per-1x32 path (default, always).
+    _compile_to_cache(**cfg)
+    # blockscale path (a8w8 only, N%128==0) is a distinct Constexpr -> separate
+    # binary; precompile it too so runtime doesn't JIT on first call.
+    if (
+        blockscale
+        and parsed["a_dtype"] == "fp8"
+        and parsed["b_dtype"] == "fp8"
+        and N % 128 == 0
+    ):
+        _compile_to_cache(**cfg, blockscale=True)
     return True
 
 
@@ -99,6 +135,12 @@ def main():
     )
     ap.add_argument(
         "--csv", nargs="+", default=_default_csvs(), help="tuned CSV(s) to precompile"
+    )
+    ap.add_argument(
+        "--blockscale",
+        action="store_true",
+        help="also precompile the a8w8 blockscale variant (A 1x128, B 128x128) "
+        "for each fp8/fp8, N%%128==0 config",
     )
     args = ap.parse_args()
 
@@ -111,7 +153,7 @@ def main():
         for row in parse_csv(csv_path):
             total += 1
             try:
-                if compile_one_config(row):
+                if compile_one_config(row, blockscale=args.blockscale):
                     done += 1
                     print(
                         f"[aot.mxscale_preshuffle] compiled {row.get('kernelName')} "
