@@ -26,6 +26,7 @@ import os
 import sys
 import warnings
 from contextlib import contextmanager
+from typing import NamedTuple
 from unittest import mock
 
 import flydsl.expr as fx
@@ -42,7 +43,9 @@ from aiter.ops.flydsl.kernels.mla_reduce import (
     _get_splitk_scratch,
     compile_mla_reduce,
     compile_mla_reduce_splitk,
+    derive_actual_max_splits,
     plan_splitk,
+    plan_splitk_capture_safe,
     select_tier,
     should_use_persistent_launch,
 )
@@ -66,6 +69,47 @@ def mla_reduce_out_atol(dt: str | torch.dtype) -> float:
 
 _out_dtype = mla_reduce_out_dtype
 _out_atol = mla_reduce_out_atol
+
+
+class Inputs(NamedTuple):
+    """One reduce fixture: the five metadata tensors plus the two output buffers.
+
+    Field order matches the ``flydsl_mla_reduce_v1`` / HIP ``mla_reduce_v1``
+    argument order (``reduce_final_map`` before ``reduce_partial_map``). The raw
+    pointer launch takes the two maps the other way round, so ``make_runner``
+    names ``pmap``/``fmap`` explicitly rather than splatting a bundle.
+    """
+
+    po: torch.Tensor  # fp32 [num_partial_rows, H, Dv]
+    pl: torch.Tensor  # fp32 [num_partial_rows, H]
+    indptr: torch.Tensor  # i32 [num_reduce_tile + 1], CSR over splits
+    fmap: torch.Tensor  # i32 [num_reduce_tile, 2], {q_start, q_end}
+    pmap: torch.Tensor  # i32 [indptr[-1]], partial-pool gather rows
+    fout: torch.Tensor  # out_dtype [num_final_rows, H, Dv]
+    flse: torch.Tensor  # fp32 [num_final_rows, H]
+
+    @property
+    def maps(self):
+        """The five metadata tensors, in ``mla_reduce_v1`` positional order."""
+        return self[:5]
+
+
+def _rand_partials(rows, H, Dv, device, g):
+    """Random fp32 partial pool; ``partial_lse`` is scaled to widen the online-softmax range."""
+    po = torch.randn(rows, H, Dv, dtype=torch.float32, device=device, generator=g)
+    pl = torch.randn(rows, H, dtype=torch.float32, device=device, generator=g) * 2.0
+    return po, pl
+
+
+def _garbage_final_map(num_tiles, active_tiles, device):
+    """``reduce_final_map`` with an identity q-range over the active prefix and an unmapped ``1 << 24`` tail, mirroring metadata that never writes the inactive slots."""
+    fmap = torch.empty(num_tiles, 2, dtype=torch.int32, device=device)
+    q = torch.arange(active_tiles, dtype=torch.int32, device=device)
+    fmap[:active_tiles, 0] = q
+    fmap[:active_tiles, 1] = q + 1
+    fmap[active_tiles:, 0] = 1 << 24
+    fmap[active_tiles:, 1] = (1 << 24) + 1
+    return fmap
 
 
 def build_irregular_inputs(
@@ -111,15 +155,7 @@ def build_irregular_inputs(
         max_base = 0
     num_partial_rows = max_base + M + pool_slack * M
 
-    partial_output = torch.randn(
-        num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
-    )
-    partial_lse = (
-        torch.randn(
-            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
-        )
-        * 2.0
-    )
+    partial_output, partial_lse = _rand_partials(num_partial_rows, H, Dv, device, g)
 
     q_start = torch.arange(num_tiles, dtype=torch.int32, device=device) * M
     reduce_final_map = torch.stack([q_start, q_start + M], dim=1).contiguous()
@@ -128,22 +164,19 @@ def build_irregular_inputs(
             reduce_final_map[t, 0] = 1 << 24
             reduce_final_map[t, 1] = (1 << 24) + M
 
-    final_output = torch.empty(num_tiles * M, H, Dv, dtype=out_dtype, device=device)
-    final_lse = torch.empty(num_tiles * M, H, dtype=torch.float32, device=device)
-    return (
+    return Inputs(
         partial_output,
         partial_lse,
         reduce_indptr,
         reduce_final_map,
         reduce_partial_map,
-        final_output,
-        final_lse,
+        torch.empty(num_tiles * M, H, Dv, dtype=out_dtype, device=device),
+        torch.empty(num_tiles * M, H, dtype=torch.float32, device=device),
     )
 
 
 def build_inputs(num_tiles, num_splits, H, Dv, out_dtype, M=1, device="cuda", seed=0):
-    """Dense/uniform reduce inputs: every tile has ``num_splits`` splits and the
-    gather map is contiguous."""
+    """Dense/uniform reduce inputs: every tile has ``num_splits`` splits and the gather map is contiguous."""
     return build_irregular_inputs(
         [num_splits] * num_tiles,
         H,
@@ -178,7 +211,7 @@ def build_serving_decode_inputs(
     active_splits = active_tiles * splits
     pool_slack = max(0, partial_pool - active_splits)
     splits_per_tile = [splits] * active_tiles + [0] * (num_reduce_tile - active_tiles)
-    po, pl, indptr, fmap, pmap, _, _ = build_irregular_inputs(
+    x = build_irregular_inputs(
         splits_per_tile,
         H,
         Dv,
@@ -189,14 +222,9 @@ def build_serving_decode_inputs(
         device=device,
         seed=seed,
     )
-    return (
-        po,
-        pl,
-        indptr,
-        fmap,
-        pmap,
-        torch.empty(active_tiles, H, Dv, dtype=out_dtype, device=device),
-        torch.empty(active_tiles, H, dtype=torch.float32, device=device),
+    return x._replace(
+        fout=torch.empty(active_tiles, H, Dv, dtype=out_dtype, device=device),
+        flse=torch.empty(active_tiles, H, dtype=torch.float32, device=device),
     )
 
 
@@ -216,25 +244,10 @@ def torch_ref(
 
 
 def torch_ref_gather(
-    po,
-    pl,
-    indptr,
-    fmap,
-    pmap,
-    H,
-    Dv,
-    out_dtype,
-    M=1,
-    num_partial_rows=None,
-    num_final_rows=None,
+    x, H, Dv, out_dtype, M=1, num_partial_rows=None, num_final_rows=None
 ):
-    """Gather-based online-softmax reference for irregular metadata.
-
-    Follows the kernel's CSR + gather contract: per tile it gathers partial rows via
-    ``pmap[indptr[t]:indptr[t+1]]`` and merges them; tiles with ``n_splits <= 1`` are
-    skipped (output rows stay zero). When ``num_partial_rows`` / ``num_final_rows``
-    are set, out-of-range pmap rows / q_start are skipped (mirrors guards-ON).
-    """
+    """Gather-based online-softmax reference for irregular metadata. Follows the kernel's CSR + gather contract: per tile it gathers partial rows via ``pmap[indptr[t]:indptr[t+1]]`` and merges them; tiles with ``n_splits <= 1`` are skipped (output rows stay zero). When ``num_partial_rows`` / ``num_final_rows`` are set, out-of-range pmap rows / q_start are skipped (mirrors guards-ON)."""
+    po, pl, indptr, fmap, pmap = x.maps
     num_tiles = fmap.shape[0]
     ref_out = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=po.device)
     ref_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=po.device)
@@ -273,22 +286,20 @@ def torch_ref_gather(
     return ref_out, ref_lse
 
 
-def hip_ref(po, pl, indptr, fmap, pmap, num_tiles, H, Dv, out_dtype, M=1):
-    """Reference output from HIP kn_mla_reduce_v1. Outputs are zero-initialized so
-    skipped (empty) tiles match a zero-initialized final buffer under test.
-    """
-    ref_out = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=po.device)
-    ref_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=po.device)
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, LDS_MAX_SPLITS, ref_out, ref_lse)
+def hip_ref(x, num_tiles, H, Dv, out_dtype, M=1):
+    """Reference output from HIP kn_mla_reduce_v1. Outputs are zero-initialized so skipped (empty) tiles match a zero-initialized final buffer under test."""
+    ref_out = torch.zeros(num_tiles * M, H, Dv, dtype=out_dtype, device=x.po.device)
+    ref_lse = torch.zeros(num_tiles * M, H, dtype=torch.float32, device=x.po.device)
+    aiter.mla_reduce_v1(*x.maps, M, LDS_MAX_SPLITS, ref_out, ref_lse)
     torch.cuda.synchronize()
     return ref_out, ref_lse
 
 
-def hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse, M=1):
-    """HIP reference sized to ``fout`` / ``flse`` (serving grids with sparse tiles)."""
-    ref_out = torch.zeros_like(fout)
-    ref_lse = torch.zeros_like(flse)
-    aiter.mla_reduce_v1(po, pl, indptr, fmap, pmap, M, LDS_MAX_SPLITS, ref_out, ref_lse)
+def hip_ref_like_fout(x, M=1):
+    """HIP reference sized to ``x.fout`` / ``x.flse`` (serving grids with sparse tiles)."""
+    ref_out = torch.zeros_like(x.fout)
+    ref_lse = torch.zeros_like(x.flse)
+    aiter.mla_reduce_v1(*x.maps, M, LDS_MAX_SPLITS, ref_out, ref_lse)
     torch.cuda.synchronize()
     return ref_out, ref_lse
 
@@ -300,15 +311,7 @@ def build_serving_sparse_grid_inputs(
     device="cuda",
     seed=0,
 ):
-    """batch=8 steady-state: 16384-tile grid, 8 active tiles × 32 splits.
-
-    Mirrors 131K-context serving metadata: partial pool 606 rows, CSR sentinel
-    at 256, garbage ``reduce_final_map`` / ``reduce_partial_map`` tail slots.
-
-    Tail tiles are flat at sentinel (``n_splits == 0``), already skipped by the
-    ``n_splits > 1`` clamp, so this fixture does **not** discriminate the
-    gather/store guards.
-    """
+    """batch=8 steady-state: 16384-tile grid, 8 active tiles × 32 splits. Mirrors 131K-context serving metadata: partial pool 606 rows, CSR sentinel at 256, garbage ``reduce_final_map`` / ``reduce_partial_map`` tail slots. Tail tiles are flat at sentinel (``n_splits == 0``), already skipped by the ``n_splits > 1`` clamp, so this fixture does **not** discriminate the gather/store guards."""
     g = torch.Generator(device=device).manual_seed(seed)
     num_reduce_tile = SERVING_NUM_REDUCE_TILE
     active_tiles = 8
@@ -322,21 +325,13 @@ def build_serving_sparse_grid_inputs(
         indptr_host.append(sentinel)
     reduce_indptr = torch.tensor(indptr_host, dtype=torch.int32, device=device)
 
-    partial_output = torch.randn(
-        num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
-    )
-    partial_lse = (
-        torch.randn(
-            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
-        )
-        * 2.0
-    )
+    partial_output, partial_lse = _rand_partials(num_partial_rows, H, Dv, device, g)
 
     reduce_partial_map = torch.empty(num_partial_rows, dtype=torch.int32, device=device)
     reduce_partial_map[:total_splits] = torch.arange(
         total_splits, dtype=torch.int32, device=device
     )
-    garbage_pmap = torch.randint(
+    reduce_partial_map[total_splits:] = torch.randint(
         -(1 << 30),
         1 << 30,
         (num_partial_rows - total_splits,),
@@ -344,25 +339,15 @@ def build_serving_sparse_grid_inputs(
         device=device,
         generator=g,
     )
-    reduce_partial_map[total_splits:] = garbage_pmap
 
-    reduce_final_map = torch.empty(num_reduce_tile, 2, dtype=torch.int32, device=device)
-    q = torch.arange(active_tiles, dtype=torch.int32, device=device)
-    reduce_final_map[:active_tiles, 0] = q
-    reduce_final_map[:active_tiles, 1] = q + 1
-    reduce_final_map[active_tiles:, 0] = 1 << 24
-    reduce_final_map[active_tiles:, 1] = (1 << 24) + 1
-
-    final_output = torch.zeros(active_tiles, H, Dv, dtype=out_dtype, device=device)
-    final_lse = torch.zeros(active_tiles, H, dtype=torch.float32, device=device)
-    return (
+    return Inputs(
         partial_output,
         partial_lse,
         reduce_indptr,
-        reduce_final_map,
+        _garbage_final_map(num_reduce_tile, active_tiles, device),
         reduce_partial_map,
-        final_output,
-        final_lse,
+        torch.zeros(active_tiles, H, Dv, dtype=out_dtype, device=device),
+        torch.zeros(active_tiles, H, dtype=torch.float32, device=device),
     )
 
 
@@ -377,16 +362,7 @@ def build_serving_mapped_slack_inputs(
     slack_p=4,
     slack_f=2,
 ):
-    """Small serving grid with allocation slack for in-process guard differentials.
-
-    Allocates ``partial_output`` / ``final_output`` with extra rows but returns
-    smaller *logical* ``num_partial_rows`` / ``num_final_rows`` for the kernel.
-    The fake-active tail (non-sentinel ``n_splits``) exercises the gather/store
-    guards adversarially.
-
-    Returns tensors plus a ``meta`` dict with logical bounds and discriminator
-    tile indices for tests.
-    """
+    """Small serving grid with allocation slack for in-process guard differentials. Allocates ``partial_output`` / ``final_output`` with extra rows but returns smaller *logical* ``num_partial_rows`` / ``num_final_rows`` for the kernel. The fake-active tail (non-sentinel ``n_splits``) exercises the gather/store guards adversarially. Returns tensors plus a ``meta`` dict with logical bounds and discriminator tile indices for tests."""
     g = torch.Generator(device=device).manual_seed(seed)
     active_tiles = 3
     gather_tile = 0
@@ -411,38 +387,22 @@ def build_serving_mapped_slack_inputs(
     logical_final_rows = active_tiles
     alloc_final_rows = logical_final_rows + slack_f
 
-    partial_output = torch.randn(
-        alloc_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
-    )
-    partial_lse = (
-        torch.randn(
-            alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g
-        )
-        * 2.0
-    )
+    partial_output, partial_lse = _rand_partials(alloc_partial_rows, H, Dv, device, g)
 
     reduce_partial_map = torch.arange(total_splits, dtype=torch.int32, device=device)
-    # Gather discriminator: one split on tile 0 points into mapped slack.
+    # Gather discriminator: one split on tile 0 points into mapped slack, holding
+    # the tile's max LSE so guards-OFF must visibly pull the result toward it.
     slack_p_row = logical_partial_rows
-    bad_split = splits_per_active // 2
-    reduce_partial_map[bad_split] = slack_p_row
+    reduce_partial_map[splits_per_active // 2] = slack_p_row
     partial_output[slack_p_row].fill_(1000.0)
-    partial_lse[slack_p_row].fill_(50.0)
     tile0_lse_max = partial_lse[:splits_per_active].max().item()
     partial_lse[slack_p_row].fill_(tile0_lse_max + 5.0)
 
-    reduce_final_map = torch.empty(num_tiles, 2, dtype=torch.int32, device=device)
-    q = torch.arange(active_tiles, dtype=torch.int32, device=device)
-    reduce_final_map[:active_tiles, 0] = q
-    reduce_final_map[:active_tiles, 1] = q + 1
-    reduce_final_map[active_tiles:store_tile, 0] = 1 << 24
-    reduce_final_map[active_tiles:store_tile, 1] = (1 << 24) + 1
-
+    # Store discriminator: one fake-active tail tile targets final-output slack.
+    reduce_final_map = _garbage_final_map(num_tiles, active_tiles, device)
     store_slack_q = logical_final_rows
     reduce_final_map[store_tile, 0] = store_slack_q
     reduce_final_map[store_tile, 1] = store_slack_q + 1
-    reduce_final_map[store_tile + 1 :, 0] = 1 << 24
-    reduce_final_map[store_tile + 1 :, 1] = (1 << 24) + 1
 
     last = int(reduce_indptr[num_tiles].item())
     t0_store = int(reduce_indptr[store_tile].item())
@@ -467,13 +427,15 @@ def build_serving_mapped_slack_inputs(
         "fout_slack_seed": fout_slack_seed,
     }
     return (
-        partial_output,
-        partial_lse,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        final_output,
-        final_lse,
+        Inputs(
+            partial_output,
+            partial_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            final_output,
+            final_lse,
+        ),
         meta,
     )
 
@@ -486,10 +448,7 @@ def build_serving_true_oob_inputs(
     seed=0,
     num_tiles=64,
 ):
-    """Fake-active tail with genuine OOB indices (guards-ON no-fault regression).
-
-    Cannot be run with ``disable_guards=True`` in-process (would GPU-fault).
-    """
+    """Fake-active tail with genuine OOB indices (guards-ON no-fault regression). Cannot be run with ``disable_guards=True`` in-process (would GPU-fault)."""
     g = torch.Generator(device=device).manual_seed(seed)
     active_tiles = 2
     splits_per_active = 32
@@ -507,45 +466,22 @@ def build_serving_true_oob_inputs(
     reduce_indptr = torch.tensor(indptr_host, dtype=torch.int32, device=device)
 
     num_partial_rows = 128
-    partial_output = torch.randn(
-        num_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
-    )
-    partial_lse = (
-        torch.randn(
-            num_partial_rows, H, dtype=torch.float32, device=device, generator=g
-        )
-        * 2.0
-    )
+    partial_output, partial_lse = _rand_partials(num_partial_rows, H, Dv, device, g)
 
+    # The tail tile's gather rows land past the end of the partial pool.
     reduce_partial_map = torch.arange(sentinel, dtype=torch.int32, device=device)
     tail_t0 = int(reduce_indptr[tail_tile].item())
     for i in range(tail_splits):
         reduce_partial_map[tail_t0 + i] = num_partial_rows + i
 
-    reduce_final_map = torch.empty(num_tiles, 2, dtype=torch.int32, device=device)
-    reduce_final_map[:active_tiles, 0] = torch.arange(
-        active_tiles, dtype=torch.int32, device=device
-    )
-    reduce_final_map[:active_tiles, 1] = torch.arange(
-        1, active_tiles + 1, dtype=torch.int32, device=device
-    )
-    reduce_final_map[active_tiles:tail_tile, 0] = 1 << 24
-    reduce_final_map[active_tiles:tail_tile, 1] = (1 << 24) + 1
-    reduce_final_map[tail_tile, 0] = 1 << 24
-    reduce_final_map[tail_tile, 1] = (1 << 24) + 1
-    reduce_final_map[tail_tile + 1 :, 0] = 1 << 24
-    reduce_final_map[tail_tile + 1 :, 1] = (1 << 24) + 1
-
-    final_output = torch.zeros(active_tiles, H, Dv, dtype=out_dtype, device=device)
-    final_lse = torch.zeros(active_tiles, H, dtype=torch.float32, device=device)
-    return (
+    return Inputs(
         partial_output,
         partial_lse,
         reduce_indptr,
-        reduce_final_map,
+        _garbage_final_map(num_tiles, active_tiles, device),
         reduce_partial_map,
-        final_output,
-        final_lse,
+        torch.zeros(active_tiles, H, Dv, dtype=out_dtype, device=device),
+        torch.zeros(active_tiles, H, dtype=torch.float32, device=device),
     )
 
 
@@ -556,14 +492,7 @@ def build_serving_stale_indptr_inputs(
     device="cuda",
     seed=0,
 ):
-    """Batch-transition metadata: batch=8 sparse grid patched to batch=1 layout.
-
-    Tile 0 becomes ``n_splits=128`` for batch=1; tiles 1..7 keep stale batch=8 CSR
-    (``n_splits=32``, stale pmap rows beyond the logical bound, stale fmap q 1..7).
-    Uses the allocation-slack trick so logical bounds are smaller than the buffers.
-
-    Returns tensors plus ``meta`` with logical bounds for guard differentials.
-    """
+    """Batch-transition metadata: batch=8 sparse grid patched to batch=1 layout. Tile 0 becomes ``n_splits=128`` for batch=1; tiles 1..7 keep stale batch=8 CSR (``n_splits=32``, stale pmap rows beyond the logical bound, stale fmap q 1..7). Uses the allocation-slack trick so logical bounds are smaller than the buffers. Returns tensors plus ``meta`` with logical bounds for guard differentials."""
     g = torch.Generator(device=device).manual_seed(seed)
     num_reduce_tile = SERVING_NUM_REDUCE_TILE
     active_tiles_batch8 = 8
@@ -585,18 +514,9 @@ def build_serving_stale_indptr_inputs(
     slack_f = 8
     alloc_final_rows = logical_final_rows + slack_f
 
-    partial_output = torch.randn(
-        alloc_partial_rows, H, Dv, dtype=torch.float32, device=device, generator=g
-    )
-    partial_lse = (
-        torch.randn(
-            alloc_partial_rows, H, dtype=torch.float32, device=device, generator=g
-        )
-        * 2.0
-    )
+    partial_output, partial_lse = _rand_partials(alloc_partial_rows, H, Dv, device, g)
 
-    total_pmap = sentinel
-    reduce_partial_map = torch.arange(total_pmap, dtype=torch.int32, device=device)
+    reduce_partial_map = torch.arange(sentinel, dtype=torch.int32, device=device)
     # Stale tiles 1..7: pmap rows from batch=8 now >= logical_partial_rows.
     stale_base = batch1_splits
     for t in range(1, active_tiles_batch8):
@@ -607,14 +527,8 @@ def build_serving_stale_indptr_inputs(
     tile1_lse_max = partial_lse[stale_base : stale_base + splits_per_active].max()
     partial_lse[stale_base].fill_(tile1_lse_max + 5.0)
 
-    reduce_final_map = torch.empty(num_reduce_tile, 2, dtype=torch.int32, device=device)
-    reduce_final_map[0, 0] = 0
-    reduce_final_map[0, 1] = 1
-    for t in range(1, active_tiles_batch8):
-        reduce_final_map[t, 0] = t
-        reduce_final_map[t, 1] = t + 1
-    reduce_final_map[active_tiles_batch8:, 0] = 1 << 24
-    reduce_final_map[active_tiles_batch8:, 1] = (1 << 24) + 1
+    # Stale fmap: tiles 1..7 keep their batch=8 q rows, past the batch=1 bound.
+    reduce_final_map = _garbage_final_map(num_reduce_tile, active_tiles_batch8, device)
 
     final_output = torch.zeros(alloc_final_rows, H, Dv, dtype=out_dtype, device=device)
     final_lse = torch.zeros(alloc_final_rows, H, dtype=torch.float32, device=device)
@@ -631,31 +545,27 @@ def build_serving_stale_indptr_inputs(
         "fout_slack_seed": fout_slack_seed,
     }
     return (
-        partial_output,
-        partial_lse,
-        reduce_indptr,
-        reduce_final_map,
-        reduce_partial_map,
-        final_output,
-        final_lse,
+        Inputs(
+            partial_output,
+            partial_lse,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            final_output,
+            final_lse,
+        ),
         meta,
     )
 
 
 def make_runner(
-    po,
-    pl,
-    indptr,
-    pmap,
-    fmap,
-    fout,
-    flse,
+    x,
     H,
     Dv,
     out_dtype_str,
-    output_lse,
     M=1,
     *,
+    output_lse=True,
     tier=None,
     disable_guards=False,
     num_partial_rows=None,
@@ -664,17 +574,11 @@ def make_runner(
     use_splitk=False,
     splitk_factor=None,
 ):
-    """Precompile + bind args; return a zero-overhead closure for the timed loop.
-
-    tier: compile-time tier override for isolated tests. None (default) uses
-    Tier.ALL (production path with device-side runtime tier selection).
-    """
+    """Precompile + bind args; return a zero-overhead closure for the timed loop. tier: compile-time tier override for isolated tests. None (default) uses Tier.ALL (production path with device-side runtime tier selection)."""
+    po, pl, indptr, fmap, pmap, fout, flse = x
     num_tiles = fmap.shape[0]
     num_cu = torch.cuda.get_device_properties(0).multi_processor_count
-    if tier is None:
-        compile_tier = Tier.ALL
-    else:
-        compile_tier = tier
+    compile_tier = Tier.ALL if tier is None else tier
     if num_partial_rows is None:
         num_partial_rows = int(po.size(0))
     if num_final_rows is None:
@@ -802,9 +706,7 @@ def bench_cudagraph(fn, num_warmup=25, num_iters=100):
 
 
 def run_cudagraph_replay(fn, num_warmup=3, num_replays=3):
-    """Capture ``fn`` into a CUDA graph and replay it, to surface replay-only
-    faults (the failure mode reported under real serving). ``fn`` writes into its
-    bound output tensors; the caller inspects those after this returns."""
+    """Capture ``fn`` into a CUDA graph and replay it, to surface replay-only faults (the failure mode reported under real serving). ``fn`` writes into its bound output tensors; the caller inspects those after this returns."""
     for _ in range(max(1, num_warmup)):
         fn()
     torch.cuda.synchronize()
@@ -822,11 +724,31 @@ def run_cudagraph_replay(fn, num_warmup=3, num_replays=3):
     torch.cuda.synchronize()
 
 
+def _run_kernel(x, H, Dv, dt, M=1, *, replay=False, **runner_kwargs):
+    """Zero ``x``'s outputs, bind the pointer-ABI runner, and run it either eagerly or through a CUDA-graph capture + replay. Results land in ``x.fout`` / ``x.flse``."""
+    x.fout.zero_()
+    x.flse.zero_()
+    run = make_runner(x, H, Dv, dt, M, **runner_kwargs)
+    if replay:
+        run_cudagraph_replay(run)
+    else:
+        run()
+        torch.cuda.synchronize()
+
+
+def _run_wrapper(x, M=1, **kwargs):
+    """Call the production torch wrapper on ``x``; results land in ``x.fout`` / ``x.flse``."""
+    flydsl_mla_reduce_v1(*x.maps, M, x.fout, x.flse, **kwargs)
+
+
+def _single_final_row(x):
+    """Narrow the fixture's output buffers to one final row (bs=1 decode)."""
+    return x._replace(fout=x.fout[:1].contiguous(), flse=x.flse[:1].contiguous())
+
+
 @contextmanager
 def _env(**kwargs):
-    """Set/unset environment variables for the duration of the block,
-    restoring the prior state on exit (a pytest-free ``monkeypatch.setenv``/
-    ``delenv``). Pass ``None`` for a var that should be unset."""
+    """Set/unset environment variables for the duration of the block, restoring the prior state on exit (a pytest-free ``monkeypatch.setenv``/ ``delenv``). Pass ``None`` for a var that should be unset."""
     sentinel = object()
     old = {k: os.environ.get(k, sentinel) for k in kwargs}
     try:
@@ -903,15 +825,15 @@ _GRAPH_CASES = [
     ("empty_middle", _GLM_SHAPE, "torch", [8, 0, 16, 8], 1, 1),
     ("mlds_max", _GLM_SHAPE, "torch", [304], 1, 1),
     ("mtp_irregular", _GLM_SHAPE, "torch", [8, 32, 16], 2, 4),
+    # Uniform 32-split tiles (runtime NLSE=1 path).
+    ("small_split", _GLM_SHAPE, "torch", [32] * 4, 1, 1),
 ]
 
 _DEGEN_TILES = [2, 4]
 
 
 def _require_cuda():
-    """``main()`` already gates on this before calling `run_checks()`; this is
-    a defensive re-check for anyone importing/calling a check function
-    directly (rule 7: functions stay independently importable)."""
+    """``main()`` already gates on this before calling `run_checks()`; this is a defensive re-check for anyone importing/calling a check function directly (rule 7: functions stay independently importable)."""
     if not torch.cuda.is_available():
         raise RuntimeError("mla_reduce check requires CUDA")
     if get_gfx() not in MLA_REDUCE_SUPPORTED_GFX:
@@ -940,13 +862,9 @@ def _assert_close(fout, flse, ref_out, ref_lse, dt):
     assert lse_err == 0, f"lse mismatch ratio={lse_err}"
 
 
-def _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, out_dtype, meta, M=1):
+def _masking_ref(x, H, Dv, out_dtype, meta, M=1):
     return torch_ref_gather(
-        po,
-        pl,
-        indptr,
-        fmap,
-        pmap,
+        x,
         H,
         Dv,
         out_dtype,
@@ -956,39 +874,22 @@ def _masking_ref(po, pl, indptr, fmap, pmap, H, Dv, out_dtype, meta, M=1):
     )
 
 
-def _run_guarded(
-    po,
-    pl,
-    indptr,
-    pmap,
-    fmap,
-    fout,
-    flse,
-    H,
-    Dv,
-    dt,
-    meta,
-    *,
-    disable_guards=False,
-    M=1,
-):
-    fout.zero_()
-    flse.zero_()
+def _logical_rows(out, lse, meta):
+    """``out``/``lse`` clipped to the fixture's logical final-row bound."""
+    n = meta["logical_final_rows"]
+    return out[:n], lse[:n]
+
+
+def _run_guarded(x, H, Dv, dt, meta, *, disable_guards=False, M=1):
+    x.fout.zero_()
+    x.flse.zero_()
     if meta.get("fout_slack_seed") is not None:
-        sq = meta["store_slack_q"]
-        fout[sq:].fill_(meta["fout_slack_seed"])
+        x.fout[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
     run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
+        x,
         H,
         Dv,
         dt,
-        True,
         M,
         disable_guards=disable_guards,
         num_partial_rows=meta["logical_partial_rows"],
@@ -996,28 +897,42 @@ def _run_guarded(
     )
     run()
     torch.cuda.synchronize()
-    return fout.clone(), flse.clone()
+    return x.fout.clone(), x.flse.clone()
 
 
-def _assert_gather_differential(
-    po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta
-):
-    ref_out, ref_lse = _masking_ref(
-        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
+def _run_guarded_cudagraph(x, H, Dv, dt, meta, *, disable_guards):
+    """CUDA-graph-replay counterpart of ``_run_guarded``, for the mapped-slack differential tests only (``store_slack_q`` bounds the slack region for both the gather and store checks there)."""
+    out = torch.zeros_like(x.fout)
+    lse = torch.zeros_like(x.flse)
+    out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
+    run = make_runner(
+        x._replace(fout=out, flse=lse),
+        H,
+        Dv,
+        dt,
+        disable_guards=disable_guards,
+        num_partial_rows=meta["logical_partial_rows"],
+        num_final_rows=meta["logical_final_rows"],
     )
-    on_out, on_lse = _run_guarded(
-        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=False
-    )
-    off_out, _off_lse = _run_guarded(
-        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=True
-    )
+    run_cudagraph_replay(run)
+    return out, lse
+
+
+def _guards_on_off(x, H, Dv, dt, meta, runner=_run_guarded):
+    """Run one mapped-slack fixture with guards ON then OFF, asserting that the guards-ON result matches the masking reference over the logical rows. Returns ``(on_out, off_out, ref_out)`` so each caller applies its own differential."""
+    ref_out, ref_lse = _masking_ref(x, H, Dv, _out_dtype(dt), meta)
+    on_out, on_lse = runner(x, H, Dv, dt, meta, disable_guards=False)
+    off_out, _off_lse = runner(x, H, Dv, dt, meta, disable_guards=True)
     _assert_close(
-        on_out[: meta["logical_final_rows"]],
-        on_lse[: meta["logical_final_rows"]],
-        ref_out[: meta["logical_final_rows"]],
-        ref_lse[: meta["logical_final_rows"]],
+        *_logical_rows(on_out, on_lse, meta),
+        *_logical_rows(ref_out, ref_lse, meta),
         dt,
     )
+    return on_out, off_out, ref_out
+
+
+def _assert_gather_differential(x, H, Dv, dt, meta):
+    _on_out, off_out, ref_out = _guards_on_off(x, H, Dv, dt, meta)
     atol = _out_atol(dt)
     q_row = meta["gather_q_row"]
     gather_err = (off_out[q_row].float() - ref_out[q_row].float()).abs().max().item()
@@ -1027,23 +942,8 @@ def _assert_gather_differential(
     )
 
 
-def _assert_store_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta):
-    ref_out, ref_lse = _masking_ref(
-        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
-    )
-    on_out, on_lse = _run_guarded(
-        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=False
-    )
-    off_out, _ = _run_guarded(
-        po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, meta, disable_guards=True
-    )
-    _assert_close(
-        on_out[: meta["logical_final_rows"]],
-        on_lse[: meta["logical_final_rows"]],
-        ref_out[: meta["logical_final_rows"]],
-        ref_lse[: meta["logical_final_rows"]],
-        dt,
-    )
+def _assert_store_differential(x, H, Dv, dt, meta):
+    on_out, off_out, _ref_out = _guards_on_off(x, H, Dv, dt, meta)
     atol = _out_atol(dt)
     sq = meta["store_slack_q"]
     seed = meta["fout_slack_seed"]
@@ -1057,18 +957,10 @@ def _assert_store_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt
 
 
 def _run_irregular(spt, gap, M, H, Dv, dt):
-    """Build irregular inputs, run the kernel, return (po, pl, indptr, fmap, pmap,
-    fout, flse)."""
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        spt, H, Dv, out_dtype, M=M, gap_stride=gap
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True, M)
-    run()
-    torch.cuda.synchronize()
-    return po, pl, indptr, fmap, pmap, fout, flse
+    """Build irregular inputs and run the kernel; returns the fixture, outputs filled."""
+    x = build_irregular_inputs(spt, H, Dv, _out_dtype(dt), M=M, gap_stride=gap)
+    _run_kernel(x, H, Dv, dt, M)
+    return x
 
 
 def test_flydsl_mla_reduce_irregular_vs_hip(case):
@@ -1076,11 +968,9 @@ def test_flydsl_mla_reduce_irregular_vs_hip(case):
     _require_cuda()
     _name, spt, gap, M, dt = case
     H, Dv = _HIP_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse = _run_irregular(spt, gap, M, H, Dv, dt)
-    ref_out, ref_lse = hip_ref(
-        po, pl, indptr, fmap, pmap, len(spt), H, Dv, _out_dtype(dt), M
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    x = _run_irregular(spt, gap, M, H, Dv, dt)
+    ref_out, ref_lse = hip_ref(x, len(spt), H, Dv, _out_dtype(dt), M)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_flydsl_mla_reduce_irregular_vs_torch_ref(case):
@@ -1088,11 +978,9 @@ def test_flydsl_mla_reduce_irregular_vs_torch_ref(case):
     _require_cuda()
     _name, spt, gap, M, dt = case
     H, Dv = _GLM_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse = _run_irregular(spt, gap, M, H, Dv, dt)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), M
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    x = _run_irregular(spt, gap, M, H, Dv, dt)
+    ref_out, ref_lse = torch_ref_gather(x, H, Dv, _out_dtype(dt), M)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_flydsl_mla_reduce_uniform_smoke(case):
@@ -1101,120 +989,47 @@ def test_flydsl_mla_reduce_uniform_smoke(case):
     (H, Dv), ref, S = case
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_inputs(
-        _SMOKE_TILES, S, H, Dv, out_dtype
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        H,
-        Dv,
-        dt,
-        True,
-        tier=select_tier(S),
-    )
-    run()
-    torch.cuda.synchronize()
+    x = build_inputs(_SMOKE_TILES, S, H, Dv, out_dtype)
+    _run_kernel(x, H, Dv, dt, tier=select_tier(S))
     if ref == "hip":
-        ref_out, ref_lse = hip_ref(
-            po, pl, indptr, fmap, pmap, _SMOKE_TILES, H, Dv, out_dtype
-        )
+        ref_out, ref_lse = hip_ref(x, _SMOKE_TILES, H, Dv, out_dtype)
     else:
-        ref_out, ref_lse = torch_ref(po, pl, _SMOKE_TILES, S, H, Dv, out_dtype)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+        ref_out, ref_lse = torch_ref(x.po, x.pl, _SMOKE_TILES, S, H, Dv, out_dtype)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_flydsl_mla_reduce_cudagraph_replay(case):
-    """Irregular metadata stays correct under CUDA-graph capture + replay (the
-    serving failure mode); no GPU fault and output matches the reference."""
+    """Irregular metadata stays correct under CUDA-graph capture + replay (the serving failure mode); no GPU fault and output matches the reference."""
     _require_cuda()
     _name, (H, Dv), ref, spt, gap, M = case
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        spt, H, Dv, out_dtype, M=M, gap_stride=gap
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True, M)
-    run_cudagraph_replay(run)
+    x = build_irregular_inputs(spt, H, Dv, out_dtype, M=M, gap_stride=gap)
+    _run_kernel(x, H, Dv, dt, M, replay=True)
     if ref == "hip":
-        ref_out, ref_lse = hip_ref(
-            po, pl, indptr, fmap, pmap, len(spt), H, Dv, out_dtype, M
-        )
+        ref_out, ref_lse = hip_ref(x, len(spt), H, Dv, out_dtype, M)
     else:
-        ref_out, ref_lse = torch_ref_gather(
-            po, pl, indptr, fmap, pmap, H, Dv, out_dtype, M
-        )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
-
-
-def test_flydsl_mla_reduce_small_split_cudagraph_replay():
-    """Uniform 32-split tiles under cudagraph replay (runtime NLSE=1 path)."""
-    _require_cuda()
-    H, Dv = _GLM_SHAPE
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    spt = [32] * 4
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        spt, H, Dv, out_dtype, M=1, gap_stride=1
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True, M=1)
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, H, Dv, out_dtype, M=1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+        ref_out, ref_lse = torch_ref_gather(x, H, Dv, out_dtype, M)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 _SERVING_SHAPE = (16, 512)
 
 
-def test_serving_sparse_grid_vs_hip():
-    """batch=8 layout: 16384-tile grid, 8 active tiles, garbage tail."""
+def test_serving_sparse_grid(replay=False):
+    """batch=8 layout: 16384-tile grid, 8 active tiles, garbage tail; eager (vs HIP) or under CUDA-graph replay (prod failure mode)."""
     _require_cuda()
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_sparse_grid_inputs(
-        *_SERVING_SHAPE, out_dtype=out_dtype
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True)
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
-
-
-def test_serving_sparse_grid_cudagraph_replay():
-    """16384-tile serving grid under CUDA-graph replay (prod failure mode)."""
-    _require_cuda()
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_sparse_grid_inputs(
-        *_SERVING_SHAPE, out_dtype=out_dtype
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, *_SERVING_SHAPE, dt, True)
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    x = build_serving_sparse_grid_inputs(*_SERVING_SHAPE, out_dtype=out_dtype)
+    _run_kernel(x, *_SERVING_SHAPE, dt, replay=replay)
+    ref_out, ref_lse = hip_ref_like_fout(x)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 # Split-K cooperative reduction for low-tile/high-split decode.
 _SPLITK_H, _SPLITK_DV = 16, 512
-_SPLITK_GRID = 16384
+_SPLITK_GRID = SERVING_NUM_REDUCE_TILE
 
 
 def _build_splitk_b1_s128(out_dtype):
@@ -1226,8 +1041,6 @@ def _build_splitk_b1_s128(out_dtype):
 
 
 def _assert_splitk_engages(indptr):
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk
-
     diffs = indptr[1:] - indptr[:-1]
     engage, K, num_slots = plan_splitk(
         active_tiles=int((diffs > 1).sum().item()),
@@ -1240,141 +1053,89 @@ def _assert_splitk_engages(indptr):
     return K, num_slots
 
 
-def test_splitk_b1_s128_vs_torch_ref(K):
-    """Split-K partial+combine matches the gather-based torch reference for the
-    low-tile/high-split decode case, across split factors K."""
-    _require_cuda()
+def _run_splitk_b1_s128(K=None, replay=False):
+    """Build b1_s128 split-K inputs, assert engagement, and run eager or under CUDA-graph replay; caller applies its own reference comparison."""
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
+    x = _build_splitk_b1_s128(out_dtype)
+    _assert_splitk_engages(x.indptr)
+    _run_kernel(
+        x,
         _SPLITK_H,
         _SPLITK_DV,
         dt,
-        True,
-        tier=None,
+        replay=replay,
         use_splitk=True,
         splitk_factor=K,
     )
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    return x, dt, out_dtype
+
+
+def test_splitk_b1_s128_vs_torch_ref(K, replay=False):
+    """Split-K partial+combine matches the gather-based torch reference for the low-tile/high-split decode case, across split factors K (``K=None`` uses the planner's own default), eager or under CUDA-graph capture + replay."""
+    _require_cuda()
+    x, dt, out_dtype = _run_splitk_b1_s128(K, replay)
+    ref_out, ref_lse = torch_ref_gather(x, _SPLITK_H, _SPLITK_DV, out_dtype)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_splitk_b1_s128_vs_hip():
     """Split-K matches the production HIP kn_mla_reduce_v1 (Dv=512 template)."""
     _require_cuda()
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        _SPLITK_H,
-        _SPLITK_DV,
-        dt,
-        True,
-        tier=None,
-        use_splitk=True,
-    )
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    x, dt, _out_dtype_ = _run_splitk_b1_s128()
+    ref_out, ref_lse = hip_ref_like_fout(x)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
-def test_splitk_b1_s128_cudagraph_replay():
-    """Split-K (2-kernel) stays correct under CUDA-graph capture + replay, with
-    a pre-allocated scratch buffer."""
-    _require_cuda()
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_splitk_b1_s128(out_dtype)
-    _assert_splitk_engages(indptr)
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        fout,
-        flse,
-        _SPLITK_H,
-        _SPLITK_DV,
-        dt,
-        True,
-        tier=None,
-        use_splitk=True,
-    )
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+# Split-K planner boundaries: (kwargs, expected (engage, K, num_slots)).
+# All cases share H=16, max_seqlen_q=1, num_cu=304 unless a case overrides it.
+# plan_splitk reads CSR-derived values at planning time; the capture-safe variant
+# decides from host values alone, so it is legal under graph capture.
+_PLAN_SPLITK_CASES = [
+    (dict(active_tiles=1, max_splits=128), (True, 16, 16)),
+    (dict(active_tiles=1, max_splits=8), (False, 1, 0)),  # below min_splits
+    (dict(active_tiles=20, max_splits=128), (False, 1, 0)),  # saturated grid
+    (
+        dict(active_tiles=1, max_splits=128, max_seqlen_q=2),
+        (False, 1, 0),
+    ),  # prefill
+]
+_PLAN_CAPTURE_SAFE_CASES = [
+    (dict(num_final_rows=32, num_kv_splits=128), (False, 1, 0)),  # saturated grid
+    (dict(num_final_rows=1, num_kv_splits=32), (False, 1, 0)),  # below min_splits
+    (
+        dict(num_final_rows=1, num_kv_splits=304, actual_max_splits=8),
+        (False, 1, 0),
+    ),
+    (
+        dict(num_final_rows=1, num_kv_splits=304, actual_max_splits=128),
+        (True, 16, 16),
+    ),
+]
 
 
-def test_splitk_engagement_boundaries():
-    """plan_splitk's real engagement boundaries, now that it is always live
-    (no env gate): too few splits to amortize, grid already saturated, and
-    prefill (max_seqlen_q != 1) all decline; the b1_s128 shape engages."""
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk
+def test_splitk_planner_boundaries():
+    """Both planners require decode, enough splits, and an unsaturated grid.
 
-    # Baseline: the b1_s128 shape engages (sanity, mirrors _assert_splitk_engages).
-    engage, _, _ = plan_splitk(
-        active_tiles=1, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
-    )
-    assert engage, "expected split-K to engage for the b1_s128 shape"
-
-    # Too few splits to amortize the extra combine kernel.
-    engage, _, _ = plan_splitk(
-        active_tiles=1, H=16, max_seqlen_q=1, max_splits=8, num_cu=304
-    )
-    assert not engage, "split-K should not engage below min_splits"
-
-    # Grid already saturated (base_blocks = active_tiles * H >= num_cu).
-    engage, _, _ = plan_splitk(
-        active_tiles=20, H=16, max_seqlen_q=1, max_splits=128, num_cu=304
-    )
-    assert not engage, "split-K should not engage once the grid is saturated"
-
-    # Prefill (max_seqlen_q != 1) is out of scope for this decode-only prototype.
-    engage, _, _ = plan_splitk(
-        active_tiles=1, H=16, max_seqlen_q=2, max_splits=128, num_cu=304
-    )
-    assert not engage, "split-K should not engage for max_seqlen_q != 1"
+    The capture-safe planner uses actual_max_splits when supplied, so a loose
+    304 budget with eight real splits must stay on the single-kernel path.
+    """
+    base = {"H": 16, "max_seqlen_q": 1, "num_cu": 304}
+    for planner, cases in (
+        (plan_splitk, _PLAN_SPLITK_CASES),
+        (plan_splitk_capture_safe, _PLAN_CAPTURE_SAFE_CASES),
+    ):
+        for kwargs, expected in cases:
+            got = planner(**{**base, **kwargs})
+            assert got == expected, (planner.__name__, kwargs, got, expected)
 
 
 # Device-adaptive, capture-safe split-K through the production wrapper.
 
 
 def _build_da_single_tile(out_dtype, splits, pool=304):
-    """One active tile (bs=1: final_output has a single row) with `splits`
-    splits, partial pool sized to `pool` so the split count can be MUTATED up to
-    `pool` across CUDA-graph replays."""
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+    """One active tile (bs=1: final_output has a single row) with `splits` splits, partial pool sized to `pool` so the split count can be MUTATED up to `pool` across CUDA-graph replays."""
+    x = build_irregular_inputs(
         [splits],
         _SPLITK_H,
         _SPLITK_DV,
@@ -1383,158 +1144,66 @@ def _build_da_single_tile(out_dtype, splits, pool=304):
         gap_stride=1,
         pool_slack=pool - splits,
     )
-    pmap = torch.arange(pool, dtype=torch.int32, device=pmap.device)
-    return po, pl, indptr, fmap, pmap, fout, flse
-
-
-def test_da_splitk_no_engage_large_batch():
-    """Default-safe: a saturated grid (base_slots >= num_cu) never engages, so
-    large-batch decode keeps the unchanged single-kernel path."""
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
-
-    engage, _, _ = plan_splitk_capture_safe(
-        num_final_rows=32, H=16, max_seqlen_q=1, num_kv_splits=128, num_cu=304
-    )
-    assert not engage
-
-
-def test_da_splitk_no_engage_low_splits():
-    """Default-safe: too few splits (num_kv_splits < min) never engages, so the
-    combine kernel is not paid on short-context / low-split decode."""
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
-
-    engage, _, _ = plan_splitk_capture_safe(
-        num_final_rows=1, H=16, max_seqlen_q=1, num_kv_splits=32, num_cu=304
-    )
-    assert not engage
+    return x._replace(pmap=torch.arange(pool, dtype=torch.int32, device=x.pmap.device))
 
 
 def test_da_splitk_wrapper_vs_hip():
     """The default-able wrapper path (DA split-K on) matches HIP for b1_s128."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
-        out_dtype, 128, pool=128
-    )
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=128
-        )
-
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    x = _build_da_single_tile(out_dtype, 128, pool=128)
+    x.fout.zero_()
+    x.flse.zero_()
+    run_cudagraph_replay(lambda: _run_wrapper(x, num_kv_splits=128))
+    ref_out, ref_lse = hip_ref_like_fout(x)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def _build_da_mixed_split_inputs(out_dtype, skipped_splits):
     """Build a high-split tile beside a stage-1-finalized stale-map tile."""
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        [skipped_splits, 64],
-        _SPLITK_H,
-        _SPLITK_DV,
-        out_dtype,
-        M=1,
-        gap_stride=1,
+    x = build_irregular_inputs(
+        [skipped_splits, 64], _SPLITK_H, _SPLITK_DV, out_dtype, M=1, gap_stride=1
     )
     # V1.2 metadata does not write this entry for n_splits <= 1. Model a
     # prior decode/capture replay leaving a valid but stale q-range behind.
-    fmap[0] = torch.tensor([0, 1], dtype=torch.int32, device=fmap.device)
-    fout.fill_(7.0)
-    flse.fill_(9.0)
-    return po, pl, indptr, fmap, pmap, fout, flse
+    x.fmap[0] = torch.tensor([0, 1], dtype=torch.int32, device=x.fmap.device)
+    x.fout.fill_(7.0)
+    x.flse.fill_(9.0)
+    return x
 
 
-def _assert_da_mixed_split_result(
-    po, pl, indptr, fmap, pmap, fout, flse, expected_out, expected_lse, out_dtype
-):
-    assert torch.equal(fout[0], expected_out)
-    assert torch.equal(flse[0], expected_lse)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout[1:], flse[1:], ref_out[1:], ref_lse[1:], out_dtype)
-
-
-def test_da_splitk_preserves_stage1_rows(skipped_splits):
-    """Split-K must not overwrite stale-map rows finalized directly by stage 1."""
+def test_da_splitk_preserves_stage1_rows(skipped_splits, replay=False):
+    """Split-K must not overwrite stale-map rows finalized directly by stage 1, eager or through CUDA-graph replay."""
     _require_cuda()
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_mixed_split_inputs(
-        out_dtype, skipped_splits
-    )
-    expected_out = fout[0].clone()
-    expected_lse = flse[0].clone()
-
-    flydsl_mla_reduce_v1(
-        po,
-        pl,
-        indptr,
-        fmap,
-        pmap,
-        1,
-        fout,
-        flse,
-        num_kv_splits=64,
-        actual_max_splits=64,
-    )
-    torch.cuda.synchronize()
-    _assert_da_mixed_split_result(
-        po, pl, indptr, fmap, pmap, fout, flse, expected_out, expected_lse, out_dtype
-    )
-
-
-def test_da_splitk_preserves_stage1_rows_cudagraph(skipped_splits):
-    """The stale-map split-K guard remains correct through CUDA-graph replay."""
-    _require_cuda()
-    dt = "bf16"
-    out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_mixed_split_inputs(
-        out_dtype, skipped_splits
-    )
-    expected_out = fout[0].clone()
-    expected_lse = flse[0].clone()
+    x = _build_da_mixed_split_inputs(out_dtype, skipped_splits)
+    expected_out = x.fout[0].clone()
+    expected_lse = x.flse[0].clone()
 
     def run():
-        flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=64,
-            actual_max_splits=64,
-        )
+        _run_wrapper(x, num_kv_splits=64, actual_max_splits=64)
 
-    run_cudagraph_replay(run)
-    _assert_da_mixed_split_result(
-        po, pl, indptr, fmap, pmap, fout, flse, expected_out, expected_lse, out_dtype
-    )
+    if replay:
+        run_cudagraph_replay(run)
+    else:
+        run()
+        torch.cuda.synchronize()
+    assert torch.equal(x.fout[0], expected_out)
+    assert torch.equal(x.flse[0], expected_lse)
+    ref_out, ref_lse = torch_ref_gather(x, _SPLITK_H, _SPLITK_DV, out_dtype)
+    _assert_close(x.fout[1:], x.flse[1:], ref_out[1:], ref_lse[1:], out_dtype)
 
 
 def test_da_splitk_capture_safe_varying_splits():
-    """One CUDA-graph capture (bs=1, grid/K/scratch baked from host num_kv_splits)
-    stays correct across replays whose per-tile split count changes on-device."""
+    """One CUDA-graph capture (bs=1, grid/K/scratch baked from host num_kv_splits) stays correct across replays whose per-tile split count changes on-device."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
-
     dt = "bf16"
     out_dtype = _out_dtype(dt)
     pool = 304
     nkv = 128
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
-        out_dtype, pool, pool=pool
-    )
+    x = _build_da_single_tile(out_dtype, pool, pool=pool)
     engage, _K, slots = plan_splitk_capture_safe(
         num_final_rows=1,
         H=_SPLITK_H,
@@ -1545,9 +1214,7 @@ def test_da_splitk_capture_safe_varying_splits():
     assert engage and slots == _SPLITK_H, "DA split-K must engage for bs=1"
 
     def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=nkv
-        )
+        _run_wrapper(x, num_kv_splits=nkv)
 
     # Warm up, then capture ONCE (grid/K/scratch fixed for this bs=1 bucket).
     for _ in range(3):
@@ -1566,70 +1233,31 @@ def test_da_splitk_capture_safe_varying_splits():
     # Replay the SAME graph with DIFFERENT per-tile split counts (bs fixed): the
     # device reads the mutated CSR each replay and adapts its K allocation.
     for s_k in [128, 304, 64, 200, 8, 96]:
-        indptr[1] = s_k  # mutate the captured CSR in place (host->device copy)
-        fout.zero_()
-        flse.zero_()
+        x.indptr[1] = s_k  # mutate the captured CSR in place (host->device copy)
+        x.fout.zero_()
+        x.flse.zero_()
         graph.replay()
         torch.cuda.synchronize()
-        ref_out, ref_lse = torch_ref_gather(
-            po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-        )
-        _assert_close(fout, flse, ref_out, ref_lse, dt)
+        ref_out, ref_lse = torch_ref_gather(x, _SPLITK_H, _SPLITK_DV, out_dtype)
+        _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 # actual_max_splits gate.
 
 
-def test_actual_max_splits_gate_loose_budget():
-    """Loose num_kv_splits budget (304) with small actual_max_splits does not
-    engage; true high actual_max_splits does."""
-    from aiter.ops.flydsl.kernels.mla_reduce import plan_splitk_capture_safe
-
-    engage_loose, _, _ = plan_splitk_capture_safe(
-        num_final_rows=1,
-        H=16,
-        max_seqlen_q=1,
-        num_kv_splits=304,
-        num_cu=304,
-        actual_max_splits=8,
-    )
-    assert not engage_loose
-
-    engage_hi, K, slots = plan_splitk_capture_safe(
-        num_final_rows=1,
-        H=16,
-        max_seqlen_q=1,
-        num_kv_splits=304,
-        num_cu=304,
-        actual_max_splits=128,
-    )
-    assert engage_hi and K == 16 and slots == 16
-
-
 def test_derive_actual_max_splits():
     """Helper matches CSR max tile width."""
-    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
-
     indptr = torch.tensor([0, 8, 12, 12], dtype=torch.int32, device="cuda")
     assert derive_actual_max_splits(indptr) == 8
 
 
 def test_actual_max_splits_wrapper_loose_budget_correct():
-    """Loose budget (304) + small actual splits stays on single-kernel path and
-    matches the torch reference."""
+    """Loose budget (304) + small actual splits stays on single-kernel path and matches the torch reference."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-    from aiter.ops.flydsl.kernels.mla_reduce import (
-        derive_actual_max_splits,
-        plan_splitk_capture_safe,
-    )
-
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(out_dtype, 8, pool=8)
-    fout = fout[:1].contiguous()
-    flse = flse[:1].contiguous()
-    actual = derive_actual_max_splits(indptr)
+    x = _single_final_row(_build_da_single_tile(out_dtype, 8, pool=8))
+    actual = derive_actual_max_splits(x.indptr)
     assert actual == 8
     engage, _, _ = plan_splitk_capture_safe(
         num_final_rows=1,
@@ -1641,68 +1269,29 @@ def test_actual_max_splits_wrapper_loose_budget_correct():
     )
     assert not engage
 
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=304,
-            actual_max_splits=actual,
-        )
-
-    run()
+    x.fout.zero_()
+    x.flse.zero_()
+    _run_wrapper(x, num_kv_splits=304, actual_max_splits=actual)
     torch.cuda.synchronize()
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
-    )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    ref_out, ref_lse = torch_ref_gather(x, _SPLITK_H, _SPLITK_DV, out_dtype)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_actual_max_splits_wrapper_cudagraph_replay():
     """Loose budget + actual_max_splits gate stays correct under graph replay."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
-
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = _build_da_single_tile(
-        out_dtype, 128, pool=128
-    )
-    fout = fout[:1].contiguous()
-    flse = flse[:1].contiguous()
-    actual = derive_actual_max_splits(indptr)
+    x = _single_final_row(_build_da_single_tile(out_dtype, 128, pool=128))
+    actual = derive_actual_max_splits(x.indptr)
     assert actual == 128
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=304,
-            actual_max_splits=actual,
-        )
-
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr, fmap, pmap, _SPLITK_H, _SPLITK_DV, out_dtype, 1
+    x.fout.zero_()
+    x.flse.zero_()
+    run_cudagraph_replay(
+        lambda: _run_wrapper(x, num_kv_splits=304, actual_max_splits=actual)
     )
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    ref_out, ref_lse = torch_ref_gather(x, _SPLITK_H, _SPLITK_DV, out_dtype)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_serving_stale_indptr_cudagraph_replay():
@@ -1710,59 +1299,31 @@ def test_serving_stale_indptr_cudagraph_replay():
     _require_cuda()
     dt = "bf16"
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_stale_indptr_inputs(
-        *_SERVING_SHAPE, out_dtype=out_dtype
-    )
-    ref_out, ref_lse = _masking_ref(
-        po, pl, indptr, fmap, pmap, *_SERVING_SHAPE, out_dtype, meta
-    )
-    on_out = fout.clone()
-    on_lse = flse.clone()
-    run_on = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        on_out,
-        on_lse,
-        *_SERVING_SHAPE,
-        dt,
-        True,
-        disable_guards=False,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    on_out.zero_()
-    on_lse.zero_()
-    on_out[meta["logical_final_rows"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_on)
-    off_out = fout.clone()
-    off_lse = flse.clone()
-    run_off = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        off_out,
-        off_lse,
-        *_SERVING_SHAPE,
-        dt,
-        True,
-        disable_guards=True,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    off_out.zero_()
-    off_lse.zero_()
-    off_out[meta["logical_final_rows"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_off)
+    x, meta = build_serving_stale_indptr_inputs(*_SERVING_SHAPE, out_dtype=out_dtype)
+    ref_out, ref_lse = _masking_ref(x, *_SERVING_SHAPE, out_dtype, meta)
+
+    def replay(disable_guards):
+        """Fresh output buffers (slack pre-seeded), captured and replayed."""
+        out = torch.zeros_like(x.fout)
+        lse = torch.zeros_like(x.flse)
+        out[meta["logical_final_rows"] :].fill_(meta["fout_slack_seed"])
+        run_cudagraph_replay(
+            make_runner(
+                x._replace(fout=out, flse=lse),
+                *_SERVING_SHAPE,
+                dt,
+                disable_guards=disable_guards,
+                num_partial_rows=meta["logical_partial_rows"],
+                num_final_rows=meta["logical_final_rows"],
+            )
+        )
+        return out, lse
+
+    on_out, on_lse = replay(False)
+    off_out, _off_lse = replay(True)
     _assert_close(
-        on_out[: meta["logical_final_rows"]],
-        on_lse[: meta["logical_final_rows"]],
-        ref_out[: meta["logical_final_rows"]],
-        ref_lse[: meta["logical_final_rows"]],
+        *_logical_rows(on_out, on_lse, meta),
+        *_logical_rows(ref_out, ref_lse, meta),
         dt,
     )
     atol = _out_atol(dt)
@@ -1779,10 +1340,8 @@ def test_serving_gather_guard_differential():
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
-        H, Dv, _out_dtype(dt)
-    )
-    _assert_gather_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta)
+    x, meta = build_serving_mapped_slack_inputs(H, Dv, _out_dtype(dt))
+    _assert_gather_differential(x, H, Dv, dt, meta)
 
 
 def test_serving_store_guard_differential():
@@ -1790,10 +1349,8 @@ def test_serving_store_guard_differential():
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
-        H, Dv, _out_dtype(dt)
-    )
-    _assert_store_differential(po, pl, indptr, fmap, pmap, fout, flse, H, Dv, dt, meta)
+    x, meta = build_serving_mapped_slack_inputs(H, Dv, _out_dtype(dt))
+    _assert_store_differential(x, H, Dv, dt, meta)
 
 
 def test_serving_gather_guard_differential_cudagraph_replay():
@@ -1801,67 +1358,13 @@ def test_serving_gather_guard_differential_cudagraph_replay():
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
-        H, Dv, _out_dtype(dt)
+    x, meta = build_serving_mapped_slack_inputs(H, Dv, _out_dtype(dt))
+    _, off_out, ref_out = _guards_on_off(
+        x, H, Dv, dt, meta, runner=_run_guarded_cudagraph
     )
-    ref_out, ref_lse = _masking_ref(
-        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
-    )
-    on_out = fout.clone()
-    on_lse = flse.clone()
-    run_on = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        on_out,
-        on_lse,
-        H,
-        Dv,
-        dt,
-        True,
-        disable_guards=False,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    on_out.zero_()
-    on_lse.zero_()
-    on_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_on)
-    off_out = fout.clone()
-    off_lse = flse.clone()
-    run_off = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        off_out,
-        off_lse,
-        H,
-        Dv,
-        dt,
-        True,
-        disable_guards=True,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    off_out.zero_()
-    off_lse.zero_()
-    off_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_off)
-    _assert_close(
-        on_out[: meta["logical_final_rows"]],
-        on_lse[: meta["logical_final_rows"]],
-        ref_out[: meta["logical_final_rows"]],
-        ref_lse[: meta["logical_final_rows"]],
-        dt,
-    )
-    atol = _out_atol(dt)
     q_row = meta["gather_q_row"]
     gather_err = (off_out[q_row].float() - ref_out[q_row].float()).abs().max().item()
-    assert gather_err > 5 * atol
+    assert gather_err > 5 * _out_atol(dt)
 
 
 def test_serving_store_guard_differential_cudagraph_replay():
@@ -1869,65 +1372,13 @@ def test_serving_store_guard_differential_cudagraph_replay():
     _require_cuda()
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
-    po, pl, indptr, fmap, pmap, fout, flse, meta = build_serving_mapped_slack_inputs(
-        H, Dv, _out_dtype(dt)
+    x, meta = build_serving_mapped_slack_inputs(H, Dv, _out_dtype(dt))
+    _, off_out, _ref_out = _guards_on_off(
+        x, H, Dv, dt, meta, runner=_run_guarded_cudagraph
     )
-    ref_out, ref_lse = _masking_ref(
-        po, pl, indptr, fmap, pmap, H, Dv, _out_dtype(dt), meta
-    )
-    on_out = fout.clone()
-    on_lse = flse.clone()
-    run_on = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        on_out,
-        on_lse,
-        H,
-        Dv,
-        dt,
-        True,
-        disable_guards=False,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    on_out.zero_()
-    on_lse.zero_()
-    on_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_on)
-    off_out = fout.clone()
-    run_off = make_runner(
-        po,
-        pl,
-        indptr,
-        pmap,
-        fmap,
-        off_out,
-        flse.clone(),
-        H,
-        Dv,
-        dt,
-        True,
-        disable_guards=True,
-        num_partial_rows=meta["logical_partial_rows"],
-        num_final_rows=meta["logical_final_rows"],
-    )
-    off_out.zero_()
-    off_out[meta["store_slack_q"] :].fill_(meta["fout_slack_seed"])
-    run_cudagraph_replay(run_off)
-    _assert_close(
-        on_out[: meta["logical_final_rows"]],
-        on_lse[: meta["logical_final_rows"]],
-        ref_out[: meta["logical_final_rows"]],
-        ref_lse[: meta["logical_final_rows"]],
-        dt,
-    )
-    atol = _out_atol(dt)
     sq = meta["store_slack_q"]
     off_slack_err = (off_out[sq:].float() - meta["fout_slack_seed"]).abs().max().item()
-    assert off_slack_err > 5 * atol
+    assert off_slack_err > 5 * _out_atol(dt)
 
 
 def test_serving_true_oob_no_fault():
@@ -1936,53 +1387,38 @@ def test_serving_true_oob_no_fault():
     dt = "bf16"
     H, Dv = _SERVING_SHAPE
     out_dtype = _out_dtype(dt)
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_true_oob_inputs(
-        H, Dv, out_dtype
-    )
-    fout.zero_()
-    flse.zero_()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, dt, True)
-    run()
-    torch.cuda.synchronize()
+    x = build_serving_true_oob_inputs(H, Dv, out_dtype)
+    _run_kernel(x, H, Dv, dt)
+    rows = x.fout.size(0)
     ref_out, ref_lse = torch_ref_gather(
-        po,
-        pl,
-        indptr,
-        fmap,
-        pmap,
+        x,
         H,
         Dv,
         out_dtype,
-        num_partial_rows=po.size(0),
-        num_final_rows=fout.size(0),
+        num_partial_rows=x.po.size(0),
+        num_final_rows=rows,
     )
-    _assert_close(fout, flse, ref_out[: fout.size(0)], ref_lse[: fout.size(0)], dt)
+    _assert_close(x.fout, x.flse, ref_out[:rows], ref_lse[:rows], dt)
 
 
 def test_flydsl_mla_reduce_degenerate_empty_tile(num_tiles):
-    """Empty-tile guard: all-empty (n_splits=0) metadata never stores through the
-    garbage q-ranges, leaving the output untouched."""
+    """Empty-tile guard: all-empty (n_splits=0) metadata never stores through the garbage q-ranges, leaving the output untouched."""
     _require_cuda()
     H, Dv = _GLM_SHAPE
     out_dtype = _out_dtype("bf16")
-    po, pl, indptr, fmap, pmap, fout, flse = build_degenerate_inputs(
-        num_tiles, H, Dv, out_dtype
-    )
-    fout.fill_(12345.0)
-    flse.fill_(12345.0)
-    expected_out = fout.clone()
-    expected_lse = flse.clone()
-    run = make_runner(po, pl, indptr, pmap, fmap, fout, flse, H, Dv, "bf16", True)
-    run()
+    x = build_degenerate_inputs(num_tiles, H, Dv, out_dtype)
+    x.fout.fill_(12345.0)
+    x.flse.fill_(12345.0)
+    expected_out = x.fout.clone()
+    expected_lse = x.flse.clone()
+    make_runner(x, H, Dv, "bf16")()
     torch.cuda.synchronize()
-    assert torch.equal(fout, expected_out)
-    assert torch.equal(flse, expected_lse)
+    assert torch.equal(x.fout, expected_out)
+    assert torch.equal(x.flse, expected_lse)
 
 
 def test_dispatch_does_not_thread_actual_max_splits():
-    """mla_decode_fwd and _mla_reduce_v1_dispatch do not accept or forward
-    actual_max_splits; the FlyDSL wrapper auto-resolves it from reduce_indptr
-    (capture-safe warmup cache)."""
+    """mla_decode_fwd and _mla_reduce_v1_dispatch do not accept or forward actual_max_splits; the FlyDSL wrapper auto-resolves it from reduce_indptr (capture-safe warmup cache)."""
     import inspect
 
     from aiter import mla
@@ -2012,14 +1448,16 @@ def test_dispatch_does_not_thread_actual_max_splits():
 
 
 def _dispatch_test_tensors(Dv=512):
-    po = torch.empty(2, 16, Dv, dtype=torch.float32)
-    pl = torch.empty(2, 16, dtype=torch.float32)
-    indptr = torch.empty(2, dtype=torch.int32)
-    fmap = torch.empty(1, 2, dtype=torch.int32)
-    pmap = torch.empty(1, dtype=torch.int32)
-    fout = torch.empty(1, 16, Dv, dtype=torch.bfloat16)
-    flse = torch.empty(1, 16, dtype=torch.float32)
-    return po, pl, indptr, fmap, pmap, fout, flse
+    """Host-side placeholders: the dispatch seam is inspected, never launched."""
+    return Inputs(
+        torch.empty(2, 16, Dv, dtype=torch.float32),
+        torch.empty(2, 16, dtype=torch.float32),
+        torch.empty(2, dtype=torch.int32),
+        torch.empty(1, 2, dtype=torch.int32),
+        torch.empty(1, dtype=torch.int32),
+        torch.empty(1, 16, Dv, dtype=torch.bfloat16),
+        torch.empty(1, 16, dtype=torch.float32),
+    )
 
 
 def test_dispatch_falls_back_outside_validated_target():
@@ -2032,26 +1470,15 @@ def test_dispatch_falls_back_outside_validated_target():
         ("gfx942", 512, 2),
     ]
     for gfx, Dv, max_seqlen_q in cases:
-        po, pl, indptr, fmap, pmap, fout, flse = _dispatch_test_tensors(Dv)
+        x = _dispatch_test_tensors(Dv)
+        args = (*x.maps, max_seqlen_q, 0, x.fout, x.flse)
         with (
             mock.patch.object(mla, "_flydsl_mla_reduce_enabled", return_value=True),
             mock.patch.object(mla, "get_gfx", return_value=gfx),
             mock.patch.object(mla.aiter, "mla_reduce_v1") as hip_reduce,
         ):
-            mla._mla_reduce_v1_dispatch(
-                po,
-                pl,
-                indptr,
-                fmap,
-                pmap,
-                max_seqlen_q,
-                0,
-                fout,
-                flse,
-            )
-        hip_reduce.assert_called_once_with(
-            po, pl, indptr, fmap, pmap, max_seqlen_q, 0, fout, flse
-        )
+            mla._mla_reduce_v1_dispatch(*args)
+        hip_reduce.assert_called_once_with(*args)
 
 
 def _assert_wrapper_rejects(expected_error, text, call):
@@ -2070,67 +1497,36 @@ def _assert_wrapper_rejects(expected_error, text, call):
 def test_mla_reduce_wrapper_rejects_invalid_pointer_abi():
     """Invalid direct calls fail before JIT compilation or GPU launch."""
     _require_cuda()
-    from aiter.ops.flydsl.kernels.mla_reduce import LDS_MAX_SPLITS
-
     H, Dv = 16, 512
     out_dtype = _out_dtype("bf16")
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
-        [2], H, Dv, out_dtype, M=1
-    )
+    x = build_irregular_inputs([2], H, Dv, out_dtype, M=1)
+    unpacked = torch.empty(1, H, Dv * 2, dtype=out_dtype, device=x.fout.device)[
+        ..., ::2
+    ]
 
-    def call(
-        partial_output=po,
-        partial_lse=pl,
-        reduce_indptr=indptr,
-        reduce_final_map=fmap,
-        reduce_partial_map=pmap,
-        final_output=fout,
-        final_lse=flse,
-        num_kv_splits=2,
-        actual_max_splits=2,
-    ):
-        flydsl_mla_reduce_v1(
-            partial_output,
-            partial_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            1,
-            final_output,
-            final_lse,
+    def call(*, num_kv_splits=2, actual_max_splits=2, **fields):
+        """One otherwise-valid wrapper call, with ``fields`` overriding the fixture."""
+        _run_wrapper(
+            x._replace(**fields),
             num_kv_splits=num_kv_splits,
             actual_max_splits=actual_max_splits,
         )
 
-    _assert_wrapper_rejects(TypeError, "partial_output", lambda: call(po.bfloat16()))
-    _assert_wrapper_rejects(
-        TypeError, "partial_lse", lambda: call(partial_lse=pl.bfloat16())
-    )
-    _assert_wrapper_rejects(
-        TypeError, "reduce_indptr", lambda: call(reduce_indptr=indptr.float())
-    )
-    _assert_wrapper_rejects(
-        ValueError, "partial_lse", lambda: call(partial_lse=pl[:-1].contiguous())
-    )
-    unpacked_fout = torch.empty(1, H, Dv * 2, dtype=out_dtype, device=fout.device)[
-        ..., ::2
+    # (expected error, required substring, the single field that makes it invalid)
+    cases = [
+        (TypeError, "partial_output", dict(po=x.po.bfloat16())),
+        (TypeError, "partial_lse", dict(pl=x.pl.bfloat16())),
+        (TypeError, "reduce_indptr", dict(indptr=x.indptr.float())),
+        (ValueError, "partial_lse", dict(pl=x.pl[:-1].contiguous())),
+        (ValueError, "packed last dimension", dict(fout=unpacked)),
+        (ValueError, "num_kv_splits", dict(num_kv_splits=LDS_MAX_SPLITS + 1)),
+        (ValueError, "actual_max_splits", dict(actual_max_splits=LDS_MAX_SPLITS + 1)),
+        (ValueError, "partial_output", dict(po=x.po.cpu())),
     ]
-    _assert_wrapper_rejects(
-        ValueError, "packed last dimension", lambda: call(final_output=unpacked_fout)
-    )
-    _assert_wrapper_rejects(
-        ValueError,
-        "num_kv_splits",
-        lambda: call(num_kv_splits=LDS_MAX_SPLITS + 1),
-    )
-    _assert_wrapper_rejects(
-        ValueError,
-        "actual_max_splits",
-        lambda: call(actual_max_splits=LDS_MAX_SPLITS + 1),
-    )
-    _assert_wrapper_rejects(
-        ValueError, "partial_output", lambda: call(partial_output=po.cpu())
-    )
+    for expected_error, text, invalid in cases:
+        _assert_wrapper_rejects(expected_error, text, lambda kw=invalid: call(**kw))
+
+    # actual_max_splits=None cannot be validated when the warmup cache misses.
     from aiter.ops.flydsl import mla_reduce_kernels
 
     with mock.patch.object(
@@ -2144,12 +1540,8 @@ def test_mla_reduce_wrapper_rejects_invalid_pointer_abi():
 
 
 def test_resolve_actual_max_splits_eager_and_capture():
-    """The warmup cache resolves the true max split eager, then serves the same
-    value under CUDA-graph capture (no device sync), and misses -> None."""
+    """The warmup cache resolves the true max split eager, then serves the same value under CUDA-graph capture (no device sync), and misses -> None."""
     _require_cuda()
-    import torch
-
-    from aiter.ops.flydsl.kernels.mla_reduce import derive_actual_max_splits
     from aiter.ops.flydsl.mla_reduce_kernels import (
         _ACTUAL_MAX_SPLITS_CACHE,
         _resolve_actual_max_splits,
@@ -2187,72 +1579,37 @@ _ADAPTIVE_SCENARIOS = [
 ]
 
 
-def test_adaptive_launch_wrapper_vs_hip(label, active, splits):
-    """Adaptive launch (split-K off) matches HIP on the serving decode shapes."""
+def test_adaptive_launch_wrapper_vs_hip(label, active, splits, replay=False):
+    """Adaptive launch (split-K off) matches HIP on the serving decode shapes, eager or under CUDA-graph capture/replay."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
     dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
-        active, splits, _out_dtype(dt)
-    )
-    fout.zero_()
-    flse.zero_()
+    x = build_serving_decode_inputs(active, splits, _out_dtype(dt))
+    x.fout.zero_()
+    x.flse.zero_()
 
     def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
-        )
+        _run_wrapper(x, num_kv_splits=splits)
 
-    run()
-    torch.cuda.synchronize()
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
-
-
-def test_adaptive_launch_cudagraph_replay():
-    """Adaptive launch stays correct under CUDA-graph capture/replay (b8_s32)."""
-    _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
-    dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
-        8, 32, _out_dtype(dt)
-    )
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=32
-        )
-
-    run_cudagraph_replay(run)
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    if replay:
+        run_cudagraph_replay(run)
+    else:
+        run()
+        torch.cuda.synchronize()
+    ref_out, ref_lse = hip_ref_like_fout(x)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_adaptive_launch_single_tile_uses_persistent():
     """bs=1 (num_final_rows==1) must not engage adaptive; still matches HIP."""
     _require_cuda()
-    from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
     dt = "bf16"
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
-        1, 32, _out_dtype(dt)
-    )
-    fout.zero_()
-    flse.zero_()
-
-    def run():
-        flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=32
-        )
-
-    run()
+    x = build_serving_decode_inputs(1, 32, _out_dtype(dt))
+    x.fout.zero_()
+    x.flse.zero_()
+    _run_wrapper(x, num_kv_splits=32)
     torch.cuda.synchronize()
-    ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
-    _assert_close(fout, flse, ref_out, ref_lse, dt)
+    ref_out, ref_lse = hip_ref_like_fout(x)
+    _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_explicit_waves_per_eu_compile_hints():
@@ -2316,41 +1673,18 @@ def test_explicit_waves_per_eu_equivalence():
 
     dt = "bf16"
     for active_tiles, splits in ((8, 32), (1, 128)):
-        po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
-            active_tiles, splits, _out_dtype(dt)
-        )
-        ref_out, ref_lse = hip_ref_like_fout(po, pl, indptr, fmap, pmap, fout, flse)
+        x = build_serving_decode_inputs(active_tiles, splits, _out_dtype(dt))
+        ref_out, ref_lse = hip_ref_like_fout(x)
 
         for waves_per_eu in (1, 4):
-            fout.zero_()
-            flse.zero_()
-
-            def run(
-                po=po,
-                pl=pl,
-                indptr=indptr,
-                fmap=fmap,
-                pmap=pmap,
-                fout=fout,
-                flse=flse,
-                splits=splits,
-                waves_per_eu=waves_per_eu,
-            ):
-                flydsl_mla_reduce_v1(
-                    po,
-                    pl,
-                    indptr,
-                    fmap,
-                    pmap,
-                    1,
-                    fout,
-                    flse,
-                    num_kv_splits=splits,
-                    waves_per_eu=waves_per_eu,
+            x.fout.zero_()
+            x.flse.zero_()
+            run_cudagraph_replay(
+                lambda x=x, s=splits, w=waves_per_eu: _run_wrapper(
+                    x, num_kv_splits=s, waves_per_eu=w
                 )
-
-            run_cudagraph_replay(run)
-            _assert_close(fout, flse, ref_out, ref_lse, dt)
+            )
+            _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
 
 def test_pointer_launch_abi_has_no_tensor_annotation_warnings():
@@ -2363,18 +1697,15 @@ def test_pointer_launch_abi_has_no_tensor_annotation_warnings():
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             for active_tiles, splits in ((8, 32), (1, 128)):
-                po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
+                x = build_serving_decode_inputs(
                     active_tiles, splits, _out_dtype("bf16")
                 )
-                inputs = po, pl, indptr, fmap, pmap
-                ref_out, ref_lse = hip_ref_like_fout(*inputs, fout, flse)
-                fout.zero_()
-                flse.zero_()
-                flydsl_mla_reduce_v1(
-                    *inputs, 1, fout, flse, num_kv_splits=splits, waves_per_eu=3
-                )
+                ref_out, ref_lse = hip_ref_like_fout(x)
+                x.fout.zero_()
+                x.flse.zero_()
+                _run_wrapper(x, num_kv_splits=splits, waves_per_eu=3)
                 torch.cuda.synchronize()
-                _assert_close(fout, flse, ref_out, ref_lse, "bf16")
+                _assert_close(x.fout, x.flse, ref_out, ref_lse, "bf16")
 
         annotation_warnings = [
             str(warning.message)
@@ -2388,148 +1719,116 @@ def test_pointer_launch_abi_has_no_tensor_annotation_warnings():
         compile_mla_reduce_splitk.cache_clear()
 
 
+def _check_name(fn):
+    """Default registry label: the check function's name minus its ``test_`` prefix."""
+    return fn.__name__.removeprefix("test_flydsl_mla_reduce_").removeprefix("test_")
+
+
 def run_checks():
-    """Run every invariant/correctness check. Returns a list of ``(name, exc)``
-    for any that failed; an empty list means everything passed. Aggregates
-    failures instead of stopping at the first one, mirroring a full pytest
-    report without depending on pytest."""
-    failures = []
+    """Run every invariant/correctness check. Returns a list of ``(name, exc)`` for any that failed; an empty list means everything passed. The registry below is data-driven: ``add`` labels a check after its function unless given an explicit ``name``, and ``add_each`` packs one case per positional arg."""
+    checks = []
 
-    def _run(name, fn, *args):
-        try:
-            fn(*args)
-        except Exception as exc:  # noqa: BLE001 - collect every failure, keep going
-            failures.append((name, exc))
+    def add(fn, *args, name=None):
+        checks.append((name or _check_name(fn), fn, args))
 
-    for case in _HIP_CASES:
-        _run(
-            f"irregular_vs_hip[{case[0]}_{case[4]}]",
-            test_flydsl_mla_reduce_irregular_vs_hip,
-            case,
-        )
-    for case in _TORCH_CASES:
-        _run(
-            f"irregular_vs_torch_ref[{case[0]}_{case[4]}]",
-            test_flydsl_mla_reduce_irregular_vs_torch_ref,
-            case,
-        )
-    for case in _SMOKE_CASES:
-        (H, Dv), ref, S = case
-        _run(
-            f"uniform_smoke[H{H}_Dv{Dv}_{ref}_s{S}]",
-            test_flydsl_mla_reduce_uniform_smoke,
-            case,
-        )
-    for case in _GRAPH_CASES:
-        _run(
-            f"cudagraph_replay[{case[0]}]",
-            test_flydsl_mla_reduce_cudagraph_replay,
-            case,
-        )
-    _run(
-        "small_split_cudagraph_replay",
-        test_flydsl_mla_reduce_small_split_cudagraph_replay,
+    def add_each(cases, name_fn, fn):
+        for case in cases:
+            checks.append((name_fn(case), fn, (case,)))
+
+    add_each(
+        _HIP_CASES,
+        lambda c: f"irregular_vs_hip[{c[0]}_{c[4]}]",
+        test_flydsl_mla_reduce_irregular_vs_hip,
     )
-    _run("serving_sparse_grid_vs_hip", test_serving_sparse_grid_vs_hip)
-    _run(
-        "serving_sparse_grid_cudagraph_replay",
-        test_serving_sparse_grid_cudagraph_replay,
+    add_each(
+        _TORCH_CASES,
+        lambda c: f"irregular_vs_torch_ref[{c[0]}_{c[4]}]",
+        test_flydsl_mla_reduce_irregular_vs_torch_ref,
     )
-    for K in [4, 8, 16]:
-        _run(f"splitk_b1_s128_vs_torch_ref[K={K}]", test_splitk_b1_s128_vs_torch_ref, K)
-    _run("splitk_b1_s128_vs_hip", test_splitk_b1_s128_vs_hip)
-    _run("splitk_b1_s128_cudagraph_replay", test_splitk_b1_s128_cudagraph_replay)
-    _run("splitk_engagement_boundaries", test_splitk_engagement_boundaries)
-    _run("da_splitk_no_engage_large_batch", test_da_splitk_no_engage_large_batch)
-    _run("da_splitk_no_engage_low_splits", test_da_splitk_no_engage_low_splits)
-    _run("da_splitk_wrapper_vs_hip", test_da_splitk_wrapper_vs_hip)
+    add_each(
+        _SMOKE_CASES,
+        lambda c: f"uniform_smoke[H{c[0][0]}_Dv{c[0][1]}_{c[1]}_s{c[2]}]",
+        test_flydsl_mla_reduce_uniform_smoke,
+    )
+    add_each(
+        _GRAPH_CASES,
+        lambda c: f"cudagraph_replay[{c[0]}]",
+        test_flydsl_mla_reduce_cudagraph_replay,
+    )
+    add(test_serving_sparse_grid, name="serving_sparse_grid_vs_hip")
+    add(test_serving_sparse_grid, True, name="serving_sparse_grid_cudagraph_replay")
+    add_each(
+        [4, 8, 16],
+        lambda K: f"splitk_b1_s128_vs_torch_ref[K={K}]",
+        test_splitk_b1_s128_vs_torch_ref,
+    )
+    add(test_splitk_b1_s128_vs_hip)
+    add(
+        test_splitk_b1_s128_vs_torch_ref,
+        None,
+        True,
+        name="splitk_b1_s128_cudagraph_replay",
+    )
+    add(test_splitk_planner_boundaries)
+    add(test_da_splitk_wrapper_vs_hip)
     for skipped_splits in (0, 1):
-        _run(
-            f"da_splitk_preserves_stage1_rows[splits={skipped_splits}]",
+        add(
             test_da_splitk_preserves_stage1_rows,
             skipped_splits,
+            name=f"da_splitk_preserves_stage1_rows[splits={skipped_splits}]",
         )
-        _run(
-            f"da_splitk_preserves_stage1_rows_cudagraph[splits={skipped_splits}]",
-            test_da_splitk_preserves_stage1_rows_cudagraph,
+        add(
+            test_da_splitk_preserves_stage1_rows,
             skipped_splits,
+            True,
+            name=f"da_splitk_preserves_stage1_rows_cudagraph[splits={skipped_splits}]",
         )
-    _run(
-        "da_splitk_capture_safe_varying_splits",
-        test_da_splitk_capture_safe_varying_splits,
+    add(test_da_splitk_capture_safe_varying_splits)
+    add(test_derive_actual_max_splits)
+    add(test_actual_max_splits_wrapper_loose_budget_correct)
+    add(test_actual_max_splits_wrapper_cudagraph_replay)
+    add(test_serving_stale_indptr_cudagraph_replay)
+    add(test_serving_gather_guard_differential)
+    add(test_serving_store_guard_differential)
+    add(test_serving_gather_guard_differential_cudagraph_replay)
+    add(test_serving_store_guard_differential_cudagraph_replay)
+    add(test_serving_true_oob_no_fault)
+    add_each(
+        _DEGEN_TILES,
+        lambda n: f"degenerate_empty_tile[tiles{n}]",
+        test_flydsl_mla_reduce_degenerate_empty_tile,
     )
-    _run(
-        "actual_max_splits_gate_loose_budget", test_actual_max_splits_gate_loose_budget
-    )
-    _run("derive_actual_max_splits", test_derive_actual_max_splits)
-    _run(
-        "actual_max_splits_wrapper_loose_budget_correct",
-        test_actual_max_splits_wrapper_loose_budget_correct,
-    )
-    _run(
-        "actual_max_splits_wrapper_cudagraph_replay",
-        test_actual_max_splits_wrapper_cudagraph_replay,
-    )
-    _run(
-        "serving_stale_indptr_cudagraph_replay",
-        test_serving_stale_indptr_cudagraph_replay,
-    )
-    _run("serving_gather_guard_differential", test_serving_gather_guard_differential)
-    _run("serving_store_guard_differential", test_serving_store_guard_differential)
-    _run(
-        "serving_gather_guard_differential_cudagraph_replay",
-        test_serving_gather_guard_differential_cudagraph_replay,
-    )
-    _run(
-        "serving_store_guard_differential_cudagraph_replay",
-        test_serving_store_guard_differential_cudagraph_replay,
-    )
-    _run("serving_true_oob_no_fault", test_serving_true_oob_no_fault)
-    for num_tiles in _DEGEN_TILES:
-        _run(
-            f"degenerate_empty_tile[tiles{num_tiles}]",
-            test_flydsl_mla_reduce_degenerate_empty_tile,
-            num_tiles,
-        )
-    _run(
-        "dispatch_does_not_thread_actual_max_splits",
-        test_dispatch_does_not_thread_actual_max_splits,
-    )
-    _run(
-        "dispatch_falls_back_outside_validated_target",
-        test_dispatch_falls_back_outside_validated_target,
-    )
-    _run(
-        "mla_reduce_wrapper_rejects_invalid_pointer_abi",
-        test_mla_reduce_wrapper_rejects_invalid_pointer_abi,
-    )
-    _run(
-        "resolve_actual_max_splits_eager_and_capture",
-        test_resolve_actual_max_splits_eager_and_capture,
-    )
+    add(test_dispatch_does_not_thread_actual_max_splits)
+    add(test_dispatch_falls_back_outside_validated_target)
+    add(test_mla_reduce_wrapper_rejects_invalid_pointer_abi)
+    add(test_resolve_actual_max_splits_eager_and_capture)
     for label, active, splits in _ADAPTIVE_SCENARIOS:
-        _run(
-            f"adaptive_launch_wrapper_vs_hip[{label}]",
+        add(
             test_adaptive_launch_wrapper_vs_hip,
             label,
             active,
             splits,
+            name=f"adaptive_launch_wrapper_vs_hip[{label}]",
         )
-    _run("adaptive_launch_cudagraph_replay", test_adaptive_launch_cudagraph_replay)
-    _run(
-        "adaptive_launch_single_tile_uses_persistent",
-        test_adaptive_launch_single_tile_uses_persistent,
+    add(
+        test_adaptive_launch_wrapper_vs_hip,
+        "b8_s32",
+        8,
+        32,
+        True,
+        name="adaptive_launch_cudagraph_replay",
     )
-    _run(
-        "explicit_waves_per_eu_compile_hints",
-        test_explicit_waves_per_eu_compile_hints,
-    )
-    _run("explicit_waves_per_eu_equivalence", test_explicit_waves_per_eu_equivalence)
-    _run(
-        "pointer_launch_abi_has_no_tensor_annotation_warnings",
-        test_pointer_launch_abi_has_no_tensor_annotation_warnings,
-    )
+    add(test_adaptive_launch_single_tile_uses_persistent)
+    add(test_explicit_waves_per_eu_compile_hints)
+    add(test_explicit_waves_per_eu_equivalence)
+    add(test_pointer_launch_abi_has_no_tensor_annotation_warnings)
 
+    failures = []
+    for name, fn, args in checks:
+        try:
+            fn(*args)
+        except Exception as exc:  # noqa: BLE001 - collect every failure, keep going
+            failures.append((name, exc))
     return failures
 
 
@@ -2549,69 +1848,55 @@ _SERVING_SCENARIOS = [
 ]
 
 
-def _roofline(active, splits, H, Dv, out_dtype):
-    """FLOPs (online-softmax weighted-sum FMA) and byte traffic for the reduce."""
-    total_splits = active * splits
+def _reduce_roofline(total_splits, final_rows, H, Dv, out_dtype):
+    """FLOPs (online-softmax weighted-sum FMA) and byte traffic for the reduce, given the total partial-row reads and final-row writes for the scenario."""
     out_bytes = torch.finfo(out_dtype).bits // 8
     flops = 2 * total_splits * H * Dv
     nbytes = (
         total_splits * H * Dv * 4  # partial_output fp32 read
         + total_splits * H * 4  # partial_lse   fp32 read
-        + active * H * Dv * out_bytes  # final_output  write
-        + active * H * 4  # final_lse     fp32 write
+        + final_rows * H * Dv * out_bytes  # final_output  write
+        + final_rows * H * 4  # final_lse     fp32 write
     )
     return flops, nbytes
 
 
-@benchmark()
-def test_mla_reduce(active, splits, H, Dv, dtype):
-    po, pl, indptr, fmap, pmap, fout, flse = build_serving_decode_inputs(
-        active, splits, dtype, H=H, Dv=Dv
-    )
-
-    # torch online-softmax reference over the active prefix only (tail tiles are
-    # empty and skipped by both the kernels and the ref).
-    ref_out, ref_lse = torch_ref_gather(
-        po, pl, indptr[: active + 1], fmap[:active], pmap, H, Dv, dtype, M=1
-    )
-
-    candidates = {
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, fout, flse, num_kv_splits=splits
-        )
-    }
+def _reduce_candidates(x, Dv, M, kv_splits):
+    """``wrapper`` (+ ``hip`` when the Dv=512 template applies) candidates shared by the three reduce perf sweeps."""
+    candidates = {"wrapper": lambda: _run_wrapper(x, M, num_kv_splits=kv_splits)}
     if Dv == 512:
         # mla_reduce_v1 signature: (..., max_seqlen_q, num_kv_splits, out, lse)
         # HIP MLA_REDUCE_ROUTER only has a Dv=512 template; skip it elsewhere.
-        candidates["hip"] = lambda: aiter.mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
-        )
+        candidates["hip"] = lambda: aiter.mla_reduce_v1(*x.maps, M, 0, x.fout, x.flse)
+    return candidates
 
-    flops, nbytes = _roofline(active, splits, H, Dv, dtype)
 
+def _bench_reduce_candidates(
+    candidates, x, ref_out, dtype, flops, nbytes, op_name, ref_lse=None
+):
+    """Time + validate each candidate; the us/graph-us/TFLOPS/TB-s/err columns shared by the mla_reduce perf sweeps. ``ref_lse`` is only checked (not tabulated) when provided, matching the serving sweep's extra invariant."""
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
-        fout.zero_()
-        flse.zero_()
+        x.fout.zero_()
+        x.flse.zero_()
         _, us = run_perftest(fn, num_warmup=25, num_iters=100)
-        out = fout.clone()
-        lse = flse.clone()
         err = checkAllclose(
             ref_out.to(dtypes.fp32),
-            out.to(dtypes.fp32),
+            x.fout.clone().to(dtypes.fp32),
             rtol=1e-2,
             atol=_out_atol(dtype),
-            msg=f"{name}: mla_reduce out",
+            msg=f"{name}: {op_name} out",
             printLog=False,
         )
-        checkAllclose(
-            ref_lse.to(dtypes.fp32),
-            lse.to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-3,
-            msg=f"{name}: mla_reduce lse",
-            printLog=False,
-        )
+        if ref_lse is not None:
+            checkAllclose(
+                ref_lse.to(dtypes.fp32),
+                x.flse.clone().to(dtypes.fp32),
+                rtol=1e-2,
+                atol=1e-3,
+                msg=f"{name}: {op_name} lse",
+                printLog=False,
+            )
         # CUDA-graph replay µs (serving path): host dispatch captured once and
         # amortized away. TFLOPS/TB/s are derived from this, not eager us.
         graph_us = bench_cudagraph(fn) * 1e3
@@ -2624,58 +1909,35 @@ def test_mla_reduce(active, splits, H, Dv, dtype):
 
 
 @benchmark()
+def test_mla_reduce(active, splits, H, Dv, dtype):
+    x = build_serving_decode_inputs(active, splits, dtype, H=H, Dv=Dv)
+    # torch online-softmax reference over the active prefix only (tail tiles are
+    # empty and skipped by both the kernels and the ref).
+    active_prefix = x._replace(indptr=x.indptr[: active + 1], fmap=x.fmap[:active])
+    ref_out, ref_lse = torch_ref_gather(active_prefix, H, Dv, dtype)
+    candidates = _reduce_candidates(x, Dv, 1, splits)
+    flops, nbytes = _reduce_roofline(active * splits, active, H, Dv, dtype)
+    return _bench_reduce_candidates(
+        candidates, x, ref_out, dtype, flops, nbytes, "mla_reduce", ref_lse
+    )
+
+
+@benchmark()
 def test_mla_reduce_uniform(tiles, splits, H, Dv, M, dtype):
     """Dense/uniform occupancy control: every tile has ``splits`` splits."""
-    po, pl, indptr, fmap, pmap, fout, flse = build_inputs(
-        tiles, splits, H, Dv, dtype, M=M
+    x = build_inputs(tiles, splits, H, Dv, dtype, M=M)
+    ref_out, _ref_lse = torch_ref(x.po, x.pl, tiles, splits, H, Dv, dtype, M=M)
+    candidates = _reduce_candidates(x, Dv, M, splits)
+    flops, nbytes = _reduce_roofline(tiles * splits, tiles * M, H, Dv, dtype)
+    return _bench_reduce_candidates(
+        candidates, x, ref_out, dtype, flops, nbytes, "mla_reduce_uniform"
     )
-    ref_out, _ref_lse = torch_ref(po, pl, tiles, splits, H, Dv, dtype, M=M)
-
-    candidates = {
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, M, fout, flse, num_kv_splits=splits
-        )
-    }
-    if Dv == 512:
-        candidates["hip"] = lambda: aiter.mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, M, 0, fout, flse
-        )
-
-    out_bytes = torch.finfo(dtype).bits // 8
-    flops = 2 * tiles * splits * H * Dv
-    nbytes = (
-        tiles * splits * H * Dv * 4
-        + tiles * splits * H * 4
-        + tiles * M * H * Dv * out_bytes
-        + tiles * M * H * 4
-    )
-
-    ret = {"gfx": get_gfx()}
-    for name, fn in candidates.items():
-        fout.zero_()
-        flse.zero_()
-        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
-        err = checkAllclose(
-            ref_out.to(dtypes.fp32),
-            fout.clone().to(dtypes.fp32),
-            rtol=1e-2,
-            atol=_out_atol(dtype),
-            msg=f"{name}: mla_reduce_uniform out",
-            printLog=False,
-        )
-        graph_us = bench_cudagraph(fn) * 1e3
-        ret[f"{name} us"] = us
-        ret[f"{name} graph us"] = graph_us
-        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
-        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
-        ret[f"{name} err"] = err
-    return ret
 
 
 @benchmark()
 def test_mla_reduce_irregular(splits_per_tile, gap_stride, pool_slack, H, Dv, dtype):
     """Irregular per-tile split cost factors: tier mismatch, gaps, pool slack."""
-    po, pl, indptr, fmap, pmap, fout, flse = build_irregular_inputs(
+    x = build_irregular_inputs(
         list(splits_per_tile),
         H,
         Dv,
@@ -2683,94 +1945,46 @@ def test_mla_reduce_irregular(splits_per_tile, gap_stride, pool_slack, H, Dv, dt
         gap_stride=gap_stride,
         pool_slack=pool_slack,
     )
-    ref_out, _ref_lse = torch_ref_gather(po, pl, indptr, fmap, pmap, H, Dv, dtype)
-
-    candidates = {
-        "wrapper": lambda: flydsl_mla_reduce_v1(
-            po,
-            pl,
-            indptr,
-            fmap,
-            pmap,
-            1,
-            fout,
-            flse,
-            num_kv_splits=max(splits_per_tile),
-        )
-    }
-    if Dv == 512:
-        candidates["hip"] = lambda: aiter.mla_reduce_v1(
-            po, pl, indptr, fmap, pmap, 1, 0, fout, flse
-        )
-
+    ref_out, _ref_lse = torch_ref_gather(x, H, Dv, dtype)
+    candidates = _reduce_candidates(x, Dv, 1, max(splits_per_tile))
     total_splits = sum(splits_per_tile)
     active = sum(1 for s in splits_per_tile if s > 1)
-    out_bytes = torch.finfo(dtype).bits // 8
-    flops = 2 * total_splits * H * Dv
-    nbytes = (
-        total_splits * H * Dv * 4
-        + total_splits * H * 4
-        + active * H * Dv * out_bytes
-        + active * H * 4
+    flops, nbytes = _reduce_roofline(total_splits, active, H, Dv, dtype)
+    return _bench_reduce_candidates(
+        candidates, x, ref_out, dtype, flops, nbytes, "mla_reduce_irregular"
     )
 
-    ret = {"gfx": get_gfx()}
-    for name, fn in candidates.items():
-        fout.zero_()
-        flse.zero_()
-        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
-        err = checkAllclose(
-            ref_out.to(dtypes.fp32),
-            fout.clone().to(dtypes.fp32),
-            rtol=1e-2,
-            atol=_out_atol(dtype),
-            msg=f"{name}: mla_reduce_irregular out",
-            printLog=False,
-        )
-        graph_us = bench_cudagraph(fn) * 1e3
-        ret[f"{name} us"] = us
-        ret[f"{name} graph us"] = graph_us
-        ret[f"{name} TFLOPS"] = flops / graph_us / 1e6
-        ret[f"{name} TB/s"] = nbytes / graph_us / 1e6
-        ret[f"{name} err"] = err
-    return ret
+
+def _log_sweep_table(rows, title):
+    """Render one perf sweep's rows as a markdown table, same log format shared by all three ``run_bench`` sweeps."""
+    df = pd.DataFrame(rows)
+    aiter.logger.info("%s (markdown):\n%s", title, df.to_markdown(index=False))
 
 
 def run_bench(args):
     """Run the three perf sweeps and print one markdown table each."""
     for dtype in args.dtype:
-        df = []
-        for (H, Dv), (active, splits) in itertools.product(args.hdv, args.scenario):
-            df.append(test_mla_reduce(active, splits, H, Dv, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "mla_reduce GLM-5.2 serving summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
+        rows = [
+            test_mla_reduce(active, splits, H, Dv, dtype)
+            for (H, Dv), (active, splits) in itertools.product(args.hdv, args.scenario)
+        ]
+        _log_sweep_table(rows, "mla_reduce GLM-5.2 serving summary")
 
-        df = []
-        for (H, Dv), tiles, splits in itertools.product(
-            args.hdv, args.tiles, args.uniform_splits
-        ):
-            df.append(test_mla_reduce_uniform(tiles, splits, H, Dv, 1, dtype))
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "mla_reduce uniform (occupancy) summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
-
-        df = []
-        for (H, Dv), spt, gap_stride, pool_slack in itertools.product(
-            args.hdv, args.splits_per_tile, args.gap_stride, args.pool_slack
-        ):
-            df.append(
-                test_mla_reduce_irregular(spt, gap_stride, pool_slack, H, Dv, dtype)
+        rows = [
+            test_mla_reduce_uniform(tiles, splits, H, Dv, 1, dtype)
+            for (H, Dv), tiles, splits in itertools.product(
+                args.hdv, args.tiles, args.uniform_splits
             )
-        df = pd.DataFrame(df)
-        aiter.logger.info(
-            "mla_reduce irregular (cost-factor) summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
+        ]
+        _log_sweep_table(rows, "mla_reduce uniform (occupancy) summary")
+
+        rows = [
+            test_mla_reduce_irregular(spt, gap_stride, pool_slack, H, Dv, dtype)
+            for (H, Dv), spt, gap_stride, pool_slack in itertools.product(
+                args.hdv, args.splits_per_tile, args.gap_stride, args.pool_slack
+            )
+        ]
+        _log_sweep_table(rows, "mla_reduce irregular (cost-factor) summary")
 
 
 def main():
