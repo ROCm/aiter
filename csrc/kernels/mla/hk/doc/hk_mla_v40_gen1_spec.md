@@ -47,7 +47,7 @@ Key numbers (m16x8):
 | $D_{\mathrm{NoPE}}$ | 448 elements, fp8 (one E8M0 scale per 64 elements) |
 | $D_{\mathrm{RoPE}}$ | 64 elements, bf16 |
 | $D_{\mathrm{QK}} = D_V$ | 512 ($= D_{\mathrm{NoPE}} + D_{\mathrm{RoPE}}$) |
-| Q residency | half pinned-VGPR (Phase A), half LDS (Phase B) |
+| Q residency | **all** pinned-VGPR (`kQkGemmTiles=16`, `kRopeInVgpr`); `p_lds_q` is prologue staging only |
 | KV residency | LDS, double-buffered (pong = 64 KiB) |
 | Output residency | LDS bounce + VRAM (OManager V3 / V3NoStage) |
 | Compiler scratch budget | m16x8: `amdgpu_num_vgpr(36)`; m16x4: `(44)` |
@@ -269,26 +269,26 @@ Critical sp3 / mfma instruction at each edge is annotated in parentheses.
               │   (Phase 1 + 2 of QMgr)                 │
               ▼                    ▼                    │
    ┌────────────────────┐  ┌──────────────────────┐     │
-   │  Q-LDS (LDS half = │  │ KV-LDS, DOUBLE pong  │     │
-   │  Q[:, 256:512])    │  │ 64x512 bf16 = 64 KiB │◀────┘
-   │  + Phase-1 staging │  │ (two 32-row sub A/B) │
-   │  + KV raw-fp8 stage│  │ buf_A / buf_B swap   │
+   │  Q-LDS (prologue    │  │ KV-LDS, DOUBLE pong  │     │
+   │  staging only —     │  │ 64x512 bf16 = 64 KiB │◀────┘
+   │  Q lands in VGPR)   │  │ (two 32-row sub A/B) │
+   │  + KV raw-fp8 stage │  │ buf_A / buf_B swap   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
-             │ ds_read_b128            │ ds_read_b128 (K side)
+             │ prologue ds_read        │ ds_read_b128 (K side)
              │                        │ ds_read_b64_tr_b16 (V side, transpose)
              ▼                        ▼
    ┌────────────────────┐  ┌──────────────────────┐
    │ q_vgpr  v64-v127   │  │ k0/k1/k2  v36-v47    │
-   │ (Q[:,0:256] Ph.A;  │  │ (KV mfma operands,   │
-   │  q_lds window Ph.B)│  │  3 tiles for N=64)   │
+   │ (FULL Q, 512 cols, │  │ (KV mfma operands,   │
+   │  read-only in loop)│  │  3 tiles for N=64)   │
    └─────────┬──────────┘  └──────────┬───────────┘
              │                        │
              └─── v_mfma_f32_16x16x32_bf16 ───┘   ← QK (operands cvt fp8→bf16 first)
                               │
                               ▼
                   ┌─────────────────────┐
-                  │ S tile (16x32 fp32) │   compiler scratch v0..v35
+                  │ S tile (16x32 fp32) │   compiler scratch v0..~v40 (soft)
                   └─────────┬───────────┘
                             │ softmax (online)
                             │   v_max3 / warp_reduce(Max)
@@ -400,8 +400,8 @@ the deferred strip-3 store land in the right pong slot (Ch. 8).
 
 | Resource | Owner / manager | Lifetime |
 |---|---|---|
-| `q_vgpr` v64..v127 (Q[:,0:256] Ph.A + `q_lds` window Ph.B) | `QManager…::load_q` | Phase A / Phase B of every iter |
-| Q-LDS region (`p_lds_q`) | QManager Phase 2 | Phase B reads (whole loop) |
+| `q_vgpr` v64..v127 (**full** Q, all 512 cols, `kQkGemmTiles=16`) | `QManager…::load_q` (prologue) | QK reads every iter (read-only after prologue) |
+| Q-LDS region (`p_lds_q`) | QManager prologue staging | prologue only (dead in the loop) |
 | KV-LDS pong (`p_lds_kv_curr/next`, 64 KiB each) | `KvManager8to16bitsV2` | one iter (then swapped) |
 | KV raw-fp8 staging LDS | `KvManager8to16bitsV2` (strips 2,3) | within one iter (strip 3 spans to next) |
 | `k0/k1/k2` v36..v47 | `KvManager8to16bitsV2::load_k_to_gpr` | inside one QK mfma pair |
@@ -541,11 +541,43 @@ change.**
 
 ### 5.2 The full map (m16x8, kBlockN=64)
 
-Compiler scratch: **36** (v0..v35). Hand-pinned: **220** (v36..v255).
+Compiler scratch: **budget 36** (`amdgpu_num_vgpr(36)`), but the allocator
+actually reaches ~**v40** — it borrows the low mfma tiles (`k_0`/`k_1`, v36..v43)
+for its own use during non-gemm windows (see note below). Hand-pinned: v36..v255.
 
 | Range | Role | Owner / writer | Reader | Lifetime |
 |---|---|---|---|---|
-| v0..v35 | Compiler scratch: address arithmetic, fp8→bf16 cvt staging, e8m0 scale dwords, `ds_read`/`tr` buffers, **carried `s3_scale`** + the `row_kv_ld_next` cse-break hold | LLVM | LLVM | whole kernel; **budget=36, spill=0** |
+| v0..~v40 | Compiler scratch: address arithmetic, fp8→bf16 cvt staging, e8m0 scale dwords, `ds_read`/`tr` buffers, **carried `s3_scale`** + the `row_kv_ld_next` cse-break hold, and SGPR lane-stashes (`v_writelane` into a dead `k_0` lane) | LLVM | LLVM | whole kernel |
+
+> **The 36 budget is a soft floor, not a hard cap — by design.** The pinned map
+> is **ordered by lifetime, shortest-lived at the lowest numbers**, precisely so
+> the compiler can borrow the bottom of it:
+>
+> | tiles | numbers | lifetime |
+> |---|---|---|
+> | `k_0`/`k_1`/`k_2` | v36..v47 | **shortest** — live only *inside* one QK/PV mfma asm block, dead between gemms |
+> | `p_comp` | v48..v63 | softmax → PV of one iter |
+> | `q_vgpr` | v64..v127 | whole loop (read-only) |
+> | `oaccu` | v128..v255 | whole loop (accumulated) |
+>
+> Because the compiler-scratch window (v0..v35) sits **directly below** the
+> shortest-lived tiles, when its pressure exceeds 36 it overflows *up* into
+> exactly the registers that are dead at that moment. ISA inspection confirms it:
+> scratch reaches ~v40 (the low `k_0`/`k_1` tiles) during softmax — the window
+> between the QK and PV gemms — and at the prologue it stashes the kernarg ptr
+> into a `v36` lane via `v_writelane` (restored later via `v_readlane`). This is
+> **safe only because** each gemm asm block define-and-consumes its `k_*` tiles
+> internally, so they hold no cross-block-live value; placing them at the lowest
+> pinned numbers is a **deliberate choice to hand the allocator a reclaimable
+> buffer zone**, not an accident of numbering.
+>
+> **The compiler does NOT know these tiles are "pinned."** They're declared to it
+> only as inline-asm clobbers at each use site, not as a reserved range — so the
+> allocator treats v36..v43 as ordinary registers it may use between those uses.
+> Nothing in the toolchain checks that the author's pinned data is dead when the
+> compiler reuses the slot; **that correctness invariant is entirely the author's
+> to uphold** (verified by the kernel producing correct output, plus ISA reading
+> — not by any metadata flag).
 | v36..v47 | `k_0 / k_1 / k_2` — three 16×32 KV mfma operand tiles (4 vgprs each). Doubles as the PV V-tile staging (`v_1`) during PV | `KvManager…::load_k_to_gpr` / `load_transposed_v_to_gpr` | QK / PV mfma (B / A operand) | inside one mfma pair |
 | v48..v63 | `p_comp` — fp32 softmax output, `kBlockN/4 = 16` fp32/lane covering the 16×64 P-tile. **Overlaid**: `p_mfma` (bf16 P for PV) on v48..v55; the QK V-operand `v_0` on v60..v63 | softmax / PV cvt | softmax (rescale), PV | softmax → PV of one iter |
 | v64..v127 | `q_vgpr` — **full** Q (all 512 cols) in mfma A-operand layout, `kQkGemmTiles=16` tiles; a small `q_lds` window at the top is prologue scratch | `QManager::load_q` (prologue) | QK mfma (A-operand), all col-tiles | whole loop (read-only after prologue) [^q-ro] |
@@ -561,15 +593,26 @@ corrupted mid-loop" is **not** a Q-VGPR clobber; look downstream.
 
 ### 5.3 Why the layout is shaped this way
 
+**The ordering principle: lifetime, shortest-lived lowest.** The pinned range is
+laid out so register lifetime *grows* with the register number — `k_*` (per-mfma)
+< `p_comp` (per-iter) < `q_vgpr` (whole loop) < `oaccu` (whole loop). This is
+deliberate: it places the shortest-lived tiles immediately above the
+compiler-scratch window, so when the compiler's own pressure spills past the 36
+soft budget it lands in registers that are *dead* at that point (§5.2). The map
+gives the allocator a reclaimable buffer zone on purpose.
+
 Going low → high (toward v255), the rationale per range (m16x8):
 
-- **v0..v35 (compiler scratch).** Bounded by `amdgpu_num_vgpr(36)`. Holds
+- **v0..~v40 (compiler scratch).** Softly bounded by `amdgpu_num_vgpr(36)` —
+  the allocator overshoots into the dead `k_0`/`k_1` tiles (v36..v43) during
+  softmax (see the §5.2 note). Holds
   per-iter dynamic state: address arithmetic for `buffer_load_lds`,
   `ds_read`/`tr` destination dwords, softmax intermediates, e8m0 scale
   dwords, and the two cross-iter scalars introduced this line of work — the
   carried `s3_scale` (deferred strip-3, Ch. 8) and the `row_kv_ld_next`
-  cse-break hold (Ch. 13). **Zero spill** is the current measurement; new
-  pinned data must come out of v36..v255, not here. Growing pinned data
+  cse-break hold (Ch. 13). The allocator may borrow the dead `k_0`/`k_1` tiles
+  (up to ~v40) between gemm sections (§5.2); new pinned data must come out of
+  v36..v255, not from this scratch window. Growing pinned data
   shrinks this window, so the deferred-strip-3 / cse-break carries are the
   minimum the scratch region can afford.
 - **k_0 / k_1 / k_2 (v36..v47).** Three 16×32 KV mfma operand tiles. Three
@@ -598,20 +641,58 @@ The audit script reports three numbers:
 
 | Number | Meaning | Current value (m16x8) |
 |---|---|---:|
-| budget | `N` from `amdgpu_num_vgpr(N)` | 36 |
-| spill | `.vgpr_spill_count` in the kernel metadata | 0 |
-| free gprs | `N - max_observed_decimal_v - 1` | tight (v0..v35) |
+| budget | `N` from `amdgpu_num_vgpr(N)` | 36 (soft — see §5.2) |
+| scratch max | highest decimal `v` the compiler emits | ~v40 (borrows dead `k_0`/`k_1`) |
 
-Zero spill is the invariant to protect. Any new pinned data, new inline-asm
-clobber, or wider unroll could push the compiler over the 36-reg scratch
-budget into spill (and into the pinned range — the classic clobber bug).
-Always re-run the audit after touching:
+**Scope of `.vgpr_spill_count`, and why it doesn't help here.** That metadata
+field counts only the compiler's *own* register pressure exceeding the physical
+256-VGPR file — i.e. when LLVM can't fit its live values and emits
+`scratch_load`/`scratch_store` to global scratch memory. It says **nothing** about
+the pinned/unpinned *overlap* this kernel relies on: the compiler doesn't model
+the author-pinned tiles as reserved (it sees them only as per-use inline-asm
+clobbers), so it never reports a "spill" for reusing v36..v43 between gemm
+sections. A clean `.vgpr_spill_count == 0` therefore does **not** certify the
+overlap is safe — and a non-zero value would be a *different* problem (>256 total
+VGPRs), not our concern. **The real invariant is: no decimal `v` overwrites a
+pinned tile while it is still live** — checkable only by ISA reading + correct
+runtime output, not by any flag. Re-check after touching:
 
 - inline asm clobber lists in the managers
 - `static_for` unroll factors in the kernel body
 - any new `sched_barrier(0)` (it widens live ranges)
 
 See `.claude/skills/check-unpinned-reg-usage/` for the script.
+
+### 5.5 The `lane_idx` cse-break idiom
+
+Throughout the managers you'll see `asm volatile("" : "+v"(lane_idx));`
+immediately after `lane_idx = opus::lane_id()`. `lane_id()` is cheap and pure,
+so without this LLVM CSEs every read into one SSA value and keeps every
+lane-derived *address* alive across the whole inlined iter (barrier + QK + PV).
+The empty `+v` asm forces a re-materialization boundary: each use recomputes
+`lane_idx` locally, so the address VGPRs die quickly. This is what keeps the
+compiler's scratch pressure low enough that it only borrows the dead `k_0`/`k_1`
+tiles (§5.2) and never a *live* pinned tile.
+
+**It is a trade — VALU for VGPR — and it is the DEFAULT, not a selective
+tweak,** because the VALU cost is almost always hidden:
+
+| region | why the extra recompute is free | rule |
+|---|---|---|
+| QManager (prologue) / OManager (epilogue) | memory-bound phases — recompute hides under vmem/LDS traffic | **always cse-break** |
+| KV load (hot path) | wave-specialized: the SIMD-mate wave runs QK/PV mfma, so this wave's extra VALU issues into slots the mfma leaves free ([[hk-m16x8-pv-pingpong]]) | cse-break |
+| everything else | little VALU effect either way, and VGPR is scarce | cse-break |
+
+**The no-break sites are not exceptions** — they're where the lane-derived
+address dies *immediately* (before any mfma), so there is no long live range to
+shorten and the break would reclaim no VGPR: the mfma-operand readers
+`load_k_to_gpr` / `load_transposed_v_to_gpr` (the mfma reads the loaded *data*,
+not the address), `get_kv_ld_row_base_idx` (a trivial `lane>>2` return), and the
+OManager epilogue readers.
+
+This is distinct from the `+v"(row_kv_ld_next)"` break in the kernel body, which
+*blocks* rematerialization of an index **load** into an address (Ch. 13.1 #9);
+the `lane_idx` breaks *force* rematerialization of a cheap ALU value.
 
 ## Chapter 6 — QManager Phase 1 (vmem → staging LDS → pinned q_vgpr)
 
@@ -684,9 +765,37 @@ non-linear cycle. The **LDS write side** is unaffected — the HW pattern
 for `buffer_load_dwordx4 lds:` is fixed at lane $\ell \to$ LDS offset
 $\ell \cdot 16$, independent of any data permutation.
 
+**Why `v_offset` and not the LDS address.** `buffer_load_lds` has **no
+per-lane LDS-address field** — the HW writes lane $\ell$ to $m0 + \ell\cdot16$
+and the pointer you pass is wave-uniform. So the swizzle cannot go on the
+write address; instead we permute the **gmem source** (`v_offset`), and the
+fixed LDS slot then holds permuted data. The permute is `col_quad ^ (S<<1)`
+with $S = (\ell{\gg}4) \mathbin{\mathrm{and}} 1$; since $S{\ll}1 = 2$,
+`^2` swaps col-quads $0\leftrightarrow2,\ 1\leftrightarrow3$.
+
+Within one 16×32 bf16 sub-tile, a row = 64 B = 4 col-quads of 16 B = 4×8 bf16
+cols:
+
+| col-quad | bf16 cols |
+|---:|---:|
+| 0 | 0–7 |
+| 1 | 8–15 |
+| 2 | 16–23 |
+| 3 | 24–31 |
+
+So `^2` swaps the two **16-col halves** $[0,16)\leftrightarrow[16,32)$
+(equivalently `byte_in_row ^= 32`), and only on odd row-bands:
+
+| rows | $S = (\text{row}{\gg}2) \mathbin{\mathrm{and}} 1$ | swap? |
+|---|---:|:---:|
+| 0–3 | 0 | identity |
+| 4–7 | 1 | **half-swapped** |
+| 8–11 | 0 | identity |
+| 12–15 | 1 | **half-swapped** |
+
 **Per-lane → staging-LDS byte (one chunk, buf 0):**
 
-| lane $\ell$ | row in warp $= \ell{\gg}2$ | col-quad logical $= \ell  \mathbin{\mathrm{and}}  3$ | $S$ | col-quad physical (vmem) | staging LDS dst |
+| lane $\ell$ | row $= \ell{\gg}2$ | col-quad logical $= \ell{ \mathbin{\mathrm{and}} }3$ | $S$ | col-quad phys (vmem) | staging LDS dst |
 |---:|---:|---:|---:|---:|---:|
 | 0 | 0 | 0 | 0 | 0 | $\ell{\cdot}16 = 0$ |
 | 1 | 0 | 1 | 0 | 1 | 16 |
@@ -698,8 +807,31 @@ $\ell \cdot 16$, independent of any data permutation.
 | 19 | 4 | 3 | 1 | **1** | 304 |
 | ⋮ | ⋮ | ⋮ | ⋮ | ⋮ | ⋮ |
 
-So the 64-col chunk lands row-major in the staging slot: row $r$
-occupies bytes $[r\cdot 64,\, r\cdot 64 + 64)$.
+The LDS dst is HW-fixed at $\ell\cdot16$ (natural order); the *data* that lands
+there is permuted. Since LDS quad $c$ is written by the lane whose source is
+$c \oplus (S{\ll}1)$, **the physical LDS quad $c$ holds the logical col-quad
+$c \oplus (S{\ll}1)$**:
+
+| row-band | LDS quad 0 holds | quad 1 | quad 2 | quad 3 |
+|---|---|---|---|---|
+| 0–3 ($S{=}0$) | cols 0–7 | 8–15 | 16–23 | 24–31 |
+| 4–7 ($S{=}1$) | cols **16–23** | **24–31** | **0–7** | **8–15** |
+| 8–11 ($S{=}0$) | cols 0–7 | 8–15 | 16–23 | 24–31 |
+| 12–15 ($S{=}1$) | cols **16–23** | **24–31** | **0–7** | **8–15** |
+
+The 64-col chunk still lands row-major (row $r$ at bytes
+$[r\cdot 64, r\cdot 64+64)$); only the two 16-col halves are swapped on the odd
+bands. Step 2's reader applies the same XOR (§6.5) so the net data is
+identity — the *only* observable effect is that the conflicting b128 cycle-0
+lane pair lands on distinct banks.
+
+> **Shared invariant.** The KvManager NoPE/RoPE writers use the byte-identical
+> swap (`col_group ^ (((lane>>4)&1)<<1)`, same row-band selector,
+> same `byte_in_row ^ 32`); its readers `load_k_to_gpr` /
+> `load_transposed_v_to_gpr` mirror it in the hot loop. QMgr and KvMgr thus
+> share one bank-arithmetic rule (Ch. 8). The difference is lifetime: QMgr's
+> reader (Step 2) runs **once** at the prologue (Q then lives in VGPR); KvMgr
+> re-reads its LDS sub-tiles **every iter**.
 
 **Per-lane vmem offset (E8M0 scale):**
 
@@ -895,7 +1027,7 @@ The 8 col-tiles per wave map to:
 
 ### 7.2 The sb8 permutation — why and how
 
-The QK GEMM's `ds_read_b128_tr_b16` reader naturally lays out a 64-col
+The QK GEMM's `ds_read_b64_tr_b16` reader naturally lays out a 64-col
 wave-tile in source col-element order $p \in [0, 64)$ — but at the
 write side, naive `ds_write_b128` of 64 cols *as-is* hits a 2-way
 `ds_write` bank conflict (the writer-side residue of the same Site C
@@ -921,7 +1053,9 @@ $$
 L = (p  \mathbin{\mathrm{and}}  7) \,\big|\, \Big(\big((p \gg 3)  \mathbin{\mathrm{and}}  1\big) \ll 5\Big) \,\big|\, \Big(\big((p \gg 3)  \mathbin{\mathrm{and}}  6\big) \ll 2\Big) \,\big|\, (p  \mathbin{\mathrm{and}}  \sim 0\mathrm{x}3F)
 $$
 
-Equivalently: **swap bits [3] and [5]** of $p$. The trailing
+Equivalently: a **3-bit rotation of the sub-tile field [5:3]** — $p$ bit 3 →
+$L$ bit 5, $p$ bit 4 → $L$ bit 3, $p$ bit 5 → $L$ bit 4 (not a plain bit-3↔bit-5
+swap; e.g. $p{=}16 \to L{=}8$). The trailing
 $(p  \mathbin{\mathrm{and}}  \sim 0\mathrm{x}3F)$ passes bits ≥ 6 through unchanged (those
 indices live above one wave-tile).
 
@@ -950,12 +1084,19 @@ in the *second half* ($4, 5, 6, 7$).
 
 #### 7.2.3 Where the perm must apply (and where it doesn't)
 
+> **Note on mechanism.** `sb8_perm_col_elems` / `sb8_inv_perm_col_elems` are the
+> *reference* closed forms, but the kernel does not call them — the equivalent
+> perm is baked **structurally** into the address maps below (the QMgr
+> chunk→data-sub-tile assignment, `buffer_managers:324-339`; the KvMgr wave→col-
+> tile partition; an inlined `sb8_perm_subtile` in OManager). Read the "perm
+> site" column as *where an sb8-equivalent reordering lives*, not as a call.
+
 | Side | Perm site | Reason |
 |---|---|---|
-| **LDS-dst writers** (manager controls the LDS dst address) | Forward `sb8_perm_col_elems` on the LDS dst col-element index | Manager-controlled writes can choose the dst; we put the perm here. |
-| **`buffer_load_lds` writers** (HW fixes the LDS dst pattern) | Forward `sb8_perm_col_elems` on the **vmem-src col**, via permuted `v_offset` | `buffer_load_lds` always writes lane $T$ to LDS $T \cdot 16$. Algebra: permuting the source col is equivalent to permuting the dst, since the HW dst pattern is a bijection. |
+| **LDS-dst writers** (manager controls the LDS dst address) | sb8-equivalent reorder baked into the LDS dst col-element index | Manager-controlled writes can choose the dst; the perm lives there. |
+| **`buffer_load_lds` writers** (HW fixes the LDS dst pattern) | sb8-equivalent reorder on the **vmem-src col**, via permuted `v_offset` | `buffer_load_lds` always writes lane $T$ to LDS $T \cdot 16$. Algebra: permuting the source col is equivalent to permuting the dst, since the HW dst pattern is a bijection. |
 | **PV reader (the V-side of the wave-tile)** | None | Reading from a permuted layout for K's reduction axis is fine — see 7.2.4. |
-| **OManager epilogue** (final VRAM write) | Inverse `sb8_inv_perm_col_elems` on the per-lane VRAM col | Un-swizzles so the user sees natural col order. Ch. 11. |
+| **OManager epilogue** (final VRAM write) | Inverse (sb8⁻¹) reorder on the per-lane VRAM col, via inlined `sb8_perm_subtile` | Un-swizzles so the user sees natural col order. Ch. 11. |
 
 #### 7.2.4 Why Q's D-axis must get the SAME perm as K's
 
@@ -1219,8 +1360,13 @@ Two key choices:
    $$
 
    Pairs with the matching XOR on `load_k_to_gpr`'s reader, and lets
-   `cvt_and_store_kv_tile`'s LDS dst address stay straight — same
-   pattern QManager Phase 2 ships.
+   `cvt_and_store_kv_tile`'s LDS dst address stay straight — the
+   **byte-identical** swap QManager ships (see §6.3 for the per-band
+   lane→col-quad and LDS-content tables; they apply here unchanged, with
+   `col_group` in place of `col_quad`). Net data is identity after the
+   reader's matching XOR; the only effect is distinct-bank placement for
+   the b128 cycle-0 pair. Difference vs QMgr: KvMgr's reader runs **every
+   iter** (K/V re-read from LDS), QMgr's runs once at the prologue.
 
 ### 8.6 NoPE cvt+store — `cvt_kv_tile_step` + `store_kv_tile_step`
 
@@ -1440,11 +1586,13 @@ then packs it into bf16 `p_mfma` (v48..v55 overlay) for PV.
 
 > **kBlockN=64 + `kUsePk` update (m16x8).** With kBlockN=64 the P-tile is 16×64,
 > so `p_comp` = `kBlockN/4 = 16` fp32/lane and the packed `p_mfma` = `kBlockN/8
-> = 8` dwords/lane. The kernel uses the `_16`-width routines
-> (`softmax_mask_p`, `softmax_p1_prescaled_16`, `max_16`), and each takes a
-> `kUsePk` template arg. In softmax, `kSoftmaxUsePk = kPvAtEnd`, so **lo warps
-> run packed** (`v_pk_*`) and **hi warps run de-packed** (`v_add_f32_e32` /
-> `v_mov_b32` / `v_exp_f32` scalars). (The oaccu-normalize at epilogue is the
+> = 8` dwords/lane. The routines: `max_16` (16-wide max, **no `kUsePk`**),
+> `softmax_p1_prescaled_16<…, kUsePk>` (the exp block, `kUsePk`-templated), and
+> `softmax_mask_p<…, kUsePk>` (an **8-VGPR** mask-only routine called **twice**
+> per softmax, at `k_p_comp_begin` and `+8`). In softmax, `kSoftmaxUsePk =
+> kPvAtEnd`, so **lo warps run packed** (`v_pk_*`) and **hi warps run de-packed**
+> (`v_add_f32_e32` / `v_mov_b32` / `v_exp_f32` scalars). (The oaccu-normalize at
+> epilogue is the
 > opposite — `kFinalRescaleUsePk = !kPvAtEnd`, lo de-packed / hi packed, §10 —
 > so each warp group carries exactly one packed phase.) Where the older text
 > says "8 fp32 / 16×32" read "16 fp32 / 16×64"; where it says v120.. read v48..
@@ -1521,18 +1669,18 @@ optimization (every tile rescales).
 | $P^{(i)}$ in bf16 for PV | `p_mfma` v48..v55 (overlay on p_comp low half) | 8 bf16x2 dwords/lane |
 | $\alpha$ (rescale for this iter) | `float rescale;` local | 1 fp32/lane, lives only within this iter |
 
-These compiler-scratch fp32 scalars sit in v0..v35 and are recreated
-each iter (LLVM is free to choose where).
+These compiler-scratch fp32 scalars sit in the compiler window (v0..~v40, §5.2)
+and are recreated each iter (LLVM is free to choose where).
 
 ### 9.3 The softmax routines (m16x8, `_16` + `kUsePk`)
 
-From `hk_mla_softmax.cuh` (all `_16`-width; each takes `kUsePk`):
+From `hk_mla_softmax.cuh` (widths and `kUsePk` differ per routine — see notes):
 
 | Routine | Inputs / Outputs | What it does |
 |---|---|---|
-| `softmax_mask_p<kCheckBoundary, GPR, kUsePk>(...)` | reads p_comp, writes p_comp | Applies the prescaled softmax scale and, on boundary tiles, fills out-of-range cols with −inf (via `set_ninf1/2<kUsePk>`) so exp → 0. De-packed when `kUsePk=false`. |
-| `max_16<…>` + `warp_reduce` (inlined) | reads p_comp, writes row_max, rescale | Local row max (v_max3 ladder over 16, no `v_pk`) + cross-lane reduce; updates $m$, computes $\alpha$ (deferred-rescale threshold, §9.1.1). |
-| `softmax_p1_prescaled_16<kIsFirstIter, k_p_comp_begin, comp_t, kUsePk>(...)` | reads p_comp + new_row_max + rescale, writes p_comp, row_sum_e | In-place `exp_2`, then row-sum reduce → running $\ell$. Packed or de-packed per `kUsePk` (§9.5). |
+| `softmax_mask_p<kCheckBoundary, GPR, kUsePk>(...)` | reads p_comp, writes p_comp | **Mask-only** (8-VGPR; called **twice**, at `k_p_comp_begin` and `+8`). Q is already scaled at load time, so this applies **no** multiply — on boundary tiles it fills out-of-range cols with −inf (via `set_ninf1/2<kUsePk>`) so exp → 0; the all-in-range fast path is a bare `return`. |
+| `max_16<GPR_START, comp_t>` + `warp_reduce` (inlined) | reads p_comp, writes row_max, rescale | Local row max (v_max3 ladder over 16, no `v_pk`, **no `kUsePk`**) + cross-lane reduce; updates $m$, computes $\alpha$ (deferred-rescale threshold, §9.1.1). |
+| `softmax_p1_prescaled_16<kIsFirstIter, k_p_comp_begin, comp_t, kUsePk>(...)` | reads p_comp + new_row_max + rescale, writes p_comp, row_sum_e | subtract-`m` add + in-place `exp_2` (no log2e multiply — prescaled), then row-sum reduce → running $\ell$. Packed or de-packed per `kUsePk` (§9.5). |
 
 `kSoftmaxUsePk = kPvAtEnd` (true for lo warps): **lo = packed, hi =
 de-packed** for the softmax block. The kernel inlines the row-max branch so
@@ -1558,17 +1706,21 @@ reduction window is 4 lanes wide.
 
 ### 9.5 The exp + add/mul block in `softmax_p1_prescaled_16` (+ `kUsePk`)
 
-`softmax_p1_prescaled_16<…, kUsePk>` emits the add/mul/exp block over the
-16 fp32 lanes. `kUsePk = kSoftmaxUsePk = kPvAtEnd` selects the ALU port:
+`softmax_p1_prescaled_16<…, kUsePk>` emits the add/exp block over the 16 fp32
+lanes. It is the **prescaled** variant: the softmax temperature (× log2e) is
+folded into Q at load time (`q *= sm_scale · log2e`), so there is **no per-tile
+log2e multiply here** — only the subtract-`m` add and the exp. (The non-prescaled
+`softmax_p1_16` is the one that carries the extra `v_pk_mul_f32` log2e step.)
+`kUsePk = kSoftmaxUsePk = kPvAtEnd` selects the ALU port:
 
-- **`kUsePk = true` (lo warps):** packed — `v_pk_add_f32` (subtract `m`) +
-  `v_pk_mul_f32` (× log2e) over 8 pairs, then `v_exp_f32` × 16, then a
-  `v_pk`-based reduction tree to `local_sum_e`.
+- **`kUsePk = true` (lo warps):** packed — `v_pk_add_f32` (subtract `m`) over 8
+  pairs, then `v_exp_f32` × 16, then a `v_pk`-based reduction tree to
+  `local_sum_e`.
 - **`kUsePk = false` (hi warps):** fully de-packed — `v_add_f32_e32` × 16,
   `v_exp_f32` × 16, then a scalar binary reduction tree. Helpers `set_ninf1`
   / `set_ninf2<kUsePk>` (in `hk_mla_softmax.cuh`) pick `v_mov_b32` vs
-  `v_pk_mov_b32` for the boundary −inf fills; `softmax_mask_p<…, kUsePk>`
-  is de-packed the same way. `max_16` has no `v_pk` and is shared.
+  `v_pk_mov_b32` for the boundary −inf fills. `max_16` (no `kUsePk` arg, no
+  `v_pk`) is shared by both.
 
 Both paths warp-reduce `local_sum_e` → `row_sum_e` through a shared tail.
 The fused asm stays one block so the compiler doesn't scatter the `v_exp`
@@ -2275,7 +2427,9 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 - `check-unpinned-reg-usage` skill (`.claude/skills/check-unpinned-reg-usage/`)
   — scans the post-`--save-temps` `.s` file for decimal `v ≥ N` (the scratch
   budget) and spill > 0. Run after every nontrivial change. Current state:
-  m16x8 `budget=36 / spill=0`; m16x4 `budget=44 / spill=0`.
+  m16x8 budget=36 (scratch reaches ~v40 into dead `k_0`/`k_1`); m16x4 budget=44.
+  `.vgpr_spill_count` only flags >256-VGPR pressure, not the pinned/unpinned
+  overlap — verify overlap safety by ISA reading + correct output (§5.2, §5.4).
 - ISA inspection (`-save-temps` + read the `.s` file) is the only way
   to catch compiler-hoist / inline-asm hazards above. Standard
   printf-debugging will not find them.
