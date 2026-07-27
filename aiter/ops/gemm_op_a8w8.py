@@ -977,6 +977,174 @@ def gemm_a8w8_blockscale_bpreshuffle(
         ) from e
 
 
+# ---------------------------------------------------------------------------
+# a8w8 blockscale bpreshuffle *batched* GEMM (bmm) -- FlyDSL gfx1250 WMMA only
+# ---------------------------------------------------------------------------
+
+_BMM_CONFIG_CACHE: dict = {}
+_BMM_HAS_GFX: dict = {}
+
+# Single conservative default used when the (B, M, N, K) shape is not in the
+# tuned CSV. tile_m=128 with ragged-M OOB clipping keeps it valid for any M;
+# the K-divisibility check below picks a tile_k that divides K.
+_BMM_DEFAULT = {
+    "tile_m": 128,
+    "tile_n": 128,
+    "m_warp": 2,
+    "n_warp": 2,
+    "num_buffers": 2,
+    "split_k": 1,
+    "cluster_m": 1,
+    "cluster_n": 1,
+}
+# Preference order for the default tile_k (largest first: fewer K-tiles = less
+# pipeline overhead), each requiring K % tile_k == 0 and K // tile_k >= nb.
+_BMM_DEFAULT_TILE_K_ORDER = (512, 256, 128)
+
+
+def get_bmm_config(B: int, M: int, N: int, K: int, tuned_file=None):
+    """Look up a tuned bmm config keyed on (gfx, cu_num, B, M, N, K).
+
+    Distinct from ``get_CKGEMM_config`` because the bmm CSV carries a batch
+    ``B`` column. Returns the config row dict, or None when the shape is
+    untuned (caller should fall back to the default config).
+    """
+    if tuned_file is None:
+        tuned_file = AITER_CONFIGS.AITER_CONFIG_A8W8_BLOCKSCALE_BPRESHUFFLE_BMM_FILE
+    if tuned_file not in _BMM_CONFIG_CACHE:
+        df = pd.read_csv(f"{tuned_file}").drop_duplicates()
+        if "gfx" in df.columns:
+            _BMM_CONFIG_CACHE[tuned_file] = df.set_index(
+                ["gfx", "cu_num", "B", "M", "N", "K"]
+            ).to_dict("index")
+            _BMM_HAS_GFX[tuned_file] = True
+        else:
+            logger.warning(
+                f"{tuned_file} has no 'gfx' column -- falling back to cu_num-only key. "
+                "Re-run the tuner or migrate the CSV to add a gfx column."
+            )
+            _BMM_CONFIG_CACHE[tuned_file] = df.set_index(
+                ["cu_num", "B", "M", "N", "K"]
+            ).to_dict("index")
+            _BMM_HAS_GFX[tuned_file] = False
+
+    gfx = get_gfx()
+    cu_num = get_cu_num()
+    has_gfx = _BMM_HAS_GFX[tuned_file]
+    key = (gfx, cu_num, B, M, N, K) if has_gfx else (cu_num, B, M, N, K)
+    config = _BMM_CONFIG_CACHE[tuned_file].get(key, None)
+    if config is not None:
+        if AITER_LOG_TUNED_CONFIG:
+            logger.info(
+                f"bmm shape B:{B} M:{M} N:{N} K:{K} is tuned on cu_num={cu_num} "
+                f"in {tuned_file}, kernel name is {config['kernelName']}!"
+            )
+    else:
+        logger.info(
+            f"bmm shape B:{B} M:{M} N:{N} K:{K} not found in {tuned_file}, "
+            "will use default config!"
+        )
+    return config
+
+
+def _bmm_default_kernel_name(N: int, K: int) -> str:
+    from .flydsl.blockscale_bpreshuffle_bmm_gfx1250 import bmm_kernel_name
+
+    cfg = dict(_BMM_DEFAULT)
+    if N % cfg["tile_n"] != 0:
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_bpreshuffle_bmm: N={N} not a multiple of the "
+            f"default tile_n={cfg['tile_n']}; add a tuned config for this shape."
+        )
+    tile_k = next(
+        (
+            tk
+            for tk in _BMM_DEFAULT_TILE_K_ORDER
+            if K % tk == 0 and K // tk >= cfg["num_buffers"]
+        ),
+        None,
+    )
+    if tile_k is None:
+        raise RuntimeError(
+            f"gemm_a8w8_blockscale_bpreshuffle_bmm: no default tile_k in "
+            f"{_BMM_DEFAULT_TILE_K_ORDER} divides K={K} with K//tile_k >= "
+            f"{cfg['num_buffers']}; add a tuned config for this shape."
+        )
+    return bmm_kernel_name(tile_k=tile_k, **cfg)
+
+
+def gemm_a8w8_blockscale_bpreshuffle_bmm_fake(
+    A: Tensor,
+    B: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    Out: Tensor,
+    M: int,
+    N: int,
+    K: int,
+    batch: int,
+    layout_mbn: int = 0,
+) -> Tensor:
+    return Out
+
+
+@torch_compile_guard(
+    mutates_args=["Out"],
+    device="cuda",
+    gen_fake=gemm_a8w8_blockscale_bpreshuffle_bmm_fake,
+)
+def gemm_a8w8_blockscale_bpreshuffle_bmm(
+    A: Tensor,
+    B: Tensor,
+    scale_a: Tensor,
+    scale_b: Tensor,
+    Out: Tensor,
+    M: int,
+    N: int,
+    K: int,
+    batch: int,
+    layout_mbn: int = 0,
+) -> Tensor:
+    """Strided-batched A8W8 blockscale bpreshuffle GEMM (FlyDSL gfx1250 WMMA).
+
+    Computes ``Out[b] = (A[b] * scale_a[b]) @ (B[b] * scale_b[b])^T`` for each of
+    ``batch`` matrices. Caller pre-processes inputs; see
+    ``aiter.ops.flydsl.blockscale_bpreshuffle_bmm_gfx1250`` for the data
+    contract (FP8 E4M3 A/B, 16x16-preshuffled B, E8M0 scales, BMN/MBN layouts).
+    Writes into and returns the pre-allocated ``Out``.
+
+    On gfx1250 the tuned kernel for (batch, M, N, K) is looked up in the tuned
+    bmm CSV; unknown shapes fall back to a single conservative default config.
+    """
+    if get_gfx() != "gfx1250":
+        raise RuntimeError(
+            "gemm_a8w8_blockscale_bpreshuffle_bmm is only implemented for gfx1250, "
+            f"got {get_gfx()}"
+        )
+
+    from .flydsl.blockscale_bpreshuffle_bmm_gfx1250 import run_from_kernel_name
+
+    config = get_bmm_config(batch, M, N, K)
+    if config is not None and str(config.get("libtype", "")) == "flydsl":
+        kernel_name = str(config.get("kernelName", ""))
+    else:
+        kernel_name = _bmm_default_kernel_name(N, K)
+
+    return run_from_kernel_name(
+        A,
+        B,
+        scale_a,
+        scale_b,
+        Out,
+        M=M,
+        N=N,
+        K=K,
+        batch=batch,
+        layout_mbn=layout_mbn,
+        kernel_name=kernel_name,
+    )
+
+
 def gfx950_a8w8_blockscale_ASM(
     XQ: Tensor,
     WQ: Tensor,
