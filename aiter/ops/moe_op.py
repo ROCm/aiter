@@ -12,7 +12,19 @@ import functools
 torch.int4 = getattr(torch, "int4", torch.uint32)
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", fc_name="topk_softmax", develop=True)
+def _topk_softmax(
+    topk_weights: Tensor,
+    topk_indices: Tensor,
+    token_expert_indices: Tensor,
+    gating_output: Tensor,
+    softmax_workspace: Tensor,
+    need_renorm: bool,
+    num_shared_experts: int = 0,
+    shared_expert_scoring_func: str = "",
+) -> None: ...
+
+
 def topk_softmax(
     topk_weights: Tensor,
     topk_indices: Tensor,
@@ -21,7 +33,36 @@ def topk_softmax(
     need_renorm: bool,
     num_shared_experts: int = 0,
     shared_expert_scoring_func: str = "",
-) -> None: ...
+) -> None:
+    # The softmax workspace is only touched on the non-power-of-2 / >256-expert
+    # path, but is always allocated here (torch caching allocator) and passed in so
+    # the C side stays torch-free. Size logic mirrors the original C implementation.
+    num_experts_total = gating_output.shape[-1]
+    num_tokens = gating_output.numel() // num_experts_total
+    num_routing_experts = (
+        num_experts_total - num_shared_experts
+        if num_shared_experts > 0
+        else num_experts_total
+    )
+    is_pow_2 = (
+        num_routing_experts != 0
+        and (num_routing_experts & (num_routing_experts - 1)) == 0
+    )
+    needs_workspace = (not is_pow_2) or num_routing_experts > 256
+    workspace_size = num_tokens * num_routing_experts if needs_workspace else 0
+    softmax_workspace = torch.empty(
+        workspace_size, dtype=dtypes.fp32, device=gating_output.device
+    )
+    _topk_softmax(
+        topk_weights,
+        topk_indices,
+        token_expert_indices,
+        gating_output,
+        softmax_workspace,
+        need_renorm,
+        num_shared_experts,
+        shared_expert_scoring_func,
+    )
 
 
 @compile_ops(
@@ -42,11 +83,21 @@ def topk_sigmoid(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
-def moe_sum(input: Tensor, output: Tensor) -> None: ...
+@compile_ops("module_moe_asm", fc_name="moe_sum", develop=True)
+def _moe_sum(input: Tensor, output: Tensor) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+def moe_sum(input: Tensor, output: Tensor) -> None:
+    # C side only implements topk in {2, 4, 5}; other topk values fall back to
+    # torch.sum on the Python side so the C side stays torch-free.
+    topk = input.shape[1]
+    if topk in (2, 4, 5):
+        _moe_sum(input, output)
+    else:
+        torch.sum(input, dim=1, out=output)
+
+
+@compile_ops("module_moe_asm", develop=True)
 def moe_align_block_size(
     topk_ids: Tensor,
     num_experts: int,
