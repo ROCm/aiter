@@ -36,7 +36,9 @@ aiter_lib = Library("aiter", "FRAGMENT")
 # Arches whose prebuilt HIP CK blockscale modules ship matching code objects.
 # Other arches (e.g. gfx1201) SIGSEGV uncatchably at kernel launch, so gate
 # before the HIP call rather than try/except. Extend when prebuilts add archs.
-_BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset({"gfx940", "gfx941", "gfx942", "gfx950"})
+_BLOCKSCALE_HIP_PREBUILT_ARCHES = frozenset(
+    {"gfx940", "gfx941", "gfx942", "gfx950", "gfx1250"}
+)
 
 
 def _hip_blockscale_supported() -> bool:
@@ -195,6 +197,28 @@ def gemm_a8w8_bpreshuffle_flydsl(
         enable_scheduler=str(scheduler).lower() != "off",
     )
     return Out
+
+
+def gemm_a8w8_blockscale_bpreshuffle_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    config: dict,
+) -> Tensor:
+    kernel_name = str(config.get("kernelName", ""))
+    if get_gfx() != "gfx1250":
+        raise RuntimeError(
+            "gemm_a8w8_blockscale_bpreshuffle_flydsl is only supported on gfx1250"
+        )
+    from .flydsl.blockscale_bpreshuffle_gemm_gfx1250 import (
+        run_gemm_a8w8_blockscale_bpreshuffle_gfx1250,
+    )
+
+    return run_gemm_a8w8_blockscale_bpreshuffle_gfx1250(
+        XQ, WQ, x_scale, w_scale, Out, kernel_name
+    )
 
 
 @compile_ops(
@@ -882,6 +906,55 @@ def gemm_a8w8_blockscale_bpreshuffle(
     m = XQ.shape[0]
     n = WQ.shape[0]
     k = XQ.shape[1]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+
+    use_gfx1250_flydsl_blockscale = (
+        get_gfx() == "gfx1250"
+        and x_scale.dtype == dtypes.fp8_e8m0
+        and w_scale.dtype == dtypes.fp8_e8m0
+    )
+    if use_gfx1250_flydsl_blockscale:
+        if not is_flydsl_available():
+            raise RuntimeError(
+                "gfx1250 a8w8 blockscale bpreshuffle with fp8_e8m0 scales "
+                "requires FlyDSL"
+            )
+        config = get_CKGEMM_config(
+            m,
+            n,
+            k,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE,
+        )
+        if config is not None and config["libtype"] == "flydsl":
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
+            )
+
+        from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_bpreshuffle_wmma_common import (
+            kernel_fits_shape,
+            kernels_list,
+        )
+
+        fits = [ki for ki in kernels_list.values() if kernel_fits_shape(ki, m, n, k)]
+        if fits:
+            want_tm = min(256, max(16, 1 << (m - 1).bit_length()))
+            ki = min(
+                fits, key=lambda x: (abs(x.tile_m - want_tm), -x.tile_n, -x.tile_k)
+            )
+            logger.warning(
+                f"[gfx1250] gemm_a8w8_blockscale_bpreshuffle untuned "
+                f"M={m}, N={n}, K={k}; falling back to flydsl kernel '{ki.name}'."
+            )
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, {"kernelName": ki.name}
+            )
+
+    # temporarily guard scale that are not fp32.
+    if x_scale.dtype == dtypes.fp8_e8m0:
+        x_scale = x_scale.to(dtypes.fp32)
+    if w_scale.dtype == dtypes.fp8_e8m0:
+        w_scale = w_scale.to(dtypes.fp32)
+
     if not _hip_blockscale_supported():
         # No CK code object for this arch -> triton preshuffle. WQ is already
         # (16,16)-shuffled (the only blockscale layout) == triton's (N//16, K*16)
@@ -920,7 +993,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
     )
     # Triton path first: it allocates its own output, so skip the Y buffer the
     # ck/asm paths below need.
-    if config is not None and config["libtype"] == "triton":
+    if (config is not None and config["libtype"] == "triton") or get_gfx() == "gfx1250":
         # kernelName optionally carries the backend hint ("triton"/"gluon");
         # anything else -> None (auto gluon->triton detection). config=None lets
         # the triton impl load its own tuned config internally. WQ is already
@@ -930,7 +1003,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             gemm_a8w8_blockscale_preshuffle as _gemm_a8w8_blockscale_preshuffle_triton,
         )
 
-        kernelName = str(config.get("kernelName", ""))
+        kernelName = str(config.get("kernelName", "")) if config is not None else ""
         backend = kernelName if kernelName in ("triton", "gluon") else None
         xq = XQ if XQ.dtype != torch.uint8 else XQ.view(dtypes.fp8)
         wq = WQ if WQ.dtype != torch.uint8 else WQ.view(dtypes.fp8)
@@ -942,7 +1015,6 @@ def gemm_a8w8_blockscale_bpreshuffle(
             dtype=dtype,
             backend=backend,
         )
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
     if config is not None:
         libtype = config["libtype"]
         kernelName = str(config.get("kernelName", ""))
@@ -967,6 +1039,10 @@ def gemm_a8w8_blockscale_bpreshuffle(
 
             return opus_gemm_a8w8_blockscale_bpreshuffle_tune(
                 XQ, WQ, x_scale, w_scale, Y, kernelId=kernelId
+            )
+        elif libtype == "flydsl" and is_flydsl_available():
+            return gemm_a8w8_blockscale_bpreshuffle_flydsl(
+                XQ, WQ, x_scale, w_scale, Y, config
             )
     try:
         return gemm_a8w8_blockscale_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y)
