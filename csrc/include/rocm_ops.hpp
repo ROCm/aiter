@@ -31,6 +31,7 @@ namespace py = pybind11;
         .value("Silu", ActivationType::Silu)                                                \
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
+        .value("Situv2", ActivationType::Situv2)                                            \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -1311,6 +1312,7 @@ namespace py = pybind11;
           py::arg("topk_indices"),                                             \
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
+          py::arg("softmax_workspace"),                                        \
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \

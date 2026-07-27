@@ -304,15 +304,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     q_dtype_w,
     isG1U1: bool,
     doweight_stage1: bool,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    expert_mask: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    expert_mask: torch.Tensor | None,
     hidden_pad: int,
     intermediate_pad: int,
-    bias1: Optional[torch.Tensor],
-    bias2: Optional[torch.Tensor],
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
     gate_mode: GateMode = GateMode.SEPARATED,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -385,8 +387,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not isG1U1 or quant_type != QuantType.per_1x32:
         _grouped_dbg("not g1u1 or not 1x32")
         return None
-    if activation not in (ActivationType.Silu, ActivationType.Swiglu):
-        _grouped_dbg("not silu or not swiglu")
+    if activation not in (
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Situv2,
+    ):
+        _grouped_dbg("unsupported activation")
         return None
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
@@ -570,8 +576,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
+    # The gfx1250 contiguous scheduler can fault during stage2 preshuffle for
+    # uneven expert routing, so keep it opt-in unless a threshold is explicit.
+    default_contiguous_threshold = (1 << 62) if get_gfx() == "gfx1250" else 16
     _contig_token_threshold = _as_int(
-        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 16
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"),
+        default_contiguous_threshold,
     )
     if token_num > _contig_token_threshold:
         grouped_contiguous_m = True
@@ -830,6 +840,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm1_a8w4_masked
     )
+    stage1_act = {
+        ActivationType.Silu: "silu",
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.Situv2: "situv2",
+    }[activation]
     _grouped_dbg("start stage1 compile")
     stage1 = stage1_compiler(
         model_dim=model_dim,
@@ -848,7 +863,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
-        act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        act=stage1_act,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
         stage1_weight_layout=stage1_weight_layout,
         wave_specialized_tdm=(
             stage1_weight_layout == "gugu"
@@ -985,7 +1002,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
         _route_rows = int(token_num) * int(topk)
         _capacity_rows = int(route_E) * int(route_max_m)
-        _fused_topids_to_rows = topids_to_rows if _route_rows < _capacity_rows else None
+        # Contiguous-M stage2 consumes complete tiles, including padding rows.
+        # Quantize the complete buffer in that mode so every consumed row has
+        # initialized payload and scale data.
+        _fused_topids_to_rows = (
+            None
+            if effective_grouped_contiguous_m
+            else topids_to_rows if _route_rows < _capacity_rows else None
+        )
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,
