@@ -79,7 +79,7 @@ from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
+from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -558,7 +558,7 @@ def build_moe_fused_route_quant_scatter_module(
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
     g2l_tag = f"_g2l_{weight_dtype}" if use_g2l else ""
-    module_name = (
+    module_name = format_kernel_name(
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{base_tag}{g2l_tag}"
     )
@@ -862,7 +862,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
     k_groups = L.block_iters
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
-    module_name = (
+    module_name = format_kernel_name(
         f"moe_fused_route_quant_scatter_stks_md{model_dim}_tk{topk}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{base_tag}"
     )
@@ -1604,7 +1604,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
-    module_name = (
+    module_name = format_kernel_name(
         f"moe_fused_route_psum_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}"
     )

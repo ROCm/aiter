@@ -16,6 +16,17 @@ from flydsl.expr import buffer_ops
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
 
+def format_kernel_name(name: str) -> str:
+    """Sanitize a kernel symbol name for the amdhsa assembler.
+
+    Config values interpolated into a kernel name may be negative (e.g. the
+    grouped-contiguous sentinel ``topk=-1`` renders as ``tk-1``). A hyphen is
+    not a legal symbol character, so the assembler misparses the
+    ``.amdhsa_kernel`` directive and the whole module fails to link.
+    """
+    return name.replace("-", "_")
+
+
 def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 
