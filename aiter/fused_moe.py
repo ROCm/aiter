@@ -1706,6 +1706,8 @@ def _flydsl_v2_stage2_wrapper(
         raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
 
     bm = cfg["tile_m"]
+    bn = cfg["tile_n"]
+    bk = cfg["tile_k"]
     sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
     epilog = cfg["epilog"]
     max_sorted = inter_states.shape[0]
@@ -1752,6 +1754,8 @@ def _flydsl_v2_stage2_wrapper(
         D_INTER=inter_dim,
         topk=topk,
         BM=bm,
+        BN=bn,
+        BK=bk,
         use_nt=cfg["use_nt"],
         a_dtype=cfg["a_dtype"],
         epilog=epilog,

@@ -97,6 +97,11 @@ def compile_gemm2_a4w4_port(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
             f"got (BM={BM}, epilog={epilog})"
         )
+    if BN not in (64, 128, 256) or BK not in (128, 256):
+        raise AssertionError(
+            "mxfp4_moe_gemm2 supports only "
+            f"(BN in {{64,128,256}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
+        )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
     use_reduce = epilog == "reduce"
@@ -161,7 +166,8 @@ def compile_gemm2_a4w4_port(
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
+    tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -405,6 +411,7 @@ G2_CACHE = {}
 def get_g2(
     BM,
     BN,
+    BK,
     use_nt,
     HIDDEN_MAX,
     epilog,
@@ -431,6 +438,7 @@ def get_g2(
     key = (
         BM,
         BN,
+        BK,
         use_nt,
         HIDDEN_MAX,
         epilog,
@@ -452,6 +460,7 @@ def get_g2(
         launch = compile_gemm2_a4w4_port(
             BM=BM,
             BN=BN,
+            BK=BK,
             use_nt=use_nt,
             HIDDEN_MAX=HIDDEN_MAX,
             epilog=epilog,
@@ -491,6 +500,7 @@ def mxfp4_moe_gemm2(
     topk,
     BM=32,
     BN=256,
+    BK=256,
     use_nt=False,
     a_dtype="fp4",
     epilog="atomic",
@@ -516,6 +526,10 @@ def mxfp4_moe_gemm2(
         raise AssertionError(
             f"D_HIDDEN (N_OUT) must be a multiple of BN ({BN}), got {D_HIDDEN}"
         )
+    if D_INTER % BK != 0:
+        raise AssertionError(
+            f"D_INTER (K) must be a multiple of BK ({BK}), got {D_INTER}"
+        )
     if D_HIDDEN > HIDDEN_MAX:
         raise AssertionError(
             f"D_HIDDEN ({D_HIDDEN}) exceeds compile cap HIDDEN_MAX ({HIDDEN_MAX})"
@@ -527,6 +541,7 @@ def mxfp4_moe_gemm2(
     launch = get_g2(
         BM,
         BN,
+        BK,
         use_nt,
         HIDDEN_MAX,
         epilog,
