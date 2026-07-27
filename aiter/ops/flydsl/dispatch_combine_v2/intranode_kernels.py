@@ -1326,6 +1326,7 @@ def make_combine_fused_reduce(
     warp_num_per_block,
     off_comb_inp,
     off_xdb_mem,
+    slot_stride_nbytes=None,
     _s3_cache=2,
 ):
     """Combine for the gemm2-fused scatter path (combine_mode='scatter_fused').
@@ -1342,8 +1343,13 @@ def make_combine_fused_reduce(
     bf16/f32 non-quant only (the fused path carries a bf16 wire).
     """
     to_acc, from_acc, zero_acc = _accum_funcs(hidden_elem_size)
-    wire_nbytes = hidden_dim * hidden_elem_size
-    n_i32 = wire_nbytes // 4
+    wire_nbytes = hidden_dim * hidden_elem_size  # valid bytes per slot (hidden row)
+    n_i32 = wire_nbytes // 4  # valid i32 units read per slot (unpadded)
+    # Per-slot stride: padded (pow2) for the TDM gather-store path so slot
+    # addresses divide the 4GB-aligned per-rank window; defaults to the natural
+    # hidden row size. Only the slot ADDRESS strides by this; the read count
+    # (n_i32) stays hidden-based so padding tail is never read.
+    slot_stride = slot_stride_nbytes if slot_stride_nbytes is not None else wire_nbytes
     topk = experts_per_token
 
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
@@ -1418,7 +1424,7 @@ def make_combine_fused_reduce(
             for k_slot in range_constexpr(topk):
                 expert_addrs.append(
                     comb_inp_base
-                    + (slot0 + fx.Int64(k_slot)) * fx.Int64(wire_nbytes)
+                    + (slot0 + fx.Int64(k_slot)) * fx.Int64(slot_stride)
                 )
             rem = arith.constant(n_i32) - unit_base
             eff = arith.select(rem < units_per_warp, rem, units_per_warp)

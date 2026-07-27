@@ -264,6 +264,33 @@ class EpDispatchCombineConfig:
             else self.elem_size
         )
 
+    @property
+    def tdm_gather_scatter(self):
+        """gemm2-fused P2P scatter via TDM gather-store (AITER_EP_P2P_TDMGATHER).
+        Requires a pow2-padded comb_inp slot so the per-slot stride divides the
+        4GB-aligned per-rank symmetric window (lets gemm2 fold (pe,slot) into a
+        single TDM gather row index). Off by default -> comb_inp layout unchanged."""
+        return self.is_fused and os.environ.get("AITER_EP_P2P_TDMGATHER", "0") in (
+            "1",
+            "true",
+            "True",
+            "yes",
+            "on",
+        )
+
+    @property
+    def comb_inp_slot_nbytes(self):
+        """Per-(token,k) comb_inp slot stride in bytes. Padded up to a power of
+        two for the TDM gather-store fused path; else the natural hidden row
+        size (hidden_dim * wire_elem_size)."""
+        base = self.hidden_dim * self.wire_elem_size
+        if self.tdm_gather_scatter:
+            p = 1
+            while p < base:
+                p <<= 1
+            return p
+        return base
+
     @classmethod
     def tuned(cls, **kwargs):
         """Build a config with geometry from tuning_configs (unless overridden in
@@ -472,7 +499,7 @@ class EpDispatchCombineOp:
                 # expert k of that token lives on one rank) -> no cross-rank collision.
                 # Weights are pre-multiplied in gemm2, so no comb_wts region.
                 regions.append(
-                    ("comb_inp", max_tok_per_rank * topk * hidden_dim * wire_elem_size)
+                    ("comb_inp", max_tok_per_rank * topk * cfg.comb_inp_slot_nbytes)
                 )
             else:
                 regions.append(
@@ -612,6 +639,7 @@ class EpDispatchCombineOp:
                     warp_num_per_block=w,
                     off_comb_inp=arena.offset("comb_inp"),
                     off_xdb_mem=arena.offset("cross_device_barrier"),
+                    slot_stride_nbytes=cfg.comb_inp_slot_nbytes,
                 )
                 for (b, w) in combine_specs
             }
@@ -1017,7 +1045,7 @@ class EpDispatchCombineOp:
             ep_arena_handle=self.arena.handle,
             ep_comb_inp_off=self.arena.offset("comb_inp"),
             ep_tis_off=self.arena.offset("recv_to_src_token"),
-            ep_wire_nbytes=self.cfg.hidden_dim * self.cfg.wire_elem_size,
+            ep_wire_nbytes=self.cfg.comb_inp_slot_nbytes,
             ep_rank=self.cfg.rank,
             ep_max_tok=self.cfg.max_num_inp_token_per_rank,
             ep_topk=self.cfg.num_experts_per_token,

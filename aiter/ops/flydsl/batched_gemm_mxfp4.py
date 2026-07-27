@@ -56,6 +56,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_wire_nbytes=0,
     ep_slot_stride=0,
     ep_arena_handle=0,
+    ep_tdm_gather=0,
+    ep_world=0,
     ep_rowmap=None,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
@@ -125,6 +127,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         ep_wire_nbytes=int(ep_wire_nbytes),
         ep_slot_stride=int(ep_slot_stride),
         ep_arena_handle=int(ep_arena_handle),
+        ep_tdm_gather=int(ep_tdm_gather),
+        ep_world=int(ep_world),
         arg_ep_rowmap=ep_rowmap_tensor,
     )
     return out

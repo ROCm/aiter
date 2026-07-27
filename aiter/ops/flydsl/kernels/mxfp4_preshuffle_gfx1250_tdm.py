@@ -21,6 +21,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue as _AV
 from .gemm_common_gfx1250 import (
     lds_load_b32_raw,
     lds_load_b128_raw,
@@ -35,6 +36,10 @@ from .gemm_common_gfx1250 import (
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp8_f32,
+)
+from .tdm_gather_shim import (
+    make_tensor_gather_descriptor,
+    tensor_store_gather,
 )
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
@@ -83,6 +88,8 @@ def launch_gemm_a8w4_tdm(
     ep_wire_nbytes: Constexpr[int] = 0,
     ep_slot_stride: Constexpr[int] = 0,
     ep_arena_handle: Constexpr[int] = 0,
+    ep_tdm_gather: Constexpr[int] = 0,
+    ep_world: Constexpr[int] = 0,
     arg_ep_rowmap: fx.Tensor = None,
 ):
     cache_tag = (
@@ -90,7 +97,7 @@ def launch_gemm_a8w4_tdm(
         a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
         stage1_quant_out, quant_wmma_rep,
         ep_p2p_write, ep_off_comb_inp, ep_wire_nbytes, ep_slot_stride,
-        ep_arena_handle,
+        ep_arena_handle, ep_tdm_gather, ep_world,
     )
     _ = cache_tag
     if ep_p2p_write:
@@ -552,7 +559,74 @@ def launch_gemm_a8w4_tdm(
 
             # -- Shared LDS -> global --
             workgroup_barrier()
-            if const_expr(ep_p2p_write):
+            if const_expr(ep_tdm_gather):
+                # EP gemm2-fused scatter via TDM gather-store. cco flat symmetric
+                # VA: peer_va = winBase + pe*perRankSize + off. The comb_inp slot is
+                # padded to a pow2 (ep_wire_nbytes) so perRankSize/wire divides
+                # exactly -> fold (pe,slot) into ONE row index = pe*K + slot with a
+                # single base lsa_ptr(0,off) and dim0_stride = wire/elem. Each wave
+                # issues the gather-stores for its row groups (8 rows per 32-bit-
+                # index instruction); dropped/padding rows get an OOB index that the
+                # HW drops. perRankSize is measured in-kernel from the lsa_ptr stride.
+                elem_bytes = 2
+                _wp_log2 = int(math.log2(ep_wire_nbytes))
+                _stride_elems = ep_wire_nbytes // elem_bytes
+                _GRP = 8
+                _ngrp = (tile_m + _GRP - 1) // _GRP
+                _pr = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0)) - fx.Int64(
+                    ep_win.lsa_ptr(fx.Int32(0), 0)
+                )
+                _K = _AV(_pr.shrui(fx.Int64(_wp_log2)).ir_value()).trunci(T.i32)
+                # OOB row-index bound: valid idx = pe*K+slot < world*K <= 256*K
+                # (world<=256, slot<K); dropped/padding rows use this as their index
+                # so the HW drops them.
+                _oob = _K * (ep_world if ep_world else 256)
+                _base0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_off_comb_inp))
+                _gboff = arith.index_cast(T.index, blk_n * elem_bytes)
+                for g in range_constexpr(_ngrp):
+                    base_row = g * _GRP
+                    if wave == g % num_waves:
+                        row_indices = []
+                        for i in range_constexpr(_GRP):
+                            r = base_row + i
+                            if const_expr(r < tile_m):
+                                gr = blk_m + r
+                                dstp = buffer_ops.buffer_load(
+                                    ep_map_rsrc, gr * 2, vec_width=1, dtype=T.i32
+                                )
+                                pe = dstp // ep_slot_stride
+                                slot = dstp % ep_slot_stride
+                                idxv = pe * _K + slot
+                                rv = arith.cmpi(
+                                    arith.CmpIPredicate.slt,
+                                    arith.constant(r, type=T.i32),
+                                    mn_oob,
+                                )
+                                dv = arith.cmpi(
+                                    arith.CmpIPredicate.sge,
+                                    dstp,
+                                    arith.constant(0, type=T.i32),
+                                )
+                                idx = arith.select(arith.andi(rv, dv), idxv, _oob)
+                                row_indices.append(idx)
+                            else:
+                                row_indices.append(_oob)
+                        desc = make_tensor_gather_descriptor(
+                            global_addr_i64=_base0,
+                            lds_base_idx=stC_idx,
+                            row_indices=row_indices,
+                            row_width=STORE_N,
+                            tensor_dim0=_stride_elems,
+                            tensor_dim1=_oob,
+                            stride=_stride_elems,
+                            elem_bytes=elem_bytes,
+                            index_size=32,
+                            lds_byte_offset=base_row * STORE_N * elem_bytes,
+                            global_byte_offset=_gboff,
+                        )
+                        tensor_store_gather(desc)
+                tdm_ops.tensor_wait(0)
+            elif const_expr(ep_p2p_write):
                 # EP gemm2-fused scatter (Direction-D): the whole (route-weighted)
                 # [tile_m x STORE_N] tile now sits row-major in LDS. Instead of a
                 # local TDM store, P2P each valid output row as coalesced 8-bf16
