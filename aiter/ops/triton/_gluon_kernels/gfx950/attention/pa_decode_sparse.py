@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Gluon (gfx950) DeepSeek-V4 sparse-MLA decode. Adapted from the vLLM DSv4 sparse
-attention kernels.
+attention kernels:
+https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
 
 K == V, so each tile is gathered once into one [BLOCK_K, HEAD] bf16 LDS buffer and
 read permuted for QK, direct for PV. fp8 dequants to bf16 on the way in. One kernel

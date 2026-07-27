@@ -439,22 +439,12 @@ def _pa_decode_sparse_gfx950_gluon(
     fp8_fnuz=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from ``cache.ndim``:
-      3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
-                             embedded UE8M0 per-64 scale + 64 RoPE bf16) or a bf16
-                             block cache; pass ``extra_*`` for the SWA+top-k two-loop,
-                             else a single segment.
-      2D [pages, D]       -> uniform pool: fp8 (uint8) + ``cache_scales``
-                             [pages, D//64] fp32, or bf16 (``cache_scales`` None).
-    ``kv_splits`` overrides the split-K count. ``skip_reduce`` (only takes effect when
-    the chosen split count > 1) returns the pre-reduce partials
-    ``(part_acc, part_m, part_l)`` -- shapes ``([N, S, H, D], [N, S, H], [N, S, H])``
-    fp32; ``m`` is the row-max in the base-2 exponent domain (row-max * softmax_scale
-    * log2e) and ``l``/``acc`` are per-split un-normalized -- same convention as the
-    triton skip_reduce partials -- instead of the final ``[N, H, D]`` output.
-    ``has_invalid`` (default False): when True, -1 sentinels anywhere in a token's
-    index range are clamped in-bounds for the gather and masked out of the softmax.
-    ``fp8_fnuz`` (uniform-pool fp8 only): fp8 e4m3 flavor -- False = OCP (bias 7),
-    True = fnuz (bias 8); selects the in-kernel dequant. Packed fp8_ds_mla is OCP.
+    3D [nb, block, ...] -> packed fp8_ds_mla (uint8: 448 NoPE fp8 e4m3 OCP +
+                           embedded UE8M0 per-64 scale + 64 RoPE bf16) or a bf16
+                           block cache; pass ``extra_*`` for the SWA+top-k two-loop,
+                           else a single segment.
+    2D [pages, D]       -> uniform pool: fp8 (uint8) + ``cache_scales``
+                           [pages, D//64] fp32, or bf16 (``cache_scales`` None).
     """
     assert q.ndim == 3, f"expected q=[b,h,d], got {q.shape}"
     assert DEVICE_ARCH == "gfx950", "gluon DSv4 decode kernel is gfx950-only"
