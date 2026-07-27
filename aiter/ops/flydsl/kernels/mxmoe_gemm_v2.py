@@ -214,12 +214,15 @@ def gemm2_body_v2(
     topk=1,
     has_pad=False,
     SBM=None,
+    g2_kstages=2,
     g2_bhoist=True,
     g2_ascale_pf=True,
     g2_bf16_lds=False,
     route_out_fp8=False,
 ):
-    # gemm2 K-loop perf knobs (default ON): 2-stage B pipeline double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
+    # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
+    if g2_kstages not in (1, 2):
+        raise AssertionError(f"g2_kstages must be 1 or 2, got {g2_kstages}")
     # SBM (sort padding unit) >= BM (compute tile); SBM==BM default byte-identical.
     if SBM is None:
         SBM = BM
@@ -519,8 +522,8 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN == 256):
-        # BM64/BN256 uses the 1-stage B path unconditionally; do not depend on env knobs.
+    if const_expr(g2_kstages == 1):
+        # 1-deep pipe: synchronous B load per K-tile.
         for kt_iv, state in range(
             fx.Int32(0),
             K_TILES_RT,
