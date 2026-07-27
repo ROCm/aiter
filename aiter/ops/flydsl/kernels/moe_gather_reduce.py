@@ -138,6 +138,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: Int32,
         slice_stride_dw: Int32,
+        num_valid_tokens: fx.Pointer,  # (1,) int32: tokens >= this are dead-tail (EP); skip (their route map is unwritten/garbage)
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -159,7 +160,20 @@ def build_moe_gather_reduce_module(
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
 
-        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, num_tokens_i32)
+        # Guard on the dynamic valid-token count (EP dead-tail skip): the grid is
+        # launched over the static num_tokens, but tokens >= num_valid_tokens are
+        # padding whose route map (topids_to_rows) was left unwritten by the route
+        # kernel -> reading it would OOB-index grouped_out. When truncation is
+        # disabled the caller passes num_tokens, so nothing is skipped.
+        nvt = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_tokens),
+                arith.constant(0, type=i32),
+                vec_width=1,
+                dtype=i32,
+            )
+        )
+        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, nvt)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
             in_rsrc = ptr_rsrc(grouped_out_flat)
@@ -308,6 +322,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
+        num_valid_tokens: fx.Pointer,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -322,6 +337,7 @@ def build_moe_gather_reduce_module(
             out,
             num_tokens,
             slice_stride_dw,
+            num_valid_tokens,
         )
         launcher.launch(
             grid=(idx_tokens, n_iters, 1),

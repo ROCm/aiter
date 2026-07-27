@@ -457,6 +457,8 @@ def build_moe_fused_route_quant_scatter_module(
     *,
     use_expert_row_base: bool = True,
     max_m: int = 0,
+    use_g2l: bool = False,
+    weight_dtype: str = "bf16",
 ):
     """Return a JIT launcher for the fused route+quant+scatter+preshuffle kernel.
 
@@ -526,14 +528,15 @@ def build_moe_fused_route_quant_scatter_module(
     topk_shift = topk.bit_length() - 1 if topk_is_pow2 else 0
 
     base_tag = "baseptr" if use_expert_row_base else f"basem{max_m}"
+    g2l_tag = f"_g2l_{weight_dtype}" if use_g2l else ""
     module_name = (
         f"moe_fused_route_quant_scatter_md{model_dim}_tk{topk}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{base_tag}"
+        f"_{quant_mode}_{L.native_tag}_{base_tag}{g2l_tag}"
     )
 
     @flyc.kernel(name=module_name)
     def fused_kernel(
-        topk_ids: fx.Pointer,  # (numel,) int32
+        topk_ids: fx.Pointer,  # (numel,) int32 (GLOBAL expert ids when use_g2l)
         counter: fx.Pointer,  # (E,) int32, init 0
         topids_to_rows: fx.Pointer,  # (numel,) int32 out
         hidden: fx.Pointer,  # (token_num*model_dim,) bf16
@@ -541,9 +544,14 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,  # preshuffled e8m0 out
         expert_row_base: fx.Pointer,  # (E,) int32 per-expert dst row base
         numel: Int32,
+        g2l_lut: fx.Pointer,  # (E_global,) int32 global->local, sentinel=n_buckets
+        weight_in: fx.Pointer,  # (numel,) f32 route weights in (used iff use_g2l)
+        gather_w: fx.Pointer,  # (numel,) weight_dtype out; kept->cast, drops->0
+        n_buckets: Int32,  # sentinel value (== dropped) / local expert count
     ):
         i32 = T.i32
         f32 = T.f32
+        wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
 
         c0_i32 = arith.constant(0, type=i32)
         c1_i32 = arith.constant(1, type=i32)
@@ -582,6 +590,33 @@ def build_moe_fused_route_quant_scatter_module(
             expert = ArithValue(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
+
+            # EP global->local remap (warp-uniform). Dropped (non-local) routes
+            # fold into bucket 0 -- matching the prior host behaviour, so they
+            # still take a unique atomic slot and never collide with a real row --
+            # and their gather weight is zeroed so the final reduce ignores them.
+            # Replaces the host cumsum/index/eq/where/masked_fill chain.
+            if const_expr(use_g2l):
+                g2l_rsrc = ptr_rsrc(g2l_lut)
+                le = buffer_ops.buffer_load(
+                    g2l_rsrc, expert, vec_width=1, dtype=i32
+                )
+                is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
+                expert = ArithValue(arith.select(is_drop, c0_i32, le))
+                # Fused weight cast+mask (warp-uniform: every lane writes the same
+                # value to gather_w[route], redundant but race-free). Reads f32
+                # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
+                # folding the host topk_weight.to(bf16) copy + masked_fill.
+                wi_rsrc = ptr_rsrc(weight_in)
+                gather_w_rsrc = ptr_rsrc(gather_w)
+                w_f32 = buffer_ops.buffer_load(
+                    wi_rsrc, route, vec_width=1, dtype=f32
+                )
+                w_cast = arith.trunc_f(wdt, w_f32)
+                w_out = arith.select(
+                    is_drop, arith.constant(0.0, type=wdt), w_cast
+                )
+                buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
             # it to the warp. Single-token pow2 cases use the dedicated st_ksplit
@@ -709,6 +744,10 @@ def build_moe_fused_route_quant_scatter_module(
         grouped_scale: fx.Pointer,
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
+        g2l_lut: fx.Pointer,
+        weight_in: fx.Pointer,
+        gather_w: fx.Pointer,
+        n_buckets: fx.Int32,
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -726,6 +765,10 @@ def build_moe_fused_route_quant_scatter_module(
             grouped_scale,
             expert_row_base,
             numel,
+            g2l_lut,
+            weight_in,
+            gather_w,
+            n_buckets,
         ).launch(
             grid=(grid_x, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
@@ -1215,14 +1258,17 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     quant_mode: str = "fp4",
     source_topk: int = 0,
     remap_rows: bool = False,
+    ksplit: bool = True,
 ):
-    """Route-indexed K-split grouped quant+preshuffle for small token counts.
+    """Route-indexed grouped quant+preshuffle.
 
     Instead of launching over every row in the (E, max_m) capacity buffer and
     skipping padding, this kernel launches only over routed rows
-    (``topids_to_rows``) and K groups. It works for both masked and contiguous-M
-    layouts because ``topids_to_rows`` already contains the global row index in
-    the actual output/input buffer.
+    (``topids_to_rows``). When ``ksplit=True`` (designed for small token counts
+    where grid.x is too small to saturate the GPU), the K-dimension is split
+    across ``grid.y = block_iters`` so each workgroup handles one K-group.
+    When ``ksplit=False`` (large token counts where grid.x already saturates),
+    ``grid.y = 1`` and each warp loops over all K-groups internally.
     """
     L = _quant_layout(feat_dim, quant_mode, wmma_rep)
     if not L.use_pk8:
@@ -1250,12 +1296,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     source_tag = f"srctk{source_topk}" if source_topk > 0 else "srcrow"
     remap_tag = "_remap" if remap_rows else ""
+    ksplit_tag = "" if ksplit else "_noKS"
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}"
+        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
     )
 
     @flyc.kernel(name=module_name)
@@ -1267,6 +1314,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,  # (E,) int32, read iff remap_rows
         route_max_m: Int32,  # masked route stride, read iff remap_rows
         numel: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: routes >= this are dead-tail padding (EP dynamic token count); skip
     ):
         i32 = T.i32
         f32 = T.f32
@@ -1294,13 +1342,21 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
         tid = ArithValue(fx.thread_idx.x)
         bid = ArithValue(fx.block_idx.x)
-        k_group = ArithValue(fx.block_idx.y)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
+        # Dynamic EP token count (capture-safe, no host sync): grid is launched over
+        # the static numel routes, but routes >= num_valid_routes (= total_recv*topk)
+        # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
+        # When truncation is disabled the caller passes numel, so nothing is skipped.
+        nvr = ArithValue(
+            buffer_ops.buffer_load(
+                ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+            )
+        )
+        route_in_range = arith.cmpi(CmpIPredicate.ult, route, nvr)
         _if_route = scf.IfOp(route_in_range)
         with ir.InsertionPoint(_if_route.then_block):
             rows_rsrc = ptr_rsrc(topids_to_rows)
@@ -1321,8 +1377,13 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                     + slot
                 )
                 is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
-                is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-                _if_store = scf.IfOp(arith.andi(is_lane0, is_k0))
+                if const_expr(ksplit):
+                    k_group = ArithValue(fx.block_idx.y)
+                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
+                    store_cond = arith.andi(is_lane0, is_k0)
+                else:
+                    store_cond = is_lane0
+                _if_store = scf.IfOp(store_cond)
                 with ir.InsertionPoint(_if_store.then_block):
                     buffer_ops.buffer_store(row, rows_rsrc, route)
                     scf.YieldOp([])
@@ -1352,10 +1413,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             lane_in_block = lane - block_in_wave * c_lanes_per_block
             is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
 
-            c = SimpleNamespace(
+            qc = SimpleNamespace(
                 i32=i32,
                 f32=f32,
-                block_iters=1,
+                block_iters=1 if ksplit else block_iters,
                 mx_blocks_per_wave_iter=mx_blocks_per_wave_iter,
                 mx_blocks_per_row=mx_blocks_per_row,
                 amax_shuffle_dists=amax_shuffle_dists,
@@ -1388,8 +1449,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 payload_rsrc=payload_rsrc,
                 scale_rsrc=scale_rsrc,
             )
-            _emit_quant_one_k_group(c, k_group)
+            if const_expr(ksplit):
+                k_group_val = ArithValue(fx.block_idx.y)
+                _emit_quant_one_k_group(qc, k_group_val)
+            else:
+                _emit_quant_block_loop(qc)
             scf.YieldOp([])
+
+    _grid_y_dim = block_iters if ksplit else 1
 
     @flyc.jit
     def launch_fused(
@@ -1400,11 +1467,14 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         row_starts: fx.Pointer,
         route_max_m: fx.Int32,
         numel: fx.Int32,
+        num_valid_routes: fx.Pointer,
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
-        grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
+        grid_y = arith.index_cast(
+            T.index, arith.constant(_grid_y_dim, type=T.i32)
+        )
         fused_kernel(
             grouped_in,
             grouped_payload,
@@ -1413,6 +1483,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             row_starts,
             route_max_m,
             numel,
+            num_valid_routes,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(BLOCK_THREADS, 1, 1),
