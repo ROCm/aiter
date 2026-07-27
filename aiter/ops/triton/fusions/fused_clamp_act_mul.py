@@ -253,11 +253,19 @@ def fused_clamp_act_mul(
         _LOGGER.info(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
+        # Persistent / software-pipelined launch: each program walks a contiguous
+        # strip of ROWS_PER_PROGRAM rows and double-buffers the TDM loads
+        # (NUM_BUFFERS) so row i+1's gate/up DMA overlaps row i's compute.
+        ROWS_PER_PROGRAM = 8
+        NUM_BUFFERS = 2
+        gluon_grid = (triton.cdiv(M, ROWS_PER_PROGRAM),)
         # ".cg" matches the Triton reference's hardcoded cache hint.
-        _fused_clamp_silu_mul_gluon_kernel[(M,)](
+        _fused_clamp_silu_mul_gluon_kernel[gluon_grid](
             *kernel_args,
             **kernel_constexprs,
             cache_modifier=".cg",
+            ROWS_PER_PROGRAM=ROWS_PER_PROGRAM,
+            NUM_BUFFERS=NUM_BUFFERS,
         )
     else:
         _fused_clamp_silu_mul_kernel[(M,)](
