@@ -531,7 +531,7 @@ def build_moe_fused_route_quant_scatter_module(
         f"_{quant_mode}_{L.native_tag}_{base_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32
         counter: fx.Pointer,  # (E,) int32, init 0
@@ -802,7 +802,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         f"_{quant_mode}_{L.native_tag}_{base_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (topk,) int32
         counter: fx.Pointer,  # (E,) int32 out
@@ -1048,7 +1048,7 @@ def build_moe_fused_quant_preshuffle_module(
         f"_{quant_mode}_{L.native_tag}_{skip_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         grouped_in: fx.Pointer,  # (n_rows*feat_dim,) bf16
         grouped_payload: fx.Pointer,  # (n_rows*payload_bytes_per_row,) uint8 out
@@ -1258,7 +1258,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         grouped_in: fx.Pointer,  # flat grouped activations
         grouped_payload: fx.Pointer,
@@ -1525,7 +1525,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
     # inline-asm coherent global load/store miscompiles here).
     _is_gfx12 = str(L.arch).startswith("gfx12")
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32
         count: fx.Pointer,  # (E,) int32 in/out (init 0) -> masked_m

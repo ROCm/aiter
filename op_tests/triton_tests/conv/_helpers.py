@@ -103,7 +103,7 @@ def apply_activation(y: torch.Tensor, activation: str):
 # correctness tests can run on CDNA hardware without being skipped.
 # AITER Triton CI relies on CDNA runners.
 SUPPORTED_ARCHS = {
-    "RDNA": {"gfx1200", "gfx1201"},
+    "RDNA": {"gfx1200", "gfx1201", "gfx1250"},
     "CDNA": {"gfx942", "gfx950"},
 }
 
@@ -418,6 +418,7 @@ def run_no_bias(suite: TestSuite, method: str = "default"):
         (1, 64, 8, 8, 128, 1, 1, (1, 1), (0, 0), (1, 1), "1x1 no bias"),
         (2, 32, 16, 16, 64, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 no bias"),
         (1, 16, 8, 8, 32, 5, 5, (1, 1), (2, 2), (1, 1), "5x5 no bias"),
+        (4096, 3, 14, 14, 1024, 14, 14, (14, 14), (0, 0), (1, 1), "kimi_k3 patch"),
     ]
     for N, C, H, W, K_out, R, S, stride, padding, dilation, desc in shapes:
         x = torch.randn((N, C, H, W), device=suite.device, dtype=suite.dtype)
