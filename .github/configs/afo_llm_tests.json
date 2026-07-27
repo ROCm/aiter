@@ -8,7 +8,7 @@
     "timeout": 90,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-1"
+    "runner": "linux-aiter-oci-mi300x-1"
   },
   {
     "test_name": "LLAMA-3.3-70B-FP4-gsm8k",
@@ -19,7 +19,7 @@
     "timeout": 90,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-1"
+    "runner": "linux-aiter-oci-mi300x-1"
   },
   {
     "test_name": "QWEN3-30B-A3B-gsm8k",
@@ -30,7 +30,7 @@
     "timeout": 90,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-1"
+    "runner": "linux-aiter-oci-mi300x-1"
   },
   {
     "test_name": "DEEPSEEK-R1-0528-gsm8k",
@@ -41,7 +41,7 @@
     "timeout": 120,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-8"
+    "runner": "linux-aiter-oci-mi300x-8"
   },
   {
     "test_name": "DEEPSEEK-V3.2-gsm8k",
@@ -52,7 +52,7 @@
     "timeout": 120,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-8"
+    "runner": "linux-aiter-oci-mi300x-8"
   },
   {
     "test_name": "LLAMA-3.1-405B-FP8-gsm8k",
@@ -63,6 +63,6 @@
     "timeout": 120,
     "extra_args": "",
     "env_vars": "",
-    "runner": "linux-aiter-mi300x-8"
+    "runner": "linux-aiter-oci-mi300x-8"
   }
 ]

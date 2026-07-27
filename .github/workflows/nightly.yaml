@@ -74,7 +74,7 @@ on:
           - gfx950
         default: 'both'
       runner_filter:
-        description: 'Comma-separated runner labels to include (e.g. linux-aiter-mi300x-1,linux-aiter-mi300x-2)'
+        description: 'Comma-separated runner labels to include (e.g. linux-aiter-oci-mi300x-1,linux-aiter-oci-mi300x-2)'
         type: string
         required: false
         default: ''
@@ -144,7 +144,7 @@ jobs:
           if [ -z "$filter" ]; then
             case "${GPU_ARCH_FILTER}" in
               gfx942)
-                filter="linux-aiter-mi300x-1,linux-aiter-mi300x-2,linux-aiter-mi300x-4,linux-aiter-mi300x-8,aiter-1gpu-runner,aiter-8gpu-runner"
+                filter="linux-aiter-oci-mi300x-1,linux-aiter-oci-mi300x-2,linux-aiter-oci-mi300x-4,linux-aiter-oci-mi300x-8,linux-aiter-oci-mi300x-1,linux-aiter-oci-mi300x-8"
                 ;;
               gfx950)
                 filter="linux-aiter-mi35x-1,linux-aiter-mi35x-8,linux-aiter-mi355-1,linux-aiter-mi355-8"
@@ -179,7 +179,7 @@ jobs:
       always() &&
       needs.load-configs.result == 'success' &&
       github.event.inputs.skip_sglang != 'true'
-    runs-on: aiter-1gpu-runner
+    runs-on: linux-aiter-oci-mi300x-1
     timeout-minutes: 30
     outputs:
       sgl_image: ${{ steps.resolve.outputs.sgl_image }}
