@@ -154,7 +154,7 @@ def build_moe_gather_reduce_module(
         out_dwords_i32 = arith.constant(out_dwords, type=i32)
         topk_i32 = arith.constant(topk, type=i32)
         vec_i32 = arith.constant(VEC, type=i32)
-        _num_tokens_i32 = ArithValue(num_tokens)
+        num_tokens_i32 = ArithValue(num_tokens)
         bid_i32 = ArithValue(bid)
         slice_stride_dw_i32 = ArithValue(slice_stride_dw)
 
@@ -162,16 +162,30 @@ def build_moe_gather_reduce_module(
         # launched over the static num_tokens, but tokens >= num_valid_tokens are
         # padding whose route map (topids_to_rows) was left unwritten by the route
         # kernel -> reading it would OOB-index grouped_out. When truncation is
-        # disabled the caller passes num_tokens, so nothing is skipped.
-        nvt = ArithValue(
-            buffer_ops.buffer_load(
-                ptr_rsrc(num_valid_tokens),
-                arith.constant(0, type=i32),
-                vec_width=1,
-                dtype=i32,
-            )
+        # disabled the caller passes a null pointer instead of a (1,) tensor, so
+        # the load must not run unconditionally.
+        num_valid_tokens_addr = arith.index_cast(T.i64, ptrtoint(num_valid_tokens))
+        num_valid_tokens_is_null = arith.cmpi(
+            CmpIPredicate.eq, num_valid_tokens_addr, arith.constant(0, type=T.i64)
         )
-        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, nvt)
+        _if_valid_tokens = scf.IfOp(
+            num_valid_tokens_is_null, results_=[i32], has_else=True
+        )
+        with ir.InsertionPoint(_if_valid_tokens.then_block):
+            scf.YieldOp([num_tokens_i32])
+        with ir.InsertionPoint(_if_valid_tokens.else_block):
+            scf.YieldOp(
+                [
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_tokens),
+                        arith.constant(0, type=i32),
+                        vec_width=1,
+                        dtype=i32,
+                    )
+                ]
+            )
+        valid_token_count = ArithValue(_if_valid_tokens.results[0])
+        tok_valid = arith.cmpi(CmpIPredicate.ult, bid_i32, valid_token_count)
         _if_tok = scf.IfOp(tok_valid)
         with ir.InsertionPoint(_if_tok.then_block):
             rows_rsrc = ptr_rsrc(topids_to_rows)
