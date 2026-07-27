@@ -175,7 +175,8 @@ def issue_a_load_lds_dt(
         car = m_row + lds_row + a_lane_row  # direct sorted row
         voffset = (lane_col ^ mask) + car * K_BYTES
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
-        v_e = (voffset + kt * KH_TILE_A) // 4  # per-lane i32-elem index
+        # The byte offset is non-negative and 4-byte aligned; avoid signed-division fixup VGPRs.
+        v_e = (voffset + kt * KH_TILE_A).shrui(fx.Int32(2))
         fx.copy(
             atom, src[v_e, None], lds_dma_dst(s_aq_base, off, elem_ty=T.i32, align=16)
         )
