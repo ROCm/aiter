@@ -763,6 +763,7 @@ with open(os.path.join(args.output_dir, "generated.cpp"), "w") as output:
             "AITER_LOG_MORE": 0,
             "AITER_DISABLE_KERNARG_PRELOAD": True,
             "AITER_ROOT_DIR": self.root,
+            "JIT_LIB_EXT": ".so",
             "AITER_CSRC_DIR": self.root,
             "CK_3RDPARTY_DIR": os.path.join(self.root, "absent_ck"),
             "HIP_KITTENS_DIR": os.path.join(self.root, "absent_kittens"),
