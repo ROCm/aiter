@@ -10,20 +10,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from aiter.ops.triton.gated_delta_net import (
-    fused_recurrent_gated_delta_rule,
-    chunk_gated_delta_rule,
-    chunk_gated_delta_rule_opt,
-    chunk_gated_delta_rule_opt_vk,
-)
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
 )
 from aiter.ops.flydsl.linear_attention_prefill_kernels import (
     chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
-)
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
-    chunk_gated_delta_rule_fwd_h_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -33,6 +24,15 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     IS_INTEL_ALCHEMIST,
     assert_close,
     device,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
+from aiter.ops.triton.gated_delta_net import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
+    fused_recurrent_gated_delta_rule,
 )
 
 
