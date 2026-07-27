@@ -15,6 +15,25 @@ them.
 
 ---
 
+## Contents
+
+1. [TL;DR + perf state](#chapter-1--tldr--perf-state)
+2. [Problem shape & notation](#chapter-2--problem-shape--notation)
+3. [High-level dataflow](#chapter-3--high-level-dataflow)
+4. [LDS budget & layout](#chapter-4--lds-budget--layout)
+5. [Pinned VGPR map](#chapter-5--pinned-vgpr-map)
+6. [QManager Phase 1 (vmem → staging LDS → pinned q_vgpr)](#chapter-6--qmanager-phase-1-vmem--staging-lds--pinned-q_vgpr)
+7. [QManager Phase 2 (staging LDS → final Q-LDS, sb8 perm)](#chapter-7--qmanager-phase-2-staging-lds--final-q-lds-sb8-perm)
+8. [KvManager double-buffered pipeline](#chapter-8--kvmanager-double-buffered-pipeline)
+9. [Softmax](#chapter-9--softmax)
+10. [PV gemm + oaccu rescale](#chapter-10--pv-gemm--oaccu-rescale)
+11. [OManager V3 / V3NoStage epilogue](#chapter-11--omanager-v3--v3nostage-epilogue)
+12. [Dispatch ladder & slim dispatch](#chapter-12--dispatch-ladder--slim-dispatch)
+13. [File map](#chapter-13--file-map)
+14. [Glossary & cross-refs](#chapter-14--glossary--cross-refs)
+
+---
+
 ## Chapter 1 — TL;DR + perf state
 
 ### What this kernel is
@@ -23,6 +42,11 @@ them.
 for gfx950 (MI350). It implements *causal-free* per-token attention for the
 DeepSeek-style MLA layout: one shared latent KV cache (one head) is read by
 many query heads, with a small RoPE tail concatenated to a larger NoPE body.
+
+**"Gen.1" means every input is converted to bf16 before the GEMMs** — Q and KV
+arrive as fp8 (+ E8M0 scales) but are cvt'd to bf16 at load time, so QK and PV
+both run on `v_mfma_f32_16x16x32_bf16`. There is no native-fp8 MFMA anywhere in
+the kernel.
 
 There are **two partitions** of the same Gen.1 design, picked by the total
 per-workgroup work $W = H \cdot \mathrm{mtp}$:
@@ -2348,7 +2372,7 @@ first iter via `kIsFirstIter = true`).
 | Term | Definition |
 |---|---|
 | **D**, $D_{\mathrm{NoPE}}$, $D_{\mathrm{RoPE}}$, $D_{\mathrm{QK}}$, $D_V$ | Head dims: 448 fp8 NoPE, 64 bf16 RoPE, 512 = 448 + 64 (= $D_V$ in V4 since PV consumes the full bf16-cast slice). |
-| **Gen.1** | This kernel family: one wave per ptile, m=16, 8 ptiles per WG. A Gen.2 is anticipated (m=32, 2 waves/ptile, 4 ptiles/WG); the `_gen1` postfix reserves room. |
+| **Gen.1** | This kernel family. Defining trait: **all inputs are converted to bf16 before the GEMMs** — QK and PV both run on `v_mfma_f32_16x16x32_bf16`, never on a native-fp8 MFMA. Also one wave per ptile, m=16, 8 ptiles per WG. (The `_gen1` postfix leaves room for a future native-fp8 variant, but none is planned.) |
 | **m16x8** | Naming convention: "m=16 mfma rows per ptile, 8 ptiles per WG." `W = H·mtp = 128`, kBlockN=64, V2 KV pipeline, occupancy 1. |
 | **m16x4** | The `W = 64` sibling: 4 ptiles per WG, kBlockN=32, V1 KV pipeline, occupancy 2. |
 | **LoNoPEWarp / HiRoPEWarp** | The two m16x8 warp types (4 warps each). Lo = tile 0 (cols 0–255, pure NoPE), PV-at-end, packed softmax, de-packed oaccu-normalize. Hi = tile 1 (cols 256–511, NoPE+RoPE), deferred PV, de-packed softmax, packed oaccu-normalize. |
