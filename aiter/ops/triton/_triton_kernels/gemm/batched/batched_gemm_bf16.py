@@ -21,8 +21,10 @@ _batched_gemm_bf16_repr = make_kernel_repr(
         "NUM_KSPLIT",
         "SPLITK_BLOCK_SIZE",
         "EVEN_K",
-        "GRID_MN",
         "cache_modifier",
+        "num_warps",
+        "num_stages",
+        "waves_per_eu",
     ],
 )
 
@@ -31,8 +33,6 @@ _batched_gemm_bf16_repr = make_kernel_repr(
     {
         "EVEN_K": lambda args: (args["K"] % args["SPLITK_BLOCK_SIZE"] == 0)
         and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0),
-        "GRID_MN": lambda args: triton.cdiv(args["M"], args["BLOCK_SIZE_M"])
-        * triton.cdiv(args["N"], args["BLOCK_SIZE_N"]),
     }
 )
 @triton.jit(repr=_batched_gemm_bf16_repr)
@@ -72,8 +72,10 @@ def _batched_gemm_bf16_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    num_warps: tl.constexpr,
+    num_stages: tl.constexpr,
+    waves_per_eu: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call batched_gemm_bf16 function
@@ -146,10 +148,17 @@ def _batched_gemm_bf16_kernel(
     split_k_start = pid_k * SPLITK_BLOCK_SIZE
     if split_k_start < K:
         # Create pointers for first block of A and B input matrices
+        # Cast M/N offsets to int64 to avoid int32 overflow in offs*stride
+        # products (offs_am*stride_am, offs_cm*stride_cm). Large per-batch
+        # matrices (M*K or M*N > 2^31) overflow otherwise.
         offs_k = tl.arange(0, BLOCK_SIZE_K)
         offs_k_split = split_k_start + offs_k
-        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_am = tl.cast(
+            (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M, tl.int64
+        )
+        offs_bn = tl.cast(
+            (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N, tl.int64
+        )
         a_ptrs = a_ptr + (
             batch_id * stride_ab
             + offs_am[:, None] * stride_am
@@ -172,17 +181,17 @@ def _batched_gemm_bf16_kernel(
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
-                a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
+                a = tl.load(a_ptrs)
             else:
-                a = tl.load(
-                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
-                )
                 b = tl.load(
                     b_ptrs,
                     mask=offs_k[:, None] < k_span - k * BLOCK_SIZE_K,
                     other=0.0,
                     cache_modifier=cache_modifier,
+                )
+                a = tl.load(
+                    a_ptrs, mask=offs_k[None, :] < k_span - k * BLOCK_SIZE_K, other=0.0
                 )
 
             accumulator = tl.dot(a, b, acc=accumulator)
@@ -203,8 +212,9 @@ def _batched_gemm_bf16_kernel(
         c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
-        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        # int64 to avoid int32 overflow in offs_cm*stride_cm for large M*N.
+        offs_cm = tl.cast(pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M), tl.int64)
+        offs_cn = tl.cast(pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N), tl.int64)
         c_ptrs = (
             c_ptr
             + pid_k * stride_ck
@@ -221,8 +231,9 @@ def _get_config(
     M: int,
     N: int,
     K: int,
+    B: int | None = None,
 ):
 
     # BF16 uses the shared 16-bit activation / 16-bit weight batched GEMM config.
-    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K)
+    config, is_tunned = get_gemm_config("BATCHED_GEMM-A16W16", M, N, K, B=B)
     return compute_splitk_params(config, K), is_tunned

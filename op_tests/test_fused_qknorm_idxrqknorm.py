@@ -205,7 +205,12 @@ def split_qkv(case: dict, qkv: torch.Tensor):
     return qkv.split(split_sizes, dim=-1)
 
 
-def make_insert_outputs(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = None):
+def make_insert_outputs(
+    case: dict,
+    *,
+    kv_cache_dtype: Optional[torch.dtype] = None,
+    index_cache_dtype: Optional[torch.dtype] = None,
+):
     q_size, _, _, iq_size, _ = case["sizes"]
     q_out = torch.empty(case["qkv"].size(0), q_size, dtype=case["dtype"], device="cuda")
     index_q_out = torch.empty(
@@ -224,7 +229,7 @@ def make_insert_outputs(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = N
         case["num_blocks"],
         case["block_size"],
         HEAD_DIM,
-        dtype=case["dtype"],
+        dtype=index_cache_dtype or case["dtype"],
         device="cuda",
     )
     return q_out, index_q_out, kv_cache, index_cache
@@ -283,12 +288,17 @@ def pertoken_quant_ref(x: torch.Tensor):
     """Per-token (per head-dim row) dynamic fp8 quant reference.
 
     x: [..., head_dim] float. Returns (dequant, scale) where
-       scale = amax/448, dequant = round_to_fp8(x/scale)*scale.
+       scale = amax/fp8_max (arch fp8 max: 240 for e4m3fnuz on gfx942,
+       448 for e4m3fn on gfx950+), dequant = round_to_fp8(x/scale)*scale.
     """
     fp8_dtype = fp8_cache_dtype()
     assert fp8_dtype is not None
+    # fp8 max is arch-dependent and MUST match the kernel's fp8Max<cache_t>():
+    # e4m3fnuz (gfx942) -> 240, e4m3fn (gfx950+) -> 448. Hardcoding 448 mis-scales
+    # the e4m3fnuz cache on MI300X.
+    fp8_max = torch.finfo(fp8_dtype).max
     amax = x.float().abs().amax(dim=-1, keepdim=True)
-    scale = torch.where(amax > 0, amax / 448.0, torch.ones_like(amax))
+    scale = torch.where(amax > 0, amax / fp8_max, torch.ones_like(amax))
     deq = (x.float() / scale).to(fp8_dtype).float() * scale
     return deq, scale.squeeze(-1)
 
@@ -350,7 +360,7 @@ def check_pertoken_fp8(
             k_deq_ref, k_scale_ref = pertoken_quant_ref(kref_row)
             v_deq_ref, v_scale_ref = pertoken_quant_ref(vref_row)
 
-            # emitted per-token scales must equal amax/448
+            # emitted per-token scales must equal amax/fp8_max
             k_scale_act = pertoken_scale_at(
                 k_scale,
                 asm_layout=asm_layout,
@@ -446,7 +456,10 @@ def gather_cache_outputs(
 
         if index_cache is not None:
             index_slot = index_slots[token].item()
-            index_k_outs.append(index_cache.view(-1, HEAD_DIM)[index_slot])
+            index_row = index_cache.view(-1, HEAD_DIM)[index_slot]
+            if index_cache.dtype != case["dtype"]:
+                index_row = maybe_view_fp8(index_row).float()
+            index_k_outs.append(index_row)
 
     index_k = torch.stack(index_k_outs) if index_k_outs else None
     return torch.stack(k_outs), torch.stack(v_outs), index_k
@@ -465,12 +478,12 @@ def gather_index_cache(
     rows = []
     flat = index_cache.view(-1, HEAD_DIM)
     for token in range(case["qkv"].size(0)):
-        rows.append(flat[index_slots[token].item()])
+        rows.append(maybe_view_fp8(flat[index_slots[token].item()]).float())
     return torch.stack(rows)
 
 
 def check_close(actual, expected, *, msg: str, rtol: float, atol: float):
-    err = checkAllclose(actual, expected, msg=msg, rtol=rtol, atol=atol)
+    err = checkAllclose(actual.float(), expected.float(), msg=msg, rtol=rtol, atol=atol)
     if err != 0:
         raise AssertionError(f"{msg} mismatch ratio: {err}")
 
@@ -495,7 +508,13 @@ def fp8_cache_ref(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (x.float() / scale).to(fp8_dtype).float() * scale
 
 
-@perftest(num_iters=10, num_warmup=1, num_rotate_args=1)
+def fp8_unit_scale_ref(x: torch.Tensor) -> torch.Tensor:
+    fp8_dtype = fp8_cache_dtype()
+    assert fp8_dtype is not None
+    return x.float().to(fp8_dtype).float()
+
+
+@perftest(num_iters=10, num_warmup=1)
 def run_fused_qknorm_idxrqknorm(
     case: dict,
     mode: str,
@@ -525,9 +544,11 @@ def run_fused_qknorm_idxrqknorm(
     kv_cache_dtype = None
     if use_fp8_kv_cache:
         kv_cache_dtype = torch.uint8 if use_uint8_kv_cache else dtypes.fp8
+    use_fp8_index_cache = use_fp8_kv_cache or mode == "asm_layout_fp8_index"
     q_out, index_q_out, kv_cache, index_cache = make_insert_outputs(
         case,
         kv_cache_dtype=kv_cache_dtype,
+        index_cache_dtype=dtypes.fp8 if use_fp8_index_cache else None,
     )
     if use_asm_layout:
         # SHUFFLE caches (separate K/V) for the page-16 asm layout.
@@ -558,6 +579,7 @@ def run_fused_qknorm_idxrqknorm(
             k_scale = torch.tensor(0.75, dtype=torch.float32, device="cuda")
             v_scale = torch.tensor(1.25, dtype=torch.float32, device="cuda")
         kv_cache_dtype_arg = "fp8_e4m3"
+    index_cache_dtype_arg = "fp8" if use_fp8_index_cache else "auto"
 
     aiter.fused_qknorm_idxrqknorm(
         qkv,
@@ -581,6 +603,7 @@ def run_fused_qknorm_idxrqknorm(
         index_q_out_arg,
         index_slot_mapping,
         kv_cache_dtype=kv_cache_dtype_arg,
+        index_cache_dtype=index_cache_dtype_arg,
         k_scale=k_scale,
         v_scale=v_scale,
         asm_layout=use_asm_layout,
@@ -607,9 +630,10 @@ def test_fused_qknorm_idxrqknorm(
     rotary_dim: int,
     num_index_heads: int = 4,
 ):
-    use_fp8_kv_cache = mode.startswith("fp8_kv_cache") or mode.startswith(
-        "asm_layout_fp8"
+    use_fp8_kv_cache = mode.startswith("fp8_kv_cache") or (
+        mode.startswith("asm_layout_fp8") and mode != "asm_layout_fp8_index"
     )
+    use_fp8_index_cache = use_fp8_kv_cache or mode == "asm_layout_fp8_index"
     if use_fp8_kv_cache and fp8_cache_dtype() is None:
         aiter.logger.info("Skip fp8_kv_cache: torch FP8 dtype is unavailable")
         return {
@@ -722,7 +746,7 @@ def test_fused_qknorm_idxrqknorm(
                     )
                 check_close(
                     index_k_out,
-                    refs["index_k"],
+                    fp8_unit_scale_ref(refs["index_k"]),
                     msg=f"{msg}(index_cache)",
                     rtol=rtol,
                     atol=atol,
@@ -756,9 +780,14 @@ def test_fused_qknorm_idxrqknorm(
                 index_k_out = gather_index_cache(
                     case, index_cache, index_slot_mapping=index_slot_mapping
                 )
+                index_k_ref = (
+                    fp8_unit_scale_ref(refs["index_k"])
+                    if use_fp8_index_cache
+                    else refs["index_k"]
+                )
                 check_close(
                     index_k_out,
-                    refs["index_k"],
+                    index_k_ref,
                     msg=f"{msg}(index_cache)",
                     rtol=rtol,
                     atol=atol,
@@ -814,6 +843,7 @@ DEFAULT_CASES = [
     ("asm_layout", "bf16", 17, 16, 64, 4),
     ("asm_layout", "fp16", 19, 16, 96, 4),
     ("asm_layout", "bf16", 13, 16, 64, 0),
+    ("asm_layout_fp8_index", "bf16", 17, 16, 64, 4),
     # fp8 path is per-token dynamic quant only (no per-tensor static scale).
     ("fp8_kv_cache_pertoken", "bf16", 17, 16, 64, 4),
     ("fp8_kv_cache_pertoken_uint8", "bf16", 17, 16, 64, 4),
@@ -828,6 +858,7 @@ l_mode = [
     "slot_mapping_fallback",
     "inplace",
     "asm_layout",
+    "asm_layout_fp8_index",
     "fp8_kv_cache_pertoken",
     "fp8_kv_cache_pertoken_uint8",
     "asm_layout_fp8_pertoken",

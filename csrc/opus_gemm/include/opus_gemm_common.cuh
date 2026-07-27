@@ -20,3 +20,6 @@
 // Both opus_gemm_a16w16_traits_gfx950 (split-barrier) and
 // opus_gemm_a16w16_flatmm_traits_gfx950 (warp-spec) live in this one header.
 #include "gfx950/opus_gemm_traits_a16w16_gfx950.cuh"
+// gfx1250 cluster/TDM split-K (workspace + reduce) traits + kargs +
+// opus_splitk_ws_handle (guarded; shared with gfx950).
+#include "gfx1250/opus_gemm_traits_a16w16_gfx1250.cuh"

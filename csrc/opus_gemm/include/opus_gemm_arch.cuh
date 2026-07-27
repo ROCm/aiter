@@ -15,6 +15,7 @@ enum class OpusGfxArch
     Unknown = 0,
     Gfx950,
     Gfx942,
+    Gfx1250,
     // future: Gfx940, Gfx1100, ...
 };
 
@@ -47,6 +48,10 @@ inline const opus_arch_detail::OpusArchInfo &opus_get_arch_info()
         else if (name.rfind("gfx942", 0) == 0)
         {
             a = OpusGfxArch::Gfx942;
+        }
+        else if (name.rfind("gfx1250", 0) == 0)
+        {
+            a = OpusGfxArch::Gfx1250;
         }
         return OpusArchInfo{a, std::move(name), dev};
     }();

@@ -1,9 +1,24 @@
-pandas
-pytest
-psutil
-matplotlib
-pyyaml
-einops
-pybind11>=3.0.1
-ninja
-flydsl==0.2.2
+# Runtime / CI Python dependencies, version-pinned for reproducible builds and
+# to reduce PyPI supply-chain risk (typosquat / upstream compromise pulling an
+# unexpected version).
+#
+# aiter builds across multiple Python versions (CI wheels on py3.10 and py3.12),
+# so packages whose pinned release drops an older Python use environment markers
+# to keep a compatible pinned version per interpreter. Baseline versions track
+# rocm/atom-dev:latest (py3.12); the py<3.11 fallbacks are the latest release of
+# that package still supporting py3.10.
+#
+# Note: torch and triton are provided by the base image as ROCm-specific builds
+# (e.g. torch 2.10.0+rocm..., triton 3.7.0+amd.rocm...) that are not published on
+# PyPI, so they are intentionally NOT pinned here — their provenance is governed
+# by the base image, not this file.
+pandas==3.0.3; python_version >= "3.11"
+pandas==2.3.3; python_version < "3.11"
+pytest==9.0.3
+psutil==7.2.2
+matplotlib==3.10.9
+pyyaml==6.0.3
+einops==0.8.2
+pybind11==3.0.4
+ninja==1.13.0
+flydsl==0.2.4

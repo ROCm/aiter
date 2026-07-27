@@ -329,7 +329,7 @@ def _attn_fwd_inner(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     # loop over k, v, and update accumulator
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
@@ -1766,6 +1766,20 @@ def attention_forward_prefill_triton_impl(
 
     # check features
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    # The kernel only special-cases an infinite *left* edge (WINDOW_SIZE_LEFT < 0).
+    # WINDOW_SIZE_RIGHT is consumed as a literal finite offset everywhere (the
+    # per-element right_bound and the block-classification bounds), so a negative
+    # right does not mean "unbounded" -- it collapses right_bound to (anchor - 1)
+    # and silently over-masks. Reject it rather than return a wrong result.
+    # (window_size_right == -1 is only valid as the "off" sentinel, i.e. together
+    # with window_size_left == -1, which leaves use_sliding_window False.) This
+    # matches the backward guard in attention_backward_triton_impl.
+    if use_sliding_window and window_size_right < 0:
+        raise NotImplementedError(
+            "Sliding-window attention requires window_size_right >= 0 "
+            f"(got window_size_right={window_size_right}). An unbounded right edge "
+            "is not supported; use window_size_right=0 for a causal window."
+        )
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )

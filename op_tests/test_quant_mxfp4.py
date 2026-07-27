@@ -145,27 +145,10 @@ def fp32_to_e2m1_rne(val: torch.Tensor) -> torch.Tensor:
     return e2m1.to(torch.uint8)
 
 
-def fp32_to_e2m1_rha(val: torch.Tensor) -> torch.Tensor:
-    """E2M1 quantization with round-half-away (matches non-gfx950 SW fallback)."""
-    a = val.abs()
-    dev = val.device
-    mag = torch.zeros_like(val, dtype=torch.uint8)
-    mag = torch.where(a >= 0.25, torch.tensor(1, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 0.75, torch.tensor(2, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 1.25, torch.tensor(3, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 1.75, torch.tensor(4, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 2.5, torch.tensor(5, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 3.5, torch.tensor(6, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 5.0, torch.tensor(7, dtype=torch.uint8, device=dev), mag)
-    sign = torch.where(
-        val < 0,
-        torch.tensor(8, dtype=torch.uint8, device=dev),
-        torch.tensor(0, dtype=torch.uint8, device=dev),
-    )
-    return sign | mag
-
-
-fp32_to_e2m1 = fp32_to_e2m1_rne if get_gfx() == "gfx950" else fp32_to_e2m1_rha
+# Both the gfx950 hardware conversion and the non-gfx950 software fallback
+# (even_round_e2m1 in csrc/kernels/quant_mxfp4.cu) perform round-to-nearest-even,
+# so the reference uses RNE on every arch.
+fp32_to_e2m1 = fp32_to_e2m1_rne
 
 
 def ref_quant_mxfp4(inp: torch.Tensor, round_mode: int = 1, group_size: int = 32):

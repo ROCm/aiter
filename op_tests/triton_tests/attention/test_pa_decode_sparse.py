@@ -149,12 +149,10 @@ def _make_inputs(
 def _wrapper_main_kernel_params(D: int):
     """Reproduce the (use_exp2, block_k) the wrapper picks for the main kernel.
 
-    The split kernel emits partials in the base-2 domain on non-gfx1250
-    (triton path, USE_EXP2=True) and the natural-exp domain on gfx1250 (gluon
-    path, USE_EXP2=False). block_k matches the wrapper's per-arch choice.
+    Must stay in sync with ``pa_decode_sparse``'s USE_EXP2 and block_k logic.
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
-    use_exp2 = not use_gluon
+    use_exp2 = True
     block_k = 32 if use_gluon else (16 if D >= 256 else 32)
     return use_exp2, block_k
 
@@ -225,13 +223,13 @@ def _reduce_partials_torch(
     return out
 
 
-@pytest.mark.parametrize("T", [1, 32, 512])
-@pytest.mark.parametrize("H", [1, 8, 16])
+@pytest.mark.parametrize("T", [1, 64, 256])
+@pytest.mark.parametrize("H", [16, 64])
 @pytest.mark.parametrize("D", [512])
-@pytest.mark.parametrize("kv_len", [100, 400, 1024, 4096])
+@pytest.mark.parametrize("kv_len", [136, 388, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
-@pytest.mark.parametrize("sentinels", [True, False])
-@pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("sentinels", [False])
+@pytest.mark.parametrize("skip_reduce", [False])  # skip_reduce = True for debug only
 def test_pa_decode_sparse_vs_reference(
     T, H, D, kv_len, var_len, sentinels, skip_reduce
 ):

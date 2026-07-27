@@ -19,6 +19,36 @@ namespace aiter {
     static constexpr bool mhc_async_load_oob_guard = false;
 #endif
 
+    // is_fn_pack_bf16 selects the bf16 (fn hi/lo split) matrix compute over the fp32
+    // one. Wave64 CDNA (gfx942/gfx950/gfx9_4_generic) use opus::mfma<bf16,..,16,16,32>
+    // (8 bf16/lane) -- native K=32 on gfx950, chained K=16 (mfma_..16x16x16bf16_1k) on
+    // gfx942; gfx1250 uses the wave32 wmma_f32_16x16x32_bf16 (16 bf16/lane, UNVERIFIED
+    // - no HW here). Gated per-arch below so each arch's builtin only reaches its own
+    // device pass; other arches (host) fall back to fp32.
+#if defined(__gfx950__) || defined(__gfx942__) || defined(__gfx9_4_generic__)
+#define MHC_BF16_MFMA 1
+#else
+#define MHC_BF16_MFMA 0
+#endif
+#if MHC_BF16_MFMA || defined(__gfx1250__)
+    static constexpr bool mhc_bf16_mma_avail = true;
+#else
+    static constexpr bool mhc_bf16_mma_avail = false;
+#endif
+
+    // Residual-load TDM completion helpers (mhc_fused_post_pre_gemm_sqrsum_kernel).
+    // On gfx1250 the residual tile is moved by the TDM engine and tracked by
+    // TENSORcnt (separate from load/async/ds counters). KEEP1 leaves the next
+    // prefetched stage in flight (<=2 inflight, within the <=3 budget); DRAIN
+    // waits for all residual TDMs. No-ops off gfx1250 (residual uses async_load).
+#if defined(__gfx1250__)
+#define MHC_TDM_KEEP1() opus::s_wait_tensorcnt(opus::number<1>{})
+#define MHC_TDM_DRAIN() opus::s_wait_tensorcnt(opus::number<0>{})
+#else
+#define MHC_TDM_KEEP1() ((void)0)
+#define MHC_TDM_DRAIN() ((void)0)
+#endif
+
     constexpr int ceil_pow2(int n) {
         if(n <= 1) return 1;
         int p = 1;
@@ -96,7 +126,7 @@ namespace aiter {
     mma_f32_16x16x4_fma((a), (b), (c))
 #endif
 
-    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k>
+    template <typename DTYPE_I, int num_warps, int tile_m, int tile_n, int tile_k, bool is_fn_pack_bf16 = false>
     __global__ __launch_bounds__(num_warps *  opus::get_warp_size(), 2)
     void mhc_pre_gemm_sqrsum_kernel(
         float* out,
@@ -322,6 +352,163 @@ namespace aiter {
                 }
             }
         };
+        // bf16 path (gfx950): read one 8-kk chunk of fn (per n) into fp32 registers,
+        // reusing the same wave64 LDS swizzle as lds_load_bf_window. kk = c*8+e maps to
+        // K_wanted = c*32 + (lane/mfma_n)*8 + e, exactly the K that x's v_a[c*8+e] holds,
+        // so mfma_f32_16x16x32_bf16(fn, x_chunk) contracts the matching 32 K.
+        static constexpr int n_chunks_bf16 = vec_tile / 8;
+        static_assert(!mhc_bf16_mma_avail || vec_tile % 8 == 0,
+                      "bf16 path needs vec_tile a multiple of 8");
+#if MHC_BF16_MFMA   // wave64 CDNA bf16 MFMA (gfx942 chained-K16 / gfx950 native K32)
+        auto lds_read_fn_chunk_bf16 = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][8], int c) {
+            #pragma unroll
+            for (int n = 0; n < repeat_n; n++) {
+                int fn_row = n * mfma_n + lane_id % mfma_n;
+                if constexpr (fn_vec_size == 1) {
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        int kk = c * 8 + e;
+                        int K_wanted = (kk / 8 * mfma_k + lane_id / mfma_n) * 8 + kk % 8;
+                        raw[n][e] = *(s_fn_rd_ptr + fn_row * tile_k +
+                                      (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
+                    }
+                } else {
+                    #pragma unroll
+                    for (int v = 0; v < 8 / fn_vec_size; v++) {
+                        int kk_base = c * 8 + v * fn_vec_size;
+                        int K_wanted_base = (kk_base / 8 * mfma_k + lane_id / mfma_n) * 8 +
+                                            kk_base % 8;
+                        int K_lds_base = K_wanted_base ^ ((fn_row & 0xF) << fn_xor_shift);
+                        fp32x4_t bf_vec = *(reinterpret_cast<fp32x4_t*>(
+                            s_fn_rd_ptr + fn_row * tile_k + K_lds_base));
+                        #pragma unroll
+                        for (int i = 0; i < fn_vec_size; i++) {
+                            raw[n][v * fn_vec_size + i] = bf_vec[i];
+                        }
+                    }
+                }
+            }
+        };
+
+#define GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH)                                        \
+        do {                                                                                      \
+            if (n_idx == 0) {                                                                     \
+                for (int i = 0; i < vec_tile; i++) {                                              \
+                    float xv = static_cast<float>(v_a[BUF][i]);                                   \
+                    sqrsum_part += xv * xv;                                                       \
+                }                                                                                 \
+            }                                                                                     \
+            /* snapshot x as bf16 chunks before the prefetch overwrites v_a[BUF] */               \
+            opus::vector_t<opus::bf16_t, 8> x_bf[n_chunks_bf16];                                  \
+            _Pragma("unroll")                                                                     \
+            for (int c = 0; c < n_chunks_bf16; c++)                                               \
+                for (int e = 0; e < 8; e++)                                                       \
+                    x_bf[c][e] = opus::fp32_to_bf16(static_cast<float>(v_a[BUF][c * 8 + e]));     \
+            if (DO_PREFETCH) {                                                                    \
+                v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
+                                                0, true, interleave_size>(                        \
+                    g_a, ga_offset + ((k) + 2) * tile_k);                                         \
+                s_wait_all_loadcnt(opus::number<2 * x_load_waitcnt>{}, opus::number<fn_lds_load_waitcnt>{}); \
+            } else {                                                                              \
+                s_wait_all_loadcnt(0_I, 0_I);                                                     \
+            }                                                                                     \
+            __builtin_amdgcn_s_barrier();                                                         \
+            float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
+            _Pragma("unroll")                                                                     \
+            for (int c = 0; c < n_chunks_bf16; c++) {                                             \
+                float raw[repeat_n][8];                                                           \
+                lds_read_fn_chunk_bf16(s_fn_rd_ptr, raw, c);                                      \
+                s_wait_all_dscnt(0_I);                                                            \
+                _Pragma("unroll")                                                                 \
+                for (int n = 0; n < repeat_n; n++) {                                              \
+                    opus::vector_t<opus::bf16_t, 8> fn_hi, fn_lo;                                 \
+                    _Pragma("unroll")                                                             \
+                    for (int e = 0; e < 8; e++) fn_hi[e] = opus::fp32_to_bf16(raw[n][e]);         \
+                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
+                    _Pragma("unroll")                                                             \
+                    for (int e = 0; e < 8; e++)                                                   \
+                        fn_lo[e] = opus::fp32_to_bf16(raw[n][e] - opus::bf16_to_fp32(fn_hi[e]));  \
+                    v_cf[n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
+                    __builtin_amdgcn_sched_barrier(0);                                            \
+                }                                                                                 \
+            }                                                                                     \
+            if (DO_PREFETCH) {                                                                    \
+                __syncthreads();                                                                  \
+                lds_load_fn_tile((k) + 2);                                                        \
+            }                                                                                     \
+        } while (0)
+#endif // MHC_BF16_MFMA (wave64 bf16 path)
+
+#if defined(__gfx1250__)   // wave32 WMMA bf16 (UNVERIFIED - no gfx1250 HW to validate)
+        // 16 bf16/lane WMMA fragment. On wave32 x's v_a index == the WMMA fragment K
+        // position, so x_bf[c][i] = v_a[c*16+i]; fn is read at kk=c*16+i with the same
+        // wave32 K_wanted the fp32 path uses, so fn_frag[i] and x_frag[i] share K.
+        static constexpr int n_chunks_bf16_w32 = vec_tile / 16;
+        static_assert(!mhc_bf16_mma_avail || vec_tile % 16 == 0,
+                      "wave32 bf16 needs vec_tile a multiple of 16");
+        auto lds_read_fn_chunk_bf16_w32 = [&](float* s_fn_rd_ptr, float (&raw)[repeat_n][16], int c) {
+            #pragma unroll
+            for (int n = 0; n < repeat_n; n++) {
+                int fn_row = n * mfma_n + lane_id % mfma_n;
+                int k_group = lane_id / mfma_m;
+                #pragma unroll
+                for (int i = 0; i < 16; i++) {
+                    int kk = c * 16 + i;
+                    int K_wanted = k_group * x_vec_size +
+                                   (kk / x_vec_size) * interleave_size * x_vec_size +
+                                   kk % x_vec_size;
+                    raw[n][i] = *(s_fn_rd_ptr + fn_row * tile_k +
+                                  (K_wanted ^ ((fn_row & 0xF) << fn_xor_shift)));
+                }
+            }
+        };
+#define GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH)                                    \
+        do {                                                                                      \
+            if (n_idx == 0) {                                                                     \
+                for (int i = 0; i < vec_tile; i++) {                                              \
+                    float xv = static_cast<float>(v_a[BUF][i]);                                   \
+                    sqrsum_part += xv * xv;                                                       \
+                }                                                                                 \
+            }                                                                                     \
+            opus::vector_t<opus::bf16_t, 16> x_bf[n_chunks_bf16_w32];                             \
+            _Pragma("unroll")                                                                     \
+            for (int c = 0; c < n_chunks_bf16_w32; c++)                                           \
+                for (int i = 0; i < 16; i++)                                                      \
+                    x_bf[c][i] = opus::fp32_to_bf16(static_cast<float>(v_a[BUF][c * 16 + i]));    \
+            if (DO_PREFETCH) {                                                                    \
+                v_a[BUF] = load_vector_nbytes<DTYPE_I, vec_tile, 8 * sizeof(DTYPE_I),             \
+                                                0, true, interleave_size>(                        \
+                    g_a, ga_offset + ((k) + 2) * tile_k);                                         \
+                s_wait_all_loadcnt(opus::number<2 * x_load_waitcnt>{}, opus::number<fn_lds_load_waitcnt>{}); \
+            } else {                                                                              \
+                s_wait_all_loadcnt(0_I, 0_I);                                                     \
+            }                                                                                     \
+            __builtin_amdgcn_s_barrier();                                                         \
+            float* s_fn_rd_ptr = s_fn + (LDS_SLOT) * tile_n * tile_k;                             \
+            _Pragma("unroll")                                                                     \
+            for (int c = 0; c < n_chunks_bf16_w32; c++) {                                         \
+                float raw[repeat_n][16];                                                          \
+                lds_read_fn_chunk_bf16_w32(s_fn_rd_ptr, raw, c);                                  \
+                s_wait_all_dscnt(0_I);                                                            \
+                _Pragma("unroll")                                                                 \
+                for (int n = 0; n < repeat_n; n++) {                                              \
+                    opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;                                \
+                    _Pragma("unroll")                                                             \
+                    for (int i = 0; i < 16; i++) fn_hi[i] = opus::fp32_to_bf16(raw[n][i]);        \
+                    v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, x_bf[c], v_cf[n]);            \
+                    _Pragma("unroll")                                                             \
+                    for (int i = 0; i < 16; i++)                                                  \
+                        fn_lo[i] = opus::fp32_to_bf16(raw[n][i] - opus::bf16_to_fp32(fn_hi[i]));  \
+                    v_cf[n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, x_bf[c], v_cf[n]);            \
+                    __builtin_amdgcn_sched_barrier(0);                                            \
+                }                                                                                 \
+            }                                                                                     \
+            if (DO_PREFETCH) {                                                                    \
+                __syncthreads();                                                                  \
+                lds_load_fn_tile((k) + 2);                                                        \
+            }                                                                                     \
+        } while (0)
+#endif // __gfx1250__ (bf16 path)
 
 #define GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)                                             \
         do {                                                                                      \
@@ -404,19 +591,44 @@ namespace aiter {
                 }                                                                                  \
             }                                                                                      \
         } while (0)
+        // is_fn_pack_bf16: bf16 hi/lo MFMA; otherwise fp32 MFMA. The bf16 body (and the
+        // gfx950-only mfma_f32_16x16x32_bf16 builtin) exists only in the gfx950 device
+        // pass; every other arch compiles the fp32 path unconditionally, so the flag is
+        // a no-op there (falls back to fp32).
+#if MHC_BF16_MFMA
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
+        if constexpr (is_fn_pack_bf16) {                                   \
+            GEMM_LOOP_BODY_BF16(BUF, LDS_SLOT, k, DO_PREFETCH);           \
+        } else {                                                          \
+            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
+        }
+#elif defined(__gfx1250__)
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
+        if constexpr (is_fn_pack_bf16) {                                   \
+            GEMM_LOOP_BODY_BF16_W32(BUF, LDS_SLOT, k, DO_PREFETCH);       \
+        } else {                                                          \
+            GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH);               \
+        }
+#else
+#define MHC_PRE_GEMM_STEP(BUF, LDS_SLOT, k, DO_PREFETCH)                    \
+        GEMM_LOOP_BODY(BUF, LDS_SLOT, k, DO_PREFETCH)
+#endif
         for (int k = 0; k < k_loop - 2; k += 2) {
-            GEMM_LOOP_BODY(0, k % 2, k, 1);
+            MHC_PRE_GEMM_STEP(0, k % 2, k, 1);
             if (k + 3 < k_loop) {
-                GEMM_LOOP_BODY(1, (k + 1) % 2, k + 1, 1);
+                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 1);
             } else {
-                GEMM_LOOP_BODY(1, (k + 1) % 2, k + 1, 0);
+                MHC_PRE_GEMM_STEP(1, (k + 1) % 2, k + 1, 0);
             }
         }
-        GEMM_LOOP_BODY(0, 0, 0, 0);
+        MHC_PRE_GEMM_STEP(0, 0, 0, 0);
         if ((k_loop & 1) == 0) {
-            GEMM_LOOP_BODY(1, 1, 0, 0);
-        } 
+            MHC_PRE_GEMM_STEP(1, 1, 0, 0);
+        }
+#undef MHC_PRE_GEMM_STEP
 #undef GEMM_LOOP_BODY
+#undef GEMM_LOOP_BODY_BF16
+#undef GEMM_LOOP_BODY_BF16_W32
 
         if (n_idx == 0) {
             float sqrsum_ = cross_row_sum_4(sqrsum_part, lane_id);
@@ -440,7 +652,7 @@ namespace aiter {
         dim3 block(num_warps * WARP_SIZE); \
         TORCH_CHECK(hc_hidden_size % (tile_k * split_k) == 0, "hc_hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hc_hidden_size >= (tile_k * split_k) * 2, "hc_hidden_size must >= tile_k * split_k * 2 stages prefetch"); \
-        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k><<<grid, block, 0, stream>>>( \
+        mhc_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, tile_m, tile_n, tile_k, MHC_PRE_BF16><<<grid, block, 0, stream>>>( \
             reinterpret_cast<float*>(out.data_ptr()), \
             reinterpret_cast<float*>(sqrsum.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(x.data_ptr()), \
@@ -477,7 +689,8 @@ namespace aiter {
         torch::Tensor& sqrsum, // (split_k, m) / (m)
         torch::Tensor& x, // (m, hc_hidden_size)
         torch::Tensor& fn, // (hc_mult3, hc_hidden_size)
-        int tile_k = 128
+        int tile_k = 128,
+        int is_fn_pack_bf16 = 0
     )
     {
         TORCH_CHECK(out.size(0) == sqrsum.size(0), "out and sqrsum must have the same number of split_k or m");
@@ -495,8 +708,16 @@ namespace aiter {
 
         const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(x));
         const hipStream_t stream = at::hip::getCurrentHIPStream();
-        
-        MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+
+        if (is_fn_pack_bf16) {
+#define MHC_PRE_BF16 true
+            MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_PRE_BF16
+        } else {
+#define MHC_PRE_BF16 false
+            MHC_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_PRE_BF16
+        }
     }
 
 
@@ -1353,6 +1574,7 @@ namespace aiter {
         DTYPE_I* residual,
         DTYPE_I* norm_weight,
         int m,
+        int n_splits,
         int gemm_out_mul_stride,
         int residual_stride,
         float rms_eps,
@@ -1360,8 +1582,7 @@ namespace aiter {
         float hc_sinkhorn_eps,
         float norm_eps,
         float hc_post_mult_value,
-        int sinkhorn_repeat,
-        int n_splits
+        int sinkhorn_repeat
     )
     {
         static constexpr int cache_policy = use_nt ? GROUP_NT : RT;
@@ -1678,28 +1899,27 @@ namespace aiter {
             floatblock_t v_layer_input_f;
 
             auto process_norm_block = [&](int norm_block_id, halfblock_t v_norm_weight) {
-                halfblock_t v_layer_input = load_layer_input_loop(norm_block_id, 0);
+                #pragma unroll
                 for(int j = 0; j < norm_block_vecs; j++) {
                     v_norm_weight_f[j] = static_cast<float>(v_norm_weight[j]);
                 }
-                for(int j = 0; j < norm_block_vecs; j++) {
-                    v_layer_input_f[j] = static_cast<float>(v_layer_input[j]);
-                }
-                for(int j = 1; j < m_oob; j++) {
-                    v_layer_input = load_layer_input_loop(norm_block_id, j);
-                    for(int k = 0; k < norm_block_vecs; k++) {
-                        v_layer_input_f[k] = v_layer_input_f[k] * v_norm_weight_f[k] * rms[j-1];
+                // Unroll over the compile-time num_rows (with a runtime r < m_oob
+                // guard) so rms[r] uses a constant index. Indexing the rms[] register
+                // array by the runtime row (rms[j-1] / rms[m_oob-1]) previously forced
+                // the whole array to spill to scratch, since the HW cannot address
+                // VGPRs by a dynamic index. The per-row LDS loads are independent, so
+                // the compiler still overlaps them across the unrolled iterations.
+                #pragma unroll
+                for(int r = 0; r < num_rows; r++) {
+                    if (r < m_oob) {
+                        halfblock_t v_layer_input = load_layer_input_loop(norm_block_id, r);
+                        #pragma unroll
+                        for(int k = 0; k < norm_block_vecs; k++) {
+                            v_layer_input_f[k] = static_cast<float>(v_layer_input[k]) * v_norm_weight_f[k] * rms[r];
+                        }
+                        store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, r * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
                     }
-                    store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, (j - 1) * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
-                    for(int j = 0; j < norm_block_vecs; j++) {
-                        v_layer_input_f[j] = static_cast<float>(v_layer_input[j]);
-                    }
-
                 }
-                for(int k = 0; k < norm_block_vecs; k++) {
-                    v_layer_input_f[k] = v_layer_input_f[k] * v_norm_weight_f[k] * rms[m_oob-1];
-                }
-                store_vector_nbytes<DTYPE_I, float, norm_block_vecs, norm_load_bytes, 0, false>(buffer_out, v_layer_input_f, (m_oob - 1) * hidden_size + norm_block_id * norm_block + lane_id * norm_block_vecs);
             };
 
             int norm_i = 0;
@@ -1784,6 +2004,7 @@ namespace aiter {
             reinterpret_cast<DTYPE_I*>(residual.data_ptr()), \
             reinterpret_cast<DTYPE_I*>(norm_weight.data_ptr()), \
             m, \
+            n_splits, \
             gemm_out_mul_stride, \
             residual_stride, \
             rms_eps, \
@@ -1791,15 +2012,18 @@ namespace aiter {
             hc_sinkhorn_eps, \
             norm_eps, \
             hc_post_mult_value, \
-            sinkhorn_repeat, \
-            n_splits \
+            sinkhorn_repeat \
         ); \
     });
 
 #define MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m) \
     if (hidden_size == 7168) { \
         if (m < 4 * cu_num) { \
-            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 7168, 1024, 1024, false); \
+            if (WARP_SIZE == 32) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 7168, 1024, 1024, false); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 7168, 1024, 1024, false); \
+            } \
         } else if (m <= 8 * cu_num) { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 7168, 512, 512, false); \
         } else { \
@@ -1807,7 +2031,11 @@ namespace aiter {
         } \
     } else if (hidden_size == 4096) { \
         if (m < 4 * cu_num) { \
-            MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 4096, 1024, 1024, false); \
+            if (WARP_SIZE == 32) { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(9, 4, 1, 4096, 1024, 1024, false); \
+            } else { \
+                MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 1, 4096, 1024, 1024, false); \
+            } \
         } else if (m <= 8 * cu_num) { \
             MHC_PRE_BIG_FUSE_RM_KERNEL_IMPL(5, 4, 2, 4096, 512, 512, false); \
         } else { \
@@ -1866,7 +2094,7 @@ namespace aiter {
         MHC_PRE_BIG_FUSE_RM_KERNEL_DISPATCH(m);
     }
 
-    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt>
+    template <typename DTYPE_I, int num_warps, int hc_mult, int tile_m, int tile_n, int tile_k, bool store_nt, bool is_fn_pack_bf16 = false>
     __global__ __launch_bounds__(num_warps * opus::get_warp_size(), 1)
     void mhc_fused_post_pre_gemm_sqrsum_kernel(
         float* out,
@@ -1940,6 +2168,31 @@ namespace aiter {
 
         static constexpr int tile_mk = tile_m * tile_k;
         static_assert(tile_mk % warp_size == 0, "tile_mk must be divisible by block_size");
+#if defined(__gfx1250__)
+        // ---- gfx1250 x (layer_input) load via TDM: a plain 2D tile ----
+        // x lands in LDS as row*tile_k + hidden (exactly what compute_store_tile
+        // reads); in global x[row][h] = row*x_stride + h. So a 2D TDM tile
+        // reproduces the async layout and leaves compute_store_tile unchanged:
+        //   dim0 = hidden (TileDim0 = tile_k, contiguous)
+        //   dim1 = row    (TileDim1 = tile_m,  stride = x_stride)
+        // Issued by warp 1 (residual is issued by warp 0), so each issuing wave
+        // keeps at most 2 TDM ops in flight (2-stage prefetch) -> still within the
+        // <=3 per-wave budget with both x and residual on TDM. tensor_dim1=m_oob
+        // gives free row OOB (out-of-range rows load 0), so no manual zero-fill and
+        // no async counter -> x is TENSORcnt-tracked, x_load_waitcnt = 0.
+        static constexpr int x_load_waitcnt = 0;
+        auto lds_load_x_tile = [&](int k){
+            if (warp_id == 1) {
+                opus::tdm_window<DTYPE_I, tile_k, tile_m> win;   // ndim=2, cpol=default_cpol=16
+                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_x))
+                    + static_cast<uint32_t>((k & 1) * tile_mk * sizeof(DTYPE_I));
+                DTYPE_I* g = x_ptr + k_split_offset + k * tile_k;
+                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride)
+                win.desc.make(lds, g, tile_k, m_oob, x_stride);
+                win.load_to_lds();
+            }
+        };
+#else
 #if defined(__gfx942__)
         static constexpr int x_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
@@ -1974,7 +2227,42 @@ namespace aiter {
                 }
             }
         };
+#endif
 
+#if defined(__gfx1250__)
+        // ---- gfx1250 residual load via TDM (Tensor Data Mover) ----
+        // The residual tile is [head=hc_mult][row=tile_m][hidden=tile_k] and must
+        // land in LDS as h*tile_mk + row*tile_k + hidden (exactly what
+        // compute_store_tile reads), so a single 3D TDM tile reproduces the async
+        // layout and leaves compute_store_tile unchanged:
+        //   dim0 = hidden (TileDim0 = tile_k, contiguous)
+        //   dim1 = row    (TileDim1 = tile_m,  stride = residual_stride)
+        //   dim2 = head   (TileDim2 = hc_mult, stride = hidden_size)
+        // TDM writes dim0-fastest -> dim1 -> dim2, i.e. linear LDS index
+        //   dim2*(tile_m*tile_k) + dim1*tile_k + dim0 = h*tile_mk + row*tile_k + hidden.
+        // One TDM op per k-step; the 2-stage (n_stages) prefetch keeps at most 2
+        // in flight (<=3 inflight budget). tensor_dim1=m_oob gives free row OOB
+        // (out-of-range rows load 0). residual is TENSORcnt-tracked, so it no longer
+        // contributes to the async counter -> residual_load_waitcnt = 0.
+        static constexpr int residual_load_waitcnt = 0;
+        auto lds_load_residual_tile = [&](int k){
+            // TDM is a wave-level DMA (not per-lane, not EXEC-gated); a single wave
+            // issues one op that fills the whole all-head tile. Only warp 0 issues;
+            // the others see the data after the tensorcnt wait + workgroup barrier
+            // in wait_load_cnt(). Build the 3D descriptor by hand (tdm_window::make
+            // is 2D-only) and reuse the vetted load_to_lds() issue path (cpol=16).
+            if (warp_id == 0) {
+                opus::tdm_window<DTYPE_I, tile_k, tile_m, hc_mult> win;  // ndim=3, cpol=default_cpol=16
+                uint32_t lds = static_cast<uint32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s_residual))
+                    + static_cast<uint32_t>((k & 1) * (hc_mult * tile_mk) * sizeof(DTYPE_I));
+                DTYPE_I* g = residual_ptr + k_split_offset + k * tile_k;
+                // make(lds_addr, global_ptr, tensor_dim0, tensor_dim1, tensor_dim0_stride,
+                //      tensor_dim1_stride, lds_barrier_addr, tensor_dim2)
+                win.desc.make(lds, g, tile_k, m_oob, residual_stride, hidden_size, 0, hc_mult);
+                win.load_to_lds();
+            }
+        };
+#else
 #if defined(__gfx942__)
         static constexpr int r_async_load_vec = 4 / sizeof(DTYPE_I);
 #else
@@ -2006,6 +2294,7 @@ namespace aiter {
                 s_offset += s_offset_i;
             }
         };
+#endif
         
         static constexpr int fn_load_vec = 16 / sizeof(float);
         static constexpr int fn_load_waitcnt = tile_n * tile_k / (warp_size * fn_load_vec);
@@ -2059,8 +2348,11 @@ namespace aiter {
             static constexpr int ds_read_vec = 16 / sizeof(DTYPE_I);
             static constexpr int step = ds_read_vec;
             static constexpr int band_j = band_mk / (warp_size * ds_read_vec);
+            // gfx1250 wave32 bf16 needs a 16-K/lane WMMA fragment = two band_j
+            // iterations (2 x ds_read_vec) combined; band_j is even for tile_k in {32,64}.
             for(int b = 0; b < m_repeat; b++) {
                 int s_offset = b * band_mk + lane_id % mfma_m * tile_k + lane_id / mfma_m * vec_tile;
+                [[maybe_unused]] float res_buf[2][ds_read_vec];  // gfx1250 bf16: buffer 2 j's -> 16/lane
                 for(int j = 0; j < band_j; j++) {
                     opus::vector_t<float, ds_read_vec> res;
                     using DTYPE_I_vec = opus::vector_t<DTYPE_I, ds_read_vec>;
@@ -2069,7 +2361,7 @@ namespace aiter {
                     for(int h = 0; h < hc_mult; h++) {
                         residual_vec[h] = *(reinterpret_cast<DTYPE_I_vec*>(s_residual_rd_ptr + s_offset + h * tile_mk));
                     }
-                    s_wait_all_dscnt(opus::number<0>{});
+                    s_wait_all_dscnt(opus::number<hc_mult>{});
                     for(int k = 0; k < ds_read_vec; k++) {
                         res[k] = static_cast<float>(x_vec[k]) * post_mix_v[b];
                     }
@@ -2087,31 +2379,107 @@ namespace aiter {
                         g_nres, res, (b * mfma_m + lane_id % mfma_m) * residual_stride + warp_id * hidden_size + i * tile_k +
                         (s_offset % tile_k) + k_split_offset);
                     s_offset += step;
-                    for(int n = 0; n < repeat_n; n++) {
-                        for(int k = 0; k < ds_read_vec; k += mma_pack_size) {
-                            fp32xmma_t a_pack;
-                            fp32xmma_t b_pack;
-                            for (int pack = 0; pack < mma_pack_size; pack++) {
-                                a_pack[pack] = v_fn[n][k + pack + j * ds_read_vec];
-                                b_pack[pack] = res[k + pack];
+                    if constexpr (is_fn_pack_bf16 && mhc_bf16_mma_avail) {
+#if MHC_BF16_MFMA
+                        // bf16 MFMA (wave64 CDNA): one mfma_f32_16x16x32_bf16 contracts
+                        // ds_read_vec (=8) K-elems/lane x 4 lane-groups = 32 K, replacing
+                        // the 8 scalar fp32 MFMAs. fn (fp32) splits into hi + unscaled
+                        // bf16 residual (fn - fp32(fn_hi)); bf16 shares fp32's 8-bit
+                        // exponent so lo keeps its magnitude without underflow (no scale),
+                        // and hi*res + lo*res accumulate into the same v_cf. res (the bf16
+                        // next_residual the reference re-loads) is the activation operand.
+                        static_assert(ds_read_vec == 8, "16x16x32 bf16 MFMA expects 8 elems/lane");
+                        opus::vector_t<opus::bf16_t, ds_read_vec> res_bf;
+                        for (int e = 0; e < ds_read_vec; e++) {
+                            res_bf[e] = opus::fp32_to_bf16(res[e]);
+                        }
+                        for(int n = 0; n < repeat_n; n++) {
+                            opus::vector_t<opus::bf16_t, ds_read_vec> fn_hi8, fn_lo8;
+                            for (int e = 0; e < ds_read_vec; e++) {
+                                fn_hi8[e] = opus::fp32_to_bf16(v_fn[n][e + j * ds_read_vec]);
                             }
-                            v_cf[b][n] = MMA_F32_16X16X4(a_pack, b_pack, v_cf[b][n]);
+                            v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_hi8, res_bf, v_cf[b][n]);
+                            for (int e = 0; e < ds_read_vec; e++) {
+                                float f = v_fn[n][e + j * ds_read_vec];
+                                fn_lo8[e] = opus::fp32_to_bf16(f - opus::bf16_to_fp32(fn_hi8[e]));
+                            }
+                            v_cf[b][n] = opus::mfma_f32_16x16x32_bf16{}(fn_lo8, res_bf, v_cf[b][n]);
+                        }
+#elif defined(__gfx1250__)
+                        // UNVERIFIED (no gfx1250 HW): wave32 WMMA bf16. One
+                        // wmma_f32_16x16x32_bf16 needs 16 K-elems/lane = two band_j steps
+                        // combined (2 x ds_read_vec). fn and res are placed at the same
+                        // fragment index using the exact (k,j) pairing the fp32 path uses
+                        // (v_fn[n][k+j*ds_read_vec] <-> res[k]); since A/B WMMA fragments
+                        // share the lane->K layout, contracting frag[i] against frag[i] is
+                        // over matching K. rept0 = the earlier j, rept1 = this j.
+                        static_assert(ds_read_vec == 8, "wave32 bf16 expects 8 elems/lane per step");
+                        static_assert(band_j % 2 == 0, "gfx1250 bf16 needs band_j even (2-j combine)");
+                        for (int e = 0; e < ds_read_vec; e++) res_buf[j & 1][e] = res[e];
+                        if ((j & 1) == 1) {
+                            opus::vector_t<opus::bf16_t, 16> res_bf;
+                            for (int e = 0; e < ds_read_vec; e++) {
+                                res_bf[e]              = opus::fp32_to_bf16(res_buf[0][e]);
+                                res_bf[ds_read_vec + e] = opus::fp32_to_bf16(res_buf[1][e]);
+                            }
+                            for (int n = 0; n < repeat_n; n++) {
+                                opus::vector_t<opus::bf16_t, 16> fn_hi, fn_lo;
+                                for (int e = 0; e < ds_read_vec; e++) {
+                                    fn_hi[e]              = opus::fp32_to_bf16(v_fn[n][e + (j - 1) * ds_read_vec]);
+                                    fn_hi[ds_read_vec + e] = opus::fp32_to_bf16(v_fn[n][e + j * ds_read_vec]);
+                                }
+                                v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_hi, res_bf, v_cf[b][n]);
+                                for (int e = 0; e < ds_read_vec; e++) {
+                                    float f0 = v_fn[n][e + (j - 1) * ds_read_vec];
+                                    float f1 = v_fn[n][e + j * ds_read_vec];
+                                    fn_lo[e]              = opus::fp32_to_bf16(f0 - opus::bf16_to_fp32(fn_hi[e]));
+                                    fn_lo[ds_read_vec + e] = opus::fp32_to_bf16(f1 - opus::bf16_to_fp32(fn_hi[ds_read_vec + e]));
+                                }
+                                v_cf[b][n] = opus::wmma_f32_16x16x32_bf16{}(fn_lo, res_bf, v_cf[b][n]);
+                            }
+                        }
+#endif
+                    } else {
+                        for(int n = 0; n < repeat_n; n++) {
+                            for(int k = 0; k < ds_read_vec; k += mma_pack_size) {
+                                fp32xmma_t a_pack;
+                                fp32xmma_t b_pack;
+                                for (int pack = 0; pack < mma_pack_size; pack++) {
+                                    a_pack[pack] = v_fn[n][k + pack + j * ds_read_vec];
+                                    b_pack[pack] = res[k + pack];
+                                }
+                                v_cf[b][n] = MMA_F32_16X16X4(a_pack, b_pack, v_cf[b][n]);
+                            }
                         }
                     }
                 }
             }
         };
 
-        // On gfx1250 the OOB guard replaces some async_load instructions with
-        // plain LDS zeroing (no async issued), so the number of in-flight async
-        // loads per stage is data-dependent (depends on m_oob), not the compile
-        // -time waitcnt constants. A partial asynccnt wait would then drain the
-        // wrong number of loads and read in-flight / stale LDS, producing
-        // non-deterministic NaNs. Drain all async loads (asynccnt 0) so the wait
-        // is correct regardless of how many were actually issued.
-        static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
-        static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
+        // gfx9 only: x and residual share the async counter, so the "leave in flight"
+        // count is one stage's worth of async loads. On gfx1250 both x and residual
+        // are TDM (TENSORcnt), there are no async loads, and these are unused.
+        [[maybe_unused]] static constexpr int x_async_wait = mhc_async_load_oob_guard ? 0 : x_load_waitcnt + residual_load_waitcnt;
+        [[maybe_unused]] static constexpr int r_async_wait = mhc_async_load_oob_guard ? 0 : residual_load_waitcnt;
+#if defined(__gfx1250__)
         auto wait_load_cnt = [&]() {
+            // x (warp 1) and residual (warp 0) are both TDM / TENSORcnt-tracked. Each
+            // issuing wave drains its current stage down to the single prefetch left in
+            // flight (KEEP1, per-wave counter; a no-op on the non-issuing warps), then
+            // the workgroup barrier publishes both tiles to all warps. fn stays on
+            // loadcnt; there are no async loads left, so the async count is -1
+            // (sentinel: suppress s_wait_asynccnt emission; 0 would emit a spurious
+            // s_wait_asynccnt 0).
+            MHC_TDM_KEEP1();
+            s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<-1>{});
+            __builtin_amdgcn_s_barrier();
+            s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<-1>{});
+        };
+#else
+        auto wait_load_cnt = [&]() {
+            // Ensure the current residual TDM stage is resident before the barrier
+            // below publishes it to all warps; leave the next prefetched stage in flight.
+            MHC_TDM_KEEP1();
             if(threadIdx.x < x_async_load_threads) {
                 s_wait_all_loadcnt(opus::number<fn_load_waitcnt*2>{}, opus::number<x_async_wait>{});
             }
@@ -2126,6 +2494,7 @@ namespace aiter {
                 s_wait_all_loadcnt(opus::number<fn_load_waitcnt>{}, opus::number<r_async_wait>{});
             }
         };
+#endif
 
         int i = 0;
         for(; i + 3 < k_loop ; i += 2) {
@@ -2156,16 +2525,19 @@ namespace aiter {
             }
             else {
                 s_wait_all_loadcnt(0_I, 0_I);
+                MHC_TDM_DRAIN();
                 __builtin_amdgcn_s_barrier();
             }
             compute_store_tile(i + 1, v_fn1);
             if (i + 2 < k_loop) {
                 s_wait_all_loadcnt(0_I, 0_I);
+                MHC_TDM_DRAIN();
                 __builtin_amdgcn_s_barrier();
                 compute_store_tile(i + 2, v_fn0);
             }
         } else if (i < k_loop) {
             s_wait_all_loadcnt(0_I, 0_I);
+            MHC_TDM_DRAIN();
             __builtin_amdgcn_s_barrier();
             compute_store_tile(i, v_fn0);
         }
@@ -2178,10 +2550,21 @@ namespace aiter {
         // contribution to the SAME output element (same idx/n_idx tile + lane->
         // row/col mapping), so the cross-warp sum is the head reduction.
         // Reuse s_residual as scratch (dead after the k_loop); cast to float.
+        // Cross-warp (over hc_mult heads) reduction of BOTH v_cf (gemm_out_mul) and
+        // sqrsum, sharing a single deposit + single barrier (2 __syncthreads total
+        // instead of 4). v_cf and sqrsum use disjoint regions of s_red, so warps
+        // 1..hc_mult-1 deposit both before one barrier, then warp 0 reduces+stores
+        // both. Reuse s_residual as scratch (dead after the k_loop); cast to float.
         float* s_red = reinterpret_cast<float*>(s_residual);
         static constexpr int v_per_lane = m_repeat * repeat_n * ovec;
-        __syncthreads();
-        // warps 1..hc_mult-1 deposit their v_cf, warp 0 reads and accumulates.
+        float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;  // disjoint
+        // sqrsum per-warp partial (computed on all warps; DPP, no barrier needed)
+        float sqrsum_w[m_repeat];
+        if (n_idx == 0) {
+            for (int b = 0; b < m_repeat; b++)
+                sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
+        }
+        __syncthreads();  // (1) s_residual reads (last compute tile) done before reuse
         if (warp_id != 0) {
             int base = (warp_id - 1) * warp_size * v_per_lane + lane_id * v_per_lane;
             int c = 0;
@@ -2189,8 +2572,11 @@ namespace aiter {
                 for (int n = 0; n < repeat_n; n++)
                     for (int e = 0; e < ovec; e++)
                         s_red[base + c++] = v_cf[b][n][e];
+            if (n_idx == 0 && lane_id < mfma_m)
+                for (int b = 0; b < m_repeat; b++)
+                    s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
         }
-        __syncthreads();
+        __syncthreads();  // (2) all deposits visible
         if (warp_id == 0) {
             for (int w = 0; w < hc_mult - 1; w++) {
                 int base = w * warp_size * v_per_lane + lane_id * v_per_lane;
@@ -2207,33 +2593,13 @@ namespace aiter {
                         g_o, v_cf[b][n], gc_offset + n * mfma_n);
                 }
             }
-        }
-
-        if (n_idx == 0) {
-            float sqrsum_w[m_repeat];
-            for (int b = 0; b < m_repeat; b++) {
-                sqrsum_w[b] = cross_row_sum_4(sqrsum_part[b], lane_id);
-            }
-            // Deposit per-warp sqrsum (lane_id < mfma_m holds the reduced rows),
-            // then warp 0 sums across warps. Reuse s_red at a disjoint offset past
-            // the v_cf scratch region.
-            float* s_sq = s_red + (hc_mult - 1) * warp_size * v_per_lane;
-            __syncthreads();
-            if (warp_id != 0 && lane_id < mfma_m) {
-                for (int b = 0; b < m_repeat; b++) {
-                    s_sq[((warp_id - 1) * mfma_m + lane_id) * m_repeat + b] = sqrsum_w[b];
-                }
-            }
-            __syncthreads();
-            if (warp_id == 0 && lane_id < mfma_m) {
+            if (n_idx == 0 && lane_id < mfma_m) {
                 for (int b = 0; b < m_repeat; b++) {
                     float acc = sqrsum_w[b];
-                    for (int w = 0; w < hc_mult - 1; w++) {
+                    for (int w = 0; w < hc_mult - 1; w++)
                         acc += s_sq[(w * mfma_m + lane_id) * m_repeat + b];
-                    }
-                    if (b * mfma_m + lane_id < m_oob) {
+                    if (b * mfma_m + lane_id < m_oob)
                         sqrsum[k_split_idx * m + idx + b * mfma_m + lane_id] = acc;
-                    }
                 }
             }
         }
@@ -2249,7 +2615,7 @@ namespace aiter {
                     "hidden_size must be divisible by tile_k * split_k"); \
         TORCH_CHECK(hidden_size >= (tile_k * split_k) * 2, \
                     "hidden_size must be >= tile_k * split_k * 2 for prefetch"); \
-        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt> \
+        mhc_fused_post_pre_gemm_sqrsum_kernel<DTYPE_I, num_warps, 4, tile_m, tile_n, tile_k, store_nt, MHC_FUSED_BF16> \
             <<<grid, block, 0, stream>>>( \
                 reinterpret_cast<float*>(gemm_out_mul.data_ptr()), \
                 reinterpret_cast<float*>(gemm_out_sqrsum.data_ptr()), \
@@ -2308,7 +2674,8 @@ namespace aiter {
         torch::Tensor& fn,              // (hc_mult3, hc_mult * hidden_size)
         int tile_m = 16,
         int tile_n = 32,
-        int tile_k = 32)
+        int tile_k = 32,
+        int is_fn_pack_bf16 = 0)
     {
         int m = layer_input.size(0);
         int hidden_size = layer_input.size(1);
@@ -2356,7 +2723,15 @@ namespace aiter {
         const hipStream_t stream = at::hip::getCurrentHIPStream();
         dim3 block(block_size);
 
-        MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+        if (is_fn_pack_bf16) {
+#define MHC_FUSED_BF16 true
+            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_FUSED_BF16
+        } else {
+#define MHC_FUSED_BF16 false
+            MHC_FUSED_POST_PRE_GEMM_SQRSUM_KERNEL_DISPATCH(tile_k);
+#undef MHC_FUSED_BF16
+        }
     }
 
 #undef MMA_F32_16X16X4
