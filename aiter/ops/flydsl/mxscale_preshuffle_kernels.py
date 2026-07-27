@@ -235,7 +235,8 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
     import pandas as pd
 
     from aiter.jit.core import AITER_CONFIGS
-    from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
     tf = tuned_file or AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE
     if tf not in _TUNED_CACHE:
@@ -244,7 +245,7 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
             _TUNED_CACHE[tf] = df.set_index(
                 ["gfx", "cu_num", "M", "N", "K", "a_dtype", "b_dtype"]
             ).to_dict("index")
-        except Exception:
+        except Exception:  # noqa: BLE001
             # missing / empty / malformed / missing-column CSV -> no tuned config
             _TUNED_CACHE[tf] = None
     tbl = _TUNED_CACHE[tf]

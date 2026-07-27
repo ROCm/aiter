@@ -28,18 +28,17 @@ if not is_flydsl_available():
         "flydsl is not installed. Skipping FlyDSL tests.", allow_module_level=True
     )
 
-from flydsl.runtime.device import get_rocm_arch  # noqa: E402
+import torch.nn.functional as F
+from flydsl.runtime.device import get_rocm_arch
 
-import torch.nn.functional as F  # noqa: E402
-
-from aiter import dtypes  # noqa: E402
-from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant  # noqa: E402
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_a16w4  # noqa: E402
-from aiter.utility import fp4_utils  # noqa: E402
-from aiter.test_common import checkAllclose  # noqa: E402
+from aiter import dtypes
 from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
     flydsl_mxscale_preshuffle_gemm,
-)  # noqa: E402
+)
+from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
+from aiter.test_common import checkAllclose
+from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 
@@ -547,7 +546,8 @@ def _verify_tuned_csv(
             err = _verify_tuned_shape(
                 run_m, N, K, a_dtype, b_dtype, cfg, dev, blockscale=blockscale
             )
-        except Exception as exc:  # a config that crashes is itself a failure
+        # a config that crashes is itself a failure
+        except Exception as exc:  # noqa: BLE001
             print(f"[{i}/{total}] {tag} ERROR: {exc}")
             errored += 1
             fails.append((M, N, K, f"exception: {exc}"))

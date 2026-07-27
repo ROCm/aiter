@@ -81,17 +81,17 @@ def parse_kernel_name(name: str):
     if not m:
         return None
     tm, tn, tk, a, b, o, wpe, xcd, sk = m.groups()
-    return dict(
-        tile_m=int(tm),
-        tile_n=int(tn),
-        tile_k=int(tk),
-        a_dtype=_SHORT_DTYPE[a],
-        b_dtype=_SHORT_DTYPE[b],
-        out_dtype=_SHORT_DTYPE[o],
-        waves_per_eu=int(wpe),
-        xcd_swizzle=int(xcd) if xcd is not None else 0,
-        split_k=int(sk) if sk is not None else 1,
-    )
+    return {
+        "tile_m": int(tm),
+        "tile_n": int(tn),
+        "tile_k": int(tk),
+        "a_dtype": _SHORT_DTYPE[a],
+        "b_dtype": _SHORT_DTYPE[b],
+        "out_dtype": _SHORT_DTYPE[o],
+        "waves_per_eu": int(wpe),
+        "xcd_swizzle": int(xcd) if xcd is not None else 0,
+        "split_k": int(sk) if sk is not None else 1,
+    }
 
 
 def estimated_lds_bytes(ki: kernelInstance) -> int:
@@ -104,7 +104,7 @@ def _max_lds_bytes() -> int:
         from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
         return int(get_shared_memory_per_block(fallback_gfx="gfx950"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 160 * 1024  # gfx950 LDS
 
 
@@ -124,9 +124,7 @@ def instance_valid(ki: kernelInstance) -> bool:
         ki.tile_m * arb
     ) % 4096 != 0:  # A coop load: n_coop = tile_m*arb//4096 must be integral
         return False
-    if estimated_lds_bytes(ki) > _max_lds_bytes():
-        return False
-    return True
+    return not estimated_lds_bytes(ki) > _max_lds_bytes()
 
 
 def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:

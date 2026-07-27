@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import csv as _csv
 import os
-from typing import Dict, List
 
 from aiter.aot.flydsl.common import compile_only_env
 from aiter.jit.core import AITER_CONFIGS
@@ -26,7 +25,7 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 
 
-def _default_csvs() -> List[str]:
+def _default_csvs() -> list[str]:
     return [AITER_CONFIGS.AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE_FILE]
 
 
@@ -90,7 +89,7 @@ def _compile_to_cache(
         )
 
 
-def parse_csv(csv_path: str) -> List[Dict]:
+def parse_csv(csv_path: str) -> list[dict]:
     with open(csv_path, newline="") as f:
         return list(_csv.DictReader(f))
 
@@ -160,7 +159,7 @@ def main():
                         f"(M={row.get('M')} N={row.get('N')} K={row.get('K')})",
                         flush=True,
                     )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 print(
                     f"[aot.mxscale_preshuffle] FAILED {row.get('kernelName')}: "
                     f"{str(exc).splitlines()[0][:120]}",

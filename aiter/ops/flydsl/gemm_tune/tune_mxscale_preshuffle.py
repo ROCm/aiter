@@ -12,21 +12,21 @@ Usage:
         --untune_file aiter/configs/mxscale_preshuffle_untuned_gemm.csv
 """
 
-import torch
 import pandas as pd
+import torch
 
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+    candidates_for,
+    kernels_list,
+)
+from aiter.ops.flydsl.utils import is_flydsl_available
+from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
+from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_a16w4
-from aiter.utility import fp4_utils
-from aiter.ops.flydsl.utils import is_flydsl_available
-from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
-    kernels_list,
-    candidates_for,
-)
 
 if is_flydsl_available():
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
@@ -131,7 +131,7 @@ def run_torch(a_deq, b_deq, dtype=dtypes.bf16):
 
 
 class MxscalePreShuffleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS = {  # noqa: RUF012
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE}",
         "untune_file": "aiter/configs/mxscale_preshuffle_untuned_gemm.csv",
@@ -159,7 +159,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         return ki.name if ki is not None else None
 
     def get_flydsl_mxscale_tune_task(self, info_keys, seed, args):
-        gfx, cu_num, M, N, K, a_dtype, b_dtype = info_keys
+        _gfx, _cu_num, M, N, K, a_dtype, b_dtype = info_keys
         if (
             not is_flydsl_available()
             or "flydsl_mxscale_preshuffle_gemm" not in globals()
@@ -275,7 +275,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         return resultdf
 
     def run_config(self, args):
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         blockscale = bool(getattr(args, "blockscale", False))
@@ -298,8 +298,8 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                         a_scale,
                         b_scale,
                         out,
-                        a_dtype=a_dtype,
-                        b_dtype=b_dtype,
+                        a_dtype=a_dtype,  # noqa: B023
+                        b_dtype=b_dtype,  # noqa: B023
                         blockscale=blockscale,
                     )
 
@@ -323,7 +323,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )

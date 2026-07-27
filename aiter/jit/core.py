@@ -143,7 +143,7 @@ AITER_CONFIG_GEMM_MXSCALE_PRESHUFFLE = os.getenv(
 )
 
 
-class AITER_CONFIG(object):
+class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
