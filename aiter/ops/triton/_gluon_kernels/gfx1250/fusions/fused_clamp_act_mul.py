@@ -74,9 +74,43 @@ def _fused_clamp_silu_mul_kernel(
     num_warps: gl.constexpr,
     cache_modifier: gl.constexpr,
 ):
-    # constants
-    NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
-    # 1D layouts
+
+    # setup
+    pid = gl.program_id(0)
+    row_base = pid * inp_stride_m
+    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    gate_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=inp_ptr + row_base,
+        shape=[n_half],
+        strides=[inp_stride_n],
+        block_shape=[BLOCK_SIZE_N],
+        layout=shared_tdm_layout,
+    )
+    gate_smem = gl.allocate_shared_memory(gate_desc.dtype, gate_desc.block_shape, shared_tdm_layout)
+    gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem)
+    up_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=inp_ptr + row_base + n_half * inp_stride_n,
+        shape=[n_half],
+        strides=[inp_stride_n],
+        block_shape=[BLOCK_SIZE_N],
+        layout=shared_tdm_layout,
+    )
+    up_smem = gl.allocate_shared_memory(up_desc.dtype, up_desc.block_shape, shared_tdm_layout)
+    gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem)
+
+    # TDM output store
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=out_ptr + pid * out_stride_m,
+        shape=[n_half],
+        strides=[out_stride_n],
+        block_shape=[BLOCK_SIZE_N],
+        layout=shared_tdm_layout,
+    )
+    out_smem = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
+    )
+
+    # row layouts created after to hide latency
     row_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
         threads_per_warp=[32],
@@ -89,74 +123,40 @@ def _fused_clamp_silu_mul_kernel(
         warps_per_cta=[num_warps],
         order=[0],
     )
-
-    # setup
-    pid = gl.program_id(0)                                  # pid
-    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)  # offsets
-    mask = offs < n_half                                    # mask
-
-    # load gate and up via the gfx1250 TDM engine
-    # Stage each contiguous half-row through LDS with an async TDM load, then read
-    # it into registers on layout row_layout. The descriptor shape is the true [n_half]
-    # extent, so any BLOCK_SIZE_N overhang (when n_half isn't a power of two) is
-    # hardware OOB zero-filled in LDS — matching the reference masked load's
-    # other=0.0.
-    row_base = pid * inp_stride_m
-    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    gate_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=inp_ptr + row_base,
-        shape=[n_half],
-        strides=[inp_stride_n],
-        block_shape=[BLOCK_SIZE_N],
-        layout=shared_tdm_layout,
-    )
-    up_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=inp_ptr + row_base + n_half * inp_stride_n,
-        shape=[n_half],
-        strides=[inp_stride_n],
-        block_shape=[BLOCK_SIZE_N],
-        layout=shared_tdm_layout,
-    )
-    # TDM output store
-    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=out_ptr + pid * out_stride_m,
-        shape=[n_half],
-        strides=[out_stride_n],
-        block_shape=[BLOCK_SIZE_N],
-        layout=shared_tdm_layout,
-    )
-    out_smem = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
-    )
-    gate_smem = gl.allocate_shared_memory(gate_desc.dtype, gate_desc.block_shape, shared_tdm_layout)
-    up_smem = gl.allocate_shared_memory(up_desc.dtype, up_desc.block_shape, shared_tdm_layout)
-    gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem)
-    gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem)
-    
-    gl.amd.gfx1250.tdm.async_wait(1)
-    gate = gate_smem.load(row_layout).to(gl.float32)
-    gl.amd.gfx1250.tdm.async_wait(0)
-    up = up_smem.load(row_layout).to(gl.float32)
-
-    # clamp
-    if HAVE_SWIGLU_CLAMP:
-        up = gl.clamp(up, -swiglu_limit, swiglu_limit)       # clamp up to [-lim, lim]
-        gate = gl.minimum(gate, swiglu_limit)                # clamp gate to <= lim
-
-    # act(gate) * up
-    out = _apply_activation_from_str(gate, ACTIVATION) * up  # use triton helper for now
+    NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
 
     # weights
+    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)  # offsets
+    mask = offs < n_half 
     if HAVE_WEIGHTS:
         if WEIGHT_BROADCAST:
-            w = gl.load(weights_ptr + pid * weights_stride_m).to(gl.float32)  # scalar applied to all out
-            out = out * w
+            w = gl.load(weights_ptr + pid * weights_stride_m).to(gl.float32)  # scalar applied to all out 
         else:
             w = gl.load(
                 weights_ptr + pid * weights_stride_m + offs * weights_stride_n,
                 mask=mask, other=0.0, cache_modifier=cache_modifier,
             ).to(gl.float32)
-            out = out * w
+    
+    # clamp
+    if HAVE_SWIGLU_CLAMP:
+        gl.amd.gfx1250.tdm.async_wait(1)
+        gate = gate_smem.load(row_layout).to(gl.float32)
+        gate = gl.minimum(gate, swiglu_limit)                # clamp gate to <= lim
+        gl.amd.gfx1250.tdm.async_wait(0)
+        up = up_smem.load(row_layout).to(gl.float32)
+        up = gl.clamp(up, -swiglu_limit, swiglu_limit)       # clamp up to [-lim, lim]
+    else:
+        gl.amd.gfx1250.tdm.async_wait(1)
+        gate = gate_smem.load(row_layout).to(gl.float32)
+        gl.amd.gfx1250.tdm.async_wait(0)
+        up = up_smem.load(row_layout).to(gl.float32)
+
+    # act(gate) * up
+    out = _apply_activation_from_str(gate, ACTIVATION) * up  # use triton helper for now
+
+    # apply weights
+    if HAVE_WEIGHTS:
+        out = out * w
 
     # group quant and store
     if HAS_QUANT:
