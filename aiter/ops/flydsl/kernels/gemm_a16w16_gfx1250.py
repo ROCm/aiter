@@ -6,22 +6,22 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as llvm_dialect
+from flydsl._mlir.dialects import rocdl as raw_rocdl
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     idx2crd,
     range_constexpr,
     rocdl,
     tdm_ops,
-    vector,
 )
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.utils.smem_allocator import check_smem_capacity
 
 # WMMA 16×16×32
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
@@ -34,6 +34,53 @@ LDS_PAD_B = 8
 _STAGE_NAMES = ("ping", "pong", "pang", "pung")
 
 _SCHED_ALLOW_SALU = 1 << 2
+
+
+def _align_up(n, a):
+    return ((n + a - 1) // a) * a
+
+
+def _i32_const(v):
+    return _raw(arith.constant(int(v), type=T.i32))
+
+
+def _to_i32_offset(offset):
+    if isinstance(offset, int):
+        return _i32_const(offset)
+    offset = arith.unwrap(offset)
+    if not isinstance(offset.type, ir.IntegerType) or offset.type.width != 32:
+        return _raw(arith.index_cast(T.i32, offset))
+    return offset
+
+
+def _buffer_load(rsrc, offset, vec_width=1, dtype=None):
+    if dtype is None:
+        dtype = T.f32
+    off = _to_i32_offset(offset)
+    off = _raw(arith.muli(off, _i32_const(dtype.width // 8)))
+    result_type = dtype if vec_width == 1 else T.vec(vec_width, dtype)
+    return rocdl.RawPtrBufferLoadOp(
+        result_type, rsrc, off, _i32_const(0), _i32_const(0)
+    ).result
+
+
+def _buffer_store(data, rsrc, offset, offset_is_bytes=False):
+    data = arith.unwrap(data)
+    off = _to_i32_offset(offset)
+    if not offset_is_bytes:
+        data_type = data.type
+        element_type = (
+            data_type.element_type if hasattr(data_type, "element_type") else data_type
+        )
+        off = _raw(arith.muli(off, _i32_const(element_type.width // 8)))
+    rocdl.RawPtrBufferStoreOp(data, rsrc, off, _i32_const(0), _i32_const(0))
+
+
+def _make_buffer_rsrc(tensor, num_records_bytes=None):
+    buf_tensor = fx.rocdl.make_buffer_tensor(
+        tensor, max_size=True, num_records_bytes=num_records_bytes
+    )
+    return fx.rocdl.get_buffer_rsrc(fx.get_iter(buf_tensor))
 
 
 def _disable_unroll_on_enclosing_loop():
@@ -225,12 +272,12 @@ def compile_gemm_a16w16(
     gpu_arch = str(get_hip_arch())
     assert gpu_arch.startswith("gfx1250"), f"Expected gfx1250, got {gpu_arch}"
 
-    wmma_op = rocdl.wmma_f32_16x16x32_f16 if is_f16 else rocdl.wmma_f32_16x16x32_bf16
-
     k_wmma_steps = tile_k // WMMA_K
 
     def _elem_type():
         return T.f16 if is_f16 else T.bf16
+
+    _fx_elem = fx.Float16 if is_f16 else fx.BFloat16
 
     wmma_m_rep = warp_tile_m // WMMA_M
     wmma_n_rep = warp_tile_n // WMMA_N
@@ -257,19 +304,32 @@ def compile_gemm_a16w16(
     lds_b_data_bytes = lds_b_elems * elem_bytes
 
     # Unified LDS allocator: contiguous [A0..A_nb-1 | B0..B_nb-1] ring slots
-    unified_alloc = SmemAllocator(None, arch=gpu_arch, global_sym_name="a16w16_unified")
-    unified_a_off = unified_alloc._align(unified_alloc.ptr, 16)
-    unified_alloc.ptr = unified_a_off + num_buffers * lds_a_data_bytes
-    unified_b_off = unified_alloc._align(unified_alloc.ptr, 16)
-    unified_alloc.ptr = unified_b_off + num_buffers * lds_b_data_bytes
+    unified_a_off = 0
+    unified_b_off = _align_up(unified_a_off + num_buffers * lds_a_data_bytes, 16)
+    lds_arena_bytes = _align_up(unified_b_off + num_buffers * lds_b_data_bytes, 16)
+    check_smem_capacity(lds_arena_bytes, gpu_arch)
 
-    stage_a_data_off = [
-        unified_a_off + i * lds_a_data_bytes for i in range(num_buffers)
-    ]
-    stage_b_data_off = [
-        unified_b_off + i * lds_b_data_bytes for i in range(num_buffers)
-    ]
-    stage_allocators = [unified_alloc] * num_buffers
+    if physical_mk:
+        a_tile_shape = (tile_m, tile_k)
+        a_outer_stride = K
+        a_pad_interval = tile_k
+        a_imm_bytes = tile_k * elem_bytes
+    else:
+        a_tile_shape = (tile_k, tile_m)
+        a_outer_stride = M
+        a_pad_interval = tile_m
+        a_imm_bytes = tile_k * M * elem_bytes
+
+    if physical_kn:
+        b_tile_shape = (tile_k, tile_n)
+        b_outer_stride = N
+        b_pad_interval = tile_n
+        b_imm_bytes = tile_k * N * elem_bytes
+    else:
+        b_tile_shape = (tile_n, tile_k)
+        b_outer_stride = K
+        b_pad_interval = tile_k
+        b_imm_bytes = tile_k * elem_bytes
 
     # TDMs per K-tile: A + B
     _TDMS_PER_TILE = 2
@@ -294,6 +354,8 @@ def compile_gemm_a16w16(
         if const_expr(split_k > 1):
             bz = gpu.block_id("z")
             split_k_base = bz * arith.index(split_k_chunk)
+        else:
+            split_k_base = arith.index(0)
 
         # Thread -> warp decomposition
         layout_thr = fx.make_layout(
@@ -316,164 +378,105 @@ def compile_gemm_a16w16(
 
         # Buffer resource descriptors
         y_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
-        y_rsrc = buffer_ops.create_buffer_resource(arg_y, num_records_bytes=y_nrec)
+        y_rsrc = _make_buffer_rsrc(arg_y, num_records_bytes=y_nrec)
         if const_expr(add_bias):
-            bias_rsrc = buffer_ops.create_buffer_resource(arg_bias, max_size=True)
+            bias_rsrc = _make_buffer_rsrc(arg_bias)
 
-        def make_a_desc(k_base, lds_a_mem_ref):
-            """TDM descriptor for A tile. Swaps dims when physical_mk=False (K-major)."""
-            if const_expr(physical_mk):
-                return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_x,
-                    lds_memref=lds_a_mem_ref,
-                    global_offset=(blk_m, k_base),
-                    tensor_shape=(tile_m, tile_k),
-                    strides=(K, 1),
-                    tile_shape=(tile_m, tile_k),
-                    elem_bytes=elem_bytes,
-                    pad_interval=tile_k,
-                    pad_amount=LDS_PAD_A,
-                    num_warps=num_warps,
-                )
-            else:
-                return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_x,
-                    lds_memref=lds_a_mem_ref,
-                    global_offset=(k_base, blk_m),
-                    tensor_shape=(tile_k, tile_m),
-                    strides=(M, 1),
-                    tile_shape=(tile_k, tile_m),
-                    elem_bytes=elem_bytes,
-                    pad_interval=tile_m,
-                    pad_amount=LDS_PAD_A,
-                    num_warps=num_warps,
-                )
-
-        def make_b_desc(k_base, lds_b_mem_ref):
-            """TDM descriptor for B tile. Swaps dims when physical_kn=True (K-major)."""
-            if const_expr(physical_kn):
-                return tdm_ops.make_tensor_descriptor_2d(
-                    global_ptr=arg_w,
-                    lds_memref=lds_b_mem_ref,
-                    global_offset=(k_base, blk_n),
-                    tensor_shape=(tile_k, tile_n),
-                    strides=(N, 1),
-                    tile_shape=(tile_k, tile_n),
-                    elem_bytes=elem_bytes,
-                    pad_interval=tile_n,
-                    pad_amount=LDS_PAD_B,
-                    num_warps=num_warps,
-                )
-            return tdm_ops.make_tensor_descriptor_2d(
-                global_ptr=arg_w,
-                lds_memref=lds_b_mem_ref,
-                global_offset=(blk_n, k_base),
-                tensor_shape=(tile_n, tile_k),
-                strides=(K, 1),
-                tile_shape=(tile_n, tile_k),
-                elem_bytes=elem_bytes,
-                pad_interval=tile_k,
-                pad_amount=LDS_PAD_B,
-                num_warps=num_warps,
-            )
-
-        # Unified LDS pointers (all NB slots) + per-stage aliases
-        big_a = SmemPtr(
-            unified_alloc.get_base(),
-            unified_a_off,
-            elem_ty,
-            shape=(num_buffers * lds_a_elems,),
-        )
-        big_b = SmemPtr(
-            unified_alloc.get_base(),
-            unified_b_off,
-            elem_ty,
-            shape=(num_buffers * lds_b_elems,),
-        )
-        big_a_mem = big_a.get()
-        big_b_mem = big_b.get()
-        stages_a = [
-            SmemPtr(
-                unified_alloc.get_base(),
-                stage_a_data_off[i],
-                elem_ty,
-                shape=(lds_a_elems,),
-            )
-            for i in range(num_buffers)
-        ]
-        stages_b = [
-            SmemPtr(
-                unified_alloc.get_base(),
-                stage_b_data_off[i],
-                elem_ty,
-                shape=(lds_b_elems,),
-            )
-            for i in range(num_buffers)
-        ]
-        stages_a_mem = [p.get() for p in stages_a]
-        stages_b_mem = [p.get() for p in stages_b]
-
-        # TDM descriptors built once at entry; lo32 advances per K-tile, LDS base per ring slot.
-        if const_expr(split_k > 1):
-            _desc_a_init = make_a_desc(split_k_base, stages_a_mem[0])
-            _desc_b_init = make_b_desc(split_k_base, stages_b_mem[0])
-        else:
-            _desc_a_init = make_a_desc(arith.index(0), stages_a_mem[0])
-            _desc_b_init = make_b_desc(arith.index(0), stages_b_mem[0])
-        dgroup1_a = _desc_a_init.dgroup1
-        dgroup1_w = _desc_b_init.dgroup1
-        addr_hi_a = vector.extract(
-            _desc_a_init.dgroup0, static_position=[3], dynamic_position=[]
-        )
-        addr_hi_w = vector.extract(
-            _desc_b_init.dgroup0, static_position=[3], dynamic_position=[]
-        )
-        addr_lo_init_a = vector.extract(
-            _desc_a_init.dgroup0, static_position=[2], dynamic_position=[]
-        )
-        addr_lo_init_w = vector.extract(
-            _desc_b_init.dgroup0, static_position=[2], dynamic_position=[]
-        )
-        a_lds_base_i32 = vector.extract(
-            _desc_a_init.dgroup0, static_position=[1], dynamic_position=[]
-        )
-        b_lds_base_i32 = vector.extract(
-            _desc_b_init.dgroup0, static_position=[1], dynamic_position=[]
-        )
-        slot_stride_a_i32 = arith.constant(lds_a_data_bytes, type=T.i32)
-        slot_stride_b_i32 = arith.constant(lds_b_data_bytes, type=T.i32)
+        lds_base_ptr = fx.SharedAllocator(static=True).allocate(lds_arena_bytes)._ptr
+        big_a_mem = fx.recast_iter(_fx_elem, fx.add_offset(lds_base_ptr, unified_a_off))
+        big_b_mem = fx.recast_iter(_fx_elem, fx.add_offset(lds_base_ptr, unified_b_off))
+        big_a_base_idx = arith.index_cast(T.index, arith.unwrap(fx.ptrtoint(big_a_mem)))
+        big_b_base_idx = arith.index_cast(T.index, arith.unwrap(fx.ptrtoint(big_b_mem)))
         slot_stride_a_elems_i32 = arith.constant(lds_a_elems, type=T.i32)
         slot_stride_b_elems_i32 = arith.constant(lds_b_elems, type=T.i32)
 
-        # Per-K-tile lo32 byte advance (tile_k*bytes row-major; outer-stride*bytes if K-major).
-        adv_a_i32 = arith.constant(
-            (tile_k if physical_mk else tile_k * M) * elem_bytes, type=T.i32
-        )
-        adv_w_i32 = arith.constant(
-            (tile_k if not physical_kn else tile_k * N) * elem_bytes, type=T.i32
-        )
-        pred_const = arith.constant(1, type=T.i32)
+        blk_m64 = fx.Int64(blk_m)
+        blk_n64 = fx.Int64(blk_n)
+        split_k_base64 = fx.Int64(split_k_base)
 
-        def _buf_idx_to_i32(buf_idx):
-            """Accept either Python int (prologue/drain) or i32 SSA (main loop)."""
+        def _global_view(tensor, elem_off, shape, stride):
+            return fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(fx.get_iter(tensor), elem_off),
+                    fx.make_layout(shape, stride),
+                )
+            )
+
+        if const_expr(physical_mk):
+            a_base_off = blk_m64 * fx.Int64(K) + split_k_base64
+        else:
+            a_base_off = split_k_base64 * fx.Int64(M) + blk_m64
+        gA = _global_view(arg_x, a_base_off, a_tile_shape, (a_outer_stride, 1))
+        atom_a = fx.rocdl.make_tdm_atom(
+            gA,
+            [None, None],
+            strides=[fx.Int64(a_outer_stride), None],
+            num_warps=num_warps,
+            pad_interval=a_pad_interval,
+            pad_amount=LDS_PAD_A,
+        )
+
+        if const_expr(physical_kn):
+            b_base_off = split_k_base64 * fx.Int64(N) + blk_n64
+        else:
+            b_base_off = blk_n64 * fx.Int64(K) + split_k_base64
+        gB = _global_view(arg_w, b_base_off, b_tile_shape, (b_outer_stride, 1))
+        atom_b = fx.rocdl.make_tdm_atom(
+            gB,
+            [None, None],
+            strides=[fx.Int64(b_outer_stride), None],
+            num_warps=num_warps,
+            pad_interval=b_pad_interval,
+            pad_amount=LDS_PAD_B,
+        )
+
+        def _slot_elem_off(buf_idx, slot_elems, slot_stride_i32):
             if const_expr(isinstance(buf_idx, int)):
-                return arith.constant(buf_idx, type=T.i32)
-            return buf_idx
+                return arith.index(buf_idx * slot_elems)
+            return arith.index_cast(T.index, arith.muli(buf_idx, slot_stride_i32))
 
-        def issue_tdm_loads(buf_idx, lo_a, lo_w):
-            """Issue A+B TDMs for one K-tile into LDS slot buf_idx; returns advanced (lo_a, lo_w)."""
-            buf_i32 = _buf_idx_to_i32(buf_idx)
-            a_addr = arith.addi(a_lds_base_i32, arith.muli(buf_i32, slot_stride_a_i32))
-            b_addr = arith.addi(b_lds_base_i32, arith.muli(buf_i32, slot_stride_b_i32))
-            dg0_a = vector.from_elements(
-                T.vec(4, T.i32), [pred_const, a_addr, lo_a, addr_hi_a]
+        def _imm64(k_tile, mul):
+            if const_expr(isinstance(k_tile, int)):
+                return fx.Int64(k_tile * mul)
+            as_index = arith.index_cast(
+                T.index, arith.muli(k_tile, arith.constant(mul, type=T.i32))
             )
-            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_a, dgroup1_a))
-            dg0_w = vector.from_elements(
-                T.vec(4, T.i32), [pred_const, b_addr, lo_w, addr_hi_w]
+            return fx.Int64(arith.index_cast(T.i64, as_index))
+
+        def issue_tdm_loads(buf_idx, k_tile):
+            """Issue A+B TDMs for K-tile k_tile into LDS ring slot buf_idx."""
+            fx.copy(
+                atom_a,
+                gA,
+                fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(
+                            big_a_mem,
+                            _slot_elem_off(
+                                buf_idx, lds_a_elems, slot_stride_a_elems_i32
+                            ),
+                        ),
+                        fx.make_layout(a_tile_shape, (lds_a_stride, 1)),
+                    )
+                ),
+                imm_offset=_imm64(k_tile, a_imm_bytes),
             )
-            tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dg0_w, dgroup1_w))
-            return arith.addi(lo_a, adv_a_i32), arith.addi(lo_w, adv_w_i32)
+            fx.copy(
+                atom_b,
+                gB,
+                fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(
+                            big_b_mem,
+                            _slot_elem_off(
+                                buf_idx, lds_b_elems, slot_stride_b_elems_i32
+                            ),
+                        ),
+                        fx.make_layout(b_tile_shape, (lds_b_stride, 1)),
+                    )
+                ),
+                imm_offset=_imm64(k_tile, b_imm_bytes),
+            )
 
         def _precompute_lane_bases(warp_base, reps, lds_stride):
             """Per-lane LDS element offsets for `reps` WMMA frags (M/N-major)."""
@@ -524,38 +527,61 @@ def compile_gemm_a16w16(
         a_lane_bases = _precompute_a_lane_bases()
         b_lane_bases = _precompute_b_lane_bases()
 
+        def _lds_transpose_load(result_type, lds_base_idx, elem_off):
+            addr_i32 = arith.index_cast(
+                T.i32, lds_base_idx + elem_off * arith.index(elem_bytes)
+            )
+            ptr_val = llvm_dialect.inttoptr(
+                ir.Type.parse("!llvm.ptr<3>"), arith.unwrap(addr_i32)
+            )
+            return raw_rocdl.ds_load_tr16_b128(result_type, ptr_val)
+
         def load_wmma_frag_tr(lds_buffer, b_lane_base, ks):
             """Load WMMA B fragment via ds_load_tr16_b128 (K-major LDS)."""
             vec8_ty = ir.VectorType.get([8], elem_ty)
+            lds_base_idx = big_b_base_idx
             results = []
             for k_half in range_constexpr(2):
                 k_row_off = (ks * WMMA_K + k_half * 16) * lds_b_stride
                 elem_off = b_lane_base + arith.index(k_row_off)
-                v = rocdl.lds_transpose_load(vec8_ty, lds_buffer, elem_off, elem_bytes)
+                v = _lds_transpose_load(vec8_ty, lds_base_idx, elem_off)
                 results.append(v)
-            return vector.shuffle(results[0], results[1], list(range(16)))
+            return (
+                fx.Vector(results[0])
+                .shuffle(fx.Vector(results[1]), list(range(16)))
+                .ir_value()
+            )
 
         def load_wmma_frag(lds_buffer, lane_base, ks):
             """Load WMMA fragment via ds_read_b128 (M/N-major LDS)."""
             vec8_ty = ir.VectorType.get([8], elem_ty)
             off0 = lane_base + arith.index(ks * WMMA_K)
             off1 = lane_base + arith.index(ks * WMMA_K + 16)
-            v0 = vector.load_op(vec8_ty, lds_buffer, [off0])
-            v1 = vector.load_op(vec8_ty, lds_buffer, [off1])
-            return vector.shuffle(v0, v1, list(range(16)))
+            v0 = arith.unwrap(
+                fx.ptr_load(fx.add_offset(lds_buffer, off0), result_type=vec8_ty)
+            )
+            v1 = arith.unwrap(
+                fx.ptr_load(fx.add_offset(lds_buffer, off1), result_type=vec8_ty)
+            )
+            return fx.Vector(v0).shuffle(fx.Vector(v1), list(range(16))).ir_value()
 
         _load_b_frag = load_wmma_frag_tr if physical_kn else load_wmma_frag
 
         def load_wmma_frag_tr_a(lds_buffer, a_lane_base, ks):
             """Load WMMA A fragment via ds_load_tr16_b128 (K-major LDS)."""
             vec8_ty = ir.VectorType.get([8], elem_ty)
+            lds_base_idx = big_a_base_idx
             results = []
             for k_half in range_constexpr(2):
                 k_row_off = (ks * WMMA_K + k_half * 16) * lds_a_stride
                 elem_off = a_lane_base + arith.index(k_row_off)
-                v = rocdl.lds_transpose_load(vec8_ty, lds_buffer, elem_off, elem_bytes)
+                v = _lds_transpose_load(vec8_ty, lds_base_idx, elem_off)
                 results.append(v)
-            return vector.shuffle(results[0], results[1], list(range(16)))
+            return (
+                fx.Vector(results[0])
+                .shuffle(fx.Vector(results[1]), list(range(16)))
+                .ir_value()
+            )
 
         _load_a_frag = load_wmma_frag_tr_a if not physical_mk else load_wmma_frag
 
@@ -591,30 +617,40 @@ def compile_gemm_a16w16(
                     )
             return b_frags
 
+        wmma_atom = fx.make_mma_atom(
+            fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, _fx_elem, fx.Float32)
+        )
+
+        def _rmem_vec(v, n, dtype):
+            t = fx.make_rmem_tensor(n, dtype)
+            t.store(fx.Vector(arith.unwrap(v)))
+            return t
+
+        def _rmem_frag_lists(a_frags, b_frags):
+            return (
+                [_rmem_vec(f, 16, _fx_elem) for f in a_frags],
+                [_rmem_vec(f, 16, _fx_elem) for f in b_frags],
+            )
+
         def wmma_tile(accs_in, a_frags, b_frags):
-            """Execute all WMMAs for one tile (ks-outer accumulate); reuseB=(wn>0) hint kept."""
-            current_accs = list(accs_in)
+            """Execute all WMMAs for one tile (ks-outer accumulate)."""
+            a_frag_ts, b_frag_ts = _rmem_frag_lists(a_frags, b_frags)
+            acc_ts = [_rmem_vec(a, 8, fx.Float32) for a in accs_in]
             for ks in range_constexpr(k_wmma_steps):
                 a_f = [
-                    a_frags[ks * wmma_m_rep + wm] for wm in range_constexpr(wmma_m_rep)
+                    a_frag_ts[ks * wmma_m_rep + wm]
+                    for wm in range_constexpr(wmma_m_rep)
                 ]
                 b_f = [
-                    b_frags[ks * wmma_n_rep + wn] for wn in range_constexpr(wmma_n_rep)
+                    b_frag_ts[ks * wmma_n_rep + wn]
+                    for wn in range_constexpr(wmma_n_rep)
                 ]
                 for wm in range_constexpr(wmma_m_rep):
                     for wn in range_constexpr(wmma_n_rep):
                         idx = wm * wmma_n_rep + wn
                         # ISA operand order: (B, A, C) — reversed from math
-                        current_accs[idx] = wmma_op(
-                            T.vec(8, T.f32),
-                            b_f[wn],
-                            a_f[wm],
-                            current_accs[idx],
-                            modC=0,
-                            reuseA=False,
-                            reuseB=(wn > 0),
-                        ).result
-            return current_accs
+                        fx.gemm(wmma_atom, acc_ts[idx], b_f[wn], a_f[wm], acc_ts[idx])
+            return [arith.unwrap(t.load()) for t in acc_ts]
 
         def _load_one_a_frag(buf_i32, ks, wm):
             """ds_load a single A fragment (ks, wm) from LDS ring slot buf_i32 (i32 SSA)."""
@@ -635,23 +671,22 @@ def compile_gemm_a16w16(
             fragment reaches its last use, issue its next-tile ds_load so the load
             co-executes with the remaining WMMAs. Returns (accs, next_a, next_b) where
             next_* are the freshly rotated-in fragments for the next K-tile."""
-            current_accs = list(accs_in)
+            a_frag_ts, b_frag_ts = _rmem_frag_lists(a_frags, b_frags)
+            acc_ts = [_rmem_vec(a, 8, fx.Float32) for a in accs_in]
             next_a = [None] * N_A_FRAGS
             next_b = [None] * N_B_FRAGS
             for ks in range_constexpr(k_wmma_steps):
                 for wm in range_constexpr(wmma_m_rep):
-                    a_f = a_frags[ks * wmma_m_rep + wm]
+                    a_f = a_frag_ts[ks * wmma_m_rep + wm]
                     for wn in range_constexpr(wmma_n_rep):
                         idx = wm * wmma_n_rep + wn
-                        current_accs[idx] = wmma_op(
-                            T.vec(8, T.f32),
-                            b_frags[ks * wmma_n_rep + wn],
+                        fx.gemm(
+                            wmma_atom,
+                            acc_ts[idx],
+                            b_frag_ts[ks * wmma_n_rep + wn],
                             a_f,
-                            current_accs[idx],
-                            modC=0,
-                            reuseA=False,
-                            reuseB=(wn > 0),
-                        ).result
+                            acc_ts[idx],
+                        )
                     rocdl.sched_barrier(_SCHED_ALLOW_SALU)
                     next_a[ks * wmma_m_rep + wm] = _load_one_a_frag(
                         next_buf_i32, ks, wm
@@ -661,11 +696,16 @@ def compile_gemm_a16w16(
                     next_b[ks * wmma_n_rep + wn] = _load_one_b_frag(
                         next_buf_i32, ks, wn
                     )
-            return current_accs, next_a, next_b
+            return [arith.unwrap(t.load()) for t in acc_ts], next_a, next_b
 
         _half_out = out_dtype in ("f16", "bf16")
         _out_elem = (
             T.f16 if out_dtype == "f16" else (T.bf16 if out_dtype == "bf16" else None)
+        )
+        _out_num = (
+            fx.Float16
+            if out_dtype == "f16"
+            else (fx.BFloat16 if out_dtype == "bf16" else None)
         )
         _bias_elem = T.f16 if is_f16 else T.bf16
 
@@ -694,37 +734,33 @@ def compile_gemm_a16w16(
                         col_base_i32 = arith.index_cast(T.i32, col_base)
                         col_base_hi = col_base_i32 + arith.constant(4, type=T.i32)
 
-                        bv_lo = buffer_ops.buffer_load(
+                        bv_lo = _buffer_load(
                             bias_rsrc, col_base_i32, vec_width=4, dtype=_bias_elem
                         )
-                        bv_hi = buffer_ops.buffer_load(
+                        bv_hi = _buffer_load(
                             bias_rsrc, col_base_hi, vec_width=4, dtype=_bias_elem
                         )
 
                         bias_elems = []
                         for i in range_constexpr(4):
-                            b_val = vector.extract(
-                                bv_lo, static_position=[i], dynamic_position=[]
-                            )
+                            b_val = fx.Vector(bv_lo)[i].ir_value()
                             bias_elems.append(_widen_to_f32(b_val))
                         for i in range_constexpr(4):
-                            b_val = vector.extract(
-                                bv_hi, static_position=[i], dynamic_position=[]
-                            )
+                            b_val = fx.Vector(bv_hi)[i].ir_value()
                             bias_elems.append(_widen_to_f32(b_val))
 
-                        bias_vec = vector.from_elements(T.vec(8, T.f32), bias_elems)
+                        bias_vec = fx.Vector.from_elements(
+                            bias_elems, fx.Float32
+                        ).ir_value()
                         acc = acc + bias_vec
 
                     if const_expr(activation is not None):
                         new_elems = []
                         for i in range_constexpr(8):
-                            val = vector.extract(
-                                acc, static_position=[i], dynamic_position=[]
-                            )
+                            val = fx.Vector(acc)[i].ir_value()
                             val = _apply_activation_scalar(val, activation)
                             new_elems.append(val)
-                        acc = vector.from_elements(T.vec(8, T.f32), new_elems)
+                        acc = fx.Vector.from_elements(new_elems, fx.Float32).ir_value()
 
                     accs[idx] = acc
             return accs
@@ -750,19 +786,12 @@ def compile_gemm_a16w16(
                             c_off_bytes = (row * n_stride + col_base) * arith.index(
                                 elem_bytes_d
                             )
-                            pair_ty = T.vec(2, _out_elem)
                             for pair in range_constexpr(4):
-                                e0 = vector.extract(
-                                    h_vec,
-                                    static_position=[pair * 2],
-                                    dynamic_position=[],
-                                )
-                                e1 = vector.extract(
-                                    h_vec,
-                                    static_position=[pair * 2 + 1],
-                                    dynamic_position=[],
-                                )
-                                pair_vec = vector.from_elements(pair_ty, [e0, e1])
+                                e0 = fx.Vector(h_vec)[pair * 2].ir_value()
+                                e1 = fx.Vector(h_vec)[pair * 2 + 1].ir_value()
+                                pair_vec = fx.Vector.from_elements(
+                                    [e0, e1], _out_num
+                                ).ir_value()
                                 byte_off = arith.index_cast(
                                     T.i32, c_off_bytes + arith.index(pair * 4)
                                 )
@@ -771,11 +800,11 @@ def compile_gemm_a16w16(
                                 )
                         else:
                             h_vec = arith.trunc_f(T.vec(8, _out_elem), final_accs[idx])
-                            i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
+                            i32_vec = fx.Vector(h_vec).bitcast(fx.Int32).ir_value()
                             c_off_bytes = (row * n_stride + col_base) * arith.index(
                                 elem_bytes_d
                             )
-                            buffer_ops.buffer_store(
+                            _buffer_store(
                                 i32_vec, y_rsrc, c_off_bytes, offset_is_bytes=True
                             )
                     else:
@@ -783,11 +812,9 @@ def compile_gemm_a16w16(
                             for half in range_constexpr(2):
                                 base = row * n_stride + col_base + arith.index(half * 4)
                                 for vi in range_constexpr(4):
-                                    val = vector.extract(
-                                        final_accs[idx],
-                                        static_position=[half * 4 + vi],
-                                        dynamic_position=[],
-                                    )
+                                    val = fx.Vector(final_accs[idx])[
+                                        half * 4 + vi
+                                    ].ir_value()
                                     byte_off = arith.index_cast(
                                         T.i32,
                                         (base + arith.index(vi)) * arith.index(4),
@@ -798,17 +825,15 @@ def compile_gemm_a16w16(
                         else:
                             for half in range_constexpr(2):
                                 vals = [
-                                    vector.extract(
-                                        final_accs[idx],
-                                        static_position=[half * 4 + vi],
-                                        dynamic_position=[],
-                                    )
+                                    fx.Vector(final_accs[idx])[half * 4 + vi].ir_value()
                                     for vi in range_constexpr(4)
                                 ]
-                                vec4 = vector.from_elements(T.vec(4, T.f32), vals)
+                                vec4 = fx.Vector.from_elements(
+                                    vals, fx.Float32
+                                ).ir_value()
                                 col = col_base + arith.index(half * 4)
                                 c_off = row * n_stride + col
-                                buffer_ops.buffer_store(vec4, y_rsrc, c_off)
+                                _buffer_store(vec4, y_rsrc, c_off)
 
         # Accumulators
         acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
@@ -831,10 +856,8 @@ def compile_gemm_a16w16(
             return accs_, a_, b_
 
         # ── Prologue (memory-bound): fill NB-1 LDS buffers, then load tile 0 ──
-        lo_a = addr_lo_init_a
-        lo_w = addr_lo_init_w
         for i in range_constexpr(num_buffers - 1):
-            lo_a, lo_w = issue_tdm_loads(i, lo_a, lo_w)
+            issue_tdm_loads(i, i)
 
         # Wait retires tile 0 (NB-2 in flight); the 2-iter WAR gap lets the main loop use one barrier.
         tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
@@ -858,12 +881,12 @@ def compile_gemm_a16w16(
             else:
                 gpu.barrier()
 
-        def _run_tile(accs_, ca, cb, lo_a_, lo_w_, cidx, lidx, do_prefetch):
+        def _run_tile(accs_, ca, cb, cidx, lidx, do_prefetch):
             """Compute K-tile cidx from carried frags; if do_prefetch, load cidx+1 into a fresh bank."""
             load_buf_i32 = arith.remui(lidx, nb_const_i32)
 
             # Refill first, then wait: keeps NB-2 tiles' TDM in flight (depth-2).
-            lo_a_, lo_w_ = issue_tdm_loads(load_buf_i32, lo_a_, lo_w_)
+            issue_tdm_loads(load_buf_i32, lidx)
             if const_expr(num_buffers == 2):
                 # NB=2: only 2 slots -> drain the just-issued TDM (RAW hazard).
                 tdm_ops.tensor_wait(0)
@@ -883,13 +906,11 @@ def compile_gemm_a16w16(
             else:
                 accs_ = wmma_tile(accs_, ca, cb)
                 nbank = None
-            return accs_, nbank, lo_a_, lo_w_
+            return accs_, nbank
 
         if const_expr(variant == "compute_bound"):
             if const_expr(main_loop_iters > 0):
                 init_state = _pack_state(accs, cur_a, cur_b) + [
-                    lo_a,
-                    lo_w,
                     load_idx_init,
                     compute_idx_init,
                 ]
@@ -898,12 +919,10 @@ def compile_gemm_a16w16(
                     _disable_unroll_on_enclosing_loop()
                     cidx = state[-1]
                     lidx = state[-2]
-                    lw = state[-3]
-                    lx = state[-4]
-                    p_accs, ca, cb = _unpack_state(state[:-4])
+                    p_accs, ca, cb = _unpack_state(state[:-2])
 
                     load_buf_i32 = arith.remui(lidx, nb_const_i32)
-                    lx, lw = issue_tdm_loads(load_buf_i32, lx, lw)
+                    issue_tdm_loads(load_buf_i32, lidx)
                     if const_expr(num_buffers == 2):
                         tdm_ops.tensor_wait(0)
                     else:
@@ -916,29 +935,23 @@ def compile_gemm_a16w16(
                     lidx1 = arith.addi(lidx, one_i32)
 
                     new_state = _pack_state(p_accs, next_a, next_b) + [
-                        lx,
-                        lw,
                         lidx1,
                         cidx1,
                     ]
                     results = yield new_state
 
-                accs, cur_a, cur_b = _unpack_state(results[:-4])
+                accs, cur_a, cur_b = _unpack_state(results[:-2])
             else:
                 accs = list(accs)
         elif const_expr(main_loop_iters > 0):
             if const_expr(main_loop_unroll):
                 # Unroll-by-2: 2 tiles/trip, ping-pong 2 register banks + odd leftover.
-                lo_a_s = lo_a
-                lo_w_s = lo_w
                 load_idx_s = load_idx_init
                 compute_idx_s = compute_idx_init
                 num_pairs = main_loop_iters // 2
 
                 if const_expr(num_pairs > 0):
                     init_state = _pack_state(accs, cur_a, cur_b) + [
-                        lo_a_s,
-                        lo_w_s,
                         load_idx_s,
                         compute_idx_s,
                     ]
@@ -947,37 +960,31 @@ def compile_gemm_a16w16(
                         _disable_unroll_on_enclosing_loop()
                         cidx = state[-1]
                         lidx = state[-2]
-                        lw = state[-3]
-                        lx = state[-4]
-                        p_accs, b0a, b0b = _unpack_state(state[:-4])
+                        p_accs, b0a, b0b = _unpack_state(state[:-2])
 
                         # sub-0: tile T from bank0, prefetch T+1 -> bank1.
-                        p_accs, bank1, lx, lw = _run_tile(
-                            p_accs, b0a, b0b, lx, lw, cidx, lidx, do_prefetch=True
+                        p_accs, bank1 = _run_tile(
+                            p_accs, b0a, b0b, cidx, lidx, do_prefetch=True
                         )
                         b1a, b1b = bank1
                         cidx1 = arith.addi(cidx, one_i32)
                         lidx1 = arith.addi(lidx, one_i32)
 
                         # sub-1: tile T+1 from bank1, prefetch T+2 -> bank0 (yielded).
-                        p_accs, bank0, lx, lw = _run_tile(
-                            p_accs, b1a, b1b, lx, lw, cidx1, lidx1, do_prefetch=True
+                        p_accs, bank0 = _run_tile(
+                            p_accs, b1a, b1b, cidx1, lidx1, do_prefetch=True
                         )
                         nb0a, nb0b = bank0
                         cidx2 = arith.addi(cidx1, one_i32)
                         lidx2 = arith.addi(lidx1, one_i32)
 
                         new_state = _pack_state(p_accs, nb0a, nb0b) + [
-                            lx,
-                            lw,
                             lidx2,
                             cidx2,
                         ]
                         results = yield new_state
 
-                    accs, cur_a, cur_b = _unpack_state(results[:-4])
-                    lo_a_s = results[-4]
-                    lo_w_s = results[-3]
+                    accs, cur_a, cur_b = _unpack_state(results[:-2])
                     load_idx_s = results[-2]
                     compute_idx_s = results[-1]
                 else:
@@ -985,12 +992,10 @@ def compile_gemm_a16w16(
 
                 # Leftover odd tile: compute the carried bank, prefetch first drain tile.
                 if const_expr(main_loop_iters % 2 == 1):
-                    accs, leftover_bank, lo_a_s, lo_w_s = _run_tile(
+                    accs, leftover_bank = _run_tile(
                         accs,
                         cur_a,
                         cur_b,
-                        lo_a_s,
-                        lo_w_s,
                         compute_idx_s,
                         load_idx_s,
                         do_prefetch=True,
@@ -1000,8 +1005,6 @@ def compile_gemm_a16w16(
             else:
                 # Single tile/trip: compute T from carried bank, prefetch T+1.
                 init_state = _pack_state(accs, cur_a, cur_b) + [
-                    lo_a,
-                    lo_w,
                     load_idx_init,
                     compute_idx_init,
                 ]
@@ -1010,27 +1013,23 @@ def compile_gemm_a16w16(
                     _disable_unroll_on_enclosing_loop()
                     cidx = state[-1]
                     lidx = state[-2]
-                    lw = state[-3]
-                    lx = state[-4]
-                    p_accs, ca, cb = _unpack_state(state[:-4])
+                    p_accs, ca, cb = _unpack_state(state[:-2])
 
                     # tile T from the carried bank, prefetch T+1 -> next bank (yielded).
-                    p_accs, bank, lx, lw = _run_tile(
-                        p_accs, ca, cb, lx, lw, cidx, lidx, do_prefetch=True
+                    p_accs, bank = _run_tile(
+                        p_accs, ca, cb, cidx, lidx, do_prefetch=True
                     )
                     next_a, next_b = bank
                     cidx1 = arith.addi(cidx, one_i32)
                     lidx1 = arith.addi(lidx, one_i32)
 
                     new_state = _pack_state(p_accs, next_a, next_b) + [
-                        lx,
-                        lw,
                         lidx1,
                         cidx1,
                     ]
                     results = yield new_state
 
-                accs, cur_a, cur_b = _unpack_state(results[:-4])
+                accs, cur_a, cur_b = _unpack_state(results[:-2])
         else:
             accs = list(accs)
             # No main loop ran — drain starts at compute_idx = 0.
@@ -1111,13 +1110,6 @@ def compile_gemm_a16w16(
         _ = cache_tag
         ctx = CompilationContext.get_current()
 
-        # Finalize LDS allocations
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            for alloc in stage_allocators:
-                alloc.finalized = False
-            for alloc in stage_allocators:
-                alloc.finalize()
-
         # Grid dimensions
         idx_m = arith.index_cast(T.index, i32_m.ir_value())
         idx_n = arith.index_cast(T.index, i32_n.ir_value())
@@ -1181,9 +1173,20 @@ def compile_gemm_a16w16(
             stream=stream,
         )
 
+    # Commented out until coexec branch is merged.
+    # launch_gemm_a8w8_blockscale.compile_hints["llvm_options"] = {
+    #     "amdgpu-expert-scheduling-mode": True,
+    #     "amdgpu-anti-hints-for-va-vdst": True,
+    #     "amdgpu-enable-static-simulator": True,
+    #     "amdgpu-static-sim-inline": True,
+    #     "amdgpu-sched-strategy": "coexec",
+    #     # "amdgpu-block-carried-latency": EnumOpt("all"),  # enable per the note above
+    # }
+
     # Backend cl::opt hints; only options present in THIS build are set.
     _llvm_opts = {
         "amdgpu-expert-scheduling-mode": True,  # valid bool cl::opt (GFX12+ only)
+        "unroll-threshold": 0,
     }
     # Experimental scheduling levers (in-process LLVM); None => cl::init default.
     if sched_strategy is not None:
