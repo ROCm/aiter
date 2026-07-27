@@ -110,7 +110,8 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+    x_scale_sglang = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
+    gemm_x_scale = x_scale_sglang if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
