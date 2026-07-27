@@ -1984,6 +1984,14 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
+        elif kn2.startswith("flydsl_moe2_layout_") and is_ep:
+            # v2 stage2 does not thread expert_mask into its reduce epilogue,
+            # so EP masking would be silently dropped; fall back under EP.
+            cfg = None
+            logger.warning(
+                "[fused_moe] FlyDSL v2 (flydsl_moe2_layout_*) stage2 does not "
+                "support expert-parallel yet; using default heuristics."
+            )
 
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
