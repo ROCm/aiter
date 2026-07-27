@@ -264,32 +264,28 @@ def m2bucket(m):
     return "xlarge"
 
 
-def get_ctas_per_cga(num_ctas, is_prefill):
-    if not is_prefill:
-        # Shard the cluster along N only for prefill.
+def get_gluon_a8w4_ctas_per_cga(m):
+    """
+    num_ctas = 1 - disables multicast
+    """
+    num_ctas = 1
+    if num_ctas == 1 or get_arch() != "gfx1250":
+        return [1, 1]
+    if m < 1024:
+        # Shard the cluster along N only for decode.
         return [1, num_ctas]
-    if num_ctas == 4:
-        return [2, 2]
-    elif num_ctas == 8:
-        return [2, 4]
-    elif num_ctas == 16:
-        return [4, 4]
-    else:
-        return [1, num_ctas]
-
-
-def get_gluon_a8w4_tile_m_scale(m):
-    if get_arch() != "gfx1250":
-        return 1
-    return get_ctas_per_cga(4, is_prefill=m >= 1024)[0]
+    return {4: [2, 2], 8: [2, 4], 16: [4, 4]}.get(num_ctas, [1, num_ctas])
 
 
 def get_kernel_config_gluon(m, n, k, routing_data):
-    block_m = routing_data.block_m
+    ctas_per_cga = get_gluon_a8w4_ctas_per_cga(m)
+    num_ctas = ctas_per_cga[0] * ctas_per_cga[1]
+    # routing_data.block_m is the tile the whole cluster covers; the heuristics
+    # below are written against the per-CTA tile, and it is scaled back up at
+    # the end.
+    block_m = routing_data.block_m // ctas_per_cga[0]
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_ctas = 1
-    ctas_per_cga = get_ctas_per_cga(num_ctas, is_prefill=m >= 1024)
     split_k = 1
 
     if block_m == 16 and k <= 768:
@@ -399,7 +395,9 @@ def moe_gemm_a8w4(
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
     # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
     padded_N = N
-    block_m = routing_data.block_m
+    # Per-CTA tile: routing_data.block_m covers the whole cluster, so divide out
+    # the same scale the caller passed to routing() (1 unless multicast is on).
+    block_m = routing_data.block_m // get_gluon_a8w4_ctas_per_cga(M)[0]
     if unpadded_N and block_m == 16:
         N = unpadded_N
     if unpadded_K and block_m == 16:
@@ -480,17 +478,9 @@ def moe_gemm_a8w4(
     stride_bias = None if bias is None else bias.stride(0)
     # moe metadata
     expt_data = routing_data.expt_data
-    # ExptData must match the kernel's effective block_m; the caller aligns it via
-    # tile_m_scale on routing(). Pure check, no kernel launched.
-    assert (
-        expt_data is None
-        or config["block_m"] == routing_data.effective_expt_data_block_m()
-    ), (
-        f"ExptData built for block_m={routing_data.effective_expt_data_block_m()} "
-        f"but kernel needs block_m={config['block_m']}. Pass "
-        f"tile_m_scale=get_gluon_a8w4_tile_m_scale(M) to routing() "
-        f"(M == number of matmul rows, i.e. num_tokens * n_expts_act)."
-    )
+    # ExptData is built for routing_data.block_m, which the config only rescales
+    # by the cluster's M split -- so it always matches what the kernel launches.
+    assert expt_data is None or config["block_m"] == routing_data.block_m
     expt_hist = None if expt_data is None else expt_data.hist
     expt_hist_sum = None if expt_data is None else expt_data.token_offs_pad[-1]
     expt_token_offs_raw = None if expt_data is None else expt_data.token_offs_raw
@@ -502,9 +492,6 @@ def moe_gemm_a8w4(
         num_blocks_n = grid_n
         grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
-    # With the descriptor-walk TDM API the block offset advances past the tensor
-    # bounds on the last K tile (uneven K) or when there are fewer K tiles than
-    # pipeline buffers; clamp the descriptor in those cases.
     if use_gluon:
         clamp_bounds = (K % config["block_k"] != 0) or (
             triton.cdiv(K, config["block_k"]) < config["num_buffers"]
@@ -870,260 +857,3 @@ def moe_gemm_torch(
         out[i, :] = y[src_idx[i], :].float().sum(0)
 
     return out
-
-
-def main():
-    import argparse
-    from aiter.ops.triton.moe.moe_routing.routing import routing
-    from aiter.ops.triton.moe.quant_moe import (
-        downcast_to_static_fp8,
-        downcast_to_mxfp,
-        upcast_from_mxfp,
-    )
-
-    parser = argparse.ArgumentParser(description="Run MoE GEMM A8W4 test")
-    parser.add_argument("--M", type=int, default=1024)
-    parser.add_argument("--N", type=int, default=1024)
-    parser.add_argument("--K", type=int, default=2880)
-    # parser.add_argument("--M", type=int, default=32)
-    # parser.add_argument("--N", type=int, default=5760)
-    # parser.add_argument("--K", type=int, default=2880)
-    # parser.add_argument("--K", type=int, default=512)
-    # parser.add_argument("--N", type=int, default=5760)
-    # parser.add_argument("--K", type=int, default=2880)
-    # parser.add_argument("--N", type=int, default=6144)
-    # parser.add_argument("--K", type=int, default=3072)
-    parser.add_argument("--E", type=int, default=1, help="Total experts")
-    parser.add_argument(
-        "--n_expts_act", type=int, default=1, help="Active experts per token"
-    )
-    parser.add_argument(
-        "--do_gather", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.add_argument(
-        "--do_scatter", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--has_y_gammas", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--apply_swiglu", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--fused_quant", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--hbm_swizzling",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable HBM scale swizzling (default: False).",
-    )
-    parser.add_argument(
-        "--mxfp8_act",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use mxfp8 microscaled activation instead of static fp8 (default: False).",
-    )
-    # PRESHUFFLE
-    parser.add_argument(
-        "--preshuffled",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use preshuffled weights instead of shuffled weights (default: False).",
-    )
-    parser.add_argument("--device", type=str, default="cuda")
-    args = parser.parse_args()
-
-    device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA/HIP device is not available")
-
-    arch = get_arch()
-    assert arch in (
-        "gfx950",
-        "gfx1250",
-    ), f"a8w4 kernel requires gfx950 or gfx1250, got {arch}"
-
-    if args.hbm_swizzling:
-        if arch == "gfx950" and (args.N % 32 != 0 or args.K % (32 * 8) != 0):
-            raise ValueError(
-                f"Shape {args.M}x{args.N}x{args.K} not supported for scale swizzling on gfx950"
-            )
-        if arch == "gfx1250" and (args.N % 128 != 0 or args.K % (32 * 4) != 0):
-            raise ValueError(
-                f"Shape {args.M}x{args.N}x{args.K} not supported for scale swizzling on gfx1250"
-            )
-
-    print("Testing MoE GEMM A8W4 kernel")
-    print(
-        f"  M={args.M}, K={args.K}, N={args.N}, E={args.E}, "
-        f"n_expts_act={args.n_expts_act}"
-    )
-    print(
-        f"  Flags: gather={args.do_gather}, scatter={args.do_scatter}, "
-        f"swiglu={args.apply_swiglu}, fused_quant={args.fused_quant}, "
-        f"gammas={args.has_y_gammas}, hbm_swizzling={args.hbm_swizzling}, "
-        f"mxfp8_act={args.mxfp8_act}"
-    )
-    print(f"  Device: {device}, Architecture: {arch}")
-
-    logits = torch.randn((args.M, args.E), dtype=torch.float16, device=device)
-    routing_data, gather_idx, scatter_idx = routing(
-        logits,
-        args.n_expts_act,
-        tile_m_scale=get_gluon_a8w4_tile_m_scale(args.M),
-    )
-
-    config = get_kernel_config_gluon(args.M, args.N, args.K, routing_data)
-    pipeline = "decode" if config["block_m"] == 16 else "prefill"
-    print(
-        f"  Config: block_m={config['block_m']}, block_n={config['block_n']}, "
-        f"block_k={config['block_k']}, num_warps={config['num_warps']}, "
-        f"num_buffers={config['num_buffers']}"
-    )
-    print(
-        f"  Pipeline: {pipeline} (gluon)" if arch == "gfx1250" else "  Pipeline: triton"
-    )
-    routing_data.gate_scal = None
-    gather_idx = gather_idx if args.do_gather else None
-    scatter_idx = scatter_idx if args.do_scatter else None
-
-    in_m = args.M * (args.n_expts_act if gather_idx is None else 1)
-
-    x_bf16 = torch.randn((in_m, args.K), dtype=torch.bfloat16, device=device) / 10
-    w_bf16 = (
-        torch.randn((args.E, args.K, args.N), dtype=torch.bfloat16, device=device) / 10
-    )
-    bias = torch.randn((args.E, args.N), dtype=torch.float32, device=device)
-    gammas = (
-        2
-        ** torch.randint(
-            -5, 0, (args.M * args.n_expts_act,), device=device, dtype=torch.float32
-        )
-        if args.has_y_gammas
-        else None
-    )
-
-    w_tri, w_scale_tri = downcast_to_mxfp(w_bf16, torch.uint8, axis=1)
-    w_ref = upcast_from_mxfp(w_tri, w_scale_tri, torch.bfloat16, axis=1)
-    if args.preshuffled:
-        w_tri = preshuffle_weights_gfx1250(w_tri)
-
-    swizzle_mx_scale = None
-    if args.hbm_swizzling:
-        if arch == "gfx1250":
-            swizzle_mx_scale = "GFX1250_SCALE"
-            w_scale_tri = swizzle_scales_gfx1250(w_scale_tri)
-        else:
-            swizzle_mx_scale = "CDNA4_SCALE"
-            w_scale_tri = swizzle_scales_gfx950(w_scale_tri)
-
-    if args.mxfp8_act:
-        x_tri, x_mx_scales = downcast_to_mxfp(x_bf16, torch.float8_e4m3fn, axis=1)
-        x_ref = upcast_from_mxfp(x_tri, x_mx_scales, torch.bfloat16, axis=1)
-        x_static_scale = None
-    else:
-        x_mx_scales = None
-        x_static_scale = x_bf16.abs().max().float() / 448.0
-        x_tri = downcast_to_static_fp8(x_bf16, x_static_scale)
-        x_ref = x_bf16.clone()
-
-    ref_y = moe_gemm_torch(
-        x_ref,
-        w_ref,
-        bias.clone(),
-        routing_data,
-        gather_idx,
-        scatter_idx,
-        gammas,
-        args.apply_swiglu,
-    )
-
-    # K_padded = 3072
-    # N_padded = args.N
-
-    # xK = x_tri.shape[1]
-    # x_pad = torch.zeros((in_m, K_padded), dtype=x_tri.dtype, device=device)
-    # x_pad[:, :xK] = x_tri
-    # x_tri = x_pad[:, :xK]
-
-    # wK, wN = w_tri.shape[1], w_tri.shape[2]
-    # w_pad = torch.zeros((args.E, N_padded, K_padded // 2), dtype=w_tri.dtype, device=device)
-    # w_pad = w_pad.transpose(1, 2)
-    # w_pad[:, :wK, :wN] = w_tri
-    # w_tri = w_pad[:, :wK, :wN]
-
-    # sK, sN = w_scale_tri.shape[1], w_scale_tri.shape[2]
-    # ws_pad = torch.zeros((args.E, N_padded, sK), dtype=w_scale_tri.dtype, device=device)
-    # ws_pad = ws_pad.transpose(1, 2)
-    # ws_pad[:, :sK, :sN] = w_scale_tri
-    # w_scale_tri = ws_pad[:, :sK, :sN]
-
-    # bias_pad = torch.zeros((args.E, N_padded), dtype=bias.dtype, device=device)
-    # bias_pad[:, :args.N] = bias
-    # bias = bias_pad[:, :args.N]
-
-    # print(f"  Stride padding: K {args.K}->{K_padded}, N {args.N}->{N_padded}")
-    # print(f"  x_tri       shape={tuple(x_tri.shape)}  stride={x_tri.stride()}")
-    # print(f"  w_tri       shape={tuple(w_tri.shape)}  stride={w_tri.stride()}")
-    # print(f"  w_scale_tri shape={tuple(w_scale_tri.shape)}  stride={w_scale_tri.stride()}")
-    # print(f"  bias        shape={tuple(bias.shape)}  stride={bias.stride()}")
-
-    quant_static_scale = None
-    out_dtype = torch.bfloat16
-    if args.fused_quant:
-        quant_static_scale = ref_y.abs().max().float() / 448.0
-        out_dtype = torch.float8_e4m3fn
-
-    print("Preshuffled:", args.preshuffled)
-    tri_y = moe_gemm_a8w4(
-        x_tri,
-        w_tri,
-        x_mx_scales,
-        w_scale_tri,
-        x_static_scale,
-        quant_static_scale,
-        bias,
-        routing_data,
-        gather_idx,
-        scatter_idx,
-        gammas,
-        swizzle_mx_scale,
-        out_dtype,
-        args.apply_swiglu,
-        preshuffled=args.preshuffled,
-    )
-    if args.fused_quant:
-        tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)
-
-    print(
-        f"  ref_y shape={tuple(ref_y.shape)} dtype={ref_y.dtype} min={ref_y.float().min().item():.4f} max={ref_y.float().max().item():.4f} nan={ref_y.isnan().sum().item()} inf={ref_y.isinf().sum().item()}"
-    )
-    print(
-        f"  tri_y shape={tuple(tri_y.shape)} dtype={tri_y.dtype} min={tri_y.float().min().item():.4f} max={tri_y.float().max().item():.4f} nan={tri_y.isnan().sum().item()} inf={tri_y.isinf().sum().item()}"
-    )
-    print(f"  ref_y[:4,:4]=\n{ref_y[:4,:4]}")
-    print(f"  tri_y[:4,:4]=\n{tri_y[:4,:4]}")
-
-    ref_f = ref_y.to(torch.float32).detach()
-    tri_f = tri_y.to(torch.float32).detach()
-    eps = 1.0e-30
-    multiplier = 1.0 / (torch.max(torch.abs(ref_f)) + eps)
-    refn = ref_f * multiplier
-    trin = tri_f * multiplier
-    ref_rms = torch.sqrt(torch.square(refn).mean()) + eps
-    rel_err = torch.abs(refn - trin) / torch.maximum(ref_rms, torch.abs(refn))
-    max_err = torch.max(rel_err).item()
-    rms_err = torch.sqrt(torch.square(rel_err).mean()).item()
-
-    maxtol, rmstol = 4e-1, 4e-2
-    print(f"maximum relative error = {max_err} (threshold = {maxtol})")
-    print(f"RMS relative error = {rms_err} (threshold = {rmstol})")
-    if max_err > maxtol or rms_err > rmstol:
-        raise AssertionError("Wrapper test failed against reference")
-    print(f"Test completed successfully ({pipeline} pipeline)")
-    return 0
-
-
-if __name__ == "__main__":
-    main()

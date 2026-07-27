@@ -12,7 +12,7 @@ from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
-    get_gluon_a8w4_tile_m_scale,
+    get_gluon_a8w4_ctas_per_cga,
 )
 
 # routing utilities
@@ -52,7 +52,7 @@ def init_routing_data(
     routing_data, gather_idx, scatter_idx = routing(
         logits,
         n_expts_act,
-        tile_m_scale=get_gluon_a8w4_tile_m_scale(m * n_expts_act),
+        tile_m_scale=get_gluon_a8w4_ctas_per_cga(m * n_expts_act)[0],
     )
     routing_data.gate_scal = None
     gather_idx = gather_idx if do_gather else None
