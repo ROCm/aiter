@@ -76,3 +76,97 @@ def test_runtime_rejects_inter_dim_not_divisible_by_bk(monkeypatch):
             BK=256,
             stream=0,
         )
+
+
+def _capture_runtime_grid(monkeypatch, **overrides):
+    class DummyTensor:
+        @staticmethod
+        def data_ptr():
+            return 0
+
+    dummy = DummyTensor()
+    captured = {}
+
+    def capture_run_compiled(
+        _launch,
+        _inter_sorted_quant,
+        _inter_sorted_shuffled_scale,
+        _w2_u8,
+        _w2_scale_u8,
+        _sorted_expert_ids,
+        _cumsum_tensor,
+        _sorted_token_ids,
+        _sorted_weights,
+        _m_logical,
+        max_m_blocks,
+        grid_blocks,
+        *_rest,
+    ):
+        captured.update(max_m_blocks=max_m_blocks, grid_blocks=grid_blocks)
+
+    monkeypatch.setattr(dispatcher, "get_g2", lambda *args, **kwargs: object())
+    monkeypatch.setattr(dispatcher, "run_compiled", capture_run_compiled)
+
+    kwargs = dict(
+        inter_sorted_quant=dummy,
+        inter_sorted_shuffled_scale=dummy,
+        w2_u8=dummy,
+        w2_scale_u8=dummy,
+        sorted_expert_ids=dummy,
+        cumsum_tensor=dummy,
+        sorted_token_ids=dummy,
+        sorted_weights=dummy,
+        out=dummy,
+        M_logical=16,
+        max_sorted=8384,
+        NE=257,
+        D_HIDDEN=6144,
+        D_INTER=512,
+        topk=9,
+        BM=32,
+        BN=128,
+        BK=256,
+        stream=0,
+    )
+    kwargs.update(overrides)
+    dispatcher.mxfp4_moe_gemm2(**kwargs)
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("m_logical", "max_sorted", "bm", "sbm", "expected_grid_blocks"),
+    [
+        (16, 8384, 32, None, 144),
+        (16, 8384, 16, 32, 288),
+        (32, 8384, 32, None, 258),
+        (16, 64, 32, None, 2),
+    ],
+)
+def test_runtime_tightens_nonpersistent_grid_to_active_expert_bound(
+    monkeypatch, m_logical, max_sorted, bm, sbm, expected_grid_blocks
+):
+    captured = _capture_runtime_grid(
+        monkeypatch,
+        M_logical=m_logical,
+        max_sorted=max_sorted,
+        BM=bm,
+        SBM=sbm,
+    )
+
+    assert captured["max_m_blocks"] == (max_sorted + bm - 1) // bm
+    assert captured["grid_blocks"] == expected_grid_blocks
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_grid_blocks"),
+    [
+        ({"n_sorted_padded": 64}, 2),
+        ({"persist": True, "cu_num": 8}, 8),
+    ],
+)
+def test_runtime_preserves_explicit_grid_selection(
+    monkeypatch, overrides, expected_grid_blocks
+):
+    captured = _capture_runtime_grid(monkeypatch, **overrides)
+
+    assert captured["grid_blocks"] == expected_grid_blocks
