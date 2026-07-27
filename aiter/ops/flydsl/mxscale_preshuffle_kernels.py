@@ -26,6 +26,42 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
+def _compact_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    s = a_scale.view(torch.uint8)
+    rows = s.shape[0]
+    if s.shape[-1] != K // 128:
+        raise ValueError(
+            f"blockscale a_scale must be (rows, K//128)=(*, {K // 128}); "
+            f"got {tuple(a_scale.shape)}"
+        )
+    per32 = s.repeat_interleave(4, dim=1)  # (rows, K//32), block-constant
+    full = shuffle_scale_a16w4(per32, 1, False).view(torch.uint8)
+    # K1 = 256-K chunk count, padded like shuffle_scale (k_scale rounded up to 8)
+    # so K not a multiple of 256 (e.g. K=384) matches the kernel's chunk sizing.
+    n1, K1 = rows // 32, (K + 255) // 256
+    fdw = full.reshape(n1, K1, 4, 16, 4)  # [n1, K1, K_Lane, N_Lane, word]
+    return fdw[:, :, 0, :, :].contiguous().reshape(-1)  # drop K_Lane
+
+
+def _compact_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    from aiter.ops.shuffle import shuffle_scale_a16w4
+
+    s = b_scale.view(torch.uint8)
+    if s.shape != (N // 128, K // 128):
+        raise ValueError(
+            f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
+            f"got {tuple(b_scale.shape)}"
+        )
+    per32 = s.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)  # (N, K//32)
+    full = shuffle_scale_a16w4(per32, 1, False).view(torch.uint8)
+    # K1 padded to the shuffle's 256-K chunk count so K=384 (K%256!=0) works.
+    n1, K1 = N // 32, (K + 255) // 256
+    fdw = full.reshape(n1, K1, 4, 16, 4)
+    return fdw[0::4, :, 0, 0, :].contiguous().reshape(-1)  # 1 word / 128-N block
+
+
 def flydsl_mxscale_preshuffle_gemm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -41,6 +77,7 @@ def flydsl_mxscale_preshuffle_gemm(
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
     split_k: int = 1,
+    blockscale: bool = False,
     stream=None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
@@ -50,6 +87,12 @@ def flydsl_mxscale_preshuffle_gemm(
     split_k>1 splits the K reduction across grid.z: each split writes an fp32
     partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
     slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
+
+    blockscale=True: a_scale/b_scale are *compact coarse* E8M0 (a_scale
+    [rows, K//128] = 1x128 per-token; b_scale [N//128, K//128] = 128x128 per-block).
+    They are packed to the compact shuffled layout here and the kernel broadcasts
+    them to the 1x32 scaled-MFMA in the scale load address (no per-1x32 buffer is
+    materialized — saves scale memory/bandwidth). Default MX mode is unchanged.
     """
     if not is_flydsl_available():
         raise RuntimeError(
@@ -83,6 +126,14 @@ def flydsl_mxscale_preshuffle_gemm(
         raise ValueError(
             f"unsupported Out dtype {Out.dtype}; expected bfloat16 or float16"
         )
+
+    bs_mode = "none"
+    if blockscale:
+        if N % 128 != 0:
+            raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
+        a_scale = _compact_blockscale_a(a_scale, K)
+        b_scale = _compact_blockscale_b(b_scale, N, K)
+        bs_mode = "ab"
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
@@ -125,6 +176,7 @@ def flydsl_mxscale_preshuffle_gemm(
             int(waves_per_eu),
             int(xcd_swizzle),
             1,  # k_batch
+            bs_mode,  # blockscale
         )
         return Out
 
@@ -159,6 +211,7 @@ def flydsl_mxscale_preshuffle_gemm(
         int(waves_per_eu),
         int(xcd_swizzle),
         split_k,  # k_batch
+        bs_mode,  # blockscale
     )
     launch_splitk_reduce(
         ptr_arg(tmp),
@@ -234,6 +287,7 @@ def gemm_mxscale_preshuffle(
     waves_per_eu=None,
     xcd_swizzle=None,
     split_k=None,
+    blockscale=False,
     config=None,
     stream=None,
 ):
@@ -290,5 +344,6 @@ def gemm_mxscale_preshuffle(
         waves_per_eu=(0 if waves_per_eu is None else waves_per_eu),
         xcd_swizzle=(0 if xcd_swizzle is None else xcd_swizzle),
         split_k=(1 if split_k is None else split_k),
+        blockscale=blockscale,
         stream=stream,
     )

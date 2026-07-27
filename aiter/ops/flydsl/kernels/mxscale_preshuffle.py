@@ -103,6 +103,7 @@ def launch_gemm(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
+    blockscale: Constexpr[str] = "none",
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -156,6 +157,16 @@ def launch_gemm(
     num_acc_n = (BN // num_waves) // 16  # 16-col n-subblocks per wave
     _scale_chunk_dw = ((K + 255) // 256) * 64  # e8m0 stride in dwords
     _scale_k0_dw = 64
+    # blockscale (A 1x128 / B 128x128): feed the coarse scale to the 1x32 MFMA by
+    # broadcasting in the load ADDRESS. A drops K_Lane(4); B drops K_Lane*N_Lane(64)
+    # and reads one word per 128-N-block (nsb//4).
+    _bs_a = blockscale in ("a", "ab")
+    _bs_b = blockscale in ("b", "ab")
+    _sc_k0_a = 16 if _bs_a else 64  # per-256K-chunk dword stride (A: drop K_Lane=4)
+    _sc_k0_b = 1 if _bs_b else 64  # (B: drop K_Lane*N_Lane=64)
+    _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
+    _scale_chunk_dw_b = ((K + 255) // 256) * _sc_k0_b
+    _b_sc_rows = (N // 128) if _bs_b else (N // 32)  # B scale super-rows
     n_coop = A_LDS_B // num_threads // 16  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
@@ -225,7 +236,7 @@ def launch_gemm(
         if const_expr(batch > 1):
             a_rstride = fx.Int32(a_row_bytes if a_row_stride < 0 else a_row_stride)
             sca_rstride = fx.Int32(
-                _scale_chunk_dw if sca_row_stride < 0 else sca_row_stride
+                _scale_chunk_dw_a if sca_row_stride < 0 else sca_row_stride
             )
             bz = fx.Int64(bz_batch)
             if const_expr(a_batch_stride < 0):
@@ -236,16 +247,18 @@ def launch_gemm(
             if const_expr(sca_batch_stride < 0):
                 sc_bstride = (
                     fx.Int64((i32_m + 31) // 32)
-                    * fx.Int64(_scale_chunk_dw)
+                    * fx.Int64(_scale_chunk_dw_a)
                     * fx.Int64(4)
                 )
                 arg_scale_a = arg_scale_a + bz * sc_bstride
             else:
                 arg_scale_a = arg_scale_a + bz * fx.Int64(sca_batch_stride)
-            arg_scale_b = arg_scale_b + bz * fx.Int64((N // 32) * _scale_chunk_dw * 4)
+            arg_scale_b = arg_scale_b + bz * fx.Int64(
+                _b_sc_rows * _scale_chunk_dw_b * 4
+            )
         else:
             a_rstride = fx.Int32(a_row_bytes)
-            sca_rstride = fx.Int32(_scale_chunk_dw)
+            sca_rstride = fx.Int32(_scale_chunk_dw_a)
 
         # A source view, bound to the last valid M row (ragged M OOB -> 0).
         _i8g = fx.PointerType.get(
@@ -357,11 +370,13 @@ def launch_gemm(
         if const_expr(batch > 1 and sca_row_stride >= 0):
             a_sc_nrec = (
                 fx.Int64(_a_sc_chunks - 1) * fx.Int64(sca_rstride)
-                + fx.Int64(_scale_chunk_dw)
+                + fx.Int64(_scale_chunk_dw_a)
             ) * fx.Int64(4)
         else:
-            a_sc_nrec = fx.Int64(_a_sc_chunks) * fx.Int64(_scale_chunk_dw) * fx.Int64(4)
-        b_sc_nrec = fx.Int64((N // 32) * _scale_chunk_dw * 4)
+            a_sc_nrec = (
+                fx.Int64(_a_sc_chunks) * fx.Int64(_scale_chunk_dw_a) * fx.Int64(4)
+            )
+        b_sc_nrec = fx.Int64(_b_sc_rows * _scale_chunk_dw_b * 4)
         sa_flat = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
                 fx.Tensor(fx.make_view(fx.inttoptr(_i32g, arg_scale_a), _sc_layout)),
@@ -380,8 +395,16 @@ def launch_gemm(
         )
         a_sc_base = [(bx_m // 32 + mp) * sca_rstride for mp in range_constexpr(m_pairs)]
         nsb = (by_n + wave * (BN // num_waves)) // 32
-        b_sc_base = [(nsb + np) * _scale_chunk_dw for np in range_constexpr(n_pairs)]
+        # B blockscale: 4 consecutive 32-N super-rows share one 128-N block scale.
+        b_sc_base = [
+            ((nsb + np) // 4 if _bs_b else (nsb + np)) * _scale_chunk_dw_b
+            for np in range_constexpr(n_pairs)
+        ]
         sc_lane = lane_div_16 * 16 + lane_mod_16
+        # blockscale drops broadcast dims from the per-lane offset: A drops K_Lane
+        # (lane_div_16); B drops K_Lane + N_Lane (all lanes read one word).
+        sc_lane_a = lane_mod_16 if _bs_a else sc_lane
+        sc_lane_b = fx.Int32(0) if _bs_b else sc_lane
 
         n_acc = m_chunks * num_acc_n
 
@@ -417,7 +440,9 @@ def launch_gemm(
 
         def load_sc(chunk_kt):
             # (sa, sb) e8m0 words per m-/n-pair for one 256-K chunk (uniform base -> SGPR soffset).
-            koff = chunk_kt * _scale_k0_dw
+            # blockscale uses smaller per-chunk strides (compact buffer) + broadcast lanes.
+            koff_a = chunk_kt * _sc_k0_a
+            koff_b = chunk_kt * _sc_k0_b
             sa = [
                 Vec(
                     fly.copy_atom_call_ssa(
@@ -425,25 +450,47 @@ def launch_gemm(
                         bs_copy,
                         sa_flat[
                             None,
-                            rocdl.readfirstlane(T.i32, a_sc_base[mp] + koff) + sc_lane,
+                            rocdl.readfirstlane(T.i32, a_sc_base[mp] + koff_a)
+                            + sc_lane_a,
                         ],
                     )
                 )[0]
                 for mp in range_constexpr(m_pairs)
             ]
-            sb = [
-                Vec(
+            # blockscale B: a wave's N-span lies in one 128-N block (per-wave N =
+            # BN//num_waves <= 128, block-aligned), so every n_pair reads the SAME
+            # word -> load once and reuse instead of n_pairs redundant loads.
+            _bs_b_dedup = (
+                _bs_b and (BN // num_waves) <= 128 and (128 % (BN // num_waves) == 0)
+            )
+            if const_expr(_bs_b_dedup):
+                _sb0 = Vec(
                     fly.copy_atom_call_ssa(
                         [T.vec(1, T.i32)],
                         bs_copy,
                         sb_flat[
                             None,
-                            rocdl.readfirstlane(T.i32, b_sc_base[np] + koff) + sc_lane,
+                            rocdl.readfirstlane(T.i32, b_sc_base[0] + koff_b)
+                            + sc_lane_b,
                         ],
                     )
                 )[0]
-                for np in range_constexpr(n_pairs)
-            ]
+                sb = [_sb0 for _ in range_constexpr(n_pairs)]
+            else:
+                sb = [
+                    Vec(
+                        fly.copy_atom_call_ssa(
+                            [T.vec(1, T.i32)],
+                            bs_copy,
+                            sb_flat[
+                                None,
+                                rocdl.readfirstlane(T.i32, b_sc_base[np] + koff_b)
+                                + sc_lane_b,
+                            ],
+                        )
+                    )[0]
+                    for np in range_constexpr(n_pairs)
+                ]
             return sa, sb
 
         def compute(accs, av, bv, sa_v, sb_v, scale_shift=None):

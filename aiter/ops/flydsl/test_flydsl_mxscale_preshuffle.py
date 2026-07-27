@@ -48,6 +48,13 @@ _SHAPES = [
     (32, 8192, 8192, 32, 128, 256),
 ]
 
+# in-kernel blockscale also covers tile_n=256 (n_pairs=2 -> B-load dedup path)
+# and K=384 (K%256!=0 -> exercises the padded-chunk compact layout, tile_k=128).
+_BLOCKSCALE_SHAPES = _SHAPES + [
+    (32, 8192, 8192, 32, 256, 256),
+    (32, 2048, 384, 32, 128, 128),
+]
+
 # (M, N, K, tile_m, tile_n, tile_k, split_k)
 _SPLITK_SHAPES = [
     (8, 2048, 7168, 32, 128, 256, 2),
@@ -293,9 +300,125 @@ def test_a8w8_blockscale(M, N, K, tile_m, tile_n, tile_k):
     assert err < 0.01, f"a8w8 blockscale mismatch ratio={err:.4f}"
 
 
+@pytest.mark.parametrize("M, N, K, tile_m, tile_n, tile_k", _BLOCKSCALE_SHAPES)
+def test_a8w8_blockscale_inkernel(M, N, K, tile_m, tile_n, tile_k):
+    """MXFP8 A x MXFP8 B coarse blockscale (A 1x128, B 128x128) via the in-kernel
+    broadcast path (blockscale=True, compact scales — no per-1x32 buffer).
+
+    Must byte-match the host-expand oracle (same values fed as full per-1x32) and
+    the dequant reference."""
+    _skip_if_not_gfx950()
+    dev = torch.device("cuda")
+    a_f, b_f = _rand_ab(M, N, K, dev)
+
+    a_q, sa = per_1x32_f8_scale_f8_quant(
+        a_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    b_q, sb = per_1x32_f8_scale_f8_quant(
+        b_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    a_codes, b_codes = a_q[:M], b_q[:N]
+    b_shuf = shuffle_weight(b_codes, layout=(16, 16))
+
+    sa_u, sb_u = sa.view(torch.uint8), sb.view(torch.uint8)
+    Ma = sa_u.shape[0]
+    assert N % 128 == 0, "blockscale test needs N % 128 == 0"
+    sa_128 = sa_u.view(Ma, K // 128, 4).amax(dim=2).contiguous()
+    sb_128 = sb_u[:N].view(N // 128, 128, K // 128, 4).amax(dim=(1, 3)).contiguous()
+
+    # Oracle: same block-constant values expanded to full per-1x32 through plain op.
+    scale_a = shuffle_scale_a16w4(sa_128.repeat_interleave(4, dim=1), 1, False)
+    scale_b = shuffle_scale_a16w4(
+        sb_128.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1), 1, False
+    )
+    out_oracle = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
+    flydsl_mxscale_preshuffle_gemm(
+        a_codes,
+        b_shuf,
+        scale_a,
+        scale_b,
+        out_oracle,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+    )
+    torch.cuda.synchronize()
+
+    # In-kernel broadcast: compact coarse scales + blockscale=True.
+    out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
+    flydsl_mxscale_preshuffle_gemm(
+        a_codes,
+        b_shuf,
+        sa_128,
+        sb_128,
+        out,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        blockscale=True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(out, out_oracle), "in-kernel blockscale != host-expand oracle"
+
+    a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
+        sa_128[:M].repeat_interleave(128, dim=1)
+    )
+    b_deq = b_codes.float() * fp4_utils.e8m0_to_f32(
+        sb_128.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    )
+    c_ref = F.linear(a_deq.to(torch.float32), b_deq.to(torch.float32)).to(
+        torch.bfloat16
+    )
+    err = checkAllclose(
+        c_ref,
+        out,
+        rtol=1e-2,
+        atol=1e-2,
+        msg="a8w8 blockscale in-kernel",
+        catastrophic_check=True,
+    )
+    assert err < 0.01, f"a8w8 blockscale in-kernel mismatch ratio={err:.4f}"
+
+
 def _verify_tuned_shape(
-    M, N, K, a_dtype, b_dtype, cfg, dev, rtol=1e-2, atol=1e-2, n_chunk=8192
+    M,
+    N,
+    K,
+    a_dtype,
+    b_dtype,
+    cfg,
+    dev,
+    rtol=1e-2,
+    atol=1e-2,
+    n_chunk=8192,
+    blockscale=False,
 ):
+
+    def _run(scale_a, scale_b, bs):
+        out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
+        flydsl_mxscale_preshuffle_gemm(
+            a_codes,
+            b_shuf,
+            scale_a,
+            scale_b,
+            out,
+            a_dtype=a_dtype,
+            b_dtype=b_dtype,
+            tile_m=cfg["tile_m"],
+            tile_n=cfg["tile_n"],
+            tile_k=cfg["tile_k"],
+            waves_per_eu=cfg["waves_per_eu"],
+            xcd_swizzle=cfg["xcd_swizzle"],
+            split_k=cfg["split_k"],
+            blockscale=bs,
+        )
+        torch.cuda.synchronize()
+        return out
+
     a_f, b_f = _rand_ab(M, N, K, dev)
     a_q, sa = per_1x32_f8_scale_f8_quant(
         a_f, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
@@ -306,52 +429,90 @@ def _verify_tuned_shape(
     del a_f, b_f
     a_codes, b_codes = a_q[:M], b_q[:N]
     b_shuf = shuffle_weight(b_codes, layout=(16, 16))
-    scale_a = shuffle_scale_a16w4(sa, 1, False)
-    scale_b = shuffle_scale_a16w4(sb, 1, False)
 
-    out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
-    flydsl_mxscale_preshuffle_gemm(
-        a_codes,
-        b_shuf,
-        scale_a,
-        scale_b,
-        out,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        tile_m=cfg["tile_m"],
-        tile_n=cfg["tile_n"],
-        tile_k=cfg["tile_k"],
-        waves_per_eu=cfg["waves_per_eu"],
-        xcd_swizzle=cfg["xcd_swizzle"],
-        split_k=cfg["split_k"],
+    if not blockscale:
+        # MX per-1x32: run once, compare to per-1x32 dequant reference.
+        out = _run(
+            shuffle_scale_a16w4(sa, 1, False),
+            shuffle_scale_a16w4(sb, 1, False),
+            False,
+        )
+        a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
+            sa[:M].repeat_interleave(32, dim=1)
+        )
+        worst = 0.0
+        for n0 in range(0, N, n_chunk):
+            n1 = min(N, n0 + n_chunk)
+            b_deq = b_codes[n0:n1].float() * fp4_utils.e8m0_to_f32(
+                sb[n0:n1].repeat_interleave(32, dim=1)
+            )
+            ref = F.linear(a_deq, b_deq).to(torch.bfloat16)
+            worst = max(
+                worst,
+                float(
+                    checkAllclose(
+                        ref,
+                        out[:, n0:n1],
+                        rtol=rtol,
+                        atol=atol,
+                        printLog=False,
+                        catastrophic_check=True,
+                    )
+                ),
+            )
+            del b_deq, ref
+        return worst
+
+    # blockscale (a8w8): compact coarse scales (A 1x128, B 128x128), run the
+    # in-kernel broadcast path once and compare to the block-constant dequant
+    # reference (same style as op_tests test_gemm_a8w8_blockscale.py). The
+    # stronger in-kernel==host-expand byte check lives in test_a8w8_blockscale_inkernel.
+    if a_dtype != "fp8" or b_dtype != "fp8":
+        raise ValueError("blockscale verify supports fp8/fp8 (a8w8) only")
+    if N % 128 != 0:
+        raise ValueError(f"blockscale verify needs N%128==0, got N={N}")
+    sau, sbu = sa.view(torch.uint8), sb.view(torch.uint8)
+    Ma = sau.shape[0]
+    sa_128 = sau.view(Ma, K // 128, 4).amax(dim=2).contiguous()
+    sb_128 = sbu[:N].view(N // 128, 128, K // 128, 4).amax(dim=(1, 3)).contiguous()
+
+    out = _run(sa_128, sb_128, True)
+    a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
+        sa_128[:M].repeat_interleave(128, dim=1)
     )
-    torch.cuda.synchronize()
-
-    a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(sa[:M].repeat_interleave(32, dim=1))
     worst = 0.0
     for n0 in range(0, N, n_chunk):
         n1 = min(N, n0 + n_chunk)
+        blk0, blk1 = n0 // 128, (n1 + 127) // 128
+        sb_rows = sb_128[blk0:blk1].repeat_interleave(128, dim=0)[: n1 - n0]
         b_deq = b_codes[n0:n1].float() * fp4_utils.e8m0_to_f32(
-            sb[n0:n1].repeat_interleave(32, dim=1)
+            sb_rows.repeat_interleave(128, dim=1)
         )
         ref = F.linear(a_deq, b_deq).to(torch.bfloat16)
-        e = checkAllclose(
-            ref,
-            out[:, n0:n1],
-            rtol=rtol,
-            atol=atol,
-            printLog=False,
-            catastrophic_check=True,
+        worst = max(
+            worst,
+            float(
+                checkAllclose(
+                    ref,
+                    out[:, n0:n1],
+                    rtol=rtol,
+                    atol=atol,
+                    printLog=False,
+                    catastrophic_check=True,
+                )
+            ),
         )
-        worst = max(worst, float(e))
         del b_deq, ref
     return worst
 
 
-def _verify_tuned_csv(csv_path, limit=None, m_cap=None, fail_thr=0.01):
+def _verify_tuned_csv(
+    csv_path, limit=None, m_cap=None, fail_thr=0.01, blockscale=False
+):
     """Sweep every shape in the tuned CSV, run it with its recorded config, and
     check accuracy. Prints a per-shape line + a summary; returns exit-style int
-    (0 = all good)."""
+    (0 = all good). blockscale=True verifies the in-kernel blockscale path
+    (in-kernel == host-expand oracle + dequant reference) with the same config."""
     import pandas as pd
 
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
@@ -366,7 +527,8 @@ def _verify_tuned_csv(csv_path, limit=None, m_cap=None, fail_thr=0.01):
     total = len(df)
     passed = failed = errored = 0
     fails = []
-    print(f"Verifying {total} tuned shapes from {csv_path}\n" + "=" * 78)
+    mode = "blockscale" if blockscale else "MX per-1x32"
+    print(f"Verifying {total} tuned shapes ({mode}) from {csv_path}\n" + "=" * 78)
     for i, row in enumerate(df.itertuples(), 1):
         M, N, K = int(row.M), int(row.N), int(row.K)
         a_dtype, b_dtype = str(row.a_dtype), str(row.b_dtype)
@@ -382,7 +544,9 @@ def _verify_tuned_csv(csv_path, limit=None, m_cap=None, fail_thr=0.01):
             f"w{cfg['waves_per_eu']}_x{cfg['xcd_swizzle']}_sk{cfg['split_k']}"
         )
         try:
-            err = _verify_tuned_shape(run_m, N, K, a_dtype, b_dtype, cfg, dev)
+            err = _verify_tuned_shape(
+                run_m, N, K, a_dtype, b_dtype, cfg, dev, blockscale=blockscale
+            )
         except Exception as exc:  # a config that crashes is itself a failure
             print(f"[{i}/{total}] {tag} ERROR: {exc}")
             errored += 1
@@ -428,12 +592,21 @@ if __name__ == "__main__":
     ap.add_argument(
         "--fail-thr", type=float, default=0.01, help="mismatch-ratio fail threshold"
     )
+    ap.add_argument(
+        "--blockscale",
+        action="store_true",
+        help="verify the in-kernel blockscale path (a8w8, N%%128==0) per config",
+    )
     args = ap.parse_args()
 
     if args.csv:
         raise SystemExit(
             _verify_tuned_csv(
-                args.csv, limit=args.limit, m_cap=args.m_cap, fail_thr=args.fail_thr
+                args.csv,
+                limit=args.limit,
+                m_cap=args.m_cap,
+                fail_thr=args.fail_thr,
+                blockscale=args.blockscale,
             )
         )
 
@@ -441,6 +614,7 @@ if __name__ == "__main__":
         test_a4w4(*shp)
         test_a8w8(*shp)
         test_a8w8_blockscale(*shp)
+        test_a8w8_blockscale_inkernel(*shp)
         print(f"OK {shp}")
     for shp in _SPLITK_SHAPES:
         test_a8w8_splitk(*shp)

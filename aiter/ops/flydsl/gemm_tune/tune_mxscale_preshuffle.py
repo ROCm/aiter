@@ -54,7 +54,9 @@ def _dequant(codes, scale, dtype, rows):
     return fp4_utils.mxfp4_to_f32(codes) * sc  # fp4
 
 
-def generate_data(m, n, k, seed, a_dtype, b_dtype, dtype=dtypes.bf16, device="cuda"):
+def generate_data(
+    m, n, k, seed, a_dtype, b_dtype, blockscale=False, dtype=dtypes.bf16, device="cuda"
+):
     torch.manual_seed(seed)
     ma, na = (m + 31) // 32 * 32, (n + 31) // 32 * 32
     a_f = torch.zeros(ma, k, dtype=torch.float32, device=device)
@@ -65,10 +67,30 @@ def generate_data(m, n, k, seed, a_dtype, b_dtype, dtype=dtypes.bf16, device="cu
     b_q, sb = _quant(b_f, b_dtype)
     a_codes, b_codes = a_q[:m], b_q[:n]
     b_shuf = shuffle_weight(b_codes, layout=(16, 16))
-    a_scale = shuffle_scale_a16w4(sa, 1, False)
-    b_scale = shuffle_scale_a16w4(sb, 1, False)
-    a_deq = _dequant(a_codes, sa, a_dtype, m)
-    b_deq = _dequant(b_codes, sb, b_dtype, n)
+    if blockscale:
+        # coarse blockscale (A 1x128, B 128x128): pass compact scales; the op packs
+        # + broadcasts in-kernel. Reference uses the block-constant scale.
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError("blockscale tune supports fp8/fp8 (a8w8) only")
+        if n % 128 != 0 or k % 128 != 0:
+            raise ValueError(
+                f"blockscale needs N%128==0 and K%128==0, got N={n}, K={k}"
+            )
+        sau, sbu = sa.view(torch.uint8), sb.view(torch.uint8)
+        sa_128 = sau.view(ma, k // 128, 4).amax(dim=2).contiguous()
+        sb_128 = sbu[:n].view(n // 128, 128, k // 128, 4).amax(dim=(1, 3)).contiguous()
+        a_scale, b_scale = sa_128, sb_128
+        a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
+            sa_128[:m].repeat_interleave(128, dim=1)
+        )
+        b_deq = b_codes.float() * fp4_utils.e8m0_to_f32(
+            sb_128.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        )
+    else:
+        a_scale = shuffle_scale_a16w4(sa, 1, False)
+        b_scale = shuffle_scale_a16w4(sb, 1, False)
+        a_deq = _dequant(a_codes, sa, a_dtype, m)
+        b_deq = _dequant(b_codes, sb, b_dtype, n)
     out = torch.empty(m, n, dtype=dtype, device=device)
     return {
         "A": a_codes,
@@ -81,7 +103,9 @@ def generate_data(m, n, k, seed, a_dtype, b_dtype, dtype=dtypes.bf16, device="cu
     }
 
 
-def run_gemm_flydsl(A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype):
+def run_gemm_flydsl(
+    A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype, blockscale=False
+):
     ki = kernels_list[kernel_id]
     flydsl_mxscale_preshuffle_gemm(
         A,
@@ -97,6 +121,7 @@ def run_gemm_flydsl(A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype):
         waves_per_eu=ki.waves_per_eu,
         xcd_swizzle=ki.xcd_swizzle,
         split_k=ki.split_k,
+        blockscale=blockscale,
     )
     return out
 
@@ -119,7 +144,11 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         _op._TUNED_CACHE.clear()
 
     def _setup_specific_arguments(self):
-        pass  # only the FlyDSL libtype; no extra CLI knobs
+        self.parser.add_argument(
+            "--blockscale",
+            action="store_true",
+            help="tune/validate the a8w8 blockscale path (A 1x128, B 128x128)",
+        )
 
     def calculate(self, results, bpes=(1, 1, 2)):
         # (inbpe, w_bpe, outbpe); fp8=1 byte/code, bf16 out=2
@@ -138,6 +167,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
             return []
         gemm_keys = ["A", "B", "a_scale", "b_scale", "out"]
         ref_keys = ["a_deq", "b_deq"]
+        blockscale = bool(getattr(args, "blockscale", False))
         tasks = []
         for kid, ki in candidates_for(a_dtype, b_dtype, M, N, K):
             info = (info_keys, kid, ki.split_k, ki.name, "flydsl")
@@ -145,9 +175,9 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                 (
                     info,
                     generate_data,
-                    (M, N, K, seed, a_dtype, b_dtype),
+                    (M, N, K, seed, a_dtype, b_dtype, blockscale),
                     run_gemm_flydsl,
-                    (gemm_keys, kid, a_dtype, b_dtype),
+                    (gemm_keys, kid, a_dtype, b_dtype, blockscale),
                     {"num_warmup": args.warmup, "num_iters": args.iters},
                     run_torch,
                     (ref_keys, dtypes.bf16),
@@ -248,6 +278,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         from aiter.test_common import run_perftest, checkAllclose
 
         untunedf = self.untunedf
+        blockscale = bool(getattr(args, "blockscale", False))
         results = []
         for i in range(len(untunedf)):
             row = untunedf.iloc[i]
@@ -258,11 +289,18 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                 self._get_run_config_err_ratio_limit(row, args)
             )
             try:
-                gd = generate_data(M, N, K, 0, a_dtype, b_dtype)
+                gd = generate_data(M, N, K, 0, a_dtype, b_dtype, blockscale=blockscale)
 
                 def _dispatch(A, B, a_scale, b_scale, out):
                     return gemm_mxscale_preshuffle(
-                        A, B, a_scale, b_scale, out, a_dtype=a_dtype, b_dtype=b_dtype
+                        A,
+                        B,
+                        a_scale,
+                        b_scale,
+                        out,
+                        a_dtype=a_dtype,
+                        b_dtype=b_dtype,
+                        blockscale=blockscale,
                     )
 
                 out, us = run_perftest(
