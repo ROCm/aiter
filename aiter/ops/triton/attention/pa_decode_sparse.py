@@ -21,17 +21,17 @@ import math
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse as gluon_pa_decode_sparse,
-)
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
-)
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
     _pa_decode_sparse as _pa_decode_sparse_gfx950,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as _pa_decode_sparse_reduce_gfx950,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
