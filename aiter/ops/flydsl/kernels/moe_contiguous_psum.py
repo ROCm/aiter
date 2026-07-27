@@ -13,7 +13,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int32, T
@@ -280,22 +280,36 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
-        # Only remap valid routes ([0, nvr)); dead-tail routes (>= num_valid_routes)
-        # hold unwritten/garbage rows from the route kernel and must NOT be used as
-        # a row index (would OOB-read starts[expert]). They are never read
-        # downstream. When truncation is disabled the caller passes numel == nvr.
-        nvr = ArithValue(
-            buffer_ops.buffer_load(
-                ptr_rsrc(num_valid_routes),
-                arith.constant(0, type=i32),
-                vec_width=1,
-                dtype=i32,
-            )
+        # Only remap valid routes ([0, valid_route_count)); dead-tail routes
+        # hold unwritten/garbage rows from the route kernel and must NOT be used
+        # as a row index (would OOB-read starts[expert]). They are never read
+        # downstream. When truncation is disabled the caller passes a null pointer
+        # instead of a (1,) tensor, so the load must not run unconditionally.
+        num_valid_routes_addr = arith.index_cast(T.i64, ptrtoint(num_valid_routes))
+        num_valid_routes_is_null = arith.cmpi(
+            CmpIPredicate.eq, num_valid_routes_addr, arith.constant(0, type=T.i64)
         )
+        _if_valid_routes = scf.IfOp(
+            num_valid_routes_is_null, results_=[i32], has_else=True
+        )
+        with ir.InsertionPoint(_if_valid_routes.then_block):
+            scf.YieldOp([ArithValue(numel)])
+        with ir.InsertionPoint(_if_valid_routes.else_block):
+            scf.YieldOp(
+                [
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_routes),
+                        arith.constant(0, type=i32),
+                        vec_width=1,
+                        dtype=i32,
+                    )
+                ]
+            )
+        valid_route_count = ArithValue(_if_valid_routes.results[0])
         tid_idx = arith.index_cast(T.index, tid)
-        nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
+        valid_route_count_idx = arith.index_cast(T.index, ArithValue(valid_route_count))
         stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        remap_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
+        remap_loop = scf.ForOp(tid_idx, valid_route_count_idx, stride_idx)
         with ir.InsertionPoint(remap_loop.body):
             route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
             row = ArithValue(
