@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+
+#include "pa_ps.cuh"
+
+#define FUNCTION_DEFINE                                                               \
+    void {{func_name}}(void* output_ptr_,                                             \
+                       void* exp_sums_ptr_,                                           \
+                       void* max_logits_ptr_,                                         \
+                       void* logits_ptr_,                                             \
+                       void* sink_token_ptr_,                                         \
+                       int stride_output_bs,                                          \
+                       int stride_output_len,                                         \
+                       int stride_output_kv_head,                                     \
+                       int stride_output_group_size,                                  \
+                       int stride_exp_sums_seq,                                       \
+                       int stride_exp_sums_head,                                      \
+                       int stride_exp_sums_part,                                      \
+                       int stride_logits_seq,                                         \
+                       int stride_logits_head,                                        \
+                       int stride_logits_part,                                        \
+                       int stride_logits_group,                                       \
+                       int batch_size,                                                \
+                       int num_kv_heads,                                              \
+                       int query_seq_len,                                             \
+                       int query_group_size,                                          \
+                       int context_partition_num,                                     \
+                       void* stream)
+
+extern "C" {
+FUNCTION_DEFINE;
+}
+
+FUNCTION_DEFINE
+{
+    constexpr int head_size = {{head_size}};
+    constexpr int query_group_size_const = {{query_group_size}};
+    constexpr int context_partition_num_const = {{context_partition_num}};
+    static_assert(head_size > 0 && head_size <= 1024,
+                  "pa_ps launcher requires 0 < head_size <= 1024");
+    static_assert(context_partition_num_const > 0 && context_partition_num_const <= 64,
+                  "pa_ps launcher supports 1..64 partition slots");
+
+    if(batch_size <= 0 || num_kv_heads <= 0 || query_seq_len <= 0 || query_group_size <= 0)
+    {
+        return;
+    }
+
+    auto* output_ptr      = reinterpret_cast<{{out_dtype}}*>(output_ptr_);
+    auto* exp_sums_ptr    = reinterpret_cast<const float*>(exp_sums_ptr_);
+    auto* max_logits_ptr  = reinterpret_cast<const float*>(max_logits_ptr_);
+    auto* logits_ptr      = reinterpret_cast<const {{logits_dtype}}*>(logits_ptr_);
+    auto* sink_token_ptr  = reinterpret_cast<const {{sink_dtype}}*>(sink_token_ptr_);
+
+    dim3 grid(batch_size, num_kv_heads, query_seq_len * query_group_size);
+    dim3 block(head_size);
+    constexpr size_t shared_mem_bytes = 0;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(aiter::pa_decode_ps_reduce_hip_kernel<{{out_dtype}},
+                                                              {{logits_dtype}},
+                                                              {{sink_dtype}},
+                                                              {{"true" if use_sinks else "false"}},
+                                                              head_size,
+                                                              query_group_size_const,
+                                                              context_partition_num_const>),
+        grid,
+        block,
+        shared_mem_bytes,
+        reinterpret_cast<hipStream_t>(stream),
+        output_ptr,
+        exp_sums_ptr,
+        max_logits_ptr,
+        logits_ptr,
+        sink_token_ptr,
+        stride_output_bs,
+        stride_output_len,
+        stride_output_kv_head,
+        stride_output_group_size,
+        stride_exp_sums_seq,
+        stride_exp_sums_head,
+        stride_exp_sums_part,
+        stride_logits_seq,
+        stride_logits_head,
+        stride_logits_part,
+        stride_logits_group);
+}

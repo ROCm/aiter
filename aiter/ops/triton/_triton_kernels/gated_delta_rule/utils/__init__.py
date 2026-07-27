@@ -7,7 +7,12 @@ from .cumsum import (
     chunk_local_cumsum_scalar,
     chunk_local_cumsum_vector,
 )
-from .index import prepare_chunk_indices, prepare_chunk_offsets
+from .index import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    prepare_num_chunks,
+    prepare_rebased_cu_seqlens,
+)
 from .l2norm import l2norm_bwd, l2norm_fwd
 from .solve_tril import solve_tril
 from .wy_representation import chunk_scaled_dot_kkt_fwd, recompute_w_u_fwd
@@ -18,6 +23,8 @@ __all__ = [
     "chunk_local_cumsum_vector",
     "prepare_chunk_indices",
     "prepare_chunk_offsets",
+    "prepare_num_chunks",
+    "prepare_rebased_cu_seqlens",
     "l2norm_fwd",
     "l2norm_bwd",
     "solve_tril",

@@ -1,17 +1,14 @@
 #pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-#include <torch/extension.h>
+#include "aiter_tensor.h"
 
-torch::Tensor aiter_add(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_mul(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_sub(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_div(torch::Tensor &input, torch::Tensor &other);
+bool aiter_add(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t &output);
+bool aiter_mul(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t &output);
+bool aiter_sub(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t &output);
+bool aiter_div(aiter_tensor_t &input, aiter_tensor_t &other, aiter_tensor_t &output);
 
-torch::Tensor aiter_add_(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_mul_(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_sub_(torch::Tensor &input, torch::Tensor &other);
-torch::Tensor aiter_div_(torch::Tensor &input, torch::Tensor &other);
-
-torch::Tensor aiter_sigmoid(torch::Tensor &input);
-torch::Tensor aiter_tanh(torch::Tensor &input);
+bool aiter_add_(aiter_tensor_t &input, aiter_tensor_t &other);
+bool aiter_mul_(aiter_tensor_t &input, aiter_tensor_t &other);
+bool aiter_sub_(aiter_tensor_t &input, aiter_tensor_t &other);
+bool aiter_div_(aiter_tensor_t &input, aiter_tensor_t &other);

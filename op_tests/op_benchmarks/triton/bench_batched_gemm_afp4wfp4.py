@@ -71,7 +71,7 @@ def run_model_benchmark(args):
     benchmark = get_model_benchmark_object(
         plot_name=get_caller_name_no_ext(),
         args=args,
-        x_names=["model_name", "M", "hidden_dim", "intermediate_dim", "batch"],
+        x_names=["M", "hidden_dim", "intermediate_dim", "batch", "model_name"],
         model_benchmark_shapes_fn=batched_model_benchmark_shapes,
     )
 

@@ -30,13 +30,13 @@
 extern "C" {
 FUNCTION_DEFINE;
 }
-                        
+
 FUNCTION_DEFINE
 {
-    const uint32_t smem_size = sizeof(aiter::sampling::RenormTempStorage<aiter::sampling::BLOCK_THREADS, aiter::sampling::REDUCE_ALGO>);
-    dim3 nblks(batch_size);
-    dim3 nthrs(aiter::sampling::BLOCK_THREADS);
-    auto kernel = aiter::sampling::TopKRenormProbKernel<aiter::sampling::BLOCK_THREADS, aiter::sampling::REDUCE_ALGO, {{vec_size}}, float, int>;
-    hipFuncSetAttribute(reinterpret_cast<const void*>(kernel), hipFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    kernel<<<nblks, nthrs, smem_size, reinterpret_cast<hipStream_t>(stream)>>>(reinterpret_cast<float*>(probs_ptr), reinterpret_cast<float*>(renormed_probs_ptr), reinterpret_cast<int*>(top_k_arr_ptr), top_k_val, vocab_size);
+    aiter::sampling::topk_renorm_from_probs(
+        reinterpret_cast<float*>(probs_ptr),
+        reinterpret_cast<float*>(renormed_probs_ptr),
+        reinterpret_cast<int*>(top_k_arr_ptr),
+        batch_size, top_k_val, vocab_size,
+        reinterpret_cast<hipStream_t>(stream));
 }

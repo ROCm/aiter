@@ -1,0 +1,355 @@
+name: vLLM disagg CI smoke workflow
+
+on:
+  schedule:
+    # Nightly vLLM DI smoke run, 2:30 AM Beijing Time (UTC+8).
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+    inputs:
+      vllm_repository:
+        description: "vLLM repository to clone"
+        required: false
+        type: string
+        default: "itej89/vllm"
+      vllm_ref:
+        description: "vLLM branch/ref with lcskrishna/vllm PR #5 changes"
+        required: false
+        type: string
+        default: "fix/moriio-ep8-dp8-read-rdma-session-routing"
+      model_name:
+        description: "MODEL_NAME passed to run_xPyD disagg Slurm script"
+        required: false
+        type: string
+        default: "DeepSeek-V3"
+      disagg_scripts_stage:
+        description: "DISAGG_SCRIPTS_STAGE visible to Spur login and compute nodes"
+        required: false
+        type: string
+        default: "/data/xinhuang/vllm-disagg-logs/"
+      spur_nodelist:
+        description: "Optional comma-separated Spur nodes for the 2-node smoke job"
+        required: false
+        type: string
+        default: "ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-16"
+      image:
+        description: "Docker image passed to run_xPyD disagg Slurm script"
+        required: false
+        type: string
+        default: "vllm/vllm-openai-rocm:v0.23.0"
+      slurm_script:
+        description: "Slurm script under .buildkite/amd-disagg"
+        required: false
+        type: string
+        default: "run_xPyD_diagg.slurm"
+      wait_timeout_minutes:
+        description: "Maximum time to wait for the Slurm job"
+        required: false
+        type: string
+        default: "420"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  vllm-disagg-smoke:
+    runs-on: [self-hosted, aiter-di-ci-spur-login-vllm]
+    timeout-minutes: 480
+    env:
+      VLLM_REPOSITORY_DEFAULT: itej89/vllm
+      VLLM_REF_DEFAULT: fix/moriio-ep8-dp8-read-rdma-session-routing
+      MODEL_NAME_DEFAULT: DeepSeek-V3
+      DISAGG_SCRIPTS_STAGE_DEFAULT: /data/xinhuang/vllm-disagg-logs/
+      SPUR_NODELIST_DEFAULT: ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-13,ml-ai-ubuntu-gpu-mi350x8-2304gb-fabric-15
+      IMAGE_DEFAULT: vllm/vllm-openai-rocm:v0.23.0
+      ROUTER_TYPE_DEFAULT: vllm-router
+      MORIIO_READ_MODE_DEFAULT: "0"
+      VLLM_ROUTER_IMAGE_DEFAULT: vllm/vllm-router:nightly
+      SLURM_SCRIPT_DEFAULT: run_xPyD_diagg.slurm
+      WAIT_TIMEOUT_MINUTES_DEFAULT: "420"
+    steps:
+      - name: Apply vLLM disagg inputs
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_EVENT_PATH" <<'PY' >> "$GITHUB_ENV"
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as f:
+              event = json.load(f)
+
+          inputs = event.get("inputs") or {}
+
+          def value(name: str, default_env: str) -> str:
+              raw = inputs.get(name, "")
+              default = os.environ[default_env]
+              return raw if raw not in ("", None) else default
+
+          print(f"VLLM_REPOSITORY={value('vllm_repository', 'VLLM_REPOSITORY_DEFAULT')}")
+          print(f"VLLM_REF={value('vllm_ref', 'VLLM_REF_DEFAULT')}")
+          print(f"MODEL_NAME={value('model_name', 'MODEL_NAME_DEFAULT')}")
+          print(
+              "DISAGG_SCRIPTS_STAGE="
+              + value("disagg_scripts_stage", "DISAGG_SCRIPTS_STAGE_DEFAULT")
+          )
+          print(f"SPUR_NODELIST={value('spur_nodelist', 'SPUR_NODELIST_DEFAULT')}")
+          print(f"IMAGE={value('image', 'IMAGE_DEFAULT')}")
+          print(f"ROUTER_TYPE={os.environ['ROUTER_TYPE_DEFAULT']}")
+          print(f"MORIIO_READ_MODE={os.environ['MORIIO_READ_MODE_DEFAULT']}")
+          print(f"VLLM_ROUTER_IMAGE={os.environ['VLLM_ROUTER_IMAGE_DEFAULT']}")
+          print(f"SLURM_SCRIPT={value('slurm_script', 'SLURM_SCRIPT_DEFAULT')}")
+          print(
+              "WAIT_TIMEOUT_MINUTES="
+              + value("wait_timeout_minutes", "WAIT_TIMEOUT_MINUTES_DEFAULT")
+          )
+          PY
+
+      - name: Show runner and Slurm state
+        run: |
+          set -euo pipefail
+          hostname
+          whoami
+          pwd
+          command -v git
+          command -v sbatch
+          command -v squeue
+          command -v scancel
+          command -v sacct || true
+          command -v spur && spur --help | head -120 || true
+
+      - name: Checkout vLLM disagg branch
+        run: |
+          set -euo pipefail
+          rm -rf vllm
+          git init vllm
+          cd vllm
+          git remote add origin "https://github.com/${VLLM_REPOSITORY}.git"
+          git fetch --depth=1 origin "${VLLM_REF}"
+          git checkout --detach FETCH_HEAD
+
+      - name: Show vLLM disagg inputs
+        run: |
+          set -euo pipefail
+          cd vllm
+          git rev-parse HEAD
+          {
+            echo "### vLLM disagg smoke input"
+            echo
+            echo "- vLLM repository: \`${VLLM_REPOSITORY}\`"
+            echo "- vLLM ref: \`${VLLM_REF}\`"
+            echo "- vLLM SHA: \`$(git rev-parse HEAD)\`"
+            echo "- MODEL_NAME: \`${MODEL_NAME}\`"
+            echo "- DISAGG_SCRIPTS_STAGE: \`${DISAGG_SCRIPTS_STAGE}\`"
+            echo "- SPUR_NODELIST: \`${SPUR_NODELIST}\`"
+            echo "- IMAGE: \`${IMAGE}\`"
+            echo "- Requested Slurm script: \`${SLURM_SCRIPT}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Submit and monitor vLLM disagg Slurm job
+        run: |
+          set -euo pipefail
+          workdir="vllm/.buildkite/amd-disagg"
+          if [[ ! -d "${workdir}" ]]; then
+            echo "Missing ${workdir}" >&2
+            exit 1
+          fi
+          cd "${workdir}"
+
+          script="${SLURM_SCRIPT}"
+          if [[ ! -f "${script}" ]]; then
+            for candidate in run_xPyD_disagg.slurm run_xPyD_diagg.slurm; do
+              if [[ -f "${candidate}" ]]; then
+                echo "Requested Slurm script ${script} not found; using ${candidate}"
+                script="${candidate}"
+                break
+              fi
+            done
+          fi
+          if [[ ! -f "${script}" ]]; then
+            echo "No run_xPyD disagg Slurm script found under ${PWD}" >&2
+            find . -maxdepth 2 -type f | sort >&2
+            exit 1
+          fi
+
+          log_root="${DISAGG_SCRIPTS_STAGE%/}"
+          mkdir -p "${DISAGG_SCRIPTS_STAGE}" "${log_root}"
+          # run_xPyD_disagg.slurm bind-mounts DISAGG_SCRIPTS_DIR into the container
+          # at /vllm-workspace/.buildkite/amd-disagg and runs vllm_disagg.sh from
+          # there. The runner checkout is login-node-local (invisible to compute
+          # nodes), and Spur sets SLURM_SUBMIT_DIR=/tmp, so stage the scripts into
+          # the compute-visible shared dir and point DISAGG_SCRIPTS_DIR at it.
+          echo "Staging disagg scripts from ${PWD} to ${DISAGG_SCRIPTS_STAGE}"
+          cp -rf ./. "${DISAGG_SCRIPTS_STAGE}/"
+          proxy_src="../../examples/disaggregated/disaggregated_serving/moriio_toy_proxy_server.py"
+          if [[ ! -f "${proxy_src}" ]]; then
+            echo "Missing MoRIIO toy proxy script: ${proxy_src}" >&2
+            exit 1
+          fi
+          cp -f "${proxy_src}" "${DISAGG_SCRIPTS_STAGE}/moriio_toy_proxy_server.py"
+          submit_log="${GITHUB_WORKSPACE}/slurm-submit.txt"
+          squeue_log="${GITHUB_WORKSPACE}/slurm-squeue.log"
+          sacct_log="${GITHUB_WORKSPACE}/slurm-sacct.txt"
+          : > "${squeue_log}"
+          : > "${sacct_log}"
+
+          # Spur NODE_FAILs (JobLaunchFailure) any job submitted with sbatch CLI
+          # resource flags (--nodelist/--nodes/--ntasks/--gres/...), but in-script
+          # #SBATCH directives ARE honored (proven pattern: ATOM pd_submit.sh
+          # writes #SBATCH --nodelist into the submitted script + bare sbatch).
+          # So pin nodes by injecting an in-script #SBATCH --nodelist rather than
+          # passing it on the CLI; the rest stays in the script's own #SBATCH
+          # (nodes=2, ntasks-per-node=1, gres=gpu:8, exclusive).
+          if [[ -n "${SPUR_NODELIST}" ]] && ! grep -q '^#SBATCH --nodelist=' "${script}"; then
+            sed -i "/^#SBATCH --exclusive/a #SBATCH --nodelist=${SPUR_NODELIST}" "${script}"
+            echo "Pinned nodes via in-script directive: #SBATCH --nodelist=${SPUR_NODELIST}"
+          fi
+          sbatch_args=()
+
+          echo "Submitting: MODEL_NAME=${MODEL_NAME} DISAGG_SCRIPTS_DIR=${DISAGG_SCRIPTS_STAGE} DISAGG_SCRIPTS_STAGE=${DISAGG_SCRIPTS_STAGE} LOG_ROOT=${log_root} IMAGE=${IMAGE} ROUTER_TYPE=${ROUTER_TYPE} MORIIO_READ_MODE=${MORIIO_READ_MODE} sbatch ${sbatch_args[*]} ${script}"
+          LOG_ROOT="${log_root}" \
+            MODEL_NAME="${MODEL_NAME}" \
+            DISAGG_SCRIPTS_DIR="${DISAGG_SCRIPTS_STAGE}" \
+            DISAGG_SCRIPTS_STAGE="${DISAGG_SCRIPTS_STAGE}" \
+            IMAGE="${IMAGE}" \
+            ROUTER_TYPE="${ROUTER_TYPE}" \
+            MORIIO_READ_MODE="${MORIIO_READ_MODE}" \
+            VLLM_ROUTER_IMAGE="${VLLM_ROUTER_IMAGE}" \
+            sbatch "${sbatch_args[@]}" "${script}" | tee "${submit_log}"
+
+          job_id="$(
+            python3 - "${submit_log}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          text = Path(sys.argv[1]).read_text(encoding="utf-8")
+          match = re.search(r"Submitted batch job\s+(\d+)", text)
+          if not match:
+              raise SystemExit(f"Could not parse Slurm job id from: {text!r}")
+          print(match.group(1))
+          PY
+          )"
+          echo "Submitted Slurm job ${job_id}"
+          echo "SLURM_JOB_ID=${job_id}" >> "${GITHUB_ENV}"
+
+          cancel_slurm_job() {
+            local rc=$?
+            if [[ "${rc}" -ne 0 && -n "${job_id:-}" ]]; then
+              echo "Cancelling Slurm job ${job_id} after workflow rc=${rc}"
+              scancel "${job_id}" || true
+            fi
+            exit "${rc}"
+          }
+          trap cancel_slurm_job EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          deadline=$((SECONDS + WAIT_TIMEOUT_MINUTES * 60))
+          while true; do
+            now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            queue_status="$(squeue -h -j "${job_id}" -o "%i|%T|%M|%D|%R" || true)"
+            if [[ -n "${queue_status}" ]]; then
+              echo "${queue_status}" | tee -a "${squeue_log}"
+              if (( SECONDS >= deadline )); then
+                echo "Timed out waiting for Slurm job ${job_id} after ${WAIT_TIMEOUT_MINUTES} minutes" >&2
+                exit 124
+              fi
+              echo "${now} job ${job_id} still running or pending"
+              sleep 60
+            else
+              echo "${now} job ${job_id} no longer appears in squeue" | tee -a "${squeue_log}"
+              break
+            fi
+          done
+
+          if command -v sacct >/dev/null 2>&1; then
+            for _ in 1 2 3 4 5; do
+              sacct -j "${job_id}" \
+                --format=JobID,State,ExitCode,Elapsed,NodeList \
+                | tee "${sacct_log}" || true
+              if awk -v job="${job_id}" '$1 == job { found=1 } END { exit !found }' "${sacct_log}" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 10
+            done
+
+            state="$(
+              awk -v job="${job_id}" '$1 == job { print $2; exit }' "${sacct_log}"
+            )"
+            echo "Slurm job ${job_id} final state: ${state:-unknown}"
+            if [[ "${state}" != COMPLETED* ]]; then
+              exit 1
+            fi
+          else
+            echo "sacct is unavailable; submitted job ${job_id} and observed it leave squeue"
+          fi
+
+      - name: Summarize Slurm result
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo
+            echo "### vLLM disagg smoke result"
+            echo
+            echo "- Model: \`${MODEL_NAME:-unknown}\`"
+            echo "- Image: \`${IMAGE:-unknown}\`"
+            echo "- Job ID: \`${SLURM_JOB_ID:-unknown}\`"
+            if [[ -f slurm-sacct.txt && -n "${SLURM_JOB_ID:-}" ]]; then
+              _row="$(awk -v j="${SLURM_JOB_ID}" '$1==j{print $2, $3, $4; exit}' slurm-sacct.txt || true)"
+              read -r _st _ec _el <<< "${_row}" || true
+              echo "- State: \`${_st:-unknown}\` · ExitCode: \`${_ec:-unknown}\` · Elapsed: \`${_el:-unknown}\`"
+              if [[ "${_ec:-}" == "-1:0" || "${_el:-}" == "00:00:00" ]]; then
+                echo "- ⚠️ Slurm launch failure (NODE_FAIL): the workload never ran — NOT a real pass."
+              fi
+            fi
+            echo
+            _pd_log="${DISAGG_SCRIPTS_STAGE%/}/vllm-disagg-pd-${SLURM_JOB_ID:-}.log"
+            if [[ -f "${_pd_log}" ]]; then
+              _verdict="$(grep -ahE '\[vllm_disagg\] (PASS|FAIL):' "${_pd_log}" | tail -1 || true)"
+              if [[ -n "${_verdict}" ]]; then
+                echo "#### Accuracy verdict"
+                echo '```text'
+                echo "${_verdict}"
+                echo '```'
+              fi
+              _tbl="$(grep -ahE '^\|' "${_pd_log}" || true)"
+              if [[ -n "${_tbl}" ]]; then
+                echo "#### gsm8k"
+                echo '```text'
+                echo "${_tbl}"
+                echo '```'
+              fi
+            else
+              echo "> No PD log at \`${_pd_log}\` — disagg workload likely never launched."
+            fi
+            echo
+            if [[ -f slurm-submit.txt ]]; then
+              echo "#### sbatch output"
+              echo '```text'
+              cat slurm-submit.txt
+              echo '```'
+            fi
+            if [[ -f slurm-sacct.txt ]]; then
+              echo "#### sacct"
+              echo '```text'
+              cat slurm-sacct.txt
+              echo '```'
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload vLLM disagg smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-disagg-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            slurm-submit.txt
+            slurm-squeue.log
+            slurm-sacct.txt

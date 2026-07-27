@@ -29,6 +29,10 @@ def worker(
     printLog=False,
     tol_err_ratio=0.05,
     compare_fn=None,
+    max_abs_delta=None,
+    output_keys=None,
+    _arg_key_list=None,
+    catastrophic_check=True,
 ):
     from aiter.test_common import run_perftest
 
@@ -38,6 +42,17 @@ def worker(
     try:
         torch.cuda.set_device(device)
         args = [el.to(device) if isinstance(el, torch.Tensor) else el for el in args]
+        if output_keys is not None and _arg_key_list is not None:
+            for key in output_keys:
+                if key in _arg_key_list:
+                    idx = _arg_key_list.index(key)
+                    if idx < len(args) and isinstance(args[idx], torch.Tensor):
+                        # Fill output with NaN before run_perftest so that
+                        # warmup runs with this initial state.  If the kernel
+                        # does not fully write the output, NaN values survive
+                        # through warmup/iters and will be caught by
+                        # checkAllclose.
+                        args[idx].fill_(float("nan"))
         torch.cuda.synchronize()
         res = None
         us = float("inf")
@@ -97,6 +112,8 @@ def worker(
                             tol_err_ratio=tol_err_ratio,
                             printLog=printLog,
                             msg=f"info:{info} res[{i}] ",
+                            max_abs_delta=max_abs_delta,
+                            catastrophic_check=catastrophic_check,
                         )
                     max_err_ratio = max(max_err_ratio, err_ratio)
     except RuntimeError as e:
@@ -149,28 +166,46 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         ref,
         *rest,
     ) = group_task[0]
-    _prev_ref_key = (id(ref_func), ref_args)
-
     pid = mp.current_process().pid
     gpuID = GPUIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
-    data = (
-        gen_data(*gen_args, device=device)
-        if not input_data and gen_data is not None
-        else input_data
-    )
-
     assert ref_func is not None or ref is not None or fast_mode != 0
     # ref=None & ref_func=None & fast_mode=1: fast tune, not compare results, do not postprocess,return all results
     # ref=None & fast_mode=0: ref_func should be given and return best result
     # (ref!=None | ref_func!=None) & fast_mode=1: compare results and return all results, but do not postprocess
     # (ref!=None | ref_func!=None) & fast_mode=0: return best result, postprocess
-    if ref is None and not fast_mode or (ref_func is not None and fast_mode):
-        ref_data_idx, *rest = ([], *ref_args) if not data else ref_args
-        updated_ref_args = tuple(data[i] for i in ref_data_idx) + tuple(rest)
-        ref = ref_func(*updated_ref_args, **ref_kwargs)
-        torch.cuda.synchronize()
+    data = None
+    data_key = None
+    cached_ref = ref
+    cached_ref_key = None
+
+    def make_data_key(cur_gen_data, cur_gen_args):
+        def normalize(arg):
+            if isinstance(arg, torch.Tensor):
+                return ("tensor", arg.data_ptr(), tuple(arg.shape), str(arg.dtype))
+            if isinstance(arg, (tuple, list)):
+                return tuple(normalize(el) for el in arg)
+            if isinstance(arg, dict):
+                return tuple(
+                    sorted((key, normalize(value)) for key, value in arg.items())
+                )
+            return arg
+
+        return (id(cur_gen_data), normalize(cur_gen_args))
+
+    def ensure_data(cur_gen_data, cur_gen_args):
+        nonlocal data, data_key, cached_ref_key
+        cur_data_key = make_data_key(cur_gen_data, cur_gen_args)
+        if cur_data_key != data_key:
+            data = (
+                cur_gen_data(*cur_gen_args, device=device)
+                if not input_data and cur_gen_data is not None
+                else input_data
+            )
+            data_key = cur_data_key
+            cached_ref_key = None
+        return data
 
     try:
         # Retrieve GPU ID from the map
@@ -209,9 +244,10 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 *rest,
             ) = group_task[i]
             # either gen_data func or inpur data
+            data = ensure_data(gen_data, gen_args)
 
             new_args = (
-                (tuple(data[i] for i in args[0]) + tuple(args[1:]))
+                (tuple(data[k] for k in args[0]) + tuple(args[1:]))
                 if gen_data is not None
                 else args
             )
@@ -219,19 +255,34 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             if ref_noused is not None:
                 ref = ref_noused
             else:
-                _cur_key = (id(ref_func), ref_args)
-                if _cur_key != _prev_ref_key:
-                    ref_data_idx_i, *rest_i = ref_args
-                    updated = tuple(data[j] for j in ref_data_idx_i) + tuple(rest_i)
+                ref = cached_ref
+                _cur_key = (id(ref_func), ref_args, data_key)
+                if (
+                    ref is None
+                    and not fast_mode
+                    or (ref_func is not None and fast_mode)
+                ) and _cur_key != cached_ref_key:
+                    ref_data_keys_i, *rest_i = ref_args
+                    updated = tuple(data[k] for k in ref_data_keys_i) + tuple(rest_i)
                     ref = ref_func(*updated, **ref_kwargs)
                     torch.cuda.synchronize()
-                    _prev_ref_key = _cur_key
+                    cached_ref = ref
+                    cached_ref_key = _cur_key
 
             # Extract rtol, atol from rest if available, otherwise use defaults.
             # Optional rest[2]: custom compare callable (e.g. cosine diff for a8w4).
+            # Optional rest[3]: explicit max_abs_delta for catastrophic error detection.
+            # Optional rest[4]: output_keys -- names of output tensors to NaN-init.
             rtol = rest[0] if len(rest) > 0 else 1e-2
             atol = rest[1] if len(rest) > 1 else 1e-2
             compare_fn = rest[2] if len(rest) > 2 and callable(rest[2]) else None
+            max_abs_delta = rest[3] if len(rest) > 3 else None
+            output_keys = (
+                rest[4]
+                if len(rest) > 4 and isinstance(rest[4], (list, tuple))
+                else None
+            )
+            arg_key_list = list(args[0]) if gen_data is not None else None
 
             work_args = (
                 gpu_id,
@@ -242,9 +293,12 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
                 ref,
                 rtol,
                 atol,
-                verbose,  # Use the verbose from work_group parameter
-                err_ratio,  # Use the err_ratio from work_group parameter
+                verbose,
+                err_ratio,
                 compare_fn,
+                max_abs_delta,
+                output_keys,
+                arg_key_list,
             )
 
             # Run worker with explicit GPU ID
@@ -253,10 +307,10 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         return rets
 
     except Exception as e:
-        print(f"Critical error in work_group: {e}")
-        # import traceback
+        import traceback
 
-        # traceback.print_exc()
+        print(f"Critical error in work_group: {e!r}")
+        traceback.print_exc()
         # Return dummy failed results for all tasks in the group
         if isinstance(tasks, list):
             return [

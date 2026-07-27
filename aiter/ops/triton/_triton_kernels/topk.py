@@ -53,17 +53,27 @@ def _topk_kernel(
     K: tl.constexpr,
     BLOCK: tl.constexpr,
     FILL_VALUE: tl.constexpr,
+    USE_TDM: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    row_ptr = X + pid * stride_xm
     offs = tl.arange(0, BLOCK)
-    mask = offs < M
-    # FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min)
-    vals = tl.load(row_ptr + offs, mask=mask, other=FILL_VALUE).to(tl.float32)
     idxs = offs.to(tl.int64)
-
     out_v_ptr = OUT_V + pid * stride_ovm
     out_i_ptr = OUT_I + pid * stride_oim
+
+    if USE_TDM:
+        row_desc = tl.make_tensor_descriptor(
+            base=X + pid * stride_xm,
+            shape=(1, M),
+            strides=(M, 1),
+            block_shape=(1, BLOCK),
+        )
+        vals = tl.reshape(row_desc.load([0, 0]), (BLOCK,)).to(tl.float32)
+    else:
+        row_ptr = X + pid * stride_xm
+        mask = offs < M
+        # FILL_VALUE = tl.constexpr(torch.finfo(torch.float32).min)
+        vals = tl.load(row_ptr + offs, mask=mask, other=FILL_VALUE).to(tl.float32)
 
     # unrolled exactly K iterations -- no break/continue needed
     for j in core.static_range(0, K):
@@ -91,6 +101,7 @@ def topk_stage1_kernel(
     CHUNK_SIZE: tl.constexpr,
     DESCENDING: tl.constexpr,
     FILL_VALUE: tl.constexpr,
+    USE_TDM: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_chunk_idx = tl.program_id(1)
@@ -100,15 +111,23 @@ def topk_stage1_kernel(
     index_ptr += cur_batch * chunk_num * k + cur_chunk_idx * k
 
     chunk_offset = cur_chunk_idx * CHUNK_SIZE
-    x_ptr += cur_batch * N + chunk_offset
-
     cols = tl.arange(0, CHUNK_SIZE)
-    mask = (chunk_offset + cols) < N
 
-    # FILL_VALUE = tl.constexpr(
-    #    torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
-    # )
-    x_val = tl.load(x_ptr + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
+    if USE_TDM:
+        x_desc = tl.make_tensor_descriptor(
+            base=x_ptr + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, CHUNK_SIZE),
+        )
+        x_val = tl.reshape(x_desc.load([0, chunk_offset]), (CHUNK_SIZE,)).to(tl.float32)
+    else:
+        x_ptr += cur_batch * N + chunk_offset
+        mask = (chunk_offset + cols) < N
+        # FILL_VALUE = tl.constexpr(
+        #    torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
+        # )
+        x_val = tl.load(x_ptr + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
     for k_idx in range(k):
         if DESCENDING:
             chunk_select_val, chunk_select_idx = tl.max(
@@ -251,29 +270,38 @@ def topk_stage2_kernel(
     DESCENDING: tl.constexpr,
     FILL_VALUE: tl.constexpr,
     MASK_INDEX_VAL: tl.constexpr,
+    USE_TDM: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
-    chunk_x += cur_batch * N
-    chunk_index += cur_batch * N
     y_ptr += cur_batch * k
     index_ptr += cur_batch * k
-
     cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < N
 
-    # FILL_VALUE = tl.constexpr(
-    #    torch.finfo(torch.float32).min if DESCENDING else torch.finfo(torch.float32).max
-    # )
-    # mask_index_val = (
-    #    tl.constexpr(torch.iinfo(torch.int32).min)
-    #    if DESCENDING
-    #    else tl.constexpr(torch.iinfo(torch.int32).max)
-    # )
-
-    chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
-    chunk_index_val = tl.load(chunk_index + cols, mask=mask, other=MASK_INDEX_VAL).to(
-        tl.int32
-    )
+    if USE_TDM:
+        cx_desc = tl.make_tensor_descriptor(
+            base=chunk_x + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, BLOCK_SIZE),
+        )
+        ci_desc = tl.make_tensor_descriptor(
+            base=chunk_index + cur_batch * N,
+            shape=(1, N),
+            strides=(N, 1),
+            block_shape=(1, BLOCK_SIZE),
+        )
+        chunk_x_val = tl.reshape(cx_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.float32)
+        chunk_index_val = tl.reshape(ci_desc.load([0, 0]), (BLOCK_SIZE,)).to(tl.int32)
+    else:
+        chunk_x += cur_batch * N
+        chunk_index += cur_batch * N
+        mask = cols < N
+        chunk_x_val = tl.load(chunk_x + cols, mask=mask, other=FILL_VALUE).to(
+            tl.float32
+        )
+        chunk_index_val = tl.load(
+            chunk_index + cols, mask=mask, other=MASK_INDEX_VAL
+        ).to(tl.int32)
 
     sorted_chunk_x, sorted_chunk_index = argsort(
         chunk_x_val, chunk_index_val, 0, descending=DESCENDING

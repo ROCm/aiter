@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from . import dtypes
 from torch import Tensor
 import triton
 import triton.language as tl
+
+from . import dtypes
+from .mx_types import (
+    MX_DEFAULT_ROUND_MODE,
+    MxDtypeInt,
+    MxScaleRoundModeInt,
+)
 
 
 def f32_to_mxfp4(x):
@@ -46,14 +52,160 @@ def mxfp4_to_f32(x):
     return mxfp4_in_f32[x.long()]
 
 
-def f32_to_e8m0(x):
+# ---------------------------------------------------------------------------
+# MX-format E8M0 block-scale: generic + dtype-tagged API
+#
+# The four scale rounding modes (FLOOR / RCEIL / CEIL / EVEN) are dtype-
+# agnostic across the whole MX format family (mxfp4 / mxfp6 / mxfp8 /
+# mxint8). Only ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
+# differ between dtypes. This mirrors PyTorch torchao's
+# ``to_mx(scaling_mode, elem_dtype)`` design, the HIP-side
+# ``MxScaleRoundMode`` enum (csrc/include/mx_quant_utils.h) and the
+# FlyDSL IR-builder helpers in
+# ``aiter/ops/flydsl/kernels/quant_utils.py::emit_mx_e8m0_scale``.
+# ---------------------------------------------------------------------------
+
+
+# ``MxScaleRoundMode`` and ``MxDtype`` live in :mod:`aiter.utility.mx_types`
+# (single source of truth across HIP / Python ops / CPU ref / FlyDSL).
+# Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos, mbits)
+# - target_max_pow2 = log2(largest pow2 <= max_normal(dtype))
+# - max_pos = max_normal(dtype) (e.g. 6.0 for fp4 e2m1, 448.0 for fp8 e4m3)
+# - mbits = mantissa bits of the target dtype (used only by EVEN mode)
+# Keyed by bare int (MxDtypeInt) so this dict can be built at import time
+# without triggering the pybind11 JIT build of module_aiter_core -- same
+# pattern as ``aiter/ops/flydsl/kernels/quant_utils.py::_DTYPE_CFG``.
+_DTYPE_CFG = {
+    MxDtypeInt.FP4_E2M1: (2, 6.0, 1),  # OCP MXFP4 / DSv4 / FlashInfer
+    MxDtypeInt.FP8_E4M3: (8, 448.0, 3),  # OCP / NVIDIA H100 / gfx950+ (e4m3fn)
+    MxDtypeInt.FP8_E4M3_FNUZ: (7, 240.0, 3),  # AMD gfx942 hardware FP8 (e4m3fnuz)
+}
+
+
+def f32_to_mx_e8m0_scale(
+    amax: Tensor,
+    *,
+    mode: int = MX_DEFAULT_ROUND_MODE,
+    dtype: int = MxDtypeInt.FP4_E2M1,
+) -> Tensor:
+    """Compute the per-block E8M0 scale for an MX format (CPU torch ref).
+
+    Mirrors PyTorch torchao ``to_mx(scaling_mode, elem_dtype)`` semantics
+    1:1, and is the CPU-side analogue of the FlyDSL
+    :func:`aiter.ops.flydsl.kernels.quant_utils.emit_mx_e8m0_scale` IR
+    builder. The four rounding formulas are dtype-agnostic; ``dtype``
+    only selects ``target_max_pow2`` / ``max_pos`` / ``mbits`` constants
+    from :data:`_DTYPE_CFG`.
+
+    See :class:`MxScaleRoundMode` (``aiter.utility.mx_types``) for the four
+    formulas and cross-stack mapping (PyTorch torchao / NV / DSv4 /
+    FlashInfer / AMD Quark naming).
+
+    Args:
+        amax: f32 (or castable) non-negative tensor of per-block
+            ``max(|x|)`` values. Caller is responsible for the per-block
+            reduction **and** for taking abs -- negative inputs produce
+            undefined results in Even mode (bit-level rounding on a
+            negative f32 sign bit).
+        mode: ``MxScaleRoundMode`` int or pybind enum. Default ``RoundUp``
+            (industry consensus for MXFP4 and MXFP8).
+        dtype: ``MxDtype`` int or pybind enum. Default ``FP4_E2M1``.
+
+    Returns:
+        E8M0-encoded biased exponent tensor (``dtypes.fp8_e8m0``), same
+        shape as ``amax``. NaN/Inf inputs map to ``0xFF`` (E8M0 NaN).
+        Inputs near FLT_MAX may also map to ``0xFF`` after ceil rounding.
+    """
+    # Normalise int / pybind enum into a plain int -- pybind11 enum classes
+    # do not auto-compare equal to ``int`` (unlike ``IntEnum``), so callers
+    # passing ``mode=1`` would otherwise mis-dispatch.
+    mode_int = int(mode)
+    dtype_int = int(dtype)
+    if dtype_int not in _DTYPE_CFG:
+        raise ValueError(
+            f"f32_to_mx_e8m0_scale: unsupported dtype {dtype!r}; "
+            f"supported: {list(_DTYPE_CFG)}"
+        )
+    target_max_pow2, max_pos, mbits = _DTYPE_CFG[dtype_int]
+    target_pow2_factor = float(1 << target_max_pow2)  # 2^target_max_pow2
+
+    if mode_int == MxScaleRoundModeInt.RoundUp:
+        # ceil_pow2(amax / max_pos) -- NV / DSv4 / FlashInfer / torchao RCEIL.
+        return _f32_to_e8m0_ceil_impl(amax / max_pos)
+
+    if mode_int == MxScaleRoundModeInt.RoundDown:
+        # floor_pow2(amax) / 2^target_max_pow2 -- OCP MX / torchao FLOOR.
+        return _f32_to_e8m0_floor_impl(amax / target_pow2_factor)
+
+    if mode_int == MxScaleRoundModeInt.Ceil:
+        # ceil_pow2(amax) / 2^target_max_pow2 -- torchao CEIL.
+        return _f32_to_e8m0_ceil_impl(amax / target_pow2_factor)
+
+    if mode_int == MxScaleRoundModeInt.Even:
+        # round_pow2_special(amax) / 2^target_max_pow2 -- torchao EVEN /
+        # Quark EVEN. val_to_add is mantissa-precision-aware:
+        # FP4 (mbits=1) -> 0x200000 (1.5x threshold)
+        # FP8 e4m3 (mbits=3) -> 0x80000  (~1.0625x threshold).
+        val_to_add = 1 << (23 - mbits - 1)
+        u32 = amax.view(torch.int32)
+        rounded = (u32 + val_to_add) & 0xFF800000
+        rounded_f = rounded.view(torch.float32)
+        return _f32_to_e8m0_floor_impl(rounded_f / target_pow2_factor)
+
+    raise ValueError(
+        f"f32_to_mx_e8m0_scale: unknown mode {mode!r} "
+        f"(expected 0=RoundDown, 1=RoundUp, 2=Even, 3=Ceil)"
+    )
+
+
+def fp4_f32_to_e8m0_scale(amax: Tensor) -> Tensor:
+    """Default MXFP4 E8M0 block scale: NV ROUND_UP / RCEIL with FP4 E2M1.
+
+    Thin convenience alias for ``f32_to_mx_e8m0_scale(amax,
+    mode=RoundUp, dtype=FP4_E2M1)`` -- i.e. ``ceil_pow2(amax / 6)``,
+    the industry-default MXFP4 formula (DSv4 Pro / FlashInfer / torchao
+    RCEIL). 1:1 mirror of the HIP helper
+    ``aiter::fp4_f32_to_e8m0_scale`` in ``csrc/include/mx_quant_utils.h``.
+    """
+    return f32_to_mx_e8m0_scale(
+        amax, mode=MX_DEFAULT_ROUND_MODE, dtype=MxDtypeInt.FP4_E2M1
+    )
+
+
+# ---------------------------------------------------------------------------
+# Low-level implementation used by the generic dispatcher above.
+#
+# ``_f32_to_e8m0_floor_impl`` and ``_f32_to_e8m0_ceil_impl`` are the only
+# two primitives that touch the f32 bit pattern; they take an
+# already-divided value (``amax / divisor``) and emit the biased exponent.
+# ---------------------------------------------------------------------------
+
+
+def _f32_to_e8m0_floor_impl(x: Tensor) -> Tensor:
+    """Floor pow2 of x as E8M0 (caller passes ``amax / divisor``).
+
+    NaN/Inf inputs (biased exponent == 0xFF) pass through unchanged --
+    the floor operation is the identity on the exponent field.
+    """
+    u32 = x.view(torch.int32)
+    exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
+    return exponent.view(dtypes.fp8_e8m0)
+
+
+def _f32_to_e8m0_ceil_impl(x: Tensor) -> Tensor:
+    """Ceil pow2 of x as E8M0 (caller passes ``amax / divisor``).
+
+    Bumps the biased exponent by 1 when any f32 mantissa bit is set,
+    except for NaN/Inf (exponent == 0xFF, kept as NaN); never rolls past
+    0xFF.
+    """
     u32 = x.view(torch.int32)
     exponent = ((u32 >> 23) & 0xFF).view(torch.uint32).to(torch.uint8)
     nan_case = exponent == 0xFF
-    round_case = ((u32 & 0x400000) > 0) & (
-        ((u32 & 0x200000) > 0) | ((u32 & 0x1FFFFF) > 0) | (exponent > 0)
-    )
-    exponent[round_case] += 1
+    mantissa_nonzero = (u32 & 0x7FFFFF) != 0
+    nonmax_exp = exponent < 0xFF
+    bump = mantissa_nonzero & nonmax_exp
+    exponent = torch.where(bump, exponent + 1, exponent)
     exponent[nan_case] = 0xFF
     return exponent.view(dtypes.fp8_e8m0)
 
@@ -70,26 +222,9 @@ def e8m0_to_f32(scale_e8m0_biased):
 
 
 def e8m0_shuffle(scale):
-    if scale is None:
-        return scale
-    if scale.dtype == torch.float32:
-        return scale
-    assert scale.ndim == 2, "scale must be a 2D tensor"
-    m, n = scale.shape
-    scale_padded = torch.empty(
-        (m + 255) // 256 * 256,
-        (n + 7) // 8 * 8,
-        dtype=scale.dtype,
-        device=scale.device,
-    )
+    from aiter.ops.shuffle import shuffle_scale
 
-    scale_padded[:m, :n] = scale
-    scale = scale_padded
-    sm, sn = scale.shape
-    scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-    scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-    scale = scale.view(sm, sn)
-    return scale
+    return shuffle_scale(scale)
 
 
 def down_size(size):
@@ -386,11 +521,11 @@ def _dynamic_mxfp4_quant_kernel_asm_layout(
             + bs_offs_2 * 2 * 2
             + bs_offs_5 * 2 * 2 * 16
             + bs_offs_3 * 2 * 2 * 16 * 4
-            + bs_offs_0 * 2 * 16 * scaleN
+            + bs_offs_0 * 2 * 16 * scaleN_pad
         )
         bs_mask1 = (bs_offs_m < M)[:, None] & (bs_offs_n < scaleN)[None, :]
         bs_mask2 = (bs_offs_m < scaleM_pad)[:, None] & (bs_offs_n < scaleN_pad)[None, :]
-        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 127)
+        bs_e8m0 = tl.where(bs_mask1, bs_e8m0, 0)
         tl.store(bs_ptr + bs_offs, bs_e8m0, mask=bs_mask2)
     else:
         bs_offs = bs_offs_m[:, None] * stride_bs_m + bs_offs_n[None, :] * stride_bs_n
@@ -646,6 +781,20 @@ def moe_mxfp4_sort(
     if len(blockscale_e8m0.shape) == 3:
         topk = blockscale_e8m0.shape[1]
         blockscale_e8m0 = blockscale_e8m0.view(-1, blockscale_e8m0.shape[-1])
+    M_i, N_i_raw = blockscale_e8m0.shape
+    # Pad N up to BLOCK_SIZE_N so that downstream kernels (which expect a
+    # padded scale stride matching ``e8m0_shuffle``) see the same layout for
+    # any ``inter_dim/32`` value.  The padded columns are zero so they
+    # contribute zero scale (no extra signal) when read by the GEMM.
+    if N_i_raw % BLOCK_SIZE_N != 0:
+        padded_N_i = triton.cdiv(N_i_raw, BLOCK_SIZE_N) * BLOCK_SIZE_N
+        padded = torch.zeros(
+            (M_i, padded_N_i),
+            dtype=blockscale_e8m0.dtype,
+            device=blockscale_e8m0.device,
+        )
+        padded[:, :N_i_raw] = blockscale_e8m0
+        blockscale_e8m0 = padded
     M_i, N_i = blockscale_e8m0.shape
     M_o, N_o = sorted_ids.shape[0], N_i
     assert (N_i // 2) % 2 == 0
@@ -693,5 +842,6 @@ def moe_mxfp4_sort(
         grid = (triton.cdiv(M_o, BLOCK_SIZE_M), triton.cdiv(N_i, BLOCK_SIZE_N))
         _moe_mxfp4_sort_kernel[grid](*common_args, **common_kwargs)
 
-    # Reshape the output to the final shape
+    # ``N_i`` was padded to a multiple of BLOCK_SIZE_N above, so ``N_o == N_i``
+    # is also a multiple of BLOCK_SIZE_N and the flat view is well-defined.
     return blockscale_e8m0_sorted.view(dtypes.fp8_e8m0).view(-1, N_o)

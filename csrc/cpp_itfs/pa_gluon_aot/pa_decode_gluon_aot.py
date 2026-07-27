@@ -261,6 +261,7 @@ def compile(
             f"{value_transposed}",
             f"{is_causal}",
             f"{cdna_version}",
+            "0",
         ]
         signature = ",".join(signature_parts)
         gluon_kernel_name = "paged_attention_decode_v2_gluon_dot_kernel"

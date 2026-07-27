@@ -255,10 +255,21 @@ def check_topk_softmax_allclose(
 
 @aiter.test_common.benchmark()
 def test_biased_grouped_topk(
-    token, expert, group, topk, topk_group, need_renorm, dtype, scale_factor=1.0
+    token,
+    expert,
+    group,
+    topk,
+    topk_group,
+    need_renorm,
+    dtype,
+    scale_factor=1.0,
+    num_iters=101,
+    num_warmup=2,
+    gating_output=None,
 ):
     ret = {}
-    gating_output = torch.randn((token, expert), dtype=dtype)
+    if gating_output is None:
+        gating_output = torch.randn((token, expert), dtype=dtype)
     correction_bias = torch.randn((expert,), dtype=dtype)
 
     (w_ref, id_ref, score_ref), us_ref = run_perftest(
@@ -286,6 +297,8 @@ def test_biased_grouped_topk(
         topk_group,
         need_renorm,
         scale_factor,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
     )
 
     # use a special function to check result. The HIP topk may using sort algorithm
@@ -595,6 +608,24 @@ parser.add_argument(
     help="""Number of topk.
     e.g.: -k 8""",
 )
+parser.add_argument(
+    "-i",
+    "--iters",
+    type=int,
+    default=101,
+    help="""Number of timed iterations per measurement (grouped/biased topk).
+    Raise this to reduce per-measurement noise.
+    e.g.: -i 500""",
+)
+parser.add_argument(
+    "-w",
+    "--warmup",
+    type=int,
+    default=2,
+    help="""Number of warmup iterations before timing (grouped/biased topk).
+    Raise this to stabilize GPU clocks for latency-bound (small-token) shapes.
+    e.g.: -w 50""",
+)
 
 args = parser.parse_args()
 
@@ -618,12 +649,78 @@ for token in args.token:
     dtype = dtypes.bf16
     need_renorm = True
     ret = test_biased_grouped_topk(
-        token, expert, group, topk, topk_group, need_renorm, dtype
+        token,
+        expert,
+        group,
+        topk,
+        topk_group,
+        need_renorm,
+        dtype,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
     )
     df.append(ret)
 df = pd.DataFrame(df)
 df_md = df.to_markdown(index=False)
 aiter.logger.info("moeTopkSoftmax_biased_grouped_topk summary (markdown):\n%s", df_md)
+
+df = []
+for token in args.token:
+    # Kimi-K2.5 shapes
+    topk = 8
+    group = 1
+    topk_group = 1
+    expert = 384
+    dtype = dtypes.bf16
+    need_renorm = True
+    ret = test_biased_grouped_topk(
+        token,
+        expert,
+        group,
+        topk,
+        topk_group,
+        need_renorm,
+        dtype,
+        scale_factor=2.827,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_biased_grouped_topk_kimi_k25 summary (markdown):\n%s", df_md
+)
+
+df = []
+for token in args.token:
+    # Kimi-K3 fused MoE-front router: logits are a row-strided slice of the
+    # fused [gate_up | experts | routed] buffer, not a standalone tensor
+    gate_up_width, num_experts, routed_width = 1536, 896, 3584
+    fused_front_width = gate_up_width + num_experts + routed_width
+    backing = torch.randn((token, fused_front_width), dtype=dtypes.bf16)
+    gating_output = backing[:, gate_up_width : gate_up_width + num_experts]
+    assert gating_output.stride(0) == fused_front_width
+    assert not gating_output.is_contiguous()
+    ret = test_biased_grouped_topk(
+        token,
+        num_experts,
+        1,  # group
+        16,  # topk
+        1,  # topk_group
+        True,  # need_renorm
+        dtypes.bf16,
+        gating_output=gating_output,
+        num_iters=args.iters,
+        num_warmup=args.warmup,
+    )
+    df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info(
+    "moeTopkSoftmax_biased_grouped_topk_kimi_k3_strided summary (markdown):\n%s",
+    df_md,
+)
 
 df = []
 for token in args.token:

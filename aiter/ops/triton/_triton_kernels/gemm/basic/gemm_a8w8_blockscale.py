@@ -25,17 +25,6 @@ _gemm_a8w8_blockscale_repr = make_kernel_repr(
 )
 
 
-_gemm_a8w8_blockscale_reduce_repr = make_kernel_repr(
-    "_gemm_a8w8_blockscale_reduce_kernel",
-    [
-        "BLOCK_SIZE_M",
-        "BLOCK_SIZE_N",
-        "ACTUAL_KSPLIT",
-        "MAX_KSPLIT",
-    ],
-)
-
-
 @triton.heuristics(
     {
         "EVEN_K": lambda args: args["K"] % args["BLOCK_SIZE_K"] == 0,
@@ -82,6 +71,7 @@ def _gemm_a8w8_blockscale_kernel(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    num_stages: tl.constexpr,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -169,7 +159,9 @@ def _gemm_a8w8_blockscale_kernel(
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        for k in tl.range(
+            pid_k * num_k_iter, (pid_k + 1) * num_k_iter, num_stages=num_stages
+        ):
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -187,11 +179,7 @@ def _gemm_a8w8_blockscale_kernel(
             b_scale = tl.load(b_scale_ptrs)
 
             # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
@@ -361,18 +349,26 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         a_scale_ptrs = (
             a_scale_ptr + offs_am * stride_ascale_m + offs_k_scale * stride_ascale_k
         )
-        offs_b_scale_n = offs_bsn // GROUP_N
+        # When the scale block covers the whole tile (GROUP_N >= BLOCK_SIZE_N and
+        # GROUP_K >= BLOCK_SIZE_K) every element shares one scalar b_scale.
+        if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+            offs_b_scale_n = (pid_n * BLOCK_SIZE_N) // GROUP_N
+        else:
+            offs_b_scale_n = offs_bsn // GROUP_N
         b_scale_ptrs = (
             b_scale_ptr
             + offs_k_scale * stride_bscale_k
             + offs_b_scale_n * stride_bscale_n
         )
-        offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
         acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+            # Load the per-K-tile block scales up-front
+            a_scale = tl.load(a_scale_ptrs)
+            b_scale = tl.load(b_scale_ptrs)
+
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
@@ -400,20 +396,18 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
                 .trans(1, 0)
             )
 
-            a_scale = tl.load(a_scale_ptrs)
-            b_scale = tl.load(b_scale_ptrs)
-
-            # Perform dot operation and apply scale
-            accumulator += (
-                tl.dot(a, b, input_precision="ieee")
-                * a_scale[:, None]
-                * b_scale[None, :]
-            )
+            if GROUP_N >= BLOCK_SIZE_N and GROUP_K >= BLOCK_SIZE_K:
+                accumulator += tl.dot(a, b) * (a_scale * b_scale)[:, None]
+            else:
+                accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale[None, :])
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
             b_ptrs += BLOCK_SIZE_K * 16 * stride_bk
 
+            offs_ks_step = (
+                k + 1
+            ) * BLOCK_SIZE_K // GROUP_K - k * BLOCK_SIZE_K // GROUP_K
             a_scale_ptrs += offs_ks_step * stride_ascale_k
             b_scale_ptrs += offs_ks_step * stride_bscale_k
 
@@ -432,69 +426,14 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
         tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit(repr=_gemm_a8w8_blockscale_reduce_repr)
-def _gemm_a8w8_blockscale_reduce_kernel(
-    c_in_ptr,
-    c_out_ptr,
-    M,
-    N,
-    stride_c_in_k,
-    stride_c_in_m,
-    stride_c_in_n,
-    stride_c_out_m,
-    stride_c_out_n,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    ACTUAL_KSPLIT: tl.constexpr,
-    MAX_KSPLIT: tl.constexpr,
-):
-
-    tl.assume(stride_c_in_k > 0)
-    tl.assume(stride_c_in_m > 0)
-    tl.assume(stride_c_in_n > 0)
-    tl.assume(stride_c_out_m > 0)
-    tl.assume(stride_c_out_n > 0)
-
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
-
-    tl.assume(pid_m > 0)
-    tl.assume(pid_n > 0)
-
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, MAX_KSPLIT)
-    c_in_ptrs = (
-        c_in_ptr
-        + (offs_k[:, None, None] * stride_c_in_k)
-        + (offs_m[None, :, None] * stride_c_in_m)
-        + (offs_n[None, None, :] * stride_c_in_n)
-    )
-
-    if ACTUAL_KSPLIT == MAX_KSPLIT:
-        c = tl.load(c_in_ptrs)
-    else:
-        c = tl.load(c_in_ptrs, mask=offs_k[:, None, None] < ACTUAL_KSPLIT, other=0.0)
-    c = tl.sum(c, axis=0)
-
-    c = c.to(c_out_ptr.type.element_ty)
-
-    c_out_ptrs = (
-        c_out_ptr
-        + (offs_m[:, None] * stride_c_out_m)
-        + (offs_n[None, :] * stride_c_out_n)
-    )
-
-    tl.store(c_out_ptrs, c)
-
-
 def _get_config(
     M: int,
     N: int,
     K: int,
     shuffle: bool = False,
+    backend: str | None = None,
 ):
     shuffle_suffix = "_PRESHUFFLED" if shuffle else ""
     config_name = f"GEMM-A8W8_BLOCKSCALE{shuffle_suffix}"
 
-    return get_gemm_config(config_name, M, N, K)
+    return get_gemm_config(config_name, M, N, K, backend=backend)

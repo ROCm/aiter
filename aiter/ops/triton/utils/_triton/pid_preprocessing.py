@@ -34,7 +34,8 @@ def remap_xcd(pid, GRID_MN, NUM_XCDS: tl.constexpr = 8):
     # We calculate the number of xcds that have pids_per_xcd pids as
     # tall_xcds
     tall_xcds = GRID_MN % NUM_XCDS
-    tall_xcds = NUM_XCDS if tall_xcds == 0 else tall_xcds
+    if tall_xcds == 0:
+        tall_xcds = tl.cast(NUM_XCDS, tall_xcds.type)
     # Compute current XCD and local pid within the XCD
     xcd = pid % NUM_XCDS
     local_pid = pid // NUM_XCDS

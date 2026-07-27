@@ -18,11 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 class QuickReduceRegime(Enum):
+    # Keep integer ids aligned with csrc/include/quick_all_reduce.cuh
     FP = 0
     FP8 = 1
     INT6 = 2
     INT4 = 3
-    NONE = 4
+    INT3 = 4
+    NONE = 5
 
 
 try:
@@ -62,14 +64,16 @@ class QuickAllReduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 8]
     _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
-    # In this order [FP, FP8, INT6, INT4].
+    # In this order [FP, FP8, INT6, INT4, INT3].
+    # INT3 is TP2-only; its entries for world_size 4/8 are unused but kept
+    # to keep the per-quant-level list indexable by QuickReduceRegime.value.
     _QR_MIN_SIZE = {
-        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB],
-        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB],
-        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 8 * MB],
-        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB],
-        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB],
-        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
+        (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB, 1 * MB],
+        (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB, 2 * MB],
+        (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 2): [2 * MB, 8 * MB, 8 * MB, 8 * MB, 8 * MB],
+        (torch.bfloat16, 4): [8 * MB, 64 * MB, 64 * MB, 16 * MB, 16 * MB],
+        (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
 
     def __init__(
@@ -77,8 +81,10 @@ class QuickAllReduce:
     ) -> None:
         """
         Quick allreduce leverages quantization for further
-        acceleration on ROCm. It currently supports FP8, Q6, and Q4
-        quantization formats and FP(float16, bfloat16).
+        acceleration on ROCm. It currently supports FP8, Q6, Q4, and Q3
+        quantization formats and FP(float16, bfloat16). Q3 (INT3) is
+        restricted to TP2 (world_size == 2) due to poor performance on
+        larger world sizes.
         Quick allreduce is designed as a complement to custom allreduce.
         Its initialization requires even stricter conditions.
         Only the ROCm MI300 series is supported for quick allreduce at
@@ -193,6 +199,22 @@ class QuickAllReduce:
             return
         self.qr_quant_level = QuickReduceRegime[regime_str]
 
+        # INT3 is only enabled for TP2 (world_size == 2).
+        # Kernel benchmarks show INT3 all-reduce on TP4/TP8 has poor
+        # performance (the extra ranks make the 3-bit codec's pack/unpack
+        # overhead outweigh the reduced communication volume), so INT3 is
+        # restricted to 2-GPU tensor parallelism. For TP4/TP8 use a wider
+        # codec (e.g. INT4) or NONE instead.
+        if self.qr_quant_level == QuickReduceRegime.INT3 and self.world_size != 2:
+            logger.warning(
+                "Custom quick allreduce is disabled: INT3 quantization is "
+                "only supported for TP2 (world_size == 2), but world_size "
+                "is %d. INT3 on TP4/TP8 is disabled due to poor kernel "
+                "performance. Use INT4/NONE for this world size.",
+                self.world_size,
+            )
+            return
+
         # TODO: If the dtype is not bfloat16 or then float16,
         # quickallreduce should not be created.
 
@@ -256,6 +278,51 @@ class QuickAllReduce:
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
         )
         return out
+
+    def should_quick_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        hidden_dim: int,
+    ):
+        if not self.should_quick_allreduce(inp):
+            return False
+        if inp.dtype != residual_inp.dtype or inp.dtype != weight.dtype:
+            return False
+        if not is_weak_contiguous(residual_inp) or not is_weak_contiguous(weight):
+            return False
+        if weight.numel() != hidden_dim or inp.numel() % hidden_dim != 0:
+            return False
+
+        row_size = hidden_dim * inp.element_size()
+        tile_size = 32 * 1024
+        return row_size > 0 and row_size <= tile_size and tile_size % row_size == 0
+
+    def quick_all_reduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual_inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        hidden_dim: int,
+    ):
+        """Performs QR allreduce fused with residual add and RMSNorm."""
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(residual_inp)
+        ops.qr_all_reduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual_inp,
+            residual_out,
+            out,
+            weight,
+            eps,
+            hidden_dim,
+            self.qr_quant_level.value,
+            self.use_fp16_kernels,
+        )
+        return out, residual_out
 
     def close(self):
         if not self.disabled and getattr(self, "_ptr", None):

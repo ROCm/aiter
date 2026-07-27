@@ -49,8 +49,13 @@ def generate_data(b, m, n, k, device="cuda"):
     x_scale = torch.rand([b, m, 1], dtype=dtypes.bf16, device=device)
     w_scale = torch.rand([b, 1, n], dtype=dtypes.bf16, device=device)
     out = torch.empty(b, m, n, dtype=dtypes.bf16, device=device)
-    # index of data [0, 1, 2, 3, 4]
-    return x, weight, x_scale, w_scale, out
+    return {
+        "x": x,
+        "weight": weight,
+        "x_scale": x_scale,
+        "w_scale": w_scale,
+        "out": out,
+    }
 
 
 class BatchedGemma8W8Tuner(GemmCommonTuner):
@@ -81,13 +86,24 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         untunedf = self.untunedf
         results = []
         for i in range(len(untunedf)):
-            B = int(untunedf.loc[i, "B"])
-            M = int(untunedf.loc[i, "M"])
-            N = int(untunedf.loc[i, "N"])
-            K = int(untunedf.loc[i, "K"])
+            row = untunedf.iloc[i]
+            B = int(row["B"])
+            M = int(row["M"])
+            N = int(row["N"])
+            K = int(row["K"])
             shape_str = f"({B}, {M}, {N}, {K})"
+            allowed_err_ratio, allowed_err_ratio_desc = (
+                self._get_run_config_err_ratio_limit(row, args)
+            )
             try:
-                x, weight, x_scale, w_scale, out = generate_data(B, M, N, K)
+                gd = generate_data(B, M, N, K)
+                x, weight, x_scale, w_scale, out = (
+                    gd["x"],
+                    gd["weight"],
+                    gd["x_scale"],
+                    gd["w_scale"],
+                    gd["out"],
+                )
                 out, us = run_perftest(
                     batched_gemm_a8w8,
                     x,
@@ -102,8 +118,8 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                 err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
                 status = (
                     "ok"
-                    if err_ratio <= args.errRatio
-                    else f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                    if err_ratio <= allowed_err_ratio
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
             except Exception as e:
@@ -185,20 +201,23 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
                             (B, M, N, K),
                             kernel_instance_test,
                             (
-                                [0, 1, 2, 3, 4],
+                                ["x", "weight", "x_scale", "w_scale", "out"],
                                 kid,
                                 splitK,
-                            ),  # [0, 1, 2, 3, 4] is index of paramters for kernel_instance_test in generate_data
+                            ),
                             {
                                 "num_warmup": args.warmup,
                                 "num_iters": args.iters,
                             },
                             run_torch,
-                            ([0, 1, 2, 3],),
+                            (["x", "weight", "x_scale", "w_scale"],),
                             {},
                             None,
                             1e-2,
                             1e-2,
+                            None,
+                            None,
+                            ("out",),
                         )
                     )
                     total_kernel_nums = total_kernel_nums + 1

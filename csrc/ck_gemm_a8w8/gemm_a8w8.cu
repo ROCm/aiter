@@ -8,11 +8,13 @@
 #include <cmath>
 #include "py_itfs_common.h"
 
-using RowwiseKernel = std::function<
-    torch::Tensor(torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, torch::Tensor &,
-                  torch::Tensor &, std::optional<torch::Tensor>,
-                  int)>;
+using RowwiseKernel = torch::Tensor (*)(torch::Tensor&,
+                                        torch::Tensor&,
+                                        torch::Tensor&,
+                                        torch::Tensor&,
+                                        torch::Tensor&,
+                                        std::optional<torch::Tensor>,
+                                        int);
 
 // For certain high priority shapes, we directly use the best kernel rather
 // than use heuristics.
@@ -98,8 +100,8 @@ RowwiseKernel rowwise_dispatch(int M, int N, int K)
     return RowwiseKernelMap{GENERATE_LOOKUP_TABLE(ABDataType, DDataType, EDataType)};
   }();
 
-  const int cu_num         = get_device_cu_num();
-  const std::string& gfx   = get_device_gfx();
+  const int cu_num           = get_device_cu_num();
+  const std::string_view gfx = get_device_gfx();
 
   // First check if this shape(M,N,K) is available in the direct lookup.
   auto it = lookup.find({gfx, cu_num, M, N, K});

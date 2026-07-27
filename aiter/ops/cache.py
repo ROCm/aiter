@@ -9,17 +9,17 @@ from ..jit.core import compile_ops
 MD_NAME = "module_cache"
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def swap_blocks(src: Tensor, dst: Tensor, block_mapping: Tensor) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def copy_blocks(
     key_caches: Tensor, value_caches: Tensor, block_mapping: Tensor
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -33,7 +33,7 @@ def reshape_and_cache(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_flash(
     key: Tensor,
     value: Tensor,
@@ -46,7 +46,7 @@ def reshape_and_cache_flash(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_pertoken_quant(
     key: Tensor,
     value: Tensor,
@@ -59,7 +59,7 @@ def reshape_and_cache_with_pertoken_quant(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_block_quant(
     key: Tensor,
     value: Tensor,
@@ -72,7 +72,7 @@ def reshape_and_cache_with_block_quant(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def reshape_and_cache_with_block_quant_for_asm_pa(
     key: Tensor,  # [batch_size, seq_len, num_heads, head_size]
     value: Tensor,  # [batch_size, seq_len, num_heads, head_size]
@@ -86,7 +86,7 @@ def reshape_and_cache_with_block_quant_for_asm_pa(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def concat_and_cache_mla(
     kv_c: Tensor,
     k_pe: Tensor,
@@ -97,27 +97,63 @@ def concat_and_cache_mla(
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
+def concat_and_cache_mla_seg(
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank]
+    k_pe: Tensor,  # [num_tokens, pe_dim]
+    kv_cache: Tensor,  # [num_blocks, page_size*(kv_lora_rank + pe_dim)] flat (seg layout)
+    slot_mapping: Tensor,  # [num_tokens]
+    kv_cache_dtype: str,
+    scale: Tensor,  # [1] fp32 static scale
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def indexer_k_quant_and_cache(
     k: Tensor,
     kv_cache: Tensor,
     slot_mapping: Tensor,
     quant_block_size: int,
     scale_fmt: str,
+    preshuffle: bool = False,
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
+def indexer_qk_rope_quant_and_cache(
+    q: Tensor,
+    q_out: Tensor,
+    weights: Tensor,
+    weights_out: Tensor,
+    k: Tensor,
+    kv_cache: Tensor,
+    slot_mapping: Tensor,
+    norm_weight: Tensor,
+    norm_bias: Tensor,
+    positions: Tensor,
+    cos_cache: Tensor,
+    sin_cache: Tensor,
+    epsilon: float,
+    quant_block_size: int,
+    scale_fmt: str,
+    weights_scale: float,
+    preshuffle: bool = False,
+    is_neox: bool = True,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
 def cp_gather_indexer_k_quant_cache(
     kv_cache: Tensor,
     dst_k: Tensor,
     dst_scale: Tensor,
     block_table: Tensor,
     cu_seq_lens: Tensor,
+    preshuffle: bool = False,
 ) -> None: ...
 
 
-@compile_ops("module_cache")
+@compile_ops("module_cache", develop=True)
 def fused_qk_rope_concat_and_cache_mla(
     q_nope: Tensor,
     q_pe: Tensor,  # [num_tokens, num_heads, pe_dim]
@@ -133,4 +169,23 @@ def fused_qk_rope_concat_and_cache_mla(
     sin_cache: Tensor,  # [max_position, rot_dim//2]
     is_neox: bool,
     is_nope_first: bool,
+) -> None: ...
+
+
+@compile_ops("module_cache", develop=True)
+def fused_qk_rope_concat_and_cache_mla_seg(
+    q_nope: Tensor,  # [num_tokens, num_heads, kv_lora_rank=512]
+    q_pe: Tensor,  # [num_tokens, num_heads, pe_dim=64]
+    kv_c: Tensor,  # [num_tokens, kv_lora_rank=512]
+    k_pe: Tensor,  # [num_tokens, pe_dim=64]
+    kv_cache: Tensor,  # [num_blocks, page_size*kv_lora + page_size*pe] flat fp8
+    q_out: Tensor,  # [num_tokens, num_heads, q_out_dim>=576] fp8 (tail untouched)
+    slot_mapping: Tensor,  # [num_tokens]
+    k_scale: Tensor,  # [1] fp32 static scale
+    q_scale: Tensor,  # [1] fp32 static scale
+    positions: Tensor,  # [num_tokens]
+    cos_cache: Tensor,  # [max_position, pe_dim//2=32]
+    sin_cache: Tensor,  # [max_position, pe_dim//2=32]
+    is_neox: bool,
+    is_nope_first: bool = True,
 ) -> None: ...

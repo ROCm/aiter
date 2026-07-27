@@ -2,17 +2,19 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include "rocm_ops.hpp"
+#include "aiter_stream.h"
 #include "fused_qk_rmsnorm_group_quant.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+    AITER_SET_STREAM_PYBIND
     m.def("fused_qk_rmsnorm_group_quant",
           &aiter::fused_qk_rmsnorm_group_quant,
-          py::arg("q_out_quantized"),
-          py::arg("q_out_scale"),
-          py::arg("q"),
-          py::arg("q_weight"),
-          py::arg("q_epsilon"),
+          py::arg("q_out_quantized")          = std::nullopt,
+          py::arg("q_out_scale")              = std::nullopt,
+          py::arg("q")                        = std::nullopt,
+          py::arg("q_weight")                 = std::nullopt,
+          py::arg("q_epsilon")                = std::nullopt,
           py::arg("q_out_unquantized")        = std::nullopt,
           py::arg("k_out")                    = std::nullopt,
           py::arg("q_res_out")                = std::nullopt,
@@ -23,4 +25,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("group_size")               = 128,
           py::arg("transpose_scale")          = false,
           py::arg("gemma_norm")              = false);
+    m.def("fused_qk_rmsnorm_per_token_quant",
+          &aiter::fused_qk_rmsnorm_per_token_quant,
+          py::arg("q_out_quantized"),
+          py::arg("q_out_scale"),
+          py::arg("q"),
+          py::arg("q_weight"),
+          py::arg("q_epsilon"),
+          py::arg("q_out_unquantized") = std::nullopt,
+          py::arg("k_out")             = std::nullopt,
+          py::arg("q_res_out")         = std::nullopt,
+          py::arg("k")                 = std::nullopt,
+          py::arg("k_weight")          = std::nullopt,
+          py::arg("k_epsilon")         = std::nullopt,
+          py::arg("q_residual")        = std::nullopt,
+          py::arg("gemma_norm")        = false);
 }

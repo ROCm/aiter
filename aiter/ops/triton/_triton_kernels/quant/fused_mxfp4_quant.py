@@ -9,8 +9,10 @@ def _rmsmorm_op(row, weight, n_cols, epsilon):
     row_norm = row * row
     row_norm = tl.sum(row_norm, axis=-1)
     norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
-
-    rms_norm = row * norm_factor[:, None] * weight
+    if weight is not None:
+        rms_norm = row * norm_factor[:, None] * weight
+    else:
+        rms_norm = row * norm_factor[:, None]
     return rms_norm
 
 

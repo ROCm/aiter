@@ -1,0 +1,64 @@
+name: Prepare Triton Wheel
+
+on:
+  workflow_call:
+    inputs:
+      docker-image:
+        description: Docker image used to resolve and download the matching Triton wheel.
+        required: false
+        type: string
+        default: rocm/pytorch:latest
+      artifact-name:
+        description: Name of the Triton wheel artifact uploaded for the caller workflow run.
+        required: false
+        type: string
+        default: triton_wheelhouse
+      retention-days:
+        description: Number of days to keep the Triton wheel artifact.
+        required: false
+        type: number
+        default: 3
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Triton wheel
+        id: download_triton_wheel
+        env:
+          TRITON_DEFAULT_ROCM_VERSION: "7.2.0"
+        run: |
+          set -euo pipefail
+          rm -rf triton_wheels
+
+          if bash .github/scripts/docker_pull_with_retry.sh "${{ inputs.docker-image }}"; then
+            if docker run --rm \
+              -v "${{ github.workspace }}:/workspace" \
+              -w /workspace \
+              "${{ inputs.docker-image }}" \
+              bash ./.github/scripts/download_triton_wheel.sh triton_wheels; then
+              echo "source=image" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::warning::Triton wheel download inside ${{ inputs.docker-image }} failed; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
+          else
+            echo "::warning::Failed to pull ${{ inputs.docker-image }}; falling back to ROCm ${TRITON_DEFAULT_ROCM_VERSION}"
+          fi
+
+          docker system prune -af || true
+          rm -rf triton_wheels
+          bash ./.github/scripts/download_triton_wheel.sh triton_wheels
+          echo "source=fallback-rocm-${TRITON_DEFAULT_ROCM_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload Triton wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: triton_wheels/
+          retention-days: ${{ inputs.retention-days }}

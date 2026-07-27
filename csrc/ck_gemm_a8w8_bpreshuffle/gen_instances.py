@@ -61,7 +61,7 @@ torch::Tensor
     // Check if this input needs to be padded.
     int M = size_to_dim_(XQ.dim() - 1, XQ.sizes());
     int N = WQ.size(0);
-    int K = WQ.size(1);
+    int K = XQ.size(1);
     bool pad = (M % {k.MPerBLOCK} != 0) || (N % {k.NPerBLOCK} != 0) || (K % ({k.KPerBLOCK}) != 0);
     if (pad)
     {{{{

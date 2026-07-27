@@ -105,7 +105,7 @@ def _gemm_a16_w16_gated_kernel(
     acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
     acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=1):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
@@ -127,8 +127,8 @@ def _gemm_a16_w16_gated_kernel(
                 cache_modifier=cache_modifier,
             )
 
-        acc0 += tl.dot(a, b0, input_precision="ieee")
-        acc1 += tl.dot(a, b1, input_precision="ieee")
+        acc0 = tl.dot(a, b0, acc=acc0)
+        acc1 = tl.dot(a, b1, acc=acc1)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak

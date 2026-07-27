@@ -24,6 +24,7 @@ def test_ff_a16w16_fused_ungated(
         pytest.skip(
             "Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices."
         )
+    torch.manual_seed(0)
     ff_ungated_test(
         ff_a16w16_fused_ungated,
         batch=batch,
@@ -47,6 +48,7 @@ def test_ff_a16w16_fused_gated(
         pytest.skip(
             "Small differences in implementation between Triton & Torch activations accumulate to beyond test bounds w/large matrices."
         )
+    torch.manual_seed(0)
 
     ff_gated_test(
         ff_a16w16_fused_gated,

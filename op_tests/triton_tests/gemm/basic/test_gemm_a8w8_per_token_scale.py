@@ -43,6 +43,7 @@ def generate_gemm_a8w8_per_token_scale_inputs(
     layout: str = "TN",
     output=False,
 ):
+    torch.manual_seed(0)
 
     if layout[0] == "T":
         x = (torch.rand((M, K), dtype=torch.float16, device="cuda") / 10).to(e4m3_type)
