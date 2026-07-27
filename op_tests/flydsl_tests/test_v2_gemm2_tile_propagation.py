@@ -1,5 +1,6 @@
 import csv
 
+import pytest
 import torch
 
 from aiter import ActivationType, QuantType, dtypes
@@ -219,6 +220,72 @@ def test_stage2_fw_routes_v2_name_to_path_b(monkeypatch):
     assert called["use_nt"] is False
     assert (called["NE"], called["D_HIDDEN"], called["D_INTER"]) == (1, 256, 128)
     assert called["max_sorted"] == 32
+
+
+@pytest.mark.parametrize(
+    ("inter_real", "rejected"),
+    [(128, True), (256, False), (None, False)],
+)
+def test_stage2_fw_path_b_rejects_padded_shard(monkeypatch, inter_real, rejected):
+    # Path B never enables the v2 gemm2's K-pad skip, so a w2 whose real inter
+    # is shorter than the stored one must be refused rather than silently
+    # accumulating the pad columns.
+    from aiter import fused_moe
+    from aiter.ops.flydsl.kernels import mxmoe_dispatcher
+
+    called = {}
+    monkeypatch.setattr(
+        mxmoe_dispatcher,
+        "mxfp4_moe_gemm2",
+        lambda **kwargs: called.update(kwargs),
+    )
+    name = build_flydslv2_gemm2_name(
+        "fp4",
+        "fp4",
+        "bf16",
+        tm=32,
+        tn=128,
+        tk=128,
+        epilog="atomic",
+        persist=False,
+        use_nt=False,
+        sbm=32,
+    )
+    w1 = torch.empty((1, 512, 64), dtype=torch.uint8, device="cpu")  # D_INTER=256
+    w2 = torch.empty((1, 256, 64), dtype=torch.uint8, device="cpu")
+    if inter_real is not None:
+        w2.inter_real = inter_real
+    inter = torch.empty((32, 64), dtype=torch.uint8, device="cpu")
+    scale = torch.empty(1, dtype=torch.uint8, device="cpu")
+    ids = torch.empty(32, dtype=torch.int32, device="cpu")
+    weights = torch.empty(32, dtype=torch.float32, device="cpu")
+    moe_out = torch.empty((1, 256), dtype=torch.bfloat16, device="cpu")
+
+    def call():
+        return fused_moe._mxfp4_a4w4_stage2_fw(
+            inter,
+            w1,
+            w2,
+            ids,
+            ids,
+            ids,
+            moe_out,
+            1,
+            w2_scale=scale,
+            a2_scale=scale,
+            block_m=32,
+            sorted_weights=weights,
+            kernelName2=name,
+            reverse_sorted=ids,
+        )
+
+    if rejected:
+        with pytest.raises(NotImplementedError, match="inter_real"):
+            call()
+        assert not called, "padded shard reached the v2 gemm2"
+    else:
+        assert call() is moe_out
+        assert called["D_INTER"] == 256
 
 
 def test_v2_aot_job_preserves_tiles(tmp_path):

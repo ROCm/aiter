@@ -1639,6 +1639,16 @@ def _mxfp4_a4w4_stage2_fw(
         # The mxmoe intermediate (inter_states + a2_scale) is byte-compatible
         # with gemm2_body_v2's native-BM scale-chunk layout at SBM=BM (verified
         # for BM in {16,32,64,128} x epilog {atomic,reduce}).
+        if inter_real is not None and inter_real != D_INTER:
+            # This path does not thread the v2 gemm2's K-pad skip (has_pad +
+            # i32_kpad), so the pad columns would be accumulated instead of
+            # skipped. v2 needs K aligned only to its BK, so an unpadded shard
+            # is the intended input here.
+            raise NotImplementedError(
+                f"FlyDSL v2 stage2 requires an unpadded inter_dim shard, got "
+                f"w2.inter_real={inter_real} with D_INTER={D_INTER}. Use a "
+                f"native flydsl_mxmoe_g2 kernelName2 for pre-padded weights."
+            )
         return _flydsl_v2_stage2_wrapper(
             inter_states=inter_states,
             w1=None,
@@ -1655,7 +1665,7 @@ def _mxfp4_a4w4_stage2_fw(
             w2_scale=w2_scale,
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
-            block_m=cfg["BM"],
+            block_m=block_m,
         )
     out = _mxfp4_a4w4_stage2(
         inter_states,
