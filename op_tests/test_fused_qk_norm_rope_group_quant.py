@@ -38,6 +38,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility.fp4_utils import f32_to_mx_e8m0_scale
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
@@ -54,6 +55,9 @@ torch.set_default_device("cuda")
 
 _FP8 = dtypes.fp8
 _FP8_MAX = float(torch.finfo(_FP8).max)
+_FP8_MX_DTYPE = (
+    MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
+)
 _DEV = "cuda"
 PE_BYTE_OFFSET = 464
 # MI355X HBM3e peak. Used only for the "%peak" perf column.
@@ -106,13 +110,14 @@ def _norm_rope_nope_fp8(x, weight, cos, sin, pos, eps, *, is_neox, group_size):
     nope, pe = normed[..., :nope_dim], normed[..., nope_dim:]
     pe_rotated = _apply_gptj_rope(pe, cos, sin, pos, is_neox=is_neox)
 
-    # nope: per-group amax -> e8m0 scale (MX RoundUp, FP8 E4M3) -> fp8. Uses the shared
-    # reference helper (== the kernel's fp_f32_to_e8m0_scale<RoundUp, FP8_E4M3>).
+    # nope: per-group amax -> e8m0 scale (MX RoundUp, HW-native FP8 E4M3) -> fp8.
+    # gfx942 uses E4M3_FNUZ (max=240), while gfx950+ uses OCP E4M3 (max=448),
+    # matching kHwFp8E4m3Dtype in the HIP kernel.
     amax = (
         nope.reshape(T, n_heads, n_groups, group_size).abs().amax(-1).clamp_min(1e-12)
     )
     scale_e8m0 = f32_to_mx_e8m0_scale(
-        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=MxDtypeInt.FP8_E4M3
+        amax, mode=MxScaleRoundModeInt.RoundUp, dtype=_FP8_MX_DTYPE
     ).view(
         torch.uint8
     )  # reinterpret the e8m0 byte (== biased exponent), not numeric cast
@@ -540,8 +545,43 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
         msg="SWA rope bf16 (exact)",
     )
 
+    # --- flydsl bf16 paged-SWA write comparison ---
+    # flydsl's fused SWA scatter is BF16-only (fp8+SWA is rejected), so this is the
+    # only apples-ish "both fuse the SWA write" comparison: flydsl writes the full KV
+    # row as bf16 into the same paged pool (block_tables[bid, pos//bs]*bs + pos%bs),
+    # while ours writes the v4 layout (fp8 nope + dup e8m0 scale + bf16 rope). flydsl
+    # moves less K-write traffic (bf16 512B vs our 448+14 fp8 + 128 bf16), so treat the
+    # ratio as indicative of kernel efficiency, not a same-output benchmark.
+    fly_us = float("nan")
+    if flydsl_qk_norm_rope_quant is not None:
+        try:
+            swa_kv_fly = torch.zeros(num_rows, D, dtype=torch.bfloat16, device=_DEV)
+            _, fly_us = run_perftest(
+                flydsl_qk_norm_rope_quant,
+                q.view(T, H * D),
+                kv.view(T, D),
+                kw,
+                cos,
+                sin,
+                pos,
+                num_q_heads=H,
+                head_dim=D,
+                rope_head_dim=RD,
+                quant=False,
+                scale_dtype="fp32",
+                swa_kv=swa_kv_fly,
+                batch_id_per_token=bid,
+                swa_block_tables=swa_block_tables,
+                swa_block_size=block_size,
+            )
+        except Exception:
+            fly_us = float("nan")
+    ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
+
     return {
         "hip_us": round(us, 3),
+        "flydsl_bf16_us": (round(fly_us, 3) if fly_us == fly_us else None),
+        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),
         "bs": bs,
         "num_phys_blocks": num_phys_blocks,
         "n_pad": n_pad,

@@ -259,7 +259,10 @@ def test_v4_nm_kernarg_scalar_slots(capfd, monkeypatch):
     expected_gqa_ratio = GQA_RATIO  # 16
     expected_kv_split = 1  # num_kv_splits=1
     expected_log2_page = 0  # log2(page_size=1)
-    expected_out16ns = 0  # out_16_nosplit=0
+    # V3-style: out_16_nosplit is DERIVED = (num_kv_splits==1) ? 1 : 0. This
+    # config is single-pass (kv_split=1) so the dispatcher writes 1 into slot 15
+    # regardless of the caller-facing arg (which _build_inputs leaves default).
+    expected_out16ns = 1
     # slots 10 (s_total_kv) and 11 (s_stride_page) are NEVER read — only 17 kernarg
     # loads, none at offsets 0xA0/0xB0). The dispatcher leaves them at 0
     # via `args = {}` zero-init to skip the per-call D2H readback that
@@ -901,7 +904,6 @@ def _run_one_point(
         inputs["qo_indptr"],
         inputs["kv_indptr"],
         inputs["kv_page_indices"],
-        inputs["kv_last_page_lens"],
         split_indptr,
         inputs["sink"],  # per-head [num_heads] sink; req'd positional
         inputs["max_seqlen_q"],
@@ -1504,8 +1506,9 @@ def test_v4_nm_multi_split():
         V3-style, and the kernel doesn't tail-drop any split. Coverage
         invariant: floor(kv/splits) >= SUB_KV (=32); 256/4=64 ✓.
 
-    (B) Rejection: multi-pass + out_16_nosplit=1 is unsupported (bf16-direct
-        is single-pass only); the wrapper must raise BEFORE the kernel.
+    (B) out_16_nosplit is derived internally (V3-style) from num_kv_splits, so
+        the caller-facing arg is ignored: multi-pass + out_16_nosplit=1 must NOT
+        raise and must still run the fp32-split + stage2-merge path.
     """
     # ---- (A) full-KV coverage ----
     NUM_SPLITS = 4
@@ -1548,13 +1551,25 @@ def test_v4_nm_multi_split():
             f"geometry / split_indptr stride / kernel early-exit)."
         )
 
-    # ---- (B) multi-pass + out_16_nosplit=1 must be rejected ----
-    args_rej = _build_inputs(batch=1, kv_seq_lens=128, q_seq_logical=1, seed=0)
-    args_rej["num_kv_splits"] = 2
-    args_rej["out_16_nosplit"] = 1
-    args_rej.pop("split_indptr")
-    with pytest.raises(ValueError, match="out_16_nosplit"):
-        aiter.mla.mla_decode_fwd_v4_nm(**args_rej)
+    # ---- (B) out_16_nosplit is now DERIVED (V3-style), so the caller-facing
+    # arg is ignored: passing out_16_nosplit=1 with multi-pass must NOT raise
+    # and must still run the fp32-split + stage2-merge path (the wrapper/kernel
+    # derive out_16_nosplit=0 from num_kv_splits>1). ----
+    args_ign = _build_inputs(batch=1, kv_seq_lens=128, q_seq_logical=1, seed=0)
+    args_ign["num_kv_splits"] = 2
+    args_ign["out_16_nosplit"] = 1  # ignored; derived to 0 for multi-pass
+    args_ign.pop("split_indptr")
+    out_ign, lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
+    torch.cuda.synchronize()
+    # Multi-pass returns fp32 split logits (NOT the bf16 single-pass alias).
+    assert out_ign.dtype == torch.float32, (
+        f"multi-pass logits should be fp32 split partials, got {out_ign.dtype} "
+        f"— out_16_nosplit=1 was NOT correctly overridden to 0."
+    )
+    assert out_ign.shape[1] == 2, (
+        f"multi-pass logits should keep the num_kv_splits=2 axis, got "
+        f"shape {tuple(out_ign.shape)}."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1636,17 +1651,23 @@ def test_v4_nm_sink():
     args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
 
-    logits_a, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_a)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_a)
     torch.cuda.synchronize()
-    logits_a_bits = logits_a.view(torch.int32).clone()
+    # `output` is the authoritative BF16 result for BOTH single-pass (kernel
+    # writes packed-BF16 into it) and multi-pass (stage2 merges into it). Read
+    # it directly instead of the returned `logits` so the byte-level sink diff
+    # is robust to whatever split count the heuristic picks — v4 nm forces
+    # occupancy-only splits (ignore_total_kv), which can be >1 even for short
+    # KV, making `logits` an FP32 partial buffer rather than packed BF16.
+    out_a = args_a["output"]  # [total_q, num_heads, dv] BF16
+    out_a_bits = out_a.view(torch.int16).clone()
 
-    logits_b, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_b)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_b)
     torch.cuda.synchronize()
-    logits_b_bits = logits_b.view(torch.int32)
+    out_b = args_b["output"]
+    out_b_bits = out_b.view(torch.int16)
 
-    # logits is 4D [total_q, num_kv_splits=1, num_heads, dv]; only [:, 0]
-    # is kernel-written.
-    finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
+    finite_both = torch.isfinite(out_a) & torch.isfinite(out_b)
     assert finite_both.any(), (
         "All output cells were NaN/inf under both sink values — the quant "
         "pipeline returned junk OR sink=10 pushed the running max into a "
@@ -1654,7 +1675,7 @@ def test_v4_nm_sink():
         "sink_b's magnitude."
     )
 
-    diff_finite = (logits_a_bits[:, 0] != logits_b_bits[:, 0]) & finite_both
+    diff_finite = (out_a_bits != out_b_bits) & finite_both
     assert diff_finite.any(), (
         "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical "
         "output among finite cells. Either the dispatcher stopped writing "
@@ -1673,12 +1694,13 @@ def test_v4_nm_sink():
         (sink_size,), -1.0e9, dtype=torch.float32, device=device
     )
 
-    logits_inf, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
-    logits_big, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_big)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_big)
     torch.cuda.synchronize()
 
-    nan_inf = torch.isnan(logits_inf[:, 0])
-    nan_big = torch.isnan(logits_big[:, 0])
+    # Compare the authoritative BF16 `output` (single/multi-pass agnostic).
+    nan_inf = torch.isnan(args_inf["output"])
+    nan_big = torch.isnan(args_big["output"])
 
     # -inf must not produce *more* NaNs than the -1e9 control. The inverse
     # would mean sink=-inf hits a kernel-side division-by-zero or

@@ -15,3 +15,8 @@ requires = [
 write_to = "aiter/_version.py"
 write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
+# Extract the PEP 440 version from a git tag, tolerating branch-marker suffixes.
+# Keep hyphenated pre/post/dev keywords in the version (e.g. v0.1.17-rc0 -> 0.1.17rc0,
+# v0.1.16.post1 -> 0.1.16.post1) but drop arbitrary hyphen suffixes such as
+# v0.1.17-longctx -> 0.1.17 (which the default regex fails to parse).
+tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2}[^-+]*(?:-(?:preview|alpha|beta|post|pre|dev|rev|rc|a|b|c|r)\\d*)?)(?:-.*)?(?:\\+.*)?$"

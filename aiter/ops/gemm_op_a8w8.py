@@ -47,6 +47,15 @@ def _hip_blockscale_supported() -> bool:
         return False
 
 
+def _ck_a8w8_supported() -> bool:
+    """The CK/asm INT8 a8w8 GEMM ships gfx9 (CDNA) code objects only; other
+    arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
+    try:
+        return get_gfx().startswith("gfx9")
+    except Exception:
+        return True
+
+
 def gen_gemm_a8w8_ck_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
@@ -538,6 +547,13 @@ def gemm_a8w8(
     #     dtypes.bf16,
     #     dtypes.fp16,
     # ], f"Output {dtype=} is currently not supported in gemm_a8w8"
+    if not _ck_a8w8_supported():
+        # RDNA (gfx11/gfx12): the CK/asm a8w8 kernel is unavailable; route to the
+        # portable Triton kernel. Registered/faked via @torch_compile_guard above,
+        # so callers stay torch.compile- and graph-capture-safe.
+        from ..ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as gemm_a8w8_triton
+
+        return gemm_a8w8_triton(XQ, WQ, x_scale, w_scale, bias, dtype=dtype)
     return gemm_a8w8_CK(XQ, WQ, x_scale, w_scale, bias, dtype, splitK)
 
 

@@ -545,8 +545,6 @@ def compile_mixed_moe_gemm1(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
-
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=T.i32)
             )
@@ -631,6 +629,17 @@ def compile_mixed_moe_gemm1(
             def moe_gemm1_body():
                 nonlocal k_base_idx, lds_x_pong, lds_x_ping
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
+
+                # per-expert 64-bit re-base: 32-bit buffer voffset overflows when w1 > 4GB
+                per_expert_w_bytes = w_nbytes // experts
+                w_addr_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_w))
+                expert_byte_off = arith.index_cast(
+                    T.i64, expert_idx * arith.constant(per_expert_w_bytes, index=True)
+                )
+                w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
+                    arith.addi(w_addr_i64, expert_byte_off),
+                    num_records_bytes=per_expert_w_bytes,
+                )
 
                 x_load_bytes = 16
                 num_x_loads = bytes_per_thread_x // x_load_bytes
@@ -765,7 +774,7 @@ def compile_mixed_moe_gemm1(
                         col_g_list.append(col_g)
 
                     global_n = by_n + n_tile_base + c_offset + lane_mod_16
-                    gate_row_w = expert_off_idx + global_n
+                    gate_row_w = global_n
                     gate_coord = idx2crd(fx.Int32(gate_row_w), layout_n_blk_intra)
                     gate_n_blk_list.append(layout_get(gate_coord, 0))
                     gate_n_intra_list.append(layout_get(gate_coord, 1))
@@ -829,7 +838,7 @@ def compile_mixed_moe_gemm1(
                         b16 = _buffer_load_vec(
                             buffer_ops,
                             vector,
-                            w_rsrc,
+                            w_rsrc_e,
                             idx_pack,
                             elem_type=w_elem_type(),
                             vec_elems=vec_elems,
