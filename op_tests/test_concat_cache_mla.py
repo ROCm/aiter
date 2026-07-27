@@ -346,9 +346,7 @@ def test_fused_rope_concat_and_cache_mla(
     # computes Q RoPE + q_out unconditionally. Comparing the two at the same
     # (num_tokens total, num_valid owned) isolates the padded-token overhead.
     num_valid = (
-        num_tokens
-        if valid_frac >= 1.0
-        else max(1, int(round(num_tokens * valid_frac)))
+        num_tokens if valid_frac >= 1.0 else max(1, round(num_tokens * valid_frac))
     )
     if num_valid < num_tokens:
         slot_mapping[num_valid:] = -1
