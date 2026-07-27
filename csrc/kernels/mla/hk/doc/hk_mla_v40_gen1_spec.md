@@ -288,7 +288,7 @@ Key sp3 ops to remember:
 - **`ds_read_b128`** — vanilla bf16 read for QK A-tile.
 - **`ds_read_b64_tr_b16`** — transpose-read for V → mfma A-operand layout (Ch. 10.2).
 - **`buffer_load_lds`** — direct vmem → LDS bypassing VGPRs (RoPE path + Q Phase 1 staging).
-- **`v_cvt_scalef32_pk_bf16_fp8`** — fused fp8 → bf16 + e8m0 scale; emitted via pinned-DST asm wrapper (Ch. 5, Ch. 13).
+- **`v_cvt_scalef32_pk_bf16_fp8`** — fused fp8 → bf16 + e8m0 scale; emitted via pinned-DST asm wrapper (Ch. 5).
 - **`v_cvt_pk_bf16_f32`** — fp32 → bf16 pack for `p_comp → p_mfma` overlay.
 
 The KV "double buffer" is the only inter-iteration LDS resident — every
@@ -464,7 +464,7 @@ Two writer-side conflicts remain documented but mitigated:
 
 | Site | Conflict | Mitigation |
 |---|---|---|
-| QManager Phase 2 NoPE writer (Site C) | 2-way `ds_write_b128` bank conflict | Vmem-load-side column-half-swap + reader XOR ([[v40-qlds-bank-conflict-swizzle]]) — not fixable by an LDS-write-address swap (Method 1 silently fails) |
+| QManager Phase 2 NoPE writer (Site C) | 2-way `ds_write_b128` bank conflict | Vmem-load-side column-half-swap + reader XOR (§6.3, §7.2) — not fixable by an LDS-write-address swap (Method 1 silently fails) |
 | OManager V32 read path (legacy) | bank conflict on `ds_read` | Left in place; V32 only, not V40 |
 
 Reader-side conflicts on V40 Q-LDS and KV-LDS were fully eliminated in
@@ -544,9 +544,9 @@ Note the tight overlap in v48..v63: `p_comp`, its bf16 `p_mfma` overlay, and
 the QK `v_0` operand all share that 16-vgpr window at different points in the
 iter. `k_0` similarly doubles as a PV V-tile carrier.
 
-[^q-ro]: Confirmed read-only after the prologue — see auto-memory
-`[[v40-pinned-q-read-only-confirmed]]`. Any V40 bug that looks like "Q got
-corrupted mid-loop" is **not** a Q-VGPR clobber; look downstream.
+[^q-ro]: Confirmed read-only after the prologue (verified by ISA scan +
+runtime probe). Any V40 bug that looks like "Q got corrupted mid-loop" is
+**not** a Q-VGPR clobber; look downstream.
 
 ### 5.3 Why the layout is shaped this way
 
@@ -567,7 +567,7 @@ Going low → high (toward v255), the rationale per range (m16x8):
   `ds_read`/`tr` destination dwords, softmax intermediates, e8m0 scale
   dwords, and the two cross-iter scalars introduced this line of work — the
   carried `s3_scale` (deferred strip-3, Ch. 8) and the `row_kv_ld_next`
-  cse-break hold (Ch. 13). The allocator may borrow the dead `k_0`/`k_1` tiles
+  cse-break hold. The allocator may borrow the dead `k_0`/`k_1` tiles
   (up to ~v40) between gemm sections (§5.2); new pinned data must come out of
   v36..v255, not from this scratch window. Growing pinned data
   shrinks this window, so the deferred-strip-3 / cse-break carries are the
@@ -580,8 +580,8 @@ Going low → high (toward v255), the rationale per range (m16x8):
   overlaid: `p_comp` (fp32, kBlockN/4), the `p_mfma` bf16 overlay on the low
   half (v48..v55), and the QK `v_0` operand on the high half (v60..v63). The
   overlay is safe because softmax→PV uses `low-to-high pack`
-  (`pack_2f32_to_bf16_pair_pinned` in `hk_mla_utils.cuh`; gotcha: not the
-  runtime-arg form — see Ch. 13). **Softmax: lo warps packed (`kSoftmaxUsePk
+  (`pack_2f32_to_bf16_pair_pinned` in `hk_mla_utils.cuh` — use the pinned-DST
+  form, not the runtime-arg form). **Softmax: lo warps packed (`kSoftmaxUsePk
   = kPvAtEnd`), hi de-packed.**
 - **q_vgpr (v64..v127).** Full Q, all 512 cols, in mfma A-operand layout
   (`kQkGemmTiles=16`, `kRopeInVgpr`). Read-only for the whole loop. A small
@@ -635,7 +635,7 @@ tweak,** because the VALU cost is almost always hidden:
 | region | why the extra recompute is free | rule |
 |---|---|---|
 | QManager (prologue) / OManager (epilogue) | memory-bound phases — recompute hides under vmem/LDS traffic | **always cse-break** |
-| KV load (hot path) | wave-specialized: the SIMD-mate wave runs QK/PV mfma, so this wave's extra VALU issues into slots the mfma leaves free ([[hk-m16x8-pv-pingpong]]) | cse-break |
+| KV load (hot path) | wave-specialized: the SIMD-mate wave runs QK/PV mfma, so this wave's extra VALU issues into slots the mfma leaves free | cse-break |
 | everything else | little VALU effect either way, and VGPR is scarce | cse-break |
 
 **The no-break sites are not exceptions** — they're where the lane-derived
@@ -646,8 +646,10 @@ not the address), `get_kv_ld_row_base_idx` (a trivial `lane>>2` return), and the
 OManager epilogue readers.
 
 This is distinct from the `+v"(row_kv_ld_next)"` break in the kernel body, which
-*blocks* rematerialization of an index **load** into an address (Ch. 13.1 #9);
-the `lane_idx` breaks *force* rematerialization of a cheap ALU value.
+*blocks* rematerialization of an index **load** into an address (otherwise the
+compiler reloads the resolved KV-row index right before the prefetch and forces a
+full `s_waitcnt vmcnt(0)` drain); the `lane_idx` breaks *force* rematerialization
+of a cheap ALU value.
 
 ## Chapter 6 — QManager Phase 1 (vmem → staging LDS → pinned q_vgpr)
 
@@ -876,10 +878,9 @@ asm hex form** (`v[0x...]`). The pinned-DST form is essential:
 
 > The natural form `v_cvt_scalef32_pk_bf16_fp8 v[N]` (template int) is
 > silently wrong because the assembler treats `N` as a constraint
-> letter, not a register number — see auto-memory
-> `[[v40-cvt-to-pinned-inline-asm-gotcha]]`. The pinned form encodes
-> the register *number* directly in the asm string and routes through a
-> `v_mov` trampoline when needed.
+> letter, not a register number. The pinned form encodes the register
+> *number* directly in the asm string and routes through a `v_mov`
+> trampoline when needed.
 
 The fp8 vector layout is 4 dwords / lane (= 16 bytes = 16 fp8 values).
 Each dword feeds **two** cvt calls (`opsel false` reads the low half,
@@ -904,8 +905,9 @@ q_vgpr slot:
 
 V4's NoPE scale layout: **one E8M0 scale per 64-col tile**, shared across
 both 32-col mfma A-tiles within the chunk. The cvt scale_f is computed
-once per chunk via `hk_mla::e8m0_to_f32` (which requires `asm volatile` —
-see `[[v40-e8m0-to-f32-asm-required]]`).
+once per chunk via `hk_mla::e8m0_to_f32`, which must use `asm volatile` — a
+pure-C++ `bit_cast<float>(b << 23)` is SSA and LLVM sinks it cross-BB past
+the `s_waitcnt` on the scale's `buffer_load_ubyte`, racing the load.
 
 ### 6.7 Why the second sched_barrier matters
 
@@ -985,10 +987,10 @@ The 8 col-tiles per wave map to:
 The QK GEMM's `ds_read_b64_tr_b16` reader naturally lays out a 64-col
 wave-tile in source col-element order $p \in [0, 64)$ — but at the
 write side, naive `ds_write_b128` of 64 cols *as-is* hits a 2-way
-`ds_write` bank conflict (the writer-side residue of the same Site C
-collision we earlier mitigated on the read side).
+`ds_write` bank conflict (the writer-side counterpart of the Site C
+conflict mitigated on the read side).
 
-The fix is a **sub-tile-of-8 permutation** ("sb8"). Treat each 64-col
+The sub-tile-of-8 permutation ("sb8") avoids it. Treat each 64-col
 wave-tile as 8 sub-tiles of width 8; store them in LDS in the order
 $[0, 2, 4, 6, 1, 3, 5, 7]$. The reader is unaffected: the per-mfma K
 rows just arrive in a permuted order, and matrix multiplication is
@@ -1055,9 +1057,9 @@ in the *second half* ($4, 5, 6, 7$).
 
 #### 7.2.4 Why Q's D-axis must get the SAME perm as K's
 
-This is the gotcha captured in `[[v40-sb8-perm-qk-reduction-axis]]`. A
-naïve view would split: "permute K's LDS for bank-conflict win, leave
-Q alone — they're independent operands." That's **wrong**.
+This is a subtle gotcha. A naïve view would split: "permute K's LDS for the
+bank-conflict win, leave Q alone — they're independent operands." That's
+**wrong**.
 
 QK is a reduction over the $D_{\mathrm{NoPE}}$ axis. The mfma
 $\sum_d Q_{m,d} \, K_{n,d}$ requires Q and K to be addressed by the
@@ -1421,11 +1423,9 @@ $$
 
 (Method 2 — same row pattern as the NoPE Method-2 vmem-side swizzle.)
 
-The previous bug `[[v40-rope-prefetch-shared-m0-bug]]` (paraphrased from
-the in-source comment): a single shared M0 with `i_off=0` and `i_off=16`
-overlapped the two calls' lane slots — call 2 wrote each lane $T$ at
-$M0 + (T+1) \cdot 16$, leaving sub-block 15 unwritten. The pre-subtract
-fix above resolves this.
+Because `buffer_load_lds`'s imm `offset:` adds to *both* the vmem source and
+the LDS dst, the hi sub-block's dst pointer is pre-subtracted by 16 so the
+two calls land at their distinct LDS slots (14 and 15) rather than overlapping.
 
 ### 8.9 Consumer: `load_k_to_gpr`
 
@@ -1699,8 +1699,7 @@ register *numbers* as template args) instead of the runtime-arg form
 (`float_2_bf16_pair`)? The pinned form encodes the destination VGPR
 number directly in the asm string, so the overlay is guaranteed. The
 runtime-arg form would emit `v_cvt_pk_bf16_f32 v[N]` with `N` as a
-constraint letter, which the assembler treats incorrectly — see
-`[[v40-cvt-to-pinned-inline-asm-gotcha]]`.
+constraint letter, which the assembler treats incorrectly.
 
 ### 9.7 The setprio interlude
 
@@ -1985,7 +1984,6 @@ Across one main-loop iter, the kernel issues `s_setprio` at three points
 | Softmax | 1 | exp/add dominated; KV writers still need bandwidth |
 
 The ladder is set by `__builtin_amdgcn_s_setprio(N)` at phase boundaries.
-This is one of the "fine-tuned setprio" wins in commit `2daf7dd6d`.
 
 ### 10.8 oaccu register grouping
 
@@ -2032,7 +2030,7 @@ Three variants are shipped:
 |---|---|---:|---|
 | `OManager16bitsV4Gen1Swizzle` | bf16 → final_output | 2112 B / warp ($\approx 16.5$ KiB) | `kEpilogueType = OutputFinal`, the common case |
 | `OManager32bitsV4Gen1Swizzle` | fp32 → split_output | 4352 B / warp ($\approx 34$ KiB) | `kEpilogueType = OutputSplit`, with a bounce, when split-O LSE is needed |
-| `OManager32bitsV4Gen1SwNoStage` | fp32 → split_output | 0 (direct) | `kEpilogueType = OutputSplit`, direct write when the LDS region is contended by the split-O reduction (see commit `15a8736c4`'s notes) |
+| `OManager32bitsV4Gen1SwNoStage` | fp32 → split_output | 0 (direct) | `kEpilogueType = OutputSplit`, direct write when the LDS region is contended by the split-O reduction |
 
 ### 11.1 Call shape: 64-cols-per-call, 8 calls per warp
 
@@ -2147,16 +2145,7 @@ coalescing for LDS budget. For fp32 split-O the downstream reduction
 step is the bottleneck, not the per-lane store coalescing, so the
 trade is favorable.
 
-### 11.6 The vmcnt(0) gate removal (commit `15a8736c4`)
-
-A prior version of `OManager32bitsV4Gen1Swizzle` (and `V3NoStage`) issued a
-`__builtin_amdgcn_s_waitcnt(0)` before each call's `buffer_store_dwordx4`.
-At `b=33, c=63333` this added ~30k cycles per epilogue invocation —
-~10 µs of pure stall. The gate was removed (the surrounding wait
-already ensures store ordering); the perf win is row 6 of the
-progression in Ch. 1.
-
-### 11.7 Reuse of oaccu VGPRs as ds_read destinations
+### 11.6 Reuse of oaccu VGPRs as ds_read destinations
 
 After stage 1 + 2 of the bf16 path (pack + write to bounce), the
 source oaccu VGPRs `GPR_BASE..GPR_BASE+7` (= 8 of the 16 vgprs/lane
@@ -2169,12 +2158,11 @@ its destination:
 | round 0 | `GPR_BASE + 0..3` |
 | round 1 | `GPR_BASE + 4..7` |
 
-This is one of the "OMgr pinned reg reuse" wins (commit `6d61ccff6`).
-The compiler would otherwise allocate fresh unpinned scratch VGPRs to
-hold the read results, and those could leak into pinned `q_vgpr` or
-oaccu if the budget ever became tight.
+This keeps the read results in already-pinned registers; the compiler would
+otherwise allocate fresh unpinned scratch VGPRs, which could leak into pinned
+`q_vgpr` or oaccu if the budget ever became tight.
 
-### 11.8 After the epilogue completes
+### 11.7 After the epilogue completes
 
 - VRAM holds the natural-col-order, sb8-un-swizzled output.
 - LDS bounce is dead (no one reads it again this work_idx).
@@ -2279,19 +2267,14 @@ Outcome:
 - **Perf-neutral** on the hot path (the cmp+cmov is free given the
   surrounding mfma cadence).
 
-### 12.5 The slim correctness fix
+### 12.5 The `row_kv_ld_next_next` carry gate
 
-Slim required one Kv-manager change. The non-slim form gated the
-`row_kv_ld_next_next` carry update — which remembers the resolved
-physical row for the iter-after-next's prefetch — on
-`kCheckBoundaryNext == false`. With slim's always-true, that condition
-was permanently false; the carry never updated and subsequent iters
-re-prefetched from a stale row, corrupting results from `b ≥ 33` at
-long contexts.
-
-Fix: re-gate the carry on `kIsGlobalLast == false` (regardless of
-`kCheckBoundaryNext`). Now the carry updates on every non-last iter,
-slim or not.
+The `row_kv_ld_next_next` carry — which remembers the resolved physical row
+for the iter-after-next's prefetch — must be gated on `kIsGlobalLast ==
+false`, **not** on `kCheckBoundaryNext`. Under slim dispatch
+`kCheckBoundaryNext` is always true, so gating on it would leave the carry
+permanently stale; gating on `kIsGlobalLast` updates it on every non-last
+iter, slim or not.
 
 ### 12.6 V32 dispatch ladder (out of scope but worth noting)
 
@@ -2333,69 +2316,9 @@ and Q-LDS region are all re-initialized; the pinned VGPRs carry no
 cross-work-idx state (oaccu is reset to zero on the next work's
 first iter via `kIsFirstIter = true`).
 
-## Chapter 13 — Hazards & gotchas
+## Chapter 13 — File map
 
-Bugs whose root cause was not in the kernel logic itself — but which
-*looked* exactly like kernel bugs and consumed real debugging time.
-Each row is one rung future-you may hit. They are the kind of failure
-ISA inspection + careful diff are good at; raw "add a printf" is not.
-
-### 13.1 Compiler / inline-asm gotchas
-
-| # | Symptom | Root cause | Fix |
-|---:|---|---|---|
-| 1 | `v_cvt_scalef32_pk_bf16_fp8 v[N]` with `N` as inline-asm template int silently produces garbage (consumer MFMA reads stale data). | The pinned-DST form IS correct, but the compiler can't see VALU→MFMA RAW hazard across the opaque inline-asm boundary. Without a manual `s_nop`, the cvt's writeback misses the MFMA's read window. | Use the `cvt_scalef32_pk_bf16_fp8_pinned` wrapper from `hk_mla_utils.cuh` which emits the `s_nop` (or use the `v_mov` trampoline form). |
-| 2 | `e8m0_to_f32` returning wrong scale on V40 KV path — ~88 % output mismatch under `att`. | The pure-C++ form `bit_cast<float>(b << 23)` is SSA. LLVM's machine-sink/LICM hoists it cross-BB past the matching `s_waitcnt` to the original `buffer_load_ubyte` def site — racing the load. `sched_barrier(0)` is *intra-BB only*; cross-BB sinks ignore it. | `asm volatile("v_lshlrev_b32 …")`. `asm volatile` is the only cross-BB ordering construct LLVM honors against asm-volatile loads. |
-| 3 | `PROBE_*_ITER` macros appear to "default to whatever the source says" but actually evaluate to 0 regardless. | `aiter/jit/optCompilerConfig.json` force-defines them via env var on the compile command line; source `#ifndef` defaults never fire. | Comment out the entry in `optCompilerConfig.json` for local debugging, then restore. |
-| 9 | (m16x8/slim) An `s_waitcnt vmcnt(0)` appears between the `v_bitop3` col swizzle and the prefetch `buffer_load` in the KV-tile loop — a full vmem drain that kills carrier/staging overlap. | The prefetch address is `row_kv_ld << 9 + …`, and `row_kv_ld` comes from a `buffer_load_dword` in `get_kv_ld_row`. The compiler **rematerializes** that index load inline right before the address, so using the loaded value as a load *address* forces a `vmcnt(0)`. | Pin the already-resolved index in a VGPR so it can't be rematerialized: `asm volatile("" : "+v"(row_kv_ld_next));` right after `row_kv_ld_next = row_kv_ld_next_next;`. Costs 1 scratch VGPR (see Ch. 5.2). |
-| 10 | (m16x8) De-packing the epilogue `oaccu` normalize with `hk::mul(oaccu, oaccu, 1/row_sum_e)` fails to compile (`invalid operand for inline asm constraint 'i'`). | `macros::mul`'s scalar op uses an `"i"` (immediate) constraint — valid only for a compile-time-constant scalar, not the runtime `1/row_sum_e`. `hk::mul_vgpr` uses `"v"` (packed). | For the de-packed sweep, emit `v_mul_f32_e32 v[%0], %1, v[%0]` with a `"v"` operand in a `static_for` over `k_o_sz` (Ch. 9.9 / 10). |
-
-### 13.2 Memory-permutation / layout gotchas
-
-| # | Symptom | Root cause | Fix |
-|---:|---|---|---|
-| 4 | "PR-A only permutes K's D-axis" reproduces with 100 % mismatch on QK output. | QK is a reduction over the D-axis. If K's D-axis is permuted in LDS but Q's isn't, mfma step $k$ multiplies $Q_{m,k}$ against $K_{n,\mathrm{perm}(k)}$ — wrong product. Q and K must be permuted **identically**. | The sb8 perm must apply to both writers (Ch. 7 and Ch. 8). KV-only PR is structurally impossible. |
-| 5 | V40 Site C QK reader: 2-way `ds_read_b128` bank conflict. Method 1 (LDS-write address swap) compiles cleanly and *looks* right by hand-derived bank math — produces ~90 % output mismatch in practice. | The non-linear `ds_read_b128` cycle 0 pairs lanes $(L, L{+}20)$. `+20` flips bit 4 *and* bit 2 of $L$ together. The Method-1 swap targets bit 4 only — analytically equivalent to Method 2, but the HW cycle's actual data routing depends on bit 2 too, so the supposedly-fixed pair still lands on the same quad. | Method 2 (**vmem-load-side** col-half-swap + reader-side XOR). Lives in `prefetch_kv_tile` and Phase 2's NoPE writer. |
-| 6 | V4 test harness: heads 1+ produce garbage RoPE values, head 0 is fine. | `quantize_v4_q` returns a non-contiguous `q_rope_bf16` slice (stride is on the head axis, not the elements axis). Without `.contiguous()`, only head 0 reads aligned bf16; heads 1+ read mis-aligned. | Always `.contiguous()` on `q_rope_bf16` between the quantizer and the kernel call. |
-
-### 13.3 Host / metadata gotchas
-
-| # | Symptom | Root cause | Fix |
-|---:|---|---|---|
-| 7 | Stochastic NaN in V40 output at `b ≥ 4`. `-ms` (max-splits) flag has no effect on perf or correctness. | `csrc/kernels/mla/metadata/v1_2_device.cuh:141` has a leftover debug override: `int32_t remain_payload = 0x7fffffff;` (was `= payload`). With splitting disabled, all works pile on `WG=0`; the epilogue's `p_lds_o` reads race the *next* work's `load_q` writes (intra-WG work-loop hazard). | Revert to `= payload`. |
-| 11 | (host) After trimming branch-only changes back toward main, `module_mla_metadata` fails to build (`number of argument annotations does not match`), or `aiter.MlaVersion` is missing at runtime. | The `MLA_METADATA_PYBIND` macro in `rocm_ops.hpp` was reverted to main's arg list (no `MlaVersion` enum, `dtype_q/dtype_kv` instead of the four `dtype_*_nope/rope` + `mla_version`), but the C++ `get_mla_metadata_v1` still has the V40 signature → pybind arg-count mismatch. | Keep the V40 `MLA_METADATA_PYBIND` (enum + `mla_version` + `dtype_{q,kv}_{nope,rope}`) whenever the C++ signature has them. |
-
-**Deferred strip-3 WAR (m16x8, §8.13).** Not a bug today, but the invariant
-to preserve: the iter N+1 deferred consume must ds_read staging slot 1 and
-complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
-`buffer_load_lds` into that slot. Reorder at your peril.
-
-### 13.4 Confirmed-not-a-bug
-
-| # | What was suspected | What's actually true |
-|---:|---|---|
-| 8 | The pinned Q VGPRs (v64..v127) might be getting clobbered mid-loop (any V40 numerical mismatch). | The pinned-q region is **read-only** after the prologue. Proven by ISA scan + runtime probe ([[v40-pinned-q-read-only-confirmed]]). When a V40 mismatch is being debugged, eliminate Q as suspect first — look downstream (K/V load, sb8 perm, OMgr un-perm). |
-
-### 13.5 Tools to reach for
-
-- **VGPR audit** — dump the ISA with `--save-temps`, then per kernel body scan
-  for a decimal `v ≥ N` (the `amdgpu_num_vgpr(N)` budget) overwriting a *live*
-  pinned tile, and read `.vgpr_spill_count` from the `.amdgpu_metadata` YAML.
-  Current state: m16x8 budget=36 (scratch reaches ~v40 into dead `k_0`/`k_1`);
-  m16x4 budget=44. `.vgpr_spill_count` only flags >256-VGPR pressure, **not** the
-  pinned/unpinned overlap — verify overlap safety by ISA reading + correct
-  output (§5.2, §5.4). Watch the clang-format caveat: `amdgpu_num_vgpr(\n N)` can
-  wrap across two lines.
-- ISA inspection (`--save-temps` + read the `.s` file) is the only way
-  to catch compiler-hoist / inline-asm hazards above. Standard
-  printf-debugging will not find them.
-- `rocprofv3 --att` thread-trace dumps for cadence analysis — useful
-  for finding the per-iter `if` branches that the middle-iter peel
-  (Ch. 12.3) was designed to eliminate.
-
-## Chapter 14 — File map
-
-### 14.1 V40 Gen.1 active files
+### 13.1 V40 Gen.1 active files
 
 | File | What it contains |
 |---|---|
@@ -2407,20 +2330,20 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 | `csrc/kernels/mla/hk/hk_mla_softmax.cuh` | Online-softmax helpers, all `kUsePk`-templated: `softmax_mask_p`, `softmax_p1_prescaled_16`, `set_ninf1/2`. |
 | `csrc/kernels/mla/hk/hk_mla_utils.cuh` | Shared with V32: traits, enums (`PvGemmEpilogueType`), and `namespace hk_mla` helpers: `e8m0_to_f32`, `encode_s_waitcnt`, `max_16`, `warp_reduce`, `cvt_scalef32_pk_bf16_fp8_pinned`, `pack_2f32_to_bf16_pair_pinned`, `get_kv_ld_row`. |
 
-### 14.2 Adjacent (not V40 Gen.1 but referenced)
+### 13.2 Adjacent (not V40 Gen.1 but referenced)
 
 | File | Role w.r.t. V40 Gen.1 |
 |---|---|
 | `csrc/kernels/mla/hk/hk_mla_buffer_managers.cuh` | V32-shared managers (`QManager8bitsV1..V5`, `KvManager8bitsV1..V3`, `OManager16bitsV1..V2`, `OManager32bitsV1..V2`, `VtManager8bitsV1`). V40 Gen.1 does not include this. |
 | `csrc/kernels/mla/hk/mi35x_v32_fwd_decode_m16x8_fp8_fp8.cuh`<br/>`csrc/kernels/mla/hk/mi35x_v32_fwd_decode_m16x4_fp8_fp8.cuh`<br/>`csrc/kernels/mla/hk/mi3xx_v32_fwd_decode_m16x8_fp8_fp8.cuh` | V32 sibling kernels. Share the per-iter-branch dispatch pattern noted in Ch. 12.6 — not in scope for Gen.1 cleanup. |
 | `csrc/kernels/mla/hk_v32_decode_fwd.cu` | V32 host wrapper. |
-| `csrc/kernels/mla/metadata/v1_2_device.cuh` | MLA work planner / metadata. Source of the `remain_payload` debug-override gotcha in Ch. 13.3. |
+| `csrc/kernels/mla/metadata/v1_2_device.cuh` | MLA work planner / metadata. |
 | `csrc/kernels/mla/reduce.cu` | Cross-WG reduction for split-O outputs (consumes the fp32 split tensor that V3 / V3NoStage produces). |
-| `aiter/jit/optCompilerConfig.json` | Per-module hipify input set + force-defines. V40 Gen.1's entry lists the 4 `.cuh` files in §14.1. Source of the `PROBE_*_ITER` macro gotcha in Ch. 13.1. |
+| `aiter/jit/optCompilerConfig.json` | Per-module hipify input set + force-defines. V40 Gen.1's entry lists the 4 `.cuh` files in §13.1. |
 
-## Chapter 15 — Glossary & cross-refs
+## Chapter 14 — Glossary & cross-refs
 
-### 15.1 Glossary
+### 14.1 Glossary
 
 | Term | Definition |
 |---|---|
@@ -2440,12 +2363,12 @@ complete its `lgkmcnt(0)` *before* iter N+1 Phase A re-issues the strip-3
 | **ptile** | One processing tile = one group's worth of work. Gen.1: ptile = 1 wave. The term is local to this doc; the AMD term "Compute Unit" means something different. |
 | **sb8 perm** | Sub-tile-of-8 permutation $[0,2,4,6,1,3,5,7]$ applied to a 64-col wave-tile's D-axis. Reorders 8 sub-tiles of 8 elements each; a **3-bit rotation of the [5:3] field** of the col-element index (bit 3→5, bit 4→3, bit 5→4 — see §7.2.2, `sb8_perm_col_elems`), not a plain bit-3↔bit-5 swap. Eliminates the 2-way `ds_write_b128` writer-side bank conflict. Applied identically to Q and K (Ch. 7.2.4). |
 | **setprio ladder** | $3 \to 2 \to 1 \to 0$ per-phase wave-priority drop within one main-loop iter. Lets the slower waves (KV writers) catch up while the faster waves (this one) are in compute-bound phases. |
-| **Site C** | The 2-way `ds_read_b128` bank conflict on the V40 QK reader. Mitigated by a row-conditional half-swap on the vmem-load side (Method 2 — Method 1 silently fails; see Ch. 13.1). |
+| **Site C** | The 2-way `ds_read_b128` bank conflict on the V40 QK reader. Mitigated by a row-conditional half-swap on the vmem-load side (Method 2; §6.3, §7.2). |
 | **slim dispatch** | Compile-time flag (`MLA_SLIM_DISPATCH=1`) that always passes `kCheckBoundaryNext=true`, halving the `mla_main` template instantiations. Perf-neutral, 40 % smaller kernel image. (Ch. 12.4) |
 | **wave-tile** | One ptile's mfma A-operand tile along the D-axis: 16 rows × 64 cols of bf16. Each KvManager call covers exactly one wave-tile per wave. |
 | **work_idx** | Index into the metadata planner's per-WG work list. The persistent kernel processes multiple work_idxs from `work_indptr[wg .. wg+1]` (Ch. 12.8). |
 
-### 15.2 Notation legend (reprint of Ch. 2.5)
+### 14.2 Notation legend (reprint of Ch. 2.5)
 
 | Symbol | Meaning | Range |
 |---|---|---|
