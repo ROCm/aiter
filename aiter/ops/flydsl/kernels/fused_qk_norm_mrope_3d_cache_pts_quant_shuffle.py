@@ -53,7 +53,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from .tensor_shim import GTensor, _run_compiled
+from .tensor_shim import GTensor, _run_compiled, ptr_arg
 
 # --- fixed HW assumption: wave64 (gfx942 / gfx950 CDNA). gfx1250 is wave32
 # and needs a dedicated variant (mirrors qk_norm_rope_quant_gfx1250.py) --
@@ -1054,9 +1054,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         stream = torch.cuda.current_stream()
     fx_stream = fx.Stream(stream)
 
-    def _ptr(t):
-        return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
-
     def _cache_ptr(t):
         elem_type = fx.Int8 if cache_is_fp8 else fx.BFloat16
         return flyc.from_c_void_p(elem_type, t.data_ptr())
@@ -1077,11 +1074,11 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         chunk_tokens = min(_MAX_GRID_Y, num_tokens - token_offset)
         _run_compiled(
             q_launch,
-            _ptr(qkv_flat),
-            _ptr(positions),
-            _ptr(cos_sin),
-            _ptr(qw),
-            _ptr(q_out),
+            ptr_arg(qkv_flat),
+            ptr_arg(positions),
+            ptr_arg(cos_sin),
+            ptr_arg(qw),
+            ptr_arg(q_out),
             chunk_tokens,
             token_offset,
             positions_stride_0,
@@ -1114,15 +1111,15 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         chunk_page_blocks = min(_MAX_GRID_Y, num_page_blocks - page_block_offset)
         _run_compiled(
             kv_launch,
-            _ptr(qkv_flat),
-            _ptr(positions),
-            _ptr(cos_sin),
-            _ptr(kw),
+            ptr_arg(qkv_flat),
+            ptr_arg(positions),
+            ptr_arg(cos_sin),
+            ptr_arg(kw),
             _cache_ptr(k_cache),
             _cache_ptr(v_cache),
-            _ptr(slot_mapping),
-            _ptr(per_tensor_k_scale),
-            _ptr(per_tensor_v_scale),
+            ptr_arg(slot_mapping),
+            ptr_arg(per_tensor_k_scale),
+            ptr_arg(per_tensor_v_scale),
             _cache_ptr(k_out_arg),
             _cache_ptr(v_out_arg),
             num_tokens,
