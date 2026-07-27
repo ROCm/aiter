@@ -240,9 +240,6 @@ def _moe_gemm_a4w4_gfx1250(
     block_id = expt_data >> 16
     M = gl.load(ExptHist + expt_id)
     start_m = gl.load(ExptOffs + expt_id)
-    # expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
-    # start_m = start_m.to(index_type)
-    # pid_n = pid_n.to(index_type)
 
     # get the packed block sizes
     # both A and B tensors are mxfp4
