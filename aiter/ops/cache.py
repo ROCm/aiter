@@ -171,7 +171,7 @@ def fused_qk_rope_concat_and_cache_mla(
     is_nope_first: bool,
     # False (default, non-DCP): slot<0 tokens early-return (skip Q RoPE + q_out).
     # True (DCP): compute Q RoPE for every token (needed after head all-gather).
-    compute_all_q: bool = False,
+    compute_all_q_rope: bool = False,
 ) -> None: ...
 
 

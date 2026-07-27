@@ -42,7 +42,7 @@ def aiter_fused_rope_concat_and_cache_mla(
     is_neox,
     is_nope_first,
     q_out_dtype=None,
-    compute_all_q=False,
+    compute_all_q_rope=False,
 ):
     aiter.fused_qk_rope_concat_and_cache_mla(
         q_nope,
@@ -61,7 +61,7 @@ def aiter_fused_rope_concat_and_cache_mla(
         is_neox,
         is_nope_first,
         # q_out_dtype,
-        compute_all_q=compute_all_q,
+        compute_all_q_rope=compute_all_q_rope,
     )
     return kv_cache, q_out
 
@@ -332,7 +332,7 @@ def test_fused_rope_concat_and_cache_mla(
     is_neox: bool,
     q_nope_layout: str = "contiguous",
     valid_frac: float = 1.0,
-    compute_all_q: bool = False,
+    compute_all_q_rope: bool = False,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -483,7 +483,7 @@ def test_fused_rope_concat_and_cache_mla(
         is_neox,
         is_nope_first,
         q_out_dtype,
-        compute_all_q=compute_all_q,
+        compute_all_q_rope=compute_all_q_rope,
     )
     # err_triton_kv = 0
     # err_triton_q_out = 0
@@ -551,10 +551,10 @@ def test_fused_rope_concat_and_cache_mla(
     # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
-    # With compute_all_q=True every token's q_out is computed → check all.
-    # With compute_all_q=False (default) padded-token q_out is left
+    # With compute_all_q_rope=True every token's q_out is computed → check all.
+    # With compute_all_q_rope=False (default) padded-token q_out is left
     # uninitialized (early-return), so only check the owned (valid-slot) tokens.
-    n_chk = num_tokens if compute_all_q else num_valid
+    n_chk = num_tokens if compute_all_q_rope else num_valid
     q_out_chk = q_out[:n_chk]
     ref_q_out_chk = ref_q_out[:n_chk]
     q_nope_delta = (
@@ -576,7 +576,7 @@ def test_fused_rope_concat_and_cache_mla(
     ret["fused_qk_us"] = avg_us
     ret["num_valid"] = num_valid
     ret["padded"] = num_tokens - num_valid
-    ret["compute_all_q"] = compute_all_q
+    ret["compute_all_q_rope"] = compute_all_q_rope
     # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
@@ -737,15 +737,15 @@ parser.add_argument(
 )
 
 parser.add_argument(
-    "-caq",
-    "--compute_all_q",
+    "-caqr",
+    "--compute_all_q_rope",
     type=dtypes.str2bool,
     nargs="*",
     default=[False, True],
     help="""compute Q RoPE for all tokens incl. slot=-1 padded (DCP path).
     False = non-DCP early-return on padded tokens; True = DCP (every rank
     RoPEs all queries). Default covers both.
-    e.g.: -caq false true""",
+    e.g.: -caqr false true""",
 )
 
 parser.add_argument(
@@ -793,17 +793,17 @@ if "fused_qk" in args.case:
                         for q_dtype in args.q_dtype:
                             for q_nope_layout in args.q_nope_layout:
                                 for valid_frac in args.valid_frac:
-                                    for compute_all_q in args.compute_all_q:
+                                    for compute_all_q_rope in args.compute_all_q_rope:
                                         if q_dtype == "fp8" and kv_cache_dtype != "fp8":
                                             continue
                                         if num_kv_heads > num_heads:
                                             continue
-                                        # Pair padding with compute_all_q: only
+                                        # Pair padding with compute_all_q_rope: only
                                         # run (full, non-DCP) and (padded, DCP
                                         # compute-all). Skip the redundant
                                         # (full, compute-all) and the
                                         # uninteresting (padded, early-return).
-                                        if compute_all_q != (valid_frac < 1.0):
+                                        if compute_all_q_rope != (valid_frac < 1.0):
                                             continue
                                         ret = test_fused_rope_concat_and_cache_mla(
                                             args.kv_lora_rank,
@@ -820,7 +820,7 @@ if "fused_qk" in args.case:
                                             is_neox,
                                             q_nope_layout,
                                             valid_frac,
-                                            compute_all_q,
+                                            compute_all_q_rope,
                                         )
                                         df.append(ret)
     df = pd.DataFrame(df)
