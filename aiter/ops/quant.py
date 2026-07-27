@@ -443,10 +443,10 @@ def per_group_quant_hip(
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
-    gemm_out_zero_init: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
+    gemm_out_zero_init: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
     """Per-group dynamic FP8 (or i8/fp4) quant.
 
     When `gemm_out_zero_init` is provided, the kernel will additionally write
@@ -755,11 +755,11 @@ def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
     scales: torch.Tensor,
-    scale_ub: Optional[torch.Tensor] = None,
+    scale_ub: torch.Tensor | None = None,
     shuffle_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
-    gemm_out_zero_init: Optional[torch.Tensor] = None,
+    gemm_out_zero_init: torch.Tensor | None = None,
 ) -> None: ...
 
 

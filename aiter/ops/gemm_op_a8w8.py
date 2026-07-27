@@ -359,11 +359,11 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = -1,
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     bpreshuffle: int = 1,
-    zero_bias_buf: Optional[Tensor] = None,
+    zero_bias_buf: Tensor | None = None,
     y_is_zeroed: int = 0,
 ) -> None: ...
 
@@ -387,11 +387,11 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
-    bpreshuffle: Optional[bool] = True,
-    zero_bias_buf: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
+    bpreshuffle: bool | None = True,
+    zero_bias_buf: Tensor | None = None,
     y_is_zeroed: bool = False,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
@@ -776,7 +776,7 @@ def gemm_a8w8_blockscale_fake(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled=False,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     y_is_zeroed: bool = False,
 ) -> torch.Tensor:
     if out is not None:
@@ -795,7 +795,7 @@ def gemm_a8w8_blockscale(
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
     isBpreshuffled: bool = False,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     y_is_zeroed: bool = False,
 ) -> torch.Tensor:
     """FP8 a8w8 blockscale GEMM (non-bpreshuffle).
@@ -915,9 +915,9 @@ def gemm_a8w8_blockscale_bpreshuffle_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     y_is_zeroed: bool = False,
-    tuned_file: Optional[str] = None,
+    tuned_file: str | None = None,
 ) -> Tensor:
     if out is not None:
         return out
@@ -931,9 +931,9 @@ def gemm_a8w8_blockscale_bpreshuffle(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     y_is_zeroed: bool = False,
-    tuned_file: Optional[str] = None,
+    tuned_file: str | None = None,
 ) -> Tensor:
     """FP8 a8w8 blockscale GEMM with bpreshuffled weight layout.
 

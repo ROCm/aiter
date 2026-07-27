@@ -172,7 +172,7 @@ def fused_rms_fp8_group_quant(
     res1=None,
     output_unquantized_inp1=False,
     transpose_scale=False,
-    gemm_out_zero_init: Optional[torch.Tensor] = None,
+    gemm_out_zero_init: torch.Tensor | None = None,
 ):
     """
     This op contains several steps:
@@ -419,7 +419,7 @@ def fused_rms_gated_fp8_group_quant(
     fp8_max: float | None = None,
     fp8_min_scaling_factor: float | None = None,
     group_size: int | None = None,
-    gemm_out_zero_init: Optional[torch.Tensor] = None,
+    gemm_out_zero_init: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gated RMSNorm + FP8 quant; launches ``_fused_rms_fp8_group_quant_kernel`` with ``GATED_RMS_FP8=True``.
 

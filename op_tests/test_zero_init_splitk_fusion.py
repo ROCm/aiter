@@ -39,10 +39,10 @@ import torch
 
 import aiter  # noqa: F401  (registers the blockscale GEMM / quant ops)
 from aiter import dtypes
-from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_bpreshuffle_cktile
+from aiter.ops.quant import per_group_quant_hip
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.activation import act_mul_and_fp8_group_quant
 from aiter.ops.triton.quant.fused_fp8_quant import (

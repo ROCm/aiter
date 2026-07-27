@@ -32,7 +32,7 @@ def _fused_qk_rmsnorm_group_quant_kernel(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
-    gemm_out_zero_init: Optional[Tensor] = None,
+    gemm_out_zero_init: Tensor | None = None,
 ) -> None: ...
 
 
@@ -74,7 +74,7 @@ def fused_qk_rmsnorm_group_quant(
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
-    gemm_out_zero_init: Optional[Tensor] = None,
+    gemm_out_zero_init: Tensor | None = None,
 ) -> None:
     # No-quant mode: when q_out_scale is None we only do RMSNorm and write to q_out_unquantized.
     no_quant = q_out_scale is None

@@ -133,7 +133,7 @@ def act_mul_and_fp8_group_quant(
     activation: Literal["silu", "gelu", "gelu_tanh"],
     group_size,
     dtype_quant=fp8_dtype,
-    gemm_out_zero_init: Optional[torch.Tensor] = None,
+    gemm_out_zero_init: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.

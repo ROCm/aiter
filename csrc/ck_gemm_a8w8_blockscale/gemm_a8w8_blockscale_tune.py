@@ -122,7 +122,7 @@ def _skip_ref(*args, **kwargs):
     covered by the default (``y_is_zeroed=False``) tuning and by
     ``op_tests/test_zero_init_splitk_fusion.py``.
     """
-    return None
+    return
 
 
 def run_gemm_a8w8_blockscale(
@@ -356,7 +356,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         run_kwargs,
         y_is_zeroed=False,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = {
             k: v
@@ -378,11 +378,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         cktile_ref_func = _skip_ref if y_is_zeroed else run_torch
         cktile_output_keys = None if y_is_zeroed else ("out",)
         for i, kernel in kernel_list.items():
-            if not get_gfx().startswith("gfx95"):
-                if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
-                    kernel.K_Warp_Tile > 64  # gfx942 not support
-                ):
-                    continue
+            if not get_gfx().startswith("gfx95") and (
+                (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8)
+                or (kernel.K_Warp_Tile > 64)  # gfx942 not support
+            ):
+                continue
 
             maxsplitK = (
                 0
@@ -442,7 +442,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         run_kwargs,
         y_is_zeroed=False,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         kernel_list = (
             candidate_kernels_bpreshuffle_dict
             if preshuffleB
