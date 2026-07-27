@@ -63,7 +63,7 @@ class _GroupedA8W4Config:
     tdm_as_in_prologue: bool = False
     grouped_persistent_m: bool = True
     grouped_contiguous_m: bool = False
-    persistent_workers: Optional[int] = None
+    persistent_workers: int | None = None
     data_format: str = "a8w4"
     act: str = "silu"
     situ_beta: float = 1.0

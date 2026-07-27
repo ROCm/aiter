@@ -467,7 +467,7 @@ def fused_moe(
     swiglu_limit=None,
     beta=None,
     linear_beta=None,
-    gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    gate_mode: str | None = GateMode.SEPARATED.value,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -542,27 +542,27 @@ def fused_moe_(
     w2: torch.Tensor,  # [expert(local_expert:EP), dim, inter_dim]
     topk_weight: torch.Tensor,
     topk_ids: torch.Tensor,
-    expert_mask: Optional[torch.Tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation: int = ActivationType.Silu.value,
     quant_type: int = QuantType.No.value,
     doweight_stage1: bool = False,
     # following for quant
-    w1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.Tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M: int = -1,
-    num_local_tokens: Optional[torch.Tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy: int = 0,
-    dtype: Optional[torch.dtype] = None,
+    dtype: torch.dtype | None = None,
     hidden_pad: int = 0,
     intermediate_pad: int = 0,
-    bias1: Optional[torch.Tensor] = None,
-    bias2: Optional[torch.Tensor] = None,
-    swiglu_limit: Optional[float] = None,
-    beta: Optional[float] = None,
-    linear_beta: Optional[float] = None,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
@@ -1184,7 +1184,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
     inter_dim_pad: int = 0,

@@ -19,8 +19,8 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 `gate_mode=GateMode.INTERLEAVE` + `a_scale_one=True` in stage1.
 """
 
-import os
 import functools
+import os
 from contextlib import contextmanager
 from enum import Enum
 from typing import Optional
@@ -28,7 +28,6 @@ from typing import Optional
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl.expr import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -40,32 +39,31 @@ except ImportError:
         return str(arch).startswith(("gfx94", "gfx95", "gfx12"))
 
 
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, memref, scf
+from flydsl._mlir.dialects.arith import CmpIPredicate
+from flydsl._mlir.extras import types as _mT
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, rocdl, vector
+from flydsl.expr.gpu import lds_space as _lds_space
+from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from flydsl._mlir import ir
-from flydsl.expr.typing import T
-
-from flydsl.expr import arith, gpu, buffer_ops, vector, rocdl, const_expr
-from flydsl.expr.gpu import lds_space as _lds_space
-from flydsl._mlir.dialects import llvm, scf, memref
-from flydsl._mlir.extras import types as _mT
-from flydsl._mlir.dialects.arith import CmpIPredicate
-
+from .layout_utils import crd2idx, idx2crd
+from .layout_utils import get as layout_get
+from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .mfma_preshuffle_pipeline import (
     _buffer_load_vec,
     buffer_copy_gmem16_dwordx4,
-    lds_store_16b_xor16,
-    lds_store_8b_xor16,
     lds_store_4b_xor16,
+    lds_store_8b_xor16,
+    lds_store_16b_xor16,
+    load_b_raw_mxfp4_dwordx4,
     make_preshuffle_b_layout,
     make_preshuffle_scale_layout,
-    load_b_raw_mxfp4_dwordx4,
-    unpack_b_mxfp4_bf16,
-    tile_chunk_coord_i32,
     swizzle_xor16,
+    tile_chunk_coord_i32,
+    unpack_b_mxfp4_bf16,
 )
-from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
-from .layout_utils import crd2idx, idx2crd, get as layout_get
 
 
 @contextmanager
@@ -144,7 +142,7 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 barrier = _barrier
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mixed_moe_gemm1(
     *,
     model_dim: int,
@@ -4956,7 +4954,7 @@ def compile_mixed_moe_gemm2(
     return launch_mixed_moe_gemm2
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mixed_moe_gemm1_a16w4(
     *,
     model_dim: int,
@@ -5083,9 +5081,8 @@ def compile_mixed_moe_gemm1_a16w4(
 
     # ---- type helpers (A16W4 forces bf16 X / i8 W; generic dispatches on dtype flags) ----
     def out_mlir():
-        return (lambda ty: ty() if callable(ty) else ty)(
-            T.f16 if out_dtype == "f16" else T.bf16
-        )
+        ty = T.f16 if out_dtype == "f16" else T.bf16
+        return ty() if callable(ty) else ty
 
     def _x_elem_type():
         if is_a16w4_stage1:
@@ -6970,7 +6967,7 @@ def compile_mixed_moe_gemm1_a16w4(
                         num_acc_n: int,
                         lds_out,
                     ):
-                        _, _, _, _, t_valid, _ = _decode_fused2_at_row(row)
+                        _, _, _, _, _t_valid, _ = _decode_fused2_at_row(row)
 
                         if const_expr(doweight_stage1):
                             tw = buffer_ops.buffer_load(
@@ -7213,7 +7210,7 @@ def compile_mixed_moe_gemm1_a16w4(
     return launch_mixed_moe_gemm1
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mixed_moe_gemm2_a16w4(
     *,
     model_dim: int,
@@ -7385,11 +7382,10 @@ def compile_mixed_moe_gemm2_a16w4(
                 "stage2 f16 output currently requires CShuffle epilogue (FLIR_MOE_STAGE2_CSHUFFLE=1)."
             )
 
-    if out_is_bf16:
-        if not supports_bf16_global_atomics(gpu_arch):
-            raise ValueError(
-                f"out_dtype='bf16' requires bf16 global atomics, got arch={gpu_arch!r}"
-            )
+    if out_is_bf16 and not supports_bf16_global_atomics(gpu_arch):
+        raise ValueError(
+            f"out_dtype='bf16' requires bf16 global atomics, got arch={gpu_arch!r}"
+        )
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -8630,10 +8626,9 @@ def compile_mixed_moe_gemm2_a16w4(
                     mask_even_i32 = arith.constant(0xFFFFFFFE, type=T.i32)
                     e_vec = _e_vec
 
-                    sw_pf = None
                     tw_pf = None
                     if const_expr(epilogue_pf is not None):
-                        sw_pf, tw_pf = epilogue_pf
+                        _, tw_pf = epilogue_pf
 
                     # No per-channel weight scale for MXFP4 (scales already applied in dequant).
                     sw_vals = [  # noqa: F841
@@ -8656,7 +8651,7 @@ def compile_mixed_moe_gemm2_a16w4(
                         c4_i32 = arith.constant(4, type=T.i32)
 
                         def _stage2_row_atomic(*, mi: int, ii: int, row_in_tile, row):
-                            fused2, t2, s2, ts_ok = _a16_decode_lds_fused(row_in_tile)
+                            _fused2, t2, _s2, ts_ok = _a16_decode_lds_fused(row_in_tile)
                             t2_safe = arith.select(
                                 ts_ok, t2, arith.constant(0, type=T.i32)
                             )
