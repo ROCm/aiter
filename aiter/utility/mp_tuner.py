@@ -39,6 +39,13 @@ def _elapsed_since_task_start(task_start_times, task_index, now=None):
     return current_time - started_at
 
 
+def _reset_task_start_times(task_start_times, task_indices):
+    """Mark tasks as queued again, so a resubmit is not judged against the
+    timestamp its previous attempt left behind."""
+    for k in task_indices:
+        task_start_times[k] = 0
+
+
 def worker(
     gpu_id,
     info,
@@ -425,6 +432,8 @@ def mp_tuner(
     # Helper function to submit tasks to pool
     def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
+        task_indices = list(task_indices)
+        _reset_task_start_times(task_start_times, task_indices)
         return {
             k: pool.apply_async(
                 _run_with_start_tracking,
@@ -636,8 +645,6 @@ def mp_tuner(
 
             # Resubmit remaining tasks
             remaining_task_indices = [k for k, _ in remaining_tasks]
-            for k in remaining_task_indices:
-                task_start_times[k] = 0
             new_rets_dict = submit_tasks(pool, gpu_map, remaining_task_indices)
             pool.close()
 

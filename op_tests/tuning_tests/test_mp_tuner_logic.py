@@ -354,5 +354,21 @@ class TestTaskExecutionTiming(unittest.TestCase):
             manager.shutdown()
 
 
+class TestTaskStartTimeReset(unittest.TestCase):
+
+    def test_reset_clears_only_the_given_slots(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        reset_start_times = getattr(tuner, "_reset_task_start_times", None)
+
+        self.assertIsNotNone(
+            reset_start_times,
+            "submitting a task must clear its start-time slot, otherwise a "
+            "resubmitted task is judged against the previous attempt's timestamp",
+        )
+        slots = [11.0, 22.0, 33.0]
+        reset_start_times(slots, [0, 2])
+        self.assertEqual(list(slots), [0, 22.0, 0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
