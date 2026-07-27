@@ -10,11 +10,12 @@ try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr import arith
-    from flydsl.expr.typing import T, Int32
-    from flydsl.expr import buffer_ops
+    from flydsl.expr.typing import Int32, T
+
+    from aiter.ops.flydsl.kernels import buffer_ops
 
     _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional
+except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
     _FLYDSL_AVAILABLE = False
 
 
@@ -577,7 +578,7 @@ def causal_conv1d_split_qkv_flydsl_fn(
     if compiled is None:
         try:
             launcher._fast_compiled = flyc.compile(launcher, *launch_args)
-        except Exception:
+        except Exception:  # noqa: BLE001
             launcher._fast_compiled = False  # fall back permanently
             launcher(*launch_args)
     elif compiled is not False:

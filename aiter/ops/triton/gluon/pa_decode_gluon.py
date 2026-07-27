@@ -4,19 +4,19 @@
 from functools import lru_cache
 
 import torch
-
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
+
+import aiter
+from aiter.ops.triton.utils._triton import arch_info
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
     from csrc.cpp_itfs.pa.pa_ps import (
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
     )
-except Exception:
+except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
@@ -24,14 +24,16 @@ FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, gpu, rocdl, buffer_ops, range_constexpr
-    from flydsl.expr.typing import T, Int32
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl._mlir import ir
-    from flydsl.compiler.kernel_function import CompilationContext
     from flydsl._mlir.dialects import arith as _mlir_arith
-except Exception:
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.expr import arith, gpu, range_constexpr, rocdl
+    from flydsl.expr.typing import Int32, T
+    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+    from aiter.ops.flydsl.kernels import buffer_ops
+except Exception:  # noqa: BLE001
     FLYDSL_PS_REDUCE_AVAILABLE = False
     flyc = None
     fx = None
@@ -64,7 +66,11 @@ except ImportError:
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
         sched_barrier as _amd_iglp_sched_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
         sched_group_barrier as _amd_iglp_sched_group_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
         set_prio as _amd_set_prio,
     )
 except ImportError:

@@ -4,34 +4,37 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from .mxfp4_gemm_common import (
-    kStages,
-    kBS_stride_k0_dw,
-    _raw,
-    _lds_ptr3,
+    _buffer_rsrc,
+    _e8m0_from_amax,
+    _fabs_f32,
+    _gep1,
     _gep3,
     _global_base_ptr1,
-    _gep1,
     _global_ptr1,
-    _buffer_rsrc,
-    _lds_swizzle_mask,
-    _fabs_f32,
-    _e8m0_from_amax,
     _inline_dpp_quad_amax,
-    kmchunks_for,
-    lds_acc_bytes_for,
-    k_half_for,
-    k_tiles_total_for,
-    kunroll_for,
-    kbs_stride_n0_dw_for,
-    kas_per_chunk_dw_for,
-    num_n_blocks_for,
-    kbs_per_expert_dw_for,
+    _lds_ptr3,
+    _lds_swizzle_mask,
+    _raw,
     bq_bytes_for,
     bscale_bytes_for,
+    k_half_for,
+    k_tiles_total_for,
+    kas_per_chunk_dw_for,
+    kbs_per_expert_dw_for,
+    kBS_stride_k0_dw,
+    kbs_stride_n0_dw_for,
+    kmchunks_for,
+    kStages,
+    kunroll_for,
+    lds_acc_bytes_for,
+    num_n_blocks_for,
 )
 
 NUM_CU = 256

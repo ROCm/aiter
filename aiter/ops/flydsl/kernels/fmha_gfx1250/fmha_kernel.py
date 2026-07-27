@@ -44,85 +44,85 @@ from __future__ import annotations
 import functools
 from contextlib import contextmanager
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, buffer_ops, gpu, rocdl, vector
+from flydsl.compiler.kernel_function import (
+    CompilationContext,
+)
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import const_expr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
 from ..tensor_shim import _run_compiled
-from flydsl.compiler.kernel_function import (
-    CompilationContext,
-)
-
-from .fmha_prologue import (
-    _emit_void,
-    _setreg,
-    _build_tdm_dgroup1,
-    _split_i64_to_lo_hi,
-    _phase4_q_load_flydsl,
-    _phase5_head_index_div_flydsl,
-    _compute_k_global_addr,
-    _compute_v_global_addr,
-    BLOCK_SIZE,
-    K_TILE_N,
-    _K_TDM_CONFIG,
-    _V_TDM_CONFIG,
-    K_ROW_BYTES,
-    V_ROW_BYTES,
-    K_SU_HALF_OFFSET,
-    V_SU_HALF_OFFSET,
-)
-
 from .fmha_core_loop import (
-    _get_types,
-    _make_v2f32,
-    _pair_k_tiles_for_wmma,
-    _load_v_two_sus_from_lds,
-    _pair_v_tiles_for_wmma,
-    _qk_pure_su,
-    _pv_pure_su,
-    _load_k_su_from_lds,
-    _sp_tiles_to_sp_pairs,
-    _softmax_part01_only,
+    ALU_PER_STAGE,
+    ALU_STAGES,
+    CNT_SU,
+    KV_BPP,
+    KV_K,
+    KV_NONE,
+    KV_V,
+    LDS_INST_COUNT,
+    LDS_K_SU_P_SIZE,
+    LDS_V_SU_P_SIZE,
+    N_LDS_PER_MSB,
+    N_LDS_V_PER_MSB,
+    N_PV_WMMA_N,
+    N_SP_PAIRS,
+    N_WMMA_K_TILES,
+    NUM_MSB,
+    PART2_SETUP_A,
+    PART2_SPLIT,
+    Q_WMMA_PER_MSB,
+    QK_HDIM,
+    RLTS_LEN,
+    SU_K_N,
+    V_HDIM,
+    WAVE_SIZE,
+    _atom_s_wait_dscnt,
+    _build_all_softmax_gemm2_ops,
+    _build_all_softmax_part2_ops,
     _build_p_tiles_from_softmax,
     _cl_su_v3_stage,
     _cl_su_v3_stage_gemm2,
-    _build_all_softmax_part2_ops,
-    _build_all_softmax_gemm2_ops,
-    _atom_s_wait_dscnt,
-    NUM_MSB,
-    WAVE_SIZE,
-    Q_WMMA_PER_MSB,
-    N_WMMA_K_TILES,
-    N_LDS_PER_MSB,
-    N_LDS_V_PER_MSB,
-    N_SP_PAIRS,
-    N_PV_WMMA_N,
-    CNT_SU,
-    SU_K_N,
-    LDS_K_SU_P_SIZE,
-    LDS_V_SU_P_SIZE,
-    KV_K,
-    KV_V,
-    KV_NONE,
-    LDS_INST_COUNT,
-    ALU_STAGES,
-    ALU_PER_STAGE,
-    RLTS_LEN,
-    QK_HDIM,
-    V_HDIM,
-    KV_BPP,
-    PART2_SPLIT,
-    PART2_SETUP_A,
+    _get_types,
+    _load_k_su_from_lds,
+    _load_v_two_sus_from_lds,
+    _make_v2f32,
+    _pair_k_tiles_for_wmma,
+    _pair_v_tiles_for_wmma,
+    _pv_pure_su,
+    _qk_pure_su,
     _rocdl_permlanex16,
+    _softmax_part01_only,
+    _sp_tiles_to_sp_pairs,
     set_vgpr_bank,
+)
+from .fmha_prologue import (
+    _K_TDM_CONFIG,
+    _V_TDM_CONFIG,
+    BLOCK_SIZE,
+    K_ROW_BYTES,
+    K_SU_HALF_OFFSET,
+    K_TILE_N,
+    V_ROW_BYTES,
+    V_SU_HALF_OFFSET,
+    _build_tdm_dgroup1,
+    _compute_k_global_addr,
+    _compute_v_global_addr,
+    _emit_void,
+    _phase4_q_load_flydsl,
+    _phase5_head_index_div_flydsl,
+    _setreg,
+    _split_i64_to_lo_hi,
 )
 
 
@@ -3222,6 +3222,7 @@ _launch_fns = {}  # {(is_causal, return_lse): launch_fn}
 
 def _patch_reusable_slot_specs():
     import ctypes
+
     from flydsl.expr.numeric import Float32, Float64
 
     if not hasattr(Float32, "_reusable_slot_spec"):

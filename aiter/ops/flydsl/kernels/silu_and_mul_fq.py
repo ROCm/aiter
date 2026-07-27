@@ -22,21 +22,22 @@ Compile options:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, vector, range_constexpr, const_expr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+)
 
 BLOCK_THREADS = 256
 WARP_SIZE = 64

@@ -7,16 +7,17 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Optional
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 import triton
 import triton.language as tl
-
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, buffer_ops, gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128

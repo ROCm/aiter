@@ -29,18 +29,20 @@ from contextlib import contextmanager
 from functools import lru_cache
 from typing import Optional
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector, buffer_ops
-from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T, Int32, Stream
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
-from .tensor_shim import _to_raw, _run_compiled
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr import math as fmath
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.typing import Int32, Stream, T
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250); D must be a multiple

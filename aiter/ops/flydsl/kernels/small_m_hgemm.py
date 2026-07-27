@@ -39,13 +39,15 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.jit.utils.chip_info import get_gfx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels import vector
 
 from .splitk_hgemm import (
     OnlineScheduler,

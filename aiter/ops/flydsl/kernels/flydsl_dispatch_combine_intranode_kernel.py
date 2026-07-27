@@ -5,18 +5,12 @@
 
 from __future__ import annotations
 
-import mori.ir.flydsl as mori_shmem
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
+import torch
 from flydsl._mlir import ir
 from flydsl.expr import T, arith, const_expr, range_constexpr
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
 from flydsl.expr.rocdl import (
     ballot,
     cvt_pk_f32_fp8,
@@ -28,6 +22,12 @@ from flydsl.expr.rocdl import (
 )
 from flydsl.expr.typing import Stream
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels.buffer_ops import (
+    buffer_load,
+    buffer_store,
+    create_buffer_resource_from_addr,
+)
 
 from .communication_ops_utils import (
     atomic_add_global_at,

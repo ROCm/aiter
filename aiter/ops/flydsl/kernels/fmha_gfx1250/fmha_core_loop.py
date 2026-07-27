@@ -16,19 +16,22 @@ Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
 
 from __future__ import annotations
 
-from .fmha_schedule import (
-    GEMM1_SCHEDULE,
-    GEMM2_SCHEDULE,
-    g1_row_idx,
-    g2_row_idx,
-    PART2_EXP_START,  # ops index where pair_exp starts (=23)
-)
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.expr import arith, rocdl, vector
-from flydsl.expr.typing import T
+from flydsl.expr import arith, rocdl
 from flydsl.expr.primitive import const_expr, range_constexpr
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
+
+from .fmha_schedule import (
+    GEMM1_SCHEDULE,
+    GEMM2_SCHEDULE,
+    PART2_EXP_START,  # ops index where pair_exp starts (=23)
+    g1_row_idx,
+    g2_row_idx,
+)
 
 # run_id offset for PART2 pkfma (rid 5..8 → MSB 0..3)
 _P2_BASE = 5
