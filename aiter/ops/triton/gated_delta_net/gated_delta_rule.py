@@ -458,7 +458,6 @@ def chunk_gated_delta_rule_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
-    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
@@ -466,6 +465,7 @@ def chunk_gated_delta_rule_opt_vk(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -498,8 +498,6 @@ def chunk_gated_delta_rule_opt_vk(
             Mutually exclusive with ``use_chunk_hip``.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
-        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
-            (`fp32` or `bf16`). Defaults to `k.dtype`.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
         num_decodes (int): number of leading decode-only sequences to skip in
             ``cu_seqlens``. When nonzero, the caller passes the ORIGINAL,
@@ -521,6 +519,8 @@ def chunk_gated_delta_rule_opt_vk(
             This is unsupported with ``use_chunk_flydsl=True``.
         inplace_final_state: Controls K5 in-place state write-back. It defaults
             to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype (torch.dtype, optional): Temporary chunk snapshot dtype
+            (`fp32` or `bf16`). Defaults to `k.dtype`.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:

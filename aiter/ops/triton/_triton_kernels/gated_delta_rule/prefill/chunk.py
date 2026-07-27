@@ -230,7 +230,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
-    snapshot_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
@@ -239,6 +238,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
+    snapshot_dtype: torch.dtype | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -264,8 +264,6 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
-        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
-            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
         use_exp2: bool — use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by K6). If None, a fresh buffer is allocated.
@@ -285,6 +283,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             place. Supported by the HIP and Triton VK K5 paths only.
         inplace_final_state: Controls in-place K5 state-pool write-back. It
             defaults to ``True`` when ``initial_state_indices`` is provided.
+        snapshot_dtype: optional temporary chunk snapshot dtype (`fp32` or
+            `bf16`). Defaults to `k.dtype` and is independent of state_dtype.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:

@@ -922,8 +922,10 @@ def chunk_fwd_kernel_o_opt_vk(
         b_k = tl.load(p_k, boundary_check=(0, 1))
         b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        if H_IS_FP32:
-            b_h = b_h.to(b_q.dtype)
+        # K6 requires matching tl.dot operand dtypes. This handles every
+        # supported input/snapshot combination (FP16/BF16 input with
+        # BF16/FP32 snapshots); same-dtype casts are eliminated by Triton.
+        b_h = b_h.to(b_q.dtype)
         b_o = tl.dot(b_q, tl.trans(b_h), acc=b_o)
         b_A = tl.dot(b_q, b_k, acc=b_A)
 
