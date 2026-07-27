@@ -314,19 +314,15 @@ legacy form if a step is ambiguous.
    Create `<arch>/<backend>/{gemm,moe}/` with a `.gitkeep` if absent.
 4. **Do not edit contents in the same commit.** Keep renames at 100% similarity;
    content changes go in a follow-up commit.
-5. **Update CI test selection.** `.github/scripts/select_triton_tests.py`
-   `resolve_gemm_config_names()` globs `configs/gemm/{dev}-{name}*.json` only —
-   it does **not** see the nested layout, so moved configs stop triggering their
-   tests. Teach it the new layout in the same PR, or note the gap explicitly.
-6. **Update docs.** `aiter/ops/triton/README.md` ("How config selection works",
+5. **Update docs.** `aiter/ops/triton/README.md` ("How config selection works",
    "Config file naming convention") and
    `aiter/ops/triton/utils/_triton/tunning/README.md` (the step that says
    `cp *.json .../configs/gemm/`) both still describe only the legacy layout.
-7. **Pull any tuning values still hardcoded in Python into the JSON.** A
+6. **Pull any tuning values still hardcoded in Python into the JSON.** A
    migrated family must be fully described by its config files.
-8. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
+7. **Verify** on the target arch: config resolves, `is_tuned` is `True` for a
    shape that has a specialized file, and numerics are unchanged.
-9. Leave the `# TODO(satya): legacy, remove` markers in `gemm_config_utils.py`
+8. Leave the `# TODO(satya): legacy, remove` markers in `gemm_config_utils.py`
    until `configs/gemm/` is empty. Deleting the legacy fallback is the final
    step of the migration, not an intermediate one.
 
