@@ -22,9 +22,6 @@ import functools
 import math
 import os
 
-import torch
-import triton
-
 # NOTE (mfma16_hip fork): ``flydsl.compiler`` / ``flydsl.expr`` /
 # ``get_rocm_arch`` are imported here for the additive HIP-aligned fork below.
 # They are side-effect-free (``flydsl`` is already a hard dependency of the
@@ -34,15 +31,17 @@ import triton
 # original ``>=0.1.8`` compatibility.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+import triton
 from flydsl.runtime.device import get_rocm_arch
 
-from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.tensor_shim import _run_compiled
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
+from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
@@ -672,7 +671,7 @@ def _resolve_state_dtype(initial_state, state_dtype):
     return resolved
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_or_compile_mfma16_hip(
     K,
     V,
@@ -703,8 +702,8 @@ def _get_or_compile_mfma16_hip(
     The hip compile module + its flydsl>=0.2.0 requirement are imported lazily
     here so the baseline path is unaffected.
     """
-    from packaging.version import Version
     import flydsl
+    from packaging.version import Version
 
     installed = Version(getattr(flydsl, "__version__", "0").split("+")[0])
     if installed < Version(_MFMA16_HIP_MIN_FLYDSL_VERSION):
@@ -830,6 +829,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # potential circular import; both sides key on the same chunk_offsets).
     from aiter.ops.chunk_gated_delta_rule_fwd_h import (
         _select_bv_for_dense as _hip_select_bv_for_dense,
+    )
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
         _select_bv_for_varlen as _hip_select_bv_for_varlen,
     )
 

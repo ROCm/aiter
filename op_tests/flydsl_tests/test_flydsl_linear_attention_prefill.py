@@ -13,6 +13,7 @@ Usage:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import pytest
@@ -49,7 +50,7 @@ try:
     )
 
     _HAS_VLLM_K5 = True
-except Exception:
+except ImportError:
     chunk_gated_delta_rule_fwd_h_vllm = None
     _HAS_VLLM_K5 = False
 
@@ -63,7 +64,7 @@ try:
     )
 
     _HAS_HIP_K5 = True
-except Exception:
+except ImportError:
     chunk_gated_delta_rule_fwd_h_hip_fn = None
     _HAS_HIP_K5 = False
 
@@ -680,7 +681,7 @@ def _is_gfx950() -> bool:
     """
     try:
         arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return "gfx950" in arch
 
@@ -994,7 +995,7 @@ def _run_perf_comparison(args: PrefillArgs):
     mainline backends used only as references; hip is skipped for shapes it does
     not support (needs K=V=128, bf16, chunk_size=64)."""
     context_lens = args.resolve_context_lens()
-    k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+    k, _w_orig, _u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
     ofs = args.output_final_state
     total_tokens = int(cu[-1].item())
 
@@ -1032,7 +1033,7 @@ def _run_perf_comparison(args: PrefillArgs):
     else:
         us_hip = float("nan")
 
-    has_hip = us_hip == us_hip  # not NaN
+    has_hip = not math.isnan(us_hip)  # not NaN
     _perf_results.append(
         {
             "Model": args.model_name or "-",
@@ -1078,7 +1079,7 @@ def _print_perf_table():
         if isinstance(val, bool):
             return ("Y" if val else "N").rjust(width)
         if isinstance(val, float):
-            if val != val:  # NaN (hip skipped for unsupported shapes)
+            if math.isnan(val):  # NaN (hip skipped for unsupported shapes)
                 return "-".rjust(width)
             return (f"{val:.2f}x" if "/" in key else f"{val:.1f}").rjust(width)
         return str(val).rjust(width)
@@ -1089,8 +1090,10 @@ def _print_perf_table():
     lines = [
         "",
         border,
-        "K5 Prefill Perf Summary (mfma16_hip vs hip vs triton; K5 device kernel us via "
-        "torch.profiler; fly/hip & tri/hip = speedup vs hip, >1 faster / <1 slower)",
+        (
+            "K5 Prefill Perf Summary (mfma16_hip vs hip vs triton; K5 device kernel us via "
+            "torch.profiler; fly/hip & tri/hip = speedup vs hip, >1 faster / <1 slower)"
+        ),
         border,
         "",
         sep,
