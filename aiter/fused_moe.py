@@ -1735,8 +1735,6 @@ def _flydsl_v2_stage2_wrapper(
                 dtype=out.dtype,
                 device=out.device,
             )
-    else:
-        out.zero_()
     mxfp4_moe_gemm2(
         inter_sorted_quant=_mxfp4_scale_u8(inter_states),
         inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
