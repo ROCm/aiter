@@ -335,7 +335,7 @@ def _apply_deadlock_guard(
     # the 1024-thread block is wave-limited (32 waves/CU / 16), with VGPR/LDS
     # headroom (measured gfx942: VGPR=40, LDS=8.7KB). Re-check if scan_stages or
     # the histogram grows enough to push VGPR>64 / LDS>32KB (would drop occ to 1).
-    max_coresident_workgroups = _multi_processor_count() * 2
+    max_coresident_workgroups = _multi_processor_count(get_rocm_arch()) * 2
     is_deadlock_free = (
         num_rows * (max_active_workgroups_per_row - 1) < max_coresident_workgroups
     )
