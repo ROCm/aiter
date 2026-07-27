@@ -20,8 +20,6 @@ Variant:
 """
 
 from types import SimpleNamespace
-from typing import Optional
-
 import torch
 
 import flydsl.compiler as flyc
