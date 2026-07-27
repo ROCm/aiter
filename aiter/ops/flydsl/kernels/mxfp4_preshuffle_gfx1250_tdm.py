@@ -8,7 +8,17 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops, vector
+from flydsl.expr import (
+    arith,
+    buffer_ops,
+    const_expr,
+    range_constexpr,
+    rocdl,
+    tdm_ops,
+    vector,
+)
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from .gemm_common_gfx1250 import (
@@ -59,13 +69,38 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
+    # EP gemm2-fused scatter: when ``ep_p2p_write`` the (bf16, stage1_act=0)
+    # epilogue does NOT TDM-store arg_c; instead each contiguous output row
+    # (grouped_row = blk_m + row) is P2P-written -- pre-multiplied by its route
+    # weight -- into the origin peer's cco symmetric ``comb_inp[slot]`` (slot =
+    # origin_lid*topk + k). The per-row (dst_packed, f32 weight) map is a
+    # (cap_rows, 2) i32 tensor passed at runtime via ``arg_ep_rowmap``. off/wire/
+    # slot_stride/arena_handle are compile-time constants (the dispatch op's arena
+    # is stable for the kernel's lifetime). Mirrors the mxscale gemm2 Direction-D
+    # epilogue in gemm_mxscale_gfx1250.py.
+    ep_p2p_write: Constexpr[int] = 0,
+    ep_off_comb_inp: Constexpr[int] = 0,
+    ep_wire_nbytes: Constexpr[int] = 0,
+    ep_slot_stride: Constexpr[int] = 0,
+    ep_arena_handle: Constexpr[int] = 0,
+    arg_ep_rowmap: fx.Tensor = None,
 ):
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
         a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
         stage1_quant_out, quant_wmma_rep,
+        ep_p2p_write, ep_off_comb_inp, ep_wire_nbytes, ep_slot_stride,
+        ep_arena_handle,
     )
     _ = cache_tag
+    if ep_p2p_write:
+        # The fused P2P scatter epilogue is a per-row buffer_store into peers'
+        # symmetric memory; it replaces the contiguous 2D TDM tensor-store and
+        # is only defined for the bf16/f16 down-proj (stage1_act=0, no quant-out).
+        if stage1_act != 0:
+            raise ValueError("ep_p2p_write is gemm2-only (stage1_act must be 0)")
+        if stage1_quant_out:
+            raise ValueError("ep_p2p_write is incompatible with stage1_quant_out")
     WMMA_M = WMMA_N = 16
     WMMA_K = 128
     WAVE = 32
@@ -135,6 +170,7 @@ def launch_gemm_a8w4_tdm(
         arg_m_tile_map: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Tensor,
+        arg_ep_rowmap: fx.Tensor,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -405,6 +441,17 @@ def launch_gemm_a8w4_tdm(
             is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
+            if const_expr(ep_p2p_write):
+                # EP gemm2-fused scatter resources (staging weight + P2P store).
+                # Defined here (epilogue scope) so they never cross the dynamic
+                # `if expert < n_experts` / mainloop scf.if boundaries.
+                import mori.cco.device.flydsl as _cco
+
+                ep_map_rsrc = buffer_ops.create_buffer_resource(
+                    arg_ep_rowmap, max_size=True
+                )
+                ep_win = _cco.Window(fx.Int64(ep_arena_handle))
+
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused silu/swiglu -> fp8 quant; stage fp8 payload to LDS, scatter scale to global.
@@ -487,32 +534,121 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=neg_limit) for p in range_constexpr(4)], fx.Float32).to(oc)
                             lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
                         else:
-                            hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
+                            if const_expr(ep_p2p_write):
+                                # Pre-multiply each output row by its route weight
+                                # (ep_rowmap[grouped_row].col1, f32) BEFORE truncating
+                                # to bf16; the combine kernel does an unweighted sum.
+                                _gr = blk_m + row_rel
+                                _wf = buffer_ops.buffer_load(
+                                    ep_map_rsrc, _gr * 2 + 1, vec_width=1, dtype=T.f32
+                                )
+                                hv = Vec.from_elements(
+                                    [acc[i] * _wf for i in range_constexpr(8)],
+                                    fx.Float32,
+                                ).to(oc)
+                            else:
+                                hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
                             lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
 
-            # -- Shared LDS -> TDM store to global --
+            # -- Shared LDS -> global --
             workgroup_barrier()
-            if const_expr(stage1_act):
-                out_stride = i32_n // 2
-                out_col_off = blk_n64 // 2
+            if const_expr(ep_p2p_write):
+                # EP gemm2-fused scatter (Direction-D): the whole (route-weighted)
+                # [tile_m x STORE_N] tile now sits row-major in LDS. Instead of a
+                # local TDM store, P2P each valid output row as coalesced 8-bf16
+                # (b128) chunks into its origin peer's comb_inp slot. Flatten
+                # (row, chunk) over ALL block threads so every lane issues a remote
+                # store each pass; consecutive lanes of one row hit consecutive
+                # remote columns -> coalesced. Rows past the expert's valid range
+                # (mn_oob) or with a sentinel dst (dropped/padding) are skipped.
+                # No per-CTA release fence: stores drain in the background and the
+                # combine kernel's cross-device barrier enforces visibility.
+                elem_bytes = 2
+                _nchunks = STORE_N // 8  # 8 bf16 (b128) per chunk
+                _nchunks_idx = arith.index(_nchunks)
+                _total = tile_m * _nchunks
+                _tid_idx = arith.index_cast(T.index, tid)
+                _blk_m_idx = arith.index_cast(T.index, blk_m)
+                for _base in range_constexpr(0, _total, block):
+                    _remaining = _total - _base
+                    _f = arith.index(_base) + _tid_idx
+                    _row = _f // _nchunks_idx
+                    _chunk = _f - _row * _nchunks_idx
+                    _row_i32 = arith.index_cast(T.i32, _row)
+                    grouped_row = _blk_m_idx + _row
+                    _dst_idx = arith.index_cast(T.i32, grouped_row * arith.index(2))
+                    dst_packed = buffer_ops.buffer_load(
+                        ep_map_rsrc, _dst_idx, vec_width=1, dtype=T.i32
+                    )
+                    row_valid = arith.cmpi(
+                        arith.CmpIPredicate.slt, _row_i32, mn_oob
+                    )
+                    dst_valid = arith.cmpi(
+                        arith.CmpIPredicate.sge,
+                        dst_packed,
+                        arith.constant(0, type=T.i32),
+                    )
+                    store_valid = arith.andi(row_valid, dst_valid)
+                    if _remaining < block:
+                        _lane_ok = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            arith.index_cast(T.i32, _tid_idx),
+                            arith.constant(_remaining, type=T.i32),
+                        )
+                        store_valid = arith.andi(store_valid, _lane_ok)
+                    origin_pe = dst_packed // ep_slot_stride
+                    slot = dst_packed % ep_slot_stride
+                    # Bake the warp-uniform column origin (blk_n) into the descriptor
+                    # BASE so a row's lanes share ONE descriptor (no address
+                    # waterfall); the per-lane column rides in the VGPR byte offset.
+                    row_base = (
+                        fx.Int64(ep_win.lsa_ptr(origin_pe, ep_off_comb_inp))
+                        + fx.Int64(slot) * fx.Int64(ep_wire_nbytes)
+                        + blk_n64 * fx.Int64(elem_bytes)
+                    )
+                    _voff_bytes = arith.index_cast(
+                        T.i32, _chunk * arith.index(8 * elem_bytes)
+                    )
+                    _lds_byte = (
+                        _row * arith.index(STORE_N) + _chunk * arith.index(8)
+                    ) * arith.index(elem_bytes)
+                    _if = scf.IfOp(store_valid, results_=[], has_else=False)
+                    with ir.InsertionPoint(_if.then_block):
+                        _v = lds_load_b128_raw(stC_idx, _lds_byte)
+                        buffer_ops.buffer_store(
+                            _v,
+                            buffer_ops.create_buffer_resource_from_addr(row_base),
+                            _voff_bytes,
+                            offset_is_bytes=True,
+                        )
+                        scf.YieldOp([])
             else:
-                out_stride = c_stride
-                out_col_off = c_inner_off
-            if const_expr(stage1_quant_out and stage1_act):
-                oc_store = fx.Int8
-                c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
-            else:
-                oc_store = oc
-                c_iter = fx.get_iter(arg_c)
-            c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
-            gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
-            atomC = make_tdm_store(gtC, mn_oob, out_stride)
-            fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
-            tdm_ops.tensor_wait(0)
+                # -- Shared LDS -> TDM store to global --
+                if const_expr(stage1_act):
+                    out_stride = i32_n // 2
+                    out_col_off = blk_n64 // 2
+                else:
+                    out_stride = c_stride
+                    out_col_off = c_inner_off
+                if const_expr(stage1_quant_out and stage1_act):
+                    oc_store = fx.Int8
+                    c_iter = fx.recast_iter(fx.Int8, fx.get_iter(arg_c))
+                else:
+                    oc_store = oc
+                    c_iter = fx.get_iter(arg_c)
+                c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
+                gtC = global_view(c_iter, c_off_rt, (tile_m, STORE_N), (STORE_N, 1))
+                atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
+                tdm_ops.tensor_wait(0)
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, f32_swiglu_limit).launch(
+    # arg_ep_rowmap is only read under ep_p2p_write; keep a valid tensor for the
+    # ABI when the caller left it unset (batched / non-EP paths).
+    if arg_ep_rowmap is None:
+        arg_ep_rowmap = arg_c
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, arg_ep_rowmap, i32_m, N, f32_swiglu_limit).launch(
         grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 

@@ -396,6 +396,15 @@ def _use_a8w4_tdm_ep() -> bool:
     return os.environ.get("AITER_GROUPED_A8W4_TDM_EP", "1") in _TRUTHY_ENV
 
 
+def _use_a8w4_tdm_ep_scatter() -> bool:
+    """Route scatter_fused (ep_scatter) through the felix TDM GEMM2 whose epilogue
+    now does the P2P scatter into peers' comb_inp (default on). Set
+    ``AITER_EP_SCATTER_TDM=0`` to force it back onto the grouped/contiguous mxscale
+    GEMM2 P2P epilogue instead (for A/B comparison).
+    """
+    return os.environ.get("AITER_EP_SCATTER_TDM", "1") in _TRUTHY_ENV
+
+
 def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
@@ -409,6 +418,8 @@ def _grouped_a8w4_tdm_moe(
     tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
     data_format="a8w4",
     expert_mask=None, num_local_tokens=None,
+    ep_scatter=False, ep_arena_handle=0, ep_comb_inp_off=0, ep_wire_nbytes=0,
+    ep_rank=0, ep_max_tok=0, ep_topk=0, ep_tis=None,
 ):
     import functools
     import torch
@@ -484,10 +495,43 @@ def _grouped_a8w4_tdm_moe(
         )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
+    # EP gemm2-fused scatter (scatter_fused): fold the ep_rowmap build into the
+    # remap pass (it already computes each route's final contiguous row), so the
+    # gemm2 TDM epilogue can P2P each weighted row into peers' comb_inp. Sized to
+    # the contiguous buffer (grouped_row = blk_m + row < contiguous_m).
+    _ep_remap = None
+    ep_rowmap = None
+    if ep_scatter:
+        _cap_rows = int(contiguous_m)
+        ep_rowmap = torch.empty(
+            (_cap_rows + 1, 2), dtype=torch.int32, device=device
+        )
+        _ep_remap = dict(
+            gather_w=_gather_w_buf,
+            tis=ep_tis,
+            ep_rowmap=ep_rowmap,
+            cap_rows=_cap_rows,
+            topk=int(topk),
+            max_tok=int(ep_max_tok),
+            slot_stride=int(ep_max_tok) * int(ep_topk),
+        )
     _starts, psum, _ = contiguous_psum_remap(
-        _masked_m, topids_to_rows, E, max_m, tile_m, num_valid_routes=_ep_nvr
+        _masked_m, topids_to_rows, E, max_m, tile_m, num_valid_routes=_ep_nvr,
+        ep=_ep_remap,
     )
     psum = psum.to(torch.int32).contiguous()
+    _ep_gemm2_kwargs = (
+        dict(
+            ep_p2p_write=1,
+            ep_off_comb_inp=int(ep_comb_inp_off),
+            ep_wire_nbytes=int(ep_wire_nbytes),
+            ep_slot_stride=int(ep_max_tok) * int(ep_topk),
+            ep_arena_handle=int(ep_arena_handle),
+            ep_rowmap=ep_rowmap,
+        )
+        if ep_scatter
+        else {}
+    )
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -564,6 +608,7 @@ def _grouped_a8w4_tdm_moe(
         tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
         out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
         stage1_act=0, bias=_b2, num_buffers=num_buffers2,
+        **_ep_gemm2_kwargs,
     )
 
     if kernel_bench_callable is not None:
@@ -591,7 +636,16 @@ def _grouped_a8w4_tdm_moe(
             psum, n_experts=E, contiguous_m=contiguous_m, N=model_dim, K=inter_dim,
             tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
             out_is_f16=out_is_f16, a_is_fp4=_a_is_fp4,
-            stage1_act=0, bias=_b2, num_buffers=num_buffers2)))
+            stage1_act=0, bias=_b2, num_buffers=num_buffers2,
+            **_ep_gemm2_kwargs)))
+
+    if ep_scatter:
+        # gemm2 already P2P-wrote each (token,k) weighted result into peers'
+        # comb_inp; the fused combine kernel reads/sums it. No gather-reduce.
+        # Return a shape-only placeholder (the caller's combine() ignores it and
+        # reads comb_inp), matching the mxscale contiguous path's contract.
+        os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm"
+        return torch.empty((token_num, model_dim), dtype=dtype, device=device)
 
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if _is_ep:
@@ -900,9 +954,13 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     # wiring lives in _grouped_a8w4_tdm_moe. doweight_stage1 is not supported with
     # EP on this path (the route kernel owns the gather weights), so it falls back
     # to the grouped path.
+    # scatter_fused (ep_scatter) rides the felix TDM GEMM2's P2P scatter epilogue
+    # (AITER_EP_SCATTER_TDM, default on); set it to 0 to force the grouped/
+    # contiguous mxscale GEMM2 P2P epilogue instead. doweight_stage1 is still
+    # unsupported on the TDM EP path (route kernel owns the gather weights).
     _tdm_ep_ok = (expert_mask is not None) and _use_a8w4_tdm_ep() and (
         not doweight_stage1
-    )
+    ) and (not ep_scatter or _use_a8w4_tdm_ep_scatter())
     if _use_a8w4_tdm_path() and stage1_weight_layout == "gugu" and (
         expert_mask is None or _tdm_ep_ok
     ):
@@ -957,6 +1015,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             data_format=data_format,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
+            ep_scatter=ep_scatter,
+            ep_arena_handle=ep_arena_handle,
+            ep_comb_inp_off=ep_comb_inp_off,
+            ep_wire_nbytes=ep_wire_nbytes,
+            ep_rank=ep_rank,
+            ep_max_tok=ep_max_tok,
+            ep_topk=ep_topk,
+            ep_tis=ep_tis,
             **_tdm_kw,
         )
 

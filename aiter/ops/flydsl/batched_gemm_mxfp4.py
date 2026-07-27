@@ -51,6 +51,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage1_quant_out=0,
     quant_scale=None,
     quant_wmma_rep=1,
+    ep_p2p_write=0,
+    ep_off_comb_inp=0,
+    ep_wire_nbytes=0,
+    ep_slot_stride=0,
+    ep_arena_handle=0,
+    ep_rowmap=None,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -83,6 +89,10 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_scale_tensor = out  # dummy, never written
     else:
         quant_scale_tensor = quant_scale.view(torch.uint8)
+    # EP gemm2-fused P2P scatter: the down-proj epilogue writes each weighted row
+    # into peers' comb_inp instead of TDM-storing arg_c. ep_rowmap carries the
+    # per-row (dst_packed, f32 weight) map; when off, pass a dummy tensor (unread).
+    ep_rowmap_tensor = ep_rowmap if ep_rowmap is not None else out
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -110,6 +120,12 @@ def flydsl_grouped_gemm_a8w4_masked(
         stage1_quant_out,
         quant_wmma_rep,
         quant_scale_tensor,
+        ep_p2p_write=int(ep_p2p_write),
+        ep_off_comb_inp=int(ep_off_comb_inp),
+        ep_wire_nbytes=int(ep_wire_nbytes),
+        ep_slot_stride=int(ep_slot_stride),
+        ep_arena_handle=int(ep_arena_handle),
+        arg_ep_rowmap=ep_rowmap_tensor,
     )
     return out
 
