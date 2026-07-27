@@ -1,15 +1,18 @@
+import functools
+
 import triton
 
-try:
-    _CACHED_ARCH = triton.runtime.driver.active.get_current_target().arch
-except RuntimeError:
-    from jax._src.lib import gpu_triton as triton_kernel_call_lib
 
-    _CACHED_ARCH = triton_kernel_call_lib.get_arch_details("0").split(":")[0]
-
-
+# Probed on first use, not at import: modules that only import this one (the
+# flash-attention backend on a GPU-less host, for one) must not need a driver.
+@functools.cache
 def get_arch():
-    return _CACHED_ARCH
+    try:
+        return triton.runtime.driver.active.get_current_target().arch
+    except RuntimeError:
+        from jax._src.lib import gpu_triton as triton_kernel_call_lib
+
+        return triton_kernel_call_lib.get_arch_details("0").split(":")[0]
 
 
 def is_gluon_avail():
