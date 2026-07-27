@@ -4,7 +4,6 @@
 # user interface
 
 import functools
-from typing import Optional, Tuple
 
 import torch
 
@@ -38,7 +37,7 @@ def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: Optional[torch.Tensor] = None,
+    correction_bias: torch.Tensor | None = None,
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
@@ -75,7 +74,7 @@ def topk_gating(
     )
 
 
-@compile_ops("module_moe_asm", fc_name="biased_grouped_topk")
+@compile_ops("module_moe_asm", fc_name="biased_grouped_topk", develop=True)
 def biased_grouped_topk_hip(
     gating_output: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -88,7 +87,7 @@ def biased_grouped_topk_hip(
 ) -> None: ...
 
 
-@compile_ops("module_moe_asm")
+@compile_ops("module_moe_asm", develop=True)
 def grouped_topk(
     gating_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -111,7 +110,7 @@ def gen_moe_fused_gate_fake_tensor(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     output = torch.empty_like(
         topk_weights, dtype=topk_weights.dtype, device=topk_weights.device
     )
@@ -121,7 +120,20 @@ def gen_moe_fused_gate_fake_tensor(
     return [output, indices]
 
 
-@compile_ops("module_moe_asm", gen_fake=gen_moe_fused_gate_fake_tensor)
+@compile_ops("module_moe_asm", fc_name="moe_fused_gate", develop=True)
+def _moe_fused_gate(
+    input: torch.Tensor,
+    bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_expert_group: int,
+    topk_group: int,
+    topk: int,
+    n_share_experts_fusion: int,
+    routed_scaling_factor: float = 1.0,
+) -> None: ...
+
+
 def moe_fused_gate(
     input: torch.Tensor,
     bias: torch.Tensor,
@@ -132,7 +144,21 @@ def moe_fused_gate(
     topk: int,
     n_share_experts_fusion: int,
     routed_scaling_factor: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]: ...
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # C side fills topk_weights / topk_ids in place and returns void; return the
+    # (aliased) tensors to preserve the original API.
+    _moe_fused_gate(
+        input,
+        bias,
+        topk_weights,
+        topk_ids,
+        num_expert_group,
+        topk_group,
+        topk,
+        n_share_experts_fusion,
+        routed_scaling_factor,
+    )
+    return topk_weights, topk_ids
 
 
 def biased_grouped_topk(
@@ -266,12 +292,12 @@ def _top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
     k: int = 2048,
-    workspace: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -321,7 +347,7 @@ def top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
@@ -354,7 +380,7 @@ def top_k_per_row_prefill_fast(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
@@ -371,7 +397,7 @@ def _top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
-    workspace: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -385,7 +411,7 @@ def top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
 ) -> None:
-    """Per-row top-k (decode). Always uses the one-block kernel — the C++
+    """Per-row top-k (decode). Always uses the one-block kernel -- the C++
     side ignores the workspace argument for decode."""
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
     # The original mb dispatch is commented out below for reference:

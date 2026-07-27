@@ -11,7 +11,7 @@ def _cdiv_pow2(n, log2_k):
 def _expt_data_compute_stage1(
     pid,
     Hist,
-    n_expts_tot,
+    n_expts_tot: tl.constexpr,
     TokenStart,
     TileStart,
     MDTileInfo,
@@ -105,7 +105,7 @@ def _expt_data_only_kernel(
     BLOCK: tl.constexpr,
     EQUAL_BLOCK: tl.constexpr,
 ):
-    """Standalone stage1+stage2 launch — builds ExptData from a precomputed
+    """Standalone stage1+stage2 launch -- builds ExptData from a precomputed
     histogram with no memset. Grid: (n_expts_tot,)."""
     pid = tl.program_id(0)
 

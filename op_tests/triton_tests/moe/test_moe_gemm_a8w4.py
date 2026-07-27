@@ -2,29 +2,31 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
 
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
+from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
     moe_gemm_a8w4,
     moe_gemm_torch,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-from aiter.ops.shuffle import shuffle_weight_gfx1250
+
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
-    downcast_to_static_fp8,
     downcast_to_mxfp,
+    downcast_to_static_fp8,
     upcast_from_mxfp,
 )
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # ---------------
 # initialize data
@@ -193,8 +195,12 @@ class Case:
             Case(4096, 256, 256, "mxfloat8_e4m3fn", 128, 4),
             Case(1000, 704, 800, "mxfloat8_e4m3fn", 8, 2),
             Case(300, 400, 800, "mxfloat8_e4m3fn", 8, 4),
+            Case(16, 400, 500, "float8_e4m3fn", 32, 2),
+            Case(32, 500, 600, "mxfloat8_e4m3fn", 64, 4),
             Case(64, 4096, 4096, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
             Case(64, 4096, 2048, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
+            Case(64, 1536, 7168, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
+            Case(256, 7168, 768, "mxfloat8_e4m3fn", 384, 6, hbm_swizzling=True),
             # smaller tests for gfx1250 ffm
             Case(16, 512, 512, "float8_e4m3fn", 32, 2),
             Case(16, 512, 512, "float8_e4m3fn", 32, 2, hbm_swizzling=True),

@@ -17,30 +17,19 @@ See ``fused_compress_attn_hca.py`` for the original wave64 documentation.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import STensor, _to_raw, _run_compiled
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
-
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the multi-wave LDS kernel references CompilationContext, STensor,
-# SmemAllocator, SmemPtr only inside @flyc.kernel / @flyc.jit closures,
-# which formatters may not see).
-_FORCE_BIND_LDS = (CompilationContext, STensor, SmemAllocator, SmemPtr, get_rocm_arch)
+from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
 SLICE = 32  # head_dim elements per block (grid-Y split)
@@ -133,22 +122,12 @@ def _build_compress_forward_kernel(
     LDS_M_ELEMS = NW * SLICE_SZ
     LDS_KV_ELEMS = NW * SLICE_SZ
     LDS_W_ELEMS = NW * SLICE_SZ
-    LDS_M_BYTES = LDS_M_ELEMS * 4
-    LDS_KV_BYTES = LDS_KV_ELEMS * 4
-    LDS_W_BYTES = LDS_W_ELEMS * 4
 
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=(f"hca_compress_smem_D{D}_NW{NW}_SL{SLICE_SZ}_S{state_size}"),
-    )
-    lds_m_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_m_off + LDS_M_BYTES
-    lds_kv_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kv_off + LDS_KV_BYTES
-    lds_w_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_w_off + LDS_W_BYTES
+    @fx.struct
+    class SharedStorage:
+        lds_m: fx.Array[fx.Float32, LDS_M_ELEMS, 16]
+        lds_kv: fx.Array[fx.Float32, LDS_KV_ELEMS, 16]
+        lds_w: fx.Array[fx.Float32, LDS_W_ELEMS, 16]
 
     _kname = f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     fm_fast = arith.FastMathFlags.fast
@@ -473,28 +452,16 @@ def _build_compress_forward_kernel(
             # Layout: per array, NW * SLICE_SZ fp32 entries; per-thread
             # base = wid * SLICE_SZ + lid * VEC; thread writes VEC values
             # at base+0, base+1, ..., base+VEC-1.
-            lds_base = allocator.get_base()
-            lds_m = STensor(
-                SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_M_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_M_ELEMS,),
-            )
-            lds_kv = STensor(
-                SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_KV_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_KV_ELEMS,),
-            )
-            lds_w = STensor(
-                SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_W_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_W_ELEMS,),
-            )
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_m_ptr = lds.lds_m.ptr
+            lds_kv_ptr = lds.lds_kv.ptr
+            lds_w_ptr = lds.lds_w.ptr
             lds_thread_base = ArithValue(wid) * c_SLICE + ArithValue(lid) * c_VEC
             for i in range_constexpr(VEC):
                 idx_i = lds_thread_base + arith.constant(i, type=i32)
-                lds_m[fx.Index(idx_i)] = m_local[i]
-                lds_kv[fx.Index(idx_i)] = kv_local[i]
-                lds_w[fx.Index(idx_i)] = w_local[i]
+                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
+                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
+                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
 
             gpu.barrier()
 
@@ -510,39 +477,31 @@ def _build_compress_forward_kernel(
                 for i in range_constexpr(VEC):
                     lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
                     # Global max across NW waves for this element.
-                    m_g = c_neg_inf
+                    m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        m_w = lds_m[fx.Index(idx_w)]
+                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
                         m_arr.append(m_w)
-                        m_g = arith.maximumf(m_g, m_w)
+                        m_g = m_g.maximumf(m_w)
 
                     # Weighted sums (kv * scale_w) and (w * scale_w).
-                    kv_sum = c_zero_f32
-                    w_sum = c_zero_f32
+                    kv_sum = fx.Float32(0.0)
+                    w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        kv_w = lds_kv[fx.Index(idx_w)]
-                        w_w = lds_w[fx.Index(idx_w)]
+                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
+                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
                         m_w = m_arr[w]
-                        scale_w = fexp_f32(arith.subf(m_w, m_g))
-                        kv_sum = arith.AddFOp(
-                            kv_sum,
-                            arith.MulFOp(kv_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                        w_sum = arith.AddFOp(
-                            w_sum,
-                            arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    rcp_w = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
+                        scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
+                        kv_sum = kv_sum + kv_w * scale_w
+                        w_sum = w_sum + w_w * scale_w
+                    rcp_w = fx.Float32(
+                        llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
+                        )
                     )
-                    comp_list.append(
-                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
-                    )
+                    comp_list.append(_to_raw(kv_sum * rcp_w))
 
                 # -- Vectorized write of VEC f32 comp values --
                 out_rsrc = buffer_ops.create_buffer_resource(
@@ -593,13 +552,6 @@ def _build_compress_forward_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        # Materialize the LDS global symbol inside the gpu_module body
-        # (the SmemAllocator was declared outside the kernel decorator).
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
         k = kernel(
@@ -1158,13 +1110,13 @@ def flydsl_hca_compress_attn_gfx1250(
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
-    kv_compressed_scratch: Optional[torch.Tensor] = None,
+    kv_compressed_scratch: torch.Tensor | None = None,
     quant: bool = False,
-    k_rope_cache: Optional[torch.Tensor] = None,
+    k_rope_cache: torch.Tensor | None = None,
     quant_group_size: int = 64,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """HCA-only 2-kernel compress + norm+rope+scatter (V4-Pro Main path).
 

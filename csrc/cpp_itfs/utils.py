@@ -2,20 +2,21 @@
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import shutil
-import os
-import subprocess
-from jinja2 import Template
-import ctypes
-from packaging.version import parse, Version
-from collections import OrderedDict
-from functools import lru_cache, partial
 import binascii
+import ctypes
 import hashlib
-import logging
-import time
 import inspect
 import json
+import logging
+import os
+import shutil
+import subprocess
+import time
+from collections import OrderedDict
+from functools import cache, lru_cache, partial
+
+from jinja2 import Template
+from packaging.version import Version, parse
 
 
 def get_git_commit_id_short():
@@ -132,7 +133,7 @@ def get_hip_version():
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
 
-@lru_cache()
+@lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
@@ -279,10 +280,10 @@ def run_lib(func_name, folder=None):
 
 
 def hash_signature(signature: str):
-    return hashlib.md5(signature.encode("utf-8")).hexdigest()
+    return hashlib.md5(signature.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_default_func_name(md_name, args: tuple):
     signature = "_".join([str(arg).lower() for arg in args])
     return f"{md_name}_{hash_signature(signature)}"
@@ -335,9 +336,9 @@ def str_to_bool(s):
 
 
 def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
+    import torch
     import triton
     import triton.language as tl
-    import torch
 
     if not isinstance(kernel, triton.JITFunction):
         raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
@@ -423,7 +424,7 @@ def check_hsaco(func_name, constexprs=None):
     return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_hsaco_launcher(hsaco_name, kernel_name):
     from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
 
@@ -464,8 +465,8 @@ class HsacoKernel:
     def __getitem__(self, grid):
         def _call(*args, **kwargs):
             if AITER_USE_HSACO:
-                import triton.language as tl
                 import torch
+                import triton.language as tl
 
                 sig = inspect.signature(self.triton_kernel.fn)
                 valid_param_names = set(sig.parameters.keys())

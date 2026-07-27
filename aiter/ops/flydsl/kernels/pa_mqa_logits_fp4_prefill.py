@@ -5,21 +5,16 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
+import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
-from flydsl.utils.smem_allocator import SmemAllocator
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -43,9 +38,6 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
         fx.Int32
     )
-
-
-allocator = None
 
 
 def compute_prefill_schedule(
@@ -77,7 +69,7 @@ def compute_prefill_schedule(
     ls = local_starts.to(torch.int32)
     le = local_ends.to(torch.int32)
 
-    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
+    # chunk count per row = ceil(le / block_k); le<=0 -> 0 chunks.
     chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
 
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
@@ -88,17 +80,17 @@ def compute_prefill_schedule(
     total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
     feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
     max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
-    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
+    # smallest feasible s, via arithmetic (no tensor gather -> no capture sync).
     first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
     safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
 
-    # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
+    # -- per-row number of CTAs (chunk-splits); 0 for empty rows --
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
     incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
     excl = incl - ctas_r  # exclusive prefix sum
     total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
 
-    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
+    # -- map each fixed slot -> (row, split) + emit cta_info in ONE kernel --
     # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
     if cta_info_out is None:
         cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
@@ -205,7 +197,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
         head_dim % 128 == 0
     ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
-    global allocator
 
     N_TILES = block_k // MFMA_N
     assert (
@@ -245,11 +236,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
     def _mod_kb(x):
         return (x & fx.Int32(_kb_mask)) if _kb_is_pow2 else (x % kv_block_size)
-
-    allocator = SmemAllocator(
-        None, arch="gfx950", global_sym_name="mqa_fp4_prefill_smem"
-    )
-    allocator.ptr = 16  # minimal, no LDS needed for this approach
 
     QS_DW = (m_tiles + 3) // 4
     qs_pad = QS_DW * 4
@@ -401,7 +387,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
             w_per_lane.append(w_f32 * ws_vec)
 
-        # ── prologue + N-1 prefetch loop + epilogue ──
+        # -- prologue + N-1 prefetch loop + epilogue --
 
         def _load_phys(c_i32_arg):
             ni_base = warp_id * fx.Int32(N_TILES_PER_WARP)
@@ -527,7 +513,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
             # Row base is folded into `out_rsrc`'s i64 base pointer (see above),
-            # so the per-token store offset is just the (small) token index —
+            # so the per-token store offset is just the (small) token index --
             # no i32 overflow even for very large stride_out_row * row_id.
             out_off_real = out_token
             out_off = in_window.select(out_off_real, oob_off)
@@ -631,8 +617,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
         )
 
-    allocator.block_threads = block_threads_k
-    return pa_mqa_logits_fp4_prefill_kernel, allocator
+    return pa_mqa_logits_fp4_prefill_kernel, block_threads_k
 
 
 # ============================================================================
@@ -650,7 +635,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    kfn, alloc = build_pa_mqa_logits_fp4_prefill_module(
+    kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
         max_blocks_per_seq=max_blocks_per_seq,
@@ -658,7 +643,6 @@ def compile_pa_mqa_logits_fp4_prefill(
         heads=heads,
         head_dim=head_dim,
     )
-    block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
     @flyc.jit
     def launch_pa_mqa_logits_fp4_prefill(
@@ -675,11 +659,6 @@ def compile_pa_mqa_logits_fp4_prefill(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        # Re-finalize the smem allocator into this launch's gpu module body.
-        alloc.finalized = False
-        cctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(cctx.gpu_module_body):
-            alloc.finalize()
         gxi = arith.index_cast(T.index, gx.ir_value())
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
@@ -705,10 +684,10 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    n_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Ragged-prefill FP4 paged MQA logits (gfx950)."""
     total_tokens, heads, head_dim_packed = q_fp4.shape
@@ -801,7 +780,7 @@ def _varqlen_windows_kernel(
     n = r - cu_b
     qlen = cu_b1 - cu_b
     le = tl.maximum(ctx_b - qlen + n + 1, 0)
-    # Rows beyond the real total Σ (cu[B]) are FLAT tail-padding — force an empty
+    # Rows beyond the real total ? (cu[B]) are FLAT tail-padding -- force an empty
     # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
     # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
     real_total = tl.load(cu_ptr + B)
@@ -816,7 +795,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
     Pass `out=(row_to_batch, local_starts, local_ends)` (fixed int32 buffers each
-    >= total_q long) to write into stable addresses — the CUDAGraph decode path
+    >= total_q long) to write into stable addresses -- the CUDAGraph decode path
     scores all padded rows, so top_k replays from these window pointers while
     `build()` refreshes their contents. Rows past the real total (cu[B]) get an
     empty window (local_ends == 0) so they are skipped.
@@ -856,18 +835,18 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
     weights: torch.Tensor,
     max_seq_len: int,
     *,
-    cu_seq_q: Optional[torch.Tensor] = None,
-    context_lens: Optional[torch.Tensor] = None,
-    windows: Optional[tuple] = None,
+    cu_seq_q: torch.Tensor | None = None,
+    context_lens: torch.Tensor | None = None,
+    windows: tuple | None = None,
     weight_scale: float = 1.0,
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    n_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    parallel_unit_num: int | None = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Variable-qlen (per-batch MTP) FP4 paged MQA logits (gfx950)."""
     total_q = q_fp4.shape[0]

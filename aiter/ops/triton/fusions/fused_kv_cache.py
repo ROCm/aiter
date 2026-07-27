@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+
 import torch
 import triton
-from typing import Tuple
+
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
 except:  # noqa: E722
@@ -20,9 +27,9 @@ except:  # noqa: E722
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
@@ -49,7 +56,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
@@ -108,7 +115,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
     the concatenated k_nope and k_pe are copied to kv_cache inplace
@@ -254,8 +261,13 @@ def fused_qk_rope_cat_and_cache_mla(
     grid = (n_pid, 1, 1)
     if DEVICE_ARCH == "gfx1250":
         _kernel = gluon_fused_qk_rope_cat_and_cache_mla_kernel
+        # The gfx1250 gluon kernel keeps an extra (unused) MAX_EMBD_POS positional
+        # arg for a uniform launch interface with the BLOCK kernel. Pass the
+        # cos/sin cache length to satisfy its signature.
+        _extra_uniform_args = (cos.shape[0],)
     else:
         _kernel = triton_fused_qk_rope_cat_and_cache_mla_kernel
+        _extra_uniform_args = ()
 
     _kernel[grid](
         q_nope,
@@ -274,6 +286,7 @@ def fused_qk_rope_cat_and_cache_mla(
         b,
         b_slot,
         num_decode_toks_for_zeros,
+        *_extra_uniform_args,
         *q_nope.stride(),
         *q_pe.stride(),
         *k_nope.stride(),

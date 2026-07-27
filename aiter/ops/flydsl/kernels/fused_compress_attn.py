@@ -16,8 +16,8 @@ Two kernel families share this file:
     online-softmax reduce, single dispatch. Parallelizes the serial softmax
     chain that bottlenecks the latency-bound small-N decode regime. On the
     CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8/FP4) shapes it
-    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4×
-    (BF16) / ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at
+    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4x
+    (BF16) / ~1.15-1.24x (FP8) at decode bs=1-32; it falls back to legacy at
     high N where CU occupancy already saturates. The K-split win comes from
     parallelizing the dtype-agnostic online-softmax pool, so FP4 reuses the
     FP8 wave-count heuristic. See ``flydsl_fused_compress_attn``'s
@@ -72,44 +72,29 @@ previous-fwd. Caller MUST invoke BEFORE ``update_compressor_states``.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector, buffer_ops
-from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T, Int32, Stream
+import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, rocdl, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import math as fmath
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.typing import Int32, Stream, T
 
-from .tensor_shim import STensor, _to_raw, _run_compiled
-from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtypeInt,
+)
+from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _MxRoundInt,
 )
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
-
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the K-split LDS path references these only inside @flyc.kernel / @flyc.jit
-# closures, which formatters may not see).
-_FORCE_BIND_LDS = (
-    CompilationContext,
-    STensor,
-    SmemAllocator,
-    SmemPtr,
-    get_rocm_arch,
-    gpu,
-)
+from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64; D must be a multiple
@@ -201,16 +186,16 @@ def _build_kernel(
       - overlap: True -> K = 2*RATIO (CSA), False -> K = RATIO (HCA, no overlap)
       - state_size: ring-buffer modulo of kv_state.shape[1] (>= K)
       - k_per_block: paged cache tokens per block (= block_size // ratio)
-      - has_block_table: False → skip cache scatter (warmup path)
+      - has_block_table: False -> skip cache scatter (warmup path)
       - quant_mode: single quant selector (the booleans below are derived):
-          "none"        → bf16 paged write (Main)            → quant=False
-          "per_row_fp8" → FP8 e4m3 per-row scale (Indexer)   → quant=True
-          "group_fp8"   → FP8 1xG group scale (Main nm-asm)  → quant=True, nm_asm
-          "fp4"         → FP4 (E2M1) per-group(32) e8m0 scale → quant=True, quant_fp4
+          "none"        -> bf16 paged write (Main)            -> quant=False
+          "per_row_fp8" -> FP8 e4m3 per-row scale (Indexer)   -> quant=True
+          "group_fp8"   -> FP8 1xG group scale (Main nm-asm)  -> quant=True, nm_asm
+          "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale -> quant=True, quant_fp4
       - use_ue8m0: only for fp8 (round scale to power-of-2); the FP4 path
         always uses the MX RoundUp e8m0 scale regardless.
       - preshuffle: only when quant (MFMA 16x16 tile / FP4 KV tile layout)
-      - enable_prefetch_input: True → Phase 2 carries k+1 loads through
+      - enable_prefetch_input: True -> Phase 2 carries k+1 loads through
         scf.for iter-args so the buffer_load issue overlaps current iter's
         softmax compute. Helps long K (HCA K=128). Larger VEC pays a register
         cost (loop-carry grows by 3*VEC fp32) -- gate off if it regresses.
@@ -258,7 +243,7 @@ def _build_kernel(
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
     if quant_fp4:
-        # FP4 KV preshuffle: k_tile = 128 elems → 4 groups of 32; data tile is
+        # FP4 KV preshuffle: k_tile = 128 elems -> 4 groups of 32; data tile is
         # [..., kv_block_size, 16] bytes (16 bytes = 32 fp4). Require D a
         # multiple of 128 and k_per_block a multiple of the 16-token tile.
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
@@ -1031,7 +1016,7 @@ def _build_kernel(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── QUANT=1: FP8 per-row scaled write + fp32 scale ──
+                    # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
                     #   (b) scale = amax / FP8_MAX (with safety floor); for
@@ -1239,12 +1224,12 @@ def _build_kernel(
                         ) + ArithValue(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
+                    # -- QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write --
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
                     # FlyDSL IR builders (emit_mx_e8m0_scale / emit_f32_to_e2m1,
                     # used by silu_and_mul_fq). Each group of 32 elements shares
                     # one e8m0 byte; NTG = 32//VEC lanes cooperate per group.
-                    #   (a) per-lane amax over VEC → group-reduce-max over NTG
+                    #   (a) per-lane amax over VEC -> group-reduce-max over NTG
                     #   (b) e8m0 = ceil_pow2(amax/6) (MX RoundUp); quant_scale =
                     #       (254 - e8m0) << 23
                     #   (c) per-element E2M1 nibble, pack VEC/2 bytes
@@ -1261,7 +1246,7 @@ def _build_kernel(
                     c16_i32 = arith.constant(16, type=i32)
                     c64_i32 = arith.constant(64, type=i32)
                     c32_i32 = arith.constant(_FP4_GROUP_SIZE, type=i32)
-                    # smallest-normal * fp4_max floor — guards all-zero groups,
+                    # smallest-normal * fp4_max floor -- guards all-zero groups,
                     # matches dsv4_rotate_quant.cu eps_amax (bit-exact w/ ref).
                     c_eps_amax = arith.constant(
                         6.0 * float.fromhex("0x1p-126"), type=f32
@@ -1384,7 +1369,7 @@ def _build_kernel(
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8
-            # else: warmup — no scatter, just consume compute.
+            # else: warmup -- no scatter, just consume compute.
 
     @flyc.jit
     def launch_fused_compress_attn(
@@ -1501,7 +1486,7 @@ def _build_kernel_ksplit(
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
     minus ``enable_prefetch_input`` (each wave runs so few iters that prefetch
     is moot). The FP8 / FP4 / ue8m0 / preshuffle scatter is emitted in wave 0,
-    where ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
+    where ``lid`` (0..63) plays the single-wave ``tid`` role -- pair-coop
     shuffle_xor and wave_reduce_max stay within wave 0's 64 lanes, identical
     to the legacy kernel's semantics.
 
@@ -1566,22 +1551,12 @@ def _build_kernel_ksplit(
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
-    LDS_BYTES = LDS_ELEMS * 4
 
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=(
-            f"csa_ksplit_smem_D{D}_R{ratio}_O{int(overlap)}_NW{NW}_S{state_size}"
-        ),
-    )
-    lds_m_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_m_off + LDS_BYTES
-    lds_kv_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kv_off + LDS_BYTES
-    lds_w_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_w_off + LDS_BYTES
+    @fx.struct
+    class SharedStorage:
+        lds_m: fx.Array[fx.Float32, LDS_ELEMS, 16]
+        lds_kv: fx.Array[fx.Float32, LDS_ELEMS, 16]
+        lds_w: fx.Array[fx.Float32, LDS_ELEMS, 16]
 
     _name_parts = [
         "fused_compress_attn",
@@ -1883,28 +1858,16 @@ def _build_kernel_ksplit(
             w_local = list(final[2 * VEC : 3 * VEC])
 
             # ---- LDS write: each lane writes VEC entries at wid*D + lid*VEC ----
-            lds_base = allocator.get_base()
-            lds_m = STensor(
-                SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
-            lds_kv = STensor(
-                SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
-            lds_w = STensor(
-                SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_ELEMS,),
-            )
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_m_ptr = lds.lds_m.ptr
+            lds_kv_ptr = lds.lds_kv.ptr
+            lds_w_ptr = lds.lds_w.ptr
             lds_thread_base = ArithValue(wid) * c_D + lid_x_vec
             for i in range_constexpr(VEC):
                 idx_i = lds_thread_base + arith.constant(i, type=i32)
-                lds_m[fx.Index(idx_i)] = m_local[i]
-                lds_kv[fx.Index(idx_i)] = kv_local[i]
-                lds_w[fx.Index(idx_i)] = w_local[i]
+                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
+                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
+                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
 
             gpu.barrier()
 
@@ -1915,36 +1878,28 @@ def _build_kernel_ksplit(
                 comp_lane = []
                 for i in range_constexpr(VEC):
                     lane_off = lid_x_vec + arith.constant(i, type=i32)
-                    m_g = c_neg_inf
+                    m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * D, type=i32) + lane_off
-                        m_w = lds_m[fx.Index(idx_w)]
+                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
                         m_arr.append(m_w)
-                        m_g = arith.maximumf(m_g, m_w)
-                    kv_sum = c_zero_f32
-                    w_sum = c_zero_f32
+                        m_g = m_g.maximumf(m_w)
+                    kv_sum = fx.Float32(0.0)
+                    w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * D, type=i32) + lane_off
-                        kv_w = lds_kv[fx.Index(idx_w)]
-                        w_w = lds_w[fx.Index(idx_w)]
-                        scale_w = fexp_f32(arith.subf(m_arr[w], m_g))
-                        kv_sum = arith.AddFOp(
-                            kv_sum,
-                            arith.MulFOp(kv_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                        w_sum = arith.AddFOp(
-                            w_sum,
-                            arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    rcp_w = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
+                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
+                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
+                        scale_w = fx.Float32(fexp_f32(_to_raw(m_arr[w] - m_g)))
+                        kv_sum = kv_sum + kv_w * scale_w
+                        w_sum = w_sum + w_w * scale_w
+                    rcp_w = fx.Float32(
+                        llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
+                        )
                     )
-                    comp_lane.append(
-                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
-                    )
+                    comp_lane.append(_to_raw(kv_sum * rcp_w))
 
                 # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
                 def wave_reduce_add(x):
@@ -2140,7 +2095,7 @@ def _build_kernel_ksplit(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
+                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
                     def wave_reduce_max(x):
@@ -2305,12 +2260,12 @@ def _build_kernel_ksplit(
                         ) + ArithValue(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
+                    # -- FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
                     # (0..63) is the single-wave ``tid`` equivalent; the
                     # butterfly group-reduce over NTG lanes stays within wave
                     # 0's 64 physical lanes. ``lid_x_vec`` replaces the legacy
-                    # ``tid_x_vec``. See _build_kernel for the full rationale. ──
+                    # ``tid_x_vec``. See _build_kernel for the full rationale. --
                     lid_x_vec_i = lid_x_vec
                     NTG = _FP4_GROUP_SIZE // VEC
                     LOG2_NTG = int(math.log2(NTG))
@@ -2473,11 +2428,6 @@ def _build_kernel_ksplit(
         plan_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(
             kv_in,
@@ -2672,26 +2622,24 @@ def flydsl_fused_compress_attn(
     rms_eps: float,
     cos_cache: torch.Tensor,  # [max_pos, ..., RD/2] bf16
     sin_cache: torch.Tensor,
-    kv_cache: Optional[torch.Tensor],  # bf16 or fp8; None ? no scatter
-    block_tables: Optional[torch.Tensor],  # [bs, max_blocks_per_seq] i32
+    kv_cache: torch.Tensor | None,  # bf16 or fp8; None ? no scatter
+    block_tables: torch.Tensor | None,  # [bs, max_blocks_per_seq] i32
     k_per_block: int,
     overlap: bool,
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
     quant: bool = False,
-    cache_scale: Optional[torch.Tensor] = None,  # fp32 [NB, k_per_block]
+    cache_scale: torch.Tensor | None = None,  # fp32 [NB, k_per_block]
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     # Master quant selector; overrides the legacy `quant` bool. Accepts:
     #   "none" | "fp8"/"per_row_fp8" (indexer) | "group_fp8" (CSA/HCA Main
     #   nm-asm) | "fp4". None -> derive from `quant` ("per_row_fp8" if quant).
-    quant_mode: Optional[str] = None,
-    k_split_num_waves: Optional[int] = None,
-    k_rope_cache: Optional[
-        torch.Tensor
-    ] = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
-    stream: Optional[torch.cuda.Stream] = None,
+    quant_mode: str | None = None,
+    k_split_num_waves: int | None = None,
+    k_rope_cache: torch.Tensor | None = None,  # group_fp8 only: paged [NB, k_per_block, RD] bf16 rope
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """FlyDSL drop-in replacement for ``fused_compress_attn`` (Triton).
 
@@ -2701,9 +2649,9 @@ def flydsl_fused_compress_attn(
 
     ``quant_mode`` selects the scatter quantization (default derived from the
     legacy ``quant`` bool: ``"fp8" if quant else "none"``):
-      - ``"none"`` → BF16 paged write (CSA / HCA Main).
-      - ``"fp8"``  → FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
-      - ``"fp4"``  → FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
+      - ``"none"`` -> BF16 paged write (CSA / HCA Main).
+      - ``"fp8"``  -> FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
+      - ``"fp4"``  -> FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
         (``kv_cache`` uint8 [NB, k_tiles, 4, k_per_block, 16];
         ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]).
 
@@ -2905,7 +2853,7 @@ def flydsl_fused_compress_attn(
         bt_seq_stride = block_tables.stride(0)
         kv_cache_arg = kv_cache
         # FP4 store derives byte offsets from constants (k_tiles/group/tile),
-        # not these strides — bind the outer block stride for completeness.
+        # not these strides -- bind the outer block stride for completeness.
         kv_cache_block_stride = kv_cache.stride(0)
         kv_cache_token_stride = kv_cache.stride(1) if not _fp4 else 0
     else:
@@ -2949,8 +2897,8 @@ def flydsl_fused_compress_attn(
         krope_token_stride = 0
 
     # ---- K-split fast path (BF16 + FP8 + FP4 scatter) ----
-    # k_split_num_waves: None ⟹ auto-pick (tuned geometries only); int>1 ⟹
-    # forced NW; 1 ⟹ forced legacy. Auto triggers for the CSA Main (BF16),
+    # k_split_num_waves: None ? auto-pick (tuned geometries only); int>1 ?
+    # forced NW; 1 ? forced legacy. Auto triggers for the CSA Main (BF16),
     # CSA Indexer (FP8), and CSA Indexer (FP4) shapes the K-split kernel
     # supports; other shapes fall through to the legacy single-wave kernel.
     _is_csa_main = (

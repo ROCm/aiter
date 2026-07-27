@@ -1,60 +1,66 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-import pandas as pd
 import os
 import sys
 import tempfile
-from aiter import QuantType
-from aiter.jit.core import (
-    get_asm_dir,
-    AITER_CSRC_DIR,
-    AITER_CONFIG_FMOE,
-    AITER_CONFIG_GROUPED_FMOE,
-    AITER_ROOT_DIR,
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+
+import aiter
+from aiter import ActivationType as ActivationType
+from aiter import (
+    QuantType,
+    ck_moe_stage1_fwd,
+    ck_moe_stage2_fwd,
+    dtype2str_dict,
+    dtypes,
 )
 from aiter.fused_moe import (
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+    asm_stage1,
+    cktile_moe_stage1,
+    cktile_moe_stage2,
     fused_moe,
     fused_topk,
     moe_sorting,
-    asm_stage1,
+    torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
-    torch_moe,
-    cktile_moe_stage1,
-    cktile_moe_stage2,
-    _mxfp4_a4w4_stage1_fw,
-    _mxfp4_a4w4_stage2_fw,
 )
+from aiter.int4_utils import (
+    convert_int8_to_uint32_int4,
+    rearrange_4bit_elements,
+)
+from aiter.jit.core import (
+    AITER_CONFIG_FMOE,
+    AITER_CONFIG_GROUPED_FMOE,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    get_asm_dir,
+)
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
 )
-from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.ops.shuffle import (
-    shuffle_weight,
+    pack_int8_to_packed_int4,
     shuffle_scale,
     shuffle_scale_a16w4,
-    shuffle_weight_a16w4,
-    pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
 )
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.int4_utils import (
-    rearrange_4bit_elements,
-    convert_int8_to_uint32_int4,
-)
-from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
-from aiter import dtypes
-from aiter import ActivationType as ActivationType
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
-import torch.nn.functional as F
-from einops import rearrange
-from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
+from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.mp_tuner import mp_tuner
 
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -67,12 +73,12 @@ except ImportError:
 if is_flydsl_available():
     try:
         from aiter.ops.flydsl.moe_kernels import (
-            get_flydsl_stage1_kernels,
-            get_flydsl_stage2_kernels,
-            get_flydsl_stage1_kernels_int4_bf16,
-            get_flydsl_stage2_kernels_int4_bf16,
             flydsl_moe_stage1,
             flydsl_moe_stage2,
+            get_flydsl_stage1_kernels,
+            get_flydsl_stage1_kernels_int4_bf16,
+            get_flydsl_stage2_kernels,
+            get_flydsl_stage2_kernels_int4_bf16,
         )
     except ImportError:
 
@@ -145,7 +151,8 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
         else:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
-    return cos_diff if cos_diff >= COS_DIFF_THRESHOLD else 0.0
+    # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
+    return cos_diff
 
 
 def tensor_compare_diagnostics(
@@ -293,7 +300,8 @@ class FmoeTuner(TunerCommon):
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fmoe.csv",
-        "errRatio": 0.5,
+        # max accepted cosine_diff; 0.1 rejects broken kernels
+        "errRatio": 0.1,
         "batch": 100,
         "profile_file": "",  # for all results
         "config_env_name": "AITER_CONFIG_FMOE",
@@ -3536,7 +3544,7 @@ class FmoeTuner(TunerCommon):
 
     def run_config(self, args):
         from aiter.fused_moe import fused_moe, fused_topk
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
@@ -4330,10 +4338,10 @@ class FmoeTuner(TunerCommon):
                 # (simple .to(dtypes.fp8)) and add it to kernels whose stage1 name does
                 # not end with _fp8 (those fuse the cast in stage1).
                 if q_dtype_a == dtypes.fp4x2:
-                    from aiter.test_common import run_perftest
                     from aiter.ops.triton.quant.fused_mxfp4_quant import (
                         fused_dynamic_mxfp4_quant_moe_sort,
                     )
+                    from aiter.test_common import run_perftest
 
                     us_qs_cache = {}
                     for bm in profileDF["block_m"].unique():
@@ -4403,8 +4411,8 @@ class FmoeTuner(TunerCommon):
 
             has_xbf16 = "xbf16" in profileDF.columns and profileDF["xbf16"].any()
             if q_type == QuantType.per_1x128 and has_xbf16:
-                from aiter.test_common import run_perftest
                 from aiter.ops.quant import per_group_quant_hip
+                from aiter.test_common import run_perftest
 
                 dummy_act = torch.randn(token, model_dim, dtype=dtype, device="cuda")
                 _, us_quant = run_perftest(
@@ -4424,8 +4432,8 @@ class FmoeTuner(TunerCommon):
             # moe_sorting fairness: flat=1 kernels sort internally; add host sort cost to others.
             has_flat = "flat" in profileDF.columns and (profileDF["flat"] == 1).any()
             if has_flat:
-                from aiter.test_common import run_perftest
                 from aiter.fused_moe import moe_sorting
+                from aiter.test_common import run_perftest
 
                 _topk_ids = torch.randint(
                     0, expert, (token, topk), dtype=torch.int32, device="cuda"
