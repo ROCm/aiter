@@ -110,6 +110,8 @@ def _fused_clamp_silu_mul_kernel(
         out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
     )
 
+    NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
+
     # row layouts created after to hide latency
     row_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
@@ -123,7 +125,6 @@ def _fused_clamp_silu_mul_kernel(
         warps_per_cta=[num_warps],
         order=[0],
     )
-    NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
 
     # weights
     offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)  # offsets
