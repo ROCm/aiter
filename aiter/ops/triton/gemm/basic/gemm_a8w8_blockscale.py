@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Optional
+import os
 import torch
 import triton
 import math
@@ -18,6 +19,7 @@ from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
+_FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -298,6 +300,10 @@ def gemm_a8w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
 
+    kernel_type_from_config = config.pop("kernel_type", None)
+    if kernel_type_from_config is not None:
+        kernel_type = kernel_type_from_config
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
@@ -334,6 +340,9 @@ def gemm_a8w8_blockscale_preshuffle(
     assert (
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
+
+    if _FORCE_GFX1250_EX:
+        config["BLOCK_SIZE_K"] = 64
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
     grid = lambda META: (  # noqa: E731

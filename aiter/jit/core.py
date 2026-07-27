@@ -777,7 +777,7 @@ def clone_3rdparty(third_party: str) -> None:
         dir_path = HIP_KITTENS_DIR
         third_party_info = {
             "url": "https://github.com/HazyResearch/HipKittens.git",
-            "commit": "a5e308a7ec633b1e94a952de629f41653a0874f3",
+            "commit": "d3cd9b31cb0ff611ff64b5701f57ccdeb7712f39",
         }
     elif third_party == "ComposableKernel":
         # TODO: ComposableKernel will be supported in the future
@@ -1590,7 +1590,7 @@ def compile_ops(
 
                     import torch
 
-                    enum_types = ["ActivationType", "QuantType"]
+                    enum_types = ["ActivationType", "QuantType", "MlaVersion"]
 
                     if not op.__doc__.startswith("Members:"):
                         doc_str = op.__doc__.split("\n")[0]
@@ -1691,9 +1691,15 @@ def compile_ops(
                         if aiter_tensor_t is not object:
                             tensor_like_types.add(aiter_tensor_t)
 
+                        enum_type_objs = tuple(
+                            namespace[el] for el in enum_types if el in namespace
+                        )
+
                         def canonicalize_hint(hint):
                             if hint in tensor_like_types:
                                 return ("tensor",)
+                            if hint in enum_type_objs:
+                                return int
 
                             origin = typing.get_origin(hint)
                             if origin in (list, List):

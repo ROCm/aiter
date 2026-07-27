@@ -44,9 +44,11 @@ try:
     from aiter.ops.opus.gemm_op_a16w16 import (
         opus_gemm_workspace_init as _opus_workspace_init,
     )
+    from aiter.ops.opus.gemm_op_a16w16 import is_splitk_kid as _opus_is_splitk_kid
 except Exception:
     _opus_tune = None
     _opus_workspace_init = None
+    _opus_is_splitk_kid = None
 
 # Every opus split-K arch (gfx950 / gfx942 / gfx1250) owns a per-stream fp32
 # workspace (process-global `opus_splitk_ws_get` registry, backed by raw
@@ -92,9 +94,15 @@ def _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype):
     """Eagerly size the opus split-K workspace on the graph capture stream.
 
     No-op when already capturing (too late to allocate), on non-registry archs,
-    or when this (shape, kid, splitK, bias) was already warmed.
+    for a non-split-K kid (never touches the workspace), or when this
+    (shape, kid, splitK, bias) was already warmed.
     """
     if not _opus_needs_ws_prewarm():
+        return
+    # Only split-K kids allocate/read the fp32 workspace; every other kid family
+    # (flatmm / persistent / mono_tile / nosplit) launches straight to its kernel
+    # and never touches the registry, so warming it for them is pure waste.
+    if _opus_is_splitk_kid is not None and not _opus_is_splitk_kid(solidx):
         return
     if torch.cuda.is_current_stream_capturing():
         return

@@ -15,6 +15,14 @@
 import argparse
 import os
 import sys
+
+# gfx1250 has no CK support: the base custom_all_reduce module won't compile with
+# CK enabled (ck_tile warp_size is not constexpr on this arch). Force the CK-free
+# build here so the JIT build succeeds without a manual `ENABLE_CK=0` prefix.
+# Must run before importing torch/aiter — ENABLE_CK is read at aiter import time
+# (aiter/jit/core.py). setdefault keeps an explicit `ENABLE_CK=1` override working.
+os.environ.setdefault("ENABLE_CK", "0")
+
 from multiprocessing import (
     Pool,
     TimeoutError as MpTimeoutError,

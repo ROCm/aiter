@@ -18,58 +18,18 @@ OPUS_A8W4_OUT_MODE_BF16 = 1
 OPUS_A8W4_OUT_MODE_FP8 = 2
 
 # Kid layout:
-# - 2000-2099: K3 decode candidates.
-# - 2100-2109: K5 direct atomic bring-up candidates.
-# - 2110-2119: K5 route-output bring-up candidates.
-OPUS_A8W4_KID_K3_ATOMIC_BM16_BN64_B3_WS2 = 2000
-OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC4_RBN2240 = 2001
-OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC5_RBN2304 = 2002
-OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072 = 2003
-OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584 = 2004
-OPUS_A8W4_KID_K3_ROUTE_BF16_BM64_FULL_N7168 = 2005
-OPUS_A8W4_KID_K3_ATOMIC_BM32_BN128_OCC1_B3_WS2 = 2006
-OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072_B3 = 2007
-OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2008
-OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2 = 2100
-OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2 = 2101
-OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168 = 2110
-OPUS_A8W4_KID_K5_ROUTE_FP8_BM64_RBN2816 = 2111
+# - 2000-2099: A8W4 decode algorithm candidates. K is selected by runtime
+#   effective inter dim at dispatch time, not encoded into the public kid.
+OPUS_A8W4_KID_ATOMIC_BM16_BN64_B3_WS2 = 2000
+OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC4_RBN2240 = 2001
+OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC5_RBN2304 = 2002
+OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072 = 2003
+OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3584 = 2004
+OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B3_WS2 = 2005
+OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072_B3 = 2006
+OPUS_A8W4_KID_ROUTE_BF16_BM32_FULL_N7168_SMALL = 2007
 
 _OPUS_A8W4_REDUCE_BLOCK_N_RE = re.compile(r"_rbn(\d+)$")
-
-
-@dataclass(frozen=True)
-class OpusA8W4ShapeFamilyContract:
-    name: str
-    logical_inter_dim: int
-    inter_dim_pad: int
-
-    @property
-    def effective_inter_dim(self) -> int:
-        return self.logical_inter_dim - self.inter_dim_pad
-
-    def matches(
-        self,
-        *,
-        model_dim: int,
-        inter_dim: int,
-        expert: int,
-        topk: int,
-        block_n: Optional[int] = None,
-    ) -> bool:
-        model_dim = int(model_dim)
-        inter_dim = int(inter_dim)
-        expert = int(expert)
-        topk = int(topk)
-        if model_dim <= 0 or expert <= 0 or topk <= 0:
-            return False
-        if inter_dim != self.logical_inter_dim:
-            return False
-        if block_n is not None:
-            block_n = int(block_n)
-            if block_n <= 0 or model_dim % block_n != 0:
-                return False
-        return self.effective_inter_dim > 0
 
 
 @dataclass(frozen=True)
@@ -98,7 +58,6 @@ class OpusA8W4Stage2Instance:
     out_mode: int
     block_m: int
     block_n: int
-    block_k: int
     sort_block_m: int
     direct_atomic: bool
     pace_route_blocks_to_pow2: bool = False
@@ -107,11 +66,8 @@ class OpusA8W4Stage2Instance:
     cachectl_b: int = 0
     cachectl_wscale: int = 0
     route_reduce: Optional[str] = None
-    tuner_candidate: bool = True
     min_tuner_token: Optional[int] = None
     max_tuner_token: Optional[int] = None
-    shape_family: str = "a8w4_decode_k3"
-    kernel_contract: str = "gfx950_a8w4_decode_v1"
     mode_default: bool = False
 
     @property
@@ -138,13 +94,10 @@ class OpusA8W4Stage2Instance:
             "out_mode": self.out_mode,
             "route_out": self.route_out,
             "kernel_block_n": self.block_n,
-            "shape_family": self.shape_family,
-            "kernel_contract": self.kernel_contract,
         }
         if route_reduce is not None:
             params["route_reduce"] = route_reduce.name
-            if route_reduce.suffix is not None:
-                params["reduce_block_n"] = route_reduce.block_n
+            params["reduce_block_n"] = route_reduce.block_n
         return params
 
     def supports_tuner_token(self, token: Optional[int]) -> bool:
@@ -167,24 +120,6 @@ class OpusA8W4RouteReduceInstance:
     auto_model_dims: tuple[int, ...] = ()
 
 
-OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT = OpusA8W4ShapeFamilyContract(
-    name="a8w4_decode_k3",
-    logical_inter_dim=512,
-    inter_dim_pad=128,
-)
-
-# K5 is kept as a small generalized decode family. It is not part of the
-# current DSV4 tuned target set, but it exercises the metadata/codegen path
-# without requiring one-off shape-specific code.
-OPUS_A8W4_K5_SHAPE_FAMILY_CONTRACT = OpusA8W4ShapeFamilyContract(
-    name="a8w4_decode_k5",
-    logical_inter_dim=768,
-    inter_dim_pad=128,
-)
-
-
-OPUS_A8W4_DSV4_MODEL_DIM = 7168
-
 OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = OpusA8W4KernelContract(
     name="gfx950_a8w4_decode_v1",
     scale_group_logical_k=32,
@@ -203,17 +138,25 @@ OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = OpusA8W4KernelContract(
     c_values_per_atomic=2,
 )
 
-OPUS_A8W4_SHAPE_FAMILY_CONTRACTS = {
-    OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT.name: OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT,
-    OPUS_A8W4_K5_SHAPE_FAMILY_CONTRACT.name: OPUS_A8W4_K5_SHAPE_FAMILY_CONTRACT,
-}
-OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT = OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT
+
+OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (384,)
+
+
+def _opus_a8w4_k_step_packed() -> int:
+    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    if k.bk_logical % k.fp4_values_per_byte != 0:
+        raise ValueError(
+            "Opus A8W4 kernel contract requires bk_logical divisible by "
+            "fp4_values_per_byte"
+        )
+    return k.bk_logical // k.fp4_values_per_byte
+
+
 OPUS_A8W4_ROUTE_REDUCE_INSTANCES = (
     OpusA8W4RouteReduceInstance(
         name="full_model_n7168",
-        block_n=OPUS_A8W4_DSV4_MODEL_DIM,
+        block_n=7168,
         threads=448,
-        auto_model_dims=(OPUS_A8W4_DSV4_MODEL_DIM,),
     ),
     OpusA8W4RouteReduceInstance(
         name="rbn2240",
@@ -264,13 +207,11 @@ def _atomic_stage2_instance(
     block_m: int,
     block_n: int,
     sort_block_m: int,
-    shape_family: str,
     block_threads: int = 0,
     min_blocks_per_cu: int = 0,
     cachectl_b: int = 0,
     cachectl_wscale: int = 0,
     pace_route_blocks_to_pow2: bool = False,
-    tuner_candidate: bool = True,
     min_tuner_token: Optional[int] = None,
     max_tuner_token: Optional[int] = None,
     mode_default: bool = False,
@@ -281,7 +222,6 @@ def _atomic_stage2_instance(
         out_mode=OPUS_A8W4_OUT_MODE_ATOMIC,
         block_m=block_m,
         block_n=block_n,
-        block_k=256,
         sort_block_m=sort_block_m,
         direct_atomic=True,
         pace_route_blocks_to_pow2=pace_route_blocks_to_pow2,
@@ -289,10 +229,8 @@ def _atomic_stage2_instance(
         min_blocks_per_cu=min_blocks_per_cu,
         cachectl_b=cachectl_b,
         cachectl_wscale=cachectl_wscale,
-        tuner_candidate=tuner_candidate,
         min_tuner_token=min_tuner_token,
         max_tuner_token=max_tuner_token,
-        shape_family=shape_family,
         mode_default=mode_default,
     )
 
@@ -304,11 +242,9 @@ def _route_stage2_instance(
     out_mode: int,
     block_m: int,
     sort_block_m: int,
-    shape_family: str,
     route_reduce: str,
     min_blocks_per_cu: int = 0,
     cachectl_b: int = 0,
-    tuner_candidate: bool = True,
     min_tuner_token: Optional[int] = None,
     max_tuner_token: Optional[int] = None,
     mode_default: bool = False,
@@ -319,26 +255,20 @@ def _route_stage2_instance(
         out_mode=out_mode,
         block_m=block_m,
         block_n=256,
-        block_k=256,
         sort_block_m=sort_block_m,
         direct_atomic=False,
         min_blocks_per_cu=min_blocks_per_cu,
         cachectl_b=cachectl_b,
         route_reduce=route_reduce,
-        tuner_candidate=tuner_candidate,
         min_tuner_token=min_tuner_token,
         max_tuner_token=max_tuner_token,
-        shape_family=shape_family,
         mode_default=mode_default,
     )
 
 
-_K3 = OPUS_A8W4_K3_SHAPE_FAMILY_CONTRACT.name
-_K5 = OPUS_A8W4_K5_SHAPE_FAMILY_CONTRACT.name
-
-OPUS_A8W4_K3_STAGE2_INSTANCES = (
+OPUS_A8W4_DECODE_STAGE2_INSTANCES = (
     _atomic_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ATOMIC_BM16_BN64_B3_WS2,
+        kid=OPUS_A8W4_KID_ATOMIC_BM16_BN64_B3_WS2,
         name="opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2",
         block_m=16,
         block_n=64,
@@ -347,11 +277,10 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         cachectl_b=3,
         cachectl_wscale=2,
         max_tuner_token=1024,
-        shape_family=_K3,
         mode_default=True,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC4_RBN2240,
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC4_RBN2240,
         name="opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ4",
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=32,
@@ -360,10 +289,9 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_blocks_per_cu=4,
         min_tuner_token=8,
         max_tuner_token=4096,
-        shape_family=_K3,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM32_OCC5_RBN2304,
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM32_OCC5_RBN2304,
         name="opus_moe2_afp8_wfp4_fp8_t32x256x256_sbm32_occ5",
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=32,
@@ -372,42 +300,28 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         min_blocks_per_cu=5,
         min_tuner_token=8,
         max_tuner_token=4096,
-        shape_family=_K3,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072,
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072,
         name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64",
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3072",
         min_tuner_token=128,
-        shape_family=_K3,
         mode_default=True,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3584,
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3584,
         name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64",
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=64,
         sort_block_m=64,
         route_reduce="rbn3584",
         min_tuner_token=128,
-        shape_family=_K3,
-    ),
-    _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_BF16_BM64_FULL_N7168,
-        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64",
-        out_mode=OPUS_A8W4_OUT_MODE_BF16,
-        block_m=64,
-        sort_block_m=64,
-        route_reduce="full_model_n7168",
-        min_tuner_token=4096,
-        shape_family=_K3,
-        mode_default=True,
     ),
     _atomic_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ATOMIC_BM32_BN128_OCC1_B3_WS2,
+        kid=OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B3_WS2,
         name="opus_moe2_afp8_wfp4_atomic_t32x128x256_sbm32_occ1_cache_b3_ws2",
         block_m=32,
         block_n=128,
@@ -418,10 +332,9 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         cachectl_wscale=2,
         min_tuner_token=1,
         max_tuner_token=2048,
-        shape_family=_K3,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_FP8_BM64_RBN3072_B3,
+        kid=OPUS_A8W4_KID_ROUTE_FP8_BM64_RBN3072_B3,
         name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_cache_b3",
         out_mode=OPUS_A8W4_OUT_MODE_FP8,
         block_m=64,
@@ -429,10 +342,9 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         route_reduce="rbn3072",
         cachectl_b=3,
         min_tuner_token=128,
-        shape_family=_K3,
     ),
     _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K3_ROUTE_BF16_BM32_FULL_N7168_SMALL,
+        kid=OPUS_A8W4_KID_ROUTE_BF16_BM32_FULL_N7168_SMALL,
         name="opus_moe2_afp8_wfp4_bf16_t32x256x256_sbm32_small",
         out_mode=OPUS_A8W4_OUT_MODE_BF16,
         block_m=32,
@@ -440,60 +352,12 @@ OPUS_A8W4_K3_STAGE2_INSTANCES = (
         route_reduce="full_model_n7168",
         min_tuner_token=1,
         max_tuner_token=64,
-        shape_family=_K3,
-    ),
-)
-
-OPUS_A8W4_K5_STAGE2_INSTANCES = (
-    _atomic_stage2_instance(
-        kid=OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_OCC6_B2_WS2,
-        name="opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_occ6_cache_b2_ws2_k5",
-        block_m=16,
-        block_n=64,
-        sort_block_m=16,
-        block_threads=128,
-        min_blocks_per_cu=6,
-        cachectl_b=2,
-        cachectl_wscale=2,
-        shape_family=_K5,
-    ),
-    _atomic_stage2_instance(
-        kid=OPUS_A8W4_KID_K5_ATOMIC_BM16_BN64_B3_WS2,
-        name="opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2_k5",
-        block_m=16,
-        block_n=64,
-        sort_block_m=16,
-        block_threads=128,
-        cachectl_b=3,
-        cachectl_wscale=2,
-        shape_family=_K5,
-        mode_default=True,
-    ),
-    _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K5_ROUTE_BF16_BM64_FULL_N7168,
-        name="opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_k5",
-        out_mode=OPUS_A8W4_OUT_MODE_BF16,
-        block_m=64,
-        sort_block_m=64,
-        route_reduce="full_model_n7168",
-        shape_family=_K5,
-        mode_default=True,
-    ),
-    _route_stage2_instance(
-        kid=OPUS_A8W4_KID_K5_ROUTE_FP8_BM64_RBN2816,
-        name="opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_k5",
-        out_mode=OPUS_A8W4_OUT_MODE_FP8,
-        block_m=64,
-        sort_block_m=64,
-        route_reduce="rbn2816",
-        shape_family=_K5,
-        mode_default=True,
     ),
 )
 
 OPUS_A8W4_STAGE2_INSTANCES = tuple(
     sorted(
-        (*OPUS_A8W4_K3_STAGE2_INSTANCES, *OPUS_A8W4_K5_STAGE2_INSTANCES),
+        OPUS_A8W4_DECODE_STAGE2_INSTANCES,
         key=lambda inst: inst.kid,
     )
 )
@@ -511,39 +375,27 @@ def _build_stage2_by_name() -> dict[str, OpusA8W4Stage2Instance]:
 
 OPUS_A8W4_STAGE2_BY_KID = {inst.kid: inst for inst in OPUS_A8W4_STAGE2_INSTANCES}
 OPUS_A8W4_STAGE2_BY_NAME = _build_stage2_by_name()
-OPUS_A8W4_TUNER_INSTANCES = tuple(
-    inst for inst in OPUS_A8W4_STAGE2_INSTANCES if inst.tuner_candidate
-)
 OPUS_A8W4_SUPPORTED_BLOCK_MS = tuple(
     sorted({inst.block_m for inst in OPUS_A8W4_STAGE2_INSTANCES})
 )
 
 
-def _build_mode_default_by_family_mode_block_m() -> dict[tuple[str, int, int], int]:
-    mode_defaults: dict[tuple[str, int, int], int] = {}
+def _build_mode_default_by_mode_block_m() -> dict[tuple[int, int], int]:
+    mode_defaults: dict[tuple[int, int], int] = {}
     for inst in OPUS_A8W4_STAGE2_INSTANCES:
         if not inst.mode_default:
             continue
-        key = (inst.shape_family, inst.out_mode, inst.block_m)
+        key = (inst.out_mode, inst.block_m)
         if key in mode_defaults:
             raise ValueError(
                 "duplicate Opus A8W4 mode default for "
-                f"shape_family={inst.shape_family}, out_mode={inst.out_mode}, "
-                f"block_m={inst.block_m}"
+                f"out_mode={inst.out_mode}, block_m={inst.block_m}"
             )
         mode_defaults[key] = inst.kid
     return mode_defaults
 
 
-OPUS_A8W4_MODE_DEFAULT_BY_FAMILY_MODE_BLOCK_M = (
-    _build_mode_default_by_family_mode_block_m()
-)
-
-
-def opus_a8w4_shape_family(
-    name: str,
-) -> Optional[OpusA8W4ShapeFamilyContract]:
-    return OPUS_A8W4_SHAPE_FAMILY_CONTRACTS.get(str(name))
+OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M = _build_mode_default_by_mode_block_m()
 
 
 def opus_a8w4_route_reduce(
@@ -554,24 +406,32 @@ def opus_a8w4_route_reduce(
     return OPUS_A8W4_ROUTE_REDUCE_BY_NAME.get(str(name))
 
 
-def opus_a8w4_shape_family_for_shape(
-    *,
-    model_dim: int,
-    inter_dim: int,
-    expert: int,
-    topk: int,
-    block_n: Optional[int] = None,
-) -> Optional[OpusA8W4ShapeFamilyContract]:
-    for contract in OPUS_A8W4_SHAPE_FAMILY_CONTRACTS.values():
-        if contract.matches(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            expert=expert,
-            topk=topk,
-            block_n=block_n,
-        ):
-            return contract
-    return None
+def opus_a8w4_effective_inter_dim(
+    logical_inter_dim: int,
+    inter_dim_pad: int,
+) -> Optional[int]:
+    logical_inter_dim = int(logical_inter_dim)
+    inter_dim_pad = int(inter_dim_pad)
+    if inter_dim_pad < 0 or logical_inter_dim <= inter_dim_pad:
+        return None
+    return logical_inter_dim - inter_dim_pad
+
+
+def opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim: int) -> int:
+    effective_inter_dim = int(effective_inter_dim)
+    if effective_inter_dim <= 0:
+        raise ValueError(
+            f"effective_inter_dim must be positive, got {effective_inter_dim}"
+        )
+    k = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
+    k_step_packed = _opus_a8w4_k_step_packed()
+    if effective_inter_dim % k_step_packed != 0:
+        raise ValueError(
+            "effective_inter_dim must be divisible by "
+            f"K_STEP_PACKED={k_step_packed}, got {effective_inter_dim}"
+        )
+    k_tiles = effective_inter_dim // k_step_packed
+    return ((k_tiles + 1) // 2) * k.scale_groups_per_row_pack
 
 
 def _opus_a8w4_stage2_instance(kid: int) -> Optional[OpusA8W4Stage2Instance]:
@@ -613,19 +473,14 @@ def _require_a8w4_stage2_instance(kid: int) -> OpusA8W4Stage2Instance:
 def opus_a8w4_decode_kid(
     out_mode: int,
     block_m: int,
-    shape_family: str = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name,
 ) -> int:
     out_mode = int(out_mode)
     block_m = int(block_m)
-    shape_family = str(shape_family)
-    kid = OPUS_A8W4_MODE_DEFAULT_BY_FAMILY_MODE_BLOCK_M.get(
-        (shape_family, out_mode, block_m)
-    )
+    kid = OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M.get((out_mode, block_m))
     if kid is not None:
         return kid
     raise ValueError(
-        "unsupported Opus A8W4 stage2 family/mode/block_m: "
-        f"{shape_family}/{out_mode}/{block_m}"
+        "unsupported Opus A8W4 stage2 mode/block_m: " f"{out_mode}/{block_m}"
     )
 
 
@@ -654,25 +509,22 @@ def opus_a8w4_supported_block_ms() -> tuple[int, ...]:
 
 def opus_a8w4_best_atomic_kid(
     token_num: int,
-    shape_family: str = OPUS_A8W4_DEFAULT_SHAPE_FAMILY_CONTRACT.name,
 ) -> int:
     del token_num
     for block_m in (32, 16):
-        kid = OPUS_A8W4_MODE_DEFAULT_BY_FAMILY_MODE_BLOCK_M.get(
-            (str(shape_family), OPUS_A8W4_OUT_MODE_ATOMIC, block_m)
+        kid = OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M.get(
+            (OPUS_A8W4_OUT_MODE_ATOMIC, block_m)
         )
         if kid is not None:
             return kid
-    raise ValueError(f"unsupported Opus A8W4 atomic family: {shape_family}")
+    raise ValueError("unsupported Opus A8W4 atomic kernel")
 
 
 def get_opus_a8w4_stage2_kernels(
-    shape_family: Optional[str] = None,
     token: Optional[int] = None,
 ) -> dict[str, dict[str, object]]:
     return {
         inst.tuner_name: inst.tuner_params()
-        for inst in OPUS_A8W4_TUNER_INSTANCES
-        if shape_family is None or inst.shape_family == shape_family
+        for inst in OPUS_A8W4_STAGE2_INSTANCES
         if inst.supports_tuner_token(token)
     }

@@ -18,7 +18,11 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import buffer_ops
 
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    ptr_rsrc,
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 BLOCK_THREADS = 256
 
@@ -98,8 +102,8 @@ def build_moe_route_maps_module():
 
     launch_route_maps.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_route_maps
@@ -164,8 +168,8 @@ def build_moe_topids_to_rows_module():
 
     launch_topids_to_rows.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch_topids_to_rows

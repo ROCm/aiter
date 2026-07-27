@@ -455,3 +455,75 @@ def moe_gemm_smoothquant_torch(
         out[i, :] = y[src_idx[i], :].sum(0)
 
     return out
+
+
+def fused_moe_int8_smoothquant(
+    hidden_states: torch.Tensor,  # [M, H] bf16/fp16
+    w13: torch.Tensor,  # [E, H, 2I] int8 (kernel layout K=H, N=2I)
+    w2: torch.Tensor,  # [E, I, H] int8 (kernel layout K=I, N=H)
+    w13_scale: torch.Tensor,  # [E, 2I] fp32 per-output-channel
+    w2_scale: torch.Tensor,  # [E, H] fp32 per-output-channel
+    gating_output: torch.Tensor,  # [M, E] routed-expert logits
+    topk: int,
+    renormalize: bool,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Online INT8 W8A8 (per-token activation + per-channel weight) fused MoE
+    forward built on the smoothquant grouped GEMM. Activations are dynamically
+    int8-quantized per token; the gated SiLU is fused in GEMM1 and the routing
+    weights are combined during the GEMM2 scatter. Portable across archs
+    (validated on gfx1151 RDNA3.5, where aiter's fp8/int4 MoE paths are absent).
+    """
+    from aiter.ops.triton.moe.moe_routing.routing import routing
+    from aiter.ops.triton.moe.quant_moe import smoothquant_quantize
+
+    M, H = hidden_states.shape
+    routing_data, gather_idx, scatter_idx = routing(
+        gating_output, topk, sm_first=not renormalize
+    )
+    gammas = routing_data.gate_scal
+
+    # GEMM1 gate/up projection: per-token int8 activations, no smoothing.
+    no_smooth_h = torch.ones(H, device=hidden_states.device, dtype=torch.float32)
+    x_int8, x_scale = smoothquant_quantize(hidden_states, no_smooth_h)
+    # GEMM1 + fused gated SiLU: w13 columns are interleaved (g,u,g,u,...) at load
+    # so the kernel's _swiglu computes silu(gate)*up directly (alpha=1, no clamp).
+    intermediate = moe_gemm_int8_smoothquant(
+        x_int8,
+        w13,
+        x_scale,
+        w13_scale,
+        None,
+        routing_data,
+        gather_idx,
+        None,
+        None,
+        False,
+        dtype,
+        apply_activation=True,
+        swiglu_add_residual=False,
+        alpha=1.0,
+        limit=None,
+    )
+    inter_dim = intermediate.shape[-1]
+
+    # GEMM2 down projection: per-token int8, scatter + combine via routing weights.
+    no_smooth_i = torch.ones(
+        inter_dim, device=hidden_states.device, dtype=torch.float32
+    )
+    i_int8, i_scale = smoothquant_quantize(intermediate, no_smooth_i)
+    out = moe_gemm_int8_smoothquant(
+        i_int8,
+        w2,
+        i_scale,
+        w2_scale,
+        None,
+        routing_data,
+        None,
+        scatter_idx,
+        gammas,
+        False,
+        dtype,
+        apply_activation=False,
+    )
+    return out

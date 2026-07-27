@@ -298,9 +298,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
             ),
@@ -332,9 +332,11 @@ def _gluon_deepgemm_fp8_paged_mqa_logits(
     logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
     gl.amd.cdna3.buffer_store(
         logits,
-        ptr=OutLogits_buffer,
-        offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-        + (context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))),
+        ptr=OutLogits_buffer
+        + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+        offsets=(
+            context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
+        ),
         mask=context_idx + gl.arange(0, ChunkK, layout=gl.SliceLayout(0, mfma_layout))
         >= 0,
     )
@@ -589,9 +591,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             store_off = context_idx + col
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + store_off,
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=store_off,
                 mask=(store_off >= 0) & (store_off < max_model_len),
             )
         return
@@ -797,9 +799,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
@@ -862,9 +864,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx
                     + ChunkKPerStage
                     + gl.arange(
@@ -934,9 +936,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx
                     + ChunkK
                     + gl.arange(
@@ -978,9 +980,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
@@ -1135,9 +1137,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
@@ -1212,9 +1214,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx_
                     + ChunkKPerStage
                     + gl.arange(
@@ -1294,9 +1296,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             logits = tl.where(mask, logits, float("-inf"))
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx_
                     + ChunkK
                     + gl.arange(
@@ -1337,9 +1339,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
@@ -1646,9 +1648,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
@@ -1711,9 +1713,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx
                     + ChunkKPerStage
                     + gl.arange(
@@ -1783,9 +1785,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx
                     + ChunkK
                     + gl.arange(
@@ -1827,9 +1829,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
@@ -1984,9 +1986,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
             ),
@@ -2061,9 +2063,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             logits = gl.reduce(o, axis=0, combine_fn=_sum_combine)
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx_
                     + ChunkKPerStage
                     + gl.arange(
@@ -2143,9 +2145,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
             logits = tl.where(mask, logits, float("-inf"))
             gl.amd.cdna3.buffer_store(
                 logits,
-                ptr=OutLogits_buffer,
-                offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-                + (
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=(
                     context_idx_
                     + ChunkK
                     + gl.arange(
@@ -2186,9 +2188,9 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx(
         logits = tl.where(mask, logits, float("-inf"))
         gl.amd.cdna3.buffer_store(
             logits,
-            ptr=OutLogits_buffer,
-            offsets=(pid_batch * next_n + pid_next_n) * stride_out_batch
-            + (
+            ptr=OutLogits_buffer
+            + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+            offsets=(
                 context_idx
                 + ChunkKPerStage
                 + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
