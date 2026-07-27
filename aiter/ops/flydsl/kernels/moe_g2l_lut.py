@@ -20,35 +20,36 @@ increments) into this same pre-route kernel.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.arith import _to_raw as _raw
-from flydsl.expr.typing import Int32, T
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    STensor,
     ptr_rsrc,
 )
 
 MAX_G2L_EXPERTS = 512
 
 
+def _lds_load(mr, idx):
+    """Load i32 from an LDS pointer at element offset ``idx``."""
+    return fx.ptr_load(mr + fx.Int64(idx))
+
+
+def _lds_store(mr, val, idx):
+    """Store i32 to an LDS pointer at element offset ``idx``."""
+    fx.ptr_store(val, mr + fx.Int64(idx))
+
+
 def build_moe_g2l_lut_module():
     """JIT launcher: single-block build of the EP global->local expert LUT."""
 
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="moe_g2l_lut_smem")
-    lds0_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds0_off + MAX_G2L_EXPERTS * 4
-    lds1_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds1_off + MAX_G2L_EXPERTS * 4
+    # Double-buffered LDS for the Hillis-Steele scan (ping-pong between passes).
+    @fx.struct
+    class SharedStorage:
+        buf0: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+        buf1: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
 
     @flyc.kernel(name="moe_g2l_lut", known_block_size=[MAX_G2L_EXPERTS, 1, 1])
     def g2l_kernel(
@@ -57,97 +58,65 @@ def build_moe_g2l_lut_module():
         counter: fx.Pointer,  # (E,) int32 out: per-bucket route counter, zeroed
         nvt: fx.Pointer,  # (1,) int32 in: num_local_tokens (= total_recv)
         nvr_out: fx.Pointer,  # (1,) int32 out: num_valid_routes = nvt * topk
-        n: Int32,
-        E: Int32,
-        topk: Int32,
+        n: fx.Int32,
+        E: fx.Int32,
+        topk: fx.Int32,
     ):
-        i32 = T.i32
-        c0 = arith.constant(0, type=i32)
-        c1 = arith.constant(1, type=i32)
-        tid = ArithValue(fx.thread_idx.x)
+        c0 = fx.Int32(0)
+        c1 = fx.Int32(1)
+        tid = gpu.thread_idx.x
+
+        m_rsrc = ptr_rsrc(mask)
+        l_rsrc = ptr_rsrc(lut)
 
         # Fold num_valid_routes = num_local_tokens * topk (the EP dead-tail route
         # bound) into this pre-route single-block kernel: thread 0 reads the (1,)
         # int32 total_recv scalar and writes nvt*topk to nvr_out. This removes the
         # standalone torch ``_ep_nvt * topk`` elementwise launch on the decode hot
         # path; the route / psum-remap / quant kernels consume nvr_out as-is.
-        is_t0 = arith.cmpi(CmpIPredicate.eq, tid, c0)
-        _if_nvr = scf.IfOp(is_t0)
-        with ir.InsertionPoint(_if_nvr.then_block):
-            nvt_val = buffer_ops.buffer_load(ptr_rsrc(nvt), c0, vec_width=1, dtype=i32)
-            nvr_val = arith.muli(nvt_val, _raw(ArithValue(topk)))
-            buffer_ops.buffer_store(nvr_val, ptr_rsrc(nvr_out), c0)
-            scf.YieldOp([])
+        if tid == c0:
+            nvt_val = buffer_ops.buffer_load(ptr_rsrc(nvt), c0, vec_width=1, dtype=T.i32)
+            buffer_ops.buffer_store(nvt_val * topk, ptr_rsrc(nvr_out), c0)
 
         # Fold the route atomic-counter zero-init into this pre-route kernel:
         # bucket count E <= n <= block size, so thread tid<E clears counter[tid],
         # removing the separate host torch.zeros(E) launch before moe_route_g2l.
-        in_bucket = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(E))
-        _if_ctr = scf.IfOp(in_bucket)
-        with ir.InsertionPoint(_if_ctr.then_block):
+        if tid < E:
             buffer_ops.buffer_store(c0, ptr_rsrc(counter), tid)
-            scf.YieldOp([])
 
-        lds_base = allocator.get_base()
-        lds0 = STensor(
-            SmemPtr(lds_base, lds0_off, T.i32, shape=(MAX_G2L_EXPERTS,)),
-            dtype=T.i32,
-            shape=(MAX_G2L_EXPERTS,),
-        )
-        lds1 = STensor(
-            SmemPtr(lds_base, lds1_off, T.i32, shape=(MAX_G2L_EXPERTS,)),
-            dtype=T.i32,
-            shape=(MAX_G2L_EXPERTS,),
-        )
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        mr0 = lds.buf0.ptr
+        mr1 = lds.buf1.ptr
 
-        m_rsrc = ptr_rsrc(mask)
-        l_rsrc = ptr_rsrc(lut)
-
-        in_range = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(n))
+        in_range = tid < n
 
         # Load 0/1 into LDS.
-        _if_load = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_load.then_block):
-            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            nz = arith.cmpi(CmpIPredicate.ne, m, c0)
-            lds0[fx.Index(tid)] = ArithValue(arith.select(nz, c1, c0))
-            scf.YieldOp([])
+        if in_range:
+            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
+            _lds_store(mr0, (m != c0).select(c1, c0), tid)
 
         gpu.barrier()
 
         # Inclusive Hillis-Steele scan (identical to moe_contiguous_psum).
-        src = lds0
-        dst = lds1
+        src, dst = mr0, mr1
         for offset in range_constexpr(1, MAX_G2L_EXPERTS):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
-            _if_scan = scf.IfOp(in_range)
-            with ir.InsertionPoint(_if_scan.then_block):
-                val = src[fx.Index(tid)]
-                has_prev = arith.cmpi(
-                    CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
-                )
-                prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
-                with ir.InsertionPoint(prev_if.then_block):
-                    prev = src[fx.Index(tid - arith.constant(offset, type=i32))]
-                    scf.YieldOp([_raw(prev)])
-                with ir.InsertionPoint(prev_if.else_block):
-                    scf.YieldOp([c0])
-                dst[fx.Index(tid)] = ArithValue(val) + ArithValue(prev_if.results[0])
-                scf.YieldOp([])
+            if in_range:
+                val = _lds_load(src, tid)
+                has_prev = tid >= fx.Int32(offset)
+                rd_idx = has_prev.select(tid - fx.Int32(offset), tid)
+                prev = has_prev.select(_lds_load(src, rd_idx), c0)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
         # lut[i] = enabled ? incl_prefix[i]-1 : E
-        _if_store = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_store.then_block):
-            incl = src[fx.Index(tid)]
-            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            nz2 = arith.cmpi(CmpIPredicate.ne, m2, c0)
-            local = ArithValue(incl) - c1
-            le = arith.select(nz2, _raw(local), _raw(ArithValue(E)))
-            buffer_ops.buffer_store(ArithValue(le), l_rsrc, tid)
-            scf.YieldOp([])
+        if in_range:
+            incl = _lds_load(src, tid)
+            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
+            local = incl - c1
+            buffer_ops.buffer_store((m2 != c0).select(local, E), l_rsrc, tid)
 
     @flyc.jit
     def launch_g2l(
@@ -161,12 +130,8 @@ def build_moe_g2l_lut_module():
         topk: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         g2l_kernel(mask, lut, counter, nvt, nvr_out, n, E, topk).launch(
-            grid=(arith.index(1), 1, 1),
+            grid=(1, 1, 1),
             block=(MAX_G2L_EXPERTS, 1, 1),
             stream=stream,
         )
