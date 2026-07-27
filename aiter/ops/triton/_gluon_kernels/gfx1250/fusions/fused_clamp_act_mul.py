@@ -103,20 +103,26 @@ def _fused_clamp_silu_mul_kernel(
     # other=0.0.
     row_base = pid * inp_stride_m
     shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    gate_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+    # One descriptor over the whole [2*n_half] row (single descriptor build):
+    # gate loads at column 0, up at column n_half. shape=[2*n_half] bounds the
+    # up-half overhang (OOB -> zero-fill); the gate-half overhang reads into the
+    # up region but is masked out on use (offs < n_half), so the output stays
+    # correct — this replaces the two separate gate/up descriptors.
+    inp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=inp_ptr + row_base,
-        shape=[n_half],
+        shape=[2 * n_half],
         strides=[inp_stride_n],
         block_shape=[BLOCK_SIZE_N],
         layout=shared_tdm_layout,
     )
-    up_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=inp_ptr + row_base + n_half * inp_stride_n,
-        shape=[n_half],
-        strides=[inp_stride_n],
-        block_shape=[BLOCK_SIZE_N],
-        layout=shared_tdm_layout,
-    )
+    # Prefetch this row's input into L2 as early as possible so the descriptor +
+    # smem setup below overlaps it and the async_load hits warm L2. speculative
+    # stays False (each row is a fresh page — nothing prior to speculate on).
+    # NOTE: benefit is marginal here (one row per program → little work between
+    # prefetch and load); prefetch really pays off in a persistent/pipelined
+    # variant that prefetches *future* rows.
+    gl.amd.gfx1250.tdm.prefetch(inp_desc, [0])
+    gl.amd.gfx1250.tdm.prefetch(inp_desc, [n_half])
     # TDM output store
     out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=out_ptr + pid * out_stride_m,
@@ -128,10 +134,10 @@ def _fused_clamp_silu_mul_kernel(
     out_smem = gl.allocate_shared_memory(
         out_ptr.dtype.element_ty, out_desc.block_shape, shared_tdm_layout
     )
-    gate_smem = gl.allocate_shared_memory(gate_desc.dtype, gate_desc.block_shape, shared_tdm_layout)
-    up_smem = gl.allocate_shared_memory(up_desc.dtype, up_desc.block_shape, shared_tdm_layout)
-    gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem)
-    gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem)
+    gate_smem = gl.allocate_shared_memory(inp_desc.dtype, inp_desc.block_shape, shared_tdm_layout)
+    up_smem = gl.allocate_shared_memory(inp_desc.dtype, inp_desc.block_shape, shared_tdm_layout)
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [0], gate_smem)       # gate = row[0:n_half]
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [n_half], up_smem)    # up   = row[n_half:2*n_half]
     
     gl.amd.gfx1250.tdm.async_wait(1)
     gate = gate_smem.load(row_layout).to(gl.float32)
