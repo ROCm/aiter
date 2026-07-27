@@ -798,6 +798,24 @@ if "fused_qk" in args.case:
                                             continue
                                         if num_kv_heads > num_heads:
                                             continue
+                                        # compute_all_q_rope (DCP: RoPE all queries
+                                        # incl. padded slot=-1) is implemented only in
+                                        # the per-head and opt MLA *decode* kernels
+                                        # (num_kv_heads==1). It is absent from the
+                                        # general decode kernel (num_tokens>=256 and
+                                        # kv_lora_rank*num_heads<2048, e.g. num_heads=2)
+                                        # and from the GQA prefill kernels
+                                        # (num_kv_heads>1). Production DCP always hits
+                                        # per-head/opt (num_kv_heads==1, num_heads>=16),
+                                        # so restrict the sweep to those. Constants
+                                        # mirror the host dispatch (MAX_TOKENS_PER_HEAD
+                                        # =256, MIN_SIZE_FOR_OPT=2048).
+                                        hits_flag_kernel = num_kv_heads == 1 and (
+                                            num_token < 256
+                                            or args.kv_lora_rank * num_heads >= 2048
+                                        )
+                                        if compute_all_q_rope and not hits_flag_kernel:
+                                            continue
                                         # Pair padding with compute_all_q_rope: only
                                         # run (full, non-DCP) and (padded, DCP
                                         # compute-all). Skip the redundant
