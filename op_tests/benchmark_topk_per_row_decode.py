@@ -309,7 +309,7 @@ def load_flydsl_kernel(symbol: str | None, flydsl_path: str | None) -> Kernel:
         module = importlib.import_module(module_name)
         runner = getattr(module, func_name)
         return Kernel("flydsl", True, symbol, runner)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - probe: report and keep going
         return Kernel(
             "flydsl",
             False,
