@@ -132,6 +132,14 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_supported",
     ),
+    "jagged_dense_bmm_autograd": (
+        ".jagged_dense_bmm_autograd",
+        "jagged_dense_bmm_autograd",
+    ),
+    "jagged_dense_bmm_bwd_dispatched": (
+        ".jagged_dense_bmm_bwd_dispatch",
+        "jagged_dense_bmm_bwd_dispatched",
+    ),
     "pa_decode": (".pa_decode", "pa_decode"),
     "prepare_pa_decode_plan": (".pa_decode_tuning", "prepare_pa_decode_plan"),
     "prepare_gemm_a16wfp4_weight": (
@@ -228,6 +236,8 @@ __all__ = [
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
+    "jagged_dense_bmm_autograd",
+    "jagged_dense_bmm_bwd_dispatched",
     "make_fp4_mqa_plan",
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
