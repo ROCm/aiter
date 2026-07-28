@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -32,6 +33,8 @@ _fused_moe_kernel_mxfp4_repr = make_kernel_repr(
         "EVEN_K",
         "MUL_ROUTED_WEIGHT",
         "top_k",
+        "A_ROW_DIVISOR",
+        "QUANTIZE_A_TO_MXFP4",
         "compute_type",
         "SWIZZLE_MX_A",
         "SWIZZLE_MX_B",
@@ -86,6 +89,8 @@ def _fused_moe_kernel_mxfp4(
     EVEN_K: tl.constexpr,
     MUL_ROUTED_WEIGHT: tl.constexpr,
     top_k: tl.constexpr,
+    A_ROW_DIVISOR: tl.constexpr,
+    QUANTIZE_A_TO_MXFP4: tl.constexpr,
     compute_type: tl.constexpr,
     SWIZZLE_MX_A: tl.constexpr,  # TODO add swizzle support
     SWIZZLE_MX_B: tl.constexpr,  # TODO add swizzle support
@@ -120,6 +125,29 @@ def _fused_moe_kernel_mxfp4(
     is_a_microscaled_format: tl.constexpr = a_mx_scale_ptr is not None
     is_b_microscaled_format: tl.constexpr = b_mx_scale_ptr is not None
     MX_PACK_DIVISOR: tl.constexpr = 32
+    tl.static_assert(A_ROW_DIVISOR > 0, "A_ROW_DIVISOR must be positive")
+    if QUANTIZE_A_TO_MXFP4:
+        tl.static_assert(
+            not is_a_microscaled_format,
+            "on-the-fly activation quantization requires unquantized A",
+        )
+        tl.static_assert(
+            is_b_microscaled_format,
+            "on-the-fly activation quantization requires microscaled B",
+        )
+        tl.static_assert(
+            a_ptr.dtype.element_ty == tl.bfloat16
+            or a_ptr.dtype.element_ty == tl.float16,
+            "on-the-fly MXFP4 activation quantization requires BF16/FP16 A",
+        )
+        tl.static_assert(
+            b_ptr.dtype.element_ty == tl.uint8,
+            "on-the-fly MXFP4 activation quantization requires E2M1 B",
+        )
+        tl.static_assert(
+            BLOCK_SIZE_K % MX_PACK_DIVISOR == 0,
+            "BLOCK_SIZE_K must be a multiple of the MX scale group",
+        )
     if is_a_microscaled_format:
         a_type: tl.constexpr = a_ptr.dtype.element_ty
         tl.static_assert(
@@ -231,7 +259,7 @@ def _fused_moe_kernel_mxfp4(
             a_mx_scale_ptrs = (
                 a_mx_scale_ptr
                 + offs_scale_ak.to(tl.int64)[None, :] * stride_amxk
-                + offs_scale_m.to(tl.int64)[:, None] // top_k * stride_amxm
+                + offs_scale_m.to(tl.int64)[:, None] // A_ROW_DIVISOR * stride_amxm
             )
     else:
         a_mx_scale_ptrs = None
@@ -285,7 +313,7 @@ def _fused_moe_kernel_mxfp4(
     offs_a_k = tl.arange(0, PACKED_BLOCK_K_A)
     offs_b_k = tl.arange(0, PACKED_BLOCK_K_B)
     a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_a_k[None, :] * stride_ak
+        offs_token[:, None] // A_ROW_DIVISOR * stride_am + offs_a_k[None, :] * stride_ak
     )
     b_ptrs = (
         b_ptr
@@ -345,16 +373,31 @@ def _fused_moe_kernel_mxfp4(
                 b_mx_scale_ptrs, mask=mask_bk_scale[None, :], other=0.0
             )
 
-            accumulator = tl.dot_scaled(
-                a,
-                a_mx_scales,
-                A_DTYPE_FORMAT,
-                b,
-                b_mx_scales,
-                B_DTYPE_FORMAT,
-                acc=accumulator,
-                fast_math=True,
-            )
+            if QUANTIZE_A_TO_MXFP4:
+                a_fp4, a_fp4_scales = _mxfp4_quant_op(
+                    a, BLOCK_SIZE_K, BLOCK_SIZE_M, MX_PACK_DIVISOR
+                )
+                accumulator = tl.dot_scaled(
+                    a_fp4,
+                    a_fp4_scales,
+                    "e2m1",
+                    b,
+                    b_mx_scales,
+                    B_DTYPE_FORMAT,
+                    acc=accumulator,
+                    fast_math=True,
+                )
+            else:
+                accumulator = tl.dot_scaled(
+                    a,
+                    a_mx_scales,
+                    A_DTYPE_FORMAT,
+                    b,
+                    b_mx_scales,
+                    B_DTYPE_FORMAT,
+                    acc=accumulator,
+                    fast_math=True,
+                )
 
             if is_a_microscaled_format:
                 if SWIZZLE_MX_A:
