@@ -242,6 +242,7 @@ __device__ void reduce_lse_massive(const MlaReduceKernelV1Params& params,
                 lse = g_partial_lse.template _load<1>(partial_lse_seq_byte_offset +
                                                       reduce_tile_pos * int32_t(sizeof(float)))[0];
             }
+            if(lse != lse) lse = -INFINITY;
             return lse;
         };
 
@@ -342,9 +343,11 @@ __device__ void reduce_output_massive(const MlaReduceKernelV1Params& params,
     auto load_output = [&](const int32_t reduce_partial_map) -> vec_f32_t {
         const int32_t tile_byte_offset =
             reduce_partial_map * int32_t(Traits::kNumHeadQ * Traits::kSizeDV * sizeof(float));
-        return buf_load_vec<kVecWidth>(g_partial_output,
+        vec_f32_t _v = buf_load_vec<kVecWidth>(g_partial_output,
                                        partial_output_seq_byte_offset + tile_byte_offset +
                                            thread_byte_offset);
+        opus::static_for<kVecWidth>([&](auto i){ if(_v[i.value]!=_v[i.value]) _v[i.value]=0.f; });
+        return _v;
     };
 
     auto oaccu_0      = load_output(reduce_partial_map_0);
@@ -631,8 +634,10 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             g_partial_output,
             partial_output_seq_byte_offset + reduce_tile_pos_out_byte_start + thread_byte_offset);
 
-        const float lse = g_partial_lse.template _load<1>(
+        opus::static_for<kVecWidth>([&](auto i){ if(reg_out[i.value]!=reg_out[i.value]) reg_out[i.value]=0.f; });
+        float lse = g_partial_lse.template _load<1>(
             partial_lse_seq_byte_offset + reduce_tile_pos_lse_start * int32_t(sizeof(float)))[0];
+        if(lse != lse) lse = -INFINITY;
         float max_lse   = lse;
         float sum_e_lse = 1.0f;
 
@@ -647,8 +652,10 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
                 g_partial_output,
                 partial_output_seq_byte_offset + reduce_tile_pos_out_bytes + thread_byte_offset);
 
-            const float lse_val = g_partial_lse.template _load<1>(
+            opus::static_for<kVecWidth>([&](auto i){ if(oaccu[i.value]!=oaccu[i.value]) oaccu[i.value]=0.f; });
+            float lse_val = g_partial_lse.template _load<1>(
                 partial_lse_seq_byte_offset + reduce_tile_pos_lse * int32_t(sizeof(float)))[0];
+            if(lse_val != lse_val) lse_val = -INFINITY;
             const float new_max_lse = opus::max(max_lse, lse_val);
             const float old_scale   = expf(max_lse - new_max_lse);
             const float new_scale   = expf(lse_val - new_max_lse);
@@ -661,8 +668,9 @@ __device__ void mla_reduce_v1_impl_simple(const MlaReduceKernelV1Params& params,
             sum_e_lse = sum_e_lse * old_scale + new_scale;
         }
 
+        const bool sum_ok = (sum_e_lse > 0.f) && (sum_e_lse == sum_e_lse);
         opus::static_for<kVecWidth>(
-            [&](auto i) { reg_out[i.value] = reg_out[i.value] / sum_e_lse; });
+            [&](auto i) { reg_out[i.value] = sum_ok ? (reg_out[i.value] / sum_e_lse) : 0.f; });
 
         const int32_t store_byte_offset = final_out_byte_offset_base +
                                           seq_idx * params.stride_s_o * int32_t(sizeof(out_t)) +
