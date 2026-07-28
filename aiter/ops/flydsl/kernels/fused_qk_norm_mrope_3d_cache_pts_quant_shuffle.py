@@ -315,6 +315,7 @@ def _build_kv_kernel(
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
+    PROD_VEC_SIZE = D // WAVE
     VEC_PAIRS = max(1, HALF // WAVE)
     WAVES_PER_BLOCK = KV_THREADS // WAVE
     PHASE1_ITERS = _ceil_div(block_size, WAVES_PER_BLOCK)
@@ -486,17 +487,23 @@ def _build_kv_kernel(
             if token_local < block_size:
                 tok = tok0 + fx.Int32(token_local)
                 if tok < num_tokens:
-                    # GTensor is a Python-side wrapper, not a DSL value (see
-                    # flydsl-best-practices.md S3) -- construct it fresh
-                    # inside this dynamic branch (cheap: pointer + descriptor
-                    # only) so the AST rewriter never has to thread it as
-                    # if/else state.
                     # ---- K: RMSNorm (over full D) + interleaved-mrope RoPE +
                     # per-tensor fp8 quant, one wave butterfly + VEC_PAIRS
                     # loop per thread (see _build_q_kernel for the same
                     # pattern). ----
                     k0s, k1s = [], []
                     sumsq_local = fx.Float32(0.0)
+                    # Production's vec_t<T, D/WAVE> gives each lane
+                    # contiguous dimensions for its local RMS accumulation.
+                    # The NEOX output mapping below owns (d, d + D/2) pairs;
+                    # reducing those pairs instead changes FP addition order
+                    # and can cross an FP8 rounding boundary.
+                    for i in range_constexpr(PROD_VEC_SIZE):
+                        norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
+                        norm_x = fx.BFloat16(
+                            qkv_t[tok, H_Q + head, norm_col]
+                        ).to(fx.Float32)
+                        sumsq_local = sumsq_local + norm_x * norm_x
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         k0 = fx.Float32(0.0)
@@ -506,7 +513,6 @@ def _build_kv_kernel(
                             k1 = fx.BFloat16(qkv_t[tok, H_Q + head, col + HALF]).to(
                                 fx.Float32
                             )
-                            sumsq_local = sumsq_local + k0 * k0 + k1 * k1
                         k0s.append(k0)
                         k1s.append(k1)
                     sumsq = wave_reduce_add(sumsq_local)
