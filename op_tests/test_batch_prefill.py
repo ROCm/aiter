@@ -888,7 +888,7 @@ def test_batch_prefill_page_size_1_linear_sglang(
         (8192, 8192),
     ],
 )
-@pytest.mark.parametrize("page_size", [16, 1024])
+@pytest.mark.parametrize("page_size", [16, 1024, 2048])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 1), (16, 1)])
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [False, True])
@@ -1710,7 +1710,7 @@ def reference_attention_kv_blockscale(
 
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("kv_cache_size_gb", [4.5])
-@pytest.mark.parametrize("page_size", [1, 16, 1024])
+@pytest.mark.parametrize("page_size", [1, 16, 1024, 2048])
 @pytest.mark.parametrize("num_qo_heads,num_kv_heads", [(8, 8), (16, 8)])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("causal", [False, True])
@@ -2591,11 +2591,11 @@ parser.add_argument(
     "--pagesize",
     type=int,
     const=None,
-    choices=[1, 16, 1024],
-    default=[1, 16, 1024],
+    choices=[1, 16, 1024, 2048],
+    default=[1, 16, 1024, 2048],
     nargs="*",
     help="""page size.
-    e.g.: -p 1024""",
+    e.g.: -p 2048""",
 )
 parser.add_argument(
     "-q",

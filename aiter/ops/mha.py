@@ -1420,11 +1420,11 @@ def cmdGenFunc_mha_batch_prefill(
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
     kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[Tensor] = None,
     block_table: Optional[Tensor] = None,
     seqlen_k: Optional[Tensor] = None,
+    sink_ptr: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -1448,6 +1448,22 @@ def cmdGenFunc_mha_batch_prefill(
             filter_fwd += "fp8bf16*"
         else:
             raise NotImplementedError("Unsupported output dtype for FP8 MHA")
+    if k.dim() == 5:
+        page_size = k.size(-2)
+        kv_memory_layout = "vectorized"
+    elif k.dim() == 4:
+        page_size = k.size(1)
+        kv_memory_layout = "linear"
+    elif k.dim() == 3:
+        page_size = 1
+        kv_memory_layout = "linear"
+    else:
+        raise ValueError(f"Unsupported batch-prefill K-cache rank: {k.dim()}")
+    if page_size not in (1, 16, 1024, 2048):
+        raise ValueError(f"Unsupported batch-prefill page size: {page_size}")
+    kv_lookup_table = "vllm" if block_table is not None else "sglang"
+    md_name += f"_ps{page_size}_{kv_memory_layout}_{kv_lookup_table}"
+    filter_fwd += f"_ps{page_size}*"
     if 0.0 < logits_soft_cap:
         md_name += "_logits"
         filter_fwd += "_logits*"
@@ -1500,6 +1516,7 @@ def cmdGenFunc_mha_batch_prefill(
     else:
         md_name += "_nsink"
         filter_fwd += "_nsink*"
+    filter_fwd += f"_{kv_memory_layout}_{kv_lookup_table}*"
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
@@ -3704,11 +3721,11 @@ def mha_batch_prefill_fake_tensors(
     v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
     kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
     kv_last_page_lens: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     seqlen_k: Optional[torch.Tensor] = None,
+    sink_ptr: Optional[Tensor] = None,
+    gen: Optional[Generator] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_vectorized = k.dim() == 5 and v.dim() == 5
