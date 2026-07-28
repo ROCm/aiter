@@ -297,7 +297,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "weights": "*fp32",
         "stride_w_batch": "i32",
         "OutLogits_buffer": "*fp32",
-        "stride_out_batch": "i32",
+        "stride_out_batch": "i64",
         "max_model_len": "i32",
         "max_block_len": "i32",
         "num_block": "i32",
@@ -380,7 +380,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 ["tt.pointer_range", 32],
             ],  # weights
             (14,): [["tt.divisibility", 16]],  # stride_w_batch
-            (15,): [["tt.pointer_range", 32]],  # OutLogits_buffer
+            # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base
+            # offset (row * stride_out_batch) can exceed a 32-bit byte offset
+            # for wide dense logits (e.g. max_model_len=1<<20). stride_out_batch
+            # is i64 and the gluon kernel advances the base pointer in 64 bit
+            # (buffer_store voffset stays int32) to avoid the 2**31 overflow.
         },
     )
 

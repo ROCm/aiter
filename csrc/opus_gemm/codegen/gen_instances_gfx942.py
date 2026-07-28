@@ -128,6 +128,7 @@ EXACT_N_ROWBLOCK_REDUCE_CONFIGS = (
     (8, 8, 8),  # N=64,  8 rows/wg
     (8, 16, 4),  # N=128, 4 rows/wg
     (8, 32, 2),  # N=256, 2 rows/wg
+    (16, 24, 4),  # N=384, 4 rows/wg
     (8, 64, 1),  # N=512, 1 row/wg
     (8, 128, 4),  # N=1024, 4 rows/wg
     (8, 128, 2),  # N=1024, 2 rows/wg

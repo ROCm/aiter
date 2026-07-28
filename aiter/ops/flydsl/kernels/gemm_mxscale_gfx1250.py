@@ -146,6 +146,8 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
+    stage1_situ_beta: float = 1.0,
+    stage1_situ_linear_beta: float = 1.0,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     stage1_quant_out: str | None = None,
@@ -223,10 +225,21 @@ def compile_mxscale_gemm(
     if epilogue_bias_mode and out_dtype not in ("bf16", "f16"):
         raise ValueError("epilogue_bias currently supports f16/bf16 outputs only")
     if stage1_act_mode is not None:
-        if stage1_act_mode not in ("silu", "swiglu"):
+        if stage1_act_mode not in ("silu", "swiglu", "situv2"):
             raise ValueError(
-                f"stage1_act must be None, 'silu', or 'swiglu', got {stage1_act!r}"
+                "stage1_act must be None, 'silu', 'swiglu', or 'situv2', "
+                f"got {stage1_act!r}"
             )
+        if stage1_act_mode == "situv2":
+            if stage1_situ_beta <= 0.0:
+                raise ValueError(
+                    f"stage1_situ_beta must be > 0, got {stage1_situ_beta!r}"
+                )
+            if stage1_situ_linear_beta <= 0.0:
+                raise ValueError(
+                    "stage1_situ_linear_beta must be > 0, "
+                    f"got {stage1_situ_linear_beta!r}"
+                )
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
@@ -1914,6 +1927,28 @@ def compile_mxscale_gemm(
                 )
                 return g * sig
 
+            def _stage1_sigmoid_elem(g):
+                neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                one = arith.constant(1.0, type=T.f32)
+                emu = llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.exp2.f32", [g * neg_log2e], [], []
+                )
+                return llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                )
+
+            def _stage1_tanh_elem(x):
+                one = arith.constant(1.0, type=T.f32)
+                neg_two_log2e = arith.constant(-2.8853900817779268, type=T.f32)
+                abs_x = x.maximumf(-x)
+                e = llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.exp2.f32", [abs_x * neg_two_log2e], [], []
+                )
+                tanh_abs = (one - e) * llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.rcp.f32", [one + e], [], []
+                )
+                return (x > arith.constant(0.0, type=T.f32)).select(tanh_abs, -tanh_abs)
+
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
@@ -1922,8 +1957,9 @@ def compile_mxscale_gemm(
                 # swiglu) or +inf to disable clamping (silu without a limit).
                 # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
                 neg_lim = -f32_swiglu_limit
-                g = -((-g).maximumf(neg_lim))
-                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
+                if const_expr(stage1_act_mode != "situv2"):
+                    g = -((-g).maximumf(neg_lim))
+                    u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(stage1_act_mode == "swiglu"):
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [g * alpha * neg_log2e], [], []
@@ -1932,6 +1968,24 @@ def compile_mxscale_gemm(
                         T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
                     )
                     return g * sig * (u + one)
+                if const_expr(stage1_act_mode == "situv2"):
+                    situ_beta = arith.constant(float(stage1_situ_beta), type=T.f32)
+                    situ_beta_rcp = arith.constant(
+                        1.0 / float(stage1_situ_beta), type=T.f32
+                    )
+                    linear_beta = arith.constant(
+                        float(stage1_situ_linear_beta), type=T.f32
+                    )
+                    linear_beta_rcp = arith.constant(
+                        1.0 / float(stage1_situ_linear_beta), type=T.f32
+                    )
+                    situ_gate = (
+                        situ_beta
+                        * _stage1_tanh_elem(g * situ_beta_rcp)
+                        * _stage1_sigmoid_elem(g)
+                    )
+                    up_scaled = linear_beta * _stage1_tanh_elem(u * linear_beta_rcp)
+                    return situ_gate * up_scaled
                 return _stage1_silu_elem(g) * u
 
             def _stage1_act_mul_vec8(gate_v8, up_v8):
@@ -3617,8 +3671,13 @@ def compile_mxscale_gemm(
             _for_ip.__exit__(None, None, None)
         else:
             if const_expr(grouped_contiguous_m):
-                masked_m_rsrc = build_buffer_resource_from_ptr(arg_masked_m)
-                layout_rsrc = build_buffer_resource_from_ptr(arg_m_tile_map)
+                _rsrc_nbytes = int(batch_count) * 4
+                masked_m_rsrc = build_buffer_resource_from_ptr(
+                    arg_masked_m, num_records_bytes=_rsrc_nbytes
+                )
+                layout_rsrc = build_buffer_resource_from_ptr(
+                    arg_m_tile_map, num_records_bytes=_rsrc_nbytes
+                )
                 flat_pid = arith.index_cast(T.index, _raw(gpu.block_idx.x))
                 bz = (
                     arith.index_cast(T.index, _raw(gpu.block_idx.z))
@@ -3814,6 +3873,8 @@ def compile_mxscale_gemm(
         _k_contiguous_1d,
         _persistent_workers,
         stage1_act_mode,
+        float(stage1_situ_beta),
+        float(stage1_situ_linear_beta),
         stage1_weight_layout_mode,
         epilogue_bias_mode,
         stage1_quant_out_mode,

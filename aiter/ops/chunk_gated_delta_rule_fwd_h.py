@@ -98,6 +98,7 @@ def chunk_gated_delta_rule_fwd_h_hip(
     g: Tensor,
     gk: Tensor,
     initial_state: Tensor,
+    initial_state_indices: Tensor,
     cu_seqlens: Tensor,
     chunk_offsets: Tensor,
     h: Tensor,
@@ -201,20 +202,27 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     state_dtype: Optional[torch.dtype] = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
+    initial_state_indices: Optional[Tensor] = None,
+    inplace_final_state: Optional[bool] = None,
 ) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
     """
-    HIP hidden state forward with h layout [V, K].
-
-    Drop-in replacement for ``chunk_gated_delta_rule_fwd_h_opt_vk``
-    when K=128, V=128, bf16.
+    HIP hidden-state forward with h layout [V, K] (K=128, V=128, bf16), always
+    returning ``(h, v_new, final_state)``.
 
     w, u: [B, H, T, K/V] head-major contiguous.
-    initial_state/final_state: [N, H, V, K].
-    h snapshots: [B, NT, H, V, K].
-    v_new output: [B, H, T_flat, V].
-    `g` is expected as a 3-D tensor in token-major [B, T, H] or
-    head-major [B, H, T] layout according to `g_head_major`.
+    h snapshots: [B, NT, H, V, K]; v_new output: [B, H, T_flat, V].
+    `g` is a 3-D tensor, token-major [B, T, H] or head-major [B, H, T].
     use_exp2 selects whether cumulative gates are interpreted in log2 space.
+
+    State handling:
+      * Dense (default): ``initial_state`` is ``[N, H, V, K]`` (``slot == i_n``)
+        and ``final_state`` is a freshly allocated ``[N, H, V, K]`` tensor.
+      * Indexed pool: pass ``initial_state`` as the pool ``[pool_size, H, V, K]``
+        plus ``initial_state_indices`` ``[N]`` (int32); each sequence's slot is
+        gathered from the index array.
+      * ``inplace_final_state`` (default: ``True`` when ``initial_state_indices``
+        is given) writes the final state back into ``initial_state`` in place and
+        returns that same buffer as ``final_state`` (no extra allocation).
     """
     if chunk_size != 64:
         raise ValueError("HIP kernel requires chunk_size=64.")
@@ -229,11 +237,18 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     T_flat = w.shape[2]
     is_varlen = cu_seqlens is not None
     NT = triton.cdiv(T, chunk_size)
-    state = _prepare_state_args(
-        initial_state=initial_state,
-        state_dtype=state_dtype,
-        device=k.device,
-    )
+
+    has_indices = initial_state_indices is not None
+    inplace = has_indices if inplace_final_state is None else inplace_final_state
+    if inplace and initial_state is None:
+        raise ValueError("`inplace_final_state` requires `initial_state`.")
+    # Indexed slots address the pool, so the final state must be written back
+    # into that pool in place; a dense `[N, ...]` final_state cannot hold them.
+    if has_indices and not inplace:
+        raise ValueError(
+            "`initial_state_indices` requires in-place update; "
+            "leave `inplace_final_state` unset or set it to True."
+        )
 
     k_hip = k.contiguous()
     w_hip = w.contiguous()
@@ -297,11 +312,47 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         if save_new_value
         else torch.empty(0, device=k.device, dtype=torch.bfloat16)
     )
-    final_state = (
-        torch.empty((N, H, V, K), device=k.device, dtype=state.tensor.dtype)
-        if output_final_state
-        else torch.empty(0, device=k.device, dtype=state.tensor.dtype)
-    )
+    # In-place mode runs directly on the caller's `initial_state` and writes the
+    # final state back into it; otherwise use the copy/cast path.
+    if inplace:
+        if initial_state.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                f"`initial_state.dtype` must be fp32 or bf16, got {initial_state.dtype}."
+            )
+        if state_dtype is not None and initial_state.dtype != state_dtype:
+            raise ValueError(
+                f"`initial_state.dtype` ({initial_state.dtype}) must match "
+                f"`state_dtype` ({state_dtype})."
+            )
+        if not initial_state.is_contiguous():
+            raise ValueError("`initial_state` must be contiguous for in-place update.")
+        state_tensor = initial_state
+        has_initial_state = True
+        resolved_state_dtype = initial_state.dtype
+    else:
+        state = _prepare_state_args(
+            initial_state=initial_state,
+            state_dtype=state_dtype,
+            device=k.device,
+        )
+        state_tensor = state.tensor
+        has_initial_state = state.has_initial_state
+        resolved_state_dtype = state_tensor.dtype
+
+    if not output_final_state:
+        final_state = torch.empty(0, device=k.device, dtype=resolved_state_dtype)
+    elif inplace:
+        final_state = state_tensor
+    else:
+        final_state = torch.empty(
+            (N, H, V, K), device=k.device, dtype=resolved_state_dtype
+        )
+
+    # No indices => dense identity mapping (slot == i_n).
+    if has_indices:
+        state_indices = initial_state_indices.to(torch.int32).contiguous()
+    else:
+        state_indices = torch.empty(0, device=k.device, dtype=torch.int32)
 
     chunk_gated_delta_rule_fwd_h_hip(
         k_hip,
@@ -309,14 +360,15 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
         u_hip,
         g_hip,
         gk_arg,
-        state.tensor,
+        state_tensor,
+        state_indices,
         cu_seqlens_int32,
         chunk_offsets_int32,
         h,
         v_new,
         final_state,
         selected_bv,
-        state.has_initial_state,
+        has_initial_state,
         output_final_state,
         save_new_value,
         use_exp2,
