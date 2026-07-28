@@ -1,4 +1,5 @@
 import argparse
+import csv
 import torch
 from triton.testing import runtime
 from aiter.ops.triton.rope.rope import RotateStyle
@@ -31,6 +32,7 @@ from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_configs,
     get_available_models,
+    get_caller_name_no_ext,
 )
 
 
@@ -515,6 +517,7 @@ def run_benchmark(args):
 
         return flops, mem
 
+    csv_rows: list[dict] = []
     for x_vals in x_vals_list:
         print("Running input config:")
         for i in range(len(x_names)):
@@ -523,6 +526,24 @@ def run_benchmark(args):
         flops, mem = bench_rope(*x_vals)
         print(f"Total flops  = {flops/1e12 : .6e} (TFLOPS)")
         print(f"Total memory = {mem/1e9 : .6e} (GB)")
+        if args.o:
+            row = {}
+            for name, val in zip(x_names, x_vals):
+                row[name] = str(val) if name == "dtype" else val
+            row["Total_TFLOPs"] = flops / 1e12
+            row["Total_memory_GB"] = mem / 1e9
+            row["repeat"] = rep
+            if args.model:
+                row["model"] = args.model
+            csv_rows.append(row)
+
+    if args.o and csv_rows:
+        out_name = f"{get_caller_name_no_ext()}.csv"
+        fieldnames = list(csv_rows[0].keys())
+        with open(out_name, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_rows)
 
     print("")
     print(
@@ -601,6 +622,13 @@ def parse_args(args: list[str] | None = None):
     parser.add_argument("--dtype", type=str, help="data type", default="bf16")
     parser.add_argument(
         "--repeat", type=int, help="number of repetition for benchmark", default=1000
+    )
+    parser.add_argument(
+        "-o",
+        "--output-csv",
+        action="store_true",
+        dest="o",
+        help="Write benchmark summary (config + estimated TFLOPs / memory) to CSV file",
     )
     args = parser.parse_args(args=args)
     return args
