@@ -3,7 +3,7 @@
 
 """Host wrapper for the FlyDSL ``jagged_dense_bmm`` BACKWARD kernels.
 
-Companion to the forward's ``jagged_dense_bmm_dispatch_v2.py``. It folds all the
+Companion to the forward's ``jagged_dense_bmm_dispatch.py``. It folds all the
 host-side glue the backward needs (previously inlined in every bench / example /
 recsys-harness driver) into one place:
 
@@ -60,7 +60,7 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- #
-# Per-shape JSON dispatch (mirrors jagged_dense_bmm_dispatch_v2's loader shape). #
+# Per-shape JSON dispatch (mirrors jagged_dense_bmm_dispatch's loader shape).    #
 # --------------------------------------------------------------------------- #
 
 # Config schema. Every key is optional; None means "use the kernel/heuristic
