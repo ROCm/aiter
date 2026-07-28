@@ -2575,3 +2575,59 @@ def compile_gemm(
     if const_expr(alg == "batch1"):
         return launch_batch1
     return launch_splitk
+
+
+def compile_sum(TOPK, N):
+    num_threads = 64
+
+    @flyc.kernel(
+        known_block_size=[num_threads, 1, 1]
+    )  # known_block_size at compile time
+    def kernel(A: fx.Tensor, B: fx.Tensor):
+        batch = fx.block_idx.x
+        tid = fx.thread_idx.x
+        copy_bits = 128
+        # copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), A.dtype)
+
+        A = fx.make_view(
+            fx.get_iter(A) + fx.Int64(batch) * (TOPK * N),
+            fx.make_layout((N, TOPK), (1, N)),
+        )
+        B = fx.make_view(fx.get_iter(B) + fx.Int64(batch) * (N), fx.make_layout(N, 1))
+        A = fx.rocdl.make_buffer_tensor(
+            A,
+            max_size=False,
+            num_records_bytes=fx.Int64(N) * (TOPK * A.dtype.width // 8),
+        )
+        B = fx.rocdl.make_buffer_tensor(
+            B,
+            max_size=False,
+            num_records_bytes=fx.Int64(N) * (B.dtype.width // 8),
+        )
+        # all_copy_atoms only partions the first mode, extra modes are considered as batch/broadcast dimension
+        for dst, src in fxh.all_copy_atoms(
+            B, A, atom_bits=copy_bits, num_threads=num_threads
+        ):
+            frag = fx.make_fragment_like(src)
+            fx.copy(copy_atom, src, frag)
+
+            vec_sum = frag[None, 0].load().to(fx.Float32)
+            for m in fx.range_constexpr(1, TOPK):
+                vec = frag[None, m].load().to(fx.Float32)
+                vec_sum += vec
+
+            # store out
+            vec_sum = vec_sum.to(dst.dtype)
+            frag = fx.make_fragment_like(dst)
+            frag.store(vec_sum)
+            fx.copy(copy_atom, frag, dst)
+
+    @flyc.jit
+    def sum(A: fx.Tensor, B: fx.Tensor, batch_size: fx.Int32, stream):
+        assert A.dtype == B.dtype
+        kernel(A, B).launch(
+            grid=(batch_size, 1, 1), block=(num_threads, 1, 1), stream=stream
+        )
+
+    return sum
