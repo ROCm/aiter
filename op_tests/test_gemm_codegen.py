@@ -35,13 +35,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 # Import arch constants directly from build_targets — no torch dependency.
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
+import pandas as pd
 from build_targets import (
     GFX_CU_NUM_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
-
-import pandas as pd
 
 REPRO_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -293,9 +292,9 @@ def test_runtime_dispatch_key():
     _section("4. Runtime dispatch — (gfx, cu_num, M, N, K) lookup key")
 
     try:
-        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
         import aiter.ops.gemm_op_a8w8 as _mod
-    except Exception as e:
+        from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print(f"  SKIP  could not import get_CKGEMM_config ({e})")
         return
 
@@ -303,7 +302,7 @@ def test_runtime_dispatch_key():
     # via rocminfo — GPU_ARCHS is intentionally ignored at runtime.  Derive the
     # test CSV rows from the actual live GPU so the test is correct on any runner.
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
@@ -355,8 +354,8 @@ def test_runtime_dispatch_key():
             cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio
             {cu_num},128,1280,8192,7,0,10.0,old_kernel,100.0,500.0,0.0
         """)
-        import logging
         import io
+        import logging
 
         buf = io.StringIO()
         handler = logging.StreamHandler(buf)
@@ -473,7 +472,7 @@ def test_blockscale_kernel_name_forwarding():
         return
 
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime, get_cu_num
+        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()

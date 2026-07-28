@@ -1,14 +1,16 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import triton
-import torch
-from aiter.ops.triton.utils.device_info import get_num_sms
 import math
+
+import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_2d,
     kernel_unified_attention_3d,
     reduce_segments,
 )
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
@@ -31,9 +33,9 @@ try:
 except:  # noqa: E722
     _reduce_segments_gluon = None
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 
 # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
 _GLUON_REDUCE_MAX_SEGMENTS = 8
@@ -815,10 +817,7 @@ def _gfx1250_unified_attention_2d(
 
     loop_variant = sel_loop_variant if loop_variant is None else loop_variant
     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
-    if not shuffled_kv_cache:
-        TILE_SIZE = BLOCK_SIZE
-    # tile size cannot be less than block size
-    elif TILE_SIZE < BLOCK_SIZE:
+    if not shuffled_kv_cache or TILE_SIZE < BLOCK_SIZE:
         TILE_SIZE = BLOCK_SIZE
 
     num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1

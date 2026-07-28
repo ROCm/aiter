@@ -98,7 +98,7 @@ def compare_arrays(
     arr1: np.ndarray,
     arr2: np.ndarray,
     k: int = 5,
-    thresholds: list[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],
+    thresholds: list[float] | None = None,
 ) -> dict:
     """
     Compare two numpy arrays and compute various difference metrics.
@@ -115,6 +115,8 @@ def compare_arrays(
         - threshold_stats: Count and percentage of differences above each threshold
         - nan_info: Information about NaN values in input arrays
     """
+    if thresholds is None:
+        thresholds = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1]
     # Check input shapes
     if arr1.shape != arr2.shape:
         raise ValueError("Input arrays must have the same shape")
@@ -365,7 +367,7 @@ def torch_mha_extend(
     sliding_window=0,
 ) -> torch.Tensor:
     """PyTorch reference implementation of paged attention."""
-    num_blocks, num_heads, head_size, block_size = value_cache.shape
+    _num_blocks, num_heads, head_size, block_size = value_cache.shape
     softmax_scale = 1.0 / (head_size**0.5)
 
     output_dtype = query.dtype
@@ -457,7 +459,7 @@ def torch_attention_compute(
     assert compute_type in [aiter.dtypes.fp8, aiter.dtypes.bf16, aiter.dtypes.fp16]
 
     num_seqs, num_q_heads_total, head_size = query.shape
-    num_blocks, num_kv_heads, _, _, _ = key_cache.shape
+    _num_blocks, num_kv_heads, _, _, _ = key_cache.shape
     query_group_size = num_q_heads_total // num_kv_heads
     query_group_size_ori = query_group_size // q_seq_len
     assert num_q_heads_total % num_kv_heads == 0
@@ -1286,7 +1288,7 @@ def run_pa_gluon_test(
     qkv_tensor = torch.randn(
         total_queries, num_query_heads + 2 * num_kv_heads, head_size, dtype=data_type
     )
-    query, key, value = torch.split(
+    query, _key, _value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*UNIFORM_RANGE)
@@ -1447,7 +1449,7 @@ def run_pa_gluon_test(
         if quant_mode == "per_token" and (quant_q or quant_kv):
             flash_style_diff_tolerance = 5e-2
 
-    quantized_query_gluon, query_scale_gluon, output_gluon = (
+    quantized_query_gluon, query_scale_gluon, _output_gluon = (
         prepare_gluon_query_and_scale(
             quantized_query,
             query_scale_factors,
@@ -2099,7 +2101,7 @@ def run_multi_pa_gluon_test(
     return pd.DataFrame(results)
 
 
-def parse_arg_and_run_test(sample_rate0: float = None):
+def parse_arg_and_run_test(sample_rate0: float | None = None):
     """Parse arguments and run tests."""
     print(f"Triton location: {triton}")
     print(f"Triton version: {triton.__version__}")

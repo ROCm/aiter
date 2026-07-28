@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 
@@ -67,7 +69,7 @@ def generate_ff_inputs(
 
 
 def ff_ungated_test(
-    fn: callable,
+    fn: Callable,
     batch: int,
     hidden_dim: int,
     intermediate_dim: int,
@@ -120,7 +122,7 @@ def ff_ungated_test(
 
 
 def ff_gated_test(
-    fn: callable,
+    fn: Callable,
     batch: int,
     hidden_dim: int,
     intermediate_dim: int,

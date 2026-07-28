@@ -39,43 +39,7 @@ def get_fwd_decode_configs(mode: AutotuneMode):
         (splitk_configs, reduce_config): Tuple of config lists for each kernel
     """
 
-    if mode == "off":
-        arch = get_arch()
-        if arch.is_rdna:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 32, "BLOCK_N": 32},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-        elif arch.is_cdna:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-        else:
-            return (
-                [
-                    triton.Config(
-                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                        num_stages=1,
-                        num_warps=4,
-                    ),
-                ],
-                [triton.Config({}, num_stages=1, num_warps=4)],
-            )
-
-    elif mode == "on":
+    if mode == "off" or mode == "on":
         arch = get_arch()
         if arch.is_rdna:
             return (

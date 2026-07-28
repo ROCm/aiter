@@ -78,7 +78,7 @@ def make_dispatch_kernel(
     scale_type_size: int = 0,
     enable_std_moe: bool = False,
     data_type=None,
-    max_recv: int = None,
+    max_recv: int | None = None,
 ):
     """Build intranode dispatch ``@flyc.kernel``. ``max_recv`` caps per-rank recv
     slots (must match combine decode); None => npes * max_tok_per_rank."""
@@ -443,7 +443,7 @@ def make_combine_kernel(
     zero_copy: bool = False,
     skip_stage1: bool = False,
     fp8_direct_cast: bool = False,
-    max_recv: int = None,
+    max_recv: int | None = None,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -995,7 +995,11 @@ def make_combine_kernel(
                     )
                     expert_vlds.append(vld_k)
 
-            def _accum_step(ec_abs, U):
+            # Bind the per-iteration resources as defaults so each definition
+            # captures its own iteration's values (also silences B023).
+            def _accum_step(
+                ec_abs, U, expert_rsrcs=expert_rsrcs, expert_vlds=expert_vlds
+            ):
                 vals = [[] for _ in range(U)]
                 for k_slot in range_constexpr(experts_per_token):
                     rsrc_k = expert_rsrcs[k_slot]

@@ -1052,8 +1052,8 @@ class TunerCommon:
                     if pd.notna(row.improvement_pct)
                     else "N/A"
                 )
-                pre_summary, _ = self._split_benchmark_status(row.pre_status)
-                post_summary, post_detail = self._split_benchmark_status(
+                _pre_summary, _ = self._split_benchmark_status(row.pre_status)
+                post_summary, _post_detail = self._split_benchmark_status(
                     row.post_status
                 )
                 if post_summary in ("ERROR", "MISMATCH"):
@@ -1485,7 +1485,7 @@ class TunerCommon:
             logger.error(
                 f"interrupted by user, tuning stopped, {completed_batches} batches processed"
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             tuning_status = "Error"
             logger.error(
                 f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {e!s}",
@@ -1581,13 +1581,13 @@ class GemmCommonTuner(TunerCommon):
         """calculate TFLOPS and bandwidth"""
         ### bpes: (inbpe, w_bpe, outbpe)
         ### gemm flops,bw
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return 0, 0
         if len(info[0]) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
-            _gfx, cu_num, m, n, k, *rest = info[0]
+            _gfx, _cu_num, m, n, k, *_rest = info[0]
         else:  # legacy subclass key: (cu_num, m, n, k, ...)
-            cu_num, m, n, k, *rest = info[0]
+            _cu_num, m, n, k, *_rest = info[0]
         flop = m * n * k * 2
         tflops = round(flop / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes
@@ -1679,7 +1679,7 @@ class GemmCommonTuner(TunerCommon):
                     kernelId,
                     splitK,
                     us,
-                    kernelName,
+                    _kernelName,
                     tflops,
                     bw,
                     errRatio,
@@ -1695,9 +1695,9 @@ class GemmCommonTuner(TunerCommon):
 
     def set_run_iters(self, input, inputdtype):
         if len(input) >= 5:  # gfx-aware key: (gfx, cu_num, m, n, k, ...)
-            _gfx, cu_num, m, n, k, *rest = input
+            _gfx, _cu_num, m, n, k, *_rest = input
         else:  # legacy subclass key: (cu_num, m, n, k, ...)
-            cu_num, m, n, k, *rest = input
+            _cu_num, m, n, k, *_rest = input
         flops = m * n * k * 2
         if flops < 256 * 5120 * 256 * 2:
             self.num_warmup = 50

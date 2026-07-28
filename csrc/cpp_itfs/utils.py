@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from functools import lru_cache, partial
 
 from jinja2 import Template
@@ -100,9 +101,9 @@ clean:
 
 def mp_lock(
     lock_path: str,
-    main_func: callable,
-    final_func: callable = None,
-    wait_func: callable = None,
+    main_func: Callable,
+    final_func: Callable | None = None,
+    wait_func: Callable | None = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -332,7 +333,7 @@ def transfer_hsaco(hsaco_path):
 
 
 def str_to_bool(s):
-    return True if s.lower() == "true" else False
+    return s.lower() == "true"
 
 
 def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
@@ -341,7 +342,9 @@ def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
     import triton.language as tl
 
     if not isinstance(kernel, triton.JITFunction):
-        raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+        raise ValueError(  # noqa: TRY004  ValueError is this helper's established contract; not changed in a style pass
+            f"Kernel {kernel} is not a triton.JITFunction"
+        )
     sig = inspect.signature(kernel.fn)
     valid_param_names = set(sig.parameters.keys())
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_param_names}

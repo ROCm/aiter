@@ -5,13 +5,12 @@
 
 from __future__ import annotations
 
-
 import pytest
 import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.ops.flydsl import is_flydsl_available, flydsl_flash_attn_func
+from aiter.ops.flydsl import flydsl_flash_attn_func, is_flydsl_available
 
 if not is_flydsl_available():
     pytest.skip("flydsl is not available", allow_module_level=True)

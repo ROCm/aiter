@@ -449,7 +449,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm2_mxfp4_masked,
         )
-    except Exception as vendored_exc:
+    except Exception as vendored_exc:  # noqa: BLE001  blanket catch is intentional here
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
                 compile_moe_grouped_gemm1_a8w4_masked,
@@ -457,7 +457,7 @@ def _maybe_grouped_gfx1250_a8w4_moe(
                 compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm2_mxfp4_masked,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  blanket catch is intentional here
             logger.warning(
                 f"[grouped_a8w4] grouped FlyDSL import failed, fallback: "
                 f"vendored={vendored_exc}; flydsl={exc}"

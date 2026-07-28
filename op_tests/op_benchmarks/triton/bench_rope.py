@@ -108,7 +108,7 @@ def run_benchmark(args):
     bwd = str_to_bool(bwd, "inplace")
 
     Q = Q if two_inputs == True else 1
-    is_mha = True if Q == 1 else False
+    is_mha = Q == 1
 
     rep = args.repeat
 

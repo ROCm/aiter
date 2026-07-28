@@ -11,9 +11,9 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
 )
 
 __all__ = [
-    "fused_rms_mxfp8_quant",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
+    "fused_rms_mxfp8_quant",
 ]
 
 _QUANT_BLOCK_SIZE = 32

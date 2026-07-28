@@ -368,8 +368,8 @@ def _build_gemm2_stage(
     exp_per_msb_list: "list[int] | int" = 0,
     lds_type: str = "V",
     has_tdm: bool = False,
-    lds_per_msb: int = None,
-    loads_per_wmma: int = None,
+    lds_per_msb: int | None = None,
+    loads_per_wmma: int | None = None,
     row_cap: int = 6,
 ) -> list[list[int]]:
     """Build 16-row GEMM2 stage schedule.

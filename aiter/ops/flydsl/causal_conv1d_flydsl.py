@@ -13,7 +13,9 @@ try:
     from flydsl.expr.typing import Int32, T
 
     _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional
+except (
+    Exception  # noqa: BLE001  blanket catch is intentional here
+):  # pragma: no cover - flydsl optional
     _FLYDSL_AVAILABLE = False
 
 

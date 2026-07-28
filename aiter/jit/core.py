@@ -15,8 +15,8 @@ import time
 import traceback
 import types
 import typing
-from typing import Any, Optional
 from collections.abc import Callable
+from typing import Any, Optional
 
 from packaging.version import Version, parse
 
@@ -610,7 +610,6 @@ def get_module_custom_op(md_name: str) -> None:
         else:
             __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
         logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
-    return
 
 
 def _so_offload_archs(so_path):
@@ -1191,7 +1190,9 @@ def get_args_of_build(ops_name: str, exclude=[]):
                         "blob_gen_cmd": single_ops["blob_gen_cmd"],
                         "third_party": single_ops["third_party"],
                     }
-                    for k in d_all_ops.keys():
+                    for (  # noqa: PLC0206  loop mutates d_all_ops[k] by key while reading single_ops[k]; .items() does not help
+                        k
+                    ) in d_all_ops:
                         if isinstance(single_ops[k], list):
                             d_all_ops[k] += single_ops[k]
                         elif isinstance(single_ops[k], str) and single_ops[k] != "":
@@ -1294,9 +1295,7 @@ def _ctypes_call(func, fc_name, md_name):
         ret_hint = _hints.get("return")
         ctypes_data_return = ctypes_status_mode and ret_hint is int
 
-        if ctypes_status_mode:
-            c_func.restype = ctypes.c_int
-        elif ret_hint is int:
+        if ctypes_status_mode or ret_hint is int:
             c_func.restype = ctypes.c_int
         elif ret_hint is float:
             c_func.restype = ctypes.c_float
@@ -1309,17 +1308,12 @@ def _ctypes_call(func, fc_name, md_name):
             hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
-            if hint is torch.Tensor:
-                argtypes.append(ctypes.POINTER(aiter_tensor_t))
-                has_tensor = True
-            elif _is_union(origin) and torch.Tensor in type_args:
+            if hint is torch.Tensor or _is_union(origin) and torch.Tensor in type_args:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
                 has_tensor = True
             elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int64)
-            elif _is_union(origin) and str in type_args:
-                argtypes.append(ctypes.c_char_p)
-            elif hint is str:
+            elif _is_union(origin) and str in type_args or hint is str:
                 argtypes.append(ctypes.c_char_p)
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
@@ -1617,7 +1611,9 @@ def compile_ops(
                             aiter_tensor_t = get_module(
                                 "module_aiter_core"
                             ).aiter_tensor_t
-                        except Exception:
+                        except (
+                            Exception  # noqa: BLE001  blanket catch is intentional here
+                        ):
                             aiter_tensor_t = object
                         namespace = {
                             "List": list,

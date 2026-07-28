@@ -1,5 +1,6 @@
 import importlib
 import inspect
+from collections.abc import Callable
 
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -7,7 +8,7 @@ _LOGGER = AiterTritonLogger()
 
 
 def gemm_tune_check(
-    func: callable,
+    func: Callable,
     N: int,
     K: int,
     M: int | None = None,

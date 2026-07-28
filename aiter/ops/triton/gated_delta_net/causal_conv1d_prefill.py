@@ -33,9 +33,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd
 )
 
 __all__ = [
+    "PAD_SLOT_ID",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
-    "PAD_SLOT_ID",
 ]
 
 

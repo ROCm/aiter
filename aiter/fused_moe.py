@@ -4,9 +4,9 @@
 import functools
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from collections.abc import Callable
 
 import torch
 
@@ -33,8 +33,8 @@ from aiter.jit.utils.chip_info import (
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
-    from aiter.ops.flydsl.utils import is_flydsl_available
     from aiter.ops.flydsl.moe_common import GateMode
+    from aiter.ops.flydsl.utils import is_flydsl_available
 except ImportError:
 
     class GateMode(Enum):
@@ -45,12 +45,12 @@ except ImportError:
         return False
 
 
-from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
 )
+from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
 BLOCK_SIZE_M = 32
 
@@ -528,7 +528,7 @@ def fused_moe_fake(
     gate_mode: str = GateMode.SEPARATED.value,
 ) -> torch.Tensor:
     device = topk_ids.device
-    M, topk = topk_ids.shape
+    M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
     model_dim = w2.shape[1]
     moe_buf = torch.empty((M, model_dim), dtype=dtype, device=device)
@@ -877,9 +877,9 @@ def fused_moe_1stage(
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
     num_local_tokens: torch.Tensor | None = None,
-    M: int = None,
+    M: int | None = None,
     device=None,
-    doweight_stage1: bool = None,
+    doweight_stage1: bool | None = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -948,7 +948,7 @@ def fused_moe_1stage(
                     a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
-        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        E, model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
             # FLAT per_1x32 kernels are always xbf16: X stays bf16 and is
             # dynamic-quantized to MXFP4 inside the kernel, so there is no host
@@ -2854,7 +2854,7 @@ def asm_stage1(
         out = out.view(dtype)
     device = out.device
     token_num, _, _ = out.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, _model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)
@@ -3004,7 +3004,7 @@ def torch_moe_stage1(
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type
-    B, D = hidden_states.shape
+    B, _D = hidden_states.shape
     topk = topk_weight.shape[1]
     N = w1.shape[1]
     E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
@@ -3317,7 +3317,7 @@ def cktile_moe_stage1(
     post_activation_layout="auto",
 ):
     token_num = hidden_states.shape[0]
-    _, n1, k1 = w1.shape
+    _, _n1, k1 = w1.shape
     _, k2, n2 = w2.shape
     D = n2 if k2 == k1 else n2 * 2  # bit4 format
     # max_num_tokens_padded = sorted_expert_ids.shape[0]*block_size

@@ -18,10 +18,11 @@
 import functools
 import os
 
-import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
+
+import aiter
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
@@ -35,16 +36,17 @@ except ImportError:
         return False
 
 
-from aiter.ops.gemm_op_common import get_padded_m
 from torch import Tensor
 
+from aiter.ops.gemm_op_common import get_padded_m
+
 try:
+    from aiter.ops.opus.gemm_op_a16w16 import is_splitk_kid as _opus_is_splitk_kid
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
     from aiter.ops.opus.gemm_op_a16w16 import (
         opus_gemm_workspace_init as _opus_workspace_init,
     )
-    from aiter.ops.opus.gemm_op_a16w16 import is_splitk_kid as _opus_is_splitk_kid
-except Exception:
+except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
     _opus_workspace_init = None
     _opus_is_splitk_kid = None
@@ -621,7 +623,7 @@ def opus_gemm(
     ), "opus_gemm does not support scaling"
     assert not bpreshuffle, "opus_gemm does not support bpreshuffle"
     splitK = int(config.get("splitK", 0)) if config is not None else 0
-    m, k = inp.shape
+    m, _k = inp.shape
     n = weights.shape[0]
     # Eagerly size the per-stream split-K workspace on torch's graph capture
     # stream so a later HIP graph capture of this shape doesn't abort (which

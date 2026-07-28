@@ -9,12 +9,12 @@ import re
 import shlex
 import shutil
 import time
+from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Literal, get_args
-from collections.abc import Iterable
 
 import matplotlib.pyplot as plt
 from triton import next_power_of_2
@@ -130,7 +130,7 @@ class TritonCache:
         cache_dir: Path | None = self.get_cache_dir()
         if cache_dir is None:
             if not self.unresolved_warned:
-                logging.warning(
+                logging.warning(  # noqa: LOG015  root-logger usage in this file is handled as a whole in the LOG015 batch
                     "Triton cache directory couldn't be determined; cache cleanup is disabled."
                 )
                 self.unresolved_warned = True
@@ -951,10 +951,10 @@ def get_bench_args(
     kernels: Iterable[Kernel] = get_args(Kernel),
     layouts: Iterable[Layout] = get_args(Layout),
     tp_models: list[TpModel] | None = None,
-    batch_range: Range = Range(
+    batch_range: Range = Range(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
         start=DEFAULT_BATCH_START, inc=DEFAULT_BATCH_INC, end=DEFAULT_BATCH_END
     ),
-    seq_range: Range = Range(
+    seq_range: Range = Range(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
         start=DEFAULT_SEQ_START, inc=DEFAULT_SEQ_INC, end=DEFAULT_SEQ_END
     ),
 ) -> list[BenchArgs]:

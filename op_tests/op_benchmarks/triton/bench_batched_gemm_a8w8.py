@@ -4,7 +4,7 @@ import torch
 import triton
 
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8 import (
-    batched_gemm_a8w8 as batched_gemm_a8w8,
+    batched_gemm_a8w8 as batched_gemm_a8w8,  # noqa: PLC0414  explicit re-export (PEP 484 redundant-alias form)
 )
 from op_tests.op_benchmarks.triton.utils.argparse import (
     add_argparse_ff,

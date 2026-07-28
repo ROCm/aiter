@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import sys
+
 import torch
 
 # Skip on unsupported arch via the same probe opus uses at import time.
@@ -21,8 +22,8 @@ if not _arch_ok:
     )
     sys.exit(0)
 
-from aiter.test_common import checkAllclose, run_perftest
 from aiter.ops.opus import gemm_a16w16_opus
+from aiter.test_common import checkAllclose, run_perftest
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):

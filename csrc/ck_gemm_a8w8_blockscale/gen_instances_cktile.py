@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -22,12 +22,11 @@ from chip_info import (
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
 from gemm_a8w8_blockscale_cktile_instance import (
-    default_kernels_cktile_dict,
     TileKernelInstance,
-    candidate_kernels_cktile_dict,
     candidate_kernels_by_name,
+    candidate_kernels_cktile_dict,
+    default_kernels_cktile_dict,
 )
 
 """

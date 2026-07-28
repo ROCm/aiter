@@ -22,7 +22,7 @@ convenient for use when we just need to call a few functions.
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 # this line makes it possible to directly load `libcudart.so` using `ctypes`
 import torch  # noqa
@@ -121,11 +121,11 @@ class CudaRTLibrary:
 
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
-    path_to_library_cache: dict[str, Any] = {}
+    path_to_library_cache: ClassVar[dict[str, Any]] = {}
 
     # class attribute to store the mapping from library path
     #  to the corresponding dictionary
-    path_to_dict_mapping: dict[str, dict[str, Any]] = {}
+    path_to_dict_mapping: ClassVar[dict[str, dict[str, Any]]] = {}
 
     def __init__(self, so_file: str | None = None):
         if so_file is None:

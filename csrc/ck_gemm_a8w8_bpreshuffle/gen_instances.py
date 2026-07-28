@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -18,7 +18,6 @@ AITER_CORE_DIR = (
 )
 sys.path.insert(0, AITER_CORE_DIR)
 from chip_info import build_tune_dict, write_lookup_header
-
 from gemm_a8w8_bpreshuffle_common import (
     default_kernels_dict,
     kernelInstance,

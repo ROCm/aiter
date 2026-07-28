@@ -19,12 +19,12 @@ from .iris import IrisCommContext, calculate_heap_size
 from .reduce_scatter import reduce_scatter
 
 __all__ = [
+    "IRIS_COMM_AVAILABLE",
     "IrisCommContext",
+    "all_gather",
     "calculate_heap_size",
     "reduce_scatter",
-    "all_gather",
     "reduce_scatter_rmsnorm_quant_all_gather",
-    "IRIS_COMM_AVAILABLE",
 ]
 
 # If we got here, Iris is available

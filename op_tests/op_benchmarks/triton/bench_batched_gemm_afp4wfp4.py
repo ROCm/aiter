@@ -5,7 +5,7 @@ import torch
 import triton
 
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
-    batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
+    batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,  # noqa: PLC0414  explicit re-export (PEP 484 redundant-alias form)
 )
 from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (

@@ -250,7 +250,7 @@ def sparse_flops_from_lut(
     D_HEAD_V: int,
 ) -> tuple[float, float]:
     """Return (sparse_flops, total_flops_dense). Uses config BLOCK_M, BLOCK_N."""
-    kv_block_indices, lut_start, lut_count = block_lut
+    _kv_block_indices, _lut_start, lut_count = block_lut
     num_sparse_pairs = lut_count.sum().item()
     config = get_sage_fwd_configs()
     BLOCK_M, BLOCK_N = config["BLOCK_M"], config["BLOCK_N"]
@@ -295,7 +295,6 @@ def run_aiter_fp8_flash_attn(
     has_descale: bool = False,
     scale: torch.Tensor | None = None,
 ):
-    scale = scale
     q, k, v, q_descale, k_descale, v_descale = fp8_quantize(q, k, v, scale=scale)
     attn_kwargs = {}
     if has_descale:
@@ -362,7 +361,7 @@ def fav3_fp8_forward_func(
     softcap: float,
     sm_margin: int,
 ):
-    batch, seqlen, num_q_heads, head_dim = q.shape
+    batch, _seqlen, num_q_heads, head_dim = q.shape
     _, _, num_kv_heads, _ = k.shape
 
     # Quantize inputs to FP8

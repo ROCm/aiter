@@ -10,7 +10,6 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import aiter as ops
-from aiter import logger
 
 from ..parallel_state import in_the_same_node_as
 

@@ -125,7 +125,7 @@ def worker(
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  blanket catch is intentional here
                 if printLog:
                     print(f"Error in process:{pid} info:{info}: {e}")
         else:

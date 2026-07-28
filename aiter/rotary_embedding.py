@@ -39,9 +39,9 @@ from aiter import (
     fused_qk_norm_rope_cache_pts_quant_shuffle,
 )
 
-AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
-AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", 0)) == 1
-AITER_ROPE_FUSED_QKNORM = int(os.environ.get("AITER_ROPE_FUSED_QKNORM", 0)) == 1
+AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", "0")) == 1
+AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", "0")) == 1
+AITER_ROPE_FUSED_QKNORM = int(os.environ.get("AITER_ROPE_FUSED_QKNORM", "0")) == 1
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -115,7 +115,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
 
-    def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -935,7 +935,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         inv_freqs = super()._compute_inv_freq(base)
         low_freq_wavelen = self.orig_max_position / self.low_freq_factor
         high_freq_wavelen = self.orig_max_position / self.high_freq_factor
@@ -1184,7 +1184,7 @@ class AiterFusedSetKVBufferArg:
 class RotaryEmbeddingFusedQKNorm(nn.Module):
     """Rotary Embedding with QKNorm fused"""
 
-    def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -1406,9 +1406,7 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         num_heads_q = num_heads
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
-        is_interleaved = (
-            True if positions.ndim == 2 and self.mrope_section is not None else False
-        )
+        is_interleaved = bool(positions.ndim == 2 and self.mrope_section is not None)
         assert is_interleaved == self.mrope_interleaved
         if fused_set_kv_buffer_arg is not None:
             q_out = torch.empty(
@@ -1539,7 +1537,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         )
         self.register_buffer("cos_sin_q_inter_cache", q_inter_cache, persistent=False)
 
-    def _compute_inv_freq(self, base: int | float) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): The HF implementation uses `torch.arange(...).float()`.
         # However, we use `torch.arange(..., dtype=torch.float)` instead to

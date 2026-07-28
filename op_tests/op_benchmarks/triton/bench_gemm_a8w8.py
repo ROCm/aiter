@@ -1,5 +1,6 @@
 import math
 import sys
+from collections.abc import Callable
 
 import triton
 
@@ -28,7 +29,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: callable
+    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: Callable
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]

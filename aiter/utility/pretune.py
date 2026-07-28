@@ -83,7 +83,9 @@ def _get_tune_script(entry: dict, csrc_dir: str):
         if "_tune" in src_expr and "pybind" not in src_expr:
             try:
                 return eval(src_expr).replace(".cu", ".py")
-            except Exception:
+            # Best-effort probe: any failure just means this src expression is
+            # not resolvable, so swallowing it silently is intentional.
+            except Exception:  # noqa: BLE001,S110
                 pass
     return None
 

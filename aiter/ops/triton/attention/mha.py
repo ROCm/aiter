@@ -49,7 +49,7 @@ def mha_set_use_int64_strides(value: bool):
 
 
 def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
-    return int(window_size[0]) if int(window_size[0]) >= 0 else 0
+    return max(int(window_size[0]), 0)
 
 
 def _flash_attn_forward(
@@ -80,7 +80,7 @@ def _flash_attn_forward(
         raise ValueError("Bias is not supported yet in the Triton Backend")
     if _MHA_IMPL != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
-    sliding_window = window_size_left if window_size_left >= 0 else 0
+    sliding_window = max(window_size_left, 0)
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)

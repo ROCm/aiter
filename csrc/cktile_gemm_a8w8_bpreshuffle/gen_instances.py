@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
+
 import pandas as pd
-import argparse
-import shutil
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = (
@@ -17,12 +18,11 @@ AITER_CORE_DIR = (
 )
 sys.path.insert(0, AITER_CORE_DIR)
 from chip_info import build_tune_dict, write_lookup_header
-
 from gemm_a8w8_bpreshuffle_cktile_common import (
-    kernelInstance,
-    kernels_list,
     default_kernels_dict,
+    kernelInstance,
     kernels_by_name,
+    kernels_list,
 )
 
 """

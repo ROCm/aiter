@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 
 import torch
 import triton
@@ -38,7 +39,7 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
-    impl: callable,
+    impl: Callable,
     shuffle: bool = False,
     test: bool = False,
 ):

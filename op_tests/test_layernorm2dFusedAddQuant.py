@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
 
 import argparse
 

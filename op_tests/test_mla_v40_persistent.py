@@ -334,7 +334,7 @@ def ref_masked_attention_v4(
     scale: float,
     out_dtype: torch.dtype,
     is_causal: bool = True,
-    causal_diagonal: int = None,
+    causal_diagonal: int | None = None,
     attn_sink: torch.Tensor = None,  # optional [h_q] fp32 per-head sink logit
 ) -> tuple[torch.Tensor, torch.Tensor]:
     attn = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
@@ -491,7 +491,7 @@ def torch_mla_v4_split_kv(
     is_causal=True,
     attn_sink: torch.Tensor = None,  # only applied on first split of each batch
 ):
-    num_page, page_size, _, d_qk = kv_silver_bf16.shape
+    _num_page, page_size, _, d_qk = kv_silver_bf16.shape
     total_q, nheads, _ = q_silver_bf16.shape
     dev = kv_silver_bf16.device
 
@@ -705,7 +705,7 @@ def test_mla_v4(
         attn_sink = torch.randn(nhead, dtype=torch.float32) * 0.5
 
     # ---- silver reference (kernel-shaped inputs: 512-byte packed FP8 + BF16 rope) ----
-    out_silver, lse_silver = torch_mla_extend_v4_silver(
+    out_silver, _lse_silver = torch_mla_extend_v4_silver(
         q_packed,
         q_rope_bf16,
         kv_packed,
@@ -882,7 +882,7 @@ def test_mla_v4(
         kv_nope_bf16 = _v4_dequant_nope_bpad8(kv_nope_fp8, kv_nope_scale_e8m0)
         kv_silver_bf16 = torch.cat([kv_nope_bf16, kv_rope_bf16], dim=-1)
 
-        partial_out_ref, partial_lse_ref, _, _ = torch_mla_v4_split_kv(
+        partial_out_ref, _partial_lse_ref, _, _ = torch_mla_v4_split_kv(
             q_silver_bf16,
             kv_silver_bf16,
             qo_indptr,

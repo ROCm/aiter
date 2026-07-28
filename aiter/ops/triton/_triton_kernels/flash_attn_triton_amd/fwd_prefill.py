@@ -39,20 +39,7 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         if FWD_CONF_OVERRIDE:
             return [FWD_CONF_OVERRIDE]
         arch = get_arch()
-        if arch.name == "gfx950":
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-        elif arch.name == "gfx942":
+        if arch.name == "gfx950" or arch.name == "gfx942":
             return [
                 triton.Config(
                     {

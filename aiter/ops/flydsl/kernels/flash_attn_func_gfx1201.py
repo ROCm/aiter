@@ -680,7 +680,9 @@ def build_flash_attn_func_module_primary(
         O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
+            None
+        ),
     ):
         ctx = CompilationContext.get_current()
 

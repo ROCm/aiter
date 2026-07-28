@@ -9,8 +9,8 @@ _LOGGER = AiterTritonLogger()
 
 def fused_mul_add(
     x: torch.Tensor,
-    a: torch.Tensor | float | int,
-    b: torch.Tensor | float | int,
+    a: torch.Tensor | float,
+    b: torch.Tensor | float,
     out: torch.Tensor | None = None,
 ):
     """

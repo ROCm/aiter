@@ -532,7 +532,7 @@ if __name__ == "__main__":
         print("All tests passed!")
         print("=" * 80)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print("=" * 80)
         print(f"TEST FAILED: {e!s}")
         print("=" * 80)

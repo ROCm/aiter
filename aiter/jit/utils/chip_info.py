@@ -155,7 +155,7 @@ def get_cu_num_custom_op() -> int:
                         if match:
                             gpu_compute_units.append(int(match.group(1)))
                         break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001  blanket catch is intentional here
             raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {e!s}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]

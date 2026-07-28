@@ -31,7 +31,7 @@ try:
     from flydsl.expr.typing import Int32, T
     from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-except Exception:
+except Exception:  # noqa: BLE001  blanket catch is intentional here
     FLYDSL_PS_REDUCE_AVAILABLE = False
     flyc = None
     fx = None

@@ -223,7 +223,7 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     assert len(grid) == 3
 
     # validate and parse signature
-    signature = list(map(lambda s: s.strip(" "), args.signature.split(",")))
+    signature = [s.strip(" ") for s in args.signature.split(",")]
 
     def hash_signature(signature: list[str]):
         m = hashlib.sha256()

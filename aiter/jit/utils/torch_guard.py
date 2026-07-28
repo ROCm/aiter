@@ -113,17 +113,10 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor"
         # Runtime comparison values, not annotations. Both spellings compare
         # equal (Optional[T] == T | None), so either side may be written either way.
-        elif param_type == (torch.Tensor | None):
-            if is_mutates:
-                type_str = f"Tensor(a{idx}!)?"
-            else:
-                type_str = "Tensor?"
-        # `X | None` (PEP 604) has origin types.UnionType, not typing.Union, so
-        # matching only the latter silently missed every PEP 604 annotation and
-        # fell through to the "unsupported type" error below. Mirrors _is_union()
-        # in aiter/jit/core.py.
-        elif get_origin(param_type) in (Union, types.UnionType) and (
-            torch.Tensor in get_args(param_type)
+        elif (
+            param_type == (torch.Tensor | None)
+            or get_origin(param_type) in (Union, types.UnionType)
+            and (torch.Tensor in get_args(param_type))
         ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)?"

@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,13 +17,12 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict_batched, write_lookup_header
-
 from batched_gemm_bf16_common import (
     default_kernels_dict,
     kernelInstance,
     kernels_list,
 )
+from chip_info import build_tune_dict_batched, write_lookup_header
 
 
 class batched_gemm_bf16_fwd_codegen:
