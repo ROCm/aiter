@@ -66,7 +66,7 @@ def _multi_processor_count(arch: str | None = None) -> int:
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return int(props.multi_processor_count)
-    except Exception:
+    except Exception:  # noqa: BLE001 - no device visible during AOT; use the floor
         fallback_min_cu = {"gfx942": 228, "gfx950": 256}
         return fallback_min_cu.get(arch or get_rocm_arch(), 64)
 
