@@ -3,6 +3,7 @@
 from packaging import version
 from packaging.version import Version
 import importlib
+import types
 from typing import Any, Callable, Optional, Union, List, get_args, get_origin
 
 aiter_lib = None
@@ -113,7 +114,13 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
                 type_str = f"Tensor(a{idx}!)?"
             else:
                 type_str = "Tensor?"
-        elif get_origin(param_type) is Union and torch.Tensor in get_args(param_type):
+        # `X | None` (PEP 604) has origin types.UnionType, not typing.Union, so
+        # matching only the latter silently missed every PEP 604 annotation and
+        # fell through to the "unsupported type" error below. Mirrors _is_union()
+        # in aiter/jit/core.py.
+        elif get_origin(param_type) in (Union, types.UnionType) and (
+            torch.Tensor in get_args(param_type)
+        ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)?"
             else:
