@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu, _swiglu_separated
 
 
 @triton.jit
@@ -26,6 +26,7 @@ def _reduce_grouped(
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
     SWIGLU_ADD_RESIDUAL: tl.constexpr,
+    SWIGLU_SEPARATED: tl.constexpr,
     USE_TDM: tl.constexpr,
     # Step 9: external residual fold-in. When HAS_EXT_RESIDUAL=True,
     # Residual[token, :] is added to `acc` before the writeback.
@@ -75,9 +76,14 @@ def _reduce_grouped(
 
         # apply nonlinearity to split-k output
         if APPLY_SWIGLU:
-            curr = _swiglu(
-                curr[None, :], alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL
-            )
+            if SWIGLU_SEPARATED:
+                curr = _swiglu_separated(
+                    curr[None, :], alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL
+                )
+            else:
+                curr = _swiglu(
+                    curr[None, :], alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL
+                )
         curr = tl.reshape(curr, [curr.shape[-1]])
         # update final accumulator
         acc += curr
