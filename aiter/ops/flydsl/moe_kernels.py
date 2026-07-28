@@ -6,13 +6,13 @@
 import functools
 import os
 import re
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-_KERNEL_PARAMS: Dict[str, Dict] = {}
+_KERNEL_PARAMS: dict[str, dict] = {}
 
 # HIP permits a much larger grid.x, but grid.y/grid.z are limited to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
@@ -181,7 +181,7 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
         base_name = name[: m.start()]
         params = _KERNEL_PARAMS.get(base_name)
         if params is not None:
-            extra: Dict = {}
+            extra: dict = {}
             if m.group("kw") is not None:
                 extra["k_wave"] = int(m.group("kw"))
             if m.group("fp4"):
@@ -196,7 +196,7 @@ def get_flydsl_kernel_params(name: str) -> dict | None:
 
 def get_flydsl_stage1_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+) -> dict[str, dict]:
     """Return {kernelName: params} for all supported stage1 configs."""
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
@@ -291,7 +291,7 @@ def get_flydsl_stage1_kernels(
 
 def get_flydsl_stage2_kernels(
     a_dtype: str, b_dtype: str, out_dtype: str
-) -> Dict[str, Dict]:
+) -> dict[str, dict]:
     """Return {kernelName: params} for all supported stage2 configs."""
     kernels = {}
     is_fp4 = b_dtype == "fp4"
@@ -344,7 +344,7 @@ def get_flydsl_stage2_kernels(
 
 
 def _register_production_variants_stage2(
-    kernels: Dict[str, Dict], a_dtype: str, b_dtype: str, out_dtype: str
+    kernels: dict[str, dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:
     """Append hand-tuned stage2 variants to ``kernels`` in-place."""
     # (a, b, out, tile_m, tile_n, tile_k, mode, suffix, overrides)
@@ -375,7 +375,7 @@ def _register_production_variants_stage2(
         kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
-def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 stage1 configs."""
     kernels = {}
     a_dtype = "bf16"
@@ -409,7 +409,7 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
     return kernels
 
 
-def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> Dict[str, Dict]:
+def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     """Return {kernelName: params} for all supported int4_bf16 stage2 configs."""
     kernels = {}
     a_dtype = "bf16"
@@ -1737,8 +1737,10 @@ def flydsl_moe_stage2(
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
-    elif mode != "reduce" and not return_per_slot and requires_flydsl_stage2_reduce(
-        token_num, model_dim, 2
+    elif (
+        mode != "reduce"
+        and not return_per_slot
+        and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
     ):
         # Atomic output uses a single buffer resource with 32-bit byte offsets.
         # Route through per-slot output + reduction once the final [M, N]
