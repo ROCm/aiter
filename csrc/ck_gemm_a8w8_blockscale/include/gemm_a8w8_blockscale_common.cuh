@@ -69,6 +69,43 @@ using CDEElementOp = PassThrough;
 // static constexpr ck::index_t Scale_Block_N = 128;
 // static constexpr ck::index_t Scale_Block_K = 128;
 
+enum class GemmSpecialization : unsigned int {
+    Default    = 0,
+    MPadding   = 1u<<0,
+    NPadding   = 1u<<1,
+    KPadding   = 1u<<2,
+    MNPadding  = MPadding|NPadding,
+    MKPadding  = MPadding|KPadding,
+    NKPadding  = NPadding|KPadding,
+    MNKPadding = MPadding|NPadding|KPadding
+};
+
+static GemmSpecialization operator|(GemmSpecialization lhs, GemmSpecialization rhs) {
+    return static_cast<GemmSpecialization>(unsigned(lhs) | unsigned(rhs));
+}
+
+static GemmSpecialization GetGemmSpec(const int64_t m,
+                               const int64_t n,
+                               const int64_t k,
+                               const int64_t m_per_block,
+                               const int64_t n_per_block,
+                               const int64_t k_per_block)
+{
+    auto HasPadding = [](int x, int y) {
+        return (x % y) != 0;
+    };
+
+    GemmSpecialization spec{};
+    if (HasPadding(m, m_per_block))
+        spec = spec | GemmSpecialization::MPadding;
+    if (HasPadding(n, n_per_block))
+        spec = spec | GemmSpecialization::NPadding;
+    if (HasPadding(k, k_per_block))
+        spec = spec | GemmSpecialization::KPadding;
+
+    return spec;
+}
+
 template <typename AB1DataType,
           typename EDataType,
           ck::index_t BlockSize,
