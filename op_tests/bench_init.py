@@ -2,11 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Bench-style static DATA/SCALE init for gfx1250 FP4/FP8 GEMM tests.
 
-Two *independent* axes -- data and scale are sampled independently, **not**
-"make the data then derive the scale by quantizing it". This matches the
-AAI/mblas ``bench_init`` guideline (canonical realistic pattern for MAF/TAF
-and competitive compares); distribution names mirror mblas-bench
-``generic_init.h`` (normal / uniform / pow2_binomial / trig).
+Two *independent* axes: data and scale are sampled independently, **not** "make
+the data then derive the scale by quantizing it".
 
 DATA (per element, iid) -- ``--data-init``::
 
@@ -141,13 +138,23 @@ def fill_scale_e8m0(shape, dist="auto", gen=None, *, device="cuda", n=POW2_BINOM
         return torch.randint(
             125, 130, shape, dtype=torch.uint8, device=device, generator=gen
         )
-    # auto / pow2_binomial: accumulate 2n+1 Bernoulli(0.5) draws (reproducible,
-    # far less memory than materialising the trials dim at once).
-    e = torch.zeros(shape, dtype=torch.int32, device=device)
-    for _ in range(2 * n + 1):
-        e += (torch.rand(shape, generator=gen, device=device) < 0.5).to(torch.int32)
-    e -= n + 1
+    # value = 2^(Binomial(2n+1, 0.5) - (n+1)); Binomial(k, 0.5) == popcount of a
+    # uniform k-bit int, so one randint + popcount (vs 2n+1 rand kernels).
+    trials = 2 * n + 1
+    assert trials <= 24, "pow2_binomial popcount path assumes <= 24 trials"
+    bits = torch.randint(
+        0, 1 << trials, shape, dtype=torch.int64, device=device, generator=gen
+    )
+    e = _popcount64(bits).to(torch.int32) - (n + 1)
     return (e + 127).clamp_(0, 255).to(torch.uint8)
+
+
+def _popcount64(x: torch.Tensor) -> torch.Tensor:
+    """Population count for a non-negative int64 tensor (SWAR bit-hack)."""
+    x = x - ((x >> 1) & 0x5555555555555555)
+    x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+    return (x * 0x0101010101010101) >> 56
 
 
 def fill_scale_e4m3(shape, dist="auto", gen=None, *, device="cuda"):

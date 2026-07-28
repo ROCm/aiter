@@ -133,28 +133,24 @@ def test_gemm(
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
-    # Single ASM kernel under test, dispatched by intype. Faithful to the model
-    # call: the wrapper allocates its own bf16 output (no preallocated buffer).
-    fn = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
-    candidates = {
-        "asm": lambda: fn(
-            inp["A"],
-            inp["B"],
-            inp["sA"],
-            inp["sB"],
-            dtype=dtypes.bf16,
-            a_preshuffle=bool(
-                apre
-            ),  # kernelName omitted -> .cu heuristic picks the tile
-        ),
-    }
+    # Single ASM kernel under test, dispatched by intype. Inputs passed as ARGS so
+    # run_perftest can rotate them (defeats the L2 hot-cache).
+    kern = aiter.gemm_a8w4_mxfp8 if intype == "a8w4" else aiter.gemm_a8w8_mxfp8
+
+    def run_asm(A, B, sA, sB):
+        return kern(A, B, sA, sB, dtype=dtypes.bf16, a_preshuffle=bool(apre))
+
+    asm_args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
+    candidates = {"asm": (run_asm, asm_args)}
 
     flops = 2 * M * N * K
     in_bytes = inp["A"].nbytes + inp["B"].nbytes + inp["sA"].nbytes + inp["sB"].nbytes
 
     ret = {"gfx": get_gfx()}
-    for name, cand in candidates.items():
-        out, us = run_perftest(cand, num_iters=num_iters, needTrace=needTrace)
+    for name, (cand, cand_args) in candidates.items():
+        out, us = run_perftest(
+            cand, *cand_args, num_iters=num_iters, needTrace=needTrace
+        )
         err = checkAllclose(
             ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
