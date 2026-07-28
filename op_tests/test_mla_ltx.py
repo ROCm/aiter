@@ -1,36 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA decode micro-tests: large page_id, KV byte offset, and >4GB pools.
+"""MLA decode: large page_id, KV byte offset, and >4GB pools (gfx950 asm).
 
-Use -n nhead or -n nhead,decode_qlen (decode_qlen = MTP+1, same as test_mla.py).
-page_size=1; compares PyTorch golden vs mla_decode_fwd (ASM .co).
-.co basenames are resolved from hsa/<gfx>/mla/mla_asm.csv (same as C++ dispatch).
+Compares torch golden vs mla_decode_fwd (.co from hsa/<gfx>/mla/mla_asm.csv).
+Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
-  python op_tests/test_mla_ltx.py --suite boundary -d bf16 -kvd bf16 -n 64,1
-  python op_tests/test_mla_ltx.py --suite page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off
-  MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/test_mla_ltx.py --suite over4g
+  python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
+  python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off
+  MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/test_mla_ltx.py --suites over4g
+  # omit --suites to run all case groups
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-import pytest
+import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import checkAllclose
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
+
+SUPPORTED_GFX = ["gfx950"]
 
 # --- Fixed MLA layout (decode absorb, page_size=1) ---
 KV_LORA_RANK = 512
@@ -45,12 +48,17 @@ SUB_KV_TILE = 128
 SAFE_PAGE_BASE = 1_000
 PAGE_ID_16M = 16_000_000
 SEED_CHUNK_PAGES = 262_144
+SEQ_PAGE_BASE = -1  # sequential kv_indices 0..ctx-1
 
 SUB_KV_KERNEL = SUB_KV_TILE  # legacy alias for bench_mla_ckv.py
 
+# Built in main(); read by @benchmark test_mla_ltx.
+_KV_POOL: tuple[torch.Tensor, int] | None = None
 
-def _parse_nhead_decode_qlen(value: int | tuple) -> tuple[int, int]:
-    """Like test_mla.py -n: int nhead -> decode_qlen=1; '16,4' -> (16, 4)."""
+
+def _parse_nhead_decode_qlen(value: int | tuple | str) -> tuple[int, int]:
+    if isinstance(value, str):
+        value = dtypes.str2tuple(value)
     if isinstance(value, int):
         return value, 1
     if isinstance(value, tuple):
@@ -127,11 +135,72 @@ class Harness:
         return self.page_id_first_over_4g() + 16
 
 
-PRESETS: dict[str, tuple[torch.dtype, torch.dtype, int]] = {
-    "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16),
-    "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64),
+# (q_dtype, kv_dtype, nhead/Gqa, decode_qlen/qSeqLen)
+# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=0, cprr=0).
+PresetConfig = tuple[torch.dtype, torch.dtype, int, int]
+
+PRESETS: dict[str, PresetConfig] = {
+    # fp8 / fp8 (mla_a8w8_*)
+    "qh8_fp8_q1": (dtypes.fp8, dtypes.fp8, 8, 1),
+    "qh16_fp8_q1": (dtypes.fp8, dtypes.fp8, 16, 1),
+    "qh16_fp8_q2": (dtypes.fp8, dtypes.fp8, 16, 2),
+    "qh16_fp8_q4": (dtypes.fp8, dtypes.fp8, 16, 4),
+    "qh32_fp8_q1": (dtypes.fp8, dtypes.fp8, 32, 1),
+    "qh32_fp8_q2": (dtypes.fp8, dtypes.fp8, 32, 2),
+    "qh32_fp8_q4": (dtypes.fp8, dtypes.fp8, 32, 4),
+    "qh64_fp8_q1": (dtypes.fp8, dtypes.fp8, 64, 1),
+    # bf16 / bf16 (mla_a16w16_* / mla_dec_stage1_*)
+    "qh8_bf16_q1": (dtypes.bf16, dtypes.bf16, 8, 1),
+    "qh8_bf16_q2": (dtypes.bf16, dtypes.bf16, 8, 2),
+    "qh16_bf16_q1": (dtypes.bf16, dtypes.bf16, 16, 1),
+    "qh16_bf16_q4": (dtypes.bf16, dtypes.bf16, 16, 4),
+    "qh16_bf16_q8": (dtypes.bf16, dtypes.bf16, 16, 8),
+    "qh32_bf16_q4": (dtypes.bf16, dtypes.bf16, 32, 4),
+    "qh64_bf16_q1": (dtypes.bf16, dtypes.bf16, 64, 1),
+    # legacy aliases
+    "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16, 1),
+    "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64, 1),
 }
-DEFAULT_PRESET = "qh16_fp8"
+DEFAULT_PRESET = "qh16_fp8_q1"
+
+
+def _csv_name_to_dtype(name: str) -> torch.dtype:
+    if name == "fp8":
+        return dtypes.fp8
+    if name == "bf16":
+        return dtypes.bf16
+    raise ValueError(f"unsupported csv dtype {name!r}")
+
+
+def decode_presets_from_csv(
+    aiter_root: Path | None = None,
+) -> dict[str, PresetConfig]:
+    """Unique decode configs in mla_asm.csv (prefill=0, causal=0, qSeqLen>=1)."""
+    seen: set[tuple[str, str, int, int]] = set()
+    out: dict[str, PresetConfig] = {}
+    for row in _load_asm_csv(aiter_root):
+        if row["prefill"] != 0 or row["causal"] != 0:
+            continue
+        q_seq = int(row["qSeqLen"])
+        if q_seq < 1:
+            continue
+        q_type = str(row["qType"])
+        kv_type = str(row["kvType"])
+        if q_type == "bf16" and kv_type == "fp8":
+            continue
+        gqa = int(row["Gqa"])
+        key = (q_type, kv_type, gqa, q_seq)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = f"qh{gqa}_{q_type}_q{q_seq}"
+        out[name] = (
+            _csv_name_to_dtype(q_type),
+            _csv_name_to_dtype(kv_type),
+            gqa,
+            q_seq,
+        )
+    return out
 
 
 def apply_config(
@@ -149,20 +218,18 @@ def apply_config(
     _sync_module_aliases()
 
 
-def apply_preset(name: str, decode_qlen: int = DECODE_QLEN) -> None:
+def apply_preset(name: str, decode_qlen: int | None = None) -> None:
     if name not in PRESETS:
         raise ValueError(f"unknown preset {name!r}, choose from {list(PRESETS)}")
-    q, kv, n = PRESETS[name]
-    apply_config(q, kv, n, decode_qlen)
+    q, kv, n, qlen = PRESETS[name]
+    apply_config(q, kv, n, decode_qlen if decode_qlen is not None else qlen)
 
 
-_apply_preset = apply_preset  # legacy alias
+_apply_preset = apply_preset
 
 
-_q0, _kv0, _n0 = PRESETS[DEFAULT_PRESET]
-HARNESS = Harness(_q0, _kv0, _n0, DECODE_QLEN)
-
-# Module-level names for bench_mla_ckv.py and similar imports.
+_q0, _kv0, _n0, _ql0 = PRESETS[DEFAULT_PRESET]
+HARNESS = Harness(_q0, _kv0, _n0, _ql0)
 NHEAD = HARNESS.nhead
 USE_FP8 = HARNESS.use_fp8
 BYTES_PER_PAGE = HARNESS.bytes_per_page
@@ -201,8 +268,6 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
 _POINT_CASES = _point_cases_for(HARNESS)
 _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
 
-
-# --- mla_asm.csv -> .co basename (logging / pytest tags; matches dispatch) ---
 _AML_ASM_CACHE: dict[str, list[dict[str, object]]] = {}
 
 
@@ -243,7 +308,6 @@ def co_name(persistent: bool, lse: bool, *, aiter_root: Path | None = None) -> s
 _co_name = co_name
 
 
-# --- golden ---
 def ref_masked_attention(query, key, value, scale, dtype, is_causal=True):
     w = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
@@ -270,7 +334,22 @@ def torch_mla_extend(
     return torch.concat(outs)
 
 
-# --- KV pool ---
+def run_torch_mla_decode(
+    q,
+    kv_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+):
+    sm = 1.0 / (QK_HEAD_DIM**0.5)
+    kv_bf16 = (
+        kv_buffer.to(torch.bfloat16) if HARNESS.kv_dtype == dtypes.fp8 else kv_buffer
+    )
+    return torch_mla_extend(
+        q, kv_bf16, qo_indptr, kv_indptr, kv_indices, sm, torch.bfloat16, True
+    )
+
+
 def _seed_pages(kv_buffer: torch.Tensor, ranges: Iterable[tuple[int, int]]) -> None:
     for base, length in ranges:
         if length <= 4096:
@@ -292,20 +371,16 @@ def _seed_pages(kv_buffer: torch.Tensor, ranges: Iterable[tuple[int, int]]) -> N
 
 
 def _build_kv_pool(num_pages: int, ranges: list[tuple[int, int]]) -> torch.Tensor:
-    elem = HARNESS.kv_dtype
-    kv = torch.zeros((num_pages, NHEAD_KV, QK_HEAD_DIM), dtype=elem, device="cuda")
+    kv = torch.zeros(
+        (num_pages, NHEAD_KV, QK_HEAD_DIM), dtype=HARNESS.kv_dtype, device="cuda"
+    )
     _seed_pages(kv, ranges)
     return kv
 
 
 def _build_persistent_metadata(
-    qo_indptr,
-    kv_indptr,
-    kv_last_page_lens,
-    max_split_per_batch,
-    *_legacy,
+    qo_indptr, kv_indptr, kv_last_page_lens, max_split_per_batch, *_legacy
 ):
-    """Persistent MLA metadata (_ps kernels). *_legacy absorbs old extra args."""
     bs = qo_indptr.shape[0] - 1
     dtype = dtypes.bf16
     sizes = aiter.get_mla_metadata_info_v1(
@@ -358,7 +433,6 @@ def _build_persistent_metadata(
     }
 
 
-# --- decode: golden vs ASM ---
 def _make_indptr(ctx_len: int, page_base: int | None):
     qlen = HARNESS.decode_qlen
     kv_indptr = torch.tensor([0, ctx_len], dtype=torch.int, device="cuda")
@@ -372,9 +446,11 @@ def _make_indptr(ctx_len: int, page_base: int | None):
     return qo_indptr, kv_indptr, kv_indices
 
 
-def mla_decode_asm(
+def run_asm_mla_decode(
+    q,
     kv_buffer,
     num_pages,
+    out,
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -384,19 +460,9 @@ def mla_decode_asm(
     max_split: int,
 ):
     sm = 1.0 / (QK_HEAD_DIM**0.5)
-    qlen = HARNESS.decode_qlen
     kv_lens = torch.ones(BATCH_SIZE, dtype=torch.int, device="cuda")
-    q = torch.randn((qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
-    kv_bf16 = (
-        kv_buffer.to(torch.bfloat16) if HARNESS.kv_dtype == dtypes.fp8 else kv_buffer
-    )
-    ref = torch_mla_extend(
-        q, kv_bf16, qo_indptr, kv_indptr, kv_indices, sm, torch.bfloat16, True
-    )
-
-    out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
     kv_view = kv_buffer.view(num_pages, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM)
-    q_asm = q.to(dtypes.fp8) if HARNESS.q_dtype == dtypes.fp8 else q
+    q_asm = q.to(dtypes.fp8) if HARNESS.use_fp8 else q
     kw = {
         "page_size": PAGE_SIZE,
         "nhead_kv": NHEAD_KV,
@@ -417,8 +483,38 @@ def mla_decode_asm(
         kv_indptr,
         kv_indices,
         kv_lens,
-        qlen,
+        HARNESS.decode_qlen,
         **kw,
+    )
+    return out
+
+
+def mla_decode_asm(
+    kv_buffer,
+    num_pages,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    *,
+    persistent: bool,
+    return_lse: bool,
+    max_split: int,
+):
+    qlen = HARNESS.decode_qlen
+    q = torch.randn((qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
+    ref = run_torch_mla_decode(q, kv_buffer, qo_indptr, kv_indptr, kv_indices)
+    out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
+    run_asm_mla_decode(
+        q,
+        kv_buffer,
+        num_pages,
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        persistent=persistent,
+        return_lse=return_lse,
+        max_split=max_split,
     )
     return ref, out
 
@@ -478,7 +574,8 @@ def _need_num_pages(
     need = 10_000
     for c in points:
         ctx = ctx_override if ctx_override > 0 else c.ctx_len
-        need = max(need, c.page_base + ctx)
+        if c.page_base >= 0:
+            need = max(need, c.page_base + ctx)
     for ctx, _ in seq:
         need = max(need, ctx + 10_000)
     return need + 1
@@ -490,250 +587,357 @@ def _seed_ranges(
     ranges = []
     for c in points:
         ctx = ctx_override if ctx_override > 0 else c.ctx_len
-        ranges.append((c.page_base, ctx))
+        if c.page_base >= 0:
+            ranges.append((c.page_base, ctx))
     for ctx, _ in seq:
         ranges.append((0, ctx))
     return ranges
 
 
-def _amax_ok(ref, asm, tol=0.05) -> tuple[bool, float]:
-    amax = (ref.float() - asm.float()).abs().max().item()
-    return amax < tol, amax
-
-
-def _filter_points(suite: str) -> list[PointCase]:
-    if suite == "all":
+def _filter_points(suites: list[str]) -> list[PointCase]:
+    if not suites:
         return list(_POINT_CASES)
-    return [c for c in _POINT_CASES if c.suite == suite]
+    want = set(suites)
+    return [c for c in _POINT_CASES if c.suite in want]
 
 
-# --- pytest ---
-_PYTEST_BOUNDARY = [
-    (c.page_base, c.ctx_len, c.label) for c in _POINT_CASES if c.suite == "boundary"
-]
+def _decode_flops_bytes(ctx_len: int) -> tuple[int, int]:
+    qlen = HARNESS.decode_qlen
+    h = HARNESS.nhead
+    d = QK_HEAD_DIM
+    dv = V_HEAD_DIM
+    flops = 2 * qlen * h * ctx_len * (d + dv)
+    elem = _dtype_element_size(HARNESS.kv_dtype)
+    nbytes = qlen * h * d * 2 + ctx_len * QK_HEAD_DIM * elem + qlen * h * dv * 2
+    return flops, nbytes
 
 
-@pytest.fixture(scope="module")
-def kv_pool_boundary():
-    n = int(
-        os.environ.get("MLA_PAGE_OOB_NUM_PAGES", str(PAGE_ID_FIRST_OVER_4G + 2_000))
-    )
-    ranges = _seed_ranges(
-        [PointCase(b, c, label, "boundary") for b, c, label in _PYTEST_BOUNDARY],
-        [],
-        0,
-    )
-    try:
-        pool = _build_kv_pool(n, ranges)
-    except torch.cuda.OutOfMemoryError as e:
-        pytest.skip(str(e))
-    yield pool, n
-    del pool
-    torch.cuda.empty_cache()
-
-
-@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MLA asm")
-@pytest.mark.parametrize("page_base,ctx_len,label", _PYTEST_BOUNDARY)
-@pytest.mark.parametrize("persistent", [True, False], ids=["ps", "nps"])
-@pytest.mark.parametrize("return_lse", [False, True], ids=["nolse", "lse"])
-def test_mla_qh64_co_boundary(
-    kv_pool_boundary, page_base, ctx_len, label, persistent, return_lse
+@benchmark()
+def test_mla_ltx(
+    page_base,
+    ctx_len,
+    label,
+    persistent,
+    return_lse,
+    max_split,
+    q_dtype,
+    kv_dtype,
+    nhead,
+    decode_qlen,
 ):
-    pool, n = kv_pool_boundary
-    ref, asm, _ = run_point(
-        pool,
-        n,
-        page_base,
-        ctx_len,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=1,
+    apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
+    if _KV_POOL is None:
+        raise RuntimeError("KV pool not initialized; call from main() only")
+
+    pool, num_pages = _KV_POOL
+    pb = None if page_base == SEQ_PAGE_BASE else page_base
+    qo, kv_i, kv_x = _make_indptr(ctx_len, pb)
+
+    qlen = HARNESS.decode_qlen
+    gen = torch.Generator(device="cuda")
+    gen.manual_seed(
+        (page_base & 0xFFFF) ^ (ctx_len & 0xFFFF) ^ int(persistent) ^ int(return_lse)
     )
-    tag = f"{label}_{co_name(persistent, return_lse)}"
-    assert checkAllclose(ref, asm, msg=tag, rtol=3e-2, atol=3e-2) == 0, tag
-
-
-def _select_cases(args) -> tuple[list[PointCase], list[tuple[int, str]]]:
-    points = _filter_points(args.suite)
-    if args.skip_mega:
-        seq: list[tuple[int, str]] = []
-    elif args.mega_ctx > 0:
-        seq = [(args.mega_ctx, f"sequential_ctx{args.mega_ctx}")]
-        if args.suite not in ("mega", "all"):
-            points = []
-    elif args.suite in ("all", "mega"):
-        seq = [(c[0], c[1]) for c in _SEQUENTIAL_CASES]
-    else:
-        seq = []
-    if args.page_base > 0:
-        ctx = args.ctx if args.ctx > 0 else 1
-        points = [
-            PointCase(args.page_base, ctx, f"page_id_{args.page_base}", "page16m")
-        ]
-        seq = []
-    if args.cases:
-        want = {x.strip() for x in args.cases.split(",")}
-        points = [c for c in points if c.label in want]
-        seq = [(ctx, lab) for ctx, lab in seq if lab in want]
-    return points, seq
-
-
-def _main():
-    p = argparse.ArgumentParser(
-        description="MLA decode: large page_id / >4GB KV pool tests"
+    q = torch.randn(
+        (qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16, generator=gen
     )
-    p.add_argument(
+    ref = run_torch_mla_decode(q, pool, qo, kv_i, kv_x)
+    out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
+
+    candidates = {
+        "asm": lambda: run_asm_mla_decode(
+            q,
+            pool,
+            num_pages,
+            out,
+            qo,
+            kv_i,
+            kv_x,
+            persistent=bool(persistent),
+            return_lse=bool(return_lse),
+            max_split=max_split,
+        ),
+    }
+    flops, nbytes = _decode_flops_bytes(ctx_len)
+    max_pid = (page_base + ctx_len - 1) if page_base >= 0 else (ctx_len - 1)
+    kv_off = _page_offset(max_pid)
+
+    ret = {
+        "gfx": get_gfx(),
+        "co": co_name(bool(persistent), bool(return_lse)),
+        "label": label,
+        "kv_off": kv_off,
+        "off_gt_4g": int(kv_off >= (1 << 32)),
+    }
+    for name, fn in candidates.items():
+        result, us = run_perftest(fn)
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            result.to(dtypes.fp32),
+            rtol=3e-2,
+            atol=3e-2,
+            msg=f"{name}: mla_ltx {label}",
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def _parse_persistent(values: list[str]) -> list[bool]:
+    out: list[bool] = []
+    for v in values:
+        if v in ("ps", "1", "true", "True"):
+            out.append(True)
+        elif v in ("nps", "0", "false", "False"):
+            out.append(False)
+        else:
+            raise ValueError(f"unknown persistent mode {v!r}")
+    return out
+
+
+def _parse_lse(values: list[str]) -> list[bool]:
+    out: list[bool] = []
+    for v in values:
+        if v in ("on", "1", "true", "True"):
+            out.append(True)
+        elif v in ("off", "0", "false", "False"):
+            out.append(False)
+        else:
+            raise ValueError(f"unknown lse mode {v!r}")
+    return out
+
+
+def _sweep_rows(
+    points: list[PointCase],
+    seq: list[tuple[int, str]],
+    ctx_override: int,
+    q_dtype,
+    kv_dtype,
+    nhead,
+    decode_qlen,
+    persistent_modes: list[bool],
+    lse_modes: list[bool],
+    max_splits: list[int],
+) -> list[dict]:
+    rows: list[dict] = []
+    for c in points:
+        ctx = ctx_override if ctx_override > 0 else c.ctx_len
+        for persistent, lse, max_split in itertools.product(
+            persistent_modes, lse_modes, max_splits
+        ):
+            rows.append(
+                test_mla_ltx(
+                    c.page_base,
+                    ctx,
+                    c.label,
+                    int(persistent),
+                    int(lse),
+                    max_split,
+                    q_dtype,
+                    kv_dtype,
+                    nhead,
+                    decode_qlen,
+                )
+            )
+    for ctx, label in seq:
+        for persistent, lse, max_split in itertools.product(
+            persistent_modes, lse_modes, max_splits
+        ):
+            rows.append(
+                test_mla_ltx(
+                    SEQ_PAGE_BASE,
+                    ctx,
+                    label,
+                    int(persistent),
+                    int(lse),
+                    max_split,
+                    q_dtype,
+                    kv_dtype,
+                    nhead,
+                    decode_qlen,
+                )
+            )
+    return rows
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("mla_ltx unsupported on %s; skipping", get_gfx())
+        return
+
+    _dq, _dkv, _dn, _dql = PRESETS[DEFAULT_PRESET]
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="MLA decode large page_id / >4GB KV pool (gfx950 asm)",
+    )
+    parser.add_argument(
+        "--preset",
+        nargs="*",
+        default=[],
+        choices=sorted(PRESETS.keys()),
+        help="named decode configs from mla_asm.csv (overrides -d/-kvd/-n when set)",
+    )
+    parser.add_argument(
+        "--suites",
         "--suite",
-        choices=["boundary", "over4g", "pa_window", "mega", "page16m", "all"],
-        default="all",
+        dest="suites",
+        nargs="*",
+        default=[],
+        choices=["boundary", "over4g", "pa_window", "mega", "page16m"],
+        help="case groups to sweep (empty = all groups)",
     )
-    _dq, _dkv, _dn = PRESETS[DEFAULT_PRESET]
-    p.add_argument(
+    parser.add_argument(
         "-d",
         "--dtype",
         type=dtypes.str2Dtype,
-        default=_dq,
+        nargs="*",
+        default=[_dq],
         choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-        metavar="{bf16, fp8}",
-        help="Q dtype (same as test_mla.py -d)",
+        help="Q dtype list",
     )
-    p.add_argument(
+    parser.add_argument(
         "-kvd",
         "--kv_dtype",
         type=dtypes.str2Dtype,
-        default=_dkv,
+        nargs="*",
+        default=[_dkv],
         choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp8"]],
-        metavar="{bf16, fp8}",
-        help="KV dtype (same as test_mla.py -kvd)",
+        help="KV dtype list",
     )
-    p.add_argument(
+    parser.add_argument(
         "-n",
         "--nhead",
         type=dtypes.str2tuple,
-        default=f"{_dn},1",
-        help="nhead and decode_qlen (MTP+1), same as test_mla.py -n",
+        nargs="*",
+        default=[(_dn, _dql)],
+        help="nhead,decode_qlen tuples (same as test_mla.py -n)",
     )
-    p.add_argument("--ctx", type=int, default=0)
-    p.add_argument("--page-base", type=int, default=0)
-    p.add_argument("--num-kv-splits", type=int, default=1)
-    p.add_argument("--cases", type=str, default="")
-    p.add_argument(
+    parser.add_argument(
+        "--persistent",
         "--ps",
-        choices=["ps", "nps", "both"],
-        default="ps",
-        help="persistent kernel variant (default: ps, matches PR #4341 large page_id fix)",
+        dest="persistent",
+        nargs="*",
+        default=["ps"],
+        help="ps / nps sweep (default ps only; --ps is alias of --persistent)",
     )
-    p.add_argument("--lse", choices=["on", "off", "both"], default="both")
-    p.add_argument(
-        "--aiter-root",
-        type=str,
-        default="",
-        help="Aiter repo root (default: parent of op_tests; used to read mla_asm.csv)",
+    parser.add_argument(
+        "--lse",
+        nargs="*",
+        default=["off", "on"],
+        help="on / off sweep (default both)",
     )
-    p.add_argument(
-        "--skip-mega",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="skip sequential_mega_over4g (default: skip; golden ref needs ~8GiB extra)",
+    parser.add_argument(
+        "--ctx",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="ctx override (0=use case default)",
     )
-    p.add_argument("--mega-ctx", type=int, default=0)
-    args = p.parse_args()
-
-    nhead, decode_qlen = _parse_nhead_decode_qlen(args.nhead)
-    apply_config(args.dtype, args.kv_dtype, nhead, decode_qlen)
-    global _POINT_CASES, _SEQUENTIAL_CASES
-    _POINT_CASES = _point_cases_for(HARNESS)
-    _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
-
-    if get_gfx() != "gfx950":
-        # gfx950 (MI350)-only asm kernels: cleanly skip on other archs (e.g.
-        # gfx942/MI300) with exit code 0 so CI does not mark this as a failure.
-        print(f"skip: gfx={get_gfx()} (need gfx950)")
-        return 0
-
-    aiter_root = Path(args.aiter_root or _aiter_root())
-
-    ps_list = {"ps": [True], "nps": [False], "both": [True, False]}[args.ps]
-    lse_list = {"on": [True], "off": [False], "both": [True, False]}[args.lse]
-    points, seq = _select_cases(args)
-
-    num_pages = int(
-        os.environ.get(
-            "MLA_PAGE_OOB_NUM_PAGES", str(_need_num_pages(points, seq, args.ctx))
-        )
+    parser.add_argument(
+        "--page-base",
+        type=int,
+        nargs="*",
+        default=[0],
+        help="if set, single custom point sweep",
     )
-    print(
-        f"config={HARNESS.summary()} suite={args.suite} pages={num_pages} "
-        f"pool_GiB={_pool_bytes(num_pages) / 2**30:.2f} "
-        f"4G_page_id>={HARNESS.page_id_first_over_4g()} stride={HARNESS.bytes_per_page}"
+    parser.add_argument(
+        "--num-kv-splits",
+        type=int,
+        nargs="*",
+        default=[1],
+        help="persistent num_kv_splits sweep",
     )
+    parser.add_argument(
+        "--mega-ctx",
+        type=int,
+        nargs="*",
+        default=[],
+        help="sequential ctx lengths (empty=default mega when suites include mega/all)",
+    )
+    args = parser.parse_args()
 
-    try:
-        kv = _build_kv_pool(num_pages, _seed_ranges(points, seq, args.ctx))
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"OOM: {e}")
-        return 2
+    persistent_modes = _parse_persistent(args.persistent)
+    lse_modes = _parse_lse(args.lse)
+    ctx_overrides = args.ctx if args.ctx else [0]
 
-    failed = 0
+    if args.preset:
+        config_rows = [PRESETS[name] for name in args.preset]
+    else:
+        config_rows = [
+            (q_dtype, kv_dtype, *_parse_nhead_decode_qlen(nhead_spec))
+            for q_dtype, kv_dtype, nhead_spec in itertools.product(
+                args.dtype, args.kv_dtype, args.nhead
+            )
+        ]
 
-    def report_point(label, page_base, ctx, ref, asm, kv_idx):
-        nonlocal failed
-        max_pid = page_base + ctx - 1
-        off = _page_offset(max_pid)
-        ok, amax = _amax_ok(ref, asm)
-        failed += int(not ok)
-        cross = (page_base & 0xFFFF0000) != (max_pid & 0xFFFF0000)
-        print(
-            f"[{'PASS' if ok else 'FAIL'}] {label:42s} base={page_base:>10d} ctx={ctx:>4d} "
-            f"pid..{max_pid} off={off} off>4G={off >= 1 << 32} cross_64k={cross} amax={amax:.6f}"
-        )
-        if not ok:
-            print(f"  kv head={kv_idx[:4].tolist()} tail={kv_idx[-4:].tolist()}")
+    for q_dtype, kv_dtype, nhead, decode_qlen in config_rows:
+        apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
+        global _POINT_CASES, _SEQUENTIAL_CASES, _KV_POOL
+        _POINT_CASES = _point_cases_for(HARNESS)
+        _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
 
-    def report_seq(label, ctx, ref, asm, kv_idx):
-        nonlocal failed
-        off = _page_offset(ctx - 1)
-        ok, amax = _amax_ok(ref, asm)
-        failed += int(not ok)
-        print(
-            f"[{'PASS' if ok else 'FAIL'}] {label:42s} ctx={ctx:>10d} "
-            f"pool_GiB={_pool_bytes(num_pages) / 2**30:.2f} max_off={off} amax={amax:.6f}"
-        )
-        if not ok:
-            print(f"  kv tail={kv_idx[-4:].tolist()}")
+        points = _filter_points(args.suites)
+        seq: list[tuple[int, str]] = []
+        if args.mega_ctx:
+            seq = [(c, f"sequential_ctx{c}") for c in args.mega_ctx]
+        elif not args.suites or "mega" in args.suites:
+            seq = [(c[0], c[1]) for c in _SEQUENTIAL_CASES]
 
-    for persistent in ps_list:
-        for lse in lse_list:
-            co = co_name(persistent, lse, aiter_root=aiter_root)
-            print(f"\n===== {co} =====")
-            for c in points:
-                ctx = args.ctx or c.ctx_len
-                ref, asm, kv_idx = run_point(
-                    kv,
-                    num_pages,
-                    c.page_base,
-                    ctx,
-                    persistent=persistent,
-                    return_lse=lse,
-                    max_split=args.num_kv_splits,
+        for page_base in args.page_base:
+            if page_base > 0:
+                for ctx_ov in ctx_overrides:
+                    ctx = ctx_ov if ctx_ov > 0 else 1
+                    points = [
+                        PointCase(page_base, ctx, f"page_id_{page_base}", "page16m")
+                    ]
+                    seq = []
+                    break
+
+        for ctx_override in ctx_overrides:
+            num_pages = int(
+                os.environ.get(
+                    "MLA_PAGE_OOB_NUM_PAGES",
+                    str(_need_num_pages(points, seq, ctx_override)),
                 )
-                report_point(c.label, c.page_base, ctx, ref, asm, kv_idx)
-            for ctx, label in seq:
-                ref, asm, kv_idx = run_sequential(
-                    kv,
+            )
+            aiter.logger.info(
+                "mla_ltx config=%s suites=%s pages=%d pool_GiB=%.2f",
+                HARNESS.summary(),
+                args.suites,
+                num_pages,
+                _pool_bytes(num_pages) / 2**30,
+            )
+            try:
+                _KV_POOL = (
+                    _build_kv_pool(num_pages, _seed_ranges(points, seq, ctx_override)),
                     num_pages,
-                    ctx,
-                    persistent=persistent,
-                    return_lse=lse,
-                    max_split=args.num_kv_splits,
                 )
-                report_seq(label, ctx, ref, asm, kv_idx)
+            except torch.cuda.OutOfMemoryError as e:
+                aiter.logger.warning("mla_ltx OOM building pool: %s", e)
+                continue
 
-    print(f"\ndone: {failed} failed")
-    return 1 if failed else 0
+            rows = _sweep_rows(
+                points,
+                seq,
+                ctx_override,
+                q_dtype,
+                kv_dtype,
+                nhead,
+                decode_qlen,
+                persistent_modes,
+                lse_modes,
+                args.num_kv_splits,
+            )
+            df = pd.DataFrame(rows)
+            aiter.logger.info(
+                "mla_ltx summary (markdown):\n%s", df.to_markdown(index=False)
+            )
+            del _KV_POOL
+            _KV_POOL = None
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    raise SystemExit(_main())
-
-# test command:python op_tests/test_mla_ltx.py   --page-base 16999216 --ctx 1   -d fp8 -kvd fp8 -n 16,1   --ps ps --lse off
+    main()
