@@ -16,6 +16,11 @@ def div_up(x, y):
     return (x + y - 1) // y
 
 
+def div_e(x, y):
+    assert x % y == 0, f"expect {x} % {y} == 0"
+    return x // y
+
+
 def fly_ast_rewrite(member):
     """Apply ASTRewriter.transform to a class member callable.
 
@@ -194,29 +199,77 @@ def get_d1_shape(tensor):
     ]
 
 
+def inner_most_stride(tensor_or_stride):
+    layout = getattr(tensor_or_stride, "layout", None)
+    if layout is not None:
+        if isinstance(layout, fx.ComposedLayout):
+            return inner_most_stride(layout.outer.stride)
+        if isinstance(layout, fx.Layout):
+            return inner_most_stride(layout.stride)
+    assert isinstance(tensor_or_stride, fx.IntTuple)
+    stride = tensor_or_stride
+    if stride.rank > 1:
+        return inner_most_stride(stride[0])
+    if stride.depth > 1:
+        return inner_most_stride(stride[0])
+    return fx.size(stride).to_py_value()
+
+
 def all_copy_atoms(*tensors, atom_bits, num_threads: int):
     """
     Given a list of tensors, iterate each atom (with specified size) in them
     in a thread-cooperative way.
-      - all input tensors are assumed to be 1D
+      - all input tensors are assumed to be 1D normally,
+        but if some tensor has extra modes, they are assumed to be batch/broadcast-dimension
+        and will be considered as extra modes of atom, only first mode is partitioned.
       - iteration is naively coalesced, caller must rearrange layouts to get best performance
+        which means 1st mode must have stride=1
       - atom size is determined by first tensor's dtype
     """
-    num_elements = fx.size(tensors[0].layout.shape).get_static_leaf_int
+    if tensors[0].layout.rank > 1:
+        shape0 = tensors[0].layout.shape[0]
+    else:
+        shape0 = tensors[0].layout.shape
+    num_elements = fx.size(shape0).get_static_leaf_int
     num_values = atom_bits // (tensors[0].dtype.width)
     num_atoms = num_elements // num_values
     assert (
         num_atoms % num_threads == 0
     ), f"expect num_atoms evenly divisible by num_threads, but got {num_atoms} % {num_threads} != 0"
+
     div_tensors = []
-    for t in tensors:
-        assert t.layout.rank < 2, "input tensor must be 1D"
-        div = fx.zipped_divide(t, fx.make_layout(num_values, 1))
+    extra_ranks = []
+    for i, t in enumerate(tensors):
+        rank = t.layout.rank
+        if rank > 1:
+            shape0 = t.layout.shape[0]
+        else:
+            shape0 = t.layout.shape
+        neles = fx.size(shape0).get_static_leaf_int
+        stride = inner_most_stride(t)
+        assert (
+            stride <= 1
+        ), f"{i=} expect all tensors to have stride=1/0 in 1st mode, but got {stride} {t} {rank}"
+        assert (
+            neles == num_elements
+        ), f"{i=} expect all tensors to have same 1st mode size, but got {num_elements} vs {neles}"
+        if rank < 2:
+            div = fx.logical_divide(t, fx.make_layout(num_values, 1))
+        else:
+            div = fx.logical_divide(t, [num_values, *[None] * (rank - 1)])
+        extra_ranks.append(rank - 1)
         div_tensors.append(div)
 
     i0 = fx.thread_idx.x
     for i in range(0, num_atoms, num_threads):
-        yield [t[None, i0 + i] for t in div_tensors]
+        atom_list = []
+        for t, rk in zip(div_tensors, extra_ranks):
+            if rk == 0:
+                coord = [None, i0 + i]
+            else:
+                coord = [(None, i0 + i), *[None] * rk]
+            atom_list.append(t[coord])
+        yield atom_list
     return
 
 
