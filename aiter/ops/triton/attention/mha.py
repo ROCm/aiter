@@ -243,7 +243,9 @@ def _flash_attn_forward(
             ), f"dao_ai softmax_lse shape {softmax_lse.shape} != expected (batch={batch}, nheads={num_q_heads}, ...)"
     else:
         if config is None:
-            config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
+            config = _get_config(
+                enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
+            )
 
         grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),

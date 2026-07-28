@@ -935,6 +935,7 @@ def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
+    head_dim_v: int | None = None,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
@@ -952,5 +953,11 @@ def _get_config(
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
     else:
         return fwd_cfg["default"]
