@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional, Tuple, Union
 
 import pandas as pd
 import torch
@@ -87,11 +86,11 @@ def _f4gemm_asm_dispatch(
     *,
     dtype: torch.dtype,
     apreshuffle: bool,
-    global_A_scale: Optional[Tensor],
-    global_B_scale: Optional[Tensor],
-    bias: Optional[Tensor],
-    alpha: Optional[float],
-    beta: Optional[float],
+    global_A_scale: Tensor | None,
+    global_B_scale: Tensor | None,
+    bias: Tensor | None,
+    alpha: float | None,
+    beta: float | None,
 ):
     """Shared gfx1250 F4GEMM dispatch: MXFP4 vs NVFP4 by global-scale presence.
     Returns the raw asm result (single Tensor, or (data, scale) tuple for mxfp8).
@@ -206,8 +205,7 @@ def gemm_a4w4(
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
     if (
-        ck_config is not None
-        and kernelName.find("_ZN") == -1
+        ck_config is not None and kernelName.find("_ZN") == -1
         # or bias is None
     ):
         splitK = 0 if splitK is None else splitK
@@ -220,9 +218,9 @@ def gemm_a4w4(
             splitK=splitK,
             kernelName=kernelName,
         )[:m]
-    assert (
-        out.shape[0] % 32 == 0
-    ), "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
+    assert out.shape[0] % 32 == 0, (
+        "Dim0 of gemm_a4w4_asm output needs to be padded to multiples of 32!"
+    )
     gemm_a4w4_asm(
         A.view(m, k // 2),
         B,
@@ -299,8 +297,8 @@ def _mxfp4_gemm_asm(
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
     out: Tensor,  # Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
-    out_scale: Optional[Tensor] = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
-    kernelName: Optional[str] = None,
+    out_scale: Tensor | None = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 
@@ -318,8 +316,8 @@ def _nvfp4_gemm_asm(
     GlobalScaleA: float,
     GlobalScaleB: float,
     out: Tensor,  # Out: bf16 [M,N] / fp4x2 [M,N/2] / fp8 [M,N]
-    out_scale: Optional[Tensor] = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
-    kernelName: Optional[str] = None,
+    out_scale: Tensor | None = None,  # mxfp8 only: E8M0 [M, N/128] (None otherwise)
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 
@@ -347,16 +345,16 @@ def _alloc_f4gemm_out(M: int, N: int, dtype: torch.dtype, device) -> Tensor:
 
 def _alloc_f4gemm_out_scale(
     M: int, N: int, dtype: torch.dtype, device
-) -> Optional[Tensor]:
+) -> Tensor | None:
     """Allocate the mxfp8 output E8M0 block-scale buffer (``None`` for bf16/fp4).
 
     Shaped ``[M, N//128]`` for the byte count; the kernel fills it in the packed
     ``(M/64, N//128, 16, 4)`` layout -- unpack via :func:`unpack_mxfp8_out_scale`."""
     if not _is_mxfp8_out(dtype):
         return None
-    assert (
-        N % MXFP8_OUT_SCALE_BLOCK == 0
-    ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    assert N % MXFP8_OUT_SCALE_BLOCK == 0, (
+        f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    )
     assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
     return torch.empty(
         (M, N // MXFP8_OUT_SCALE_BLOCK), dtype=dtypes.fp8_e8m0, device=device
@@ -368,9 +366,9 @@ def unpack_mxfp8_out_scale(packed: Tensor, M: int, N: int) -> Tensor:
     ``(M/64, N//128, 16, 4)`` layout to row-major ``[M, N//128]`` (requires
     ``M % 64 == 0``)."""
     assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
-    assert (
-        N % MXFP8_OUT_SCALE_BLOCK == 0
-    ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    assert N % MXFP8_OUT_SCALE_BLOCK == 0, (
+        f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
+    )
     scaleN = N // MXFP8_OUT_SCALE_BLOCK
     u8 = packed.reshape(-1).view(torch.uint8)[: (M // 64) * scaleN * 16 * 4]
     rm = u8.reshape(M // 64, scaleN, 16, 4).permute(0, 3, 2, 1).reshape(M, scaleN)
@@ -385,7 +383,7 @@ def gemm_mxfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16, fp4x2 (packed e2m1), or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+) -> Tensor | tuple[Tensor, Tensor]:
     """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales. ``dtype``:
     bf16 ``[M,N]``, packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1), or mxfp8
     (``dtypes.fp8``) returning ``(out_fp8 [M,N], scale_e8m0)``. ``scale_e8m0`` is
@@ -418,7 +416,7 @@ def gemm_nvfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16, fp4x2 (packed e2m1), or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
-) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+) -> Tensor | tuple[Tensor, Tensor]:
     """NVFP4 GEMM (preload SGPR mode). D = A * B with e4m3 scales + global alphas.
     ``dtype``: bf16 ``[M,N]``, packed FP4 ``[M,N//2]`` fp4x2 (cvt_scale=1), or
     mxfp8 (``dtypes.fp8``) returning ``(out_fp8 [M,N], scale_e8m0)``.
@@ -460,13 +458,13 @@ def gemm_a4w4o4_fake(
     B: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,
-    global_B_scale: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,
+    global_B_scale: Tensor | None = None,
 ) -> torch.Tensor:
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
@@ -480,19 +478,19 @@ def gemm_a4w4o4(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/block] e8m0 (MXFP4) / e4m3 (NVFP4)
     B_scale: Tensor,  # B_scale:[N, K/block]
-    bias: Optional[Tensor] = None,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    global_B_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
+    bias: Tensor | None = None,
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
+    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
 ) -> torch.Tensor:
     """A4W4 GEMM with packed FP4 (e2m1, cvt_scale=1) output ``[*lead, N//2]``.
     gfx1250 only. MXFP4 vs NVFP4 by global-scale presence (see :func:`gemm_a4w4`)."""
-    assert (
-        get_gfx() in _GFX1250
-    ), f"gemm_a4w4o4 (packed FP4 output) is only supported on gfx1250, got {get_gfx()}"
+    assert get_gfx() in _GFX1250, (
+        f"gemm_a4w4o4 (packed FP4 output) is only supported on gfx1250, got {get_gfx()}"
+    )
     out = _f4gemm_asm_dispatch(
         A,
         B,
@@ -514,14 +512,14 @@ def gemm_a4w4o8_fake(
     B: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,
-    global_B_scale: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor]:
+    bias: Tensor | None = None,
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,
+    global_B_scale: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
     lead = A.shape[:-1]
@@ -536,21 +534,21 @@ def gemm_a4w4o8(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/block] e8m0 (MXFP4) / e4m3 (NVFP4)
     B_scale: Tensor,  # B_scale:[N, K/block]
-    bias: Optional[Tensor] = None,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    global_B_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-) -> Tuple[Tensor, Tensor]:
+    bias: Tensor | None = None,
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
+    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+) -> tuple[Tensor, Tensor]:
     """A4W4 GEMM with mxfp8 output: returns ``(fp8 e4m3 data [*lead, N], E8M0
     scale)``. The scale is in the PACKED ``(M/64, N//128, 16, 4)`` layout --
     unpack via :func:`unpack_mxfp8_out_scale`. gfx1250 only. MXFP4 vs NVFP4 by
     global-scale presence (see :func:`gemm_a4w4`)."""
-    assert (
-        get_gfx() in _GFX1250
-    ), f"gemm_a4w4o8 (mxfp8 output) is only supported on gfx1250, got {get_gfx()}"
+    assert get_gfx() in _GFX1250, (
+        f"gemm_a4w4o8 (mxfp8 output) is only supported on gfx1250, got {get_gfx()}"
+    )
     o, s = _f4gemm_asm_dispatch(
         A,
         B,

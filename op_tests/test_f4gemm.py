@@ -15,12 +15,12 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
-from aiter.ops.shuffle import shuffle_weight_f4, shuffle_scale_f4
+from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from aiter.utility.mx_types import MxScaleRoundModeInt, MxDtypeInt
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 try:
     import bench_init
@@ -151,14 +151,14 @@ def _prep_mxfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
         xs = bench_init.fill_scale_e8m0((M, K // MXFP4_SCALE_BLOCK), scale_init, gen)
         ws = bench_init.fill_scale_e8m0((N, K // MXFP4_SCALE_BLOCK), scale_init, gen)
     ref = run_torch_mxfp4(xq, wq, xs, ws, noscale=noscale)
-    inp = dict(
-        A=shuffle_weight_f4(xq) if apre else xq,
-        B=shuffle_weight_f4(wq),
-        sA=shuffle_scale_f4(xs, 7),
-        sB=shuffle_scale_f4(ws, 7),
-        gA=None,
-        gB=None,
-    )
+    inp = {
+        "A": shuffle_weight_f4(xq) if apre else xq,
+        "B": shuffle_weight_f4(wq),
+        "sA": shuffle_scale_f4(xs, 7),
+        "sB": shuffle_scale_f4(ws, 7),
+        "gA": None,
+        "gB": None,
+    }
     return inp, ref
 
 
@@ -182,14 +182,14 @@ def _prep_nvfp4(M, N, K, apre, data_init, scale_init, gen, noscale=False):
     # Per-tensor global scale is NOT part of bench_init: keep neutral.
     gA = gB = 1.0
     ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, noscale=noscale)
-    inp = dict(
-        A=shuffle_weight_f4(xq) if apre else xq,
-        B=shuffle_weight_f4(wq),
-        sA=shuffle_scale_f4(xs, 8),
-        sB=shuffle_scale_f4(ws, 8),
-        gA=gA,  # NVFP4 per-tensor global scales (floats)
-        gB=gB,
-    )
+    inp = {
+        "A": shuffle_weight_f4(xq) if apre else xq,
+        "B": shuffle_weight_f4(wq),
+        "sA": shuffle_scale_f4(xs, 8),
+        "sB": shuffle_scale_f4(ws, 8),
+        "gA": gA,  # NVFP4 per-tensor global scales (floats)
+        "gB": gB,
+    }
     return inp, ref
 
 
@@ -342,7 +342,7 @@ def test_gemm(
         # gemm_a4w4 (single tensor), fp4 -> gemm_a4w4o4 (single tensor [.,N//2]),
         # fp8 -> gemm_a4w4o8 ((data, scale) tuple). Not timed/tabled.
         if mode == "func":
-            a4_kwargs = dict(apreshuffle=bool(apre))
+            a4_kwargs = {"apreshuffle": bool(apre)}
             if intype == "nvfp4":
                 # global scales are Optional[Tensor] (schema); a non-None value
                 # selects the NVFP4 path -- wrap the float scalars as tensors.
@@ -360,15 +360,15 @@ def test_gemm(
             elif out_fp4:
                 res = aiter.gemm_a4w4o4(*args, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4o4 must return a tensor"
-                assert (
-                    res.shape == out.shape
-                ), f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
+                assert res.shape == out.shape, (
+                    f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
+                )
             else:  # bf16
                 res = aiter.gemm_a4w4(*args, dtype=out_dtype, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4 must return a tensor"
-                assert (
-                    res.shape == out.shape
-                ), f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
+                assert res.shape == out.shape, (
+                    f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
+                )
         if out_fp4:
             # e2m1 is deterministic: compare dequantized values with zero
             # tolerance (exact fp4-code match). Borderline RNE ties may differ.
