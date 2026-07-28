@@ -59,11 +59,9 @@ def _get_gemm_config_cached(
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
 
-    When ``backend`` is given, configs are looked up in the per-backend
-    subdirectory ``gemm/<backend>/`` (e.g. ``gemm/gluon/``); if that backend
-    has no default config file, it falls back to the shared ``gemm/`` directory.
-    ``backend=None`` (the default) keeps the original ``gemm/`` behavior, so
-    existing callers are unaffected.
+    Resolves from ``<arch>/<backend>/gemm/`` (prefix-less filenames) first;
+    ``backend=None`` tries triton then gluon. Falls back to the legacy flat
+    ``gemm/`` layout (arch-prefixed) for unmigrated configs.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -81,20 +79,42 @@ def _get_gemm_config_cached(
     dev = arch_info.get_arch()
     cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
 
-    # Per-backend config directory, falling back to the shared gemm/ dir if the
-    # backend has no default config file (e.g. triton uses the shared dir).
-    base_dir = f"{AITER_TRITON_CONFIGS_PATH}/gemm"
-    cfg_dir = base_dir
-    if backend is not None:
-        backend_dir = f"{base_dir}/{backend}"
-        if os.path.exists(f"{backend_dir}/{dev}-{config_name}.json"):
-            cfg_dir = backend_dir
+    # New layout <arch>/<backend>/gemm/ (no prefix) first, then legacy flat
+    # gemm/ (arch-prefixed) for unmigrated configs.
+    # TODO(satya): drop the legacy dirs once all configs are migrated.
+    arch_prefix = f"{dev}-"
+    if backend is None:
+        candidate_dirs = [
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/gemm", ""),
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm", ""),
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+        ]
+    else:
+        candidate_dirs = [
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/gemm", ""),
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{backend}",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+        ]
+    cfg_dir, name_prefix = candidate_dirs[-1]
+    for _dir, _prefix in candidate_dirs:
+        if os.path.exists(f"{_dir}/{_prefix}{config_name}.json"):
+            cfg_dir, name_prefix = _dir, _prefix
+            break
 
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{cfg_dir}/{dev}-{config_name}.json"
+        fpath = f"{cfg_dir}/{name_prefix}{config_name}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
@@ -109,7 +129,7 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{cfg_dir}/{dev}-{config_name}-{specialized_filename}.json"
+            fpath = f"{cfg_dir}/{name_prefix}{config_name}-{specialized_filename}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
             ):
@@ -122,7 +142,7 @@ def _get_gemm_config_cached(
         if B is not None:
             bnk_key = f"{B}_{N}_{K}"
             if bnk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-                fpath = f"{cfg_dir}/{dev}-{config_name}-B={B}-N={N}-K={K}.json"
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-B={B}-N={N}-K={K}.json"
                 if _load_config_file(
                     _get_gemm_config_cached._config_cache,
                     cache_key,
@@ -137,7 +157,7 @@ def _get_gemm_config_cached(
         if config_dict_key == "default":
             nk_key = f"{N}_{K}"
             if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-                fpath = f"{cfg_dir}/{dev}-{config_name}-N={N}-K={K}.json"
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-N={N}-K={K}.json"
                 if _load_config_file(
                     _get_gemm_config_cached._config_cache,
                     cache_key,

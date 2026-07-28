@@ -14,6 +14,7 @@ from torch import Tensor
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes, fp4_utils
 from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
@@ -23,7 +24,6 @@ from ..utility.mx_types import (
 )
 from . import triton
 from .enum import ActivationType, QuantType
-from ..jit.utils.chip_info import get_cu_num, get_gfx
 
 # Type alias for round-mode parameters; Union keeps int interop without
 # triggering the JIT build that loading MxScaleRoundMode would cause.
@@ -443,14 +443,15 @@ def per_group_quant_hip(
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
-) -> Tuple[Tensor, Tensor]:
+    scale_type: torch.dtype = dtypes.fp32,
+) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
     if scale is None:
         scale = torch.empty(
-            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+            (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
         )
     else:
         raise ValueError("unsupported: static per token quant")
@@ -460,14 +461,25 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(
-        y,
-        x.view(-1, group_size),
-        scale,
-        shuffle_scale=transpose_scale,
-        num_rows=num_rows,
-        num_rows_factor=num_rows_factor,
-    )
+    if scale_type == dtypes.fp8_e8m0:
+        dynamic_per_group_scaled_quant(
+            y,
+            x,
+            scale,
+            group_size,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
+    else:
+        dynamic_per_token_scaled_quant(
+            y,
+            x.view(-1, group_size),
+            scale,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
     return y, scale
 
 
@@ -763,14 +775,20 @@ def dynamic_per_group_scaled_quant(
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
-    ``out.dtype`` selects the element format:
+    ``out.dtype`` selects the element format; ``scales.dtype`` selects the
+    scale format for fp8 output:
       * ``dtypes.fp4x2`` / ``torch.uint8`` -> MXFP4 (e8m0 byte scale)
-      * ``dtypes.fp8``                      -> MXFP8 (fp32 per-group scale today)
+      * ``dtypes.fp8``                      -> fp8, e8m0 or fp32 scale
+        depending on ``scales.dtype``
       * ``dtypes.i8``                       -> int8 per-group (fp32 scale)
+
+    For e8m0 scale output, ``shuffle_scale=True`` means the MX hardware
+    scale-load swizzle when ``group_size == 32``, and a plain transpose
+    (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
+    sizes.
 
     Only ``group_size`` in {32, 64, 128} is supported.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -1216,41 +1234,107 @@ def partial_transpose(
 ) -> None: ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_fp4quant_inplace(
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rotate_activation_fp4quant", develop=True
+)
+def _rotate_activation_fp4quant(
     out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     group_size: int = 32,
+    shuffle_scale: bool = True,
 ) -> None:
-    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
-    ...
+    """Hadamard-rotate activation, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
+def _rotate_activation_bf16(
     out: torch.Tensor,
     input: torch.Tensor,
 ) -> None:
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
-    ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation_fp4quant_inplace(
+def rotate_activation(
     out: torch.Tensor,
+    input: torch.Tensor,
+    scale: torch.Tensor | None = None,
+    group_size: int | None = None,
+    shuffle_scale: bool = True,
+) -> None:
+    """Walsh-Hadamard transform along the last dim (1/sqrt(N) scaling),
+    dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain hadamard rotate in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: hadamard-rotate then FP4-quantize into packed ``out``
+      + e8m0 ``scale`` (``scale`` required; ``group_size`` defaults to 32).
+      ``shuffle_scale`` selects the dsv4 preshuffled scale layout.
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert scale is not None, "fp4 rotate_activation requires `scale`"
+        _rotate_activation_fp4quant(
+            out,
+            scale,
+            input,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+        )
+    else:
+        _rotate_activation_bf16(out, input)
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp4quant", develop=True
+)
+def _rope_rotate_activation_fp4quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
-    FP4-quantize, then dequantize back to BF16."""
-    ...
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
+    Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
+def _rope_rotate_activation_bf16(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp8quant", develop=True
+)
+def _rope_rotate_activation_fp8quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 128,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
+    fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
+    receives the per-(row, ``1 x group_size``) block scales ``scale = absMax / fp8_max``.
+    """
+
+
 def rope_rotate_activation(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1258,16 +1342,81 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
-    out_scale: Optional[torch.Tensor] = None,
-    group_size: int = 128,
+    out_scale: torch.Tensor | None = None,
+    group_size: int | None = None,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate, dispatching on ``out.dtype``:
 
-    When ``out_scale`` is given, the rotated activation is additionally
-    fp8-quantized in-kernel (fusing what ``get_hip_quant(per_1x128)`` would do):
-    ``out`` must be fp8 and receives ``round(rotated / scale)``, while
-    ``out_scale`` (``[m, dim // group_size]`` fp32) receives the per-(row,
-    ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
-    ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
-    ``input``)."""
-    ...
+    - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
+      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
+      selects the dsv4 preshuffled scale layout.
+    - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
+      ``scale`` (``scale`` required; ``group_size`` defaults to 128).
+
+    When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
+    RoPE (plus any quantization) is applied.
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        _rope_rotate_activation_fp4quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+            do_rotate_act=do_rotate_act,
+        )
+    elif out.dtype == dtypes.fp8:
+        assert out_scale is not None, "fp8 rope_rotate_activation requires `out_scale`"
+        _rope_rotate_activation_fp8quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=128 if group_size is None else group_size,
+            do_rotate_act=do_rotate_act,
+        )
+    else:
+        _rope_rotate_activation_bf16(
+            out, input, cos, sin, positions, rope_dim, do_rotate_act=do_rotate_act
+        )
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
+    kvcache: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    epsilon: float,
+    rope_dim: int,
+    kv_block_size: int = 16,
+    group_size: int = 32,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = False,
+) -> None:
+    """Fused RMSNorm, RoPE, optional Hadamard rotate, FP4 quant, and KV cache write.
+
+    When ``shuffle_scale`` is True, writes FlyDSL KV preshuffle layout:
+    kvcache [num_blocks, k_tiles, 4, kv_block_size, 16],
+    scale [num_blocks, k_tiles, 4, kv_block_size].
+
+    ``slot_mapping`` (int64 [num_tokens]) scatters each token to its paged KV
+    slot ``slot_mapping[token]`` (= physical_block * kv_block_size + offset); a
+    negative entry marks a padded token whose write is skipped.
+    """
