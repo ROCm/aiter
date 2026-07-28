@@ -41,6 +41,49 @@ if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
     AITER_CORE_DIR = os.path.join(AITER_CORE_DIR, "aiter_meta")
 
 
+def _find_rocm_home():
+    # 1. Env var override (optional, not required — escape hatch for users)
+    rocm = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
+    if rocm:
+        return rocm
+    # 2. rocm_sdk Python package (TheRock, no subprocess needed)
+    try:
+        from rocm_sdk._devel import get_devel_root
+
+        root = str(get_devel_root())
+        if os.path.isdir(root):
+            return root
+    except Exception:
+        pass
+    # 3. hipconfig --rocmpath (tool-based discovery)
+    hipconfig = shutil.which("hipconfig")
+    if hipconfig:
+        try:
+            result = subprocess.run(
+                [hipconfig, "--rocmpath"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and os.path.isdir(result.stdout.strip()):
+                return result.stdout.strip()
+        except Exception:
+            pass
+    # 4. rocm-sdk CLI fallback (TheRock, when Python import unavailable)
+    rocm_sdk = shutil.which("rocm-sdk")
+    if rocm_sdk:
+        try:
+            result = subprocess.run(
+                [rocm_sdk, "path", "--root"], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and os.path.isdir(result.stdout.strip()):
+                return result.stdout.strip()
+        except Exception:
+            pass
+    # 5. Fallback
+    return "/opt/rocm"
+
+
+_ROCM_HOME = _find_rocm_home()
+
+
 def get_amdgpu_arch():
     """Find amdgpu-arch and return the detected GPU architecture."""
     result = subprocess.run(
@@ -49,7 +92,7 @@ def get_amdgpu_arch():
     amdgpu_arch_path = (
         result.stdout.strip()
         if result.returncode == 0
-        else "/opt/rocm/llvm/bin/amdgpu-arch"
+        else os.path.join(_ROCM_HOME, "llvm", "bin", "amdgpu-arch")
     )
     result = subprocess.run(
         amdgpu_arch_path, shell=True, capture_output=True, text=True
@@ -127,7 +170,7 @@ def mp_lock(
 def get_hip_version():
     hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
+        [hipconfig_home, "--version"], capture_output=True, text=True
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
