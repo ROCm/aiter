@@ -476,9 +476,8 @@ def kid_rejects_shape(k_inst, M, N, K):
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
-        if 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES:  # batch=1 in tune path
-            return True
-        return False
+        # batch=1 in tune path
+        return 1 * padded_M * padded_N * 4 > UINT32_MAX_BYTES
 
     if k_inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_ws":
         # Same numeric constraints as the plain cluster_tdm_splitk_ws variant.
@@ -503,12 +502,6 @@ def kid_rejects_shape(k_inst, M, N, K):
         # cwn>1) GPU-hang at runtime and no barrier-sync variant fixes it. Reject
         # here too so an explicit-id / heuristic path can never launch a hanging kid.
         # Override with OPUS_ALLOW_2D=1 for isolated root-cause probing only.
-        if (
-            k_inst.cluster_wg_m > 1
-            and k_inst.cluster_wg_n > 1
-            and os.environ.get("OPUS_ALLOW_2D") != "1"
-        ):
-            return True
         # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used
         # to fault at runtime, but the root cause was a clang<=22 (HIP<=7.2)
         # codegen bug in the bounded-buffer C-store address lowering (it sank the
@@ -516,7 +509,11 @@ def kid_rejects_shape(k_inst, M, N, K):
         # bits). That is now worked around in opus.hpp::gmem::_store (inline-asm
         # voffset barrier, auto-gated to __clang_major__<=22), so large clusterlaunch
         # tiles are safe to tune again. No tile-area cap here.
-        return False
+        return (
+            k_inst.cluster_wg_m > 1
+            and k_inst.cluster_wg_n > 1
+            and os.environ.get("OPUS_ALLOW_2D") != "1"
+        )
 
     # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
     # (both full and last) even AND >=2.

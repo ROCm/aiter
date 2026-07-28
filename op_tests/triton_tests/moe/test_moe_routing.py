@@ -330,8 +330,8 @@ def _check_routing_data_bucket(
     for i, e in enumerate(flat_ids):
         token = i // n_expts_act
         ground[e].append((token, flat_w[i]))
-    for e in ground:
-        ground[e].sort()
+    for v in ground.values():
+        v.sort()
 
     got = {e: [] for e in range(n_expts_tot)}
     e = 0
@@ -346,8 +346,8 @@ def _check_routing_data_bucket(
             f"has expert {flat_ids[src[j]]}, expected {e}"
         )
         got[e].append((token, scal[j]))
-    for e in got:
-        got[e].sort()
+    for v in got.values():
+        v.sort()
 
     for e in range(n_expts_tot):
         rb, tb = ground[e], got[e]

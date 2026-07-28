@@ -138,9 +138,7 @@ def qr_variable_input(rank, world_size):
     torch.cuda.set_device(device)
     qr_max_size = None  # MB
     _ptr = ops.init_custom_qr(rank, world_size, qr_max_size)
-    ranks = []
-    for i in range(world_size):
-        ranks.append(i)
+    ranks = list(range(world_size))
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:29500",

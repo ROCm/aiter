@@ -346,7 +346,9 @@ class AITER_CONFIG:
         mp_lock(lock_path, write_config)
         return new_file_path
 
-    @functools.lru_cache(maxsize=20)
+    # Cache is keyed on (self, env_name, ...); this object is a
+    # process-lifetime singleton, so the retained reference is not a leak.
+    @functools.lru_cache(maxsize=20)  # noqa: B019
     def get_config_file(self, env_name, default_file, tuned_file_name):
         config_env_file = os.getenv(env_name)
         # default_file = f"{AITER_ROOT_DIR}/aiter/configs/{tuned_file_name}.csv"
@@ -1172,12 +1174,12 @@ def get_args_of_build(ops_name: str, exclude=None):
                     "blob_gen_cmd": [],
                 }
                 # traverse opts
-                for ops_name, d_ops in data.items():
+                for op_name, d_ops in data.items():
                     # Cannot contain tune ops
-                    if ops_name.endswith("tune"):
+                    if op_name.endswith("tune"):
                         continue
                     # exclude
-                    if ops_name in exclude:
+                    if op_name in exclude:
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
@@ -1186,7 +1188,7 @@ def get_args_of_build(ops_name: str, exclude=None):
                     ):
                         continue
                     d_single_ops = {
-                        "md_name": ops_name,
+                        "md_name": op_name,
                         "srcs": single_ops["srcs"],
                         "flags_extra_cc": single_ops["flags_extra_cc"],
                         "flags_extra_hip": single_ops["flags_extra_hip"],
@@ -1628,7 +1630,7 @@ def compile_ops(
                             "aiter_tensor_t": aiter_tensor_t,
                         }
 
-                        exec(
+                        exec(  # noqa: S102
                             f"from aiter import*\ndef {doc_str}: pass",
                             namespace,
                         )

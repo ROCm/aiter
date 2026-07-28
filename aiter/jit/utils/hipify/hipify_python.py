@@ -738,9 +738,8 @@ def is_special_file(rel_filepath):
         if "sparse" in rel_filepath.lower():
             return True
         elif "linalg" in rel_filepath.lower():
-            if "batchlinearalgebralibblas" in rel_filepath.lower():
-                return False  # don't use "special" mappings for this specific linalg cublas file
-            return True
+            # don't use "special" mappings for this specific linalg cublas file
+            return "batchlinearalgebralibblas" not in rel_filepath.lower()
     return False
 
 

@@ -254,8 +254,7 @@ def test_qknorm_allreduce(
         )
 
     max_err = 0.0
-    ii = 0
-    for outs, us in rets:
+    for ii, (outs, us) in enumerate(rets):
         msg = f"test_qknorm_allreduce: {shape=} {dtype=} {withGraph=} {us:>8.2f}"
         err_q = checkAllclose(q_outs[ii], outs[0].to(q_outs[ii]), msg=msg)
         err_k = checkAllclose(k_outs[ii], outs[1].to(k_outs[ii]), msg=msg)
@@ -263,7 +262,6 @@ def test_qknorm_allreduce(
         max_err = max(max_err, err_q)
         max_err = max(max_err, err_k)
         max_err = max(max_err, err_v)
-        ii += 1
     return {
         "min_us": min(all_us),
         "max_us": max(all_us),

@@ -344,7 +344,7 @@ def test_edge_values(float_dtype, round_mode):
     name = _MODE_NAME[round_mode]
 
     inp_zero = torch.zeros(rows, cols, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_zero, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_zero, group_size=32, round_mode=round_mode)
     assert packed.view(torch.uint8).sum() == 0, f"zero input failed mode={name}"
 
     inp_large = torch.full((rows, cols), 1e4, dtype=float_dtype, device="cuda")

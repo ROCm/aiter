@@ -725,8 +725,7 @@ class GemmTuner(GemmCommonTuner):
             libtype = info[4]
             res_one.append(get_gfx())
             res_one.append(get_cu_num())
-            for ele in info[0]:
-                res_one.append(ele)
+            res_one.extend(info[0])
 
             res_one.append(libtype)
             res_one.append(int(solidx))

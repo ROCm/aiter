@@ -1160,7 +1160,7 @@ def enable_trace_function_call_for_thread() -> None:
         filename = (
             f"VLLM_TRACE_FUNCTION_for_process_{os.getpid()}"
             f"_thread_{threading.get_ident()}_"
-            f"at_{datetime.datetime.now()}.log"
+            f"at_{datetime.datetime.now(datetime.timezone.utc)}.log"
         ).replace(" ", "_")
         log_path = os.path.join(tmp_dir, "vllm", get_vllm_instance_id(), filename)
         os.makedirs(os.path.dirname(log_path), exist_ok=True)

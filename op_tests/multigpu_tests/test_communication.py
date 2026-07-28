@@ -70,7 +70,7 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
         )
     finally:
         aiter.destroy_dist_env()
-        return out, us
+    return out, us
 
 
 def test_communication(tp_size, shape, dtype, withGraph=False):
@@ -149,7 +149,7 @@ def run_all_reduce_rmsnorm(
         )
     finally:
         aiter.destroy_dist_env()
-        return (out, residual_out), us
+    return (out, residual_out), us
 
 
 def run_all_reduce_rmsnorm_quant(
@@ -213,7 +213,7 @@ def run_all_reduce_rmsnorm_quant(
         )
     finally:
         aiter.destroy_dist_env()
-        return (out, residual_out, ysacle), us
+    return (out, residual_out, ysacle), us
 
 
 def test_all_reduce_rmsnorm(tp_size, shape, dtype, withGraph=False, perTKQuant=False):

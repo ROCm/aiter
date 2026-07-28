@@ -43,7 +43,10 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
-import torch
+# isort and black disagree here: isort wants two blank lines after this block,
+# black folds them back to one because the `# fmt: off` below starts a
+# formatting-disabled region. black is the one CI enforces, so it wins.
+import torch  # noqa: I001
 import triton
 import triton.language as tl
 from triton.experimental import gluon

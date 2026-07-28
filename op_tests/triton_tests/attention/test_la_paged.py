@@ -144,29 +144,29 @@ def test_persistent_lean_attention(
     start_q = 0
     ref_out = torch.empty_like(q, dtype=v.dtype)
     # qb = torch.empty((h, n_ctx_q*batch, d), dtype=init_dtype)
-    for h in range(h):
+    for hi in range(h):
         for b in range(len(n_ctx)):
-            # print(f"h={h}")
+            # print(f"hi={hi}")
             # print(f"n_ctx_q={N_CTX_Q}")
             # print(f"M shape: {M.shape}")
-            qb = q[h, start_q : (start_q + int(n_ctx_q)), :]
+            qb = q[hi, start_q : (start_q + int(n_ctx_q)), :]
             # print(f"qb shape: {qb.shape}")
             idxs = [
-                ref_block_tables[h][b][kv_b_i] * BLOCK_N + b_i
-                for kv_b_i in range(len(ref_block_tables[h][b]))
+                ref_block_tables[hi][b][kv_b_i] * BLOCK_N + b_i
+                for kv_b_i in range(len(ref_block_tables[hi][b]))
                 for b_i in range(BLOCK_N)
             ]
             # print(f'idxs: {idxs}')
             idxs = torch.tensor(idxs, dtype=torch.int32, device="cuda")
-            kb = torch.index_select(k[h], dim=0, index=idxs)
+            kb = torch.index_select(k[hi], dim=0, index=idxs)
             # print(f"{kb} kb shape: {kb.shape}")
-            vb = torch.index_select(v[h], dim=0, index=idxs)
+            vb = torch.index_select(v[hi], dim=0, index=idxs)
             # print(f"{vb} vb shape: {vb.shape}")
             p = torch.matmul(qb, kb.transpose(0, 1)) * sm_scale
             # print(f"p shape: {p.shape}")
             p = torch.softmax(p.float(), dim=-1).to(q.dtype)
             refb = torch.matmul(p, vb)
-            ref_out[h, start_q : (start_q + int(n_ctx_q)), :] = refb
+            ref_out[hi, start_q : (start_q + int(n_ctx_q)), :] = refb
             # print(f"refb={refb}")
             # print(f"refb shape: {refb.shape}")
             start += b

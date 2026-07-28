@@ -10,7 +10,6 @@ import torch
 
 import aiter
 from aiter import dtypes, pertoken_quant
-from aiter import paged_attn as ops
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -250,38 +249,6 @@ def run_aiter_asm(
         None,
         qo_indptr,
         # kernelName="_ZN5aiter42pa_bf16_pertokenFp8_gqa10_1tg_4w_mtp3_msk1E",
-    )
-
-
-@perftest()
-def run_aiter_hip(
-    query,
-    k_cache,
-    v_cache,
-    block_tables,
-    seq_lens,
-    max_seq_len,
-    max_qlen,
-    kv_cache_dtype,
-    num_kv_heads,
-    scale,
-    k_scale=None,
-    v_scale=None,
-):
-    return ops.PagedAttention.forward_decode(
-        query,
-        k_cache,
-        v_cache,
-        block_tables,
-        seq_lens,
-        max_seq_len,
-        kv_cache_dtype,
-        num_kv_heads,
-        scale,
-        None,
-        k_scale,
-        v_scale,
-        mtp=max_qlen,
     )
 
 
