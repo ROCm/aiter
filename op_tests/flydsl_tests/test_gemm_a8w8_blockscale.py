@@ -171,16 +171,6 @@ def get_large_shapes():
     ]
 
 
-def get_tdm_store_shapes():
-    return [
-        (128, 128, 128),
-        (256, 256, 256),
-        (128, 512, 256),
-        (128, 256, 1024),
-        (512, 1024, 1024),
-    ]
-
-
 @pytest.mark.parametrize("M, N, K", get_basic_shapes())
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_a8w8_blockscale_basic(M, N, K, dtype):
@@ -383,97 +373,6 @@ def test_gemm_a8w8_blockscale_large(M, N, K):
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("M, N, K", get_tdm_store_shapes())
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gemm_a8w8_blockscale_tdm_store_basic(M, N, K, dtype):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=dtype,
-        use_tdm_store=True,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize("M, N, K", [(128, 256, 256)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_gemm_a8w8_blockscale_tdm_store_dtype(M, N, K, dtype):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=dtype,
-        use_tdm_store=True,
-    )
-
-    rtol = 1e-3 if dtype == torch.float32 else 1e-2
-    atol = 1e-3 if dtype == torch.float32 else 1e-2
-    _assert_close(out, ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("M, N, K", [(128, 256, 256), (256, 512, 512)])
-@pytest.mark.parametrize("num_buffers", [2, 3, 4])
-def test_gemm_a8w8_blockscale_tdm_store_num_buffers(M, N, K, num_buffers):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K, num_buffers=num_buffers)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = shuffle_weight_gfx1250(w)
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=torch.bfloat16,
-        num_buffers=num_buffers,
-        use_tdm_store=True,
-    )
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.parametrize("M, N, K", [(128, 128, 128), (256, 256, 256)])
-def test_gemm_a8w8_blockscale_tdm_store_preallocated_output(M, N, K):
-    _check_gfx1250()
-    _check_shape_compat(M, N, K)
-    torch.cuda.empty_cache()
-
-    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
-    y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
-    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
-    w = shuffle_weight_gfx1250(w)
-
-    out = gemm_a8w8_blockscale(
-        x,
-        w,
-        x_scale,
-        w_scale,
-        dtype=torch.bfloat16,
-        y=y,
-        use_tdm_store=True,
-    )
-    assert out.data_ptr() == y.data_ptr(), "Output should reuse pre-allocated y"
-    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-M", type=int, default=128)
@@ -487,11 +386,6 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--num-buffers", type=int, default=2, choices=[2, 3, 4, 5, 6, 7, 8]
-    )
-    parser.add_argument(
-        "--tdm-store",
-        action="store_true",
-        help="Use the LDS-staged TDM-store epilogue.",
     )
     parser.add_argument(
         "--variant",
@@ -542,7 +436,6 @@ if __name__ == "__main__":
         w_scale,
         dtype=dtype,
         num_buffers=args.num_buffers,
-        use_tdm_store=args.tdm_store,
         variant=args.variant,
         **tuned,
     )
@@ -553,6 +446,6 @@ if __name__ == "__main__":
     _assert_close(out, ref, rtol=rtol, atol=atol)
     print(
         f"PASSED M={args.M} N={args.N} K={args.K} dtype={args.dtype} "
-        f"num_buffers={args.num_buffers} tdm_store={args.tdm_store} "
+        f"num_buffers={args.num_buffers} "
         f"variant={args.variant} " + " ".join(f"{k}={v}" for k, v in tuned.items())
     )
