@@ -56,6 +56,15 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+def qr_exchange_handles(ptr, world_size, group):
+    # 64 == sizeof(hipIpcMemHandle_t)
+    handle = torch.empty(64, dtype=torch.uint8)
+    ops.qr_get_handle(ptr, handle.data_ptr())
+    handles = [None] * world_size
+    dist.all_gather_object(handles, handle, group=group)
+    ops.qr_open_handles(ptr, [h.data_ptr() for h in handles])
+
+
 MB = 1024 * 1024
 
 
@@ -238,11 +247,8 @@ class QuickAllReduce:
         Creates a shared buffer for quickreduce.
         Has to be called after init_custom_qr
         """
-        handle = ops.qr_get_handle(self._ptr)
         world_size = dist.get_world_size(group=self.group)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, handle, group=self.group)
-        ops.qr_open_handles(self._ptr, handles)
+        qr_exchange_handles(self._ptr, world_size, self.group)
 
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
