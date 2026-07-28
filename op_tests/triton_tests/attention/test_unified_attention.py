@@ -10,7 +10,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention,
     is_2d_gluon_available,
 )
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
@@ -574,6 +574,7 @@ def test_triton_unified_attn_3d(
         (torch.bfloat16, torch.bfloat16, torch.bfloat16, False, False, False),
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, False, True, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, True, True, False),
+        (torch.float16, torch.float16, torch.float16, False, False, False),
     ],
 )
 @pytest.mark.parametrize(
@@ -607,7 +608,6 @@ def test_triton_unified_attn(
         pytest.skip("skip shuffled_kv_cache, 2d gluon not available")
     query_lens = [x[0] for x in seq_lens]
     kv_lens_list = [x[1] for x in seq_lens]
-
     (
         query,
         key_cache_orig,

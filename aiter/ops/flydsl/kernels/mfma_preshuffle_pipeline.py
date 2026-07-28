@@ -261,13 +261,8 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
     which on gfx942 expands to ~5 VALU per element. The shift is exact for
     unscaled int8 values and introduces <0.5 ULP error for scaled values.
     """
-    vec1_i32_t = T.vec(1, T.i32)
-    vec2_i32 = T.i32x2
-    vec4_i8 = T.i8x4
-    vec1_i64 = T.vec(1, T.i64)
-
-    v1 = vector.from_elements(vec1_i32_t, [val_i32])
-    i8x4 = vector.bitcast(vec4_i8, v1)
+    v1 = vector.from_elements(T.vec(1, T.i32), [val_i32])
+    i8x4 = vector.bitcast(T.i8x4, v1)
 
     f32_vals = []
     for i in range(4):
@@ -279,16 +274,10 @@ def _i8x4_in_i32_to_bf16x4_i64(val_i32, arith, vector, scale_val=None):
 
     c16 = fx.Int32(16)
     c_ffff0000 = fx.Int32(0xFFFF0000)
-    bits0 = arith.bitcast(T.i32, f32_vals[0])
-    bits1 = arith.bitcast(T.i32, f32_vals[1])
-    bits2 = arith.bitcast(T.i32, f32_vals[2])
-    bits3 = arith.bitcast(T.i32, f32_vals[3])
-    i32_lo = (bits0 >> c16) | (bits1 & c_ffff0000)
-    i32_hi = (bits2 >> c16) | (bits3 & c_ffff0000)
-
-    v2 = vector.from_elements(vec2_i32, [i32_lo, i32_hi])
-    v64 = vector.bitcast(vec1_i64, v2)
-    return vector.extract(v64, static_position=[0], dynamic_position=[])
+    bits = [arith.bitcast(T.i32, f) for f in f32_vals]
+    i32_lo = (bits[0] >> c16) | (bits[1] & c_ffff0000)
+    i32_hi = (bits[2] >> c16) | (bits[3] & c_ffff0000)
+    return _pack_i32_pair_to_i64(i32_lo, i32_hi, vector)
 
 
 def load_b_raw_w4a16(
@@ -392,10 +381,7 @@ def _int4_to_bf16x4_i64_gfx950(
         i32_hi = rocdl.cvt_pk_bf16_f32(f32_vals[2], f32_vals[3])
     else:
         c16 = fx.Float32(16.0)
-        if scale_val is not None:
-            effective_scale = scale_val * c16
-        else:
-            effective_scale = c16
+        effective_scale = scale_val * c16 if scale_val is not None else c16
         raw_scale = _uw(effective_scale)
         f32_vals = [_MulFOp(v, raw_scale).result for v in f32_vals]
         # Truncate f32→bf16 via bit-shift (exact for scaled int values).
@@ -405,9 +391,7 @@ def _int4_to_bf16x4_i64_gfx950(
         i32_lo = (bf16_vals[0] >> c16_shift) | (bf16_vals[1] & c_ffff0000)
         i32_hi = (bf16_vals[2] >> c16_shift) | (bf16_vals[3] & c_ffff0000)
 
-    v2 = vector.from_elements(T.vec(2, T.i32), [i32_lo, i32_hi])
-    v64 = vector.bitcast(T.vec(1, T.i64), v2)
-    return vector.extract(v64, static_position=[0], dynamic_position=[])
+    return _pack_i32_pair_to_i64(i32_lo, i32_hi, vector)
 
 
 def unpack_b_w4a16(
@@ -523,17 +507,10 @@ def load_b_pack_k32(
 
     b_i32x4 = vector.bitcast(T.i32x4, b16)
 
-    half = ki_step % 2
-    if half == 0:
-        d0 = vector.extract(b_i32x4, static_position=[0], dynamic_position=[])
-        d1 = vector.extract(b_i32x4, static_position=[1], dynamic_position=[])
-    else:
-        d0 = vector.extract(b_i32x4, static_position=[2], dynamic_position=[])
-        d1 = vector.extract(b_i32x4, static_position=[3], dynamic_position=[])
-
-    v2 = vector.from_elements(T.vec(2, T.i32), [d0, d1])
-    v64 = vector.bitcast(T.vec(1, T.i64), v2)
-    return vector.extract(v64, static_position=[0], dynamic_position=[])
+    base = (ki_step % 2) * 2
+    d0 = vector.extract(b_i32x4, static_position=[base], dynamic_position=[])
+    d1 = vector.extract(b_i32x4, static_position=[base + 1], dynamic_position=[])
+    return _pack_i32_pair_to_i64(d0, d1, vector)
 
 
 def tile_chunk_coord_i32(
@@ -581,6 +558,29 @@ def buffer_copy_gmem16_dwordx4(
     )
 
 
+def _lds_store_xor16(
+    vector,
+    *,
+    lds_memref,
+    vec_ty,
+    layout_lds,
+    row_local: ir.Value,
+    col_local_i32: ir.Value,
+    tx_c4: ir.Value,
+    k_blocks16: ir.Value,
+    lds_base: ir.Value,
+    vec_part: ir.Value,
+    elem_bytes: int,
+):
+    """Store one chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
+    if elem_bytes not in (1, 2):
+        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
+    col_swz_bytes = swizzle_xor16(row_local, col_local_i32 * tx_c4, k_blocks16)
+    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
+    idx0 = crd2idx((fx.Int32(row_local), fx.Int32(col_swz)), layout_lds) + lds_base
+    vector.store(vector.bitcast(vec_ty, vec_part), lds_memref, [idx0])
+
+
 def lds_store_16b_xor16(
     arith,
     vector,
@@ -597,15 +597,19 @@ def lds_store_16b_xor16(
     elem_bytes: int = 1,
 ):
     """Store one 16B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
-    if elem_bytes not in (1, 2):
-        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    col_local_bytes = col_local_i32 * tx_c4
-    col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
-    coord_store = (row_local, col_swz)
-    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
-    v16 = vector.bitcast(vec16_ty, vec_part_i32x4)
-    vector.store(v16, lds_memref, [idx0])
+    _lds_store_xor16(
+        vector,
+        lds_memref=lds_memref,
+        vec_ty=vec16_ty,
+        layout_lds=layout_lds,
+        row_local=row_local,
+        col_local_i32=col_local_i32,
+        tx_c4=tx_c4,
+        k_blocks16=k_blocks16,
+        lds_base=lds_base,
+        vec_part=vec_part_i32x4,
+        elem_bytes=elem_bytes,
+    )
 
 
 def lds_store_8b_xor16(
@@ -624,15 +628,19 @@ def lds_store_8b_xor16(
     elem_bytes: int = 1,
 ):
     """Store one 8B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
-    if elem_bytes not in (1, 2):
-        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    col_local_bytes = col_local_i32 * tx_c4
-    col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
-    coord_store = (row_local, col_swz)
-    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
-    v8 = vector.bitcast(vec8_ty, vec_part_i32x2)
-    vector.store(v8, lds_memref, [idx0])
+    _lds_store_xor16(
+        vector,
+        lds_memref=lds_memref,
+        vec_ty=vec8_ty,
+        layout_lds=layout_lds,
+        row_local=row_local,
+        col_local_i32=col_local_i32,
+        tx_c4=tx_c4,
+        k_blocks16=k_blocks16,
+        lds_base=lds_base,
+        vec_part=vec_part_i32x2,
+        elem_bytes=elem_bytes,
+    )
 
 
 def lds_store_4b_xor16(
@@ -651,15 +659,19 @@ def lds_store_4b_xor16(
     elem_bytes: int = 1,
 ):
     """Store one 4B chunk into LDS with CK-style XOR16 swizzle on the K dimension."""
-    if elem_bytes not in (1, 2):
-        raise ValueError(f"elem_bytes must be 1 or 2, got {elem_bytes!r}")
-    col_local_bytes = col_local_i32 * tx_c4
-    col_swz_bytes = swizzle_xor16(row_local, col_local_bytes, k_blocks16)
-    col_swz = col_swz_bytes if elem_bytes == 1 else col_swz_bytes // 2
-    coord_store = (row_local, col_swz)
-    idx0 = crd2idx(tuple(fx.Int32(c) for c in coord_store), layout_lds) + lds_base
-    v4 = vector.bitcast(vec4_ty, vec_part_i32x1)
-    vector.store(v4, lds_memref, [idx0])
+    _lds_store_xor16(
+        vector,
+        lds_memref=lds_memref,
+        vec_ty=vec4_ty,
+        layout_lds=layout_lds,
+        row_local=row_local,
+        col_local_i32=col_local_i32,
+        tx_c4=tx_c4,
+        k_blocks16=k_blocks16,
+        lds_base=lds_base,
+        vec_part=vec_part_i32x1,
+        elem_bytes=elem_bytes,
+    )
 
 
 def lds_load_pack_k32(
@@ -763,22 +775,24 @@ __all__ = [
     "PreshuffleBLayout",
     "PreshuffleScaleLayout",
     "buffer_copy_gmem16_dwordx4",
+    "extract_bf16_scale",
     "lds_load_pack_k32",
     "lds_row_major_idx",
     "lds_store_4b_xor16",
     "lds_store_8b_xor16",
     "lds_store_16b_xor16",
+    "load_b_pack_k32",
+    "load_b_raw_mxfp4_dwordx4",
+    "load_b_raw_w4a16",
+    "load_b_raw_w4a16_groupwise",
     "make_preshuffle_b_layout",
     "make_preshuffle_scale_layout",
-    "load_b_pack_k32",
-    "load_b_raw_w4a16",
-    "unpack_b_w4a16",
-    "load_b_raw_w4a16_groupwise",
-    "unpack_b_w4a16_groupwise",
-    "extract_bf16_scale",
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
+    "unpack_b_mxfp4_bf16",
+    "unpack_b_w4a16",
+    "unpack_b_w4a16_groupwise",
     "xcd_remap_bx_by",
 ]
 
@@ -822,16 +836,13 @@ def _load_groupwise_scale(
         scale_dtype = T.f32
 
     if scale_dtype == T.bf16:
-        # (E, G//2, N, 2) layout: dword at [e, pair, n] holds bf16 scales
-        # for groups 2*pair and 2*pair+1.
+        # (E, G//2, N, 2) layout: same flat formula but with G//2 pairs of groups.
         pair_idx = group_idx >> fx.Index(1)  # group_idx // 2
-        # Dword index: same flat formula but with G//2 groups
         num_pairs = num_groups // 2
         c_npm1 = fx.Index(num_pairs - 1)
         dword_base = expert_offset * c_npm1 + n_global
         dword_elem = dword_base + pair_idx * c_npe
         dword_idx = arith.index_cast(T.i32, dword_elem)
-        # Return raw i32 dword — extraction deferred to compute phase.
         scale_val = buffer_ops.buffer_load(
             scale_rsrc, dword_idx, vec_width=1, dtype=T.i32
         )
@@ -932,3 +943,286 @@ def unpack_b_w4a16_groupwise(packed32, scale_val, arith, vector, use_gfx950_cvt=
     return unpack_b_w4a16(
         packed32, arith, vector, scale_val=scale_val, use_gfx950_cvt=use_gfx950_cvt
     )
+
+
+def _cvt_scalef32_pk_bf16_fp4(packed_i32, scale_f32, byte_idx, arith, vector):
+    """GFX950 hardware: v_cvt_scalef32_pk_bf16_fp4.
+
+    Converts 2 FP4 E2M1 nibbles (from *byte_idx* of *packed_i32*) to
+    2 bf16 values (already scaled by *scale_f32*), returned as i32
+    (2 packed bf16).
+
+    One instruction replaces ~36 VALU of the software path.
+    """
+    from flydsl._mlir.dialects import llvm
+
+    byte_idx_i32 = arith.constant(byte_idx, type=T.i32)
+    result_v2bf16 = llvm.call_intrinsic(
+        T.vec(2, T.bf16),
+        "llvm.amdgcn.cvt.scalef32.pk.bf16.fp4",
+        [packed_i32, scale_f32, byte_idx_i32],
+        [],
+        [],
+    )
+    vec1_i32_t = T.vec(1, T.i32)
+    return vector.extract(
+        vector.bitcast(vec1_i32_t, result_v2bf16),
+        static_position=[0],
+        dynamic_position=[],
+    )
+
+
+def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
+    """Convert 4 FP4 E2M1 nibbles (in 4 bytes of i32) to 4 bf16 packed as i64.
+
+    Each byte of *packed4* holds one nibble in bits [3:0]:
+      bit[3] = sign, bits[2:1] = exponent (bias=1), bit[0] = mantissa.
+
+    Unsigned value table (3-bit index):
+      000->0.0, 001->0.5, 010->1.0, 011->1.5,
+      100->2.0, 101->3.0, 110->4.0, 111->6.0
+
+    *scale_f32*, when provided, is an f32 E8M0 block-scale multiplied
+    into every element before truncation to bf16.
+    """
+    vec1_i32_t = T.vec(1, T.i32)
+    vec2_i32 = T.i32x2
+    vec4_i8 = T.i8x4
+    vec1_i64 = T.vec(1, T.i64)
+
+    v1 = vector.from_elements(vec1_i32_t, [packed4])
+    i8x4 = vector.bitcast(vec4_i8, v1)
+
+    c1 = arith.constant(1, type=T.i32)
+    c3_shift = arith.constant(3, type=T.i32)
+    c7 = arith.constant(7, type=T.i32)
+    c22 = arith.constant(22, type=T.i32)
+    c23 = arith.constant(23, type=T.i32)
+    c31 = arith.constant(31, type=T.i32)
+    c126 = arith.constant(126, type=T.i32)
+    c_zero = arith.constant(0, type=T.i32)
+    c_half_bits = arith.constant(0x3F000000, type=T.i32)  # 0.5f
+
+    f32_vals = []
+    for i in range(4):
+        nibble_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
+        n = arith.extui(T.i32, nibble_i8)
+
+        sign_bit = arith.andi(arith.shrui(n, c3_shift), c1)
+        unsigned_val = arith.andi(n, c7)
+        exp_field = arith.shrui(unsigned_val, c1)
+        mant_field = arith.andi(unsigned_val, c1)
+
+        f32_norm = arith.ori(
+            arith.shli(arith.addi(exp_field, c126), c23),
+            arith.shli(mant_field, c22),
+        )
+
+        is_zero = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c_zero)
+        is_subnorm = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c1)
+
+        f32_bits = arith.select(
+            is_zero,
+            c_zero,
+            arith.select(is_subnorm, c_half_bits, f32_norm),
+        )
+        f32_bits = arith.ori(f32_bits, arith.shli(sign_bit, c31))
+
+        v = arith.bitcast(T.f32, f32_bits)
+        if scale_f32 is not None:
+            v = v * scale_f32
+        f32_vals.append(v)
+
+    c16 = arith.constant(16, type=T.i32)
+    c_ffff0000 = arith.constant(0xFFFF0000, type=T.i32)
+    bits0 = arith.bitcast(T.i32, f32_vals[0])
+    bits1 = arith.bitcast(T.i32, f32_vals[1])
+    bits2 = arith.bitcast(T.i32, f32_vals[2])
+    bits3 = arith.bitcast(T.i32, f32_vals[3])
+    i32_lo = arith.shrui(bits0, c16) | (bits1 & c_ffff0000)
+    i32_hi = arith.shrui(bits2, c16) | (bits3 & c_ffff0000)
+
+    v2 = vector.from_elements(vec2_i32, [i32_lo, i32_hi])
+    v64 = vector.bitcast(vec1_i64, v2)
+    return vector.extract(v64, static_position=[0], dynamic_position=[])
+
+
+def load_b_raw_mxfp4(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    arg_b,
+    b_rsrc,
+    layout_b,
+    base_k: ir.Value,
+    ku: int,
+    n_blk: ir.Value,
+    n_intra: ir.Value,
+    lane_div_16: ir.Value,
+    elem_type: ir.Type,
+    kpack_bytes: int = 16,
+):
+    """Load 4 bytes of packed FP4 from a kpack=16 preshuffle layout.
+
+    Addressing for kpack=16 (``shuffle_weight_a16w4`` format):
+      - Layout shape: ``(n0, k0, klane=4, nlane=16, kpack=16)``
+      - The A-side LDS has klane stride = 8 bf16 elements, advancing
+        by 32 bf16 per ku step.  B must match: each klane loads 4 bytes
+        (8 FP4 = 8 K elements) at K_start = base_k + ku*32 + lane*8.
+      - In the preshuffle layout this maps to:
+          k0 = base_k//128 + ku//4
+          klane_hw = ku % 4          (compile-time)
+          kpack_byte = lane_div_16*4  (runtime)
+
+    Returns a single i32 containing 4 packed bytes (8 FP4 nibbles).
+    """
+    if kpack_bytes != 16:
+        raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
+
+    c128 = arith.constant(128, index=True)
+    c4 = arith.constant(4, index=True)
+
+    k0_base = base_k // c128
+    k0 = k0_base + arith.constant(ku // 4, index=True)
+    klane_hw = arith.constant(ku % 4, index=True)
+    byte_offset = lane_div_16 * c4
+
+    coord_pack = (n_blk, k0, klane_hw, n_intra, arith.constant(0, index=True))
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+    idx_bytes = idx_pack + byte_offset
+
+    b4 = _buffer_load_vec(
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_bytes,
+        elem_type=elem_type,
+        vec_elems=4,
+        elem_bytes=1,
+        offset_in_bytes=True,
+    )
+    packed32 = vector.extract(
+        vector.bitcast(T.vec(1, T.i32), b4),
+        static_position=[0],
+        dynamic_position=[],
+    )
+    return packed32
+
+
+def load_b_raw_mxfp4_dwordx4(
+    buffer_ops,
+    arith,
+    vector,
+    *,
+    arg_b,
+    b_rsrc,
+    layout_b,
+    base_k: ir.Value,
+    n_blk: ir.Value,
+    n_intra: ir.Value,
+    lane_div_16: ir.Value,
+    elem_type: ir.Type,
+    kpack_bytes: int = 16,
+    cache_modifier: int = 0,
+):
+    """Load 16 bytes (vec4_i32) of packed FP4 via buffer_load_dwordx4.
+
+    CK-style addressing: klane = lane_div_16, loading the full kpack
+    for the thread's sub-lane. Returns vec4_i32 where i32[j] contains
+    8 FP4 elements for kIter j.
+
+    Layout: ``(n0, k0, klane=4, nlane=16, kpack=16)``
+    """
+    if kpack_bytes != 16:
+        raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
+
+    c128 = arith.constant(128, index=True)
+    k0 = base_k // c128
+
+    coord_pack = (n_blk, k0, lane_div_16, n_intra, arith.constant(0, index=True))
+    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+
+    b16 = _buffer_load_vec(
+        buffer_ops,
+        vector,
+        b_rsrc,
+        idx_pack,
+        elem_type=elem_type,
+        vec_elems=16,
+        elem_bytes=1,
+        offset_in_bytes=True,
+    )
+    return vector.bitcast(T.vec(4, T.i32), b16)
+
+
+def _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32):
+    """Hardware fast-path: 4 x v_cvt_scalef32_pk_bf16_fp4."""
+    vec2_i32 = T.i32x2
+    vec1_i64 = T.vec(1, T.i64)
+
+    lo0 = _cvt_scalef32_pk_bf16_fp4(packed32, scale_f32, 0, arith, vector)
+    lo1 = _cvt_scalef32_pk_bf16_fp4(packed32, scale_f32, 1, arith, vector)
+    v2_lo = vector.from_elements(vec2_i32, [lo0, lo1])
+    v64_lo = vector.bitcast(vec1_i64, v2_lo)
+    b0 = vector.extract(v64_lo, static_position=[0], dynamic_position=[])
+
+    hi0 = _cvt_scalef32_pk_bf16_fp4(packed32, scale_f32, 2, arith, vector)
+    hi1 = _cvt_scalef32_pk_bf16_fp4(packed32, scale_f32, 3, arith, vector)
+    v2_hi = vector.from_elements(vec2_i32, [hi0, hi1])
+    v64_hi = vector.bitcast(vec1_i64, v2_hi)
+    b1 = vector.extract(v64_hi, static_position=[0], dynamic_position=[])
+
+    return (b0, b1)
+
+
+def _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32):
+    """Software fallback for non-GFX950 targets."""
+    c_0f = arith.constant(0x0F, type=T.i32)
+    c4 = arith.constant(4, type=T.i32)
+    c8 = arith.constant(8, type=T.i32)
+    c12 = arith.constant(12, type=T.i32)
+    c16 = arith.constant(16, type=T.i32)
+    c20 = arith.constant(20, type=T.i32)
+    c24 = arith.constant(24, type=T.i32)
+    c28 = arith.constant(28, type=T.i32)
+
+    n0 = packed32 & c_0f
+    n1 = arith.shrui(packed32, c4) & c_0f
+    n2 = arith.shrui(packed32, c8) & c_0f
+    n3 = arith.shrui(packed32, c12) & c_0f
+    first = n0 | arith.shli(n1, c8) | arith.shli(n2, c16) | arith.shli(n3, c24)
+
+    n4 = arith.shrui(packed32, c16) & c_0f
+    n5 = arith.shrui(packed32, c20) & c_0f
+    n6 = arith.shrui(packed32, c24) & c_0f
+    n7 = arith.shrui(packed32, c28) & c_0f
+    second = n4 | arith.shli(n5, c8) | arith.shli(n6, c16) | arith.shli(n7, c24)
+
+    b0 = _fp4x4_in_i32_to_bf16x4_i64(first, arith, vector, scale_f32=scale_f32)
+    b1 = _fp4x4_in_i32_to_bf16x4_i64(second, arith, vector, scale_f32=scale_f32)
+    return (b0, b1)
+
+
+def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None, use_hw_cvt=True):
+    """Unpack 8 FP4 E2M1 nibbles (packed in i32) to 2 x i64 (8 bf16).
+
+    Each byte of *packed32* holds two FP4 nibbles: low nibble = K_even,
+    high nibble = K_even+1.  For ``mfma_f32_16x16x16bf16_1k`` the B
+    operand needs 4 consecutive K values per i64.  So we unpack the
+    lower 2 bytes (4 consecutive nibbles) into b0 and the upper 2 bytes
+    into b1.
+
+    *scale_f32* is the decoded E8M0 block-scale (as f32).
+
+    When *use_hw_cvt* is True (default), uses the GFX950 hardware
+    instruction ``v_cvt_scalef32_pk_bf16_fp4`` which converts 2 FP4
+    nibbles to 2 bf16 (with scale) in a single VALU cycle.  This
+    replaces ~144 VALU of the software fallback with 4 instructions.
+
+    Returns ``(b0, b1)`` -- two i64 values, each containing 4 bf16 for
+    one ``mfma_f32_16x16x16bf16_1k`` call.
+    """
+    if use_hw_cvt and scale_f32 is not None:
+        return _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32)
+    return _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32)

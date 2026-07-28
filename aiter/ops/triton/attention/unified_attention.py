@@ -24,9 +24,19 @@ try:
 except:  # noqa: E722
     _unified_attention_gluon_kernel_2d = None
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_reduce import (
+        reduce_segments_gluon as _reduce_segments_gluon,
+    )
+except:  # noqa: E722
+    _reduce_segments_gluon = None
+
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+
+# Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
+_GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -124,13 +134,15 @@ def select_3d_config(
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
+    SLIDING_WINDOW: int = None,
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
     assert kv_cache_dtype in (
+        torch.float16,
         torch.bfloat16,
         e4m3_dtype,
-    ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
+    ), f"kv_cache_dtype only supports F16 ({torch.float16}) BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype})"
     reduce_num_warps = 2
     attn_warps = 2
     waves_per_eu = 2
@@ -157,11 +169,14 @@ def select_3d_config(
             # GFX12 fallback
             waves_per_eu = 1
 
-        occ = waves_per_eu * 4 // attn_warps
-        MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
-        num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
-        num_segments = min(MAX_SEGMENTS, num_segments)
-        num_segments = triton.next_power_of_2(num_segments)
+        if SLIDING_WINDOW is not None and SLIDING_WINDOW > 0:
+            num_segments = 1
+        else:
+            occ = waves_per_eu * 4 // attn_warps
+            MAX_SEGMENTS = max(1, math.ceil(max_seqlen_k / TILE_SIZE))
+            num_segments = max(1, target_num_prgms // 4 * occ // max(1, num_2d_prgms))
+            num_segments = min(MAX_SEGMENTS, num_segments)
+            num_segments = triton.next_power_of_2(num_segments)
 
         # # this section increases the num_warps if the occ is too high
         # total_num_wg = num_2d_prgms * num_segments
@@ -214,6 +229,13 @@ def select_3d_config(
             TILE_SIZE % block_size == 0
         ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
+
+    # gfx1151 (RDNA3.5) decode is memory-latency-bound at bs=1: the default 2
+    # warps/workgroup leave unified_attention at only ~31% of the LPDDR5X
+    # bandwidth roofline. 8 warps/workgroup reach ~59% (1.5-1.9x on bf16 decode)
+    # with bitwise-identical output. Mirrors the waves_per_eu=8 gfx1151 tuning above.
+    if DEVICE_ARCH == "gfx1151":
+        attn_warps = 8
 
     attn_config = {
         "TILE_SIZE": TILE_SIZE,
@@ -480,6 +502,7 @@ def unified_attention(
             kv_cache_dtype,
             shuffled_kv_cache,
             NUM_BLOCKS_GATHER_PER_TILE,
+            SLIDING_WINDOW,
         )
         NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
         if NUM_SEGMENTS > 1:
@@ -640,6 +663,41 @@ def unified_attention(
         elif skip_reduce:
             return segm_output, segm_max, segm_expsum
 
+        head_size_padded = triton.next_power_of_2(head_size)
+        # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
+        gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
+        use_gluon_reduce = (
+            IS_DEVICE_ARCH_GFX12
+            and _reduce_segments_gluon is not None
+            and ALL_DECODE
+            and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
+            and head_size_padded % 32 == 0
+            and num_query_heads % gluon_num_warps == 0
+        )
+        if use_gluon_reduce:
+            _reduce_segments_gluon[(q.shape[0],)](
+                output_ptr=out,
+                segm_output_ptr=segm_output,
+                segm_max_ptr=segm_max,
+                segm_expsum_ptr=segm_expsum,
+                seq_lens_ptr=seqused_k,
+                num_query_heads=num_query_heads,
+                out_scale_ptr=output_scale,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                H=num_query_heads,
+                S=NUM_SEGMENTS,
+                D=head_size,
+                D_PAD=head_size_padded,
+                TILE_SIZE=reduce_config["TILE_SIZE"],
+                NUM_WARPS=gluon_num_warps,
+                IS_FP8_OUT=(out.dtype == e4m3_dtype),
+                FP8_MIN=torch.finfo(e4m3_dtype).min,
+                FP8_MAX=torch.finfo(e4m3_dtype).max,
+                num_warps=gluon_num_warps,
+            )
+            return out
+
         reduce_segments[(q.shape[0], num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
@@ -653,7 +711,7 @@ def unified_attention(
             output_stride_1=out.stride(1),
             block_table_stride=block_table.stride(0),
             HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
+            HEAD_SIZE_PADDED=head_size_padded,
             query_start_len_ptr=cu_seqlens_q,
             BLOCK_Q=BLOCK_Q,
             **reduce_config,
@@ -715,42 +773,14 @@ def _gfx1250_unified_attention_2d(
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
         num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
-        # TILE_SIZE must be a multiple of the page size. Default to 128 so that
-        # small pages pack several blocks per tile, but grow it to BLOCK_SIZE
-        # when the page is larger (e.g. --block-size 256) so the invariant
-        # TILE_SIZE >= BLOCK_SIZE still holds.
-        TILE_SIZE = max(128, BLOCK_SIZE)
-        num_kv_blocks = TILE_SIZE // BLOCK_SIZE
-        assert (
-            TILE_SIZE >= BLOCK_SIZE
-        ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
     else:
         BLOCK_SIZE = k.shape[1]
         NUM_KV_HEADS = k.shape[2]
-        TILE_SIZE = BLOCK_SIZE
-        num_kv_blocks = 1
-    assert (
-        num_kv_blocks & (num_kv_blocks - 1) == 0
-    ), "num_kv_blocks must be a power of 2"
 
     SLIDING_WINDOW = 1 + window_size[0]
     ALL_DECODE = max_seqlen_q == 1
     NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    num_warps = 4
-    BLOCK_M = 128
-    waves_per_eu = 1
-    SLIDING_WINDOW = 1 + window_size[0]
-    ALL_DECODE = max_seqlen_q == 1
-    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
-    num_warps = 4
-    BLOCK_M = 128
-    waves_per_eu = 1
-    if SLIDING_WINDOW > 0:
-        sel_loop_variant = 0
-    elif shuffled_kv_cache or TILE_SIZE > 32:
-        sel_loop_variant = 2
-    else:
-        sel_loop_variant = 0
+    num_buffers = None
     if ALL_DECODE:
         sel_loop_variant = 0
         BLOCK_M = (
@@ -758,34 +788,66 @@ def _gfx1250_unified_attention_2d(
             if NUM_QUERIES_PER_KV <= 16
             else triton.next_power_of_2(NUM_QUERIES_PER_KV)
         )
-        if Q_FP8 and KV_FP8:
-            num_warps = 1
-            waves_per_eu = 2
-            TILE_SIZE = 256
-        else:
-            num_warps = 1
-            waves_per_eu = 2
+        num_warps = 1
+        waves_per_eu = 2
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+    elif SLIDING_WINDOW > 0:
+        # Prefill, sliding window
+        sel_loop_variant = 0
+        BLOCK_M = 64
+        num_warps = 4
+        waves_per_eu = 4
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+    else:
+        # Prefill, full attention
+        sel_loop_variant = 2
+        BLOCK_M = 128
+        num_warps = 4
+        waves_per_eu = 2
+        TILE_SIZE = 128 if (Q_FP8 and KV_FP8) else 64
+        num_buffers = 2
 
-    # auto mode, otherwise use the provided variant
-    if loop_variant is None:
-        loop_variant = sel_loop_variant
+        if max_seqlen_k < 2048:
+            BLOCK_M = 64
+            num_warps = 2 if (Q_FP8 and KV_FP8) else 1
+            sel_loop_variant = 0
+            num_buffers = 2
+
+    loop_variant = sel_loop_variant if loop_variant is None else loop_variant
+    # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
+    if not shuffled_kv_cache:
+        TILE_SIZE = BLOCK_SIZE
+    # tile size cannot be less than block size
+    elif TILE_SIZE < BLOCK_SIZE:
+        TILE_SIZE = BLOCK_SIZE
+
+    num_kv_blocks = TILE_SIZE // BLOCK_SIZE if shuffled_kv_cache else 1
+    assert (
+        num_kv_blocks & (num_kv_blocks - 1) == 0
+    ), "num_kv_blocks must be a power of 2"
 
     assert (
         TILE_SIZE >= BLOCK_SIZE
     ), f"TILE_SIZE={TILE_SIZE} must be multiple of PAGE_SIZE={BLOCK_SIZE}"
 
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # Upper bound on masked tiles. +1 because the causal diagonal isnt
-    # tile-aligned, the query_span-wide band sits at an arbitrary key offset
-    # and can spill into one extra tile
+    # Upper bound on masked tiles
     query_span = (BLOCK_M - 1) // NUM_QUERIES_PER_KV + 1
     max_mask_tiles = (query_span + TILE_SIZE - 1) // TILE_SIZE + 1
     # other variants do at most 2 masking at the end of loop
     if max_mask_tiles > 2:
         loop_variant = 0
-    total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
+    # fall back to the standard double-buffered loop
+    if TILE_SIZE <= 32:
+        loop_variant = 0
+    if not ALL_DECODE:
+        total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
+    else:
+        total_query_blocks = NUM_SEQS
     NUM_WARPS = num_warps
-    num_buffers = 2 if loop_variant == 0 else 3
+    if num_buffers is None:
+        num_buffers = 2 if loop_variant == 0 else 3
+        num_buffers = 2 if ALL_DECODE else num_buffers
 
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1

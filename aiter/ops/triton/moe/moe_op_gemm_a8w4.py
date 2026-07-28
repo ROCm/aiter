@@ -5,6 +5,7 @@ import functools
 import itertools
 import os
 import json
+import warnings
 import torch
 import triton
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
@@ -13,6 +14,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a8w4 import (
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a8w4 import (
     _moe_gemm_a8w4_decode as _moe_gemm_a8w4_decode_gluon,
+    _moe_gemm_a8w4_decode_persistent as _moe_gemm_a8w4_decode_persistent_gluon,
     _moe_gemm_a8w4_prefill as _moe_gemm_a8w4_prefill_gluon,
 )
 from aiter.ops.triton.moe.reduce import reduce_grouped
@@ -184,9 +186,6 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
                 grid_n = triton.cdiv(n, block_n)
                 grid = grid_m * grid_n * split_k
 
-            if k >= 512:
-                block_k = 512
-
         elif block_m == 32:
             if n <= 1024:
                 block_n = 128
@@ -246,22 +245,30 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_stages = 3
+    num_buffers = 3
     split_k = 1
     block_k = 512
+    use_persistent = False
+    persistent_iters = 0
 
     if block_m == 16:
         block_k = 512
         num_warps = 4
-        if get_arch() == "gfx1250":
-            # decode (block_m==16): NUM_BUFFERS=3 + block_n=128 restores the
-            # software-pipelined expert GEMM; the #3504 decode kernel's
-            # block_n=256/NUM_BUFFERS=1 regressed conc-1 decode on gfx1250.
+        if k <= 768:
+            use_persistent = True
+            persistent_iters = 3
             block_n = 128
-            num_stages = 3
+            block_k = 256
+            num_buffers = 2
+        elif n <= 1536:
+            block_n = 128
+            num_buffers = 3
+        elif n <= 3072:
+            block_n = 128
+            num_buffers = 2
         else:
             block_n = 256
-            num_stages = 1
+            num_buffers = 1
 
     elif block_m == 32:
         if n <= 1024:
@@ -276,16 +283,20 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         block_k = 256
         num_warps = 4
 
+    num_buffers = min(num_buffers, triton.cdiv(k, block_k))
+
     ret = {
         "block_m": block_m,
         "block_n": block_n,
         "block_k": block_k,
         "num_warps": num_warps,
-        "num_stages": num_stages,
+        "num_buffers": num_buffers,
         "xcd_swizzle": num_xcds,
         "split_k": split_k,
         "w_cache_modifier": w_cache_modifier,
         "waves_per_eu": 0,
+        "use_persistent": use_persistent,
+        "persistent_iters": persistent_iters,
     }
     return ret
 
@@ -313,6 +324,7 @@ def moe_gemm_a8w4(
     alpha=1.0,
     limit=1.0,
     swiglu_add_residual=True,
+    preshuffled=False,
     unpadded_N=None,
     unpadded_K=None,
     # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
@@ -329,6 +341,10 @@ def moe_gemm_a8w4(
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
     """
     use_gluon = get_arch() == "gfx1250"
+    if preshuffled:
+        assert (
+            use_gluon
+        ), "preshuffled weights are only supported by the gluon (gfx1250) kernel"
     assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
     x_has_mx = x_scales is not None
     if x_has_mx:
@@ -343,6 +359,14 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
+    # Temporary: TDM async_gather over mxfp8 activations and prefill is broken on gfx1250
+    if use_gluon and gather_indx is not None and M > 1024 and x_has_mx:
+        warnings.warn(
+            "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
+        )
+    if preshuffled:
+        # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
+        N = w.shape[-1] * 16
     # Output buffer must be sized to the PADDED N: the kernel writes full
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
     # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
@@ -365,6 +389,15 @@ def moe_gemm_a8w4(
     # StridedLayout callers keep their tuned BK<256.
     if swizzle_mx_scale == "CDNA4_SCALE" and config["block_k"] < 256:
         config["block_k"] = 256
+    # Fall back to TDM if the scale width is below the gfx1250 direct-to-LDS
+    # floor (32 bits = 4 uint8 scales) or K is uneven
+    X_SCALE_TDM = False
+    if use_gluon and x_has_mx:
+        mx_scale_block_k = config["block_k"] // 32
+        ASYNC_COPY_MIN_SCALE_WIDTH = 16
+        X_SCALE_TDM = (
+            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+        )
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -426,9 +459,65 @@ def moe_gemm_a8w4(
     # pid grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
+    if use_gluon and config["use_persistent"]:
+        num_blocks_n = grid_n
+        grid_n = triton.cdiv(num_blocks_n, config["persistent_iters"])
     grid = grid_m * grid_n * config["split_k"]
     # launch kernel
-    if use_gluon and block_m == 16:
+    if use_gluon and config["use_persistent"]:
+        _moe_gemm_a8w4_decode_persistent_gluon[(grid,)](
+            y,
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            stride_x_mx_m,
+            stride_x_mx_k,
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            x_static_scale,
+            quant_static_scale,
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            num_blocks_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            NUM_BUFFERS=config["num_buffers"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            PRESHUFFLED=preshuffled,
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
+            N_ITERS=config["persistent_iters"],
+            num_warps=config["num_warps"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif use_gluon and block_m == 16:
         _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
@@ -472,10 +561,10 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            PRESHUFFLED=preshuffled,
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
@@ -524,10 +613,11 @@ def moe_gemm_a8w4(
             config["block_n"],
             config["block_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
-            NUM_BUFFERS=config["num_stages"],
+            NUM_BUFFERS=config["num_buffers"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            MASK_K_LIMIT=K % config["block_k"],
-            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            PRESHUFFLED=preshuffled,
+            X_SCALE_TDM=X_SCALE_TDM,
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
             num_warps=config["num_warps"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],

@@ -49,7 +49,8 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
-    swiglu_limit: float = 0.0,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -75,14 +76,20 @@ def build_silu_and_mul_fq_module(
     _need_fp8 = quant_mode == "fp8"
     _need_quant = _need_fp4 or _need_fp8
     assert _need_fp4 or _need_fp8 or quant_mode == "none"
-    if act not in ("silu", "swiglu"):
+    if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"Unsupported activation for split-K path: {act!r}")
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
-    VEC = max(ELEMS_PER_THREAD, 2)
-    if VEC % 2 != 0:
-        VEC += 1
+    # VEC (a thread's contiguous vector) must be a power of two so it evenly
+    # divides both the 32-element quant block and the 16-element gate/up block;
+    # round up to the next power of two (even isn't enough: inter_dim=1536 gives
+    # VEC=6, which divides neither). Cap at 8 (dwordx4/128-bit); VEC=16 fails
+    # instruction selection. Wider inter_dim uses more COLS_PER_ITER iterations.
+    VEC = 2
+    while VEC < ELEMS_PER_THREAD:
+        VEC *= 2
+    VEC = min(VEC, 8)
     assert 32 % VEC == 0, f"VEC={VEC} must divide 32 evenly"
     if gui_layout:
         assert VEC <= 16, f"VEC={VEC} must be <=16 for block-interleave layout"
@@ -124,6 +131,7 @@ def build_silu_and_mul_fq_module(
         topk_ids: fx.Pointer,
         bias: fx.Pointer,
         token_num: Int32,
+        swiglu_limit_f: fx.Float32,
     ):
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -277,12 +285,58 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
-                    if const_expr(swiglu_limit != 0):
-                        _limit = arith.constant(float(swiglu_limit), type=f32)
-                        _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
-                    else:
-                        _limit = arith.constant(7.0, type=f32)
-                        _neg_limit = arith.constant(-7.0, type=f32)
+                    # ``swiglu_limit`` is a runtime f32 scalar.  The host passes the
+                    # clamp bound (7.0 default for swiglu) or +inf to disable the
+                    # clamp (silu without a configured limit).  ``min(x, lim)`` is
+                    # expressed via the wrapped ``maximumf`` + negation so the kernel
+                    # never bakes the limit as a compile-time constant.
+                    _neg_limit = -swiglu_limit_f
+
+                    # The helpers below are re-defined per unrolled ``iter_idx`` on
+                    # purpose: they close over SSA values emitted at this insertion
+                    # point.  Bind those values as defaults so each definition
+                    # captures *its own* iteration's values (also silences B023).
+                    def _fmin(x, _neg_limit=_neg_limit):
+                        # min(x, lim) == -max(-x, -lim)
+                        return -((-x).maximumf(_neg_limit))
+
+                    def _sigmoid_s(x, neg_log2e=neg_log2e):
+                        emu = llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.exp2.f32", [x * neg_log2e], [], []
+                        )
+                        return llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [c1_f32 + emu], [], []
+                        )
+
+                    def _tanh_s(x):
+                        # tanh(x) = 2*sigmoid(2x) - 1
+                        two = arith.constant(2.0, type=f32)
+                        return two * _sigmoid_s(two * x) - c1_f32
+
+                    # SiTUv2 scale params are compile-time constants (folded via
+                    # arith.constant), consistent with the main gemm1 kernel's
+                    # compile-time situ_beta/situ_linear_beta model.
+                    _sv2_beta_f32 = arith.constant(float(situ_beta), type=f32)
+                    _sv2_beta_rcp = arith.constant(1.0 / float(situ_beta), type=f32)
+                    _sv2_linbeta_f32 = arith.constant(float(situ_linear_beta), type=f32)
+                    _sv2_linbeta_rcp = arith.constant(
+                        1.0 / float(situ_linear_beta), type=f32
+                    )
+
+                    def _situv2_elem(
+                        g,
+                        u,
+                        _sv2_beta_f32=_sv2_beta_f32,
+                        _sv2_beta_rcp=_sv2_beta_rcp,
+                        _sv2_linbeta_f32=_sv2_linbeta_f32,
+                        _sv2_linbeta_rcp=_sv2_linbeta_rcp,
+                    ):
+                        # beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
+                        situ_g = (
+                            _sv2_beta_f32 * _tanh_s(g * _sv2_beta_rcp) * _sigmoid_s(g)
+                        )
+                        up_sc = _sv2_linbeta_f32 * _tanh_s(u * _sv2_linbeta_rcp)
+                        return situ_g * up_sc
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
@@ -299,19 +353,17 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
-                        gate = g
-                        linear = u
-                        t = gate * neg_log2e
+                        if const_expr(act == "situv2"):
+                            # SiTUv2: no clamp (tanh self-saturates).
+                            act_vals.append(_situv2_elem(g, u))
+                            continue
+                        # gate: upper-clamped only; linear: clamped to [-lim, lim].
+                        gate = _fmin(g)
+                        linear = _fmin(u).maximumf(_neg_limit)
                         if const_expr(act == "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
                             t = gate * swiglu_neg_alpha_log2e
-                        elif const_expr(swiglu_limit != 0 and act != "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
-                            t = gate * swiglu_neg_alpha_log2e
+                        else:
+                            t = gate * neg_log2e
 
                         emu = llvm.call_intrinsic(
                             f32, "llvm.amdgcn.exp2.f32", [t], [], []
@@ -556,6 +608,7 @@ def build_silu_and_mul_fq_module(
         bias: fx.Pointer,
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
+        swiglu_limit_f: fx.Float32,
         stream: fx.Stream = fx.Stream(None),
     ):
         ctx = CompilationContext.get_current()
@@ -572,6 +625,7 @@ def build_silu_and_mul_fq_module(
             topk_ids,
             bias,
             token_num,
+            swiglu_limit_f,
         )
         launcher.launch(
             grid=(idx_rows, 1, 1),

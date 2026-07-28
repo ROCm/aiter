@@ -53,9 +53,12 @@ def create_shared_layouts(
 
 
 def create_wmma_layouts(num_warps):
-    warp_bases = [(0, 1)]
-    for i in range(int(math.log2(num_warps // 2))):
-        warp_bases.append((1 << i, 0))
+    warp_bases = []
+    for i in range(int(math.log2(num_warps))):
+        if i == 0:
+            warp_bases.append((0, 1))
+        else:
+            warp_bases.append((1 << (i - 1), 0))
     warp_bases = tuple(warp_bases)
 
     wmma_layout = gl.amd.AMDWMMALayout(
@@ -203,7 +206,13 @@ def _gemm_a16w16_bandwidth_bound_kernel(
     # Main pipeline loop
     num_k_tiles = gl.cdiv(K, BLOCK_K)
 
-    for _ in range(num_k_tiles - (NUM_BUFFERS - 1)):
+    # The interior iterations step K with update_tensor_descriptor(add_offsets=...),
+    # which moves the tile position only and leaves the descriptor's OOB bound
+    # untouched.  That is fine for every full K tile, but the final tile may be
+    # partial (K need not be a multiple of BLOCK_K).  Peel that last load out of
+    # the loop and install the true remaining extent with set_bounds so the TDM
+    # engine zero-fills past K instead of reading out of bounds.
+    for _ in range(num_k_tiles - (NUM_BUFFERS - 1) - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
@@ -257,6 +266,64 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
         compute_idx += 1
+
+    # ---- Peeled final K tile (bounds-checked) ----
+    # The descriptors are already positioned at the last tile by the interior
+    # loop's add_offsets.  Rewrite the OOB extent to the real remaining size so
+    # a partial tail tile is clamped (the M/N extents are unchanged from make).
+    k_main = (num_k_tiles - 1) * BLOCK_K
+    if LAYOUT[0] == "T":
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, set_bounds=[M - pid_m * BLOCK_M, K - k_main]
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, set_bounds=[K - k_main, M - pid_m * BLOCK_M]
+        )
+
+    if LAYOUT[1] == "T":
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, set_bounds=[K - k_main, N - pid_n * BLOCK_N]
+        )
+    else:
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, set_bounds=[N - pid_n * BLOCK_N, K - k_main]
+        )
+
+    gl.amd.gfx1250.tdm.async_load(
+        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    )
+
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+
+    load_idx += 1
+
+    if LAYOUT[0] == "T":
+        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_A
+        )
+    else:
+        cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_A,
+        )
+
+    if LAYOUT[1] == "T":
+        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index(compute_idx % NUM_BUFFERS), OPERAND_LAYOUT_B
+        )
+    else:
+        cur_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index(compute_idx % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_B,
+        )
+
+    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+    compute_idx += 1
 
     # Epilogue: no more loads
     for i in gl.static_range(NUM_BUFFERS - 1):
@@ -557,7 +624,10 @@ def _gemm_a16w16_compute_bound_kernel(
     compute_idx += 1
 
     # ---- Remaining main-loop iterations ----
-    for _ in range(num_k_tiles - NUM_BUFFERS - 1):
+    # The final K tile is peeled out after this loop so its (possibly partial)
+    # TDM load can be bounds-checked with set_bounds; the interior iterations
+    # use the fast add_offsets path that leaves the OOB bound untouched.
+    for _ in range(num_k_tiles - NUM_BUFFERS - 2):
 
         # WMMA for the current tile — uses operands pre-loaded in the
         # *previous* iteration so no ds_read stall before the matrix op.
@@ -623,6 +693,67 @@ def _gemm_a16w16_compute_bound_kernel(
         cur_a = next_a
         cur_b = next_b
         compute_idx += 1
+
+    # ---- Peeled final K tile (bounds-checked) ----
+    # Identical to a main-loop iteration except the TDM load is bounds-checked:
+    # the descriptors are already positioned at the last tile, so rewrite the
+    # OOB extent to the real remaining size (the M/N extents are unchanged from
+    # make) and skip the trailing add_offsets since there is no next load.
+    accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
+
+    k_main = (num_k_tiles - 1) * BLOCK_K
+    if LAYOUT[0] == "T":
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, set_bounds=[M - pid_m * BLOCK_M, K - k_main]
+        )
+    else:
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, set_bounds=[K - k_main, M - pid_m * BLOCK_M]
+        )
+
+    if LAYOUT[1] == "T":
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, set_bounds=[K - k_main, N - pid_n * BLOCK_N]
+        )
+    else:
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, set_bounds=[N - pid_n * BLOCK_N, K - k_main]
+        )
+
+    gl.amd.gfx1250.tdm.async_load(
+        a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
+    )
+
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+
+    load_idx += 1
+
+    if LAYOUT[0] == "T":
+        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_A
+        )
+    else:
+        next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            a_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_A,
+        )
+
+    if LAYOUT[1] == "T":
+        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS), OPERAND_LAYOUT_B
+        )
+    else:
+        next_b = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            b_buffer.index((compute_idx + 1) % NUM_BUFFERS).permute([1, 0]),
+            OPERAND_LAYOUT_B,
+        )
+
+    cur_a = next_a
+    cur_b = next_b
+    compute_idx += 1
 
     # Epilogue: no more TDM loads; drain the remaining NUM_BUFFERS-1 tiles.
     # The first NUM_BUFFERS-2 iterations still use the pre-load / WMMA pattern.

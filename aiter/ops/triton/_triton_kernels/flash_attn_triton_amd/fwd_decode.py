@@ -1059,6 +1059,16 @@ def attention_forward_decode_triton_impl(
     )
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
+    # As in the prefill kernel, WINDOW_SIZE_RIGHT is used as a literal finite
+    # offset (no infinite-right branch), so a negative right collapses the band
+    # and silently over-masks. Reject it instead. (right == -1 is only valid as
+    # the off sentinel, paired with left == -1, which leaves this flag False.)
+    if use_sliding_window and window_size_right < 0:
+        raise NotImplementedError(
+            "Sliding-window attention requires window_size_right >= 0 "
+            f"(got window_size_right={window_size_right}). An unbounded right edge "
+            "is not supported; use window_size_right=0 for a causal window."
+        )
     use_block_table = block_table is not None
 
     # get shapes and strides

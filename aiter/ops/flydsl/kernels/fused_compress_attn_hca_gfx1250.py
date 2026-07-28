@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HCA-path compress + norm+rope+scatter kernels — **gfx1250 (RDNA4, wave32)**.
+"""HCA-path compress + norm+rope+scatter kernels -- **gfx1250 (RDNA4, wave32)**.
 
 Port of ``fused_compress_attn_hca.py`` (wave64) to gfx1250 wave32.
 Key differences:
   - BLOCK_THREADS = 32 (wave32)
   - SLICE = 32 (head_dim elements per block)
   - VEC = SLICE_SZ / 32 (vs /64)
-  - Kernel B: D=512 → VEC=16, requires split load/store paths
+  - Kernel B: D=512 -> VEC=16, requires split load/store paths
   - Kernel names suffixed with "w32"
 
 See ``fused_compress_attn_hca.py`` for the original wave64 documentation.
@@ -29,17 +29,8 @@ from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from .tensor_shim import STensor, _to_raw, _run_compiled
-
-# Force-bind LDS-related imports so isort/ruff/format hooks don't drop them
-# (the multi-wave LDS kernel references CompilationContext, STensor,
-# SmemAllocator, SmemPtr only inside @flyc.kernel / @flyc.jit closures,
-# which formatters may not see).
-_FORCE_BIND_LDS = (CompilationContext, STensor, SmemAllocator, SmemPtr, get_rocm_arch)
+from .tensor_shim import _to_raw, _run_compiled
+from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
 SLICE = 32  # head_dim elements per block (grid-Y split)
@@ -81,7 +72,7 @@ def _build_compress_forward_kernel(
         elements starting at lid*VEC within the block's slice.
       - K=ratio split across ``k_split_num_waves`` waves; each wave processes
         K_PER_WAVE = K/NW positions (= 16 for K=128, NW=8).
-      - Per-wave local online-softmax → (m_local, kv_local, w_local) lists
+      - Per-wave local online-softmax -> (m_local, kv_local, w_local) lists
         of VEC values per thread.
       - LDS cross-wave reduction: only wave 0 active; each thread reads
         NW*VEC values from LDS, computes VEC reduced compressed values,
@@ -89,16 +80,16 @@ def _build_compress_forward_kernel(
 
     Tuning knobs:
       - ``k_split_num_waves`` (= NW): trades K-serial chain length for LDS
-        reduce cost. Small N → larger NW (more waves → more CU coverage);
-        large N → smaller NW (less LDS overhead).
-      - ``slice_size``: VEC width per thread. slice_size=64 → VEC=1 scalar
-        (more blocks per boundary → small-N champion); slice_size=512 →
-        VEC=8 (1 block per boundary, v1-like → large-N coalesced HBM).
+        reduce cost. Small N -> larger NW (more waves -> more CU coverage);
+        large N -> smaller NW (less LDS overhead).
+      - ``slice_size``: VEC width per thread. slice_size=64 -> VEC=1 scalar
+        (more blocks per boundary -> small-N champion); slice_size=512 ->
+        VEC=8 (1 block per boundary, v1-like -> large-N coalesced HBM).
 
     Phase 1 (state cache) is integrated by splitting each wave's K range at
     ``clamp(window_len, k_start, k_end)`` into a Phase 1 sub-loop reading
     kv_state + score_state (padded softmax when ``s < 0``) and a Phase 2
-    sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to ≥ 0
+    sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to >= 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
     assert (
@@ -132,22 +123,12 @@ def _build_compress_forward_kernel(
     LDS_M_ELEMS = NW * SLICE_SZ
     LDS_KV_ELEMS = NW * SLICE_SZ
     LDS_W_ELEMS = NW * SLICE_SZ
-    LDS_M_BYTES = LDS_M_ELEMS * 4
-    LDS_KV_BYTES = LDS_KV_ELEMS * 4
-    LDS_W_BYTES = LDS_W_ELEMS * 4
 
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=(f"hca_compress_smem_D{D}_NW{NW}_SL{SLICE_SZ}_S{state_size}"),
-    )
-    lds_m_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_m_off + LDS_M_BYTES
-    lds_kv_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kv_off + LDS_KV_BYTES
-    lds_w_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_w_off + LDS_W_BYTES
+    @fx.struct
+    class SharedStorage:
+        lds_m: fx.Array[fx.Float32, LDS_M_ELEMS, 16]
+        lds_kv: fx.Array[fx.Float32, LDS_KV_ELEMS, 16]
+        lds_w: fx.Array[fx.Float32, LDS_W_ELEMS, 16]
 
     _kname = f"hca_compress_forward_w32_D{D}_R{ratio}_NW{NW}_SL{SLICE_SZ}_S{state_size}_flydsl"
     fm_fast = arith.FastMathFlags.fast
@@ -197,10 +178,10 @@ def _build_compress_forward_kernel(
             )
 
         # Per-thread wave / lane (block-local).
-        wid = arith.divsi(_to_raw(tid), c_WS)  # ∈ [0, NW)
-        lid = arith.remui(_to_raw(tid), c_WS)  # ∈ [0, 32)
+        wid = arith.divsi(_to_raw(tid), c_WS)  # ? [0, NW)
+        lid = arith.remui(_to_raw(tid), c_WS)  # ? [0, 32)
 
-        # ── Load plan row ──────────────────────────────────────────────
+        # -- Load plan row ----------------------------------------------
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
@@ -234,7 +215,7 @@ def _build_compress_forward_kernel(
 
             def _load_bf16_vec_to_f32(rsrc, base_off_elems_i32):
                 """Load VEC contiguous bf16 elements starting at
-                ``base_off_elems_i32`` → list of VEC f32 values.
+                ``base_off_elems_i32`` -> list of VEC f32 values.
 
                 VEC=1: unaligned-safe scalar via dword + bit-extract.
                 VEC>=2: vectorized i32 buffer_load + bitcast to bf16.
@@ -282,7 +263,7 @@ def _build_compress_forward_kernel(
                     return out
 
             def _load_f32_vec(rsrc, base_off_elems_i32):
-                """Load VEC f32 starting at base → list of VEC f32 values."""
+                """Load VEC f32 starting at base -> list of VEC f32 values."""
                 if const_expr(VEC <= 4):
                     raw = buffer_ops.buffer_load(
                         rsrc, base_off_elems_i32, vec_width=VEC, dtype=f32
@@ -295,7 +276,7 @@ def _build_compress_forward_kernel(
                         for i in range(VEC)
                     ]
                 else:
-                    # VEC == 8: AMD HW max is dwordx4 → 2 loads.
+                    # VEC == 8: AMD HW max is dwordx4 -> 2 loads.
                     assert VEC == 8
                     half = VEC // 2
                     r0 = buffer_ops.buffer_load(
@@ -370,7 +351,7 @@ def _build_compress_forward_kernel(
                 """Padding-aware vector softmax step over VEC lanes. When
                 score_k == -inf, w_k is forced to 0 (avoids NaN when m_old
                 is also -inf). Safe in both Phase 1 (padding can occur) and
-                Phase 2 (score finite → pad-select branch is dead code).
+                Phase 2 (score finite -> pad-select branch is dead code).
                 """
                 new_m, new_kv, new_w = [], [], []
                 for i in range_constexpr(VEC):
@@ -403,15 +384,15 @@ def _build_compress_forward_kernel(
                     new_m.append(m_new)
                 return new_m, new_kv, new_w
 
-            # ── Wave's K range: [wid * K_PER_WAVE, (wid+1) * K_PER_WAVE) ──
+            # -- Wave's K range: [wid * K_PER_WAVE, (wid+1) * K_PER_WAVE) --
             k_start_i32 = ArithValue(wid) * c_K_per_wave
             k_end_i32 = k_start_i32 + c_K_per_wave
 
             # Split point inside this wave's K range. Each wave sees a
             # window_len-dependent slice of Phase 1 followed by Phase 2.
             # Cases (`wl = window_len`):
-            #   wl ≤ k_start:  pure Phase 2 (entire wave is input)
-            #   wl ≥ k_end:    pure Phase 1 (entire wave is state cache)
+            #   wl <= k_start:  pure Phase 2 (entire wave is input)
+            #   wl >= k_end:    pure Phase 1 (entire wave is state cache)
             #   else:          mixed (Phase 1 in [k_start, wl), Phase 2 in [wl, k_end))
             # ``split`` = clamp(wl, k_start, k_end) gives the boundary;
             # both sub-loops are empty when their bound collapses, so any
@@ -444,7 +425,7 @@ def _build_compress_forward_kernel(
 
             # Sub-loop 2: Phase 2 sub-range [split, k_end). Reads input;
             # uses padded softmax (the is-pad-score branch is dead code
-            # since Phase 2 scores are always finite — compiler elides).
+            # since Phase 2 scores are always finite -- compiler elides).
             # Carry Phase 1's accumulator through as init.
             final = phase1_local
             for k_static, state in range(
@@ -468,36 +449,24 @@ def _build_compress_forward_kernel(
             kv_local = list(final[VEC : 2 * VEC])
             w_local = list(final[2 * VEC : 3 * VEC])
 
-            # ── LDS write: each thread writes VEC entries per array ──
+            # -- LDS write: each thread writes VEC entries per array --
             # Layout: per array, NW * SLICE_SZ fp32 entries; per-thread
             # base = wid * SLICE_SZ + lid * VEC; thread writes VEC values
             # at base+0, base+1, ..., base+VEC-1.
-            lds_base = allocator.get_base()
-            lds_m = STensor(
-                SmemPtr(lds_base, lds_m_off, T.f32, shape=(LDS_M_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_M_ELEMS,),
-            )
-            lds_kv = STensor(
-                SmemPtr(lds_base, lds_kv_off, T.f32, shape=(LDS_KV_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_KV_ELEMS,),
-            )
-            lds_w = STensor(
-                SmemPtr(lds_base, lds_w_off, T.f32, shape=(LDS_W_ELEMS,)),
-                dtype=T.f32,
-                shape=(LDS_W_ELEMS,),
-            )
+            lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+            lds_m_ptr = lds.lds_m.ptr
+            lds_kv_ptr = lds.lds_kv.ptr
+            lds_w_ptr = lds.lds_w.ptr
             lds_thread_base = ArithValue(wid) * c_SLICE + ArithValue(lid) * c_VEC
             for i in range_constexpr(VEC):
                 idx_i = lds_thread_base + arith.constant(i, type=i32)
-                lds_m[fx.Index(idx_i)] = m_local[i]
-                lds_kv[fx.Index(idx_i)] = kv_local[i]
-                lds_w[fx.Index(idx_i)] = w_local[i]
+                fx.ptr_store(m_local[i], lds_m_ptr + fx.Int32(idx_i))
+                fx.ptr_store(kv_local[i], lds_kv_ptr + fx.Int32(idx_i))
+                fx.ptr_store(w_local[i], lds_w_ptr + fx.Int32(idx_i))
 
             gpu.barrier()
 
-            # ── Cross-wave reduction: only wave 0 reads and reduces ──
+            # -- Cross-wave reduction: only wave 0 reads and reduces --
             # Wave 0's 64 threads cover SLICE_SZ = 64 * VEC head_dim elements
             # (VEC elements per thread). For each owned element, the thread
             # reads NW values from LDS (one per K-split wave) and computes
@@ -509,41 +478,33 @@ def _build_compress_forward_kernel(
                 for i in range_constexpr(VEC):
                     lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
                     # Global max across NW waves for this element.
-                    m_g = c_neg_inf
+                    m_g = fx.Float32(c_neg_inf)
                     m_arr = []
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        m_w = lds_m[fx.Index(idx_w)]
+                        m_w = fx.ptr_load(lds_m_ptr + fx.Int32(idx_w))
                         m_arr.append(m_w)
-                        m_g = arith.maximumf(m_g, m_w)
+                        m_g = m_g.maximumf(m_w)
 
                     # Weighted sums (kv * scale_w) and (w * scale_w).
-                    kv_sum = c_zero_f32
-                    w_sum = c_zero_f32
+                    kv_sum = fx.Float32(0.0)
+                    w_sum = fx.Float32(0.0)
                     for w in range_constexpr(NW):
                         idx_w = arith.constant(w * SLICE_SZ, type=i32) + lane_off
-                        kv_w = lds_kv[fx.Index(idx_w)]
-                        w_w = lds_w[fx.Index(idx_w)]
+                        kv_w = fx.ptr_load(lds_kv_ptr + fx.Int32(idx_w))
+                        w_w = fx.ptr_load(lds_w_ptr + fx.Int32(idx_w))
                         m_w = m_arr[w]
-                        scale_w = fexp_f32(arith.subf(m_w, m_g))
-                        kv_sum = arith.AddFOp(
-                            kv_sum,
-                            arith.MulFOp(kv_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                        w_sum = arith.AddFOp(
-                            w_sum,
-                            arith.MulFOp(w_w, scale_w, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    rcp_w = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [w_sum], [], []
+                        scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
+                        kv_sum = kv_sum + kv_w * scale_w
+                        w_sum = w_sum + w_w * scale_w
+                    rcp_w = fx.Float32(
+                        llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
+                        )
                     )
-                    comp_list.append(
-                        arith.MulFOp(kv_sum, rcp_w, fastmath=fm_fast).result
-                    )
+                    comp_list.append(_to_raw(kv_sum * rcp_w))
 
-                # ── Vectorized write of VEC f32 comp values ──
+                # -- Vectorized write of VEC f32 comp values --
                 out_rsrc = buffer_ops.create_buffer_resource(
                     kv_compressed, max_size=True
                 )
@@ -557,7 +518,7 @@ def _build_compress_forward_kernel(
                     out_vec = vector.from_elements(T.vec(VEC, T.f32), comp_list)
                     buffer_ops.buffer_store(out_vec, out_rsrc, out_off)
                 else:
-                    # VEC > 4: AMD HW max is dwordx4 → split into N× dwordx4 stores.
+                    # VEC > 4: AMD HW max is dwordx4 -> split into Nx dwordx4 stores.
                     quarter = 4
                     n_chunks = VEC // quarter
                     for q in range_constexpr(n_chunks):
@@ -592,13 +553,6 @@ def _build_compress_forward_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        # Materialize the LDS global symbol inside the gpu_module body
-        # (the SmemAllocator was declared outside the kernel decorator).
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
         k = kernel(
@@ -640,11 +594,18 @@ def _build_norm_rope_scatter_kernel(
     k_per_block: int,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant: bool = False,
+    quant_group_size: int = 64,
 ):
-    """Build per-row RMSNorm + GPT-J RoPE + BF16 paged scatter for HCA.
+    """Build per-row RMSNorm + GPT-J RoPE + paged scatter for HCA (wave32).
 
     Reads kv_compressed[num_compress, head_dim] fp32 and the plan; for each
     boundary, normalizes / rotates / scatters into kv_cache.
+
+    quant=False: BF16 single-buffer scatter (nope + rope in one kv_cache row).
+    quant=True : FP8 nope (1xG e8m0 group-quant) + inline duplicated e8m0 scale into
+                 kv_cache (V4 nm asm layout), rotated PE bf16 into a SEPARATE k_rope_buff
+                 -- byte-identical to the C++ k_wave / fused_kv_compress_scatter output.
     """
     D = head_dim
     RD = rope_head_dim
@@ -656,9 +617,19 @@ def _build_norm_rope_scatter_kernel(
     assert D % BLOCK_THREADS == 0
     assert RD > 0 and RD % 2 == 0 and RD % VEC == 0
 
+    # FP8 1xG e8m0 group-quant geometry (nope region only). GROUP_SIZE must divide
+    # NOPE and be a multiple of VEC (a lane's VEC slice never crosses a group).
+    GROUP_SIZE_Q = quant_group_size
+    assert (not quant) or (
+        NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+    ), f"quant: NOPE={NOPE} must be divisible by group={GROUP_SIZE_Q}, group%VEC==0"
+    assert (not quant) or VEC % 4 == 0, f"quant: VEC={VEC} must be a multiple of 4"
+    RTS = GROUP_SIZE_Q // VEC if quant else 1  # threads per group (=4 for G=64,VEC=16)
+    log2_rts = int(math.log2(RTS)) if quant else 0
+
     _kname = (
         f"hca_norm_rope_scatter_w32_D{D}_RD{RD}_R{ratio}_KB{k_per_block}"
-        f"{'_rmsbf16' if rms_weight_is_bf16 else ''}_flydsl"
+        f"{'_rmsbf16' if rms_weight_is_bf16 else ''}{'_fp8' if quant else ''}_flydsl"
     )
     fm_fast = arith.FastMathFlags.fast
     log2_block = int(math.log2(BLOCK_THREADS))
@@ -671,11 +642,14 @@ def _build_norm_rope_scatter_kernel(
         rms_weight: fx.Tensor,  # [head_dim] bf16 or f32
         cos_cache: fx.Tensor,  # [max_pos, RD/2] bf16
         sin_cache: fx.Tensor,
-        kv_cache: fx.Tensor,  # [NB, k_per_block, D] bf16
-        kv_cache_block_stride: Int32,  # bf16 elements
+        kv_cache: fx.Tensor,  # bf16: [NB,k_per_block,D]; fp8: [NB,k_per_block,entry] nope+scale
+        kv_cache_block_stride: Int32,  # elements (bf16 or fp8/byte)
         kv_cache_token_stride: Int32,
         block_table: fx.Tensor,  # [bs, max_blocks_per_seq] i32
         block_table_seq_stride: Int32,
+        k_rope_buff: fx.Tensor,  # fp8 only: paged [NB,k_per_block,RD] bf16 rope (dummy if !quant)
+        krope_block_stride: Int32,
+        krope_token_stride: Int32,
     ):
         f32 = T.f32
         i32 = T.i32
@@ -699,7 +673,7 @@ def _build_norm_rope_scatter_kernel(
                 w = arith.AddFOp(w, peer, fastmath=fm_fast).result
             return w
 
-        # ── Load plan row ──
+        # -- Load plan row --
         plan_rsrc = buffer_ops.create_buffer_resource(plan, max_size=True)
         plan_base = ArithValue(pid) * arith.constant(4, type=i32)
         plan_vec = buffer_ops.buffer_load(plan_rsrc, plan_base, vec_width=4, dtype=i32)
@@ -711,12 +685,12 @@ def _build_norm_rope_scatter_kernel(
         with _if_then(_if_active):
             tid_x_vec = ArithValue(tid) * arith.constant(VEC, type=i32)
 
-            # ── Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] ──
+            # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
             kvc_rsrc = buffer_ops.create_buffer_resource(kv_compressed, max_size=True)
             base_off = (
                 ArithValue(pid) * ArithValue(kv_compressed_row_stride) + tid_x_vec
             )
-            # VEC ∈ {2, 4, 8, 16}: VEC <= 4 → single dwordx{VEC}; VEC>4 → N× dwordx4.
+            # VEC ? {2, 4, 8, 16}: VEC <= 4 -> single dwordx{VEC}; VEC>4 -> Nx dwordx4.
             if const_expr(VEC <= 4):
                 raw = buffer_ops.buffer_load(
                     kvc_rsrc, base_off, vec_width=VEC, dtype=f32
@@ -741,7 +715,7 @@ def _build_norm_rope_scatter_kernel(
                             vector.extract(r, static_position=[i], dynamic_position=[])
                         )
 
-            # ── RMSNorm (wave reduce-add of squares / D + eps; rsqrt) ──
+            # -- RMSNorm (wave reduce-add of squares / D + eps; rsqrt) --
             sq_local = arith.constant(0.0, type=f32)
             for i in range_constexpr(VEC):
                 sq_local = arith.AddFOp(
@@ -784,7 +758,7 @@ def _build_norm_rope_scatter_kernel(
                         )
                         rmsw_lane.append(arith.extf(f32, bf16_v))
                 else:
-                    # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
+                    # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4
                     half_dw = 4
                     half_bf16 = half_dw * 2
                     rmsw_lane = []
@@ -839,7 +813,7 @@ def _build_norm_rope_scatter_kernel(
                 for i in range(VEC)
             ]
 
-            # ── GPT-J RoPE on RD tail ──
+            # -- GPT-J RoPE on RD tail --
             comp_pos_i32 = arith.muli(arith.divsi(_to_raw(position), c_ratio), c_ratio)
             cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
             sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
@@ -914,12 +888,7 @@ def _build_norm_rope_scatter_kernel(
                 rotated_lane[2 * k] = new_e
                 rotated_lane[2 * k + 1] = new_o
 
-            out_lane = [
-                arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
-                for i in range_constexpr(VEC)
-            ]
-
-            # ── Paged BF16 scatter ──
+            # -- Paged scatter dest (shared by bf16 / fp8) --
             ci = arith.divsi(_to_raw(position), c_ratio)
             block_in_seq = arith.divsi(ci, c_k_per_block)
             slot_in_block = arith.remui(ci, c_k_per_block)
@@ -930,37 +899,78 @@ def _build_norm_rope_scatter_kernel(
             physical_block = buffer_ops.buffer_load(
                 bt_rsrc, bt_off, vec_width=1, dtype=i32
             )
-
-            cache_off = (
-                ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
-                + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-                + tid_x_vec
-            )
-            out_vec_t = T.vec(VEC, T.bf16)
-            raw_vec = vector.from_elements(vecVf32, out_lane)
-            bf16_vec = raw_vec.truncf(out_vec_t)
+            cache_base = ArithValue(physical_block) * ArithValue(
+                kv_cache_block_stride
+            ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
             out_rsrc = buffer_ops.create_buffer_resource(kv_cache, max_size=True)
-            cache_off_dw = ArithValue(cache_off) >> c_one_i32
-            dwords = (VEC + 1) // 2
-            bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
-            if const_expr(dwords == 1):
-                scalar_i32 = vector.extract(
-                    bf16_as_i32, static_position=[0], dynamic_position=[]
+
+            if const_expr(quant):
+                # -- group_fp8 (V4 nm-asm) via shared emitter (wave32; same layout
+                # as wave64 CSA/HCA -- single source of truth). --
+                _krope_base = ArithValue(physical_block) * ArithValue(
+                    krope_block_stride
+                ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                emit_group_fp8_nm_asm_scatter(
+                    normed_lane=normed_lane,
+                    rotated_lane=rotated_lane,
+                    lane=tid,
+                    is_rope_t=is_rope_t,
+                    cache_base=_to_raw(cache_base),
+                    out_rsrc=out_rsrc,
+                    krope_base=_to_raw(_krope_base),
+                    krope_rsrc=buffer_ops.create_buffer_resource(
+                        k_rope_buff, max_size=True
+                    ),
+                    VEC=VEC,
+                    NOPE=NOPE,
+                    RTS=RTS,
+                    log2_rts=log2_rts,
+                    ROPE_THREAD_LO=ROPE_THREAD_LO,
+                    wave_width=BLOCK_THREADS,
+                    vecVf32=vecVf32,
+                    fm_fast=fm_fast,
                 )
-                buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
-            elif const_expr(dwords <= 4):
-                buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
             else:
-                # dwords > 4 (VEC=16 → dwords=8): split into 2× dwordx4
-                c4_i32 = arith.constant(4, type=i32)
-                lo = vector.extract_strided_slice(
-                    T.vec(4, T.i32), bf16_as_i32, offsets=[0], sizes=[4], strides=[1]
-                )
-                hi = vector.extract_strided_slice(
-                    T.vec(4, T.i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
-                )
-                buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
-                buffer_ops.buffer_store(hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32)
+                # ---- BF16 single-buffer scatter (nope + rope contiguous) ----
+                out_lane = [
+                    arith.select(is_rope_t, rotated_lane[i], normed_lane[i])
+                    for i in range_constexpr(VEC)
+                ]
+                cache_off = ArithValue(cache_base) + tid_x_vec
+                out_vec_t = T.vec(VEC, T.bf16)
+                raw_vec = vector.from_elements(vecVf32, out_lane)
+                bf16_vec = raw_vec.truncf(out_vec_t)
+                cache_off_dw = ArithValue(cache_off) >> c_one_i32
+                dwords = (VEC + 1) // 2
+                bf16_as_i32 = vector.bitcast(T.vec(dwords, T.i32), bf16_vec)
+                if const_expr(dwords == 1):
+                    scalar_i32 = vector.extract(
+                        bf16_as_i32, static_position=[0], dynamic_position=[]
+                    )
+                    buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
+                elif const_expr(dwords <= 4):
+                    buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+                else:
+                    # dwords > 4 (VEC=16 -> dwords=8): split into 2x dwordx4
+                    c4_i32 = arith.constant(4, type=i32)
+                    lo = vector.extract_strided_slice(
+                        T.vec(4, T.i32),
+                        bf16_as_i32,
+                        offsets=[0],
+                        sizes=[4],
+                        strides=[1],
+                    )
+                    hi = vector.extract_strided_slice(
+                        T.vec(4, T.i32),
+                        bf16_as_i32,
+                        offsets=[4],
+                        sizes=[4],
+                        strides=[1],
+                    )
+                    buffer_ops.buffer_store(lo, out_rsrc, cache_off_dw)
+                    buffer_ops.buffer_store(
+                        hi, out_rsrc, ArithValue(cache_off_dw) + c4_i32
+                    )
 
     @flyc.jit
     def launch_hca_norm_rope_scatter(
@@ -975,6 +985,9 @@ def _build_norm_rope_scatter_kernel(
         kv_cache_token_stride: fx.Int32,
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
+        k_rope_buff: fx.Tensor,
+        krope_block_stride: fx.Int32,
+        krope_token_stride: fx.Int32,
         plan_capacity: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
@@ -991,6 +1004,9 @@ def _build_norm_rope_scatter_kernel(
             kv_cache_token_stride,
             block_table,
             block_table_seq_stride,
+            k_rope_buff,
+            krope_block_stride,
+            krope_token_stride,
         )
         k.launch(
             grid=(idx_p, 1, 1),
@@ -1031,12 +1047,12 @@ def compile_hca_compress_forward_gfx1250(
 
     ``slice_size`` controls per-thread vector width (VEC = slice_size / 64).
     Larger slice_size means each thread handles more head_dim elements per
-    K-iter (wider buffer_load → better HBM coalescing), but fewer blocks
-    per boundary (NUM_SPLIT = head_dim / slice_size). slice_size=64 → VEC=1
-    (8 blocks/boundary, small-N champion); slice_size=512 → VEC=8
+    K-iter (wider buffer_load -> better HBM coalescing), but fewer blocks
+    per boundary (NUM_SPLIT = head_dim / slice_size). slice_size=64 -> VEC=1
+    (8 blocks/boundary, small-N champion); slice_size=512 -> VEC=8
     (1 block/boundary, v1-like HBM access, large-N champion).
 
-    ``state_size`` is the ring-buffer modulo of ``kv_state.shape[1]`` (≥ ratio).
+    ``state_size`` is the ring-buffer modulo of ``kv_state.shape[1]`` (>= ratio).
     Cached per (head_dim, ratio, state_size, k_split_num_waves, slice_size) tuple.
     """
     launcher = _build_compress_forward_kernel(
@@ -1050,7 +1066,7 @@ def compile_hca_compress_forward_gfx1250(
     return launcher
 
 
-@lru_cache(maxsize=8)
+@lru_cache(maxsize=16)
 def compile_hca_norm_rope_scatter_gfx1250(
     *,
     head_dim: int,
@@ -1059,6 +1075,8 @@ def compile_hca_norm_rope_scatter_gfx1250(
     k_per_block: int,
     rms_weight_is_bf16: bool,
     rms_eps: float,
+    quant: bool = False,
+    quant_group_size: int = 64,
 ):
     launcher = _build_norm_rope_scatter_kernel(
         head_dim=head_dim,
@@ -1067,6 +1085,8 @@ def compile_hca_norm_rope_scatter_gfx1250(
         k_per_block=k_per_block,
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
+        quant=quant,
+        quant_group_size=quant_group_size,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -1092,6 +1112,9 @@ def flydsl_hca_compress_attn_gfx1250(
     head_dim: int,
     rope_head_dim: int,
     kv_compressed_scratch: Optional[torch.Tensor] = None,
+    quant: bool = False,
+    k_rope_cache: Optional[torch.Tensor] = None,
+    quant_group_size: int = 64,
     k_split_num_waves: Optional[int] = None,
     slice_size: Optional[int] = None,
     stream: Optional[torch.cuda.Stream] = None,
@@ -1099,7 +1122,15 @@ def flydsl_hca_compress_attn_gfx1250(
     """HCA-only 2-kernel compress + norm+rope+scatter (V4-Pro Main path).
 
     Restrictions: ratio=128, overlap=False (implicit), head_dim=512 supported.
-    BF16 cache scatter only.
+
+    Cache scatter dtype:
+      * ``quant=False`` (default): BF16 single-buffer scatter -- nope + rope written
+        contiguously into ``kv_cache`` [NB, k_per_block, head_dim] bf16.
+      * ``quant=True``: FP8 1xG e8m0 group-quant. ``kv_cache`` is fp8
+        [NB, k_per_block, entry] holding nope fp8 + inline duplicated e8m0 scale
+        (V4 nm asm layout); rotated PE bf16 goes to ``k_rope_cache``
+        [NB, k_per_block, rope_head_dim] bf16. Byte-identical to the C++
+        ``fused_kv_compress_scatter`` k_wave output.
 
     Phase 1 (state cache) is enabled by passing real ``kv_state`` /
     ``score_state`` / ``state_slot_mapping``. When ``window_len > 0`` in
@@ -1108,7 +1139,7 @@ def flydsl_hca_compress_attn_gfx1250(
 
     When ``k_split_num_waves`` / ``slice_size`` are ``None`` (the default),
     the launcher auto-picks via :func:`hca_per_n_config` keyed on
-    ``plan_gpu.shape[0]`` (CUDAGraph-stable dispatch — see that function's
+    ``plan_gpu.shape[0]`` (CUDAGraph-stable dispatch -- see that function's
     docstring). Override only when bench-sweeping; the default matches the
     production tuning used by ATOM's compressor.
     """
@@ -1120,7 +1151,7 @@ def flydsl_hca_compress_attn_gfx1250(
             slice_size = auto_slice
         if k_split_num_waves is None:
             k_split_num_waves = auto_kw
-    # User-facing input validation — must be ``raise`` not ``assert`` (asserts
+    # User-facing input validation -- must be ``raise`` not ``assert`` (asserts
     # are stripped under ``python -O``, which would let invalid inputs reach
     # the kernel and silently corrupt outputs / fault the GPU).
     if head_dim != 512:
@@ -1170,8 +1201,26 @@ def flydsl_hca_compress_attn_gfx1250(
     if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
         raise ValueError("state_slot_mapping must be 1D int32")
 
-    if kv_cache.dtype != torch.bfloat16:
-        raise TypeError(f"HCA 2-kernel kv_cache must be bf16; got {kv_cache.dtype}")
+    if quant:
+        if kv_cache.dtype not in (torch.float8_e4m3fnuz, torch.float8_e4m3fn):
+            raise TypeError(
+                f"HCA fp8 kv_cache must be fp8 (e4m3fnuz/e4m3fn); got {kv_cache.dtype}"
+            )
+        if k_rope_cache is None:
+            raise ValueError(
+                "HCA fp8 path requires k_rope_cache (paged bf16 rope buffer)"
+            )
+        if k_rope_cache.dtype != torch.bfloat16:
+            raise TypeError(f"k_rope_cache must be bf16; got {k_rope_cache.dtype}")
+        if k_rope_cache.dim() != 3 or k_rope_cache.shape[2] != rope_head_dim:
+            raise ValueError(
+                f"k_rope_cache shape {tuple(k_rope_cache.shape)} != [NB, k_per_block, {rope_head_dim}]"
+            )
+        if not k_rope_cache.is_contiguous():
+            raise ValueError("k_rope_cache must be contiguous")
+    else:
+        if kv_cache.dtype != torch.bfloat16:
+            raise TypeError(f"HCA 2-kernel kv_cache must be bf16; got {kv_cache.dtype}")
     if block_tables.dtype != torch.int32:
         raise TypeError(f"block_tables must be int32; got {block_tables.dtype}")
     if not block_tables.is_contiguous():
@@ -1197,7 +1246,7 @@ def flydsl_hca_compress_attn_gfx1250(
     # CRITICAL: must pass current_stream when stream is None. Stream(None) =
     # NULL/default stream, which during CUDA graph capture produces an empty
     # graph entry (kernel launches don't get recorded into the active graph),
-    # so replay is a no-op → HCA boundaries silently never fire in decode CG.
+    # so replay is a no-op -> HCA boundaries silently never fire in decode CG.
     # Match v1 single-kernel pattern (fused_compress_attn.py:1381).
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -1239,7 +1288,19 @@ def flydsl_hca_compress_attn_gfx1250(
         k_per_block=k_per_block,
         rms_weight_is_bf16=rms_weight_is_bf16,
         rms_eps=rms_eps,
+        quant=quant,
+        quant_group_size=quant_group_size,
     )
+    # k_rope_buff is referenced only on the quant path; pass kv_cache as a dummy
+    # (valid tensor, never read) when bf16 so the launcher arity stays fixed.
+    if quant:
+        krope_buf = k_rope_cache
+        krope_bs = int(k_rope_cache.stride(0))
+        krope_ts = int(k_rope_cache.stride(1))
+    else:
+        krope_buf = kv_cache
+        krope_bs = 0
+        krope_ts = 0
     norm_args = (
         kv_compressed,
         int(kv_compressed.stride(0)),
@@ -1252,6 +1313,9 @@ def flydsl_hca_compress_attn_gfx1250(
         int(kv_cache.stride(1)),
         block_tables,
         int(block_tables.stride(0)),
+        krope_buf,
+        krope_bs,
+        krope_ts,
         int(plan_capacity),
         stream_obj,
     )

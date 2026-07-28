@@ -5,7 +5,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     gemm_a16wfp4_preshuffle,
 )
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.shuffle import shuffle_scale_gemm
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
 from aiter.ops.shuffle import shuffle_weight
 
 # Note this is specified by the HW and cannot be changed.

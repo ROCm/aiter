@@ -9,8 +9,13 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.quant import quant_mxfp4_hip
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
+from aiter.ops.quant import per_1x32_f4_quant, quant_mxfp4_hip
+from aiter.ops.shuffle import (
+    shuffle_scale,
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
 from aiter.test_common import benchmark
 
 torch.set_default_device("cuda")
@@ -145,27 +150,10 @@ def fp32_to_e2m1_rne(val: torch.Tensor) -> torch.Tensor:
     return e2m1.to(torch.uint8)
 
 
-def fp32_to_e2m1_rha(val: torch.Tensor) -> torch.Tensor:
-    """E2M1 quantization with round-half-away (matches non-gfx950 SW fallback)."""
-    a = val.abs()
-    dev = val.device
-    mag = torch.zeros_like(val, dtype=torch.uint8)
-    mag = torch.where(a >= 0.25, torch.tensor(1, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 0.75, torch.tensor(2, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 1.25, torch.tensor(3, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 1.75, torch.tensor(4, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 2.5, torch.tensor(5, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 3.5, torch.tensor(6, dtype=torch.uint8, device=dev), mag)
-    mag = torch.where(a >= 5.0, torch.tensor(7, dtype=torch.uint8, device=dev), mag)
-    sign = torch.where(
-        val < 0,
-        torch.tensor(8, dtype=torch.uint8, device=dev),
-        torch.tensor(0, dtype=torch.uint8, device=dev),
-    )
-    return sign | mag
-
-
-fp32_to_e2m1 = fp32_to_e2m1_rne if get_gfx() == "gfx950" else fp32_to_e2m1_rha
+# Both the gfx950 hardware conversion and the non-gfx950 software fallback
+# (even_round_e2m1 in csrc/kernels/quant_mxfp4.cu) perform round-to-nearest-even,
+# so the reference uses RNE on every arch.
+fp32_to_e2m1 = fp32_to_e2m1_rne
 
 
 def ref_quant_mxfp4(inp: torch.Tensor, round_mode: int = 1, group_size: int = 32):
@@ -281,10 +269,14 @@ def test_e8m0_shuffle(m, n, float_dtype):
 def test_a16w4_shuffle(m, n, float_dtype, gate_up):
     rows, cols = m, n
     scaleN = cols // 32
-    if rows % 32 != 0 or scaleN % 8 != 0:
+    if rows % 32 != 0:
         return {"result": "SKIP"}
     K_pk = cols // 2
-    if K_pk % 64 != 0:
+    if gate_up:
+        if scaleN % 8 != 0:
+            return {"result": "SKIP"}
+    elif K_pk % 64 != 0:
+        # w2 weight GUI shuffle; scale k_groups pad handles scaleN % 8 != 0.
         return {"result": "SKIP"}
 
     torch.manual_seed(42)
@@ -316,6 +308,34 @@ def test_a16w4_shuffle(m, n, float_dtype, gate_up):
     ), f"a16w4 scale mismatch (gate_up={gate_up})"
 
     return {"result": "PASS"}
+
+
+@benchmark()
+def test_gui_shuffle_scale_w2_k_pad(inter_tp, float_dtype):
+    """GUI w2 scale shuffle pads k_groups to a multiple of 8 (DSV4 inter=640)."""
+    E, hidden_tp = 8, 512
+    k_groups = inter_tp // 32
+    k_groups_padded = (k_groups + 7) // 8 * 8
+
+    w2 = torch.randn(E, hidden_tp, inter_tp, dtype=float_dtype, device="cuda")
+    _, w2_scale = per_1x32_f4_quant(w2, quant_dtype=aiter.dtypes.fp4x2)
+    s2d = w2_scale.view(-1, w2_scale.shape[-1])
+
+    out_auto = shuffle_scale_a16w4(s2d, E, False)
+    assert out_auto.shape == (E * hidden_tp, k_groups_padded)
+
+    k_ = s2d.shape[1]
+    k_padded = (k_ + 7) // 8 * 8
+    pre = torch.zeros(s2d.shape[0], k_padded, dtype=s2d.dtype, device=s2d.device)
+    pre[:, :k_] = s2d
+    out_explicit = shuffle_scale(
+        pre, experts_cnt=E, is_guinterleave=True, gate_up=False
+    )
+    assert torch.equal(
+        out_auto.view(torch.uint8).cpu(), out_explicit.view(torch.uint8).cpu()
+    ), f"inter_tp={inter_tp}"
+
+    return {"result": "PASS", "inter_tp": inter_tp}
 
 
 @benchmark()
@@ -478,6 +498,7 @@ if __name__ == "__main__":
         (64, 512),
         (96, 256),
     ]
+    gui_scale_pad_inter = [256, 640]
     float_dtypes = [torch.bfloat16, torch.float16]
 
     df = []
@@ -499,6 +520,8 @@ if __name__ == "__main__":
             a16w4_shapes, float_dtypes, [False, True]
         ):
             df.append(test_a16w4_shuffle(m, n, dt, gu))
+        for inter_tp, dt in itertools.product(gui_scale_pad_inter, float_dtypes):
+            df.append(test_gui_shuffle_scale_w2_k_pad(inter_tp, dt))
 
     if args.edge or run_all:
         for dt, rm in itertools.product(float_dtypes, round_modes):

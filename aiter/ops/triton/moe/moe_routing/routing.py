@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 from dataclasses import dataclass, field
@@ -7,6 +8,19 @@ from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+
+# HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
+# path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
+# for batch sizes in [MIN_M (default 16), MAX_M (default 128)]. Unset, or outside that
+# window (tiny M where the expert union can't shrink, or prefill), falls through to stock.
+_USE_HERD = os.environ.get("AITER_TRITON_USE_HERD", "") not in (
+    "",
+    "0",
+    "false",
+    "False",
+)
+_HERD_MIN_M = int(os.environ.get("AITER_TRITON_HERD_MIN_M", "16"))
+_HERD_MAX_M = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
 
 
 @dataclass
@@ -79,7 +93,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     hist = hist[:n_expts_tot]
     assert hist.dtype == torch.int32
     # scratchpad
-    if n_gates <= 65536:
+    if n_gates <= 65536 - 1:  # save one token id for OOB checks
         combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
     else:
         combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
@@ -218,7 +232,7 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = 128
+    BLOCK = triton.next_power_of_2(n_expts_tot)
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:
@@ -294,6 +308,12 @@ def routing(
     # flat top-k path: plain top-k + softmax (score_mode is None)
     # ------------------------------------------------------------------
     if score_mode is None:
+        # HERD: env-gated fused min-unique routing (decode-sized batches only;
+        # prefill / large M falls through to the stock top-k path below).
+        if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M:
+            from .minunique import routing_minunique
+
+            return routing_minunique(logits, n_expts_act, sm_first=sm_first)
         from .topk import topk
 
         HIST_BLOCK_M = 32
@@ -329,6 +349,20 @@ def routing(
     # ------------------------------------------------------------------
     # fused path: fused routing math + sort (score_mode given)
     # ------------------------------------------------------------------
+
+    # HERD: env-gated fused min-unique routing for decode-sized batches.
+    # Only for non-grouped-topk (DSv4 flat topk with sqrtsoftplus).
+    if _USE_HERD and _HERD_MIN_M <= num_tokens <= _HERD_MAX_M and not use_grouped_topk:
+        from .minunique import routing_minunique_fused
+
+        return routing_minunique_fused(
+            logits,
+            n_expts_act,
+            score_mode=score_mode,
+            bias=bias,
+            renorm=renorm,
+            routed_scaling_factor=routed_scaling_factor,
+        )
 
     if use_grouped_topk and num_expert_group != 1:
         assert (

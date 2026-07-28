@@ -417,7 +417,7 @@ class TestGetCfg2stages(unittest.TestCase):
             f.write(
                 "256,16,7168,256,256,8,ActivationType.Silu,torch.bfloat16,"
                 "torch.float8_e4m3fnuz,torch.float8_e4m3fnuz,QuantType.per_Token,"
-                "1,0,32,0,flydsl_k1,flydsl_k2,50.0,flydsl_fallback\n"
+                "1,0,32,0,legacy_k1,legacy_k2,50.0,legacy_tag\n"
             )
             path = f.name
 

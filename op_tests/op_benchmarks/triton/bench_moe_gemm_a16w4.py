@@ -12,7 +12,7 @@ from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
 )
-from aiter.ops.shuffle import shuffle_scale_moe
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 import tempfile
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
