@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,16 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import (  # noqa: E402
+from chip_info import (
     build_tune_dict,
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
-from gemm_a8w8_blockscale_cktile_instance import (  # noqa: E402
-    default_kernels_cktile_dict,
+from gemm_a8w8_blockscale_cktile_instance import (
     TileKernelInstance,
-    candidate_kernels_cktile_dict,
     candidate_kernels_by_name,
+    candidate_kernels_cktile_dict,
+    default_kernels_cktile_dict,
 )
 
 """
@@ -255,8 +254,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for _, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for _, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_code(self, kernels_dict: dict):
@@ -265,7 +266,7 @@ torch::Tensor
         """
 
         # generate instances code
-        for _, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances

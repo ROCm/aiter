@@ -1,8 +1,7 @@
-from ..jit.core import compile_ops
 import torch
-from typing import Optional
-
 from torch import Tensor
+
+from ..jit.core import compile_ops
 
 
 # JIT-compiled binding to the C++ kernel. Output `y` and scratch `workspace`
@@ -86,8 +85,8 @@ class GroupNorm(torch.nn.Module):
         num_channels: int,
         eps: float = 1e-5,
         affine: bool = True,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.num_groups = num_groups

@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,16 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import (  # noqa: E402
+from chip_info import (
     build_tune_dict,
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
-from gemm_a8w8_blockscale_instance import (  # noqa: E402
-    default_kernels_dict,
+from gemm_a8w8_blockscale_instance import (
     KernelInstance,
-    candidate_kernels_dict,
     candidate_kernels_by_name,
+    candidate_kernels_dict,
+    default_kernels_dict,
 )
 
 """
@@ -183,12 +182,12 @@ torch::Tensor
             {k.AK1}, {k.BK1},
             {k.MPerXDL}, {k.NPerXDL},
             {k.WAVE_MAP_M}, {k.WAVE_MAP_N},
-            S<{(", ").join(map(lambda x:str(x),k.ABLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.BBLOCK_TRANSFER))}>,
+            S<{(", ").join(str(x) for x in k.ABLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.BBLOCK_TRANSFER)}>,
             {k.CSHUFFLE_MX_PER_WAVE_PERSHUFFLE},
             {k.CSHUFFLE_NX_PER_WAVE_PERSHUFFLE},
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_TRANSFER))}>,
-            S<{(", ").join(map(lambda x:str(x),k.CBLOCK_SPV))}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_TRANSFER)}>,
+            S<{(", ").join(str(x) for x in k.CBLOCK_SPV)}>,
             ck::BlockGemmPipelineScheduler::{k.PIPELINE_Sched},
             ck::BlockGemmPipelineVersion::v{k.PIPELINE_VERSION},
             ck::tensor_operation::device::GemmSpecialization::{{GemmSpec}}>;
@@ -373,7 +372,7 @@ torch::Tensor
         ) as f:
             f.write(MAINFEST_head)
             seen_kernel_names = set()
-            for _, k in kernels_dict.items():
+            for k in kernels_dict.values():
                 if k.name not in seen_kernel_names:
                     seen_kernel_names.add(k.name)
                     f.write(MAINFEST_template.format(kernel_name=k.name))
@@ -385,7 +384,7 @@ torch::Tensor
         """
 
         # generate instances code
-        for _, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_ck_instance(k)
 
         # generate lookup dict for kernel instances

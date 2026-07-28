@@ -10,7 +10,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
@@ -31,12 +30,13 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
+
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
-    lds_load_b128_raw,
     lds_load_b32_raw,
+    lds_load_b128_raw,
     lds_store_b64,
     lds_store_b128,
     pipeline_fence,
@@ -92,7 +92,7 @@ def _deepgemm_num_1d_blocks_per_group(
         from aiter.jit.utils.chip_info import get_cu_num
 
         num_sms = max(1, int(get_cu_num()))
-    except Exception:
+    except Exception:  # noqa: BLE001
         num_sms = 128
     best, min_usage = 8, 2**31
     for cand in (8, 16):
@@ -126,7 +126,7 @@ def compile_mxscale_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -146,6 +146,8 @@ def compile_mxscale_gemm(
     grouped_contiguous_num_1d_blocks: int | None = None,
     persistent_workers: int | None = None,
     stage1_act: str | None = None,
+    stage1_situ_beta: float = 1.0,
+    stage1_situ_linear_beta: float = 1.0,
     stage1_weight_layout: str = "gguu",
     epilogue_bias: bool = False,
     stage1_quant_out: str | None = None,
@@ -223,10 +225,21 @@ def compile_mxscale_gemm(
     if epilogue_bias_mode and out_dtype not in ("bf16", "f16"):
         raise ValueError("epilogue_bias currently supports f16/bf16 outputs only")
     if stage1_act_mode is not None:
-        if stage1_act_mode not in ("silu", "swiglu"):
+        if stage1_act_mode not in ("silu", "swiglu", "situv2"):
             raise ValueError(
-                f"stage1_act must be None, 'silu', or 'swiglu', got {stage1_act!r}"
+                "stage1_act must be None, 'silu', 'swiglu', or 'situv2', "
+                f"got {stage1_act!r}"
             )
+        if stage1_act_mode == "situv2":
+            if stage1_situ_beta <= 0.0:
+                raise ValueError(
+                    f"stage1_situ_beta must be > 0, got {stage1_situ_beta!r}"
+                )
+            if stage1_situ_linear_beta <= 0.0:
+                raise ValueError(
+                    "stage1_situ_linear_beta must be > 0, "
+                    f"got {stage1_situ_linear_beta!r}"
+                )
         if split_k != 1:
             raise ValueError("stage1_act GEMM epilogue fuse requires split_k == 1")
         if wave_specialized_tdm and stage1_weight_layout_mode != "gugu":
@@ -287,11 +300,10 @@ def compile_mxscale_gemm(
         _persistent_workers = 0
 
     use_cluster = cluster_m > 1 or cluster_n > 1
-    if use_cluster:
-        if cluster_m * cluster_n > 16:
-            raise ValueError(
-                f"cluster_m * cluster_n must be <= 16, got {cluster_m}*{cluster_n}"
-            )
+    if use_cluster and cluster_m * cluster_n > 16:
+        raise ValueError(
+            f"cluster_m * cluster_n must be <= 16, got {cluster_m}*{cluster_n}"
+        )
     effective_waves_per_eu = waves_per_eu
     if use_cluster and effective_waves_per_eu is None:
         effective_waves_per_eu = 2
@@ -1914,6 +1926,28 @@ def compile_mxscale_gemm(
                 )
                 return g * sig
 
+            def _stage1_sigmoid_elem(g):
+                neg_log2e = arith.constant(-1.4426950408889634, type=T.f32)
+                one = arith.constant(1.0, type=T.f32)
+                emu = llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.exp2.f32", [g * neg_log2e], [], []
+                )
+                return llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
+                )
+
+            def _stage1_tanh_elem(x):
+                one = arith.constant(1.0, type=T.f32)
+                neg_two_log2e = arith.constant(-2.8853900817779268, type=T.f32)
+                abs_x = x.maximumf(-x)
+                e = llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.exp2.f32", [abs_x * neg_two_log2e], [], []
+                )
+                tanh_abs = (one - e) * llvm.call_intrinsic(
+                    T.f32, "llvm.amdgcn.rcp.f32", [one + e], [], []
+                )
+                return (x > arith.constant(0.0, type=T.f32)).select(tanh_abs, -tanh_abs)
+
             def _stage1_act_mul_scalar(g, u):
                 one = arith.constant(1.0, type=T.f32)
                 alpha = arith.constant(1.702, type=T.f32)
@@ -1922,8 +1956,9 @@ def compile_mxscale_gemm(
                 # swiglu) or +inf to disable clamping (silu without a limit).
                 # min(x, lim) == -max(-x, -lim), expressed via wrapped maximumf.
                 neg_lim = -f32_swiglu_limit
-                g = -((-g).maximumf(neg_lim))
-                u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
+                if const_expr(stage1_act_mode != "situv2"):
+                    g = -((-g).maximumf(neg_lim))
+                    u = (-((-u).maximumf(neg_lim))).maximumf(neg_lim)
                 if const_expr(stage1_act_mode == "swiglu"):
                     emu = llvm.call_intrinsic(
                         T.f32, "llvm.amdgcn.exp2.f32", [g * alpha * neg_log2e], [], []
@@ -1932,6 +1967,24 @@ def compile_mxscale_gemm(
                         T.f32, "llvm.amdgcn.rcp.f32", [one + emu], [], []
                     )
                     return g * sig * (u + one)
+                if const_expr(stage1_act_mode == "situv2"):
+                    situ_beta = arith.constant(float(stage1_situ_beta), type=T.f32)
+                    situ_beta_rcp = arith.constant(
+                        1.0 / float(stage1_situ_beta), type=T.f32
+                    )
+                    linear_beta = arith.constant(
+                        float(stage1_situ_linear_beta), type=T.f32
+                    )
+                    linear_beta_rcp = arith.constant(
+                        1.0 / float(stage1_situ_linear_beta), type=T.f32
+                    )
+                    situ_gate = (
+                        situ_beta
+                        * _stage1_tanh_elem(g * situ_beta_rcp)
+                        * _stage1_sigmoid_elem(g)
+                    )
+                    up_scaled = linear_beta * _stage1_tanh_elem(u * linear_beta_rcp)
+                    return situ_gate * up_scaled
                 return _stage1_silu_elem(g) * u
 
             def _stage1_act_mul_vec8(gate_v8, up_v8):
@@ -2975,8 +3028,9 @@ def compile_mxscale_gemm(
                             def _mid_prefetch_ws(
                                 _k_off=(
                                     split_k_base
-                                    + loop_iter * arith.index(num_buffers * tile_k)
-                                    + arith.index(buf_idx * tile_k)
+                                    + loop_iter
+                                    * arith.index(num_buffers * tile_k)  # noqa: B008
+                                    + arith.index(buf_idx * tile_k)  # noqa: B008
                                 ),
                             ):
                                 _l2_prefetch(_k_off)
@@ -3103,9 +3157,10 @@ def compile_mxscale_gemm(
                                 _ab=addr_boxes,
                                 _k_off=(
                                     split_k_base
-                                    + arith.index(pre_loaded * tile_k)
-                                    + loop_iter * arith.index(num_buffers * tile_k)
-                                    + arith.index(buf_idx * tile_k)
+                                    + arith.index(pre_loaded * tile_k)  # noqa: B008
+                                    + loop_iter
+                                    * arith.index(num_buffers * tile_k)  # noqa: B008
+                                    + arith.index(buf_idx * tile_k)  # noqa: B008
                                 ),
                             ):
                                 dg0_a = vector.from_elements(
@@ -3349,7 +3404,7 @@ def compile_mxscale_gemm(
                     )
                 _tail_as_idx = as_full_idx if tdm_as_in_prologue else None
 
-                def _as_idx_for(cs):
+                def _as_idx_for(cs, _tail_as_idx=_tail_as_idx):
                     return _tail_as_idx if tdm_as_in_prologue else stages_as_idx[cs]
 
                 if const_expr(_outstanding == -1):
@@ -3446,7 +3501,9 @@ def compile_mxscale_gemm(
                                 + loop_iters * arith.index(num_buffers * tile_k)
                             )
 
-                            def _tail_mid_nws(_ls=_load_stage, _ab=_tail_ab):
+                            def _tail_mid_nws(
+                                _ls=_load_stage, _ab=_tail_ab, _tail_load_k=_tail_load_k
+                            ):
                                 _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k)
                                 _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k)
                                 if const_expr(stage1_dual_b):
@@ -3819,6 +3876,8 @@ def compile_mxscale_gemm(
         _k_contiguous_1d,
         _persistent_workers,
         stage1_act_mode,
+        float(stage1_situ_beta),
+        float(stage1_situ_linear_beta),
         stage1_weight_layout_mode,
         epilogue_bias_mode,
         stage1_quant_out_mode,
@@ -4006,13 +4065,12 @@ def compile_mxscale_gemm(
         for op in ctx.gpu_module_body.operations:
             if const_expr(
                 hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
-            ):
-                if const_expr(effective_waves_per_eu is not None):
-                    _wpe = int(effective_waves_per_eu)
-                    if const_expr(_wpe >= 1):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe
-                        )
+            ) and const_expr(effective_waves_per_eu is not None):
+                _wpe = int(effective_waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        ir.IntegerType.get_signless(32), _wpe
+                    )
         launcher.launch(
             grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
@@ -4201,13 +4259,12 @@ def compile_mxscale_gemm(
         for op in ctx.gpu_module_body.operations:
             if const_expr(
                 hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
-            ):
-                if const_expr(effective_waves_per_eu is not None):
-                    _wpe = int(effective_waves_per_eu)
-                    if const_expr(_wpe >= 1):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe
-                        )
+            ) and const_expr(effective_waves_per_eu is not None):
+                _wpe = int(effective_waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        ir.IntegerType.get_signless(32), _wpe
+                    )
         launcher.launch(
             grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
@@ -4284,8 +4341,8 @@ def compile_a8w4_gemm(**kw):
 
 
 __all__ = [
-    "compile_mxscale_gemm",
+    "compile_a8w4_gemm",
     "compile_mxfp4_gemm",
     "compile_mxfp8_gemm",
-    "compile_a8w4_gemm",
+    "compile_mxscale_gemm",
 ]

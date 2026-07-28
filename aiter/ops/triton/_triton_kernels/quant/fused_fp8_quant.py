@@ -290,9 +290,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and (not NORM_BEFORE_GATE):
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_r, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    x_el = x_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     x_el = x_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     x_el = x_el * tl.sigmoid(z_el)
@@ -316,9 +314,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and (not NORM_BEFORE_GATE):
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_g, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    x_el = x_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     x_el = x_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     x_el = x_el * tl.sigmoid(z_el)
@@ -336,9 +332,7 @@ def _fused_rms_fp8_group_quant_kernel(
             if HAS_Z_GATED and NORM_BEFORE_GATE:
                 Z_base = Z + rows[:, None] * stride_z_row + col_offsets
                 z_el = tl.load(Z_base, mask=mask_g, other=0.0).to(tl.float32)
-                if ACTIVATION == "swish":
-                    y_el = y_el * (z_el * tl.sigmoid(z_el))
-                elif ACTIVATION == "silu":
+                if ACTIVATION == "swish" or ACTIVATION == "silu":
                     y_el = y_el * (z_el * tl.sigmoid(z_el))
                 elif ACTIVATION == "sigmoid":
                     y_el = y_el * tl.sigmoid(z_el)

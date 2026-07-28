@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
 import multiprocessing as mp
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
+
+import torch
+
+from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
-from aiter import dtypes
-from aiter import logger
 
 
 def _is_mapping_error(exc: BaseException) -> bool:
@@ -124,10 +125,9 @@ def worker(
             try:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  blanket catch is intentional here
                 if printLog:
                     print(f"Error in process:{pid} info:{info}: {e}")
-                pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
         us = -1  # float("inf")
@@ -137,7 +137,7 @@ def worker(
             print(f"Timeout in process:{pid} info:{info}: {e}")
         us = float("inf")
         max_err_ratio = 1.0
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         if printLog:
             print(f"Unexpected Error in process:{pid} info:{info}: {e}")
             import traceback
@@ -306,7 +306,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
             rets.append(ret)
         return rets
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         import traceback
 
         print(f"Critical error in work_group: {e!r}")
@@ -521,7 +521,7 @@ def mp_tuner(
                     else:
                         consecutive_timeouts = 0
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 # Check if it's a process crash (segfault, memory fault, etc.)
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
@@ -584,7 +584,7 @@ def mp_tuner(
             try:
                 pool.terminate()
                 pool.join()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
             pool = mp.Pool(processes=parallel_num)
@@ -633,7 +633,7 @@ def mp_tuner(
     try:
         pool.terminate()
         pool.join()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Warning: Error during pool cleanup: {e}")
 
     # Print summary

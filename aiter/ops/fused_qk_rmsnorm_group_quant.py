@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
 from torch import Tensor
+
 from aiter.ops.enum import QuantType
 
-from .fused_qk_norm_rope_cache_quant import _fused_qk_rmsnorm
 from ..jit.core import compile_ops
 from ..utility import dtypes
+from .fused_qk_norm_rope_cache_quant import _fused_qk_rmsnorm
 
 
 @compile_ops(
@@ -17,18 +17,18 @@ from ..utility import dtypes
     develop=True,
 )
 def _fused_qk_rmsnorm_group_quant_kernel(
-    q_out_quantized: Optional[Tensor] = None,
-    q_out_scale: Optional[Tensor] = None,
-    q: Optional[Tensor] = None,
-    q_weight: Optional[Tensor] = None,
+    q_out_quantized: Tensor | None = None,
+    q_out_scale: Tensor | None = None,
+    q: Tensor | None = None,
+    q_weight: Tensor | None = None,
     q_epsilon: float = 1e-6,
-    q_out_unquantized: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    q_res_out: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    k_weight: Optional[Tensor] = None,
-    k_epsilon: Optional[float] = None,
-    q_residual: Optional[Tensor] = None,
+    q_out_unquantized: Tensor | None = None,
+    k_out: Tensor | None = None,
+    q_res_out: Tensor | None = None,
+    k: Tensor | None = None,
+    k_weight: Tensor | None = None,
+    k_epsilon: float | None = None,
+    q_residual: Tensor | None = None,
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
@@ -47,30 +47,30 @@ def _fused_qk_rmsnorm_per_token_quant_kernel(
     q: Tensor,
     q_weight: Tensor,
     q_epsilon: float,
-    q_out_unquantized: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    q_res_out: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    k_weight: Optional[Tensor] = None,
-    k_epsilon: Optional[float] = None,
-    q_residual: Optional[Tensor] = None,
+    q_out_unquantized: Tensor | None = None,
+    k_out: Tensor | None = None,
+    q_res_out: Tensor | None = None,
+    k: Tensor | None = None,
+    k_weight: Tensor | None = None,
+    k_epsilon: float | None = None,
+    q_residual: Tensor | None = None,
     gemma_norm: bool = False,
 ) -> None: ...
 
 
 def fused_qk_rmsnorm_group_quant(
-    q_out_quantized: Optional[Tensor] = None,
-    q_out_scale: Optional[Tensor] = None,
-    q: Optional[Tensor] = None,
-    q_weight: Optional[Tensor] = None,
+    q_out_quantized: Tensor | None = None,
+    q_out_scale: Tensor | None = None,
+    q: Tensor | None = None,
+    q_weight: Tensor | None = None,
     q_epsilon: float = 1e-6,
-    q_out_unquantized: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    q_res_out: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    k_weight: Optional[Tensor] = None,
-    k_epsilon: Optional[float] = None,
-    q_residual: Optional[Tensor] = None,
+    q_out_unquantized: Tensor | None = None,
+    k_out: Tensor | None = None,
+    q_res_out: Tensor | None = None,
+    k: Tensor | None = None,
+    k_weight: Tensor | None = None,
+    k_epsilon: float | None = None,
+    q_residual: Tensor | None = None,
     group_size: int = 128,
     transpose_scale: bool = False,
     gemma_norm: bool = False,
@@ -143,13 +143,13 @@ def fused_qk_rmsnorm_per_token_quant(
     q: Tensor,
     q_weight: Tensor,
     q_epsilon: float,
-    q_out_unquantized: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    q_res_out: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    k_weight: Optional[Tensor] = None,
-    k_epsilon: Optional[float] = None,
-    q_residual: Optional[Tensor] = None,
+    q_out_unquantized: Tensor | None = None,
+    k_out: Tensor | None = None,
+    q_res_out: Tensor | None = None,
+    k: Tensor | None = None,
+    k_weight: Tensor | None = None,
+    k_epsilon: float | None = None,
+    q_residual: Tensor | None = None,
     gemma_norm: bool = False,
 ) -> None:
     if q_out_quantized.dtype != dtypes.fp8:
@@ -180,21 +180,21 @@ def fused_qk_rmsnorm_per_token_quant(
 
 
 def fused_qk_rmsnorm(
-    q_out_quantized: Optional[Tensor] = None,
-    q_out_scale: Optional[Tensor] = None,
-    q: Optional[Tensor] = None,
-    q_weight: Optional[Tensor] = None,
+    q_out_quantized: Tensor | None = None,
+    q_out_scale: Tensor | None = None,
+    q: Tensor | None = None,
+    q_weight: Tensor | None = None,
     q_epsilon: float = 1e-6,
-    q_out_unquantized: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    q_res_out: Optional[Tensor] = None,
-    k: Optional[Tensor] = None,
-    k_weight: Optional[Tensor] = None,
-    k_epsilon: Optional[float] = None,
-    q_residual: Optional[Tensor] = None,
+    q_out_unquantized: Tensor | None = None,
+    k_out: Tensor | None = None,
+    q_res_out: Tensor | None = None,
+    k: Tensor | None = None,
+    k_weight: Tensor | None = None,
+    k_epsilon: float | None = None,
+    q_residual: Tensor | None = None,
     gemma_norm: bool = False,
-    quant_type: Optional[QuantType] = QuantType.No,
-    group_size: Optional[int] = None,
+    quant_type: QuantType | None = QuantType.No,
+    group_size: int | None = None,
     transpose_scale: bool = False,
 ) -> None:
     # Centralized interface

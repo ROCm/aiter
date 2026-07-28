@@ -2,21 +2,22 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
 
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter import logger
 from torch import Tensor
 from torch.library import Library
+
+from aiter import logger
 
 from ..jit.core import (
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
     compile_ops,
 )
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
@@ -45,7 +46,7 @@ def _hip_blockscale_supported() -> bool:
     """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
     try:
         return get_gfx() in _BLOCKSCALE_HIP_PREBUILT_ARCHES
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -54,7 +55,7 @@ def _ck_a8w8_supported() -> bool:
     arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
     try:
         return get_gfx().startswith("gfx9")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 
@@ -64,7 +65,7 @@ def gen_gemm_a8w8_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor:
     return Out
@@ -79,7 +80,7 @@ def gemm_a8w8_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
@@ -232,8 +233,8 @@ def _gemm_a8w8_asm(
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    kernelName: str | None = None,
+    bias: Tensor | None = None,  # bias:[1, N] f32
     bpreshuffle: bool = True,
     splitK: int = -1,
 ) -> None: ...
@@ -246,9 +247,9 @@ def gemm_a8w8_asm(
     w_scale: Tensor,
     Out: Tensor,
     kernelName: str = "",
-    bias: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = True,
-    splitK: Optional[int] = None,
+    bias: Tensor | None = None,
+    bpreshuffle: bool | None = True,
+    splitK: int | None = None,
 ) -> Tensor:
     _gemm_a8w8_asm(
         XQ,
@@ -564,9 +565,9 @@ def gemm_a8w8_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
@@ -577,9 +578,9 @@ def gemm_a8w8(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -654,9 +655,9 @@ def gemm_a8w8_CK(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -690,7 +691,7 @@ def gemm_a8w8_bpreshuffle_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -703,7 +704,7 @@ def gemm_a8w8_bpreshuffle(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -1340,7 +1341,7 @@ def _mxfp8_mxfp8_gemm_asm(
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 

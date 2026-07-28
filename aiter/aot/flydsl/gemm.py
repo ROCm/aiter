@@ -34,7 +34,6 @@ import os
 import re
 import sys
 import time
-from typing import Dict, Optional
 
 import flydsl.expr as fx
 
@@ -83,7 +82,7 @@ _SHORT_DTYPE = {
 }
 
 
-def _parse_bool(value: Optional[str]) -> bool:
+def _parse_bool(value: str | None) -> bool:
     if value is None:
         return False
     normalized = value.strip().lower()
@@ -96,7 +95,7 @@ def _parse_bool(value: Optional[str]) -> bool:
     raise ValueError(f"Expected True/False, got {value!r}")
 
 
-def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
+def _parse_preshuffle_kernel_name(name: str) -> dict | None:
     m = _PRESHUFFLE_RE.fullmatch(name)
     if m is None:
         return None
@@ -472,7 +471,7 @@ def compile_one_config(
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result

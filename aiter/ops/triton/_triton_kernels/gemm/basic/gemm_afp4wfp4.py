@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _gemm_afp4wfp4_repr = make_kernel_repr(
     "_gemm_afp4wfp4_kernel",
@@ -724,7 +724,7 @@ def _get_config(
     # Note: Config files use K=2*K in their naming
     K = 2 * K
     if shuffle:
-        cfg, is_tuned = get_gemm_config(
+        return get_gemm_config(
             "GEMM-AFP4WFP4_PRESHUFFLED",
             M,
             N,
@@ -732,12 +732,4 @@ def _get_config(
             bounds=(4, 8, 16, 31, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192),
         )
     else:
-        cfg, is_tuned = get_gemm_config("GEMM-AFP4WFP4", M, N, K)
-    if cfg.get("NUM_KSPLIT", None) is None:
-        cfg["NUM_KSPLIT"] = 1
-    cfg.setdefault("GROUP_SIZE_M", 8)
-    cfg.setdefault("num_stages", 0)
-    cfg.setdefault("waves_per_eu", 0)
-    cfg.setdefault("matrix_instr_nonkdim", 16)
-    cfg.setdefault("cache_modifier", ".cg")
-    return cfg, is_tuned
+        return get_gemm_config("GEMM-AFP4WFP4", M, N, K)
