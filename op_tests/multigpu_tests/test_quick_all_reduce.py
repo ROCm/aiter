@@ -42,7 +42,7 @@ def allreduce_quick(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -65,9 +65,8 @@ def allreduce_quick(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()
@@ -99,7 +98,7 @@ def test_allreduce_quick(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     quantization: str = "INT4",
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -141,9 +140,7 @@ def qr_variable_input(rank, world_size):
     torch.cuda.set_device(device)
     qr_max_size = None  # MB
     _ptr = ops.init_custom_qr(rank, world_size, qr_max_size)
-    ranks = []
-    for i in range(world_size):
-        ranks.append(i)
+    ranks = list(range(world_size))
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:29500",

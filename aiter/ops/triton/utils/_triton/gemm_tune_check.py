@@ -1,17 +1,18 @@
 import importlib
 import inspect
-from typing import Optional
+from collections.abc import Callable
+
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
 
 def gemm_tune_check(
-    func: callable,
+    func: Callable,
     N: int,
     K: int,
-    M: Optional[int] = None,
-    shuffle: Optional[bool] = None,
+    M: int | None = None,
+    shuffle: bool | None = None,
 ):
     """
     This function returns if a AITER Triton GEMM is tunned for a specific shape
@@ -37,7 +38,7 @@ def gemm_tune_check(
 
     if hasattr(module, "_get_config"):
 
-        get_config_func = getattr(module, "_get_config")
+        get_config_func = module._get_config
         sig = inspect.signature(get_config_func)
 
         if (
@@ -51,7 +52,9 @@ def gemm_tune_check(
                 if shuffle is not None:
                     _, is_tunned = get_config_func(M, N, K, shuffle=shuffle)
                 else:
-                    raise Exception(f"Please specify shuffle (True/False) for {module}")
+                    raise RuntimeError(
+                        f"Please specify shuffle (True/False) for {module}"
+                    )
 
             return is_tunned
 
@@ -59,4 +62,4 @@ def gemm_tune_check(
             f"{module} _get_config not yet supported for inspection"
         )
 
-    raise Exception(f"{module} does not have _get_config function")
+    raise RuntimeError(f"{module} does not have _get_config function")

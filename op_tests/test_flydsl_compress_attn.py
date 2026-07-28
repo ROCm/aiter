@@ -245,25 +245,25 @@ def _build_inputs(shape, bs, mtp, mode):
 
 def _run_kernel(inp, *, use_2kernel):
     """Run kernel into ``inp['kv_cache']`` / ``inp['cache_scale']`` in place."""
-    common = dict(
-        kv_in=inp["kv_in"],
-        score_in=inp["score_in"],
-        kv_state=inp["kv_state"],
-        score_state=inp["score_state"],
-        state_slot_mapping=inp["state_slot_mapping"],
-        plan_gpu=inp["plan_gpu"],
-        ape=inp["ape"],
-        rms_weight=inp["rms_weight"],
-        rms_eps=inp["rms_eps"],
-        cos_cache=inp["cos_cache"],
-        sin_cache=inp["sin_cache"],
-        kv_cache=inp["kv_cache"],
-        block_tables=inp["block_tables"],
-        k_per_block=inp["k_per_block"],
-        ratio=inp["ratio"],
-        head_dim=inp["head_dim"],
-        rope_head_dim=inp["rope_head_dim"],
-    )
+    common = {
+        "kv_in": inp["kv_in"],
+        "score_in": inp["score_in"],
+        "kv_state": inp["kv_state"],
+        "score_state": inp["score_state"],
+        "state_slot_mapping": inp["state_slot_mapping"],
+        "plan_gpu": inp["plan_gpu"],
+        "ape": inp["ape"],
+        "rms_weight": inp["rms_weight"],
+        "rms_eps": inp["rms_eps"],
+        "cos_cache": inp["cos_cache"],
+        "sin_cache": inp["sin_cache"],
+        "kv_cache": inp["kv_cache"],
+        "block_tables": inp["block_tables"],
+        "k_per_block": inp["k_per_block"],
+        "ratio": inp["ratio"],
+        "head_dim": inp["head_dim"],
+        "rope_head_dim": inp["rope_head_dim"],
+    }
     if use_2kernel:
         flydsl_hca_compress_attn(**common)
     else:
@@ -607,25 +607,25 @@ def test_flydsl_csa_nm_asm_fp8(bs, mtp=0):
     nb = inp["kv_cache"].shape[0]
     kpb = inp["k_per_block"]
 
-    common = dict(
-        kv_in=inp["kv_in"],
-        score_in=inp["score_in"],
-        kv_state=inp["kv_state"],
-        score_state=inp["score_state"],
-        plan_gpu=inp["plan_gpu"],
-        state_slot_mapping=inp["state_slot_mapping"],
-        ape=inp["ape"],
-        rms_weight=inp["rms_weight"],
-        rms_eps=inp["rms_eps"],
-        cos_cache=inp["cos_cache"],
-        sin_cache=inp["sin_cache"],
-        block_tables=inp["block_tables"],
-        k_per_block=kpb,
-        overlap=overlap,
-        ratio=ratio,
-        head_dim=D,
-        rope_head_dim=RD,
-    )
+    common = {
+        "kv_in": inp["kv_in"],
+        "score_in": inp["score_in"],
+        "kv_state": inp["kv_state"],
+        "score_state": inp["score_state"],
+        "plan_gpu": inp["plan_gpu"],
+        "state_slot_mapping": inp["state_slot_mapping"],
+        "ape": inp["ape"],
+        "rms_weight": inp["rms_weight"],
+        "rms_eps": inp["rms_eps"],
+        "cos_cache": inp["cos_cache"],
+        "sin_cache": inp["sin_cache"],
+        "block_tables": inp["block_tables"],
+        "k_per_block": kpb,
+        "overlap": overlap,
+        "ratio": ratio,
+        "head_dim": D,
+        "rope_head_dim": RD,
+    }
 
     fly_entry = torch.zeros(nb, kpb, D, dtype=dtypes.fp8)
     fly_rope = torch.zeros(nb, kpb, RD, dtype=torch.bfloat16)
