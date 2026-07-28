@@ -86,9 +86,74 @@ def _pointer_buffer_tensor(ptr, dtype, shape, stride):
 
 
 def _pointer_buffer_resource(ptr, dtype, shape, stride):
-    """Build a raw buffer descriptor for a documented low-level MLA boundary."""
+    """Build a raw buffer descriptor (legacy under cleanup-skill §2).
+
+    Two operations remain on this raw path; both were carried through a real
+    public-layout-API migration attempt, gated on correctness/ISA/perf:
+
+    * Partial-output gather (``load_o_elems`` / ``_o3d_vec_load``): an
+      ``fx.gather`` migration was numerically exact and preserved the packed
+      load width, but ``pred=`` lowers to a per-call wavefront-divergent
+      branch (exec-mask save/branch/restore) in FlyDSL 0.2.4, costing 9-20%
+      on the serving wrapper metrics. Expressible, but not at an acceptable
+      cost in this hot per-split path.
+    * ``indptr`` CSR-sentinel scalar load (``_scalar_indptr``): a true §2
+      hard boundary. The layout-view/buffer-tensor API has no route to a
+      wave-uniform ``s_buffer_load`` -- only the raw
+      ``buffer_ops.buffer_load(..., is_scalar=True)`` path emits it, and the
+      one available substitute regresses to a per-lane VGPR load plus a
+      broadcast.
+
+    The split-K f32 scratch and final-output store paths that previously used
+    this helper now go through ``_pointer_buffer_tensor`` + ``copy_atom_call``.
+
+    Retained per §2 (scalar-base/per-thread-offset ops where no layout form
+    preserves the required ISA) and reported per §10.6 (surface remaining
+    legacy raw-descriptor use).
+    """
     return buffer_ops.create_buffer_resource(
         _pointer_view(ptr, dtype, shape, stride), max_size=True
+    )
+
+
+def _out_copy_atom(vec: int, out_numeric_t):
+    """Widest legal buffer copy atom for a VEC-element output fragment.
+
+    bf16/fp16 at VEC in {1, 2, 4, 8} is 2/4/8/16 bytes per thread, all within
+    the 128-bit atom ceiling, so one atom always covers the fragment -- unlike
+    the f32 split-K scratch path, where VEC == 8 needs two composed atoms.
+    """
+    if fx.const_expr(vec == 1):
+        op = fx.rocdl.BufferCopy16b()
+    elif fx.const_expr(vec == 2):
+        op = fx.rocdl.BufferCopy32b()
+    elif fx.const_expr(vec == 4):
+        op = fx.rocdl.BufferCopy64b()
+    elif fx.const_expr(vec == 8):
+        op = fx.rocdl.BufferCopy128b()
+    else:
+        raise ValueError(f"Unsupported output vector width: {vec}")
+    return fx.make_copy_atom(op, out_numeric_t)
+
+
+def _store_final_out(buf, row, head_idx, tid, elems_f32, vec, out_numeric_t):
+    """Write VEC elements to ``buf[row, head_idx, tid*VEC : +VEC]``.
+
+    Truncating to ``out_numeric_t`` before the copy keeps this one packed
+    buffer store of the whole fragment rather than a per-element (scalarized)
+    buffer_store_short.
+    """
+    reg_layout = fx.make_layout(vec, 1)
+    row_tiled = fx.logical_divide(fx.slice(buf, (row, head_idx, None)), reg_layout)
+    frag = fx.make_rmem_tensor(reg_layout, out_numeric_t)
+    frag.store(
+        _make_vector(
+            [elems_f32[i].to(out_numeric_t) for i in fx.range_constexpr(vec)],
+            out_numeric_t,
+        )
+    )
+    fx.copy_atom_call(
+        _out_copy_atom(vec, out_numeric_t), frag, fx.slice(row_tiled, (None, tid))
     )
 
 
@@ -262,40 +327,26 @@ def compile_mla_reduce(
             )
             return _vector_elements(v, fx.Float32, VEC)
 
-        def store_o_elems(off_idx, elems_f32):
-            """Cast VEC fp32 scalars to out_t and emit one vector buffer store.
-
-            Truncate each element to out_t first, then pack into the out_t vector
-            so the store lowers to buffer_store_dwordx2/4 instead of a per-element
-            (scalarized) buffer_store_short.
-            """
-            if fx.const_expr(VEC == 1):
-                buffer_ops.buffer_store(
-                    elems_f32[0].to(out_numeric_t), final_output_rsrc, off_idx
-                )
-                return
-            out_vec = _make_vector(
-                [elems_f32[i].to(out_numeric_t) for i in fx.range_constexpr(VEC)],
-                out_numeric_t,
+        def store_o_elems(row_idx, head_idx, elems_f32):
+            """Cast VEC fp32 scalars to out_t and emit one packed store."""
+            _store_final_out(
+                final_output_buf, row_idx, head_idx, tid, elems_f32, VEC, out_numeric_t
             )
-            buffer_ops.buffer_store(out_vec, final_output_rsrc, off_idx)
 
         tid = fx.thread_idx.x
         col = tid * c_VEC
         lane = tid % WARP
         wave = tid // WARP
 
-        # FlyDSL 0.2.4 boundary: the runtime gather needs a VEC-wide buffer
-        # load; the view/copy API cannot preserve this buffer ISA for VEC=1..8.
+        # Legacy raw descriptor: the layout-API gather costs a divergent
+        # branch per split (see _pointer_buffer_resource).
         partial_output_rsrc = _pointer_buffer_resource(
             partial_output,
             fx.Float32,
             (num_partial_rows, H, Dv),
             (H * Dv, Dv, 1),
         )
-        # FlyDSL 0.2.4 boundary: runtime output strides require a packed buffer
-        # store; a layout copy would scalarize the bf16/fp16 vector write.
-        final_output_rsrc = _pointer_buffer_resource(
+        final_output_buf = _pointer_buffer_tensor(
             final_output,
             out_numeric_t,
             (num_final_rows, H, Dv),
@@ -332,8 +383,8 @@ def compile_mla_reduce(
             (H, 1),
         )
 
-        # FlyDSL 0.2.4 does not expose the descriptor behind a buffer tensor.
-        # Keep this resource only for wave-uniform s_buffer_load CSR sentinels.
+        # Hard §2 boundary: only the raw descriptor emits s_buffer_load for
+        # this wave-uniform CSR read (see _pointer_buffer_resource).
         indptr_rsrc = _pointer_buffer_resource(
             reduce_indptr,
             fx.Int32,
@@ -449,8 +500,7 @@ def compile_mla_reduce(
                 return in_bounds.select(lse, neg_inf)
 
             def store_result(seq, out_elems):
-                store_off = seq * stride_s_o + head * stride_h_o + tid * c_VEC
-                store_o_elems(store_off, out_elems)
+                store_o_elems(seq, head, out_elems)
 
             def store_lse(seq, max_lse, sum_e):
                 if fx.const_expr(output_lse):
@@ -996,28 +1046,59 @@ def compile_mla_reduce_splitk(
     )
     default_stream = fx.Stream(None)
 
-    def _f32_vec_load(rsrc, offset):
-        """Keep VEC-wide dynamic scratch loads as buffer ISA in FlyDSL 0.2.4.
+    def _f32_copy_atom():
+        """Map VEC f32 scratch elements onto the widest legal buffer copy atom.
 
-        Copy atoms cannot preserve the required vector transaction for every
-        supported VEC width (1, 2, 4, or 8).
+        VEC in {1, 2, 4} map directly onto one BufferCopy{32,64,128}b atom
+        (4/8/16 bytes/thread). VEC == 8 is 32 bytes/thread -- wider than the
+        128-bit atom ceiling, and FlyDSL 0.2.4 has no single atom for it --
+        so it is split into two BufferCopy128b atoms over adjacent 4-wide
+        chunks of the row. This mirrors the 2x-dwordx4 composition
+        ``fused_compress_attn.py``'s ``_load_f32_vec`` already uses for
+        VEC=8 f32 (there via two raw ``buffer_ops.buffer_load`` calls; here
+        via ``copy_atom_call`` against a layout view).
         """
-        if fx.const_expr(VEC == 1):
-            return [
-                fx.Float32(
-                    buffer_ops.buffer_load(rsrc, offset, vec_width=1, dtype=T.f32)
-                )
-            ]
-        v = buffer_ops.buffer_load(rsrc, offset, vec_width=VEC, dtype=T.f32)
-        return _vector_elements(v, fx.Float32, VEC)
+        chunk = VEC if VEC <= 4 else 4
+        if fx.const_expr(chunk == 1):
+            op = fx.rocdl.BufferCopy32b()
+        elif fx.const_expr(chunk == 2):
+            op = fx.rocdl.BufferCopy64b()
+        else:
+            op = fx.rocdl.BufferCopy128b()
+        return fx.make_copy_atom(op, fx.Float32), chunk, VEC // chunk
 
-    def _f32_vec_store(rsrc, offset, elems):
-        """Keep VEC-wide dynamic scratch stores as one buffer transaction."""
-        if fx.const_expr(VEC == 1):
-            buffer_ops.buffer_store(elems[0], rsrc, offset)
-            return
-        vec = _make_vector(elems, fx.Float32)
-        buffer_ops.buffer_store(vec, rsrc, offset)
+    def _f32_chunk_tile_idx(tid, n_chunks, c):
+        if fx.const_expr(n_chunks == 1):
+            return tid
+        return tid * fx.Int32(n_chunks) + fx.Int32(c)
+
+    def _f32_vec_load(buf, row, tid):
+        """Load VEC f32 scratch elements at (row, tid*VEC) via a buffer
+        tensor layout view + copy atom(s). See ``_f32_copy_atom`` for the
+        VEC == 8 two-atom composition."""
+        atom, chunk, n_chunks = _f32_copy_atom()
+        reg_layout = fx.make_layout(chunk, 1)
+        row_tiled = fx.logical_divide(fx.slice(buf, (row, None)), reg_layout)
+        elems = []
+        for c in fx.range_constexpr(n_chunks):
+            idx = _f32_chunk_tile_idx(tid, n_chunks, c)
+            r = fx.make_rmem_tensor(reg_layout, fx.Float32)
+            fx.copy_atom_call(atom, fx.slice(row_tiled, (None, idx)), r)
+            v = r.load()
+            elems.extend(v[i] for i in fx.range_constexpr(chunk))
+        return elems
+
+    def _f32_vec_store(buf, row, tid, elems):
+        """Store VEC f32 scratch elements at (row, tid*VEC); see
+        ``_f32_vec_load``."""
+        atom, chunk, n_chunks = _f32_copy_atom()
+        reg_layout = fx.make_layout(chunk, 1)
+        row_tiled = fx.logical_divide(fx.slice(buf, (row, None)), reg_layout)
+        for c in fx.range_constexpr(n_chunks):
+            idx = _f32_chunk_tile_idx(tid, n_chunks, c)
+            r = fx.make_rmem_tensor(reg_layout, fx.Float32)
+            r.store(_make_vector(elems[c * chunk : (c + 1) * chunk], fx.Float32))
+            fx.copy_atom_call(atom, r, fx.slice(row_tiled, (None, idx)))
 
     def _o3d_vec_load(rsrc, row_idx, head_idx, col_idx):
         """Keep the runtime 3-D gather on buffer_load for VEC-wide ISA parity."""
@@ -1052,7 +1133,7 @@ def compile_mla_reduce_splitk(
             (num_partial_rows, H, Dv),
             (H * Dv, Dv, 1),
         )
-        sk_acc_rsrc = _pointer_buffer_resource(
+        sk_acc_buf = _pointer_buffer_tensor(
             sk_acc,
             fx.Float32,
             (sk_grid, Dv),
@@ -1138,7 +1219,7 @@ def compile_mla_reduce_splitk(
         regs = [results[i] for i in fx.range_constexpr(VEC)]
         m = results[VEC]
         lse_acc = results[VEC + 1]
-        _f32_vec_store(sk_acc_rsrc, w * Dv + col, regs)
+        _f32_vec_store(sk_acc_buf, w, tid, regs)
         if tid == fx.Int32(0):
             store_partial_metadata(g_ml, w, m, lse_acc)
 
@@ -1155,20 +1236,16 @@ def compile_mla_reduce_splitk(
         num_final_rows: fx.Int32,
     ):
         out_numeric_t = _out_numeric_t(out_dtype)
-        c_VEC = VEC
         tid = fx.thread_idx.x
-        col = tid * c_VEC
         sk_grid = fx.grid_dim.x
 
-        sk_acc_rsrc = _pointer_buffer_resource(
+        sk_acc_buf = _pointer_buffer_tensor(
             sk_acc,
             fx.Float32,
             (sk_grid * K, Dv),
             (Dv, 1),
         )
-        # FlyDSL 0.2.4 boundary: combine writes use runtime output strides and
-        # need the same packed bf16/fp16 buffer store as the normal path.
-        final_output_rsrc = _pointer_buffer_resource(
+        final_output_buf = _pointer_buffer_tensor(
             final_output,
             out_numeric_t,
             (num_final_rows, H, Dv),
@@ -1236,7 +1313,7 @@ def compile_mla_reduce_splitk(
                 mj = g_ml[prow, 0]
                 lj = g_ml[prow, 1]
                 wj = _exp(mj - M)
-                accj = _f32_vec_load(sk_acc_rsrc, prow * Dv + col)
+                accj = _f32_vec_load(sk_acc_buf, prow, tid)
                 regs = [regs[i] + accj[i] * wj for i in fx.range_constexpr(VEC)]
                 den = den + lj * wj
 
@@ -1245,22 +1322,9 @@ def compile_mla_reduce_splitk(
             out_elems = [regs[i] * inv for i in fx.range_constexpr(VEC)]
 
             if q_valid:
-                store_off = q_start * stride_s_o + head * stride_h_o + tid * VEC
-                if fx.const_expr(VEC == 1):
-                    buffer_ops.buffer_store(
-                        out_elems[0].to(out_numeric_t),
-                        final_output_rsrc,
-                        store_off,
-                    )
-                else:
-                    out_vec = _make_vector(
-                        [
-                            out_elems[i].to(out_numeric_t)
-                            for i in fx.range_constexpr(VEC)
-                        ],
-                        out_numeric_t,
-                    )
-                    buffer_ops.buffer_store(out_vec, final_output_rsrc, store_off)
+                _store_final_out(
+                    final_output_buf, q_start, head, tid, out_elems, VEC, out_numeric_t
+                )
                 if fx.const_expr(output_lse):
                     bad = _is_zero_or_nan(den)
                     inf = fx.Float32(float("inf"))
