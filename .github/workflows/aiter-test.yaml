@@ -6,15 +6,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]  # Triggers on PRs targeting `main`
-    paths:
-      - '**'
-      - '!**/*.md'
-      - '!docs/**'
-      - '!LICENSE'
-      - '!.gitignore'
-      - '!.github/workflows/**'
-      - '.github/workflows/aiter-test.yaml'
-      - '!.github/scripts/sglang_downstream.py'
 
   workflow_dispatch:
   schedule:
@@ -34,8 +25,102 @@ env:
   TRITON_WHEEL_ARTIFACT_NAME: triton_wheelhouse
 
 jobs:
+  detect_aiter_test_scope:
+    name: Detect Aiter Test Scope
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_tests: ${{ steps.detect.outputs.run_tests }}
+      reason: ${{ steps.detect.outputs.reason }}
+    steps:
+      - name: Detect whether Aiter tests are required
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+            echo "reason=non_pull_request_event" >> "$GITHUB_OUTPUT"
+            echo "Aiter tests are required for ${GITHUB_EVENT_NAME}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "${PR_DRAFT}" = "true" ]; then
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=draft_pull_request" >> "$GITHUB_OUTPUT"
+            echo "Aiter tests are skipped because this pull request is a draft." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          requires_aiter_tests() {
+            local file="$1"
+
+            case "${file}" in
+              .github/workflows/aiter-test.yaml)
+                return 0
+                ;;
+              *.md|docs/*|LICENSE|.gitignore|.github/scripts/sglang_downstream.py)
+                return 1
+                ;;
+              .github/workflows/*)
+                return 1
+                ;;
+              *)
+                return 0
+                ;;
+            esac
+          }
+
+          mapfile -t changed_files < <(
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --jq '.[].filename'
+          )
+
+          run_files=()
+          ignored_files=()
+          for file in "${changed_files[@]}"; do
+            if requires_aiter_tests "${file}"; then
+              run_files+=("${file}")
+            else
+              ignored_files+=("${file}")
+            fi
+          done
+
+          if [ "${#run_files[@]}" -gt 0 ]; then
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+            echo "reason=matching_changed_files" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+            echo "reason=only_ignored_changed_files" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "## Aiter Test Scope"
+            echo
+            echo "- Changed files: ${#changed_files[@]}"
+            echo "- Files requiring Aiter tests: ${#run_files[@]}"
+            echo "- Ignored files: ${#ignored_files[@]}"
+            echo
+            if [ "${#run_files[@]}" -gt 0 ]; then
+              echo "Aiter tests are required because at least one changed file matches the Aiter test scope."
+              echo
+              echo "Files requiring Aiter tests:"
+              printf '%s\n' "${run_files[@]}" | sed 's/^/- `/' | sed 's/$/`/'
+            else
+              echo "Aiter tests are not required for this pull request."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   check-signal:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    needs: detect_aiter_test_scope
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -48,9 +133,9 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   build_aiter_wheels:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: build-only-aiter
-    needs: check-signal
+    needs: [detect_aiter_test_scope, check-signal]
     permissions:
       id-token: write
       contents: read
@@ -328,9 +413,9 @@ jobs:
           S3_PUBLIC: "https://rocm.frameworks-nightlies.amd.com/whl-staging/gfx942-gfx950"
 
   split_aiter_tests:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
     runs-on: ubuntu-latest
-    needs: [check-signal, build_aiter_wheels]
+    needs: [detect_aiter_test_scope, check-signal, build_aiter_wheels]
     outputs:
       shard_count: 8
     steps:
@@ -350,8 +435,8 @@ jobs:
           retention-days: 7
 
   prepare_triton_wheel:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
-    needs: check-signal
+    if: ${{ needs.detect_aiter_test_scope.outputs.run_tests == 'true' && (!github.event.pull_request || github.event.pull_request.draft == false) }}
+    needs: [detect_aiter_test_scope, check-signal]
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
       docker-image: rocm/pytorch:latest
@@ -360,10 +445,11 @@ jobs:
 
   standard:
     if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       (!github.event.pull_request || github.event.pull_request.draft == false) &&
       github.event.action != 'labeled'
     name: Standard Tests (1 GPU)
-    needs: [build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
+    needs: [detect_aiter_test_scope, build_aiter_wheels, split_aiter_tests, prepare_triton_wheel]
     strategy:
       fail-fast: false
       matrix:
@@ -677,11 +763,12 @@ jobs:
 
   standard-test-finish:
     if: >-
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       !github.event.pull_request.draft &&
       github.event.action != 'labeled'
     name: Standard Test Results
     runs-on: ubuntu-latest
-    needs: [standard]
+    needs: [detect_aiter_test_scope, standard]
     steps:
       - name: Download all test logs
         uses: actions/download-artifact@v4
@@ -956,11 +1043,12 @@ jobs:
     if: >-
       always() &&
       !cancelled() &&
+      needs.detect_aiter_test_scope.outputs.run_tests == 'true' &&
       !github.event.pull_request.draft &&
       github.event.action != 'labeled' &&
       github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    needs: [standard]
+    needs: [detect_aiter_test_scope, standard]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -1121,3 +1209,73 @@ jobs:
           name: tuned-op-bench-${{ github.sha }}
           path: /tmp/publish/
           retention-days: 90
+
+  aiter-test-gate:
+    name: Aiter Test Gate
+    if: always()
+    runs-on: ubuntu-latest
+    needs:
+      - detect_aiter_test_scope
+      - check-signal
+      - build_aiter_wheels
+      - split_aiter_tests
+      - prepare_triton_wheel
+      - standard
+      - standard-test-finish
+    steps:
+      - name: Evaluate Aiter test gate
+        env:
+          RUN_TESTS: ${{ needs.detect_aiter_test_scope.outputs.run_tests }}
+          REASON: ${{ needs.detect_aiter_test_scope.outputs.reason }}
+          DETECT_RESULT: ${{ needs.detect_aiter_test_scope.result }}
+          CHECK_SIGNAL_RESULT: ${{ needs['check-signal'].result }}
+          BUILD_RESULT: ${{ needs.build_aiter_wheels.result }}
+          SPLIT_RESULT: ${{ needs.split_aiter_tests.result }}
+          TRITON_RESULT: ${{ needs.prepare_triton_wheel.result }}
+          STANDARD_RESULT: ${{ needs.standard.result }}
+          STANDARD_FINISH_RESULT: ${{ needs['standard-test-finish'].result }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Aiter Test Gate"
+            echo
+            echo "- Scope detection: ${DETECT_RESULT}"
+            echo "- Aiter tests required: ${RUN_TESTS:-unknown}"
+            echo "- Reason: ${REASON:-unknown}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DETECT_RESULT}" != "success" ]; then
+            echo "::error::Aiter test scope detection did not succeed: ${DETECT_RESULT}"
+            exit 1
+          fi
+
+          if [ "${RUN_TESTS}" != "true" ]; then
+            echo "Aiter tests are not required for this change." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          failed=()
+          for result in \
+            "check-signal=${CHECK_SIGNAL_RESULT}" \
+            "build_aiter_wheels=${BUILD_RESULT}" \
+            "split_aiter_tests=${SPLIT_RESULT}" \
+            "prepare_triton_wheel=${TRITON_RESULT}" \
+            "standard=${STANDARD_RESULT}" \
+            "standard-test-finish=${STANDARD_FINISH_RESULT}"
+          do
+            job="${result%%=*}"
+            status="${result#*=}"
+            echo "- ${job}: ${status}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${status}" != "success" ]; then
+              failed+=("${job}=${status}")
+            fi
+          done
+
+          if [ "${#failed[@]}" -gt 0 ]; then
+            printf 'Aiter test gate failed because required jobs did not pass:\n' >&2
+            printf '  %s\n' "${failed[@]}" >&2
+            exit 1
+          fi
+
+          echo "Aiter test gate passed." >> "$GITHUB_STEP_SUMMARY"
