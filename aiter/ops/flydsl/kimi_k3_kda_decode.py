@@ -13,6 +13,9 @@ import torch
 from .kernels.kimi_k3_kda_decode import (
     create_kimi_k3_kda_decode_kernel,
 )
+from .kernels.kimi_k3_kda_decode_fb import (
+    create_kimi_k3_kda_decode_fb_kernel,
+)
 from .kernels.tensor_shim import _run_compiled
 
 _HEADS = 12
@@ -68,7 +71,7 @@ def _check_tensor(
 ) -> None:
     if tensor.shape != shape:
         raise ValueError(
-            f"`{name}` must have shape {list(shape)}, " f"got {list(tensor.shape)}."
+            f"`{name}` must have shape {list(shape)}, got {list(tensor.shape)}."
         )
     if tensor.dtype != dtype:
         raise ValueError(f"`{name}` must have dtype {dtype}, got {tensor.dtype}.")
@@ -76,8 +79,7 @@ def _check_tensor(
         raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
     if inner_strides and tensor.stride()[-len(inner_strides) :] != inner_strides:
         raise ValueError(
-            f"`{name}` must have inner strides {inner_strides}, "
-            f"got {tensor.stride()}."
+            f"`{name}` must have inner strides {inner_strides}, got {tensor.stride()}."
         )
 
 
@@ -92,12 +94,16 @@ def _check_same_device(
             raise ValueError(f"`{name}` must be on {device}, got {tensor.device}.")
 
 
-def flydsl_kimi_k3_kda_decode(
+def _validate_kda_inputs(
+    *,
+    api_name: str,
+    batch_source: str,
+    device: torch.device,
+    batch: int,
     x: torch.Tensor,
     conv_weight: torch.Tensor,
     conv_bias: torch.Tensor | None,
     conv_state: torch.Tensor,
-    raw_g: torch.Tensor,
     raw_beta: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -106,48 +112,33 @@ def flydsl_kimi_k3_kda_decode(
     state_indices: torch.Tensor,
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
-    norm_eps: float,
-    out: torch.Tensor | None = None,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run fused Kimi-K3 KDA decode on MI350-series GPUs.
-
-    This pure-decode specialization fuses the packed width-4 Q/K/V causal
-    convolution, the FP32 recurrent-state update, and the BF16
-    RMSNorm/sigmoid output gate. Slot zero is reserved: non-positive
-    ``state_indices`` produce zero output without modifying either cache.
-
-    The layout is fixed to Kimi-K3 TP8: 12 local heads and 128-dimensional
-    key/value state. Call
-    :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
-    model implementation.
-    """
-    if not x.is_cuda:
-        raise ValueError("`x` must be a CUDA tensor.")
-    device = x.device
+    """Validate operands shared by both explicit KDA specializations."""
     if not is_flydsl_kimi_k3_kda_decode_supported(device):
-        raise RuntimeError("`flydsl_kimi_k3_kda_decode` requires a gfx950 GPU.")
-    batch = x.shape[0] if x.ndim == 2 else -1
+        raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
-        raise ValueError("`x` must have a non-empty batch dimension.")
+        raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
     if conv_bias is not None:
         raise ValueError("This specialization requires `conv_bias=None`.")
     if lower_bound is None:
         raise ValueError("This specialization requires the KDA lower-bound gate.")
 
-    tensors = (
-        ("conv_weight", conv_weight),
-        ("conv_state", conv_state),
-        ("raw_g", raw_g),
-        ("raw_beta", raw_beta),
-        ("A_log", A_log),
-        ("dt_bias", dt_bias),
-        ("state", state),
-        ("state_indices", state_indices),
-        ("output_gate", output_gate),
-        ("norm_weight", norm_weight),
+    _check_same_device(
+        (
+            ("x", x),
+            ("conv_weight", conv_weight),
+            ("conv_state", conv_state),
+            ("raw_beta", raw_beta),
+            ("A_log", A_log),
+            ("dt_bias", dt_bias),
+            ("state", state),
+            ("state_indices", state_indices),
+            ("output_gate", output_gate),
+            ("norm_weight", norm_weight),
+        ),
+        device,
     )
-    _check_same_device(tensors, device)
-
     _check_tensor(
         "x",
         x,
@@ -179,21 +170,12 @@ def flydsl_kimi_k3_kda_decode(
         _DIM,
     ):
         raise ValueError(
-            "`state` must have shape [cache, 12, 128, 128], "
-            f"got {list(state.shape)}."
+            f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
         )
     if state.dtype != torch.float32:
         raise ValueError("`state` must have dtype torch.float32.")
     if state.stride()[-3:] != (_DIM * _DIM, _DIM, 1):
         raise ValueError("`state` must be contiguous within each cache slot.")
-    _check_tensor(
-        "raw_g",
-        raw_g,
-        shape=(1, batch, _HEADS, _DIM),
-        dtype=torch.bfloat16,
-        device=device,
-        inner_strides=(_DIM, 1),
-    )
     _check_tensor(
         "raw_beta",
         raw_beta,
@@ -244,21 +226,84 @@ def flydsl_kimi_k3_kda_decode(
     )
 
     if out is None:
-        out = torch.empty(
+        return torch.empty(
             (1, batch, _HEADS, _DIM),
             dtype=torch.bfloat16,
             device=device,
         )
-    else:
-        _check_same_device((("out", out),), device)
-        _check_tensor(
-            "out",
-            out,
-            shape=(1, batch, _HEADS, _DIM),
-            dtype=torch.bfloat16,
-            device=device,
-            inner_strides=(1,),
-        )
+    _check_same_device((("out", out),), device)
+    _check_tensor(
+        "out",
+        out,
+        shape=(1, batch, _HEADS, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    return out
+
+
+def flydsl_kimi_k3_kda_decode(
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_g: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run fused Kimi-K3 KDA decode on MI350-series GPUs.
+
+    This pure-decode specialization fuses the packed width-4 Q/K/V causal
+    convolution, the FP32 recurrent-state update, and the BF16
+    RMSNorm/sigmoid output gate. Slot zero is reserved: non-positive
+    ``state_indices`` produce zero output without modifying either cache.
+
+    The layout is fixed to Kimi-K3 TP8: 12 local heads and 128-dimensional
+    key/value state. Call
+    :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
+    model implementation.
+    """
+    if not x.is_cuda:
+        raise ValueError("`x` must be a CUDA tensor.")
+    device = x.device
+    batch = x.shape[0] if x.ndim == 2 else -1
+    out = _validate_kda_inputs(
+        api_name="flydsl_kimi_k3_kda_decode",
+        batch_source="x",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+    _check_same_device((("raw_g", raw_g),), device)
+    _check_tensor(
+        "raw_g",
+        raw_g,
+        shape=(1, batch, _HEADS, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_DIM, 1),
+    )
 
     executable = create_kimi_k3_kda_decode_kernel(
         float(norm_eps),
@@ -299,7 +344,116 @@ def flydsl_kimi_k3_kda_decode(
     return out
 
 
+def flydsl_kimi_k3_kda_decode_with_f_b(
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    x: torch.Tensor,
+    conv_weight: torch.Tensor,
+    conv_bias: torch.Tensor | None,
+    conv_state: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float | None,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the explicit gfx950 Kimi-K3 f_b plus KDA decode specialization.
+
+    The kernel consumes ``f_a`` and the head-local ``f_b_weight`` directly,
+    accumulates the projection in FP32, and rounds once to BF16 before the KDA
+    lower-bound decay gate. It does not materialize the projected raw-g tensor
+    in global memory.
+    """
+    if not f_a.is_cuda:
+        raise ValueError("`f_a` must be a CUDA tensor.")
+    device = f_a.device
+    batch = f_a.shape[0] if f_a.ndim == 2 else -1
+    _check_same_device((("f_b_weight", f_b_weight),), device)
+    _check_tensor(
+        "f_a",
+        f_a,
+        shape=(batch, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(1,),
+    )
+    _check_tensor(
+        "f_b_weight",
+        f_b_weight,
+        shape=(_HEADS, _DIM, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_DIM, 1),
+    )
+    out = _validate_kda_inputs(
+        api_name="flydsl_kimi_k3_kda_decode_with_f_b",
+        batch_source="f_a",
+        device=device,
+        batch=batch,
+        x=x,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        conv_state=conv_state,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        state=state,
+        state_indices=state_indices,
+        output_gate=output_gate,
+        norm_weight=norm_weight,
+        out=out,
+    )
+
+    executable = create_kimi_k3_kda_decode_fb_kernel(
+        float(norm_eps),
+        float(lower_bound),
+    )
+    with torch.cuda.device(device):
+        stream = torch.cuda.current_stream(device)
+        _run_compiled(
+            executable,
+            f_a,
+            f_b_weight,
+            x,
+            conv_weight,
+            conv_state,
+            raw_beta,
+            A_log,
+            dt_bias,
+            state,
+            state_indices,
+            output_gate,
+            norm_weight,
+            out,
+            batch,
+            f_a.stride(0),
+            f_b_weight.stride(0),
+            f_b_weight.stride(1),
+            x.stride(0),
+            conv_weight.stride(0),
+            conv_weight.stride(1),
+            conv_state.stride(0),
+            conv_state.stride(1),
+            conv_state.stride(2),
+            raw_beta.stride(1),
+            state.stride(0),
+            output_gate.stride(0),
+            output_gate.stride(1),
+            out.stride(1),
+            out.stride(2),
+            stream,
+        )
+    return out
+
+
 __all__ = [
     "flydsl_kimi_k3_kda_decode",
+    "flydsl_kimi_k3_kda_decode_with_f_b",
     "is_flydsl_kimi_k3_kda_decode_supported",
 ]

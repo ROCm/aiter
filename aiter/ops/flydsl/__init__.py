@@ -50,6 +50,7 @@ if is_flydsl_available():
     )
     from .kimi_k3_kda_decode import (
         flydsl_kimi_k3_kda_decode,
+        flydsl_kimi_k3_kda_decode_with_f_b,
         is_flydsl_kimi_k3_kda_decode_supported,
     )
     from .kernels.pa_mqa_logits_fp4 import (
@@ -75,6 +76,7 @@ if is_flydsl_available():
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_kimi_k3_kda_decode",
+        "flydsl_kimi_k3_kda_decode_with_f_b",
         "is_flydsl_kimi_k3_kda_decode_supported",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",

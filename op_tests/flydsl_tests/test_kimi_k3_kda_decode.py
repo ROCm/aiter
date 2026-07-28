@@ -31,6 +31,7 @@ pytestmark = pytest.mark.skipif(
 
 from aiter.ops.flydsl.kimi_k3_kda_decode import (  # noqa: E402
     flydsl_kimi_k3_kda_decode,
+    flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
 )
 
@@ -288,6 +289,60 @@ def _run(inputs: Inputs) -> torch.Tensor:
     )
 
 
+def _make_fb_inputs(
+    batch: int,
+    seed: int = 20260728,
+) -> tuple[torch.Tensor, torch.Tensor, Inputs]:
+    generator = torch.Generator(device=_DEVICE).manual_seed(seed + 10_000 + batch)
+    f_a_storage = torch.randn(
+        (batch, _DIM + 5),
+        dtype=torch.bfloat16,
+        device=_DEVICE,
+        generator=generator,
+    )
+    f_a = f_a_storage[:, :_DIM]
+    f_b_weight = (
+        0.05
+        * torch.randn(
+            (_HEADS, _DIM, _DIM),
+            dtype=torch.bfloat16,
+            device=_DEVICE,
+            generator=generator,
+        )
+    ).to(torch.bfloat16)
+    inputs = _make_inputs(batch, seed)
+    projected = F.linear(
+        f_a.float(),
+        f_b_weight.view(_HEADS * _DIM, _DIM).float(),
+    ).to(torch.bfloat16)
+    inputs.raw_g.copy_(projected.view(1, batch, _HEADS, _DIM))
+    return f_a, f_b_weight, inputs
+
+
+def _run_with_f_b(
+    f_a: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    inputs: Inputs,
+) -> torch.Tensor:
+    return flydsl_kimi_k3_kda_decode_with_f_b(
+        f_a=f_a,
+        f_b_weight=f_b_weight,
+        x=inputs.x,
+        conv_weight=inputs.conv_weight,
+        conv_bias=None,
+        conv_state=inputs.conv_state,
+        raw_beta=inputs.raw_beta,
+        A_log=inputs.A_log,
+        dt_bias=inputs.dt_bias,
+        lower_bound=_LOWER_BOUND,
+        state=inputs.state,
+        state_indices=inputs.state_indices,
+        output_gate=inputs.output_gate,
+        norm_weight=inputs.norm_weight,
+        norm_eps=_NORM_EPS,
+    )
+
+
 def test_public_api_and_support_predicate() -> None:
     import aiter.ops.flydsl as flydsl_ops
 
@@ -298,6 +353,15 @@ def test_public_api_and_support_predicate() -> None:
     )
     assert is_flydsl_kimi_k3_kda_decode_supported(0)
     assert not is_flydsl_kimi_k3_kda_decode_supported("cpu")
+
+
+def test_f_b_public_api() -> None:
+    import aiter.ops.flydsl as flydsl_ops
+
+    assert (
+        flydsl_ops.flydsl_kimi_k3_kda_decode_with_f_b
+        is flydsl_kimi_k3_kda_decode_with_f_b
+    )
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])
@@ -338,3 +402,44 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.count_nonzero(actual) == 0
     assert torch.equal(inputs.conv_state, conv_before)
     assert torch.equal(inputs.state, state_before)
+
+
+@pytest.mark.parametrize("batch", [1, 8, 16])
+def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+
+    reference = _reference(reference_inputs)
+    actual = _run_with_f_b(f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(actual).any()
+    assert _relative_rmse(reference, actual) < 1e-3
+    assert _relative_rmse(reference_inputs.state, actual_inputs.state) < 1e-3
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+    inputs.state_indices.copy_(torch.tensor([0, -1], dtype=torch.int32, device=_DEVICE))
+    conv_before = inputs.conv_state.clone()
+    state_before = inputs.state.clone()
+
+    actual = _run_with_f_b(f_a, f_b_weight, inputs)
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(actual) == 0
+    assert torch.equal(inputs.conv_state, conv_before)
+    assert torch.equal(inputs.state, state_before)
+
+
+def test_f_b_api_rejects_invalid_projection_inputs() -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
+
+    with pytest.raises(ValueError, match="`f_a` must have dtype"):
+        _run_with_f_b(f_a.float(), f_b_weight, inputs)
+    with pytest.raises(ValueError, match="`f_b_weight` must have shape"):
+        _run_with_f_b(f_a, f_b_weight[:, :, :-1], inputs)
+    with pytest.raises(ValueError, match="`f_b_weight` must have inner strides"):
+        _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
