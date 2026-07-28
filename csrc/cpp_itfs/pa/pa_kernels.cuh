@@ -904,7 +904,8 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const scalar_t* __restrict__ tmp_out, // [num_seqs*mtp, num_heads,
                                           // max_num_partitions, head_size]
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const int sliding_window = 0)
 {
     const int num_heads = gridDim.x;
     const int head_idx  = blockIdx.x;
@@ -912,7 +913,12 @@ __inline__ __device__ void _paged_attention_ll4mi_reduce_kernel(
     const auto MTP      = gridDim.z;
     const auto mtp      = blockIdx.z;
 
-    const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
+    const int partition_offset_token =
+        (sliding_window > 0 && context_len > sliding_window)
+            ? ((context_len - sliding_window) / PARTITION_SIZE) * PARTITION_SIZE
+            : 0;
+    const int num_partitions =
+        DIVIDE_ROUND_UP(context_len - partition_offset_token, PARTITION_SIZE);
     constexpr int NUM_WARPS  = NUM_THREADS / WARP_SIZE;
     const int warpid         = threadIdx.x / WARP_SIZE;
     const int laneid         = threadIdx.x % WARP_SIZE;

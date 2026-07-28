@@ -79,12 +79,20 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_QKV_mfma16_
     constexpr int T_PAR_SIZE = 256;
     const int context_len = context_lens[seq_idx];
 
-    const int partition_start_token_idx = partition_idx * T_PAR_SIZE; // partition_size;
+    int partition_offset_token = 0;
+    if constexpr (SLIDING_WINDOW_ENABLED) {
+        if (sliding_window > 0 && context_len > sliding_window) {
+            partition_offset_token =
+                ((context_len - sliding_window) / T_PAR_SIZE) * T_PAR_SIZE;
+        }
+    }
+    const int partition_start_token_idx =
+        partition_offset_token + partition_idx * T_PAR_SIZE;
     if (partition_start_token_idx >= context_len) {
         return;
     }
     const int* block_table_seq = block_tables + seq_idx * max_num_blocks_per_seq;
-    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);    
+    _paged_attention_kernel<scalar_t, cache_t, KV_DTYPE, BLOCK_SIZE, HEAD_SIZE, NUM_THREADS, ALIBI_ENABLED, GQA_RATIO, MTP, AttentionVariant, SLIDING_WINDOW_ENABLED>(block_table_seq, static_cast<int64_t>(query_loc), context_len, partition_start_token_idx, q, k_cache, v_cache, scale, alibi_slopes, q_stride, kv_block_stride, kv_head_stride, kv_seq_stride, exp_sums, max_logits, out, logits_soft_cap, logits_soft_cap_rcp, q_scale_ptr, k_scale_ptr, v_scale_ptr, variant, sliding_window);
 }
 
 // Grid: (num_heads, num_seqs).
@@ -105,7 +113,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int* __restrict__ cu_query_lens,         // [num_seqs+1]
     const int* __restrict__ context_lens,         // [num_seqs]
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const int sliding_window)
 {
     const int num_heads = gridDim.x;
     const auto MTP = gridDim.z;
@@ -121,7 +130,15 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
         return;
     }
     const int context_len = context_lens[seq_idx];
-    _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(static_cast<int64_t>(query_loc), context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr);
+    if (context_len == 0) {
+        OUTT* out_ptr = out +
+                        (static_cast<int64_t>(query_loc) + blockIdx.z) *
+                            gridDim.x * HEAD_SIZE +
+                        static_cast<int64_t>(blockIdx.x) * HEAD_SIZE;
+        out_ptr[threadIdx.x] = OUTT(0);
+        return;
+    }
+    _paged_attention_ll4mi_reduce_kernel<scalar_t, OUTT, HEAD_SIZE, NUM_THREADS, PARTITION_SIZE, NPAR_LOOPS>(static_cast<int64_t>(query_loc), context_len, out, exp_sums, max_logits, tmp_out, max_num_partitions, fp8_out_scale_ptr, sliding_window);
 }
 
 #else // !defined(__HIP__MI300_MI250__) TODO: Add NAVI support
@@ -187,7 +204,8 @@ __global__ __launch_bounds__(NUM_THREADS) void paged_attention_ll4mi_reduce_kern
     const int* __restrict__ cu_query_lens,         // [num_seqs+1]
     const int* __restrict__ context_lens,         // [num_seqs]
     const int max_num_partitions,
-    const float* __restrict__ fp8_out_scale_ptr)
+    const float* __restrict__ fp8_out_scale_ptr,
+    const int sliding_window)
 {
     UNREACHABLE_CODE
 }
