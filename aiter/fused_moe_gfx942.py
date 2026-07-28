@@ -58,8 +58,8 @@ def get_tune_space():
     return [
         # decoding ignored BLOCK_N/BLOCK_K
         Config(16, 16, 16, False).to_string(),
-        # Config(64, 256, 64, True).to_string(),
-        # Config(64, 256, 128, True).to_string(),
+        Config(64, 256, 64, True).to_string(),
+        Config(64, 256, 128, True).to_string(),
         Config(64, 128, 256, True).to_string(),
         Config(64, 128, 128, True).to_string(),
     ]
@@ -247,7 +247,7 @@ def fused_moe_gfx942(
             TOPK=TOPK,
             BLOCK_TILE_SIZE_M=kcfgs.BLOCK_M,
             BLOCK_TILE_SIZE_N=kcfgs.BLOCK_N,
-            BLOCK_TILE_SIZE_K=None,  # kcfgs.BLOCK_K,
+            BLOCK_TILE_SIZE_K=None, # kcfgs.BLOCK_K,
             stage="gateup",
             alg="prefill_1x4",
             E=E,
@@ -276,23 +276,25 @@ def fused_moe_gfx942(
 
         if weight_dtype_str == "fp8":
             assert qtype_str in ["ptpc", "per_tensor"]
-            down_in, down_in_scale = quant_func(
-                gemm1_out.view(B * TOPK, -1),
-                scale=None,
-                quant_dtype=w2.dtype,
-                num_rows=None,
-            )
+            if qtype_str == "ptpc":
+                down_in, down_in_scale = quant_func(
+                    gemm1_out.view(B * TOPK, -1),
+                    scale=None,
+                    quant_dtype=w2.dtype,
+                    num_rows=None,
+                )
+            elif qtype_str == "per_tensor":
+                fmax = torch.finfo(w2.dtype).max
+                down_in_scale = down_in.float().abs().amax() / fmax
+                down_in = (down_in.float() / down_in_scale).clamp(-fmax, fmax).to(w2.dtype)
+                down_in_scale = down_in_scale.reshape(1).to(torch.float32)
         else:
             down_in = gemm1_out
-            down_in_scale = torch.empty(
-                1, dtype=torch.float32, device=hidden_states.device
-            )
+            down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)
 
-        gemm2_out = torch.empty(
-            [sorted_expert_ids.shape[0] * kcfgs.BLOCK_M, N2],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        gemm2_out = torch.empty([B, TOPK, N2],
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device)
 
         # Compile and launch down kernel (splitk; consumes the bf16 gateup output directly,
         # no inter-stage quantization).
@@ -327,18 +329,7 @@ def fused_moe_gfx942(
             B,
             task_num,
         )
-        loc_ids = torch.empty([B, TOPK], dtype=torch.int32, device=hidden_states.device)
-
-        # invert_sorted_ids scans only [0, num_valid) (bound read on-device, no host
-        # sync): the tail of sorted_ids (>= num_valid) is uninitialized, and its garbage
-        # can racily map real tokens onto unwritten gemm2_out rows, producing NaN in the
-        # sorted_sum gather. num_valid_ids[0] is the down kernel's write boundary; the
-        # full sorted size only sizes the launch grid.
-        invert_sorted_ids(TOPK)(
-            sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], B
-        )
-        sorted_sum(TOPK, N2)(loc_ids, gemm2_out, cur_out, B)
-
+        cur_out = torch.sum(gemm2_out, dim=1)
         return cur_out
 
     if B == 1:

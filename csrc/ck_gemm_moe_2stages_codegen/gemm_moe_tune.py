@@ -14,6 +14,13 @@ from aiter.jit.core import (
     AITER_CONFIG_FMOE,
     AITER_ROOT_DIR,
 )
+from aiter.jit.core import (
+    get_asm_dir,
+    AITER_CSRC_DIR,
+    AITER_CONFIG_FMOE,
+    AITER_CONFIG_GROUPED_FMOE,
+    AITER_ROOT_DIR,
+)
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
@@ -2158,9 +2165,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(
-        self, args, target_fused_moe=None, try_extra_ref=False, config_string=""
-    ):
+    def run_config(self, args, target_fused_moe=None, try_extra_ref=False, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
@@ -3196,7 +3201,7 @@ class FmoeTuner(TunerCommon):
                         target_fused_moe, config_string=config_string
                     ),
                     try_extra_ref=True,
-                    config_string=config_string,
+                    config_string = config_string,
                 )
             except Exception as e:
                 print(f"{RED}Error with config {config_string}: {e}{END}")
