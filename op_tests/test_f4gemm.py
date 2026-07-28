@@ -360,15 +360,15 @@ def test_gemm(
             elif out_fp4:
                 res = aiter.gemm_a4w4o4(*args, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4o4 must return a tensor"
-                assert res.shape == out.shape, (
-                    f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
-                )
+                assert (
+                    res.shape == out.shape
+                ), f"gemm_a4w4o4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
             else:  # bf16
                 res = aiter.gemm_a4w4(*args, dtype=out_dtype, **a4_kwargs)
                 assert not isinstance(res, tuple), "gemm_a4w4 must return a tensor"
-                assert res.shape == out.shape, (
-                    f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
-                )
+                assert (
+                    res.shape == out.shape
+                ), f"gemm_a4w4 shape mismatch: {tuple(res.shape)} vs {tuple(out.shape)}"
         if out_fp4:
             # e2m1 is deterministic: compare dequantized values with zero
             # tolerance (exact fp4-code match). Borderline RNE ties may differ.
