@@ -92,6 +92,12 @@ def _as_int(value, default: int | None = None) -> int | None:
     return int(value)
 
 
+def _as_float(value, default: float) -> float:
+    if value is None or str(value).strip() == "":
+        return float(default)
+    return float(value)
+
+
 def _scheduler_variants(row, base_job):
     # Production dispatch (grouped_moe_gfx1250._maybe_grouped_gfx1250_a8w4_moe)
     # hardcodes grouped_persistent_m=False and expert_sched_mode=False; the only
@@ -142,6 +148,13 @@ def parse_csv(csv_path: str):
             topk = int(row.get("topk") or 1)
             raw_max_m = _as_int(row.get("max_m"), token_num)
             max_m = _align_max_m(raw_max_m, warp_tile_m)
+            act_type = row.get("act_type", "")
+            if "Situv2" in act_type:
+                act = "situv2"
+            elif "Swiglu" in act_type:
+                act = "swiglu"
+            else:
+                act = "silu"
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
                 "model_dim": int(row["model_dim"]),
@@ -161,7 +174,9 @@ def parse_csv(csv_path: str):
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
                 "stage1_weight_layout": row.get("stage1_weight_layout") or "gguu",
-                "act": "swiglu" if "Swiglu" in row.get("act_type", "") else "silu",
+                "act": act,
+                "situ_beta": _as_float(row.get("situ_beta"), 1.0),
+                "situ_linear_beta": _as_float(row.get("situ_linear_beta"), 1.0),
                 "data_format": (
                     "fp4" if "float4" in row.get("q_dtype_a", "") else "a8w4"
                 ),
@@ -424,23 +439,23 @@ def compile_one_config(**job):
         )
         warp_tile_m = job["tile_m"] // job["m_warp"]
         contiguous = bool(job.get("grouped_contiguous_m", False))
-        common = dict(
-            model_dim=job["model_dim"],
-            inter_dim=job["inter_dim"],
-            experts=job["experts"],
-            max_m=job["max_m"],
-            tile_m=job["tile_m"],
-            tile_n=job["tile_n"],
-            tile_k=job["tile_k"],
-            m_warp=job["m_warp"],
-            n_warp=job["n_warp"],
-            out_dtype=job["out_dtype"],
-            num_buffers=job["num_buffers"],
-            grouped_persistent_m=job["grouped_persistent_m"],
-            grouped_contiguous_m=contiguous,
-            persistent_workers=job["persistent_workers"],
-            expert_sched_mode=job["expert_sched_mode"],
-        )
+        common = {
+            "model_dim": job["model_dim"],
+            "inter_dim": job["inter_dim"],
+            "experts": job["experts"],
+            "max_m": job["max_m"],
+            "tile_m": job["tile_m"],
+            "tile_n": job["tile_n"],
+            "tile_k": job["tile_k"],
+            "m_warp": job["m_warp"],
+            "n_warp": job["n_warp"],
+            "out_dtype": job["out_dtype"],
+            "num_buffers": job["num_buffers"],
+            "grouped_persistent_m": job["grouped_persistent_m"],
+            "grouped_contiguous_m": contiguous,
+            "persistent_workers": job["persistent_workers"],
+            "expert_sched_mode": job["expert_sched_mode"],
+        }
         if contiguous:
             act_lead = 1
             ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
@@ -508,6 +523,8 @@ def compile_one_config(**job):
             )
             exe1 = compiler1(
                 act=job["act"],
+                situ_beta=job.get("situ_beta", 1.0),
+                situ_linear_beta=job.get("situ_linear_beta", 1.0),
                 stage1_weight_layout=job["stage1_weight_layout"],
                 split_k=job["split_k1"],
                 **common,
@@ -593,7 +610,7 @@ def compile_one_config(**job):
         elapsed = time.time() - t0
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Catch everything and return cleanly with compile_time=None: the AOT pool
         # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
         # NOT retry it. An escaping exception crashes the worker (exitcode != 0),

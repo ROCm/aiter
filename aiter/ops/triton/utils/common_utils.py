@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List
+
+import json
 
 import torch
 import triton
-import json
 
 
 def prev_power_of_2(x: int) -> int:
@@ -13,12 +13,11 @@ def prev_power_of_2(x: int) -> int:
     return out // 2 if out > x else out
 
 
-STATIC_MAX_SEQ_LENS: List[int] = []
+STATIC_MAX_SEQ_LENS: list[int] = []
 USE_RUNTIME_MAX_SEQ_LEN: bool = False
 
 
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
-    global USE_RUNTIME_MAX_SEQ_LEN
 
     if USE_RUNTIME_MAX_SEQ_LEN:
         return prev_power_of_2(runtime_max_seq_len)

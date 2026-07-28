@@ -5,11 +5,10 @@
 
 from __future__ import annotations
 
-import mori.ir.flydsl as mori_shmem
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
+import torch
 from flydsl._mlir import ir
 from flydsl.expr import T, arith, const_expr, range_constexpr
 from flydsl.expr.buffer_ops import (
@@ -79,7 +78,7 @@ def make_dispatch_kernel(
     scale_type_size: int = 0,
     enable_std_moe: bool = False,
     data_type=None,
-    max_recv: int = None,
+    max_recv: int | None = None,
 ):
     """Build intranode dispatch ``@flyc.kernel``. ``max_recv`` caps per-rank recv
     slots (must match combine decode); None => npes * max_tok_per_rank."""
@@ -168,14 +167,11 @@ def make_dispatch_kernel(
             is_dup = dup_ballot != 0
 
             dest_tok_lane0 = fx.Int32(0)
-            if lane == 0:
-                if dup_ballot == 0:
-                    dest_tok_lane0 = atomic_add_global_at(
-                        buffer_load(
-                            _r_p2p_tok_off, dest_pe, vec_width=1, dtype=T.i64()
-                        ),
-                        1,
-                    )
+            if lane == 0 and dup_ballot == 0:
+                dest_tok_lane0 = atomic_add_global_at(
+                    buffer_load(_r_p2p_tok_off, dest_pe, vec_width=1, dtype=T.i64()),
+                    1,
+                )
             dest_tok_id = readlane(T.i32(), dest_tok_lane0, 0)
 
             # Recv-cap overflow (mori max_total_recv_tokens): overflow slots take
@@ -203,46 +199,40 @@ def make_dispatch_kernel(
                     dest_ctr_addr = addr_dest_pe_ctr + fx.Int64(dest_pe) * 4
                     atomic_add_global_at(dest_ctr_addr, 1)
 
-            if lane < experts_per_token:
-                if do_publish:
-                    wt_src_off = src_tok * experts_per_token + lane
-                    wt_val = buffer_load(_r_wts, wt_src_off, vec_width=1, dtype=T.f32())
-                    idx_val = buffer_load(
-                        _r_idx, wt_src_off, vec_width=1, dtype=T.i32()
-                    )
-                    dest_slot = dest_tok_id * experts_per_token + lane
-                    _r_wts_remote = create_buffer_resource_from_addr(
-                        buffer_load(_r_p2p_out_wts, dest_pe, vec_width=1, dtype=T.i64())
-                    )
-                    buffer_store(
-                        arith.bitcast(T.i32(), wt_val), _r_wts_remote, dest_slot
-                    )
-                    _r_idx_remote = create_buffer_resource_from_addr(
-                        buffer_load(_r_p2p_out_idx, dest_pe, vec_width=1, dtype=T.i64())
-                    )
-                    buffer_store(idx_val, _r_idx_remote, dest_slot)
+            if lane < experts_per_token and do_publish:
+                wt_src_off = src_tok * experts_per_token + lane
+                wt_val = buffer_load(_r_wts, wt_src_off, vec_width=1, dtype=T.f32())
+                idx_val = buffer_load(_r_idx, wt_src_off, vec_width=1, dtype=T.i32())
+                dest_slot = dest_tok_id * experts_per_token + lane
+                _r_wts_remote = create_buffer_resource_from_addr(
+                    buffer_load(_r_p2p_out_wts, dest_pe, vec_width=1, dtype=T.i64())
+                )
+                buffer_store(arith.bitcast(T.i32(), wt_val), _r_wts_remote, dest_slot)
+                _r_idx_remote = create_buffer_resource_from_addr(
+                    buffer_load(_r_p2p_out_idx, dest_pe, vec_width=1, dtype=T.i64())
+                )
+                buffer_store(idx_val, _r_idx_remote, dest_slot)
 
-            if const_expr(enable_scales):
-                if do_publish:
-                    # Lane-strided (lane < scale_n_i32 would drop the tail).
-                    _r_scales = create_buffer_resource_from_addr(addr_inp_scales)
-                    _r_sc_remote = create_buffer_resource_from_addr(
-                        buffer_load(
-                            create_buffer_resource_from_addr(
-                                arith.unwrap(addr_p2p_out_scales)
-                            ),
-                            dest_pe,
-                            vec_width=1,
-                            dtype=T.i64(),
-                        )
+            if const_expr(enable_scales) and do_publish:
+                # Lane-strided (lane < scale_n_i32 would drop the tail).
+                _r_scales = create_buffer_resource_from_addr(addr_inp_scales)
+                _r_sc_remote = create_buffer_resource_from_addr(
+                    buffer_load(
+                        create_buffer_resource_from_addr(
+                            arith.unwrap(addr_p2p_out_scales)
+                        ),
+                        dest_pe,
+                        vec_width=1,
+                        dtype=T.i64(),
                     )
-                    for k_off in range(lane, scale_n_i32, 64):
-                        sc_src_off = src_tok * scale_n_i32 + k_off
-                        sc_val = buffer_load(
-                            _r_scales, sc_src_off, vec_width=1, dtype=T.i32()
-                        )
-                        sc_dst_off = dest_tok_id * scale_n_i32 + k_off
-                        buffer_store(sc_val, _r_sc_remote, sc_dst_off)
+                )
+                for k_off in range(lane, scale_n_i32, 64):
+                    sc_src_off = src_tok * scale_n_i32 + k_off
+                    sc_val = buffer_load(
+                        _r_scales, sc_src_off, vec_width=1, dtype=T.i32()
+                    )
+                    sc_dst_off = dest_tok_id * scale_n_i32 + k_off
+                    buffer_store(sc_val, _r_sc_remote, sc_dst_off)
 
             # Each lane owns 4 i32 (16 B); dropped slots get copy_end == off => no-op.
             remote_tok_addr = (
@@ -318,9 +308,8 @@ def make_dispatch_kernel(
                 atomic_add_global_at(addr_out_total_recv, peer_recv_count)
                 buffer_store(fx.Int32(0), _r_dest_ctr, src_pe)
 
-        if global_warp_id == 0:
-            if lane == 0:
-                buffer_store(fx.Int32(0), _r_tok_off, 0)
+        if global_warp_id == 0 and lane == 0:
+            buffer_store(fx.Int32(0), _r_tok_off, 0)
 
         # Phase 4: ConvertDispatchOutput (StdMoE).
         if const_expr(enable_std_moe):
@@ -359,12 +348,11 @@ def make_dispatch_kernel(
                 )
 
                 packed_slot_lane0 = fx.Int32(0)
-                if lane == 0:
-                    if is_local:
-                        count_addr = (
-                            addr_out_packed_recv_count + fx.Int64(local_expert_id) * 4
-                        )
-                        packed_slot_lane0 = atomic_add_global_at(count_addr, 1)
+                if lane == 0 and is_local:
+                    count_addr = (
+                        addr_out_packed_recv_count + fx.Int64(local_expert_id) * 4
+                    )
+                    packed_slot_lane0 = atomic_add_global_at(count_addr, 1)
                 packed_slot = readlane(T.i32(), packed_slot_lane0, 0)
 
                 safe_local_expert = is_local.select(local_expert_id, 0)
@@ -378,16 +366,15 @@ def make_dispatch_kernel(
                     slot_map_addr = addr_out_disp_tok_map + fx.Int64(smoe_idx) * 8
                     store_i64_global_system(slot_map_addr, slot_val_i64)
 
-                if lane == 0:
-                    if is_local:
-                        src_pos_enc = buffer_load(
-                            _r_tis_local, smoe_tok_id, vec_width=1, dtype=T.i32()
-                        )
-                        store_i32_system(
-                            addr_out_packed_recv_src_info,
-                            packed_linear_idx,
-                            src_pos_enc,
-                        )
+                if lane == 0 and is_local:
+                    src_pos_enc = buffer_load(
+                        _r_tis_local, smoe_tok_id, vec_width=1, dtype=T.i32()
+                    )
+                    store_i32_system(
+                        addr_out_packed_recv_src_info,
+                        packed_linear_idx,
+                        src_pos_enc,
+                    )
 
                 src_tok_base = addr_shmem_tok + fx.Int64(smoe_tok_id) * nbytes
                 dst_tok_base = (
@@ -444,7 +431,7 @@ def make_combine_kernel(
     zero_copy: bool = False,
     skip_stage1: bool = False,
     fp8_direct_cast: bool = False,
-    max_recv: int = None,
+    max_recv: int | None = None,
 ):
     """Build the intranode combine ``@flyc.kernel``.
 
@@ -996,13 +983,25 @@ def make_combine_kernel(
                     )
                     expert_vlds.append(vld_k)
 
-            def _accum_step(ec_abs, U):
+            # Bind the per-iteration resources as defaults so each definition
+            # captures its own iteration's values (also silences B023).
+            def _accum_step(
+                ec_abs,
+                U,
+                expert_rsrcs=expert_rsrcs,
+                expert_vlds=expert_vlds,
+                tok_id=tok_id,
+            ):
                 vals = [[] for _ in range(U)]
                 for k_slot in range_constexpr(experts_per_token):
                     rsrc_k = expert_rsrcs[k_slot]
                     vld_k = expert_vlds[k_slot]
                     for u in range_constexpr(U):
-                        kw = dict(vec_width=1, dtype=T.i32(), cache_modifier=SLC_CACHE)
+                        kw = {
+                            "vec_width": 1,
+                            "dtype": T.i32(),
+                            "cache_modifier": SLC_CACHE,
+                        }
                         if u > 0:
                             kw["soffset_bytes"] = u * 256
                         vals[u].append(_maybe_load(rsrc_k, ec_abs, vld_k, **kw))
@@ -1016,12 +1015,12 @@ def make_combine_kernel(
 
                 for u in range_constexpr(U):
                     acc = _accum_experts(vals[u])
-                    kw = dict(cache_modifier=SLC_CACHE)
+                    kw = {"cache_modifier": SLC_CACHE}
                     if u > 0:
                         kw["soffset_bytes"] = u * out_step
                     buffer_store(acc, rsrc_out, out_off, **kw)
 
-            def _accum_loop(end, U):
+            def _accum_loop(end, U, hdim_off=hdim_off):
                 step = U * 64
                 # Align end down to step so the main loop never overruns; tail
                 # covers the remainder (U==1 => empty tail).
@@ -1180,7 +1179,7 @@ def make_dispatch_jit(
         addr_out_disp_tok_map: fx.Int64,
         addr_disp_grid_bar: fx.Int64,
         inp_cur_tok: fx.Int32,
-        stream: Stream = Stream(None),
+        stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = (
             _key_rank,
@@ -1310,7 +1309,7 @@ def make_combine_jit(
         addr_inp_disp_tok_map: fx.Int64,
         addr_inp_disp_wts: fx.Int64,
         cur_rank_num_token: fx.Int32,
-        stream: Stream = Stream(None),
+        stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = (
             _key_rank,

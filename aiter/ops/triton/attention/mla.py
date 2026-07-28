@@ -1,31 +1,33 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import triton
-import torch
-from aiter.ops.triton.utils.device_info import get_num_sms
 import math
-from aiter.ops.triton._triton_kernels.attention.mla import (
-    _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
-)
+
+import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_kernel as triton_mla_decode_fwd_kernel,
 )
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_decode_fwd_reduce_kernel as triton_mla_decode_fwd_reduce_kernel,
 )
+from aiter.ops.triton._triton_kernels.attention.mla import (
+    _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
+)
+from aiter.ops.triton.utils.device_info import get_num_sms
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
         _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
     )
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
+        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
     )
 except:  # noqa: E722
     gluon_mla_prefill_fwd_kernel_non_pipelined = None
@@ -33,7 +35,7 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -82,11 +84,10 @@ def select_3d_config(
         reduce_num_warps = 4
         attn_waves_per_eu = 1
         reduce_waves_per_eu = 1
-        if shuffled_kv_cache:
-            if kv_dtype == torch.uint8:
-                assert (
-                    block_size == 128
-                ), "Only block_size == 128 is supported for FP4 KV cache"
+        if shuffled_kv_cache and kv_dtype == torch.uint8:
+            assert (
+                block_size == 128
+            ), "Only block_size == 128 is supported for FP4 KV cache"
 
         occ = attn_waves_per_eu * 4 // attn_num_warps
         MAX_SEGMENTS = max(1, math.ceil(maybe_guess_max_seqlen_k / TILE_SIZE))
@@ -145,8 +146,8 @@ def mla_prefill_fwd(
         not shuffled_kv_cache
     ), "Shuffled kv cache is not supported in mla_prefill_fwd"
 
-    total_num_tokens, num_query_heads, qk_head_dim = q.shape
-    num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
+    _total_num_tokens, num_query_heads, qk_head_dim = q.shape
+    _num_blocks, block_size, num_kv_heads, _ = kv_buffer.shape
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     q_dtype = q.dtype

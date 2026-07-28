@@ -5,21 +5,16 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
+import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
-from flydsl.utils.smem_allocator import SmemAllocator
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -45,9 +40,6 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     )
 
 
-allocator = None
-
-
 def compute_prefill_schedule(
     row_to_batch,
     local_starts,
@@ -55,8 +47,14 @@ def compute_prefill_schedule(
     block_k,
     parallel_unit_num,
     max_seq_len,
+    cta_info_out=None,
 ):
-    """Compute the persistent-grid schedule for ragged-prefill MQA logits."""
+    """Compute the persistent-grid schedule for ragged-prefill MQA logits.
+
+    Pass `cta_info_out` (a fixed [parallel_unit_num, CTA_INFO_WIDTH] int32 buffer)
+    to write the schedule into a stable address (CUDAGraph decode: the captured
+    kernel replays from this pointer while `build()` refreshes its contents).
+    """
     device = local_ends.device
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
@@ -94,7 +92,10 @@ def compute_prefill_schedule(
 
     # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
     # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
-    cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    if cta_info_out is None:
+        cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
+    else:
+        cta_info = cta_info_out
     safe_i32 = safe.reshape(1).to(torch.int32)
     total_splits_i32 = total_splits.reshape(1).to(torch.int32)
     BLOCK_P = 256
@@ -196,7 +197,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
         head_dim % 128 == 0
     ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
-    global allocator
 
     N_TILES = block_k // MFMA_N
     assert (
@@ -236,11 +236,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
     def _mod_kb(x):
         return (x & fx.Int32(_kb_mask)) if _kb_is_pow2 else (x % kv_block_size)
-
-    allocator = SmemAllocator(
-        None, arch="gfx950", global_sym_name="mqa_fp4_prefill_smem"
-    )
-    allocator.ptr = 16  # minimal, no LDS needed for this approach
 
     QS_DW = (m_tiles + 3) // 4
     qs_pad = QS_DW * 4
@@ -622,8 +617,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
         )
 
-    allocator.block_threads = block_threads_k
-    return pa_mqa_logits_fp4_prefill_kernel, allocator
+    return pa_mqa_logits_fp4_prefill_kernel, block_threads_k
 
 
 # ============================================================================
@@ -641,7 +635,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    kfn, alloc = build_pa_mqa_logits_fp4_prefill_module(
+    kfn, block_threads = build_pa_mqa_logits_fp4_prefill_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
         max_blocks_per_seq=max_blocks_per_seq,
@@ -649,7 +643,6 @@ def compile_pa_mqa_logits_fp4_prefill(
         heads=heads,
         head_dim=head_dim,
     )
-    block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
     @flyc.jit
     def launch_pa_mqa_logits_fp4_prefill(
@@ -666,11 +659,6 @@ def compile_pa_mqa_logits_fp4_prefill(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        # Re-finalize the smem allocator into this launch's gpu module body.
-        alloc.finalized = False
-        cctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(cctx.gpu_module_body):
-            alloc.finalize()
         gxi = arith.index_cast(T.index, gx.ir_value())
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
@@ -696,10 +684,10 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    n_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Ragged-prefill FP4 paged MQA logits (gfx950)."""
     total_tokens, heads, head_dim_packed = q_fp4.shape
@@ -756,3 +744,143 @@ def flydsl_pa_mqa_logits_fp4_prefill(
         stream,
     )
     return out
+
+
+@triton.jit
+def _varqlen_windows_kernel(
+    cu_ptr,  # [B+1] int32, prefix-sum of per-batch qlen
+    ctx_ptr,  # [B] int32, per-batch KV length
+    row_to_batch_ptr,  # [total_q] int32 (out)
+    local_starts_ptr,  # [total_q] int32 (out)
+    local_ends_ptr,  # [total_q] int32 (out)
+    total_q,
+    B,
+    BLOCK: tl.constexpr,
+):
+    """Fused build of ragged-row metadata for per-batch variable qlen (MTP)."""
+    pid = tl.program_id(0)
+    r = pid * BLOCK + tl.arange(0, BLOCK)
+    rmask = r < total_q
+
+    lo = tl.zeros([BLOCK], tl.int32)
+    hi = tl.full([BLOCK], B, tl.int32)
+    for _ in tl.static_range(32):
+        mid = (lo + hi) // 2
+        cu_mid = tl.load(
+            cu_ptr + 1 + tl.minimum(mid, B - 1), mask=(mid < B), other=2147483647
+        )
+        go_right = cu_mid <= r
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    b = tl.minimum(lo, B - 1)
+
+    cu_b = tl.load(cu_ptr + b, mask=rmask, other=0)
+    cu_b1 = tl.load(cu_ptr + b + 1, mask=rmask, other=0)
+    ctx_b = tl.load(ctx_ptr + b, mask=rmask, other=0)
+    n = r - cu_b
+    qlen = cu_b1 - cu_b
+    le = tl.maximum(ctx_b - qlen + n + 1, 0)
+    # Rows beyond the real total Σ (cu[B]) are FLAT tail-padding — force an empty
+    # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
+    # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
+    real_total = tl.load(cu_ptr + B)
+    le = tl.where(r < real_total, le, tl.zeros([BLOCK], tl.int32))
+
+    tl.store(row_to_batch_ptr + r, b, mask=rmask)
+    tl.store(local_starts_ptr + r, tl.zeros([BLOCK], tl.int32), mask=rmask)
+    tl.store(local_ends_ptr + r, le, mask=rmask)
+
+
+def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
+    """Build ragged-row metadata for per-batch variable query length (MTP).
+
+    Pass `out=(row_to_batch, local_starts, local_ends)` (fixed int32 buffers each
+    >= total_q long) to write into stable addresses — the CUDAGraph decode path
+    scores all padded rows, so top_k replays from these window pointers while
+    `build()` refreshes their contents. Rows past the real total (cu[B]) get an
+    empty window (local_ends == 0) so they are skipped.
+    """
+    dev = cu_seq_q.device
+    cu = cu_seq_q.to(torch.int32).contiguous()
+    ctx = context_lens.to(torch.int32).contiguous()
+    B = ctx.shape[0]
+    if out is None:
+        row_to_batch = torch.empty(total_q, dtype=torch.int32, device=dev)
+        local_starts = torch.empty(total_q, dtype=torch.int32, device=dev)
+        local_ends = torch.empty(total_q, dtype=torch.int32, device=dev)
+    else:
+        row_to_batch, local_starts, local_ends = out
+    if total_q > 0:
+        BLOCK = 256
+        grid = (triton.cdiv(total_q, BLOCK),)
+        _varqlen_windows_kernel[grid](
+            cu,
+            ctx,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            total_q,
+            B,
+            BLOCK=BLOCK,
+        )
+    return row_to_batch, local_starts, local_ends
+
+
+def flydsl_pa_mqa_logits_fp4_varqlen(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    max_seq_len: int,
+    *,
+    cu_seq_q: torch.Tensor | None = None,
+    context_lens: torch.Tensor | None = None,
+    windows: tuple | None = None,
+    weight_scale: float = 1.0,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: int | None = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Variable-qlen (per-batch MTP) FP4 paged MQA logits (gfx950)."""
+    total_q = q_fp4.shape[0]
+    if windows is None:
+        if cu_seq_q is None or context_lens is None:
+            raise ValueError(
+                "flydsl_pa_mqa_logits_fp4_varqlen: pass windows=(row_to_batch, "
+                "local_starts, local_ends) built once via "
+                "compute_varqlen_windows, or both cu_seq_q and context_lens "
+                "to build them here."
+            )
+        windows = compute_varqlen_windows(cu_seq_q, context_lens, total_q)
+    row_to_batch, local_starts, local_ends = windows
+    if parallel_unit_num is None:
+        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
+        parallel_unit_num = total_q * chunks_per_seq
+    return flydsl_pa_mqa_logits_fp4_prefill(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_to_batch,
+        local_starts,
+        local_ends,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        num_warps=num_warps,
+        parallel_unit_num=parallel_unit_num,
+        out=out,
+        cta_info=cta_info,
+        n_ctas=n_ctas,
+        stream=stream,
+    )

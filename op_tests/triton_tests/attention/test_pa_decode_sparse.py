@@ -22,7 +22,7 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale):
     Returns:
         [B, M, H, D] same dtype as q.
     """
-    B, M, H, D = q.shape
+    B, M, H, _D = q.shape
     K = topk_idxs.shape[-1]
     device = q.device
     out_dtype = q.dtype
