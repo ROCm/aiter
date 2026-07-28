@@ -61,6 +61,10 @@ from .tensor_shim import GTensor, _run_compiled, ptr_arg
 # not implemented here; the public API raises clearly on that arch.
 WAVE = 64
 _LOG2_WAVE = int(math.log2(WAVE))
+# The production HIP kernel reduces RMSNorm over 32-lane logical warps.
+# Keep wave64 for the output mapping, but reduce each half-wave independently.
+RMS_GROUP = 32
+_LOG2_RMS_GROUP = int(math.log2(RMS_GROUP))
 
 # Threads per KV-fusion block: KV_THREADS // WAVE waves, each looping over
 # the page block's tokens. 512 gives good occupancy and, for the common
@@ -121,6 +125,7 @@ def _build_q_kernel(
 ):
     H_Q, H_K, H_V, D = num_heads_q, num_heads_k, num_heads_v, head_size
     HALF = D // 2
+    PROD_VEC_SIZE = D // RMS_GROUP
     VEC_PAIRS = max(1, HALF // WAVE)
 
     kname = f"qk_norm_mrope_q_H{H_Q}_D{D}_flydsl"
@@ -145,13 +150,14 @@ def _build_q_kernel(
         # merely *called* from it are not. See flydsl-best-practices.md S1.
         fm_fast = arith.FastMathFlags.fast
 
-        def wave_reduce_add(x):
+        def rms_reduce_add(x, lane):
             v = x
-            for sh_exp in range_constexpr(_LOG2_WAVE):
-                off = WAVE // (2 << sh_exp)
-                peer = v.shuffle_xor(off, WAVE)
+            for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
+                off = RMS_GROUP // (2 << sh_exp)
+                peer = v.shuffle_xor(off, RMS_GROUP)
                 v = v.addf(peer, fastmath=fm_fast)
-            return v
+            other_half = v.shuffle_xor(RMS_GROUP, WAVE)
+            return (lane < RMS_GROUP).select(v, other_half)
 
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
             """Interleaved 3D-mrope cos/sin gather for column ``col`` in
@@ -200,16 +206,21 @@ def _build_q_kernel(
         q_out_t = GTensor(q_out, dtype=T.bf16, shape=(-1, H_Q, D))
 
         if const_expr(D == 64):
-            # Only lanes 0..31 own a NEOX pair. All 64 lanes participate in
-            # the reduction; the upper half contributes zero.
+            # Both half-waves reproduce production's contiguous D/32
+            # accumulation and XOR-by-16..1 reduction. Only the lower half
+            # owns output for D=64.
             x0 = fx.Float32(0.0)
             x1 = fx.Float32(0.0)
             sumsq_local = fx.Float32(0.0)
+            if tid < RMS_GROUP:
+                for i in range_constexpr(PROD_VEC_SIZE):
+                    norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
+                    norm_x = fx.BFloat16(qkv_t[tok, bid_x, norm_col]).to(fx.Float32)
+                    sumsq_local = sumsq_local + norm_x * norm_x
             if tid < HALF:
                 x0 = fx.BFloat16(qkv_t[tok, bid_x, tid]).to(fx.Float32)
                 x1 = fx.BFloat16(qkv_t[tok, bid_x, tid + HALF]).to(fx.Float32)
-                sumsq_local = x0 * x0 + x1 * x1
-            sumsq = wave_reduce_add(sumsq_local)
+            sumsq = rms_reduce_add(sumsq_local, tid)
             rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
             if tid < HALF:
                 w0 = fx.BFloat16(qw_t[tid]).to(fx.Float32)
@@ -233,14 +244,18 @@ def _build_q_kernel(
             # over the full D-wide row via one wave butterfly. ----
             x0s, x1s = [], []
             sumsq_local = fx.Float32(0.0)
+            if tid < RMS_GROUP:
+                for i in range_constexpr(PROD_VEC_SIZE):
+                    norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
+                    norm_x = fx.BFloat16(qkv_t[tok, bid_x, norm_col]).to(fx.Float32)
+                    sumsq_local = sumsq_local + norm_x * norm_x
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
                 x0 = fx.BFloat16(qkv_t[tok, bid_x, col]).to(fx.Float32)
                 x1 = fx.BFloat16(qkv_t[tok, bid_x, col + HALF]).to(fx.Float32)
                 x0s.append(x0)
                 x1s.append(x1)
-                sumsq_local = sumsq_local + x0 * x0 + x1 * x1
-            sumsq = wave_reduce_add(sumsq_local)
+            sumsq = rms_reduce_add(sumsq_local, tid)
             rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
             # ---- Pass 2: per-pair weight + RoPE + store. ----
@@ -315,7 +330,7 @@ def _build_kv_kernel(
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
-    PROD_VEC_SIZE = D // WAVE
+    PROD_VEC_SIZE = D // RMS_GROUP
     VEC_PAIRS = max(1, HALF // WAVE)
     WAVES_PER_BLOCK = KV_THREADS // WAVE
     PHASE1_ITERS = _ceil_div(block_size, WAVES_PER_BLOCK)
@@ -386,12 +401,13 @@ def _build_kv_kernel(
         )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
 
-        def wave_reduce_add(v):
-            for sh_exp in range_constexpr(_LOG2_WAVE):
-                off = WAVE // (2 << sh_exp)
-                peer = v.shuffle_xor(off, WAVE)
+        def rms_reduce_add(v, lane):
+            for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
+                off = RMS_GROUP // (2 << sh_exp)
+                peer = v.shuffle_xor(off, RMS_GROUP)
                 v = v.addf(peer, fastmath=fm_fast)
-            return v
+            other_half = v.shuffle_xor(RMS_GROUP, WAVE)
+            return (lane < RMS_GROUP).select(v, other_half)
 
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
             if const_expr(is_interleaved):
@@ -493,17 +509,16 @@ def _build_kv_kernel(
                     # pattern). ----
                     k0s, k1s = [], []
                     sumsq_local = fx.Float32(0.0)
-                    # Production's vec_t<T, D/WAVE> gives each lane
-                    # contiguous dimensions for its local RMS accumulation.
-                    # The NEOX output mapping below owns (d, d + D/2) pairs;
-                    # reducing those pairs instead changes FP addition order
-                    # and can cross an FP8 rounding boundary.
-                    for i in range_constexpr(PROD_VEC_SIZE):
-                        norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
-                        norm_x = fx.BFloat16(
-                            qkv_t[tok, H_Q + head, norm_col]
-                        ).to(fx.Float32)
-                        sumsq_local = sumsq_local + norm_x * norm_x
+                    # The lower half-wave reproduces production's
+                    # vec_t<T, D/32> accumulation and XOR-by-16..1 tree, then
+                    # broadcasts the result to the upper output-owning lanes.
+                    if lane < RMS_GROUP:
+                        for i in range_constexpr(PROD_VEC_SIZE):
+                            norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
+                            norm_x = fx.BFloat16(
+                                qkv_t[tok, H_Q + head, norm_col]
+                            ).to(fx.Float32)
+                            sumsq_local = sumsq_local + norm_x * norm_x
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         k0 = fx.Float32(0.0)
@@ -515,7 +530,7 @@ def _build_kv_kernel(
                             )
                         k0s.append(k0)
                         k1s.append(k1)
-                    sumsq = wave_reduce_add(sumsq_local)
+                    sumsq = rms_reduce_add(sumsq_local, lane)
                     rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
                     for p in range_constexpr(VEC_PAIRS):
@@ -873,8 +888,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             ``num_heads_v`` (every real GQA/MQA config satisfies this --
             K and V always share the same head grouping).
         head_size: D; supported values are 64, 128, and 256. D=64 uses the
-            lower half of the wave for NEOX pairs while all lanes cooperate
-            in RMS reduction.
+            lower half of the wave for NEOX pairs. RMS reduction uses the
+            production kernel's 32-lane grouping for every head size.
         is_neox_style: must be ``True`` (NEOX pair layout ``(i, i+D/2)``;
             GPT-J interleaved-pair layout is not implemented).
         mrope_section_: 3-entry list summing to ``head_size // 2``
