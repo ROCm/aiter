@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
@@ -18,25 +19,37 @@ from build_targets import (  # noqa: F401 -- re-exported for callers
 
 logger = logging.getLogger("aiter")
 
+IS_WINDOWS = sys.platform == "win32"
+# Windows ROCm ships `hipinfo` instead of `rocminfo`; the output formats differ,
+# so each has its own compute-unit parser below.
+_GPU_INFO_TOOL = "hipinfo" if IS_WINDOWS else "rocminfo"
+
+
+def _run_gpu_info_tool() -> str:
+    """Run the platform GPU info tool (rocminfo / hipinfo) and return stdout."""
+    tool = executable_path(_GPU_INFO_TOOL)
+    result = subprocess.run(
+        [tool],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
 
 @functools.lru_cache(maxsize=1)
 def _detect_native() -> list[str]:
     try:
-        rocminfo = executable_path("rocminfo")
-        result = subprocess.run(
-            [rocminfo],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,
-        )
-        for line in result.stdout.splitlines():
+        output = _run_gpu_info_tool()
+        for line in output.splitlines():
+            # rocminfo: "Name: gfx942"; hipinfo: "gcnArchName: gfx1200"
             match = re.search(r"\b(gfx\w+)\b", line, re.IGNORECASE)
             if match:
                 return [match.group(1).lower()]
     except Exception as e:
-        raise RuntimeError(f"Get GPU arch from rocminfo failed: {e}") from e
-    raise RuntimeError("No gfx arch found in rocminfo output.")
+        raise RuntimeError(f"Get GPU arch from {_GPU_INFO_TOOL} failed: {e}") from e
+    raise RuntimeError(f"No gfx arch found in {_GPU_INFO_TOOL} output.")
 
 
 @torch_compile_guard()
@@ -137,27 +150,44 @@ def get_gfx_list() -> list[str]:
     return gfxs
 
 
+def _parse_cu_num_rocminfo(output: str) -> list[int]:
+    devices = re.split(r"Agent\s*\d+", output)
+    gpu_compute_units: list[int] = []
+    for device in devices:
+        for line in device.split("\n"):
+            if "Device Type" in line and line.find("GPU") != -1:
+                match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
+                if match:
+                    gpu_compute_units.append(int(match.group(1)))
+                break
+    return gpu_compute_units
+
+
+def _parse_cu_num_hipinfo(output: str) -> list[int]:
+    # hipinfo prints one block per device with a line like:
+    #   "multiProcessorCount:           80"
+    # On AMD GPUs this is the compute-unit count.
+    return [
+        int(m.group(1)) for m in re.finditer(r"multiProcessorCount\s*:\s*(\d+)", output)
+    ]
+
+
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
     cu_num = int(os.getenv("CU_NUM", 0))
     if cu_num == 0:
         try:
-            rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
-            output = result.stdout
-            devices = re.split(r"Agent\s*\d+", output)
-            gpu_compute_units = []
-            for device in devices:
-                for line in device.split("\n"):
-                    if "Device Type" in line and line.find("GPU") != -1:
-                        match = re.search(r"Compute Unit\s*:\s*(\d+)", device)
-                        if match:
-                            gpu_compute_units.append(int(match.group(1)))
-                        break
+            output = _run_gpu_info_tool()
+            if IS_WINDOWS:
+                gpu_compute_units = _parse_cu_num_hipinfo(output)
+            else:
+                gpu_compute_units = _parse_cu_num_rocminfo(output)
         except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
+            raise RuntimeError(
+                f"Get GPU Compute Unit from {_GPU_INFO_TOOL} failed {str(e)}"
+            )
+        if not gpu_compute_units:
+            raise RuntimeError(f"No GPU Compute Unit found in {_GPU_INFO_TOOL} output.")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num
@@ -420,10 +450,38 @@ def write_lookup_header(
         f.write(lookup_end)
 
 
+@functools.lru_cache(maxsize=1)
+def _load_hip_runtime():
+    """Load the HIP runtime shared library."""
+    import ctypes
+    import glob
+
+    if not IS_WINDOWS:
+        return ctypes.CDLL("libamdhip64.so")
+
+    # Windows ROCm ships a version-suffixed DLL, e.g. `amdhip64_7.dll`.
+    from cpp_extension import _find_rocm_home
+
+    rocm_home = _find_rocm_home()
+    candidates = (
+        sorted(glob.glob(os.path.join(rocm_home, "bin", "amdhip64*.dll")))
+        if rocm_home
+        else []
+    )
+    candidates.append("amdhip64.dll")
+    last_err = None
+    for name in candidates:
+        try:
+            return ctypes.CDLL(name)
+        except OSError as e:
+            last_err = e
+    raise RuntimeError(f"Could not load the AMD HIP runtime: {last_err}")
+
+
 def _get_pci_chip_id(device_id=0):
     import ctypes
 
-    libhip = ctypes.CDLL("libamdhip64.so")
+    libhip = _load_hip_runtime()
     chip_id = ctypes.c_int(0)
     hipDeviceAttributePciChipId = 10019
     err = libhip.hipDeviceGetAttribute(

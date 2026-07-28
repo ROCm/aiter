@@ -5,6 +5,7 @@
 import multiprocessing
 import os
 import socket
+import sys
 import time
 import logging
 
@@ -108,6 +109,28 @@ class FileBaton:
 
     @staticmethod
     def _pid_alive(pid):
+        if sys.platform == "win32":
+            # os.kill() on Windows calls TerminateProcess() for any signal
+            # other than CTRL_C/CTRL_BREAK_EVENT, so a `kill(pid, 0)` liveness
+            # probe would kill the very builder we are checking on.
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, wintypes.DWORD(pid)
+            )
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:
+                    return False
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
