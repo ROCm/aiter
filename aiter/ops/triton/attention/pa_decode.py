@@ -2,10 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 from typing import Optional
 
 import triton
 import torch
+
+# gfx950: the new-triton LLVM backend over-allocates VGPRs (LSR) on the paged
+# attention decode GQA kernel, cutting occupancy. Force a low waves_per_eu to
+# restore it. 0 = use the grp-size heuristic below; env override wins when > 0.
+_PA_DECODE_WPE = int(os.environ.get("AITER_PA_DECODE_WPE", "0"))
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
     _paged_attn_decode_v1_wo_dot_kernel,
     _paged_attn_decode_v1_w_dot_kernel,
@@ -222,6 +228,11 @@ def paged_attn_decode_v1(
             query_grp_sz_pow2 = 16
         else:
             query_grp_sz_pow2 = triton.next_power_of_2(query_grp_sz)
+        # gfx950/new-triton: force a low waves_per_eu on the GQA decode kernel to
+        # undo the LSR VGPR over-allocation occupancy loss. Small groups prefer 1,
+        # larger groups (>=16) prefer 2. Env override wins when set. NOTE: use the
+        # real query_grp_sz, not query_grp_sz_pow2 (which is clamped to 16 above).
+        _wpe = _PA_DECODE_WPE or (1 if query_grp_sz <= 8 else 2)
         _paged_attn_decode_v1_w_dot_kernel[grid](
             output,
             query,
@@ -250,6 +261,7 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
+            waves_per_eu=_wpe,
         )
 
 
