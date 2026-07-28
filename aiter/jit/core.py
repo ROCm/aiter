@@ -1626,8 +1626,14 @@ def compile_ops(
                             Exception  # noqa: BLE001  blanket catch is intentional here
                         ):
                             aiter_tensor_t = object
+                        # Every name the doc_str rewriting above can emit has to
+                        # be bound here. `from aiter import *` in the exec below
+                        # is not a reliable source: it only ever supplied these
+                        # by accident, via submodules that happened to do
+                        # `from typing import ...` at module scope.
                         namespace = {
                             "List": list,
+                            "Tuple": tuple,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
