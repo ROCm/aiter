@@ -29,62 +29,6 @@ static constexpr MxDtype kHwFp8E4m3 =
 template <int N>
 using ic = std::integral_constant<int, N>;
 
-// Cross-lane float max over THREADS_PER_GROUP adjacent lanes.
-// gfx950+: __builtin_amdgcn_update_dpp keeps the DPP visible to the scheduler
-// so the 2-wait-state hazard is honoured; permlane16/32_swap for 32/64 lanes.
-// gfx942: falls back to wave_reduce (rocprim warp_move_dpp + row_bcast).
-#if !defined(__gfx942__)
-template <int dpp_ctrl>
-__device__ __forceinline__ float dpp_max_step(float v)
-{
-    const int shuffled = __builtin_amdgcn_update_dpp(
-        0, __builtin_bit_cast(int, v), dpp_ctrl, 0xf, 0xf, true);
-    return fmaxf(v, __builtin_bit_cast(float, shuffled));
-}
-#endif
-
-template <int thread_num>
-__device__ __forceinline__ float group_reduce_max(float v)
-{
-    static_assert(thread_num >= 1 && thread_num <= 64 &&
-                      (thread_num & (thread_num - 1)) == 0,
-                  "thread_num must be a power of two in [1,64]");
-#if defined(__gfx942__)
-    auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
-    return wave_reduce<float, decltype(fmax_op), thread_num>(v, fmax_op);
-#else
-    if constexpr(thread_num >= 2)
-    {
-        v = dpp_max_step<0xb1>(v);
-    }
-    if constexpr(thread_num >= 4)
-    {
-        v = dpp_max_step<0x4e>(v);
-    }
-    if constexpr(thread_num >= 8)
-    {
-        v = dpp_max_step<0x141>(v);
-    }
-    if constexpr(thread_num >= 16)
-    {
-        v = dpp_max_step<0x140>(v);
-    }
-    if constexpr(thread_num >= 32)
-    {
-        const opus::vector_t<opus::u32_t, 2> sw = __builtin_amdgcn_permlane16_swap(
-            std::bit_cast<opus::u32_t>(v), std::bit_cast<opus::u32_t>(v), false, true);
-        v = fmaxf(std::bit_cast<float>(sw.x), std::bit_cast<float>(sw.y));
-    }
-    if constexpr(thread_num == 64)
-    {
-        const opus::vector_t<opus::u32_t, 2> sw = __builtin_amdgcn_permlane32_swap(
-            std::bit_cast<opus::u32_t>(v), std::bit_cast<opus::u32_t>(v), false, true);
-        v = fmaxf(std::bit_cast<float>(sw.x), std::bit_cast<float>(sw.y));
-    }
-    return v;
-#endif
-}
-
 template <typename scalar_t,
           int HEAD_DIM,
           int RD,
@@ -260,7 +204,9 @@ __global__ void inverse_rope_group_quant_kernel(
         }
         if constexpr(THREADS_PER_GROUP > 1)
         {
-            amax = group_reduce_max<THREADS_PER_GROUP>(amax);
+            auto fmax_op = [](float a, float b) { return fmaxf(a, b); };
+            amax = wave_reduce<float, decltype(fmax_op), THREADS_PER_GROUP>(
+                amax, fmax_op);
         }
 
         // --- E8M0 block scale ---
