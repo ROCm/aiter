@@ -194,32 +194,30 @@ def get_d1_shape(tensor):
     ]
 
 
-def all_element_of_tensors(*tensors, tiled_copy):
+def all_copy_atoms(*tensors, atom_bits, num_threads: int):
     """
-    Given a list of tensors, partition them into thread-view tensors according to
-    simple coalescing rules. and return a iterable to yield all elements of the
-    thread-view tensors, which are compatible for copy-atom operation.
+    Given a list of tensors, iterate each atom (with specified size) in them
+    in a thread-cooperative way.
+      - all input tensors are assumed to be 1D
+      - iteration is naively coalesced, caller must rearrange layouts to get best performance
+      - atom size is determined by first tensor's dtype
     """
+    num_elements = fx.size(tensors[0].layout.shape).get_static_leaf_int
+    num_values = atom_bits // (tensors[0].dtype.width)
+    num_atoms = num_elements // num_values
+    assert (
+        num_atoms % num_threads == 0
+    ), f"expect num_atoms evenly divisible by num_threads, but got {num_atoms} % {num_threads} != 0"
+    div_tensors = []
+    for t in tensors:
+        assert t.layout.rank < 2, "input tensor must be 1D"
+        div = fx.zipped_divide(t, fx.make_layout(num_values, 1))
+        div_tensors.append(div)
 
-    def is_register(t):
-        address_space = None
-        try:
-            # workaround for cases like:
-            #    'CoordTensorType' object has no attribute 'address_space'
-            address_space = t.address_space
-        finally:
-            return address_space == fx.AddressSpace.Register
-
-    thrcpy = tiled_copy.get_slice(fx.thread_idx.x)
-    thrviews = [thrcpy.partition_S(t) if not is_register(t) else t for t in tensors]
-
-    shape = get_d1_shape(thrviews[0])
-    for t in thrviews[1:]:
-        assert (
-            get_d1_shape(t) == shape
-        ), f"tensor {t} shape is not compatible with leader {shape}"
-
-    yield from all_elements(*thrviews, scalar=False)
+    i0 = fx.thread_idx.x
+    for i in range(0, num_atoms, num_threads):
+        yield [t[None, i0 + i] for t in div_tensors]
+    return
 
 
 def _as_ptr(p, dtype=None):
