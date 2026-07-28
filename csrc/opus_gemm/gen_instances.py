@@ -378,25 +378,25 @@ class opus_gemm_codegen:
         # with register_emit("gfx1250", ...) calls + one import in this file.
         from codegen.common import dispatch_emit
 
-        emit_kwargs = dict(
-            pipeline_header=pipeline_header,
-            traits_header=traits_header,
-            kernel_func=kernel_func,
-            da=da,
-            db=db,
-            traits_name=traits_name,
-            kargs_name=kargs_name,
-            kargs_template_vars=_kargs_template_vars,
-            instance_impl_preamble=instance_impl_preamble,
-            instance_impl_host_tu_split=instance_impl_host_tu_split,
-            record_one_instantiation=_record_one_instantiation,
-            make_host_decl=_make_host_decl,
-            make_device_decl=_make_device_decl,
-            A16W16_TUNE_HOST_EXTRA=A16W16_TUNE_HOST_EXTRA,
-            A8W8_SCALE_HOST_EXTRA=A8W8_SCALE_HOST_EXTRA,
-            A16W16_TUNE_TAGS=A16W16_TUNE_TAGS,
-            BIAS_HOST_VALIDATE=self.BIAS_HOST_VALIDATE,
-        )
+        emit_kwargs = {
+            "pipeline_header": pipeline_header,
+            "traits_header": traits_header,
+            "kernel_func": kernel_func,
+            "da": da,
+            "db": db,
+            "traits_name": traits_name,
+            "kargs_name": kargs_name,
+            "kargs_template_vars": _kargs_template_vars,
+            "instance_impl_preamble": instance_impl_preamble,
+            "instance_impl_host_tu_split": instance_impl_host_tu_split,
+            "record_one_instantiation": _record_one_instantiation,
+            "make_host_decl": _make_host_decl,
+            "make_device_decl": _make_device_decl,
+            "A16W16_TUNE_HOST_EXTRA": A16W16_TUNE_HOST_EXTRA,
+            "A8W8_SCALE_HOST_EXTRA": A8W8_SCALE_HOST_EXTRA,
+            "A16W16_TUNE_TAGS": A16W16_TUNE_TAGS,
+            "BIAS_HOST_VALIDATE": self.BIAS_HOST_VALIDATE,
+        }
         dispatch_emit(self, k, **emit_kwargs)
 
     # Shared host-side bias validation + kargs population. Consumed by gfx950

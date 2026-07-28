@@ -136,7 +136,7 @@ def _layernorm_backward(
         num_warps=num_warps,
         IGNORE_DW_DB=IGNORE_DW_DB_IN_FUSED,
     )
-    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)  # noqa: E731
+    grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
     if not IGNORE_DW_DB_IN_FUSED:
         dwdb_block_n = max(16, N // 256)
         dwdb_block_n = triton.next_power_of_2(dwdb_block_n)

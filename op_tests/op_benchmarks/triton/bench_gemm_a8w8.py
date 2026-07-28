@@ -47,7 +47,7 @@ def bench_gemm_fn(
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
     ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -174,7 +174,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)

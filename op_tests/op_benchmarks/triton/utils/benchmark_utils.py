@@ -138,7 +138,7 @@ def model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -158,7 +158,7 @@ def batched_model_benchmark_shapes(args):
     if args.model == "all":
         M_list = [args.M if args.M is not None else 4096]
     else:
-        M_list = [args.M] if args.M is not None else [2**i for i in range(0, 15)]
+        M_list = [args.M] if args.M is not None else [2**i for i in range(15)]
     batch_size = args.B if args.B is not None else 16
     shapes = []
     for M in M_list:

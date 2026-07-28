@@ -488,7 +488,7 @@ def test_pa_ps(
     actual_blocks = (seq_lens_kv + block_size - 1) // block_size
     kv_indptr[1 : batch_size + 1] = torch.cumsum(actual_blocks, dim=0)
     kv_indices_lst = []
-    for i in range(0, batch_size):
+    for i in range(batch_size):
         kv_indices_lst += block_tables_lst[i][: actual_blocks[i]]
     kv_indices = torch.tensor(kv_indices_lst, dtype=torch.int)
 

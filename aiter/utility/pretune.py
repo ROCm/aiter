@@ -78,11 +78,11 @@ _SENTINEL = object()  # distinct from None: "not in fallback table"
 
 def _get_tune_script(entry: dict, csrc_dir: str):
     """Derive the tune .py path from the non-pybind _tune.cu src entry."""
-    AITER_CSRC_DIR = csrc_dir  # noqa: N806,F841 — referenced by eval()
+    AITER_CSRC_DIR = csrc_dir  # noqa: F841 — referenced by eval()
     for src_expr in entry.get("srcs", []):
         if "_tune" in src_expr and "pybind" not in src_expr:
             try:
-                return eval(src_expr).replace(".cu", ".py")  # noqa: S307
+                return eval(src_expr).replace(".cu", ".py")
             except Exception:
                 pass
     return None
@@ -446,7 +446,7 @@ def _main() -> None:
 
     # Deferred import: core requires torch, not available during CI metadata phase
     sys.path.insert(0, os.path.join(repo_dir, "aiter"))
-    from jit import core  # noqa: PLC0415
+    from jit import core
 
     seen_keys: set = set()
     for mod in modules:

@@ -197,7 +197,7 @@ def build_flash_attn_func_module_primary(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         seq_len: fx.Int32,
     ):
         elem_type = dtype_to_elem_type(dtype_str)
@@ -674,7 +674,7 @@ def build_flash_attn_func_module_primary(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
@@ -770,7 +770,7 @@ def build_flash_attn_func_module_primary(
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
-    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):
         return flyc.compile(
             launch_flash_attn_func,
             _ptr_arg(Q),

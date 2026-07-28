@@ -6,7 +6,7 @@ from functools import lru_cache
 import torch
 
 import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice

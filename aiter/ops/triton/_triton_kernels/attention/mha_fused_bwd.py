@@ -32,7 +32,7 @@ _bwd_preprocess_repr = make_kernel_repr(
 @triton.jit(repr=_bwd_preprocess_repr)
 def _bwd_preprocess(
     o_ptr,
-    do_ptr,  # noqa: E741
+    do_ptr,
     delta_ptr,
     stride_o_b,
     stride_o_h,
@@ -671,7 +671,7 @@ def _bwd_kernel_dkdvdq_causal(
         dropout_p,
         philox_seed,
         batch_philox_offset,
-        dropout_offset,  #
+        dropout_offset,
         seqlen_q,
         seqlen_k,  # max sequence length for q and k
         start_n,
@@ -718,7 +718,7 @@ def _bwd_kernel_dkdvdq_causal(
         dropout_p,
         philox_seed,
         batch_philox_offset,
-        dropout_offset,  #
+        dropout_offset,
         seqlen_q,
         seqlen_k,  # max sequence length for q and k
         start_n,

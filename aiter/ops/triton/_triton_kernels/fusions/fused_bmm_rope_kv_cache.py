@@ -798,7 +798,7 @@ def _fused_fp8_bmm_rope_cat_and_cache_mla_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k_idx in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k_idx in range(tl.cdiv(K, BLOCK_SIZE_K)):
             if EVEN_K:
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)

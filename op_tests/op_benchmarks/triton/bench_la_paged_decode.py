@@ -78,7 +78,7 @@ def input_helper(
 
     block_tables = []
     for i in range(B):
-        block_table = random.sample(range(0, num_blocks), num_blocks) + [
+        block_table = random.sample(range(num_blocks), num_blocks) + [
             random.randint(0, num_blocks - 1)
             for _ in range(max_num_blks_per_seq - num_blocks)
         ]
@@ -116,7 +116,7 @@ def input_la_helper(
     BLOCK_M = 16
     BLOCK_N = KV_BLK_SZ
 
-    n_ctx = [SEQ_LEN for _ in range(0, B)]
+    n_ctx = [SEQ_LEN for _ in range(B)]
     N_CTX_Q = 16
 
     try:
@@ -157,7 +157,7 @@ def input_la_helper(
 
     block_tables = []
     for head in range(H_Q):
-        b = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
 
@@ -423,7 +423,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

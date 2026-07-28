@@ -237,7 +237,7 @@ def e2e_moe_kernel(
         a_scale = tl.load(A_scale)
         w1_scale = tl.load(W1_scale + off_experts)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K1)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K1)):
         # Masking ensures we don't load from invalid tokens or indices
         if EVEN_K:
             a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
@@ -432,7 +432,7 @@ def e2e_moe_persistent_kernel(
 
     pid_m = start_m
 
-    for _ in range(0, m_tile_per_sm):
+    for _ in range(m_tile_per_sm):
         # pid_m = pid_m_start + m_off
         offs_token_id = pid_m * BLOCK_SIZE_M + offs_m
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
@@ -443,7 +443,7 @@ def e2e_moe_persistent_kernel(
         off_experts = tl.load(expert_ids_ptr + pid_m)
         # tl.device_print("pid_m", pid_m)
         # TODO mem fault when when pid_n != 0
-        for pid_n in range(0, num_pid_n):
+        for pid_n in range(num_pid_n):
             offs_half = (pid_n * BLOCK_SIZE_HALF + i_floor) % N_HALF
             # (i % 2): [0, 1, 0, 1, ...] (alternating)
             # (i % 2) * (N // 2) : [0, (N // 2), 0, (N // 2),...]
@@ -474,7 +474,7 @@ def e2e_moe_persistent_kernel(
                 a_scale = tl.load(A_scale)
                 w1_scale = tl.load(W1_scale + off_experts)
 
-            for k in range(0, tl.cdiv(K, BLOCK_SIZE_K1)):
+            for k in range(tl.cdiv(K, BLOCK_SIZE_K1)):
                 # Masking ensures we don't load from invalid tokens or indices
                 if EVEN_K:
                     a = tl.load(a_ptrs, mask=(token_mask[:, None]), other=0.0)
@@ -525,7 +525,7 @@ def e2e_moe_persistent_kernel(
             tl.atomic_add(i_ptrs, acc, mask=i_mask, sem="release")
             # TODO quantization
 
-        for pid_k in range(0, num_pid_k):
+        for pid_k in range(num_pid_k):
             offs_w2k = (pid_k * BLOCK_SIZE_K2 + offs_k2) % K
             offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
 
@@ -556,7 +556,7 @@ def e2e_moe_persistent_kernel(
                 i_scale = 1
                 w2_scale = tl.load(W2_scale + off_experts)
 
-            for n in range(0, tl.cdiv(N_HALF, BLOCK_SIZE_N2)):
+            for n in range(tl.cdiv(N_HALF, BLOCK_SIZE_N2)):
                 # Masking ensures we don't load from invalid tokens or indices
 
                 if EVEN_N:

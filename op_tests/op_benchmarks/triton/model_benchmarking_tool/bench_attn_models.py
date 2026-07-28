@@ -26,9 +26,9 @@ def disable_logs(logger: str) -> None:
 
 
 disable_logs("aiter")
-from aiter.ops.triton.utils._triton.arch_info import get_arch  # noqa: E402
-from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main  # noqa: E402
-from op_tests.op_benchmarks.triton.bench_mla_decode import (  # noqa: E402
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mla_decode import (
     main as bench_mla_main,
 )
 

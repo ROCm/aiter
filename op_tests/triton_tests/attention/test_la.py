@@ -11,7 +11,7 @@ from aiter.ops.triton.attention.lean_atten import (
     persistent_lean_attention,
 )
 from aiter.ops.triton._triton_kernels.attention.lean_atten import _get_config
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 DEBUG_MODE = False
 
@@ -176,7 +176,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
             False,
             1,
             4,
-        ),  #
+        ),
         (
             False,
             1,
@@ -192,7 +192,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
             False,
             1,
             4,
-        ),  #
+        ),
         (
             False,
             1,
@@ -257,7 +257,7 @@ def reference_attention(q, k, v, n_ctx, n_ctx_q, causal):
             False,
             1,
             4,
-        ),  #
+        ),
         (
             False,
             3,

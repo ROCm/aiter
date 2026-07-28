@@ -15,7 +15,7 @@ import aiter
 from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
@@ -2231,7 +2231,7 @@ def parse_arg_and_run_test(sample_rate0: float = None):
 
         # Print rows for each compute_type
         for ct in compute_types:
-            row = f"{str(ct):<{ct_width}}"
+            row = f"{ct!s:<{ct_width}}"
             for col in valid_columns:
                 val = mean_table[str(ct)][col]
                 if val is None:

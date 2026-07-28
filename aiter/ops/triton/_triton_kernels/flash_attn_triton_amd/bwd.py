@@ -1487,7 +1487,7 @@ def _bwd_kernel_fused_atomic_causal(
             dropout_p,
             philox_seed,
             batch_philox_offset,
-            dropout_offset,  #
+            dropout_offset,
             seqlen_q,
             seqlen_k,  # max sequence length for q and k
             start_n,
@@ -1534,7 +1534,7 @@ def _bwd_kernel_fused_atomic_causal(
             dropout_p,
             philox_seed,
             batch_philox_offset,
-            dropout_offset,  #
+            dropout_offset,
             seqlen_q,
             seqlen_k,  # max sequence length for q and k
             start_n,
@@ -1795,7 +1795,7 @@ def _bwd_kernel_split_dkdv_causal(
             dropout_p,
             philox_seed,
             batch_philox_offset,
-            dropout_offset,  #
+            dropout_offset,
             seqlen_q,
             seqlen_k,  # max sequence length for q and k
             start_n,
@@ -1837,7 +1837,7 @@ def _bwd_kernel_split_dkdv_causal(
             dropout_p,
             philox_seed,
             batch_philox_offset,
-            dropout_offset,  #
+            dropout_offset,
             seqlen_q,
             seqlen_k,  # max sequence length for q and k
             start_n,
@@ -2747,7 +2747,7 @@ def _bwd_kernel_split_dq_noncausal(
 @triton.jit
 def _bwd_preprocess(
     Out,
-    DO,  # noqa: E741
+    DO,
     Delta,
     stride_ob,
     stride_oh,
@@ -2790,7 +2790,7 @@ def _bwd_preprocess(
         + q_start * stride_om
         + offs_m[:, None] * stride_om
         + offs_d[None, :] * stride_od
-    )  # noqa: E741
+    )
     off_do = (
         bid * stride_dob
         + hid * stride_doh
@@ -2842,10 +2842,10 @@ def _bwd_dkdv_inner(
     stride_delta_m,
     BLOCK_M: tl.constexpr,  # 16
     BLOCK_N: tl.constexpr,  # 128
-    HEAD_DIM_QK: tl.constexpr,  #
-    HEAD_DIM_V: tl.constexpr,  #
-    ACTUAL_HEAD_DIM_QK: tl.constexpr,  #
-    ACTUAL_HEAD_DIM_V: tl.constexpr,  #
+    HEAD_DIM_QK: tl.constexpr,
+    HEAD_DIM_V: tl.constexpr,
+    ACTUAL_HEAD_DIM_QK: tl.constexpr,
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -2896,7 +2896,7 @@ def _bwd_dkdv_inner(
 
     for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
-            print(f"iter {blk_idx}: curr_m = {curr_m}")  # noqa: E701
+            print(f"iter {blk_idx}: curr_m = {curr_m}")
         offs_m = curr_m + tl.arange(0, BLOCK_M)
         # update the mask because offs_m advanced
         mask_m = offs_m < seqlen_q
@@ -3045,13 +3045,13 @@ def _bwd_dq_inner(
     stride_lse_m,
     stride_delta_m,
     seqlen_q,
-    seqlen_k,  #
-    BLOCK_M2: tl.constexpr,  #
-    BLOCK_N2: tl.constexpr,  #
+    seqlen_k,
+    BLOCK_M2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
     HEAD_DIM_QK: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     ACTUAL_HEAD_DIM_QK: tl.constexpr,
-    ACTUAL_HEAD_DIM_V: tl.constexpr,  #
+    ACTUAL_HEAD_DIM_V: tl.constexpr,
     dropout_p,
     philox_seed,
     batch_philox_offset,
@@ -3061,7 +3061,7 @@ def _bwd_dq_inner(
     start_m,
     start_n,
     end_n,
-    num_steps,  #
+    num_steps,
     descale_q,
     descale_k,
     descale_v,
@@ -3101,7 +3101,7 @@ def _bwd_dq_inner(
     RCP_LN2: tl.constexpr = 1.4426950408889634  # = 1.0 / ln(2)
     for blk_idx in tl.range(num_steps, num_stages=1):
         if DEBUG_TRITON:
-            print(f"iter {blk_idx}: curr_n = {curr_n}")  # noqa: E701
+            print(f"iter {blk_idx}: curr_n = {curr_n}")
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
         # end_n is needed because the end of causal True might not be perfectly
         # aligned with the end of the block
@@ -3109,9 +3109,9 @@ def _bwd_dq_inner(
         if DEBUG_TRITON_DETAIL:
             print(
                 f"start_n = {start_n}, end_n = {end_n}, offs_n: {offs_n.shape}\n{offs_n}"
-            )  # noqa: E701
+            )
         if DEBUG_TRITON_DETAIL:
-            print(f"mask_n: {mask_n.shape}\n{mask_n}")  # noqa: E701
+            print(f"mask_n: {mask_n.shape}\n{mask_n}")
         mask_kT = mask_n[None, :]
         mask_vT = mask_n[None, :]
         mask_mn = mask_m[:, None] & (offs_n[None, :] < end_n)
@@ -3146,7 +3146,7 @@ def _bwd_dq_inner(
             qk_scaled += alibi_block
 
         if DEBUG_TRITON_DETAIL:
-            print(f"qk scaled: {qk.shape}\n", qk_scaled)  # noqa: E701
+            print(f"qk scaled: {qk.shape}\n", qk_scaled)
 
         # Compute probabilities - handle invalid rows where m is -inf
         # For rows where m is -inf, no keys were valid, so p should be 0
@@ -3386,7 +3386,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
     hkid = remap_xcd(hkid, HK, NUM_XCD)
 
     if DEBUG_TRITON:
-        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
     # figure out varlen start and end
     q_start = 0
     k_start = 0
@@ -3415,7 +3415,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 
     delta_qk = seqlen_q - seqlen_k
     if DEBUG_TRITON:
-        print(f"delta_qk = {delta_qk}")  # noqa: E701
+        print(f"delta_qk = {delta_qk}")
     PADDED_HEAD_QK: tl.constexpr = ACTUAL_HEAD_DIM_QK != HEAD_DIM_QK
     PADDED_HEAD_V: tl.constexpr = ACTUAL_HEAD_DIM_V != HEAD_DIM_V
     offs_d_qk = tl.arange(0, HEAD_DIM_QK)
@@ -3442,13 +3442,13 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             if DEBUG_TRITON:
                 print(
                     f"q >= k: start_delta = delta_qk aligned to BLOCK_M = {start_delta_q_gt_k}"
-                )  # noqa: E701
+                )
         else:
             start_delta = start_delta_q_lt_k
             if DEBUG_TRITON:
                 print(
                     f"q < k: start_delta = residue btw multiple BLOCK_N and delta_qk = {delta_aligned} = aligned to BLOCK_M = {start_delta_q_lt_k}"
-                )  # noqa: E701
+                )
 
         offs_n = start_n + tl.arange(0, BLOCK_N1)
         # Mask for loading K and V
@@ -3494,7 +3494,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 residue_m = max(start_n + delta_qk - start_m, 0)
                 len_m = BLOCK_N1 + residue_m
                 if DEBUG_TRITON:
-                    print(f"residue_m = {residue_m}")  # noqa: E701
+                    print(f"residue_m = {residue_m}")
 
             # offset input and output tensor by batch and Q/K heads
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
@@ -3548,7 +3548,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             if DEBUG_TRITON:
                 print(
                     f"Masked: start_n: {start_n}; start_m: {start_m}, num_steps: {num_steps}"
-                )  # noqa: E701
+                )
             dk, dv = _bwd_dkdv_inner(
                 dk,
                 dv,  # output tensors
@@ -3615,15 +3615,13 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             end_m = start_m + num_steps * BLOCK_M1
 
             if DEBUG_TRITON:
-                print(
-                    f"start_m after Masked step: {start_m}; num_steps: {num_steps}"
-                )  # noqa: E701
+                print(f"start_m after Masked step: {start_m}; num_steps: {num_steps}")
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_n: {start_n}, start_m: {start_m}, end_m: {end_m}, num_steps: {num_steps}"
-                )  # noqa: E701
+                )
             if DEBUG_TRITON:
-                print("unMasked")  # noqa: E701
+                print("unMasked")
             dk, dv = _bwd_dkdv_inner(
                 dk,
                 dv,  # output tensors
@@ -3691,12 +3689,12 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
         if DEBUG_TRITON:
             print(
                 f"end_n = start_m + BLOCK_M = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2}"
-            )  # noqa: E701
+            )
         if start_m + BLOCK_M2 < delta_qk:
             if DEBUG_TRITON:
                 print(
                     f"start_m + BLOCK_M2 = {start_m} + {BLOCK_M2} = {start_m + BLOCK_M2} < delta_qk of {delta_qk}"
-                )  # noqa: E701
+                )
             return
 
         offs_m = start_m + tl.arange(0, BLOCK_M2)
@@ -3723,7 +3721,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             # clamp end_n at [0, seqlen_k]
             end_n = max(min(end_n, seqlen_k), 0)
             if DEBUG_TRITON:
-                print(f"delta_qk: {delta_qk}; end_n: {end_n}")  # noqa: E701
+                print(f"delta_qk: {delta_qk}; end_n: {end_n}")
             # offset input and output tensor by batch and Q/K heads
             adj_q = bid * stride_qb + hqid * stride_qh + q_start * stride_qm
             adj_do = bid * stride_dob + hqid * stride_doh + q_start * stride_dom
@@ -3812,7 +3810,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 descale_v,
                 WINDOW_SIZE_LEFT,
                 WINDOW_SIZE_RIGHT,
-                MASK=True,  #
+                MASK=True,
                 USE_SLIDING_WINDOW=USE_SLIDING_WINDOW,
                 ENABLE_DROPOUT=ENABLE_DROPOUT,
                 USE_ALIBI=USE_ALIBI,
@@ -3842,7 +3840,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             if DEBUG_TRITON:
                 print(
                     f"unMasked: start_m: {start_m}, start_n: {start_n}, end_n: {end_n}, num_steps: {num_steps}"
-                )  # noqa: E701
+                )
             dq = _bwd_dq_inner(
                 dq,
                 q,
@@ -4010,7 +4008,7 @@ def bwd_kernel_fused_noncausal(
     hkid = remap_xcd(hkid, HK, NUM_XCD)
 
     if DEBUG_TRITON:
-        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")  # noqa: E701
+        print(f"\npid: {pid}, bid: {bid}, hkid: {hkid}")
     # figure out varlen start and end
     q_start = 0
     k_start = 0
@@ -4160,7 +4158,7 @@ def bwd_kernel_fused_noncausal(
                 dropout_p,
                 philox_seed,
                 batch_philox_offset,
-                dropout_offset,  #
+                dropout_offset,
                 alibi_slope,
                 seqlen_q,
                 seqlen_k,  # max sequence length for q and k
@@ -4763,7 +4761,7 @@ def attention_backward_triton_impl(
         if causal:
 
             if DEBUG_TRITON:
-                print(f"bwd_kernel: grid = {grid}")  # noqa: E701
+                print(f"bwd_kernel: grid = {grid}")
             bwd_kernel_fused_causal[grid](
                 q,
                 k,

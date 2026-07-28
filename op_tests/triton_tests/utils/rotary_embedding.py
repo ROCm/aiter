@@ -8,7 +8,7 @@ import math
 from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 # from vllm.model_executor.custom_op import CustomOp
 

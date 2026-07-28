@@ -3,7 +3,7 @@ import pytest
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -117,7 +117,7 @@ def get_x_vals():
     x_vals_with_batch = [
         (b, 2**m, n, k)
         for b in range(1, 17)
-        for m in range(0, 9)
+        for m in range(9)
         for (n, k) in [(512, 128), (128, 512)]
     ]
     # x_vals_with_batch = [(1, 1, 128, 512+128), ] # TODO check

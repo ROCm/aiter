@@ -26,7 +26,7 @@ from csrc.cpp_itfs.utils import (
     get_default_func_name,
     run_lib,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_gluon_dot_kernel,
     paged_attention_decode_v2_gluon_large_block_dot_kernel,
@@ -259,7 +259,7 @@ def compile_attention_kernel(
             "i32:16",  # num_seqs
             "i32:16",  # num_kv_heads
             "i32:16",  # max_context_partition_num
-            f"{str(compute_type_tl)}",
+            f"{compute_type_tl!s}",
             f"{query_seq_len}",  # QUERY_SEQ_LEN (constexpr)
             f"{one_query_group_size}",  # ONE_QUERY_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",

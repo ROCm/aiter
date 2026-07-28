@@ -98,7 +98,7 @@ def fused_moe_mxfp4(
     B_tl_dtype = torch_to_triton_dtype[B.dtype]
     B_DTYPE_FORMAT = get_scaled_dot_format_string(B_tl_dtype)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )

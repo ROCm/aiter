@@ -131,7 +131,7 @@ def _gemm_a8wfp4_kernel(
         offs_bn = offs_bn_raw % N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, num_k_iter):
+        for k in range(num_k_iter):
             # Load A inside the loop with correct K offset
             offs_ak = tl.arange(0, BLOCK_SIZE_K) + k * BLOCK_SIZE_K  # Add k offset
             offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak

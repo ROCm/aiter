@@ -365,7 +365,7 @@ def test_skinny_gemm(dtype, m, n, k, quantDtype=dtypes.fp8, cu_count=80):
     else:
         b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, bias, dtype)
 
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, quantDtype: {quantDtype}, torch avg: {avg_a:<8.2f} us, skinny_gemm avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )
@@ -577,15 +577,15 @@ def _iter_flydsl_csv_cases():
     for _, row in rows.iterrows():
         q_dtype = dtypes.fp8 if "float8" in str(row["q_dtype_w"]) else dtypes.i8
         yield (
-            dict(
-                dtype=dtypes.bf16,
-                m=int(row["M"]),
-                n=int(row["N"]),
-                k=int(row["K"]),
-                quantDtype=q_dtype,
-                pad_a=128,
-                skip_ck=True,
-            ),
+            {
+                "dtype": dtypes.bf16,
+                "m": int(row["M"]),
+                "n": int(row["N"]),
+                "k": int(row["K"]),
+                "quantDtype": q_dtype,
+                "pad_a": 128,
+                "skip_ck": True,
+            },
             {
                 "source": "flydsl_csv",
                 "libtype": str(row.get("libtype", "")),

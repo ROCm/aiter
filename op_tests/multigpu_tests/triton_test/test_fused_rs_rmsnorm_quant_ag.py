@@ -125,7 +125,7 @@ def run_fused_kernel(
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -472,7 +472,7 @@ if __name__ == "__main__":
 
     except Exception as e:
         print("=" * 80)
-        print(f"TEST FAILED: {str(e)}")
+        print(f"TEST FAILED: {e!s}")
         print("=" * 80)
         traceback.print_exc()
         sys.exit(1)

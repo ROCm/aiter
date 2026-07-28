@@ -186,7 +186,7 @@ def _attn_fwd_inner(
     if IS_FP8:
         qk += tl.dot(q, kT) * q_descale * k_descale  # Apply FP8 scaling
     else:
-        qk = tl.dot(q, kT, acc=qk)  # noqa: F821
+        qk = tl.dot(q, kT, acc=qk)
 
     if USE_ALIBI:
         row_idx = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -516,7 +516,7 @@ def _fwd_kernel_splitK(
     # initialize pointer to m and l
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)  # noqa: F821
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
 
     # loop over k, v and update accumulator
     if USE_BLOCK_TABLE:

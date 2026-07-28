@@ -306,7 +306,6 @@ def fused_qk_norm_rope_1way(
     (RoPE freqs are computed in fp32 there and the precision is consumed by the
     fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
     """
-    ...
 
 
 @compile_ops(

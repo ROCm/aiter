@@ -59,7 +59,7 @@ def static_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = lambda meta: (rows,)
     _static_per_tensor_quant_fp8_i8_kernel[grid](
         qx, x_in, scale_in, cols, x_in.stride(0), NUM_COL_POW2=NUM_COL_POW2
     )
@@ -86,7 +86,7 @@ def dynamic_per_tensor_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = lambda meta: (rows,)
     _dynamic_per_tensor_quant_fp8_i8_kernel[grid](
         x_in,
         scale_out,
@@ -129,7 +129,7 @@ def dynamic_per_token_quant_fp8_i8(
     rows = x_in.shape[0]
     cols = x_in.shape[1]
     NUM_COL_POW2 = triton.next_power_of_2(cols)
-    grid = lambda meta: (rows,)  # noqa: E731
+    grid = lambda meta: (rows,)
     _dynamic_per_token_quant_fp8_i8_kernel[grid](
         qx,
         scale_out,

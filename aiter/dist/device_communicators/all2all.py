@@ -35,7 +35,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         assert has_mori(), (
             "MoRI kernels not found. Please follow https://github.com/ROCm/mori/blob/main/README.md"
             " to install MoRI kernels."
-        )  # noqa
+        )
 
         super().__init__(cpu_group)
         self.handle_cache = Cache()
@@ -70,23 +70,23 @@ class MoriAll2AllManager(All2AllManagerBase):
             block_num = 32
             rdma_block_num = 16
 
-        return dict(
-            rank=rank,
-            world_size=num_ep_ranks,
-            data_type=quant_dtype,
-            hidden_dim=token_hidden_size,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            max_token_type_size=input_dtype.itemsize,
-            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
-            num_experts_per_rank=num_local_experts,
-            num_experts_per_token=num_experts_per_token,
-            warp_num_per_block=warp_num_per_block,
-            block_num=block_num,
-            kernel_type=kernel_type,
-            rdma_block_num=rdma_block_num,
-            gpu_per_node=gpu_per_node,
-        )
+        return {
+            "rank": rank,
+            "world_size": num_ep_ranks,
+            "data_type": quant_dtype,
+            "hidden_dim": token_hidden_size,
+            "scale_dim": scale_dim,
+            "scale_type_size": scale_type_size,
+            "max_token_type_size": input_dtype.itemsize,
+            "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
+            "num_experts_per_rank": num_local_experts,
+            "num_experts_per_token": num_experts_per_token,
+            "warp_num_per_block": warp_num_per_block,
+            "block_num": block_num,
+            "kernel_type": kernel_type,
+            "rdma_block_num": rdma_block_num,
+            "gpu_per_node": gpu_per_node,
+        }
 
     def _make_handle(self, **kwargs):
         import mori  # type: ignore[import-not-found]
@@ -181,22 +181,22 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         num_experts_per_token: int,
     ):
 
-        return dict(
-            rank=rank,
-            world_size=num_ep_ranks,
+        return {
+            "rank": rank,
+            "world_size": num_ep_ranks,
             # Buffer sized for input dtype (bf16) so one op handles both
             # bf16 and quantized input without reallocation; the dispatch
             # kernel specialisation is selected at call time by input.dtype.
-            data_type=input_dtype,
-            hidden_dim=token_hidden_size,
-            scale_dim=scale_dim,
-            scale_type_size=scale_type_size,
-            max_token_type_size=input_dtype.itemsize,
-            max_num_inp_token_per_rank=max_num_tokens_per_dp_rank,
-            num_experts_per_rank=num_local_experts,
-            num_experts_per_token=num_experts_per_token,
-            quant_type=self._make_quant_type(input_dtype, quant_dtype),
-        )
+            "data_type": input_dtype,
+            "hidden_dim": token_hidden_size,
+            "scale_dim": scale_dim,
+            "scale_type_size": scale_type_size,
+            "max_token_type_size": input_dtype.itemsize,
+            "max_num_inp_token_per_rank": max_num_tokens_per_dp_rank,
+            "num_experts_per_rank": num_local_experts,
+            "num_experts_per_token": num_experts_per_token,
+            "quant_type": self._make_quant_type(input_dtype, quant_dtype),
+        }
 
     def _make_handle(self, **kwargs):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)

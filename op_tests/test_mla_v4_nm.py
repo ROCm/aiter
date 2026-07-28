@@ -154,22 +154,22 @@ def _build_inputs(
         device=device,
     )
 
-    return dict(
-        q=q,
-        qrope=qrope,
-        kv_buffer=kv_buffer,
-        kvrope=kvrope,
-        output=output,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        split_indptr=split_indptr,
-        max_seqlen_q=q_seq_logical,
-        sink=sink,
-        num_kv_splits=num_kv_splits,
-        out_16_nosplit=0,
-    )
+    return {
+        "q": q,
+        "qrope": qrope,
+        "kv_buffer": kv_buffer,
+        "kvrope": kvrope,
+        "output": output,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "split_indptr": split_indptr,
+        "max_seqlen_q": q_seq_logical,
+        "sink": sink,
+        "num_kv_splits": num_kv_splits,
+        "out_16_nosplit": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -688,19 +688,19 @@ def _build_bf16_inputs(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
         )
 
-    return dict(
-        q_bf16=q_bf16,
-        kv_bf16=kv_bf16,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        sink=sink,
-        max_seqlen_q=q_seq_logical,
-        kv_seq_lens=kv_seq_lens,
-        batch=batch,
-        q_seq_logical=q_seq_logical,
-    )
+    return {
+        "q_bf16": q_bf16,
+        "kv_bf16": kv_bf16,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "sink": sink,
+        "max_seqlen_q": q_seq_logical,
+        "kv_seq_lens": kv_seq_lens,
+        "batch": batch,
+        "q_seq_logical": q_seq_logical,
+    }
 
 
 def _run_one_point(
@@ -1617,19 +1617,19 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
         device=device,
     )
 
-    return dict(
-        q=q_packed,
-        qrope=q_rope.contiguous(),
-        kv_buffer=kv_packed,
-        kvrope=kv_rope.contiguous(),
-        output=output,
-        qo_indptr=bf["qo_indptr"],
-        kv_indptr=bf["kv_indptr"],
-        kv_page_indices=bf["kv_page_indices"],
-        kv_last_page_lens=bf["kv_last_page_lens"],
-        max_seqlen_q=bf["max_seqlen_q"],
-        sink=sink,
-    )
+    return {
+        "q": q_packed,
+        "qrope": q_rope.contiguous(),
+        "kv_buffer": kv_packed,
+        "kvrope": kv_rope.contiguous(),
+        "output": output,
+        "qo_indptr": bf["qo_indptr"],
+        "kv_indptr": bf["kv_indptr"],
+        "kv_page_indices": bf["kv_page_indices"],
+        "kv_last_page_lens": bf["kv_last_page_lens"],
+        "max_seqlen_q": bf["max_seqlen_q"],
+        "sink": sink,
+    }
 
 
 @needs_gfx950

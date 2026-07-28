@@ -17,9 +17,9 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import build_tune_dict_batched, write_lookup_header  # noqa: E402
+from chip_info import build_tune_dict_batched, write_lookup_header
 
-from batched_gemm_a8w8_common import (  # noqa: E402
+from batched_gemm_a8w8_common import (
     default_kernels_dict,
     kernelInstance,
     kernels_list,

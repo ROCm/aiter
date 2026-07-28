@@ -234,32 +234,26 @@ class TunerCommon:
     @abstractmethod
     def _setup_specific_arguments(self):
         """set specific arguments"""
-        pass
 
     @abstractmethod
     def pre_process(self, args):
         """pre_process tunedf and untunedf"""
-        pass
 
     @abstractmethod
     def tune(self, untunedf, tunedf, args):
         """tune process, return all results"""
-        pass
 
     @abstractmethod
     def getKernelName(self, kernel_id):
         """obtain name of the kernel from its id"""
-        pass
 
     @abstractmethod
     def calculate(self, results, inbpe=2, outbpe=2):
         """calculate TFLOPS and bandwidth"""
-        pass
 
     @abstractmethod
     def result_to_df(self, rets):
         """transfer results to dataframe"""
-        pass
 
     def update_config_files(self, file_path: str, merge_name: str):
         path_list = file_path.split(os.pathsep) if file_path else []
@@ -559,11 +553,9 @@ class TunerCommon:
     @abstractmethod
     def result_to_csv(self, results, file, concat=False):
         """write result to csv file, all means concat all results to file"""
-        pass
 
     def update_tflops_bw(self, tune_file):
         """update tflops and bw from old tune_file"""
-        pass
 
     def run_config(self, args):
         """Run the production operator for each shape in the untuned CSV.
@@ -576,7 +568,6 @@ class TunerCommon:
     def _clear_op_caches(self):
         """Clear operator-specific config caches. Subclasses should override this
         to clear only their own caches."""
-        pass
 
     def _set_config_env_for_run_config(self, args, config_file=None):
         """Set the config env var to point to a tuned config file, clear caches,
@@ -1343,7 +1334,6 @@ class TunerCommon:
         if report_file:
             print(f"Compare results written to {report_file}", flush=True)
 
-    #
     def run(self, args, fast_mode=False):
         """tuner run function"""
         self.pre_process(args)
@@ -1498,7 +1488,7 @@ class TunerCommon:
         except Exception as e:
             tuning_status = "Error"
             logger.error(
-                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {str(e)}",
+                f"error in batch {processed_batches} of {total_batches} after {completed_batches} completed batches: {e!s}",
                 exc_info=True,
             )
         finally:

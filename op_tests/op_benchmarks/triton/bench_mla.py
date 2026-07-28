@@ -11,7 +11,7 @@ from aiter.ops.triton.attention.mla import mla_decode_fwd
 from aiter.ops.triton.attention.mla import mla_prefill_fwd
 from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
 from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 import argparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,

@@ -195,7 +195,6 @@ class IrisCommContext:
             # __exit__() is called here automatically
         """
         # Iris context cleanup is handled automatically
-        pass
 
     @property
     def is_initialized(self) -> bool:

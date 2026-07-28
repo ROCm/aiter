@@ -123,7 +123,7 @@ def fused_moe(
             has_zp=has_zp,
         )
 
-        return lambda: moe_fn(  # noqa: E731
+        return lambda: moe_fn(
             a,
             b,
             triton_out_silu if silu_fused else triton_out,

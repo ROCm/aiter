@@ -11,7 +11,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]

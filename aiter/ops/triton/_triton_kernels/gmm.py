@@ -175,7 +175,7 @@ def _process_gmm_tile(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if K_DIVISIBLE_BY_BLOCK_SIZE_K:
             lhs = tl.load(lhs_ptrs)
             rhs = tl.load(rhs_ptrs)
@@ -593,7 +593,7 @@ def tgmm_persistent_kernel(
             # Initialize bias accumulator
             bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-            for _ in range(0, loop_m):
+            for _ in range(loop_m):
                 lhs = tl.load(lhs_ptrs)
                 rhs = tl.load(rhs_ptrs)
 
@@ -764,7 +764,7 @@ def tgmm_non_persistent_kernel(
     # Initialize bias accumulator
     bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-    for _ in range(0, loop_m):
+    for _ in range(loop_m):
         lhs = tl.load(lhs_ptrs)
         rhs = tl.load(rhs_ptrs)
 

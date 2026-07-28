@@ -136,7 +136,7 @@ def bench_fn(
     ms = triton.testing.do_bench(
         lambda: fn(x, w1, w2, c_dtype, y=y, activation=activation),
         warmup=25,
-        rep=100,  # noqa: E731
+        rep=100,
     )
 
     # Return exactly one scalar depending on which metric is active
@@ -254,7 +254,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, "Fused FF")
         return 0
     run_benchmark(args, defaults)

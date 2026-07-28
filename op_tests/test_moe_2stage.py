@@ -800,28 +800,28 @@ def _row_to_kwargs(row):
     # Tuned CSV rows do not carry gate mode explicitly. Infer the runtime mode
     # from the selected activation/weight dtype layout used by fused_moe.
     gate_mode = _effective_gate_mode(aq_dtype, wq_dtype)
-    return dict(
-        dtype=_str2dtype(row["dtype"]),
-        token=int(row["token"]),
-        model_dim=int(row["model_dim"]),
-        inter_dim=inter_dim,
-        E=int(row["expert"]),
-        topk=int(row["topk"]),
-        actType=act_type,
-        gateMode=gate_mode,
-        qType=q_type,
-        AQDType=aq_dtype,
-        WQDType=wq_dtype,
-        use_g1u1=dtypes.str2bool(str(row["use_g1u1"])),
-        doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
-        hidden_pad=0,
-        intermediate_pad=0,
-        preshuffle=True,
-        reference_intermediate_pad=reference_intermediate_pad,
-        swiglu_limit=_effective_swiglu_limit(
+    return {
+        "dtype": _str2dtype(row["dtype"]),
+        "token": int(row["token"]),
+        "model_dim": int(row["model_dim"]),
+        "inter_dim": inter_dim,
+        "E": int(row["expert"]),
+        "topk": int(row["topk"]),
+        "actType": act_type,
+        "gateMode": gate_mode,
+        "qType": q_type,
+        "AQDType": aq_dtype,
+        "WQDType": wq_dtype,
+        "use_g1u1": dtypes.str2bool(str(row["use_g1u1"])),
+        "doweight_stage1": dtypes.str2bool(str(row["doweight_stage1"])),
+        "hidden_pad": 0,
+        "intermediate_pad": 0,
+        "preshuffle": True,
+        "reference_intermediate_pad": reference_intermediate_pad,
+        "swiglu_limit": _effective_swiglu_limit(
             q_type, aq_dtype, wq_dtype, args.swiglu_limit
         ),
-    )
+    }
 
 
 def _iter_csv_cases():

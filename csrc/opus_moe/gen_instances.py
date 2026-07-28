@@ -20,7 +20,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from opus_moe_common import (  # noqa: E402
+from opus_moe_common import (
     OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS,
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_ATOMIC,

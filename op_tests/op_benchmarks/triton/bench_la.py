@@ -357,7 +357,7 @@ def bench_lean_attention(
     XCD_REMAP = True
 
     # Triton LeanAttention output
-    fn = lambda: _persistent_lean_attention(  # noqa: E731
+    fn = lambda: _persistent_lean_attention(
         q,
         k,
         v,

@@ -23,7 +23,7 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 # ---------------

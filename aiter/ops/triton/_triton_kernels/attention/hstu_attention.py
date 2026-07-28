@@ -43,7 +43,7 @@ except ImportError:
 
 
 @triton.jit
-def _hstu_attn_fwd_one_block(  # noqa: C901
+def _hstu_attn_fwd_one_block(
     start_n,
     seq_len,
     offs_m,
@@ -114,7 +114,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
 
 
 @triton.jit
-def _hstu_attn_fwd_compute(  # noqa C901
+def _hstu_attn_fwd_compute(
     Q,
     K,
     V,
@@ -333,7 +333,7 @@ _hstu_attn_fwd_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_hstu_attn_fwd_repr)
-def _hstu_attn_fwd(  # noqa C901
+def _hstu_attn_fwd(
     Q,
     K,
     V,
@@ -410,7 +410,7 @@ def _hstu_attn_fwd(  # noqa C901
 
 
 @triton.jit
-def _hstu_attn_bwd_one_block(  # noqa C901
+def _hstu_attn_bwd_one_block(
     start_m,
     offs_n,
     offs_m,
@@ -528,7 +528,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
 
 
 @triton.jit
-def _hstu_attn_bwd_one_col_block(  # noqa C901
+def _hstu_attn_bwd_one_col_block(
     start_n,
     seq_len,
     n_targets,
@@ -723,7 +723,7 @@ _hstu_attn_bwd_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_hstu_attn_bwd_repr)
-def _hstu_attn_bwd(  # noqa C901
+def _hstu_attn_bwd(
     Q,
     K,
     V,

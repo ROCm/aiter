@@ -136,7 +136,7 @@ class ShmRingBuffer:
         created object to other processes by pickling it. The other processes will
         get the name of the shared memory and open it, so that they can access the
         same shared memory buffer.
-        """  # noqa
+        """
         self.n_reader = n_reader
         self.metadata_size = 1 + n_reader
         self.max_chunk_bytes = max_chunk_bytes
@@ -168,7 +168,7 @@ class ShmRingBuffer:
             ):
                 try:
                     self.shared_memory = shared_memory.SharedMemory(name=name)
-                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html # noqa
+                    # See https://docs.python.org/3/library/multiprocessing.shared_memory.html
                     # Some platforms allocate memory based on page size,
                     # so the shared memory block size may be larger or equal
                     # to the requested size. The size parameter is ignored

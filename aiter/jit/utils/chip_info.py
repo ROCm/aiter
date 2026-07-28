@@ -9,7 +9,7 @@ import subprocess
 from cpp_extension import executable_path
 from torch_guard import torch_compile_guard
 
-from build_targets import (  # noqa: F401 -- re-exported for callers
+from build_targets import (
     GFX_MAP,
     _parse_gpu_archs_env,
     filter_tune_df,
@@ -157,7 +157,7 @@ def get_cu_num_custom_op() -> int:
                             gpu_compute_units.append(int(match.group(1)))
                         break
         except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
+            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {e!s}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num

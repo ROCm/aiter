@@ -1,8 +1,8 @@
 import torch
 import triton
-import triton.experimental.gluon as gluon
+from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 import argparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
@@ -57,7 +57,7 @@ def make_kv_cache_shuffled_layout(
         for v in range(coalesced_size_log2, coalesced_size_log2 + WAPR_SIZE_LOG2)
     ]
     if num_warps_log2 > 0:
-        warp_bases = [[1 << v, 0] for v in range(0, num_warps_log2)]
+        warp_bases = [[1 << v, 0] for v in range(num_warps_log2)]
     elif total_num_warps == 1:
         warp_bases = []
     else:

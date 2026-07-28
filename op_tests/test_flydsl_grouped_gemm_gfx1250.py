@@ -34,7 +34,7 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
-from aiter.aot.flydsl.common import run_only_env  # noqa: E402
+from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,

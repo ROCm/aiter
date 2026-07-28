@@ -71,7 +71,7 @@ def bench_fn(M: int, N8: int, N16: int, K: int, metric: str, **kwargs):
     )
 
     ms = triton.testing.do_bench(
-        lambda: fused_gemm_a8w8_blockscale_a16w16(  # noqa: E731
+        lambda: fused_gemm_a8w8_blockscale_a16w16(
             x_fp8,
             w_fp8,
             x_fp8_scale,
@@ -110,7 +110,7 @@ def get_x_vals(args=None):
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_fused_args(kernel_name, args=args)
     plot_name = get_caller_name_no_ext()
-    run = lambda: run_fused_benchmark(  # noqa: E731
+    run = lambda: run_fused_benchmark(
         parsed_args,
         defaults,
         kernel_label,

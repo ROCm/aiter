@@ -109,7 +109,7 @@ def fused_gemm_afp4wfp4_split_cat(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -288,7 +288,7 @@ def fused_gemm_afp4wfp4_preshuffle_split_cat(
         triton.cdiv(D * S3, triton.cdiv(N, config["BLOCK_SIZE_N"]))
     )
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

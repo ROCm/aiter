@@ -148,7 +148,7 @@ def chunk_gated_delta_rule_ref(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
         diagonal=1,
     )
-    for i in range(0, seq_len // chunk_size):
+    for i in range(seq_len // chunk_size):
         q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ S

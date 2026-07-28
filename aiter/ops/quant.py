@@ -806,7 +806,6 @@ def dynamic_per_group_scaled_quant_fp4(
 
     Only support group_size in [32, 64, 128].
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -838,7 +837,6 @@ def moe_smooth_per_token_scaled_quant_v1(
     """
     v1: token loops along topk experts. Only supports moe stage1.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -857,7 +855,6 @@ def moe_smooth_per_token_scaled_quant_v2(
     """
     v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -872,7 +869,6 @@ def mxfp4_moe_sort_hip(
     """
     MoE scale sorting with MXFP4 shuffle layout.
     """
-    ...
 
 
 def mxfp4_moe_sort_fwd(
@@ -912,7 +908,6 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
     for MXFP4, fp8 for MXFP8.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -1241,7 +1236,6 @@ def rotate_activation_fp4quant_inplace(
     group_size: int = 32,
 ) -> None:
     """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
@@ -1250,7 +1244,6 @@ def rotate_activation(
     input: torch.Tensor,
 ) -> None:
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
@@ -1265,7 +1258,6 @@ def rope_rotate_activation_fp4quant_inplace(
 ) -> None:
     """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
     FP4-quantize, then dequantize back to BF16."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
@@ -1288,4 +1280,3 @@ def rope_rotate_activation(
     ``1 x group_size``) block scales ``scale = absMax / fp8_max``. Without
     ``out_scale`` it is the bf16/fp16 in-place path (``out`` shares dtype with
     ``input``)."""
-    ...

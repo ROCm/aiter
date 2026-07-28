@@ -122,11 +122,11 @@ def reduce_grouped(
         x,
         x.stride(0),
         x.stride(1),
-        x.stride(2),  #
+        x.stride(2),
         out,
         out.stride(0),
-        out.stride(1),  #
-        indx,  #
+        out.stride(1),
+        indx,
         x.shape[0],
         x.shape[1],
         x.shape[2],
@@ -137,13 +137,13 @@ def reduce_grouped(
         reduction_n,
         BLOCK_N=BLOCK_N,
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
-        K=K,  #
+        K=K,
         SWIGLU_ADD_RESIDUAL=swiglu_add_residual,
         USE_TDM=is_tdm_avail(),
         Residual=residual,
         stride_extres_m=res_stride_m,
         stride_extres_n=res_stride_n,
         HAS_EXT_RESIDUAL=has_ext_residual,
-        num_warps=2,  #
+        num_warps=2,
     )
     return out

@@ -9,7 +9,7 @@ from triton.experimental.gluon.language.amd.gfx1250 import async_copy
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]

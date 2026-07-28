@@ -142,7 +142,7 @@ def fused_gemm_afp4wfp4_a16w16(
                 config["BLOCK_SIZE_M"] >= 32
             ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

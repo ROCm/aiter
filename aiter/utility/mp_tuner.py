@@ -127,7 +127,6 @@ def worker(
             except Exception as e:
                 if printLog:
                     print(f"Error in process:{pid} info:{info}: {e}")
-                pass
         else:
             print(f"Runtime Error in process:{pid} info:{info}: {e}")
         us = -1  # float("inf")

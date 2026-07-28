@@ -7,7 +7,7 @@
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 import triton
 import triton.language as tl
-import triton.language.core as core
+from triton.language import core
 from triton.language.standard import _log2, zeros_like
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 

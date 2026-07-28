@@ -150,7 +150,7 @@ class FmhaBwdOGradDotOKernel:
     F_hdim: int  # hdim
     F_dtype: str  # data type
     F_spad: str  # true/false
-    F_dvpad: str  #
+    F_dvpad: str
     F_mode: str  # value from MODE_MAP
     F_occupancy: int
 
@@ -199,7 +199,7 @@ def get_bwd_dot_do_o_blobs(
     def get_occupancy(dtype, hdim):
         return 2
 
-    gen = list()
+    gen = []
 
     for dtype in BWD_DTYPE_MAP.keys():
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)
@@ -304,10 +304,10 @@ class FmhaBwdConvertQGradKernel:
     F_bm0: int  # tile size along q seqlen (block size)
     F_bn0: int  # tile size along k seqlen
     F_spad: str  # true/false
-    F_dpad: str  #
+    F_dpad: str
     F_mode: str  # value from MODE_MAP
-    F_occupancy: int  #
-    F_deterministic: str  #
+    F_occupancy: int
+    F_deterministic: str
 
     @property
     def template(self) -> str:
@@ -361,7 +361,7 @@ def get_bwd_convert_dq_blobs(
     def get_occupancy(dtype, hdim):
         return 2
 
-    gen = list()
+    gen = []
 
     for dtype in BWD_DTYPE_MAP.keys():
         d = get_fmha_bwd_dq_dk_dv_tile_ppl_dict_from_dtype(dtype)

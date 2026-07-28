@@ -408,7 +408,7 @@ if PREBUILD_KERNELS != 0:
 
         # Retune GEMM shapes on the live GPU after the main build phase.
         if PRETUNE_MODULES:
-            from aiter.utility.pretune import run_pretune_modules  # noqa: E402
+            from aiter.utility.pretune import run_pretune_modules
 
             cfg_path = OPT_COMPILER_CONFIG
             with open(cfg_path, "r", encoding="utf-8") as _f:

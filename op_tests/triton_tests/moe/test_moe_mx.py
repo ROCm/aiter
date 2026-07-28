@@ -11,7 +11,7 @@ from op_tests.triton_tests.moe.test_moe import (
     torch_moe_ref,
     torch_moe_align_block_size_ref,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
 from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 

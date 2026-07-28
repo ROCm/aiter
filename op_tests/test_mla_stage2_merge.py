@@ -57,7 +57,7 @@ MGC = 16
 def _stage2_merge_vec(
     Mid_O,  # [T, N, H, Lv] fp32
     Mid_lse,  # [T, N, H, 1] fp32
-    O,  # noqa: E741  [T, H, Lv]
+    O,
     qo_indptr,
     kv_indptr,
     kv_last_page_lens,

@@ -108,7 +108,7 @@ def fused_gemm_a16w16_quant_x(
     else:
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         META["NUM_KSPLIT"]
         * triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"])

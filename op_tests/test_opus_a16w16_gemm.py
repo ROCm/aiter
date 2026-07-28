@@ -12,7 +12,7 @@ import sys
 import torch
 
 # Skip on unsupported arch via the same probe opus uses at import time.
-from aiter.ops.opus._arch import _detect_arch  # noqa: E402
+from aiter.ops.opus._arch import _detect_arch
 
 _arch_ok, _detected_gfx = _detect_arch({"gfx950", "gfx942", "gfx1250"})
 if not _arch_ok:
@@ -21,8 +21,8 @@ if not _arch_ok:
     )
     sys.exit(0)
 
-from aiter.test_common import checkAllclose, run_perftest  # noqa: E402
-from aiter.ops.opus import gemm_a16w16_opus  # noqa: E402
+from aiter.test_common import checkAllclose, run_perftest
+from aiter.ops.opus import gemm_a16w16_opus
 
 
 def _torch_ref(A: torch.Tensor, B: torch.Tensor, out_dtype):

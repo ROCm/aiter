@@ -115,26 +115,26 @@ def make_inputs(
         device="cuda",
     )
 
-    return dict(
-        query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        q_fp8=q_fp8,
-        k_fp8=k_fp8,
-        v_fp8=v_fp8,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        out_scale=out_scale,
-        output=output,
-        cu_query_lens=cu_query_lens,
-        kv_lens=kv_lens,
-        query_lens=query_lens_t,
-        block_tables=block_tables,
-        max_query_len=max_query_len,
-        max_kv_len=max_kv_len,
-        scale=scale,
-    )
+    return {
+        "query": query,
+        "key_cache": key_cache,
+        "value_cache": value_cache,
+        "q_fp8": q_fp8,
+        "k_fp8": k_fp8,
+        "v_fp8": v_fp8,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "out_scale": out_scale,
+        "output": output,
+        "cu_query_lens": cu_query_lens,
+        "kv_lens": kv_lens,
+        "query_lens": query_lens_t,
+        "block_tables": block_tables,
+        "max_query_len": max_query_len,
+        "max_kv_len": max_kv_len,
+        "scale": scale,
+    }
 
 
 def _mode_label(args):

@@ -83,7 +83,6 @@ def run_torch_fused(
     is_nope_first,
     out_dtype,
 ):
-    #
     q_pe_reshaped = q_pe.unsqueeze(0)
     num_tokens = k_pe.shape[0]
     qk_rope_head_dim = k_pe.shape[-1]

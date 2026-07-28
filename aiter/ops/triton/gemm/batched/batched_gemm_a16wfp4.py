@@ -4,7 +4,7 @@
 from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
     _batched_gemm_a16wfp4_reduce_kernel,
     _batched_gemm_a16wfp4_kernel,
@@ -170,7 +170,7 @@ def batched_gemm_a16wfp4_(
         stride_cm = y_pp.stride(2)
         stride_cn = y_pp.stride(3)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         B,
         (
             META["NUM_KSPLIT"]

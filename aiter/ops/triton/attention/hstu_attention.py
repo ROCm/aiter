@@ -97,7 +97,7 @@ def triton_hstu_attention_fwd(
             AUTOTUNE_Z,
         )
 
-    grid = lambda meta: (  # noqa E731
+    grid = lambda meta: (
         triton.cdiv(N, meta["BLOCK_M"]),
         Z * H,
     )
@@ -200,7 +200,7 @@ def triton_hstu_attention_bwd(
             AUTOTUNE_Z,
         )
 
-    grid = lambda meta: (  # noqa E731
+    grid = lambda meta: (
         Z * H,
         (triton.cdiv(N, meta["BLOCK_N"]) if meta["SEQUENCE_PARALLEL"] else 1),
     )

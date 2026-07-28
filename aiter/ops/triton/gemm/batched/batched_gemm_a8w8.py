@@ -75,7 +75,7 @@ def batched_gemm_a8w8(
     if config is None:
         config, _ = _get_config(M, N, K)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         B,
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )

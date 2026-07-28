@@ -57,4 +57,3 @@ def causal_conv1d_update(
         - Uses register-based sliding window for efficiency
         - Pass empty tensors (torch.empty(0, ...)) for optional parameters
     """
-    ...

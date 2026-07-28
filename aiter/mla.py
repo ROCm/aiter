@@ -21,7 +21,7 @@ from aiter.ops.attention import get_mla_decode_fwd_max_splits
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     qo_indptr,
     kv_indptr,
@@ -92,7 +92,7 @@ def _fwd_kernel_stage2_asm(
             e_sum = 0.0
             e_max = -float("inf")
             acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
-            for split_kv_id in range(0, num_valid_kv_splits):
+            for split_kv_id in range(num_valid_kv_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
                     mask=mask_d,

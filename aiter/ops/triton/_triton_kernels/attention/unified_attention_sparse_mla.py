@@ -152,7 +152,7 @@ def _kernel_unified_attention_sparse_mla_2d(
     # iterate topk indices in tiles of TILE_SIZE
     num_tiles = (topk_count + TILE_SIZE - 1) // TILE_SIZE
     KV_cache_modifier: tl.constexpr = ".cg" if ALL_DECODE else ""
-    for t in range(0, num_tiles):
+    for t in range(num_tiles):
         tile_start = t * TILE_SIZE
         offs_t = tl.arange(0, TILE_SIZE)
         valid_t = (tile_start + offs_t) < topk_count

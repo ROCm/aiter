@@ -17,13 +17,13 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
         (1, 96, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
-        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
+        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
         (1, 128, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
         (1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),  #
+        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
         (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.float16, 16, 64, 2, 4),
         (
             8,
@@ -120,7 +120,7 @@ def test_persistent_lean_attention(
         ref_b_ctx = []
         kv_n_ctx_idx = 0
 
-        r = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        r = random.sample(range(num_kv_blocks), num_kv_blocks)
         for i in range(num_kv_blocks):
             ref_b.append(r[i])
             if i == kv_n_ctx[kv_n_ctx_idx] - 1:
@@ -254,7 +254,7 @@ def main():
 
     block_tables = []
     for head in range(h):
-        b = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
     print(f"KV block tables shape={kv_block_tables.shape}")

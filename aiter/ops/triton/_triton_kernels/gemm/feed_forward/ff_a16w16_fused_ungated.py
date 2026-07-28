@@ -81,7 +81,7 @@ def _ff_a16w16_fused_ungated(
     w1_ptrs = w1_ptr + (offs_k[:, None] * stride_w1k + offs_w1n[None, :] * stride_w1n)
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
@@ -127,7 +127,7 @@ def _ff_a16w16_fused_ungated(
     w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
     y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs,

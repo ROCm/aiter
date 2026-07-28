@@ -14,7 +14,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()

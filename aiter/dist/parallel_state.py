@@ -1840,7 +1840,7 @@ def initialize_model_parallel(
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
-    )  # noqa
+    )
 
     # When custom groups are provided, all communication goes through them
     # (standard ops assert via _assert_no_custom_group). Skip expensive

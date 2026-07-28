@@ -6,7 +6,7 @@ from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     generate_gemm_afp4wfp4_inputs,
 )

@@ -141,7 +141,7 @@ def _install_stubs():
 _install_stubs()
 
 sys.path.insert(0, str(_REPO_ROOT / "csrc" / "gemm_a16w16"))
-from gemm_a16w16_tune import GemmA16W16Tuner  # noqa: E402
+from gemm_a16w16_tune import GemmA16W16Tuner
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -185,7 +185,7 @@ def _make_tuner():
 
 
 def _call_get_asm_tasks(tuner, m, n, k, asm_kernels):
-    import aiter.dtypes as dtypes
+    from aiter import dtypes
 
     info_keys = (
         "gfx942",

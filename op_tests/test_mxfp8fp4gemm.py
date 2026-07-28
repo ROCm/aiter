@@ -104,12 +104,12 @@ def _prep(intype: str, M: int, N: int, K: int, apre: int, init: str):
 
     ref = _ref(intype, A, B, sA, sB, M, N).to(dtypes.bf16)
 
-    inp = dict(
-        A=shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
-        B=shuffle_mxfp8fp4_b(B),
-        sA=shuffle_mxfp8fp4_scale(sA),
-        sB=shuffle_mxfp8fp4_scale(sB),
-    )
+    inp = {
+        "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
+        "B": shuffle_mxfp8fp4_b(B),
+        "sA": shuffle_mxfp8fp4_scale(sA),
+        "sB": shuffle_mxfp8fp4_scale(sB),
+    }
     return inp, ref
 
 

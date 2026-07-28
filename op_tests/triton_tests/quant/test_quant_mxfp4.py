@@ -11,7 +11,7 @@ from aiter.utility.fp4_utils import (
 )
 from aiter.utility.fp4_utils import mxfp4_to_f32
 from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

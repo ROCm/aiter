@@ -4,7 +4,7 @@
 from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8wfp4 import (
     _gemm_a8wfp4_kernel,
     _get_config,
@@ -100,7 +100,7 @@ def gemm_a8wfp4(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             config["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

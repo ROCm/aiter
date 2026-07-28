@@ -86,7 +86,7 @@ def bench_fn(M: int, N: int, K: int, metric: str, **kwargs):
     )
 
     ms = triton.testing.do_bench(
-        lambda: fused_gemm_afp4wfp4_mul_add(  # noqa: E731
+        lambda: fused_gemm_afp4wfp4_mul_add(
             x_fp4,
             w_fp4_triton,
             x_fp4_scale_triton,
@@ -126,7 +126,7 @@ def get_x_vals(args=None):
 def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_fused_args(kernel_name, args=args)
     plot_name = get_caller_name_no_ext()
-    run = lambda: run_fused_benchmark(  # noqa: E731
+    run = lambda: run_fused_benchmark(
         parsed_args,
         defaults,
         kernel_label,

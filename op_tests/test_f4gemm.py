@@ -78,14 +78,14 @@ def _prep_mxfp4(M, N, K, apre, dtype, init):
         xs = torch.full((M, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
         ws = torch.full((N, K // MXFP4_SCALE_BLOCK), 0x7F, dtype=torch.uint8)
     ref = run_torch_mxfp4(xq, wq, xs, ws, dtype)
-    inp = dict(
-        A=shuffle_weight_f4(xq) if apre else xq,
-        B=shuffle_weight_f4(wq),
-        sA=shuffle_scale_f4(xs, 7),
-        sB=shuffle_scale_f4(ws, 7),
-        gA=None,
-        gB=None,
-    )
+    inp = {
+        "A": shuffle_weight_f4(xq) if apre else xq,
+        "B": shuffle_weight_f4(wq),
+        "sA": shuffle_scale_f4(xs, 7),
+        "sB": shuffle_scale_f4(ws, 7),
+        "gA": None,
+        "gB": None,
+    }
     return inp, ref
 
 
@@ -106,14 +106,14 @@ def _prep_nvfp4(M, N, K, apre, dtype, init):
         ws = torch.full((N, K // NVFP4_SCALE_BLOCK), 0x38, dtype=torch.uint8)
         gA = gB = 1.0
     ref = run_torch_nvfp4(xq, wq, xs, ws, gA, gB, dtype)
-    inp = dict(
-        A=shuffle_weight_f4(xq) if apre else xq,
-        B=shuffle_weight_f4(wq),
-        sA=shuffle_scale_f4(xs, 8),
-        sB=shuffle_scale_f4(ws, 8),
-        gA=gA,  # NVFP4 per-tensor global scales (floats)
-        gB=gB,
-    )
+    inp = {
+        "A": shuffle_weight_f4(xq) if apre else xq,
+        "B": shuffle_weight_f4(wq),
+        "sA": shuffle_scale_f4(xs, 8),
+        "sB": shuffle_scale_f4(ws, 8),
+        "gA": gA,  # NVFP4 per-tensor global scales (floats)
+        "gB": gB,
+    }
     return inp, ref
 
 

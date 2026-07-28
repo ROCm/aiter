@@ -27,7 +27,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
+from torch import nn
 from dataclasses import dataclass
 from aiter import (
     dtypes,

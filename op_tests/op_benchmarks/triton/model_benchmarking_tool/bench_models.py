@@ -11,7 +11,7 @@ import re
 import matplotlib.pyplot as plt
 import argparse
 from triton.runtime.errors import OutOfResources
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
     main as bench_gemm_a16w16_main,

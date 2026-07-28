@@ -16,7 +16,7 @@ from aiter.ops.triton.utils.types import str_to_torch_dtype
 from typing import Union
 
 from aiter.ops.shuffle import shuffle_weight
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

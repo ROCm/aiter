@@ -359,12 +359,12 @@ def ref_masked_attention_v4(
         m = attn_aug.max(dim=-1).values
         attn_exp = torch.exp(attn - m.unsqueeze(-1))  # NOTE: only over real K
         sink_exp = torch.exp(sink - m.unsqueeze(-1))  # [h, q, 1]
-        l = attn_exp.sum(-1) + sink_exp.squeeze(-1)  # noqa: E741
+        l = attn_exp.sum(-1) + sink_exp.squeeze(-1)
     else:
         lse = attn.logsumexp(dim=-1)
         m = attn.max(dim=-1).values
         attn_exp = torch.exp(attn - m.unsqueeze(-1))
-        l = attn_exp.sum(-1)  # noqa: E741
+        l = attn_exp.sum(-1)
     out = torch.einsum("hqk,khd->qhd", attn_exp, value.float())
     out = out / l.transpose(0, 1).unsqueeze(-1)
     return out.to(out_dtype), lse

@@ -1002,7 +1002,11 @@ def make_combine_kernel(
                     rsrc_k = expert_rsrcs[k_slot]
                     vld_k = expert_vlds[k_slot]
                     for u in range_constexpr(U):
-                        kw = dict(vec_width=1, dtype=T.i32(), cache_modifier=SLC_CACHE)
+                        kw = {
+                            "vec_width": 1,
+                            "dtype": T.i32(),
+                            "cache_modifier": SLC_CACHE,
+                        }
                         if u > 0:
                             kw["soffset_bytes"] = u * 256
                         vals[u].append(_maybe_load(rsrc_k, ec_abs, vld_k, **kw))
@@ -1016,7 +1020,7 @@ def make_combine_kernel(
 
                 for u in range_constexpr(U):
                     acc = _accum_experts(vals[u])
-                    kw = dict(cache_modifier=SLC_CACHE)
+                    kw = {"cache_modifier": SLC_CACHE}
                     if u > 0:
                         kw["soffset_bytes"] = u * out_step
                     buffer_store(acc, rsrc_out, out_off, **kw)

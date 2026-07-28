@@ -148,7 +148,7 @@ def e2e_moe(
     if _USE_MOE_PERSISTENT_KERNEL:
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
         # TODO add N_split support to get more parallelism
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             min(NUM_SMS, triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])),
         )
         stride_im = Intermediate.stride(0)
@@ -196,7 +196,7 @@ def e2e_moe(
 
         return C
     else:
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(W1.shape[1], META["BLOCK_SIZE_N"]),
         )

@@ -338,7 +338,7 @@ def get_num_splits_and_buffer_sizes(
     tiles_per_head = 0
     if causal:
         # Prefill - Causal
-        for i in range(0, num_m_blocks):
+        for i in range(num_m_blocks):
             tiles_per_head += (((i + 1) * BLOCK_M) + BLOCK_N - 1) // BLOCK_N
     else:
         # Decode or Not Causal

@@ -13,7 +13,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_dual_rmsnorm_mxfp8_quant,
     fused_flatten_mxfp8_quant,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 
 QUANT_BLOCK_SIZE = 32
 LEGACY_BLOCK_SIZE = 128

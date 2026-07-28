@@ -1254,18 +1254,18 @@ def run_ck(
         max_seqlen_q,
         max_seqlen_k,
     )
-    kernel_kwargs = dict(
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        q_descale=q_descale,
-        k_descale=k_descale,
-        v_descale=v_descale,
-        kv_block_descale=kv_block_descale,
-        kv_last_page_lens=kv_last_page_lens,
-        block_table=block_table,
-        seqlen_k=seqlen_k,
-        return_lse=return_lse,
-    )
+    kernel_kwargs = {
+        "causal": causal,
+        "logits_soft_cap": logits_soft_cap,
+        "q_descale": q_descale,
+        "k_descale": k_descale,
+        "v_descale": v_descale,
+        "kv_block_descale": kv_block_descale,
+        "kv_last_page_lens": kv_last_page_lens,
+        "block_table": block_table,
+        "seqlen_k": seqlen_k,
+        "return_lse": return_lse,
+    }
 
     if profile:
         result, time_us = profile_func(
@@ -2009,11 +2009,16 @@ def test_batch_prefill_large_kvcache(
     extra_kwargs = {}
     if is_fp8:
         if quant_mode == "kv_blockscale":
-            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "kv_block_descale": kv_block_descale,
+            }
         else:
-            extra_kwargs = dict(
-                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
-            )
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
 
     result = aiter.mha_batch_prefill_func(
         q_kernel,
@@ -2245,11 +2250,16 @@ def test_batch_prefill_4gb_boundary_targeted(
     extra_kwargs = {}
     if is_fp8:
         if quant_mode == "kv_blockscale":
-            extra_kwargs = dict(q_descale=q_descale, kv_block_descale=kv_block_descale)
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "kv_block_descale": kv_block_descale,
+            }
         else:
-            extra_kwargs = dict(
-                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
-            )
+            extra_kwargs = {
+                "q_descale": q_descale,
+                "k_descale": k_descale,
+                "v_descale": v_descale,
+            }
 
     out = aiter.mha_batch_prefill_func(
         q_kernel,

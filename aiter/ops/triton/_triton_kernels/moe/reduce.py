@@ -8,7 +8,7 @@ def _reduce_grouped(
     X,
     stride_xb: tl.uint64,
     stride_xm: tl.uint64,
-    stride_xn,  #
+    stride_xn,
     Out,
     stride_om: tl.uint64,
     stride_on,  # output tensor

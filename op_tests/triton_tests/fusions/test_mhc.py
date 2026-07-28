@@ -831,7 +831,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     if n != 4:
         pytest.skip("aiter.mhc_post hardcodes hc_mult == 4")
 
-    import aiter.jit.utils.chip_info as chip_info
+    from aiter.jit.utils import chip_info
 
     arch_id = chip_info.get_gfx()
     block = _hip_post_dispatch_block(C, arch_id)

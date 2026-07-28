@@ -400,16 +400,16 @@ def _make_inputs(
     ip_p, ix_p = _csr(total_pages, 1)
     ip_e, ix_e = _csr(total_tokens, 2)
 
-    return dict(
-        q=q,
-        unified_kv=unified_kv,
-        kv_indices_prefix=ix_p,
-        kv_indptr_prefix=ip_p,
-        kv=kv,
-        kv_indices_extend=ix_e,
-        kv_indptr_extend=ip_e,
-        attn_sink=attn_sink,
-    )
+    return {
+        "q": q,
+        "unified_kv": unified_kv,
+        "kv_indices_prefix": ix_p,
+        "kv_indptr_prefix": ip_p,
+        "kv": kv,
+        "kv_indices_extend": ix_e,
+        "kv_indptr_extend": ip_e,
+        "attn_sink": attn_sink,
+    }
 
 
 def _make_inputs_fp8(
@@ -464,30 +464,30 @@ def _make_inputs_fp8(
     ip_p, ix_p = _csr(total_pages, 1)
     ip_e, ix_e = _csr(total_tokens, 2)
 
-    kernel = dict(
-        q_nope=qn,
-        q_rope=qr,
-        unified_kv_nope=ukn,
-        unified_kv_rope=ukr,
-        kv_indices_prefix=ix_p,
-        kv_indptr_prefix=ip_p,
-        kv_nope=kn,
-        kv_rope=kr,
-        kv_indices_extend=ix_e,
-        kv_indptr_extend=ip_e,
-        attn_sink=attn_sink,
-    )
-    ref = dict(
-        q_fp32=q_fp32,
-        ukv_fp32=ukv_fp32,
-        kv_fp32=kv_fp32,
-        kv_indices_prefix=ix_p,
-        kv_indptr_prefix=ip_p,
-        kv_indices_extend=ix_e,
-        kv_indptr_extend=ip_e,
-        attn_sink=attn_sink,
-    )
-    return dict(kernel=kernel, ref=ref)
+    kernel = {
+        "q_nope": qn,
+        "q_rope": qr,
+        "unified_kv_nope": ukn,
+        "unified_kv_rope": ukr,
+        "kv_indices_prefix": ix_p,
+        "kv_indptr_prefix": ip_p,
+        "kv_nope": kn,
+        "kv_rope": kr,
+        "kv_indices_extend": ix_e,
+        "kv_indptr_extend": ip_e,
+        "attn_sink": attn_sink,
+    }
+    ref = {
+        "q_fp32": q_fp32,
+        "ukv_fp32": ukv_fp32,
+        "kv_fp32": kv_fp32,
+        "kv_indices_prefix": ix_p,
+        "kv_indptr_prefix": ip_p,
+        "kv_indices_extend": ix_e,
+        "kv_indptr_extend": ip_e,
+        "attn_sink": attn_sink,
+    }
+    return {"kernel": kernel, "ref": ref}
 
 
 # ---------------------------------------------------------------------------

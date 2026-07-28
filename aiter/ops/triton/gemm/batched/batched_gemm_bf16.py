@@ -243,7 +243,7 @@ def batched_gemm_bf16(
         else:
             y_pp = None
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             B,
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

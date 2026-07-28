@@ -103,8 +103,8 @@ def run_gemm_a4w4_blockscale_asm(
 def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
     torch.manual_seed(seed)
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
-    x = torch.randn((m, k), dtype=dtype, device=device)  #
-    w = torch.randn((n, k), dtype=dtype, device=device)  #
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    w = torch.randn((n, k), dtype=dtype, device=device)
     _, x_scales = quant_func(x, shuffle=False)
     _, w_scales = quant_func(w, shuffle=False)
     x, x_scales_shuffle = quant_func(x, shuffle=True)

@@ -4,7 +4,7 @@
 from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
@@ -182,7 +182,7 @@ def gemm_afp4wfp4_(
 
     # config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -344,7 +344,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -473,7 +473,7 @@ def gemm_afp4wfp4_preshuffle(
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             (
                 triton.cdiv(M, META["BLOCK_SIZE_M"])
                 * triton.cdiv(N, META["BLOCK_SIZE_N"])
@@ -556,7 +556,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

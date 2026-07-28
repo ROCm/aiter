@@ -268,7 +268,7 @@ def _fused_moe_silu_kernel_gptq_awq(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
 
@@ -455,7 +455,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
     num_tiles = num_pid_m * num_pid_n
     # Compute how many tiles are outside the padding region
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
-    for _ in range(0, num_valid_tiles):
+    for _ in range(num_valid_tiles):
         tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
         pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -510,7 +510,7 @@ def _fused_moe_persistent_silu_kernel_gptq_awq(
         # of fp32 values for higher accuracy.
         # `accumulator` will be converted back to fp16 after the loop.
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
 
@@ -772,7 +772,7 @@ def _fused_moe_silu_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if EVEN_K:
@@ -933,7 +933,7 @@ def _fused_moe_persistent_silu_kernel(
     # Compute how many tiles are outside the padding region
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
-    for _ in range(0, num_valid_tiles):
+    for _ in range(num_valid_tiles):
         tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
         pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -984,7 +984,7 @@ def _fused_moe_persistent_silu_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
             if EVEN_K:

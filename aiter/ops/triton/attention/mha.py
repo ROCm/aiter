@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-import aiter.ops.triton.utils.types as types
+from aiter.ops.triton.utils import types
 from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
 from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -245,7 +245,7 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 

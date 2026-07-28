@@ -73,7 +73,7 @@ if os.path.isdir(_flydsl_cache) and "FLYDSL_RUNTIME_CACHE_DIR" not in os.environ
 if AITER_TRITON_ONLY:
     logger.info("Triton ops only: CK and HIP ops (and their JIT build) are skipped.")
 elif AITER_AOT_IMPORT:
-    from .jit import core as core  # noqa: E402
+    from .jit import core as core
 else:
     # NOTE: do NOT wrap this block in try/except.
     # Catching ImportError here silently truncates the top-level aiter
@@ -84,52 +84,52 @@ else:
     # opus is gfx950-only but the package self-guards (warn + stubs on
     # non-gfx950) inside aiter/ops/opus/__init__.py, so its import line
     # is safe to put at top-level without try/except.
-    from .jit import core as core  # noqa: E402
-    from .utility import dtypes as dtypes  # noqa: E402
-    from .ops.enum import *  # noqa: F403,E402
-    from .ops.norm import *  # noqa: F403,E402
-    from .ops.quant import *  # noqa: F403,E402
-    from .ops.gemm_op_a8w8 import *  # noqa: F403,E402
-    from .ops.gemm_op_a16w16 import *  # noqa: F403,E402
-    from .ops.gemm_op_a4w4 import *  # noqa: F403,E402
-    from .ops.gemm_op_a8w4 import *  # noqa: F403,E402
-    from .ops.batched_gemm_op_a8w8 import *  # noqa: F403,E402
-    from .ops.batched_gemm_op_bf16 import *  # noqa: F403,E402
-    from .ops.deepgemm import *  # noqa: F403,E402
-    from .ops.opus import *  # noqa: F403,E402
-    from .ops.aiter_operator import *  # noqa: F403,E402
-    from .ops.activation import *  # noqa: F403,E402
-    from .ops.attention import *  # noqa: F403,E402
-    from .ops.custom import *  # noqa: F403,E402
-    from .ops.custom_all_reduce import *  # noqa: F403,E402
-    from .ops.quick_all_reduce import *  # noqa: F403,E402
-    from .ops.moe_op import *  # noqa: F403,E402
-    from .ops.moe_sorting import *  # noqa: F403,E402
-    from .ops.moe_sorting_opus import *  # noqa: F403,E402
-    from .ops.moe_mxfp4_aux import *  # noqa: F403,E402
-    from .ops.pa_sparse_prefill_opus import *  # noqa: F403,E402
-    from .ops.pos_encoding import *  # noqa: F403,E402
-    from .ops.cache import *  # noqa: F403,E402
-    from .ops.rmsnorm import *  # noqa: F403,E402
-    from .ops.communication import *  # noqa: F403,E402
-    from .ops.rope import *  # noqa: F403,E402
-    from .ops.topk import *  # noqa: F403,E402
-    from .ops.topk_plain import topk_plain  # noqa: F403,F401,E402
-    from .ops.mha import *  # noqa: F403,E402
-    from .ops.gradlib import *  # noqa: F403,E402
-    from .ops.trans_ragged_layout import *  # noqa: F403,E402
-    from .ops.sample import *  # noqa: F403,E402
-    from .ops.fused_qk_norm_mrope_cache_quant import *  # noqa: F403,E402
-    from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401,E402
+    from .jit import core as core
+    from .utility import dtypes as dtypes
+    from .ops.enum import *
+    from .ops.norm import *
+    from .ops.quant import *
+    from .ops.gemm_op_a8w8 import *
+    from .ops.gemm_op_a16w16 import *
+    from .ops.gemm_op_a4w4 import *
+    from .ops.gemm_op_a8w4 import *
+    from .ops.batched_gemm_op_a8w8 import *
+    from .ops.batched_gemm_op_bf16 import *
+    from .ops.deepgemm import *
+    from .ops.opus import *
+    from .ops.aiter_operator import *
+    from .ops.activation import *
+    from .ops.attention import *
+    from .ops.custom import *
+    from .ops.custom_all_reduce import *
+    from .ops.quick_all_reduce import *
+    from .ops.moe_op import *
+    from .ops.moe_sorting import *
+    from .ops.moe_sorting_opus import *
+    from .ops.moe_mxfp4_aux import *
+    from .ops.pa_sparse_prefill_opus import *
+    from .ops.pos_encoding import *
+    from .ops.cache import *
+    from .ops.rmsnorm import *
+    from .ops.communication import *
+    from .ops.rope import *
+    from .ops.topk import *
+    from .ops.topk_plain import topk_plain  # noqa: F401
+    from .ops.mha import *
+    from .ops.gradlib import *
+    from .ops.trans_ragged_layout import *
+    from .ops.sample import *
+    from .ops.fused_qk_norm_mrope_cache_quant import *
+    from .ops.fused_qknorm_idxrqknorm import (  # noqa: F401
         fused_qknorm_idxrqknorm,
     )
-    from .ops.fused_qk_norm_rope_cache_quant import *  # noqa: F403,E402
-    from .ops.fused_qk_rmsnorm_group_quant import *  # noqa: F403,E402
-    from .ops.groupnorm import *  # noqa: F403,E402
-    from .ops.mhc import *  # noqa: F403,E402
-    from .ops.causal_conv1d_update import *  # noqa: F403,E402
-    from .ops.fused_split_gdr_update import *  # noqa: F403,E402
-    from . import mla  # noqa: F403,F401,E402
+    from .ops.fused_qk_norm_rope_cache_quant import *
+    from .ops.fused_qk_rmsnorm_group_quant import *
+    from .ops.groupnorm import *
+    from .ops.mhc import *
+    from .ops.causal_conv1d_update import *
+    from .ops.fused_split_gdr_update import *
+    from . import mla  # noqa: F401
 
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
@@ -139,7 +139,7 @@ try:
         reduce_scatter as iris_reduce_scatter,  # noqa: F401  # avoid shadowing C++ reduce_scatter exported by custom_all_reduce.py
         all_gather,  # noqa: F401
         reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
-        IRIS_COMM_AVAILABLE,  # noqa: F401
+        IRIS_COMM_AVAILABLE,
     )
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import

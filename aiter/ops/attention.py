@@ -1000,7 +1000,6 @@ def get_pa_metadata_v1(
         [5] reduce_partial_map: (#partial_tiles),   The locations in partial buffer of partial tiles waiting for being
                                                     reduced.
     """
-    ...
 
 
 def get_ps_metadata_info_v1(
@@ -1353,7 +1352,6 @@ def _get_mla_metadata_v1_impl(
         [5] reduce_partial_map  (#partial_tiles)                Partial-buffer locations of the
                                                 tiles awaiting reduction.
     """
-    ...
 
 
 def get_mla_metadata_v1(
@@ -1471,7 +1469,6 @@ def get_mla_metadata_v1_no_redundant(
         [5] reduce_partial_map: (#partial_tiles),    The locations in partial buffer of partial tiles waiting for being
                                                      reduced.
     """
-    ...
 
 
 @compile_ops("module_mla_reduce", develop=True)
@@ -1519,7 +1516,6 @@ def mla_reduce_v1(
         final_lse: optional [bs, h] fp32. Combined LSE; written only when
             provided.
     """
-    ...
 
 
 @triton.jit(do_not_specialize=["tile_reduce_cnt"])

@@ -35,13 +35,13 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO_ROOT)
 # Import arch constants directly from build_targets — no torch dependency.
 sys.path.insert(0, os.path.join(_REPO_ROOT, "aiter", "jit", "utils"))
-from build_targets import (  # noqa: E402
+from build_targets import (
     GFX_CU_NUM_MAP,
     filter_tune_df,
     get_build_targets_env,
 )
 
-import pandas as pd  # noqa: E402
+import pandas as pd
 
 REPRO_CSV = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

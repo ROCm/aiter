@@ -25,7 +25,6 @@ def rope_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_uncached_bwd")
@@ -45,7 +44,6 @@ def rope_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_uncached_fwd")
@@ -67,7 +65,6 @@ def rope_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_uncached_bwd")
@@ -89,7 +86,6 @@ def rope_2c_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_cached_fwd")
@@ -110,7 +106,6 @@ def rope_cached_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_cached_bwd")
@@ -131,7 +126,6 @@ def rope_cached_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_cached_fwd")
@@ -154,7 +148,6 @@ def rope_cached_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_cached_bwd")
@@ -177,7 +170,6 @@ def rope_cached_2c_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_cached_positions_fwd")
@@ -200,7 +192,6 @@ def rope_cached_positions_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_cached_positions_fwd")
@@ -225,7 +216,6 @@ def rope_cached_positions_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_cached_positions_offsets_fwd")
@@ -249,7 +239,6 @@ def rope_cached_positions_offsets_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_2c_cached_positions_offsets_fwd")
@@ -275,7 +264,6 @@ def rope_cached_positions_offsets_2c_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_thd_fwd")
@@ -297,7 +285,6 @@ def rope_thd_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_thd_bwd")
@@ -319,7 +306,6 @@ def rope_thd_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_2d_fwd")
@@ -347,7 +333,6 @@ def rope_2d_fwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 @compile_ops("module_rope_1c_2d_bwd")
@@ -375,7 +360,6 @@ def rope_2d_bwd_impl(
     When rotate dim is smaller than d, front part is just copied if nope_first is true, or later part is copied
     if nope_first is false. Rotate dim is freqs/cos/sin.shape[-1] * 2 if reuse_freqs_front_part else 1.
     """
-    ...
 
 
 def rope_fwd(

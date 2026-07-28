@@ -134,7 +134,7 @@ def parse_args():
 
 
 def main():
-    import aiter.ops.triton.utils._triton.arch_info as arch_info
+    from aiter.ops.triton.utils._triton import arch_info
 
     if not (arch_info.is_fp4_avail()):
         print("MXFP4 is not available on this architecture")
@@ -143,7 +143,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)

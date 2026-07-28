@@ -8,7 +8,7 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.device_info import get_num_xcds
@@ -195,7 +195,7 @@ def _gemm_a8w8_kernel(
     acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=mfma_layout)
 
     # num_stages:2
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
+    for k in range(gl.cdiv(K, BLOCK_SIZE_K) - 1):
 
         # advance pointers for block A and B
         a_ptr += BLOCK_SIZE_K * stride_ak
@@ -463,7 +463,7 @@ def _gemm_a8w8_preshuffled_kernel(
 
     cur_b = b
     # num_stages:2
-    for k in range(0, gl.cdiv(K, BLOCK_SIZE_K) - 1):
+    for k in range(gl.cdiv(K, BLOCK_SIZE_K) - 1):
 
         # advance pointers for block A and B
         a_ptr += BLOCK_SIZE_K * stride_ak

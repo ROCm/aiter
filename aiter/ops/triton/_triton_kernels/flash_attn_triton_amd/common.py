@@ -89,7 +89,7 @@ def _cast_varlen_to_fp8_kernel_2d(
 
     # STEP 1: Find max absolute value across the entire sequence
     num_of_blocks = tl.cdiv(seqlen, BLOCK_SIZE)
-    for blk_idx in range(0, num_of_blocks):
+    for blk_idx in range(num_of_blocks):
         offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         offs_dim = tl.arange(0, HEAD_DIM)
 
@@ -121,7 +121,7 @@ def _cast_varlen_to_fp8_kernel_2d(
     tl.store(desc_ptr, descale)
 
     # STEP 2: Apply scaling and convert to FP8
-    for blk_idx in range(0, num_of_blocks):
+    for blk_idx in range(num_of_blocks):
         offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         offs_dim = tl.arange(0, HEAD_DIM)
 

@@ -1815,13 +1815,11 @@ def test_qk_norm_rope_cache_block_quant(
     elif total_len < num_tokens:
         seq_lens[-1] += num_tokens - total_len
     max_tpb = max(seq_lens)
-    #
     cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
     cu_q_len[0] = 0
     for i in range(batch_size):
         cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
-    #
     assert (
         cu_q_len[-1].item() == num_tokens
     ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_tokens={num_tokens}"
@@ -1973,7 +1971,6 @@ def test_qk_norm_rope_cache_block_quant(
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
     chunk_left_ctx_lens = page_size - 1
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
-    #
     chunk_qkv = torch.randn(
         (chunk_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -2013,7 +2010,6 @@ def test_qk_norm_rope_cache_block_quant(
     v_scale_chunk_ref = v_scale_ref.clone()
     k_scale_chunk = k_scale.clone()
     v_scale_chunk = v_scale.clone()
-    #
     (
         q_chunk_ref,
         k_chunk_ref,
@@ -2064,7 +2060,6 @@ def test_qk_norm_rope_cache_block_quant(
             max_tokens_per_batch=chunk_left_ctx_lens,
         )
     )
-    #
     print(
         f"chunk-prefill: torch avg: {avg_torch_chunk:.2f} us, cu avg: {avg_cu_chunk:.2f} us"
     )
@@ -3277,7 +3272,6 @@ if __name__ == "__main__":
                     num_prefill_batches=8,
                     prefill_seq_len=100,
                 )
-    #
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608

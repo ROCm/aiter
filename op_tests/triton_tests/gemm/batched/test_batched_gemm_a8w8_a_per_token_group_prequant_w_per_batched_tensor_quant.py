@@ -139,8 +139,8 @@ def get_x_vals():
         (8192, 8192, 1024),
         (16384, 8192, 1024),
     ]
-    x_vals += [(v**2, 128, 512) for v in range(0, 7)]
-    x_vals += [(v**2, 512, 128) for v in range(0, 7)]
+    x_vals += [(v**2, 128, 512) for v in range(7)]
+    x_vals += [(v**2, 512, 128) for v in range(7)]
     x_vals += [(1, 128, 1)]  # minimal case
     return x_vals
 

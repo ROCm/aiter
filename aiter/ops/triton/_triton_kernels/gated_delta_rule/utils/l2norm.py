@@ -10,7 +10,7 @@ supporting both forward and backward passes.
 """
 
 import torch
-import torch.nn as nn
+from torch import nn
 import triton
 import triton.language as tl
 

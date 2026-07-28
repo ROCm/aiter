@@ -525,7 +525,7 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             desc_scale_cur, [blk_cur, 0], kv_scale_shared.index(0)
         )
 
-        for j in range(0, n_blocks):
+        for j in range(n_blocks):
             buf = j % NUM_BUFFERS
             context_idx = split_context_start + j * KVBlockSize
             # blk = blk_cur

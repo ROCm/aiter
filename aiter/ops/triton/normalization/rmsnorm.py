@@ -47,7 +47,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs(x)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _rms_norm_kernel[grid](
         x,
         y,
@@ -82,7 +82,7 @@ def _rmsnorm_forward_with_add(
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs(x)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _fused_add_rmsnorm_kernel[grid](
         x,
         out,
@@ -124,7 +124,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         else None
     )
 
-    grid_bwd = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid_bwd = lambda meta: (NUM_PRGMS,)
     _rmsnorm_bwd_triton[grid_bwd](
         dz_,
         x_,
@@ -143,7 +143,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     )
 
     if need_reduction:
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]  # noqa: E731
+        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,
@@ -333,7 +333,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -403,7 +403,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -474,7 +474,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -538,7 +538,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,

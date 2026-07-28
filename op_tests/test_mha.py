@@ -1019,14 +1019,14 @@ def test_mha_bwd_with_sink_dq_dk_dv(
     )
     out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, causal)
 
-    common_bwd_args = dict(
-        dropout_p=0.0,
-        softmax_scale=softmax_scale,
-        is_causal=causal,
-        window_size_left=-1,
-        window_size_right=0 if causal else -1,
-        deterministic=False,
-    )
+    common_bwd_args = {
+        "dropout_p": 0.0,
+        "softmax_scale": softmax_scale,
+        "is_causal": causal,
+        "window_size_left": -1,
+        "window_size_right": 0 if causal else -1,
+        "deterministic": False,
+    }
 
     dq_base, dk_base, dv_base, _ = aiter.mha_bwd(
         dout, q.detach(), k.detach(), v.detach(), out, lse, **common_bwd_args
@@ -1071,14 +1071,14 @@ def test_mha_bwd_sink_null_gives_same_as_no_sink(dtype):
     )
     out, lse = _sink_run_fwd(q.detach(), k.detach(), v.detach(), softmax_scale, False)
 
-    common = dict(
-        dropout_p=0.0,
-        softmax_scale=softmax_scale,
-        is_causal=False,
-        window_size_left=-1,
-        window_size_right=-1,
-        deterministic=False,
-    )
+    common = {
+        "dropout_p": 0.0,
+        "softmax_scale": softmax_scale,
+        "is_causal": False,
+        "window_size_left": -1,
+        "window_size_right": -1,
+        "deterministic": False,
+    }
 
     dq1, dk1, dv1, d1 = aiter.mha_bwd(
         dout, q.detach(), k.detach(), v.detach(), out, lse, **common

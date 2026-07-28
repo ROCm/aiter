@@ -131,7 +131,7 @@ def test_moe_Smoothquant_instance(
     input = torch.randn(dim, dtype=dtype, device="cuda")
     xscale = torch.randn((expert, n), dtype=xscaleType, device="cuda")
     # topk_id = torch.randint(0, expert, (m, topk), dtype=dtypes.i32, device="cuda")
-    topk_id = torch.tensor([list(range(0, topk))] * m, dtype=dtypes.i32, device="cuda")
+    topk_id = torch.tensor([list(range(topk))] * m, dtype=dtypes.i32, device="cuda")
     (a, yscale_a), avg_a = run_torch_topk(
         input, x_scale=xscale, topk_id=topk_id, quant_dtype=quant_dtype
     )

@@ -134,7 +134,7 @@ def fused_moe_gelu(
     group_n = 0 if block_shape is None else block_shape[1]
     if _USE_MOE_PERSISTENT_KERNEL:
         NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             min(
                 NUM_SMS,
                 triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -180,7 +180,7 @@ def fused_moe_gelu(
             **config,
         )
     else:
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             triton.cdiv(EM, META["BLOCK_SIZE_M"])
             * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
         )

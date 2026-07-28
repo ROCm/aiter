@@ -274,7 +274,7 @@ def run_benchmark(args):
         )
 
         num_tokens = query.shape[0]
-        fn = lambda: context_attention_fwd(  # noqa: E731
+        fn = lambda: context_attention_fwd(
             query,
             k,
             v,
@@ -375,7 +375,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

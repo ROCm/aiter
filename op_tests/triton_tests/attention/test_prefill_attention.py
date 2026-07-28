@@ -100,7 +100,7 @@ def test_op_fwd(Z, H, SEQLEN, HEAD_DIM, causal, absorb, varlen, dtype=torch.floa
     prefill_triton(q, k, v, tri_out, b_start_loc, b_seq_len, SEQLEN, causal)
     sm_scale = 1.0 / (HEAD_DIM**0.5)
 
-    for i in range(0, Z):
+    for i in range(Z):
         start_q, start_k = b_start_loc[i], b_start_loc[i]
         seqlen_q, seqlen_k = b_seq_len[i], b_seq_len[i]
         end_q, end_k = start_q + seqlen_q, start_k + seqlen_k

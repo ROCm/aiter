@@ -127,10 +127,10 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         hist,
         n_expts_tot,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -199,10 +199,10 @@ def sort_tokens_fused(
         n_expts_tot,
         hist,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters

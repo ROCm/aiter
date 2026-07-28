@@ -68,7 +68,6 @@ from typing_extensions import ParamSpec, TypeIs, assert_never
 
 from aiter import logger
 
-
 # Exception strings for non-implemented encoder/decoder scenarios
 
 STR_NOT_IMPL_ENC_DEC_SWA = (
@@ -1114,7 +1113,7 @@ def find_library(lib_name: str) -> str:
     `lib_name` is full filename, with both prefix and suffix.
     This function resolves `lib_name` to the full path of the library.
     """
-    # Adapted from https://github.com/openai/triton/blob/main/third_party/nvidia/backend/driver.py#L19 # noqa
+    # Adapted from https://github.com/openai/triton/blob/main/third_party/nvidia/backend/driver.py#L19
     # According to https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard
     # `/sbin/ldconfig` should exist in all Linux systems.
     # `/sbin/ldconfig` searches the library in the system
@@ -1380,10 +1379,8 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
         index = args.index("--config")
         if index == len(args) - 1:
-            raise ValueError(
-                "No config file specified! \
-                             Please check your command-line arguments."
-            )
+            raise ValueError("No config file specified! \
+                             Please check your command-line arguments.")
 
         file_path = args[index + 1]
 

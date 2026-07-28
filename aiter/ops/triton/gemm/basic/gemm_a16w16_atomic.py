@@ -81,7 +81,7 @@ def gemm_a16w16_atomic_(
         else:
             y = torch.zeros((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"])
         * triton.cdiv(N, META["BLOCK_SIZE_N"])
         * META["NUM_KSPLIT"],

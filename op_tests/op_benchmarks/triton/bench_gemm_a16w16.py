@@ -220,7 +220,7 @@ def main(args: list[str] | None = None) -> None:
     parsed_args, defaults = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args, defaults)

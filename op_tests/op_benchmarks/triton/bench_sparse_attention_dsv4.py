@@ -334,7 +334,7 @@ def check_correctness(device: str):
             max_diff = (out.float() - ref.float()).abs().max().item()
             torch.testing.assert_close(out.float(), ref.float(), atol=1e-2, rtol=1e-2)
             print(
-                f"  {backend:6s} sink={str(has_sink):5s}: OK (max|delta|={max_diff:.4f})"
+                f"  {backend:6s} sink={has_sink!s:5s}: OK (max|delta|={max_diff:.4f})"
             )
 
 

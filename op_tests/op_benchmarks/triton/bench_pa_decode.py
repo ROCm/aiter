@@ -161,7 +161,7 @@ def paged_attn_decode(
     k_scale = torch.tensor([1.0])
     v_scale = torch.tensor([1.0])
 
-    return lambda: paged_attention_decode(  # noqa: E731
+    return lambda: paged_attention_decode(
         output=triton_output,
         query=query,
         key_cache=key_cache_tri,
@@ -307,7 +307,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)
