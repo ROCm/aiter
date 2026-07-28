@@ -41,7 +41,7 @@ def fused_recurrent_gated_delta_rule(
     gk: torch.Tensor | None = None,
     gv: torch.Tensor | None = None,
     beta: torch.Tensor | None = None,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
@@ -205,7 +205,7 @@ def chunk_gated_delta_rule(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
@@ -324,7 +324,7 @@ def chunk_gated_delta_rule(
         k, _ = l2norm_fwd(k)
 
     # Call aiter's chunk forward pass
-    g, o, A, final_state = chunk_gated_delta_rule_fwd(
+    g, o, _A, final_state = chunk_gated_delta_rule_fwd(
         q=q,
         k=k,
         v=v,
@@ -426,7 +426,7 @@ def chunk_gated_delta_rule_opt(
         k, _ = l2norm_fwd(k)
 
     # Call aiter's optimized chunk forward pass
-    g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt(
+    _g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt(
         q=q,
         k=k,
         v=v,
@@ -532,7 +532,7 @@ def chunk_gated_delta_rule_opt_vk(
         q, _ = l2norm_fwd(q)
         k, _ = l2norm_fwd(k)
 
-    g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt_vk(
+    _g_cumsum, o, final_state = chunk_gated_delta_rule_fwd_opt_vk(
         q=q,
         k=k,
         v=v,

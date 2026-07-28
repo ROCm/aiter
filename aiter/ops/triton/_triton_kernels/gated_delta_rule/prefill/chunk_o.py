@@ -896,7 +896,7 @@ def chunk_fwd_kernel_o_opt_vk(
         if IS_VARLEN:
             g += (i_h * T_flat + bos).to(tl.int64)
         else:
-            g += (((i_b * H + i_h) * T_flat)).to(tl.int64)
+            g += ((i_b * H + i_h) * T_flat).to(tl.int64)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -1084,7 +1084,7 @@ def chunk_bwd_dv_local(
     g: torch.Tensor | None = None,
     g_gamma: torch.Tensor | None = None,
     A: torch.Tensor | None = None,
-    scale: float = None,
+    scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,

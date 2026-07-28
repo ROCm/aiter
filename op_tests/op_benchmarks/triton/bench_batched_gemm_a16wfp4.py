@@ -1,25 +1,27 @@
+import math
 import sys
+
 import torch
 import triton
-import math
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
-    generate_batched_gemm_a16wfp4_inputs,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    generate_batched_gemm_a16wfp4_inputs,
 )
 
 
@@ -32,7 +34,7 @@ def bench_gemm_fn(
     layout: str,
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
         batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops
@@ -125,7 +127,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args)
@@ -138,7 +140,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args)
@@ -164,7 +166,7 @@ def main(args: list[str] | None = None):
     args, defaults = parse_args(args=args)
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(args, defaults)
