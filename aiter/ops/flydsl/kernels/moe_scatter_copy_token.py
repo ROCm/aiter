@@ -35,19 +35,17 @@ Block : (BLOCK_THREADS, 1, 1)
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -152,7 +150,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst: fx.Pointer,
         dst_src: fx.Pointer,
         num_dst: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

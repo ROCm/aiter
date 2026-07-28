@@ -1,25 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a16wfp4 import (
-    _batched_gemm_a16wfp4_reduce_kernel,
     _batched_gemm_a16wfp4_kernel,
+    _batched_gemm_a16wfp4_reduce_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
 from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import (
     get_splitk,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -32,12 +31,12 @@ def batched_gemm_a16wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    transpose_bm: Optional[bool] = False,
-    prequant: Optional[bool] = True,
-    y_scale: Optional[torch.Tensor] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    transpose_bm: bool | None = False,
+    prequant: bool | None = True,
+    y_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if y is None:
         Bx, M, _ = x.shape
@@ -70,12 +69,12 @@ def batched_gemm_a16wfp4_(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    transpose_bm: Optional[bool] = False,
-    prequant: Optional[bool] = True,
-    y_scale: Optional[torch.Tensor] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    transpose_bm: bool | None = False,
+    prequant: bool | None = True,
+    y_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Computes batched matrix multiplication Y[i] = X[i] @ W[i]^T with BF16 activations and FP4 weights.
@@ -170,7 +169,7 @@ def batched_gemm_a16wfp4_(
         stride_cm = y_pp.stride(2)
         stride_cn = y_pp.stride(3)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         B,
         (
             META["NUM_KSPLIT"]
@@ -242,12 +241,12 @@ def batched_gemm_a16wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    transpose_bm: Optional[bool] = False,
-    prequant: Optional[bool] = True,
-    y_scale: Optional[torch.Tensor] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    transpose_bm: bool | None = False,
+    prequant: bool | None = True,
+    y_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
     return batched_gemm_a16wfp4_(

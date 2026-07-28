@@ -22,21 +22,21 @@ Compile options:
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, vector, range_constexpr, const_expr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, vector
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+)
 
 BLOCK_THREADS = 256
 WARP_SIZE = 64
@@ -49,6 +49,8 @@ def build_silu_and_mul_fq_module(
     gui_layout: bool = False,
     act: str = "silu",
     enable_bias: bool = False,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -74,7 +76,7 @@ def build_silu_and_mul_fq_module(
     _need_fp8 = quant_mode == "fp8"
     _need_quant = _need_fp4 or _need_fp8
     assert _need_fp4 or _need_fp8 or quant_mode == "none"
-    if act not in ("silu", "swiglu"):
+    if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"Unsupported activation for split-K path: {act!r}")
 
     scale_cols = inter_dim // 32
@@ -290,9 +292,51 @@ def build_silu_and_mul_fq_module(
                     # never bakes the limit as a compile-time constant.
                     _neg_limit = -swiglu_limit_f
 
-                    def _fmin(x):
+                    # The helpers below are re-defined per unrolled ``iter_idx`` on
+                    # purpose: they close over SSA values emitted at this insertion
+                    # point.  Bind those values as defaults so each definition
+                    # captures *its own* iteration's values (also silences B023).
+                    def _fmin(x, _neg_limit=_neg_limit):
                         # min(x, lim) == -max(-x, -lim)
                         return -((-x).maximumf(_neg_limit))
+
+                    def _sigmoid_s(x, neg_log2e=neg_log2e):
+                        emu = llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.exp2.f32", [x * neg_log2e], [], []
+                        )
+                        return llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.rcp.f32", [c1_f32 + emu], [], []
+                        )
+
+                    def _tanh_s(x):
+                        # tanh(x) = 2*sigmoid(2x) - 1
+                        two = arith.constant(2.0, type=f32)
+                        return two * _sigmoid_s(two * x) - c1_f32
+
+                    # SiTUv2 scale params are compile-time constants (folded via
+                    # arith.constant), consistent with the main gemm1 kernel's
+                    # compile-time situ_beta/situ_linear_beta model.
+                    _sv2_beta_f32 = arith.constant(float(situ_beta), type=f32)
+                    _sv2_beta_rcp = arith.constant(1.0 / float(situ_beta), type=f32)
+                    _sv2_linbeta_f32 = arith.constant(float(situ_linear_beta), type=f32)
+                    _sv2_linbeta_rcp = arith.constant(
+                        1.0 / float(situ_linear_beta), type=f32
+                    )
+
+                    def _situv2_elem(
+                        g,
+                        u,
+                        _sv2_beta_f32=_sv2_beta_f32,
+                        _sv2_beta_rcp=_sv2_beta_rcp,
+                        _sv2_linbeta_f32=_sv2_linbeta_f32,
+                        _sv2_linbeta_rcp=_sv2_linbeta_rcp,
+                    ):
+                        # beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)
+                        situ_g = (
+                            _sv2_beta_f32 * _tanh_s(g * _sv2_beta_rcp) * _sigmoid_s(g)
+                        )
+                        up_sc = _sv2_linbeta_f32 * _tanh_s(u * _sv2_linbeta_rcp)
+                        return situ_g * up_sc
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
@@ -309,6 +353,10 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
+                        if const_expr(act == "situv2"):
+                            # SiTUv2: no clamp (tanh self-saturates).
+                            act_vals.append(_situv2_elem(g, u))
+                            continue
                         # gate: upper-clamped only; linear: clamped to [-lim, lim].
                         gate = _fmin(g)
                         linear = _fmin(u).maximumf(_neg_limit)
@@ -561,7 +609,7 @@ def build_silu_and_mul_fq_module(
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
         swiglu_limit_f: fx.Float32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

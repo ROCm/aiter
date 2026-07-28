@@ -277,19 +277,19 @@ def store_acc_vec8_to_buffer(
 
 
 __all__ = [
-    # LDS helpers
-    "get_lds_memref",
     # Raw LLVM path
     "extract_lds_base_idx",
+    # LDS helpers
+    "get_lds_memref",
+    "issue_tdm_loads",
     "lds_load_b128_raw",
     "lds_transpose_load_raw",
-    # Pipeline
-    "workgroup_barrier",
     "pipeline_fence",
     "pipeline_fence_signal",
     "pipeline_fence_wait",
-    "issue_tdm_loads",
+    "store_acc_vec8_to_buffer",
     # Epilogue
     "store_acc_vec8_to_lds",
-    "store_acc_vec8_to_buffer",
+    # Pipeline
+    "workgroup_barrier",
 ]
