@@ -80,6 +80,14 @@ run g2_n256_nb4       16 256 256 2      16 256 128 4
 run g2_n256_k256_b3   16 256 256 2      16 256 256 3
 # E: combine the winners
 run both_nb3          16 256 256 3      16 512 128 3
+# F: tile_m=64 == rows/expert, so the weight slab is read once instead of 4x.
+#    Per-unit-M-work TDM traffic drops ~3x (39040 -> 12928 B per K-tile).
+run g1_m64_nb2        64 256 256 2      16 512 128 2
+run g1_m64_nb3        64 256 256 3      16 512 128 2
+run g1_m64_n128_nb3   64 128 256 3      16 512 128 2
+run g1_m64_n128_nb4   64 128 256 4      16 512 128 2
+run g1_m32_nb3        32 256 256 3      16 512 128 2
+run g1_m128_nb2      128 256 256 2      16 512 128 2
 
 echo
 echo "================ SUMMARY ================"
