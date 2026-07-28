@@ -1,5 +1,6 @@
-from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental import gluon
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -39,7 +40,7 @@ def get_gemm_afp4wfp4_preshuffle_layouts(num_warps, BLOCK_M, BLOCK_N, BLOCK_K):
     )
 
     # Shared memory layouts
-    PAD_INTERVAL_A = 256 if BLOCK_K_BYTES <= 256 else BLOCK_K_BYTES
+    PAD_INTERVAL_A = max(256, BLOCK_K_BYTES)
     shared_A = gl.PaddedSharedLayout.with_identity_for(
         [[PAD_INTERVAL_A, 16]], [BLOCK_M, BLOCK_K_BYTES], [1, 0]
     )

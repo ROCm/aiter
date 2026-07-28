@@ -3,6 +3,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -16,26 +17,26 @@ from aiter.jit.core import (
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
     get_asm_dir,
 )
-from aiter.utility.base_tuner import GemmCommonTuner
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.opus.gemm_op_a8w8 import (
     opus_gemm_a8w8_blockscale_bpreshuffle_tune,
 )
+from aiter.ops.shuffle import shuffle_weight
+from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
     kernels_list as candidate_kernels_bpreshuffle_dict,
 )
-from gemm_a8w8_blockscale_instance import candidate_kernels_dict
-from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 # cktile
 from gemm_a8w8_blockscale_cktile_instance import (
-    candidate_kernels_cktile_dict,
     BLOCK_PER_CU_MAX,
+    candidate_kernels_cktile_dict,
 )
+from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 block_shape = (128, 128)
 
@@ -198,7 +199,7 @@ def generate_data(m, n, k, seed, device="cuda"):
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
         "untune_file": "aiter/configs/a8w8_blockscale_untuned_gemm.csv",
@@ -317,7 +318,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         block_per_cu,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = {
             k: v
@@ -332,11 +333,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_cktile = []
         for i, kernel in kernel_list.items():
-            if not get_gfx().startswith("gfx95"):
-                if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
-                    kernel.K_Warp_Tile > 64  # gfx942 not support
-                ):
-                    continue
+            if not get_gfx().startswith("gfx95") and (
+                (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8)
+                or (kernel.K_Warp_Tile > 64)  # gfx942 not support
+            ):
+                continue
 
             maxsplitK = (
                 0
@@ -394,7 +395,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         kernel_list = (
             candidate_kernels_bpreshuffle_dict
             if preshuffleB
@@ -506,7 +507,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             gemm_a8w8_blockscale,
             gemm_a8w8_blockscale_bpreshuffle,
         )
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         is_preshuffle = args.preshuffle
         untunedf = self.untunedf
@@ -560,7 +561,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
@@ -576,7 +577,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         asm_kernel_list_csv = (
             f"{get_asm_dir()}/fp8gemm_blockscale/fp8gemm_bf16_blockscale.csv"
         )

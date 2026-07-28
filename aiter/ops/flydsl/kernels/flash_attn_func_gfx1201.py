@@ -35,6 +35,10 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import (
+    llvm as _llvm,
+)
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -45,14 +49,13 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T, Vector as Vec
-from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
+
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-)
 
 KERNEL_NAME = "flash_attn_func_gfx1201_c_exp_a_k_noswizzle_kernel"
 _LOG2E = host_math.log2(host_math.e)
@@ -197,7 +200,7 @@ def build_flash_attn_func_module_primary(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         seq_len: fx.Int32,
     ):
         elem_type = dtype_to_elem_type(dtype_str)
@@ -599,7 +602,7 @@ def build_flash_attn_func_module_primary(
             # Opt3: Prefetch next V pack while current WMMA executes
             v_base = v_buf_base(0)
 
-            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
+            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val, v_base=v_base):
                 d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                 v_elems = []
                 for k_sub in range_constexpr(8):
@@ -674,10 +677,12 @@ def build_flash_attn_func_module_primary(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(  # noqa: B008  framework idiom: default is evaluated once at import on purpose
+            None
+        ),
     ):
         ctx = CompilationContext.get_current()
 
@@ -770,7 +775,7 @@ def build_flash_attn_func_module_primary(
         stream = kwargs.pop("stream", fx.Stream(None))
         _run_compiled(launch_flash_attn_func, *args, stream)
 
-    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):  # noqa: E741
+    def _compile(Q, K, V, O, batch_size, seq_len, stream=None):
         return flyc.compile(
             launch_flash_attn_func,
             _ptr_arg(Q),

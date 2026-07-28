@@ -1,3 +1,4 @@
+# NOTE: vendored from vLLM; `envs` / `current_platform` / `enable_trace_function_call` live in vllm modules that were not carried over, so these helpers are unusable here as-is.
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
 * Copyright (C) 2024-2025, The vLLM team.
@@ -34,25 +35,15 @@ import uuid
 import warnings
 import weakref
 from asyncio import FIRST_COMPLETED, ensure_future
-from functools import lru_cache, partial, wraps
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Awaitable, Callable, Hashable
+from functools import cache, lru_cache, partial, wraps
 from platform import uname
 from typing import (
     Any,
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    Dict,
     Generic,
-    Hashable,
-    List,
     Literal,
-    Optional,
-    OrderedDict,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
     overload,
 )
 from uuid import uuid4
@@ -67,7 +58,6 @@ from packaging.version import Version
 from typing_extensions import ParamSpec, TypeIs, assert_never
 
 from aiter import logger
-
 
 # Exception strings for non-implemented encoder/decoder scenarios
 
@@ -259,11 +249,11 @@ class rpd_trace:
                 connection.commit()
         except sqlite3.OperationalError as e:
             print(f"SQLite operational error: {e}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"An error occurred while creating the filename: {e}")
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_hipScopedMarker_available():
     try:
         from hipScopedMarker import hipScopedMarker
@@ -317,7 +307,7 @@ class LRUCache(Generic[T]):
 
     def __init__(self, capacity: int):
         self.cache: OrderedDict[Hashable, T] = OrderedDict()
-        self.pinned_items: Set[Hashable] = set()
+        self.pinned_items: set[Hashable] = set()
         self.capacity = capacity
 
     def __contains__(self, key: Hashable) -> bool:
@@ -340,8 +330,8 @@ class LRUCache(Generic[T]):
     def touch(self, key: Hashable) -> None:
         self.cache.move_to_end(key)
 
-    def get(self, key: Hashable, default_value: Optional[T] = None) -> Optional[T]:
-        value: Optional[T]
+    def get(self, key: Hashable, default_value: T | None = None) -> T | None:
+        value: T | None
         if key in self.cache:
             value = self.cache[key]
             self.cache.move_to_end(key)
@@ -366,7 +356,7 @@ class LRUCache(Generic[T]):
     def _unpin(self, key: Hashable) -> None:
         self.pinned_items.remove(key)
 
-    def _on_remove(self, key: Hashable, value: Optional[T]):
+    def _on_remove(self, key: Hashable, value: T | None):
         pass
 
     def remove_oldest(self, remove_pinned=False):
@@ -391,9 +381,9 @@ class LRUCache(Generic[T]):
         while len(self.cache) > self.capacity:
             self.remove_oldest()
 
-    def pop(self, key: Hashable, default_value: Optional[T] = None) -> Optional[T]:
+    def pop(self, key: Hashable, default_value: T | None = None) -> T | None:
         run_on_remove = key in self.cache
-        value: Optional[T] = self.cache.pop(key, default_value)
+        value: T | None = self.cache.pop(key, default_value)
         # remove from pinned items
         if key in self.pinned_items:
             self._unpin(key)
@@ -448,7 +438,7 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_cpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -458,7 +448,7 @@ def is_cpu() -> bool:
         return False
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_openvino() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -468,7 +458,7 @@ def is_openvino() -> bool:
         return False
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_neuron() -> bool:
     try:
         import transformers_neuronx
@@ -477,7 +467,7 @@ def is_neuron() -> bool:
     return transformers_neuronx is not None
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_xpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -502,7 +492,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
     from vllm import _custom_ops as ops
@@ -528,7 +518,7 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
-    if current_platform.is_cuda_alike():
+    if current_platform.is_cuda_alike():  # noqa: F821
         torch.cuda.manual_seed_all(seed)
 
     if is_xpu():
@@ -539,7 +529,7 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_vllm_instance_id() -> str:
     """
     If the environment variable VLLM_INSTANCE_ID is set, return it.
@@ -547,10 +537,10 @@ def get_vllm_instance_id() -> str:
     Instance id represents an instance of the VLLM. All processes in the same
     instance should have the same instance id.
     """
-    return envs.VLLM_INSTANCE_ID or f"vllm-instance-{random_uuid()}"
+    return envs.VLLM_INSTANCE_ID or f"vllm-instance-{random_uuid()}"  # noqa: F821
 
 
-@lru_cache(maxsize=None)
+@cache
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(uname()).lower()
@@ -583,7 +573,7 @@ async def iterate_with_cancellation(
     # Can use anext() in python >= 3.10
     awaits = [ensure_future(iterator.__anext__())]
     while True:
-        done, pending = await asyncio.wait(awaits, timeout=1)
+        done, _pending = await asyncio.wait(awaits, timeout=1)
         if await is_cancelled():
             with contextlib.suppress(BaseException):
                 awaits[0].cancel()
@@ -601,8 +591,8 @@ async def iterate_with_cancellation(
 
 async def merge_async_iterators(
     *iterators: AsyncGenerator[T, None],
-    is_cancelled: Optional[Callable[[], Awaitable[bool]]] = None,
-) -> AsyncGenerator[Tuple[int, T], None]:
+    is_cancelled: Callable[[], Awaitable[bool]] | None = None,
+) -> AsyncGenerator[tuple[int, T], None]:
     """Merge multiple asynchronous iterators into a single iterator.
 
     This method handle the case where some iterators finish before others.
@@ -618,7 +608,7 @@ async def merge_async_iterators(
     timeout = None if is_cancelled is None else 1
     try:
         while awaits:
-            done, pending = await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 awaits.keys(), return_when=FIRST_COMPLETED, timeout=timeout
             )
             if is_cancelled is not None and await is_cancelled():
@@ -640,7 +630,7 @@ async def merge_async_iterators(
                 await it.aclose()
 
 
-async def collect_from_async_generator(iterator: AsyncGenerator[T, None]) -> List[T]:
+async def collect_from_async_generator(iterator: AsyncGenerator[T, None]) -> list[T]:
     """Collect all items from an async generator into a list."""
     items = []
     async for item in iterator:
@@ -660,7 +650,7 @@ def get_ip() -> str:
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
 
     # try ipv6
@@ -670,7 +660,7 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
 
     warnings.warn(
@@ -709,7 +699,7 @@ def sched_yield():
         time.sleep(0)
 
 
-@lru_cache()
+@lru_cache
 def get_zmq_base_path() -> str:
     return tempfile.gettempdir()
 
@@ -743,7 +733,7 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
+def find_process_using_port(port: int) -> psutil.Process | None:
     for conn in psutil.net_connections():
         if conn.laddr.port == port:
             try:
@@ -753,7 +743,7 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
-def update_environment_variables(envs: Dict[str, str]):
+def update_environment_variables(envs: dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
@@ -765,7 +755,7 @@ def update_environment_variables(envs: Dict[str, str]):
         os.environ[k] = v
 
 
-def chunk_list(lst: List[T], chunk_size: int):
+def chunk_list(lst: list[T], chunk_size: int):
     """Yield successive chunk_size chunks from lst."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i : i + chunk_size]
@@ -798,8 +788,8 @@ def _generate_random_fp8(
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -818,7 +808,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -828,19 +818,19 @@ def create_kv_caches_with_random_flash(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     seed_everything(seed)
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     key_value_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
     scale = head_size**-0.5
 
-    key_caches: List[torch.Tensor] = []
-    value_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
 
     for _ in range(num_layers):
         key_value_cache = torch.empty(
@@ -863,11 +853,11 @@ def create_kv_caches_with_random(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -881,7 +871,7 @@ def create_kv_caches_with_random(
     scale = head_size**-0.5
     x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -893,7 +883,7 @@ def create_kv_caches_with_random(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -914,7 +904,7 @@ def print_warning_once(msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_pin_memory_available() -> bool:
 
     if in_wsl():
@@ -938,12 +928,12 @@ def is_pin_memory_available() -> bool:
 
 class DeviceMemoryProfiler:
 
-    def __init__(self, device: Optional[torch.types.Device] = None):
+    def __init__(self, device: torch.types.Device | None = None):
         self.device = device
 
     def current_memory_usage(self) -> float:
         # Return the memory usage in bytes.
-        if current_platform.is_cuda_alike():
+        if current_platform.is_cuda_alike():  # noqa: F821
             torch.cuda.reset_peak_memory_stats(self.device)
             mem = torch.cuda.max_memory_allocated(self.device)
         elif is_xpu():
@@ -965,11 +955,11 @@ class DeviceMemoryProfiler:
 
 
 def make_ndarray_with_pad(
-    x: List[List[T]],
+    x: list[list[T]],
     pad: T,
     dtype: npt.DTypeLike,
     *,
-    max_len: Optional[int] = None,
+    max_len: int | None = None,
 ) -> npt.NDArray:
     """
     Make a padded array from 2D inputs.
@@ -990,12 +980,12 @@ def make_ndarray_with_pad(
 
 
 def make_tensor_with_pad(
-    x: List[List[T]],
+    x: list[list[T]],
     pad: T,
     dtype: torch.dtype,
     *,
-    max_len: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
+    max_len: int | None = None,
+    device: str | torch.device | None = None,
     pin_memory: bool = False,
 ) -> torch.Tensor:
     """
@@ -1017,7 +1007,7 @@ def make_tensor_with_pad(
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
-    target_device: Union[str, torch.device],
+    target_device: str | torch.device,
     pin_memory: bool,
 ) -> torch.Tensor:
     """Asynchronously create a tensor and copy it from host to device."""
@@ -1033,10 +1023,10 @@ def get_dtype_size(dtype: torch.dtype) -> int:
 # `collections` helpers
 def is_list_of(
     value: object,
-    typ: Type[T],
+    typ: type[T],
     *,
     check: Literal["first", "all"] = "first",
-) -> TypeIs[List[T]]:
+) -> TypeIs[list[T]]:
     if not isinstance(value, list):
         return False
 
@@ -1048,31 +1038,31 @@ def is_list_of(
     assert_never(check)
 
 
-JSONTree = Union[
-    Dict[str, "JSONTree[T]"], List["JSONTree[T]"], Tuple["JSONTree[T]", ...], T
-]
+JSONTree = (
+    dict[str, "JSONTree[T]"] | list["JSONTree[T]"] | tuple["JSONTree[T]", ...] | T
+)
 """A nested JSON structure where the leaves need not be JSON-serializable."""
 
 
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: Dict[str, JSONTree[T]],
-) -> Dict[str, JSONTree[U]]: ...
+    value: dict[str, JSONTree[T]],
+) -> dict[str, JSONTree[U]]: ...
 
 
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: List[JSONTree[T]],
-) -> List[JSONTree[U]]: ...
+    value: list[JSONTree[T]],
+) -> list[JSONTree[U]]: ...
 
 
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: Tuple[JSONTree[T], ...],
-) -> Tuple[JSONTree[U], ...]: ...
+    value: tuple[JSONTree[T], ...],
+) -> tuple[JSONTree[U], ...]: ...
 
 
 @overload
@@ -1093,7 +1083,7 @@ def json_map_leaves(func: Callable[[T], U], value: JSONTree[T]) -> JSONTree[U]:
         return func(value)
 
 
-def flatten_2d_lists(lists: List[List[T]]) -> List[T]:
+def flatten_2d_lists(lists: list[list[T]]) -> list[T]:
     """Flatten a list of lists to a single list."""
     return [item for sublist in lists for item in sublist]
 
@@ -1107,14 +1097,14 @@ def init_cached_hf_modules() -> None:
     init_hf_modules()
 
 
-@lru_cache(maxsize=None)
+@cache
 def find_library(lib_name: str) -> str:
     """
     Find the library file in the system.
     `lib_name` is full filename, with both prefix and suffix.
     This function resolves `lib_name` to the full path of the library.
     """
-    # Adapted from https://github.com/openai/triton/blob/main/third_party/nvidia/backend/driver.py#L19 # noqa
+    # Adapted from https://github.com/openai/triton/blob/main/third_party/nvidia/backend/driver.py#L19
     # According to https://en.wikipedia.org/wiki/Filesystem_Hierarchy_Standard
     # `/sbin/ldconfig` should exist in all Linux systems.
     # `/sbin/ldconfig` searches the library in the system
@@ -1123,7 +1113,7 @@ def find_library(lib_name: str) -> str:
     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
     locs = [line.split()[-1] for line in libs.splitlines() if lib_name in line]
     # `LD_LIBRARY_PATH` searches the library in the user-defined paths
-    env_ld_library_path = envs.LD_LIBRARY_PATH
+    env_ld_library_path = envs.LD_LIBRARY_PATH  # noqa: F821
     if not locs and env_ld_library_path:
         locs = [
             os.path.join(dir, lib_name)
@@ -1142,7 +1132,7 @@ def find_nccl_library() -> str:
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
-    so_file = envs.VLLM_NCCL_SO_PATH
+    so_file = envs.VLLM_NCCL_SO_PATH  # noqa: F821
 
     # manually load the nccl library
     if so_file:
@@ -1165,16 +1155,16 @@ def enable_trace_function_call_for_thread() -> None:
     if enabled via the VLLM_TRACE_FUNCTION environment variable
     """
 
-    if envs.VLLM_TRACE_FUNCTION:
+    if envs.VLLM_TRACE_FUNCTION:  # noqa: F821
         tmp_dir = tempfile.gettempdir()
         filename = (
             f"VLLM_TRACE_FUNCTION_for_process_{os.getpid()}"
             f"_thread_{threading.get_ident()}_"
-            f"at_{datetime.datetime.now()}.log"
+            f"at_{datetime.datetime.now(datetime.timezone.utc)}.log"
         ).replace(" ", "_")
         log_path = os.path.join(tmp_dir, "vllm", get_vllm_instance_id(), filename)
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        enable_trace_function_call(log_path)
+        enable_trace_function_call(log_path)  # noqa: F821
 
 
 # `functools` helpers
@@ -1187,8 +1177,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def deprecate_kwargs(
     *kws: str,
-    is_deprecated: Union[bool, Callable[[], bool]] = True,
-    additional_message: Optional[str] = None,
+    is_deprecated: bool | Callable[[], bool] = True,
+    additional_message: str | None = None,
 ) -> Callable[[F], F]:
     deprecated_kws = set(kws)
 
@@ -1222,7 +1212,7 @@ def deprecate_kwargs(
 
 
 @lru_cache(maxsize=2)
-def get_cuda_visible_devices(return_str=False) -> List[Any]:
+def get_cuda_visible_devices(return_str=False) -> list[Any]:
     """Get the value of the CUDA_VISIBLE_DEVICES environment variable."""
     cuda_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES", None)
     if cuda_visible_devices:
@@ -1242,7 +1232,7 @@ def get_cuda_visible_devices(return_str=False) -> List[Any]:
 
 
 @lru_cache(maxsize=8)
-def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
+def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
     # LRU Cache purposes.
 
@@ -1342,7 +1332,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         return super().parse_args(processed_args, namespace)
 
     @staticmethod
-    def _pull_args_from_config(args: List[str]) -> List[str]:
+    def _pull_args_from_config(args: list[str]) -> list[str]:
         """Method to pull arguments specified in the config file
         into the command-line args variable.
 
@@ -1380,10 +1370,8 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
 
         index = args.index("--config")
         if index == len(args) - 1:
-            raise ValueError(
-                "No config file specified! \
-                             Please check your command-line arguments."
-            )
+            raise ValueError("No config file specified! \
+                             Please check your command-line arguments.")
 
         file_path = args[index + 1]
 
@@ -1410,7 +1398,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         return args
 
     @staticmethod
-    def _load_config_file(file_path: str) -> List[str]:
+    def _load_config_file(file_path: str) -> list[str]:
         """Loads a yaml file and returns the key value pairs as a
         flattened list with argparse like pattern
         ```yaml
@@ -1434,19 +1422,19 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             )
 
         # only expecting a flat dictionary of atomic types
-        processed_args: List[str] = []
+        processed_args: list[str] = []
 
-        config: Dict[str, Union[int, str]] = {}
+        config: dict[str, int | str] = {}
         try:
             with open(file_path, "r") as config_file:
                 config = yaml.safe_load(config_file)
-        except Exception as ex:
+        except Exception:
             logger.error(
                 "Unable to read the config file at %s. \
                 Make sure path is correct",
                 file_path,
             )
-            raise ex
+            raise
 
         for key, value in config.items():
             processed_args.append("--" + key)
@@ -1477,13 +1465,11 @@ def supports_kw(
     param_val = params.get(kw_name)
 
     # Types where the it may be valid, i.e., explicitly defined & nonvariadic
-    passable_kw_types = set(
-        (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        )
-    )
+    passable_kw_types = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
     if param_val:
         is_sig_param = param_val.kind in passable_kw_types
@@ -1514,11 +1500,11 @@ def supports_kw(
 
 
 def resolve_mm_processor_kwargs(
-    init_kwargs: Optional[Dict[str, Any]],
-    inference_kwargs: Optional[Dict[str, Any]],
+    init_kwargs: dict[str, Any] | None,
+    inference_kwargs: dict[str, Any] | None,
     callable: Callable[..., object],
     allow_var_kwargs: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Applies filtering to eliminate invalid mm_processor_kwargs, i.e.,
     those who are not explicit keywords to the given callable (of one is
     given; otherwise no filtering is done), then merges the kwarg dicts,
@@ -1549,9 +1535,9 @@ def resolve_mm_processor_kwargs(
 
 def get_allowed_kwarg_only_overrides(
     callable: Callable[..., object],
-    overrides: Optional[Dict[str, Any]],
+    overrides: dict[str, Any] | None,
     allow_var_kwargs: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Given a callable which has one or more keyword only params and a dict
     mapping param names to values, drop values that can be not be kwarg

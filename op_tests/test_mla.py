@@ -4,6 +4,7 @@
 import argparse
 import itertools
 import random
+
 import pandas as pd
 import torch
 
@@ -21,18 +22,16 @@ torch.set_printoptions(sci_mode=False)
 
 
 def check_support(dtype, kv_dtype, nhead):
-    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
-        return False
-    return True
+    return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
 
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> None:
     x, y = x.double(), y.double()
-    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
+    ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    amax_diff = (x - y).abs().max().item()
+    (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -305,7 +304,7 @@ def test_mla(
         # )
 
         out_asm = torch.empty((total_qo, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm = run_perftest(
+        (_attn_logits, _attn_lse), us_asm = run_perftest(
             aiter.mla.mla_prefill_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -404,7 +403,7 @@ def test_mla(
     def test_absorb_decode_bf16():
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -452,7 +451,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -507,7 +506,7 @@ def test_mla(
             seq_info = kv_indptr
             use_2d_view = False
 
-        (attn_logits, attn_lse), us_gluon_decode = run_perftest(
+        (_attn_logits, attn_lse), us_gluon_decode = run_perftest(
             mla_gluon,
             q_nope,
             q_pe,

@@ -12,11 +12,11 @@ prefill fills the GPU via the token dimension.
 import torch
 import triton
 
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_prefill_sparse import (
     _pa_prefill_sparse as gluon_pa_prefill_sparse,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 DEVICE_ARCH = arch_info.get_arch()
 

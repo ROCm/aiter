@@ -1,26 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
-    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
-    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
-    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-    _get_config,
-)
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -70,10 +75,10 @@ def gemm_afp4wfp4_fake_tensor(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -106,10 +111,10 @@ def gemm_afp4wfp4_(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -182,7 +187,7 @@ def gemm_afp4wfp4_(
 
     # config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -256,10 +261,10 @@ def gemm_afp4wfp4(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     if config is None:
         config_hashable = None
@@ -277,9 +282,9 @@ def gemm_afp4wfp4_preshuffled_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights using preshuffled scales.
@@ -344,7 +349,7 @@ def gemm_afp4wfp4_preshuffled_scales(
 
     config["BLOCK_SIZE_N"] = max(config["BLOCK_SIZE_N"], 32)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -418,10 +423,10 @@ def gemm_afp4wfp4_preshuffle(
     w_preshuf: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -470,11 +475,13 @@ def gemm_afp4wfp4_preshuffle(
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             get_gemm_afp4wfp4_preshuffle_layouts,
             get_gemm_afp4wfp4_preshuffle_layouts_cga,
         )
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             (
                 triton.cdiv(M, META["BLOCK_SIZE_M"])
                 * triton.cdiv(N, META["BLOCK_SIZE_N"])
@@ -570,7 +577,7 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32 and M_POW2 > 16:
         M_POW2 = 16
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -645,9 +652,9 @@ def gemm_afp4wfp4_preshuffled_weight_scales(
     w,
     x_scales,
     w_scales,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     This this a backward-compatible API and will be deprecated in future release
