@@ -191,7 +191,7 @@ def reference_torch(
         kv = kv.float()
         if h_kv != 1:
             kv = kv.repeat_interleave(h_q // h_kv, dim=0)
-        kv[kv != kv] = 0.0
+        kv[kv != kv] = 0.0  # noqa: PLR0124
         attn_weight = query @ kv.transpose(-2, -1)  # [h_q, s_q, s_k]
         if (is_causal and query.size(1) > 1) or indices is not None:
             mask = torch.ones(s_q, s_k, dtype=torch.bool)

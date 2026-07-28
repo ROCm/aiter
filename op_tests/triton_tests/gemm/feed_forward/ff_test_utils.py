@@ -97,7 +97,7 @@ def ff_ungated_test(
     elif activation is None:
         pass
     else:
-        raise Exception(f"Unsupported activation: {activation}")
+        raise RuntimeError(f"Unsupported activation: {activation}")
     torch_out = torch_out @ w2
 
     if output:
@@ -150,7 +150,7 @@ def ff_gated_test(
     elif activation is None:
         gating = torch_out[:, :intermediate_dim]
     else:
-        raise Exception(f"Unsupported activation: {activation}")
+        raise RuntimeError(f"Unsupported activation: {activation}")
     torch_y = torch_out[:, intermediate_dim:]
     torch_intermediate = gating * torch_y
     torch_out = torch_intermediate @ w2

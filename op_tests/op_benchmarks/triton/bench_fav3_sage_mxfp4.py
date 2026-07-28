@@ -747,11 +747,12 @@ def main():
 
     assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
 
-    if getattr(args, "block_sparsity", None) is not None:
-        if not (0 <= args.block_sparsity <= 1):
-            raise ValueError(
-                f"-block_sparsity must be in [0, 1], got {args.block_sparsity}"
-            )
+    if getattr(args, "block_sparsity", None) is not None and not (
+        0 <= args.block_sparsity <= 1
+    ):
+        raise ValueError(
+            f"-block_sparsity must be in [0, 1], got {args.block_sparsity}"
+        )
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

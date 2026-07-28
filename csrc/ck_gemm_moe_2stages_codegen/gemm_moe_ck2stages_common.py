@@ -372,7 +372,11 @@ def get_gemm1_kernels_list(
     splitk: bool = False,
 ) -> list:
     arch = get_gfx()
-    if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
+    if (
+        Adtype in bit16_list
+        and Bdtype in bit16_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a16w16_gfx950"
         else:
@@ -380,11 +384,15 @@ def get_gemm1_kernels_list(
     elif (
         Adtype in bit8_list
         and Bdtype in bit8_list
-        and Adtype == Adtype
+        and Adtype == Adtype  # noqa: PLR0124
         and QuantType in QuantType_list
     ):
         tag = "a8w8blkscale"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a8w8_gfx950"
         else:
@@ -443,7 +451,11 @@ def get_gemm2_kernels_list(
 ) -> list:
     arch = get_gfx()
 
-    if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
+    if (
+        Adtype in bit16_list
+        and Bdtype in bit16_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a16w16_gfx950"
         else:
@@ -451,11 +463,15 @@ def get_gemm2_kernels_list(
     elif (
         Adtype in bit8_list
         and Bdtype in bit8_list
-        and Adtype == Adtype
+        and Adtype == Adtype  # noqa: PLR0124
         and QuantType in QuantType_list
     ):
         tag = "a8w8blkscale"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a8w8_gfx950"
         else:

@@ -85,7 +85,7 @@ def _is_triton_installed():
     ]:
         try:
             return pkg, pkg_version(pkg)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             pass
     return None
 
@@ -353,7 +353,7 @@ if PREBUILD_KERNELS != 0:
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
                 os.remove(f)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
 
         def build_one_module(one_opt_args):

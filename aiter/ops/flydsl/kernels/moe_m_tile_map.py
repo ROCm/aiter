@@ -163,7 +163,7 @@ def build_moe_m_tile_map_module():
         m_tile_map: fx.Pointer,
         experts: fx.Int32,
         max_m_tiles: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

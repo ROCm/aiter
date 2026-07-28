@@ -89,7 +89,7 @@ def cat_and_cache_mla(
     (b_slot,) = slot_mapping.shape
 
     assert (
-        b == bk and b_slot == b_slot
+        b == bk and b_slot == b_slot  # noqa: PLR0124
     ), "K batch dimensions and slot_mapping should be identical (bk == bk == b_slot)"
     assert kh == kh2 == h_cache, "K head should be identical"
     if kv_cache.dtype == torch.uint8:

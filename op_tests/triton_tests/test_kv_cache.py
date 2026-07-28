@@ -255,8 +255,8 @@ def test_cat_and_cache_mla(
     torch_k_pe = k_pe
 
     if cache_dtype == torch.bfloat16:
-        torch_k_lora = torch_k_lora
-        torch_k_pe = torch_k_pe
+        torch_k_lora = torch_k_lora  # noqa: PLW0127
+        torch_k_pe = torch_k_pe  # noqa: PLW0127
     elif cache_dtype == e4m3_dtype:
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
         torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(torch.bfloat16)

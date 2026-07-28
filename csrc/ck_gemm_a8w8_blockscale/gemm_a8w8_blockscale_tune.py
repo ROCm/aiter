@@ -333,11 +333,11 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         ref_keys = ["x", "weight", "x_scale", "w_scale"]
         tasks_cktile = []
         for i, kernel in kernel_list.items():
-            if not get_gfx().startswith("gfx95"):
-                if (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8) or (
-                    kernel.K_Warp_Tile > 64  # gfx942 not support
-                ):
-                    continue
+            if not get_gfx().startswith("gfx95") and (
+                (kernel.M_Warp * kernel.N_Warp * kernel.K_Warp == 8)
+                or (kernel.K_Warp_Tile > 64)  # gfx942 not support
+            ):
+                continue
 
             maxsplitK = (
                 0

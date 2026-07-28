@@ -257,7 +257,7 @@ def _fused_moe_kernel(
     elif use_fp8_w8a8:
         # if group_k > 0 and group_n > 0:
         if BLOCK_SCALE:
-            accumulator = accumulator
+            accumulator = accumulator  # noqa: PLW0127
         else:
             accumulator = accumulator * a_scale * b_scale
 
@@ -462,7 +462,7 @@ def _fused_moe_persistent_kernel(
         elif use_fp8_w8a8:
             # if group_k > 0 and group_n > 0:
             if BLOCK_SCALE:
-                accumulator = accumulator
+                accumulator = accumulator  # noqa: PLW0127
             else:
                 accumulator = accumulator * a_scale * b_scale
 

@@ -43,7 +43,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -886,12 +886,10 @@ if __name__ == "__main__":
         [None, torch.float8_e4m3fnuz, torch.int8],
     ):
 
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
-        elif pa_variant == PAVariant.Asm:
-            if quant_cache_dtype not in [None, torch.int8]:
-                continue
+        if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
+            continue
+        if pa_variant == PAVariant.Asm and quant_cache_dtype not in [None, torch.int8]:
+            continue
 
         test_paged_attention(
             ctx_len,

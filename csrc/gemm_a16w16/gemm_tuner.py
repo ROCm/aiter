@@ -62,7 +62,7 @@ def clean():
                 for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
                     try:
                         mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
-                    except Exception:  # noqa: BLE001
+                    except Exception:  # noqa: BLE001,S110
                         pass
     except Exception as e:  # noqa: BLE001
         print(f"Resource cleanup warning: {e}")

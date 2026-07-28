@@ -156,11 +156,10 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
         elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
             pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
 
-    if shuffle:
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     if backend not in ("gluon",) and K < 512:
         pytest.skip("Small-K shapes exercise gluon-only paths.")

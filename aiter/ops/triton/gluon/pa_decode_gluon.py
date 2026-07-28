@@ -4941,7 +4941,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         stride_logits_group,
         batch_size,
         num_kv_heads,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()

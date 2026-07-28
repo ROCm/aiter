@@ -120,7 +120,7 @@ def run_fused_benchmark(
         )
     for arg in unsupported_args:
         if getattr(args, arg, None) != getattr(defaults, arg, None):
-            raise Exception(f"Argument '{arg}' is not supported for {kernel_label}.")
+            raise RuntimeError(f"Argument '{arg}' is not supported for {kernel_label}.")
     run_fused_shape_benchmark(args, x_names, bench_fn, get_x_vals, plot_name)
 
 

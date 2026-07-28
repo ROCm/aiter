@@ -1179,7 +1179,7 @@ def make_dispatch_jit(
         addr_out_disp_tok_map: fx.Int64,
         addr_disp_grid_bar: fx.Int64,
         inp_cur_tok: fx.Int32,
-        stream: Stream = Stream(None),
+        stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = (
             _key_rank,
@@ -1309,7 +1309,7 @@ def make_combine_jit(
         addr_inp_disp_tok_map: fx.Int64,
         addr_inp_disp_wts: fx.Int64,
         cur_rank_num_token: fx.Int32,
-        stream: Stream = Stream(None),
+        stream: Stream = Stream(None),  # noqa: B008
     ):
         _ = (
             _key_rank,

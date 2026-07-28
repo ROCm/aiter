@@ -136,7 +136,7 @@ def chunk_gated_delta_rule_ref(
             attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()
         ).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=torch.float, device=q.device)
-    attn = attn
+    attn = attn  # noqa: PLW0127
     k_cumsum = attn @ v
     k_cumdecay = attn @ (k_beta * decay_exp)
     v = k_cumsum

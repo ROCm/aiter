@@ -3028,8 +3028,9 @@ def compile_mxscale_gemm(
                             def _mid_prefetch_ws(
                                 _k_off=(
                                     split_k_base
-                                    + loop_iter * arith.index(num_buffers * tile_k)
-                                    + arith.index(buf_idx * tile_k)
+                                    + loop_iter
+                                    * arith.index(num_buffers * tile_k)  # noqa: B008
+                                    + arith.index(buf_idx * tile_k)  # noqa: B008
                                 ),
                             ):
                                 _l2_prefetch(_k_off)
@@ -3156,9 +3157,10 @@ def compile_mxscale_gemm(
                                 _ab=addr_boxes,
                                 _k_off=(
                                     split_k_base
-                                    + arith.index(pre_loaded * tile_k)
-                                    + loop_iter * arith.index(num_buffers * tile_k)
-                                    + arith.index(buf_idx * tile_k)
+                                    + arith.index(pre_loaded * tile_k)  # noqa: B008
+                                    + loop_iter
+                                    * arith.index(num_buffers * tile_k)  # noqa: B008
+                                    + arith.index(buf_idx * tile_k)  # noqa: B008
                                 ),
                             ):
                                 dg0_a = vector.from_elements(

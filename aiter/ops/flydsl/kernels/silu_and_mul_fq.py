@@ -609,7 +609,7 @@ def build_silu_and_mul_fq_module(
         token_num: fx.Int32,
         num_sorted_rows: fx.Int32,
         swiglu_limit_f: fx.Float32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

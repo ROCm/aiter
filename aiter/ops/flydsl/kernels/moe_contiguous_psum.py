@@ -147,7 +147,7 @@ def build_moe_contiguous_psum_module():
         contiguous_m: fx.Pointer,
         experts: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_kernel(masked_m, starts, psum, contiguous_m, experts, tile_m).launch(
             grid=(arith.index(1), 1, 1),
@@ -287,7 +287,7 @@ def build_moe_contiguous_psum_remap_module():
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_kernel(
             masked_m,
@@ -466,7 +466,7 @@ def build_moe_route_psum_fused_module():
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_fused_kernel(
             topk_ids,

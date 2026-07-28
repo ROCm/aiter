@@ -171,7 +171,7 @@ def test_gfx1250_allreduce(
         pool.join()
         str(e)
         if isinstance(e, (MpTimeoutError, TimeoutError)):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004
                 f"Worker timed out after {_INIT_TIMEOUT_SEC}s — likely hung "
                 f"in IPC handle exchange (hipIpcGetMemHandle/"
                 f"hipIpcOpenMemHandle). On MI450, "

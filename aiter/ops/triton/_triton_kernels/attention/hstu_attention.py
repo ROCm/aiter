@@ -264,7 +264,8 @@ def _hstu_attn_fwd_compute(
             V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             end_n += BLOCK_N
 
-        if HAS_MULTIPLE_TARGETS and CAUSAL:
+        # Not merged: the `# pyre-ignore[61]` between the two ifs applies to the inner one; merging would silently drop that suppression.
+        if HAS_MULTIPLE_TARGETS and CAUSAL:  # noqa: SIM102
             # pyre-ignore[61]
             if uih_end < start_m:
                 low_delta = start_m

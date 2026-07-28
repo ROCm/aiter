@@ -649,7 +649,7 @@ def get_ip() -> str:
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
 
     # try ipv6
@@ -659,7 +659,7 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
 
     warnings.warn(
@@ -807,7 +807,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 

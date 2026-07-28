@@ -10,7 +10,11 @@ _DEFAULT_SORT_BLOCK_M = 32
 
 
 def _value_is_empty(value) -> bool:
-    return value is None or value != value or str(value).strip() in ("", "nan", "None")
+    return (
+        value is None
+        or value != value  # noqa: PLR0124
+        or str(value).strip() in ("", "nan", "None")
+    )
 
 
 def _cfg_first(cfg: dict, *names: str):

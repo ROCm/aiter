@@ -632,34 +632,32 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # decode_q_pe on TDM async_store — those alternatives lower per-WGP
         # SIMD-instruction count but degrade IPC enough that wall-clock
         # dispatch time grows.
-        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE:
-            if pid < num_decode_toks_for_zeros * QH:
-                decode_q_pe_base = (
-                    pid_b * decode_q_pe_out_stride_b + pid_hq * decode_q_pe_out_stride_h
-                )
-                gl.amd.cdna4.buffer_store(
-                    q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
-                    ptr=decode_q_pe_out_ptr,
-                    offsets=(
-                        decode_q_pe_base + d_pe_offs * decode_q_pe_out_stride_d
-                    ).to(gl.int32),
-                )
-                z = gl.zeros(
-                    [BLOCK_D_nope],
-                    dtype=q_nope_zeros_out_ptr.dtype.element_ty,
-                    layout=L_NOPE,
-                )
-                zeros_base = (
-                    pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                )
-                gl.amd.cdna4.buffer_store(
-                    z,
-                    ptr=q_nope_zeros_out_ptr,
-                    offsets=(zeros_base + d_nope_offs * q_nope_zeros_out_stride_d).to(
-                        gl.int32
-                    ),
-                )
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid < num_decode_toks_for_zeros * QH:
+            decode_q_pe_base = (
+                pid_b * decode_q_pe_out_stride_b + pid_hq * decode_q_pe_out_stride_h
+            )
+            gl.amd.cdna4.buffer_store(
+                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+                ptr=decode_q_pe_out_ptr,
+                offsets=(decode_q_pe_base + d_pe_offs * decode_q_pe_out_stride_d).to(
+                    gl.int32
+                ),
+            )
+            z = gl.zeros(
+                [BLOCK_D_nope],
+                dtype=q_nope_zeros_out_ptr.dtype.element_ty,
+                layout=L_NOPE,
+            )
+            zeros_base = (
+                pid_b * q_nope_zeros_out_stride_b + pid_hq * q_nope_zeros_out_stride_h
+            )
+            gl.amd.cdna4.buffer_store(
+                z,
+                ptr=q_nope_zeros_out_ptr,
+                offsets=(zeros_base + d_nope_offs * q_nope_zeros_out_stride_d).to(
+                    gl.int32
+                ),
+            )
 
         # Drain the in-flight q_out async_stores.
         gl.amd.gfx1250.tdm.async_wait(0)

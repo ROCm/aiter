@@ -431,9 +431,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if N % 16 != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
+        if not k_inst.has_oob and (
+            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
+        ):
+            return True
         return False
 
     if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
@@ -452,9 +453,10 @@ def kid_rejects_shape(k_inst, M, N, K):
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
+        if not k_inst.has_oob and (
+            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
+        ):
+            return True
         # Workspace + reduce buffer-resource size limit.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
@@ -555,9 +557,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
+        if not k_inst.has_oob and (
+            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
+        ):
+            return True
         return False
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
@@ -652,7 +655,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 
         if get_gfx_runtime().lower() == "gfx1250":
             return _gfx1250_select_candidates(M, N, K, cu_num)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
 
     # Step 1: structural tile-align fallback for non-splitk pipelines.
@@ -687,7 +690,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
             if (getattr(_klist.get(kid), "arch_prefix", "") or "gfx950").lower()
             == _run_arch
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
     # Step 6: drop known-bad kids permanently.
@@ -855,7 +858,7 @@ def _ensure_kids_compiled(candidate_kids):
                 _entries = getattr(_jev, "entries", None)
                 if isinstance(_entries, dict):
                     _entries.pop("module_deepgemm_opus", None)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             pass
 
         # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
@@ -898,7 +901,7 @@ def _ensure_kids_compiled(candidate_kids):
                 )
                 if os.path.exists(_so):
                     os.remove(_so)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
         finally:
             # Restore in-process flag for the parent (mp_tuner children
@@ -1133,7 +1136,7 @@ def _quiet_aiter_logger_once():
         return
     try:
         logger.setLevel(logging.WARNING)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
 
 

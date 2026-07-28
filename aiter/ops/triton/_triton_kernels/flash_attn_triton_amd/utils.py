@@ -239,7 +239,7 @@ def get_shape_from_layout(
         if max_seqlen is None:
             raise ValueError("max_seqlen must be provided for varlen (thd) layout")
 
-        batch, max_seqlen_final, num_heads, head_dim = (
+        batch, max_seqlen_final, num_heads, head_dim = (  # noqa: PLW0127
             len(cu_seqlens) - 1,
             max_seqlen,
             num_heads,

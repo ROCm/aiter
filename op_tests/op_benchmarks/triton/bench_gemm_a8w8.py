@@ -134,13 +134,15 @@ def run_benchmark(args, defaults):
             impl = gluon_gemm_a8w8
     else:
         if args.shuffle:
-            raise Exception("Argument --shuffle is only supported with --gluon flag.")
+            raise RuntimeError(
+                "Argument --shuffle is only supported with --gluon flag."
+            )
         impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args, impl)
@@ -152,7 +154,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args, impl)

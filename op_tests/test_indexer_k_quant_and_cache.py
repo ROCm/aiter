@@ -152,7 +152,7 @@ def test_indexer_k_quant_and_cache(
             err2_k = checkAllclose(k_ref.to(torch.float), k_vllm.to(torch.float))
             err2_s = checkAllclose(s_ref, s_vllm)
             ret.update({"vllm us": us2, "vllm k_err": err2_k, "vllm s_err": err2_s})
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             # Ignore all exceptions here because vllm._custom_ops is optional and may not be available.
             pass
     return ret

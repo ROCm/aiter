@@ -906,9 +906,10 @@ def build_module(
         # ASM kernel debug instrumentation (host prints + post-launch sync) in
         # *.cu is compiled only when AITER_ASM_DEBUG=1, mirroring poc_kl's
         # `compile-dbg` / -DASM_DEBUG. Default builds stay free of debug code.
-        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0:
-            if not any("ASM_DEBUG" in f for f in flags_extra_hip):
-                flags_hip.append("-DASM_DEBUG")
+        if int(os.environ.get("AITER_ASM_DEBUG", "0")) != 0 and not any(
+            "ASM_DEBUG" in f for f in flags_extra_hip
+        ):
+            flags_hip.append("-DASM_DEBUG")
 
         flags_cc += flags_extra_cc
         flags_hip += flags_extra_hip
@@ -1179,9 +1180,10 @@ def get_args_of_build(ops_name: str, exclude=None):
                         continue
                     single_ops = convert(d_ops)
                     # exclude experimental ops if AITER_ENABLE_EXPERIMENTAL is not set
-                    if not is_experimental_enabled():
-                        if single_ops.get("is_experimental", False):
-                            continue
+                    if not is_experimental_enabled() and single_ops.get(
+                        "is_experimental", False
+                    ):
+                        continue
                     d_single_ops = {
                         "md_name": ops_name,
                         "srcs": single_ops["srcs"],

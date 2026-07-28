@@ -207,7 +207,7 @@ class HsacoLauncher:
         """Cleanup on destruction"""
         try:
             self.unload_module()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             pass
 
 

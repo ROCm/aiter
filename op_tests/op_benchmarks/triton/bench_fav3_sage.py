@@ -1428,11 +1428,10 @@ def main():
     if block_sparse:
         args.fav3_sage = True
         args.fav3_fp8 = args.aiter_fp8 = args.aiter_bf16 = False
-        if args.block_sparsity is not None:
-            if not (0 <= args.block_sparsity <= 1):
-                raise ValueError(
-                    f"--block_sparsity must be in [0, 1], got {args.block_sparsity}"
-                )
+        if args.block_sparsity is not None and not (0 <= args.block_sparsity <= 1):
+            raise ValueError(
+                f"--block_sparsity must be in [0, 1], got {args.block_sparsity}"
+            )
         if getattr(args, "block_mask_file", None):
             if not os.path.isfile(args.block_mask_file.strip()):
                 raise FileNotFoundError(

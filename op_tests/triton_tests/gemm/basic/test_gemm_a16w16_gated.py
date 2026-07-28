@@ -68,7 +68,7 @@ def test_gemm_a16_w16_gated(M: int, N: int, K: int, dtype, output, layout, activ
     elif activation is None:
         gating = torch_out[:, : N // 2]
     else:
-        raise Exception(f"Unsupported activation: {activation}")
+        raise RuntimeError(f"Unsupported activation: {activation}")
     torch_y = torch_out[:, N // 2 :]
     torch_out = gating * torch_y
 

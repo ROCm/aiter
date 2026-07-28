@@ -442,7 +442,8 @@ def la_persistent(
                     print(f"    Inner loop: l_iter={l_iter}, mask.shape={mask.shape}")
                     torch.set_printoptions(threshold=10_000)
                     print(f"    mask = {mask}")
-            if causal and (BLOCK_RATIO == 1):
+            # Not merged: commented-out alternative condition sits between the two ifs.
+            if causal and (BLOCK_RATIO == 1):  # noqa: SIM102
                 # if (l_iter == (tile_iter_end - tile_iter) - 1):
                 if (iter + (l_iter - local_iter)) == (tile_iter_end - 1):
                     mask = offs_m[:, None] >= offs_n[None, :]

@@ -1057,7 +1057,7 @@ def _mla_prefill_reduce_kernel(
             ) * stride_lse_tok + head_id * stride_lse_head
             lse = tl.load(partial_lse_ptr + lse_offset)
 
-            is_valid = lse == lse
+            is_valid = lse == lse  # noqa: PLR0124
             lse = tl.where(is_valid, lse, -float("inf"))
 
             lse_values = tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse, lse_values)
@@ -1108,7 +1108,7 @@ def _mla_prefill_reduce_kernel(
                 )
 
                 # Handle NaN in output (NaN != NaN)
-                is_valid_out = partial_out == partial_out
+                is_valid_out = partial_out == partial_out  # noqa: PLR0124
                 partial_out = tl.where(is_valid_out, partial_out, 0.0)
 
                 acc += scale * partial_out

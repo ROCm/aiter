@@ -368,27 +368,24 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
             q_pe.to(q_out_ptr.dtype.element_ty),
         )
 
-        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE:
-            if pid < num_decode_toks_for_zeros * QH:
-                decode_q_pe_out_ptrs = (
-                    decode_q_pe_out_ptr
-                    + pid_b * decode_q_pe_out_stride_b
-                    + pid_hq * decode_q_pe_out_stride_h
-                )
-                tl.store(
-                    decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
-                    q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
-                )
-                z = tl.zeros(
-                    (BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty
-                )
-                tl.store(
-                    q_nope_zeros_out_ptr
-                    + pid_b * q_nope_zeros_out_stride_b
-                    + pid_hq * q_nope_zeros_out_stride_h
-                    + d_nope_offs * q_nope_zeros_out_stride_d,
-                    z,
-                )
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid < num_decode_toks_for_zeros * QH:
+            decode_q_pe_out_ptrs = (
+                decode_q_pe_out_ptr
+                + pid_b * decode_q_pe_out_stride_b
+                + pid_hq * decode_q_pe_out_stride_h
+            )
+            tl.store(
+                decode_q_pe_out_ptrs + d_pe_offs * decode_q_pe_out_stride_d,
+                q_pe.to(decode_q_pe_out_ptr.dtype.element_ty),
+            )
+            z = tl.zeros((BLOCK_D_nope,), dtype=q_nope_zeros_out_ptr.dtype.element_ty)
+            tl.store(
+                q_nope_zeros_out_ptr
+                + pid_b * q_nope_zeros_out_stride_b
+                + pid_hq * q_nope_zeros_out_stride_h
+                + d_nope_offs * q_nope_zeros_out_stride_d,
+                z,
+            )
 
         # pid_hk = pid_hq // QH_PER_KH
         # is_kv = pid_hq % QH_PER_KH == 0

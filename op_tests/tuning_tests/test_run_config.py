@@ -70,7 +70,7 @@ def _resolve_config_via_aiter(config_property):
         config_file = getattr(AITER_CONFIGS, config_property, None)
         if config_file and os.path.exists(config_file):
             return config_file
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
     return None
 

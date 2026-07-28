@@ -164,12 +164,15 @@ def tensor_cache(
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal last_args, last_kwargs, last_result
 
-        if last_args is not None and last_kwargs is not None:
-            if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
-                if all(a is b for a, b in zip(args, last_args, strict=False)) and all(
-                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
-                ):
-                    return last_result
+        if (
+            last_args is not None
+            and last_kwargs is not None
+            and len(args) == len(last_args)
+            and len(kwargs) == len(last_kwargs)
+            and all(a is b for a, b in zip(args, last_args, strict=False))
+            and all(k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items())
+        ):
+            return last_result
 
         result = fn(*args, **kwargs)
         last_args, last_kwargs, last_result = args, kwargs, result

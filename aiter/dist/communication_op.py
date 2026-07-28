@@ -66,7 +66,7 @@ def _normalize_fused_ar_rms_quant_type(quant_type):
             return "mxfp4"
         try:
             return _normalize_fused_ar_rms_quant_type(QuantType(quant_type))
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             pass
     raise ValueError(
         "unsupported fused AR+RMSNorm quant_type="

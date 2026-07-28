@@ -835,9 +835,10 @@ def _build_lds_v_schedule(blk, su):
 def _get_lds_slots(stage, gemm_idx, cycle23, qpoint=GEMM_INST_COUNT // 4 - 1):
     # qpoint: the WMMA index where s_wait_dscnt occupies the slot.
     # GEMM1 (QK): GEMM_INST_COUNT//4-1 = 5. GEMM2 (PV): PV_GEMM_INST_COUNT//4-1 = 3.
-    if const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1):
-        if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-            return 0
+    if (const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1)) and const_expr(
+        gemm_idx == qpoint and not WAIT_DSCNT0
+    ):
+        return 0
     if const_expr(cycle23 == 1):
         if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
             return 0
@@ -849,12 +850,12 @@ def _get_valu_slots(
     stage, gemm_idx, cycle23, default=2, qpoint=GEMM_INST_COUNT // 4 - 1
 ):
     # qpoint: same as _get_lds_slots. Pass PV_GEMM_INST_COUNT//4-1 for GEMM2.
-    if const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1):
-        if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-            return 0
-    if const_expr(stage == 0 and cycle23 == 1):
-        if const_expr(gemm_idx in (4, 8, 12)):
-            return 0
+    if (const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1)) and const_expr(
+        gemm_idx == qpoint and not WAIT_DSCNT0
+    ):
+        return 0
+    if const_expr(stage == 0 and cycle23 == 1) and const_expr(gemm_idx in (4, 8, 12)):
+        return 0
     return default
 
 

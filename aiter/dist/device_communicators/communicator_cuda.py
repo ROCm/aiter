@@ -529,7 +529,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else:
                         out, res_out, scale_out = result
                     fused_ok = True
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(

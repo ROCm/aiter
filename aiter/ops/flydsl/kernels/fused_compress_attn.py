@@ -1400,7 +1400,7 @@ def _build_kernel(
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(
@@ -2426,7 +2426,7 @@ def _build_kernel_ksplit(
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(

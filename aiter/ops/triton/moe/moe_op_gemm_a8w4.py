@@ -429,7 +429,7 @@ def moe_gemm_a8w4(
         )
         out_dtype = torch.float8_e4m3fn
     else:
-        out_dtype = out_dtype
+        out_dtype = out_dtype  # noqa: PLW0127
     y, y_final = allocate_output(
         M,
         padded_N,

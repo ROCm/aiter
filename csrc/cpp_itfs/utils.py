@@ -465,7 +465,9 @@ class HsacoKernel:
         import triton
 
         if not isinstance(kernel, triton.JITFunction):
-            raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
+            raise ValueError(  # noqa: TRY004
+                f"Kernel {kernel} is not a triton.JITFunction"
+            )
         self.triton_kernel = kernel
         self.stream = stream
 

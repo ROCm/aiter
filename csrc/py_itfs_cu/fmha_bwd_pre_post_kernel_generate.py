@@ -219,9 +219,8 @@ def get_bwd_dot_do_o_blobs(
                 F_mode=mode,
                 F_occupancy=get_occupancy(dtype, hdim),
             )
-            if kernel_filter != "":
-                if not fnmatch.fnmatch(k.name, kernel_filter):
-                    continue
+            if kernel_filter != "" and not fnmatch.fnmatch(k.name, kernel_filter):
+                continue
             gen.append(k)
 
     return gen
@@ -385,9 +384,8 @@ def get_bwd_convert_dq_blobs(
                 F_occupancy=get_occupancy(dtype, hdim),
                 F_deterministic=deterministic,
             )
-            if kernel_filter != "":
-                if not fnmatch.fnmatch(k.name, kernel_filter):
-                    continue
+            if kernel_filter != "" and not fnmatch.fnmatch(k.name, kernel_filter):
+                continue
             gen.append(k)
 
     return gen

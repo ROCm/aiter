@@ -90,7 +90,7 @@ def get_hip_version():
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001,S110
         pass
     # The fallbacks below previously hard-coded /opt/rocm, so they never
     # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
@@ -116,7 +116,7 @@ def get_hip_version():
                     [rocm_hipconfig, "--version"], text=True
                 )
                 return output
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
     # Fallback: read HIP version from a header / info file under each root.
     for root in rocm_roots:

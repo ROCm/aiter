@@ -383,7 +383,7 @@ def test_runtime_dispatch_key():
             if path:
                 try:
                     os.unlink(path)
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001,S110
                     pass
 
 
@@ -457,7 +457,7 @@ def test_write_name_keyed_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 
@@ -673,7 +673,7 @@ def test_blockscale_kernel_name_forwarding():
         for p in csv_paths:
             try:
                 os.unlink(p)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 
@@ -730,7 +730,7 @@ def test_write_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
 
 

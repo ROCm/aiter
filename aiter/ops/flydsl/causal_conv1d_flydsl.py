@@ -400,7 +400,7 @@ def build_causal_conv1d_flydsl_module(
         vs1: Int32,
         num_programs: Int32,
         grid_y_dim: Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         gx = arith.index_cast(T.index, num_programs)
         gy = arith.index_cast(T.index, grid_y_dim)

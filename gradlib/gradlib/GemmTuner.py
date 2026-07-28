@@ -86,8 +86,8 @@ def generate_data(
 
 
 def get_gemm_ref(inp, weights, bias, scaleA, scaleB, indtype, outdtype):
-    scaleA = scaleA
-    scaleB = scaleB
+    scaleA = scaleA  # noqa: PLW0127
+    scaleB = scaleB  # noqa: PLW0127
     if indtype == dtypes.fp8:
         x = inp.to(dtypes.fp32) * scaleA
         weight = weights.to(dtypes.fp32) * scaleB

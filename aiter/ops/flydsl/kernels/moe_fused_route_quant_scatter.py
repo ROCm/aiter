@@ -718,7 +718,7 @@ def build_moe_fused_route_quant_scatter_module(
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -951,7 +951,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(k_groups, type=T.i32))
@@ -1191,7 +1191,7 @@ def build_moe_fused_quant_preshuffle_module(
         n_rows: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_blocks)
         fused_kernel(
@@ -1409,7 +1409,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         route_max_m: fx.Int32,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
@@ -1832,7 +1832,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         tile_m: fx.Int32,
         num_workers: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

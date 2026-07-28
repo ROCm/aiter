@@ -370,7 +370,7 @@ def _run_file_pool(
             try:
                 if proc.is_alive():
                     proc.kill()
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001,S110
                 pass
 
     if retries_used:

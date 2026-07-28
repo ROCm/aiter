@@ -454,7 +454,8 @@ def processKernelLaunches(string, stats):
                 # In /* xxx */
                 if c == "/" and prev_c == "*":
                     in_comment = ""
-            elif in_comment == '"':
+            # Not merged: the `# In ""` comment documents this branch; merging would displace it.
+            elif in_comment == '"':  # noqa: SIM102
                 # In ""
                 if c == '"' and prev_c != "\\":
                     in_comment = ""

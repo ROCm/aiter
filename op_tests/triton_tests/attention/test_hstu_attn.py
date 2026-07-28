@@ -34,7 +34,7 @@ def generate_sparse_seq_len(
         return torch.ones(size=(size,), device=device, dtype=torch.int) * max_seq_len
     elif sparsity >= 0.5:
         min_seq_len: int = int((2 * sparsity - 1.0) * max_seq_len)
-        max_seq_len: int = max_seq_len
+        max_seq_len: int = max_seq_len  # noqa: PLW0127
     else:
         min_seq_len: int = 0
         max_seq_len: int = int(2 * sparsity * max_seq_len)

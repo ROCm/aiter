@@ -169,9 +169,10 @@ def paged_attention_rocm(
     v_shuffle = value_cache.dim() == 5
 
     quant_method = "vllm::Fp8QuantMethod::kPerTensor"
-    if key_scale is not None:
-        if key_scale.numel() == (key_cache.size(0) * block_size * num_kv_heads):
-            quant_method = "vllm::Fp8QuantMethod::kPerHead"
+    if key_scale is not None and key_scale.numel() == (
+        key_cache.size(0) * block_size * num_kv_heads
+    ):
+        quant_method = "vllm::Fp8QuantMethod::kPerHead"
 
     func = compile(
         gqa_ratio,

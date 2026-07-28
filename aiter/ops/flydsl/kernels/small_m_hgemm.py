@@ -201,9 +201,10 @@ def _validate_small_m_registry_config(
         wave_repeat = n_tile_repeat == 2 and block_n_warps == 2 and tile_n == 192
         if not (classic_repeat or wave_repeat):
             raise ValueError
-    if persistent_n_tiles > 1:
-        if not b_to_lds or n_tile_repeat != 1 or tile_n < 128 or block_n_warps < 2:
-            raise ValueError
+    if persistent_n_tiles > 1 and (
+        not b_to_lds or n_tile_repeat != 1 or tile_n < 128 or block_n_warps < 2
+    ):
+        raise ValueError
     if n < tile_n or n % tile_n != 0:
         raise ValueError
     if persistent_n_tiles > n // tile_n:
@@ -1387,7 +1388,7 @@ def compile_small_m_hgemm_kernel(
         m: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         if const_expr(WAVES_PER_EU > 0):

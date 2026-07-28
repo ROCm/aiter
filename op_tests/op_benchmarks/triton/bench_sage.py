@@ -1505,7 +1505,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
     print("-" * 38)
     for name, ms, tflops in rows:
-        if ms != ms:  # nan
+        if ms != ms:  # nan  # noqa: PLR0124
             print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
         else:
             print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")

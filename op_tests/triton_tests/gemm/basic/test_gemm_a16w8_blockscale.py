@@ -124,11 +124,10 @@ def test_gemm(dtype, M, N, K, output, shuffle):
     prequant = False
     block_shape_n, block_shape_k = block_shape
 
-    if shuffle:
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(

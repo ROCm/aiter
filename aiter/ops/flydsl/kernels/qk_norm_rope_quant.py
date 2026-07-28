@@ -808,7 +808,7 @@ def _build_kernel(
         swa_pos_stride: fx.Int32,
         swa_cache_size: fx.Int32,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_tokens = arith.index_cast(T.index, _to_raw(num_tokens))
         k = kernel(

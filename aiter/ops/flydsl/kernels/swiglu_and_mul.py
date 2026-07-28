@@ -187,7 +187,7 @@ def build_swiglu_and_mul_module(inter_dim: int):
         x: fx.Tensor,
         out: fx.Tensor,
         num_rows: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

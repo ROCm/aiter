@@ -968,7 +968,9 @@ def _run_perf_comparison(args: PrefillArgs):
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
-        us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
+        us_vllm / us_fly
+        if (us_fly > 0 and us_vllm == us_vllm)  # noqa: PLR0124
+        else float("nan")
     )
 
     # bench333 cases carry trace-derived structural features (head/mid/
@@ -1108,7 +1110,9 @@ def _print_perf_table():
             if isinstance(val, bool):
                 cells.append(("Y" if val else "N").rjust(width))
             elif isinstance(val, float):
-                if val != val:  # NaN (e.g. vLLM column when vllm not installed)
+                if (
+                    val != val  # noqa: PLR0124
+                ):  # NaN (e.g. vLLM column when vllm not installed)
                     cells.append("-".rjust(width))
                 elif "_vs_" in key:
                     cells.append(f"{val:.2f}x".rjust(width))

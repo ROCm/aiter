@@ -876,7 +876,7 @@ def _run_compiled(exe, args):
 
             while ir.Context.current is not None:
                 ir.Context.current.__exit__(None, None, None)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001,S110
             pass
         raise
 

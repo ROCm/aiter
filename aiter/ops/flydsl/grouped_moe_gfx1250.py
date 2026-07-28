@@ -603,9 +603,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg:
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
+    if _grouped_sync_dbg and (
+        torch.any(flat_experts < 0) or torch.any(flat_experts >= E)
+    ):
+        raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
 
     if grouped_contiguous_m:
