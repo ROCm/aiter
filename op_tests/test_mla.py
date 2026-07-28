@@ -139,6 +139,7 @@ def test_mla(
     return_lse=False,
     is_causal=True,
     sequential_page_indices=False,
+    gluon_num_kv_splits=None,
 ):
     ret = {}
 
@@ -231,11 +232,14 @@ def test_mla(
 
     us_aiter = None
     prefill_ref_token_cap = 512 * 1024
+    ck_prefill_max_qk_head_dim = 256
     # Prefill ref builds [nhead, (batch*ctx)^2] fp32 attn weights; bound both
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
-    # (1M+) never trigger the O(N^2) ref.
+    # (1M+) never trigger the O(N^2) ref. CK prefill supports QK head
+    # dimensions up to 256; larger absorbed-MLA decode shapes remain enabled.
     if (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
+        and qk_head_dim <= ck_prefill_max_qk_head_dim
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
         and total_qo <= prefill_ref_token_cap
@@ -517,6 +521,7 @@ def test_mla(
             sm_scale,
             use_2d_view=use_2d_view,
             min_kv_seq_len=ctx_lens,
+            num_kv_splits=gluon_num_kv_splits,
             return_lse=return_lse,
         )
 
@@ -579,6 +584,7 @@ def test_mla(
             use_2d_view=use_2d_view,
             kv_scale=1.0,
             min_kv_seq_len=ctx_lens,
+            num_kv_splits=gluon_num_kv_splits,
             return_lse=return_lse,
         )
 
@@ -855,6 +861,13 @@ parser.add_argument(
     help="""Enable/disable causal masking. Default: True.
     --causal / --no-causal""",
 )
+parser.add_argument(
+    "--gluon-num-kv-splits",
+    type=int,
+    default=None,
+    help="""Override Gluon MLA's automatic split count.
+    e.g.: --gluon-num-kv-splits 32""",
+)
 
 
 args = parser.parse_args()
@@ -882,6 +895,7 @@ for nhead, decode_qlen in args.nhead:
                 return_lse=args.return_lse,
                 is_causal=args.causal,
                 sequential_page_indices=args.sequential_page_indices,
+                gluon_num_kv_splits=args.gluon_num_kv_splits,
             )
             df.append(ret)
     df = pd.DataFrame(df)

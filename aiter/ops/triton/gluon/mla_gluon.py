@@ -10,14 +10,15 @@
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
 #   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
-#                        nhead <= 16, batch_size=1, NUM_KV_SPLITS=256.
-#                        2-D (batch, split) grid. Always splits + always
-#                        reduces. NHEAD < BLOCK_H masks OOB heads on Q load
-#                        and O store.
+#                        nhead <= 16, batch_size=1. 3-D
+#                        (batch, split, q_pos) grid. Automatic NUM_KV_SPLITS
+#                        is bounded by qlen and the minimum KV sequence length.
+#                        NHEAD < BLOCK_H masks OOB heads on Q load and O store.
 #   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
-#                        nhead <= 16, batch_size >= 1, 2-D (batch, split) grid,
-#                        NUM_KV_SPLITS = max(1, 256 // batch_size). Full decode
-#                        (stage-1 + stage-2 reduce into the final O).
+#                        nhead <= 16, batch_size >= 1. 3-D
+#                        (batch, split, q_pos) grid. Automatic NUM_KV_SPLITS
+#                        is bounded by batch_size, qlen, and KV block count.
+#                        Full decode (stage-1 + stage-2 reduce into final O).
 #                        NHEAD < BLOCK_H masks OOB heads on Q load and O store.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
@@ -28,7 +29,7 @@
 #
 # Full decode for all regimes. For NUM_KV_SPLITS>1 stage-1 writes per-split acc +
 # fp32 lse; stage-2 (_mla_softmax_reducev_kernel) reduces into O. RETURN_LSE also
-# returns the merged fp32 lse [B, H] (stage-2 for splits>1, else stage-1).
+# returns the merged fp32 lse [B, QLEN, H] (stage-2 for splits>1, else stage-1).
 #
 # 3-stage software pipeline (double-buffered, BLOCK_N with 2x(BLOCK_N/2) KV slices):
 #   AC = async_copy (global->LDS), LL = load (LDS->reg), P = page, K = K-cache, V = V-cache
@@ -54,6 +55,26 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
+_MAX_NUM_KV_SPLITS = 256
+
+
+def _resolve_num_kv_splits(auto_num_kv_splits, num_kv_splits):
+    """Return the automatic split count or a validated caller override."""
+    if num_kv_splits is None:
+        return auto_num_kv_splits
+    if isinstance(num_kv_splits, bool) or not isinstance(num_kv_splits, int):
+        raise TypeError(
+            "num_kv_splits must be an int or None, "
+            f"got {type(num_kv_splits).__name__}"
+        )
+    if not 1 <= num_kv_splits <= _MAX_NUM_KV_SPLITS:
+        raise ValueError(
+            f"num_kv_splits must be in [1, {_MAX_NUM_KV_SPLITS}], "
+            f"got {num_kv_splits}"
+        )
+    return num_kv_splits
+
 
 # fmt: off
 @gluon.jit
@@ -108,10 +129,9 @@ def _mla_gluon(
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
 ):
-    # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
-    # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
-    # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
-    # it into grid axis 1 (after the head-block index); bh16 uses grid axis 2.
+    # Grid mapping: all stage-1 launches are 3-D. bh64 uses an XCD-aware
+    # multi-batch mapping and packs q_pos into grid axis 1 after the head-block
+    # index. bh16 uses (batch, split, q_pos), with q_pos on grid axis 2.
     # When QLEN==1, q_pos is always 0 and the layout below is identical to before.
     if REGIME == 'bh64':
         NUM_M_BLOCKS: gl.constexpr = (NHEAD + BLOCK_H - 1) // BLOCK_H
@@ -819,6 +839,7 @@ def mla_gluon(
     return_lse=False,
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
+    num_kv_splits=None,
 ):
     """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
 
@@ -838,6 +859,10 @@ def mla_gluon(
 
     return_lse=True: additionally returns the merged log-sum-exp, a separate
         fp32 tensor [batch, qlen, nhead]
+
+    num_kv_splits=None uses the regime's automatic split policy.
+    Set num_kv_splits to an integer in [1, 256] when a graph-captured caller
+    cannot provide a useful min_kv_seq_len and has an externally tuned schedule.
 
     DSv4 Sparse prefill packs NoPE and RoPE in to one contiguous row (448+64).
     To run DSv4 prefill, it requires has_pe=False, prepares valid Q / K in q_nope / kv_c,
@@ -905,7 +930,11 @@ def mla_gluon(
         base_grid = (
             NUM_XCDS * triton.cdiv(nhead, BLOCK_H) * qlen * (batch_size // NUM_XCDS)
         )
-        NUM_KV_SPLITS = max(1, triton.next_power_of_2(triton.cdiv(256, base_grid)))
+        auto_num_kv_splits = max(
+            1,
+            triton.next_power_of_2(triton.cdiv(_MAX_NUM_KV_SPLITS, base_grid)),
+        )
+        NUM_KV_SPLITS = _resolve_num_kv_splits(auto_num_kv_splits, num_kv_splits)
 
         assert (
             batch_size % 64 == 0
@@ -927,25 +956,37 @@ def mla_gluon(
         BLOCK_H = 16
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
-        NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
-        # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
-        # that every split is non-empty (floor split size = min_kv_seq_len //
-        # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
+        NUM_XCDS = 1  # unused by the bh16 (batch, split, q_pos) grid mapping
+        # Both bh16 regimes support num_iter in {1, 2, ...}
+        # (no gl.assume(num_iter >= 3) in the kernel). The automatic policy keeps
+        # every split non-empty. An explicit override may create empty leading
+        # splits for short sequences; stage 1 skips them and stage 2 derives the
+        # valid split range from the runtime sequence length.
         if REGIME == "bh16bn128":
             assert (
                 batch_size == 1
             ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-            NUM_KV_SPLITS = max(1, min(256 // (batch_size * qlen), min_kv_seq_len))
+            auto_num_kv_splits = max(
+                1,
+                min(
+                    _MAX_NUM_KV_SPLITS // (batch_size * qlen),
+                    min_kv_seq_len,
+                ),
+            )
         else:  # bh16bn64
             # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
             # but never split a sequence into more blocks than it has: bound by the
             # shortest seq's block count so every split holds >= 1 block (no wasted
             # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
             # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
-            NUM_KV_SPLITS = max(
-                1, min(256 // (batch_size * qlen), triton.cdiv(min_kv_seq_len, BLOCK_N))
+            auto_num_kv_splits = max(
+                1,
+                min(
+                    _MAX_NUM_KV_SPLITS // (batch_size * qlen),
+                    triton.cdiv(min_kv_seq_len, BLOCK_N),
+                ),
             )
+        NUM_KV_SPLITS = _resolve_num_kv_splits(auto_num_kv_splits, num_kv_splits)
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
