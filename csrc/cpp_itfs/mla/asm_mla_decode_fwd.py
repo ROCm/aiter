@@ -47,6 +47,20 @@ def compile(
             (gqa_ratio, page_size, q_dtype, kv_dtype, num_kv_splits, v_head_dim),
         )
 
+    # Both .co kernels selected below are ps=0 (page_size=1 only) — see
+    # /sgl-workspace/aiter/hsa/gfx950/mla/mla_asm.csv. The launcher template
+    # passes s_log2_plen=log2(page_size), but these assembly blobs ignore it,
+    # silently corrupting outputs at page_size>1. Refuse instead of corrupting.
+    if page_size != 1:
+        raise NotImplementedError(
+            'asm_mla_decode_fwd (bf16 decode-stage1 kernel) only supports '
+            'page_size=1 in this AITER build; got page_size={}. The bf16 '
+            'a16w16_dec_stage1 kernels do not have a paged (_ps) variant '
+            'shipped in hsa/gfx950/mla/. Use page_size=1 or wait for an AITER '
+            'release that ships mla_dec_stage1_bf16_a16w16_*_ps.co.'
+            .format(page_size)
+        )
+
     if not_built(func_name):
         if gqa_ratio == 128:
             hsaco_path = f"{AITER_CORE_DIR}/hsa/{GPU_ARCH}/mla/mla_dec_stage1_bf16_a16w16_subQ128_mqa128.co"
