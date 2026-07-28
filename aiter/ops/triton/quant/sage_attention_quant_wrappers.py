@@ -32,7 +32,7 @@ def fused_sage_quant_mxfp4(
     layout="bshd",
 ):
     if layout == "bhsd":
-        b, h_qo, qo_len, head_dim = q.shape
+        b, _h_qo, _qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
 
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (

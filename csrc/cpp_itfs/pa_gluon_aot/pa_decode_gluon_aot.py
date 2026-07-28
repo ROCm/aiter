@@ -392,6 +392,7 @@ def compile(
                 capture_output=True,
                 text=True,
                 timeout=100,
+                check=False,
             )
             if result.returncode != 0 and result.stderr:
                 print(f"Warning: {result.stderr}")

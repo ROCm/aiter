@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+from typing import Any, ClassVar
+
 import torch
 import torch.nn.functional as F
 from batched_gemm_a8w8_common import kernels_list
@@ -57,7 +59,7 @@ def generate_data(b, m, n, k, device="cuda"):
 
 
 class BatchedGemma8W8Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_A8W8_BATCHED_GEMM}",
         "untune_file": "aiter/configs/a8w8_untuned_batched_gemm.csv",

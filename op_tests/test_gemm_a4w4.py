@@ -22,7 +22,7 @@ pd.set_option("display.max_colwidth", 30)
 
 @perftest(num_iters=5)
 def run_torch(x, w, x_scales, w_scales, dtype):
-    m, k = x.shape
+    m, _k = x.shape
     n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)

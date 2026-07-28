@@ -23,9 +23,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
         os.environ.get("AITER_AR_1STAGE", "")
     )
     _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
-    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
-        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
     )
 
     def __init__(

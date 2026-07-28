@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -230,7 +231,7 @@ def libtype_list(string):
 
 
 class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE}",
         "untune_file": "aiter/configs/a8w8_bpreshuffle_untuned_gemm.csv",

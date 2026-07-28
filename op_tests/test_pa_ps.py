@@ -650,7 +650,7 @@ def test_pa_ps(
         # Prepare V cache for both methods
         v_shuffled = asm_V_shuffle(v_quant_)
 
-        out_aiter_asm, us_pa_ps = run_aiter_asm_ps(
+        _out_aiter_asm, us_pa_ps = run_aiter_asm_ps(
             Q=query,
             K=k_quant_,
             V=v_shuffled,

@@ -44,7 +44,7 @@ def main():
         )
 
     with concurrent.futures.ProcessPoolExecutor(
-        os.environ.get("MAX_JOBS", 16)
+        os.environ.get("MAX_JOBS", "16")
     ) as executor:
         executor.map(process_config, configs)
 

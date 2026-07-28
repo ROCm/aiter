@@ -23,6 +23,7 @@ limitations under the License.
 
 import os
 from functools import lru_cache
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -376,7 +377,7 @@ class Gemm:
 
 
 class GemmTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",

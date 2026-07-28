@@ -798,9 +798,9 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             # Per-token quantization for KV cache
             (
                 quantized_keys,
-                key_scale_factors_flat,
+                _key_scale_factors_flat,
                 quantized_values,
-                value_scale_factors_flat,
+                _value_scale_factors_flat,
                 key_scale_original,
                 value_scale_original,
             ) = quantize_kv_cache_symmetric(

@@ -309,7 +309,7 @@ def save_shapes(
     scaleAB,
     bpreshuffle,
 ):
-    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+    save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
     global tuned_df
     if save_gemm:
         tuned_df = pd.concat(
@@ -684,7 +684,7 @@ class TunedGemm:
 
     def __init__(self):
         # self.extensions_created = False
-        self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", 0))
+        self.save_gemm = int(os.environ.get("AITER_TUNE_GEMM", "0"))
         self.untune_path = f"{this_dir}/configs/bf16_untuned_gemm.csv"
         self.tune_path = AITER_CONFIGS.AITER_CONFIG_GEMM_BF16_FILE
         if self.save_gemm == 1:

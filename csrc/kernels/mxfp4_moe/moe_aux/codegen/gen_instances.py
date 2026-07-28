@@ -12,6 +12,7 @@
 
 import argparse
 from pathlib import Path
+from typing import Any, ClassVar
 
 # ── Supported shape tuples ─────────────────────────────────────────────────
 # (NE, D_HIDDEN, D_INTER, TOPK)
@@ -368,7 +369,7 @@ class mxfp4_moe_aux_codegen:
             (inst_dir / f"{inst.name}.cu").write_text(text)
 
     # fn_type -> lookup-table macro name (one table per aux entry).
-    _MACRO = {
+    _MACRO: ClassVar[dict[str, Any]] = {
         "SortQuantFn": "GENERATE_AUX_SORT_QUANT_LOOKUP_TABLE",
         "Sort3StageFn": "GENERATE_AUX_SORT3STAGE_LOOKUP_TABLE",
         "SortOnlyZiFn": "GENERATE_AUX_SORT_ONLY_ZI_LOOKUP_TABLE",

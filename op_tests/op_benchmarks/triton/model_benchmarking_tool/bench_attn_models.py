@@ -33,6 +33,8 @@ from op_tests.op_benchmarks.triton.bench_mla_decode import (
     main as bench_mla_main,
 )
 
+logger = logging.getLogger(__name__)
+
 # Module-level tracking for head dimension warnings
 # Stores (model_name, kernel) tuples to ensure each warning is logged once
 _logged_hdim_warnings: set[tuple[str, str]] = set()
@@ -130,7 +132,7 @@ class TritonCache:
         cache_dir: Path | None = self.get_cache_dir()
         if cache_dir is None:
             if not self.unresolved_warned:
-                logging.warning(  # noqa: LOG015  root-logger usage in this file is handled as a whole in the LOG015 batch
+                logger.warning(  # noqa: LOG015  root-logger usage in this file is handled as a whole in the LOG015 batch
                     "Triton cache directory couldn't be determined; cache cleanup is disabled."
                 )
                 self.unresolved_warned = True
@@ -140,7 +142,7 @@ class TritonCache:
         size_mb: float = self.get_dir_size_mb(cache_dir)
         if size_mb <= max_cache_mb:
             return
-        logging.warning(
+        logger.warning(
             "Triton cache directory is %.2f MB (max allowed: %d MB). Wiping %s.",
             size_mb,
             max_cache_mb,
@@ -149,7 +151,7 @@ class TritonCache:
         try:
             shutil.rmtree(cache_dir)
         except OSError as e:
-            logging.warning(
+            logger.warning(
                 "Failed to wipe Triton cache directory [%s]. %s: %s",
                 cache_dir,
                 type(e).__name__,
@@ -238,7 +240,7 @@ class Model:
             warning_key: tuple[str, str] = (self.name, kernel)
             if warning_key not in _logged_hdim_warnings:
                 if kernel == "bwdo":
-                    logging.warning(
+                    logger.warning(
                         "%s: Effective head sizes aren't equal to the original values. "
                         "Backward one-kernel only supports power of 2 head sizes. "
                         "dqk: %d -> %d, dv: %d -> %d",
@@ -249,7 +251,7 @@ class Model:
                         effective_dv,
                     )
                 elif kernel == "bwdf":
-                    logging.warning(
+                    logger.warning(
                         "%s: Effective head sizes aren't equal to the original values. "
                         "Backward fused only supports power of 2 head sizes without PE. "
                         "dqk: %d -> %d, dv: %d -> %d",
@@ -476,7 +478,7 @@ def get_stdout(out: str, err: str, num_out_lines: int) -> list[list[str]] | None
     assert num_out_lines >= 0, "Expected number of stdout lines must be non-negative."
     # Check empty stderr:
     if err:
-        logging.error("Standard error stream isn't empty: [%s]", err)
+        logger.error("Standard error stream isn't empty: [%s]", err)
         return None
     # Split stdout:
     out_lines: list[list[str]] = [
@@ -484,7 +486,7 @@ def get_stdout(out: str, err: str, num_out_lines: int) -> list[list[str]] | None
     ]
     # Check number of lines in stdout:
     if len(out_lines) != num_out_lines:
-        logging.error(
+        logger.error(
             "Standard out stream doesn't have %d lines: [%s]", num_out_lines, out
         )
         return None
@@ -513,11 +515,11 @@ def get_mha_bench_result(
     l0, l1, l2, l3 = out_lines
     # Check stdout line #1 (progress line "[counter/total] <model> B=... ..."):
     if not (len(l0) >= 2 and l0[0].startswith("[") and l0[0].endswith("]")):
-        logging.error("Progress line doesn't match: %s", l0)
+        logger.error("Progress line doesn't match: %s", l0)
         return None
     # Check stdout line #2 (benchmark name):
     if not (len(l1) == 1 and l1[0].startswith("bench_mha") and l1[0].endswith(":")):
-        logging.error("Benchmark name doesn't match: %s", l1)
+        logger.error("Benchmark name doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table header):
     # x_names: model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V, causal, function, dtype, impl, fused
@@ -528,7 +530,7 @@ def get_mha_bench_result(
         and l2[13] == metric.user_unit
         and (len(l2) == 14 or l2[14] == f"({metric.user_unit})")
     ):
-        logging.error("Table header doesn't match: %s", l2)
+        logger.error("Table header doesn't match: %s", l2)
         return None
     # Check stdout line #4 (table data):
     # Columns: row_idx, model, BATCH, HQ, HK, N_CTX_Q, N_CTX_K, D_HEAD, D_HEAD_V,
@@ -546,13 +548,11 @@ def get_mha_bench_result(
                 int(float(l3[6])) == args.s,
             ]
         ):
-            logging.error("Table data doesn't match: %s", l3)
+            logger.error("Table data doesn't match: %s", l3)
             return None
         return float(l3[-1])
     except ValueError as e:
-        logging.error(
-            "Unexpected numeric conversion error. %s: %s", type(e).__name__, e
-        )
+        logger.error("Unexpected numeric conversion error. %s: %s", type(e).__name__, e)
         return None
 
 
@@ -568,7 +568,7 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
     l0, l1, l2 = out_lines
     # Check stdout line #1 (benchmark name):
     if l0 != ["bench_mla_decode:"]:
-        logging.error("Benchmark name doesn't match: %s", l0)
+        logger.error("Benchmark name doesn't match: %s", l0)
         return None
     # Check stdout line #2 (table header):
     # Triton sometimes appends a "(ms)" annotation token after the last column name.
@@ -588,7 +588,7 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
         and len(l1) in (9, 10)
         and (len(l1) == 9 or l1[9] == "(ms)")
     ):
-        logging.error("Table header doesn't match: %s", l1)
+        logger.error("Table header doesn't match: %s", l1)
         return None
     # Check stdout line #3 (table data):
     try:
@@ -607,13 +607,11 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
                 int(float(l2[8])) == 32,
             ]
         ):
-            logging.error("Table data doesn't match: %s", l2)
+            logger.error("Table data doesn't match: %s", l2)
             return None
         return float(l2[9])
     except ValueError as e:
-        logging.error(
-            "Unexpected numeric conversion error. %s: %s", type(e).__name__, e
-        )
+        logger.error("Unexpected numeric conversion error. %s: %s", type(e).__name__, e)
         return None
 
 
@@ -644,7 +642,7 @@ def run_bench(args: BenchArgs, metric: Metric) -> float | None:
             required = int(match.group(1))
             hw_limit = int(match.group(2))
             ratio: float = required / hw_limit
-            logging.error(
+            logger.error(
                 "Out of LDS on %s: %d / %d (%.1fx)",
                 args.to_log_str(),
                 required,
@@ -652,12 +650,12 @@ def run_bench(args: BenchArgs, metric: Metric) -> float | None:
                 ratio,
             )
         else:
-            logging.error(
+            logger.error(
                 "Out of resources while benchmarking %s. %s", args.to_log_str(), e
             )
 
     except (Exception, SystemExit) as e:
-        logging.error(
+        logger.error(
             "Unexpected error while benchmarking %s. %s: %s",
             args.to_log_str(),
             type(e).__name__,
@@ -678,17 +676,17 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
         json_path = Path(__file__).resolve().parent / json_path
 
     if not json_path.exists():
-        logging.critical("Model shapes file [%s] does not exist.", json_path)
+        logger.critical("Model shapes file [%s] does not exist.", json_path)
         raise SystemExit(1)
     if not json_path.is_file():
-        logging.critical("Model shapes path [%s] is not a regular file.", json_path)
+        logger.critical("Model shapes path [%s] is not a regular file.", json_path)
         raise SystemExit(1)
 
     try:
         with json_path.open("r", encoding="utf-8") as file:
             root: object = json.load(file)
     except OSError as e:
-        logging.critical(
+        logger.critical(
             "Unable to open model shapes file [%s]. %s: %s",
             json_path,
             type(e).__name__,
@@ -696,7 +694,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
         )
         raise SystemExit(1) from e
     except json.JSONDecodeError as e:
-        logging.critical(
+        logger.critical(
             "Invalid JSON in model shapes file [%s]. %s: %s",
             json_path,
             type(e).__name__,
@@ -705,7 +703,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
         raise SystemExit(1) from e
 
     if not isinstance(root, dict):
-        logging.critical(
+        logger.critical(
             "Invalid model shapes format in [%s]. Top-level JSON value must be an object.",
             json_path,
         )
@@ -714,7 +712,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
     models: list[Model] = []
     for base_name_raw, backends_raw in root.items():
         if not isinstance(base_name_raw, str) or not base_name_raw.strip():
-            logging.error(
+            logger.error(
                 "Skipping malformed model entry with invalid name key type/value: %r",
                 base_name_raw,
             )
@@ -722,7 +720,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
         base_name: str = base_name_raw.strip()
 
         if not isinstance(backends_raw, dict):
-            logging.error(
+            logger.error(
                 "Skipping model '%s': expected object for model payload, got %s.",
                 base_name,
                 type(backends_raw).__name__,
@@ -734,7 +732,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
             if entries_raw is None:
                 continue
             if not isinstance(entries_raw, list):
-                logging.error(
+                logger.error(
                     "Skipping '%s' backend for model '%s': expected list, got %s.",
                     backend_name,
                     base_name,
@@ -744,7 +742,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
 
             for idx, entry_raw in enumerate(entries_raw):
                 if not isinstance(entry_raw, dict):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': expected object, got %s.",
                         backend_name,
                         idx,
@@ -763,7 +761,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         else base_name
                     )
                 else:
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': 'comment' must be a string.",
                         backend_name,
                         idx,
@@ -783,7 +781,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                 # In Python, bool is a subclass of int, so True/False pass `isinstance(..., int)`.
                 # We want to reject Booleans as valid values, so we explicitly check for bool.
                 if not isinstance(hq_raw, int) or isinstance(hq_raw, bool):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
                         backend_name,
                         idx,
@@ -792,7 +790,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                     )
                     continue
                 if not isinstance(hkv_raw, int) or isinstance(hkv_raw, bool):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
                         backend_name,
                         idx,
@@ -801,7 +799,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                     )
                     continue
                 if not isinstance(dqk_raw, int) or isinstance(dqk_raw, bool):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
                         backend_name,
                         idx,
@@ -810,7 +808,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                     )
                     continue
                 if not isinstance(dv_raw, int) or isinstance(dv_raw, bool):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
                         backend_name,
                         idx,
@@ -819,7 +817,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                     )
                     continue
                 if not isinstance(use_sink_raw, bool):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be a boolean.",
                         backend_name,
                         idx,
@@ -830,7 +828,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                 if not isinstance(sliding_window_left_raw, int) or isinstance(
                     sliding_window_left_raw, bool
                 ):
-                    logging.error(
+                    logger.error(
                         "Skipping malformed %s entry #%d for model '%s': '%s' must be an integer.",
                         backend_name,
                         idx,
@@ -851,7 +849,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         sliding_window_left=sliding_window_left_raw,
                     )
                 except Exception as e:
-                    logging.error(
+                    logger.error(
                         "Skipping invalid %s entry #%d for model '%s'. %s: %s",
                         backend_name,
                         idx,
@@ -864,7 +862,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                 models.append(model)
 
     if not models:
-        logging.critical(
+        logger.critical(
             "No valid model entries found in model shapes file: %s", json_path
         )
         raise SystemExit(1)
@@ -884,13 +882,13 @@ def get_models(model_filter: str | None = None) -> list[Model]:
 
     model_filter = model_filter.strip()
     if not model_filter:  # Empty string after stripping
-        logging.debug("Empty model name filter, returning all models.")
+        logger.debug("Empty model name filter, returning all models.")
         return all_models
 
     try:
         pattern: re.Pattern[str] = re.compile(model_filter, re.IGNORECASE)
     except re.error:
-        logging.warning(
+        logger.warning(
             "Invalid model filter regex: %r - returning all models.",
             model_filter,
         )
@@ -899,17 +897,17 @@ def get_models(model_filter: str | None = None) -> list[Model]:
     filtered_models: list[Model] = [
         model for model in all_models if pattern.search(model.name)
     ]
-    logging.debug("Number of filtered models: %d", len(filtered_models))
+    logger.debug("Number of filtered models: %d", len(filtered_models))
     if not filtered_models:
-        logging.warning("There are no models after filtering by model name.")
+        logger.warning("There are no models after filtering by model name.")
     return filtered_models
 
 
 def list_models() -> None:
     """Log all available models with head counts and dimensions."""
-    logging.info("Available models:")
+    logger.info("Available models:")
     for model in get_models():
-        logging.info(
+        logger.info(
             "%s kernel_backend=%s hq=%d hkv=%d dqk=%d dv=%d sink=%s sliding_window_left=%d",
             model.name,
             model.kernel_backend_str(),
@@ -974,7 +972,7 @@ def get_bench_args(
         if kernel == "bwdf" and (model.use_sink or model.sliding_window_left > 0):
             skipped_key = (model.name, kernel)
             if skipped_key not in skipped_model_kernels:
-                logging.info(
+                logger.info(
                     "Skipping %s for model '%s': fused backward doesn't support sink or sliding window attention.",
                     kernel,
                     model.name,
@@ -1057,8 +1055,8 @@ class GlobalStats:
             return
 
         # Overall failure statistics
-        logging.info("=== Benchmark Statistics ===")
-        logging.info(
+        logger.info("=== Benchmark Statistics ===")
+        logger.info(
             "Total failures: %d / %d (%.2f%%)",
             self.global_stats.num_failures,
             self.global_stats.num_benchmarks,
@@ -1066,10 +1064,10 @@ class GlobalStats:
         )
 
         # Failures grouped by kernel and model
-        logging.info("=== Failures by Kernel and Model ===")
+        logger.info("=== Failures by Kernel and Model ===")
         for (kernel, model), stats in sorted(self.kernel_model_stats.items()):
             if stats.num_failures > 0:
-                logging.info(
+                logger.info(
                     "[%s, %s]: %d / %d failures (%.2f%%)",
                     kernel,
                     model,
@@ -1268,25 +1266,25 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
 
 
 def get_bench_args_from_cli(args: argparse.Namespace) -> list[BenchArgs]:
-    logging.debug("Requested kernels: %s", args.kernel)
+    logger.debug("Requested kernels: %s", args.kernel)
 
-    logging.debug("Requested layouts: %s", args.layout)
+    logger.debug("Requested layouts: %s", args.layout)
 
-    logging.debug("Requested model filter: %s", args.model)
+    logger.debug("Requested model filter: %s", args.model)
     filtered_models: list[Model] = get_models(args.model)
     model_names: list[str] = [model.name for model in filtered_models]
-    logging.debug("Resolved model names: %s", model_names)
+    logger.debug("Resolved model names: %s", model_names)
 
-    logging.debug("Requested tensor parallelism: %s", args.tensor_parallelism)
+    logger.debug("Requested tensor parallelism: %s", args.tensor_parallelism)
 
-    logging.debug(
+    logger.debug(
         "Requested batch range: start=%d inc=%d end=%d",
         args.batch_start,
         args.batch_inc,
         args.batch_end,
     )
 
-    logging.debug(
+    logger.debug(
         "Requested seq. length range: start=%d inc=%d end=%d",
         args.seq_start,
         args.seq_inc,
@@ -1294,9 +1292,9 @@ def get_bench_args_from_cli(args: argparse.Namespace) -> list[BenchArgs]:
     )
 
     metric: Metric = args.metric
-    logging.debug("Performance metric is %s in %s.", metric.name, metric.user_unit)
+    logger.debug("Performance metric is %s in %s.", metric.name, metric.user_unit)
 
-    logging.debug("Output data will be saved to [%s] file.", args.output)
+    logger.debug("Output data will be saved to [%s] file.", args.output)
 
     return get_bench_args(
         kernels=args.kernel,
@@ -1327,22 +1325,22 @@ def main(args: list[str] | None = None) -> None:
         list_models()
         return
 
-    logging.info("Benchmarking attention configurations for %s arch...", get_arch())
+    logger.info("Benchmarking attention configurations for %s arch...", get_arch())
 
     metric: Metric = parsed_args.metric
     if metric != METRICS["time"] and any(
         model.use_mla for model in get_models(parsed_args.model)
     ):
         metric = METRICS["time"]
-        logging.warning(
+        logger.warning(
             "One or more benchmarks are backed by MLA. MLA benchmark doesn't support throughput or bandwidth metrics, switching to time metric."
         )
 
     bench_args: list[BenchArgs] = get_bench_args_from_cli(parsed_args)
     num_bench_args: int = len(bench_args)
-    logging.info("Number of benchmark configurations: %d", num_bench_args)
+    logger.info("Number of benchmark configurations: %d", num_bench_args)
     if num_bench_args == 0:
-        logging.warning(
+        logger.warning(
             "There's no valid benchmark configuration for the given input combination."
         )
         return
@@ -1361,7 +1359,7 @@ def main(args: list[str] | None = None) -> None:
                 global_stats.report_failure(ba.kernel, m.name)
             else:
                 global_stats.report_success(ba.kernel, m.name)
-                logging.debug(
+                logger.debug(
                     "%04d performance of %s is %.3f %s.",
                     ba_i,
                     ba.to_log_str(),
@@ -1376,7 +1374,7 @@ def main(args: list[str] | None = None) -> None:
     end_timestamp: float = time.perf_counter()
     elapsed_time_s: float = end_timestamp - start_timestamp
     elapsed_time_hms: str = time.strftime("%H:%M:%S", time.gmtime(elapsed_time_s))
-    logging.info("Finished, execution took %s hh:mm:ss.", elapsed_time_hms)
+    logger.info("Finished, execution took %s hh:mm:ss.", elapsed_time_hms)
 
 
 if __name__ == "__main__":

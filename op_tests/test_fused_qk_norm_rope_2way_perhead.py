@@ -445,7 +445,7 @@ def _validate_v_perhead_case(
     v_ref = torch.cat([v0, v1], dim=1).contiguous()
 
     if collect_perf:
-        (v_pt, v_pt_s), baseline_us = _run_v_baseline(v0, v1)
+        (_v_pt, _v_pt_s), baseline_us = _run_v_baseline(v0, v1)
         (v_ph, v_ph_s), hip_us = _run_v_perhead(v0, v1)
     else:
         _v_pt, _v_pt_s = _run_v_baseline(v0, v1)[0]

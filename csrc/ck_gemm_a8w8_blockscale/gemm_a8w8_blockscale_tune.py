@@ -3,6 +3,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -198,7 +199,7 @@ def generate_data(m, n, k, seed, device="cuda"):
 
 
 class GemmA8W8BlockScaleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}",
         "untune_file": "aiter/configs/a8w8_blockscale_untuned_gemm.csv",

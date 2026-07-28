@@ -157,8 +157,8 @@ def main():
     # Check if we're already in a torchrun environment
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # Running under torchrun, use environment variables directly
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         run_worker(local_rank, world_size)
     else:
         # Not in torchrun, spawn processes manually

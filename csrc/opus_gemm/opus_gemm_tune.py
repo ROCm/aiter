@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -1291,7 +1292,7 @@ def _install_opus_perftest_once():
 
 
 class OpusGemmA16W16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": OPUS_DEBUG_TUNED_CSV,
         "untune_file": "aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv",
@@ -1302,7 +1303,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     }
 
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
-    OUT_COLUMNS = [
+    OUT_COLUMNS: ClassVar[list[Any]] = [
         "cu_num",
         "M",
         "N",

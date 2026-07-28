@@ -11,7 +11,6 @@ logger = logging.getLogger("aiter")
 
 
 def getLogger():
-    global logger
     if not logger.handlers:
         # Configure log level from environment variable
         # Valid values: DEBUG, INFO (default), WARNING, ERROR
@@ -29,7 +28,7 @@ def getLogger():
         logger.setLevel(log_level)
 
         console_handler = logging.StreamHandler()
-        if int(os.environ.get("AITER_LOG_MORE", 0)):
+        if int(os.environ.get("AITER_LOG_MORE", "0")):
             formatter = logging.Formatter(
                 fmt="[%(name)s %(levelname)s] %(asctime)s.%(msecs)03d - %(processName)s:%(process)d - %(pathname)s:%(lineno)d - %(funcName)s\n%(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",

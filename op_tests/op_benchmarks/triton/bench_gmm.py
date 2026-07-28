@@ -46,6 +46,8 @@ from aiter.ops.triton.utils.gmm_common import (
     str_from_group_sizes_dtype,
 )
 
+logger = logging.getLogger(__name__)
+
 # Benchmark.
 # ------------------------------------------------------------------------------
 
@@ -180,7 +182,7 @@ def benchmark_gmm(
         )
     )
     def benchmark(M: int, K: int, N: int, G: int, provider: str):
-        logging.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
+        logger.info("    (M, K, N, G) = (%d, %d, %d, %d)", M, K, N, G)
 
         lhs, rhs, multiple_group_sizes, out, bias = gen_tensors(
             M,
@@ -206,7 +208,7 @@ def benchmark_gmm(
         gb_sum = 0.0
 
         for group_sizes in multiple_group_sizes:
-            logging.debug(
+            logger.debug(
                 "      group_sizes (first 5) = %s", str(group_sizes[:5].tolist())
             )
 
@@ -274,19 +276,19 @@ def benchmark_gmm(
         p20_gbps = round(gb_sum / p80_s_sum, 2)
         p80_gbps = round(gb_sum / p20_s_sum, 2)
 
-        logging.info(
+        logger.info(
             "      ms: p20 = %7.4f, p50 = %7.4f, p80 = %7.4f",
             p20_ms,
             p50_ms,
             p80_ms,
         )
-        logging.info(
+        logger.info(
             "      TFLOPS: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
             p20_tflops,
             p50_tflops,
             p80_tflops,
         )
-        logging.info(
+        logger.info(
             "      GB/s: p20 = %6.2f, p50 = %6.2f, p80 = %6.2f",
             p20_gbps,
             p50_gbps,
@@ -300,8 +302,8 @@ def benchmark_gmm(
         if metric == "bandwidth":
             return p50_gbps, p20_gbps, p80_gbps
 
-    logging.info("Benchmarking Triton %s kernel:", desc)
-    logging.info(
+    logger.info("Benchmarking Triton %s kernel:", desc)
+    logger.info(
         "  input_type = %s, output_type = %s, group_sizes_type = %s, rng_seed = %d, use_bias = %s, accumulate = %s",
         in_dtype_str,
         out_dtype_str,
@@ -310,21 +312,21 @@ def benchmark_gmm(
         use_bias,
         accumulate,
     )
-    logging.info(
+    logger.info(
         "  trans_lhs = %s, trans_rhs = %s",
         trans_lhs,
         trans_rhs,
     )
-    logging.info(
+    logger.info(
         "  num_group_sizes = %d, unif_group_sizes = %s",
         num_group_sizes,
         unif_group_sizes,
     )
     if has_grid_dim:
-        logging.info("  overridden persistent grid_dim = %d", grid_dim)
+        logger.info("  overridden persistent grid_dim = %d", grid_dim)
     if has_work_stealing:
-        logging.info("  work stealing enabled")
-    logging.info(
+        logger.info("  work stealing enabled")
+    logger.info(
         "  metric = %s (in %s)",
         metric,
         unit,

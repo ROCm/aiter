@@ -348,11 +348,11 @@ def test_edge_values(float_dtype, round_mode):
     assert packed.view(torch.uint8).sum() == 0, f"zero input failed mode={name}"
 
     inp_large = torch.full((rows, cols), 1e4, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_large, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_large, group_size=32, round_mode=round_mode)
     assert packed.view(torch.uint8).max() > 0, f"large input failed mode={name}"
 
     inp_tiny = torch.full((rows, cols), 1e-10, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_tiny, group_size=32, round_mode=round_mode)
 
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
     packed, _scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=round_mode)
@@ -385,7 +385,7 @@ def test_invalid_round_mode():
             "quant_mxfp4_hip(x, group_size=32, round_mode=4)\n"
         ),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
     if proc.returncode == 0:
         raise AssertionError(
             "round_mode=4 should have been rejected by AITER_CHECK; "

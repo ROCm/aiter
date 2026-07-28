@@ -9,6 +9,7 @@ import tempfile
 import time
 from abc import abstractmethod
 from operator import itemgetter
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -34,7 +35,7 @@ def _read_csv(filepath, **kwargs):
 
 
 class TunerCommon:
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         "verbose": False,
         "tune_file": "",
         "untune_file": "",
@@ -46,7 +47,7 @@ class TunerCommon:
         "iters": 101,  # 101 run iters for profiling
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
     }
-    dtype2bpe_dict = {
+    dtype2bpe_dict: ClassVar[dict[str, Any]] = {
         dtypes.fp16: 2,
         dtypes.bf16: 2,
         dtypes.i16: 2,
@@ -1527,7 +1528,7 @@ class TunerCommon:
 
 class GemmCommonTuner(TunerCommon):
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "sort": True,  # Enable sorting by default for GEMM tuners
     }
@@ -1680,7 +1681,7 @@ class GemmCommonTuner(TunerCommon):
         resultdf = self.get_tuned_gemm_list(file)
         for i in range(len(resultdf)):
             if len(resultdf.loc[i]) == 8:
-                *keys, kernelId, splitK, us, kernelName = tuple(resultdf.loc[i])
+                *keys, kernelId, splitK, us, _kernelName = tuple(resultdf.loc[i])
             else:
                 (
                     *keys,

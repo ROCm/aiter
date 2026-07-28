@@ -1945,7 +1945,6 @@ def initialize_model_parallel(
     )
 
     # Build the custom allreduce group(s) (optional).
-    global _CUSTOM
     assert not _CUSTOM, "custom allreduce group is already initialized"
     if custom_group_config is not None:
         for gname, ranks in custom_group_config.items():
@@ -2222,7 +2221,6 @@ def is_global_first_rank() -> bool:
     """
     try:
         # If world group is available, use it for the most accurate check
-        global _WORLD
         if _WORLD is not None:
             return _WORLD.is_first_rank
 

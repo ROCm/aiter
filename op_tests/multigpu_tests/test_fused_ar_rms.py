@@ -101,7 +101,7 @@ def fused_ar_rmsnorm(
         @perftest()
         def run_ca(x):
             if not post_per_token_quant:
-                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                out, _res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, x, weight, eps
                 )
                 return out

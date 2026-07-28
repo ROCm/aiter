@@ -180,7 +180,6 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
 
     Cache populated as a side effect. Use _get_miopen_solver to read.
     """
-    global _miopen_solver_cache
 
     unique = []
     seen = set()
@@ -224,6 +223,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
             text=True,
             timeout=120,
             env={**os.environ, "MIOPEN_LOG_LEVEL": "6"},
+            check=False,
         )
     except subprocess.TimeoutExpired:
         print(

@@ -18,6 +18,7 @@
 import os
 import pickle
 from contextlib import contextmanager
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -642,7 +643,7 @@ class _GFX1250BufferProxy:
 
 class CustomAllreduce:
 
-    _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
 
     def _select_ops(self):
         """Select the ops backend.
@@ -1323,7 +1324,7 @@ class CustomAllreduce:
     # all-gather kernel is pure memcpy parametrized only by sizeof(T). View
     # ints as same-size floats so callers gathering token-id tensors work
     # (e.g. DeepSeek-V4-Pro hash-gate gathers int32 across DP ranks).
-    _INT_TO_FP_VIEW = {
+    _INT_TO_FP_VIEW: ClassVar[dict[str, Any]] = {
         torch.int64: torch.float64,
         torch.int32: torch.float32,
         torch.int16: torch.float16,

@@ -14,6 +14,7 @@ import functools
 import os
 import sys
 from functools import lru_cache
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -397,7 +398,7 @@ def libtype_list(string):
 
 
 class GemmA16W16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_BF16}",
         "untune_file": "aiter/configs/bf16_untuned_gemm.csv",

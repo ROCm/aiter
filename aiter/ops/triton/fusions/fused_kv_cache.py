@@ -156,7 +156,7 @@ def fused_qk_rope_cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_pe // 16
         SCALE_K_WIDTH_NOPE = (
@@ -171,7 +171,7 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
             _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape

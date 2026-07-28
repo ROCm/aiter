@@ -105,6 +105,7 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(

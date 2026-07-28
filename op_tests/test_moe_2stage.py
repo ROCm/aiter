@@ -49,6 +49,8 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 
+logger = logging.getLogger(__name__)
+
 torch.int4 = getattr(torch, "int4", torch.uint32)
 torch.set_default_device("cuda")
 AITER_MOE_EXPERT_BALANCE = (
@@ -475,12 +477,12 @@ def test_fmoe(
         us1 = kernel_us.get("stage1")
         us2_stage = kernel_us.get("stage2")
         if not kernel_us:
-            logging.warning(
+            logger.warning(
                 "kernel_bench: no kernels captured (non-2stage/1stage path?) (quant:%s)",
                 AQDType,
             )
         else:
-            logging.info(
+            logger.info(
                 "kernel_bench: stage1=%s us, stage2=%s us (quant:%s)",
                 "n/a" if us1 is None else f"{us1:.2f}",
                 "n/a" if us2_stage is None else f"{us2_stage:.2f}",
@@ -509,7 +511,7 @@ def test_fmoe(
     # masked by atomic-reduction noise, so detect NaN explicitly and deterministically.
     has_nan = out2_ck.isnan().any().item()
     if has_nan:
-        logging.error(
+        logger.error(
             "output contains NaN! (possible aiter #3117 stage2 K-pad regression)"
         )
     err = checkAllclose(
@@ -526,7 +528,7 @@ def test_fmoe(
 
     logits_diff = calc_diff(out2_ref, out2_ck)
     if logits_diff > 1e-3:
-        logging.warning(
+        logger.warning(
             f"logits_diff: {logits_diff} is too large, please check the implementation"
         )
     if strict_accuracy:
@@ -535,9 +537,9 @@ def test_fmoe(
             err != 0 and logits_diff > 0.01
         ), f"accuracy check failed: checkAllclose err={err}, logits_diff={logits_diff}"
     elif has_nan:
-        logging.warning("accuracy check failed (non-strict): output contains NaN")
+        logger.warning("accuracy check failed (non-strict): output contains NaN")
     elif err != 0 and logits_diff > 0.01:
-        logging.warning(
+        logger.warning(
             f"accuracy check failed (non-strict): err={err}, logits_diff={logits_diff}"
         )
 

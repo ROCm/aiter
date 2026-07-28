@@ -220,6 +220,7 @@ def test_flydsl_fmha_correctness_multi_device():
         capture_output=True,
         text=True,
         timeout=120,
+        check=False,
     )
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if "MULTI_DEVICE_OK" in proc.stdout:

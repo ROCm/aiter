@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -33,7 +34,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):
-    m, k = x.shape
+    m, _k = x.shape
     n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)
@@ -57,7 +58,7 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 
 
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
-    m, k = x.shape
+    m, _k = x.shape
     _n, _k = weight.shape
     res = aiter.gemm_a4w4_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
@@ -125,7 +126,7 @@ def generate_data(m, n, k, seed, device="cuda", dtype=dtypes.bf16):
 
 
 class GemmA4W4BlockScaleTuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A4W4}",
         "untune_file": "aiter/configs/a4w4_blockscale_untuned_gemm.csv",

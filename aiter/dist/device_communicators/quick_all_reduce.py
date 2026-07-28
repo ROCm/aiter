@@ -4,6 +4,7 @@
 import logging
 import os
 from enum import Enum
+from typing import Any, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -60,13 +61,13 @@ MB = 1024 * 1024
 
 class QuickAllReduce:
 
-    _SUPPORTED_WORLD_SIZES = [2, 4, 8]
-    _SUPPORTED_DTYPES = [torch.float16, torch.bfloat16]
+    _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8]
+    _SUPPORTED_DTYPES: ClassVar[list[Any]] = [torch.float16, torch.bfloat16]
     # The following data is based on kernel tests.
     # In this order [FP, FP8, INT6, INT4, INT3].
     # INT3 is TP2-only; its entries for world_size 4/8 are unused but kept
     # to keep the per-quant-level list indexable by QuickReduceRegime.value.
-    _QR_MIN_SIZE = {
+    _QR_MIN_SIZE: ClassVar[dict[str, Any]] = {
         (torch.float16, 2): [1 * MB, 2 * MB, 2 * MB, 1 * MB, 1 * MB],
         (torch.float16, 4): [1 * MB, 16 * MB, 4 * MB, 2 * MB, 2 * MB],
         (torch.float16, 8): [16 * MB, 4 * MB, 4 * MB, 8 * MB, 8 * MB],
@@ -175,7 +176,7 @@ class QuickAllReduce:
         # due to slower match operations
         # If environment variable is set to 1, we convert input to fp16
         self.use_fp16_kernels = int(
-            os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", 1)
+            os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", "1")
         )
         regime_str = os.environ.get("AITER_QUICK_REDUCE_QUANTIZATION", "NONE")
         if regime_str not in QuickReduceRegime.__members__:
@@ -216,7 +217,7 @@ class QuickAllReduce:
         # quickallreduce should not be created.
 
         # AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB is specified in MB
-        qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", 0))
+        qr_max_size = int(os.environ.get("AITER_QUICK_REDUCE_MAX_SIZE_BYTES_MB", "0"))
         if qr_max_size > 0:
             if qr_max_size < 1:
                 logger.info(

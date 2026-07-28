@@ -16,7 +16,7 @@ PACKAGE_NAME = "amd-aiter"
 FLYDSL_VERSION = "flydsl==0.2.4"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
-PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", 0))
+PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
@@ -96,7 +96,7 @@ def _run_install_triton():
     subprocess.check_call(["bash", install_triton])
 
 
-AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0))
+AITER_USE_SYSTEM_TRITON = int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0"))
 
 
 def _torch_version_below(min_version):

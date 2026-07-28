@@ -258,7 +258,7 @@ def fused_ar_rmsnorm_per_group_quant(
 
     result, us = run_fused(x)
     if emit_bf16:
-        out_fp8, scale_out, res_out, bf16_out = result
+        out_fp8, scale_out, _res_out, bf16_out = result
     else:
         out_fp8, scale_out, _res_out = result
         bf16_out = None

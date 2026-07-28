@@ -4,6 +4,7 @@
 import os
 import sys
 import tempfile
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -295,7 +296,7 @@ _GEN_DATA_1STAGE_KEYS = [
 
 
 class FmoeTuner(TunerCommon):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
@@ -4775,7 +4776,7 @@ class GroupedFmoeTuner(FmoeTuner):
     TILE_K = 256
     TILE_M_CANDIDATES = (16, 32, 64, 128)
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GROUPED_FMOE}",
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_grouped_fmoe.csv",
@@ -5044,7 +5045,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     unit.
     """
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_untuned_fmoe.csv",
         "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",

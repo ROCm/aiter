@@ -46,7 +46,7 @@ if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
 def get_amdgpu_arch():
     """Find amdgpu-arch and return the detected GPU architecture."""
     result = subprocess.run(
-        "which amdgpu-arch", shell=True, capture_output=True, text=True
+        "which amdgpu-arch", shell=True, capture_output=True, text=True, check=False
     )
     amdgpu_arch_path = (
         result.stdout.strip()
@@ -54,22 +54,22 @@ def get_amdgpu_arch():
         else "/opt/rocm/llvm/bin/amdgpu-arch"
     )
     result = subprocess.run(
-        amdgpu_arch_path, shell=True, capture_output=True, text=True
+        amdgpu_arch_path, shell=True, capture_output=True, text=True, check=False
     )
     return result.stdout.strip().split("\n")[0]
 
 
 DEFAULT_GPU_ARCH = get_amdgpu_arch()
 GPU_ARCH = os.environ.get("GPU_ARCHS", DEFAULT_GPU_ARCH)
-AITER_REBUILD = int(os.environ.get("AITER_REBUILD", 0))
+AITER_REBUILD = int(os.environ.get("AITER_REBUILD", "0"))
 
 HOME_PATH = os.environ.get("HOME")
 AITER_MAX_CACHE_SIZE = os.environ.get("AITER_MAX_CACHE_SIZE", None)
 AITER_ROOT_DIR = os.environ.get("AITER_ROOT_DIR", f"{HOME_PATH}/.aiter")
 BUILD_DIR = os.path.abspath(os.path.join(AITER_ROOT_DIR, "build"))
-AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
-AITER_DEBUG = int(os.getenv("AITER_DEBUG", 0))
-AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", 0))
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
+AITER_DEBUG = int(os.getenv("AITER_DEBUG", "0"))
+AITER_USE_HSACO = int(os.getenv("AITER_USE_HSACO", "0"))
 
 if AITER_REBUILD >= 1:
     # Wipe the build dir without a shell: BUILD_DIR is recreated just below.
@@ -129,7 +129,11 @@ def mp_lock(
 def get_hip_version():
     hipconfig_home = shutil.which("hipconfig")
     version = subprocess.run(
-        f"{hipconfig_home} --version", shell=True, capture_output=True, text=True
+        f"{hipconfig_home} --version",
+        shell=True,
+        capture_output=True,
+        text=True,
+        check=False,
     )
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 

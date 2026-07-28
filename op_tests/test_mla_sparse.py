@@ -392,7 +392,7 @@ def test_mla(
     q = torch.randn((total_q, nhead, qk_head_dim), dtype=torch.bfloat16)
 
     # troch implementation
-    out_ref, lse_ref = torch_mla_extend(
+    out_ref, _lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         qo_indptr,

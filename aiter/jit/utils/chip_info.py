@@ -137,11 +137,13 @@ def get_gfx_list() -> list[str]:
 
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
-    cu_num = int(os.getenv("CU_NUM", 0))
+    cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
         try:
             rocminfo = executable_path("rocminfo")
-            result = subprocess.run([rocminfo], capture_output=True, text=True)
+            result = subprocess.run(
+                [rocminfo], capture_output=True, text=True, check=False
+            )
             output = result.stdout
             devices = re.split(r"Agent\s*\d+", output)
             gpu_compute_units = []

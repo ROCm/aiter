@@ -39,7 +39,6 @@ def get_default_kwargs(
     d["NUM_WARPS"] = 4
     d["WARP_THREADS_K"] = 8
     global GDR_GLOBAL_CONFIG_MAP
-    global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
         fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")

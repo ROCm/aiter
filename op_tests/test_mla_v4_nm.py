@@ -1865,6 +1865,7 @@ def _run_oob_guardpage_worker(worker_args, fault_label):
         text=True,
         timeout=300,
         preexec_fn=_no_core_dump,
+        check=False,
     )
     combined = proc.stdout + proc.stderr
     faulted = (

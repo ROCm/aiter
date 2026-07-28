@@ -891,7 +891,11 @@ def get_so_files_size_and_count():
     """Get the total size and number of so files in aiter build directory."""
     try:
         du_result = subprocess.run(
-            ["du", "-sh", BUILD_DIR], capture_output=True, text=True, timeout=100
+            ["du", "-sh", BUILD_DIR],
+            capture_output=True,
+            text=True,
+            timeout=100,
+            check=False,
         )
         if du_result.returncode == 0:
             total_size_of_so_files = du_result.stdout.split()[0]
@@ -909,6 +913,7 @@ def get_so_files_size_and_count():
             capture_output=True,
             text=True,
             timeout=100,
+            check=False,
         )
         if so_count_result.returncode == 0:
             number_of_so_files = so_count_result.stdout.strip()
@@ -928,12 +933,10 @@ def prebuild_normal_accuracy_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS
@@ -976,12 +979,10 @@ def prebuild_normal_performance_cases_aot_so():
     global BATCH_SIZE_OPTIONS
     global HEAD_CONFIGURATIONS
     global CONTEXT_LENGTH_OPTIONS
-    global COMPUTE_TYPE_OPTIONS
     global QUANT_MODE_OPTIONS
     global HEAD_DIMENSION_OPTIONS
     global TRANS_V_OPTIONS
     global KV_VARLEN_OPTIONS
-    global QUANT_Q_AND_KV_OPTIONS
     global USE_TORCH_FLASH_REF_OPTIONS
     global USE_AOT_IMPL_OPTIONS
     global CONTEXT_PARTITION_SIZE_OPTIONS

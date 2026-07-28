@@ -2226,7 +2226,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 # ---- Core loop: no causal mask ----
                 (
-                    sp_out,
+                    _sp_out,
                     kv_out,
                     o_tiles,
                     su_sp_tiles_out,

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -107,7 +108,7 @@ def run_gemm_a8w8(x, weight, x_scale, w_scale, out, kernelId, splitK):
 
 
 class GemmA8W8Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GEMM_A8W8}",
         "untune_file": "aiter/configs/a8w8_untuned_gemm.csv",

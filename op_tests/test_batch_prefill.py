@@ -315,7 +315,7 @@ def ref_masked_attention(
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query.float(), key.float())
 
     if 0 < logits_soft_cap:
-        mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", 0))
+        mode = int(os.environ.get("CK_TILE_ATTENTION_LOGITS_SOFT_CAP_DEFAULT", "0"))
         if mode == 0:
             attn_weights = logits_soft_cap * torch.tanh(attn_weights / logits_soft_cap)
         else:
@@ -3567,6 +3567,7 @@ def _aick1171_run_in_subprocess(child_code: str, timeout: int = 180):
         text=True,
         timeout=timeout,
         env=env,
+        check=False,
     )
 
 

@@ -295,7 +295,7 @@ def run_pretune(
             "--all",
         ]
         _log(f"[pretune] running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, env=env)
+        result = subprocess.run(cmd, env=env, check=False)
         if result.returncode != 0:
             _warn(
                 f"[pretune] tuner exited {result.returncode} for {module_name}. "

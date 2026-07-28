@@ -56,7 +56,7 @@ def ref_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, _heads, dim = q.size()
+    batch_size, next_n, _heads, _dim = q.size()
     _num_block, block_size, _, _dim = kv_cache.size()
     logits = torch.full(
         [batch_size * next_n, max_model_len],
@@ -106,7 +106,7 @@ def ref_fp8_paged_mqa_logits_ragged(
     kv_indices: torch.Tensor,
     max_model_len: int,
 ):
-    batch_size, next_n, _heads, dim = q.size()
+    batch_size, next_n, _heads, _dim = q.size()
     _seq_kv, _block_size, _dim = kv_cache.size()  # 3d
     logits = torch.full(
         [batch_size * next_n, max_model_len],

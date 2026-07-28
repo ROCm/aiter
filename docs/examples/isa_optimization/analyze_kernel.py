@@ -34,7 +34,10 @@ def analyze_isa(co_path: str, mcpu: str):
         sys.exit(1)
 
     result = subprocess.run(
-        [objdump, "-d", f"--mcpu={mcpu}", co_path], capture_output=True, text=True
+        [objdump, "-d", f"--mcpu={mcpu}", co_path],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if result.returncode != 0:
         print(f"Error: llvm-objdump failed:\n{result.stderr}", file=sys.stderr)

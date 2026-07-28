@@ -15,6 +15,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from typing import Any, ClassVar
 
 import pandas as pd
 
@@ -102,6 +103,7 @@ def _run_tuner(script, untuned, tuned, extra_args=None, timeout=300, mp=1):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         _cleanup_stale_lock_files()
@@ -551,7 +553,7 @@ class TestTunePipeline(unittest.TestCase):
 class TestShapeGrouped(unittest.TestCase):
     """Test --shape_grouped: same profile count, correct tuned row count."""
 
-    CONFIGS = {
+    CONFIGS: ClassVar[dict[str, Any]] = {
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
@@ -631,7 +633,7 @@ class TestShapeGrouped(unittest.TestCase):
 class TestComparePipeline(unittest.TestCase):
     """Test --compare --update_improved end-to-end."""
 
-    CONFIGS = {
+    CONFIGS: ClassVar[dict[str, Any]] = {
         "a8w8_blockscale": {
             "script": "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
             "header": ["M", "N", "K"],
@@ -752,6 +754,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
                 timeout=timeout,
                 cwd=AITER_ROOT,
                 env=env,
+                check=False,
             )
         except subprocess.TimeoutExpired as e:
             raise AssertionError(

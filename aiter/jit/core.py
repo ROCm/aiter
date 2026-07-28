@@ -83,8 +83,8 @@ PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
-AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", 0))
-AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", 0))
+AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
+AITER_LOG_TUNED_CONFIG = int(os.getenv("AITER_LOG_TUNED_CONFIG", "0"))
 
 
 # config_env start here
@@ -603,7 +603,6 @@ __mds = {}
 
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
-    global __mds
     if md_name not in __mds:
         if "AITER_JIT_DIR" in os.environ:
             __mds[md_name] = importlib.import_module(md_name)

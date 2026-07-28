@@ -1074,11 +1074,11 @@ def attention_forward_decode_triton_impl(
         )
         block_size_k = 0  # Not used
     if is_new_kv:
-        _, seqlen_kn, nheads_kn, dim_kn = get_shape_from_layout(k_new, layout)
+        _, _seqlen_kn, nheads_kn, _dim_kn = get_shape_from_layout(k_new, layout)
         stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(
             k_new, layout
         )
-        _, seqlen_vn, nheads_vn, dim_vn = get_shape_from_layout(v_new, layout)
+        _, _seqlen_vn, nheads_vn, _dim_vn = get_shape_from_layout(v_new, layout)
         stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(
             v_new, layout
         )

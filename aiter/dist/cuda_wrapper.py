@@ -78,7 +78,7 @@ def find_loaded_library(lib_name) -> str | None:
 
 
 class CudaRTLibrary:
-    exported_functions = [
+    exported_functions: ClassVar[list[Any]] = [
         # ​cudaError_t cudaSetDevice ( int  device )
         Function("cudaSetDevice", cudaError_t, [ctypes.c_int]),
         # cudaError_t 	cudaDeviceSynchronize ( void )

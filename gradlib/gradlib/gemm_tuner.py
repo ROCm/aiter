@@ -98,7 +98,7 @@ def runGemmTuner():
     ext_group.add_argument(
         "--batch_size",
         type=int,
-        default=os.getenv("GTUNE_BATCH_SIZE", 1),
+        default=os.getenv("GTUNE_BATCH_SIZE", "1"),
         help="Batch size to tune for",
     )
     ext_group.add_argument(
@@ -110,7 +110,7 @@ def runGemmTuner():
     ext_group.add_argument(
         "--tp",
         type=int,
-        default=os.getenv("GTUNE_TP", 1),
+        default=os.getenv("GTUNE_TP", "1"),
         help="Tensor parallelism to be used.",
     )
     args = gtuner.parse_args()
