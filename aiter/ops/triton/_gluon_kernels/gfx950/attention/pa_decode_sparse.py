@@ -45,6 +45,33 @@ def _fp8_to_f32(x_u8, FP8_FNUZ: gl.constexpr):
 
 
 @gluon.jit
+def _slots(
+    indices_ptr,
+    seg_start,
+    k_pos,
+    hi,
+    num_rows,
+    BLOCK_SIZE: gl.constexpr,
+    MASKED: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
+):
+    # Returns in whatever layout k_pos carries. Called once per gather layout: NoPE
+    # and RoPE tile their warps differently, and re-loading this tiny broadcast
+    # vector is cheaper than a cross-lane convert between the two.
+    if MASKED:
+        in_range = k_pos < hi
+        slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
+        valid = in_range & (slot >= 0) & (slot < num_rows)
+        slot = gl.where(valid, slot, 0)
+    else:
+        slot = gl.load(indices_ptr + seg_start + k_pos)
+        valid = slot >= 0  # -1 sentinels: clamp in-bounds, mask score below
+        if HAS_INVALID:
+            slot = gl.where(valid, slot, 0)
+    return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32), valid
+
+
+@gluon.jit
 def _decode_tile(
     q_dot,
     cache_ptr,
@@ -64,6 +91,7 @@ def _decode_tile(
     offs_full,
     offs_rope,
     k_rng_slot,
+    k_rng_rope,
     qk_layout: gl.constexpr,
     pv_layout: gl.constexpr,
     k_layout: gl.constexpr,
@@ -92,21 +120,16 @@ def _decode_tile(
     neg_inf = float("-inf")
     if not USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets (see _cache_load)
-    k_pos = k_start + k_rng_slot
-    if MASKED:
-        in_range = k_pos < hi
-        slot = gl.load(indices_ptr + seg_start + k_pos, mask=in_range, other=-1)
-        valid1d = in_range & (slot >= 0) & (slot < num_rows)
-        safe_slot = gl.where(valid1d, slot, 0)
-    elif HAS_INVALID:
-        slot = gl.load(indices_ptr + seg_start + k_pos)
-        valid1d = slot >= 0  # -1 sentinels: clamp in-bounds, mask score below
-        safe_slot = gl.where(valid1d, slot, 0)
-    else:
-        slot = gl.load(indices_ptr + seg_start + k_pos)
-        safe_slot = slot
-    block_idx = (safe_slot // BLOCK_SIZE).to(gl.int32)
-    pos = (safe_slot % BLOCK_SIZE).to(gl.int32)
+    block_idx, pos, valid1d = _slots(
+        indices_ptr,
+        seg_start,
+        k_start + k_rng_slot,
+        hi,
+        num_rows,
+        BLOCK_SIZE,
+        MASKED,
+        HAS_INVALID,
+    )
     block_idx_g = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_l))
     pos_g = gl.convert_layout(pos, gl.SliceLayout(1, gather_l))
     if MASKED:
@@ -148,17 +171,26 @@ def _decode_tile(
         else:
             x_u8 = _cache_load(cache_ptr, nope_off, USE_BUFFER_LOAD)
             exps = _cache_load(cache_ptr, scl_off, USE_BUFFER_LOAD)
+        # Keep the dequant in f32: gfx950 has no bf16 multiply, so a bf16 path
+        # lowers to an emulated mul and doubles the loop.
         x_fp8 = x_u8.to(gl.float8e4nv, bitcast=True)
         scales = gl.exp2(exps.to(gl.float32) - 127.0)
         k_nope = (x_fp8.to(gl.float32) * scales).to(gl.bfloat16)
         kv_smem.store(k_nope)
-        block_idx_gr = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_rope_l))
-        pos_gr = gl.convert_layout(pos, gl.SliceLayout(1, gather_rope_l))
+        block_idx_gr, pos_gr, valid_gr = _slots(
+            indices_ptr,
+            seg_start,
+            k_start + k_rng_rope,
+            hi,
+            num_rows,
+            BLOCK_SIZE,
+            MASKED,
+            HAS_INVALID,
+        )
         rope_off = (block_idx_gr * (cs0 // 2) + pos_gr * 288 + 224)[
             :, None
         ] + offs_rope[None, :]
         if MASKED:
-            valid_gr = gl.convert_layout(valid1d, gl.SliceLayout(1, gather_rope_l))
             k_rope = _cache_load(
                 cache_bf16_ptr,
                 rope_off,
@@ -228,6 +260,7 @@ def _gd_fp8(
     offs_full,
     offs_rope,
     k_rng_slot,
+    k_rng_rope,
     gather_l: gl.constexpr,
     gather_rope_l: gl.constexpr,
     BLOCK_SIZE: gl.constexpr,
@@ -237,23 +270,20 @@ def _gd_fp8(
     HAS_INVALID: gl.constexpr,
     FP8_FNUZ: gl.constexpr,
 ):
-    """Gather + dequant one full fp8 tile to bf16 regs (k_nope, k_rope). Split from
-    the LDS-write/MFMA so the pipeline runs this tile's gather+dequant while the
-    previous tile's MFMAs are on the matrix core -> the dequant hides behind them.
-    UNIFORM: one fp8 gather + separate fp32 scales, no RoPE (k_rope is a dead
-    alias). Else: packed NoPE fp8 (over-read) + embedded UE8M0 + RoPE bf16.
-    Returns (k_nope, k_rope, valid); valid is the per-slot >=0 mask (all-True and
-    DCE'd when HAS_INVALID is False), consumed by _qkpv_fp8 for the score mask."""
-    slot = gl.load(indices_ptr + seg_start + k_start + k_rng_slot)
+    """Gather + dequant one full fp8 tile to bf16 regs. Split from the LDS-write/MFMA
+    so the gather issues an iteration early."""
     if not USE_BUFFER_LOAD:
         cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets (see _cache_load)
-    valid = slot >= 0
-    if HAS_INVALID:
-        slot = gl.where(valid, slot, 0)  # clamp -1 sentinels in-bounds for the gather
-    block_idx = (slot // BLOCK_SIZE).to(gl.int32)
-    pos = (slot % BLOCK_SIZE).to(gl.int32)
-    bg = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_l))
-    pg = gl.convert_layout(pos, gl.SliceLayout(1, gather_l))
+    bg, pg, valid = _slots(
+        indices_ptr,
+        seg_start,
+        k_start + k_rng_slot,
+        0,  # hi/num_rows: unused at MASKED=False
+        0,
+        BLOCK_SIZE,
+        False,
+        HAS_INVALID,
+    )
     if UNIFORM:
         NGRP: gl.constexpr = HEAD_SIZE // 64
         kv_off = (bg * cs0 + pg * HEAD_SIZE)[:, None] + offs_full[None, :]
@@ -273,8 +303,16 @@ def _gd_fp8(
             x_u8.to(gl.float8e4nv, bitcast=True).to(gl.float32)
             * gl.exp2(exps.to(gl.float32) - 127.0)
         ).to(gl.bfloat16)
-        bgr = gl.convert_layout(block_idx, gl.SliceLayout(1, gather_rope_l))
-        pgr = gl.convert_layout(pos, gl.SliceLayout(1, gather_rope_l))
+        bgr, pgr, _ = _slots(
+            indices_ptr,
+            seg_start,
+            k_start + k_rng_rope,
+            0,
+            0,
+            BLOCK_SIZE,
+            False,
+            HAS_INVALID,
+        )
         rope_off = (bgr * (cs0 // 2) + pgr * 288 + 224)[:, None] + offs_rope[None, :]
         k_rope = _cache_load(cache_bf16_ptr, rope_off, USE_BUFFER_LOAD)
     return k_nope, k_rope, valid
@@ -387,16 +425,13 @@ def _process_segment(
     offs_full = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, gather_l))
     offs_rope = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, gather_rope_l))
     k_rng_slot = gl.arange(0, BLOCK_K, layout=slot_l)
+    k_rng_rope = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(1, gather_rope_l))
 
     # Peel the (possibly partial) last tile: [lo, hi_full) are full BLOCK_K tiles
     # whose slots are all valid -> mask-free. Only the peeled tail carries masking.
     hi_full = lo + ((hi - lo) // BLOCK_K) * BLOCK_K
 
     if IS_FP8:
-        # Prologue/epilogue software pipeline: gather + DEQUANT tile i into bf16
-        # registers while the previous tile's MFMAs run (VALU+matrix-core co-issue
-        # hides the quant cost). One LDS buffer, so the LDS write of tile i still
-        # waits on tile i-1's reads, but the gather+dequant is off the critical path.
         n_full = (hi_full - lo) // BLOCK_K
         if n_full > 0:
             kn, kr, vld = _gd_fp8(
@@ -409,6 +444,7 @@ def _process_segment(
                 offs_full,
                 offs_rope,
                 k_rng_slot,
+                k_rng_rope,
                 gather_l,
                 gather_rope_l,
                 BLOCK_SIZE,
@@ -429,6 +465,7 @@ def _process_segment(
                     offs_full,
                     offs_rope,
                     k_rng_slot,
+                    k_rng_rope,
                     gather_l,
                     gather_rope_l,
                     BLOCK_SIZE,
@@ -510,6 +547,7 @@ def _process_segment(
                 offs_full,
                 offs_rope,
                 k_rng_slot,
+                k_rng_rope,
                 qk_layout,
                 pv_layout,
                 k_layout,
@@ -552,6 +590,7 @@ def _process_segment(
             offs_full,
             offs_rope,
             k_rng_slot,
+            k_rng_rope,
             qk_layout,
             pv_layout,
             k_layout,
@@ -667,10 +706,13 @@ def _pa_decode_sparse(
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
+    # Warps tile dim 0 here, one warp already covers all 64 RoPE columns, so putting
+    # them on dim 1 (as the NoPE gather does) overshoots 4x and every warp re-gathers
+    # the same tile. Worth ~10% on packed fp8.
     gather_rope_l: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 8],
         threads_per_warp=[8, 8],
-        warps_per_cta=[1, NUM_WARPS],
+        warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     slot_l: gl.constexpr = gl.SliceLayout(1, gather_l)
@@ -828,7 +870,6 @@ def _pa_decode_sparse(
         else:
             l_final = l_pv
         out = acc / l_final[:, None]
-        # store output
         offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, pv_layout))
         o_off = (
             query_idx * out_stride0 + h_pv[:, None] * out_stride1 + offs_d_o[None, :]
