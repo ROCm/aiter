@@ -6,8 +6,7 @@
 The forward and backward kernels use the same address-computation idioms with
 operand roles relabelled. These are factored here so there is a single source of
 truth, and so the thread-coordinate decomposition is expressed with FlyDSL
-layout algebra (idx2crd over a make_layout) rather than hand-rolled integer
-division/modulo.
+layout algebra (idx2crd over a make_layout).
 
 All helpers build FlyDSL expressions and must be called from inside a
 @flyc.kernel body.
