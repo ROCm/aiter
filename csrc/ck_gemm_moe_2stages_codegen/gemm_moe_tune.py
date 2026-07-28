@@ -2165,7 +2165,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args, target_fused_moe=None, try_extra_ref=False, config_string=""):
+    def run_config(self, args, target_fused_moe=None, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import run_perftest, checkAllclose
 
@@ -2345,66 +2345,30 @@ class FmoeTuner(TunerCommon):
                     err_ratio = 1.0
                 else:
                     err_ratio = checkAllclose(out, ref, msg=f"run_config {shape_str}")
-                    if try_extra_ref:
-                        # try compare with extra references (due to different implementations)
-                        try:
-                            # use weight-decompression only algorithm as second reference
-                            w1_deq = w1_qt.to(dtype=hidden.dtype) * w1_scale.view(
-                                w1_scale.shape[0], -1, 1
-                            ).to(dtype=hidden.dtype)
-                            w2_deq = w2_qt.to(dtype=hidden.dtype) * w2_scale.view(
-                                w2_scale.shape[0], -1, 1
-                            ).to(dtype=hidden.dtype)
-
-                            ref2 = self.torch_moe_2stages(
-                                hidden,
-                                w1_deq,
-                                w2_deq,
-                                topk_weights,
-                                topk_ids,
-                                dtype=dtype,
-                                activation=act_type,
-                                quant_type=QuantType.No,
-                                doweight_stage1=doweight_stage1,
-                            )
-                            err_ratio2 = checkAllclose(
-                                out, ref2, msg=f"run_config {shape_str}"
-                            )
-                            err_ratio = min(err_ratio, err_ratio2)
-                        except Exception:
-                            pass
-
-                        if q_type == QuantType.per_Tensor:
-                            try:
-                                # inputs are quantized per-Token while weights are quantized per-Tensor
-                                a1_qt, a1_scale = aiter.get_torch_quant(
-                                    QuantType.per_Token
-                                )(hidden, quant_dtype=q_dtype_a)
-                                ref2 = self.torch_moe_2stages(
-                                    a1_qt,
-                                    w1_qt,
-                                    w2_qt,
-                                    topk_weights,
-                                    topk_ids,
-                                    a1_scale=a1_scale,
-                                    w1_scale=w1_scale,
-                                    w2_scale=w2_scale,
-                                    dtype=dtype,
-                                    activation=act_type,
-                                    quant_type=QuantType.per_Token,
-                                    doweight_stage1=doweight_stage1,
-                                )
-                                err_ratio2 = checkAllclose(
-                                    out, ref2, msg=f"run_config {shape_str}"
-                                )
-                                err_ratio = min(err_ratio, err_ratio2)
-                            except Exception:
-                                pass
-
-                    if err_ratio <= args.errRatio:
+                    # Element-wise err_ratio (atol/rtol) is overly strict for lossy
+                    # fp4/fp8 MoE: even a correct kernel differs on most elements
+                    # vs the higher-precision reference. op_tests/test_moe_2stage.py
+                    # judges these paths by cosine similarity (logits_diff) instead,
+                    # so accept a shape if either metric passes. A genuinely wrong
+                    # (uncorrelated) kernel still has large logits_diff and fails.
+                    _x = out.to(dtypes.fp32)
+                    _y = ref.to(dtypes.fp32)
+                    _den = (_x * _x + _y * _y).sum()
+                    logits_diff = (
+                        float(1.0 - (2.0 * (_x * _y).sum() / _den).item())
+                        if _den.item() != 0
+                        else 0.0
+                    )
+                    cos_tol = float(os.environ.get("AITER_RUN_CONFIG_COS_TOL", "0.01"))
+                    if err_ratio <= allowed_err_ratio or logits_diff <= cos_tol:
                         status = "ok"
                     else:
-                        status = f"mismatch:err_ratio={err_ratio:.4f}(>{args.errRatio})"
+                        diag = tensor_compare_diagnostics(ref, out)
+                        status = (
+                            f"mismatch:err_ratio={err_ratio:.6g}"
+                            f"(>{allowed_err_ratio_desc}),"
+                            f"logits_diff={logits_diff:.6g}(>{cos_tol})(>{diag})"
+                        )
                 results.append(
                     {
                         "shape": shape_str,
@@ -3119,7 +3083,7 @@ class FmoeTuner(TunerCommon):
         )
         from functools import partial
 
-        results_base = self.run_config(args, try_extra_ref=True)
+        results_base = self.run_config(args)
         better_kernels = {}
 
         for i in range(len(self.untunedf)):
@@ -3200,7 +3164,6 @@ class FmoeTuner(TunerCommon):
                     target_fused_moe=partial(
                         target_fused_moe, config_string=config_string
                     ),
-                    try_extra_ref=True,
                     config_string = config_string,
                 )
             except Exception as e:
