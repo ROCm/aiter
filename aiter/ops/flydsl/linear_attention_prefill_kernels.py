@@ -18,18 +18,83 @@ For an end-to-end GDN forward that uses this K5 wrapper, call
 
 from __future__ import annotations
 
+import csv
+import functools
 import math
+import os
+import warnings
+from pathlib import Path
 
 import torch
 import triton
+from packaging.version import Version
 
+import flydsl
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.runtime.device import get_rocm_arch
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
-from .kernels.tensor_shim import _run_compiled
+from .kernels.chunk_gated_delta_h_naive import compile_chunk_gated_delta_h_naive
+from .kernels.chunk_gated_delta_h_naive_opt import (
+    compile_chunk_gated_delta_h_naive_opt,
+)
+
+# KV forks: ``kv`` is the WITH-lds_g variant (OPT-C(g) g-staging), ``mfma16_2wave_opt1``
+# is the stripped no-lds_g variant (gating reads g inline from HBM). File names,
+# symbol names and the host ``_fork`` selector all agree.
+from .kernels.chunk_gated_delta_h_kv import compile_chunk_gated_delta_h_kv
+from .kernels.chunk_gated_delta_h_mfma16_hip import (
+    compile_chunk_gated_delta_h_mfma16_hip,
+)
+from .kernels.chunk_gated_delta_h_mfma16_3wave_opt2 import (
+    compile_chunk_gated_delta_h_mfma16_3wave_opt2,
+)
+from .kernels.chunk_gated_delta_h_mfma16_2wave_opt1 import (
+    compile_chunk_gated_delta_h_mfma16_2wave_opt1,
+)
+from .kernels.chunk_gated_delta_h_mfma32_vk import (
+    compile_chunk_gated_delta_h_mfma32_vk,
+)
+
+try:
+    from .kernels.chunk_gated_delta_h_hipport import (
+        compile_chunk_gated_delta_h_hipport,
+    )
+except ModuleNotFoundError:
+    compile_chunk_gated_delta_h_hipport = None
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+
+# The K5 kernel passes every tensor slot as ``fx.Pointer`` (raw data pointer).
+# The kernel body wraps each one as ``GTensor(..., shape=(-1,))`` and never
+# reads the FlyDSL memref shape/stride, so the pointer ABI produces identical
+# device code while skipping the per-launch DLPack export + layout-buffer
+# packing that the default layout-dynamic ``fx.Tensor`` memref incurs under
+# flydsl >=0.2.0. ``fx.Pointer`` host wrapping (``flyc.from_c_void_p`` +
+# ``PointerAdaptor`` fast dispatch) only exists from 0.2.0, so this op alone
+# requires 0.2.0 (the rest of aiter.ops.flydsl only needs >=0.1.8).
+_K5_MIN_FLYDSL_VERSION = Version("0.2.0")
+_installed_flydsl_version = Version(getattr(flydsl, "__version__", "0").split("+")[0])
+if _installed_flydsl_version < _K5_MIN_FLYDSL_VERSION:
+    raise ImportError(
+        "FlyDSL K5 linear-attention prefill requires `flydsl` "
+        f">=`{_K5_MIN_FLYDSL_VERSION}` (for the fx.Pointer argument ABI), "
+        f"but got `{getattr(flydsl, '__version__', 'unknown')}`."
+    )
+
+
+def _as_ptr(t: torch.Tensor):
+    """Wrap a torch tensor as a flydsl ``Pointer`` argument (raw data ptr).
+
+    Uses ``fx.Uint8`` element type: the K5 kernel re-types every slot inside
+    the body via ``GTensor(ptr, dtype=...)``, so the host-side element type is
+    irrelevant to codegen and only needs to be a valid 1-byte unit.
+    """
+    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
+
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
@@ -43,9 +108,303 @@ __all__ = [
 
 # -- K5 host wrapper (FlyDSL kernel + rule-based BV selection) ------------
 
-_compiled_kernels = {}
 _BV_CANDIDATES = [16, 32, 64]
 _DEFAULT_BV = 16
+
+# The trace-calibrated BV carve-outs in ``_target_bv_for_shape`` were swept
+# exclusively on gfx950 (V=128, BT=64, 256 CUs). They assume gfx950's CU
+# count and wave-occupancy behavior, so they are gated to gfx950 -- on any
+# other arch the carve-outs return ``None`` and the generic CU-fill default
+# applies instead (matches the pre-calibration behavior, no regression).
+# ``get_rocm_arch()`` may return a feature-suffixed string like
+# ``gfx950:sramecc+:xnack-``; normalize before matching.
+_IS_GFX950 = get_rocm_arch().split(":")[0].startswith("gfx950")
+_IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
+
+# gfx942 (MI30x, 80 CUs) CU-fill target for the mfma16_hip fork. Calibrated by
+# sweeping BV in {16,32,64} across the full K5 benchmark shape set on gfx942
+# (see op_tests/flydsl_tests/_bv_sweep_gfx942.py): a target of 64 CTAs (~0.8
+# wave over the 80 CUs) reproduces the measured-best BV for every swept shape.
+# mfma16_hip's larger-BV tiles are efficient enough that forcing a smaller BV
+# just to fill all 80 CUs is a net loss, so the target is intentionally BELOW
+# the live CU count. On gfx942 the baseline/naive forks abort (K=32 MFMA) and
+# every other fork pins its own BV, so mfma16_hip is the only consumer of this
+# heuristic BV -- this target is tuned specifically for it.
+_GFX942_MFMA16HIP_TARGET_CTAS = 64
+
+# gfx942 H=8/Hg=2 varlen carve-out（当前 K5 生产 shape：V=128, BT=64,
+# is_varlen, seqlen=8192）。20260721 在卡7（gfx942, GPU 空闲）实测按 T 强扫
+# BV∈{16,32,64} 得到的 best BV 随 batch 内序列数 N 单调递增：
+#   N=1 (T=8192) →16 · N=2 (T=16384) →32 · N>=3 (T>=24576) →64
+# 通用 target(64) 会在 N=3 时把 BV=64 的 grid(=N*H*ceil(V/BV)=48) 误判为
+# "不够一个 wave" 而降到 BV=32（实测 662us vs BV=64 的 498us，慢约 25%）。
+# 把该 shape family 的 grid-fill 目标下调到 48，N>=3 的 BV=64 grid 恰好达标，
+# 与实测 best BV 完全吻合；其它 gfx942 shape 不受影响（仍用 64 / csv 精确命中）。
+_GFX942_MFMA16HIP_H8HG2_TARGET_CTAS = 48
+
+# gfx950 has 256 CUs. Used as the fallback CU count when the live device
+# query is unavailable (e.g. CPU-only meta runs).
+_GFX950_CU_COUNT = 256
+
+# ---------------------------------------------------------------------------
+# Tuned-csv BV lookup (csv-best preferred, rule-based fallback)
+# ---------------------------------------------------------------------------
+# Offline-tuned table mapping a shape family to its measured-best BV. This is
+# the SAME csv the AOT path (``aiter/aot/flydsl/chunk_gdn_h.py``) uses as its
+# pre-compile seed list. At runtime we consult it FIRST for an exact-match
+# best BV; on a miss (the table is sparse -- a few dozen rows) we fall back to
+# the rule-based ``_target_bv_for_shape`` / CU-fill heuristic, so coverage is
+# never worse than the pure-rule path.
+#
+# Built once per process (mirrors ``GDR_GLOBAL_CONFIG_MAP`` in
+# ``linear_attention_kernels``): we keep, per key, the BV of the row with the
+# smallest measured ``duration``.
+_TUNED_BV_CSV = Path(__file__).resolve().parent / "chunk_gdn_h_tuned.csv"
+# key = (arch, dtype, K, V, BT, H, Hg, T_flat, N, is_varlen) -> (BV, duration)
+_TUNED_BV_MAP: dict[tuple, tuple[int, float]] | None = None
+
+
+def _parse_csv_bool(s: str) -> bool:
+    return str(s).strip() in ("True", "true", "1", "yes")
+
+
+def _load_tuned_bv_map() -> dict[tuple, tuple[int, float]]:
+    """Parse ``chunk_gdn_h_tuned.csv`` into a best-BV lookup, once per process.
+
+    Keeps the BV from the minimum-``duration`` row for each shape-family key.
+    Malformed rows are skipped so a partially hand-edited csv can never break
+    the runtime path (we just fall back to the rule for those shapes).
+    """
+    global _TUNED_BV_MAP
+    if _TUNED_BV_MAP is not None:
+        return _TUNED_BV_MAP
+
+    out: dict[tuple, tuple[int, float]] = {}
+    try:
+        with open(_TUNED_BV_CSV, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    key = (
+                        row["arch"],
+                        row["dtype"],
+                        int(row["K"]),
+                        int(row["V"]),
+                        int(row["BT"]),
+                        int(row["H"]),
+                        int(row["Hg"]),
+                        int(row["T_flat"]),
+                        int(row["N"]),
+                        _parse_csv_bool(row["is_varlen"]),
+                    )
+                    bv = int(row["BV"])
+                    dur = float(row["duration"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                prev = out.get(key)
+                if prev is None:
+                    out[key] = (bv, dur)
+                    continue
+                # Ambiguity guard: the lookup key intentionally omits the
+                # use_g/use_gk/use_h0/store_fs/save_vn/wu_contig switches (they
+                # are not tuned as independent BV dimensions today). If a future
+                # csv edit introduces two rows that share this key but disagree
+                # on BV, the min-duration row silently wins -- which could be a
+                # row tuned under a different switch combo than the caller's.
+                # Surface it so the csv author can decide whether the switch
+                # belongs in the key.
+                if bv != prev[0]:
+                    warnings.warn(
+                        "FlyDSL K5 tuned csv: conflicting BV for shape key "
+                        f"{key}: BV={prev[0]} (dur={prev[1]:.1f}) vs BV={bv} "
+                        f"(dur={dur:.1f}); keeping the lower-duration row. If "
+                        "these rows differ only by a use_*/store_fs/save_vn/"
+                        "wu_contig switch, consider adding that switch to the "
+                        "lookup key.",
+                        stacklevel=2,
+                    )
+                if dur < prev[1]:
+                    out[key] = (bv, dur)
+    except OSError:
+        # No csv on disk (e.g. trimmed deployment): rule-only path.
+        pass
+
+    _TUNED_BV_MAP = out
+    return out
+
+
+def _lookup_csv_bv(
+    *,
+    dtype_str: str | None,
+    K: int | None,
+    BT: int | None,
+    H: int,
+    Hg: int,
+    V: int,
+    T_flat: int,
+    N: int,
+    is_varlen: bool,
+) -> int | None:
+    """Exact-match best BV from the tuned csv, or ``None`` on miss.
+
+    Returns ``None`` whenever any key field needed to form the csv key is
+    unavailable (``dtype_str`` / ``K`` / ``BT`` are optional on the
+    ``_heuristic_bv`` signature for backward compatibility), so callers that
+    don't pass them simply skip straight to the rule-based path.
+    """
+    if dtype_str is None or K is None or BT is None:
+        return None
+    table = _load_tuned_bv_map()
+    if not table:
+        return None
+    hit = table.get(
+        (
+            get_rocm_arch(),
+            dtype_str,
+            K,
+            V,
+            BT,
+            H,
+            Hg,
+            T_flat,
+            N,
+            is_varlen,
+        )
+    )
+    return hit[0] if hit is not None else None
+
+
+@functools.lru_cache(maxsize=None)
+def _cu_count(device_index: int) -> int:
+    """Number of compute units (CTA "wave" width) for the target device.
+
+    The grid-fill heuristic targets "one wave of CTAs over the device's
+    CUs"; the wave width is the CU count, which is arch/SKU-specific (256
+    on gfx950, but differs on gfx942 and others). We read it from the live
+    device properties (``multi_processor_count``) instead of hardcoding
+    256, falling back to the gfx950 value only when the query fails.
+    """
+    try:
+        idx = device_index if device_index >= 0 else torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        cu = int(getattr(props, "multi_processor_count", 0) or 0)
+        if cu > 0:
+            return cu
+    except Exception:
+        pass
+    return _GFX950_CU_COUNT
+
+
+# ---------------------------------------------------------------------------
+# Host-side overhead caches
+# ---------------------------------------------------------------------------
+# The flyc launcher requires every tensor argument to be an ``fx.Tensor``
+# (``None`` is not accepted), and the K5 kernel reads the offset arrays as
+# int32 (``GTensor(..., dtype=T.i32, ...)``). The Triton-side cached prologue
+# helpers (``prepare_chunk_offsets`` / ``prepare_rebased_cu_seqlens``) return
+# int64, so the launch path was previously doing ``.to(torch.int32)`` on
+# every forward, even though the underlying int64 tensor is identity-stable
+# across forwards thanks to ``@tensor_cache``. We sidestep that by:
+#
+#   1. ``_as_int32``: attaches the int32 view directly onto the int64 tensor
+#      as a private attribute (``Tensor`` objects accept arbitrary
+#      attributes). The first forward casts once; every subsequent forward
+#      is a pure ``getattr`` -- no ATen op dispatch, no allocator hit, no
+#      D2D copy. Lifetime is bound to the int64 tensor itself, so when the
+#      upstream ``@tensor_cache`` evicts an entry the int32 copy is freed
+#      automatically (no ``id``-recycling hazard, unlike a global dict).
+#
+#   2. Null-arg launch placeholder: on the ``cu_seqlens is None`` (batched)
+#      path the kernel reads neither ``cu_seqlens`` nor ``chunk_offsets``
+#      (and the ``use_*`` guards skip the optional gate/state loads), but
+#      ``@flyc.jit`` still requires a real tensor in every slot. A local
+#      ``torch.empty(0)`` (one per forward, MoE-style) satisfies that
+#      without any global cache.
+_INT32_ATTR = "_flydsl_int32_view"
+_PROLOGUE_ATTR = "_flydsl_prologue_cache"
+
+
+def _as_int32(t: torch.Tensor) -> torch.Tensor:
+    """Return an int32 narrowing of ``t``, cached on the tensor itself.
+
+    ``t`` is expected to come from one of the ``@tensor_cache``-decorated
+    prologue helpers (so its identity is stable across forwards). The
+    cached int32 result lives as an attribute on ``t`` itself, which keeps
+    cache invalidation trivially correct: when the upstream cache evicts
+    ``t``, the int32 copy is collected with it.
+    """
+    if t.dtype == torch.int32:
+        return t
+    cached = getattr(t, _INT32_ATTR, None)
+    if cached is None:
+        cached = t.to(torch.int32)
+        try:
+            object.__setattr__(t, _INT32_ATTR, cached)
+        except (AttributeError, TypeError):
+            # Some tensor subclasses or autograd-tracked tensors disallow
+            # ad-hoc attributes; fall back to the uncached cast (still
+            # correct, just no longer hot-path-optimised for this caller).
+            pass
+    return cached
+
+
+def _resolve_prologue(
+    cu_seqlens: torch.Tensor,
+    BT: int,
+    num_decodes: int,
+    num_decode_tokens: int,
+):
+    """Resolve the per-shape varlen prologue in one cached lookup.
+
+    Each of ``prepare_chunk_offsets`` / ``prepare_num_chunks`` /
+    ``prepare_rebased_cu_seqlens`` is already ``@tensor_cache``-decorated, so
+    every call is "just" a tuple compare + dict lookup. That is still
+    ~0.55us each via the upstream Python wrapper (≈1.7us total across the
+    three calls), so we collapse them into a single tuple attached
+    directly to ``cu_seqlens`` (keyed by ``(BT, num_decodes,
+    num_decode_tokens)``). After the first forward on a given
+    ``cu_seqlens`` tensor, this is one ``getattr`` + one dict get on a
+    tiny dict, ~0.15us.
+
+    The exact minimum segment length (``min_seqlen``) is cached here too.
+    Reading it requires a ``min().item()`` host<->device sync (~5us), but the
+    sync is paid once per ``cu_seqlens`` tensor, not per forward. That lets
+    the BV heuristic keep the min-based balanced-split carve-outs without a
+    separate launch-plan cache.
+
+    Returns ``(NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)``.
+    """
+    cache_key = (BT, num_decodes, num_decode_tokens)
+    cache = getattr(cu_seqlens, _PROLOGUE_ATTR, None)
+    if cache is None:
+        cache = {}
+        try:
+            object.__setattr__(cu_seqlens, _PROLOGUE_ATTR, cache)
+        except (AttributeError, TypeError):
+            # Subclass disallows ad-hoc attrs; fall through to recomputing
+            # (still correct, just slower).
+            cache = None
+    if cache is not None:
+        hit = cache.get(cache_key)
+        if hit is not None:
+            return hit
+
+    chunk_offsets = prepare_chunk_offsets(
+        cu_seqlens, BT, num_decodes, num_decode_tokens
+    )
+    NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+    kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+        cu_seqlens, num_decodes, num_decode_tokens
+    )
+    N = len(kernel_cu_seqlens) - 1
+    if N >= 1:
+        seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
+        min_seqlen = int(seg_lens.min().item())
+    else:
+        min_seqlen = None
+    result = (NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)
+    if cache is not None:
+        cache[cache_key] = result
+    return result
 
 
 def _legal_bv_candidates(V: int) -> list[int]:
@@ -69,56 +428,123 @@ def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
 
 
 def _target_bv_for_shape(
-    *, H: int, Hg: int, T_flat: int, N: int, is_varlen: bool
+    *,
+    H: int,
+    Hg: int,
+    V: int,
+    T_flat: int,
+    N: int,
+    is_varlen: bool,
+    min_seqlen: int | None = None,
 ) -> int | None:
-    """Return the calibrated BV regime before legality/grid adjustment."""
+    """Return the calibrated BV regime before legality/grid adjustment.
+
+    Calibration scope (gfx950, V=128, BT=64, is_varlen=True):
+      * H==32, Hg==16  : N in {2, 3} swept on T_flat in [2000, 25000].
+        Outside that (T_flat, N) cube the rule deliberately returns
+        ``None`` so the grid-fill default applies -- matches the
+        pre-20260604 behavior. The N=2 / N=3 carve-outs are the only
+        new behavior; everything else is preserved exactly.
+      * H==16          : 32k-context many-seq carve-out (unchanged).
+
+    Args:
+        min_seqlen: smallest segment length in the (varlen) batch, i.e.
+            ``min(cu_seqlens[1:] - cu_seqlens[:-1])``. Used by the
+            "balanced-split" carve-outs to distinguish "segments ~= T/N each"
+            from "one dominant segment + small tails" -- a distinction the
+            average length cannot make (a balanced and a skewed split can
+            share the same average), so the EXACT min is required. The
+            caller computes it once and caches it on the ``cu_seqlens``
+            tensor (see ``_resolve_prologue``) so the per-forward path pays
+            no ``.item()`` host<->device sync. When None, those sub-rules
+            fall through to the T_flat-only logic.
+
+    If you extend this rule, please keep:
+      (a) every return statement guarded by an explicit T_flat range
+          you actually measured;
+      (b) the "no data -> return None" fallthrough at the end of each
+          branch so untested combos can't silently regress.
+
+    All carve-outs below were swept on gfx950 only, so they are skipped on
+    other arches (``_IS_GFX950`` guard) -- non-gfx950 falls through to the
+    generic CU-fill default, preserving the pre-calibration behavior.
+    """
+    if _IS_GFX942:
+        # gfx942 mfma16_hip carve-out（当前生产 shape H=8/Hg=2, V=128, BT=64,
+        # is_varlen）。用 N 驱动的 grid-fill（target=48）拟合卡7实测 best BV：
+        #   N=1→16 · N=2→32 · N>=3→64（对变长序列比纯 T_flat 阈值泛化更好）。
+        # 仅限该 shape family，其它 gfx942 shape 保持 return None → 通用默认。
+        if is_varlen and H == 8 and Hg == 2:
+            return _select_bv_for_grid(
+                H=H, V=V, N=N, target_ctas=_GFX942_MFMA16HIP_H8HG2_TARGET_CTAS
+            )
+        return None
+    if not _IS_GFX950:
+        return None
     if is_varlen and H == 32 and Hg == 16:
-        if N == 2 and 11000 <= T_flat < 15000:
-            return 16
-        if N == 3 and not (10000 <= T_flat < 12000 or 20000 <= T_flat < 25000):
-            return 64
+        if N == 2:
+            # Calibrated range: T_flat in [2000, 25000]. Two flips
+            # measured on H=32/Hg=16/V=128/gfx950 (notes:
+            # _bv_sweep_n2_20260604):
+            #   T_flat <  8000 : BV=32 (grid 256, exactly one wave)
+            #   8000 <= T_flat < 12000 : BV=16
+            #   12000 <= T_flat < 13000 : BV=32 (narrow tail-fit window)
+            #   13000 <= T_flat <= 25000 : BV=16
+            # T_flat outside [2000, 25000] is NOT covered; fall through.
+            #
+            # Balanced-split carve-out (bench20260604_051030, n=2 T~16k
+            # cluster, 134 cases): when both segments are roughly
+            # balanced (min_seqlen >= 6300), BV=32 wins by 17-76us per
+            # case across T_flat in [12000, 20000]. The earlier
+            # T_flat-only rule misses this because it assumed n=2 with
+            # T>=13000 was always "long single-segment dominant"; large
+            # min_seqlen indicates the opposite (two comparable runs).
+            # The (T_flat, min_seqlen) window was sweep-validated to
+            # avoid any regression vs the T_flat-only rule on 44
+            # measured (T_flat, head) points (notes: _bv_sweep_n2_balanced).
+            if (
+                12000 <= T_flat <= 20000
+                and min_seqlen is not None
+                and min_seqlen >= 6300
+            ):
+                return 32
+            if 2000 <= T_flat <= 25000:
+                if T_flat < 8000:
+                    return 32
+                if 12000 <= T_flat < 13000:
+                    return 32
+                return 16
+            # else: untested range, fall through to default
+        elif N == 3:
+            # Calibrated range: T_flat in [8000, 30000]. Across this
+            # whole range BV=32 (grid=N*H*ceil(V/32) = 384, ~1.5 waves
+            # on 256 CUs) measured 22-95us faster than the prior BV=64
+            # / grid-fill choice, including the bench20260603 cluster
+            # T~=16384 cu=[0,head,head+10000,T] (~85us per case, 200+
+            # cases). T_flat outside this range is NOT covered; fall
+            # through.
+            #
+            # Balanced-split carve-out (notes: _bv_sweep_n3_balanced,
+            # 20 measured (T_flat, min_seg, max_seg) points): when the
+            # smallest segment is >= 3000 the three segments are large
+            # enough that BV=64 (grid 192, exactly 0.75 wave on 256 CUs)
+            # wins by 11-74us across T_flat in [10000, 25000]. The
+            # earlier rule missed this because the original calibration
+            # only swept skewed splits (head << T) where one tiny
+            # segment makes BV=64 padding-bound. Validated decision
+            # boundary: min_seg <= 2384 -> BV=32 still wins, min_seg
+            # >= 3000 -> BV=64 wins; no regression observed on the
+            # skewed-split cluster (which has min_seg << 3000).
+            if T_flat >= 10000 and min_seqlen is not None and min_seqlen >= 3000:
+                return 64
+            if 8000 <= T_flat <= 30000:
+                return 32
+            # else: untested range, fall through to default
+        # N==1 and N>=4 are NOT touched by this branch -- the original
+        # behavior (return None -> grid-fill default) is preserved.
     if is_varlen and H == 16 and T_flat >= 32768 and N >= 7:
         return 64
     return None
-
-
-def _lookup_tuned_bv(
-    dtype_str,
-    K,
-    V,
-    BT,
-    H,
-    Hg,
-    T_flat,
-    N,
-    use_g,
-    use_gk,
-    use_h0,
-    store_fs,
-    save_vn,
-    is_varlen,
-    wu_contig,
-):
-    """Select ``BV`` with the rule-based grid/CU heuristic."""
-    del (
-        dtype_str,
-        K,
-        BT,
-        use_g,
-        use_gk,
-        use_h0,
-        store_fs,
-        save_vn,
-        wu_contig,
-    )
-    return _heuristic_bv(
-        H=H,
-        Hg=Hg,
-        V=V,
-        T_flat=T_flat,
-        N=N,
-        is_varlen=is_varlen,
-    )
 
 
 def _heuristic_bv(
@@ -129,8 +555,27 @@ def _heuristic_bv(
     T_flat: int,
     N: int,
     is_varlen: bool,
+    min_seqlen: int | None = None,
+    device_index: int | None = None,
+    dtype_str: str | None = None,
+    K: int | None = None,
+    BT: int | None = None,
 ) -> int:
-    """Pick a sensible BV for the requested shape. Pure function: no IO, no state.
+    """Pick a sensible BV for the requested shape.
+
+    Selection order:
+      1. Exact-match best BV from the offline-tuned csv
+         (``chunk_gdn_h_tuned.csv``), when the full key is available and the
+         row's BV is legal for this ``V``. This gives the measured optimum
+         for shapes that were actually swept.
+      2. Otherwise the rule-based heuristic below (CTA/CU grid-fill plus the
+         trace-calibrated carve-outs), which generalizes to shapes the sparse
+         csv does not cover.
+
+    The csv table is parsed once per process, then this is just an exact-key
+    dict lookup plus scalar arithmetic. It runs once per forward (MoE/GEMM-
+    style host recompute), while expensive inputs such as the exact
+    ``min_seqlen`` are cached separately by ``_resolve_prologue``.
 
     Rules calibrated against a 27-point sweep matrix on gfx950 (20 in-csv
     shapes + 7 csv-uncovered probes). The 27 points span H in
@@ -142,7 +587,8 @@ def _heuristic_bv(
         reduces per-CTA overhead; smaller BV exposes more CTAs for CU
         utilization.
 
-      * ``is_varlen=False`` -- target one wave of CTAs over gfx950's 256 CUs.
+      * ``is_varlen=False`` -- target one wave of CTAs over the device's CUs
+        (live ``multi_processor_count``; 256 on gfx950).
 
       * ``is_varlen=True`` -- the target grid depends on (H, T_local) jointly:
           H <= 8:
@@ -178,15 +624,53 @@ def _heuristic_bv(
         V (rare: V<16 or V not divisible by 16), falls back to the
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
+    # 1. csv-best exact match (preferred). Only honoured when the row's BV is
+    #    legal for this V; an out-of-range / non-divisor BV in a hand-edited
+    #    csv silently falls through to the rule rather than launching a bad
+    #    grid.
+    csv_bv = _lookup_csv_bv(
+        dtype_str=dtype_str,
+        K=K,
+        BT=BT,
+        H=H,
+        Hg=Hg,
+        V=V,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
+    )
+    if csv_bv is not None and csv_bv in _legal_bv_candidates(V):
+        return csv_bv
+
+    # 2. rule-based fallback (generalizes beyond the sparse csv).
     target_bv = _target_bv_for_shape(
-        H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
+        H=H,
+        Hg=Hg,
+        V=V,
+        T_flat=T_flat,
+        N=N,
+        is_varlen=is_varlen,
+        min_seqlen=min_seqlen,
     )
-    target_ctas = (
-        _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
-    )
+    if target_bv is not None:
+        target_ctas = _grid_ctas(H=H, V=V, N=N, BV=target_bv)
+    elif _IS_GFX942:
+        # gfx942 calibrated target for the mfma16_hip fork (the only heuristic-BV
+        # consumer on this arch). Targeting 64 CTAs instead of the live 80 CUs
+        # reproduces the swept per-shape optimum (BV=64 for varlen and larger-H
+        # non-varlen; BV=32/16 only for the small-H non-varlen single-sequence
+        # shapes). See _GFX942_MFMA16HIP_TARGET_CTAS.
+        target_ctas = _GFX942_MFMA16HIP_TARGET_CTAS
+    else:
+        # Generic default: target one wave of CTAs over the device's CUs.
+        # Use the live CU count (256 on gfx950, differs on other arches)
+        # rather than a hardcoded gfx950 value.
+        idx = device_index if device_index is not None else -1
+        target_ctas = _cu_count(idx)
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
+@functools.lru_cache(maxsize=None)
 def _get_or_compile(
     K,
     V,
@@ -204,87 +688,402 @@ def _get_or_compile(
     state_bf16=False,
     g_log2_scaled=False,
 ):
-    cache_key = (
-        K,
-        V,
-        BT,
-        BV,
-        H,
-        Hg,
-        use_g,
-        use_gk,
-        use_h0,
-        store_fs,
-        save_vn,
-        is_varlen,
-        wu_contig,
-        state_bf16,
-        g_log2_scaled,
+    """Compile (and cache) the K5 kernel for one compile-time config.
+
+    Cached via ``lru_cache`` keyed on the full compile-time constant set,
+    mirroring the gemm/moe/gdr_decode flydsl ops. ``maxsize=None`` because
+    the number of distinct configs is naturally bounded by the compile-time
+    constant combinations.
+    """
+    return compile_chunk_gated_delta_h(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
     )
-    if cache_key not in _compiled_kernels:
-        _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
-            K=K,
-            V=V,
-            BT=BT,
-            BV=BV,
-            H=H,
-            Hg=Hg,
-            USE_G=use_g,
-            USE_GK=use_gk,
-            USE_INITIAL_STATE=use_h0,
-            STORE_FINAL_STATE=store_fs,
-            SAVE_NEW_VALUE=save_vn,
-            IS_VARLEN=is_varlen,
-            WU_CONTIGUOUS=wu_contig,
-            STATE_DTYPE_BF16=state_bf16,
-            G_IS_LOG2_SCALED=g_log2_scaled,
-        )
-    return _compiled_kernels[cache_key]
 
 
-def _launch_kernel(
-    launch_fn,
-    BV,
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_kv(
+    K,
     V,
-    N,
+    BT,
+    BV,
     H,
-    k,
-    u,
-    w,
-    vn_arg,
-    g_arg,
-    gk_arg,
-    h,
-    h0_arg,
-    ht_arg,
-    cu_arg,
-    co_arg,
-    T,
-    T_flat,
-    stream,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
 ):
-    grid_v = triton.cdiv(V, BV)
-    grid_nh = N * H
-    _run_compiled(
-        launch_fn,
-        k,
-        u,
-        w,
-        vn_arg,
-        g_arg,
-        gk_arg,
-        h,
-        h0_arg,
-        ht_arg,
-        cu_arg,
-        co_arg,
-        T,
-        T_flat,
-        N,
-        grid_v,
-        grid_nh,
-        stream,
+    """Compile (and cache) the KV-layout K5 kernel (separate implementation:
+    VWARP 16x16x16 + 3-wave + coalesced KV h-store). Same compile-time config
+    surface as the baseline; distinct cache namespace."""
+    return compile_chunk_gated_delta_h_kv(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
     )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_mfma16_hip(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+    use_state_indices=False,
+    sched_gfx942=False,
+):
+    """Compile (and cache) the mfma16 / HIP-aligned K5 kernel (formerly the "vk"
+    fork): 16x16x16 bf16 MFMA + HIP-matching warp partition, writing the public
+    VK layout [..., V, K]. Same compile-time config surface as the baseline / KV
+    paths; distinct cache namespace.
+
+    ``use_state_indices`` compiles the indexed state-pool variant: the SSM
+    ``initial_state`` is a pool ``[pool_size, H, V, K]`` and each sequence's slot
+    is gathered from an ``initial_state_indices[N]`` int32 array (with in-place
+    final-state write-back into the same pool slot), mirroring the HIP kernel."""
+    return compile_chunk_gated_delta_h_mfma16_hip(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+        USE_STATE_INDICES=use_state_indices,
+        SCHED_GFX942=sched_gfx942,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_mfma16_3wave_opt2(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the mfma16_3wave_opt2 K5 kernel -- currently an exact
+    copy of mfma16_2wave_opt1 (VWARP MFMA 16x16x16, HIP-aligned store-overlap,
+    input k pre-transposed [B,Hg,K,T], output public VK [..., V, K]). Kept as a
+    separate compile/cache namespace so a 3-wave occupancy variant can diverge
+    from the 2-wave line without disturbing it."""
+    return compile_chunk_gated_delta_h_mfma16_3wave_opt2(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_hipport(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the HIP-PORT K5 kernel: a detail-for-detail FlyDSL
+    replica of the hand-tuned HIP/C++ kernel's split-M scheme (K=16 mfma,
+    register h-state, software-pipeline panel prefetch). BV==64 only; other
+    shapes fall back to the baseline."""
+    return compile_chunk_gated_delta_h_hipport(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_mfma16_2wave_opt1(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE (un-pipelined) KV-fork K5 kernel. Same
+    VWARP layout + coalesced KV h-store (h in [..., K, V], host returns a
+    transposed VK view) as the optimized KV fork, but with all prefetch /
+    software-pipeline scheduling removed -- for trace baselining."""
+    return compile_chunk_gated_delta_h_mfma16_2wave_opt1(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_mfma32_vk(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """编译 mfma32 VK 基础版 K5 kernel。"""
+    return compile_chunk_gated_delta_h_mfma32_vk(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_naive(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE (un-pipelined) BASELINE-fork K5 kernel.
+    Same public VK h-layout and tiling as the baseline ``_get_or_compile``,
+    but with all prefetch / software-pipeline scheduling removed -- for
+    trace baselining. Works at any BV (it is the baseline layout)."""
+    return compile_chunk_gated_delta_h_naive(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_or_compile_naive_opt(
+    K,
+    V,
+    BT,
+    BV,
+    H,
+    Hg,
+    use_g,
+    use_gk,
+    use_h0,
+    store_fs,
+    save_vn,
+    is_varlen,
+    wu_contig,
+    state_bf16=False,
+    g_log2_scaled=False,
+):
+    """Compile (and cache) the NAIVE-OPT K5 kernel: the naive fork with the
+    OPT-DGL w-load (direct HBM->LDS via buffer_load_lds + two-sided XOR
+    swizzle) forced on. Same public VK h-layout / tiling / numerics as the
+    naive fork; only the w staging path differs."""
+    return compile_chunk_gated_delta_h_naive_opt(
+        K=K,
+        V=V,
+        BT=BT,
+        BV=BV,
+        H=H,
+        Hg=Hg,
+        USE_G=use_g,
+        USE_GK=use_gk,
+        USE_INITIAL_STATE=use_h0,
+        STORE_FINAL_STATE=store_fs,
+        SAVE_NEW_VALUE=save_vn,
+        IS_VARLEN=is_varlen,
+        WU_CONTIGUOUS=wu_contig,
+        STATE_DTYPE_BF16=state_bf16,
+        G_IS_LOG2_SCALED=g_log2_scaled,
+    )
+
+
+def _resolve_state_dtype(initial_state, state_dtype):
+    """Mirror the legacy state-dtype resolution. Cheap; runs every call."""
+    if initial_state is not None:
+        resolved = initial_state.dtype
+        if state_dtype is not None and state_dtype != resolved:
+            raise ValueError(
+                f"state_dtype={state_dtype} conflicts with "
+                f"initial_state.dtype={initial_state.dtype}; pass them "
+                f"consistently or omit state_dtype."
+            )
+    elif state_dtype is not None:
+        resolved = state_dtype
+    else:
+        resolved = torch.float32
+    if resolved not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"SSM state dtype must be float32 or bfloat16, got {resolved}."
+        )
+    return resolved
+
+
+# Valid ``_fork`` selectors for ``chunk_gated_delta_rule_fwd_h_flydsl``. Each
+# maps to its own compiled kernel + cache namespace (see the dispatch in the
+# wrapper body). ``None`` (not listed here) means the baseline kernel.
+_K5_FORKS = frozenset(
+    {
+        "kv",
+        "mfma16_hip",
+        "mfma16_2wave_opt1",
+        "mfma16_3wave_opt2",
+        "mfma32_vk",
+        "naive",
+        "naive_opt",
+        "hipport",
+    }
+)
 
 
 def chunk_gated_delta_rule_fwd_h_flydsl(
@@ -302,8 +1101,31 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+    _fork: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
+
+    ``_fork`` selects which compiled kernel implementation to run; it is an
+    internal routing knob set by the thin per-fork public wrappers
+    (``chunk_gated_delta_rule_fwd_h_flydsl_kv`` etc.), not part of the public
+    API. Valid values:
+
+      * ``None``        -> baseline kernel (``chunk_gated_delta_h.py``).
+      * ``"kv"``        -> KV fork (coalesced [..., K, V] h-store); BV==64 only.
+      * ``"mfma16_hip"`` -> mfma16 / HIP-aligned fork (public [..., V, K]
+        layout; 16x16x16 MFMA + HIP split-M warp partition; NON-VWARP only);
+        BV in {16, 32, 64} (N_REPEAT = BV // 16).
+      * ``"mfma16_3wave_opt2"`` -> exact copy of mfma16_2wave_opt1 (KV-in /
+        VK-out fork); divergence base for a 3-wave variant.
+      * ``"mfma16_2wave_opt1"``  -> un-pipelined KV fork; BV==64 only.
+      * ``"naive"``     -> un-pipelined baseline fork; any BV.
+
+    The ``kv``/``mfma16_2wave_opt1`` forks store h in [..., K, V] (coalesced) and the
+    wrapper returns a transposed VK view; every other fork writes the public
+    VK layout ([..., V, K]) directly. Forks gated on BV==64 fall back to the
+    baseline kernel for other BV values.
 
     Signature is API-compatible with
     ``aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h.chunk_gated_delta_rule_fwd_h_opt_vk``:
@@ -347,152 +1169,241 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         (h, v_new, final_state) in VK-ordered layout (``[..., V, K]`` on the
         last two dims).
 
-    BV-tile selection is rule-based. ``chunk_gdn_h_tuned.csv`` remains an AOT
-    seed list for pre-compilation, but runtime BV selection does not read it.
+    BV-tile selection prefers an exact match from ``chunk_gdn_h_tuned.csv``
+    (the same file AOT uses as its pre-compilation seed list), then falls
+    back to the rule-based heuristic for shapes the sparse csv does not cover.
     """
-    # Layout is fixed to head-major contiguous (matches Triton VK wrapper).
-    wu_contiguous = True
-
-    g_log2_scaled = bool(use_exp2)
-
-    # SSM state dtype: derived from ``initial_state.dtype`` when provided,
-    # otherwise from ``state_dtype`` kwarg, otherwise default f32 (matches
-    # the legacy behaviour). Only ``torch.float32`` and ``torch.bfloat16``
-    # are supported by the kernel.
-    if initial_state is not None:
-        resolved_state_dtype = initial_state.dtype
-        if state_dtype is not None and state_dtype != resolved_state_dtype:
-            raise ValueError(
-                f"state_dtype={state_dtype} conflicts with "
-                f"initial_state.dtype={initial_state.dtype}; pass them consistently "
-                f"or omit state_dtype."
-            )
-    elif state_dtype is not None:
-        resolved_state_dtype = state_dtype
-    else:
-        resolved_state_dtype = torch.float32
-    if resolved_state_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(
-            f"SSM state dtype must be float32 or bfloat16, got {resolved_state_dtype}."
-        )
-    state_bf16 = resolved_state_dtype == torch.bfloat16
-
-    B, T, Hg, K = k.shape
-    BT = chunk_size
-
-    H = w.shape[1]
-    V = u.shape[-1]
-    T_flat = w.shape[2]
-
-    if cu_seqlens is None:
-        N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
-        kernel_cu_seqlens = None
-    else:
-        # Pass the ORIGINAL (cache-stable) cu_seqlens + the decode ints into
-        # the cached prologue helpers. They all key on the original tensor's
-        # identity, so chunk_offsets / NT / the rebased kernel cu_seqlens are
-        # computed ONCE per (cu_seqlens_id, BT, num_decodes, num_decode_tokens)
-        # tuple and every subsequent forward is a pure cache hit -> no
-        # per-forward D2H. (Passing a freshly-rebased tensor instead would key
-        # the offset/num-chunk caches on an unstable identity and re-fire the
-        # .tolist()/int() syncs every call.)
-        chunk_offsets = prepare_chunk_offsets(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        NT = prepare_num_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
-        # Rebased kernel-facing cu_seqlens (matches the pre-sliced prefill
-        # data). N is the prefill sequence count (len() is a shape read, no
-        # sync).
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
-        N = len(kernel_cu_seqlens) - 1
-
-    assert K <= 256
-
-    h = k.new_empty(B, NT, H, V, K)
-    final_state = (
-        k.new_empty(N, H, V, K, dtype=resolved_state_dtype)
-        if output_final_state
-        else None
-    )
-    v_new_buf = k.new_empty(B, H, T_flat, V, dtype=u.dtype)
-    v_new = v_new_buf if save_new_value else None
-
-    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
-
-    # G layout is fixed to head-major [B, H, T_flat] (matches Triton VK /
-    # HIP K5). The kernel reads ``g`` with stride-1 along the T dim; require
-    # the caller to provide a contiguous head-major tensor.
-    if g is not None:
-        assert g.is_contiguous(), (
-            "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
-            f"or [H, T_flat]); got strides={g.stride()}, shape={tuple(g.shape)}."
-        )
-        assert g.shape[-1] == T_flat, (
-            f"FlyDSL K5: ``g.shape[-1]`` must equal T_flat={T_flat}, "
-            f"got g.shape={tuple(g.shape)}."
-        )
-        assert g.shape[-2] == H, (
-            f"FlyDSL K5: ``g.shape[-2]`` must equal H={H}, "
-            f"got g.shape={tuple(g.shape)}."
-        )
-    g_arg = g if g is not None else dummy
-
-    # Mirror the Triton VK wrapper: when ``use_exp2=True`` the K5 kernel
-    # interprets ``gk`` in log2 space, so pre-scale by log2(e) here. The
-    # kernel-side ``_fast_exp`` for ``gk`` is shared with the ``g`` path;
-    # ``g`` itself must already be log2-scaled by the K1+K2 producer when
-    # use_exp2 is on.
-    if gk is not None:
-        gk = gk.contiguous()
-        if g_log2_scaled:
-            gk = gk * _RCP_LN2
-    gk_arg = gk if gk is not None else dummy
-    h0_arg = initial_state if initial_state is not None else dummy
-    ht_arg = final_state if final_state is not None else dummy
-    vn_arg = v_new_buf
-    # cu_arg / co_arg are the kernel-facing (rebased) offsets, narrowed to
-    # int32. `.to(torch.int32)` is a device-to-device cast (no host sync); the
-    # resulting fresh objects are consumed only by the kernel launch, so their
-    # identity does not matter for the @tensor_cache helpers above.
-    cu_arg = (
-        kernel_cu_seqlens.to(torch.int32)
-        if kernel_cu_seqlens is not None
-        else dummy.to(torch.int32)
-    )
-    co_arg = (
-        chunk_offsets.to(torch.int32)
-        if chunk_offsets is not None
-        else dummy.to(torch.int32)
-    )
-    stream = torch.cuda.current_stream()
+    # All shape/flag-derived launch products (BV, launch_fn, grid dims,
+    # output-buffer shapes, ...) are recomputed inline per forward, MoE/GEMM-
+    # style: no per-shape launch-plan cache. This is affordable because each
+    # individually-expensive input is itself cached -- the compiled kernel via
+    # ``_get_or_compile`` (lru_cache), the varlen prologue + exact
+    # ``min_seqlen`` via the per-cu_seqlens cache in ``_resolve_prologue``, and
+    # the int32 offset views via ``_as_int32``. Everything else here is cheap
+    # host-side arithmetic.
 
     use_g = g is not None
     use_gk = gk is not None
     use_h0 = initial_state is not None
-    is_varlen = cu_seqlens is not None
+    g_log2_scaled = bool(use_exp2)
 
-    # Resolve BV from the rule-based grid/CU heuristic.
-    BV = _lookup_tuned_bv(
-        dtype_str=str(k.dtype),
-        K=K,
-        V=V,
-        BT=BT,
-        H=H,
-        Hg=Hg,
-        T_flat=T_flat,
-        N=N,
-        use_g=use_g,
-        use_gk=use_gk,
-        use_h0=use_h0,
-        store_fs=bool(output_final_state),
-        save_vn=bool(save_new_value),
-        is_varlen=is_varlen,
-        wu_contig=wu_contiguous,
+    # Indexed state-pool support (mfma16_hip fork only). When
+    # ``initial_state_indices`` is given, ``initial_state`` is a pool
+    # ``[pool_size, H, V, K]`` and each sequence gathers its slot from the index
+    # array; the final state is written back in place into that same pool
+    # (mirrors ``chunk_gated_delta_rule_fwd_h_hip_fn``). ``inplace_final_state``
+    # defaults to True whenever indices are given.
+    use_state_indices = initial_state_indices is not None
+    inplace = use_state_indices if inplace_final_state is None else inplace_final_state
+    if use_state_indices:
+        if _fork != "mfma16_hip":
+            raise NotImplementedError(
+                "FlyDSL K5: initial_state_indices is only implemented for the "
+                f"mfma16_hip fork; got _fork={_fork!r}."
+            )
+        if initial_state is None:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires initial_state (the "
+                "state pool)."
+            )
+        if not inplace:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires in-place final-state "
+                "write-back; leave inplace_final_state unset or set it to True."
+            )
+        if not output_final_state:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices requires output_final_state=True "
+                "(the indexed path writes the final state back into the pool)."
+            )
+    elif inplace and initial_state is None:
+        raise ValueError("FlyDSL K5: inplace_final_state requires initial_state.")
+
+    # State-dtype validation: cheap, and raises on bad / conflicting dtypes.
+    # ``state_bf16`` is the only derived bit the compile key needs.
+    resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
+    state_bf16 = resolved_state_dtype is torch.bfloat16
+
+    # The KV forks ("kv" and "mfma16_2wave_opt1") consume k pre-transposed to
+    # [B, Hg, K, T_flat] (K major, T innermost so GEMM2 sees each BT row
+    # contiguous). This is now their REQUIRED input layout -- the caller
+    # (upstream / tests) owns the transpose, the host does NOT permute. Every
+    # other fork keeps the original token-major [B, T_flat, Hg, K] layout.
+    # mfma32_vk 用 token-major k（与 Triton VK 一致），不需要 pre-transpose
+    _kv_k_pretransposed = _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2")
+    if _kv_k_pretransposed:
+        B, Hg, K, T = k.shape
+    else:
+        B, T, Hg, K = k.shape
+    H = w.shape[1]
+    V = u.shape[-1]
+    T_flat = w.shape[2]
+    BT = chunk_size
+
+    assert K <= 256
+
+    if cu_seqlens is None:
+        N = B
+        NT = triton.cdiv(T, BT)
+        chunk_offsets = None
+        kernel_cu_seqlens = None
+        is_varlen = False
+        min_seqlen = None
+    else:
+        # The exact ``min_seqlen`` comes from the per-``cu_seqlens`` cache, so
+        # its ``.item()`` host<->device sync is paid once per cu_seqlens tensor
+        # (not per forward) -- letting the heuristic use the exact min without
+        # a per-call stall and without a launch-plan cache.
+        NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen = _resolve_prologue(
+            cu_seqlens, BT, num_decodes, num_decode_tokens
+        )
+        is_varlen = True
+
+    if _IS_GFX942:
+        # gfx942：BV 选择与 hip K5（chunk_gated_delta_rule_fwd_h_hip_fn）逐函数对齐，
+        # 直接复用 hip 的解析式选择（_compute_bv），绕过 csv-best 与 rule carve-out，
+        # 保证同 shape 下 flydsl 与 hip 选出**完全相同**的 BV。gfx950 仍走下面的
+        # csv-best + heuristic 路径。lazy import 避免与 hip 模块潜在的循环导入。
+        # 两侧 chunk_offsets 同源（prepare_chunk_offsets），dense 的 T_flat/H/device
+        # 口径也一致，故直接把 flydsl 现有变量喂给 hip 的选择函数即可。
+        from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+            _select_bv_for_dense as _hip_select_bv_for_dense,
+            _select_bv_for_varlen as _hip_select_bv_for_varlen,
+        )
+
+        if is_varlen:
+            BV = _hip_select_bv_for_varlen(chunk_offsets, H)
+        else:
+            BV = _hip_select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
+    else:
+        BV = _heuristic_bv(
+            H=H,
+            Hg=Hg,
+            V=V,
+            T_flat=T_flat,
+            N=N,
+            is_varlen=is_varlen,
+            min_seqlen=min_seqlen,
+            device_index=k.device.index if k.device.type == "cuda" else -1,
+            dtype_str=str(k.dtype),
+            K=K,
+            BT=BT,
+        )
+
+    if _fork is not None and _fork not in _K5_FORKS:
+        raise ValueError(
+            f"FlyDSL K5: unknown ``_fork`` {_fork!r}; expected one of "
+            f"{sorted(_K5_FORKS)} or None (baseline)."
+        )
+
+    # The KV forks ("kv" and "mfma16_2wave_opt1") are BV==64-only kernels. Pin BV=64
+    # directly (ignore the heuristic) so they never silently fall back to the
+    # baseline kernel -- the baseline expects token-major k, which would
+    # mis-read the [B, Hg, K, T] layout the KV forks require. V must be a
+    # multiple of 64 for this to be legal.
+    if _fork == "mfma32_vk":
+        BV = 64
+        if V % BV != 0:
+            raise ValueError(f"FlyDSL K5 mfma32_vk: requires V % 64 == 0; got V={V}.")
+    elif _fork in ("kv", "mfma16_2wave_opt1", "mfma16_3wave_opt2"):
+        # ``kv`` is still BV=64-only. ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``
+        # are VWARP-parameterized (BV = NUM_WARPS*16, NUM_WARPS in {1,2,4}), so
+        # they accept BV in {16,32,64}; override with FLYDSL_K5_KVNAIVE_BV for
+        # A/B sweeps, otherwise default to 64 (the tuned production choice).
+        if _fork in ("mfma16_2wave_opt1", "mfma16_3wave_opt2"):
+            _bv_env = os.environ.get("FLYDSL_K5_KVNAIVE_BV")
+            BV = int(_bv_env) if _bv_env else 64
+            assert BV in (16, 32, 64), "mfma16_2wave_opt1 BV must be in {16,32,64}"
+        else:
+            BV = 64
+        if V % BV != 0:
+            raise ValueError(
+                f"FlyDSL K5 {_fork}: requires V % BV == 0; got V={V}, BV={BV}."
+            )
+    elif _fork == "mfma16_hip":
+        # mfma16_hip accepts BV in {16,32,64}; it normally uses the tuned/
+        # heuristic BV. Allow an env override for A/B BV sweeps (mirrors
+        # FLYDSL_K5_KVNAIVE_BV). The hand-tuned HIP K5 reference is fixed at
+        # BV=16, so FLYDSL_K5_MFMA16HIP_BV=16 reproduces the HIP tiling.
+        _bv_env = os.environ.get("FLYDSL_K5_MFMA16HIP_BV")
+        if _bv_env:
+            BV = int(_bv_env)
+            assert BV in (16, 32, 64), "mfma16_hip BV must be in {16,32,64}"
+            if V % BV != 0:
+                raise ValueError(
+                    f"FlyDSL K5 mfma16_hip: requires V % BV == 0; got V={V}, BV={BV}."
+                )
+
+    # Fork routing. Each fork maps to its OWN compiled kernel (distinct
+    # ``_get_or_compile*`` cache namespace) -- no shared flag dispatch:
+    #   * kv / mfma16_2wave_opt1 : separate VWARP kernels storing h coalesced as
+    #     [..., K, V]; gated on BV==64, else fall back to baseline.
+    #   * mfma16_hip : NON-VWARP (HIP split-M) kernel writing the public VK
+    #     layout [..., V, K] directly; gated on BV==64, else fall back to baseline.
+    #   * mfma16_3wave_opt2 : exact copy of mfma16_2wave_opt1 (KV-in/VK-out).
+    #   * naive         : un-pipelined twin of the baseline kernel; ANY BV
+    #     (baseline layout, NOT the BV==64-only VWARP fork).
+    #   * None          : baseline kernel.
+    _vwarp_gate = BV == 64
+    # mfma16_2wave_opt1 is VWARP-parameterized (BV in {16,32,64} -> NUM_WARPS in {1,2,4}).
+    _mfma16_2wave_opt1_gate = BV in (16, 32, 64)
+    _kv_opt_active = (_fork == "kv") and _vwarp_gate
+    _mfma16_2wave_opt1_active = (
+        _fork == "mfma16_2wave_opt1"
+    ) and _mfma16_2wave_opt1_gate
+    # mfma16_hip is fully BV-parameterized (N_REPEAT = BV // 16, with distinct
+    # BV==16 and BV>=32 schedules), so accept BV in {16,32,64} directly instead
+    # of only BV==64. This keeps every BV on the mfma16_hip K=16 kernel and
+    # avoids the baseline fallback (which emits the gfx950-only K=32 bf16 MFMA
+    # and aborts on gfx942 for the BV!=64 shapes, e.g. Hv=64 qwen).
+    _mfma16_hip_gate = BV in (16, 32, 64)
+    _mfma16_hip_active = (_fork == "mfma16_hip") and _mfma16_hip_gate
+    # mfma16_3wave_opt2 is a copy of mfma16_2wave_opt1 (same KV-in/VK-out fork).
+    _mfma16_3wave_opt2_gate = BV in (16, 32, 64)
+    _mfma16_3wave_opt2_active = (
+        _fork == "mfma16_3wave_opt2"
+    ) and _mfma16_3wave_opt2_gate
+    _hipport_active = (_fork == "hipport") and _vwarp_gate
+    _mfma32_vk_active = (_fork == "mfma32_vk") and (BV == 64)
+    _naive_active = _fork == "naive"
+    _naive_opt_active = _fork == "naive_opt"
+    # KV-class forks (h stored [..., K, V] -> host transposes to VK).
+    # NOTE: mfma16_2wave_opt1 now writes the public VK layout [..., V, K] directly
+    # (h-b128 coalesced store via lds_ht), so it is NOT in the transpose set --
+    # only the optimized ``kv`` fork still writes [..., K, V] and needs the view.
+    # mfma32_vk 也直接写 VK layout，且 k 是 token-major（不需要 pre-transpose）。
+    _kv_active = (
+        _kv_opt_active or _mfma16_2wave_opt1_active or _mfma16_3wave_opt2_active
     )
-
-    launch_fn = _get_or_compile(
+    _kv_needs_transpose = _kv_opt_active
+    if _mfma32_vk_active:
+        _compile_fn = _get_or_compile_mfma32_vk
+    elif _kv_opt_active:
+        _compile_fn = _get_or_compile_kv
+    elif _mfma16_2wave_opt1_active:
+        _compile_fn = _get_or_compile_mfma16_2wave_opt1
+    elif _mfma16_hip_active:
+        _compile_fn = _get_or_compile_mfma16_hip
+    elif _mfma16_3wave_opt2_active:
+        _compile_fn = _get_or_compile_mfma16_3wave_opt2
+    elif _hipport_active:
+        _compile_fn = _get_or_compile_hipport
+    elif _naive_active:
+        _compile_fn = _get_or_compile_naive
+    elif _naive_opt_active:
+        _compile_fn = _get_or_compile_naive_opt
+    else:
+        _compile_fn = _get_or_compile
+    # ``use_state_indices`` is an mfma16_hip-only compile knob; every other
+    # fork's ``_get_or_compile*`` shares the common signature without it.
+    _extra_compile_kwargs = (
+        # SCHED_GFX942 仅在 gfx942 上开启（_IS_GFX942）；其它 arch（含 gfx950）传
+        # False，emit 与改动前逐字节一致，且并入 lru_cache key 成为独立编译产物。
+        {"use_state_indices": use_state_indices, "sched_gfx942": _IS_GFX942}
+        if _mfma16_hip_active
+        else {}
+    )
+    launch_fn = _compile_fn(
         K,
         V,
         BT,
@@ -505,30 +1416,472 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
         output_final_state,
         save_new_value,
         is_varlen,
-        wu_contiguous,
+        True,
         state_bf16=state_bf16,
         g_log2_scaled=g_log2_scaled,
+        **_extra_compile_kwargs,
     )
-    _launch_kernel(
-        launch_fn,
-        BV,
-        V,
-        N,
-        H,
-        k,
-        u,
-        w,
-        vn_arg,
-        g_arg,
-        gk_arg,
-        h,
-        h0_arg,
-        ht_arg,
-        cu_arg,
-        co_arg,
+
+    # Null-arg placeholder for the @flyc.jit slots the kernel ignores on this
+    # path (one local scalar tensor allocated per forward, MoE-style -- no
+    # global cache). Sized 1 (not 0) so its ``data_ptr()`` is always a valid
+    # non-null device address for the launcher's unused arg slots.
+    dummy = torch.empty(1, device=k.device, dtype=torch.float32)
+    int32_dummy = dummy.to(torch.int32) if not is_varlen else None
+    cu_arg = (
+        _as_int32(kernel_cu_seqlens) if kernel_cu_seqlens is not None else int32_dummy
+    )
+    co_arg = _as_int32(chunk_offsets) if chunk_offsets is not None else int32_dummy
+    stream = torch.cuda.current_stream(k.device)
+
+    grid_v = triton.cdiv(V, BV)
+    grid_nh = N * H
+
+    # h hidden-state layout:
+    #   * baseline & mfma16_hip fork -> [B, NT, H, V, K] (true VK, K innermost).
+    #   * KV fork (BV==64)    -> [B, NT, H, K, V] (coalesced KV stores); a
+    #     transposed VK view is returned below so the public layout stays VK.
+    # ``_kv_active`` was set at the compile-fn selection above; the mfma16_hip
+    # fork (``_mfma16_hip_active``) writes the public VK layout directly, no view needed.
+    h_shape = (B, NT, H, K, V) if _kv_needs_transpose else (B, NT, H, V, K)
+    vn_shape = (B, H, T_flat, V)
+    vn_dtype = u.dtype
+    fs_shape = (N, H, V, K) if output_final_state else None
+    fs_dtype = resolved_state_dtype if output_final_state else None
+    save_vn = save_new_value
+
+    # G contiguity guard. We only check ``is_contiguous`` (not the full
+    # shape): a mismatched ``g.shape[-1]`` vs ``w.shape[2]`` (T_flat) can
+    # only happen if the caller breaks the documented [B, H, T_flat]
+    # contract -- in which case strides diverge and ``is_contiguous()``
+    # catches the common modes (transposed view, slice) for ~50ns.
+    if g is not None and not g.is_contiguous():
+        raise AssertionError(
+            "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
+            f"or [H, T_flat]); got strides={g.stride()}, shape={tuple(g.shape)}."
+        )
+
+    # gk pre-scaling: still per-call work (allocates a new tensor). Cannot
+    # be cached without aliasing across forwards; an upstream producer
+    # change to emit log2-space gk directly would eliminate this entirely.
+    if gk is not None:
+        gk = gk.contiguous()
+        if g_log2_scaled:
+            gk = gk * _RCP_LN2
+
+    # mfma16_2wave_opt1 (vn-direct): k already arrives pre-transposed as
+    # [B, Hg, K, T_flat] (the caller owns the transpose), so GEMM2 sees each BT
+    # row contiguous with no host-side permute/contiguous. The kernel is pinned
+    # to BV=64 above, so there is no baseline fallback that would expect the
+    # original token-major layout.
+    h = k.new_empty(h_shape)
+    v_new_buf = k.new_empty(vn_shape, dtype=vn_dtype)
+    if fs_shape is None:
+        final_state = None
+    elif inplace:
+        # In-place write-back: the final state aliases the ``initial_state``
+        # buffer (the pool when indexed, or the dense [N,H,V,K] state otherwise),
+        # so no separate output tensor is allocated. The kernel writes each
+        # sequence's slot back into this same buffer.
+        final_state = initial_state
+    else:
+        final_state = k.new_empty(fs_shape, dtype=fs_dtype)
+
+    # The 11 tensor slots, wrapped as raw fx.Pointer args. Keep the torch
+    # tensors referenced as locals (``k``/``u``/``h``/... above) so the storage
+    # stays alive across the (synchronous) launch -- ``from_c_void_p`` only
+    # captures the data pointer, not a reference to the tensor.
+    tensor_args = tuple(
+        _as_ptr(t)
+        for t in (
+            k,
+            u,
+            w,
+            v_new_buf,
+            g if g is not None else dummy,
+            gk if gk is not None else dummy,
+            h,
+            initial_state if initial_state is not None else dummy,
+            final_state if final_state is not None else dummy,
+            cu_arg,
+            co_arg,
+        )
+    )
+
+    # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
+    # arg). Always supply it for that fork -- a real int32 [N] index array when
+    # indexed, else a 1-elem int32 dummy for the dense path. ``si_i32`` is kept
+    # as a local so its storage stays alive across the synchronous launch.
+    if _mfma16_hip_active:
+        if use_state_indices:
+            si_i32 = initial_state_indices.to(torch.int32).contiguous()
+            if si_i32.numel() != N:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices length "
+                    f"({si_i32.numel()}) must equal the number of sequences "
+                    f"N={N}."
+                )
+        else:
+            si_i32 = dummy.to(torch.int32)
+        tensor_args = tensor_args + (_as_ptr(si_i32),)
+
+    launch_fn(
+        *tensor_args,
         T,
         T_flat,
+        N,
+        grid_v,
+        grid_nh,
         stream,
     )
 
-    return h, v_new, final_state
+    # OPT-KV: the optimized ``kv`` fork wrote h as [B, NT, H, K, V]; return a
+    # transposed VIEW so the public layout stays VK (zero-copy stride swap).
+    # The VK forks and mfma16_2wave_opt1 (h-b128) write the public VK layout
+    # ([..., V, K]) directly, so no view is needed.
+    if _kv_needs_transpose:
+        h = h.transpose(-2, -1)
+
+    return h, (v_new_buf if save_vn else None), final_state
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_kv(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Separate KV-layout K5 implementation (VWARP 16x16x16 + coalesced KV
+    h-store). NOTE: the KV kernel is now the un-pipelined, no-lds_g variant
+    (the previous software-pipelined implementation was overwritten).
+
+    BV is pinned to 64 (BV==64-only fork; it never falls back to the baseline).
+    ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]`` (K major, T
+    innermost) -- the caller owns the transpose so GEMM2 reads each BT row
+    contiguously with no host-side permute. (All other flydsl forks except
+    mfma16_2wave_opt1 take the token-major ``[B, T_flat, Hg, K]`` layout instead.)
+    The returned h is the usual VK layout (transposed view)."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="kv",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    initial_state_indices: torch.Tensor | None = None,
+    inplace_final_state: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """mfma16 / HIP-aligned K5 implementation (formerly the "vk" fork): NON-VWARP
+    only -- uses the 16x16x16 bf16 MFMA and the SAME split-M warp partition (BT
+    split-M, K split across waves, V not split across warps) as the hand-tuned
+    HIP/C++ K5 kernel, writing the public VK layout [..., V, K]. API-identical to
+    ``chunk_gated_delta_rule_fwd_h_flydsl``.
+
+    Supports the indexed state-pool contract via ``initial_state_indices`` /
+    ``inplace_final_state`` (see ``chunk_gated_delta_rule_fwd_h_flydsl``),
+    matching ``chunk_gated_delta_rule_fwd_h_hip_fn``. The returned h is the usual
+    VK layout."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        initial_state_indices=initial_state_indices,
+        inplace_final_state=inplace_final_state,
+        _fork="mfma16_hip",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """mfma16_3wave_opt2 K5 implementation -- currently an EXACT copy of
+    ``chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1`` (VWARP MFMA
+    16x16x16, HIP-aligned store-overlap), kept as a separate compile/cache
+    namespace so a 3-wave occupancy variant can diverge from the 2-wave line.
+
+    Like 2wave_opt1, ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]``
+    (K major, T innermost); the output h is the public VK ``[..., V, K]`` layout
+    written directly (no host transpose)."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="mfma16_3wave_opt2",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma32_vk(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """mfma32 VK 基础版 K5 kernel。k 使用 token-major [B, T, Hg, K]（不需要 pre-transpose）。
+    h 直接写 VK layout [V, K]。BV=64 固定。"""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="mfma32_vk",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_hipport(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """HIP-PORT FlyDSL K5 implementation: a detail-for-detail replica of the
+    hand-tuned HIP/C++ kernel (``csrc/kernels/chunk_gated_delta_rule_fwd_h.cu``)
+    -- "split-M" wave mapping (each wave owns one 16-row BT M-tile, loops over
+    BV), K=16 mfma, register h-state with a cooperative VK transpose store, and
+    the HIP software-pipeline panel prefetch. Same public VK outputs as the
+    other flydsl forks; used only when the chosen BV is 64, else it falls back
+    to the baseline."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="hipport",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE (un-pipelined) KV-fork K5 implementation. Same VWARP layout +
+    coalesced KV h-store (h in [..., K, V], host returns a transposed VK view)
+    as ``chunk_gated_delta_rule_fwd_h_flydsl_kv``, but with all prefetch /
+    software-pipeline scheduling removed -- used to baseline the raw bottleneck
+    structure in a trace before re-designing the pipeline.
+
+    BV is pinned to 64 (this is a BV==64-only fork; it never falls back to the
+    baseline). ``k`` MUST be passed PRE-TRANSPOSED to ``[B, Hg, K, T_flat]``
+    (K major, T innermost) -- the caller owns the transpose so GEMM2 reads each
+    BT row contiguously with no host-side permute. (All other flydsl forks take
+    the token-major ``[B, T_flat, Hg, K]`` layout instead.)"""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="mfma16_2wave_opt1",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_naive(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE (un-pipelined) BASELINE-fork K5 implementation. Same public VK
+    h-layout and tiling as the baseline ``chunk_gated_delta_rule_fwd_h_flydsl``,
+    but with all prefetch / software-pipeline scheduling removed -- used to
+    baseline the raw bottleneck structure in a trace before re-designing the
+    pipeline. Works at ANY BV (it is the baseline layout)."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="naive",
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    chunk_size: int = 64,
+    save_new_value: bool = True,
+    cu_seqlens: torch.LongTensor | None = None,
+    state_dtype: torch.dtype | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """NAIVE-OPT K5 implementation: the naive fork with the OPT-DGL w-load
+    (direct HBM->LDS ``buffer_load_lds`` + two-sided XOR swizzle) forced on.
+    Same public VK h-layout / tiling / numerics as
+    ``chunk_gated_delta_rule_fwd_h_flydsl_naive``; only the w staging path
+    differs (no ds_write / no VGPR staging for w). Works at ANY BV."""
+    return chunk_gated_delta_rule_fwd_h_flydsl(
+        k,
+        w,
+        u,
+        g=g,
+        gk=gk,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=chunk_size,
+        save_new_value=save_new_value,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        use_exp2=use_exp2,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        _fork="naive_opt",
+    )

@@ -4,8 +4,11 @@
 """Unit tests for FlyDSL Linear Attention Prefill (chunk_gated_delta_h) regressions.
 
 Usage:
-    HIP_VISIBLE_DEVICES=7 pytest -sv aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -s
-    HIP_VISIBLE_DEVICES=7 python -m pytest aiter/ops/flydsl/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-16k-aws" -v -s
+    rm -rf ~/.triton/cache
+    export GATED_DELTA_RULE_TRITON_AUTOTUNE=1
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 pytest -sv op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -s
+    FLYDSL_RUNTIME_ENABLE_CACHE=0 HIP_VISIBLE_DEVICES=7 python -m pytest op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py::TestPerformance -k "varlen-64k-qwen-ptpc-ali" -v -s
+    bash op_tests/flydsl_tests/run_test_flydsl_gdr_k5_prefill.sh
 """
 
 from __future__ import annotations
@@ -31,6 +34,13 @@ if not is_flydsl_available():
 try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl,
+        chunk_gated_delta_rule_fwd_h_flydsl_kv,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2,
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1,
+        chunk_gated_delta_rule_fwd_h_flydsl_naive,
+        chunk_gated_delta_rule_fwd_h_flydsl_naive_opt,
+        chunk_gated_delta_rule_fwd_h_flydsl_hipport,
     )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
@@ -50,6 +60,26 @@ try:
 except Exception:
     chunk_gated_delta_rule_fwd_h_vllm = None
     _HAS_VLLM_K5 = False
+
+# HIP/C++ K5 (chunk_gated_delta_rule_fwd_h.cu). JIT-compiled on first call.
+# Same public VK outputs as the FlyDSL / Triton opt_vk backends, but it
+# requires K=V=128 + bf16 inputs, so cases that violate that are skipped
+# in the correctness test and excluded from the perf launch.
+try:
+    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+        chunk_gated_delta_rule_fwd_h_hip_fn,
+    )
+
+    _HAS_HIP_K5 = True
+except Exception:
+    chunk_gated_delta_rule_fwd_h_hip_fn = None
+    _HAS_HIP_K5 = False
+
+# When True, ``test_consistency_flydsl_mfma16_hip_vs_hip`` requires the
+# flydsl-hip fork to match HIP/C++ BIT-FOR-BIT (torch.equal). Until the LDS /
+# layout / (optionally) numeric alignment work fully lands it stays False and
+# the test only records the gap + asserts a loose same-algorithm band.
+_MFMA16_HIP_VS_HIP_BITEXACT = False
 
 torch.set_default_device("cuda")
 
@@ -88,6 +118,11 @@ class PrefillArgs:
     # shapes share the same ``(T, num_seqs)``. Typical values are a log
     # count or a hex digest of cu_seqlens.
     trace_tag: str = ""
+    # Appended to the display id when a group sweeps multiple
+    # ``max_num_batched_tokens`` values, so a fixed (tp, full_prompt_len) stays
+    # unique across the batched-token sweep. Empty for single-value groups, so
+    # their ids are unchanged.
+    bt_tag: str = ""
 
     @property
     def Hg(self):
@@ -123,6 +158,8 @@ class PrefillArgs:
         tag = self.model_name + "_" if self.model_name else ""
         tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
         tag += f"_TP{self.tp}_T{self.full_prompt_len}"
+        if self.bt_tag:
+            tag += f"_{self.bt_tag}"
         if not self.is_varlen:
             tag += "_novarlen"
         if not self.output_final_state:
@@ -167,7 +204,13 @@ class PrefillGroup:
     is_varlen: bool = True
     output_final_state: bool = True
     ssm_state_dtype: torch.dtype = torch.float32
-    # Three semantics for ``max_num_batched_tokens``:
+    # Semantics for ``max_num_batched_tokens``:
+    #   - list/tuple : sweep -- materialise one case per element (Cartesian with
+    #           tps x full_prompt_lens). Each element is itself one of the specs
+    #           below (int / "full_prompt_len" / None). For the varlen path this
+    #           sweeps the batch size N = mnbt // full_prompt_len. ids get an
+    #           ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+    #           unique. Example: ``max_num_batched_tokens=[16384, 32768, 65536]``.
     #   - int : use this exact value for every expanded case (e.g. you want
     #           a fixed scheduler budget across a sweep of full_prompt_len).
     #   - "full_prompt_len" : tie it to each case's full_prompt_len. The
@@ -181,36 +224,134 @@ class PrefillGroup:
     #           length 1024. Preserving that behavior is what keeps the
     #           varlen path's per-case shape unchanged across this refactor.
     max_num_batched_tokens: object = None
+    # Optional "trace-derived 3-segment" expansion knob. When set, each
+    # expanded case overrides ``_build_context_lens`` with the explicit
+    # 3-segment layout ``[head, mid_seqlen, full_prompt_len - head - mid_seqlen]``,
+    # i.e. cu_seqlens = [0, head, head + mid_seqlen, full_prompt_len].
+    # This reproduces the worst K5 regression family found in bench
+    # results 20260603 (n=3, T ~= 16384, middle segment == 10000): the
+    # K5 kernel exhibits a near-constant ~543us cost across this whole
+    # cluster regardless of head_seqlen, while triton K5 varies with the
+    # head split between ~460-495us. Sweeping head_seqlens lets us probe
+    # the kernel's sensitivity (or lack thereof) to the head boundary.
+    # Group is materialised as the (tps x full_prompt_lens x head_seqlens)
+    # Cartesian product when this is not None.
+    head_seqlens: object = None  # list[int] | None
+    mid_seqlen: int = 10000
+    # Number of segments per expanded case when ``head_seqlens`` is set:
+    #   num_segments=3 (default): context_lens = [head, mid_seqlen, full_len-head-mid_seqlen]
+    #     -> cu_seqlens = [0, head, head+mid_seqlen, full_len]   (n=3)
+    #   num_segments=2          : context_lens = [head, full_len-head]
+    #     -> cu_seqlens = [0, head, full_len]                    (n=2)
+    #     ``mid_seqlen`` is ignored in this mode; the tail length is whatever
+    #     remains after ``head``. Used to cover the n=2 T=16384 regression
+    #     clusters (head near 6400 / 8192 / 9912 / 10000) found in the
+    #     bench_gdr 20260604 trace.
+    num_segments: int = 3
 
 
 def expand_groups(groups):
     out = []
     for g in groups:
+        # ``max_num_batched_tokens`` may be a single spec (int / "full_prompt_len"
+        # / None) OR a list/tuple of such specs. A list materialises one case per
+        # value (Cartesian with tps x full_prompt_lens) -- e.g. to sweep the
+        # scheduler token budget, which for the varlen path sweeps the batch size
+        # (N = mnbt // full_prompt_len). When more than one value is present, ids
+        # gain an ``mnbt{value}`` suffix so a fixed (tp, full_prompt_len) stays
+        # unique; a single value keeps the original ids unchanged.
+        mnbt_specs = g.max_num_batched_tokens
+        if not isinstance(mnbt_specs, (list, tuple)):
+            mnbt_specs = [mnbt_specs]
+        _sweep_mnbt = len(mnbt_specs) > 1
         for tp in g.tps:
             for full_len in g.full_prompt_lens:
-                if g.max_num_batched_tokens == "full_prompt_len":
-                    mnbt = full_len
-                elif g.max_num_batched_tokens is None:
-                    mnbt = 32768  # PrefillArgs dataclass default
-                else:
-                    mnbt = g.max_num_batched_tokens
-                out.append(
-                    PrefillArgs(
-                        K=g.K,
-                        V=g.V,
-                        Hk=g.Hk,
-                        Hv=g.Hv,
-                        tp=tp,
-                        full_prompt_len=full_len,
-                        model_name=g.model_name,
-                        BT=g.BT,
-                        max_num_batched_tokens=mnbt,
-                        dtype=g.dtype,
-                        is_varlen=g.is_varlen,
-                        output_final_state=g.output_final_state,
-                        ssm_state_dtype=g.ssm_state_dtype,
-                    )
-                )
+                for mnbt_spec in mnbt_specs:
+                    if mnbt_spec == "full_prompt_len":
+                        mnbt = full_len
+                    elif mnbt_spec is None:
+                        mnbt = 32768  # PrefillArgs dataclass default
+                    else:
+                        mnbt = mnbt_spec
+                    bt_tag = f"mnbt{mnbt}" if _sweep_mnbt else ""
+
+                    # head_seqlens=None : preserve the original "equal split via
+                    # _build_context_lens" behavior. Otherwise materialise one
+                    # PrefillArgs per (tp, full_len, head) triple with an
+                    # explicit 3-segment cu_seqlens layout
+                    # [head, mid_seqlen, full_len - head - mid_seqlen].
+                    if g.head_seqlens is None:
+                        out.append(
+                            PrefillArgs(
+                                K=g.K,
+                                V=g.V,
+                                Hk=g.Hk,
+                                Hv=g.Hv,
+                                tp=tp,
+                                full_prompt_len=full_len,
+                                model_name=g.model_name,
+                                BT=g.BT,
+                                max_num_batched_tokens=mnbt,
+                                dtype=g.dtype,
+                                is_varlen=g.is_varlen,
+                                output_final_state=g.output_final_state,
+                                ssm_state_dtype=g.ssm_state_dtype,
+                                bt_tag=bt_tag,
+                            )
+                        )
+                    else:
+                        for head in g.head_seqlens:
+                            if g.num_segments == 2:
+                                tail = full_len - head
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=2) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head}."
+                                    )
+                                context_lens = [head, tail]
+                                tag = f"head{head}_tail{tail}"
+                            elif g.num_segments == 3:
+                                tail = full_len - head - g.mid_seqlen
+                                if tail <= 0:
+                                    raise ValueError(
+                                        f"head_seqlens (num_segments=3) produced "
+                                        f"non-positive tail ({tail}) for "
+                                        f"group={g.model_name!r} "
+                                        f"full_prompt_len={full_len} head={head} "
+                                        f"mid_seqlen={g.mid_seqlen}. Drop this "
+                                        f"(full_len, head) combo or raise "
+                                        f"full_prompt_len."
+                                    )
+                                context_lens = [head, g.mid_seqlen, tail]
+                                tag = f"head{head}_mid{g.mid_seqlen}"
+                            else:
+                                raise ValueError(
+                                    f"num_segments={g.num_segments} unsupported; "
+                                    f"only 2 or 3 are implemented."
+                                )
+                            if _sweep_mnbt:
+                                tag = f"{tag}_mnbt{mnbt}"
+                            out.append(
+                                PrefillArgs(
+                                    K=g.K,
+                                    V=g.V,
+                                    Hk=g.Hk,
+                                    Hv=g.Hv,
+                                    tp=tp,
+                                    full_prompt_len=full_len,
+                                    model_name=g.model_name,
+                                    BT=g.BT,
+                                    max_num_batched_tokens=mnbt,
+                                    dtype=g.dtype,
+                                    is_varlen=g.is_varlen,
+                                    output_final_state=g.output_final_state,
+                                    ssm_state_dtype=g.ssm_state_dtype,
+                                    context_lens=context_lens,
+                                    trace_tag=tag,
+                                )
+                            )
     return out
 
 
@@ -237,6 +378,14 @@ _PREFILL_GROUPS = [
         output_final_state=False,
         max_num_batched_tokens="full_prompt_len",
     ),
+    PrefillGroup(
+        model_name="Qwen3.5-397B-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[1024, 2048, 4096, 8192],
+        is_varlen=False,
+        max_num_batched_tokens="full_prompt_len",
+    ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
     # else, so they collapse into a single group. Original rows left
     # max_num_batched_tokens at the PrefillArgs default of 32768, which
@@ -251,10 +400,17 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=32768,
     ),
     PrefillGroup(
+        model_name="varlen-64k-qwen-ptpc-ali",
+        Hv=64,
+        tps=[8],
+        full_prompt_lens=[8192],
+        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        max_num_batched_tokens=[65536],
+    ),
+    PrefillGroup(
         model_name="varlen-16k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
         max_num_batched_tokens=16384,
     ),
@@ -262,39 +418,41 @@ _PREFILL_GROUPS = [
         model_name="varlen-32k-aws",
         Hv=32,
         tps=[1],
-        # full_prompt_lens=[1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000],
         full_prompt_lens=[1000, 5000, 10000],
+        # full_prompt_lens=[1000],
         max_num_batched_tokens=32768,
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n1",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[5000, 10000],
+        max_num_batched_tokens="full_prompt_len",
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n3-mid10k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
+        mid_seqlen=10000,
+    ),
+    PrefillGroup(
+        model_name="flydsl-k5-n2-16k",
+        Hv=32,
+        tps=[1],
+        full_prompt_lens=[16384],
+        max_num_batched_tokens=16384,
+        head_seqlens=[4000, 6396, 8192, 9912, 10000],
+        num_segments=2,
     ),
 ]
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
 
-# Perf-test parametrization is identical to the correctness one; trace-
-# derived shapes have been removed from this file.
-PERF_PARAMS = list(PREFILL_PARAMS)
-PERF_TEST_IDS = [repr(p) for p in PERF_PARAMS]
-
-
-# Mirror every base shape with a bf16-SSM-state variant. The bf16 vs f32
-# kernel paths only differ in two ``if const_expr`` branches:
-#   - h0 load (gated by USE_INITIAL_STATE)
-#   - ht store (gated by STORE_FINAL_STATE)
-# The bf16 mirror keeps ``output_final_state`` from the base shape, so:
-#   - ``_nofs`` shapes (use_h0=True, store_fs=False) cover the h0 load path
-#   - default shapes (use_h0=True, store_fs=True) cover both paths
-# Only ``(use_h0=False, store_fs=False)`` would generate IR identical to
-# the f32 path; none of the current PREFILL_PARAMS hits that combo, so we
-# do not filter here. If you add such a case later, gate the mirror with
-# ``if _base.output_final_state or _make_inputs(...) provides h0``.
-# NOTE: bf16 SSM-state mirrors disabled for focused perf profiling.
-# PREFILL_PARAMS.extend(
-#     [
-#         _dataclass_replace(_base, ssm_state_dtype=torch.bfloat16)
-#         for _base in list(PREFILL_PARAMS)
-#     ]
-# )
+PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
 
 # -- bf16 SSM-state params (paired with TestStateDtypeBF16 below) ------
@@ -517,18 +675,111 @@ def _normalize_opt_v_new(vn_opt):
     return vn_opt.permute(0, 2, 1, 3).contiguous()
 
 
+def _is_gfx950() -> bool:
+    """Whether the current GPU is CDNA4 / gfx950 (MI350).
+
+    The baseline / ``naive`` / ``naive_opt`` FlyDSL K5 forks emit the
+    ``mfma_f32_16x16x32_bf16`` (K=32 bf16) MFMA and ``mfma32_vk`` emits
+    ``mfma_f32_32x32x16_bf16`` -- both are gfx950-only instructions. On gfx942
+    (CDNA3 / MI300) they fail to compile with an LLVM ``Cannot select``
+    abort, so the perf harness skips them there. The remaining forks
+    (``kv`` / ``mfma16_hip`` / ``mfma16_2wave_opt1`` / ``mfma16_3wave_opt2``)
+    use the K=16 ``mfma_f32_16x16x16bf16_1k`` and run on both.
+    """
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+    return "gfx950" in arch
+
+
+def _hip_k5_supported(args: PrefillArgs) -> bool:
+    """The HIP K5 kernel only handles K=V=128, bf16 inputs, chunk_size=64."""
+    return (
+        _HAS_HIP_K5
+        and args.K == 128
+        and args.V == 128
+        and args.dtype == torch.bfloat16
+        and args.BT == 64
+    )
+
+
+def chunk_gated_delta_rule_fwd_h_hip_k5(
+    k,
+    w,
+    u,
+    g=None,
+    initial_state=None,
+    output_final_state=False,
+    cu_seqlens=None,
+):
+    """HIP/C++ K5 host wrapper, adapted to this file's K5 calling convention.
+
+    Mirrors the FlyDSL / Triton ``opt_vk`` backends: takes the GQA-layout
+    ``k`` ([B, T, Hg, K]), head-major ``w`` / ``u`` ([B, H, T, K/V]), and a
+    head-major cumulative-gate ``g`` ([H, T_total] or [B, H, T_total]) in
+    natural-log space, and returns VK-ordered ``h`` ([B, NT, H, V, K]),
+    head-major ``v_new`` ([B, H, T, V]), and VK ``final_state``
+    ([N, H, V, K]) -- identical public outputs to the other backends, so
+    the shared ``_assert_k5_outputs_match_ref`` comparator applies directly.
+
+    The underlying kernel's ``USE_EXP2`` path expects log2-space gates, so we
+    pass ``use_exp2=False`` here to keep the natural-log-space ``g`` contract
+    shared with the PyTorch reference (the kernel then applies the LOG2E
+    scale internally).
+    """
+    H = w.shape[1]
+    T_flat = w.shape[2]
+
+    # The HIP wrapper wants a 3-D head-major g [B, H, T_flat]. This file
+    # produces a 2-D [H, T_total] gate for the B=1 varlen / dense cases.
+    if g is not None:
+        if g.dim() == 2:
+            g_hip = g.reshape(1, H, T_flat).contiguous()
+        else:
+            g_hip = g.contiguous()
+    else:
+        g_hip = None
+
+    return chunk_gated_delta_rule_fwd_h_hip_fn(
+        k,
+        w,
+        u,
+        g=g_hip,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        chunk_size=64,
+        cu_seqlens=cu_seqlens,
+        use_exp2=False,
+        g_head_major=True,
+    )
+
+
 # -- Performance benchmark ----------------------------------------------
 
 
 _K5_KERNEL_PREFIXES = [
     "chunk_gdn_fwd_h_flydsl_vk",
+    "chunk_gdn_fwd_h_flydsl_kv",
+    "chunk_gdn_fwd_h_flydsl_mfma16",
+    "chunk_gdn_fwd_h_flydsl_naive",
     "chunk_gated_delta_rule_fwd_kernel_h",
+]
+
+# The HIP/C++ K5 kernel is a templated __global__ whose profiler symbol is
+# either the demangled ``...chunk_gated_delta_rule_fwd_h_hip_kernel<...>`` or
+# a mangled ``_ZN...`` form. Match it as a substring (the templated name never
+# appears at offset 0 after demangling because of the leading return type).
+_K5_KERNEL_SUBSTRINGS = [
+    "chunk_gated_delta_rule_fwd_h_hip_kernel",
 ]
 
 
 def _is_k5_kernel(name: str) -> bool:
     """Return True if *name* is a K5 hidden-state recurrence kernel."""
-    return any(name.startswith(p) for p in _K5_KERNEL_PREFIXES)
+    if any(name.startswith(p) for p in _K5_KERNEL_PREFIXES):
+        return True
+    return any(s in name for s in _K5_KERNEL_SUBSTRINGS)
 
 
 def _bench_fn(fn, *args, **kwargs):
@@ -560,7 +811,69 @@ def _bench_fn(fn, *args, **kwargs):
 
 # -- Correctness tests ---------------------------------------------------
 
-PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
+
+def _assert_mean_abs_within(out, ref, *, mean_atol, label):
+    """Guard the *mean* absolute error, not just the per-element worst case.
+
+    ``torch.testing.assert_close``'s ``atol`` only bounds the single worst
+    element, which for bf16 K5 over a long chunked recurrence sits close to
+    the 5e-2 element tolerance (a few outlier tokens at the tail of the
+    33-segment chain). The mean abs error, by contrast, is ~2-3e-3 in
+    practice and is what actually moves when an implementation regresses the
+    *whole* distribution (e.g. a gating / accumulation bug) without yet
+    tripping any single element past 5e-2. Bound it here.
+    """
+    mean_abs = (out.float() - ref.float()).abs().mean().item()
+    assert mean_abs <= mean_atol, (
+        f"{label}: mean abs error {mean_abs:.3e} exceeds mean_atol "
+        f"{mean_atol:.3e} (per-element atol may still pass; this guards "
+        f"whole-distribution drift)"
+    )
+
+
+def _assert_close_lowmem(a, b, *, atol, rtol, msg, chunk_rows=1 << 22):
+    """Memory-frugal elementwise ``|a-b| <= atol + rtol*|b|`` check.
+
+    Equivalent in semantics to ``torch.testing.assert_close(a, b, atol, rtol)``
+    but streams over a flattened view in row chunks so it never materialises
+    more than one chunk-sized fp32 temporary. Used for the mfma16_2wave_opt1/triton_vk
+    consistency check, where the h / v_new tensors at long context are
+    multi-GiB and the stock ``assert_close`` (which up-casts both whole tensors
+    and builds a full mismatch report) OOMs on a 256 GiB card. On mismatch it
+    reports the worst element's abs error / allowed tol rather than dumping the
+    entire tensor.
+    """
+    assert a.shape == b.shape, f"{msg}: shape {tuple(a.shape)} vs {tuple(b.shape)}"
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    n = af.numel()
+    worst_abs = 0.0
+    worst_allowed = 0.0
+    worst_idx = -1
+    n_bad = 0
+    for s in range(0, n, chunk_rows):
+        e = min(s + chunk_rows, n)
+        ac = af[s:e].float()
+        bc = bf[s:e].float()
+        abs_e = (ac - bc).abs()
+        allowed = atol + rtol * bc.abs()
+        bad = abs_e > allowed
+        nb = int(bad.sum().item())
+        if nb:
+            n_bad += nb
+            # track the single worst (abs - allowed) margin in this chunk
+            margin = abs_e - allowed
+            mi = int(margin.argmax().item())
+            if abs_e[mi].item() - allowed[mi].item() > worst_abs - worst_allowed:
+                worst_abs = abs_e[mi].item()
+                worst_allowed = allowed[mi].item()
+                worst_idx = s + mi
+        del ac, bc, abs_e, allowed, bad
+    assert n_bad == 0, (
+        f"{msg}: {n_bad}/{n} elements exceed atol={atol:g}+rtol={rtol:g}*|b|. "
+        f"Worst @ flat idx {worst_idx}: abs_err={worst_abs:.3e} > "
+        f"allowed={worst_allowed:.3e}."
+    )
 
 
 def _assert_k5_outputs_match_ref(
@@ -575,6 +888,7 @@ def _assert_k5_outputs_match_ref(
     label,
     atol=5e-2,
     rtol=5e-2,
+    mean_atol=5e-3,
 ):
     """Compare a K5 backend's outputs against the PyTorch FP32 reference.
 
@@ -587,28 +901,45 @@ def _assert_k5_outputs_match_ref(
     f32-state is one ``truncf`` on the final_state, which stays well within
     bf16 ULP for sane inputs and never exceeds the historical f32-state
     margins.
+
+    Two complementary bounds are enforced per output:
+      * ``atol`` / ``rtol`` (5e-2): the per-element worst case.
+      * ``mean_atol`` (5e-3): the mean abs error, which catches a regression
+        that shifts the whole distribution before any single element trips
+        the looser element tolerance. Measured mean abs is ~2-3e-3 on the
+        varlen-32k-aws shape, so 5e-3 leaves ~2x headroom over bf16 noise.
     """
+    h_out_f = h_out.float()
+    vn_out_f = _normalize_opt_v_new(vn_out).float()
     torch.testing.assert_close(
-        h_out.float(),
+        h_out_f,
         h_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: h mismatch",
     )
+    _assert_mean_abs_within(h_out_f, h_ref, mean_atol=mean_atol, label=f"{label} h")
     torch.testing.assert_close(
-        _normalize_opt_v_new(vn_out).float(),
+        vn_out_f,
         vn_ref.float(),
         atol=atol,
         rtol=rtol,
         msg=f"{label}: v_new mismatch",
     )
+    _assert_mean_abs_within(
+        vn_out_f, vn_ref, mean_atol=mean_atol, label=f"{label} v_new"
+    )
     if output_final_state:
+        fs_out_f = fs_out.float()
         torch.testing.assert_close(
-            fs_out.float(),
+            fs_out_f,
             fs_ref.float(),
             atol=atol,
             rtol=rtol,
             msg=f"{label}: final_state mismatch",
+        )
+        _assert_mean_abs_within(
+            fs_out_f, fs_ref, mean_atol=mean_atol, label=f"{label} final_state"
         )
     else:
         assert fs_out is None, f"{label}: expected None final_state"
@@ -655,6 +986,372 @@ class TestCorrectness:
             label="flydsl",
         )
 
+    @pytest.mark.skipif(not _HAS_HIP_K5, reason="HIP K5 kernel not importable")
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_hip(self, args: PrefillArgs):
+        """HIP/C++ K5 impl. Same public VK outputs as the baseline flydsl
+        path. The kernel only supports K=V=128 + bf16 + chunk_size=64, so
+        cases outside that envelope are skipped."""
+        if not _hip_k5_supported(args):
+            pytest.skip(
+                reason="HIP K5 kernel requires K=V=128, bfloat16, chunk_size=64"
+            )
+        # Pin the seed so the bf16 v_new comparison is reproducible: a few
+        # ``u - w @ h`` entries cancel to near-zero, where the rtol band is
+        # tiny and an unlucky random draw can push bf16 round-off past it.
+        torch.manual_seed(42)
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_hip, vn_hip, fs_hip = chunk_gated_delta_rule_fwd_h_hip_k5(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        # HIP K5 accumulates the h-state in f32 (only the stored h / v_new /
+        # final_state are bf16), so it tracks the f32 reference far more
+        # tightly than the shared 5e-2 / 5e-3 band -- even at 128k context the
+        # error does not accumulate. Measured worst case over the full
+        # PREFILL_PARAMS HIP-supported sweep (gfx942, truncf f32->bf16, the
+        # least accurate path; gfx950 RNE is tighter still):
+        #   h            max 2.2e-3  mean 6.7e-5
+        #   v_new        max 3.9e-3  mean 2.5e-4
+        #   final_state  max 9.7e-4  mean 4.8e-5
+        # The bounds below leave ~2.5x margin on the worst element and ~4x on
+        # the mean, so they stay green under seed / arch jitter while being 5x
+        # tighter than the shared default -- a real HIP regression that the
+        # loose band waved through now trips here.
+        _assert_k5_outputs_match_ref(
+            h_hip,
+            vn_hip,
+            fs_hip,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="hip",
+            atol=1e-2,
+            rtol=1e-2,
+            mean_atol=1e-3,
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_kv(self, args: PrefillArgs):
+        """Separate KV-layout FlyDSL K5 impl (VWARP 16x16x16 + coalesced KV
+        h-store). BV is pinned to 64; k must be pre-transposed to [B, Hg, K, T].
+        Same VK public outputs as the baseline flydsl path."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # kv fork now consumes k PRE-TRANSPOSED to [B, Hg, K, T] (caller owns
+        # the transpose); the reference still takes token-major [B, T, Hg, K].
+        k_kv = k.permute(0, 2, 3, 1).contiguous()
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_kv(
+            k_kv,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_kv",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
+        """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
+        MFMA + HIP warp partition. Same VK public outputs as the baseline flydsl
+        path; only the BV==64 configs exercise the kernel, others fall back."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_mfma16_hip",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_mfma16_3wave_opt2(self, args: PrefillArgs):
+        """mfma16_3wave_opt2 fork -- currently an exact copy of mfma16_2wave_opt1
+        (VWARP MFMA 16x16x16, HIP-aligned store-overlap). KV-in fork: k is passed
+        PRE-TRANSPOSED to [B, Hg, K, T]; output is public VK [..., V, K]."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # mfma16_3wave_opt2 consumes k PRE-TRANSPOSED to [B, Hg, K, T] (like
+        # mfma16_2wave_opt1). The reference still takes token-major k.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
+            k_kvn,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_mfma16_3wave_opt2",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_hipport(self, args: PrefillArgs):
+        """HIP-PORT FlyDSL K5 impl: detail-for-detail replica of the hand-tuned
+        HIP/C++ kernel's split-M scheme (K=16 mfma, register h-state, coalesced
+        VK transpose store, software-pipeline panel prefetch). Same public VK
+        outputs as the baseline flydsl path; only the BV==64 configs exercise
+        the hipport kernel, others fall back to the baseline."""
+        # Pin the seed so the bf16 v_new comparison is reproducible: a few
+        # ``u - w @ h`` entries cancel to near-zero, where the rtol band is
+        # tiny and an unlucky random draw can push bf16 round-off past it
+        # (mirrors test_correctness_hip).
+        torch.manual_seed(42)
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_hipport(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="hipport",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_naive(self, args: PrefillArgs):
+        """Naive (un-pipelined) fork of the BASELINE FlyDSL K5 kernel: same
+        baseline layout / VK public outputs, with all prefetch / software-
+        pipeline scheduling removed (cross-chunk w prefetch, OPT-VC g/gk/u
+        emitter queue, OPT-K / OPT-W interleaves). Works at any BV (not gated
+        on BV==64). Used to baseline the raw bottleneck structure in a trace."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_naive(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_naive",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_naive_opt(self, args: PrefillArgs):
+        """Naive-OPT fork: the naive kernel with the OPT-DGL w-load (direct
+        HBM->LDS buffer_load_lds + two-sided XOR swizzle) forced on. Same
+        public VK outputs / numerics as the naive fork; only the w staging
+        path differs (no ds_write / no VGPR staging for w)."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_naive_opt",
+        )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_correctness_flydsl_mfma16_2wave_opt1(self, args: PrefillArgs):
+        """Naive (un-pipelined) KV-fork FlyDSL K5 impl (same VWARP layout +
+        coalesced KV h-store as flydsl_kv, all prefetch/pipeline scheduling
+        removed). Same VK public outputs as the baseline flydsl path; only the
+        BV==64 configs exercise the naive KV kernel, others fall back."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # mfma16_2wave_opt1 consumes k PRE-TRANSPOSED to [B, Hg, K, T] (the caller owns
+        # the transpose; the host no longer permutes). The reference still
+        # takes the original token-major [B, T, Hg, K] k.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
+            k_kvn,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_mfma16_2wave_opt1",
+        )
+
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_triton_vk(self, args: PrefillArgs):
         """Triton VK K5 (h: [V, K]) -- same input/output layout as FlyDSL."""
@@ -694,6 +1391,84 @@ class TestCorrectness:
             output_final_state=args.output_final_state,
             label="triton_vk",
         )
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_consistency_mfma16_2wave_opt1_vs_triton_vk(self, args: PrefillArgs):
+        """Direct mfma16_2wave_opt1 <-> triton_vk consistency (NOT vs the FP32 ref).
+
+        Both backends consume identical inputs (k / w_c / u_c / g / h0 / cu)
+        and return VK-ordered outputs, and they implement the same bf16 +
+        exp2 VK-layout K5 recurrence -- so they should agree almost bit for
+        bit. Measured on varlen-32k-aws: h max ~1e-4, v_new max ~1e-3,
+        final_state bit-identical. This is a *far* tighter regression guard
+        than the 5e-2 element tolerance against the FP32 reference (which is
+        dominated by shared bf16 round-off): a real bug in either kernel that
+        the loose ref tolerance would wave through shows up here as a >1e-3
+        divergence between the two backends. Tolerance is set to 2e-3 to
+        absorb only the residual bf16 last-bit ordering noise in v_new.
+        """
+        if args.ssm_state_dtype != torch.float32:
+            pytest.skip("Triton VK reference only supports f32 SSM state.")
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        # mfma16_2wave_opt1 needs k pre-transposed to [B, Hg, K, T]; triton_vk keeps the
+        # original token-major [B, T, Hg, K] layout.
+        k_kvn = k.permute(0, 2, 3, 1).contiguous()
+        h_kvn, vn_kvn, fs_kvn = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
+            k_kvn,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_vk, vn_vk, fs_vk = chunk_gated_delta_rule_fwd_h_opt_vk(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        atol = rtol = 2e-3
+        # Compare directly in the backends' native layout/dtype. The big h /
+        # v_new tensors at long context (e.g. Hv64 T=128000, NT~2000 chunks)
+        # are multi-GiB each; ``assert_close(a.float(), b.float())`` would
+        # alloc several extra full-size fp32 copies (plus more inside
+        # assert_close's mismatch-report path) and OOM. ``_assert_close_lowmem``
+        # streams the ``|a-b| <= atol + rtol*|b|`` check in chunks instead.
+        _assert_close_lowmem(
+            h_kvn,
+            h_vk,
+            atol=atol,
+            rtol=rtol,
+            msg="mfma16_2wave_opt1 vs triton_vk: h mismatch",
+        )
+        # v_new is head-major [B,H,T,V] in both backends; compare as-is (the
+        # shared permutation to [B,T,H,V] is a no-op for an elementwise check).
+        _assert_close_lowmem(
+            vn_kvn,
+            vn_vk,
+            atol=atol,
+            rtol=rtol,
+            msg="mfma16_2wave_opt1 vs triton_vk: v_new mismatch",
+        )
+        if args.output_final_state:
+            _assert_close_lowmem(
+                fs_kvn,
+                fs_vk,
+                atol=atol,
+                rtol=rtol,
+                msg="mfma16_2wave_opt1 vs triton_vk: final_state mismatch",
+            )
+        else:
+            assert fs_kvn is None and fs_vk is None
 
     @pytest.mark.skipif(
         not _HAS_VLLM_K5,
@@ -757,7 +1532,7 @@ class TestCorrectness:
         # K5 returned ``v_new`` in head-major [B, H, T, V] layout (aiter's
         # convention). ``h`` and ``final_state`` follow the same vk layout as
         # the aiter ``opt_vk`` path, so we compare them directly.
-        atol, rtol = 5e-2, 5e-2
+        atol, rtol, mean_atol = 5e-2, 5e-2, 5e-3
         torch.testing.assert_close(
             h_vllm.float(),
             h_ref.float(),
@@ -765,12 +1540,16 @@ class TestCorrectness:
             rtol=rtol,
             msg="vllm: h mismatch",
         )
+        _assert_mean_abs_within(h_vllm, h_ref, mean_atol=mean_atol, label="vllm h")
         torch.testing.assert_close(
             vn_vllm.float(),
             vn_ref.float(),
             atol=atol,
             rtol=rtol,
             msg="vllm: v_new mismatch",
+        )
+        _assert_mean_abs_within(
+            vn_vllm, vn_ref, mean_atol=mean_atol, label="vllm v_new"
         )
         if args.output_final_state:
             torch.testing.assert_close(
@@ -779,6 +1558,9 @@ class TestCorrectness:
                 atol=atol,
                 rtol=rtol,
                 msg="vllm: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_vllm, fs_ref, mean_atol=mean_atol, label="vllm final_state"
             )
         else:
             assert fs_vllm is None, "vllm: expected None final_state"
@@ -832,13 +1614,16 @@ class TestCorrectness:
             else None
         )
 
-        atol, rtol = 5e-2, 5e-2
+        atol, rtol, mean_atol = 5e-2, 5e-2, 5e-3
         torch.testing.assert_close(
             h_origin_opt_vk.float(),
             h_ref.float(),
             atol=atol,
             rtol=rtol,
             msg="triton_origin_opt: h mismatch",
+        )
+        _assert_mean_abs_within(
+            h_origin_opt_vk, h_ref, mean_atol=mean_atol, label="triton_origin_opt h"
         )
         torch.testing.assert_close(
             vn_origin_opt.float(),
@@ -847,6 +1632,12 @@ class TestCorrectness:
             rtol=rtol,
             msg="triton_origin_opt: v_new mismatch",
         )
+        _assert_mean_abs_within(
+            vn_origin_opt,
+            vn_ref,
+            mean_atol=mean_atol,
+            label="triton_origin_opt v_new",
+        )
         if args.output_final_state:
             torch.testing.assert_close(
                 fs_origin_opt_vk.float(),
@@ -854,6 +1645,12 @@ class TestCorrectness:
                 atol=atol,
                 rtol=rtol,
                 msg="triton_origin_opt: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_origin_opt_vk,
+                fs_ref,
+                mean_atol=mean_atol,
+                label="triton_origin_opt final_state",
             )
 
 
@@ -889,9 +1686,81 @@ def _run_perf_comparison(args: PrefillArgs):
         else None
     )
 
+    # Both KV forks (kv, mfma16_2wave_opt1) require k pre-transposed to [B, Hg, K, T].
+    # Do it ONCE outside the timed window (the caller owns the transpose now),
+    # so the benchmarked KV-fork time reflects the kernel alone -- matching the
+    # other forks which consume the token-major k without a host permute.
+    k_kvn = k.permute(0, 2, 3, 1).contiguous()
+
     # K5 launch closures: each invokes the K5 host wrapper of its backend.
     def flydsl_launch():
         chunk_gated_delta_rule_fwd_h_flydsl(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_kv_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_kv(
+            k=k_kvn,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_mfma16_hip_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_mfma16_3wave_opt2_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_3wave_opt2(
+            k=k_kvn,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_mfma16_2wave_opt1_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_mfma16_2wave_opt1(
+            k=k_kvn,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_naive_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_naive(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+    def flydsl_naive_opt_launch():
+        chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
             k=k,
             w=w_c,
             u=u_c,
@@ -947,6 +1816,22 @@ def _run_perf_comparison(args: PrefillArgs):
             cu_seqlens=cu,
         )
 
+    # HIP/C++ K5. Same VK hidden-state layout as the flydsl backends, so it
+    # consumes the same h0 (fp32) and head-major w_c / u_c. Only valid for
+    # K=V=128 + bf16; gated by ``_hip_k5_supported`` below.
+    hip_supported = _hip_k5_supported(args)
+
+    def hip_launch():
+        chunk_gated_delta_rule_fwd_h_hip_k5(
+            k=k,
+            w=w_c,
+            u=u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
     # Warmup FlyDSL once so its internal BV-autotune sweep does not
     # leak into the timed window. Triton's own ``triton.autotune`` is
     # already absorbed by ``_bench_fn``'s NUM_WARMUP=5 prelude, except
@@ -955,91 +1840,124 @@ def _run_perf_comparison(args: PrefillArgs):
     # converge the autotuner on long-T shapes. Pre-warm it once here
     # for parity with FlyDSL so that ``us_vllm`` reflects steady-state
     # kernel time, not the autotune sweep.
-    flydsl_launch()
+    # gfx950-only forks. These fail on gfx942 with an UNRECOVERABLE process
+    # abort (not a catchable Python exception), so they must be hard-gated
+    # behind the arch check rather than wrapped in try/except:
+    #   * baseline / naive / naive_opt -> K=32 bf16 MFMA (mfma_f32_16x16x32_bf16),
+    #     which LLVM cannot select on gfx942 ("Cannot select ... Aborted").
+    #   * mfma16_2wave_opt1 -> over-budget on gfx942 for K=V=128 (~70KB LDS >
+    #     64KB).
+    # The kv / mfma16_hip / mfma16_3wave_opt2 forks use the K=16 MFMA and fit
+    # the 64KB budget, so they run on both gfx942 and gfx950.
+    _gfx950 = _is_gfx950()
+
+    ok_fly = ok_naive = ok_naive_opt = ok_mfma16_2wave_opt1 = _gfx950
+    ok_kv = ok_mfma16_hip = ok_mfma16_3wave_opt2 = True
+
+    if ok_fly:
+        flydsl_launch()
+    if ok_kv:
+        flydsl_kv_launch()
+    if ok_mfma16_hip:
+        flydsl_mfma16_hip_launch()
+    if ok_mfma16_3wave_opt2:
+        flydsl_mfma16_3wave_opt2_launch()
+    if ok_mfma16_2wave_opt1:
+        flydsl_mfma16_2wave_opt1_launch()
+    if ok_naive:
+        flydsl_naive_launch()
+    if ok_naive_opt:
+        flydsl_naive_opt_launch()
     if _HAS_VLLM_K5:
         vllm_launch()
+    if hip_supported:
+        hip_launch()
     torch.cuda.synchronize()
 
-    us_fly = _bench_fn(flydsl_launch)
+    us_fly = _bench_fn(flydsl_launch) if ok_fly else float("nan")
+    us_fly_kv = _bench_fn(flydsl_kv_launch) if ok_kv else float("nan")
+    us_fly_mfma16_hip = (
+        _bench_fn(flydsl_mfma16_hip_launch) if ok_mfma16_hip else float("nan")
+    )
+    us_fly_mfma16_3wave_opt2 = (
+        _bench_fn(flydsl_mfma16_3wave_opt2_launch)
+        if ok_mfma16_3wave_opt2
+        else float("nan")
+    )
+    us_fly_mfma16_2wave_opt1 = (
+        _bench_fn(flydsl_mfma16_2wave_opt1_launch)
+        if ok_mfma16_2wave_opt1
+        else float("nan")
+    )
+    us_fly_naive = _bench_fn(flydsl_naive_launch) if ok_naive else float("nan")
+    us_fly_naive_opt = (
+        _bench_fn(flydsl_naive_opt_launch) if ok_naive_opt else float("nan")
+    )
     us_triton_vk = _bench_fn(triton_vk_launch)
     us_triton_origin_opt = _bench_fn(triton_origin_opt_launch)
     us_vllm = _bench_fn(vllm_launch) if _HAS_VLLM_K5 else float("nan")
+    us_hip = _bench_fn(hip_launch) if hip_supported else float("nan")
 
     fly_vs_vk = us_triton_vk / us_fly if us_fly > 0 else float("inf")
+    # fly_opt (mfma16_2wave_opt1) speedup vs Triton_vk (>1 means fly_opt is faster).
+    fly_opt_vs_vk = (
+        us_triton_vk / us_fly_mfma16_2wave_opt1
+        if us_fly_mfma16_2wave_opt1 > 0
+        else float("inf")
+    )
     fly_vs_origin_opt = us_triton_origin_opt / us_fly if us_fly > 0 else float("inf")
     fly_vs_vllm = (
         us_vllm / us_fly if (us_fly > 0 and us_vllm == us_vllm) else float("nan")
     )
-
-    # bench333 cases carry trace-derived structural features (head/mid/
-    # tail seqlen, log_count); compute these once so the summary table
-    # can display them in a bench333-specific sub-table. Non-bench333
-    # rows leave these fields at their defaults (None / 0).
-    head_seqlen = mid_seqlen = tail_seqlen = 0
-    log_count = 0
-    if args.context_lens is not None and args.model_name == "prefill-bench333":
-        lens = list(args.context_lens)
-        if len(lens) == 1:
-            head_seqlen, tail_seqlen = int(lens[0]), 0
-        elif len(lens) == 2:
-            head_seqlen, tail_seqlen = int(lens[0]), int(lens[1])
-        elif len(lens) >= 3:
-            mids = lens[1:-1]
-            head_seqlen = int(lens[0])
-            tail_seqlen = int(lens[-1])
-            mid_seqlen = int(mids[0]) if all(m == mids[0] for m in mids) else 0
-        # trace_tag is set to "cnt{log_count}" by _build_bench407_params.
-        if args.trace_tag.startswith("cnt"):
-            try:
-                log_count = int(args.trace_tag[3:])
-            except ValueError:
-                log_count = 0
-
-    # For bench333 trace shapes the model name is the same string for
-    # all 333 rows ("prefill-bench333") which is useless in the per-row
-    # summary table. Use the trailing "T{T}_n{N}_cnt{log_count}" suffix
-    # of the pytest id instead, so each row's Model cell uniquely
-    # identifies the case.
-    if args.model_name == "prefill-bench333" and args.context_lens is not None:
-        n_seqs = len(args.context_lens)
-        T_total = sum(args.context_lens)
-        model_label = f"T{T_total}_n{n_seqs}_{args.trace_tag}"
-    else:
-        model_label = args.model_name or "-"
+    # HIP speedup vs Triton_vk (>1 means HIP is faster than Triton_vk).
+    hip_vs_vk = (
+        us_triton_vk / us_hip if (us_hip > 0 and us_hip == us_hip) else float("nan")
+    )
+    # fly_hip (mfma16_hip) speedup vs Triton_vk (>1 means fly_hip is faster).
+    fly_hip_vs_vk = (
+        us_triton_vk / us_fly_mfma16_hip
+        if (us_fly_mfma16_hip > 0 and us_fly_mfma16_hip == us_fly_mfma16_hip)
+        else float("nan")
+    )
+    # fly_hip speedup vs the hand-tuned HIP kernel (>1 means fly_hip is faster).
+    fly_hip_vs_hip = (
+        us_hip / us_fly_mfma16_hip
+        if (
+            us_fly_mfma16_hip > 0
+            and us_fly_mfma16_hip == us_fly_mfma16_hip
+            and us_hip == us_hip
+        )
+        else float("nan")
+    )
 
     _perf_results.append(
         {
-            "Model": model_label,
+            "Model": args.model_name or "-",
             "TP": args.tp,
-            "K": args.K,
-            "V": args.V,
             "Hg": args.Hg,
             "H": args.H,
             "SeqLen": args.full_prompt_len,
             "T": total_tokens,
             "varlen": args.is_varlen,
             "final_st": args.output_final_state,
-            "state": "bf16" if args.ssm_state_dtype == torch.bfloat16 else "fp32",
-            # bench333-only fields (0 for main-table rows)
-            "T_prefill": total_tokens if args.model_name == "prefill-bench333" else 0,
-            "num_seqs_prefill": (
-                len(args.context_lens)
-                if args.context_lens is not None
-                and args.model_name == "prefill-bench333"
-                else 0
-            ),
-            "head_seqlen": head_seqlen,
-            "mid_seqlen": mid_seqlen,
-            "tail_seqlen": tail_seqlen,
-            "log_count": log_count,
-            # Perf columns (same for all rows)
             "FlyDSL_vk(us)": us_fly,
+            "FlyDSL_kv(us)": us_fly_kv,
+            "FlyDSL_mfma16_2wave_opt1(us)": us_fly_mfma16_2wave_opt1,
+            "FlyDSL_mfma16_hip(us)": us_fly_mfma16_hip,
+            "FlyDSL_mfma16_3wave_opt2(us)": us_fly_mfma16_3wave_opt2,
+            "FlyDSL_naive(us)": us_fly_naive,
+            "FlyDSL_naive_opt(us)": us_fly_naive_opt,
             "Triton_vk(us)": us_triton_vk,
             "Triton_origin_opt(us)": us_triton_origin_opt,
             "vLLM_vk(us)": us_vllm,
+            "HIP_vk(us)": us_hip,
             "flydsl_vs_vk": fly_vs_vk,
             "flydsl_vs_origin_opt": fly_vs_origin_opt,
             "flydsl_vs_vllm": fly_vs_vllm,
+            "hip_vs_vk": hip_vs_vk,
+            "flydsl_opt_vs_vk": fly_opt_vs_vk,
+            "fly_hip_vs_vk": fly_hip_vs_vk,
+            "fly_hip_vs_hip": fly_hip_vs_hip,
         }
     )
 
@@ -1047,148 +1965,150 @@ def _run_perf_comparison(args: PrefillArgs):
 class TestPerformance:
     """Kernel-only performance comparison: FlyDSL vs Triton opt_vk vs Triton opt3_kv."""
 
-    @pytest.mark.parametrize("args", PERF_PARAMS, ids=PERF_TEST_IDS)
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_perf_comparison(self, args: PrefillArgs):
         _run_perf_comparison(args)
+
+
+_naive_opt_perf_results: list[dict] = []
+
+
+class TestNaiveOptPerformance:
+    """Focused A/B: naive vs naive_opt (DGL w-load) device kernel time.
+
+    Isolates the OPT-DGL w-load win by benching the two forks on identical
+    inputs. The DGL fork should not be slower than the naive fork; we assert
+    a small regression guard band and record the measured speedup for the
+    summary table printed at session teardown.
+    """
+
+    @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
+    def test_perf_naive_vs_naive_opt(self, args: PrefillArgs):
+        context_lens = args.resolve_context_lens()
+        k, _, _, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
+
+        def naive_launch():
+            chunk_gated_delta_rule_fwd_h_flydsl_naive(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        def naive_opt_launch():
+            chunk_gated_delta_rule_fwd_h_flydsl_naive_opt(
+                k=k,
+                w=w_c,
+                u=u_c,
+                g=g,
+                initial_state=h0,
+                output_final_state=args.output_final_state,
+                cu_seqlens=cu,
+            )
+
+        naive_us = _bench_fn(naive_launch)
+        naive_opt_us = _bench_fn(naive_opt_launch)
+        speedup = naive_us / naive_opt_us if naive_opt_us > 0 else float("nan")
+
+        _naive_opt_perf_results.append(
+            {
+                "id": repr(args),
+                "naive_us": naive_us,
+                "naive_opt_us": naive_opt_us,
+                "speedup": speedup,
+            }
+        )
+
+        # Regression guard: DGL must not be materially slower than naive.
+        # Allow a 5% band for measurement noise on tiny shapes.
+        assert naive_opt_us <= naive_us * 1.05, (
+            f"naive_opt ({naive_opt_us:.1f} us) is slower than naive "
+            f"({naive_us:.1f} us) by more than 5% on {args!r}"
+        )
+
+
+def _print_naive_opt_perf_table():
+    if not _naive_opt_perf_results:
+        return
+    lines = [
+        "",
+        "=" * 78,
+        "naive vs naive_opt (DGL w-load) -- K5 device kernel time (us)",
+        "=" * 78,
+        f"{'shape':<44} {'naive':>9} {'naive_opt':>10} {'speedup':>8}",
+        "-" * 78,
+    ]
+    for r in _naive_opt_perf_results:
+        lines.append(
+            f"{r['id']:<44} {r['naive_us']:>9.1f} "
+            f"{r['naive_opt_us']:>10.1f} {r['speedup']:>7.2f}x"
+        )
+    lines.append("-" * 78)
+    print("\n".join(lines))
 
 
 def _print_perf_table():
     if not _perf_results:
         return
 
-    # Two column layouts:
-    #   - main_cols  : for hand-written PrefillGroup shapes (Qwen3.5-35B
-    #                  / 397B / varlen-fs / bench333-varlen) showing
-    #                  SeqLen + T + varlen + final_st.
-    #   - bench_cols : for bench333 trace-derived shapes showing
-    #                  T_prefill + num_seqs_prefill + head/mid/tail
-    #                  + log_count instead. SeqLen / T are redundant
-    #                  here because T_prefill carries the same info.
-    perf_tail_cols = [
-        ("FlyDSL", "FlyDSL_vk(us)", 8),
-        ("Tri_vk", "Triton_vk(us)", 8),
-        ("Tri_orig_opt", "Triton_origin_opt(us)", 12),
-        ("vLLM", "vLLM_vk(us)", 8),
-        ("fly/vk", "flydsl_vs_vk", 7),
-        ("fly/o_opt", "flydsl_vs_origin_opt", 9),
-        ("fly/vllm", "flydsl_vs_vllm", 8),
+    # Size the Model column to the widest model name so long names (e.g.
+    # "Qwen3.5-397B-ptpc-ali") don't overflow the fixed width and shift the
+    # whole data row out of alignment with the header.
+    _model_w = max([len("Model")] + [len(str(r["Model"])) for r in _perf_results])
+
+    cols = [
+        ("Model", "Model", _model_w),
+        ("TP", "TP", 2),
+        ("Hg", "Hg", 2),
+        ("H", "H", 2),
+        ("SeqLen", "SeqLen", 6),
+        ("T", "T", 5),
+        ("v", "varlen", 1),
+        ("fs", "final_st", 2),
+        ("FlyDSL", "FlyDSL_vk(us)", 6),
+        ("naive", "FlyDSL_naive(us)", 6),
+        ("fly_2w", "FlyDSL_mfma16_2wave_opt1(us)", 6),
+        ("fly_3w", "FlyDSL_mfma16_3wave_opt2(us)", 6),
+        ("fly_hip", "FlyDSL_mfma16_hip(us)", 7),
+        ("HIP", "HIP_vk(us)", 6),
+        ("Tri_vk", "Triton_vk(us)", 6),
+        ("vLLM", "vLLM_vk(us)", 6),
+        ("fly/vk", "flydsl_vs_vk", 6),
+        ("hip/vk", "hip_vs_vk", 6),
+        ("2w/vk", "flydsl_opt_vs_vk", 6),
+        ("fly_hip/vk", "fly_hip_vs_vk", 10),
+        ("fly_hip/hip", "fly_hip_vs_hip", 11),
     ]
-    main_cols = [
-        ("Model", "Model", 16),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("SeqLen", "SeqLen", 7),
-        ("T", "T", 7),
-        ("var", "varlen", 3),
-        ("fs", "final_st", 3),
-    ] + perf_tail_cols
-    bench_cols = [
-        ("Model", "Model", 22),
-        ("TP", "TP", 3),
-        ("Hg", "Hg", 3),
-        ("H", "H", 3),
-        ("T_prefill", "T_prefill", 9),
-        ("n_pref", "num_seqs_prefill", 6),
-        ("head", "head_seqlen", 6),
-        ("mid", "mid_seqlen", 6),
-        ("tail", "tail_seqlen", 6),
-        ("log_cnt", "log_count", 7),
-    ] + perf_tail_cols
 
-    def _build_header_sep(cols):
-        header = " | ".join(display.rjust(width) for display, _, width in cols)
-        sep = "-+-".join("-" * width for _, _, width in cols)
-        return header, sep
+    def _fmt_cell(val, key, width):
+        if isinstance(val, bool):
+            return ("Y" if val else "N").rjust(width)
+        if isinstance(val, float):
+            if val != val:  # NaN (vLLM column when vllm not installed)
+                return "-".rjust(width)
+            return (f"{val:.2f}x" if "_vs_" in key else f"{val:.1f}").rjust(width)
+        return str(val).rjust(width)
 
-    def _fmt_row(row, cols):
-        cells = []
-        for display, key, width in cols:
-            val = row[key]
-            if isinstance(val, bool):
-                cells.append(("Y" if val else "N").rjust(width))
-            elif isinstance(val, float):
-                if val != val:  # NaN (e.g. vLLM column when vllm not installed)
-                    cells.append("-".rjust(width))
-                elif "_vs_" in key:
-                    cells.append(f"{val:.2f}x".rjust(width))
-                else:
-                    cells.append(f"{val:.1f}".rjust(width))
-            else:
-                cells.append(str(val).rjust(width))
-        return " | ".join(cells)
+    header = "|".join(display.rjust(w) for display, _, w in cols)
+    sep = "+".join("-" * w for _, _, w in cols)
+    border = "=" * len(header)
 
-    main_header, main_sep = _build_header_sep(main_cols)
-    bench_header, bench_sep = _build_header_sep(bench_cols)
-    border = "=" * max(len(main_header), len(bench_header))
-
-    # Bucket rows by SSM-state dtype and by main-vs-bench333. Keep each
-    # bucket's order consistent with ``_perf_results`` insertion so rows
-    # line up with the parametrize id order. bench333 trace rows are
-    # tagged by ``log_count > 0`` (main groups all leave log_count at 0).
-    def _split(rows):
-        main = [r for r in rows if r.get("log_count", 0) == 0]
-        bench = [r for r in rows if r.get("log_count", 0) > 0]
-        return main, bench
-
-    rows_fp32_main, rows_fp32_bench = _split(
-        [r for r in _perf_results if r["state"] == "fp32"]
-    )
-    rows_bf16_main, rows_bf16_bench = _split(
-        [r for r in _perf_results if r["state"] == "bf16"]
-    )
-
-    lines = ["", border]
-    lines.append(
-        "K5 Prefill Performance Summary "
-        "(K5 device kernel time only, via torch.profiler)"
-    )
-    lines.append(
-        "  Triton K5 references always use fp32 SSM state; only FlyDSL's "
-        "SSM-state dtype changes between the sub-tables below."
-    )
-    lines.append(border)
-
-    def _emit_subtable(title, rows, cols, header, sep):
-        if not rows:
-            return
-        lines.append("")
-        lines.append(title)
-        lines.append(sep)
-        lines.append(header)
-        lines.append(sep)
-        for row in rows:
-            lines.append(_fmt_row(row, cols))
-        lines.append(sep)
-
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- main groups",
-        rows_fp32_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = fp32] -- bench333 trace shapes",
-        rows_fp32_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- main groups",
-        rows_bf16_main,
-        main_cols,
-        main_header,
-        main_sep,
-    )
-    _emit_subtable(
-        "[FlyDSL SSM state = bf16] -- bench333 trace shapes",
-        rows_bf16_bench,
-        bench_cols,
-        bench_header,
-        bench_sep,
-    )
+    lines = [
+        "",
+        border,
+        "K5 Prefill Performance Summary (K5 device kernel time only, via torch.profiler)",
+        border,
+        "",
+        sep,
+        header,
+        sep,
+    ]
+    for row in _perf_results:
+        lines.append("|".join(_fmt_cell(row[k], k, w) for _, k, w in cols))
+    lines.append(sep)
     lines.append("")
     print("\n".join(lines))
 
@@ -1198,6 +2118,7 @@ def _print_summary_table(request):
     """Print the summary performance table after all tests finish."""
     yield
     _print_perf_table()
+    _print_naive_opt_perf_table()
 
 
 # -- bf16 SSM-state correctness ----------------------------------------
@@ -1261,12 +2182,21 @@ class TestStateDtypeBF16:
         # length) for sane inputs.
         atol = 5e-2
         rtol = 5e-2
+        # bf16-state only diverges from f32-state by one bf16 trunc on the SSM
+        # state (h / v_new are bit-identical; final_state mean abs ~1.6e-5,
+        # max ~2.4e-4 in practice). A 1e-3 mean bound -- far tighter than the
+        # 5e-3 used against the FP32 ref -- guards this feature's narrow
+        # numeric envelope without false positives.
+        mean_atol = 1e-3
         torch.testing.assert_close(
             h_bf16.float(),
             h_f32.float(),
             atol=atol,
             rtol=rtol,
             msg="bf16-state vs f32-state: h mismatch",
+        )
+        _assert_mean_abs_within(
+            h_bf16, h_f32, mean_atol=mean_atol, label="bf16-state vs f32-state h"
         )
         if vn_f32 is not None:
             torch.testing.assert_close(
@@ -1276,6 +2206,12 @@ class TestStateDtypeBF16:
                 rtol=rtol,
                 msg="bf16-state vs f32-state: v_new mismatch",
             )
+            _assert_mean_abs_within(
+                vn_bf16,
+                vn_f32,
+                mean_atol=mean_atol,
+                label="bf16-state vs f32-state v_new",
+            )
         if args.output_final_state:
             torch.testing.assert_close(
                 fs_bf16.float(),
@@ -1283,6 +2219,12 @@ class TestStateDtypeBF16:
                 atol=atol,
                 rtol=rtol,
                 msg="bf16-state vs f32-state: final_state mismatch",
+            )
+            _assert_mean_abs_within(
+                fs_bf16,
+                fs_f32,
+                mean_atol=mean_atol,
+                label="bf16-state vs f32-state final_state",
             )
 
     @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
