@@ -339,7 +339,7 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    MAX_BLOCK_M = 64
+    MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
     if num_queries_per_kv <= 16:
         BLOCK_M = 16
     else:
