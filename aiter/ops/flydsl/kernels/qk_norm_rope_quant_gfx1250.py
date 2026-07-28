@@ -59,7 +59,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
 from flydsl.expr import math as fmath
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl.expr.vector import ReductionOp
 from flydsl._mlir.dialects import llvm, rocdl
@@ -190,7 +190,7 @@ def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
     # bf16 -> i32 dwords: VEC bf16 = VEC/2 dwords
     dwords = vec // 2
     bf16_as_i32 = vector.bitcast(T.vec(dwords, i32), bf16v)
-    off_bytes = row_base_bytes + ArithValue(idx) * (vec * 2)
+    off_bytes = row_base_bytes + idx * (vec * 2)
 
     if const_expr(dwords <= 4):
         buffer_ops.buffer_store(bf16_as_i32, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -203,9 +203,7 @@ def _store_bf16_vec(vals_list, out_rsrc, row_base_bytes, idx, vec):
             T.vec(4, i32), bf16_as_i32, offsets=[4], sizes=[4], strides=[1]
         )
         buffer_ops.buffer_store(lo, out_rsrc, off_bytes, offset_is_bytes=True)
-        buffer_ops.buffer_store(
-            hi, out_rsrc, ArithValue(off_bytes) + 16, offset_is_bytes=True
-        )
+        buffer_ops.buffer_store(hi, out_rsrc, off_bytes + 16, offset_is_bytes=True)
 
 
 def _store_fp8_packed(
@@ -234,10 +232,8 @@ def _store_fp8_packed(
         c_neg_uf = arith.constant(-(2.0**-8), type=f32)
         safe = []
         for v in vals_list:
-            vv = v.ir_value() if hasattr(v, "ir_value") else v
-            is_tn = ArithValue(arith.cmpf(CmpFPredicate.OLT, vv, c0)) & arith.cmpf(
-                CmpFPredicate.OGT, vv, c_neg_uf
-            )
+            vv = ArithValue(v.ir_value() if hasattr(v, "ir_value") else v)
+            is_tn = (vv < c0) & (vv > c_neg_uf)
             safe.append(is_tn.select(c0, vv))
 
     # Pack each group of 4 fp32 into one i32 dword via cvt_pk_fp8_f32.
@@ -251,7 +247,7 @@ def _store_fp8_packed(
         pk = rocdl.cvt_pk_fp8_f32(i32, safe[base + 2], safe[base + 3], pk, 1)
         dword_list.append(pk)
 
-    off_bytes = row_base_bytes + ArithValue(idx) * vec
+    off_bytes = row_base_bytes + idx * vec
     store_vec_ty = T.vec(n_dwords, i32)
     store_vec = vector.from_elements(store_vec_ty, dword_list)
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -411,7 +407,7 @@ def _build_kernel(
                 """Load VEC bf16 from a 1D weight fx.Tensor via raw buffer_load.
                 Splits into dwordx4 chunks for VEC=16."""
                 wrsrc = buffer_ops.create_buffer_resource(weight_tensor, max_size=True)
-                tid_x_vec = ArithValue(tid_val) * VEC
+                tid_x_vec = tid_val * VEC
                 off_dw = tid_x_vec >> 1
                 f32_list = _load_bf16_raw(wrsrc, off_dw)
                 f32_vec = vector.from_elements(T.vec(VEC, f32), f32_list)
@@ -432,14 +428,14 @@ def _build_kernel(
                     bf16_v = vector.extract(
                         vec_bf16, static_position=[i], dynamic_position=[]
                     )
-                    out.append(arith.extf(f32, bf16_v))
+                    out.append(bf16_v.extf(f32))
             else:
                 half_dw = 4
                 half_bf16 = half_dw * 2  # 8 bf16 per chunk
                 for chunk in range_constexpr(dwords // half_dw):
                     r = buffer_ops.buffer_load(
                         rsrc,
-                        ArithValue(off_dw) + (chunk * half_dw),
+                        off_dw + (chunk * half_dw),
                         vec_width=half_dw,
                         dtype=i32,
                     )
@@ -448,7 +444,7 @@ def _build_kernel(
                         bf16_v = vector.extract(
                             vbf16, static_position=[i], dynamic_position=[]
                         )
-                        out.append(arith.extf(f32, bf16_v))
+                        out.append(bf16_v.extf(f32))
             return out
 
         bid_x = fx.block_idx.x  # 0..H-1 (Q head) or H (KV)
@@ -461,11 +457,11 @@ def _build_kernel(
         # valid token instead of branching: they recompute an already-valid row
         # and write byte-identical results (idempotent), so there is no OOB
         # access and no divergent bounds check on the hot path.
-        tok = ArithValue(bid_t) * ROWS_PER_WG + ArithValue(tid_y)
-        _nt_m1 = _to_raw(ArithValue(_to_raw(num_tokens)) - 1)
-        tok = ArithValue(arith.minsi(_to_raw(tok), _nt_m1))
+        tok = bid_t * ROWS_PER_WG + tid_y
+        _nt_m1 = _to_raw(num_tokens - 1)
+        tok = arith.minsi(_to_raw(tok), _nt_m1)
         bid_t = tok  # all downstream token offsets use the clamped token
-        bid_t_idx = arith.index_cast(T.index, _to_raw(tok))
+        bid_t_idx = tok.index_cast(T.index)
 
         def _ptr_buffer_resource(ptr, num_records_bytes=None):
             addr = fx.ptrtoint(ptr)
@@ -479,14 +475,13 @@ def _build_kernel(
         # --- shared: load position (i64 -> i32) ---
         pos_rsrc = _ptr_buffer_resource(positions)
         pos_val_i64 = buffer_ops.buffer_load(pos_rsrc, bid_t, vec_width=1, dtype=T.i64)
-        pos_i32 = arith.trunci(i32, pos_val_i64)
+        pos_i32 = pos_val_i64.trunci(i32)
 
         # --- shared: cos/sin buffer resources (all threads load, NOPE
         # threads clamp index to 0 so the load is in-bounds/harmless) ---
         cos_rsrc = buffer_ops.create_buffer_resource(cos_cache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(sin_cache, max_size=True)
-        c_half_rd = arith.constant(RD // 2, type=i32)
-        cos_sin_row_base = ArithValue(pos_i32) * c_half_rd
+        cos_sin_row_base = pos_i32 * (RD // 2)
 
         def wave_reduce_add(x):
             w = _to_raw(x)
@@ -515,16 +510,10 @@ def _build_kernel(
             VEC-wide fp32 vectors already loaded by the caller."""
             # ---- Issue cos/sin loads EARLY so they overlap with the
             # sumsq reduction ALU below (latency hiding). ----
-            is_rope_t = arith.cmpi(
-                CmpIPredicate.sge,
-                _to_raw(tid),
-                arith.constant(ROPE_THREAD_LO, type=i32),
-            )
-            rope_rel_raw = ArithValue(tid) - arith.constant(ROPE_THREAD_LO, type=i32)
+            is_rope_t = _to_raw(tid >= ROPE_THREAD_LO)
+            rope_rel_raw = tid - ROPE_THREAD_LO
             rope_rel = arith.maxsi(_to_raw(rope_rel_raw), arith.constant(0, type=i32))
-            cs_off = cos_sin_row_base + ArithValue(rope_rel) * arith.constant(
-                PAIRS_PER_THREAD, type=i32
-            )
+            cs_off = cos_sin_row_base + rope_rel * PAIRS_PER_THREAD
             if const_expr(PAIRS_PER_THREAD == 1):
                 cos_raw = buffer_ops.buffer_load(
                     cos_rsrc, cs_off, vec_width=1, dtype=T.bf16
@@ -595,9 +584,9 @@ def _build_kernel(
                 group_idx = tid >> log2_tpg
                 lane_in_group = tid & (TPG - 1)
                 if lane_in_group == 0:
-                    my_scale_off = scale_base_off + ArithValue(group_idx)
+                    my_scale_off = scale_base_off + group_idx
                     if const_expr(is_e8m0):
-                        e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased).result
+                        e8m0_i8 = e8m0_biased.trunci(T.i8)
                         buffer_ops.buffer_store(e8m0_i8, scale_rsrc, my_scale_off)
                     else:
                         buffer_ops.buffer_store(scale_val, scale_rsrc, my_scale_off)
@@ -615,25 +604,19 @@ def _build_kernel(
 
             # ---- Extract cos/sin values (loads issued early, now consumed) ----
             if const_expr(PAIRS_PER_THREAD == 1):
-                cos_vals = [arith.extf(f32, cos_raw)]
-                sin_vals = [arith.extf(f32, sin_raw)]
+                cos_vals = [cos_raw.extf(f32)]
+                sin_vals = [sin_raw.extf(f32)]
             else:
                 cos_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            cos_raw, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    vector.extract(
+                        cos_raw, static_position=[i], dynamic_position=[]
+                    ).extf(f32)
                     for i in range(PAIRS_PER_THREAD)
                 ]
                 sin_vals = [
-                    arith.extf(
-                        f32,
-                        vector.extract(
-                            sin_raw, static_position=[i], dynamic_position=[]
-                        ),
-                    )
+                    vector.extract(
+                        sin_raw, static_position=[i], dynamic_position=[]
+                    ).extf(f32)
                     for i in range(PAIRS_PER_THREAD)
                 ]
 
@@ -644,9 +627,9 @@ def _build_kernel(
                 o = scaled_raw[2 * k + 1]
                 c = cos_vals[k]
                 s = sin_vals[k]
-                rotated[2 * k] = arith.subf(
-                    arith.MulFOp(e, c, fastmath=fm_fast).result,
-                    arith.MulFOp(o, s, fastmath=fm_fast).result,
+                rotated[2 * k] = (
+                    arith.MulFOp(e, c, fastmath=fm_fast).result
+                    - arith.MulFOp(o, s, fastmath=fm_fast).result
                 )
                 rotated[2 * k + 1] = arith.AddFOp(
                     arith.MulFOp(e, s, fastmath=fm_fast).result,
@@ -655,7 +638,7 @@ def _build_kernel(
                 ).result
 
             final_list = [
-                arith.select(is_rope_t, rotated[i], scaled_raw[i])
+                ArithValue(is_rope_t).select(rotated[i], scaled_raw[i])
                 for i in range_constexpr(VEC)
             ]
 
@@ -679,9 +662,7 @@ def _build_kernel(
                         )
 
         # ============ runtime dispatch on bid_x < H ============
-        q_tok_off_bytes = arith.MulIOp(
-            bid_t_idx, arith.constant(H * D * 2, type=T.index)
-        ).result
+        q_tok_off_bytes = bid_t_idx * (H * D * 2)
 
         if bid_x < H:
             # ---------- Q path ----------
@@ -689,11 +670,7 @@ def _build_kernel(
             # Q load: use raw buffer_load to handle VEC=16 correctly.
             q_in_rsrc = _ptr_buffer_resource(q_in)
             # Per-token byte offset → dword offset for Q input.
-            q_row_off_elems = (
-                ArithValue(bid_t) * (H * D)
-                + ArithValue(head_idx) * D
-                + ArithValue(tid) * VEC
-            )
+            q_row_off_elems = bid_t * (H * D) + head_idx * D + tid * VEC
             q_off_dw = q_row_off_elems >> 1
             q_f32_list = _load_bf16_raw(q_in_rsrc, q_off_dw)
             q_f32_fly_vec = vector.from_elements(T.vec(VEC, f32), q_f32_list)
@@ -709,9 +686,7 @@ def _build_kernel(
                 qw_f32 = None
 
             if const_expr(quant):
-                q_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(H * D, type=T.index)
-                ).result
+                q_tok_off_fp8 = bid_t_idx * (H * D)
                 qo_g_tmp = GTensor(
                     q_out,
                     dtype=T.i8,
@@ -719,11 +694,9 @@ def _build_kernel(
                     static_bytes_offset_i64=q_tok_off_fp8,
                 )
                 qo_rsrc = qo_g_tmp.rsrc
-                row_base_bytes = ArithValue(head_idx) * D
+                row_base_bytes = head_idx * D
                 qs_rsrc = _ptr_buffer_resource(q_scale)
-                scale_base_off_q = (
-                    ArithValue(bid_t) * (H * NG) + ArithValue(head_idx) * NG
-                )
+                scale_base_off_q = bid_t * (H * NG) + head_idx * NG
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
@@ -743,7 +716,7 @@ def _build_kernel(
                     static_bytes_offset_i64=q_tok_off_bytes,
                 )
                 qo_rsrc = qo_g_tmp.rsrc
-                row_base_bytes_q = ArithValue(head_idx) * (D * 2)
+                row_base_bytes_q = head_idx * (D * 2)
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
@@ -757,9 +730,7 @@ def _build_kernel(
         else:
             # ---------- KV path ----------
             kv_rsrc = _ptr_buffer_resource(kv_in)
-            kv_off_elems = (
-                ArithValue(bid_t) * ArithValue(kv_in_row_stride) + ArithValue(tid) * VEC
-            )
+            kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
             kv_off_dw = kv_off_elems >> 1
 
             kv_f32_list = _load_bf16_raw(kv_rsrc, kv_off_dw)
@@ -772,9 +743,7 @@ def _build_kernel(
             w_f32 = w_vec.to(fx.Float32)
 
             if const_expr(quant):
-                kv_tok_off_fp8 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D, type=T.index)
-                ).result
+                kv_tok_off_fp8 = bid_t_idx * D
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.i8,
@@ -784,7 +753,7 @@ def _build_kernel(
                 kvo_rsrc = kvo_g_tmp.rsrc
                 row_base_bytes = arith.constant(0, type=i32)
                 kvs_rsrc = _ptr_buffer_resource(kv_scale)
-                scale_base_off_kv = ArithValue(bid_t) * NG
+                scale_base_off_kv = bid_t * NG
                 emit_body(
                     weighted=True,
                     x_f32_vec=x_vec_f32,
@@ -796,9 +765,7 @@ def _build_kernel(
                     scale_base_off=scale_base_off_kv,
                 )
             else:
-                kv_tok_off_bf16 = arith.MulIOp(
-                    bid_t_idx, arith.constant(D * 2, type=T.index)
-                ).result
+                kv_tok_off_bf16 = bid_t_idx * (D * 2)
                 kvo_g_tmp = GTensor(
                     kv_out,
                     dtype=T.bf16,
@@ -817,34 +784,26 @@ def _build_kernel(
                     bid_i32 = buffer_ops.buffer_load(
                         bid_rsrc, bid_t, vec_width=1, dtype=i32
                     )
-                    do_swa = ArithValue(bid_i32) >= 0
+                    do_swa = bid_i32 >= 0
                     bid_safe = arith.maxsi(bid_i32, arith.constant(0, type=i32))
                     if const_expr(paged):
                         blk = arith.divsi(pos_i32, _to_raw(swa_cache_size))
-                        bt_off = ArithValue(bid_safe) * ArithValue(
-                            swa_slot_stride
-                        ) + ArithValue(blk)
+                        bt_off = bid_safe * swa_slot_stride + blk
                         bt_rsrc = _ptr_buffer_resource(state_slot_mapping)
                         phys = buffer_ops.buffer_load(
                             bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
                         )
-                        in_blk = arith.remsi(pos_i32, _to_raw(swa_cache_size))
-                        row = ArithValue(phys) * ArithValue(
-                            swa_cache_size
-                        ) + ArithValue(in_blk)
-                        swa_off_elems = ArithValue(row) * ArithValue(swa_pos_stride)
+                        in_blk = pos_i32 % swa_cache_size
+                        row = phys * swa_cache_size + in_blk
+                        swa_off_elems = row * swa_pos_stride
                     else:
                         slot_rsrc = _ptr_buffer_resource(state_slot_mapping)
                         slot = buffer_ops.buffer_load(
                             slot_rsrc, bid_safe, vec_width=1, dtype=i32
                         )
-                        ring = arith.remsi(pos_i32, _to_raw(swa_cache_size))
-                        swa_off_elems = ArithValue(slot) * ArithValue(
-                            swa_slot_stride
-                        ) + ArithValue(ring) * ArithValue(swa_pos_stride)
-                    swa_off_bytes = arith.index_cast(
-                        T.index, _to_raw(swa_off_elems)
-                    ) * arith.constant(2, type=T.index)
+                        ring = pos_i32 % swa_cache_size
+                        swa_off_elems = slot * swa_slot_stride + ring * swa_pos_stride
+                    swa_off_bytes = swa_off_elems.index_cast(T.index) * 2
                     swa_g_tmp = GTensor(
                         swa_kv,
                         dtype=T.bf16,
@@ -893,12 +852,12 @@ def _build_kernel(
     ):
         # grid.y = ceil(num_tokens / ROWS_PER_WG): each workgroup covers
         # ROWS_PER_WG tokens (one per wave via thread_idx.y).
-        _nt = ArithValue(_to_raw(num_tokens))
+        _nt = num_tokens
         _gy_i32 = arith.divsi(
             _to_raw(_nt + ROWS_PER_WG - 1),
             arith.constant(ROWS_PER_WG, type=T.i32),
         )
-        idx_grid_y = arith.index_cast(T.index, _gy_i32)
+        idx_grid_y = _gy_i32.index_cast(T.index)
         k = kernel(
             q_in,
             kv_in,
