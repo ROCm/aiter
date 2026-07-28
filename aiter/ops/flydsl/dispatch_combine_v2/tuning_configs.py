@@ -136,8 +136,8 @@ _GFX1250_SCHED_BF16 = (
     (128, 128, 8, 64, 2),  # <=128:  latency-bound; combine warp 2 (fewest warps win)
     (512, 192, 32, 64, 4),  # <=512:  disp peak; comb 64/4
     (1536, 192, 32, 96, 4),  # <=1536: comb block 96
-    (4096, 192, 32, 128, 4),  # <=4096: comb block 128
-    (None, 192, 32, 128, 8),  # >4096:  comb warp 8
+    (4096, 192, 32, 128, 8),  # <=4096: comb block 128, warp 8 (#500)
+    (None, 192, 32, 192, 8),  # >4096:  comb block 192, warp 8 (#500; 242/273 GB/s @8192/16384)
 )
 _GFX1250_DEFAULT = dict(
     dispatch_block_num=192,

@@ -549,7 +549,7 @@ def make_combine(
     fp8_direct_cast=False,
     fp4=False,
     reset_total_recv=True,
-    _unroll=2,
+    _unroll=4,
 ):
     # Transport dtype = external dtype; fp8_direct_cast wires fp8 while the output
     # stays bf16 (2 i32 per fp8 unit). fp4: i32 = 8 fp4.
@@ -590,17 +590,10 @@ def make_combine(
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
-        # ── Stage 1: cross-device entry barrier (xdb) ──
-        # The grid barrier (comb_bar) is REQUIRED so every block reads xdb_cur_flag
-        # before block 0 bumps xdb_flag; else a slow block reads the bumped flag and
-        # the per-peer == handshake deadlocks.
-        fx.barrier()
-        if tid == 0:
-            P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+        # ── Stage 1: cross-device entry barrier (block 0 only) ──
+        # Block 0 handles the full xdb handshake, then signals other blocks
+        # via comb_bar. Eliminates the grid barrier and per-block xdb spin.
         if grid_thread_id < npes:
-            P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
-            P.fence_system_acquire()
-            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
@@ -609,14 +602,23 @@ def make_combine(
             P.atomic_add_global(
                 fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
             )
-        if tid < npes:
+        if grid_thread_id < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
+            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-            P.fence_system_acquire()
-        fx.barrier()
-        P.fence_system_acquire()  # ALL threads: peers' out_tok visible
+        if bid == 0:
+            fx.barrier()
+            if tid == 0:
+                P.store_i32_system(
+                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
+                )
+        if bid != 0:
+            if tid == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
+            fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -649,10 +651,13 @@ def make_combine(
             expert_valids = []
             expert_pes = []
             expert_toks = []
+            # One coalesced tok_map load per lane, then broadcast each k_slot
+            # via readlane (replaces K per-k_slot buffer_loads).
+            encoded_my = buffer_load(
+                rsrc_tok_map, tok_map_base + lane, vec_width=1, dtype=T.i32()
+            )
             for k_slot in range_constexpr(experts_per_token):
-                encoded_k = buffer_load(
-                    rsrc_tok_map, tok_map_base + k_slot, vec_width=1, dtype=T.i32()
-                )
+                encoded_k = readlane(T.i32(), encoded_my, k_slot)
                 dest_pe_k = encoded_k // max_recv  # sentinel: dest_pe == npes
                 dest_tok_k = encoded_k % max_recv  # peer-local recv slot
                 valid_k = dest_pe_k < npes
@@ -796,6 +801,13 @@ def make_combine(
                         _one(unit_base + u)
 
             _accum_loop()
+
+        # Epilogue: block 0 waits for every other block to finish (comb_bar
+        # increments from Stage-1), then resets comb_bar for the next call.
+        if global_warp_id == 0:
+            if lane == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
+                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(
@@ -1092,7 +1104,8 @@ def make_combine_scatter(
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
         # ── Stage 2: cross-device barrier ──
-        # release Stage-1's P2P writes before signaling peers (else Stage-3 races them)
+        # Grid sync ensures all blocks finished Stage-1 scatter writes.
+        # Block 0 then handles xdb and signals completion via comb_bar.
         P.fence_system_release()
         fx.barrier()
         if tid == 0:
@@ -1100,7 +1113,6 @@ def make_combine_scatter(
         if grid_thread_id < npes:
             P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
             P.fence_system_acquire()
-            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
@@ -1109,14 +1121,25 @@ def make_combine_scatter(
             P.atomic_add_global(
                 fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
             )
-        if tid < npes:
+        if grid_thread_id < npes:
             xdb_slot = fx.Int64(window.lsa_ptr(my_lsa_rank, off_xdb_mem)) + fx.Int64(
-                tid
+                grid_thread_id
             ) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_slot, xdb_cur_flag)
-            P.fence_system_acquire()
-        fx.barrier()
-        P.fence_system_acquire()
+        if bid == 0:
+            fx.barrier()
+            if tid == 0:
+                P.store_i32_system(
+                    fx.Int64(addr_comb_bar),
+                    arith.constant(0),
+                    arith.constant(block_num + 1),
+                )
+        if bid != 0:
+            if tid == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num)
+            fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
         if const_expr(reset_total_recv):
             if tid == 0:
                 buffer_store(arith.constant(0), rsrc_total_recv, 0)
@@ -1279,6 +1302,13 @@ def make_combine_scatter(
                         _one(unit_base + u)
 
             _loop()
+
+        # Epilogue: block 0 waits for every other block's Stage-3 completion
+        # (comb_bar reached 2*block_num), then resets comb_bar for the next call.
+        if global_warp_id == 0:
+            if lane == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 2 * block_num - 1)
+                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(
