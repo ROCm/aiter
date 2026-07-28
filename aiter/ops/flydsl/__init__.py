@@ -57,6 +57,7 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .latent_moe_tail import latent_moe_tail, supports_latent_moe_tail
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
@@ -70,6 +71,8 @@ if is_flydsl_available():
         "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "latent_moe_tail",
+        "supports_latent_moe_tail",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
