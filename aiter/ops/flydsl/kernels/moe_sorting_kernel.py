@@ -180,6 +180,7 @@ def _lds_store_raw(raw_ptr, val, idx):
 
 
 _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
+_dummy_local_tokens_cache = {}  #  dummy placeholder when has_local_tokens=False
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,7 @@ def _compile_moe_sorting_oneshot(
     max_tokens: int = 128,
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
+    has_local_tokens: bool = False,
 ):
     """Compile the oneshot MoE sorting kernel (single kernel, all phases in LDS).
 
@@ -203,9 +205,18 @@ def _compile_moe_sorting_oneshot(
     topk : int
         Experts per token (e.g. 8 for DeepSeek R1).
     max_tokens : int
-        Upper bound on T for LDS sizing. Actual T is passed at runtime.
+        Upper bound on T for LDS sizing (always the static padded capacity,
+        never the dynamic per-call count -- keeps LDS size, grid/workspace
+        sizing, and kernel-variant selection identical across CUDA graph
+        capture and replay).
     unit_size : int
         GEMM tile-M for padding alignment (default 32).
+    has_local_tokens : bool
+        When True, an extra ``p_local_tokens`` [1]-element i32 tensor arg is
+        read on-device for the *exact* per-call token count, used for data-dependent loop bounds and the
+        ``num_valid_ids[1]`` output. Never synced to host -- CUDA-graph-safe.
+        The sentinel value written into padding rows always uses the static
+        ``max_tokens``-scale ``i32_tokens`` arg.
     """
     arch = get_hip_arch()
     E = num_experts
@@ -260,6 +271,7 @@ def _compile_moe_sorting_oneshot(
         num_valid_ids: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
     ):
@@ -267,7 +279,15 @@ def _compile_moe_sorting_oneshot(
         tid = gpu.thread_idx.x
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
+
         tokens = i32_tokens
+        if has_local_tokens:
+            ltok_rsrc = buffer_ops.create_buffer_resource(
+                local_tokens_tensor, max_size=True
+            )
+            tokens = buffer_ops.buffer_load(
+                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
         c_zero_i32 = fx.Int32(0)
         c_one_i32 = fx.Int32(1)
         c_oob_idx = fx.Int32(0x7FFFFFFF)
@@ -612,7 +632,7 @@ def _compile_moe_sorting_oneshot(
                 sorted_w_rsrc,
                 c_zero_i32,
                 total_padded_pre,
-                c_sentinel | tokens,
+                c_sentinel | i32_tokens,
                 ONESHOT_BLOCK,
                 tid,
                 c_oob_idx,
@@ -746,11 +766,13 @@ def _compile_moe_sorting_oneshot(
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = moe_sorting_oneshot_kernel(
             topk_ids_tensor,
             topk_weights_tensor,
@@ -760,6 +782,7 @@ def _compile_moe_sorting_oneshot(
             num_valid_ids_out,
             moe_buf,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_moe_buf_elems,
         )
@@ -794,6 +817,7 @@ def _compile_moe_sorting_multiphase(
     topk: int,
     unit_size: int = UNIT_SIZE,
     has_mask: bool = False,
+    has_local_tokens: bool = False,
     k4_block: int = 256,
 ):
     """Compile the multiphase MoE sorting kernels (2 or 4 kernels via HBM workspace).
@@ -855,11 +879,12 @@ def _compile_moe_sorting_multiphase(
         my_start,
         my_end,
         i32_mesh_stride,
+        i32_scan_words_per_row,
         c_topk,
         K4_BLOCK,
         has_mask,
     ):
-        """P23 Step 4: EP mask check, read uint8 mesh, DPP prefix sum, scatter tokens."""
+
         lane = tid % WARP_SIZE
         wave = tid // WARP_SIZE
         K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
@@ -871,7 +896,7 @@ def _compile_moe_sorting_multiphase(
                 mask_rsrc, my_expert, vec_width=1, dtype=T.i32
             )
             p23_bid_enabled = p23_bid_mask != c_zero
-        i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
+        i32_words_per_row = i32_scan_words_per_row
         n_mesh_iters = (my_start != my_end).select(
             (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) // fx.Int32(K4_BLOCK), c_zero
         )
@@ -997,8 +1022,9 @@ def _compile_moe_sorting_multiphase(
         workspace: fx.Tensor,
         i32_total_elems: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = clear_workspace_kernel(workspace, i32_total_elems)
         launcher.launch(grid=(n_grid, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 
@@ -1012,6 +1038,7 @@ def _compile_moe_sorting_multiphase(
     def p0_scatter_kernel(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_niters: fx.Int32,
@@ -1024,7 +1051,15 @@ def _compile_moe_sorting_multiphase(
         c_topk = fx.Int32(topk)
         c_one = fx.Int32(1)
 
-        total = i32_tokens * c_topk
+        tokens_ = i32_tokens
+        if has_local_tokens:
+            ltok_rsrc = buffer_ops.create_buffer_resource(
+                local_tokens_tensor, max_size=True
+            )
+            tokens_ = buffer_ops.buffer_load(
+                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
+        total = tokens_ * c_topk
 
         _s = fx.Index(0)
         _e = ArithValue(i32_niters).index_cast(T.index)
@@ -1047,14 +1082,21 @@ def _compile_moe_sorting_multiphase(
     def launch_p0(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_niters: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p0_scatter_kernel(
-            topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_niters
+            topk_ids,
+            workspace,
+            local_tokens_tensor,
+            i32_tokens,
+            i32_mesh_stride,
+            i32_niters,
         )
         launcher.launch(grid=(n_grid, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
 
@@ -1077,6 +1119,8 @@ def _compile_moe_sorting_multiphase(
     def p1_count_kernel(
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
+        i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
     ):
@@ -1092,11 +1136,21 @@ def _compile_moe_sorting_multiphase(
 
         reduce_mr = fx.SharedAllocator().allocate(P1SharedStorage).peek().reduce.ptr
 
+        # Data-dependent scan
+        tokens_ = i32_tokens
+        if has_local_tokens:
+            ltok_rsrc = buffer_ops.create_buffer_resource(
+                local_tokens_tensor, max_size=True
+            )
+            tokens_ = buffer_ops.buffer_load(
+                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
+
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
-        i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
-        n_iters = (i32_words_per_row + fx.Int32(K3_WORDS_PER_ITER - 1)) >> fx.Int32(
-            K3_WORDS_PER_ITER_LOG2
-        )
+        i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
+        n_iters = (
+            i32_scan_words_per_row + fx.Int32(K3_WORDS_PER_ITER - 1)
+        ) >> fx.Int32(K3_WORDS_PER_ITER_LOG2)
 
         if has_mask:
             mask_rsrc = buffer_ops.create_buffer_resource(
@@ -1123,14 +1177,16 @@ def _compile_moe_sorting_multiphase(
             word_base = fx.Int32(_i) * fx.Int32(K3_WORDS_PER_ITER) + tid * fx.Int32(
                 K3_VEC_WIDTH
             )
-            valid = word_base < i32_words_per_row
+            valid = word_base < i32_scan_words_per_row
             safe_addr = mesh_row_i32_base + valid.select(word_base, c_zero)
             vec4 = buffer_ops.buffer_load(ws_rsrc, safe_addr, vec_width=4, dtype=T.i32)
 
             iter_cnt = c_zero
             for _wi in range_constexpr(K3_VEC_WIDTH):
                 word = Vec(vec4)[_wi]
-                word_valid = valid & ((word_base + fx.Int32(_wi)) < i32_words_per_row)
+                word_valid = valid & (
+                    (word_base + fx.Int32(_wi)) < i32_scan_words_per_row
+                )
                 b0 = word & c_ff
                 b1 = (word >> fx.Int32(8)) & c_ff
                 b2 = (word >> fx.Int32(16)) & c_ff
@@ -1174,12 +1230,20 @@ def _compile_moe_sorting_multiphase(
     def launch_p1(
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
+        i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p1_count_kernel(
-            workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size
+            workspace,
+            expert_mask_tensor,
+            local_tokens_tensor,
+            i32_tokens,
+            i32_mesh_stride,
+            i32_mesh_size,
         )
         launcher.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
 
@@ -1206,6 +1270,7 @@ def _compile_moe_sorting_multiphase(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
@@ -1227,14 +1292,34 @@ def _compile_moe_sorting_multiphase(
 
         reduce_mr = fx.SharedAllocator().allocate(P0V2SharedStorage).peek().reduce.ptr
 
-        # Precompute mesh row base (in i32 words) and words per row
         mesh_row_i32_base = (eid * i32_mesh_stride) >> fx.Int32(2)
+
         i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
 
-        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
-        total_assignments = i32_tokens * c_topk
-        scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+        tokens_ = i32_tokens
+        if has_local_tokens:
+            ltok_rsrc = buffer_ops.create_buffer_resource(
+                local_tokens_tensor, max_size=True
+            )
+            tokens_ = buffer_ops.buffer_load(
+                ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+            )
 
+        # Phase 3 (count) only needs to scan words that can hold real mesh
+        # bytes -- the first tokens_ columns (dynamic per-call count), never
+        # the full static row width used by Phase 1's clear.
+        i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
+
+        clear_niters = (i32_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+        total_assignments = tokens_ * c_topk
+        scatter_niters = (total_assignments + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(9)
+        count_niters = (i32_scan_words_per_row + fx.Int32(P0V2_BLOCK - 1)) >> fx.Int32(
+            9
+        )
+
+        # Hoist before if/else: AST rewriter extracts branches into separate
+        # functions, so variables must be defined in outer scope first.
+        is_local_expert = c_one != c_zero
         # EP: load mask, write cumsum=0 for masked experts, set loop bounds to 0
         if has_mask:
             m_val = buffer_ops.buffer_load(mask_rsrc, eid, vec_width=1, dtype=T.i32)
@@ -1245,6 +1330,7 @@ def _compile_moe_sorting_multiphase(
             )
             clear_niters = is_local_expert.select(clear_niters, c_zero)
             scatter_niters = is_local_expert.select(scatter_niters, c_zero)
+            count_niters = is_local_expert.select(count_niters, c_zero)
 
         # ---- Phase 1: Clear this expert's mesh row ----
         for _ci in range(
@@ -1293,7 +1379,6 @@ def _compile_moe_sorting_multiphase(
         gpu.barrier()
 
         # ---- Phase 3: Count non-zero bytes + warp/cross-wave reduce ----
-        count_niters = clear_niters  # same loop structure, reuse (already EP-gated)
         for _ki, state in range(
             fx.Index(0),
             ArithValue(count_niters).index_cast(T.index),
@@ -1303,7 +1388,7 @@ def _compile_moe_sorting_multiphase(
             cnt_so_far = state[0]
 
             word_base = fx.Int32(_ki) * c_block + tid
-            valid = word_base < i32_words_per_row
+            valid = word_base < i32_scan_words_per_row
             safe_addr = mesh_row_i32_base + valid.select(word_base, c_zero)
             word = buffer_ops.buffer_load(ws_rsrc, safe_addr, vec_width=1, dtype=T.i32)
 
@@ -1351,15 +1436,18 @@ def _compile_moe_sorting_multiphase(
         topk_ids: fx.Tensor,
         workspace: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p0v2_kernel(
             topk_ids,
             workspace,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
             i32_mesh_size,
@@ -1392,6 +1480,7 @@ def _compile_moe_sorting_multiphase(
         num_valid_ids: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
@@ -1447,6 +1536,15 @@ def _compile_moe_sorting_multiphase(
         # Each block independently: prefix sum (redundant), scatter for its expert only.
         if is_sort_block:
             my_expert = bid
+
+            tokens_ = i32_tokens
+            if has_local_tokens:
+                ltok_rsrc = buffer_ops.create_buffer_resource(
+                    local_tokens_tensor, max_size=True
+                )
+                tokens_ = buffer_ops.buffer_load(
+                    ltok_rsrc, fx.Int32(0), vec_width=1, dtype=T.i32
+                )
 
             # Step 1: Load expert counts from workspace -> pad to unit_size -> LDS cumsum
             # Process E experts in chunks of K4_BLOCK (256). Most models have
@@ -1537,7 +1635,7 @@ def _compile_moe_sorting_multiphase(
                     num_valid_ids, max_size=True
                 )
                 buffer_ops.buffer_store(total_padded, nvalid_rsrc, c_zero)
-                buffer_ops.buffer_store(i32_tokens, nvalid_rsrc, c_one)
+                buffer_ops.buffer_store(tokens_, nvalid_rsrc, c_one)
 
             # Step 3: Write sorted_expert_ids for THIS expert (using local_idx_p23 for EP)
             # Store local_idx to LDS cumsum[tid], barrier, read cumsum[my_expert]
@@ -1563,6 +1661,8 @@ def _compile_moe_sorting_multiphase(
             )
 
             # Step 4: Mesh-based scatter (EP mask + uint8 mesh read + DPP prefix sum + scatter)
+
+            i32_scan_words_per_row = (tokens_ + fx.Int32(3)) >> fx.Int32(2)
             scatter_end_pos_t0 = _p23_scatter_mesh(
                 tid,
                 scatter_mr,
@@ -1575,6 +1675,7 @@ def _compile_moe_sorting_multiphase(
                 my_start,
                 my_end,
                 i32_mesh_stride,
+                i32_scan_words_per_row,
                 c_topk,
                 K4_BLOCK,
                 has_mask,
@@ -1602,13 +1703,15 @@ def _compile_moe_sorting_multiphase(
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         launcher = p23_kernel(
             workspace,
             topk_weights_tensor,
@@ -1618,6 +1721,7 @@ def _compile_moe_sorting_multiphase(
             num_valid_ids_out,
             moe_buf,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
             i32_mesh_size,
@@ -1636,17 +1740,20 @@ def _compile_moe_sorting_multiphase(
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
         i32_moe_buf_elems: fx.Int32,
         n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         l1 = p0v2_kernel(
             topk_ids,
             workspace,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
             i32_mesh_size,
@@ -1662,6 +1769,7 @@ def _compile_moe_sorting_multiphase(
             num_valid_ids_out,
             moe_buf,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
             i32_mesh_size,
@@ -1680,6 +1788,7 @@ def _compile_moe_sorting_multiphase(
         num_valid_ids_out: fx.Tensor,
         moe_buf: fx.Tensor,
         expert_mask_tensor: fx.Tensor,
+        local_tokens_tensor: fx.Tensor,
         i32_tokens: fx.Int32,
         i32_mesh_stride: fx.Int32,
         i32_mesh_size: fx.Int32,
@@ -1689,18 +1798,29 @@ def _compile_moe_sorting_multiphase(
         n_grid_k1: fx.Int32,
         n_grid_k2: fx.Int32,
         n_grid_p23: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = None,
     ):
+        stream = stream if stream is not None else fx.Stream(None)
         l1 = clear_workspace_kernel(workspace, i32_ws_total)
         l1.launch(grid=(n_grid_k1, 1, 1), block=(K1_BLOCK, 1, 1), stream=stream)
 
         l2 = p0_scatter_kernel(
-            topk_ids, workspace, i32_tokens, i32_mesh_stride, i32_p0_niters
+            topk_ids,
+            workspace,
+            local_tokens_tensor,
+            i32_tokens,
+            i32_mesh_stride,
+            i32_p0_niters,
         )
         l2.launch(grid=(n_grid_k2, 1, 1), block=(K2_BLOCK, 1, 1), stream=stream)
 
         l3 = p1_count_kernel(
-            workspace, expert_mask_tensor, i32_mesh_stride, i32_mesh_size
+            workspace,
+            expert_mask_tensor,
+            local_tokens_tensor,
+            i32_tokens,
+            i32_mesh_stride,
+            i32_mesh_size,
         )
         l3.launch(grid=(E, 1, 1), block=(K3_BLOCK, 1, 1), stream=stream)
 
@@ -1713,6 +1833,7 @@ def _compile_moe_sorting_multiphase(
             num_valid_ids_out,
             moe_buf,
             expert_mask_tensor,
+            local_tokens_tensor,
             i32_tokens,
             i32_mesh_stride,
             i32_mesh_size,
@@ -1781,6 +1902,7 @@ def compile_moe_sorting(
     max_tokens=128,
     unit_size=UNIT_SIZE,
     has_mask=False,
+    has_local_tokens=False,
     k4_block=256,
 ):
     """Compile MoE sorting kernels for all paths (oneshot + multiphase).
@@ -1794,12 +1916,14 @@ def compile_moe_sorting(
         max_tokens=max_tokens,
         unit_size=unit_size,
         has_mask=has_mask,
+        has_local_tokens=has_local_tokens,
     )
     _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_multiphase(
         num_experts=num_experts,
         topk=topk,
         unit_size=unit_size,
         has_mask=has_mask,
+        has_local_tokens=has_local_tokens,
         k4_block=k4_block,
     )
     return launch_oneshot, launch_p0v2_p23, launch_4k_fused
@@ -1831,19 +1955,45 @@ def moe_sorting_flydsl(
     All output tensors (sorted_ids, sorted_weights, sorted_expert_ids,
     num_valid_ids, moe_buf) must be pre-allocated by the caller.
 
+    ``num_local_tokens``, when a CUDA tensor, is never read on the host (no
+    ``.item()``/sync -- this is what makes the whole path safe to call from
+    inside ``torch.cuda.graph()`` capture, e.g. under DP-attention + EP). Host
+    -side sizing (LDS, workspace, grid dims, which kernel variant to launch)
+    always uses the static padded capacity ``topk_ids.shape[0]`` instead, so
+    kernel selection is identical across capture and replay regardless of the
+    real per-call token count. The exact count is read **on-device** inside
+    the compiled kernel (mirroring Opus's ``p_local_tokens`` pattern) and used
+    only for data-dependent loop bounds / the ``num_valid_ids[1]`` output.
+
     Returns
     -------
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf
     """
     topk = topk_ids.shape[1]
-    if num_local_tokens is not None:
-        M = (
-            num_local_tokens.item()
-            if isinstance(num_local_tokens, torch.Tensor)
-            else int(num_local_tokens)
-        )
-    else:
+    has_local_tokens = (
+        isinstance(num_local_tokens, torch.Tensor) and num_local_tokens.is_cuda
+    )
+    if has_local_tokens:
+        local_tokens_tensor = num_local_tokens
         M = topk_ids.shape[0]
+    else:
+        local_tokens_tensor = None
+        if isinstance(num_local_tokens, torch.Tensor):
+            M = int(num_local_tokens.item())
+        else:
+            M = (
+                int(num_local_tokens)
+                if num_local_tokens is not None
+                else topk_ids.shape[0]
+            )
+
+    if local_tokens_tensor is None:
+        local_tokens_tensor = _dummy_local_tokens_cache.get(topk_ids.device)
+        if local_tokens_tensor is None:
+            local_tokens_tensor = torch.zeros(
+                1, dtype=torch.int32, device=topk_ids.device
+            )
+            _dummy_local_tokens_cache[topk_ids.device] = local_tokens_tensor
 
     sub_tokens = _compute_sub_tokens(num_experts)
 
@@ -1890,6 +2040,7 @@ def moe_sorting_flydsl(
             max_tokens=max_tokens,
             unit_size=unit_size,
             has_mask=has_mask,
+            has_local_tokens=has_local_tokens,
         )
         oneshot_args = (
             topk_ids,
@@ -1900,6 +2051,7 @@ def moe_sorting_flydsl(
             num_valid_ids,
             moe_buf_i32,
             mask_tensor,
+            local_tokens_tensor,
             M,
             moe_buf_elems,
             n_grid_blocks,
@@ -1927,6 +2079,7 @@ def moe_sorting_flydsl(
             topk=topk,
             unit_size=unit_size,
             has_mask=has_mask,
+            has_local_tokens=has_local_tokens,
             k4_block=k4_block,
         )
         stream = torch.cuda.current_stream(device)
@@ -1945,6 +2098,7 @@ def moe_sorting_flydsl(
                 num_valid_ids,
                 moe_buf_i32,
                 mask_tensor,
+                local_tokens_tensor,
                 M,
                 mesh_stride,
                 ws_mesh_i32,
@@ -1968,6 +2122,7 @@ def moe_sorting_flydsl(
                 num_valid_ids,
                 moe_buf_i32,
                 mask_tensor,
+                local_tokens_tensor,
                 M,
                 mesh_stride,
                 ws_mesh_i32,
