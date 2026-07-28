@@ -20,6 +20,13 @@ from aiter import (
     dtype2str_dict,
     dtypes,
 )
+from aiter.jit.core import (
+    get_asm_dir,
+    AITER_CSRC_DIR,
+    AITER_CONFIG_FMOE,
+    AITER_CONFIG_GROUPED_FMOE,
+    AITER_ROOT_DIR,
+)
 from aiter.fused_moe import (
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
@@ -3573,7 +3580,7 @@ class FmoeTuner(TunerCommon):
 
         return tasks_flydsl
 
-    def run_config(self, args, target_fused_moe=None, try_extra_ref=False):
+    def run_config(self, args, target_fused_moe=None, try_extra_ref=False, config_string=""):
         from aiter.fused_moe import fused_moe, fused_topk
         from aiter.test_common import checkAllclose, run_perftest
 
@@ -4901,6 +4908,7 @@ class FmoeTuner(TunerCommon):
                         target_fused_moe, config_string=config_string
                     ),
                     try_extra_ref=True,
+                    config_string = config_string,
                 )
             except Exception as e:
                 print(f"{RED}Error with config {config_string}: {e}{END}")
@@ -4973,6 +4981,7 @@ class FmoeTuner(TunerCommon):
             # Merge with existing tuned file: keep existing rows that are not
             # being updated, so repeated runs don't lose entries for shapes
             # where the new kernel doesn't beat the baseline.
+            key_cols = []
             if os.path.exists(output_file):
                 existing_df = pd.read_csv(output_file)
                 # Build key for dedup: use the untuned input columns
