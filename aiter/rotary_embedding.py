@@ -24,20 +24,20 @@
 """Rotary Positional Embeddings."""
 
 import math
+
+# from custom_op import CustomOp
+import os
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 from torch import nn
-from dataclasses import dataclass
+
 from aiter import (
     dtypes,
     fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
     fused_qk_norm_rope_cache_pts_quant_shuffle,
 )
-
-# from custom_op import CustomOp
-
-import os
 
 AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
 AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", 0)) == 1

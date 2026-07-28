@@ -2,19 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import triton
 import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.quant.quant import (
-    _static_per_tensor_quant_fp8_i8_kernel,
+    _dynamic_mxfp4_quant_kernel,
+    _dynamic_mxfp8_quant_kernel,
+    _dynamic_nvfp4_quant_kernel,
     _dynamic_per_tensor_quant_fp8_i8_kernel,
     _dynamic_per_token_quant_fp8_i8_kernel,
-    _dynamic_mxfp4_quant_kernel,
-    _mxfp4_quant_op,
-    _dynamic_mxfp8_quant_kernel,
-    _mxfp8_quant_op,
     _fp8_legacy_to_mxfp8_kernel,
-    _dynamic_nvfp4_quant_kernel,
+    _mxfp4_quant_op,
+    _mxfp8_quant_op,
     _nvfp4_quant_op,
+    _static_per_tensor_quant_fp8_i8_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype

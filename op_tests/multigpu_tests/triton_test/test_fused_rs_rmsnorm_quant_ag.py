@@ -8,20 +8,21 @@ This script tests the fully fused Triton kernel that combines multiple operation
 in a single kernel launch for optimal performance.
 """
 
-import torch
-import torch.distributed as dist
-import os
+import logging
 import multiprocessing as mp
+import os
 import sys
 import traceback
-import logging
+
+import torch
+import torch.distributed as dist
 
 import aiter
-from aiter.test_common import checkAllclose, perftest, ensure_spawn_method
 from aiter.ops.triton.comms import (
     IrisCommContext,
     reduce_scatter_rmsnorm_quant_all_gather,
 )
+from aiter.test_common import checkAllclose, ensure_spawn_method, perftest
 
 logger = logging.getLogger("aiter")
 

@@ -6,11 +6,11 @@ import torch
 from csrc.cpp_itfs.sampling.top_k_renorm_probs import (
     top_k_renorm_probs as top_k_renorm_probs_core,
 )
-from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
-    top_p_sampling_from_probs as top_p_sampling_from_probs_core,
-)
 from csrc.cpp_itfs.sampling.top_k_top_p_sampling_from_probs import (
     top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs_core,
+)
+from csrc.cpp_itfs.sampling.top_p_sampling_from_probs import (
+    top_p_sampling_from_probs as top_p_sampling_from_probs_core,
 )
 from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 

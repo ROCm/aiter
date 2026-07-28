@@ -2,6 +2,7 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_moe_sorting_opus"

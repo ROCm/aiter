@@ -25,6 +25,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -32,7 +33,6 @@ from aiter.ops.shuffle import (
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

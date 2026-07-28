@@ -1,9 +1,10 @@
-from itertools import product
-import os
-import sys
-import triton
 import argparse
+import os
 import subprocess
+import sys
+from itertools import product
+
+import triton
 from _utils import pre_pruning_rules
 
 

@@ -2,16 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
+
 import torch
-import aiter
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
-    sage_fwd,
     map_dims,
+    sage_fwd,
 )
-
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant
-
 from aiter.ops.triton.utils._triton import arch_info
 
 

@@ -22,17 +22,16 @@ import os
 import re
 from functools import lru_cache
 
-import torch
-
-from aiter.jit.utils.chip_info import get_gfx
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import scf
-from flydsl._mlir import ir
+
+from aiter.jit.utils.chip_info import get_gfx
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
 

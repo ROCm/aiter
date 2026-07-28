@@ -6,11 +6,12 @@
 
 #  Top-K on GPU:  1-stage (tiny rows) + 2-stage (large rows) Triton kernels,
 from __future__ import annotations
+
 import math
+
 import torch
 import triton
 import triton.language as tl
-
 
 from aiter.ops.triton._triton_kernels.topk import (
     _topk_kernel,

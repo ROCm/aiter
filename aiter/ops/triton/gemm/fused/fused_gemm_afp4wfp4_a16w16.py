@@ -2,18 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+
 import torch
 import triton
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     _fused_gemm_afp4wfp4_a16w16_kernel,
-    _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _fused_gemm_afp4wfp4_a16w16_reduce_kernel,
+    _fused_gemm_afp4wfp4_preshuffle_a16w16_kernel,
     _get_config,
 )
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()

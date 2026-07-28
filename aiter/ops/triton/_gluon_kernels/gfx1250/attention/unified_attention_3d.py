@@ -1,16 +1,17 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
-from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton import arch_info
-from triton.language.core import _aggregate as aggregate
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 import math
+
+import torch
+import triton.experimental.gluon.language as gl
+import triton.language as tl
+from triton.experimental import gluon
+from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 

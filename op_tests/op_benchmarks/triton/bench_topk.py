@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import argparse
 import itertools
 import math
@@ -7,15 +8,17 @@ import shutil
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import triton
 from triton.testing import runtime
+
 from aiter.ops.triton.topk import topk as triton_topk
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
+    get_model_configs,
 )
 
 DEVICE = "cuda"

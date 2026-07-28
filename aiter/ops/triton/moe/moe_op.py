@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
-from typing import Any
-from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
+
 from aiter.ops.triton._triton_kernels.moe.moe_op import (
-    _fused_moe_kernel_gptq_awq,
-    _fused_moe_persistent_kernel_gptq_awq,
     _fused_moe_kernel,
+    _fused_moe_kernel_gptq_awq,
     _fused_moe_persistent_kernel,
+    _fused_moe_persistent_kernel_gptq_awq,
 )
+from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

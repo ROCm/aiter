@@ -1,12 +1,13 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle,
 )

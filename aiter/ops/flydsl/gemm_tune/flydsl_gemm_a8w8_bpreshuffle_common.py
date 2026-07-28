@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from dataclasses import dataclass
 import math
 import os
+from dataclasses import dataclass
 
 from aiter.ops.flydsl.utils import (
     addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
+)
+from aiter.ops.flydsl.utils import (
     get_shared_memory_per_block,
 )
 

@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
-import itertools
-import torch
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
-from aiter import dtypes
-from enum import Enum
-from einops import rearrange
 import argparse
+import itertools
+import random
+from enum import Enum
+
+import pytest
+import torch
+from einops import rearrange
+
+from aiter import dtypes, pertoken_quant
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {

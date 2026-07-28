@@ -147,7 +147,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a4w4 import gemm_a4w4
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []

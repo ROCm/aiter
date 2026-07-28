@@ -4,15 +4,15 @@
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from aiter.ops.triton.utils.types import _is_fp8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 from aiter.ops.triton._triton_kernels.attention.mha_onekernel_bwd import (
     _bwd_preprocess,
+    _get_config,
     bwd_kernel_causal,
     bwd_kernel_noncausal,
-    _get_config,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import _is_fp8
 
 _LOGGER = AiterTritonLogger()
 

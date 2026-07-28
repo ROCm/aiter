@@ -9,8 +9,8 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes, paged_attn as ops
-from aiter import pertoken_quant
+from aiter import dtypes, pertoken_quant
+from aiter import paged_attn as ops
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")

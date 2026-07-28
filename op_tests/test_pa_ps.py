@@ -3,18 +3,17 @@
 
 import argparse
 import itertools
-from aiter.ops.enum import QuantType
-import numpy as np
 import random
 
+import numpy as np
 import pandas as pd
 import torch
+import torch.profiler as tpf
 
 import aiter
-from aiter import dtypes
-from aiter import pertoken_quant
+from aiter import dtypes, pertoken_quant
+from aiter.ops.enum import QuantType
 from aiter.test_common import benchmark, checkAllclose, perftest
-import torch.profiler as tpf
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

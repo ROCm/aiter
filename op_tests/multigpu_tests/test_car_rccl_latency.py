@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
+
 import torch
 import torch.distributed as dist
-from multiprocessing import Pool, freeze_support, set_start_method
 
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (

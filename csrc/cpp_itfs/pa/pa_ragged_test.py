@@ -1,12 +1,14 @@
-import random
 import itertools
-import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
+import random
 from enum import Enum
+
+import pytest
+import torch
 from einops import rearrange
+
+import aiter
+from aiter import pertoken_quant
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 from csrc.cpp_itfs.pa.pa_ragged import paged_attention_ragged
 
 uniform_range = (-1, 1)

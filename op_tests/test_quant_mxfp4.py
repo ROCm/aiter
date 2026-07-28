@@ -397,8 +397,8 @@ def test_invalid_round_mode():
 
 def test_default_round_mode_drift():
     """Verify Python MX_DEFAULT_ROUND_MODE matches C++ kDefaultMxScaleRoundMode."""
-    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt
     from aiter.jit.core import get_module
+    from aiter.utility.mx_types import MX_DEFAULT_ROUND_MODE, MxScaleRoundModeInt
 
     assert MX_DEFAULT_ROUND_MODE in (
         MxScaleRoundModeInt.RoundDown,

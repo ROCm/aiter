@@ -6,9 +6,9 @@ This module provides a pure Python implementation using hip-python
 to load and launch Triton-compiled kernels from HSACO binary files.
 """
 
+import logging
 import os
 import sys
-import logging
 
 logger = logging.getLogger("aiter")
 

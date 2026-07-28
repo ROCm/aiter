@@ -1,10 +1,12 @@
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
-from aiter import dtypes
 import argparse
-import pandas as pd
 import random
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
 

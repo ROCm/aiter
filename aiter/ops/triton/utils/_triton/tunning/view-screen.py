@@ -1,6 +1,7 @@
+import argparse
 import os
 import sys
-import argparse
+
 from _utils import (
     config_parms_key,
     read_screen_file,

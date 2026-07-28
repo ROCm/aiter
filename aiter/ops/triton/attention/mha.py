@@ -2,17 +2,18 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils import types
-from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
-from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
+from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
+from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

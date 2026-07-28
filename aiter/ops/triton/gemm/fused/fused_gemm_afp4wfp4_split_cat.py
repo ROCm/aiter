@@ -3,12 +3,13 @@
 
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-    _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_preshuffle_split_cat,
+    _fused_gemm_afp4wfp4_split_cat,
     _fused_gemm_afp4wfp4_split_cat_reduce,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import _get_config
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import get_splitk
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

@@ -9,24 +9,25 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
+
+# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
+# and ARCH_MAP_REGISTRY at import time.
+from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
+from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from codegen.common import (
     _A16W16_TAGS,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
+)
+from codegen.common import (
     kid_arch as _kid_arch_common,
 )
-
-# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
-# and ARCH_MAP_REGISTRY at import time.
-from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
-from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
-from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from opus_gemm_common import (
     HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
-    heuristic_kids_for_arch,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -37,6 +38,7 @@ from opus_gemm_common import (
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    heuristic_kids_for_arch,
     kernels_list,
 )
 

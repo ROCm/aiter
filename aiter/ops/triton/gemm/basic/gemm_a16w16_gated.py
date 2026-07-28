@@ -3,11 +3,12 @@
 
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_gated import (
     _gemm_a16_w16_gated_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

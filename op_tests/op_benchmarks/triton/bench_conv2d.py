@@ -46,25 +46,25 @@ import torch
 import torch.nn.functional as F
 import triton
 
+from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv._utils import (
     BLOCK_K,
-    _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
+    _out_hw,
 )
-from aiter.ops.triton.conv._prepack import prepack_nchw_to_cblocked
 from aiter.ops.triton.conv.conv2d import (
+    _resolve_route,
     conv2d,
     conv2d_nchw,
     conv2d_nchw_cblocked,
     conv2d_nhwc,
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
-    _resolve_route,
 )
 from op_tests.triton_tests.conv._helpers import (
-    dynamic_conv_tolerances,
     _winograd_tolerances,
+    dynamic_conv_tolerances,
 )
 
 

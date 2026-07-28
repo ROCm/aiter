@@ -25,8 +25,9 @@ Example usage1 for aot:
 
 import functools
 import os
-from collections.abc import Callable
 import threading
+from collections.abc import Callable
+
 import triton.compiler.compiler as triton_compiler
 
 # Use thread-local storage to avoid multi-threading race conditions

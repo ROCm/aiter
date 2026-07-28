@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
-from typing import Any
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
     get_scaled_dot_format_string,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 _LOGGER = AiterTritonLogger()

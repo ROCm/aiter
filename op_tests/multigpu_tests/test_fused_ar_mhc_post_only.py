@@ -27,8 +27,8 @@ from aiter.dist.parallel_state import (
 )
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.ops.custom_all_reduce import (
-    fused_allreduce_mhc_post_only,
     fused_allreduce_mhc_post_one_stage,
+    fused_allreduce_mhc_post_only,
     fused_allreduce_mhc_post_split,
 )
 from aiter.test_common import benchmark, checkAllclose

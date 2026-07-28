@@ -1,16 +1,17 @@
 import pytest
 import torch
-import triton
 import torch.nn.functional as F
+import triton
+
+from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.routing import (
+    compute_expt_data_torch,
     routing,
     routing_from_hash,
     routing_torch,
-    compute_expt_data_torch,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):

@@ -1,8 +1,9 @@
 import os
-import triton
-from triton.testing import runtime
+
 import torch
+import triton
 import triton.language as tl
+from triton.testing import runtime
 
 
 @triton.jit

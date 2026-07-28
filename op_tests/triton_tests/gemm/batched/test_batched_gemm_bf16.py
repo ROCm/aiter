@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import math
-import torch
-import pytest
 import functools
-from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
-    batched_gemm_bf16,
-    _is_gluon_available,
-)
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+import math
+
+import pytest
+import torch
 import torch.nn.functional as F
+
+from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+    _is_gluon_available,
+    batched_gemm_bf16,
+)
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 
 def is_gluon_supported():

@@ -5,12 +5,14 @@ import functools
 
 import pandas as pd
 import torch
-from aiter import logger
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
+from aiter import logger
+from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 

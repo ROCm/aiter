@@ -1,16 +1,17 @@
+import argparse
+import random
+import sys
+
+import torch
 import triton
 from utils.benchmark_utils import get_model_configs
-import torch
-import argparse
-from aiter.ops.triton.attention.pa_decode import paged_attention_decode
-from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
-import sys
-import random
 
+from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
+from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
 )
 
 

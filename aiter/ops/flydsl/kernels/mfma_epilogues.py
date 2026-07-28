@@ -33,11 +33,11 @@ modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from collections.abc import Callable
+from contextlib import contextmanager
 
-from flydsl._mlir import ir
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl.expr.typing import T
 

@@ -26,9 +26,10 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from aiter.dist.parallel_state import in_the_same_node_as
 from aiter import logger
+from aiter.dist.parallel_state import in_the_same_node_as
 from aiter.utility.dtypes import fp8
+
 from .rocm_version import get_rocm_version
 
 
@@ -602,8 +603,9 @@ class _GFX1250BufferProxy:
 
     def get_external_ipc_meta(self, tensor):
         """Exchange a tensor's pointer across ranks using VMM."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
         import torch.distributed as dist
+
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         ca = self._ca
         store = dist.distributed_c10d._get_default_store()
@@ -845,7 +847,7 @@ class CustomAllreduce:
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
         GPU buffers across processes via the HIP VMM API (exported fd + Unix
         socket) instead of IPC handles."""
-        from .vmm_allocator import VMMBuffer, vmm_exchange, load_hip_runtime
+        from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
         # gfx1250 is 1-stage only — no tmp buffer after Signal needed

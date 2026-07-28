@@ -1,18 +1,19 @@
-import torch
-import sys
 import math
 import random
+import sys
+
+import torch
 import triton
 
 from aiter.ops.triton.attention.pa_prefill import context_attention_fwd
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    get_dtype_bytes,
     get_caller_name_no_ext,
+    get_dtype_bytes,
+    get_model_configs,
     print_vgpr,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.attention.test_pa_prefill import seed_everything
 
 

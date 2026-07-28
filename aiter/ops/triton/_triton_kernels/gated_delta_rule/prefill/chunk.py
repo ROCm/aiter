@@ -11,6 +11,12 @@ Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 
 import torch
 
+from ..utils import (
+    chunk_local_cumsum,
+    chunk_scaled_dot_kkt_fwd,
+    recompute_w_u_fwd,
+    solve_tril,
+)
 from .chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
     chunk_gated_delta_rule_fwd_h_opt,
@@ -19,12 +25,6 @@ from .chunk_delta_h import (
 from .chunk_o import chunk_fwd_o, chunk_fwd_o_opt, chunk_fwd_o_opt_vk
 from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
-from ..utils import (
-    chunk_local_cumsum,
-    chunk_scaled_dot_kkt_fwd,
-    recompute_w_u_fwd,
-    solve_tril,
-)
 
 
 def _is_gfx12_runtime() -> bool:

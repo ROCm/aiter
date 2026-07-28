@@ -2,10 +2,10 @@
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 # generate kernel instances to speed up compilation
 
-from dataclasses import dataclass
 import argparse
 import fnmatch
 import itertools
+from dataclasses import dataclass
 from pathlib import Path
 
 GEN_DIR = ""  # in Cmake, have to generate files in same folder

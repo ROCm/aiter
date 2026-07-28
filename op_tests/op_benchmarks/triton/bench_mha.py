@@ -1,32 +1,34 @@
-import torch
-import warnings
 import argparse
-import itertools
 import dataclasses
-from dataclasses import dataclass
+import itertools
+import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
+
+import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_with_kvcache,
-    mha_set_use_fused_bwd_kernel,
     mha_set_impl,
+    mha_set_use_fused_bwd_kernel,
 )
 from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
 from aiter.test_mha_common import (
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
-    get_caller_name_no_ext,
 )
 
 

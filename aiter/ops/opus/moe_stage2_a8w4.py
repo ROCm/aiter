@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 import torch
 from torch import Tensor
 
@@ -14,11 +13,11 @@ from .moe_stage2_a8w4_meta import (
     OPUS_A8W4_OUT_MODE_FP8,
     opus_a8w4_best_atomic_kid,
     opus_a8w4_decode_kid,
+    opus_a8w4_effective_inter_dim,
     opus_a8w4_kid_block_m,
     opus_a8w4_kid_is_fp8,
     opus_a8w4_kid_name,
     opus_a8w4_kid_uses_route,
-    opus_a8w4_effective_inter_dim,
     opus_a8w4_scale_cols_for_effective_inter_dim,
 )
 

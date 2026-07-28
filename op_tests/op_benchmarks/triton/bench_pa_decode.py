@@ -1,17 +1,19 @@
-import sys
-import random
-import torch
 import argparse
+import random
+import sys
+
+import torch
 import triton
+
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
-    get_dtype_bytes,
     get_caller_name_no_ext,
+    get_dtype_bytes,
+    get_model_configs,
     print_vgpr,
 )
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
 
 def input_helper(

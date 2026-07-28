@@ -29,8 +29,8 @@ from typing import Any
 
 import torch
 from torch.distributed import ReduceOp
-from aiter import logger
 
+from aiter import logger
 
 # === export types and functions from nccl to Python ===
 # for the original nccl definition, please check

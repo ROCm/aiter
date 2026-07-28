@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
-from packaging import version
-from packaging.version import Version
 import importlib
 import types
-from typing import Any, Union, get_args, get_origin
 from collections.abc import Callable
+from typing import Any, Union, get_args, get_origin
+
+from packaging import version
+from packaging.version import Version
 
 aiter_lib = None
 
@@ -217,9 +218,10 @@ def torch_compile_guard(
             return func(*args, **kwargs)
 
         try:
+            import inspect
+
             import torch
             from torch.library import Library  # noqa: F401  availability probe
-            import inspect
         except ImportError:
             return wrapper
 

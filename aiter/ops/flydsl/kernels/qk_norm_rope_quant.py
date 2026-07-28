@@ -49,8 +49,6 @@ who already have all buffers and want the lowest-overhead path.
 import math
 from functools import lru_cache
 
-import torch
-
 # NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
 # whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
 # into ``module_aiter_core``. That JIT module is not yet built when
@@ -58,17 +56,15 @@ import torch
 # module load time crashes setup with ``KeyError: 'module_aiter_core'``.
 # Defer the import until the first runtime call instead -- sibling modules
 # (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
+import torch
+from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
-from flydsl.expr.typing import T, Int32, Stream
+from flydsl.expr.typing import Int32, Stream, T
 from flydsl.expr.vector import ReductionOp
-from flydsl._mlir.dialects import llvm, rocdl
-
-from .tensor_shim import GTensor, _to_raw, _run_compiled
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -76,9 +72,13 @@ from .tensor_shim import GTensor, _to_raw, _run_compiled
 # (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+)
+
+from .tensor_shim import GTensor, _run_compiled, _to_raw
 
 # --- shape constants (V4-Pro MVP) -------------------------------------------
 BLOCK_THREADS = 64  # 1 wave64

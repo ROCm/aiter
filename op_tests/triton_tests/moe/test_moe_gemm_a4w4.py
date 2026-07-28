@@ -2,19 +2,19 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
 
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
-
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    mxfp4_quant,
     moe_gemm_a4w4,
     moe_gemm_torch,
+    mxfp4_quant,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
+
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
@@ -24,6 +24,7 @@ from aiter.ops.triton.moe.quant_moe import (
 
 # target-specific utilities
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # ---------------
 # initialize data

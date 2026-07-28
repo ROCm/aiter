@@ -6,9 +6,9 @@ import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import pandas as pd
 
 from aiter import dtypes
 from aiter.dist.communication_op import (

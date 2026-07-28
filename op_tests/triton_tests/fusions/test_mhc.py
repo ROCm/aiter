@@ -35,9 +35,9 @@ from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_post_inputs,
     get_test_shapes,
     is_doubly_stochastic,
+    mhc_e2e_ref,
     mhc_post_torch,
     mhc_torch,
-    mhc_e2e_ref,
 )
 
 try:
@@ -740,8 +740,8 @@ def test_mhc_post_preallocated_output():
     """Verify in-place path: result is out and matches reference."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 128, 4, 1024
@@ -769,8 +769,8 @@ def test_mhc_post_squeeze_post_mix():
     """Pass post_mix as (M, n, 1) — as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 64, 4, 512

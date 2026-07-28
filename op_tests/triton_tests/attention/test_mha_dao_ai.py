@@ -3,8 +3,9 @@
 
 import contextlib
 
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -12,8 +13,8 @@ from aiter.ops.triton.attention.mha import (
 )
 from aiter.test_mha_common import (
     attention_ref,
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
 
 

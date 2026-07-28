@@ -1,12 +1,14 @@
 import warnings
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from typing import Literal
+
 from .common import apply_rotary
 from .utils import (
-    DEBUG,
     AUTOTUNE,
+    DEBUG,
     AutotuneMode,
     get_arch,
     get_padded_headsize,

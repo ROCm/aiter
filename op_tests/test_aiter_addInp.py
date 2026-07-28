@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from torch.profiler import profile, ProfilerActivity
-from aiter import dtypes
 import argparse
+
+import torch
+from torch.profiler import ProfilerActivity, profile
+
+import aiter
+from aiter import dtypes
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

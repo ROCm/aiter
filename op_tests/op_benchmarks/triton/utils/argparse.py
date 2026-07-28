@@ -1,4 +1,5 @@
 import argparse
+
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
 )

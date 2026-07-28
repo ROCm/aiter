@@ -12,8 +12,8 @@ support reduce-scatter and all-gather operations. All core iris functions
 import logging
 import math
 
-import torch
 import iris
+import torch
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True

@@ -16,10 +16,11 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
-from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr.typing import T
+
 from .tensor_shim import GTensor, _to_raw
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634

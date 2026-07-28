@@ -15,31 +15,35 @@ import torch
 # Triton
 import triton
 
-# AITER: GMM defaults and utility functions
-from aiter.ops.triton.utils.gmm_common import (
-    SUPPORTED_DTYPES_STR,
-    DTYPE_STR,
-    dtype_from_str,
-    DTYPE,
-    str_from_dtype,
-    SUPPORTED_GROUP_SIZES_DTYPES_STR,
-    GROUP_SIZES_DTYPE_STR,
-    group_sizes_dtype_from_str,
-    GROUP_SIZES_DTYPE,
-    str_from_group_sizes_dtype,
-    TRANS_LHS,
-    TRANS_RHS,
-    RNG_SEED,
-    NUM_GROUP_SIZES,
-    gen_gmm_tensors,
-    gen_tgmm_tensors,
-)
-
 # AITER: Triton kernel wrappers
 from aiter.ops.triton.gmm import (
     gmm as triton_gmm,
-    ptgmm as triton_ptgmm,
+)
+from aiter.ops.triton.gmm import (
     nptgmm as triton_nptgmm,
+)
+from aiter.ops.triton.gmm import (
+    ptgmm as triton_ptgmm,
+)
+
+# AITER: GMM defaults and utility functions
+from aiter.ops.triton.utils.gmm_common import (
+    DTYPE,
+    DTYPE_STR,
+    GROUP_SIZES_DTYPE,
+    GROUP_SIZES_DTYPE_STR,
+    NUM_GROUP_SIZES,
+    RNG_SEED,
+    SUPPORTED_DTYPES_STR,
+    SUPPORTED_GROUP_SIZES_DTYPES_STR,
+    TRANS_LHS,
+    TRANS_RHS,
+    dtype_from_str,
+    gen_gmm_tensors,
+    gen_tgmm_tensors,
+    group_sizes_dtype_from_str,
+    str_from_dtype,
+    str_from_group_sizes_dtype,
 )
 
 # Benchmark.

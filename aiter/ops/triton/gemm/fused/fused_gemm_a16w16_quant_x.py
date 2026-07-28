@@ -3,14 +3,15 @@
 
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a16w16_quant_x import (
     _fused_gemm_a16w16_quant_x_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

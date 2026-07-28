@@ -1,31 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
 import argparse
-import random
 import hashlib
-import pandas as pd
+import random
+import sys
+
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import triton
+
 import aiter
-from aiter import dtypes
-from aiter import pertoken_quant, per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
-from aiter.ops.triton.utils._triton import arch_info
+from aiter import dtypes, per_tensor_quant, pertoken_quant
 from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_common import benchmark, checkAllclose, perftest
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
     pa_decode_gluon_aot,
 )
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
+    get_so_files_size_and_count,
     prebuild_normal_accuracy_cases_aot_so,
     prebuild_normal_performance_cases_aot_so,
-    get_so_files_size_and_count,
 )
 
 try:

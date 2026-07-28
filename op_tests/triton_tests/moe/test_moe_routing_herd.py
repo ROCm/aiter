@@ -14,9 +14,9 @@ import triton
 
 import aiter.ops.triton.moe.moe_routing.routing as routing_mod
 from aiter.ops.triton.moe.moe_routing.routing import (
+    compute_expt_data_torch,
     routing,
     routing_torch,
-    compute_expt_data_torch,
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch

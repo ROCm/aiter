@@ -28,8 +28,8 @@ import triton
 
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
     PAD_SLOT_ID,
-    _causal_conv1d_fwd_split_qkv_tile_kernel,
     _causal_conv1d_fwd_split_qkv_kernel,
+    _causal_conv1d_fwd_split_qkv_tile_kernel,
 )
 
 __all__ = [

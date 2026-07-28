@@ -268,11 +268,11 @@ def _bench_gluon_fp8(
     if the gluon path is unavailable.
     """
     try:
+        from aiter.ops.shuffle import shuffle_weight
         from aiter.ops.triton.attention.pa_mqa_logits import (
             deepgemm_fp8_paged_mqa_logits,
         )
         from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
-        from aiter.ops.shuffle import shuffle_weight
 
         fp8_dtype = get_fp8_e4m3_dtype()
         batch_size = q_bf16.shape[0]

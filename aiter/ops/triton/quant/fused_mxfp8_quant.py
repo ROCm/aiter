@@ -5,9 +5,9 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
-    _fused_rms_mxfp8_kernel,
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
+    _fused_rms_mxfp8_kernel,
 )
 
 __all__ = [

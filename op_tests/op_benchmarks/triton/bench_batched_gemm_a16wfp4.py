@@ -1,25 +1,27 @@
+import math
 import sys
+
 import torch
 import triton
-import math
-from aiter.ops.triton.utils._triton import arch_info
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
-    generate_batched_gemm_a16wfp4_inputs,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_a16wfp4 import (
+    generate_batched_gemm_a16wfp4_inputs,
 )
 
 

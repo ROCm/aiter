@@ -23,14 +23,15 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-import triton
 import torch
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.mla_decode_rope import (
     _fwd_grouped_kernel_stage1_rope,
     _fwd_kernel_stage2,
     _get_config,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

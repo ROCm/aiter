@@ -1,8 +1,9 @@
 # tests are adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py
-import torch
 import pytest
-from aiter.ops.triton.utils.types import get_fp8_dtypes
+import torch
+
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 fp8_info = torch.finfo(e4m3_type)

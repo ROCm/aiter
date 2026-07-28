@@ -7,14 +7,15 @@ Runs each tuner on small shapes, verifies CSV output, and tests
 --shape_grouped with profile row count comparison.
 """
 
+import csv
 import glob
 import os
+import subprocess
 import sys
-import csv
 import tempfile
 import textwrap
-import subprocess
 import unittest
+
 import pandas as pd
 
 AITER_ROOT = os.path.dirname(

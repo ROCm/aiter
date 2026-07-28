@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, run_perftest, benchmark
-from aiter import dtypes
-import functools
 import argparse
+import functools
+
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 MAX_TOKEN_SUPPORTED = 16384
 

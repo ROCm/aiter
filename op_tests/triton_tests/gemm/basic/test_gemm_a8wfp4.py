@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 from enum import Enum
+
+import pytest
+import torch
+
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils._triton import arch_info
 
 # Debug
 DEBUG = False

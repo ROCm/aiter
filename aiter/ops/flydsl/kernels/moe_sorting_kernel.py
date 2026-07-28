@@ -22,16 +22,16 @@ Packed token ID format: (topk_position << 24) | token_id
 
 import functools
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import buffer_ops, gpu, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 

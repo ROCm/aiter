@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )

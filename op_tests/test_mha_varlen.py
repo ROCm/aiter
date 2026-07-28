@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import pytest
 import argparse
 import itertools
-import pandas as pd
 
+import pandas as pd
+import pytest
 import torch
+
 import aiter
 from aiter import dtypes
+from aiter.test_common import benchmark, run_perftest
 from aiter.test_mha_common import (
     attention_ref,
     attn_bias_from_alibi_slopes,
@@ -18,7 +20,6 @@ from aiter.test_mha_common import (
     generate_random_padding_mask,
     pad_rearrange_dropout_mask_hts_to_bhss,
 )
-from aiter.test_common import benchmark, run_perftest
 
 
 def run_torch(

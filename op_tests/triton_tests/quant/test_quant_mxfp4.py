@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
+import torch
 
-from aiter.ops.triton.quant import dynamic_mxfp4_quant
-from aiter.ops.triton.quant import dynamic_nvfp4_quant
+from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_nvfp4_quant
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.utility.fp4_utils import (
     dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant,
 )
 from aiter.utility.fp4_utils import mxfp4_to_f32
-from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

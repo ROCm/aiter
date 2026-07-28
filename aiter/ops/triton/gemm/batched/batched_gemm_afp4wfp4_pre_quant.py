@@ -2,10 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

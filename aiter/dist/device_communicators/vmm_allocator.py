@@ -9,11 +9,11 @@ This module provides an alternative using the HIP VMM API
 which exports a POSIX fd that can be passed across processes via Unix sockets.
 """
 
+import array
 import ctypes
 import os
 import socket
 import struct
-import array
 import threading
 
 

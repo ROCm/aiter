@@ -6,17 +6,16 @@ Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
 """
 
-import os
 import csv
 import functools
-
+import os
 
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_common import GateMode
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -446,16 +445,16 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
             compile_moe_grouped_gemm1_a8w4_masked,
-            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
+            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm2_mxfp4_masked,
         )
     except Exception as vendored_exc:
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
                 compile_moe_grouped_gemm1_a8w4_masked,
-                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
+                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm2_mxfp4_masked,
             )
         except Exception as exc:

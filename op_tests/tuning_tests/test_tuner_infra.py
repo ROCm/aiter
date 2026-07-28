@@ -6,10 +6,11 @@ Level 1: Unit tests for base_tuner infrastructure (no GPU required).
 Covers: CSV I/O, merge/dedup, calculate, post_process (topk selection).
 """
 
+import argparse
 import os
 import tempfile
 import unittest
-import argparse
+
 import pandas as pd
 
 TEST_GFX = "gfx942"

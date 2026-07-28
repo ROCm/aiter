@@ -22,12 +22,12 @@ from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops
 from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import T, Int32
+from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256

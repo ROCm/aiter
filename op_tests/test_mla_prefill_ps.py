@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
-
-import aiter
 import argparse
 import itertools
+import random
+import sys
+
 import numpy as np
 import pandas as pd
-import random
 import torch
 
-from aiter import dtypes
-from aiter import per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+import aiter
+from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # This test only supports gfx950, skip on gfx942
 if get_gfx() == "gfx942":

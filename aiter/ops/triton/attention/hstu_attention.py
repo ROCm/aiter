@@ -19,19 +19,18 @@ import torch
 # @manual=//triton:triton
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
+    _get_bwd_config,
+    _get_fwd_config,
+    _hstu_attn_bwd,
+    _hstu_attn_fwd,
+)
+
 # @manual=//triton:triton
 from aiter.ops.triton.utils.common_utils import (
     prev_power_of_2,
     switch_to_contiguous_if_needed,
 )
-from aiter.ops.triton._triton_kernels.attention.hstu_attention import (
-    _hstu_attn_fwd,
-    _get_fwd_config,
-    _hstu_attn_bwd,
-    _get_bwd_config,
-)
-
-
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

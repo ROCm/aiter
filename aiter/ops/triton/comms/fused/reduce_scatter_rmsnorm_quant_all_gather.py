@@ -13,17 +13,19 @@ This module implements a fully fused Triton kernel that performs:
 Based on Iris example: examples/22_rs_rmsnorm_fp8quant_ag/reduce_scatter_rmsnorm_quant_fused.py
 """
 
-import torch
-from torch import Tensor
-import triton
-import triton.language as tl
 import logging
 from typing import TYPE_CHECKING
 
+import torch
+import triton
+import triton.language as tl
+from torch import Tensor
+
+from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
+from aiter.ops.triton.comms.all_gather import _all_gather_impl
+
 # Import shared implementations
 from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
-from aiter.ops.triton.comms.all_gather import _all_gather_impl
-from aiter.ops.triton._triton_kernels.normalization.rmsnorm import _rms_norm_kernel
 
 if TYPE_CHECKING:
     from ..iris import IrisCommContext

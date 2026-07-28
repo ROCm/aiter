@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import json
+
 import torch
 import triton
-import json
 
 
 def prev_power_of_2(x: int) -> int:

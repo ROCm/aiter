@@ -1,6 +1,7 @@
-from collections import namedtuple
-import os
 import concurrent.futures
+import os
+from collections import namedtuple
+
 from csrc.cpp_itfs.pa.pa import compile
 
 PAConfig = namedtuple(

@@ -1,14 +1,16 @@
+import ctypes
+
 from jinja2 import Template
+
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
-    transfer_hsaco,
     AITER_CORE_DIR,
+    CK_DIR,
+    compile_template_op,
     get_default_func_name,
     not_built,
     run_lib,
-    CK_DIR,
+    transfer_hsaco,
 )
-import ctypes
 
 MD_NAME = "asm_moe"
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/moe/asm_moe.cpp.jinja", "r") as f:
@@ -375,7 +377,8 @@ def asm_moe(
     workspace=None,
 ):
     import torch
-    from csrc.cpp_itfs.torch_utils import torch_to_hip_types, torch_to_c_types
+
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types, torch_to_hip_types
 
     E, dim, inter_dim = w2.shape
     global_E = E

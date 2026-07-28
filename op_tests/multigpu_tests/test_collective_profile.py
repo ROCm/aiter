@@ -23,18 +23,19 @@ After running, check the generated trace file (e.g., trace_rank0.json)
 and search for "record_param_comms" events.
 """
 
-import os
 import json
+import os
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import ProfilerActivity, profile
 
 from aiter.dist.communication_op import (
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_reduce_scatter,
-    tensor_model_parallel_all_gather,
 )
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,

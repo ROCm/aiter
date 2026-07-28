@@ -3,10 +3,11 @@
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     _fused_gemm_a8w8_blockscale_split_cat,
     _fused_gemm_a8w8_blockscale_split_cat_reduce,
-    _fused_gemm_a8w8_blockscale_preshuffle_split_cat,
     _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger

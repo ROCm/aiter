@@ -1,20 +1,21 @@
 import torch
 import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_mul_add import (
     fused_gemm_a8w8_blockscale_mul_add,
 )
-from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
-    generate_gemm_a8w8_blockscale_inputs,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
-)
 from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
+    make_mul_add_ab,
     metric_to_scalar,
     parse_fused_args,
     run_fused_benchmark,
-    make_mul_add_ab,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
+    generate_gemm_a8w8_blockscale_inputs,
 )
 
 block_shape = (128, 128)  # matches module-level `block_shape` in similar kernels

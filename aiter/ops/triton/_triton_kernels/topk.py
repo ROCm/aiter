@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 from triton.language import core
 from triton.language.standard import _log2, zeros_like
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _topk_kernel_repr = make_kernel_repr(

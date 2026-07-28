@@ -1,21 +1,20 @@
-import torch
 import pytest
+import torch
+import torch.nn.functional as F
+
+import aiter
+import aiter as rocm_aiter
 from aiter.ops.triton.quant.fused_fp8_quant import (
-    fused_rms_fp8_per_tensor_static_quant,
-    fused_rms_fp8_group_quant,
     fused_flatten_fp8_group_quant,
     fused_reduce_act_mul_fp8_group_quant,
     fused_reduce_rms_fp8_group_quant,
+    fused_rms_fp8_group_quant,
+    fused_rms_fp8_per_tensor_static_quant,
     fused_silu_mul_fp8_per_tensor_static_quant,
 )
-
 from aiter.test_common import (
     checkAllclose,
 )
-import aiter
-import torch.nn.functional as F
-
-import aiter as rocm_aiter
 
 rocm_aiter_fp8_dtype = rocm_aiter.dtypes.fp8
 

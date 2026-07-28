@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
 import argparse
+import os
+import random
 
 import torch
-import os
-
 import triton
 
-from aiter.test_common import run_perftest
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+from aiter.test_common import run_perftest
 
 
 def cdiv(x: int, y: int) -> int:

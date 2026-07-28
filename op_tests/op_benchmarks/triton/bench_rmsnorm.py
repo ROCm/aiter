@@ -1,16 +1,18 @@
 import argparse
+
 import torch
 import triton
+
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
-from op_tests.triton_tests.normalization.test_rmsnorm import (
-    generate_rmsnorm_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
+)
+from op_tests.triton_tests.normalization.test_rmsnorm import (
+    generate_rmsnorm_inputs,
 )
 
 

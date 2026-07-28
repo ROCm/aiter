@@ -28,11 +28,11 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._triton_kernels.rope.rope import (
-    _get_neox_rotated_x_1D,
-    _get_gptj_rotated_x_1D,
-)
 from aiter.ops.triton._triton_kernels.quant.quant import _nvfp4_quant_op
+from aiter.ops.triton._triton_kernels.rope.rope import (
+    _get_gptj_rotated_x_1D,
+    _get_neox_rotated_x_1D,
+)
 
 
 @gluon.constexpr_function

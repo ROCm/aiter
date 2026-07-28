@@ -5,13 +5,13 @@
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp8wfp8 import (
     _gemm_afp8wfp8_kernel,
     _gemm_afp8wfp8_preshuffle_kernel,
     _get_config,
-)
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
 )
 
 

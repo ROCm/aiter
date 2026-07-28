@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes
 import argparse
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 
 @perftest(num_iters=2)

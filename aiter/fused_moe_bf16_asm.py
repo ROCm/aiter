@@ -3,10 +3,16 @@
 
 import torch
 import torch.nn.functional as F
+
 import aiter
-from aiter import logger
-from aiter import pertoken_quant, get_hip_quant
-from aiter import ActivationType, QuantType, dtypes
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    get_hip_quant,
+    logger,
+    pertoken_quant,
+)
 from aiter.fused_moe import fused_moe
 
 BLOCK_SIZE_M = 32

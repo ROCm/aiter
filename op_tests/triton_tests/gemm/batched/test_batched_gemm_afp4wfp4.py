@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
 

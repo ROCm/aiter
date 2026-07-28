@@ -4,14 +4,14 @@
 import pytest
 import torch
 
+from aiter.ops.triton.quant.fused_mxfp8_quant import (
+    fused_dual_rmsnorm_mxfp8_quant,
+    fused_flatten_mxfp8_quant,
+    fused_rms_mxfp8_quant,
+)
 from aiter.ops.triton.quant.quant import (
     dynamic_mxfp8_quant,
     fp8_legacy_to_mxfp8,
-)
-from aiter.ops.triton.quant.fused_mxfp8_quant import (
-    fused_rms_mxfp8_quant,
-    fused_dual_rmsnorm_mxfp8_quant,
-    fused_flatten_mxfp8_quant,
 )
 from aiter.ops.triton.utils._triton import arch_info
 

@@ -18,8 +18,8 @@ import os
 import pytest
 
 from aiter import dtypes
-from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_decode
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_decode
 
 try:
     from unittest.mock import patch

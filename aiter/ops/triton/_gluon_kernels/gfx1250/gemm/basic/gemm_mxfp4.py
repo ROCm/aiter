@@ -1,5 +1,6 @@
-from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental import gluon
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 SCALE_GROUP_ELEMS = 32

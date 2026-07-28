@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import triton
 import torch
+import triton
+
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
+)
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_weight
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_gemm
 
 DEVICE_ARCH = arch_info.get_arch()
 

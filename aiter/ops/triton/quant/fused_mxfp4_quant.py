@@ -1,19 +1,21 @@
 from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from aiter.utility import dtypes
-from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
-    _fused_rms_mxfp4_quant_kernel,
-    _fused_flatten_mxfp4_quant,
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
-    _fused_reduce_rms_mxfp4_quant_kernel,
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
-)
+
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
 )
+from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
+    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
+    _fused_flatten_mxfp4_quant,
+    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
+    _fused_reduce_rms_mxfp4_quant_kernel,
+    _fused_rms_mxfp4_quant_kernel,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility import dtypes
 
 _LOGGER = AiterTritonLogger()
 

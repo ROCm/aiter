@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import benchmark, perftest, checkAllclose
 import random
-from csrc.cpp_itfs.pa.pa import paged_attention_rocm
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter.test_common import benchmark, checkAllclose, perftest
+from csrc.cpp_itfs.pa.pa import paged_attention_rocm
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

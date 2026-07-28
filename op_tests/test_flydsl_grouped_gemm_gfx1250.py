@@ -25,9 +25,9 @@ per-kernel bench that times gemm1 and gemm2 in isolation
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 import os
 import sys
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -43,8 +43,7 @@ from aiter.fused_moe import (
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
-from aiter.utility import fp4_utils
-from aiter.utility import dtypes
+from aiter.utility import dtypes, fp4_utils
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.
@@ -451,8 +450,8 @@ def _run_grouped_via_fused_moe(
         # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
         # populates the per-stage launch callables (and yields a correct ``out`` to
         # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
-        from aiter.test_common import run_perftest
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+        from aiter.test_common import run_perftest
 
         kernel_bench_callable: list = []
         _grouped.kernel_bench_callable = kernel_bench_callable

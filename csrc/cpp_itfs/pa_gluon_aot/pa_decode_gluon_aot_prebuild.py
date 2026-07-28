@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
 import argparse
+import concurrent.futures
+import multiprocessing
 import random
 import subprocess
-import multiprocessing
-import concurrent.futures
+import sys
 from multiprocessing import cpu_count
 
 import pandas as pd
@@ -17,12 +17,12 @@ import triton.language as tl
 import aiter
 from aiter import dtypes
 from aiter.test_common import benchmark
+from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
+    pa_decode_gluon_aot,
+)
 from csrc.cpp_itfs.utils import (
     BUILD_DIR,
     get_default_func_name,
-)
-from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot import (
-    pa_decode_gluon_aot,
 )
 
 MD_NAME = "pa_decode_attention_reduce_kernel"

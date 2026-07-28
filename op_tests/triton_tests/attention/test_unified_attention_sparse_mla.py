@@ -1,11 +1,12 @@
 # test code is adapted from flashMLA:
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_decoding.py
-import random
 import dataclasses
-
-import torch
-import pytest
+import random
 from math import ceil
+
+import pytest
+import torch
+
 from aiter.ops.triton.attention.unified_attention_sparse_mla import (
     unified_attention_sparse_mla,
 )

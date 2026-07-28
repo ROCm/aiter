@@ -23,11 +23,11 @@ import torch.distributed
 from aiter.ops.enum import QuantType
 
 from .parallel_state import (
-    get_tp_group,
-    get_pp_group,
+    get_custom_group,
     get_dp_group,
     get_ep_group,
-    get_custom_group,
+    get_pp_group,
+    get_tp_group,
     has_custom_group,
 )
 

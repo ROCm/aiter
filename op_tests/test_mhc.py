@@ -2,17 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-from aiter.test_common import (
-    checkAllclose,
-    benchmark,
-    run_perftest,
-)
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-import argparse
-import pandas as pd
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 try:
     from aiter.ops.mhc import mhc_fused_post_pre_large_m
@@ -73,6 +75,7 @@ def mhc_pre_tilelang(
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
     """
     import math
+
     import tilelang
     import tilelang.language as T
 
@@ -580,9 +583,10 @@ def mhc_post_tilelang(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    import math
+
     import tilelang
     import tilelang.language as T
-    import math
 
     @tilelang.jit(
         pass_configs={

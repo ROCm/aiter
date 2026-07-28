@@ -10,17 +10,17 @@ torch.cumsum (avoids rocprim trampoline overhead for small E).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512

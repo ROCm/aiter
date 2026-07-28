@@ -13,16 +13,20 @@ where each token's K range is an unordered subset of a unified KV pool.
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
+)
+from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse as gluon_pa_decode_sparse,
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
-)
 
 DEVICE_ARCH = arch_info.get_arch()
 

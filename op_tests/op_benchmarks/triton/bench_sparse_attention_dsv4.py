@@ -14,20 +14,20 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4.py --shapes prefill
 """
 
-from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
-    _sparse_attn_prefill_kernel as csa_prefill_tl,
-)
-
 import argparse
 
 import torch
 import triton
 
+from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
+    _sparse_attn_prefill_kernel as csa_prefill_tl,
+)
+
 # The Gluon prefill kernel is opt-in (gfx950 + Triton >= 3.6). Probe it once at
 # import time; the benchmark falls back to Triton-only when unavailable.
 try:
-    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
     from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
 
     HAS_GLUON = get_gfx() == "gfx950"
 except ImportError:

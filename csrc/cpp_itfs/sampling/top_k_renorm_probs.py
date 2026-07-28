@@ -3,7 +3,8 @@
 
 
 from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op
 
 MD_NAME = "top_k_renorm_probs"
 
@@ -35,6 +36,7 @@ def top_k_renorm_probs(
     top_k_val,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     probs = probs.float()

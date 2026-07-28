@@ -1,37 +1,39 @@
 import argparse
+
 import torch
 from triton.testing import runtime
-from aiter.ops.triton.rope.rope import RotateStyle
+
 from aiter.ops.triton.rope.rope import (
-    rope_fwd,
-    rope_fwd_inplace,
+    RotateStyle,
     rope_bwd,
-    rope_thd_fwd,
-    rope_thd_fwd_inplace,
-    rope_thd_bwd,
+    rope_cached_bwd,
     rope_cached_fwd,
     rope_cached_fwd_inplace,
+    rope_cached_positions_bwd,
     rope_cached_positions_fwd,
     rope_cached_positions_fwd_inplace,
+    rope_cached_positions_offsets_bwd,
     rope_cached_positions_offsets_fwd,
     rope_cached_positions_offsets_fwd_inplace,
-    rope_cached_bwd,
-    rope_cached_positions_bwd,
-    rope_cached_positions_offsets_bwd,
+    rope_cached_thd_positions_2c_bwd,
     rope_cached_thd_positions_2c_fwd,
     rope_cached_thd_positions_2c_fwd_inplace,
-    rope_cached_thd_positions_offsets_2c_fwd,
-    rope_cached_thd_positions_offsets_2c_fwd_inplace,
-    rope_cached_thd_positions_2c_bwd,
     rope_cached_thd_positions_offsets_2c_bwd,
     # rope_fwd_2d,
     # rope_fwd_2d_inplace,
+    rope_cached_thd_positions_offsets_2c_fwd,
+    rope_cached_thd_positions_offsets_2c_fwd_inplace,
+    rope_fwd,
+    rope_fwd_inplace,
+    rope_thd_bwd,
+    rope_thd_fwd,
+    rope_thd_fwd_inplace,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_available_models,
+    get_model_configs,
 )
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
-    get_available_models,
-)
 
 
 def str_to_bool(v, vstr):

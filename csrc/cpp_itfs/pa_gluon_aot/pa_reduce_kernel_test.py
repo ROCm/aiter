@@ -1,25 +1,26 @@
-import sys
+import argparse
 import hashlib
+import sys
+
+import numpy as np
+import torch
 import triton
 import triton.language as tl
-import aiter
-import torch
-import numpy as np
-import argparse
-
 from jinja2 import Template
-from aiter.test_common import perftest
+
+import aiter
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     paged_attention_decode_v2_reduce_kernel,
 )
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
+from aiter.test_common import perftest
 from csrc.cpp_itfs.gluon_aot_tools.compile import (
     CompileArgs,
     compile_kernel,
 )
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
     AITER_CORE_DIR,
+    compile_template_op,
     get_default_func_name,
     run_lib,
 )

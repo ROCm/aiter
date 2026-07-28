@@ -1,12 +1,13 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import gemm_a16w8_blockscale
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w8_blockscale import (
     generate_gemm_a16w8_blockscale_inputs,

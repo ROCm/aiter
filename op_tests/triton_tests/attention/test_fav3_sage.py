@@ -1,25 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-import pytest
 import logging
-import numpy as np
 import math
-from aiter.test_mha_common import (
-    attention_ref,
-    attention_ref_block_sparse,
-)
+
+import numpy as np
+import pytest
+import torch
+
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_mha_common import (
+    attention_ref,
+    attention_ref_block_sparse,
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)

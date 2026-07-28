@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import random
 import argparse
+import random
 
 import pytest
 import torch
 
-from aiter.test_common import checkAllclose, run_perftest
-from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter import dtypes
-from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from aiter.ops.triton.utils._triton import arch_info
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
+from aiter.test_common import checkAllclose, run_perftest
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA device is required"

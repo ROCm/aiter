@@ -1,11 +1,14 @@
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.moe.reduce import _reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
         reduce_grouped_gluon as _reduce_grouped_gluon,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.moe.reduce import (
         reduce_grouped_gluon_num_warps as _reduce_grouped_gluon_num_warps,
     )
 except (ImportError, ModuleNotFoundError):

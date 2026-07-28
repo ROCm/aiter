@@ -3,19 +3,19 @@
 # import hip
 # hip.hip.hipInit(0)
 
-import random
-import triton
-import torch
-
-from aiter.ops.triton.attention.mla import mla_decode_fwd
-from aiter.ops.triton.attention.mla import mla_prefill_fwd
-from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
-from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 import argparse
+import random
+
+import torch
+import triton
+
+from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
+from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)

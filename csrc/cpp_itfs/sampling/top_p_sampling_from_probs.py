@@ -2,10 +2,12 @@
 # Copyright (C) 2018-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 
-from jinja2 import Template
-from csrc.cpp_itfs.sampling.util import get_seed_and_offset
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import math
+
+from jinja2 import Template
+
+from csrc.cpp_itfs.sampling.util import get_seed_and_offset
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op, str_to_bool
 
 MD_NAME = "top_p_sampling_from_probs"
 
@@ -44,6 +46,7 @@ def top_p_sampling_from_probs(
     generator=None,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     batch_size = probs.size(0)

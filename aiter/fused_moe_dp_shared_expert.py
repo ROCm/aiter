@@ -1,28 +1,29 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
+import functools
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-import functools
+
+import torch
+
 import aiter
-from aiter import logger
-from aiter import ActivationType, QuantType, dtypes
-from aiter.utility import fp4_utils
+from aiter import ActivationType, QuantType, dtypes, logger
 
 # from aiter import get_torch_quant as get_quant
 from aiter import get_hip_quant as get_quant
-from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.fused_moe import moe_sorting
 from aiter.jit.core import (
-    AITER_ROOT_DIR,
     AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
     PY,
     bd_dir,
     mp_lock,
 )
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime, gfx_from_cu_num
-from aiter.fused_moe import moe_sorting
+from aiter.utility import fp4_utils
+from aiter.utility.fp4_utils import moe_mxfp4_sort
 
 BLOCK_SIZE_M = 32
 

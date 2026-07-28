@@ -1,23 +1,25 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
+import argparse
+import csv
+import inspect
+import tempfile
 from itertools import chain
 from pathlib import Path
-import triton.profiler as proton
+
 import torch
-import argparse
-from aiter.ops.triton.moe.moe_routing.routing import routing
+import triton.profiler as proton
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
-    mxfp4_quant,
     moe_gemm_a4w4,
+    mxfp4_quant,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-import tempfile
+from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-import inspect
-import csv
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):

@@ -1,11 +1,12 @@
 import torch
+import triton.experimental.gluon.language as gl
 import triton.language as tl
 from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd, pid_grid
-from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
-from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy
+
+from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 def matmul_launch_metadata(grid, kernel, args):

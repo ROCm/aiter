@@ -2,11 +2,11 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 # mypy: allow-untyped-defs
+import logging
 import multiprocessing
 import os
 import socket
 import time
-import logging
 
 logger = logging.getLogger("aiter")
 

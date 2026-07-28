@@ -1,14 +1,13 @@
 import os
-from pathlib import Path
-import torch
 import tempfile
+from pathlib import Path
 
 import pytest
-
+import torch
 import triton
 import triton.language as tl
 from triton.backends.compiler import GPUTarget
-from triton.tools.compile import compile_kernel, CompileArgs
+from triton.tools.compile import CompileArgs, compile_kernel
 
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (

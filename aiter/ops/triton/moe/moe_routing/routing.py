@@ -1,13 +1,15 @@
 import os
+from dataclasses import dataclass, field
+
 import torch
 import triton
-from dataclasses import dataclass, field
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 # HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
 # path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)

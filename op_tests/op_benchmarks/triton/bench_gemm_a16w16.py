@@ -1,22 +1,23 @@
+import math
+
 import torch
 import triton
-import math
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-    generate_gemm_a16w16_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
-
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
 )
 
 

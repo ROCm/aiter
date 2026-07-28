@@ -1,13 +1,15 @@
+import argparse
+import math
+
 import torch
 import triton
-from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
+from triton.experimental import gluon
+
 from aiter.ops.triton.utils._triton import arch_info
-import argparse
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
-import math
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)

@@ -19,13 +19,14 @@ Usage:
     python test_reduce_scatter_all_gather.py --test reduce_scatter
 """
 
-import os
-import torch
-import torch.distributed as dist
+import logging
 import multiprocessing as mp
+import os
 import sys
 import traceback
-import logging
+
+import torch
+import torch.distributed as dist
 
 import aiter
 from aiter.test_common import ensure_spawn_method
@@ -34,8 +35,8 @@ from aiter.test_common import ensure_spawn_method
 try:
     from aiter.ops.triton.comms import (
         IrisCommContext,
-        reduce_scatter,
         all_gather,
+        reduce_scatter,
     )
 
     IRIS_AVAILABLE = True

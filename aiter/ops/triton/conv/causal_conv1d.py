@@ -1,9 +1,10 @@
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
+    PAD_SLOT_ID,
     _causal_conv1d_fwd_kernel,
     _causal_conv1d_update_kernel,
-    PAD_SLOT_ID,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 

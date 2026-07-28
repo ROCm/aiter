@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Literal
 import argparse
 import csv
 import glob
@@ -12,15 +10,15 @@ import re
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
-
+from aiter.ops.mha import flash_attn_fp8_pertensor_func, flash_attn_func
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -31,6 +29,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
@@ -38,7 +37,6 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
-
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )

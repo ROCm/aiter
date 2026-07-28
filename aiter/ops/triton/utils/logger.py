@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 
 
 # AITER Triton Logger which is singleton object around python logging.

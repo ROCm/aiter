@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.jit.core import is_experimental_enabled
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
-import pandas as pd
+import itertools
 import math
 import os
+import random
 from pathlib import Path
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

@@ -17,17 +17,19 @@ TO be added features:
     -
 """
 
-import torch
-from bisect import bisect_right
 import math
+from bisect import bisect_right
+
+import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.attention.lean_atten import (
-    la_persistent,
     _get_config,
+    la_persistent,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

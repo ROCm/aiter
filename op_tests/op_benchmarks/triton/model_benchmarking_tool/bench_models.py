@@ -1,39 +1,48 @@
-from abc import ABC, abstractmethod
-from contextlib import redirect_stdout, redirect_stderr
-from typing import TypeAlias
-from collections.abc import Callable
-import io
-import logging
-import shlex
-import os
-import pandas as pd
-import json
-import re
-import matplotlib.pyplot as plt
 import argparse
-from triton.runtime.errors import OutOfResources
-from aiter.ops.triton.utils._triton import arch_info
+import io
+import json
+import logging
+import os
+import re
+import shlex
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
+from typing import TypeAlias
 
-from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
-    main as bench_gemm_a16w16_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
-    main as bench_gemm_a8w8_per_token_scale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
-    main as bench_gemm_a8w8_blockscale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
-    main as bench_gemm_afp4wfp4_main,
-)
+import matplotlib.pyplot as plt
+import pandas as pd
+from triton.runtime.errors import OutOfResources
+
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
+)
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
+    main as bench_batched_gemm_a16wfp4_main,
 )
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
-from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
-    main as bench_batched_gemm_a16wfp4_main,
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
+    main as bench_gemm_a8w8_blockscale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
+    main as bench_gemm_a8w8_per_token_scale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
+    main as bench_gemm_a16w16_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
+    main as bench_gemm_afp4wfp4_main,
+)
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+    main as bench_moe_gemm_a8w4_main,
 )
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
@@ -41,16 +50,8 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
     main as bench_moe_gemm_a8w8_blockscale_main,
 )
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
-    main as bench_moe_gemm_a8w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
-    main as bench_moe_gemm_a4w4_main,
-)
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
-from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
-from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
 from op_tests.op_benchmarks.triton.bench_unified_attention import (
     main as bench_unified_attention_main,
 )

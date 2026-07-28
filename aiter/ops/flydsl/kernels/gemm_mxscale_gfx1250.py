@@ -10,7 +10,6 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
@@ -31,12 +30,13 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
+
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
     get_lds_memref,
     issue_tdm_loads,
-    lds_load_b128_raw,
     lds_load_b32_raw,
+    lds_load_b128_raw,
     lds_store_b64,
     lds_store_b128,
     pipeline_fence,

@@ -7,9 +7,9 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _LOGGER = AiterTritonLogger()
 

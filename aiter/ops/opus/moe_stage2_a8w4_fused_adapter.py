@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-
 import torch
 
 OPUS_A8W4_STAGE2_KERNEL = "opus_moe_stage2_a8w4_decode"
@@ -80,8 +79,8 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         opus_a8w4_kid_block_m,
         opus_a8w4_kid_from_name,
         opus_a8w4_kid_reduce_block_n,
-        opus_a8w4_reduce_block_n_from_name,
         opus_a8w4_kid_uses_route,
+        opus_a8w4_reduce_block_n_from_name,
     )
 
     sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)

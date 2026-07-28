@@ -1,41 +1,42 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import random
 
-from op_tests.test_rope import (
-    ref_rope_sbhd_fwd,
-    ref_rope_thd_fwd,
-    RotateStyle,
-    ref_rope_2d_fwd,
-)
+import pytest
+import torch
+
 from aiter.ops.triton.rope.rope import (
-    rope_fwd,
-    rope_fwd_inplace,
     rope_bwd,
-    rope_thd_fwd,
-    rope_thd_fwd_inplace,
-    rope_thd_bwd,
+    rope_cached_bwd,
     rope_cached_fwd,
     rope_cached_fwd_inplace,
+    rope_cached_positions_bwd,
     rope_cached_positions_fwd,
     rope_cached_positions_fwd_inplace,
+    rope_cached_positions_offsets_bwd,
     rope_cached_positions_offsets_fwd,
     rope_cached_positions_offsets_fwd_inplace,
-    rope_cached_bwd,
-    rope_cached_positions_bwd,
-    rope_cached_positions_offsets_bwd,
+    rope_cached_thd_positions_2c_bwd,
     rope_cached_thd_positions_2c_fwd,
     rope_cached_thd_positions_2c_fwd_inplace,
+    rope_cached_thd_positions_offsets_2c_bwd,
     rope_cached_thd_positions_offsets_2c_fwd,
     rope_cached_thd_positions_offsets_2c_fwd_inplace,
-    rope_cached_thd_positions_2c_bwd,
-    rope_cached_thd_positions_offsets_2c_bwd,
+    rope_fwd,
     rope_fwd_2d,
     rope_fwd_2d_inplace,
     rope_fwd_3d,
+    rope_fwd_inplace,
+    rope_thd_bwd,
+    rope_thd_fwd,
+    rope_thd_fwd_inplace,
+)
+from op_tests.test_rope import (
+    RotateStyle,
+    ref_rope_2d_fwd,
+    ref_rope_sbhd_fwd,
+    ref_rope_thd_fwd,
 )
 
 DEBUG_MODE = False

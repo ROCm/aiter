@@ -57,12 +57,12 @@ def _job_key(job: dict) -> tuple:
 
 def parse_csv(csv_path: str):
     """Parse an fp4 tuned CSV into unique mxmoe-port compile jobs (one per stage)."""
+    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
     )
-    from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
 
     jobs = []
     seen = set()

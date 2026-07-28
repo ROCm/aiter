@@ -1,10 +1,12 @@
-import random
-import torch
-from aiter import dtypes
-from enum import Enum
 import argparse
 import os
+import random
+from enum import Enum
+
 import numpy as np
+import torch
+
+from aiter import dtypes
 
 uniform_range = (-1, 1)
 

@@ -1,26 +1,29 @@
-import sys
-import triton
 import math
+import sys
+
+import triton
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
-    generate_gemm_a8w8_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
-
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+    generate_gemm_a8w8_inputs,
 )
 
 

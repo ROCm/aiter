@@ -3,16 +3,17 @@
 
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _batched_gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
     _batched_gemm_bf16_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _batched_gemm_splitk_reduce_kernel,
-)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
 
@@ -86,12 +87,12 @@ def batched_gemm_bf16(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
-            _KERNEL_MAP,
-        )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             create_shared_layouts,
             create_wmma_layouts,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
+            _KERNEL_MAP,
         )
 
         assert (

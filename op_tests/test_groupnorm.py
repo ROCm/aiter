@@ -1,7 +1,9 @@
+import argparse
 import random
+
 import numpy as np
 import torch
-import argparse
+
 from aiter.ops.groupnorm import GroupNorm
 
 random.seed(0)

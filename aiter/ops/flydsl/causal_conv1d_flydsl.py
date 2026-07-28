@@ -9,9 +9,8 @@ import torch
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith
-    from flydsl.expr.typing import T, Int32
-    from flydsl.expr import buffer_ops
+    from flydsl.expr import arith, buffer_ops
+    from flydsl.expr.typing import Int32, T
 
     _FLYDSL_AVAILABLE = True
 except Exception:  # pragma: no cover - flydsl optional

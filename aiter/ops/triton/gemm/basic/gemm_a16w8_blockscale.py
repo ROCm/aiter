@@ -3,6 +3,7 @@
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -11,8 +12,8 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w8_blockscale import (
     _gemm_a16w8_blockscale_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

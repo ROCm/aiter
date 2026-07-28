@@ -2,17 +2,17 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
+
 import torch
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
     sage_fwd_mxfp4,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
-
-
-import aiter
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_sage_fwd_configs_mxfp4():

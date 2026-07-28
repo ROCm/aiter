@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import random
+
+import pandas as pd
 import torch
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, pertoken_quant
 from aiter import paged_attn as ops
+from aiter.ops import attention
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
     tensor_dump,
     tensor_load,
-    benchmark,
 )
-from aiter import pertoken_quant
-from aiter.ops import attention
-
-import argparse
-import pandas as pd
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {

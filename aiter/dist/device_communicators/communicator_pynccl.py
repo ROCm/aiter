@@ -7,6 +7,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
+from aiter import logger
+
 from .pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
@@ -16,7 +18,6 @@ from .pynccl_wrapper import (
     ncclRedOpTypeEnum,
     ncclUniqueId,
 )
-from aiter import logger
 
 current_stream = torch.cuda.current_stream
 _NCCL_SYMM_OPS_REGISTERED = False

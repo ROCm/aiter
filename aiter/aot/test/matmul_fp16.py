@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 try:
-    from triton.tools.compile import compile_kernel, CompileArgs
+    from triton.tools.compile import CompileArgs, compile_kernel
 except ImportError:
     print("Warning: compile_kernel or CompileArgs is not in triton.tools.compile!")
 

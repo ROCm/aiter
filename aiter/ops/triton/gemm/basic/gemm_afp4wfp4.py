@@ -3,19 +3,26 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
-    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
-    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
-    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
-    _get_config,
-)
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel as _triton_gemm_afp4wfp4_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_kernel_preshuffle_scales as _triton_gemm_afp4wfp4_kernel_preshuffle_scales,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _gemm_afp4wfp4_preshuffle_kernel as _triton_gemm_afp4wfp4_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+    _get_config,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -469,6 +476,8 @@ def gemm_afp4wfp4_preshuffle(
     if use_gluon:
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             gemm_mxfp4_preshuffle_gfx1250 as _gluon_gemm_mxfp4_preshuffle_gfx1250,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp4 import (
             get_gemm_afp4wfp4_preshuffle_layouts,
         )
 

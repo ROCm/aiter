@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
+import logging
 import os
 import sys
-import logging
+
+import torch
 
 logger = logging.getLogger("aiter")
 
@@ -84,6 +85,11 @@ else:
     # opus is gfx950-only but the package self-guards (warn + stubs on
     # non-gfx950) inside aiter/ops/opus/__init__.py, so its import line
     # is safe to put at top-level without try/except.
+    # isort: off
+    # Order below is load-bearing, do not sort. `dtypes` must be bound on the
+    # aiter package before any submodule that does `from aiter import dtypes`
+    # (mla.py among others) gets pulled in, otherwise that resolves against a
+    # partially initialised aiter and raises ImportError.
     from .jit import core as core
     from .utility import dtypes as dtypes
     from .ops.enum import *
@@ -131,15 +137,19 @@ else:
     from .ops.fused_split_gdr_update import *
     from . import mla  # noqa: F401
 
+    # isort: on
+
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
     from .ops.triton.comms import (
-        IrisCommContext,  # noqa: F401
-        calculate_heap_size,  # noqa: F401
-        reduce_scatter as iris_reduce_scatter,  # noqa: F401  # avoid shadowing C++ reduce_scatter exported by custom_all_reduce.py
-        all_gather,  # noqa: F401
-        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
         IRIS_COMM_AVAILABLE,
+        IrisCommContext,  # noqa: F401
+        all_gather,  # noqa: F401
+        calculate_heap_size,  # noqa: F401
+        reduce_scatter_rmsnorm_quant_all_gather,  # noqa: F401
+    )
+    from .ops.triton.comms import (
+        reduce_scatter as iris_reduce_scatter,  # noqa: F401  # avoid shadowing C++ reduce_scatter exported by custom_all_reduce.py
     )
 except (ImportError, AttributeError):
     # Iris or triton not available, skip import

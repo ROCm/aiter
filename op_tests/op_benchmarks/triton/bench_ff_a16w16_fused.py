@@ -1,32 +1,33 @@
+import math
 import sys
+
+import matplotlib.pyplot as plt
 import torch
 import triton
-import math
+
+from aiter.ops.triton.gemm.feed_forward.ff_a16w16 import (
+    ff_a16w16_gated,
+    ff_a16w16_nogate,
+)
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_gated import (
     ff_a16w16_fused_gated,
 )
 from aiter.ops.triton.gemm.feed_forward.ff_a16w16_fused_ungated import (
     ff_a16w16_fused_ungated,
 )
-from aiter.ops.triton.gemm.feed_forward.ff_a16w16 import (
-    ff_a16w16_gated,
-    ff_a16w16_nogate,
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_shape_benchmark_object,
+    model_benchmark_shapes,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
     generate_ff_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    get_ff_args,
-    add_argparse_ff,
-)
-
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    model_benchmark_shapes,
-    get_shape_benchmark_object,
-    print_vgpr,
-)
-import matplotlib.pyplot as plt
 
 
 def get_model_benchmark_object(

@@ -1,26 +1,28 @@
+import math
 import sys
+
 import torch
 import triton
-import math
+
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import (
     batched_gemm_afp4wfp4 as batched_gemm_afp4wfp4,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    batched_model_benchmark_shapes,
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
     generate_batched_gemm_afp4wfp4_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
-    batched_model_benchmark_shapes,
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-from aiter.ops.triton.utils._triton import arch_info
 
 
 def bench_gemm_fn(

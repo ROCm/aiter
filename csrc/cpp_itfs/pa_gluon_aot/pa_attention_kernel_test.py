@@ -1,43 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
-import os
-import sys
-import hashlib
-import aiter
-import numpy as np
 import argparse
+import hashlib
+import os
 import random
+import sys
 import tempfile
+
+import numpy as np
 import torch
-from jinja2 import Template
-from aiter.test_common import perftest
-from aiter import pertoken_quant, per_tensor_quant
-from csrc.cpp_itfs.torch_utils import torch_to_c_types
 import triton
 import triton.language as tl
+from jinja2 import Template
 
-from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
-    compile_gluon_kernel,
-    CompileGluonArgs,
+import aiter
+from aiter import per_tensor_quant, pertoken_quant
+from aiter.ops.triton.gluon.pa_decode_gluon import (
+    get_cdna_version,
+    paged_attention_decode_v2_gluon_dot_kernel,
+    paged_attention_decode_v2_gluon_large_block_dot_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_common import perftest
+from csrc.cpp_itfs.gluon_aot_tools.compile_gluon import (
+    CompileGluonArgs,
+    compile_gluon_kernel,
+)
+from csrc.cpp_itfs.torch_utils import torch_to_c_types
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
     AITER_CORE_DIR,
+    compile_template_op,
     get_default_func_name,
     run_lib,
 )
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.gluon.pa_decode_gluon import (
-    paged_attention_decode_v2_gluon_dot_kernel,
-    paged_attention_decode_v2_gluon_large_block_dot_kernel,
-    get_cdna_version,
-)
 from op_tests.triton_tests.test_pa_decode_gluon import (
-    torch_attention_compute,
     create_kv_cache,
-    quantize_kv_cache_symmetric,
     quantize_kv_cache_per_tensor,
+    quantize_kv_cache_symmetric,
     shuffle_value_cache_layout,
+    torch_attention_compute,
 )
 
 TORCH_TO_TL_DTYPE = {

@@ -1,10 +1,11 @@
+import argparse
 import importlib
 import json
 import os
 import re
 import warnings
-import argparse
-from op_tests.op_benchmarks.triton.utils.argparse import get_parser, add_argparse_ff
+
+from op_tests.op_benchmarks.triton.utils.argparse import add_argparse_ff, get_parser
 
 MODEL_SHAPES_JSON = os.path.abspath(
     os.path.join(

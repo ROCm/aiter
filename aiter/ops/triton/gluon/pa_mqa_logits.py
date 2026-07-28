@@ -3,17 +3,20 @@
 
 import triton
 import triton.language as tl
-
-from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
+
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
-        sched_barrier as _amd_iglp_sched_barrier,
-        sched_group_barrier as _amd_iglp_sched_group_barrier,
         s_set_prio as _amd_s_set_prio,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_barrier as _amd_iglp_sched_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
+        sched_group_barrier as _amd_iglp_sched_group_barrier,
     )
 except ImportError:
     # ignore iglp hint

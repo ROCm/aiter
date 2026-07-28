@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from . import dtypes
 from .mx_types import (

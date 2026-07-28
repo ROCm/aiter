@@ -2,9 +2,9 @@ import torch
 import triton
 
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,

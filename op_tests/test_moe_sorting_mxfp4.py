@@ -16,21 +16,23 @@ Covers two operations, dispatched by ``--quant-dtype``:
         Compared paths: ref / split / HIP-fused (no Triton).
 """
 
+import argparse
+import itertools
+
+import pandas as pd
 import torch
+
 import aiter
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.fused_moe import moe_sorting, fused_topk
-from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter import dtypes, get_torch_quant
+from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
-from aiter import get_torch_quant, dtypes
 from aiter.ops.quant import (
     per_1x32_f8_scale_f8_quant,
     per_1x32_mx_quant_hip,
 )
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-import pandas as pd
-import itertools
-import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

@@ -21,6 +21,7 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
+
 from .mfma_preshuffle_pipeline import xcd_remap_bx_by
 
 # (dsrd_preload, dvmem_preload) per (tile_m, tile_n, tile_k).

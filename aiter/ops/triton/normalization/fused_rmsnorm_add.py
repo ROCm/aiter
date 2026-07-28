@@ -4,7 +4,7 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
     _gluon_fused_rms_kernel,
@@ -12,6 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.norm.fused_rmsnorm_add import (
 from aiter.ops.triton._triton_kernels.normalization.fused_rmsnorm_add import (
     _triton_fused_rms_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _fused_rmsnorm_add_core(x, weight, epsilon, res1):

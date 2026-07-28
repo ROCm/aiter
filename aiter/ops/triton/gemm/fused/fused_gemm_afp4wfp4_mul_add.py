@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import triton
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
+
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     _fused_gemm_afp4wfp4_mul_add_kernel,
-    _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
     _fused_gemm_afp4wfp4_mul_add_reduce_kernel,
+    _fused_gemm_afp4wfp4_preshuffle_mul_add_kernel,
     _get_config,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-
-import os
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()

@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import copy
+
+import pandas as pd
 import torch
 from torch import Tensor
+
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.utility.dtypes import get_dtype_fp8
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
-import argparse
-import pandas as pd
+from aiter.utility.dtypes import get_dtype_fp8
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -199,7 +201,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+    from aiter import reshape_and_cache, reshape_and_cache_with_pertoken_quant
 
     if kv_cache_dtype == "auto":
         reshape_and_cache(

@@ -35,6 +35,10 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import (
+    llvm as _llvm,
+)
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -45,14 +49,13 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T, Vector as Vec
-from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
+
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-)
 
 KERNEL_NAME = "flash_attn_func_gfx1201_c_exp_a_k_noswizzle_kernel"
 _LOG2E = host_math.log2(host_math.e)

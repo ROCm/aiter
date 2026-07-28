@@ -1,14 +1,16 @@
 import warnings
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from typing import Literal
-from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
+
+from .common import apply_rotary, compute_alibi_block, compute_fp8_scaling_factors
 from .utils import (
     AUTOTUNE,
-    AutotuneMode,
     DEBUG,
     FWD_CONF_OVERRIDE,
+    AutotuneMode,
     get_arch,
     is_fp8,
     remap_xcd,

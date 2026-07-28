@@ -20,13 +20,14 @@ import os
 from pathlib import Path
 
 import torch  # isort: split
-from aiter import dtypes
+
+import gc
+import multiprocessing as mp
+import time
 
 from GemmTuner import GemmTuner
 
-import time
-import multiprocessing as mp
-import gc
+from aiter import dtypes
 
 
 def generate_mk_sets(model_dir, tp=1):

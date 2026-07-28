@@ -15,8 +15,8 @@ Run:
 import csv
 import os
 import re
-import sys
 import subprocess
+import sys
 import unittest
 
 AITER_ROOT = os.path.dirname(

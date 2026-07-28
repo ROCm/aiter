@@ -1,7 +1,7 @@
-from ..jit.core import compile_ops
 import torch
-
 from torch import Tensor
+
+from ..jit.core import compile_ops
 
 
 # JIT-compiled binding to the C++ kernel. Output `y` and scratch `workspace`

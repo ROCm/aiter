@@ -2,20 +2,21 @@
 # Copyright (C) 2018-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-import shutil
-import os
-import subprocess
-from jinja2 import Template
-import ctypes
-from packaging.version import parse, Version
-from collections import OrderedDict
-from functools import lru_cache, partial
 import binascii
+import ctypes
 import hashlib
-import logging
-import time
 import inspect
 import json
+import logging
+import os
+import shutil
+import subprocess
+import time
+from collections import OrderedDict
+from functools import lru_cache, partial
+
+from jinja2 import Template
+from packaging.version import Version, parse
 
 
 def get_git_commit_id_short():
@@ -335,9 +336,9 @@ def str_to_bool(s):
 
 
 def compile_hsaco_from_triton(kernel, *args, grid=(1, 1, 1), **kwargs):
+    import torch
     import triton
     import triton.language as tl
-    import torch
 
     if not isinstance(kernel, triton.JITFunction):
         raise ValueError(f"Kernel {kernel} is not a triton.JITFunction")
@@ -464,8 +465,8 @@ class HsacoKernel:
     def __getitem__(self, grid):
         def _call(*args, **kwargs):
             if AITER_USE_HSACO:
-                import triton.language as tl
                 import torch
+                import triton.language as tl
 
                 sig = inspect.signature(self.triton_kernel.fn)
                 valid_param_names = set(sig.parameters.keys())

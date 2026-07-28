@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
-from aiter.test_common import checkAllclose, perftest
-from aiter import dtypes
+
+from aiter import ActivationType, dtypes, pertoken_quant
+from aiter.fused_moe import fused_topk
 from aiter.fused_moe_bf16_asm import (
     asm_moe_tkw1,
     torch_moe_tkw1,
 )
-from aiter.fused_moe import fused_topk
-from aiter.ops.shuffle import shuffle_weight
-from aiter import pertoken_quant
 from aiter.int4_utils import *
-from aiter import ActivationType
-import argparse
+from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import checkAllclose, perftest
 
 BLOCK_SIZE_M = 32
 

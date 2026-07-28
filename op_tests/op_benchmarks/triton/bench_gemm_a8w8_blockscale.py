@@ -1,29 +1,33 @@
+import math
+
 import torch
 import triton
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as triton_gemm_a8w8_blockscale,
+)
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale_preshuffle as triton_gemm_a8w8_blockscale_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gemm_a8w8_blockscale,
 )
 from aiter.test_common import checkAllclose
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
+)
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_blockscale import (
     generate_gemm_a8w8_blockscale_inputs,
     run_torch,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-import math
 
 block_shape = (128, 128)
 

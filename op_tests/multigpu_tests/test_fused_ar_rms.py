@@ -1,38 +1,39 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import os
-import aiter
-import torch
-import torch.nn.functional as F
-import torch.distributed as dist
 import argparse
 import itertools
-import pandas as pd
-from aiter import dtypes
+import logging
+import os
+from multiprocessing import Pool, freeze_support, set_start_method
 
-from aiter.dist.parallel_state import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
-    get_tp_group,
-    graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
-)
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+
+import aiter
+from aiter import dtypes
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
 )
+from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    graph_capture,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 

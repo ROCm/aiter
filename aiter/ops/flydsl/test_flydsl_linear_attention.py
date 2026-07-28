@@ -9,12 +9,13 @@ Usage:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 import triton
 import triton.language as tl
 
-from dataclasses import dataclass
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 if not torch.cuda.is_available():

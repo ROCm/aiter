@@ -2,11 +2,9 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
-
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
@@ -14,10 +12,13 @@ from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_torch,
 )
 
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
+
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
-    dequant_x_blockscale,
     dequant_w_blockscale,
+    dequant_x_blockscale,
 )
 
 # ---------------

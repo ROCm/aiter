@@ -5,18 +5,18 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import enum
 import json
 import multiprocessing
-from multiprocessing.connection import wait as wait_for_sentinels
+import os
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
-import enum
-import os
-from typing import Any
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from multiprocessing.connection import wait as wait_for_sentinels
+from typing import Any
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64

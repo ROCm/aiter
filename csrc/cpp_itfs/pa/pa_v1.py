@@ -1,7 +1,9 @@
-from jinja2 import Template
-from csrc.cpp_itfs.utils import compile_template_op, AITER_CORE_DIR, str_to_bool
 import ctypes
 import math
+
+from jinja2 import Template
+
+from csrc.cpp_itfs.utils import AITER_CORE_DIR, compile_template_op, str_to_bool
 
 MD_NAME = "pa_v1"
 
@@ -130,6 +132,7 @@ def paged_attention_v1(
     sliding_window: int = 0,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     warpSize = torch.cuda.get_device_properties(out.device).warp_size

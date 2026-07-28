@@ -1,7 +1,8 @@
 import sys
+
 from _utils import (
-    run_profile,
     get_input_shape_and_config_list,
+    run_profile,
 )
 
 ############################################################

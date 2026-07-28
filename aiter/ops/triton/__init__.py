@@ -17,11 +17,11 @@ try:
 
     # Re-export communication primitives at this level for convenience
     from .comms import (  # noqa: F401  deliberate re-export for convenience
-        IrisCommContext,
-        reduce_scatter,
-        all_gather,
-        reduce_scatter_rmsnorm_quant_all_gather,
         IRIS_COMM_AVAILABLE,
+        IrisCommContext,
+        all_gather,
+        reduce_scatter,
+        reduce_scatter_rmsnorm_quant_all_gather,
     )
 
     _COMMS_AVAILABLE = True

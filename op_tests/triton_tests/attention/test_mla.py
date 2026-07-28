@@ -2,19 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.mla import (
-    mla_prefill_fwd,
     mla_decode_fwd,
+    mla_prefill_fwd,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 

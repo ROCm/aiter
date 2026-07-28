@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import warnings
+
+import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_ungated import (
     _ff_a16w16_fused_ungated,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
-
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

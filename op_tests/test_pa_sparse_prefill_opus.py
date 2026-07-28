@@ -63,8 +63,8 @@ import torch
 
 import aiter  # noqa: F401  (registers the top-level export)
 from aiter.ops.pa_sparse_prefill_opus import (
-    pa_sparse_prefill_opus,
     pa_sparse_prefill_fp8_opus,
+    pa_sparse_prefill_opus,
 )
 from aiter.test_common import benchmark, checkAllclose, perftest
 

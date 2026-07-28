@@ -5,20 +5,19 @@
 
 from __future__ import annotations
 
-import re
 import functools
+import re
 from itertools import product
 
-import torch
-from torch import Tensor
-
 import flydsl.expr as fx
-from aiter import logger
+import torch
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from torch import Tensor
 
+from aiter import logger
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
 

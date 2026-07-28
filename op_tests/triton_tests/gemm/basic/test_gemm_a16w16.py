@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
-from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16, _is_gluon_available
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import _is_gluon_available, gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_atomic import gemm_a16w16_atomic
 from op_tests.triton_tests.utils.types import str_to_torch_dtype
 

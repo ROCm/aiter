@@ -1,23 +1,25 @@
+import math
+
 import torch
 import triton
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8_per_token_scale import (
     gemm_a8w8_per_token_scale,
+)
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_per_token_scale import (
     generate_gemm_a8w8_per_token_scale_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
-    get_caller_name_no_ext,
-    print_vgpr,
-)
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-import math
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):

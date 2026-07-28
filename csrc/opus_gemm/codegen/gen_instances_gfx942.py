@@ -8,11 +8,11 @@ from pathlib import Path
 from opus_gemm_common import OpusGemmInstance
 
 from codegen.common import (
-    WARP_SIZE,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
     W3_KERNEL_PAIRS,
+    WARP_SIZE,
     register_arch_map,
     register_emit,
 )

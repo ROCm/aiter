@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import triton
-import torch
 import pytest
+import torch
+import triton
 
 from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
 

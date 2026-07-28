@@ -30,18 +30,15 @@
 
 import argparse
 import fnmatch
+import os
 import re
 import shutil
 import sys
-import os
+from collections.abc import Iterable, Iterator, Mapping
+from enum import Enum
 
 from . import constants
-from .cuda_to_hip_mappings import CUDA_TO_HIP_MAPPINGS
-from .cuda_to_hip_mappings import MATH_TRANSPILATIONS
-
-from collections.abc import Iterator
-from collections.abc import Mapping, Iterable
-from enum import Enum
+from .cuda_to_hip_mappings import CUDA_TO_HIP_MAPPINGS, MATH_TRANSPILATIONS
 
 
 class CurrentState(Enum):

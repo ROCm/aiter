@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
-import aiter
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from gemm_a8w8_common import kernels_list
+
+import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIG_GEMM_A8W8
 from aiter.utility.base_tuner import GemmCommonTuner
-from gemm_a8w8_common import kernels_list
 from aiter.utility.mp_tuner import mp_tuner
 
 
@@ -138,7 +140,7 @@ class GemmA8W8Tuner(GemmCommonTuner):
 
     def run_config(self, args):
         from aiter.ops.gemm_op_a8w8 import gemm_a8w8
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []

@@ -30,13 +30,13 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.fused_compress_attn import flydsl_fused_compress_attn
 from aiter.ops.flydsl.kernels.fused_compress_attn_hca import flydsl_hca_compress_attn
 from aiter.ops.torch_ref.fused_compress_attn import (
     fused_compress_attn as fused_compress_attn_reference,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 

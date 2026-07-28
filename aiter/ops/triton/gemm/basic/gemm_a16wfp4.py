@@ -3,21 +3,22 @@
 
 import torch
 import triton
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _gemm_a16wfp4_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     get_splitk,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 

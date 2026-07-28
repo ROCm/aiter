@@ -20,8 +20,8 @@
 #      to triton JIT kernel
 # ========================================================================
 
-import os
 import math
+import os
 from functools import lru_cache
 
 import torch
@@ -30,11 +30,10 @@ from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
-
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
@@ -46,10 +45,10 @@ if triton_version >= Version("3.5.0"):
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
     )
     from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
     from aiter.ops.triton.gluon.pa_mqa_logits import (
@@ -65,10 +64,10 @@ else:
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,

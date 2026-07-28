@@ -6,12 +6,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 import triton
 import triton.language as tl
-
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr

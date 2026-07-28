@@ -1,12 +1,13 @@
+import inspect
+
 import torch
+import triton
+from packaging.version import Version
 
 from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
     _fp8_mqa_logits_kernel,
 )
 from aiter.ops.triton.utils._triton import arch_info
-import inspect
-from packaging.version import Version
-import triton
 
 TRITON_VERSION = Version(triton.__version__)
 TRITON_GE_36 = TRITON_VERSION >= Version("3.6.0")

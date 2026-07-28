@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 from torch import Tensor
+
 from ..jit.core import compile_ops
-import functools
 
 
 @compile_ops(

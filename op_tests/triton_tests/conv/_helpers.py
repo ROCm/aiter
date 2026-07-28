@@ -40,12 +40,12 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv._utils import (
-    _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
+    _out_hw,
 )
-from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv.conv2d import (
     conv2d_nchw,
     conv2d_nchw_cblocked,

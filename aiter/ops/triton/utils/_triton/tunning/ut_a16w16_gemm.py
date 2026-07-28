@@ -1,13 +1,14 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
 import triton
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
     generate_gemm_a16w16_inputs,

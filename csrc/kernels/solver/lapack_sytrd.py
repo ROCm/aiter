@@ -1,6 +1,6 @@
 import numpy as np
-from scipy.linalg.lapack import dsytrd
 from scipy.linalg import blas
+from scipy.linalg.lapack import dsytrd
 
 
 def _copy_lower_to(A_src, A_dst):

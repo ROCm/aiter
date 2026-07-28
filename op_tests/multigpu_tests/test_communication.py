@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
+import multiprocessing as mp
+import os
+import sys
+import traceback
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import os
+
 import aiter
-from aiter.test_common import checkAllclose, perftest
-from aiter.dist.parallel_state import graph_capture
 from aiter import dtypes
-import sys
-import traceback
-import logging
-import multiprocessing as mp
-import argparse
+from aiter.dist.parallel_state import graph_capture
+from aiter.test_common import checkAllclose, perftest
 
 logger = logging.getLogger("aiter")
 

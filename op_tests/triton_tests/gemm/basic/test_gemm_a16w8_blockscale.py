@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+
+# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
+import torch.nn.functional as F
+import triton
+
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
 )
-from aiter.ops.triton.utils.types import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight
-
-# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
-import torch.nn.functional as F
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)
 

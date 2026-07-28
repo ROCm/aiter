@@ -1,22 +1,23 @@
 import torch
 import triton
+
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_a16w16 import (
     fused_gemm_afp4wfp4_a16w16,
-)
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
-)
-from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
-    generate_gemm_a16w16_inputs,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
-    get_caller_name_no_ext,
 )
 from op_tests.op_benchmarks.triton.bench_fused_gemm_commons import (
     metric_to_scalar,
     parse_fused_args,
     run_fused_benchmark,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a16w16 import (
+    generate_gemm_a16w16_inputs,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
 )
 
 dimension = ["M", "N4", "N16", "K"]

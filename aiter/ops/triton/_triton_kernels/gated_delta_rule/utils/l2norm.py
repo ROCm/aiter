@@ -10,9 +10,9 @@ supporting both forward and backward passes.
 """
 
 import torch
-from torch import nn
 import triton
 import triton.language as tl
+from torch import nn
 
 from ..gated_delta_rule_utils import IS_AMD, autotune_cache_kwargs, input_guard
 

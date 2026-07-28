@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from collections.abc import Iterable, Mapping
+from pathlib import Path
 
 import pandas as pd
 

@@ -3,12 +3,14 @@
 
 import functools
 import json
+
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
+
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 # NOTE: triton fails to import tl.constexprs so create them here for the file
 DROPOUT_USE_PYTORCH = False

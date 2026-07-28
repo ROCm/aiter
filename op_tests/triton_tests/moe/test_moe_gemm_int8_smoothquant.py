@@ -2,23 +2,24 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
-
-# Routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
-
-# SmoothQuant quantization utilities
-from aiter.ops.triton.moe.quant_moe import (
-    smoothquant_quantize,
-    quantize_weights_int8,
-)
 
 # SmoothQuant MoE utilities
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
     preshuffle_weights,
+)
+
+# Routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
+
+# SmoothQuant quantization utilities
+from aiter.ops.triton.moe.quant_moe import (
+    quantize_weights_int8,
+    smoothquant_quantize,
 )
 
 # ---------------

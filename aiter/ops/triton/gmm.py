@@ -10,32 +10,32 @@ import warnings
 
 # PyTorch
 import torch
-from torch import Tensor
 
 # Triton
 import triton
+from torch import Tensor
+
+# AITER: GMM Triton kernels
+from aiter.ops.triton._triton_kernels.gmm import (
+    get_config,
+    gmm_kernel,
+    tgmm_non_persistent_kernel,
+    tgmm_persistent_kernel,
+)
 
 # AITER: GMM utility functions
 from aiter.ops.triton.utils.gmm_common import (
     DTYPE,
-    is_power_of_2,
-    check_input_device_dtype,
     check_bias_shape_stride,
-    get_gmm_shape,
+    check_input_device_dtype,
     get_gmm_output,
+    get_gmm_shape,
     get_gmm_transposition,
-    get_tgmm_shape,
-    get_tgmm_output,
     get_tgmm_bias_grad,
+    get_tgmm_output,
+    get_tgmm_shape,
     get_tgmm_transposition,
-)
-
-# AITER: GMM Triton kernels
-from aiter.ops.triton._triton_kernels.gmm import (
-    gmm_kernel,
-    tgmm_persistent_kernel,
-    tgmm_non_persistent_kernel,
-    get_config,
+    is_power_of_2,
 )
 
 # GMM PyTorch wrapper.

@@ -3,23 +3,23 @@
 
 import math
 
-import triton
 import torch
-from aiter.ops.triton._triton_kernels.attention.pa_decode import (
-    _paged_attn_decode_v1_wo_dot_kernel,
-    _paged_attn_decode_v1_w_dot_kernel,
-    _paged_attn_decode_v2_wo_dot_kernel,
-    _paged_attn_decode_v2_wo_dot_reduce_kernel,
-    _paged_attn_decode_v2_w_dot_kernel,
-    _paged_attn_decode_v2_w_dot_reduce_kernel,
-    _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
-    _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
-    _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
-    _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
-)
+import triton
 
+from aiter.ops.triton._triton_kernels.attention.pa_decode import (
+    _paged_attn_decode_v1_w_dot_kernel,
+    _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
+    _paged_attn_decode_v1_wo_dot_kernel,
+    _paged_attn_decode_v1_wo_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_w_dot_kernel,
+    _paged_attn_decode_v2_w_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_w_dot_reduce_kernel,
+    _paged_attn_decode_v2_w_dot_reduce_kernel_per_token_quant,
+    _paged_attn_decode_v2_wo_dot_kernel,
+    _paged_attn_decode_v2_wo_dot_kernel_per_token_quant,
+    _paged_attn_decode_v2_wo_dot_reduce_kernel,
+    _paged_attn_decode_v2_wo_dot_reduce_kernel_per_token_quant,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()

@@ -42,38 +42,39 @@ import sys
 
 import pandas as pd
 import torch
-from aiter import dtypes, logger
-from aiter.utility.base_tuner import GemmCommonTuner, INVALID_TIME
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.opus.gemm_op_a16w16 import (
-    opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
-)
 
 # opus_gemm_common is a sibling file in csrc/opus_gemm/.
 from opus_gemm_common import (
-    a16w16_kernels_list,
-    a16w16_kernels_list_nooob,
-    a16w16_kernels_list_cpol,
-    a16w16_kernels_list_cpol_nooob,
+    BIAS_AWARE_KIDS,
+    GFX1250_CLUSTERLAUNCH_KID_OF,
+    GFX1250_PLAIN_KID_OF,
+    HEURISTIC_DEFAULT_KIDS,
+    NON_SPLITK_KIDS,
+    SPLITK_KIDS,
+    _opus_sidecar_path,
     a16w16_flatmm_kernels_list,
     a16w16_flatmm_splitk_kernels_list,
     a16w16_flatmm_splitk_kernels_list_nooob,
+    a16w16_kernels_list,
+    a16w16_kernels_list_cpol,
+    a16w16_kernels_list_cpol_nooob,
+    a16w16_kernels_list_nooob,
     a16w16_persistent_kernels_list,
     a16w16_persistent_kernels_list_cpol,
-    a16w16_persistent_kernels_list_nooob,
     a16w16_persistent_kernels_list_cpol_nooob,
+    a16w16_persistent_kernels_list_nooob,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
-    gfx1250_kernels_list,
     gfx1250_clusterlaunch_kernels_list,
-    GFX1250_PLAIN_KID_OF,
-    GFX1250_CLUSTERLAUNCH_KID_OF,
-    SPLITK_KIDS,
-    NON_SPLITK_KIDS,
-    BIAS_AWARE_KIDS,
-    HEURISTIC_DEFAULT_KIDS,
-    _opus_sidecar_path,
+    gfx1250_kernels_list,
 )
+
+from aiter import dtypes, logger
+from aiter.ops.opus.gemm_op_a16w16 import (
+    opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
+)
+from aiter.utility.base_tuner import INVALID_TIME, GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 # gfx1250 candidate-filter knobs (see _gfx1250_select_candidates).
 GFX1250_TOP_TILES = 8  # top-N tiles by grid-occupancy fit
@@ -682,8 +683,9 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 
     # Step 5: arch post-filter.
     try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
         from opus_gemm_common import kernels_list as _klist
+
+        from aiter.jit.utils.chip_info import get_gfx_runtime
 
         _run_arch = get_gfx_runtime().lower()
         cands = frozenset(
@@ -759,9 +761,10 @@ def _ensure_kids_compiled(candidate_kids):
         True if a rebuild was triggered (sidecar grew), False if every
         required kid was already compiled.
     """
+    from opus_gemm_common import heuristic_kids_for_arch
+
     from aiter.jit import core as _jit_core
     from aiter.jit.utils.file_baton import FileBaton
-    from opus_gemm_common import heuristic_kids_for_arch
 
     candidate_kids = frozenset(int(k) for k in candidate_kids)
     # Restrict the heuristic-default kid set to the running GPU's arch.

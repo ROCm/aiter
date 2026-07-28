@@ -1,34 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import (
-    checkAllclose,
-    run_perftest,
-    perftest,
-)
-from aiter.fused_moe import (
-    fused_topk,
-    fused_moe,
-    torch_moe,
-)
-
-from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import (
-    shuffle_weight,
-    shuffle_weight_a16w4,
-    shuffle_scale_a16w4,
-)
-from aiter import ActivationType
-from aiter import QuantType
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter import pertoken_quant
-from aiter import dtypes
-from aiter import get_gfx
-from aiter.utility import fp4_utils
 import argparse
 import os
+
+import torch
+
+import aiter
+from aiter import ActivationType, QuantType, dtypes, get_gfx, pertoken_quant
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    torch_moe,
+)
+from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
+from aiter.test_common import (
+    checkAllclose,
+    perftest,
+    run_perftest,
+)
+from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4

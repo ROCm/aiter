@@ -3,13 +3,15 @@
 
 
 import os
+
 import torch
 from torch.distributed import ProcessGroup
 
-from aiter import logger, get_hip_quant
+from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False

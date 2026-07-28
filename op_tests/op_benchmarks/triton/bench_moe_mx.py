@@ -1,17 +1,19 @@
 import argparse
 import sys
+
 import triton
-from aiter.ops.triton.utils.types import torch_to_triton_dtype
-from aiter.ops.triton.utils._triton import arch_info
+
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
-from op_tests.triton_tests.moe.test_moe_mx import input_helper
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import torch_to_triton_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
-    get_model_configs,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
 )
+from op_tests.triton_tests.moe.test_moe_mx import input_helper
 
 
 def model_benchmark_configs(args):

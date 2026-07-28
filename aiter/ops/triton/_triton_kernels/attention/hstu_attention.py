@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import json
 
 # @manual=//triton:triton
@@ -20,10 +21,10 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-import functools
+
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 try:
     from triton.language.extra.libdevice import (

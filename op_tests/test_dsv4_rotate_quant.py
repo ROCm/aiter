@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from aiter.test_common import (
-    checkAllclose,
-    benchmark,
-    run_perftest,
-)
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
 from aiter import dtypes, get_gfx
-import argparse
-import pandas as pd
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 torch.set_default_device("cuda")
 

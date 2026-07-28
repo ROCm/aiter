@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
+import itertools
+import random
+
+import pandas as pd
+import torch
 import triton
 import triton.language as tl
-import pandas as pd
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)

@@ -1,41 +1,42 @@
 from __future__ import annotations
-from typing import Literal, Any
-import csv
-import json
-import torch
-import os
-import glob
 
-import sys
 import argparse
-import aiter
-import triton
+import csv
+import glob
+import json
 import logging
+import os
+import sys
+from typing import Any, Literal
 
+import torch
+import triton
 from aiter.ops.triton.mha import (
     flash_attn_func,
 )
 
+import aiter
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
+from aiter.ops.triton.attention.fav3_sage import (
+    fav3_sage_wrapper_func,
+    get_sage_fwd_configs,
+)
+from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
+from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_block_sparse,
 )
 from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
 )
-from op_tests.triton_tests.attention.test_fav3_sage import check_attention_outputs
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
-
-from aiter.ops.triton.attention.fav3_sage import (
-    fav3_sage_wrapper_func,
-    get_sage_fwd_configs,
+from op_tests.triton_tests.attention.test_fav3_sage import (
+    check_attention_outputs,
+    compare_accuracy,
 )
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-from op_tests.triton_tests.attention.test_fav3_sage import compare_accuracy
 
 CAUSAL = False
 layout_converter = {

@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import triton
-import pytest
+
 from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 

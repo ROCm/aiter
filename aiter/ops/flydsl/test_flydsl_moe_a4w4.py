@@ -22,8 +22,9 @@ import argparse
 import sys
 
 import torch
+
 import aiter
-from aiter import dtypes, QuantType, ActivationType
+from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
