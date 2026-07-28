@@ -216,12 +216,14 @@ def _f4f4_v_kperm(device):
     return kp
 
 
-def _pack_v_mxfp4_colmajor(v_bshd):
-    """Fused-Triton MXFP4 V pack for f4f4: PURE microscaling -- one Triton kernel per 128-kv tile
-    computes the per-(dv-channel, 32-kv-block) E8M0 on V, block-normalizes + E2M1-packs the col-major
-    blocks, and writes the E8M0 image straight into v_descale in the kernel's LDS-gather byte order --
-    no host-side permutation, no multi-GB torch intermediates, ragged tail masked (no pre-pad copy).
-    Returns (v_fp4_view, v_descale)."""
+@torch.library.custom_op("aiter::pack_v_mxfp4_colmajor_raw", mutates_args=())
+def _pack_v_mxfp4_colmajor_raw(v_bshd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Opaque core of the mxfp4-V pack: runs the Triton kernel and returns the *contiguous*
+    packed byte buffer (numel+64) + the E8M0 image. The kernel + its in-place buffer init are
+    hidden inside this custom op, so inductor sees a pure node (no visible mutation / as_strided
+    alias) that its reorder_for_compute_comm_overlap pass can hoist into a collective's shadow --
+    unlike the raw mutating Triton kernel, which it pins after the exposed collective. The caller
+    applies the (pure) as_strided reinterpretation outside."""
     b, kv_len, h_kv, head_dim = v_bshd.shape
     assert head_dim == 128, head_dim
     tile = 128
@@ -248,6 +250,33 @@ def _pack_v_mxfp4_colmajor(v_bshd):
         h_kv, nT, kv_len,
         num_warps=1, num_stages=1,
     )
+    return buf, v_descale
+
+
+@_pack_v_mxfp4_colmajor_raw.register_fake
+def _(v_bshd):
+    b, kv_len, h_kv, head_dim = v_bshd.shape
+    tile = 128
+    kv_pad = ((kv_len + tile - 1) // tile) * tile
+    nT = kv_pad // tile
+    numel = b * h_kv * nT * 8192
+    return (
+        torch.empty(numel + 64, dtype=torch.uint8, device=v_bshd.device),
+        torch.empty(b, h_kv, nT * 512, dtype=torch.uint8, device=v_bshd.device),
+    )
+
+
+def _pack_v_mxfp4_colmajor(v_bshd):
+    """Fused-Triton MXFP4 V pack for f4f4: PURE microscaling -- per-(dv-channel, 32-kv-block) E8M0,
+    block-normalized + E2M1-packed col-major blocks. Runs the pack inside an opaque custom op
+    (``_pack_v_mxfp4_colmajor_raw``, hoistable so it overlaps the exposed Q/K collective) that returns
+    the contiguous packed bytes, then reinterprets them into the fmha kernel's col-major fp4 V layout
+    via a pure as_strided view. Returns (v_fp4_view, v_descale)."""
+    b, kv_len, h_kv, head_dim = v_bshd.shape
+    assert head_dim == 128, head_dim
+    tile = 128
+    kv_pad = ((kv_len + tile - 1) // tile) * tile
+    buf, v_descale = torch.ops.aiter.pack_v_mxfp4_colmajor_raw(v_bshd)
     v_fp4_view = torch.as_strided(
         buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
     )
