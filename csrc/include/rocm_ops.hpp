@@ -2021,6 +2021,19 @@ namespace py = pybind11;
           py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
+#define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
+    m.def("inverse_rope_group_quant",                  \
+          &aiter::inverse_rope_group_quant,            \
+          py::arg("o"),                                \
+          py::arg("x_fp8"),                            \
+          py::arg("x_scale"),                          \
+          py::arg("positions"),                        \
+          py::arg("cos_cache"),                        \
+          py::arg("sin_cache"),                        \
+          py::arg("num_groups"),                       \
+          py::arg("quant_group_size") = 128,           \
+          py::arg("transpose_scale")  = false);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
