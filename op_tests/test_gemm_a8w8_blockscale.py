@@ -110,13 +110,23 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    x_scale_sglang = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
-    gemm_x_scale = x_scale_sglang if ck_preshuffle else x_scale
+    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
+    if ck_preshuffle:
+        x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
+        b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
+            x, gemm_weight, x_scale_strided, w_scale, dtype
+        )
+        checkAllclose(
+            a,
+            b_strided,
+            msg="ck strided x_scale",
+            catastrophic_check=True,
+        )
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
