@@ -24,7 +24,7 @@
 """Rotary Positional Embeddings."""
 
 import math
-from typing import Any, List
+from typing import Any
 
 import torch
 from torch import nn
@@ -479,7 +479,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
-        self.scaling_factors: List[float] = scaling_factors  # noqa
+        self.scaling_factors: list[float] = scaling_factors
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )

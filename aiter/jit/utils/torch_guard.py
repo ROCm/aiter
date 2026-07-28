@@ -4,7 +4,7 @@ from packaging import version
 from packaging.version import Version
 import importlib
 import types
-from typing import Any, Optional, Union, get_args, get_origin
+from typing import Any, Union, get_args, get_origin
 from collections.abc import Callable
 
 aiter_lib = None
@@ -110,7 +110,9 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = f"Tensor(a{idx}!)"
             else:
                 type_str = "Tensor"
-        elif param_type == Optional[torch.Tensor]:
+        # Runtime comparison values, not annotations. Both spellings compare
+        # equal (Optional[T] == T | None), so either side may be written either way.
+        elif param_type == (torch.Tensor | None):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)?"
             else:
@@ -130,7 +132,7 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
             type_str = "SymInt"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
-        elif param_type == Optional[torch.Generator]:
+        elif param_type == (torch.Generator | None):
             type_str = "Generator?"
         elif (
             get_origin(param_type) in (list, list)
@@ -142,7 +144,7 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor[]"
         elif get_origin(param_type) in (list, list) and get_args(param_type)[0] is int:
             type_str = "int[]"
-        elif param_type == Optional[torch.dtype]:
+        elif param_type == (torch.dtype | None):
             type_str = "ScalarType?"
         else:
             type_str = "*"
@@ -216,7 +218,7 @@ def torch_compile_guard(
 
         try:
             import torch
-            from torch.library import Library
+            from torch.library import Library  # noqa: F401  availability probe
             import inspect
         except ImportError:
             return wrapper

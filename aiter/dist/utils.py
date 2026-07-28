@@ -41,7 +41,6 @@ from typing import (
     Generic,
     Literal,
     TypeVar,
-    Union,
     overload,
 )
 from collections import OrderedDict
@@ -1038,9 +1037,9 @@ def is_list_of(
     assert_never(check)
 
 
-JSONTree = Union[
-    dict[str, "JSONTree[T]"], list["JSONTree[T]"], tuple["JSONTree[T]", ...], T
-]
+JSONTree = (
+    dict[str, "JSONTree[T]"] | list["JSONTree[T]"] | tuple["JSONTree[T]", ...] | T
+)
 """A nested JSON structure where the leaves need not be JSON-serializable."""
 
 

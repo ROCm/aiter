@@ -16,7 +16,7 @@ try:
     from . import comms
 
     # Re-export communication primitives at this level for convenience
-    from .comms import (
+    from .comms import (  # noqa: F401  deliberate re-export for convenience
         IrisCommContext,
         reduce_scatter,
         all_gather,
