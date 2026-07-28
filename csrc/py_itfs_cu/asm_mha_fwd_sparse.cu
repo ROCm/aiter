@@ -1645,8 +1645,9 @@ fmha_v3_fwd_mxfp4(at::Tensor& q,
 
 // =====================================================================
 // DENSE (non-sparse) f4f4 entry. Identical contract to fmha_v3_fwd_mxfp4
-// except V is packed as per-channel fp4 (int8/uint8 bytes, col-major)
-// rather than fp8. Routes to the dedicated kernel fwd_hd128_f4f4.co via
+// except V is packed as mxfp4 (E2M1 col-major bytes + a uint8 per-(dv,32-kv
+// -block) E8M0 block-scale image in v_descale) rather than fp8. Routes to
+// the dedicated kernel fwd_hd128_f4f4.co via
 // aiter::fmha_fwd_v3_f4f4. This is the first-class f4f4 launch path
 // (mirrors fmha_v3_fwd_mxfp4 exactly); no env var / general fmha_v3_fwd.
 // =====================================================================
@@ -1666,12 +1667,12 @@ fmha_v3_fwd_f4f4(at::Tensor& q,
     TORCH_CHECK(is_byte(q.dtype().toScalarType()) && is_byte(k.dtype().toScalarType()),
                 "fmha_v3_fwd_f4f4: Q and K must be int8/uint8 (fp4-packed bytes).");
     TORCH_CHECK(is_byte(v.dtype().toScalarType()),
-                "fmha_v3_fwd_f4f4: V must be int8/uint8 (per-channel fp4-packed bytes).");
+                "fmha_v3_fwd_f4f4: V must be int8/uint8 (mxfp4 E2M1-packed bytes).");
     TORCH_CHECK(is_byte(q_descale.dtype().toScalarType()) &&
                     is_byte(k_descale.dtype().toScalarType()),
                 "fmha_v3_fwd_f4f4: Q/K per-block E8M0 scales must be int8/uint8 byte tensors.");
-    TORCH_CHECK(v_descale.dtype() == torch::kFloat32,
-                "fmha_v3_fwd_f4f4: V descale must be fp32 (per output channel).");
+    TORCH_CHECK(is_byte(v_descale.dtype().toScalarType()),
+                "fmha_v3_fwd_f4f4: V descale must be an int8/uint8 E8M0 block-scale image.");
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(q_descale); CHECK_DEVICE(k_descale); CHECK_DEVICE(v_descale);
 

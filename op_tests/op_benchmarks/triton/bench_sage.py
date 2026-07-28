@@ -648,7 +648,9 @@ def make_f4f4_runner(
     k_quant = k_quant.contiguous()
     q_descale = q_descale.contiguous()
     k_descale = k_descale.contiguous()
-    v_descale = v_descale.to(torch.float32).contiguous()
+    # f4f4 v_descale is the uint8 E8M0 image (no fp32 header) -- keep it uint8; a .to(float32)
+    # here would VALUE-cast the E8M0 bytes and corrupt the block scales.
+    v_descale = v_descale.contiguous()
 
     softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
 

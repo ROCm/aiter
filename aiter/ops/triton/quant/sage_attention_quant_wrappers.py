@@ -320,9 +320,9 @@ def _pack_v_mxfp4_colmajor(v_bshd):
         dv = (n * 32 + chan_L).long()
         for k in range(2):
             eimg[:, :, :, k, :, n] = escratch[:, :, :, k, kblk_L, dv]
-    eimg_f32 = eimg.reshape(b, h_kv, nT * 512).contiguous().view(torch.float32)
-    header = torch.ones(b, h_kv, head_dim, device=dev, dtype=torch.float32)
-    v_descale = torch.cat([header, eimg_f32], dim=-1).contiguous()
+    # E8M0 image only, as uint8 [b, h_kv, nT*512] -- no 512 B fp32 per-channel header (f4f4 is pure
+    # MX; the kernel reads the E8M0 image at byte offset kv*4 with per-(b,h) stride kv_seq_len*4).
+    v_descale = eimg.reshape(b, h_kv, nT * 512).contiguous()
     v_fp4_view = torch.as_strided(
         buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
     )

@@ -486,10 +486,10 @@ def _gen_fmha_v3_fwd_f4f4_fake_tensors(
 def fmha_v3_fwd_f4f4(
     q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
     k: Tensor,                    # [b, sk, hk, 64], int8/uint8
-    v: Tensor,                    # [b, sk, hk, 128], int8/uint8 (per-channel fp4, col-major)
+    v: Tensor,                    # [b, sk, hk, 128], int8/uint8 (mxfp4 E2M1, col-major)
     q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
     k_descale: Tensor,            # E8M0 per-block bytes
-    v_descale: Tensor,            # fp32 per output channel, [b*hk, 128]
+    v_descale: Tensor,            # uint8 E8M0 block-scale image, [b, hk, nT*512]
     softmax_scale: float,
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
@@ -4012,9 +4012,9 @@ def flash_attn_f4f4_pertensor_func(
     Args:
         q: int8/uint8 tensor [b, sq, hq, hd/2 = 64], fp4-packed (bshd).
         k: int8/uint8 tensor [b, sk, hk, 64], fp4-packed (bshd).
-        v: int8/uint8 tensor [b, sk, hk, 128], per-channel fp4 col-major view (bshd).
+        v: int8/uint8 tensor [b, sk, hk, 128], mxfp4 E2M1 col-major view (bshd).
         q_descale, k_descale: int8/uint8 E8M0 per-block scales.
-        v_descale: fp32 per output channel.
+        v_descale: uint8 E8M0 block-scale image [b, hk, nT*512] (no fp32 header).
         softmax_scale: if None, defaults to hd_logical**-0.5 where
             hd_logical = q.shape[-1] * 2 (fp4-packed).
 
