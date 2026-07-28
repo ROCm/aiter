@@ -66,6 +66,27 @@ def get_tune_space():
 
 
 @cache
+def _get_compiled_sorted_sum_kernel(TOPK, N):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_sorted_sum
+
+    return compile_sorted_sum(
+        TOPK=TOPK,
+        N=N,
+    )
+
+
+@cache
+def _get_compiled_invert_sorted_ids_kernel(TOPK):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+        compile_invert_sorted_ids,
+    )
+
+    return compile_invert_sorted_ids(
+        TOPK=TOPK,
+    )
+
+
+@cache
 def _get_compiled_sum_kernel(TOPK, N):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_sum
 
@@ -133,26 +154,13 @@ def _launch(kernel_fn, *args):
     _run_compiled(kernel_fn, *prepared_args, stream)
 
 
-from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (  # noqa: E402
-    flydsl_absmax,
-    flydsl_quant_per_tensor,
-    sorted_sum,
-    invert_sorted_ids,
-)
-
-
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
     assert scale is None
     assert num_rows is None
-
-    amax = torch.empty(1, dtype=torch.float32, device=x.device)
-    xq = torch.empty_like(x, dtype=quant_dtype)
-    flydsl_absmax()(x, amax)
-    flydsl_quant_per_tensor(quant_dtype)(x, amax, xq)
     fmax = torch.finfo(quant_dtype).max
-    xs = amax / fmax
+    xs = x.float().abs().amax() / fmax
+    xq = (x.float() / xs).clamp(-fmax, fmax).to(quant_dtype)
     xs = xs.reshape(1).to(torch.float32)
-
     return xq, xs
 
 
@@ -233,7 +241,7 @@ def fused_moe_gfx942(
             quant_func = (
                 aiter.get_hip_quant(aiter.QuantType.per_Token)
                 if quant_type == QuantType.per_Token
-                else _quant_per_tensor
+                else aiter.get_hip_quant(aiter.QuantType.per_Tensor)
             )
             gateup_in, a_scale = quant_func(
                 hidden_states,
@@ -299,7 +307,9 @@ def fused_moe_gfx942(
             )
 
         gemm2_out = torch.empty(
-            [B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device
+            [sorted_expert_ids.shape[0] * kcfgs.BLOCK_M, N2],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
 
         # Compile and launch down kernel (splitk; consumes the bf16 gateup output directly,
@@ -335,10 +345,13 @@ def fused_moe_gfx942(
             B,
             task_num,
         )
+        loc_ids = torch.empty([B, TOPK], dtype=torch.int32, device=hidden_states.device)
 
-        sum_kernel = _get_compiled_sum_kernel(TOPK=TOPK, N=N2)
-        _launch(sum_kernel, gemm2_out, cur_out, B)
-        #cur_out = torch.sum(gemm2_out, dim=1)
+        invert_sorted_ids = _get_compiled_invert_sorted_ids_kernel(TOPK)
+        _launch(invert_sorted_ids, sorted_ids, loc_ids, sorted_ids.shape[0], B)
+
+        sum_kernel = _get_compiled_sorted_sum_kernel(TOPK=TOPK, N=N2)
+        _launch(sum_kernel, loc_ids, gemm2_out, cur_out, B)
 
         return cur_out
 
