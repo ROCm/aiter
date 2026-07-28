@@ -57,8 +57,8 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 
 def qr_exchange_handles(ptr, world_size, group):
-    # 64 == sizeof(hipIpcMemHandle_t)
-    handle = torch.empty(64, dtype=torch.uint8)
+    # 64 == sizeof(hipIpcMemHandle_t); must be host memory (qr_get_handle memcpys into data_ptr)
+    handle = torch.empty(64, dtype=torch.uint8, device="cpu")
     ops.qr_get_handle(ptr, handle.data_ptr())
     handles = [None] * world_size
     dist.all_gather_object(handles, handle, group=group)
