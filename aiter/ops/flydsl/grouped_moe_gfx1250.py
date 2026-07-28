@@ -6,18 +6,16 @@ Supports optional DeepGEMM-style contiguous-M scheduler
 (AITER_GROUPED_DEEPGEMM_CONTIGUOUS=1 or CSV grouped_contiguous_m=1).
 """
 
-import os
 import csv
 import functools
-
-from typing import Optional
+import os
 
 import torch
 
 from aiter import ActivationType, QuantType, dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_common import GateMode
 
 # Opt-in switch for the gfx1250 FlyDSL grouped-GEMM path.
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
@@ -77,7 +75,7 @@ def _load_grouped_config_rows():
             from aiter.jit.core import AITER_CONFIGS
 
             cfg_path = AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE
-        except Exception:
+        except Exception:  # noqa: BLE001
             cfg_path = ""
     cached = _GROUPED_CONFIG_CACHE.get(cfg_path)
     if cached is not None:
@@ -304,15 +302,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     q_dtype_w,
     isG1U1: bool,
     doweight_stage1: bool,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
-    expert_mask: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    expert_mask: torch.Tensor | None,
     hidden_pad: int,
     intermediate_pad: int,
-    bias1: Optional[torch.Tensor],
-    bias2: Optional[torch.Tensor],
+    bias1: torch.Tensor | None,
+    bias2: torch.Tensor | None,
     gate_mode: GateMode = GateMode.SEPARATED,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
@@ -385,8 +385,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if not isG1U1 or quant_type != QuantType.per_1x32:
         _grouped_dbg("not g1u1 or not 1x32")
         return None
-    if activation not in (ActivationType.Silu, ActivationType.Swiglu):
-        _grouped_dbg("not silu or not swiglu")
+    if activation not in (
+        ActivationType.Silu,
+        ActivationType.Swiglu,
+        ActivationType.Situv2,
+    ):
+        _grouped_dbg("unsupported activation")
         return None
     if gate_mode not in (GateMode.SEPARATED, GateMode.INTERLEAVE):
         _grouped_dbg(f"unsupported gate_mode={gate_mode}")
@@ -441,19 +445,19 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     try:
         from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
             compile_moe_grouped_gemm1_a8w4_masked,
-            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm1_mxfp4_masked,
+            compile_moe_grouped_gemm2_a8w4_masked,
             compile_moe_grouped_gemm2_mxfp4_masked,
         )
-    except Exception as vendored_exc:
+    except Exception as vendored_exc:  # noqa: BLE001  blanket catch is intentional here
         try:
             from kernels.moe_grouped_gemm_mxscale_gfx1250 import (
                 compile_moe_grouped_gemm1_a8w4_masked,
-                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm1_mxfp4_masked,
+                compile_moe_grouped_gemm2_a8w4_masked,
                 compile_moe_grouped_gemm2_mxfp4_masked,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001  blanket catch is intentional here
             logger.warning(
                 f"[grouped_a8w4] grouped FlyDSL import failed, fallback: "
                 f"vendored={vendored_exc}; flydsl={exc}"
@@ -570,8 +574,12 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     if os.environ.get("AITER_GROUPED_DEEPGEMM_CONTIGUOUS", "0") in _TRUTHY_ENV:
         grouped_contiguous_m = True
     # Switch to DeepGEMM-style contiguous-M at large batches (env-overridable).
+    # The gfx1250 contiguous scheduler can fault during stage2 preshuffle for
+    # uneven expert routing, so keep it opt-in unless a threshold is explicit.
+    default_contiguous_threshold = (1 << 62) if get_gfx() == "gfx1250" else 16
     _contig_token_threshold = _as_int(
-        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"), 16
+        os.environ.get("AITER_GROUPED_CONTIGUOUS_TOKEN_THRESHOLD"),
+        default_contiguous_threshold,
     )
     if token_num > _contig_token_threshold:
         grouped_contiguous_m = True
@@ -595,9 +603,10 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         and not torch.cuda.is_current_stream_capturing()
     )
 
-    if _grouped_sync_dbg:
-        if torch.any(flat_experts < 0) or torch.any(flat_experts >= E):
-            raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
+    if _grouped_sync_dbg and (
+        torch.any(flat_experts < 0) or torch.any(flat_experts >= E)
+    ):
+        raise ValueError("grouped a8w4 path expects local expert ids in [0, E)")
     counts = None
 
     if grouped_contiguous_m:
@@ -830,6 +839,11 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         if data_format == "fp4"
         else compile_moe_grouped_gemm1_a8w4_masked
     )
+    stage1_act = {
+        ActivationType.Silu: "silu",
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.Situv2: "situv2",
+    }[activation]
     _grouped_dbg("start stage1 compile")
     stage1 = stage1_compiler(
         model_dim=model_dim,
@@ -848,7 +862,9 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         grouped_persistent_m=False,
         grouped_contiguous_m=effective_grouped_contiguous_m,
         persistent_workers=None,
-        act="swiglu" if activation == ActivationType.Swiglu else "silu",
+        act=stage1_act,
+        situ_beta=float(situ_beta),
+        situ_linear_beta=float(situ_linear_beta),
         stage1_weight_layout=stage1_weight_layout,
         wave_specialized_tdm=(
             stage1_weight_layout == "gugu"
@@ -985,7 +1001,14 @@ def _maybe_grouped_gfx1250_a8w4_moe(
         _fused_masked_m = None if effective_grouped_contiguous_m else masked_m
         _route_rows = int(token_num) * int(topk)
         _capacity_rows = int(route_E) * int(route_max_m)
-        _fused_topids_to_rows = topids_to_rows if _route_rows < _capacity_rows else None
+        # Contiguous-M stage2 consumes complete tiles, including padding rows.
+        # Quantize the complete buffer in that mode so every consumed row has
+        # initialized payload and scale data.
+        _fused_topids_to_rows = (
+            None
+            if effective_grouped_contiguous_m
+            else topids_to_rows if _route_rows < _capacity_rows else None
+        )
         grouped_a2_payload, grouped_a2_scale = flydsl_moe_fused_quant_preshuffle(
             grouped_a2,
             route_E,
@@ -1377,7 +1400,7 @@ def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
     gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -1446,12 +1469,12 @@ def _get_compiled_scatter_copy(row_bytes: int):
 
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,  # (token_num, Wp) uint8
-    a1_scale_token_u8: Optional[torch.Tensor],  # (token_num, Ws) uint8 or None
+    a1_scale_token_u8: torch.Tensor | None,  # (token_num, Ws) uint8 or None
     rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
     E: int,
     max_m: int,
-    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
-    a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
+    grouped_a1: torch.Tensor | None = None,  # (E, max_m, Wp) uint8 out
+    a1_scale_raw: torch.Tensor | None = None,  # (E, max_m, Ws) uint8 out
 ):
     """Copy token payload/scale into grouped layout via rows_to_tokens map.
 
@@ -1509,9 +1532,7 @@ def flydsl_moe_scatter_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    grouped_a1_scale: Optional[
-        torch.Tensor
-    ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    grouped_a1_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Fused route-gather + WMMA preshuffle for e8m0 scale rows. Returns grouped_a1_scale."""
     device = a1_scale_token_u8.device
@@ -1549,7 +1570,7 @@ def flydsl_moe_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    out: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Preshuffle grouped row-major e8m0 scale into WMMA layout. Returns out."""
     device = scale_grouped_u8.device

@@ -43,9 +43,6 @@ path.
 
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
-
-import torch
 
 # NOTE: ``aiter.utility.dtypes`` transitively imports ``aiter.ops.enum``,
 # whose ``ActivationType = type(_ActivationType(0))`` triggers a JIT call
@@ -54,17 +51,15 @@ import torch
 # module load time crashes setup with ``KeyError: 'module_aiter_core'``.
 # Defer the import until the first runtime call instead -- sibling modules
 # (moe_kernels._get_dtypes, gemm_kernels._get_dtypes) use the same pattern.
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, vector, buffer_ops
+import torch
+from flydsl._mlir.dialects import llvm, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T, Int32, Stream
+from flydsl.expr.typing import Int32, Stream, T
 from flydsl.expr.vector import ReductionOp
-from flydsl._mlir.dialects import llvm, rocdl
-
-from .tensor_shim import GTensor, _to_raw, _run_compiled
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -72,9 +67,13 @@ from .tensor_shim import GTensor, _to_raw, _run_compiled
 # (mirrors the FlyDSL AOT-friendly pattern in ``quant_utils``).
 from aiter.ops.flydsl.kernels.quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _D,
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
+from aiter.utility.mx_types import (
+    MxDtypeInt as _D,
+)
+
+from .tensor_shim import GTensor, _run_compiled, _to_raw
 
 _STATIC_ADAPTOR_CACHE = {}
 _STATIC_ADAPTOR_CACHE_MAX = 64
@@ -668,15 +667,14 @@ def _build_kernel(
                 _store_bf16_vec(
                     final_list, bf16_out_rsrc, bf16_out_row_base_bytes, tid, VEC
                 )
-                if const_expr(kv_write):
-                    if do_swa:
-                        _store_bf16_vec(
-                            final_list,
-                            swa_out_rsrc,
-                            swa_out_row_base_bytes,
-                            tid,
-                            VEC,
-                        )
+                if const_expr(kv_write) and do_swa:
+                    _store_bf16_vec(
+                        final_list,
+                        swa_out_rsrc,
+                        swa_out_row_base_bytes,
+                        tid,
+                        VEC,
+                    )
 
         # ============ runtime dispatch on bid_x < H ============
         q_tok_off_bytes = arith.MulIOp(
@@ -889,7 +887,7 @@ def _build_kernel(
         swa_pos_stride: fx.Int32,
         swa_cache_size: fx.Int32,
         num_tokens: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         # grid.y = ceil(num_tokens / ROWS_PER_WG): each workgroup covers
         # ROWS_PER_WG tokens (one per wave via thread_idx.y).
@@ -982,25 +980,25 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     num_q_heads: int,
     head_dim: int,
     rope_head_dim: int,
-    q_weight: Optional[torch.Tensor] = None,
+    q_weight: torch.Tensor | None = None,
     quant: bool = False,
-    quant_group_size: Optional[int] = None,
+    quant_group_size: int | None = None,
     scale_dtype: str = SCALE_DTYPE_FP32,
-    q_out: Optional[torch.Tensor] = None,
-    kv_out: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    kv_scale: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
-) -> Tuple[
+    q_out: torch.Tensor | None = None,
+    kv_out: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """Fused RMSNorm + GPT-J RoPE + optional FP8 quant (gfx1250 wave32).
 

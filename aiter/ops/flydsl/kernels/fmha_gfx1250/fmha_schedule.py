@@ -28,8 +28,6 @@ This matches the actual ISA pattern (L1279-1285 area):
   WMMA0 → tensor_load×2 → WMMA1 → ds_load,exp,ds_load,ds_load → WMMA2
 """
 
-from typing import List
-
 # ---------------------------------------------------------------------------
 # Token constants
 # ---------------------------------------------------------------------------
@@ -91,7 +89,7 @@ _CY_P0 = 1  # max3 / permlane / mul
 _CY_P1 = 1  # permlane / merge
 
 
-def row_cycles(row: List[int], cy_p2: int = 1) -> int:
+def row_cycles(row: list[int], cy_p2: int = 1) -> int:
     """Compute cycle estimate for a schedule row.
     Token costs: TDM=4, O_RESC0=1, EXP_Mx=3, P2_Mx=1(pkfma), P0/P1/K/V=1.
     """
@@ -119,7 +117,7 @@ def row_cycles(row: List[int], cy_p2: int = 1) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _interleave(a_tokens: List[int], b_tokens: List[int]) -> List[int]:
+def _interleave(a_tokens: list[int], b_tokens: list[int]) -> list[int]:
     """Interleave two token lists: [a0, b0, a1, b1, ...]."""
     result = []
     for i in range(max(len(a_tokens), len(b_tokens))):
@@ -130,7 +128,7 @@ def _interleave(a_tokens: List[int], b_tokens: List[int]) -> List[int]:
     return result
 
 
-def _distribute(tokens: List[int], n_wmma: int) -> List[List[int]]:
+def _distribute(tokens: list[int], n_wmma: int) -> list[list[int]]:
     """Distribute tokens evenly across n_wmma rows."""
     rows = [[] for _ in range(n_wmma)]
     if not tokens:
@@ -147,7 +145,7 @@ def _distribute(tokens: List[int], n_wmma: int) -> List[List[int]]:
     return rows
 
 
-def _k_tokens_for_stage(has_tdm_wmma0: bool) -> List[List[int]]:
+def _k_tokens_for_stage(has_tdm_wmma0: bool) -> list[list[int]]:
     """Build per-WMMA K tile load token lists for one GEMM1 stage.
 
     K schedule: each MSB gets N_LDS_PER_MSB=6 loads.
@@ -180,7 +178,7 @@ def _k_tokens_for_stage(has_tdm_wmma0: bool) -> List[List[int]]:
     return rows_k
 
 
-def _v_tokens_for_stage() -> List[List[int]]:
+def _v_tokens_for_stage() -> list[list[int]]:
     """Build per-WMMA V tile load token lists (always starts at WMMA 0)."""
     rows_v = [[] for _ in range(_GEMM_INST_COUNT)]
     load_per_wmma = 3
@@ -195,7 +193,7 @@ def _v_tokens_for_stage() -> List[List[int]]:
     return rows_v
 
 
-def _exp_tokens(exp_per_msb: int, n_wmma_active: int) -> List[int]:
+def _exp_tokens(exp_per_msb: int, n_wmma_active: int) -> list[int]:
     """Round-robin exp tokens: [P2_M0, P2_M1, P2_M2, P2_M3, P2_M0, ...]."""
     tokens = []
     counts = [0] * _NUM_MSB
@@ -214,7 +212,7 @@ def _exp_tokens(exp_per_msb: int, n_wmma_active: int) -> List[int]:
     return tokens
 
 
-def _cheap_tokens(cheap_per_msb: int) -> List[int]:
+def _cheap_tokens(cheap_per_msb: int) -> list[int]:
     """Round-robin cheap PART2 tokens (pkadd/cvt/sum)."""
     tokens = []
     counts = [0] * _NUM_MSB
@@ -244,7 +242,7 @@ def _build_gemm1_stage(
     cheap_per_msb: int,
     lds_type: str = "K",
     has_tdm: bool = False,
-) -> List[List[int]]:
+) -> list[list[int]]:
     """Build balanced 24-row schedule for one GEMM1 stage.
 
     Design principles:
@@ -285,7 +283,7 @@ def _build_gemm1_stage(
     for msb in range(_NUM_MSB):
         loads_left = k_rem[msb]  # = _N_LDS_PER_MSB (6)
         while loads_left > 0 and w < n - _N_PV_WMMA_N:
-            row: List[int] = []
+            row: list[int] = []
             # K loads for this MSB (up to 3 per WMMA, same bank)
             n_k = min(3, loads_left)
             row.extend([K_TOK[msb]] * n_k)
@@ -307,7 +305,7 @@ def _build_gemm1_stage(
     o_start = 14  # was: n - _N_PV_WMMA_N - 1 = 19
 
     # ---- Build flat P2 token list: same-MSB consecutive for bank grouping ----
-    p2_flat: List[int] = []
+    p2_flat: list[int] = []
     for msb in range(_NUM_MSB):
         p2_flat.extend([_P2[msb]] * exp_rem[msb])
     for msb in range(_NUM_MSB):
@@ -367,13 +365,13 @@ def _build_gemm2_stage(
     p0_per_msb: int,
     p1_total: int,
     p2_per_msb: int,
-    exp_per_msb_list: "List[int] | int" = 0,
+    exp_per_msb_list: "list[int] | int" = 0,
     lds_type: str = "V",
     has_tdm: bool = False,
-    lds_per_msb: int = None,
-    loads_per_wmma: int = None,
+    lds_per_msb: int | None = None,
+    loads_per_wmma: int | None = None,
     row_cap: int = 6,
-) -> List[List[int]]:
+) -> list[list[int]]:
     """Build 16-row GEMM2 stage schedule.
 
     Key design rules (matching the reference schedule):
@@ -415,7 +413,7 @@ def _build_gemm2_stage(
     for msb in range(_NUM_MSB):
         ld_rem = lds_per_msb
         while ld_rem > 0 and w < n:
-            row: List[int] = []
+            row: list[int] = []
             n_ld = min(loads_per_wmma, ld_rem)
             row.extend([LD_TOK[msb]] * n_ld)
             ld_rem -= n_ld
@@ -442,7 +440,7 @@ def _build_gemm2_stage(
     # VALU_DEP_4 (0 stall on gfx1250, just encoding hint).
     # Constraint: ds_load companions in load WMMAs remain same-MSB (unchanged
     # above). Only this post-load section is interleaved.
-    p01_flat: List[int] = []
+    p01_flat: list[int] = []
     max_p0_rem = max(p0_rem) if p0_rem else 0
     for step in range(max_p0_rem):
         for msb in range(_NUM_MSB):
@@ -453,7 +451,7 @@ def _build_gemm2_stage(
         p01_flat.extend([_P2[msb]] * p2_rem[msb])
 
     # exp_flat: remaining EXP per MSB (same-MSB consecutive)
-    exp_flat: List[int] = []
+    exp_flat: list[int] = []
     for msb in range(_NUM_MSB):
         exp_flat.extend([_EXP[msb]] * exp_rem[msb])
 
@@ -511,7 +509,7 @@ def _build_gemm2_stage(
 # Stage 3 has V tile loads (lds_type='V'), no TDM.
 
 
-def build_gemm1_schedule() -> List[List[int]]:
+def build_gemm1_schedule() -> list[list[int]]:
     # All 4 stages as direct flat table — edit rows to adjust load distribution.
     # Budgets: P2(exp)=10+10+4+0/MSB, P2(cheap)=0+0+21+33/MSB, O_RESC0=4/stage
     # Token order per row: ds_loads first (K_Mx/V_Mx), then P2/O_RESC0.
@@ -640,7 +638,7 @@ def build_gemm1_schedule() -> List[List[int]]:
 # Totals: P0=22/MSB ✓  P1=8 ✓  P2=24/MSB ✓  EXP=8/MSB=32 total ✓
 
 
-def build_gemm2_schedule() -> List[List[int]]:
+def build_gemm2_schedule() -> list[list[int]]:
     sched = []
     # All 4 stages as direct flat table — edit rows to adjust load distribution.
     # Budgets: P0=10+12/MSB, P1=8, P2=24/MSB, EXP=8/MSB
@@ -724,8 +722,8 @@ def build_gemm2_schedule() -> List[List[int]]:
 # ---------------------------------------------------------------------------
 # Pre-built tables
 # ---------------------------------------------------------------------------
-GEMM1_SCHEDULE: List[List[int]] = build_gemm1_schedule()
-GEMM2_SCHEDULE: List[List[int]] = build_gemm2_schedule()
+GEMM1_SCHEDULE: list[list[int]] = build_gemm1_schedule()
+GEMM2_SCHEDULE: list[list[int]] = build_gemm2_schedule()
 
 
 # ---------------------------------------------------------------------------
@@ -818,8 +816,8 @@ _TOKEN_NAME_TO_ID: dict = {v: k for k, v in _TOKEN_NAMES.items()}
 
 
 def save_schedule_to_csv(
-    g1_schedule: List[List[int]],
-    g2_schedule: List[List[int]],
+    g1_schedule: list[list[int]],
+    g2_schedule: list[list[int]],
     filename: str,
 ) -> None:
     """Export GEMM1+GEMM2 schedules to a CSV file for manual editing."""
@@ -854,13 +852,13 @@ def parse_schedule_from_csv(filename: str):
     Rows not present in the CSV are left empty ([]).
     Use validate_schedule() afterwards to catch token-range errors.
     """
-    g1: List[List[int]] = [[] for _ in range(_GEMM_INST_COUNT * 4)]
-    g2: List[List[int]] = [[] for _ in range(_PV_GEMM_INST_COUNT * 4)]
+    g1: list[list[int]] = [[] for _ in range(_GEMM_INST_COUNT * 4)]
+    g2: list[list[int]] = [[] for _ in range(_PV_GEMM_INST_COUNT * 4)]
 
     with open(filename, newline="") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if not line or line.startswith("#") or line.startswith("gemm"):
+            if not line or line.startswith(("#", "gemm")):
                 continue
             parts = line.split(",", 3)
             if len(parts) < 3:
@@ -874,7 +872,7 @@ def parse_schedule_from_csv(filename: str):
             wmma = int(parts[2])
             toks_str = parts[3].strip() if len(parts) > 3 else ""
 
-            tokens: List[int] = []
+            tokens: list[int] = []
             for tok in toks_str.split():
                 if not tok:
                     continue

@@ -43,13 +43,16 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
-import torch
+# isort and black disagree here: isort wants two blank lines after this block,
+# black folds them back to one because the `# fmt: off` below starts a
+# formatting-disabled region. black is the one CI enforces, so it wins.
+import torch  # noqa: I001
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
 
 # fmt: off
@@ -61,7 +64,7 @@ def _mla_gluon(
     K_pe_cache,
     Req_to_tokens,
     B_seq_len,
-    O,  # noqa: E741
+    O,
     Attn_sink,
     sm_scale,
     kv_scale,
@@ -723,7 +726,7 @@ def _mla_gluon(
 def _mla_softmax_reducev_kernel(
     Logits,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
     stride_l_b,

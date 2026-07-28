@@ -11,8 +11,8 @@ re-exporting A8W4 data from the package source of truth.
 
 from __future__ import annotations
 
-import sys
 import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
