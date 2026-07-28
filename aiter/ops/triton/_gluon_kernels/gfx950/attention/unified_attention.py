@@ -1599,16 +1599,46 @@ def unified_attention(
     BLOCK_SIZE = k.shape[1]
     NUM_KV_HEADS = k.shape[2]
 
-    if Q_FP8 and KV_FP8:
-        waves_per_eu = 4 if HEAD_SIZE < 128 else 3
+    # waves_per_eu is dtype-independent; high values fall off a codegen cliff on Triton
+    # 3.7/3.8 in every configuration measured, so both branches below sit under it.
+    #   HEAD_SIZE>=128: 2 for both phases. The fp8-specific 3 this used to pick was
+    #     neutral on 3.6/3.7 but a cliff on 3.8 (mean 1.5x slower decode / 2.0x prefill,
+    #     worst cell 2.3x), flipping fp8 prefill from winning to losing vs Triton.
+    #   HEAD_SIZE<128 (calibrated at 64): decode 1, prefill 3. The 4 this used to pick is
+    #     the *worst* of {1,2,3,4} on 3.7/3.8 — mean 1.17x slower decode and 1.44x slower
+    #     prefill on 3.8 (worst cell 1.9x), hitting bf16 and fp8 alike.
+    # Measured over decode+prefill x bf16+fp8 x Triton 3.6.0/3.7.0/3.8.0; see
+    # bench_gluon_ua/{tune_hs64.py, perf_scan_triton_36_37_38_7_28/,
+    # perf_scan_hs64_triton_36_37_38_7_28/}.
+    if HEAD_SIZE < 128:
+        waves_per_eu = 1 if max_seqlen_q == 1 else 3
     else:
-        waves_per_eu = 4 if HEAD_SIZE < 128 else 2
+        waves_per_eu = 2
     # Decode: 16x16 MFMA with BLOCK_M=16 — matches the GQA query-per-KV packing,
     # halves row-waste, fewer VGPRs; memory-bound so MFMA throughput is moot.
     # Prefill: 32x32 MFMA with BLOCK_M=128 — compute-bound, ~2x MFMA throughput.
     if max_seqlen_q == 1:
-        # decode: 16x16/BM16, single-buffered 32KB LDS (occupancy 2 — memory-bound)
-        num_warps, block_m, mfma_dim, num_buffers = 1, 16, 16, 1
+        if Q_FP8:  # fp8 dot; KV_FP8 alone keeps the bf16 dot (fp8 KV converts on load)
+            # fp8 decode runs the 32x32 tile (v_mfma_scale_f32_32x32x64_f8f6f4), not the
+            # 16x16 one the bf16 path uses. The 16x16 fp8 dot (...16x16x128_f8f6f4) does
+            # not lower at the K_WIDTH=16 this kernel sets — ConvertTritonAMDGPUToLLVM
+            # fails on Triton 3.6.0/3.7.0/3.8.0 alike, for NUM_BUFFERS 1 or 2 and BLOCK_M
+            # 16 or 32. K_WIDTH=32 (the instruction's 32 elements/lane) does compile, but
+            # the results are wrong — 91% relative-mean error vs a bf16 reference where
+            # 32x32 gives 2.6% (pure fp8 quantization) — so the dot-operand element order
+            # does not match what the instruction expects, and enabling 16x16 fp8 needs a
+            # layout fix, not a K_WIDTH bump. The upside is small anyway: measured 16x16 is
+            # only 1.00-1.04x faster than 32x32 here, decode being memory-bound. So 32x32
+            # stands despite wasting M rows when num_queries_per_kv < 32.
+            # Double-buffered: the single-buffer path is only validated for 16x16.
+            num_warps, block_m, mfma_dim, num_buffers = 1, 32, 32, 2
+        else:
+            # decode: 16x16/BM16. Single-buffered 32KB LDS (occupancy 2 — memory-bound)
+            # only pays off once the KV tile is large enough for halving LDS to buy that
+            # occupancy; at HEAD_SIZE=64 the tile is already half the size and nb=2 wins
+            # on all three Triton versions (7% bf16, 24% fp8).
+            num_warps, block_m, mfma_dim = 1, 16, 16
+            num_buffers = 1 if HEAD_SIZE >= 128 else 2
     else:
         # prefill: 32x32/BM128, double-buffered (compute-bound, overlap load w/ MFMA)
         num_warps, block_m, mfma_dim, num_buffers = 4, 128, 32, 2
