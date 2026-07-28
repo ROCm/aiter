@@ -1141,7 +1141,11 @@ def get_args_of_build(ops_name: str, exclude=None):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
                         if "torch" in el:
-                            pass
+                            # Bound solely for the eval() below: these config
+                            # strings can reference torch (e.g.
+                            # torch.utils.cmake_prefix_path). Static analysis
+                            # cannot see that use, hence the noqa.
+                            import torch  # noqa: F401
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
