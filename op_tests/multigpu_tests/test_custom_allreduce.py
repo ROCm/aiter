@@ -58,9 +58,8 @@ def allreduce_custom(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()

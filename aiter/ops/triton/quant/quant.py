@@ -21,16 +21,16 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 __all__ = [
-    "static_per_tensor_quant_fp8_i8",
+    "_mxfp4_quant_op",
+    "_mxfp8_quant_op",
+    "_nvfp4_quant_op",
+    "dynamic_mxfp4_quant",
+    "dynamic_mxfp8_quant",
+    "dynamic_nvfp4_quant",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
-    "dynamic_mxfp4_quant",
-    "_mxfp4_quant_op",
-    "dynamic_mxfp8_quant",
     "fp8_legacy_to_mxfp8",
-    "_mxfp8_quant_op",
-    "dynamic_nvfp4_quant",
-    "_nvfp4_quant_op",
+    "static_per_tensor_quant_fp8_i8",
 ]
 
 _MXFP8_QUANT_BLOCK_SIZE = 32

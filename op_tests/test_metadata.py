@@ -207,7 +207,7 @@ def compare_metadata(golden, test):
 
 @benchmark()
 def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters):
-    inputs, out_meta, kv_lens = build_decode_inputs(
+    inputs, out_meta, _kv_lens = build_decode_inputs(
         batch_size, ctx_len, dtype, kvtype, nhead, jitter=jitter, seed=seed
     )
 

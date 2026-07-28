@@ -48,7 +48,7 @@ MIN_SEQ_K: float = 1 / SEQ_K_MULTIPLIER
 
 
 def seq_k_to_token_count(seq_k: float) -> int:
-    return int(round(seq_k * SEQ_K_MULTIPLIER))
+    return round(seq_k * SEQ_K_MULTIPLIER)
 
 
 DEFAULT_SEQ_START_K: float = 1.0

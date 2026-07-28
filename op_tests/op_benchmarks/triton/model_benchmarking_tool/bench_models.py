@@ -222,7 +222,7 @@ class GemmKernelHandler(KernelHandler):
             "Kernel": self._kernel,
             "batch_size": None,
             "seq_len": None,
-            "B": shape["B"] if "B" in shape else None,
+            "B": shape.get("B", None),
             "M": self._M,
             "N": shape["N"],
             "K": shape["K"],
@@ -607,16 +607,11 @@ def call_function(
                 )
             )
         else:
-            print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
+            print(f"Out of resources while benchmarking {handler.to_str()}. {e}")
 
     except (Exception, SystemExit) as e:
         print(
-            "Unexpected error while benchmarking %s. %s: %s"
-            % (
-                handler.to_str(),
-                type(e).__name__,
-                e,
-            )
+            f"Unexpected error while benchmarking {handler.to_str()}. {type(e).__name__}: {e}"
         )
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
@@ -890,7 +885,7 @@ def filter_models_and_kernels(
         filtered: ModelShapesData = {}
         for m, kernels in data.items():
             matched_kernels = _filter_by_regex(
-                kernel_pattern, "kernel", sorted(list(kernels.keys()))
+                kernel_pattern, "kernel", sorted(kernels.keys())
             )
             kept = {k: kernels[k] for k in matched_kernels}
             if kept:
@@ -905,8 +900,8 @@ def filter_models_and_kernels(
 
 def main() -> None:
     data = read_json("model_shapes.json")
-    available_models = sorted(list(data.keys()))
-    available_kernels = sorted(list(KERNEL_DICT.keys()))
+    available_models = sorted(data.keys())
+    available_kernels = sorted(KERNEL_DICT.keys())
     args = parse_args(available_models, available_kernels)
 
     models = args.model

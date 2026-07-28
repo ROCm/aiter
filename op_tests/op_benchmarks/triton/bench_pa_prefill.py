@@ -208,8 +208,6 @@ def run_benchmark(args):
     x_vals_list = model_benchmark_configs(args)
     x_names = ["model", "BS", "HQ", "HK", "MAX_SEQ_LEN", "HEAD_DIM"]
 
-    model_name = "paged-attn-decode"
-
     line_names = ["Time_(ms)", "TFLOPS", "Bandwidth_(GB/s)"]
     line_vals = ["time", "tflops", "bandwidth"]
 
@@ -268,9 +266,9 @@ def run_benchmark(args):
             num_queries_per_kv=num_queries_per_kv,
             dtype=dtype,
             kv_cache_dtype=kv_cache_dtype,
-            device=[
+            device=next(
                 f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)
-            ][0],
+            ),
             use_alibi_slope=use_alibi_slope,
         )
 

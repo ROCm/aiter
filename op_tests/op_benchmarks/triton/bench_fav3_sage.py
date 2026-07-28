@@ -625,7 +625,7 @@ def create_benchmark_configs_from_captured(inputs: list[dict[str, Any]], args):
     x_vals_list = []
     for i, inp in enumerate(inputs):
         # Shape from BSHD format: (batch, seqlen, heads, dim)
-        x_vals_list.append((i))
+        x_vals_list.append(i)
 
     x_names = [
         "INPUT_IDX",

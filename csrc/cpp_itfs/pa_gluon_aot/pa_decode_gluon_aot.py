@@ -119,7 +119,7 @@ def compile(
     is_causal: int,
     use_sinks: int,
     cdna_version: int,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """Compile the combined attention and reduce kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)

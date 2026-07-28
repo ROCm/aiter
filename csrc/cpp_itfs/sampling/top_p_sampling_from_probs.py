@@ -21,7 +21,7 @@ with open(
 def compile(
     vec_size: int,
     deterministic: bool,
-    folder: str = None,
+    folder: str | None = None,
 ):
     return compile_template_op(
         src_template,

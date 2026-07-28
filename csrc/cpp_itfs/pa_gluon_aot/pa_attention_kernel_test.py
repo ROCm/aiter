@@ -140,7 +140,7 @@ def compile_attention_kernel(
     is_causal: int,
     cdna_version: int,
     md_name: str,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """Compile the attention kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
@@ -350,7 +350,7 @@ def run_compiled_attention_kernel(
     is_causal: int,
     cdna_version: int,
     md_name: str,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """
     Compile and run the compiled attention kernel with perftest timing
@@ -751,7 +751,7 @@ def test_attention_kernel(kernel_type: str = "compiled"):
         dtype=data_type,
         device=device,
     )
-    query, key, value = torch.split(
+    query, _key, _value = torch.split(
         qkv_tensor, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*UNIFORM_RANGE)
@@ -810,9 +810,9 @@ def test_attention_kernel(kernel_type: str = "compiled"):
             # Per-tensor quantization for KV cache
             (
                 quantized_keys,
-                key_scale_factors_flat,
+                _key_scale_factors_flat,
                 quantized_values,
-                value_scale_factors_flat,
+                _value_scale_factors_flat,
                 key_scale_original,
                 value_scale_original,
             ) = quantize_kv_cache_per_tensor(

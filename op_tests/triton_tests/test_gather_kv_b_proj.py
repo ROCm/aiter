@@ -29,7 +29,7 @@ def ref_gather_kv_b_proj(
     kv_proj_weight: torch.Tensor,  # [tp_heads * (qk_nope_head_dim + v_head_dim), kv_c_dim]
     kv_proj_scale: torch.Tensor,  # [weight_n] per-row or [N//128, K//128] block
     qk_nope_head_dim: int = 128,
-    v_head_dim: int = None,
+    v_head_dim: int | None = None,
 ):
     if v_head_dim is None:
         v_head_dim = qk_nope_head_dim
@@ -39,7 +39,7 @@ def ref_gather_kv_b_proj(
     kv_c_dim = 512
     kv_pe_dim = 64
 
-    num_block, block_size, hidden_dim = k_buffer.shape
+    _num_block, _block_size, hidden_dim = k_buffer.shape
     weight_n, weight_k = kv_proj_weight.shape
     per_row_scale = kv_proj_scale.dim() == 1 or (
         kv_proj_scale.dim() == 2 and kv_proj_scale.shape[1] == 1
@@ -709,8 +709,8 @@ def test_gather_kv_b_proj_asymmetric_dims(
         kv_indptr,
         kv_indices,
         kv_prefix_sum_context_lens,
-        context_lens,
-        num_block,
+        _context_lens,
+        _num_block,
     ) = _make_kv_test_data(
         batch_size,
         block_size,

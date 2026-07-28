@@ -127,7 +127,7 @@ def _ref_pa_sparse_prefill_opus(
     Computation is done in fp32 to mirror the kernel's fp32 accumulator;
     ``index_select`` requires Long indices on the PyTorch side.
     """
-    n, h, d = q.shape
+    n, _h, _d = q.shape
     out = torch.zeros_like(q)
 
     q_f32 = q.to(torch.float32)

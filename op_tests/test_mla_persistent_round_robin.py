@@ -36,9 +36,7 @@ def check_support(dtype, kv_dtype, nhead):
         return False
     if dtype == dtypes.fp8 and kv_dtype == dtypes.fp8:
         return False
-    if get_gfx() == "gfx942":
-        return False
-    return True
+    return get_gfx() != "gfx942"
 
 
 def cal_diff(
@@ -137,7 +135,7 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 

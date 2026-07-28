@@ -138,7 +138,6 @@ def context_attention_fwd_torch(
             # Output
             acc_total = acc + acc_self
             output[q_start:q_end, h] = acc_total.to(output.dtype)
-    return
 
 
 def _get_alibi_slopes(total_num_heads: int, device: torch.device) -> torch.Tensor:

@@ -230,7 +230,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     if any(t.dtype != torch.bfloat16 for t in (k, w, u)):
         raise TypeError("HIP kernel requires `k`, `w`, and `u` to be bfloat16.")
 
-    B, T, Hg, K = k.shape
+    B, T, _Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
     T_flat = w.shape[2]

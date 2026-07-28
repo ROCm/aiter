@@ -38,12 +38,12 @@ if quant is not None:
 if _COMMS_AVAILABLE:
     __all__.extend(
         [
-            "comms",
-            "IrisCommContext",
-            "reduce_scatter",
-            "all_gather",
-            "reduce_scatter_rmsnorm_quant_all_gather",
             "IRIS_COMM_AVAILABLE",
+            "IrisCommContext",
+            "all_gather",
+            "comms",
+            "reduce_scatter",
+            "reduce_scatter_rmsnorm_quant_all_gather",
         ]
     )
 

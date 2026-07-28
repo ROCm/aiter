@@ -252,11 +252,10 @@ def _bwd_dkdv_inner(
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT_scaled += alibi_block
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"qT: {qT.shape}\n", qT)
-                print(f"k: {k.shape}\n", k)
-                print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"qT: {qT.shape}\n", qT)
+            print(f"k: {k.shape}\n", k)
+            print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
         # TODO: remove the scaling of m later when we removed re-scaling in fwd
         if USE_EXP2:
             pT = tl.math.exp2(qkT_scaled * RCP_LN2 - m[None, :] * RCP_LN2)
@@ -269,13 +268,12 @@ def _bwd_dkdv_inner(
             # bottom right of the (seqlen_q, seqlen_k) matrix
             causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
             mask = causal_mask & mask_nm
-            if DEBUG_TRITON_DETAIL:
-                if start_n == 256:
-                    print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
-                    print(
-                        f"qkT after causal: {qkT.shape}\n",
-                        tl.where(causal_mask, qkT * sm_scale, 0.0),
-                    )
+            if DEBUG_TRITON_DETAIL and start_n == 256:
+                print(f"causal_mask: {causal_mask.shape}\n", causal_mask)
+                print(
+                    f"qkT after causal: {qkT.shape}\n",
+                    tl.where(causal_mask, qkT * sm_scale, 0.0),
+                )
             pT = tl.where(mask, pT, 0.0)
         if SLIDING_WINDOW > 0:
             window_mask = offs_n[:, None] >= (
@@ -308,9 +306,8 @@ def _bwd_dkdv_inner(
             else:
                 dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"pT: {pT.shape}\n", pT)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_deltam, mask=mask_m)
         # Compute dP and dS.

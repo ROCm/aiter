@@ -38,7 +38,7 @@ def gemm_tune_check(
 
     if hasattr(module, "_get_config"):
 
-        get_config_func = getattr(module, "_get_config")
+        get_config_func = module._get_config
         sig = inspect.signature(get_config_func)
 
         if (

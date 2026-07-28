@@ -59,7 +59,7 @@ def torch_moe_ref(
     if fp8_w8a8:
         a, _, a_scale = quantize_fp8(a)
 
-    M, top_k, N = c.shape
+    _M, top_k, N = c.shape
     _, K = a.shape
 
     if int4_w4a16:
@@ -245,7 +245,7 @@ def torch_e2e_moe(
         a, _, a_scale = quantize_fp8(a)
 
     M, top_k, _ = c.shape
-    E, N, _ = w1.shape
+    _E, N, _ = w1.shape
 
     # Repeat a -> (M, top_k, K)
     a_expanded = a.unsqueeze(1).repeat(1, top_k, 1)
@@ -938,8 +938,8 @@ def test_fused_moe_gelu(
         a,
         b,
         triton_out,
-        triton_out_silu,
-        b_zp,
+        _triton_out_silu,
+        _b_zp,
         a_scale,
         b_scale,
         topk_weights,

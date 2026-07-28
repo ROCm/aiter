@@ -826,7 +826,7 @@ def fused_kv_norm_rope_group_quant(
         raise ValueError(
             f"kv must be 2D [T,D] or 3D [T,NK,D]; got rank {kv.dim()} shape={tuple(kv.shape)}"
         )
-    num_tokens, num_kv_heads, head_dim = kv_3d.shape
+    _num_tokens, _num_kv_heads, head_dim = kv_3d.shape
     rot_dim = cos_cache.shape[-1] * 2
     nope_dim = head_dim - rot_dim
     if nope_dim <= 0:

@@ -1559,7 +1559,7 @@ def test_v4_nm_multi_split():
     args_ign["num_kv_splits"] = 2
     args_ign["out_16_nosplit"] = 1  # ignored; derived to 0 for multi-pass
     args_ign.pop("split_indptr")
-    out_ign, lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
+    out_ign, _lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
     torch.cuda.synchronize()
     # Multi-pass returns fp32 split logits (NOT the bf16 single-pass alias).
     assert out_ign.dtype == torch.float32, (

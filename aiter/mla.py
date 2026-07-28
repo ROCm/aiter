@@ -122,7 +122,7 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_meta_param(
     num_kv_splits,
     bs,
@@ -184,7 +184,7 @@ def get_meta_param(
                 )
                 for i in range(1, 17)
             ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        num_kv_splits = max(tmp, key=lambda x: x[0])[1]
 
     get_block_n_fp8 = {
         8: 64,

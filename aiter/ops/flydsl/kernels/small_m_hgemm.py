@@ -56,9 +56,9 @@ from .splitk_hgemm import (
 from .tensor_shim import GTensor, _to_raw, get_dtype_in_kernel
 
 __all__ = [
+    "SMALL_M_KERNEL_MAX",
     "compile_small_m_hgemm_kernel",
     "iter_small_m_registry_configs",
-    "SMALL_M_KERNEL_MAX",
     "small_m_kernel_name",
 ]
 

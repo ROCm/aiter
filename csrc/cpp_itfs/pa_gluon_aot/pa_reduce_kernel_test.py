@@ -75,7 +75,7 @@ def compile_reduce_kernel(
     context_partition_size: int,
     use_sinks: int,
     md_name: str,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """Compile the reduce kernel for paged attention decode."""
     head_size_pow2 = triton.next_power_of_2(head_size)
@@ -197,7 +197,7 @@ def run_compiled_kernel(
     max_context_partition_num: int,
     context_partition_size: int,
     md_name: str,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     """
     Compile and run the compiled kernel with perftest timing

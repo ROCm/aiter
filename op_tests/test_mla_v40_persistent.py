@@ -114,8 +114,10 @@ def dump_mla_metadata_v1_txt(
 
     work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
     lines = [
-        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
-        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        (
+            f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+            f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n"
+        ),
         line_for("bs_indptr", lambda r: int(r[0].item())),
         line_for("partial_indptr", lambda r: int(r[1].item())),
         line_for("w_q_start", lambda r: int(r[2].item())),

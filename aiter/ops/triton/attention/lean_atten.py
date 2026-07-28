@@ -132,7 +132,7 @@ def _persistent_lean_attention(
     RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
-    config: dict = {},
+    config: dict | None = None,
 ):
     """
     Internal implementation of Lean Attention with workload scheduling and buffer allocation.
@@ -161,6 +161,8 @@ def _persistent_lean_attention(
     Returns:
         Tuple[torch.Tensor, float]: Output tensor and kernel execution time (currently 0).
     """
+    if config is None:
+        config = {}
     DEBUG = False
 
     NUM_XCDS = get_num_xcds()
@@ -172,8 +174,7 @@ def _persistent_lean_attention(
     ), "Incompatible Q/K/V Hidden Dimensions"
     # Allow irregular head dims by padding compute width and masking I/O
     HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
-    if HEAD_DIM_PADDED < 16:
-        HEAD_DIM_PADDED = 16
+    HEAD_DIM_PADDED = max(HEAD_DIM_PADDED, 16)
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For gfx942, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -312,7 +313,7 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
 
-    la_kernel = la_persistent[grid](
+    la_persistent[grid](
         False,
         0,
         q,

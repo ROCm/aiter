@@ -1002,7 +1002,7 @@ def _get_config(
         _get_config._config_dict["default"] = config
 
     key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
+    if key not in _get_config._config_dict:
         dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
@@ -1014,7 +1014,7 @@ def _get_config(
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
-    for setting in _get_config._config_dict[key].keys():
+    for setting in _get_config._config_dict[key]:
         potential_block_m = setting.replace("M_LEQ_", "")
         if potential_block_m.isnumeric():
             bounds.append(int(potential_block_m))

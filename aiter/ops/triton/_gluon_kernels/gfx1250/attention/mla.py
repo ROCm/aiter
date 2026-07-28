@@ -40,7 +40,6 @@ class MLAConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -1034,7 +1033,7 @@ class MLAProgram:
 
     @gluon.jit
     def get_kv_buffer_row_offsets(self, block_idx):
-        return ((block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx)).to(gl.int32)
+        return (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32)
 
     @gluon.jit
     def tdm_load_global_to_shared_kv_lora(self, row_offsets, buffer_id):

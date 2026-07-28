@@ -114,7 +114,7 @@ def causal_conv1d_split_qkv_hip_fn(
     if conv_states.dtype != torch.bfloat16:
         raise TypeError("HIP causal_conv1d kernel requires bfloat16 `conv_states`.")
 
-    dim, _cu_seqlen = x.shape
+    _dim, _cu_seqlen = x.shape
     _, width = weight.shape
     if width != 4:
         raise ValueError(f"HIP causal_conv1d kernel requires width=4, got {width}.")

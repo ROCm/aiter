@@ -1,5 +1,4 @@
 # Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-# coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
 # Copyright (C) 2023-2026 The vLLM team.
@@ -1820,11 +1819,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=(
-                        rope_scaling["mrope_interleaved"]
-                        if "mrope_interleaved" in rope_scaling
-                        else False
-                    ),
+                    mrope_interleaved=(rope_scaling.get("mrope_interleaved", False)),
                 )
             else:
                 rotary_emb = RotaryEmbedding(

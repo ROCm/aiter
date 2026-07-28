@@ -69,7 +69,7 @@ def test_dp_shared_expert_moe(
     time_list = []
     moe_buf = torch.zeros_like(hidden_states)
     for rank in range(dp_size):
-        moe_buf_tmp = torch.zeros_like(hidden_states)
+        torch.zeros_like(hidden_states)
         res, avg_t = run_perftest(
             fused_moe_dp_share_expert,
             hidden_states,

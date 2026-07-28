@@ -714,7 +714,7 @@ class TestCorrectness:
         if args.ssm_state_dtype != torch.float32:
             pytest.skip("vLLM K5 reference only supports f32 SSM state.")
         context_lens = args.resolve_context_lens()
-        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+        k, w_orig, u_orig, _w_c, _u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 
@@ -795,7 +795,7 @@ class TestCorrectness:
         if args.ssm_state_dtype != torch.float32:
             pytest.skip("triton_origin_opt reference only supports f32 SSM state.")
         context_lens = args.resolve_context_lens()
-        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+        k, w_orig, u_orig, _w_c, _u_c, g, h0, cu, _ = _make_inputs(
             context_lens, args=args
         )
 

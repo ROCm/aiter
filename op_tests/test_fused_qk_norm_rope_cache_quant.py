@@ -2071,14 +2071,14 @@ def test_qk_norm_rope_cache_block_quant(
     # Combine prefill + chunk slots to check all pages with data
     all_slots_so_far = torch.cat([slot_mapping, chunk_slot_mapping])
     chunk_slots_edit = torch.unique(all_slots_so_far // page_size)
-    chunk_k_cache_err = checkAllclose(
+    checkAllclose(
         k_cache_ref.float()[chunk_slots_edit],
         k_cache.float()[chunk_slots_edit],
         msg="chunk k_cache",
         rtol=5e-2,
         atol=0.05,
     )
-    chunk_v_cache_err = checkAllclose(
+    checkAllclose(
         v_cache_ref.float()[chunk_slots_edit],
         v_cache.float()[chunk_slots_edit],
         msg="chunk v_cache",

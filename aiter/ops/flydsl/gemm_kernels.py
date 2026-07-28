@@ -327,8 +327,11 @@ def selection_filter(m, n, k, kwargs):
     smem_cap = SMEM_CAPACITY_MAP[GPU_ARCH]
     if not (smem_use_s0 <= smem_cap):
         return False
-    if m >= 4096 and n >= 4096 and k >= 4096:
-        if not (
+    return not (
+        m >= 4096
+        and n >= 4096
+        and k >= 4096
+        and not (
             TILE_M == 256
             and TILE_N == 256
             and TILE_K == 64
@@ -337,9 +340,8 @@ def selection_filter(m, n, k, kwargs):
             and BLOCK_M_WARPS == 2
             and BLOCK_N_WARPS == 4
             and BLOCK_K_WARPS == 1
-        ):
-            return False
-    return True
+        )
+    )
 
 
 def _validate_hgemm_tiling(

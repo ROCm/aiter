@@ -165,7 +165,7 @@ def _parse_all_benchmark_results(lines):
         stripped = line.strip()
         if "| " not in stripped:
             continue
-        if stripped.startswith("Shape") or stripped.startswith("-"):
+        if stripped.startswith(("Shape", "-")):
             continue
         parts = [p.strip() for p in stripped.split("|")]
         if len(parts) < 3:

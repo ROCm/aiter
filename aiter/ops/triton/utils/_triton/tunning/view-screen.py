@@ -131,20 +131,19 @@ def main():
 
             config_name = m_config_map[m]
 
-            fout.write("""  "%s": {\n""" % (config_name))
+            fout.write(f"""  "{config_name}": {{\n""")
             for i_parms_key, parms_key in enumerate(config_parms_key):
                 parm = config_list[i_parms_key]
 
                 if parms_key == "cache_modifier":
                     fout.write(
-                        """    "%s": %s"""
-                        % (
+                        """    "{}": {}""".format(
                             parms_key,
                             """".cg\"""" if parm == "0" else "null",
                         )
                     )
                 else:
-                    fout.write("""    "%s": %s""" % (parms_key, parm))
+                    fout.write(f"""    "{parms_key}": {parm}""")
 
                 if i_parms_key != len(config_parms_key) - 1:
                     fout.write(""",\n""")

@@ -397,7 +397,7 @@ def moe_sorting(
         logger.error(
             f"Moe_sorting info: {max_num_tokens_padded=} {block_size=} {num_experts=} {topk=} {topk_ids.shape=}"
         )
-        raise e
+        raise
 
 
 def get_topk_valid_mask(
@@ -1027,7 +1027,7 @@ def get_block_size_M(token, topk, expert, inter_dim):
         rnd = (tg_num + cu_num - 1) // cu_num
         empty = cu_num - tg_num % cu_num
         tmp.append((rnd, empty, el))
-    return sorted(tmp, key=lambda x: x[:2])[0][-1]
+    return min(tmp, key=lambda x: x[:2])[-1]
 
 
 @functools.lru_cache(maxsize=2048)

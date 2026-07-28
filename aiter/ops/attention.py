@@ -1160,7 +1160,7 @@ def get_mla_metadata_info_v1(
 
     effective_seqlen_qo = 1 if is_sparse else max_seqlen_qo
     packed_qo_len = effective_seqlen_qo * num_head_qo
-    max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 16))
+    max_qo_tiles_per_batch = math.ceil(packed_qo_len / 16)
 
     if (
         get_gfx() == "gfx950"
@@ -1174,7 +1174,7 @@ def get_mla_metadata_info_v1(
             # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 64))
+            max_qo_tiles_per_batch = math.ceil(packed_qo_len / 64)
     elif (
         num_head_qo == 16
         or (
@@ -1209,7 +1209,7 @@ def get_mla_metadata_info_v1(
             and effective_seqlen_qo == 1
         )
     ):
-        max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
+        max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
         get_gfx() == "gfx950"
         and (packed_qo_len >= 128 or num_head_qo > 64)
@@ -1220,7 +1220,7 @@ def get_mla_metadata_info_v1(
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
         else:
-            max_qo_tiles_per_batch = int(math.ceil(packed_qo_len / 128))
+            max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
 
     batch_size = batch_size * max_seqlen_qo if is_sparse else batch_size
     tile_cnt = batch_size * max_qo_tiles_per_batch
@@ -1572,8 +1572,7 @@ def decode_update_mla_metadata_v1_kernel(
         kv_offset += seq_kv_delta
         if kv_offset <= 0:
             work_kv_len += kv_offset - 1
-            if work_kv_len < 1:
-                work_kv_len = 1
+            work_kv_len = max(work_kv_len, 1)
             kv_offset = 1
         kv_end = seq_kv_end - kv_offset
         kv_start = kv_end - work_kv_len

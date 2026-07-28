@@ -49,7 +49,7 @@ class Instance:
     body      the launch<...> call wrapped by the extern "C" function.
     """
 
-    __slots__ = ("name", "fn_type", "include", "params", "body")
+    __slots__ = ("body", "fn_type", "include", "name", "params")
 
     def __init__(self, name, fn_type, include, params, body):
         self.name = name

@@ -122,7 +122,7 @@ def pod_attention(
         max_tiles_per_wg,
         tiles_per_head,
         num_splits,
-        even_split,
+        _even_split,
     ) = get_num_splits_and_buffer_sizes(
         False,  # causal
         batch_size,
@@ -163,7 +163,7 @@ def pod_attention(
         max_tiles_per_wg_pf,
         tiles_per_head_pf,
         num_splits_pf,
-        even_split_pf,
+        _even_split_pf,
     ) = get_num_splits_and_buffer_sizes(
         True,  # causal,
         batch_size_pf,

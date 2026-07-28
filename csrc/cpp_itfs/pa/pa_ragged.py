@@ -24,7 +24,7 @@ def compile(
     partition_size: int = 256,
     mtp: int = 1,
     logits_soft_cap_enabled: bool = False,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     import os
 
@@ -133,7 +133,7 @@ def paged_attention_ragged(
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
     gqa_ratio = int(num_heads / num_kv_heads)
-    npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    npar_loops = math.ceil(max_num_partitions / warpSize)
     func = compile(
         gqa_ratio,
         head_size,

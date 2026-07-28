@@ -80,7 +80,7 @@ def test_gemm_a16_w16(M: int, N: int, K: int, backend, kernel_type):
         pytest.skip("Gluon not supported on this architecture")
     _skip_if_triton_on_gfx1250(backend)
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, _y = generate_gemm_a16w16_inputs(
         M,
         N,
         K,
@@ -183,7 +183,7 @@ def test_gemm_a16_w16_layout(M: int, N: int, K: int, layout, backend, kernel_typ
 def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, output=output
     )
 
@@ -204,7 +204,7 @@ def test_gemm_a16_w16_atomic(M: int, N: int, K: int, output):
 def test_gemm_a16_w16_atomic_layout(M: int, N: int, K: int, layout):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, _, out_dtype, y = generate_gemm_a16w16_inputs(
+    x, w, _, _out_dtype, y = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, layout=layout, output=True
     )
 

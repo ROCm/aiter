@@ -228,7 +228,7 @@ def _gfx1250_select_candidates(
     sel = set()
     for t in tiles[:top_tiles]:
         sel.add(GFX1250_PLAIN_KID_OF[t])
-        bm, bn, bk = t
+        bm, bn, _bk = t
         gx = _ceil_div(M, bm)
         gy = _ceil_div(N, bn)
         # M-direction cluster (cwm) admission. A clusterlaunch kid groups cwm
@@ -439,18 +439,14 @@ def kid_rejects_shape(k_inst, M, N, K):
         waves_per_wg = k_inst.BLOCK_SIZE // 64
         t_k = waves_per_wg // (k_inst.T_M * k_inst.T_N)
         k_tile_full = k_inst.B_K * t_k
-        if K < k_tile_full or K % k_tile_full != 0:
-            return True
-        return False
+        return bool(K < k_tile_full or K % k_tile_full != 0)
 
     if k_inst.kernel_tag == "a16w16_flatmm":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
         if N % 16 != 0:
             return True
-        if K % B_K != 0:
-            return True
-        return False
+        return K % B_K != 0
 
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
@@ -463,9 +459,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
         UINT32_MAX_BYTES = (1 << 32) - 1
         per_slice_bytes = 1 * padded_M * padded_N * 4  # batch=1 in tune path
-        if per_slice_bytes > UINT32_MAX_BYTES:
-            return True
-        return False
+        return per_slice_bytes > UINT32_MAX_BYTES
 
     if k_inst.kernel_tag == "a16w16_cluster_tdm_splitk_ws":
         # gfx1250 WMMA kernel: ragged M/N ARE supported -- the main kernel
@@ -574,9 +568,7 @@ def kid_rejects_shape(k_inst, M, N, K):
         # N%16 vector-store guard (same root cause as a16w16 family);
         # already implied by N%B_N==0 with B_N % 64 == 0, but keep the
         # explicit check for symmetry.
-        if N % 16 != 0:
-            return True
-        return False
+        return N % 16 != 0
 
     return False
 
@@ -1807,13 +1799,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 # shape-driven candidate set would have excluded them.
                 shape_cands = shape_cands | forced_kids
             opus_candidate_kids |= shape_cands
-        if opus_candidate_kids:
-            if _ensure_kids_compiled(opus_candidate_kids):
-                logger.info(
-                    f"opus_gemm_tune: expanded subset-compile sidecar to cover "
-                    f"{len(opus_candidate_kids)} candidate kids; "
-                    f"module_deepgemm_opus will rebuild on next call."
-                )
+        if opus_candidate_kids and _ensure_kids_compiled(opus_candidate_kids):
+            logger.info(
+                f"opus_gemm_tune: expanded subset-compile sidecar to cover "
+                f"{len(opus_candidate_kids)} candidate kids; "
+                f"module_deepgemm_opus will rebuild on next call."
+            )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench
@@ -1989,7 +1980,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             bad = 0
             fixed = []
             for item in ret:
-                info, us, err = item
+                info, us, _err = item
                 if us is not None and us == 0.0:
                     fixed.append((info, INVALID_TIME, 1.0))
                     bad += 1

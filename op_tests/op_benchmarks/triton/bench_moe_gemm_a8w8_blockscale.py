@@ -216,15 +216,9 @@ def bench_mlp_single_weight_init(
     M, K = xg.shape
     K, N = wg.shape
     config, _ = _get_config(M, N, K)
-    config["BLOCK_SIZE_M"] = (
-        128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
-    )
-    config["BLOCK_SIZE_N"] = (
-        128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
-    )
-    config["BLOCK_SIZE_K"] = (
-        128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
-    )
+    config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
+    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
+    config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
 
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):

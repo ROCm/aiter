@@ -149,7 +149,7 @@ def get_mhc_config(
 
     # Extract M_LEQ_x keys and their thresholds, sorted ascending
     m_leq_keys = []
-    for key in config_dict.keys():
+    for key in config_dict:
         if key.startswith("M_LEQ_"):
             try:
                 threshold = int(key[6:])  # Extract number after "M_LEQ_"

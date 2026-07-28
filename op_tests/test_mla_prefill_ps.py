@@ -531,7 +531,7 @@ def test_mla_prefill(
     if not skip_reference:
         # TODO: optimize reference implementation(too slow for large context length)
         kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
-        out_ref, lse_ref = torch_mla_extend(
+        out_ref, _lse_ref = torch_mla_extend(
             Q_bf16,
             kv_buffer,
             qo_indptr,

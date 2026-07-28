@@ -83,7 +83,7 @@ def ref_causal_conv1d_update_single_token(
                     else 0.0
                 )
                 t = j - val
-                mask_x = (0 <= t) and (t < seqlen)
+                mask_x = 0 <= t < seqlen
                 v_x = float(x[b, f, t].item()) if mask_x else 0.0
                 new_v = v_cs if mask_cs else v_x
                 if j < state_len:

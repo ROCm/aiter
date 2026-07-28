@@ -62,7 +62,7 @@ def jagged_to_padded_dense(
     q: torch.Tensor, offsets: torch.Tensor, max_seq_len: int, padding_value
 ):
     assert len(q.shape) == 2, "q needs to be 2-dim tensor"
-    L, D = q.shape
+    _L, D = q.shape
     B = offsets.shape[0] - 1
     padded_shape = (B, max_seq_len, D)
     padded_q = torch.full(padded_shape, padding_value, dtype=q.dtype, device=q.device)
@@ -113,7 +113,7 @@ def qkv_to_padded_dense(
 
 # convert sequences from dense format to jagged format
 def dense_to_jagged(seq: torch.Tensor, offsets: torch.Tensor, L: int):
-    B, N, HV = seq.shape
+    B, _N, HV = seq.shape
     assert L == offsets[-1], f"jagged dim mismatch {offsets[-1]} != {L}!"
     out = torch.empty((L, HV), dtype=seq.dtype, device=seq.device)
 

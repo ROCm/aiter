@@ -40,8 +40,8 @@ def fused_qkv_split_qk_rope(
         have_nope = False
 
     assert qkv.shape[-1] == q_size + 2 * kv_size, "Shape error"
-    assert head_dim // ((2 if have_nope else 1)) == triton.next_power_of_2(
-        head_dim // ((2 if have_nope else 1))
+    assert head_dim // (2 if have_nope else 1) == triton.next_power_of_2(
+        head_dim // (2 if have_nope else 1)
     ), "head_dim should be power of 2"
 
     if have_nope:

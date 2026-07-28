@@ -77,18 +77,17 @@ def qknorm_allreduce(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                q_out, k_out, v_out = method(
-                    qkv_in,
-                    q_w,
-                    k_w,
-                    cos_sin_cache,
-                    position_ids,
-                    head_dim,
-                    rotary_dim,
-                    1e-6,
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            q_out, k_out, v_out = method(
+                qkv_in,
+                q_w,
+                k_w,
+                cos_sin_cache,
+                position_ids,
+                head_dim,
+                rotary_dim,
+                1e-6,
+            )
         q_out.fill_(0)
         k_out.fill_(0)
         v_out.fill_(0)

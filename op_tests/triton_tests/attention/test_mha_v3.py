@@ -288,7 +288,7 @@ def test_flash_attn_kvcache(
             block_table,
             k_cache_paged,
             v_cache_paged,
-            num_blocks,
+            _num_blocks,
         ) = _generate_block_kvcache(
             seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
@@ -440,7 +440,7 @@ def test_flash_attn_kvcache_noncontiguous_paged(
         block_table,
         k_cache_paged,
         v_cache_paged,
-        num_blocks,
+        _num_blocks,
     ) = _generate_interleaved_block_kvcache(
         seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
     )
@@ -853,8 +853,8 @@ def test_mha_varlen_fp8(
         k,
         v,
         output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     triton_out = flash_attn_varlen_fp8_func(
@@ -1510,9 +1510,9 @@ def test_flash_attn_varlen_func_graph(mha_type):
         q,
         k,
         v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        _output_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     q_orig = q_unpad.clone()

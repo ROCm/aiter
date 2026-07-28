@@ -466,9 +466,8 @@ def test_paged_attention(
             or sliding_window != 0
         ):
             pytest.skip()
-    elif pa_variant == PAVariant.Naive:
-        if use_alibi:
-            pytest.skip()
+    elif pa_variant == PAVariant.Naive and use_alibi:
+        pytest.skip()
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -659,7 +658,7 @@ if __name__ == "__main__":
 
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
-    if not args.pa_variant == [PAVariant.Shomy]:
+    if args.pa_variant != [PAVariant.Shomy]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
@@ -671,9 +670,8 @@ if __name__ == "__main__":
         args.quant_cache_dtype,
     ):
 
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
+        if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
+            continue
 
         test_paged_attention(
             ctx_len,

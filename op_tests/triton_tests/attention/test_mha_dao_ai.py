@@ -352,9 +352,9 @@ def test_mha_dao_ai_varlen_graph(dao_ai_impl, mha_type, default_device):
         q,
         k,
         v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        _output_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     q_orig = q_unpad.clone()

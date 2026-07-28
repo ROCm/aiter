@@ -102,9 +102,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     dtype = torch.bfloat16
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -299,9 +298,8 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -577,7 +575,7 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     offs = False
 
     torch.manual_seed(0)
-    q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    q, k, _, _, _freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
         KH,

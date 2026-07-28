@@ -118,12 +118,12 @@ def flash_attn_fused_backward(
             stride_descale_do_z,
         )
 
-    IS_VARLEN = True if cu_seqlens_q is not None else False
+    IS_VARLEN = cu_seqlens_q is not None
 
     # get strides and shape
     if IS_VARLEN:
         # Layout for q,k,v is thd ie [total tokens, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = (
+        batch, _seqlen_q, num_q_heads, head_sz = (
             len(cu_seqlens_q) - 1,
             max_seqlen_q,
             q.shape[1],
@@ -140,7 +140,7 @@ def flash_attn_fused_backward(
         do_strides = (0, do.stride(1), do.stride(0), do.stride(2))
     else:
         # Layout for q,k,v is bshd ie [batch, seq_len, num_head, head_dim]
-        batch, seqlen_q, num_q_heads, head_sz = q.shape
+        batch, _seqlen_q, num_q_heads, head_sz = q.shape
         _, num_k_heads = k.shape[1], k.shape[2]
         q_strides = (q.stride(0), q.stride(2), q.stride(1), q.stride(3))
         k_strides = (k.stride(0), k.stride(2), k.stride(1), k.stride(3))

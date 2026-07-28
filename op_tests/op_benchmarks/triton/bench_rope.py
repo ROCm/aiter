@@ -524,7 +524,7 @@ def run_benchmark(args):
         print(f"Total flops  = {flops/1e12 : .6e} (TFLOPS)")
         print(f"Total memory = {mem/1e9 : .6e} (GB)")
 
-    print("")
+    print()
     print(
         "This script will not print out runtime as short running kernels cannot be measured accurately through triton.testing.do_bench function, please use rocprof to measure accurate runtime, use -h/--help for more information"
     )

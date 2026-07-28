@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from copy import copy
-from dataclasses import dataclass
 import os
 import sys
+from copy import copy
+from dataclasses import dataclass
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -59,22 +59,18 @@ class kernelInstance:
             for element in [
                 f"moe_cktile2stages_gemm{self.stage}",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBlock,
-                            self.NPerBlock,
-                            self.KPerBlock,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBlock,
+                        self.NPerBlock,
+                        self.KPerBlock,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.WAVE_MAP_M, self.WAVE_MAP_N])),
+                ("x").join(str(x) for x in [self.WAVE_MAP_M, self.WAVE_MAP_N]),
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.WAVE_TILE_M, self.WAVE_TILE_N, self.WAVE_TILE_K],
-                    )
+                    str(x)
+                    for x in [self.WAVE_TILE_M, self.WAVE_TILE_N, self.WAVE_TILE_K]
                 ),
                 str(self.Block_Per_CU) + "perCU",
                 self.QuantType,
@@ -564,7 +560,7 @@ def get_gemm1_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm1_kernels_dict[tag]
-    for id, kernel in kernels_list.items():
+    for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP
         kernel.QuantType = QuantType
@@ -613,7 +609,7 @@ def get_gemm2_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = gemm2_kernels_dict[tag]
-    for id, kernel in kernels_list.items():
+    for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.ActOP = ActOP
         kernel.QuantType = QuantType
@@ -635,6 +631,6 @@ def get_gemm2_kernels_list(
 
 
 def get_heuristic_dispatch_template(tag):
-    if tag not in heuristic_dispatch_dict.keys():
+    if tag not in heuristic_dispatch_dict:
         raise ValueError(f"Unsupported type for heuristic_dispatch: {tag}")
     return heuristic_dispatch_dict[tag]

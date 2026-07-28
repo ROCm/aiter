@@ -39,8 +39,6 @@ def _layernorm_forward(
         x, y, weight, bias, mean, rstd, x.stride(0), y.stride(0), M, N, eps, BLOCK_SIZE
     )
 
-    return
-
 
 def _layernorm_forward_with_add(
     y: torch.Tensor,
@@ -76,8 +74,6 @@ def _layernorm_forward_with_add(
         epsilon,
         BLOCK_SIZE,
     )
-
-    return
 
 
 def _layernorm_backward(

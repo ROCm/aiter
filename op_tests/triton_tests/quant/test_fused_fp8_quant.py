@@ -701,7 +701,7 @@ def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
 
 
 def silu_mul_fp8_quantization_ref(x, x_scale, rocm_fp8_dtype):
-    m, n2 = x.shape
+    _m, n2 = x.shape
     assert n2 % 2 == 0
     n = n2 // 2
     x1, x2 = x.split([n, n], dim=-1)

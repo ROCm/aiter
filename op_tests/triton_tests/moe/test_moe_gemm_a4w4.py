@@ -137,13 +137,9 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
@@ -230,11 +226,10 @@ def test_op(
 ):
     if get_arch() != "gfx950":
         pytest.skip("FP4 kernels are not supported on MI300.")
-    if hbm_swizzling:
-        if n % 32 != 0 or k % (32 * 8) != 0:
-            pytest.skip(
-                f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
-            )
+    if hbm_swizzling and (n % 32 != 0 or k % (32 * 8) != 0):
+        pytest.skip(
+            f"Shape {m}x{n}x{k} is not supported for scale swizzling on AMD GPU"
+        )
 
     torch.manual_seed(0)
 

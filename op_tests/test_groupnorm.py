@@ -103,9 +103,7 @@ def main(args):
         speedups.append(speedup)
 
         print(
-            "shape={} torch_time={:.4f} ms, opt_time={:.4f} ms, speedup={:.4f} is_equal={}".format(
-                shape, torch_time, opt_time, speedup, is_equal
-            ),
+            f"shape={shape} torch_time={torch_time:.4f} ms, opt_time={opt_time:.4f} ms, speedup={speedup:.4f} is_equal={is_equal}",
             flush=True,
         )
 

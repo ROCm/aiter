@@ -48,10 +48,7 @@ def getMaxJobs():
 
 def is_develop_mode():
     for arg in sys.argv:
-        if arg == "develop":
-            return True
-        # pip install -e
-        elif "editable" in arg:
+        if arg == "develop" or "editable" in arg:
             return True
     return False
 
@@ -59,6 +56,7 @@ def is_develop_mode():
 if not AITER_TRITON_ONLY and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
+
         from packaging.version import Version
 
         if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
@@ -287,11 +285,12 @@ if PREBUILD_KERNELS != 0:
             "skip precompilation in this environment"
         )
     else:
+        import glob
+
         from jit.utils.mha_recipes import (
             get_mha_varlen_prebuild_variants_by_names,
         )
         from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
-        import glob
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)

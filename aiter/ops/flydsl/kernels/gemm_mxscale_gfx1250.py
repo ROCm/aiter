@@ -126,7 +126,7 @@ def compile_mxscale_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -300,11 +300,10 @@ def compile_mxscale_gemm(
         _persistent_workers = 0
 
     use_cluster = cluster_m > 1 or cluster_n > 1
-    if use_cluster:
-        if cluster_m * cluster_n > 16:
-            raise ValueError(
-                f"cluster_m * cluster_n must be <= 16, got {cluster_m}*{cluster_n}"
-            )
+    if use_cluster and cluster_m * cluster_n > 16:
+        raise ValueError(
+            f"cluster_m * cluster_n must be <= 16, got {cluster_m}*{cluster_n}"
+        )
     effective_waves_per_eu = waves_per_eu
     if use_cluster and effective_waves_per_eu is None:
         effective_waves_per_eu = 2
@@ -4062,13 +4061,12 @@ def compile_mxscale_gemm(
         for op in ctx.gpu_module_body.operations:
             if const_expr(
                 hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
-            ):
-                if const_expr(effective_waves_per_eu is not None):
-                    _wpe = int(effective_waves_per_eu)
-                    if const_expr(_wpe >= 1):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe
-                        )
+            ) and const_expr(effective_waves_per_eu is not None):
+                _wpe = int(effective_waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        ir.IntegerType.get_signless(32), _wpe
+                    )
         launcher.launch(
             grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
@@ -4257,13 +4255,12 @@ def compile_mxscale_gemm(
         for op in ctx.gpu_module_body.operations:
             if const_expr(
                 hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func"
-            ):
-                if const_expr(effective_waves_per_eu is not None):
-                    _wpe = int(effective_waves_per_eu)
-                    if const_expr(_wpe >= 1):
-                        op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                            ir.IntegerType.get_signless(32), _wpe
-                        )
+            ) and const_expr(effective_waves_per_eu is not None):
+                _wpe = int(effective_waves_per_eu)
+                if const_expr(_wpe >= 1):
+                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
+                        ir.IntegerType.get_signless(32), _wpe
+                    )
         launcher.launch(
             grid=(gx, gy, gz),
             block=(block_threads, 1, 1),
@@ -4340,8 +4337,8 @@ def compile_a8w4_gemm(**kw):
 
 
 __all__ = [
-    "compile_mxscale_gemm",
+    "compile_a8w4_gemm",
     "compile_mxfp4_gemm",
     "compile_mxfp8_gemm",
-    "compile_a8w4_gemm",
+    "compile_mxscale_gemm",
 ]

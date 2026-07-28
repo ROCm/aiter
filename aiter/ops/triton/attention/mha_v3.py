@@ -870,7 +870,7 @@ class _FlashAttnFP8Wrapper(torch.autograd.Function):
         deterministic: bool,
         sm_margin: int,
     ):
-        batch, seqlen, num_q_heads, head_dim = q.shape
+        batch, _seqlen, num_q_heads, head_dim = q.shape
         _, _, num_kv_heads, _ = k.shape
 
         # Quantize inputs to FP8

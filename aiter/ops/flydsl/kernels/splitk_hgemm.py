@@ -1093,7 +1093,6 @@ def compile_hgemm_kernel(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
-        return
 
     @flyc.jit
     def launch_hgemm_kernel(

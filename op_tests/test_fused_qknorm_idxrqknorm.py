@@ -307,7 +307,7 @@ def gather_shuffle_k_row(
 ) -> torch.Tensor:
     """Read one (token-slot, head) K head-dim row from a SHUFFLE K cache
     [num_blocks, num_kv_heads, head_dim/x, block_size, x]."""
-    nb, nkv, hd_over_x, bs, x = kv_cache_k.shape
+    _nb, _nkv, hd_over_x, _bs, x = kv_cache_k.shape
     head_dim = hd_over_x * x
     block, offset = divmod(slot, block_size)
     row = torch.empty(head_dim, dtype=kv_cache_k.dtype, device=kv_cache_k.device)
@@ -321,7 +321,7 @@ def gather_shuffle_v_row(
 ) -> torch.Tensor:
     """Read one (token-slot, head) V head-dim row from a SHUFFLE V cache
     [num_blocks, num_kv_heads, block_size/x, head_dim, x]."""
-    nb, nkv, bs_over_x, head_dim, x = kv_cache_v.shape
+    _nb, _nkv, _bs_over_x, head_dim, x = kv_cache_v.shape
     block, offset = divmod(slot, block_size)
     row = torch.empty(head_dim, dtype=kv_cache_v.dtype, device=kv_cache_v.device)
     for d in range(head_dim):

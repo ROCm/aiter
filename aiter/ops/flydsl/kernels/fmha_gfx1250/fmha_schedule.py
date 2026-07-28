@@ -858,7 +858,7 @@ def parse_schedule_from_csv(filename: str):
     with open(filename, newline="") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
-            if not line or line.startswith("#") or line.startswith("gemm"):
+            if not line or line.startswith(("#", "gemm")):
                 continue
             parts = line.split(",", 3)
             if len(parts) < 3:

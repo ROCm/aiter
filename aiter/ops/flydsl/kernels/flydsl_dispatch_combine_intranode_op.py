@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 _TUNING_CONFIGS_DIR = Path(__file__).resolve().parent / "mega_moe_tuning_config"
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _device_cu_count(device_index):
     """CU count (ROCm ``multiProcessorCount``) for the resident-block bound."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count

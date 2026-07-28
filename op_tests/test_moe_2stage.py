@@ -1,36 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import itertools
+import argparse
 import gc
+import itertools
+import logging
+import os
 from contextlib import nullcontext
+
+import pandas as pd
+import torch
+
 import aiter
 from aiter import dtypes
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.int4_utils import (
-    rearrange_4bit_elements,
-    convert_int8_to_uint32_int4,
-)
-from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
-from aiter.utility import fp4_utils
-from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx, get_cu_num
-import argparse
-import os
-import pandas as pd
-import logging
-
+from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
-    fused_topk,
     fused_moe,
+    fused_topk,
     get_2stage_cfgs,
     get_padded_M,
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.aot.flydsl.common import run_only_env
+from aiter.int4_utils import (
+    convert_int8_to_uint32_int4,
+    rearrange_4bit_elements,
+)
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.utility import fp4_utils
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -41,11 +42,11 @@ except ModuleNotFoundError as e:
 
 
 from aiter.ops.shuffle import (
-    shuffle_weight,
-    shuffle_scale_a16w4,
-    shuffle_weight_a16w4,
     pack_int8_to_packed_int4,
+    shuffle_scale_a16w4,
     shuffle_scale_for_int4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
 )
 
 torch.int4 = getattr(torch, "int4", torch.uint32)
@@ -231,13 +232,15 @@ def test_fmoe(
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
     elif (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and WQDType == dtypes.fp4x2
-    ) or is_mxfp8:  # a16w4 & a8w4 & mxfp8
-        a1_qt = input.to(dtypes.bf16)
-        a1_scale = None
-    elif qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        (
+            qType == aiter.QuantType.per_1x32
+            and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
+            and WQDType == dtypes.fp4x2
+        )
+        or is_mxfp8
+        or qType == aiter.QuantType.per_1x32
+        and WQDType == dtypes.i4x2
+    ):  # a16w4 & a8w4 & mxfp8
         a1_qt = input.to(dtypes.bf16)
         a1_scale = None
     else:

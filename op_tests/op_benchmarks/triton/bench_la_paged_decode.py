@@ -141,8 +141,6 @@ def input_la_helper(
         list_sum_block_n.append(len_sum)
     batch_num_block_n = torch.tensor(list_sum_block_n, device="cuda", dtype=torch.int32)
 
-    sm_scale = 0.5
-
     # Allocate Tensors
     q = torch.empty((H_Q, N_CTX_Q * B, D), dtype=dtype, device="cuda").normal_(
         mean=0.0, std=0.5

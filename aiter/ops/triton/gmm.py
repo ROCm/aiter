@@ -223,13 +223,13 @@ def gmm(
             if key.startswith("BLOCK_SIZE_")
             else config[key] > 0
         )
-        for key in {
+        for key in (
             "BLOCK_SIZE_M",
             "BLOCK_SIZE_K",
             "BLOCK_SIZE_N",
             "GROUP_SIZE",
             "GRID_DIM",
-        }
+        )
     ), "Invalid GMM kernel config."
 
     # Override grid dimension, if optional argument is provided.
@@ -433,13 +433,13 @@ def ptgmm(
             if key.startswith("BLOCK_SIZE_")
             else config[key] > 0
         )
-        for key in {
+        for key in (
             "BLOCK_SIZE_M",
             "BLOCK_SIZE_K",
             "BLOCK_SIZE_N",
             "GROUP_SIZE",
             "GRID_DIM",
-        }
+        )
     ), "Invalid PTGMM kernel config."
 
     # Override grid dimension, if optional argument is provided.
@@ -655,12 +655,12 @@ def nptgmm(
             if key.startswith("BLOCK_SIZE_")
             else config[key] > 0
         )
-        for key in {
+        for key in (
             "BLOCK_SIZE_M",
             "BLOCK_SIZE_K",
             "BLOCK_SIZE_N",
             "GROUP_SIZE",
-        }
+        )
     ), "Invalid NPTGMM kernel config."
 
     grid = _nptgmm_grid(

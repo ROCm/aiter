@@ -801,10 +801,7 @@ def fused_quant_fp8_sort(
 
     N_blocks = triton.cdiv(N, block_size)
 
-    if quant_dtype == dtypes.fp8:
-        DTYPE_MAX = 448.0
-        DTYPE_MIN = -448.0
-    elif quant_dtype == torch.float8_e4m3fn:
+    if quant_dtype == dtypes.fp8 or quant_dtype == torch.float8_e4m3fn:
         DTYPE_MAX = 448.0
         DTYPE_MIN = -448.0
     else:

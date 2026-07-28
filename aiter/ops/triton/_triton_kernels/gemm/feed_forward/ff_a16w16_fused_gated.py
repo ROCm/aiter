@@ -86,7 +86,7 @@ def _ff_a16w16_fused_gated(
         0, BLOCK_SIZE_N // 2
     )
     offs_w1n1 = (
-        (pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2))
+        pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
     ) + (N // 2)
     w1n0_ptrs = w1_ptr + (
         offs_k[:, None] * stride_w1k + offs_w1n0[None, :] * stride_w1n

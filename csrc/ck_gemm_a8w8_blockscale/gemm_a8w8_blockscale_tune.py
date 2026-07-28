@@ -16,26 +16,26 @@ from aiter.jit.core import (
     AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE,
     get_asm_dir,
 )
-from aiter.utility.base_tuner import GemmCommonTuner
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.ops.shuffle import shuffle_weight
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.opus.gemm_op_a8w8 import (
     opus_gemm_a8w8_blockscale_bpreshuffle_tune,
 )
+from aiter.ops.shuffle import shuffle_weight
+from aiter.utility.base_tuner import GemmCommonTuner
+from aiter.utility.mp_tuner import mp_tuner
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from ck_gemm_a8w8_blockscale_bpreshuffle.gemm_a8w8_blockscale_bpreshuffle_common import (
     kernels_list as candidate_kernels_bpreshuffle_dict,
 )
-from gemm_a8w8_blockscale_instance import candidate_kernels_dict
-from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 # cktile
 from gemm_a8w8_blockscale_cktile_instance import (
-    candidate_kernels_cktile_dict,
     BLOCK_PER_CU_MAX,
+    candidate_kernels_cktile_dict,
 )
+from gemm_a8w8_blockscale_instance import candidate_kernels_dict
+from opus_gemm.opus_gemm_common import gfx942_a8w8_kernels_list
 
 block_shape = (128, 128)
 
@@ -317,7 +317,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         block_per_cu,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         # kernel_list = candidate_kernels_bpreshuffle_cktile_dict if preshuffleB else candidate_kernels_cktile_dict
         kernel_list = {
             k: v
@@ -394,7 +394,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         kernel_list = (
             candidate_kernels_bpreshuffle_dict
             if preshuffleB
@@ -506,7 +506,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             gemm_a8w8_blockscale,
             gemm_a8w8_blockscale_bpreshuffle,
         )
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         is_preshuffle = args.preshuffle
         untunedf = self.untunedf
@@ -576,7 +576,7 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         preshuffleB,
         run_kwargs,
     ):
-        gfx, cu_num, M, N, K = info_keys
+        _gfx, _cu_num, M, N, K = info_keys
         asm_kernel_list_csv = (
             f"{get_asm_dir()}/fp8gemm_blockscale/fp8gemm_bf16_blockscale.csv"
         )

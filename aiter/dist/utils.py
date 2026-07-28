@@ -34,7 +34,9 @@ import uuid
 import warnings
 import weakref
 from asyncio import FIRST_COMPLETED, ensure_future
-from functools import lru_cache, partial, wraps
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Awaitable, Callable, Hashable
+from functools import cache, lru_cache, partial, wraps
 from platform import uname
 from typing import (
     Any,
@@ -43,8 +45,6 @@ from typing import (
     TypeVar,
     overload,
 )
-from collections import OrderedDict
-from collections.abc import AsyncGenerator, Awaitable, Callable, Hashable
 from uuid import uuid4
 
 import numpy as np
@@ -252,7 +252,7 @@ class rpd_trace:
             print(f"An error occurred while creating the filename: {e}")
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_hipScopedMarker_available():
     try:
         from hipScopedMarker import hipScopedMarker
@@ -437,7 +437,7 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_cpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -447,7 +447,7 @@ def is_cpu() -> bool:
         return False
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_openvino() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -457,7 +457,7 @@ def is_openvino() -> bool:
         return False
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_neuron() -> bool:
     try:
         import transformers_neuronx
@@ -466,7 +466,7 @@ def is_neuron() -> bool:
     return transformers_neuronx is not None
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_xpu() -> bool:
     from importlib.metadata import PackageNotFoundError, version
 
@@ -491,7 +491,7 @@ def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
     from vllm import _custom_ops as ops
@@ -528,7 +528,7 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_vllm_instance_id() -> str:
     """
     If the environment variable VLLM_INSTANCE_ID is set, return it.
@@ -539,7 +539,7 @@ def get_vllm_instance_id() -> str:
     return envs.VLLM_INSTANCE_ID or f"vllm-instance-{random_uuid()}"
 
 
-@lru_cache(maxsize=None)
+@cache
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(uname()).lower()
@@ -572,7 +572,7 @@ async def iterate_with_cancellation(
     # Can use anext() in python >= 3.10
     awaits = [ensure_future(iterator.__anext__())]
     while True:
-        done, pending = await asyncio.wait(awaits, timeout=1)
+        done, _pending = await asyncio.wait(awaits, timeout=1)
         if await is_cancelled():
             with contextlib.suppress(BaseException):
                 awaits[0].cancel()
@@ -607,7 +607,7 @@ async def merge_async_iterators(
     timeout = None if is_cancelled is None else 1
     try:
         while awaits:
-            done, pending = await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 awaits.keys(), return_when=FIRST_COMPLETED, timeout=timeout
             )
             if is_cancelled is not None and await is_cancelled():
@@ -698,7 +698,7 @@ def sched_yield():
         time.sleep(0)
 
 
-@lru_cache()
+@lru_cache
 def get_zmq_base_path() -> str:
     return tempfile.gettempdir()
 
@@ -903,7 +903,7 @@ def print_warning_once(msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
-@lru_cache(maxsize=None)
+@cache
 def is_pin_memory_available() -> bool:
 
     if in_wsl():
@@ -1096,7 +1096,7 @@ def init_cached_hf_modules() -> None:
     init_hf_modules()
 
 
-@lru_cache(maxsize=None)
+@cache
 def find_library(lib_name: str) -> str:
     """
     Find the library file in the system.
@@ -1427,13 +1427,13 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         try:
             with open(file_path, "r") as config_file:
                 config = yaml.safe_load(config_file)
-        except Exception as ex:
+        except Exception:
             logger.error(
                 "Unable to read the config file at %s. \
                 Make sure path is correct",
                 file_path,
             )
-            raise ex
+            raise
 
         for key, value in config.items():
             processed_args.append("--" + key)
@@ -1464,13 +1464,11 @@ def supports_kw(
     param_val = params.get(kw_name)
 
     # Types where the it may be valid, i.e., explicitly defined & nonvariadic
-    passable_kw_types = set(
-        (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            inspect.Parameter.KEYWORD_ONLY,
-        )
-    )
+    passable_kw_types = {
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }
 
     if param_val:
         is_sig_param = param_val.kind in passable_kw_types

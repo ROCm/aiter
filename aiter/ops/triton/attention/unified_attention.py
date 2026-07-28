@@ -136,7 +136,7 @@ def select_3d_config(
     kv_cache_dtype: torch.dtype,
     shuffled_kv_cache: bool = False,
     NUM_BLOCKS_GATHER_PER_TILE: int = 1,
-    SLIDING_WINDOW: int = None,
+    SLIDING_WINDOW: int | None = None,
 ):
     # TODO: wait for Triton compiler to support ds_load_tr4 before we can include torch.uint8 kv_cache_dtype
     # assert kv_cache_dtype in (torch.bfloat16, e4m3_dtype, torch.uint8, ), f"kv_cache_dtype only supports BF16 ({torch.bfloat16}), FP8 ({e4m3_dtype}), FP4 ({torch.uint8})"
@@ -774,7 +774,7 @@ def _gfx1250_unified_attention_2d(
     if shuffled_kv_cache:
         # key_cache: num_blocks, num_kv_heads, head_size // x, block_size, x
         # value_cache: num_blocks, num_kv_heads, block_size // x, head_size, x
-        num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, K_WIDTH = k.shape
+        num_blocks, NUM_KV_HEADS, _, BLOCK_SIZE, _K_WIDTH = k.shape
     else:
         BLOCK_SIZE = k.shape[1]
         NUM_KV_HEADS = k.shape[2]

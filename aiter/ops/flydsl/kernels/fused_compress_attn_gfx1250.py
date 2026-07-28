@@ -628,7 +628,7 @@ def _build_kernel(
                     )
                     phase2_state = yield (list(new_m) + list(new_kv) + list(new_w))
 
-                m_final, kv_final, w_final = _split_state(phase2_state)
+                _m_final, kv_final, w_final = _split_state(phase2_state)
             else:
                 # Phase 2 with single-iter prefetch, restructured to avoid a
                 # per-iter clamp on the speculative k+1 load.

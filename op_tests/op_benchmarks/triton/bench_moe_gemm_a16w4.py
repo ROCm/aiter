@@ -208,7 +208,7 @@ def bench_mlp_single_weight_init(
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+        rdata, gather_indx, _scatter_indx = routing(logits, n_expts_act)
         x = moe_gemm_a16w4(
             x,
             w1,

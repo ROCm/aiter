@@ -181,7 +181,7 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
 
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
-    x, w, x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
         B, M, N, K, dtype, layout=layout, output=True
     )
 

@@ -10,17 +10,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from aiter.ops.triton.gated_delta_net import (
-    fused_recurrent_gated_delta_rule,
-    chunk_gated_delta_rule,
-    chunk_gated_delta_rule_opt,
-    chunk_gated_delta_rule_opt_vk,
-)
 from aiter.ops.chunk_gated_delta_rule_fwd_h import (
     chunk_gated_delta_rule_fwd_h_hip_fn,
-)
-from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
-    chunk_gated_delta_rule_fwd_h_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -30,6 +21,15 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     IS_INTEL_ALCHEMIST,
     assert_close,
     device,
+)
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
+from aiter.ops.triton.gated_delta_net import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
+    fused_recurrent_gated_delta_rule,
 )
 
 
@@ -50,12 +50,12 @@ def recurrent_gated_delta_rule_ref(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
 ):
-    q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
     )
     B, H, T, K, V = *k.shape, v.shape[-1]
     o = torch.zeros(B, H, T, V).to(v)
@@ -88,7 +88,7 @@ def chunk_gated_delta_rule_ref(
     g: torch.Tensor,
     beta: torch.Tensor,
     chunk_size: int = 64,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
 ):
@@ -96,8 +96,8 @@ def chunk_gated_delta_rule_ref(
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
     # Calculate padding needed to make T a multiple of BT
-    q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
     )
 
     T = q.shape[-2]
@@ -109,7 +109,7 @@ def chunk_gated_delta_rule_ref(
         v = F.pad(v, (0, 0, 0, pad_len))
         beta = F.pad(beta, (0, pad_len))
         g = F.pad(g, (0, pad_len))
-    q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
+    q, k, v, beta, g = (x.to(torch.float32) for x in [q, k, v, beta, g])
     decay = g
     chunk_size = BT
     b, h, seq_len, d_k = q.shape
@@ -123,9 +123,9 @@ def chunk_gated_delta_rule_ref(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
         diagonal=0,
     )
-    q, k, v, k_beta, decay = map(
-        lambda x: rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size),
-        [q, k, v, k_beta, decay.unsqueeze(-1)],
+    q, k, v, k_beta, decay = (
+        rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size)
+        for x in [q, k, v, k_beta, decay.unsqueeze(-1)]
     )
     decay = decay.squeeze(-1).cumsum(-1)
     decay_exp = decay.exp()[..., None]
@@ -211,8 +211,8 @@ def test_fused_recurrent(
     g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.float32))
     g = g / gate_logit_normalizer
     h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_() for x in (q, k, v, beta, g, h0)
     )
     ref, ref_ht = recurrent_gated_delta_rule_ref(
         q=F.normalize(
@@ -307,8 +307,8 @@ def test_chunk(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule(
@@ -409,9 +409,8 @@ def test_fused_sigmoid_gating_delta_rule_update(
     initial_state_indices = torch.arange(B, dtype=torch.long)
 
     # Move to device
-    q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices = map(
-        lambda x: x.to(device),
-        (q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices),
+    q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices = (
+        x.to(device) for x in (q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices)
     )
 
     # Compute reference using recurrent implementation
@@ -510,8 +509,8 @@ def test_chunk_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
     # do = torch.randn_like(v)
     # dht = torch.rand_like(h0)
@@ -622,8 +621,8 @@ def test_chunk_opt(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule_opt(
@@ -725,8 +724,8 @@ def test_chunk_opt_hip(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
     initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
 
@@ -814,8 +813,8 @@ def test_chunk_opt_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule_opt(
@@ -901,8 +900,8 @@ def test_chunk_opt_varlen_hip(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
     initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
 
@@ -1149,8 +1148,8 @@ def test_chunk_opt_vk(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     # opt_vk expects initial_state in [N, H, V, K] layout
@@ -1234,8 +1233,8 @@ def test_chunk_opt_vk_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
 
     # opt_vk expects initial_state in [N, H, V, K] layout

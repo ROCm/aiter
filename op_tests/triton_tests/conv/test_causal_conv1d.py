@@ -348,7 +348,7 @@ def test_causal_conv1d_varlen(
 
     splits = [torch.split(var, seqlens[0], dim=-1) for var in (x_ref)]
     for i in range(len(seqlens[0])):
-        x_s = [v[i].unsqueeze(0) for v in splits][0]
+        x_s = next(v[i].unsqueeze(0) for v in splits)
         if padded_state_indices[i] == PAD_SLOT_ID:
             continue
         out_ref_b.append(

@@ -479,7 +479,7 @@ def fused_moe_int8_smoothquant(
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.quant_moe import smoothquant_quantize
 
-    M, H = hidden_states.shape
+    _M, H = hidden_states.shape
     routing_data, gather_idx, scatter_idx = routing(
         gating_output, topk, sm_first=not renormalize
     )

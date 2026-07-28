@@ -43,7 +43,7 @@ def fused_sage_quant_mxfp4(
         )
 
     elif layout == "bshd":
-        b, qo_len, h_qo, head_dim = q.shape
+        b, _qo_len, _h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
 
         stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (

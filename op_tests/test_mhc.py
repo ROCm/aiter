@@ -531,8 +531,8 @@ def test_mhc_pre(
     # arches it falls back to fp32 (so err/us == the fp32 columns).
     if fn_pack_bf16:
         (
-            post_mix_bf16,
-            comb_mix_bf16,
+            _post_mix_bf16,
+            _comb_mix_bf16,
             layer_input_bf16,
         ), hip_bf16_us = run_perftest(
             aiter.mhc_pre,
@@ -900,8 +900,8 @@ def test_mhc_post_pre(
     # fp32 (err/us == the fp32 fused columns).
     if fn_pack_bf16:
         (
-            post_mix_bf16,
-            comb_mix_bf16,
+            _post_mix_bf16,
+            _comb_mix_bf16,
             layer_input_bf16,
             next_residual_bf16,
         ), fused_bf16_us = run_perftest(

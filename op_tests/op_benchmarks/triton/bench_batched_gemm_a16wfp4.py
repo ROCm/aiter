@@ -34,7 +34,7 @@ def bench_gemm_fn(
     layout: str,
 ):
     c_dtype = torch.bfloat16
-    x, w, x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
+    x, w, _x_scale, w_scale, y = generate_batched_gemm_a16wfp4_inputs(
         batch, M, N, K, c_dtype, layout=layout, output=True
     )
     # flops

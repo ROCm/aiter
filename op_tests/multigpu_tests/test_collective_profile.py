@@ -95,7 +95,7 @@ def run_worker(local_rank, world_size):
             residual = torch.randn(shape, dtype=torch.float16, device=device)
             weight = torch.randn(hidden_size, dtype=torch.float16, device=device)
             eps = 1e-5
-            out2, residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+            out2, _residual_out = tensor_model_parallel_fused_allreduce_rmsnorm(
                 out1, residual, weight, eps
             )
             torch.cuda.synchronize()

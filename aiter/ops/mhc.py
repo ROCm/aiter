@@ -473,9 +473,7 @@ def mhc_fused_post_pre_large_m(
     """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
     m = residual_in.size(0)
 
-    if post_layer_mix.ndim == 3:
-        post_layer_mix = post_layer_mix.contiguous()
-    elif not post_layer_mix.is_contiguous():
+    if post_layer_mix.ndim == 3 or not post_layer_mix.is_contiguous():
         post_layer_mix = post_layer_mix.contiguous()
     if not comb_res_mix.is_contiguous():
         comb_res_mix = comb_res_mix.contiguous()

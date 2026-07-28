@@ -25,7 +25,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
-    e5m2_type, e4m3_type = get_fp8_dtypes()
+    _e5m2_type, e4m3_type = get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
     x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(

@@ -23,7 +23,7 @@ def gather_kv_b_proj(
     weight_preshuffle: bool = False,
     shuffled_kv_cache: bool = False,
 ):
-    num_block, block_size, hidden_dim = k_buffer.shape
+    _num_block, block_size, _hidden_dim = k_buffer.shape
     batch_size = kv_indptr.shape[0] - 1
     weight_n, packed_weight_k = kv_proj_weight.shape
     fp4_weight_dtype = getattr(torch, "float4_e2m1fn_x2", None)

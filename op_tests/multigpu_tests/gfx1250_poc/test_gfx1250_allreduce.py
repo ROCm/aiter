@@ -25,17 +25,18 @@ os.environ.setdefault("ENABLE_CK", "0")
 
 from multiprocessing import (
     Pool,
-    TimeoutError as MpTimeoutError,
     freeze_support,
     set_start_method,
 )
+from multiprocessing import (
+    TimeoutError as MpTimeoutError,
+)
 
+import pandas as pd
 import torch
 import torch.distributed as dist
-import pandas as pd
 
-from aiter import dtypes
-from aiter import logger
+from aiter import dtypes, logger
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import benchmark, checkAllclose, perftest
 
@@ -44,7 +45,7 @@ set_start_method("spawn", force=True)
 _INIT_TIMEOUT_SEC = 120
 
 
-def _get_gpu_arch(device_idx: int = None) -> str:
+def _get_gpu_arch(device_idx: int | None = None) -> str:
     if device_idx is None:
         device_idx = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device_idx)
@@ -66,6 +67,7 @@ def _worker(
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
 
+    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
     from aiter.dist.parallel_state import (
         destroy_distributed_environment,
         destroy_model_parallel,
@@ -75,7 +77,6 @@ def _worker(
         init_distributed_environment,
         set_custom_all_reduce,
     )
-    from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 
     arch = _get_gpu_arch()
     logger.info("RANK %d: arch=%s, tp_size=%d, init...", rank, arch, tp_size)
@@ -110,9 +111,8 @@ def _worker(
 
     if with_graph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()
@@ -143,7 +143,7 @@ def test_gfx1250_allreduce(
     shape: tuple,
     dtype: torch.dtype,
     with_graph: bool = False,
-    distributed_init_method: str = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

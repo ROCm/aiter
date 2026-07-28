@@ -95,7 +95,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
         f"FUSED_GEMM_A8W8_BLOCKSCALE_MUL_ADD: x.shape={tuple(x.shape)} w.shape={tuple(w.shape)} x_scale={tuple(x_scales.shape)} w_scale={tuple(w_scales.shape)} "
     )
 
-    if isinstance(a, float) or isinstance(a, int):
+    if isinstance(a, (float, int)):
         IS_A_SCALAR = True
         IS_A_TENSOR = False
     elif isinstance(a, torch.Tensor) and a.is_contiguous():
@@ -104,7 +104,7 @@ def fused_gemm_a8w8_blockscale_mul_add(
             IS_A_SCALAR = True
         else:
             IS_A_SCALAR = False
-    if isinstance(b, float) or isinstance(b, int):
+    if isinstance(b, (float, int)):
         IS_B_SCALAR = True
         IS_B_TENSOR = False
     elif isinstance(b, torch.Tensor) and b.is_contiguous():

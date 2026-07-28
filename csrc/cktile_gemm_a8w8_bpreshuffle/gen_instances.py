@@ -228,8 +228,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for mnk, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for mnk, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_instances(self, kernels_dict):
@@ -240,7 +242,7 @@ torch::Tensor
             shutil.rmtree(self.instances_path)
         os.mkdir(self.instances_path)
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         self.gen_lookup_dict(kernels_dict)

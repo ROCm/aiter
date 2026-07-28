@@ -535,15 +535,14 @@ def _build_kernel(
                 )
             else:
                 _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
-                if const_expr(kv_write):
-                    if do_swa:
-                        _store_bf16_vec_g(
-                            final_list,
-                            swa_out_g,
-                            arith.constant(0, type=i32),
-                            tid,
-                            VEC,
-                        )
+                if const_expr(kv_write) and do_swa:
+                    _store_bf16_vec_g(
+                        final_list,
+                        swa_out_g,
+                        arith.constant(0, type=i32),
+                        tid,
+                        VEC,
+                    )
 
         # ============ runtime dispatch on bid_x < H ============
         # Per-token byte offsets fold ``bid_t`` into the buffer descriptor

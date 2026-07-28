@@ -625,8 +625,6 @@ def test_triton_mhc_matches_hip(M, n, C):
 
     rms_eps = 1e-6
     hc_pre_eps = 0.0
-    hc_sinkhorn_eps = 0.0
-    hc_post_mult_value = 2.0
     sinkhorn_repeat = 20
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(

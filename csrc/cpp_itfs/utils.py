@@ -14,7 +14,7 @@ import subprocess
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from functools import lru_cache, partial
+from functools import cache, lru_cache, partial
 
 from jinja2 import Template
 from packaging.version import Version, parse
@@ -134,7 +134,7 @@ def get_hip_version():
     return parse(version.stdout.split()[-1].rstrip("-").replace("-", "+"))
 
 
-@lru_cache()
+@lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
     ret = os.system(f"hipcc {flag_hip} -x hip -c /dev/null -o /dev/null")
     if ret == 0:
@@ -284,7 +284,7 @@ def hash_signature(signature: str):
     return hashlib.md5(signature.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_default_func_name(md_name, args: tuple):
     signature = "_".join([str(arg).lower() for arg in args])
     return f"{md_name}_{hash_signature(signature)}"
@@ -427,7 +427,7 @@ def check_hsaco(func_name, constexprs=None):
     return os.path.exists(f"{BUILD_DIR}/{GPU_ARCH}/{hsaco_name}.hsaco")
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_hsaco_launcher(hsaco_name, kernel_name):
     from csrc.cpp_itfs.hsaco_launcher import HsacoLauncher, read_hsaco
 

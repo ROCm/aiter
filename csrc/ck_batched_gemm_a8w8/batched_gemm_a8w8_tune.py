@@ -18,10 +18,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, weight, x_scale, w_scale, bias=None, dtype=dtypes.bf16):
@@ -130,11 +127,11 @@ class BatchedGemma8W8Tuner(GemmCommonTuner):
         return results
 
     def calculate(self, results, bpes=(1, 1, 2)):
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return -1, -1
         print(info[0])
-        gfx, cu_num, b, m, n, k = info[0]
+        _gfx, _cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes

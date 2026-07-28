@@ -126,7 +126,7 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     bk, kh, kv_lora_rank = k_nope.shape
     bk2, kh2, qk_rope_head_dim = k_rope.shape
 
-    b_cache, h_cache, d_cache = kv_cache.shape
+    _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (
@@ -465,7 +465,7 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     bk, kh, kv_lora_rank = k_nope.shape
     bk2, kh2, qk_rope_head_dim = k_rope.shape
 
-    b_cache, h_cache, d_cache = kv_cache.shape
+    _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (

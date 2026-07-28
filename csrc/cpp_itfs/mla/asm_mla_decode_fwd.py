@@ -22,7 +22,7 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla/asm_mla_decode_fwd.cpp.jinja", "r
 mgcs = {16: 64, 128: 16}
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_meta_param(num_kv_splits, device, bs):
     import torch
 
@@ -41,7 +41,7 @@ def compile(
     kv_dtype: str,
     num_kv_splits: int,
     v_head_dim: int,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     if func_name is None:
         func_name = get_default_func_name(

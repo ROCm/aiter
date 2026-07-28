@@ -325,7 +325,7 @@ def _compile_moe_sorting_oneshot(
         c_unit = fx.Int32(unit_size)
         c_sub_tokens = fx.Int32(sub_tokens)
         c_smem_cols = fx.Int32(smem_cols)
-        c_sentinel = fx.Int32((topk << 24))
+        c_sentinel = fx.Int32(topk << 24)
 
         # =================== MOE_BUF ZEROING (blocks > 0 only) ===============
         if bid != c_zero_i32:

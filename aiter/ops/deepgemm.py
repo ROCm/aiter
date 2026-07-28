@@ -61,7 +61,7 @@ def opus_gemm_a16w16_tune(
 
 
 __all__ = [
-    "deepgemm_ck",
     "deepgemm",
+    "deepgemm_ck",
     "opus_gemm_a16w16_tune",
 ]

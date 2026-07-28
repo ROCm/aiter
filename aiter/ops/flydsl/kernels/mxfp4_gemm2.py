@@ -740,7 +740,7 @@ def _flat_mxfp4_epilog(
 
     _r_next, _grp_next, _col0_next = _issue_load(*_blocks[0])
     for _bi in range_constexpr(len(_blocks)):
-        mr, half = _blocks[_bi]
+        mr, _half = _blocks[_bi]
         r, group, col0 = _r_next, _grp_next, _col0_next
         if _bi + 1 < len(_blocks):
             _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])

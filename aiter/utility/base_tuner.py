@@ -315,7 +315,9 @@ class TunerCommon:
         assert path_list, "output tuned file is empty"
         return path_list[0]
 
-    def get_tuned_gemm_list(self, tuned_gemm_file, columns=[]):
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
+        if columns is None:
+            columns = []
         all_tuned_file = self.update_config_files(tuned_gemm_file, self.name)
         if os.path.exists(all_tuned_file):
             try:
@@ -992,8 +994,10 @@ class TunerCommon:
 
         lines = [
             "============= Compare Report =============",
-            f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
-            f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}",
+            (
+                f"Total shapes: {total} | {verb}: {update_count + no_baseline_count} "
+                f"(improved: {update_count}, new: {no_baseline_count}) | Skipped: {skip_count}"
+            ),
             f"Threshold: >= {threshold_percent:.1f}% improvement to update {target_desc}",
             "",
         ]
@@ -1531,18 +1535,22 @@ class GemmCommonTuner(TunerCommon):
     def __init__(
         self,
         name,
-        key=["gfx", "cu_num", "M", "N", "K"],
-        resultList=[
-            "kernelId",
-            "splitK",
-            "us",
-            "kernelName",
-            "tflops",
-            "bw",
-            "errRatio",
-        ],
+        key=None,
+        resultList=None,
         description=None,
     ):
+        if resultList is None:
+            resultList = [
+                "kernelId",
+                "splitK",
+                "us",
+                "kernelName",
+                "tflops",
+                "bw",
+                "errRatio",
+            ]
+        if key is None:
+            key = ["gfx", "cu_num", "M", "N", "K"]
         super().__init__(name, key, resultList, description)
         # Swap M and N positions to ensure N comes before M
         self.sort_keys = list(key)

@@ -14,8 +14,14 @@ import torch
 import torch.distributed as dist
 import zmq
 from torch.distributed import ProcessGroup
-from zmq import IPV6  # type: ignore
-from zmq import SUB, SUBSCRIBE, XPUB, XPUB_VERBOSE, Context  # type: ignore
+from zmq import (  # type: ignore
+    IPV6,  # type: ignore
+    SUB,
+    SUBSCRIBE,
+    XPUB,
+    XPUB_VERBOSE,
+    Context,
+)
 
 # import vllm.envs as envs
 # from vllm.distributed.utils import StatelessProcessGroup, sched_yield
@@ -33,11 +39,12 @@ VLLM_SLEEP_WHEN_IDLE = False
 
 # logger = init_logger(__name__)
 from aiter import logger
+
 from .utils import (
     get_ip,
     get_open_port,
-    is_valid_ipv6_address,
     get_open_zmq_ipc_path,
+    is_valid_ipv6_address,
     sched_yield,
 )
 

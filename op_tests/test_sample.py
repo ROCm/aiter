@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, run_perftest, benchmark
-from aiter.ops.triton.topk import topk
-from aiter.ops.triton.softmax import softmax
-from aiter import dtypes
 import argparse
+
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.ops.triton.softmax import softmax
+from aiter.ops.triton.topk import topk
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.manual_seed(1)
@@ -228,7 +230,7 @@ if args.m is not None:
 if len(args.sample_type) > 0:
     l_sample_type = args.sample_type
 
-list_sample_func = [d_sample[key] for key in args.sample_type if key in d_sample.keys()]
+list_sample_func = [d_sample[key] for key in args.sample_type if key in d_sample]
 
 for test_func in list_sample_func:
     df = []

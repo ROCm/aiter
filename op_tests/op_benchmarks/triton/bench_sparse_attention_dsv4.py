@@ -234,7 +234,7 @@ def run_prefill_bench(args, device: str):
             glu_ms = _time_backend(
                 "gluon", q, kv, indices, indptr, num_queries, num_heads, scale
             )
-            glu_tflops, glu_gbps = _perf(glu_ms)
+            glu_tflops, _glu_gbps = _perf(glu_ms)
             speedup = tri_ms / glu_ms if glu_ms > 0 else float("nan")
             rows.append(
                 (

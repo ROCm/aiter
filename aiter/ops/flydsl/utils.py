@@ -4,7 +4,7 @@
 """General utilities shared across all FlyDSL kernel families."""
 
 import importlib.util
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -19,7 +19,7 @@ def addressable_lds_bytes_for_gfx(gfx: str) -> int:
         return 163840
     if g.startswith("gfx1250"):
         return 327680
-    if g.startswith("gfx7") or g.startswith("gfx8"):
+    if g.startswith(("gfx7", "gfx8")):
         return 32768
     return 65536
 
@@ -32,7 +32,7 @@ def _default_cuda_device_index():
         return None
 
 
-@lru_cache(maxsize=None)
+@cache
 def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) -> int:
     try:
         props = torch.cuda.get_device_properties(device_index)

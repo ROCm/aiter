@@ -316,7 +316,7 @@ def _fwd_grouped_kernel_stage1(
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
     split_kv_id = tl.program_id(2)
 
-    VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
+    VALID_BLOCK_H: tl.constexpr = min(kv_group_num, BLOCK_H)
     cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
     mask_h = mask_h & (cur_head < q_head_num)

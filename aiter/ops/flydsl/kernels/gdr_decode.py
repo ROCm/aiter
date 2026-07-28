@@ -411,7 +411,6 @@ def create_vk_gdr_decode_kernel(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
             scf.YieldOp([])
-        return
 
     @flyc.jit
     def launch_gdr_decode_kernel(

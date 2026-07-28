@@ -71,12 +71,12 @@ def bench_gemm_fn(
     K: int,
     metric: str,
     layout: str,
-    activation: str = None,
+    activation: str | None = None,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w, out_dtype, y = generate_gemm_a16w16_gated_inputs(
+    x, w, _out_dtype, y = generate_gemm_a16w16_gated_inputs(
         M, N, K, c_dtype, layout=layout, output=True
     )
 

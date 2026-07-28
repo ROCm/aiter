@@ -353,9 +353,8 @@ def _moe_gemm_a8w8(
     if not EVEN_K:
         mask_x_k = offs_x_k < MASK_K_LIMIT
         mask_w_k = offs_w_k < (MASK_K_LIMIT)
-        if is_w_microscaled:
-            if SWIZZLE_MX_SCALE is None:
-                mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+        if is_w_microscaled and SWIZZLE_MX_SCALE is None:
+            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
         if is_x_microscaled:
             mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 

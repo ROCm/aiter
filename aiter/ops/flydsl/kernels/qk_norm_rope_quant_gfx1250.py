@@ -667,15 +667,14 @@ def _build_kernel(
                 _store_bf16_vec(
                     final_list, bf16_out_rsrc, bf16_out_row_base_bytes, tid, VEC
                 )
-                if const_expr(kv_write):
-                    if do_swa:
-                        _store_bf16_vec(
-                            final_list,
-                            swa_out_rsrc,
-                            swa_out_row_base_bytes,
-                            tid,
-                            VEC,
-                        )
+                if const_expr(kv_write) and do_swa:
+                    _store_bf16_vec(
+                        final_list,
+                        swa_out_rsrc,
+                        swa_out_row_base_bytes,
+                        tid,
+                        VEC,
+                    )
 
         # ============ runtime dispatch on bid_x < H ============
         q_tok_off_bytes = arith.MulIOp(

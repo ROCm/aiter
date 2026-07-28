@@ -216,7 +216,7 @@ def compile_kernel(args: CompileArgs):
             suffix += "c"
         if hints.get((i,), None) == 16:
             suffix += "d"
-    func_name = "_".join([out_name, sig_hash, suffix])
+    func_name = f"{out_name}_{sig_hash}_{suffix}"
     asm = ccinfo.asm[backend.binary_ext]  # store binary data once
 
     hex_ = str(binascii.hexlify(asm))[2:-1]
@@ -246,7 +246,7 @@ def compile_kernel(args: CompileArgs):
         "kernel_docstring": doc_string,
         "shared": ccinfo.metadata.shared,
         "num_warps": args.num_warps,
-        "algo_info": "_".join([const_sig, meta_sig]),
+        "algo_info": f"{const_sig}_{meta_sig}",
         "gridX": grid[0],
         "gridY": grid[1],
         "gridZ": grid[2],

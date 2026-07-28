@@ -299,7 +299,7 @@ def e2e_moe_kernel(
     num_k = tl.cdiv(K, BLOCK_SIZE_K2)
     for _k in tl.range(0, num_k, num_stages=atomic_num_stages):
         k = (num_k + (_k * k_sign)) % num_k
-        k = ((k + pid_n * 4)) % num_k
+        k = (k + pid_n * 4) % num_k
         # k = _k
 
         if use_int8_w8a16:

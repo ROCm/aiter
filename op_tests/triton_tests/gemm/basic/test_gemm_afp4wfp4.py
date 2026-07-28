@@ -230,7 +230,7 @@ def test_gemm_afp4_wfp4(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,
@@ -310,7 +310,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         w_scales,
         x_scales_shuffled,
         w_scales_shuffled,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

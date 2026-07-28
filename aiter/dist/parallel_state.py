@@ -1209,8 +1209,6 @@ class GroupCoordinator:
         # Send object
         torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
-        return None
-
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""

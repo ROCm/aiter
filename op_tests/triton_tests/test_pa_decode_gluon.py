@@ -315,7 +315,7 @@ def reference_masked_attention(
             query_len, key_len, dtype=torch.bool, device=query.device
         ).tril(diagonal=key_len - query_len)
         # attention_bias.masked_fill_(causal_mask.logical_not(), float(-3.4e38))
-        attention_bias.masked_fill_(causal_mask.logical_not(), float(-3.4e38))
+        attention_bias.masked_fill_(causal_mask.logical_not(), (-3.4e38))
         attention_weights += attention_bias
 
     if sliding_window > 0:
@@ -2022,12 +2022,18 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     sample_rate=1.0,
-    sinks_options=[False],
-    sliding_window_options=[0, 128],
-    ps_options=[False],
+    sinks_options=None,
+    sliding_window_options=None,
+    ps_options=None,
 ) -> pd.DataFrame:
     """Run all tests."""
     # Generate all test configurations
+    if ps_options is None:
+        ps_options = [False]
+    if sliding_window_options is None:
+        sliding_window_options = [0, 128]
+    if sinks_options is None:
+        sinks_options = [False]
     test_configs = []
 
     for use_torch_flash_ref in use_torch_flash_ref_options:

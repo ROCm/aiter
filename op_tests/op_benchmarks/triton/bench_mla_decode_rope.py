@@ -53,7 +53,7 @@ def model_benchmark_configs(args: argparse.Namespace):
     fa_configs = []
     batch_size = args.B if args.B else 4
 
-    for model_name, config in configs.items():
+    for config in configs.values():
         num_q_heads = config["num_attention_heads"]
         num_kv_heads = config["num_key_value_heads"]
         assert (

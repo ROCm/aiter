@@ -153,7 +153,7 @@ class QuickAllReduce:
             for _ in range(self.world_size)
         ]
         dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
+        [t.item() for t in gather_list]
 
         # test nvlink first, this will filter out most of the cases
         # where custom quick allreduce is not supported

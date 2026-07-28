@@ -21,7 +21,7 @@ from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, activation: str = None
+    M: int, N: int, K: int, metric: str, layout: str, activation: str | None = None
 ):
     c_dtype = torch.bfloat16
     x, w, _, y = generate_gemm_a16w16_gated_inputs(

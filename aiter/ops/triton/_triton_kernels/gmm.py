@@ -24,7 +24,7 @@ from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 # ------------------------------------------------------------------------------
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_config(
     gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False
 ) -> dict[str, int]:
@@ -43,7 +43,7 @@ def get_config(
             get_config._config_dict = json.load(config_file)
             assert all(
                 gmm_type in get_config._config_dict
-                for gmm_type in {"gmm", "ptgmm", "nptgmm"}
+                for gmm_type in ("gmm", "ptgmm", "nptgmm")
             ), "Not all GMM variants are present in the configuration file."
     # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
     #       config in the dictionary.

@@ -493,7 +493,7 @@ def gemm_a16w16_opus(
     -------
     Tensor with shape [M, N] when A was 2D, [batch, M, N] when A was 3D.
     """
-    XQ, WQ, Y, M, N, K, batch, reshape_out_to_2d = _validate_and_reshape(
+    XQ, WQ, Y, M, N, K, _batch, reshape_out_to_2d = _validate_and_reshape(
         A, B, bias, dtype, out
     )
 
@@ -552,8 +552,8 @@ def opus_gemm_workspace_init() -> None: ...
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
-    "opus_gemm_workspace_init",
     "is_splitk_kid",
+    "opus_gemm_a16w16_tune",
+    "opus_gemm_workspace_init",
 ]

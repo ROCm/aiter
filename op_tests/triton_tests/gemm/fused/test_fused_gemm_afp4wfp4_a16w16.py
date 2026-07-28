@@ -102,7 +102,7 @@ def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
         w_fp4_scale,
         x_fp4_scale_triton,
         w_fp4_scale_triton,
-        out_dtype,
+        _out_dtype,
         y_fp4,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

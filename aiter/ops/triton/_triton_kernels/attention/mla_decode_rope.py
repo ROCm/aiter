@@ -301,14 +301,11 @@ def _fwd_grouped_kernel_stage1_rope(
             + offs_c[None, :]
         )
 
-        if USE_ROPE:
-            if LAST_SPLIT:
-                k_pe_last_token_ptrs = (
-                    k_pe_t_out
-                    + cur_batch * stride_kpe_tokens_out_b
-                    + tl.arange(0, BLOCK_R)
-                )
-                tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
+        if USE_ROPE and LAST_SPLIT:
+            k_pe_last_token_ptrs = (
+                k_pe_t_out + cur_batch * stride_kpe_tokens_out_b + tl.arange(0, BLOCK_R)
+            )
+            tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
 
         tl.store(
             Att_Out + offs_mid_o,

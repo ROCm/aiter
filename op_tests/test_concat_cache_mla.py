@@ -386,7 +386,7 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    (ref_kv_cache, ref_q_out), ref_us = run_torch_fused(
+    (ref_kv_cache, ref_q_out), _ref_us = run_torch_fused(
         q_pe,
         k_pe,
         q_nope,

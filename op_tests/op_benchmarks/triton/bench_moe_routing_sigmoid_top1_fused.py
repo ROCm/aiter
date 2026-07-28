@@ -191,7 +191,7 @@ def main():
         config_file = args.model_configs
         configs = get_model_configs(config_path=config_file, models=args.model)
         x_vals = []
-        for _, config in configs.items():
+        for config in configs.values():
             # layer takes (M, K) as input and produces (M, N) -> N is the number of experts
             assert (
                 "n_routed_experts" in config

@@ -85,7 +85,7 @@ def cat_and_cache_mla(
         if shuffled_kv_cache:
             b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (

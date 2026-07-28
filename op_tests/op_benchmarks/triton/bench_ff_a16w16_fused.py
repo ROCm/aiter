@@ -87,13 +87,13 @@ def bench_fn(
     metric: str,
     layout: str,
     gating: bool,
-    activation: str = None,
+    activation: str | None = None,
     e2e_fused: bool = False,
     **kwargs,
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = torch.bfloat16
-    x, w1, w2, out_dtype, _, y = generate_ff_inputs(
+    x, w1, w2, _out_dtype, _, y = generate_ff_inputs(
         batch,
         hidden_dim,
         intermediate_dim,

@@ -1884,7 +1884,7 @@ def compile_moe_grouped_gemm2_mxfp4_masked(**kwargs):
 
 __all__ = [
     "compile_moe_grouped_gemm1_a8w4_masked",
-    "compile_moe_grouped_gemm2_a8w4_masked",
     "compile_moe_grouped_gemm1_mxfp4_masked",
+    "compile_moe_grouped_gemm2_a8w4_masked",
     "compile_moe_grouped_gemm2_mxfp4_masked",
 ]

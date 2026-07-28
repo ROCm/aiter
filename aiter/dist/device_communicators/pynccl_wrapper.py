@@ -308,7 +308,7 @@ class NCCLLibrary:
                 lib = ctypes.CDLL(so_file)
                 NCCLLibrary.path_to_library_cache[so_file] = lib
             self.lib = NCCLLibrary.path_to_library_cache[so_file]
-        except Exception as e:
+        except Exception:
             logger.error(
                 "Failed to load NCCL library from %s. "
                 "It is expected if you are not running on NVIDIA/AMD GPUs."
@@ -320,7 +320,7 @@ class NCCLLibrary:
                 so_file,
                 platform.platform(),
             )
-            raise e
+            raise
 
         if so_file not in NCCLLibrary.path_to_dict_mapping:
             _funcs: dict[str, Any] = {}
@@ -548,10 +548,10 @@ class NCCLLibrary:
 
 __all__ = [
     "NCCLLibrary",
+    "buffer_type",
+    "cudaStream_t",
+    "ncclComm_t",
     "ncclDataTypeEnum",
     "ncclRedOpTypeEnum",
     "ncclUniqueId",
-    "ncclComm_t",
-    "cudaStream_t",
-    "buffer_type",
 ]

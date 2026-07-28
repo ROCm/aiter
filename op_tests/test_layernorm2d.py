@@ -64,7 +64,7 @@ def test_layernorm2d(dtype, m, n):
     weight = torch.randn(n, dtype=dtype, device="cuda")
     bias = torch.randn(n, dtype=dtype, device="cuda")
     hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
+    _q, k, _v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     input = k
     (a, *_), avg_a = run_torch(input, weight, bias, 1e-5)
     (b, *_), avg_b = run_ck(input, weight, bias, 1e-5)
@@ -81,7 +81,7 @@ def test_layernorm2d_fuseAdd(dtype, m, n):
     bias = torch.randn(n, dtype=dtype, device="cuda")
     res = torch.randn(dim, dtype=dtype, device="cuda")
     hidden_stats = torch.randn(m, n * 8, dtype=dtype, device="cuda")
-    q, k, v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
+    _q, _k, _v = torch.split(hidden_stats, [6 * n, n, n], dim=1)
     # input = k
     (a, res_a, *_), avg_a = run_torch(input, weight, bias, 1e-5, residual=res)
     (b, res_b, *_), avg_b = run_ck(input, weight, bias, 1e-5, residual=res)

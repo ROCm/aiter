@@ -193,7 +193,7 @@ def expand_moe_dtypes(json_strings: list[str]) -> list[str]:
 
 
 def expand_interpolations(json_string: str, config_files: list[Path]) -> list[str]:
-    if not (json_string.startswith("f'") or json_string.startswith('f"')):
+    if not (json_string.startswith(("f'", 'f"'))):
         return [json_string]
     # Replace config path placeholder
     if r"{AITER_TRITON_CONFIGS_PATH}" in json_string:
@@ -576,8 +576,10 @@ def parse_source_file_recursively(
     source_file: Path,
     config_files: list[Path],
     visited: set[Path],
-    deps_to_ignore: set[Path] = set(),
+    deps_to_ignore: set[Path] | None = None,
 ) -> None:
+    if deps_to_ignore is None:
+        deps_to_ignore = set()
     stack = [source_file]
 
     while stack:
@@ -640,8 +642,10 @@ def add_files_to_dependency_graph(
     file_type: str,
     config_files: list[Path],
     visited: set[Path],
-    deps_to_ignore: set[Path] = set(),
+    deps_to_ignore: set[Path] | None = None,
 ) -> None:
+    if deps_to_ignore is None:
+        deps_to_ignore = set()
     for f in files:
         parse_source_file_recursively(
             graph, f, config_files, visited, deps_to_ignore=deps_to_ignore
@@ -814,7 +818,7 @@ def write_env_file(env_var: str, env_file: str, tests_to_run: list[Path]) -> Non
         with open(env_file, "a") as env_file_fd:
             env_file_fd.write(env_file_data + "\n")
         logging.info("Wrote tests to run to [%s] environment file.", env_file)
-    except IOError:
+    except OSError:
         logging.exception("I/O error while writing to [%s] environment file.", env_file)
         logging.info("The entire Triton test suite will be executed.")
 

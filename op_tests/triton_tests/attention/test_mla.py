@@ -52,7 +52,7 @@ def shuffle_kv_buffer(
         # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
         layout = (16, 16)
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 16
 
@@ -105,7 +105,7 @@ def dynamic_nvfp4_quant_kv_buffer(
     dtype = kv_buffer.dtype
     assert dtype == torch.bfloat16
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 128
 

@@ -99,7 +99,7 @@ def kv_ptr_factory(
     )  # e.g., ctx_lens=10, page_size=3 --> padded_ctx_lens=12
     index_total = num_seqs * padded_ctx_lens
     head_per_row = int(np.ceil(ctx_lens / page_size))
-    head_total = num_seqs * int(np.ceil(ctx_lens / page_size))
+    num_seqs * int(np.ceil(ctx_lens / page_size))
 
     # Generate heads (Start from 0, page_size, 2xpage_size, ...)
     all_heads = np.arange(0, index_total, page_size)
@@ -210,7 +210,7 @@ def test_paged_attention(
         if use_alibi:
             alibi_slopes = torch.randn(num_query_heads, dtype=dtypes.fp32)
         assert num_query_heads % num_kv_heads == 0
-        num_queries_per_kv = num_query_heads // num_kv_heads
+        num_query_heads // num_kv_heads
         max_seq_len = ctx_lens
         padded_ctx_lens = page_size * int(np.ceil(max_seq_len / page_size))  # e.g.,
         num_blocks = padded_ctx_lens * num_seqs
@@ -243,7 +243,7 @@ def test_paged_attention(
 
         data = torch.load(in_pt)
         query = data["q"].clone().detach().to(TARGET_DEVICE)
-        workspace = torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
+        torch.empty(*data["workspace_buffer_shape"]).to(TARGET_DEVICE)
         key_cache = torch.empty(*data["k_buffer_shape"]).to(TARGET_DEVICE)
         value_cache = torch.empty(*data["v_buffer_shape"]).to(TARGET_DEVICE)
         kv_indptr = data["kv_indptr"].clone().detach().to(TARGET_DEVICE)

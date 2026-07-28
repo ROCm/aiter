@@ -75,8 +75,8 @@ OTHER_REAL_SHAPE: tuple[int, int, int, int] = (267424, 1280, 2560, 32)
 
 # Transpositions.
 
-TRANS_LSH_STR: set[str] = {f"tlhs{b}" for b in {"F", "T"}}
-TRANS_RHS_STR: set[str] = {f"trhs{b}" for b in {"F", "T"}}
+TRANS_LSH_STR: set[str] = {f"tlhs{b}" for b in ("F", "T")}
+TRANS_RHS_STR: set[str] = {f"trhs{b}" for b in ("F", "T")}
 
 
 def trans_from_str(trans_str: str, tensor_str: str) -> bool:

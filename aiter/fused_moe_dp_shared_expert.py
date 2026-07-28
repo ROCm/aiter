@@ -152,9 +152,8 @@ def fused_moe_dp_share_expert(
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
 
-    global_E = E
     if expert_mask is not None:
-        global_E = expert_mask.numel()
+        expert_mask.numel()
     dtype = hidden_states.dtype if dtype is None else dtype
     assert dtype in [
         dtypes.fp16,
@@ -268,7 +267,7 @@ def fused_moe_1stage(
                 a1_scale = scale_t
 
         token_num = hidden_states.shape[0]
-        E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+        E, _model_dim, _inter_dim = get_inter_dim(w1.shape, w2.shape)
         if quant_type == QuantType.per_1x32:
             a1_scale = fp4_utils.moe_mxfp4_sort(
                 a1_scale,
@@ -324,7 +323,7 @@ def get_block_size_M(token, topk, expert, inter_dim):
         rnd = (tg_num + cu_num - 1) // cu_num
         empty = cu_num - tg_num % cu_num
         tmp.append((rnd, empty, el))
-    return sorted(tmp, key=lambda x: x[:2])[0][-1]
+    return min(tmp, key=lambda x: x[:2])[-1]
 
 
 cfg_2stages = None
@@ -794,7 +793,7 @@ def asm_stage1(
         out = out.view(dtype)
     device = out.device
     token_num, _, _ = out.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E, _model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
 
     if quant_type == QuantType.per_Tensor:
         a1_scale = a1_scale.view(1, 1).repeat(token_num, 1)

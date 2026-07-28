@@ -123,7 +123,7 @@ def indexer_k_fp4_paged_preshuffle(k, slot_mapping, kv_cache, kv_scale, kv_block
       kv_cache[p, kt, kc, o, :]  = 16 packed bytes for K[(kt*4+kc)*32 : +32]
       kv_scale[p, kt, kc, sflat] = e8m0 byte, sflat = (o%16)*4 + (o//16)
     """
-    num_tokens, head_dim = k.shape
+    _num_tokens, head_dim = k.shape
     k_tiles = head_dim // 128
     packed, e8m0 = fp4_quant_e2m1_with_e8m0(k)
     valid = slot_mapping >= 0

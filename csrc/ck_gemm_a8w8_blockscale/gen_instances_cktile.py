@@ -251,8 +251,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for _, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for _, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_code(self, kernels_dict: dict):
@@ -261,7 +263,7 @@ torch::Tensor
         """
 
         # generate instances code
-        for _, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances

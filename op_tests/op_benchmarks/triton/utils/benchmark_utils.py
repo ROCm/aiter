@@ -357,13 +357,9 @@ def print_vgpr(fun, table_start="result-table-name"):
 
 
 def get_dtype_bytes(dtype):
-    if dtype in [torch.float16, tl.float16]:
+    if dtype in [torch.float16, tl.float16] or dtype in [torch.bfloat16, tl.bfloat16]:
         return 2
-    elif dtype in [torch.bfloat16, tl.bfloat16]:
-        return 2
-    elif dtype in [torch.float32, tl.float32]:
-        return 4
-    elif dtype == torch.int32:
+    elif dtype in [torch.float32, tl.float32] or dtype == torch.int32:
         return 4
     elif dtype == torch.int64:
         return 8

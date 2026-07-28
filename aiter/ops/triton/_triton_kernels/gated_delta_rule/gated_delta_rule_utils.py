@@ -28,8 +28,13 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-if TYPE_CHECKING:
+# `fla` is an optional dependency. TC004 wants this import at runtime because
+# __version__ is read inside the deprecation decorator below, but hoisting it
+# makes importing this module fail outright wherever fla is absent. Keep it
+# guarded; that decorator path is the only thing that needs it.
+if TYPE_CHECKING:  # noqa: TC004
     from fla import __version__
+
 
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
@@ -104,8 +109,6 @@ def check_environments():
             f"Current Python version {py_version} is below the recommended 3.11 version. "
             "It is recommended to upgrade to Python 3.11 or higher for the best experience.",
         )
-
-    return None
 
 
 check_environments()

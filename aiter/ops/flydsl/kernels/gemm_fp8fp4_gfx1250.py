@@ -104,7 +104,7 @@ def compile_fp8fp4_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -669,9 +669,8 @@ def compile_fp8fp4_gemm(
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
 
-        if const_expr(inst_prefetch):
-            if rocdl.wave_id() == fx.Int32(0):
-                _s_prefetch_inst_burst(num_pages=4)
+        if const_expr(inst_prefetch) and rocdl.wave_id() == fx.Int32(0):
+            _s_prefetch_inst_burst(num_pages=4)
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -3531,7 +3530,7 @@ def compile_ptpc_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 4,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     cluster_m: int = 1,
     cluster_n: int = 1,

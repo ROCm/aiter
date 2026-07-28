@@ -64,11 +64,8 @@ def run_allgather(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_gather(
-                    x, use_custom=use_custom, dim=dim
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_gather(x, use_custom=use_custom, dim=dim)
         out.fill_(0)
 
         @perftest()
@@ -116,7 +113,7 @@ def call_ccl_allgather_naive(
     x = x.to(device)
 
     # warmup and align all gpu
-    group = get_tp_group().device_group
+    get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):

@@ -315,8 +315,6 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
         k_out.copy_(k_quantized)
         v_out.copy_(v_quantized)
 
-    return None
-
 
 @perftest()
 def run_fused_mrope_3d_rms_set_kv_shuffle(
@@ -415,7 +413,6 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
             x,
             rotary_dim,
         )
-    return None
 
 
 @benchmark()

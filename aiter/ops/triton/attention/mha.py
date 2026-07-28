@@ -89,7 +89,7 @@ def _flash_attn_forward(
     # FP8
     IS_FP8 = types._is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
-    is_varlen = True if cu_seqlens_q is not None else False
+    is_varlen = cu_seqlens_q is not None
 
     if IS_FP8:
         o = torch.zeros(

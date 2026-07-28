@@ -99,10 +99,10 @@ class BatchedGemmBf16Tuner(GemmCommonTuner):
         return results
 
     def calculate(self, results, bpes=(2, 2, 2)):
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time == -1:
             return -1, -1
-        gfx, cu_num, b, m, n, k = info[0]
+        _gfx, _cu_num, b, m, n, k = info[0]
         flops = m * n * k * 2 * b
         tflops = round(flops / (time * 1000000), 2)
         lhs_bpe, rhs_bpe, out_bpe = bpes

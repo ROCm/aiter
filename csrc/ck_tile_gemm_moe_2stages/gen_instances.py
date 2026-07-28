@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import argparse
 import itertools
-from pathlib import Path
-import shutil
+import os
 import re
+import shutil
+import sys
+from pathlib import Path
+
+from chip_info import get_gfx, get_gfx_list
 from moe_cktile2stages_common import (
     act_dict,
     dtype_dict,
-    kernelInstance,
     get_gemm1_kernels_list,
     get_gemm2_kernels_list,
     get_heuristic_dispatch_template,
+    kernelInstance,
 )
-import sys
-from chip_info import get_gfx, get_gfx_list
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -346,9 +347,7 @@ template torch::Tensor
                 ):
                     f.write(
                         LOOKUP_template.format(
-                            MNK="{"
-                            + (", ").join(map(lambda x: str(x), list(mnk)))
-                            + "}",
+                            MNK="{" + (", ").join(str(x) for x in list(mnk)) + "}",
                             kernel_name=k.name,
                         )
                     )
@@ -401,8 +400,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for k_name in self.kernel_name_list:
-                f.write(MAINFEST_template.format(kernel_name=k_name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k_name)
+                for k_name in self.kernel_name_list
+            )
             f.write(MAINFEST_end)
 
         return f"./manifests/{k0.dispatch_suffix}_manifest_{tag}.h"
@@ -410,7 +411,7 @@ torch::Tensor
     """generate all instances and headers"""
 
     def gen_instances(self, tag, kernels_dict):
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
             if k.name not in self.kernel_name_list:
                 self.kernel_name_list.append(k.name)
@@ -650,7 +651,7 @@ if __name__ == "__main__":
     for a_type, c_dtype, act_type, is_split_k in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l
     ):
-        has_bias = True if act_type == "swiglu" else False
+        has_bias = act_type == "swiglu"
 
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:
@@ -695,7 +696,7 @@ if __name__ == "__main__":
         gen_manifest_files.append(manifest_file)
 
         # Collect kernel names with their C++ type arguments for name dispatch
-        for mnk, k in kernel_dict_merge.items():
+        for k in kernel_dict_merge.values():
             name_lookup_entries.append(
                 (k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype)
             )

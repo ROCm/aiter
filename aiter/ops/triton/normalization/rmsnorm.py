@@ -159,10 +159,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
 def _should_use_large_m_small_n(M: int, N: int) -> bool:
 
-    if M > 8192 and N <= 2048:
-        return True
-
-    return False
+    return bool(M > 8192 and N <= 2048)
 
 
 def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):

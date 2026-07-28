@@ -1,7 +1,7 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
-#!/usr/bin/env python3
 # mypy: allow-untyped-defs
 """The Python Hipify script.
 ##
@@ -66,39 +66,38 @@ to their actual types."""
 PYTORCH_TEMPLATE_MAP = {"Dtype": "scalar_t", "T": "scalar_t"}
 
 __all__ = [
-    "InputError",
-    "openf",
-    "bcolors",
+    "CurrentState",
     "GeneratedFileCleaner",
-    "match_extensions",
-    "matched_files_iter",
-    "preprocess_file_and_save_result",
-    "compute_stats",
+    "HipifyResult",
+    "InputError",
+    "Trie",
     "add_dim3",
-    "processKernelLaunches",
-    "find_closure_group",
+    "bcolors",
+    "compute_stats",
+    "extract_arguments",
+    "file_add_header",
+    "file_specific_replacement",
     "find_bracket_group",
+    "find_closure_group",
     "find_parentheses_group",
-    "replace_math_functions",
-    "hip_header_magic",
-    "replace_extern_shared",
+    "fix_static_global_kernels",
     "get_hip_file_path",
+    "hip_header_magic",
+    "hipify",
+    "is_caffe2_gpu_file",
+    "is_cusparse_file",
     "is_out_of_place",
     "is_pytorch_file",
-    "is_cusparse_file",
     "is_special_file",
-    "is_caffe2_gpu_file",
-    "is_caffe2_gpu_file",
-    "Trie",
+    "match_extensions",
+    "matched_files_iter",
+    "openf",
+    "preprocess_file_and_save_result",
     "preprocessor",
-    "file_specific_replacement",
-    "file_add_header",
-    "fix_static_global_kernels",
-    "extract_arguments",
+    "processKernelLaunches",
+    "replace_extern_shared",
+    "replace_math_functions",
     "str2bool",
-    "CurrentState",
-    "HipifyResult",
-    "hipify",
 ]
 
 
@@ -712,25 +711,19 @@ def is_out_of_place(rel_filepath):
         return False
     if rel_filepath.startswith("third_party/nvfuser/"):
         return False
-    if rel_filepath.startswith("tools/autograd/templates/"):
-        return False
-    return True
+    return not rel_filepath.startswith("tools/autograd/templates/")
 
 
 # Keep this synchronized with includes/ignores in build_amd.py
 def is_pytorch_file(rel_filepath):
     assert not os.path.isabs(rel_filepath)
     if rel_filepath.startswith("aten/"):
-        if rel_filepath.startswith("aten/src/ATen/core/"):
-            return False
-        return True
+        return not rel_filepath.startswith("aten/src/ATen/core/")
     if rel_filepath.startswith("torch/"):
         return True
     if rel_filepath.startswith("third_party/nvfuser/"):
         return True
-    if rel_filepath.startswith("tools/autograd/templates/"):
-        return True
-    return False
+    return bool(rel_filepath.startswith("tools/autograd/templates/"))
 
 
 def is_cusparse_file(rel_filepath):
@@ -977,7 +970,7 @@ def preprocessor(
     def mk_repl(templ, include_current_dir=True):
         def repl(m):
             f = m.group(1)
-            dirpath, filename = os.path.split(f)
+            _dirpath, filename = os.path.split(f)
             if f.startswith(
                 (
                     "ATen/cuda",

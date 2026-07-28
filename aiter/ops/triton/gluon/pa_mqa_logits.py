@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: EXE005  the `#!=----` separators below are decorative
+# comments, not shebangs; ruff's heuristic flags all 66 of them.
 
 import triton
 import triton.language as tl

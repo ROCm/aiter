@@ -54,15 +54,26 @@ try:
         sys.path.insert(0, os.path.abspath(_opus_csrc))
     from opus_gemm_common import (
         SPLITK_KIDS as _opus_splitk_kids,
+    )
+    from opus_gemm_common import (
         kernels_list as _opus_kernels_list,
     )
     from opus_gemm_tune import (
-        candidate_kids_for_shape as _opus_candidate_kids_for_shape,
-        candidate_splitK as _opus_candidate_splitK,
-        kid_rejects_shape as _opus_kid_rejects_shape,
-        kid_rejects_bias as _opus_kid_rejects_bias,
         _ensure_kids_compiled as _opus_ensure_kids_compiled,
     )
+    from opus_gemm_tune import (
+        candidate_kids_for_shape as _opus_candidate_kids_for_shape,
+    )
+    from opus_gemm_tune import (
+        candidate_splitK as _opus_candidate_splitK,
+    )
+    from opus_gemm_tune import (
+        kid_rejects_bias as _opus_kid_rejects_bias,
+    )
+    from opus_gemm_tune import (
+        kid_rejects_shape as _opus_kid_rejects_shape,
+    )
+
     from aiter.ops.opus.gemm_op_a16w16 import (
         opus_gemm_a16w16_tune as _opus_gemm_a16w16_tune,
     )
@@ -451,7 +462,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
         )
 
     def _clear_op_caches(self):
-        from aiter.tuned_gemm import get_GEMM_A16W16_config_, get_GEMM_A16W16_config
+        from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
 
         get_GEMM_A16W16_config_.cache_clear()
         get_GEMM_A16W16_config.cache_clear()
@@ -463,8 +474,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
         return super().calculate(results, bpes=(2, 2, 2))
 
     def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
         from aiter.tuned_gemm import gemm_a16w16
-        from aiter.test_common import run_perftest, checkAllclose
 
         untunedf = self.untunedf
         results = []
@@ -599,8 +610,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
         rtol, atol = _default_tol(outdtype)
         tasks = []
         solidx = 0
-        for key in asm_kernels.keys():
-            tile_m, tile_n, pf, splitK_flag, subK, bias_flag, bPreshuffle = key
+        for key in asm_kernels:
+            tile_m, tile_n, _pf, splitK_flag, subK, bias_flag, bPreshuffle = key
             kernelName = asm_kernels[key][0]
             start = 1
             if splitK_flag:

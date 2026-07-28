@@ -106,7 +106,7 @@ def calculate_heap_size(
 
     # Total with overhead
     total_bytes = mem_input + mem_rs + mem_quant + mem_gather
-    total_with_overhead = int(math.ceil(total_bytes * overhead_factor))
+    total_with_overhead = math.ceil(total_bytes * overhead_factor)
 
     logger.debug(
         f"Heap size calculation: M={M}, N={N}, dtype={dtype}, world_size={world_size}, "

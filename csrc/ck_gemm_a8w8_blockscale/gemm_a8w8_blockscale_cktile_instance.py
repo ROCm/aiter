@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices,Inc. All rights reserved.
-from copy import copy
-from dataclasses import dataclass
 import os
 import sys
+from copy import copy
+from dataclasses import dataclass
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -54,34 +54,19 @@ class TileKernelInstance:
 
         parts = [
             "a8w8_blockscale_cktile",
+            ("x").join(str(x) for x in [self.M_Tile, self.N_Tile, self.K_Tile]),
+            ("x").join(str(x) for x in [self.M_Warp, self.N_Warp, self.K_Warp]),
             ("x").join(
-                map(
-                    lambda x: str(x),
-                    [self.M_Tile, self.N_Tile, self.K_Tile],
-                )
-            ),
-            ("x").join(
-                map(
-                    lambda x: str(x),
-                    [self.M_Warp, self.N_Warp, self.K_Warp],
-                )
-            ),
-            ("x").join(
-                map(
-                    lambda x: str(x),
-                    [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile],
-                )
+                str(x) for x in [self.M_Warp_Tile, self.N_Warp_Tile, self.K_Warp_Tile]
             ),
             self.Scheduler.lower(),
             ("x").join(
-                map(
-                    lambda x: str(int(x)),
-                    [
-                        self.TiledMMAPermuteN,
-                        self.TransposeC,
-                        self.UsePersistentKernel,
-                    ],
-                )
+                str(int(x))
+                for x in [
+                    self.TiledMMAPermuteN,
+                    self.TransposeC,
+                    self.UsePersistentKernel,
+                ]
             ),
             str(self.BlockPerCu),
         ]

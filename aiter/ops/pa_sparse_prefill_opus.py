@@ -263,8 +263,8 @@ def pa_sparse_prefill_fp8_opus(
 
 
 __all__ = [
-    "pa_sparse_prefill_opus_fwd",
-    "pa_sparse_prefill_opus",
-    "pa_sparse_prefill_fp8_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
+    "pa_sparse_prefill_fp8_opus_fwd",
+    "pa_sparse_prefill_opus",
+    "pa_sparse_prefill_opus_fwd",
 ]

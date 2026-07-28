@@ -349,8 +349,7 @@ class TestUpdateConfigFiles(unittest.TestCase):
         path = os.path.join(self.tmpdir, name)
         with open(path, "w") as f:
             f.write(",".join(header) + "\n")
-            for row in rows:
-                f.write(",".join(str(v) for v in row) + "\n")
+            f.writelines(",".join(str(v) for v in row) + "\n" for row in rows)
         return path
 
     def test_single_path_returns_as_is(self):

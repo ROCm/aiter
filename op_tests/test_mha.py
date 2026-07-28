@@ -119,7 +119,7 @@ def run_ck(
     if dropout_p > 0.0:
         _, seqlen_q, _, d = q.shape
         _, seqlen_k, _, d = k.shape
-        _, seqlen_k, _, d_v = v.shape
+        _, seqlen_k, _, _d_v = v.shape
         S_dmask = ck_randval_to_dropout_mask(S_dmask, dropout_p)
         S_dmask_converted = convert_flash_attn_S_to_softmax(
             S_dmask,
@@ -347,9 +347,7 @@ def test_flash_attn_output(
     print(
         f"softmax_lse Pytorch max diff: {(softmax_lse_pt - softmax_lse_ref).abs().max().item()}"
     )
-    softmax_lse_tol = max(
-        2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01
-    )
+    max(2 * (softmax_lse_pt - softmax_lse_ref).abs().max().item(), 0.01)
     # assert (softmax_lse - softmax_lse_ref).abs().max().item() <= softmax_lse_tol
 
     print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
@@ -665,7 +663,7 @@ def test_flash_attn_seq_padding(
 
     # Find and print coordinates of max difference
     max_diff_indices = torch.unravel_index(torch.argmax(diff_tensor), diff_tensor.shape)
-    b, s_q, h, d_idx = max_diff_indices
+    b, s_q, _h, _d_idx = max_diff_indices
     print(
         f"Coordinates of max difference (batch, seq_q, head, dim): {tuple(x.item() for x in max_diff_indices)}"
     )
@@ -974,7 +972,7 @@ def test_mha_bwd_sink_dsink(
     )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
-    dq, dk, dv, softmax_d = aiter.mha_bwd(
+    _dq, _dk, _dv, _softmax_d = aiter.mha_bwd(
         dout,
         q.detach(),
         k.detach(),

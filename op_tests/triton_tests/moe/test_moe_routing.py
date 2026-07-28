@@ -79,13 +79,9 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
@@ -207,7 +203,7 @@ def routing_score_mode_torch(
     renorm=True,
     routed_scaling_factor=1.0,
 ):
-    n_tokens, n_expts_tot = logits.shape
+    _n_tokens, n_expts_tot = logits.shape
 
     # 1. Score transform; bias added only for selection.
     transformed_f32 = _score_transform_torch(logits, score_mode).to(torch.float32)
@@ -247,7 +243,7 @@ def routing_from_hash_torch(
     renorm=True,
     routed_scaling_factor=1.0,
 ):
-    n_tokens, n_expts_tot = router_logits.shape
+    _n_tokens, n_expts_tot = router_logits.shape
     iid = input_ids.to(torch.int64)
     # Expert ids come straight from the table — no per-row sort.
     expt_indx = tid2eid[iid, :n_expts_act].to(torch.int32)
@@ -604,7 +600,7 @@ def _ref_arbitrary_grouped(
     """General reference honoring an arbitrary expert->group table (equal-size
     groups). Used for the non-contiguous mapping case where the aiter refs
     (which assume contiguous .view groups) don't apply."""
-    nt, ne = logits.shape
+    nt, _ne = logits.shape
     f32 = logits.float()
     if score_mode == "softmax":
         scores = torch.softmax(f32, dim=-1)
@@ -907,7 +903,7 @@ def bench_routing():
     proton.start("routing")
     proton.activate()
     for i in range(100):
-        tri_routing_data, tri_gather, tri_scatter = routing(tri_logits, n_expts_act)
+        _tri_routing_data, _tri_gather, _tri_scatter = routing(tri_logits, n_expts_act)
     proton.finalize()
     try:
         import os

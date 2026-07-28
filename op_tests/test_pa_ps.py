@@ -470,7 +470,7 @@ def test_pa_ps(
         head_size,
         dtype=dtype,
     )
-    query, key, value = torch.split(
+    query, _key, _value = torch.split(
         qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*uniform_range)
@@ -752,7 +752,7 @@ def test_pa_ps(
         )
         ret["err fp8"] = err
     else:
-        out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
+        _out_aiter_asm, us_aiter_asm = run_aiter_asm_ps(
             Q=query,
             K=k_quant_,
             V=asm_V_shuffle(v_quant_),

@@ -1,5 +1,6 @@
 import copy
 import functools
+import itertools
 import json
 import os
 
@@ -72,7 +73,7 @@ def _get_gemm_config_cached(
     assert bounds is None or (
         len(bounds) > 0
         and all(x > 0 for x in bounds)
-        and all(x < y for x, y in zip(bounds, bounds[1:]))
+        and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
     if not hasattr(_get_gemm_config_cached, "_config_cache"):

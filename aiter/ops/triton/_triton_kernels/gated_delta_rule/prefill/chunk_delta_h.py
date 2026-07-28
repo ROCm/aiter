@@ -1105,7 +1105,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         if IS_VARLEN:
             g += (i_h * T_flat + bos).to(tl.int64)
         else:
-            g += (((i_n * H + i_h) * T_flat)).to(tl.int64)
+            g += ((i_n * H + i_h) * T_flat).to(tl.int64)
 
     if USE_INITIAL_STATE:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))

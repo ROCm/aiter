@@ -1489,8 +1489,8 @@ def attention_forward_prefill_triton_impl(
     if IS_VARLEN:
         # shape
         total_seqlen_q, nheads_q, head_size_q = q.shape
-        total_seqlen_k, nheads_k, head_size_k = k.shape
-        total_seqlen_v, nheads_v, head_size_v = v.shape
+        _total_seqlen_k, nheads_k, head_size_k = k.shape
+        _total_seqlen_v, nheads_v, head_size_v = v.shape
 
         # assert shapes
         assert (
@@ -1908,7 +1908,7 @@ def attention_forward_prefill_triton_impl(
         IS_VARLEN=IS_VARLEN,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False if bias is None else True,
+        USE_BIAS=not bias is None,
         USE_ALIBI=use_alibi,
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,

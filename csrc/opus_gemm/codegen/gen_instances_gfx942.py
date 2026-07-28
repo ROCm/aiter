@@ -114,7 +114,7 @@ KERNEL_FUNC_MAP = {
     "a16w16_wave_k_coop": "gemm_a16w16_wave_k_coop_kernel",
     "a16w16_wave_k_coop_accum": "gemm_a16w16_wave_k_coop_accum_kernel",
     # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
-    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
+    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS},
     **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
 }
 

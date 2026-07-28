@@ -680,7 +680,7 @@ void
 """
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
-            for mnk, k in kernels_dict.items():
+            for k in kernels_dict.values():
                 if k.kernel_tag in A16W16_TUNE_TAGS:
                     f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
                 elif k.kernel_tag in NOSCALE_TAGS:
@@ -883,7 +883,7 @@ void
         self._host_instantiations = []
         self._device_instantiations = []
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         # Emit one fused HOST TU + N device TUs (one per kid, dtype) + one dedicated splitk_reduce.device.cu.
@@ -1094,7 +1094,7 @@ if __name__ == "__main__":
     if os.path.exists(sidecar_path):
         try:
             with open(sidecar_path) as f:
-                sidecar_kids = set(int(x) for x in json.load(f))
+                sidecar_kids = {int(x) for x in json.load(f)}
         except (OSError, ValueError):
             sidecar_kids = set()
 
@@ -1146,8 +1146,9 @@ if __name__ == "__main__":
             "// Auto-generated. See gen_instances.py.\n"
             "#pragma once\n"
         )
-        for a in archs_for_header:
-            f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
+        f.writelines(
+            f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
+        )
 
     # gfx950 a8w8 (kid 1, 2) is only needed when the module is built with
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.

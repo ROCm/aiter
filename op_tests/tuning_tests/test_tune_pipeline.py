@@ -765,7 +765,7 @@ class TestOnlineTuneE2E(unittest.TestCase):
     def test_online_tune_triggers_and_succeeds(self):
         """AITER_ONLINE_TUNE=1 with empty config -> tuner runs, op succeeds."""
         with tempfile.TemporaryDirectory() as tmp:
-            result, tuned_csv, untuned_csv = self._run_online_tune_script(tmp)
+            result, tuned_csv, _untuned_csv = self._run_online_tune_script(tmp)
 
             if result.returncode != 0:
                 print(f"\n=== ONLINE TUNE E2E STDOUT ===\n{result.stdout[-3000:]}")

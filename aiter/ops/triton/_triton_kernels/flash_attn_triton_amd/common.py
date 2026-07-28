@@ -362,7 +362,7 @@ def _apply_rotary_kernel(
         assert (
             max_seqlen is not None
         ), "If cu_seqlens is passed, max_seqlen must also be provided"
-        total_seqlen, nheads, headdim = x.shape
+        _total_seqlen, nheads, headdim = x.shape
         assert cu_seqlens is not None
         batch_p_1 = cu_seqlens.shape[0]
         batch = batch_p_1 - 1

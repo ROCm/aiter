@@ -139,7 +139,7 @@ AITER_CONFIG_GEMM_BF16 = os.getenv(
 )
 
 
-class AITER_CONFIG(object):
+class AITER_CONFIG:
     @property
     def AITER_CONFIG_GEMM_A4W4_FILE(self):
         return self.get_config_file(
@@ -489,7 +489,7 @@ def validate_and_update_archs():
     return archs
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def hip_flag_checker(flag_hip: str) -> bool:
     import subprocess
 
@@ -506,7 +506,7 @@ def hip_flag_checker(flag_hip: str) -> bool:
     return True
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def check_LLVM_MAIN_REVISION():
     # for https://github.com/ROCm/ROCm/issues/5646 and https://github.com/ROCm/composable_kernel/pull/3469
     # ck using following logic...
@@ -555,12 +555,12 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
     def do_rename_and_mv(name, src, dst, ret):
         newName = name
         if hipify:
-            if name.endswith(".cpp") or name.endswith(".cu"):
+            if name.endswith((".cpp", ".cu")):
                 newName = name.replace(".cpp", ".cu")
                 ret.append(f"{dst}/{newName}")
             shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
         else:
-            if name.endswith(".cpp") or name.endswith(".cu"):
+            if name.endswith((".cpp", ".cu")):
                 ret.append(f"{src}/{newName}")
 
     ret = []
@@ -593,7 +593,7 @@ def check_numa_custom_op() -> None:
         )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def check_numa():
     check_numa_custom_op()
 
@@ -1016,7 +1016,7 @@ def build_module(
                         "error:",
                         "\033[31merror:\033[0m",
                         "-->".join(traceback.format_exception(*sys.exc_info())),
-                        flags=re.I,
+                        flags=re.IGNORECASE,
                     ),
                 )
             )
@@ -1102,7 +1102,9 @@ def _get_ck_exclude_modules():
     return ck_modules
 
 
-def get_args_of_build(ops_name: str, exclude=[]):
+def get_args_of_build(ops_name: str, exclude=None):
+    if exclude is None:
+        exclude = []
     d_opt_build_args = {
         "srcs": [],
         "md_name": "",
@@ -1136,7 +1138,7 @@ def get_args_of_build(ops_name: str, exclude=[]):
                 for idx, el in enumerate(val):
                     if isinstance(el, str):
                         if "torch" in el:
-                            import torch as torch
+                            pass
                         val[idx] = eval(el)
                 d_ops[k] = val
             elif isinstance(val, str):
@@ -1383,12 +1385,11 @@ def _ctypes_call(func, fc_name, md_name):
                     raise TypeError(
                         f"{fc_name}: '{pname}' expects int, got {type(value).__name__}"
                     )
-            elif hint is float:
-                if not isinstance(value, (float, int)):
-                    raise TypeError(
-                        f"{fc_name}: '{pname}' expects float, "
-                        f"got {type(value).__name__}"
-                    )
+            elif hint is float and not isinstance(value, (float, int)):
+                raise TypeError(
+                    f"{fc_name}: '{pname}' expects float, "
+                    f"got {type(value).__name__}"
+                )
 
     def caller(*args, **kwargs):
         nonlocal _arg_checked
@@ -1505,8 +1506,10 @@ def compile_ops(
             func.arg_checked = False
 
             @functools.wraps(func)
-            def wrapper(*args, custom_build_args={}, **kwargs):
+            def wrapper(*args, custom_build_args=None, **kwargs):
 
+                if custom_build_args is None:
+                    custom_build_args = {}
                 md_name = _md_name
                 try:
                     module = None

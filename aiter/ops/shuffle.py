@@ -122,7 +122,7 @@ def interleave_gate_up_rows(w: torch.Tensor) -> torch.Tensor:
 
 def moe_shuffle_weight(
     src: torch.Tensor,
-    experts_cnt: int = None,
+    experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
     layout=(16, 16),
@@ -239,7 +239,7 @@ def shuffle_weight_NK(
 
 def shuffle_scale_n32k4(
     src: torch.Tensor,
-    experts_cnt: int = None,
+    experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
 ) -> torch.Tensor:
@@ -338,7 +338,7 @@ def shuffle_weight_f4(src: torch.Tensor) -> torch.Tensor:
 
 def shuffle_scale(
     src: torch.Tensor,
-    experts_cnt: int = None,
+    experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
 ) -> torch.Tensor:
@@ -411,7 +411,7 @@ def shuffle_scale(
 
 def moe_shuffle_scale(
     src: torch.Tensor,
-    experts_cnt: int = None,
+    experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
 ) -> torch.Tensor:

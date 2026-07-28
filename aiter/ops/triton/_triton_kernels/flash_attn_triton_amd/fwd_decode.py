@@ -1020,7 +1020,7 @@ def attention_forward_decode_triton_impl(
 
     # kernel_configs
     is_new_kv = False  # Cache has been updated, so no new KV in kernel
-    use_alibi, (stride_az, stride_ah) = True if alibi_slopes is not None else False, (
+    use_alibi, (stride_az, stride_ah) = alibi_slopes is not None, (
         alibi_slopes.stride() if alibi_slopes is not None else (None, None)
     )
     use_cache_seqlens = cache_seqlens is not None
@@ -1044,15 +1044,14 @@ def attention_forward_decode_triton_impl(
     # Handle paged KV cache layout
     if use_block_table:
         # For paged attention, k_cache and v_cache have shape [num_blocks, block_size, nheads, head_dim]
-        num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
-        num_blocks_vc, block_size_v, nheads_vc, dim_vc = v_cache.shape
+        _num_blocks_kc, block_size_k, nheads_kc, dim_kc = k_cache.shape
+        _num_blocks_vc, _block_size_v, nheads_vc, dim_vc = v_cache.shape
         # Get the actual sequence length from the block_table upper bound.
         # Avoid cache_seqlens.max().item(): GPU-to-CPU sync is illegal during
         # CUDA graph capture, and the block-table bound is always safe.
         assert block_table is not None
         num_blocks_per_seq = block_table.shape[1]
         seqlen_kc = num_blocks_per_seq * block_size_k
-        seqlen_vc = seqlen_kc
 
         # Strides for paged layout
         stride_kc_z = 0  # No batch dimension in paged cache
@@ -1069,7 +1068,7 @@ def attention_forward_decode_triton_impl(
         stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(
             k_cache, layout
         )
-        _, seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
+        _, _seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
         stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(
             v_cache, layout
         )
@@ -1088,7 +1087,7 @@ def attention_forward_decode_triton_impl(
         stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = None, None, None, None
         _, _seqlen_vn, nheads_vn, _dim_vn = None, None, None, None
         stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = None, None, None, None
-    _, seqlen_o, nheads_o, dim_o = get_shape_from_layout(out, layout)
+    _, _seqlen_o, nheads_o, _dim_o = get_shape_from_layout(out, layout)
     stride_oz, stride_oh, stride_om, stride_od = get_stride_from_layout(out, layout)
     assert (
         dim_q == dim_kc == dim_vc

@@ -85,18 +85,14 @@ def get_dtype_in_kernel(dtype: str):
 def get_dtype_vec_size(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 8
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 8
 
 
 def get_dtype_bytes(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 2
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 2
 
 

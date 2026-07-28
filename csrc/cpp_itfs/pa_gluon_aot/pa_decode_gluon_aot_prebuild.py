@@ -646,8 +646,8 @@ def run_multi_pa_gluon_test(
     use_aot_impl_options,
     context_partition_size_options,
     num_processes=None,
-    sinks_options=[False],
-    sliding_window_options=[0],
+    sinks_options=None,
+    sliding_window_options=None,
 ) -> pd.DataFrame:
     """
     Run all tests using multiprocessing for parallel execution.
@@ -659,6 +659,10 @@ def run_multi_pa_gluon_test(
     Returns:
         DataFrame containing all test results
     """
+    if sliding_window_options is None:
+        sliding_window_options = [0]
+    if sinks_options is None:
+        sinks_options = [False]
     cdna_version = 3
     # Generate all test configurations
     test_configs = []

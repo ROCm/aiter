@@ -52,7 +52,7 @@ def moe_smoothquant_fwd(
 
 
 # following are pure torch implement
-@functools.lru_cache()
+@functools.lru_cache
 def get_dtype_max(dtype):
     try:
         dtypeMax = torch.finfo(dtype).max
@@ -167,7 +167,7 @@ def per_1x32_f4_quant(
     shape_original = x.shape
     x = x.view(-1, shape_original[-1])
 
-    m, n = x.shape
+    m, _n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 
@@ -281,7 +281,7 @@ def per_1x32_f8_scale_f8_quant(
     shape_original = x.shape
     x = x.view(-1, shape_original[-1])
 
-    m, n = x.shape
+    m, _n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 
@@ -346,7 +346,7 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
     return decorator
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_torch_quant(qType):
     tmp = {
         QuantType.No: lambda *a, **k: (a[0], None),
@@ -364,7 +364,7 @@ def get_torch_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_hip_quant(qType):
     # `per_1x32` points to the dtype-aware MX entry so callers can do
     # `get_hip_quant(QuantType.per_1x32)(x, quant_dtype=dtypes.fp4x2)` for
@@ -387,7 +387,7 @@ def get_hip_quant(qType):
     return tmp.get(qType.value, raise_NotImplementedError)
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_triton_quant(qType):
     tmp = {
         QuantType.No: lambda *a, **k: (a[0], None),
@@ -676,7 +676,7 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_torch_act(aType):
     tmp = {
         ActivationType.No: lambda *a, **k: a[0],

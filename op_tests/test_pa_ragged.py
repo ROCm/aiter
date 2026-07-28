@@ -695,9 +695,8 @@ def test_paged_attention(
             or quant_cache_dtype not in [None, dtypes.i8]
         ):
             pytest.skip()
-    elif pa_variant == PAVariant.Naive:
-        if use_alibi:
-            pytest.skip()
+    elif pa_variant == PAVariant.Naive and use_alibi:
+        pytest.skip()
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -889,9 +888,9 @@ def test_paged_attention(
         else:
             k_quant_, k_scale_, v_quant_, v_scale_ = (
                 key_cache,
-                torch.empty((0)),
+                torch.empty(0),
                 value_cache,
-                torch.empty((0)),
+                torch.empty(0),
             )
 
             out_aiter_naive, time_aiter_naive = run_aiter_naive(
@@ -1039,7 +1038,7 @@ if __name__ == "__main__":
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
-    if not args.pa_variant == [PAVariant.Shomy, PAVariant.Asm]:
+    if args.pa_variant != [PAVariant.Shomy, PAVariant.Asm]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype

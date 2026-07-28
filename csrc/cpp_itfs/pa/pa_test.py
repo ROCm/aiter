@@ -123,7 +123,7 @@ def torch_mha_extend(
     k_scale=None,  # [num_heads, num_blocks * block_size]
     v_scale=None,  # [num_heads, num_blocks * block_size]
 ):
-    num_blocks, num_heads, head_size, block_size = v_cache.shape
+    _num_blocks, num_heads, head_size, block_size = v_cache.shape
     sm_scale = 1.0 / (head_size**0.5)
 
     dtype = q.dtype
@@ -302,7 +302,7 @@ def test_pa_mtp(
         head_size,
         dtype=dtype,
     )
-    query, key, value = torch.split(
+    query, _key, _value = torch.split(
         qkv, [num_query_heads, num_kv_heads, num_kv_heads], dim=1
     )
     query.uniform_(*uniform_range)

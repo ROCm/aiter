@@ -130,13 +130,9 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)

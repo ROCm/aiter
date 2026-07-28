@@ -728,9 +728,9 @@ def test_paged_attention(
         if quant_algo == "NO":
             k_quant_, k_scale_, v_quant_, v_scale_ = (
                 k_cache,
-                torch.empty((0)),
+                torch.empty(0),
                 v_cache,
-                torch.empty((0)),
+                torch.empty(0),
             )
         elif quant_algo == "KV_8BIT_PER_TOKEN":
             k_quant_, k_scale_, v_quant_, v_scale_, k_scale_asm, v_scale_asm = (

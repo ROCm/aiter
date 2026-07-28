@@ -242,7 +242,7 @@ def run_benchmark(custom, args):
         seqlens_k = torch.maximum(seqlens_k, seqlens_q)
 
         if DECODE_P > 0.0:
-            num_decode = int(round(DECODE_P * BATCH))
+            num_decode = round(DECODE_P * BATCH)
             if num_decode > 0:
                 decode_idx = torch.randperm(BATCH, device=seqlens_q.device)[:num_decode]
                 seqlens_q[decode_idx] = 1

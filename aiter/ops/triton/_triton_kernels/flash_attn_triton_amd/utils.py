@@ -24,25 +24,25 @@ logger = logging.getLogger(__name__)
 AutotuneMode = Literal["off", "on", "sweep"]
 
 __all__ = [
-    # Runtime info
-    "get_arch",
-    "is_hip",
+    "AUTOTUNE",
+    "BWD_MODE",
+    "DEBUG",
+    "PHILOX_OFFSET",
+    "PHILOX_SEED",
+    "SHAPE_EXPECTATIONS",
+    "USE_EXP2",
+    "USE_TRITON_ROCM",
     # Global config
     "AutotuneMode",
-    "AUTOTUNE",
-    "DEBUG",
-    "USE_TRITON_ROCM",
-    "BWD_MODE",
-    "USE_EXP2",
-    "PHILOX_SEED",
-    "PHILOX_OFFSET",
-    "SHAPE_EXPECTATIONS",
-    # FP8
-    "is_fp8",
+    # Runtime info
+    "get_arch",
+    "get_padded_headsize",
     # Shape/stride helpers
     "get_shape_from_layout",
     "get_stride_from_layout",
-    "get_padded_headsize",
+    # FP8
+    "is_fp8",
+    "is_hip",
     # Misc helpers
     "round_multiple",
 ]
@@ -233,7 +233,7 @@ def get_shape_from_layout(
     elif layout == "bshd":
         batch, max_seqlen_final, num_heads, head_dim = x.shape
     elif layout == "thd":
-        total_seqlen, num_heads, head_dim = x.shape
+        _total_seqlen, num_heads, head_dim = x.shape
         if cu_seqlens is None:
             raise ValueError("cu_seqlens must be provided for varlen (thd) layout")
         if max_seqlen is None:

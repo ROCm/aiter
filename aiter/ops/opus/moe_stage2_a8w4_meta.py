@@ -105,9 +105,7 @@ class OpusA8W4Stage2Instance:
         token = int(token)
         if self.min_tuner_token is not None and token < self.min_tuner_token:
             return False
-        if self.max_tuner_token is not None and token > self.max_tuner_token:
-            return False
-        return True
+        return not (self.max_tuner_token is not None and token > self.max_tuner_token)
 
 
 @dataclass(frozen=True)

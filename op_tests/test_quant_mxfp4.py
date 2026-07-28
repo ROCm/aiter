@@ -355,7 +355,7 @@ def test_edge_values(float_dtype, round_mode):
     packed, scale = quant_mxfp4_hip(inp_tiny, group_size=32, round_mode=round_mode)
 
     inp_neg = torch.full((rows, cols), -3.0, dtype=float_dtype, device="cuda")
-    packed, scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=round_mode)
+    packed, _scale = quant_mxfp4_hip(inp_neg, group_size=32, round_mode=round_mode)
     py_packed, _ = ref_quant_mxfp4(inp_neg.cpu(), round_mode=round_mode, group_size=32)
     assert torch.equal(
         packed.view(torch.uint8).cpu(), py_packed
@@ -378,10 +378,12 @@ def test_invalid_round_mode():
     cmd = [
         sys.executable,
         "-c",
-        "import torch, aiter\n"
-        "from aiter.ops.quant import quant_mxfp4_hip\n"
-        "x = torch.randn(32, 64, dtype=torch.bfloat16, device='cuda')\n"
-        "quant_mxfp4_hip(x, group_size=32, round_mode=4)\n",
+        (
+            "import torch, aiter\n"
+            "from aiter.ops.quant import quant_mxfp4_hip\n"
+            "x = torch.randn(32, 64, dtype=torch.bfloat16, device='cuda')\n"
+            "quant_mxfp4_hip(x, group_size=32, round_mode=4)\n"
+        ),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if proc.returncode == 0:

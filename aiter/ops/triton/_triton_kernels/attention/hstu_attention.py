@@ -226,7 +226,7 @@ def _hstu_attn_fwd_compute(
                     if HAS_CONTEXTUAL_SEQ_LEN:
                         low = low if low > contextual_seq_len else 0
                     else:
-                        low = low if low > 0 else 0
+                        low = max(0, low)
                 if HAS_MULTIPLE_TARGETS:
                     uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
                     if uih_end < start_m:
@@ -577,13 +577,12 @@ def _hstu_attn_bwd_one_col_block(
             low = start_n
             if HAS_MAX_ATTN_LEN:
                 high = start_n + max_attn_len + BLOCK_N
-                high = high if high < seq_len else seq_len
+                high = min(seq_len, high)
             else:
                 high = seq_len
         if HAS_CONTEXTUAL_SEQ_LEN:
             contextual_block_end = tl.cdiv(contextual_seq_len, BLOCK_M) * BLOCK_M
-            if low < contextual_block_end:
-                low = contextual_block_end
+            low = max(low, contextual_block_end)
     else:
         low = 0
         high = start_n + BLOCK_N

@@ -424,30 +424,34 @@ class GemmTuner(GemmCommonTuner):
 
     def __init__(
         self,
-        key=[
-            "gfx",
-            "cu_num",
-            "M",
-            "N",
-            "K",
-            "bias",
-            "dtype",
-            "outdtype",
-            "scaleAB",
-            "bpreshuffle",
-        ],
-        resultList=[
-            "libtype",
-            "solidx",
-            "splitK",
-            "us",
-            "kernelName",
-            "err_ratio",
-            "tflops",
-            "bw",
-        ],
+        key=None,
+        resultList=None,
         description="GemmTuner (hipblaslt-only)",
     ):
+        if resultList is None:
+            resultList = [
+                "libtype",
+                "solidx",
+                "splitK",
+                "us",
+                "kernelName",
+                "err_ratio",
+                "tflops",
+                "bw",
+            ]
+        if key is None:
+            key = [
+                "gfx",
+                "cu_num",
+                "M",
+                "N",
+                "K",
+                "bias",
+                "dtype",
+                "outdtype",
+                "scaleAB",
+                "bpreshuffle",
+            ]
         super().__init__(
             "GemmTuner",
             key=key,
@@ -553,10 +557,10 @@ class GemmTuner(GemmCommonTuner):
         outbpe,
     ):
         """calculate TFLOPS and bandwidth"""
-        info, time, err_ratio = results
+        info, time, _err_ratio = results
         if time <= 0:
             return -1, -1
-        gfx, cu_num, m, n, k = info
+        _gfx, _cu_num, m, n, k = info
         flops = m * n * k * 2
         tflops = round(flops / (time * 1000000), 2)
 
@@ -802,7 +806,7 @@ class GemmTuner(GemmCommonTuner):
             resultsdf.to_csv(profile_file, index=False)
 
     def set_run_iters(self, input, inputdtype):
-        gfx, cu_num, m, n, k, *rest = input
+        _gfx, _cu_num, m, n, k, *_rest = input
         flops = m * n * k * 2
         if flops < 128 * 5120 * 256 * 2:
             self.num_warmup = 30

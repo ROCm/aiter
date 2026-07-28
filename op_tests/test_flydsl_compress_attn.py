@@ -97,7 +97,7 @@ def _build_inputs(shape, bs, mtp, mode):
     Both modes append SENTINEL_PAD trailing rows with position=-1 so the
     kernel's plan-capacity > num_compress padding-bail path is exercised.
     """
-    label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    _label, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
     if get_gfx() == "gfx1250":
         preshuffle = False  # gfx1250 (wave32) uses the linear FP8 layout
     dim_full = (2 if overlap else 1) * D
@@ -264,7 +264,7 @@ def _run_kernel(inp, *, use_2kernel):
 def test_flydsl_compress_attn(shape_label, bs, mtp, mode, path):
     """One case. ``mode`` ? {'decode','prefill'}, ``path`` ? {'single','2kernel'}."""
     shape = _shape_by_label(shape_label)
-    _, D, RD, ratio, overlap, quant, ue8m0, preshuffle = shape
+    _, D, RD, ratio, overlap, quant, ue8m0, _preshuffle = shape
     use_2kernel = path == "2kernel"
     inp = _build_inputs(shape, bs, mtp, mode)
 

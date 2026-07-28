@@ -24,7 +24,7 @@ def compile(
     mtp: int = 1,
     quant_method: str = "vllm::Fp8QuantMethod::kPerTensor",
     v_shuffle: bool = False,
-    folder: str = None,
+    folder: str | None = None,
 ):
     return compile_template_op(
         src_template,
@@ -164,8 +164,8 @@ def paged_attention_rocm(
     kv_block_stride = key_cache.stride(0)
     kv_head_stride = key_cache.stride(1)
     gqa_ratio = int(num_heads / num_kv_heads)
-    max_num_partitions = int(math.ceil(max_context_len / partition_size))
-    npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    npar_loops = math.ceil(max_num_partitions / warpSize)
     v_shuffle = value_cache.dim() == 5
 
     quant_method = "vllm::Fp8QuantMethod::kPerTensor"

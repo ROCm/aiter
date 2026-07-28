@@ -24,9 +24,7 @@ torch.set_printoptions(sci_mode=False)
 
 
 def check_support(dtype, kv_dtype, nhead):
-    if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
-        return False
-    return True
+    return not (dtype == dtypes.fp8 and kv_dtype == dtypes.bf16)
 
 
 def cal_diff(
@@ -486,7 +484,7 @@ def test_mla(
         decode_qlen,
     )
     total_kv = new_kv_indptr[-1].item()  # change into pertoken total_kv
-    out_ref, lse_ref = torch_mla_extend(
+    out_ref, _lse_ref = torch_mla_extend(
         q,
         kv_buffer,
         new_qo_indptr,
@@ -503,7 +501,7 @@ def test_mla(
         kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q,
             kv_buffer.view(num_page, page_size, nhead_kv, qk_head_dim),
@@ -552,7 +550,7 @@ def test_mla(
         kv_buffer_fp8 = kv_buffer.to(kvtype)
         kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
 
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend(
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend(
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8,
             new_qo_indptr,
@@ -567,7 +565,7 @@ def test_mla(
             kv_scale=kv_scale,
         )
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd,
             q_fp8 if dtype == dtypes.fp8 else q,
             kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),

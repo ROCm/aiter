@@ -372,7 +372,7 @@ def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
     BATCH, SEQLEN, NUM_HEADS = 1, 32, 4
 
     torch.manual_seed(7)
-    q, k, v = input_helper(
+    q, k, _v = input_helper(
         BATCH,
         NUM_HEADS,
         NUM_HEADS,

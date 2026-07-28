@@ -16,8 +16,8 @@ from .utils import is_flydsl_available
 _MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
-    "is_flydsl_available",
     "GateMode",
+    "is_flydsl_available",
 ]
 
 if is_flydsl_available():
@@ -60,16 +60,16 @@ if is_flydsl_available():
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-        "flydsl_preshuffle_gemm_a8",
+        "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+        "FP8_MQA_LOGITS_VARIANTS",
+        "flydsl_flash_attn_func",
+        "flydsl_fp8_mqa_logits",
+        "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
-        "flydsl_hgemm",
-        "flydsl_flash_attn_func",
-        "flydsl_qk_norm_rope_quant",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
-        "flydsl_fp8_mqa_logits",
-        "FP8_MQA_LOGITS_VARIANTS",
-        "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+        "flydsl_preshuffle_gemm_a8",
+        "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
     ]

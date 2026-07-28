@@ -392,7 +392,7 @@ def test_persistent_lean_attention(
     XCD_REMAP = False
 
     # Triton LeanAttention output
-    la_out, ms = _persistent_lean_attention(
+    la_out, _ms = _persistent_lean_attention(
         q,
         k,
         v,
@@ -595,7 +595,7 @@ def main():
     )
 
     # Triton LeanAttention output
-    la_out, ms = _persistent_lean_attention(
+    la_out, _ms = _persistent_lean_attention(
         q,
         k,
         v,

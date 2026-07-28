@@ -62,8 +62,8 @@ else:
 
 
 __all__ = [
-    "opus_gemm_a16w16_tune",
-    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
     "gemm_a16w16_opus",
+    "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
 ]

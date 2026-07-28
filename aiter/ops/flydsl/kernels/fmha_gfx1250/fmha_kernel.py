@@ -741,7 +741,7 @@ def _load_initial_kv_tiles(ty, kv_lds_addrs, blk, su):
 # ============================================================================
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
     """Compile FMHA kernel variant. Cached per (is_causal, return_lse)."""
     IS_CAUSAL = int(is_causal)
@@ -2506,7 +2506,7 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 # ---- Core loop: with causal mask ----
                 (
-                    sp_out,
+                    _sp_out,
                     kv_out,
                     o_tiles,
                     su_sp_tiles_out,

@@ -22,7 +22,7 @@
 
 import math
 import os
-from functools import lru_cache
+from functools import cache
 
 import torch
 import triton
@@ -243,7 +243,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _compile_deepgemm_fp8_paged_mqa_logits(
     ChunkQ,
     ChunkK,

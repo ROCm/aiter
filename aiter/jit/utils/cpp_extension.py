@@ -49,18 +49,18 @@ VersionMap = dict[str, VersionRange]
 MINIMUM_CLANG_VERSION = (3, 3, 0)
 
 __all__ = [
+    "BuildExtension",
+    "CUDAExtension",
+    "CppExtension",
+    "check_compiler_is_gcc",
     "check_compiler_ok_for_platform",
     "get_compiler_abi_compatibility_and_version",
-    "BuildExtension",
-    "CppExtension",
-    "CUDAExtension",
+    "get_cxx_compiler",
     "include_paths",
+    "is_ninja_available",
     "library_paths",
     "load",
-    "is_ninja_available",
     "verify_ninja_availability",
-    "get_cxx_compiler",
-    "check_compiler_is_gcc",
 ]
 
 
@@ -249,9 +249,7 @@ with compiling PyTorch from source.
 HIP_VERSION = get_hip_version()
 ROCM_HOME = _find_rocm_home()
 HIP_HOME = _join_rocm_home("hip") if ROCM_HOME else None
-IS_HIP_EXTENSION = (
-    True if ((ROCM_HOME is not None) and (HIP_VERSION is not None)) else False
-)
+IS_HIP_EXTENSION = bool(ROCM_HOME is not None and HIP_VERSION is not None)
 ROCM_VERSION = None
 if HIP_VERSION is not None:
     ROCM_VERSION = tuple(int(v) for v in HIP_VERSION.split(".")[:2])
@@ -409,9 +407,8 @@ def get_compiler_abi_compatibility_and_version(
         A tuple that contains a boolean that defines if the compiler is (likely) ABI-incompatible with PyTorch,
         followed by a `Version` string that contains the compiler version separated by dots.
     """
-    if not torch_exclude:
-        if not _is_binary_build():
-            return (True, Version("0.0.0"))
+    if not torch_exclude and not _is_binary_build():
+        return (True, Version("0.0.0"))
     if os.environ.get("TORCH_DONT_CHECK_COMPILER_ABI") in [
         "ON",
         "1",
@@ -563,7 +560,6 @@ class BuildExtension(build_ext):
         if self.compiler.compiler_type == "msvc":
             self.compiler._cpp_extensions += [".cu", ".cuh"]
             original_compile = self.compiler.compile
-            original_spawn = self.compiler.spawn
         else:
             original_compile = self.compiler._compile
 
@@ -1212,9 +1208,9 @@ def check_compiler_is_gcc(compiler):
         return False
     compiler_path = os.path.realpath(results[0].strip())
     # On RHEL/CentOS c++ is a gcc compiler wrapper
-    if os.path.basename(compiler_path) == "c++" and "gcc version" in version_string:
-        return True
-    return False
+    return bool(
+        os.path.basename(compiler_path) == "c++" and "gcc version" in version_string
+    )
 
 
 def _jit_compile(
@@ -1460,7 +1456,7 @@ def _write_ninja_file_and_build_library(
 def is_ninja_available():
     """Return ``True`` if the `ninja <https://ninja-build.org/>`_ build system is available on the system, ``False`` otherwise."""
     try:
-        subprocess.check_output("ninja --version".split())
+        subprocess.check_output(["ninja", "--version"])
     except Exception:
         return False
     else:

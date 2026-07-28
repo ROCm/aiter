@@ -1,23 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import ctypes
 import itertools
 import math
 import os
 import weakref
 
+import pandas as pd
 import pytest
 import torch
-
-import pandas as pd
+from einops import rearrange, repeat
 
 import aiter
-from aiter import dtypes
-from aiter import per_tensor_quant
-from einops import rearrange, repeat
-import argparse
-
+from aiter import dtypes, per_tensor_quant
 from aiter.test_common import (
     perftest,
 )
@@ -142,10 +139,7 @@ def should_skip_rocm72_issue(causal, logits_soft_cap):
 
     # Only skip on ROCm 7.2.x + gfx950
     major, minor = rocm_version
-    if (major, minor) == (7, 2) and gpu_arch == "gfx950":
-        return True
-
-    return False
+    return bool((major, minor) == (7, 2) and gpu_arch == "gfx950")
 
 
 def check_common_skip_conditions(
@@ -158,13 +152,12 @@ def check_common_skip_conditions(
     """
 
     # FP8 is inference-only, no backward pass needed, so LSE is not required
-    if skip_test_if(
-        is_input_fp8 and return_lse,
-        "FP8 is inference-only, LSE not needed for backward pass",
-    ):
-        return True
-
-    return False
+    return bool(
+        skip_test_if(
+            is_input_fp8 and return_lse,
+            "FP8 is inference-only, LSE not needed for backward pass",
+        )
+    )
 
 
 def check_layout_skip_conditions(
@@ -1565,7 +1558,7 @@ def per_page_quant(tensor, page_size, quant_dtype):
         quantized: quantized tensor [num_pages, page_size, num_heads, head_dim]
         descales: [num_pages, num_heads] per-page descale factors
     """
-    num_pages, ps, num_heads, head_dim = tensor.shape
+    _num_pages, ps, _num_heads, _head_dim = tensor.shape
     assert ps == page_size
 
     # Compute per-page max absolute value
@@ -2354,11 +2347,10 @@ def run_batch_prefill_kv_blockscale(
 
     quant_dtype = dtypes.fp8
     # KV_BLOCKSCALE only supports page_size=1024
-    if page_size != 1024:
-        if skip_test_if(
-            True, f"KV_BLOCKSCALE only supports page_size=1024, got {page_size}"
-        ):
-            return {"status": "skipped"}
+    if page_size != 1024 and skip_test_if(
+        True, f"KV_BLOCKSCALE only supports page_size=1024, got {page_size}"
+    ):
+        return {"status": "skipped"}
 
     k_vector_size = get_vector_size(quant_dtype)
 

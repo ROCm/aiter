@@ -73,18 +73,17 @@ def fused_ar_rmsnorm(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                if not post_per_token_quant:
-                    out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            if not post_per_token_quant:
+                out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, x, weight, eps
+                )
+            else:
+                out, res_out, scale_out = (
+                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                         x, x, weight, eps
                     )
-                else:
-                    out, res_out, scale_out = (
-                        tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                            x, x, weight, eps
-                        )
-                    )
+                )
         out.fill_(0)
         res_out.fill_(0)
 
@@ -107,7 +106,7 @@ def fused_ar_rmsnorm(
                 )
                 return out
             else:
-                out, res_out, scale_out = (
+                out, _res_out, scale_out = (
                     tensor_model_parallel_fused_allreduce_rmsnorm_quant(
                         x, x, weight, eps
                     )
@@ -160,12 +159,9 @@ def get_acc_value_with_cudagraph(
 
     # out = torch.empty_like(x)
     graph = torch.cuda.CUDAGraph()
-    with graph_capture() as gc:
-        with torch.cuda.graph(graph, stream=gc.stream):
-            # out = torch.empty_like(x)
-            out, res_out = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x, x, weight, eps
-            )
+    with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+        # out = torch.empty_like(x)
+        out, _res_out = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
     out.fill_(0)
 
     def run_ca():
@@ -211,11 +207,11 @@ def get_acc_value_only(
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
     # warmup and align all gpu
-    group = get_tp_group().device_group
+    get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
-        out, res = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
+        out, _res = tensor_model_parallel_fused_allreduce_rmsnorm(x, x, weight, eps)
 
     # destroy
     if dist.is_initialized():
@@ -257,21 +253,20 @@ def split_ar_rmsnorm(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                ar_out = tensor_model_parallel_all_reduce(x)
-                # out = aiter.rms_norm(ar_out, weight, eps, 0)
-                out = torch.empty_like(ar_out)
-                residual_out = torch.empty_like(ar_out)
-                aiter.rmsnorm2d_fwd_with_add(
-                    out,
-                    ar_out,
-                    x,
-                    residual_out,
-                    weight,
-                    eps,
-                    0,
-                )
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            ar_out = tensor_model_parallel_all_reduce(x)
+            # out = aiter.rms_norm(ar_out, weight, eps, 0)
+            out = torch.empty_like(ar_out)
+            residual_out = torch.empty_like(ar_out)
+            aiter.rmsnorm2d_fwd_with_add(
+                out,
+                ar_out,
+                x,
+                residual_out,
+                weight,
+                eps,
+                0,
+            )
         out.fill_(0)
 
         @perftest()

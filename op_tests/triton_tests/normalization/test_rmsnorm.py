@@ -24,7 +24,7 @@ def generate_rmsnorm_inputs(M, N, dtype):
 
 
 def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
-    M, N = x.shape
+    _M, N = x.shape
     # cast to float32 as the triton kernel
     x_f32 = x.float()
     g_f32 = g.float()

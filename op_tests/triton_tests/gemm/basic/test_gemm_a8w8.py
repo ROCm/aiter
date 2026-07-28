@@ -341,7 +341,7 @@ def test_gemm_splitk_skip_reduce(in_dtype, out_dtype, m, n, k, num_ksplit):
 
     in_dtype = str_to_torch_dtype[in_dtype]
     out_dtype = str_to_torch_dtype[out_dtype]
-    x, weight, weight_triton, x_scale, w_scale, bias, _ = generate_gemm_a8w8_inputs(
+    x, weight, weight_triton, x_scale, w_scale, _bias, _ = generate_gemm_a8w8_inputs(
         M=m,
         N=n,
         K=k,

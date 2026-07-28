@@ -21,10 +21,7 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(

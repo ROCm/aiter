@@ -208,8 +208,10 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
         )
     lines.extend(
         [
-            "using OpusMoeStage2A8W4DefaultContract = "
-            f"{_cpp_effective_contract_alias(effective_inter_dims[0])};\n\n",
+            (
+                "using OpusMoeStage2A8W4DefaultContract = "
+                f"{_cpp_effective_contract_alias(effective_inter_dims[0])};\n\n"
+            ),
         ]
     )
     for block_m in block_ms:
@@ -218,10 +220,14 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
         lines.append(f"constexpr int kStage2A8W4DecodeBlockN{block_n} = {block_n};\n")
     lines.extend(
         [
-            "constexpr int kStage2A8W4DecodeDefaultBlockM = "
-            f"kStage2A8W4DecodeBlockM{k.default_block_m};\n",
-            "constexpr int kStage2A8W4DecodeDefaultBlockN = "
-            f"kStage2A8W4DecodeBlockN{k.default_block_n};\n",
+            (
+                "constexpr int kStage2A8W4DecodeDefaultBlockM = "
+                f"kStage2A8W4DecodeBlockM{k.default_block_m};\n"
+            ),
+            (
+                "constexpr int kStage2A8W4DecodeDefaultBlockN = "
+                f"kStage2A8W4DecodeBlockN{k.default_block_n};\n"
+            ),
             f"constexpr int kStage2A8W4DecodeDefaultCtaThreads = {k.default_cta_threads};\n",
             f"constexpr int kStage2A8W4DecodeBKLogical = {k.bk_logical};\n",
             f"constexpr int kStage2A8W4DecodeMfmaM = {k.mfma_m};\n",
@@ -229,12 +235,18 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
             f"constexpr int kStage2A8W4DecodeMfmaK = {k.mfma_k};\n",
             f"constexpr int kStage2A8W4DecodeFp4ValuesPerByte = {k.fp4_values_per_byte};\n",
             f"constexpr int kStage2A8W4DecodeVectorBytes = {k.vector_bytes};\n",
-            "constexpr int kStage2A8W4DecodeScaleGroupLogicalK = "
-            f"{k.scale_group_logical_k};\n",
-            "constexpr int kStage2A8W4DecodeScaleGroupsPerRowPack = "
-            f"{k.scale_groups_per_row_pack};\n",
-            "constexpr int kStage2A8W4DecodeScaleWordsPerGroupPack = "
-            f"{k.scale_words_per_group_pack};\n",
+            (
+                "constexpr int kStage2A8W4DecodeScaleGroupLogicalK = "
+                f"{k.scale_group_logical_k};\n"
+            ),
+            (
+                "constexpr int kStage2A8W4DecodeScaleGroupsPerRowPack = "
+                f"{k.scale_groups_per_row_pack};\n"
+            ),
+            (
+                "constexpr int kStage2A8W4DecodeScaleWordsPerGroupPack = "
+                f"{k.scale_words_per_group_pack};\n"
+            ),
             f"constexpr int kStage2A8W4DecodeCVec = {k.c_vec};\n",
             f"constexpr int kStage2A8W4DecodeCValuesPerAtomic = {k.c_values_per_atomic};\n\n",
         ]
@@ -244,10 +256,14 @@ def _emit_a8w4_meta_header(effective_inter_dims: tuple[int, ...]) -> str:
         suffix = _cpp_name_suffix(inst.name)
         lines.extend(
             [
-                f"constexpr int kStage2A8W4RouteReduce{suffix}BlockN = "
-                f"{inst.block_n};\n",
-                f"constexpr int kStage2A8W4RouteReduce{suffix}Threads = "
-                f"{inst.threads};\n",
+                (
+                    f"constexpr int kStage2A8W4RouteReduce{suffix}BlockN = "
+                    f"{inst.block_n};\n"
+                ),
+                (
+                    f"constexpr int kStage2A8W4RouteReduce{suffix}Threads = "
+                    f"{inst.threads};\n"
+                ),
             ]
         )
     lines.append(

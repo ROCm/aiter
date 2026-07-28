@@ -2934,11 +2934,10 @@ def _bwd_dkdv_inner(
             alibi_block = -1 * alibi_slope * tl.abs(relative_pos_block)
             qkT_scaled += alibi_block
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"qT: {qT.shape}\n", qT)
-                print(f"k: {k.shape}\n", k)
-                print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"qT: {qT.shape}\n", qT)
+            print(f"k: {k.shape}\n", k)
+            print(f"qkT scaled: {qkT.shape}\n", qkT_scaled)
 
         # Compute probabilities - handle invalid rows where m is -inf
         # For rows where m is -inf, no keys were valid, so pT should be 0
@@ -2977,13 +2976,12 @@ def _bwd_dkdv_inner(
                         offs_n[:, None] <= right_bound
                     )
                 mask = window_mask & mask
-            if DEBUG_TRITON_DETAIL:
-                if start_n == 256:
-                    print(f"mask: {mask.shape}\n", mask)
-                    print(
-                        f"pT after mask: {pT.shape}\n",
-                        tl.where(mask, pT, 0.0),
-                    )
+            if DEBUG_TRITON_DETAIL and start_n == 256:
+                print(f"mask: {mask.shape}\n", mask)
+                print(
+                    f"pT after mask: {pT.shape}\n",
+                    tl.where(mask, pT, 0.0),
+                )
             pT = tl.where(mask, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
@@ -2994,9 +2992,8 @@ def _bwd_dkdv_inner(
         else:
             dv = tl.dot(pT.to(do.type.element_ty), do, acc=dv)
 
-        if DEBUG_TRITON_DETAIL:
-            if start_n == 256:
-                print(f"pT: {pT.shape}\n", pT)
+        if DEBUG_TRITON_DETAIL and start_n == 256:
+            print(f"pT: {pT.shape}\n", pT)
         # D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m * stride_delta_m, mask=mask_m)
         # Compute dP and dS.
@@ -4400,7 +4397,7 @@ def attention_backward_triton_impl(
         # shape
         total_seqlen_q, nheads_q, head_size_q = q.shape
         total_seqlen_k, nheads_k, head_size_k = k.shape
-        total_seqlen_v, nheads_v, head_size_v = v.shape
+        _total_seqlen_v, nheads_v, head_size_v = v.shape
         nheads_lse, total_seqlen_lse = softmax_lse.shape
 
         # assert shapes
@@ -4524,7 +4521,7 @@ def attention_backward_triton_impl(
         batch_q, seqlen_q, nheads_q, head_size_q = q.shape
         batch_k, seqlen_k, nheads_k, head_size_k = k.shape
         batch_v, seqlen_v, nheads_v, head_size_v = v.shape
-        batch_lse, nheads_lse, seqlen_lse = softmax_lse.shape
+        _batch_lse, nheads_lse, _seqlen_lse = softmax_lse.shape
 
         # assert batch dimensions
         assert (

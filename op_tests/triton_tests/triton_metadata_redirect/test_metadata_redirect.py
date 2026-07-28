@@ -5801,7 +5801,7 @@ def test_f32_kernel():
         )
 
         with AOTMetadataContext("empty_kernel", temp_dir):
-            triton_kernel0, output_files0 = compile_kernel(compile_args)
+            _triton_kernel0, _output_files0 = compile_kernel(compile_args)
 
 
 def test_jit():

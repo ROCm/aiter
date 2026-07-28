@@ -21,12 +21,12 @@ from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import arith
 
 __all__ = [
-    "store_i32_system",
-    "store_i64_global_system",
+    "GeometryTuningTable",
+    "atomic_add_global_at",
     "fence_system_acquire",
     "load_i64_global",
-    "atomic_add_global_at",
-    "GeometryTuningTable",
+    "store_i32_system",
+    "store_i64_global_system",
 ]
 
 
@@ -143,9 +143,7 @@ class GeometryTuningTable:
                 and int(r["local_expert_num"]) != local_expert_num
             ):
                 return False
-            if need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy):
-                return False
-            return True
+            return not (need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy))
 
         def _build(rules, want_dtype, need_zc):
             return {

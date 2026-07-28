@@ -16,12 +16,12 @@ MAX_TOKEN_SUPPORTED = 16384
 
 @perftest()
 def run_torch(
-    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}
+    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg=None
 ):
+    if quantCfg is None:
+        quantCfg = {}
     num_batch, num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
-    dtype = k_cache.dtype
-    device = k_cache.device
 
     k_scale = None
     v_scale = None
@@ -102,8 +102,10 @@ def run_torch(
 
 @perftest()
 def run_aiter(
-    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg={}
+    key, value, k_cache, v_cache, slot_mapping, block_size, x, asm_layout, quantCfg=None
 ):
+    if quantCfg is None:
+        quantCfg = {}
     if quantCfg:
         k_scale = quantCfg["k_scale"]
         v_scale = quantCfg["v_scale"]

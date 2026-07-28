@@ -24,7 +24,7 @@ from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_deco
 try:
     from unittest.mock import patch
 except ImportError:  # pragma: no cover
-    from mock import patch
+    from unittest.mock import patch
 
 bf16 = dtypes.bf16
 fp8 = dtypes.fp8

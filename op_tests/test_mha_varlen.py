@@ -330,7 +330,7 @@ def run_ck_seq_padding(
     out_batches = []
     for i in range(batch_size):
         start = int(cu_seqlens_q_padded[i].item())
-        end = int(cu_seqlens_q_padded[i + 1].item())
+        int(cu_seqlens_q_padded[i + 1].item())
         keep = q_actual_lens[i]
         out_batch = torch.zeros(q.size(1), nheads, d_v, dtype=dtype, device=device)
         out_batch[:keep] = out_flat[start : start + keep]
@@ -1284,7 +1284,7 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
-    dq, dk, dv, _ = aiter.mha_varlen_bwd(
+    _dq, _dk, _dv, _ = aiter.mha_varlen_bwd(
         dout,
         q,
         k,

@@ -23,7 +23,7 @@ pd.set_option("display.max_colwidth", 30)
 @perftest(num_iters=5)
 def run_torch(x, w, x_scales, w_scales, dtype):
     m, k = x.shape
-    n, k = w.shape
+    n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
@@ -102,7 +102,7 @@ def test_gemm(dtype, M, N, K):
     wshuffle = shuffle_weight(w, layout=(16, 16))
     x_scales = x_scales.view(torch.uint8)
     w_scales = w_scales.view(torch.uint8)
-    a, avg_a = run_torch(x, w, x_scales, w_scales, dtype)
+    a, _avg_a = run_torch(x, w, x_scales, w_scales, dtype)
     # out1 = torch.empty(M, N, dtype=dtype)
     # b, avg_b = run_triton(x, w.T, x_scales, w_scales, out1, dtype)
     # b, avg_b = a, 0

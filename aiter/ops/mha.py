@@ -499,7 +499,7 @@ def fmha_fwd_with_sink_asm(
         allocated even when `return_lse=False`; in that case the contents are
         undefined and callers should ignore the returned `lse`.
     """
-    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
+    batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(3)
 
     if out is None:
@@ -587,7 +587,7 @@ def fmha_fwd_with_sink_varlen_asm(
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
     cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
 
-    total_q, q_head_num, qk_head_dim = q.shape
+    total_q, q_head_num, _qk_head_dim = q.shape
     v_head_dim = v.size(2)
 
     if out is None:
@@ -1933,9 +1933,7 @@ def _flash_attn_forward(
             return False
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
         # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
-        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
-            return False
-        return True
+        return not seqlen_k * k.stride(1) * k.element_size() >= 1 << 32
 
     def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
         # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
@@ -1946,9 +1944,7 @@ def _flash_attn_forward(
         # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
         if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
             return False
-        if seqlen_k * v.stride(1) * v.element_size() >= (1 << 32):
-            return False
-        return True
+        return not seqlen_k * v.stride(1) * v.element_size() >= 1 << 32
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2386,7 +2382,6 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
@@ -2805,10 +2800,6 @@ def _flash_attn_varlen_forward(
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     sink_size = 0 if sink_size >= max_seqlen_k else sink_size
-    mask = causal == True and window_size_left == -1  # causal mask
-    nmask = (
-        causal == False and window_size_left == -1 and window_size_right == -1
-    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
@@ -3080,10 +3071,6 @@ def _flash_attn_varlen_backward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
-    mask = causal == True and window_size_left == -1  # causal mask
-    nmask = (
-        causal == False and window_size_left == -1 and window_size_right == -1
-    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def pssk():
@@ -3931,7 +3918,7 @@ def mha_batch_prefill_func(
             raise ValueError("K/V linear layout must match page size and head count")
     if k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Batch prefill requires K/V with contiguous last dimension")
-    out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
+    out_padded, softmax_lse, S_dmask, _rng_state = _mha_batch_prefill(
         q,
         k,
         v,

@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+import random
+
 import torch
 import torch.nn.functional as F
-import random
-import os
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, hipb_create_extension, hipb_findallsols, hipb_mm
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_cu_num
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import shuffle_weight
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import hipb_mm, hipb_create_extension, hipb_findallsols
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx, get_cu_num
+from aiter.test_common import benchmark, checkAllclose, perftest
 
 try:
     from tuned_op_bench_utils import append_tuned_op_bench_rows
@@ -19,9 +21,10 @@ except ModuleNotFoundError as e:
     if e.name != "tuned_op_bench_utils":
         raise
     from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
-import pandas as pd
 import argparse
 from functools import lru_cache
+
+import pandas as pd
 
 # pd.set_option('display.max_rows', 200)
 # pd.set_option('display.max_columns', 100)
@@ -167,7 +170,7 @@ def test_gemm(dtype, m, n, k, quantDtype=dtypes.i8, pad_a=128, skip_ck=False):
     # x_pad, _ = F.pad(x,(0,128), "constant", 0).split([x.shape[1], 128],dim=1)
     # print(f"{x_pad.shape=}{x_pad.stride()}")
 
-    a, avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
+    a, _avg_a = run_torch(x, weight, x_scale, w_scale, bias, dtype)
     # skip_ck bypasses gemm_a8w8_CK (module_gemm_a8w8) only; run_gemm_ck_bpreshuffle is unaffected (gated by quantDtype below)
     if skip_ck:
         avg_b = err_b = None

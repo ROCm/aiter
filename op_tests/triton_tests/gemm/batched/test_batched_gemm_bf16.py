@@ -32,7 +32,7 @@ def generate_batched_gemm_a16w16_inputs(
     if isinstance(dtype, str):
         dtype = str_to_torch_dtype[dtype]
     # Scale input range so worst-case accumulation (val^2 * K) stays within bf16 max (~65504)
-    hi = min(20, int(math.isqrt(65504 // max(K, 1))))
+    hi = min(20, math.isqrt(65504 // max(K, 1)))
     hi = max(hi, 1)
     if layout[0] == "T":
         x = torch.randint(-hi, hi, (B, M, K), dtype=dtype, device="cuda")

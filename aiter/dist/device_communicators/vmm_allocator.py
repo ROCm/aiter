@@ -268,7 +268,7 @@ def _recv_fd(sock_path: str, timeout: float = 120.0) -> int:
         server.settimeout(timeout)
         conn, _ = server.accept()
         with conn:
-            msg, ancdata, _, _ = conn.recvmsg(
+            _msg, ancdata, _, _ = conn.recvmsg(
                 1, socket.CMSG_LEN(ctypes.sizeof(ctypes.c_int))
             )
             for cmsg_level, cmsg_type, cmsg_data in ancdata:

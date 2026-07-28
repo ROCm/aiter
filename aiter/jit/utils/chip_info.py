@@ -24,8 +24,7 @@ def _detect_native() -> list[str]:
         rocminfo = executable_path("rocminfo")
         result = subprocess.run(
             [rocminfo],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=True,
         )
@@ -142,9 +141,7 @@ def get_cu_num_custom_op() -> int:
     if cu_num == 0:
         try:
             rocminfo = executable_path("rocminfo")
-            result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-            )
+            result = subprocess.run([rocminfo], capture_output=True, text=True)
             output = result.stdout
             devices = re.split(r"Agent\s*\d+", output)
             gpu_compute_units = []

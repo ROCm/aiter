@@ -679,8 +679,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
     # ==================== Attention State Initialization ====================
     # Initialize attention computation state
-    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
-    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    max_logits = max_logits_base_offsets.to(gl.float32) * 0.0 - float("inf")
+    exp_sums = max_logits_base_offsets.to(gl.float32) * 0.0
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -901,7 +901,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # Apply scaling to QK scores
         qk_matrix = qk_scale_value * qk_matrix
         # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        qk_matrix = gl.where(combined_mask, qk_matrix, float(-3.4e38))
+        qk_matrix = gl.where(combined_mask, qk_matrix, (-3.4e38))
 
         # ==================== Softmax Computation ====================
         # Compute new maximum logits
@@ -926,9 +926,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = tl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = tl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 # Use fast reciprocal plus multiplies instead of a full divide.
@@ -1942,7 +1940,7 @@ def paged_attention_decode_sliding_window_head_1(
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
         attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Optimization: For per-token quant mode, load value_scale early and fuse its reduction
@@ -1954,9 +1952,7 @@ def paged_attention_decode_sliding_window_head_1(
             )
             valid_token_mask = qk_column_offsets < context_length
             # Mask out value_scale of invalid tokens
-            value_scale_value = gl.where(
-                valid_token_mask, value_scale_value, float(0.0)
-            )
+            value_scale_value = gl.where(valid_token_mask, value_scale_value, 0.0)
             value_scale_broadcast = tl.broadcast_to(
                 value_scale_value[None, :], attention_scores.shape
             )
@@ -2984,7 +2980,7 @@ def paged_attention_decode_sliding_window(
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
         attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -3006,9 +3002,7 @@ def paged_attention_decode_sliding_window(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = gl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = gl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 # Optimization: compute reciprocal once and reuse, use multiply instead of divide for FP8_MAX_VALUE
@@ -3609,8 +3603,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
 
     # Initialize attention state variables
-    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
-    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    max_logits = max_logits_base_offsets.to(gl.float32) * 0.0 - float("inf")
+    exp_sums = max_logits_base_offsets.to(gl.float32) * 0.0
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -3848,7 +3842,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         attention_scores = qk_scale_value * attention_scores
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -3872,9 +3866,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = tl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = tl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 value_scale_value = (

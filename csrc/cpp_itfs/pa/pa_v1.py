@@ -25,7 +25,7 @@ def compile(
     partition_size: int = 256,
     mtp: int = 1,
     sliding_window_enabled: bool = False,
-    folder: str = None,
+    folder: str | None = None,
 ):
     return compile_template_op(
         src_template,
@@ -189,8 +189,8 @@ def paged_attention_v1(
         key_cache.stride(2) if kv_cache_layout == "HND" else key_cache.stride(1)
     )
     gqa_ratio = int(num_heads / num_kv_heads)
-    max_num_partitions = int(math.ceil(max_context_len / partition_size))
-    npar_loops = int(math.ceil(max_num_partitions / warpSize))
+    max_num_partitions = math.ceil(max_context_len / partition_size)
+    npar_loops = math.ceil(max_num_partitions / warpSize)
     logits_soft_cap_enabled = logits_soft_cap > 0
     alibi_enabled = alibi_slopes is not None
     sliding_window_enabled = sliding_window > 0

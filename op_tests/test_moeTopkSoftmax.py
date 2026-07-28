@@ -55,7 +55,7 @@ def test_fuse(
     # from aiter.fused_moe import fused_topk
     # return fused_topk(hidden_states, gating_output, topk, renormalize)
 
-    M, expert = gating_output.shape
+    M, _expert = gating_output.shape
     topk_weights = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
     )
@@ -81,7 +81,7 @@ def test_asm(
     topk: int,
     renormalize: bool,
 ):
-    M, expert = gating_output.shape
+    M, _expert = gating_output.shape
     topk_weights = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
     )
@@ -107,7 +107,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E + 10), dtype=dtype, device="cuda")
     # making gating_output as strided tensor for testing
     gating_output = gating_output[:, :E]
-    (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
+    (topk_weights_a, topk_ids_a), _avg_a = test_nofuse(gating_output, topk, renormalize)
     id_ref, _ref = torch.sort(topk_ids_a)
     w_ref = topk_weights_a.gather(1, _ref)
 
@@ -401,7 +401,7 @@ def test_grouped_topk(
     w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
-    is_softmax = True if scoring_func == "softmax" else False
+    is_softmax = scoring_func == "softmax"
     _, us_aiter = run_perftest(
         aiter.grouped_topk,
         gating_output,

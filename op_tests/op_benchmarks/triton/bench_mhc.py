@@ -132,7 +132,7 @@ def get_benchmark_configs(args):
     # --with-hip: C=512 is excluded because the greedy post dispatcher selects
     # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
     Cs = [1280, 2560, 4096, 7168]
-    return sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
+    return sorted(product(Ms, [n], Cs), key=lambda x: (x[2], x[0]))
 
 
 def _compute_metrics(

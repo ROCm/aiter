@@ -29,15 +29,12 @@ def checkClose(a, b, rtol=1e-3, atol=0.01):
         return True
     else:
         percent = (a[mask]).numel() / a.numel()
-        if percent > 0.01:
-            return False
-        else:
-            return True
+        return not percent > 0.01
 
 
 def run_torch(x, w, x_scales, w_scales, dtype):
     m, k = x.shape
-    n, k = w.shape
+    n, _k = w.shape
     # First convert the x and w inputs to f32.
     x_f32 = fp4_utils.mxfp4_to_f32(x)
     w_f32 = fp4_utils.mxfp4_to_f32(w)
@@ -61,7 +58,7 @@ def kernel_instance_test(x, weight, x_scale, w_scale, out, kernel_id, splitK=0):
 
 def run_gemm_a4w4_blockscale(x, weight, x_scale, w_scale, out, kernel_id, splitK):
     m, k = x.shape
-    n, k = weight.shape
+    _n, _k = weight.shape
     res = aiter.gemm_a4w4_blockscale_tune(
         x, weight, x_scale, w_scale, out, kernel_id, splitK
     )
@@ -80,7 +77,7 @@ def run_gemm_a4w4_blockscale_asm(
     bpreshuffle=True,
     splitK=None,
 ):
-    m, k = x.shape
+    m, _k = x.shape
     # if splitK is not None and splitK > 0:
     #    out_reset = torch.zeros(
     #        out.shape[0], out.shape[1], dtype=dtype, device=torch.cuda.current_device()
@@ -315,7 +312,7 @@ class GemmA4W4BlockScaleTuner(GemmCommonTuner):
             asm_kernels_id = ck_kernels_num + 1
             asm_kernel_list_csv = f"{get_asm_dir()}/f4gemm/f4gemm_bf16_per1x32Fp4.csv"
             asm_kernels = self.get_asm_kernels(asm_kernel_list_csv)
-            asm_tiles = [key for key in asm_kernels.keys()]
+            asm_tiles = [key for key in asm_kernels]
             for key in asm_tiles:
                 tile_m, tile_n, splitk = key
                 maxsplitK = (

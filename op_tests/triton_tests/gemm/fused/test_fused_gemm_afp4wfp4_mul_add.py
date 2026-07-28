@@ -85,7 +85,7 @@ def test_fused_gemm_afp4wfp4_mul_add(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,
