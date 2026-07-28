@@ -261,6 +261,90 @@ def sage_quant_v_fp4_colmajor_kernel(
 
 
 @triton.jit
+def sage_quant_v_mxfp4_colmajor_kernel(
+    v_ptr,      # V [b, h_kv, S, D]
+    out_ptr,    # uint8 [b, h_kv, nT*8192]  col-major fp4 blocks (BLOCK-normalized codes)
+    e_ptr,      # uint8 [b, h_kv, nT, 2(k), 2(kblk), 128(D)]  E8M0 (+127) per (dv-channel, k, kblk)
+    kperm_ptr,  # int32 [64]  'meas' kv-col permutation
+    stride_vb,
+    stride_vh,
+    stride_vs,
+    stride_vd,
+    stride_ob,
+    stride_oh,
+    stride_eb,
+    stride_eh,
+    h_kv,
+    nT,
+    S,
+):
+    """MXFP4 V pack (fused Triton): per-(dv-channel, 32-kv-block) E8M0 computed DIRECTLY on V, block-
+    normalized E2M1 codes in the SAME col-major LDS layout as sage_quant_v_fp4_colmajor_kernel, plus
+    the E8M0 image (e_ptr, then reshaped host-side to the v_descale tail). One program per 128-kv tile;
+    the 32-kv block for MFMA K-block kblk is cols [kblk*32, kblk*32+32) (kperm order). Tail-masked."""
+    pid = tl.program_id(0)
+    t = pid % nT
+    bh = pid // nT
+    bb = bh // h_kv
+    hh = bh % h_kv
+
+    kk = tl.arange(0, 64)
+    tok_in_half = tl.load(kperm_ptr + kk)  # [64]
+    jj = tl.arange(0, 16)
+    ooff = kk[:, None] * 16 + jj[None, :]
+    is_kblk0 = kk < 32  # [64] cols 0..31 = kblk0, 32..63 = kblk1
+    vbase = v_ptr + bb * stride_vb + hh * stride_vh
+    obase0 = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192
+    ebase = e_ptr + bb * stride_eb + hh * stride_eh + t * (2 * 2 * 128)
+    is_last = t == nT - 1
+    E2M1_MAX = 6.0
+    for u in tl.static_range(8):
+        n = u // 2  # head-dim 32-block
+        k = u % 2   # kv 64-half
+        token = t * 128 + k * 64 + tok_in_half  # [64]
+        chan_lo = n * 32 + 2 * jj   # [16] even channels -> low nibble
+        chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
+        row = token[:, None] * stride_vs
+        a_lo = vbase + row + chan_lo[None, :] * stride_vd
+        a_hi = vbase + row + chan_hi[None, :] * stride_vd
+        if is_last:
+            tok_mask = (token < S)[:, None]
+            v_lo = tl.load(a_lo, mask=tok_mask, other=0.0).to(tl.float32)
+            v_hi = tl.load(a_hi, mask=tok_mask, other=0.0).to(tl.float32)
+        else:
+            v_lo = tl.load(a_lo).to(tl.float32)
+            v_hi = tl.load(a_hi).to(tl.float32)
+        abs_lo = tl.abs(v_lo)
+        abs_hi = tl.abs(v_hi)
+        # per-(kblk, channel) block amax over the 32 cols of each kblk -> [16]
+        amax_lo_0 = tl.max(tl.where(is_kblk0[:, None], abs_lo, 0.0), axis=0)
+        amax_lo_1 = tl.max(tl.where(is_kblk0[:, None], 0.0, abs_lo), axis=0)
+        amax_hi_0 = tl.max(tl.where(is_kblk0[:, None], abs_hi, 0.0), axis=0)
+        amax_hi_1 = tl.max(tl.where(is_kblk0[:, None], 0.0, abs_hi), axis=0)
+        E_lo_0 = tl.ceil(tl.log2(tl.maximum(amax_lo_0, 1e-12) / E2M1_MAX))
+        E_lo_1 = tl.ceil(tl.log2(tl.maximum(amax_lo_1, 1e-12) / E2M1_MAX))
+        E_hi_0 = tl.ceil(tl.log2(tl.maximum(amax_hi_0, 1e-12) / E2M1_MAX))
+        E_hi_1 = tl.ceil(tl.log2(tl.maximum(amax_hi_1, 1e-12) / E2M1_MAX))
+        # block-normalize each col by its kblk's E8M0, then E2M1
+        E_lo_col = tl.where(is_kblk0[:, None], E_lo_0[None, :], E_lo_1[None, :])
+        E_hi_col = tl.where(is_kblk0[:, None], E_hi_0[None, :], E_hi_1[None, :])
+        code_lo = _e2m1_code(v_lo / tl.exp2(E_lo_col))
+        code_hi = _e2m1_code(v_hi / tl.exp2(E_hi_col))
+        byte = (code_lo | (code_hi << 4)).to(tl.uint8)
+        tl.store(obase0 + u * 1024 + ooff, byte)
+        # E8M0 image bytes: e[t,k,kblk,chan] = clamp(E+127, 0, 255)
+        e_tk = ebase + k * (2 * 128)
+        e_lo_0 = tl.minimum(tl.maximum(E_lo_0 + 127.0, 0.0), 255.0).to(tl.uint8)
+        e_lo_1 = tl.minimum(tl.maximum(E_lo_1 + 127.0, 0.0), 255.0).to(tl.uint8)
+        e_hi_0 = tl.minimum(tl.maximum(E_hi_0 + 127.0, 0.0), 255.0).to(tl.uint8)
+        e_hi_1 = tl.minimum(tl.maximum(E_hi_1 + 127.0, 0.0), 255.0).to(tl.uint8)
+        tl.store(e_tk + 0 * 128 + chan_lo, e_lo_0)
+        tl.store(e_tk + 0 * 128 + chan_hi, e_hi_0)
+        tl.store(e_tk + 1 * 128 + chan_lo, e_lo_1)
+        tl.store(e_tk + 1 * 128 + chan_hi, e_hi_1)
+
+
+@triton.jit
 def _rotate_quantize_q_kernel(
     Q,
     Q_q,

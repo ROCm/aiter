@@ -9,6 +9,7 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
     sage_quant_v_fp4_colmajor_kernel,
+    sage_quant_v_mxfp4_colmajor_kernel,
     sage_quant_kernel,
     _rot_k_only_kernel,
     _rot_q_kernel,
@@ -281,103 +282,47 @@ def _pack_v_fp4_colmajor(v_bshd):
     return v_fp4_view, v_descale
 
 
-# E2M1 nearest-code midpoints (ties toward lower magnitude), matching the triton _e2m1_code and the
-# f6f4_pv host packer. searchsorted(right=False) returns #{midpoints < |x|} == the E2M1 code index.
-_E2M1_MIDPOINTS = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0]
-
-
-def _e2m1_codes_torch(x):
-    bnd = torch.tensor(_E2M1_MIDPOINTS, device=x.device, dtype=torch.float32)
-    idx = torch.searchsorted(bnd, x.abs().contiguous().to(torch.float32), right=False).to(torch.uint8)
-    sign = (x < 0).to(torch.uint8) * 8
-    return idx | sign
-
-
 def _pack_v_mxfp4_colmajor(v_bshd):
-    """MXFP4 V pack for f4f4 (env AITER_F4F4_MXFP4_V): PURE microscaling -- per-(dv-channel,
-    32-kv-block) E8M0 computed directly on V, applied by the scaled PV MFMA. The per-channel fp32
-    descale is DROPPED (it added ~no accuracy for real peaked attention, and dropping it lets the
-    kernel epilogue skip the 64 per-channel-descale gathers+muls). The col-major V-DATA layout is
-    byte-identical to ``_pack_v_fp4_colmajor`` (same 'meas' kperm + 8x1024 B blocks) -- only the code
-    VALUES change (block-normalized) -- so the SAME f4f4 .co reads it. The returned descale buffer is:
-
-        v_descale (per (b, h_kv)) = [ 128 f32 UNUSED header (ones) | nT*128 f32 (= nT*512 B) E8M0 ]
-
-    The header slot is kept only so the E8M0 image stays at byte offset 512, where the kernel prefetch
-    reads it (byte layout k*256 + L*4 + n = E8M0[dv=n*32+L%32, kvblk=k*2+L//32] + 127); the kernel's
-    MXFP4-V epilogue ignores the header. Layout mirrors the f6f4_pv host packer, kept in-tree with the
-    f4f4 'meas' kperm.
-
-    Returns (v_fp4_view, v_descale): v_fp4_view is the same strided [b, kv_pad, h_kv, 128] uint8 view
-    as ``_pack_v_fp4_colmajor``; v_descale is f32 [b, h_kv, 128 + nT*128].
-    """
+    """Fused-Triton MXFP4 V pack for f4f4 (env AITER_F4F4_MXFP4_V): PURE microscaling -- one Triton
+    kernel per 128-kv tile computes the
+    per-(dv-channel, 32-kv-block) E8M0 on V, block-normalizes + E2M1-packs the col-major blocks, and
+    emits the E8M0 image -- no multi-GB torch intermediates, ragged tail masked (no pre-pad copy).
+    The cheap E8M0-image reshape (small) stays host-side. Returns the same (v_fp4_view, v_descale)."""
     b, kv_len, h_kv, head_dim = v_bshd.shape
     assert head_dim == 128, head_dim
     tile = 128
     kv_pad = ((kv_len + tile - 1) // tile) * tile
     nT = kv_pad // tile
     dev = v_bshd.device
-    kperm = _f4f4_v_kperm(dev).to(torch.long)  # [64] 'meas' kv-col permutation
+    kperm = _f4f4_v_kperm(dev)
+    v_tok = v_bshd.permute(0, 2, 1, 3)  # [b, h_kv, kv_len, 128] (strided; kernel reads strides + masks tail)
 
-    v_tok = v_bshd.permute(0, 2, 1, 3).to(torch.float32)  # [b, h_kv, kv_len, 128]
-    if kv_pad != kv_len:  # zero-pad the ragged tail to a full 128-tile (padded tokens -> code 0)
-        pad = torch.zeros(b, h_kv, kv_pad - kv_len, head_dim, device=dev, dtype=torch.float32)
-        v_tok = torch.cat([v_tok, pad], dim=2)
-
-    # PURE MX: the per-channel fp32 descale is DROPPED (synthetic + on-kernel tests showed it adds
-    # ~no accuracy for real peaked attention). E8M0 is computed DIRECTLY on v (not on a per-channel
-    # normalized vn), and the kernel epilogue applies only 1/L (no per-channel descale mul).
-    vv = v_tok.reshape(b, h_kv, nT, tile, head_dim)                  # raw v, NOT per-channel normalized
-
-    # Per-(dv, k-half, kblk) E8M0 over the kperm-grouped 32-token blocks (the tokens sharing an MFMA
-    # K-block); block kblk of half k holds original tokens k*64 + kperm[kblk*32 : kblk*32+32].
-    E2M1_MAX = 6.0
-    Eexp = torch.zeros(b, h_kv, nT, head_dim, 2, 2, device=dev)        # [.,.,.,D,k,kblk]
-    E_full = torch.zeros(b, h_kv, nT, tile, head_dim, device=dev)
-    for k in range(2):
-        for kblk in range(2):
-            tok = k * 64 + kperm[kblk * 32: kblk * 32 + 32]           # [32] tokens within the tile
-            grp = vv[:, :, :, tok, :]                                 # [b, h_kv, nT, 32, D]
-            bmax = grp.abs().amax(dim=3).clamp_min(1e-12)             # [b, h_kv, nT, D]
-            E = torch.ceil(torch.log2(bmax / E2M1_MAX))              # E8M0 exponent (spans full range)
-            Eexp[:, :, :, :, k, kblk] = E
-            E_full[:, :, :, tok, :] = E.unsqueeze(3)
-
-    xn = vv / torch.exp2(E_full)                                      # block-normalized -> fuller E2M1
-    codes = _e2m1_codes_torch(xn)                                    # uint8 [b, h_kv, nT, 128, 128]
-
-    # Col-major LDS pack: 8x1024 B blocks/tile (u = 2*n + k), IDENTICAL layout to _pack_v_fp4_colmajor.
     numel = b * h_kv * nT * 8192
     buf = torch.empty(numel + 64, dtype=torch.uint8, device=dev)
     buf[numel:].zero_()
-    blocks = []
-    for u in range(8):
-        n, k = u // 2, u % 2
-        blk = codes[:, :, :, k * 64:k * 64 + 64, n * 32:n * 32 + 32]  # [b, h_kv, nT, 64(tok), 32(ch)]
-        blk = blk.index_select(3, kperm)                             # kv-col order (col kk -> kperm[kk])
-        lo = blk[..., 0::2]                                          # even channels -> low nibble
-        hi = blk[..., 1::2]                                         # odd channels  -> high nibble
-        packed = (lo | (hi << 4)).to(torch.uint8)                    # [b, h_kv, nT, 64, 16]
-        blocks.append(packed.reshape(b, h_kv, nT, 1, 1024))
-    out = torch.cat(blocks, dim=3).reshape(b, h_kv, nT * 8192)
-    buf[:numel].view(b, h_kv, nT * 8192).copy_(out)
-
-    # E8M0 image: per (b, h_kv, tile) 512 B, byte(k, L, n) = E8M0[dv=n*32+L%32, kvblk=k*2+L//32] + 127.
+    packed = buf[:numel].view(b, h_kv, nT * 8192)
+    escratch = torch.empty(b, h_kv, nT, 2, 2, 128, dtype=torch.uint8, device=dev)  # E8M0+127 per (t,k,kblk,dv)
+    grid = (b * h_kv * nT,)
+    sage_quant_v_mxfp4_colmajor_kernel[grid](
+        v_tok, packed, escratch, kperm,
+        v_tok.stride(0), v_tok.stride(1), v_tok.stride(2), v_tok.stride(3),
+        packed.stride(0), packed.stride(1),
+        escratch.stride(0), escratch.stride(1),
+        h_kv, nT, kv_len,
+        num_warps=1, num_stages=1,
+    )
+    # E8M0 image: reshape escratch[t,k,kblk,dv] -> eimg byte(t,k,L,n) = E8M0[dv=n*32+L%32, kvblk=k*2+L//32].
     Lr = torch.arange(64, device=dev)
-    row = (Lr % 32).long()
-    kblk_l = (Lr // 32).long()
-    eimg = torch.zeros(b, h_kv, nT, 2, 64, 4, device=dev, dtype=torch.uint8)
+    kblk_L = (Lr // 32).long()
+    chan_L = (Lr % 32).long()
+    eimg = torch.empty(b, h_kv, nT, 2, 64, 4, dtype=torch.uint8, device=dev)
     for n in range(4):
-        dv = (n * 32 + row).long()                                   # [64] channel per lane
+        dv = (n * 32 + chan_L).long()
         for k in range(2):
-            e = Eexp[:, :, :, dv, k, kblk_l]                         # [b, h_kv, nT, 64] (dv & kblk per lane)
-            eimg[:, :, :, k, :, n] = (e + 127.0).clamp(0, 255).to(torch.uint8)
-    eimg_f32 = eimg.reshape(b, h_kv, nT * 512).contiguous().view(torch.float32)  # [b, h_kv, nT*128]
-
-    # 512 B unused header (per-channel descale dropped) keeps the E8M0 image at byte offset 512, where
-    # the kernel prefetch reads it (kernel epilogue ignores the header in the MXFP4-V path).
+            eimg[:, :, :, k, :, n] = escratch[:, :, :, k, kblk_L, dv]
+    eimg_f32 = eimg.reshape(b, h_kv, nT * 512).contiguous().view(torch.float32)
     header = torch.ones(b, h_kv, head_dim, device=dev, dtype=torch.float32)
-    v_descale = torch.cat([header, eimg_f32], dim=-1).contiguous()  # [b, h, 128 + nT*128] f32
+    v_descale = torch.cat([header, eimg_f32], dim=-1).contiguous()
     v_fp4_view = torch.as_strided(
         buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
     )
