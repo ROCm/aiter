@@ -132,7 +132,7 @@ class TritonCache:
         cache_dir: Path | None = self.get_cache_dir()
         if cache_dir is None:
             if not self.unresolved_warned:
-                logger.warning(  # noqa: LOG015  root-logger usage in this file is handled as a whole in the LOG015 batch
+                logger.warning(
                     "Triton cache directory couldn't be determined; cache cleanup is disabled."
                 )
                 self.unresolved_warned = True
