@@ -269,7 +269,7 @@ def load_aiter_module() -> tuple[object | None, str]:
         import aiter
 
         return aiter, ""
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - probe: report and keep going
         return None, f"aiter import failed: {type(exc).__name__}: {exc}"
 
 
@@ -279,11 +279,11 @@ def load_vllm_kernel(vllm_path: str | None) -> Kernel:
         custom_ops = importlib.import_module("vllm._custom_ops")
         runner = custom_ops.top_k_per_row_decode
         return Kernel("vllm_rocm", True, "vllm._custom_ops", runner)
-    except Exception as custom_exc:
+    except Exception as custom_exc:  # noqa: BLE001 - probe: report and keep going
         try:
             runner = torch.ops._C.top_k_per_row_decode
             return Kernel("vllm_rocm", True, "torch.ops._C", runner)
-        except Exception as ops_exc:
+        except Exception as ops_exc:  # noqa: BLE001 - probe: report and keep going
             return Kernel(
                 "vllm_rocm",
                 False,
