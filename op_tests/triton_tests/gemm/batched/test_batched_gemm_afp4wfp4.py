@@ -2,7 +2,6 @@ import torch
 import pytest
 from aiter.ops.triton.gemm.batched.batched_gemm_afp4wfp4 import batched_gemm_afp4wfp4
 from aiter.ops.triton.utils._triton import arch_info
-from typing import Union
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -13,7 +12,7 @@ def generate_batched_gemm_afp4wfp4_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[str, torch.dtype],
+    dtype: str | torch.dtype,
     layout: str = "TN",
     output: bool = False,
 ):

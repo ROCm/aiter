@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_a16w16 import (
@@ -21,13 +20,13 @@ def fused_gemm_a8w8_blockscale_a16w16(
     w_fp8_scale: torch.Tensor,
     x_bf16: torch.Tensor,
     w_bf16: torch.Tensor,
-    bias_fp8: Optional[torch.Tensor] = None,
-    bias_bf16: Optional[torch.Tensor] = None,
-    dtype: Optional[float] = torch.bfloat16,
-    y_fp8: Optional[torch.Tensor] = None,
-    y_bf16: Optional[torch.Tensor] = None,
-    skip_reduce: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias_fp8: torch.Tensor | None = None,
+    bias_bf16: torch.Tensor | None = None,
+    dtype: float | None = torch.bfloat16,
+    y_fp8: torch.Tensor | None = None,
+    y_bf16: torch.Tensor | None = None,
+    skip_reduce: bool | None = False,
+    config: dict | None = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT + B using the block-scale quantization approach for x_fp8 and w_fp8.

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton.utils._triton import arch_info
@@ -31,8 +30,8 @@ def gemm_a8wfp4(
     y,
     x_scales,
     w_scales,
-    dtype: Optional[float] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    config: dict | None = None,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP8 activations and FP4 weights.

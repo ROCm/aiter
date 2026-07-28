@@ -4,7 +4,6 @@
 import torch
 import aiter
 from aiter.test_common import checkAllclose, run_perftest, benchmark
-from typing import Tuple
 from aiter import dtypes
 import functools
 import argparse
@@ -323,7 +322,7 @@ def run_aiter_for_asmpa(
 def test_reshape_and_cache(
     ctx_lens: int,
     bs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     DTyoe_KV: torch.dtype,

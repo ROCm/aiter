@@ -13,7 +13,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
-from typing import Iterable, Literal, Optional, get_args
+from typing import Literal, get_args
+from collections.abc import Iterable
 
 import matplotlib.pyplot as plt
 from triton import next_power_of_2
@@ -59,10 +60,10 @@ DEFAULT_SEQ_END: int = seq_k_to_token_count(DEFAULT_SEQ_END_K)
 
 
 class TritonCache:
-    cache_dir: Optional[Path]
+    cache_dir: Path | None
     cache_dir_initialized: bool
     unresolved_warned: bool
-    last_cache_check_ts: Optional[float]
+    last_cache_check_ts: float | None
 
     def __init__(self) -> None:
         self.cache_dir = None
@@ -71,16 +72,16 @@ class TritonCache:
         self.missing_warned = False
         self.last_cache_check_ts = None
 
-    def get_cache_dir(self) -> Optional[Path]:
+    def get_cache_dir(self) -> Path | None:
         """Resolve and cache Triton cache directory."""
         if self.cache_dir_initialized:
             return self.cache_dir
-        triton_cache_dir: Optional[str] = os.getenv("TRITON_CACHE_DIR")
+        triton_cache_dir: str | None = os.getenv("TRITON_CACHE_DIR")
         if triton_cache_dir:
             self.cache_dir = Path(triton_cache_dir)
             self.cache_dir_initialized = True
             return self.cache_dir
-        triton_home: Optional[str] = os.getenv("TRITON_HOME")
+        triton_home: str | None = os.getenv("TRITON_HOME")
         if triton_home:
             self.cache_dir = Path(triton_home) / ".triton" / "cache"
             self.cache_dir_initialized = True
@@ -114,7 +115,7 @@ class TritonCache:
 
     def wipe_if_oversize(
         self,
-        max_cache_mb: Optional[int],
+        max_cache_mb: int | None,
         check_interval_s: float = 60.0,
     ) -> None:
         if max_cache_mb is None or max_cache_mb < 0:
@@ -126,7 +127,7 @@ class TritonCache:
         ):
             return
         self.last_cache_check_ts = now_ts
-        cache_dir: Optional[Path] = self.get_cache_dir()
+        cache_dir: Path | None = self.get_cache_dir()
         if cache_dir is None:
             if not self.unresolved_warned:
                 logging.warning(
@@ -327,7 +328,7 @@ METRICS: dict[str, Metric] = {
 @dataclass(kw_only=True)
 class BenchArgs:
     kernel: Kernel
-    layout: Optional[Layout]
+    layout: Layout | None
     tp_model: TpModel
     b: int
     s: int
@@ -450,7 +451,7 @@ class BenchArgs:
             metric.unit,
         ]
 
-    def csv_data(self, perf: Optional[float] = None) -> list[str | int | float | None]:
+    def csv_data(self, perf: float | None = None) -> list[str | int | float | None]:
         """Return CSV data row as a list of mixed types."""
         m: Model = self.tp_model.model
         return [
@@ -471,7 +472,7 @@ class BenchArgs:
         ]
 
 
-def get_stdout(out: str, err: str, num_out_lines: int) -> Optional[list[list[str]]]:
+def get_stdout(out: str, err: str, num_out_lines: int) -> list[list[str]] | None:
     assert num_out_lines >= 0, "Expected number of stdout lines must be non-negative."
     # Check empty stderr:
     if err:
@@ -492,7 +493,7 @@ def get_stdout(out: str, err: str, num_out_lines: int) -> Optional[list[list[str
 
 def get_mha_bench_result(
     args: BenchArgs, metric: Metric, out: str, err: str
-) -> Optional[float]:
+) -> float | None:
     """Get result from `bench_mha.py`.
 
     Expected stdout (4 lines):
@@ -502,7 +503,7 @@ def get_mha_bench_result(
     Line 4 - data: "0  <model>  <b>  <hq>  <hk>  <sq>  <sk>  <d>  <dv>  <causal>  <fn>  <dtype>  <impl>  <fused>  <value>"
     """
     # Get preprocessed stdout (4 lines: progress + plot name + header + data):
-    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=4)
+    out_lines: list[list[str]] | None = get_stdout(out, err, num_out_lines=4)
     if out_lines is None:
         return None
     l0: list[str]
@@ -555,10 +556,10 @@ def get_mha_bench_result(
         return None
 
 
-def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]:
+def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> float | None:
     """Get result from `bench_mla_decode.py`."""
     # Get preprocessed stdout:
-    out_lines: Optional[list[list[str]]] = get_stdout(out, err, num_out_lines=3)
+    out_lines: list[list[str]] | None = get_stdout(out, err, num_out_lines=3)
     if out_lines is None:
         return None
     l0: list[str]
@@ -616,8 +617,8 @@ def get_mla_bench_result(args: BenchArgs, out: str, err: str) -> Optional[float]
         return None
 
 
-def run_bench(args: BenchArgs, metric: Metric) -> Optional[float]:
-    perf: Optional[float] = None
+def run_bench(args: BenchArgs, metric: Metric) -> float | None:
+    perf: float | None = None
 
     out = io.StringIO()
     err = io.StringIO()
@@ -871,7 +872,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
     return models
 
 
-def get_models(model_filter: Optional[str] = None) -> list[Model]:
+def get_models(model_filter: str | None = None) -> list[Model]:
     all_models: list[Model] = load_models()
     model_names: list[str] = [model.name for model in all_models]
     assert len(model_names) == len(
@@ -922,7 +923,7 @@ def list_models() -> None:
 
 
 def get_tp_models(
-    models: Optional[list[Model]] = None,
+    models: list[Model] | None = None,
     tps: Iterable[TpDegree] = get_args(TpDegree),
 ) -> list[TpModel]:
     if models is None:
@@ -949,7 +950,7 @@ class Range:
 def get_bench_args(
     kernels: Iterable[Kernel] = get_args(Kernel),
     layouts: Iterable[Layout] = get_args(Layout),
-    tp_models: Optional[list[TpModel]] = None,
+    tp_models: list[TpModel] | None = None,
     batch_range: Range = Range(
         start=DEFAULT_BATCH_START, inc=DEFAULT_BATCH_INC, end=DEFAULT_BATCH_END
     ),
@@ -1354,7 +1355,7 @@ def main(args: list[str] | None = None) -> None:
         writer.writerow(BenchArgs.csv_header(metric))
 
         for ba_i, ba in enumerate(bench_args, start=1):
-            perf: Optional[float] = run_bench(ba, metric)
+            perf: float | None = run_bench(ba, metric)
             m: Model = ba.tp_model.model
             if perf is None:
                 global_stats.report_failure(ba.kernel, m.name)

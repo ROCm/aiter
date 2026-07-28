@@ -3,7 +3,6 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
 import functools
 import pandas as pd
 from ..jit.core import (
@@ -28,7 +27,7 @@ def gen_batched_gemm_bf16_tune_fake_tensor(
     gen_fake=gen_batched_gemm_bf16_tune_fake_tensor,
 )
 def batched_gemm_bf16(
-    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Optional[Tensor] = None, splitK: int = 0
+    XQ: Tensor, WQ: Tensor, out: Tensor, bias: Tensor | None = None, splitK: int = 0
 ) -> Tensor: ...
 
 
@@ -104,9 +103,9 @@ def get_CKBatchedGEMM_config(
 def batched_gemm_bf16_CK(
     XQ: Tensor,
     WQ: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype=dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ):
     assert dtype in [
         dtypes.bf16,

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
 
 import torch
 
@@ -46,11 +45,11 @@ def triton_hstu_attention_fwd(
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
     causal: bool,
-    num_targets: Optional[torch.Tensor],
+    num_targets: torch.Tensor | None,
     max_attn_len: int,
     contextual_seq_len: int,
-    sort_by_length_indices: Optional[torch.Tensor],
-    config: Optional[dict] = None,
+    sort_by_length_indices: torch.Tensor | None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """
     HSTU attention forward pass with SiLU activation: Y = silu(alpha * (Q @ K^T)) @ V.
@@ -148,15 +147,15 @@ def triton_hstu_attention_bwd(
     dk: torch.Tensor,
     dv: torch.Tensor,
     seq_offsets: torch.Tensor,
-    num_targets: Optional[torch.Tensor],
+    num_targets: torch.Tensor | None,
     N: int,
     alpha: float,
     max_attn_len: int,
     causal: float,
     contextual_seq_len: int,
-    sort_by_length_indices: Optional[torch.Tensor],
-    config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sort_by_length_indices: torch.Tensor | None,
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     HSTU attention backward pass computing gradients for Q, K, V.
 
@@ -274,7 +273,7 @@ class _AttentionFunction(torch.autograd.Function):
         v: torch.Tensor,
         seq_offsets: torch.Tensor,
         causal: bool,
-        num_targets: Optional[torch.Tensor],
+        num_targets: torch.Tensor | None,
         max_attn_len: int,
         contextual_seq_len: int,
         sort_by_length: bool,
@@ -314,7 +313,7 @@ class _AttentionFunction(torch.autograd.Function):
 
     @staticmethod
     # pyre-ignore[14]
-    def backward(ctx, dout: torch.Tensor) -> Tuple[
+    def backward(ctx, dout: torch.Tensor) -> tuple[
         None,
         None,
         torch.Tensor,

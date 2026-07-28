@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from typing import Optional
 from aiter.ops.triton.utils.types import get_dtype_max
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
@@ -366,7 +365,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     yscale: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
-    scale_ub: Optional[torch.Tensor] = None,
+    scale_ub: torch.Tensor | None = None,
     clamp_out: bool = False,
     dump_rms_norm: bool = False,
 ):

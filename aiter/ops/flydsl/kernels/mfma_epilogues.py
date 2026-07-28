@@ -34,7 +34,7 @@ modules (`arith`, `vector`, `gpu`) and the `range_constexpr` iterator.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Callable
+from collections.abc import Callable
 
 from flydsl._mlir import ir
 import flydsl.expr as fx

@@ -25,7 +25,7 @@ Example usage1 for aot:
 
 import functools
 import os
-from typing import Callable, Dict, Optional
+from collections.abc import Callable
 import threading
 import triton.compiler.compiler as triton_compiler
 
@@ -101,7 +101,7 @@ class AOTMetadataContext:
         self.kernel_name = kernel_name
         self.dir = dir
         self._previously_registered = False
-        self._previous_dir: Optional[str] = None
+        self._previous_dir: str | None = None
 
     def __enter__(self):
         registry = _get_thread_registry()

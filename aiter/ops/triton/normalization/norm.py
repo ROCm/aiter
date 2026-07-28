@@ -3,7 +3,6 @@
 
 import torch
 import triton
-from typing import Optional
 from aiter.ops.triton._triton_kernels.normalization.norm import (
     _layernorm_kernel,
     _fused_add_layernorm_kernel,
@@ -250,7 +249,7 @@ def layer_norm(
     weight: torch.Tensor,
     bias: torch.Tensor,
     eps: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization over a mini-batch of inputs.
@@ -276,7 +275,7 @@ def layernorm2d_fwd_with_add(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two inputs and then applies Layer Normalization
@@ -316,7 +315,7 @@ def layernorm2d_fwd_with_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -379,7 +378,7 @@ def layernorm2d_fwd_with_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output
@@ -441,7 +440,7 @@ def layernorm2d_fwd_with_add_dynamicquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Adds two input toegether, then does layer Normalization before quantizing the final output
@@ -510,7 +509,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     weight: torch.Tensor,
     bias: torch.Tensor,
     epsilon: float = 1e-5,
-    x_bias: Optional[torch.Tensor] = None,
+    x_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Applies Layer Normalization and then quantizes the output

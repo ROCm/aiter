@@ -13,7 +13,7 @@ import os
 import json
 import logging
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal
 import triton.language as tl
 
 import torch
@@ -81,7 +81,7 @@ class GpuArch:
     """GPU architecture information."""
 
     name: str  # e.g., "gfx942", "gfx1100"
-    family: Optional[ArchFamily] = None
+    family: ArchFamily | None = None
 
     @property
     def is_cdna(self) -> bool:
@@ -174,7 +174,7 @@ _FP8_DTYPES = frozenset(
 
 
 def is_fp8(
-    x: Union[torch.dtype, torch.Tensor, list[torch.Tensor], tuple[torch.Tensor, ...]],
+    x: torch.dtype | torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
 ) -> bool:
     """Check if dtype/tensor(s) are FP8.
 
@@ -224,8 +224,8 @@ def is_fp8(
 def get_shape_from_layout(
     x: torch.Tensor,
     layout: Literal["bshd", "bhsd", "thd"],
-    cu_seqlens: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Extract (batch, max_seqlen, num_heads, head_dim) from tensor based on layout."""
     if layout == "bhsd":

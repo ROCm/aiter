@@ -3,7 +3,7 @@
 
 import torch
 import os
-from typing import Optional, Callable
+from collections.abc import Callable
 from dataclasses import dataclass
 import functools
 import aiter
@@ -117,25 +117,25 @@ def fused_moe_dp_share_expert(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
     w2,  # [expert(local_expert:EP), dim, inter_dim]
-    expert_mask: Optional[torch.tensor] = None,  # EP
+    expert_mask: torch.Tensor | None = None,  # EP
     activation=ActivationType.Silu,
     quant_type=QuantType.No,
     doweight_stage1=False,
     # following for quant
-    w1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), inter_dim, 1]
-    w2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), model_dim, 1]
-    a1_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, model_dim]
-    a2_scale: Optional[torch.tensor] = None,  # [expert(local_expert:EP), 1, inter_dim]
+    w1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), inter_dim, 1]
+    w2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), model_dim, 1]
+    a1_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, model_dim]
+    a2_scale: torch.Tensor | None = None,  # [expert(local_expert:EP), 1, inter_dim]
     # following for tuning
     block_size_M=None,
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
     moe_sorting_dispatch_policy=0,
     dtype=None,
     dp_size=1,
     dp_rank=0,
-    moe_buf: Optional[
-        torch.tensor
-    ] = None,  # you can use no-shared expert result here, it will atomic add to it
+    moe_buf: (
+        torch.Tensor | None
+    ) = None,  # you can use no-shared expert result here, it will atomic add to it
 ):
     """user API"""
     orig_M, model_dim = hidden_states.shape
@@ -229,7 +229,7 @@ def fused_moe_1stage(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
     if quant_type == QuantType.No and activation == ActivationType.Silu and not isG1U1:
         # pure bf16
@@ -575,7 +575,7 @@ def fused_moe_2stages(
     w2_scale=None,  # [expert(local_expert:EP), model_dim, 1]
     a1_scale=None,  # [expert(local_expert:EP), 1, model_dim]
     a2_scale=None,  # [expert(local_expert:EP), 1, inter_dim]
-    num_local_tokens: Optional[torch.tensor] = None,
+    num_local_tokens: torch.Tensor | None = None,
 ):
 
     quant_func = get_quant(quant_type)

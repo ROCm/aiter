@@ -139,7 +139,7 @@ def context_attention_fwd_torch(
     return
 
 
-def _get_alibi_slopes(total_num_heads: int, device: torch.tensor) -> torch.Tensor:
+def _get_alibi_slopes(total_num_heads: int, device: torch.Tensor) -> torch.Tensor:
     closest_power_of_2 = 2 ** math.floor(math.log2(total_num_heads))
     base = torch.tensor(
         2 ** (-(2 ** -(math.log2(closest_power_of_2) - 3))),

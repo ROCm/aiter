@@ -5,7 +5,6 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional
 
 import torch
 import torch.distributed as dist
@@ -36,7 +35,7 @@ def allreduce_custom(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -93,7 +92,7 @@ def test_allreduce_custom(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

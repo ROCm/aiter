@@ -8,7 +8,6 @@ to load and launch Triton-compiled kernels from HSACO binary files.
 
 import os
 import sys
-from typing import List, Tuple
 import logging
 
 logger = logging.getLogger("aiter")
@@ -123,9 +122,9 @@ class HsacoLauncher:
 
     def launch_kernel(
         self,
-        kernel_args: List,
-        grid: Tuple[int, int, int] = (1, 1, 1),
-        block: Tuple[int, int, int] = (256, 1, 1),
+        kernel_args: list,
+        grid: tuple[int, int, int] = (1, 1, 1),
+        block: tuple[int, int, int] = (256, 1, 1),
         shared_mem_bytes: int = 0,
         stream=None,
     ):
@@ -215,9 +214,9 @@ class HsacoLauncher:
 def launch_triton_kernel(
     hsaco_data: bytes,
     kernel_name: str,
-    kernel_args: List,
-    grid: Tuple[int, int, int] = (1, 1, 1),
-    block: Tuple[int, int, int] = (256, 1, 1),
+    kernel_args: list,
+    grid: tuple[int, int, int] = (1, 1, 1),
+    block: tuple[int, int, int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
     stream=None,
 ) -> int:
@@ -270,9 +269,9 @@ def launch_triton_kernel(
 def launch_triton_kernel_from_file(
     hsaco_path: str,
     kernel_name: str,
-    kernel_args: List,
-    grid: Tuple[int, int, int] = (1, 1, 1),
-    block: Tuple[int, int, int] = (256, 1, 1),
+    kernel_args: list,
+    grid: tuple[int, int, int] = (1, 1, 1),
+    block: tuple[int, int, int] = (256, 1, 1),
     shared_mem_bytes: int = 0,
     stream=None,
 ) -> int:

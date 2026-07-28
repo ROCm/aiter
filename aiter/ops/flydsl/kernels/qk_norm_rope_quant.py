@@ -48,7 +48,6 @@ who already have all buffers and want the lowest-overhead path.
 
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
 
 import torch
 
@@ -67,7 +66,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import T, Int32, Stream
 from flydsl.expr.vector import ReductionOp
-from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl._mlir.dialects import llvm, rocdl
 
 from .tensor_shim import GTensor, _to_raw, _run_compiled
@@ -907,25 +905,25 @@ def flydsl_qk_norm_rope_quant(
     num_q_heads: int,
     head_dim: int,
     rope_head_dim: int,
-    q_weight: Optional[torch.Tensor] = None,
+    q_weight: torch.Tensor | None = None,
     quant: bool = False,
-    quant_group_size: Optional[int] = None,
+    quant_group_size: int | None = None,
     scale_dtype: str = SCALE_DTYPE_FP32,
-    q_out: Optional[torch.Tensor] = None,
-    kv_out: Optional[torch.Tensor] = None,
-    q_scale: Optional[torch.Tensor] = None,
-    kv_scale: Optional[torch.Tensor] = None,
-    swa_kv: Optional[torch.Tensor] = None,
-    state_slot_mapping: Optional[torch.Tensor] = None,
-    batch_id_per_token: Optional[torch.Tensor] = None,
-    swa_block_tables: Optional[torch.Tensor] = None,
-    swa_block_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
-) -> Tuple[
+    q_out: torch.Tensor | None = None,
+    kv_out: torch.Tensor | None = None,
+    q_scale: torch.Tensor | None = None,
+    kv_scale: torch.Tensor | None = None,
+    swa_kv: torch.Tensor | None = None,
+    state_slot_mapping: torch.Tensor | None = None,
+    batch_id_per_token: torch.Tensor | None = None,
+    swa_block_tables: torch.Tensor | None = None,
+    swa_block_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """Fused RMSNorm + GPT-J RoPE + optional FP8 quant for Q and KV in one launch.
 

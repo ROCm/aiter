@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
@@ -34,14 +33,14 @@ def _is_gluon_available():
 def gemm_a16w16_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -60,14 +59,14 @@ def gemm_a16w16_fake_tensor(
 def gemm_a16w16_(
     x: torch.Tensor,
     w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -342,14 +341,14 @@ def gemm_a16w16_(
 def gemm_a16w16(
     x,
     w,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes 16 bit matrix multiplication Y = X @ W^T

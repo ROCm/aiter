@@ -562,7 +562,7 @@ def checkAllclose(
         return percent
 
 
-def tensor_dump(x: torch.tensor, name: str, dir="./"):
+def tensor_dump(x: torch.Tensor, name: str, dir="./"):
     x_cpu = x.cpu().view(torch.uint8)
     filename = f"{dir}/{name}.bin"
     x_cpu.numpy().tofile(filename)

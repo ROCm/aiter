@@ -1,5 +1,5 @@
 import torch
-from typing import Literal, Optional, Tuple
+from typing import Literal
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
@@ -17,26 +17,26 @@ def fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    k_new: Optional[torch.Tensor],
-    v_new: Optional[torch.Tensor],
-    qv: Optional[torch.Tensor],
-    out: Optional[torch.Tensor],
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    cu_seqlens_k_new: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    page_table: Optional[torch.Tensor],
-    kv_batch_idx: Optional[torch.Tensor],
-    leftpad_k: Optional[torch.Tensor],
-    rotary_cos: Optional[torch.Tensor],
-    rotary_sin: Optional[torch.Tensor],
-    seqlens_rotary: Optional[torch.Tensor],
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
+    k_new: torch.Tensor | None,
+    v_new: torch.Tensor | None,
+    qv: torch.Tensor | None,
+    out: torch.Tensor | None,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    cu_seqlens_k_new: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    max_seqlen_q: int | None,
+    max_seqlen_k: int | None,
+    page_table: torch.Tensor | None,
+    kv_batch_idx: torch.Tensor | None,
+    leftpad_k: torch.Tensor | None,
+    rotary_cos: torch.Tensor | None,
+    rotary_sin: torch.Tensor | None,
+    seqlens_rotary: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
@@ -44,11 +44,11 @@ def fwd(
     attention_chunk: int,
     softcap: float,
     rotary_interleaved: bool,
-    scheduler_metadata: Optional[torch.Tensor] = None,
+    scheduler_metadata: torch.Tensor | None = None,
     num_splits: int = 1,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """
     Flash Attention v3 forward pass compatible interface for AMD Triton implementation.
 
@@ -408,15 +408,15 @@ def bwd(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_q: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    max_seqlen_q: int | None,
+    max_seqlen_k: int | None,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
@@ -425,10 +425,10 @@ def bwd(
     deterministic: bool,
     sm_margin: int = 0,
     *,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor]:
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor]:
     """
     Flash Attention v3 backward pass compatible interface for AMD Triton implementation.
 
@@ -587,8 +587,8 @@ def bwd(
 def fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Combine partial outputs from split attention computation.
@@ -619,12 +619,12 @@ def get_scheduler_metadata(
     headdim_v: int,
     qkv_dtype: torch.dtype,
     cache_seqlens: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    cu_seqlens_k_new: Optional[torch.Tensor] = None,
-    seqused_q: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    page_size: Optional[int] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    cu_seqlens_k_new: torch.Tensor | None = None,
+    seqused_q: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    page_size: int | None = None,
     max_seqlen_k_new: int = 0,
     causal: bool = False,
     window_size_left: int = -1,
@@ -632,7 +632,7 @@ def get_scheduler_metadata(
     attention_chunk: int = 0,
     has_softcap: bool = False,
     num_splits: int = 0,
-    pack_gqa: Optional[bool] = None,
+    pack_gqa: bool | None = None,
     sm_margin: int = 0,
 ) -> None:
     """

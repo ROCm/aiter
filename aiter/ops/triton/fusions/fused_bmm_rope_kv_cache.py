@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -45,16 +44,16 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
     positions: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    y: Optional[torch.Tensor] = None,
+    y: torch.Tensor | None = None,
     transpose_bm: bool = True,
     prequant: bool = True,
-    y_scale: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    k_scale: Optional[torch.Tensor] = None,
+    y_scale: torch.Tensor | None = None,
+    config: str | None = None,
+    k_scale: torch.Tensor | None = None,
     is_neox: bool = False,
     q_out_dtype=None,
     num_decode_toks_for_zeros: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused FP4 BMM + RoPE + concat + KV-cache write for MLA.
 
@@ -392,12 +391,12 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
     sin: torch.Tensor,
     group_size: int = 128,
     transpose_bm: bool = True,
-    config: Optional[dict] = None,
-    k_scale: Optional[torch.Tensor] = None,
+    config: dict | None = None,
+    k_scale: torch.Tensor | None = None,
     is_neox: bool = False,
-    q_out_dtype: Optional[torch.dtype] = torch.bfloat16,
+    q_out_dtype: torch.dtype | None = torch.bfloat16,
     num_decode_toks_for_zeros: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused FP8 BMM + RoPE + concat + KV-cache write for MLA.
 

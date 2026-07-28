@@ -4,7 +4,7 @@ import argparse
 import itertools
 import dataclasses
 from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Callable
 import triton
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.attention.mha import (

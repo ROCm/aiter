@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Optional
 import aiter
 from aiter import logger
 from aiter import pertoken_quant, get_hip_quant
@@ -588,8 +587,8 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    topk_ids: Optional[torch.Tensor] = None,
-    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 

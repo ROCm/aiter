@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-from typing import Optional
 import aiter
 import torch
 import torch.nn.functional as F
@@ -48,7 +47,7 @@ def fused_ar_rmsnorm(
     weight,
     eps,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     post_per_token_quant: bool = False,
 ):
     device = torch.device(f"cuda:{rankID}")
@@ -136,7 +135,7 @@ def get_acc_value_with_cudagraph(
     weight,
     eps,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -193,7 +192,7 @@ def get_acc_value_only(
     weight,
     eps,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -233,7 +232,7 @@ def split_ar_rmsnorm(
     weight,
     eps,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -315,7 +314,7 @@ def test_fused_ar_rmsnorm(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     post_per_token_quant: bool = False,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -404,7 +403,7 @@ def fused_ar_rmsnorm_pad_stride(
     x_pad_to_multiple=0,
     input_strided=False,
     residual_strided=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -452,7 +451,7 @@ def fused_ar_rmsnorm_padded_input(
     weight,
     eps,
     input_storage_width,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -502,7 +501,7 @@ def test_fused_ar_rmsnorm_pad_stride_case(
     x_pad_to_multiple=0,
     input_strided=False,
     residual_strided=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -599,7 +598,7 @@ def test_fused_ar_rmsnorm_padded_input_case(
     dtype,
     *,
     input_storage_width,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -686,7 +685,7 @@ def fused_ar_rmsnorm_gemma(
     residual,
     weight,
     eps,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -727,7 +726,7 @@ def test_fused_ar_gemma_rmsnorm_case(
     shape,
     dtype,
     *,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -798,7 +797,7 @@ def test_fused_ar_gemma_rmsnorm_case(
     }
 
 
-def _set_ar_1stage_override(stage_override: Optional[str]):
+def _set_ar_1stage_override(stage_override: str | None):
     if stage_override is None:
         os.environ.pop("AITER_AR_1STAGE", None)
     else:
@@ -844,8 +843,8 @@ def fused_ar_gemma_rmsnorm_quant(
     residual,
     weight,
     eps,
-    stage_override: Optional[str] = None,
-    distributed_init_method: Optional[str] = None,
+    stage_override: str | None = None,
+    distributed_init_method: str | None = None,
 ):
     _set_ar_1stage_override(stage_override)
     device = torch.device(f"cuda:{rankID}")
@@ -891,8 +890,8 @@ def _fused_ar_gemma_rmsnorm_quant_case(
     shape,
     dtype,
     *,
-    stage_override: Optional[str],
-    distributed_init_method: Optional[str] = None,
+    stage_override: str | None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

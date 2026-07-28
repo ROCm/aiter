@@ -15,7 +15,6 @@ the Python-side per-boundary loop makes it ~100x slower than the kernel.
 
 import math
 from functools import lru_cache
-from typing import Optional
 
 import torch
 
@@ -78,12 +77,12 @@ def fused_compress_attn(
     head_dim: int,
     rope_head_dim: int,
     quant: bool = False,
-    cache_scale: Optional[torch.Tensor] = None,
+    cache_scale: torch.Tensor | None = None,
     use_ue8m0: bool = True,
     preshuffle: bool = True,
     group_quant: bool = False,
     quant_group_size: int = 64,
-    k_rope_buff: Optional[torch.Tensor] = None,
+    k_rope_buff: torch.Tensor | None = None,
 ) -> None:
     """Side-effecting reference: writes into ``kv_cache`` (+ ``cache_scale``
     when ``quant=True``). Mirrors flydsl kernel's plan-driven dispatch.

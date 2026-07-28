@@ -24,7 +24,6 @@ import itertools
 import os
 import random
 import sys
-from typing import Optional, Tuple
 
 import pandas as pd
 import torch
@@ -582,10 +581,10 @@ def test_pa_decode(
     kv_head_num: int,
     ctx_len: int,
     mtp: int = 0,
-    scales: Optional[Tuple[float, float, float]] = None,
+    scales: tuple[float, float, float] | None = None,
     varlen: bool = False,
     use_sink: bool = False,
-    context_lens: Optional[list] = None,
+    context_lens: list | None = None,
 ) -> dict:
     """Random FP8 paged inputs (arbitrary kv_len) vs the torch host reference.
 
@@ -1045,9 +1044,9 @@ def test_pa_decode_vmask(
     kv_head_num: int,
     ctx_len: int,
     mtp: int = 0,
-    scales: Optional[Tuple[float, float, float]] = None,
+    scales: tuple[float, float, float] | None = None,
     varlen: bool = False,
-    context_lens: Optional[list] = None,
+    context_lens: list | None = None,
 ) -> dict:
     """V-mask correctness: filling the last-page padding region with NaN vs 0 must
     yield BIT-IDENTICAL *kernel* output.

@@ -7,7 +7,6 @@ import shutil
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -71,7 +70,7 @@ class RoofDot:
     P: float  # FLOPs / s
 
 
-def _measure_topk(batch: int, M: int, K: int) -> Tuple[float, _FlopMem]:
+def _measure_topk(batch: int, M: int, K: int) -> tuple[float, _FlopMem]:
     x = torch.rand(batch, M, device=DEVICE, dtype=torch.float32)
     tiny_row_thresh = 1024
     if M <= tiny_row_thresh and K <= 8:
@@ -89,15 +88,15 @@ def _measure_topk(batch: int, M: int, K: int) -> Tuple[float, _FlopMem]:
     return ms / 1e3, fm
 
 
-def _collect_roof_points(M: int, K: int) -> List[RoofDot]:
-    pts: List[RoofDot] = []
+def _collect_roof_points(M: int, K: int) -> list[RoofDot]:
+    pts: list[RoofDot] = []
     for B in BATCH_SIZES:
         t, fm = _measure_topk(B, M, K)
         pts.append(RoofDot(B, fm.flops / fm.bytes, fm.flops / t))
     return pts
 
 
-def _plot_roofline(points: List[RoofDot], M: int, K: int, out_dir: Path) -> None:
+def _plot_roofline(points: list[RoofDot], M: int, K: int, out_dir: Path) -> None:
     I_vals = [p.AI for p in points]
     P_vals = [p.P for p in points]
     labels = [str(p.batch) for p in points]

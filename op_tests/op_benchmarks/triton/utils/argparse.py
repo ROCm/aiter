@@ -1,5 +1,4 @@
 import argparse
-from typing import Tuple
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_available_models,
 )
@@ -42,7 +41,7 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
 
 def get_ff_args(
     parser: argparse.ArgumentParser, args: list[str] | None = None
-) -> Tuple[dict, dict]:
+) -> tuple[dict, dict]:
     """
     Does additional processing on parser args for feed-forward blocks.
     """

@@ -3,7 +3,6 @@
 
 import multiprocessing
 import os
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -41,7 +40,7 @@ def allreduce_quick(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -98,7 +97,7 @@ def test_allreduce_quick(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     quantization: str = "INT4",
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"

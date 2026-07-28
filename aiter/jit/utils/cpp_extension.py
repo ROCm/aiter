@@ -17,7 +17,6 @@ import subprocess
 import sys
 import sysconfig
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
@@ -39,8 +38,8 @@ SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
 
-VersionRange = Tuple[Tuple[int, ...], Tuple[int, ...]]
-VersionMap = Dict[str, VersionRange]
+VersionRange = tuple[tuple[int, ...], tuple[int, ...]]
+VersionMap = dict[str, VersionRange]
 # The following values were taken from the following GitHub gist that
 # summarizes the minimum valid major versions of g++/clang++ for each supported
 # CUDA version: https://gist.github.com/ax3l/9489132
@@ -139,7 +138,7 @@ def get_hip_version():
     raise RuntimeError("ROCm version file not found")
 
 
-def _find_rocm_home() -> Optional[str]:
+def _find_rocm_home() -> str | None:
     """Find the ROCm install path."""
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
@@ -177,7 +176,7 @@ def _find_rocm_home() -> Optional[str]:
     return rocm_home
 
 
-def _find_rocm_devel_include() -> Optional[str]:
+def _find_rocm_devel_include() -> str | None:
     """Locate the header tree shipped by the rocm-sdk-devel pip package.
 
     The rocm-sdk split-package layout puts runtime bits in `_rocm_sdk_core`
@@ -330,7 +329,7 @@ def _is_binary_build() -> bool:
     return not BUILT_FROM_SOURCE_VERSION_PATTERN.match(torch.version.__version__)
 
 
-def _accepted_compilers_for_platform() -> List[str]:
+def _accepted_compilers_for_platform() -> list[str]:
     # gnu-c++ and gnu-cc are the conda gcc compilers
     return ["g++", "gcc", "gnu-c++", "gnu-cc", "clang++", "clang"]
 
@@ -398,7 +397,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 def get_compiler_abi_compatibility_and_version(
     compiler, torch_exclude=False
-) -> Tuple[bool, Version]:
+) -> tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
 
@@ -985,7 +984,7 @@ def CUDAExtension(name, sources, *args, **kwargs):
     return setuptools.Extension(name, sources, *args, **kwargs)
 
 
-def include_paths(cuda: bool = False) -> List[str]:
+def include_paths(cuda: bool = False) -> list[str]:
     """
     Get the include paths required to build a C++ or CUDA extension.
 
@@ -1021,7 +1020,7 @@ def include_paths(cuda: bool = False) -> List[str]:
     return paths
 
 
-def library_paths(cuda: bool = False) -> List[str]:
+def library_paths(cuda: bool = False) -> list[str]:
     """
     Get the library paths required to build a C++ or CUDA extension.
 
@@ -1048,14 +1047,14 @@ def library_paths(cuda: bool = False) -> List[str]:
 
 def load(
     name,
-    sources: Union[str, List[str]],
+    sources: str | list[str],
     extra_cflags=None,
     extra_cuda_cflags=None,
     extra_ldflags=None,
     extra_include_paths=None,
     build_directory=None,
     verbose=False,
-    with_cuda: Optional[bool] = None,
+    with_cuda: bool | None = None,
     is_python_module=True,
     is_standalone=False,
     keep_intermediates=True,
@@ -1227,7 +1226,7 @@ def _jit_compile(
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module,
     is_standalone,
     keep_intermediates=True,
@@ -1362,7 +1361,7 @@ def _jit_compile(
 
 
 def _write_ninja_file_and_compile_objects(
-    sources: List[str],
+    sources: list[str],
     objects,
     cflags,
     post_cflags,
@@ -1371,7 +1370,7 @@ def _write_ninja_file_and_compile_objects(
     cuda_dlink_post_cflags,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1409,14 +1408,14 @@ def _write_ninja_file_and_compile_objects(
 
 def _write_ninja_file_and_build_library(
     name,
-    sources: List[str],
+    sources: list[str],
     extra_cflags,
     extra_cuda_cflags,
     extra_ldflags,
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
@@ -1508,7 +1507,7 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
     return extra_ldflags
 
 
-def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
+def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
     # If cflags is given, there may already be user-provided arch flags in it
     # (from `extra_compile_args`)
     if cflags is not None:
@@ -1533,7 +1532,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
     return flags
 
 
-def _get_num_workers(verbose: bool) -> Optional[int]:
+def _get_num_workers(verbose: bool) -> int | None:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):

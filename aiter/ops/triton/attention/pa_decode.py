@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from typing import Optional
 
 import triton
 import torch
@@ -164,7 +163,7 @@ def paged_attn_decode_v1(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
     tp_rank: int = 0,
@@ -264,7 +263,7 @@ def paged_attn_decode_v2(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
     max_num_partitions: int,
@@ -445,7 +444,7 @@ def paged_attn_decode_v1_per_token_quant(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     tp_rank: int = 0,
@@ -551,7 +550,7 @@ def paged_attn_decode_v2_per_token_quant(
     compute_type,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     max_num_partitions: int,

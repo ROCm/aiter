@@ -5,7 +5,6 @@
 
 import functools
 import os
-from typing import Optional
 import torch
 import triton
 import triton.language as tl
@@ -924,17 +923,17 @@ def mla_prefill_ps_fwd(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    work_indptr: Optional[torch.Tensor],
-    work_info_set: Optional[torch.Tensor],
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
     max_seqlen_q: int,
     is_causal: bool,
-    reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tensor] = None,
-    reduce_partial_map: Optional[torch.Tensor] = None,
+    reduce_indptr: torch.Tensor | None = None,
+    reduce_final_map: torch.Tensor | None = None,
+    reduce_partial_map: torch.Tensor | None = None,
     softmax_scale: float = None,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape

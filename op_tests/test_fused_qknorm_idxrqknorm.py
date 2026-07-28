@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -208,8 +207,8 @@ def split_qkv(case: dict, qkv: torch.Tensor):
 def make_insert_outputs(
     case: dict,
     *,
-    kv_cache_dtype: Optional[torch.dtype] = None,
-    index_cache_dtype: Optional[torch.dtype] = None,
+    kv_cache_dtype: torch.dtype | None = None,
+    index_cache_dtype: torch.dtype | None = None,
 ):
     q_size, _, _, iq_size, _ = case["sizes"]
     q_out = torch.empty(case["qkv"].size(0), q_size, dtype=case["dtype"], device="cuda")
@@ -235,7 +234,7 @@ def make_insert_outputs(
     return q_out, index_q_out, kv_cache, index_cache
 
 
-def make_shuffle_caches(case: dict, *, kv_cache_dtype: Optional[torch.dtype] = None):
+def make_shuffle_caches(case: dict, *, kv_cache_dtype: torch.dtype | None = None):
     """Allocate page-`block_size` SHUFFLE (asm_layout) K/V caches.
 
     Matches reshape_and_cache(asm_layout=True):
@@ -428,11 +427,11 @@ def check_pertoken_fp8(
 def gather_cache_outputs(
     case: dict,
     kv_cache: torch.Tensor,
-    index_cache: Optional[torch.Tensor],
+    index_cache: torch.Tensor | None,
     *,
-    index_slot_mapping: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    index_slot_mapping: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ):
     index_slots = (
         index_slot_mapping if index_slot_mapping is not None else case["slot_mapping"]
@@ -469,7 +468,7 @@ def gather_index_cache(
     case: dict,
     index_cache: torch.Tensor,
     *,
-    index_slot_mapping: Optional[torch.Tensor] = None,
+    index_slot_mapping: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather the per-token index_k rows from the page-128-flat index cache."""
     index_slots = (
@@ -488,7 +487,7 @@ def check_close(actual, expected, *, msg: str, rtol: float, atol: float):
         raise AssertionError(f"{msg} mismatch ratio: {err}")
 
 
-def fp8_cache_dtype() -> Optional[torch.dtype]:
+def fp8_cache_dtype() -> torch.dtype | None:
     if dtypes.fp8 is not torch.uint8:
         return dtypes.fp8
     return getattr(torch, "float8_e4m3fnuz", getattr(torch, "float8_e4m3fn", None))

@@ -41,7 +41,6 @@ Usage:
 """
 
 import os
-from typing import Optional
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -201,7 +200,7 @@ def fused_ar_rmsnorm_per_group_quant(
     eps,
     group_size=128,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
 ):
@@ -315,7 +314,7 @@ def test_fused_ar_rmsnorm_per_group_quant(
     dtype,
     group_size=128,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     emit_bf16: bool = False,
     transpose_scale: bool = False,
 ):

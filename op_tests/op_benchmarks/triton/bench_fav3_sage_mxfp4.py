@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Dict, Any
+from typing import Any
 import csv
 import torch
 import os
@@ -637,7 +637,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
     """
     Load captured input tensors from disk.
     Args:

@@ -4,7 +4,6 @@
 """Preshuffle GEMM (layout API): f16/bf16/fp8/int8, ping-pong scf.for loop with scheduler hints."""
 
 import functools
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -127,7 +126,7 @@ def compile_preshuffle_gemm(
     in_dtype: str = "fp8",
     out_dtype: str = "bf16",
     epilogue: str = "none",  # "none", "bias", "bias_relu", "bias_silu", "bias_gelu"
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     enable_scheduler: bool = True,
     use_async_copy: bool = False,
     xcd_swizzle: int = 0,

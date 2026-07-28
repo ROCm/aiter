@@ -5,7 +5,6 @@ import torch
 import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import dtypes
-from typing import Tuple
 import argparse
 import itertools
 import pandas as pd
@@ -122,7 +121,7 @@ def run_aiter(
 def test_reshape_and_cache(
     ctx_lens: int,
     bs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     DType_KV: torch.dtype,

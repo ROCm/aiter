@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import warnings
 import triton
@@ -20,10 +19,10 @@ def ff_a16w16_fused_ungated(
     x,
     w_up,
     w_down,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
 ):
     """
     Computes a full feed-forward operation with activation (e.g FF with Relu)

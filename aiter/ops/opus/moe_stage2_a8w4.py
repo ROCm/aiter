@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -30,7 +29,7 @@ def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
 
-def _optional_contiguous(tensor: Optional[Tensor]) -> Optional[Tensor]:
+def _optional_contiguous(tensor: Tensor | None) -> Tensor | None:
     return None if tensor is None else _contiguous(tensor)
 
 
@@ -56,7 +55,7 @@ def _pad_scale_rows(tensor: Tensor, rows: int) -> Tensor:
     return padded
 
 
-def _route_out_mode_from_dtype(route_out_dtype: Optional[str]) -> int:
+def _route_out_mode_from_dtype(route_out_dtype: str | None) -> int:
     if route_out_dtype is None:
         return OPUS_A8W4_OUT_MODE_FP8
     route_out_dtype = str(route_out_dtype).strip().lower()
@@ -93,7 +92,7 @@ def _gen_opus_moe_stage2_a8w4_decode_fake_tensors(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
@@ -122,7 +121,7 @@ def _opus_moe_stage2_a8w4_decode_fwd_raw(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
@@ -152,16 +151,16 @@ def opus_moe_stage2_a8w4_decode_fwd(
     a2_scale: Tensor,
     w2_scale: Tensor,
     sorted_token_ids: Tensor,
-    sorted_weights: Optional[Tensor],
+    sorted_weights: Tensor | None,
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     *,
     block_m: int,
     inter_dim_pad: int,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     kernel_id: int = -1,
     return_per_slot: bool = False,
-    route_out_dtype: Optional[str] = None,
+    route_out_dtype: str | None = None,
 ) -> Tensor:
     effective_inter_dim = opus_a8w4_effective_inter_dim(
         inter_states.shape[2], inter_dim_pad
@@ -242,7 +241,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
 
 def opus_moe_stage2_reduce_token_slot_route_output_fwd(
     route_out: Tensor,
-    out: Optional[Tensor] = None,
+    out: Tensor | None = None,
     *,
     topk: int | None = None,
     block_n: int | None = None,

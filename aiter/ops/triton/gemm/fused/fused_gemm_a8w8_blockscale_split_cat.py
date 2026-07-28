@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
@@ -23,8 +22,8 @@ def fused_gemm_a8w8_blockscale_split_cat(
     w_scale: torch.Tensor,
     S1: int,
     S2: int,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    config: dict | None = None,
 ):
     """
     Computes the 8 bit matmul C = X @ W^T using the block-scale quantization approach.
@@ -211,8 +210,8 @@ def fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     w_scale: torch.Tensor,
     S1: int,
     S2: int,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    config: dict | None = None,
     is_x_scale_transposed: bool = True,
 ):
     """

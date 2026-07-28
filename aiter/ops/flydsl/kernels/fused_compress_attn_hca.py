@@ -43,7 +43,6 @@ to use the legacy single-kernel ``flydsl_fused_compress_attn``.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
 
 import torch
 
@@ -1118,13 +1117,13 @@ def flydsl_hca_compress_attn(
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
-    kv_compressed_scratch: Optional[torch.Tensor] = None,
+    kv_compressed_scratch: torch.Tensor | None = None,
     quant: bool = False,
-    k_rope_cache: Optional[torch.Tensor] = None,
+    k_rope_cache: torch.Tensor | None = None,
     quant_group_size: int = 64,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """HCA-only 2-kernel compress + norm+rope+scatter (V4-Pro Main path).
 
@@ -1382,10 +1381,10 @@ def flydsl_hca_compress_forward(
     ape: torch.Tensor,  # [ratio, head_dim] f32
     ratio: int,
     head_dim: int,
-    kv_compressed_out: Optional[torch.Tensor] = None,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    kv_compressed_out: torch.Tensor | None = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """HCA pool ONLY (Kernel A): softmax-pool ratio source positions (state-cache
     ring + ragged input + ape) -> ``kv_compressed[num_compress, head_dim]`` fp32.

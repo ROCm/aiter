@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 from torch import autograd
 from enum import IntEnum
-from typing import Tuple, Union
 from aiter.ops.triton._triton_kernels.rope.rope import (
     _rope_kernel_sbhd_fwd,
     _rope_kernel_sbhd_bwd,
@@ -1593,9 +1592,7 @@ class RoPE(autograd.Function):
         )
 
     @staticmethod
-    def backward(
-        ctx, output_grads: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         (freqs,) = ctx.saved_tensors
         return (
             rope_bwd(
@@ -1631,7 +1628,7 @@ class RoPETHD(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cu_seqlens, freqs = ctx.saved_tensors
         return (
             rope_thd_bwd(
@@ -1676,7 +1673,7 @@ class RoPECached(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cos, sin = ctx.saved_tensors
         return (
             rope_cached_bwd(

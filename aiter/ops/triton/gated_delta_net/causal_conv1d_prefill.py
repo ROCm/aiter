@@ -23,8 +23,6 @@ The ``@triton.jit`` kernels themselves live in
 concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 """
 
-from typing import List, Optional, Tuple
-
 import torch
 import triton
 
@@ -44,17 +42,17 @@ __all__ = [
 def causal_conv1d_split_qkv_triton_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
+    seq_lens_cpu: list[int],
     k_dim: int,
     v_dim: int,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
     activation: str = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """1D per-token Triton causal conv1d with fused split output for prefill.
 
     Returns contiguous (q, k, v) of shapes [cu_seqlen, k_dim] / [cu_seqlen, v_dim].
@@ -139,7 +137,7 @@ def causal_conv1d_split_qkv_triton_fn(
 
 def _build_chunk_schedule(
     query_start_loc: torch.Tensor, block_m: int
-) -> Tuple[int, torch.Tensor, torch.Tensor]:
+) -> tuple[int, torch.Tensor, torch.Tensor]:
     """Vectorized (sequence, chunk) schedule, exact-sized (no padding).
 
     ``batch_ptr[pid]`` is the sequence owning program ``pid`` and
@@ -166,20 +164,20 @@ def _build_chunk_schedule(
 def causal_conv1d_split_qkv_triton_tile_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
     k_dim: int,
     v_dim: int,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     block_m: int = 64,
     block_n: int = 32,
     num_warps: int = 4,
     metadata=None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """2D-tiled prefill causal conv1d with fused split q/k/v output.
 
     Drop-in alternative to the 1D ``causal_conv1d_split_qkv_triton_fn``.

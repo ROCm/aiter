@@ -3,7 +3,7 @@
 
 import torch
 import triton
-from typing import Any, Dict, Optional
+from typing import Any
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
@@ -54,9 +54,9 @@ def e2e_moe(
     W2: torch.Tensor,
     Intermediate: torch.Tensor,
     C: torch.Tensor,
-    A_scale: Optional[torch.Tensor],
-    W1_scale: Optional[torch.Tensor],
-    W2_scale: Optional[torch.Tensor],
+    A_scale: torch.Tensor | None,
+    W1_scale: torch.Tensor | None,
+    W2_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     sorted_token_ids: torch.Tensor,
     topk_ids,
@@ -66,7 +66,7 @@ def e2e_moe(
     top_k: int,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
-    config: Optional[Dict[str, Any]] = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """
     End-to-end fused MoE computation with up-projection (W1) and down-projection (W2) in single kernel.

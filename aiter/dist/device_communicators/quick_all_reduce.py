@@ -4,7 +4,6 @@
 import logging
 import os
 from enum import Enum
-from typing import Union
 
 import torch
 import torch.distributed as dist
@@ -76,9 +75,7 @@ class QuickAllReduce:
         (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
 
-    def __init__(
-        self, group: ProcessGroup, device: Union[int, str, torch.device]
-    ) -> None:
+    def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
         """
         Quick allreduce leverages quantization for further
         acceleration on ROCm. It currently supports FP8, Q6, Q4, and Q3

@@ -14,14 +14,13 @@ import pandas as pd
 import math
 import os
 from pathlib import Path
-from typing import Union
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
 
 
 def dump_mla_metadata_v1_txt(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     *,
     batch: int,
     q_seq_len: int,

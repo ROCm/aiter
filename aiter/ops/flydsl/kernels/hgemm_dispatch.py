@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
 
 from .small_m_hgemm import compile_small_m_hgemm_kernel
 from .splitk_hgemm import compile_hgemm_kernel
@@ -14,7 +13,7 @@ def compile_flydsl_hgemm_kernel(
     n: int,
     k: int,
     *,
-    kernel_family: Optional[str] = None,
+    kernel_family: str | None = None,
     tile_m: int = 128,
     tile_n: int = 128,
     tile_k: int = 64,

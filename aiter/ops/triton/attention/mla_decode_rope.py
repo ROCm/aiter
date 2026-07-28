@@ -23,7 +23,6 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
-from typing import Optional
 import triton
 import torch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -156,10 +155,10 @@ def decode_attention_fwd_grouped_rope(
     attn_logits: torch.Tensor,
     num_kv_splits: int,
     sm_scale: float,
-    logit_cap: Optional[float] = 0.0,
-    use_rope: Optional[bool] = False,
-    is_neox_style: Optional[bool] = False,
-    config: Optional[dict[str, any]] = None,
+    logit_cap: float | None = 0.0,
+    use_rope: bool | None = False,
+    is_neox_style: bool | None = False,
+    config: dict[str, any] | None = None,
 ):
     """
     Multi-head Latent Attention (MLA) decode with RoPE and low-rank compression.

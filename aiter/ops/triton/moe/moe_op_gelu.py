@@ -4,7 +4,7 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Dict, Optional, List
+from typing import Any
 
 from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -52,8 +52,8 @@ def fused_moe_gelu(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    A_scale: Optional[torch.Tensor],
-    B_scale: Optional[torch.Tensor],
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -64,8 +64,8 @@ def fused_moe_gelu(
     compute_type: tl.dtype,
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
-    block_shape: Optional[List[int]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    block_shape: list[int] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """
     Fused MoE computation with GELU activation and optional quantization.

@@ -4,7 +4,6 @@
 import sys
 import argparse
 import random
-from typing import List, Optional, Tuple, Union, Dict
 import hashlib
 import pandas as pd
 import numpy as np
@@ -98,8 +97,8 @@ def compare_arrays(
     arr1: np.ndarray,
     arr2: np.ndarray,
     k: int = 5,
-    thresholds: List[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],
-) -> Dict:
+    thresholds: list[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],
+) -> dict:
     """
     Compare two numpy arrays and compute various difference metrics.
 
@@ -199,8 +198,8 @@ def compare_arrays(
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     """Convert cache dtype specification to torch dtype."""
     if isinstance(cache_dtype, str):
@@ -230,12 +229,12 @@ def create_kv_cache(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
+    device: str | None = "cuda",
     itemsize: int = 1,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Create key and value cache tensors."""
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -252,7 +251,7 @@ def create_kv_cache(
         elements_per_vector,
     )
 
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -264,7 +263,7 @@ def create_kv_cache(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -359,8 +358,8 @@ def torch_mha_extend(
     block_tables: torch.Tensor,
     context_lengths: torch.Tensor,
     query_output_indptr: torch.Tensor,
-    key_scale: Optional[torch.Tensor] = None,
-    value_scale: Optional[torch.Tensor] = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
     sinks=None,
     sliding_window=0,
 ) -> torch.Tensor:
@@ -433,20 +432,20 @@ def torch_attention_compute(
     context_lengths: torch.Tensor,  # [num_seqs]
     softmax_scale: float,
     q_seq_len: int,
-    query_scale: Optional[
-        torch.Tensor
-    ] = None,  # per-tensor [1] or per-token [num_seqs, num_q_heads, 1]
-    key_scale: Optional[
-        torch.Tensor
-    ] = None,  # per-tensor [1] or per-token [num_blocks, num_kv_heads, block_size, 1]
-    value_scale: Optional[torch.Tensor] = None,  # same as key_scale
-    alibi_slopes: Optional[torch.Tensor] = None,  # [num_kv_heads, query_group_size]
+    query_scale: (
+        torch.Tensor | None
+    ) = None,  # per-tensor [1] or per-token [num_seqs, num_q_heads, 1]
+    key_scale: (
+        torch.Tensor | None
+    ) = None,  # per-tensor [1] or per-token [num_blocks, num_kv_heads, block_size, 1]
+    value_scale: torch.Tensor | None = None,  # same as key_scale
+    alibi_slopes: torch.Tensor | None = None,  # [num_kv_heads, query_group_size]
     compute_type: torch.dtype = torch.bfloat16,
     output_dtype: torch.dtype = torch.bfloat16,
     kv_block_size: int = 16,
     context_partition_size: int = 256,
     is_causal: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Main attention computation stage for Triton's two-stage paged attention decode with FP8.
     Returns intermediate tensors for reduce stage: exp_sums, max_logits, partial_output
@@ -818,14 +817,14 @@ def torch_mha_extend_flashattn_style(
     context_lengths: torch.Tensor,  # [num_seqs]
     softmax_scale: float,
     q_seq_len: int,
-    query_scale: Optional[
-        torch.Tensor
-    ] = None,  # per-tensor [1] or per-token [num_seqs, num_q_heads, 1]
-    key_scale: Optional[
-        torch.Tensor
-    ] = None,  # per-tensor [1] or per-token [num_blocks, num_kv_heads, block_size, 1]
-    value_scale: Optional[torch.Tensor] = None,  # same as key_scale
-    alibi_slopes: Optional[torch.Tensor] = None,  # [num_kv_heads, query_group_size]
+    query_scale: (
+        torch.Tensor | None
+    ) = None,  # per-tensor [1] or per-token [num_seqs, num_q_heads, 1]
+    key_scale: (
+        torch.Tensor | None
+    ) = None,  # per-tensor [1] or per-token [num_blocks, num_kv_heads, block_size, 1]
+    value_scale: torch.Tensor | None = None,  # same as key_scale
+    alibi_slopes: torch.Tensor | None = None,  # [num_kv_heads, query_group_size]
     compute_type: torch.dtype = torch.bfloat16,
     kv_block_size: int = 16,
     context_partition_size: int = 256,
@@ -881,7 +880,7 @@ def quantize_kv_cache_symmetric(
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     quant_dtype: torch.dtype,
-) -> Tuple[
+) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Apply symmetric per-token quantization to KV cache."""
@@ -953,7 +952,7 @@ def quantize_kv_cache_per_tensor(
     key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
     value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size]
     quant_dtype: torch.dtype,
-) -> Tuple[
+) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     """Apply per-tensor quantization to KV cache."""
@@ -1071,7 +1070,7 @@ def prepare_gluon_query_and_scale(
     num_query_heads: int,
     num_kv_heads: int,
     head_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Prepare inputs for Gluon kernel by reshaping and transposing tensors.
 
@@ -1145,9 +1144,9 @@ def run_gluon_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
     use_aot_impl: bool = False,
-    sinks: Optional[torch.Tensor] = None,
+    sinks: torch.Tensor | None = None,
     sliding_window: int = 0,
     ps=False,
 ) -> None:
@@ -1240,7 +1239,7 @@ def run_gluon_kernel(
 def run_pa_gluon_test(
     context_length: int,
     batch_size: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     compute_type: torch.dtype,
@@ -1255,7 +1254,7 @@ def run_pa_gluon_test(
     use_sinks: bool,
     sliding_window: int,
     ps: bool,
-) -> Dict[str, Union[float, str]]:
+) -> dict[str, float | str]:
     """Test paged attention decode with assembly and gluon implementations."""
     data_type = compute_type
     if compute_type == aiter.dtypes.fp8:

@@ -10,7 +10,6 @@ import os
 import csv
 import functools
 
-from typing import Optional
 
 import torch
 
@@ -1401,7 +1400,7 @@ def flydsl_moe_gather_reduce(
     grouped_out: torch.Tensor,  # (E,max_m,D) or (split_k,E,max_m,D) bf16/f16
     topids_to_rows: torch.Tensor,  # (token_num, topk) int32 grouped flat rows
     gather_w: torch.Tensor,  # (token_num, topk) route weight, f32/bf16/f16
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
@@ -1470,12 +1469,12 @@ def _get_compiled_scatter_copy(row_bytes: int):
 
 def flydsl_moe_scatter_copy_token(
     a1_payload: torch.Tensor,  # (token_num, Wp) uint8
-    a1_scale_token_u8: Optional[torch.Tensor],  # (token_num, Ws) uint8 or None
+    a1_scale_token_u8: torch.Tensor | None,  # (token_num, Ws) uint8 or None
     rows_to_tokens: torch.Tensor,  # (E*max_m,) int32 grouped row -> token (-1 pad)
     E: int,
     max_m: int,
-    grouped_a1: Optional[torch.Tensor] = None,  # (E, max_m, Wp) uint8 out
-    a1_scale_raw: Optional[torch.Tensor] = None,  # (E, max_m, Ws) uint8 out
+    grouped_a1: torch.Tensor | None = None,  # (E, max_m, Wp) uint8 out
+    a1_scale_raw: torch.Tensor | None = None,  # (E, max_m, Ws) uint8 out
 ):
     """Copy token payload/scale into grouped layout via rows_to_tokens map.
 
@@ -1533,9 +1532,7 @@ def flydsl_moe_scatter_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    grouped_a1_scale: Optional[
-        torch.Tensor
-    ] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    grouped_a1_scale: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Fused route-gather + WMMA preshuffle for e8m0 scale rows. Returns grouped_a1_scale."""
     device = a1_scale_token_u8.device
@@ -1573,7 +1570,7 @@ def flydsl_moe_preshuffle_scale(
     *,
     wmma_rep: int,
     scale_k_per_tile: int,
-    out: Optional[torch.Tensor] = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
+    out: torch.Tensor | None = None,  # (E, max_m//wmma_rep, Ws*wmma_rep)
 ):
     """Preshuffle grouped row-major e8m0 scale into WMMA layout. Returns out."""
     device = scale_grouped_u8.device

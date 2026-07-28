@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from typing import Tuple
 
 import pytest
 import torch
@@ -58,7 +57,7 @@ def _make_qkv(
     dtype: torch.dtype,
     seed: int = 0,
     device: str = "cuda",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     g = torch.Generator(device=device).manual_seed(seed)
     shape = (batch, seq_len, num_heads, head_dim)
     q = torch.randn(shape, generator=g, dtype=dtype, device=device)

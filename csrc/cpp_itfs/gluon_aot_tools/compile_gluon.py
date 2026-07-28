@@ -5,7 +5,6 @@ import sys
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import triton
 import triton.backends
@@ -226,7 +225,7 @@ def compile_gluon_kernel(args: CompileGluonArgs):
     # validate and parse signature
     signature = list(map(lambda s: s.strip(" "), args.signature.split(",")))
 
-    def hash_signature(signature: List[str]):
+    def hash_signature(signature: list[str]):
         m = hashlib.sha256()
         m.update(" ".join(signature).encode())
         return m.hexdigest()[:8]

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
 
 import torch
 
@@ -28,7 +27,7 @@ def _cfg_int(value, default: int = 0) -> int:
     return int(float(value))
 
 
-def _cfg_optional_int(value) -> Optional[int]:
+def _cfg_optional_int(value) -> int | None:
     if _value_is_empty(value):
         return None
     return int(float(value))
@@ -226,8 +225,8 @@ def opus_a8w4_stage2_wrapper(
     topk_ids=None,
     block_m: int = _DEFAULT_SORT_BLOCK_M,
     kernel_id: int = -1,
-    stage2_block_m: Optional[int] = None,
-    stage2_reduce_block_n: Optional[int] = None,
+    stage2_block_m: int | None = None,
+    stage2_reduce_block_n: int | None = None,
     route_out: bool = False,
     **_kwargs,
 ):

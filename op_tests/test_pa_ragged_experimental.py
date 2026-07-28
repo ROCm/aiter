@@ -1,18 +1,10 @@
 import random
-from typing import List, Optional, Tuple, Union
-import itertools
 import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
 from aiter import dtypes
 from enum import Enum
-from einops import rearrange
 import argparse
 import os
 import numpy as np
-from aiter import paged_attention_ragged
 
 uniform_range = (-1, 1)
 
@@ -24,8 +16,8 @@ class PAVariant(Enum):
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -54,11 +46,11 @@ def kv_cache_factory_v2(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -67,7 +59,7 @@ def kv_cache_factory_v2(
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     key_cache_shape = (num_blocks, 1, num_heads, head_size)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -77,7 +69,7 @@ def kv_cache_factory_v2(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, 1, num_heads, head_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -94,7 +86,7 @@ def kv_ptr_factory(
     num_seqs: int,
     ctx_lens: int,
     page_size: int,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     # kv_indptr
     num_blocks_list = [ctx_lens] * num_seqs
     kv_indptr = torch.tensor([0] + num_blocks_list).cumsum(dim=0, dtype=torch.int)
@@ -187,7 +179,7 @@ def test_paged_attention(
     in_pt: str,
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     page_size: int,

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List
 
 import torch
 import triton
@@ -13,7 +12,7 @@ def prev_power_of_2(x: int) -> int:
     return out // 2 if out > x else out
 
 
-STATIC_MAX_SEQ_LENS: List[int] = []
+STATIC_MAX_SEQ_LENS: list[int] = []
 USE_RUNTIME_MAX_SEQ_LEN: bool = False
 
 

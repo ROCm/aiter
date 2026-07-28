@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from contextlib import redirect_stdout, redirect_stderr
-from typing import Callable, TypeAlias, Optional
+from typing import TypeAlias
+from collections.abc import Callable
 import io
 import logging
 import shlex
@@ -575,10 +576,10 @@ def read_json(json_path: str) -> ModelShapesData:
 
 def call_function(
     bench_fn: Callable[[list[str]], None], handler: KernelHandler
-) -> Optional[str]:
+) -> str | None:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    raw_result: Optional[str] = None
+    raw_result: str | None = None
 
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):

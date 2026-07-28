@@ -5,7 +5,7 @@
 import torch
 import ctypes
 from torch.library import Library
-from typing import Callable, Optional, Tuple
+from collections.abc import Callable
 from csrc.cpp_itfs.utils import AITER_LOG_MORE, logger
 
 
@@ -84,10 +84,10 @@ def direct_register_custom_op(
     op_name: str,
     op_func: Callable,
     mutates_args: list[str],
-    fake_impl: Optional[Callable] = None,
-    target_lib: Optional[Library] = None,
+    fake_impl: Callable | None = None,
+    target_lib: Library | None = None,
     dispatch_key: str = "CUDA",
-    tags: Tuple[torch.Tag, ...] = (),
+    tags: tuple[torch.Tag, ...] = (),
 ):
     """
     `torch.library.custom_op` can have significant overhead because it

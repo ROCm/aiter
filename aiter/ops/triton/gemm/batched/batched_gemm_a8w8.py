@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8 import (
@@ -18,11 +17,11 @@ def batched_gemm_a8w8(
     WQ: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    splitK: Optional[int] = None,
-    YQ: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    splitK: int | None = None,
+    YQ: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with per-batch scaling.

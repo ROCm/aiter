@@ -36,7 +36,6 @@ import random
 import traceback
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -180,16 +179,16 @@ class TestSuite:
         self.verbose = verbose
         self.print_shapes = print_shapes
         self.layout_mode = layout_mode
-        self.results: List[TestResult] = []
+        self.results: list[TestResult] = []
 
     def check_close(
         self,
         name: str,
         got: torch.Tensor,
         ref: torch.Tensor,
-        K_red: Optional[int] = None,
-        rtol: Optional[float] = None,
-        atol: Optional[float] = None,
+        K_red: int | None = None,
+        rtol: float | None = None,
+        atol: float | None = None,
     ) -> TestResult:
         got32 = got.float()
         ref32 = ref.float()
@@ -218,7 +217,7 @@ class TestSuite:
     def all_passed(self) -> bool:
         return all(r.passed for r in self.results)
 
-    def failed_results(self) -> List[TestResult]:
+    def failed_results(self) -> list[TestResult]:
         return [r for r in self.results if not r.passed]
 
 
@@ -241,7 +240,7 @@ def run_all_methods(
     suite: TestSuite,
     x: torch.Tensor,
     w: torch.Tensor,
-    b: Optional[torch.Tensor],
+    b: torch.Tensor | None,
     stride,
     padding,
     dilation,

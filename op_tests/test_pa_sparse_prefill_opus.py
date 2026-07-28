@@ -56,7 +56,6 @@ import itertools
 import math
 import os
 import sys
-from typing import Optional, Tuple
 
 import pandas as pd
 import pytest
@@ -81,7 +80,7 @@ def _skip(reason: str) -> bool:
     return True
 
 
-def _get_gpu_arch() -> Optional[str]:
+def _get_gpu_arch() -> str | None:
     if not torch.cuda.is_available():
         return None
     try:
@@ -186,7 +185,7 @@ _FP8_MAX = 448.0  # e4m3fn max normal
 _FP8_KV_TILE_SIZE = 64  # KV_TILE_SIZE of the fp8 16mx1_16nx4 kernel
 
 
-def _quantize_nope(real: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def _quantize_nope(real: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``[R, 448]`` real values into a packed ``[R, 512]`` fp8 row
     (NoPE fp8 + E8M0 block scales + zero pad) and return ``(packed_fp8, deq)``
     where ``deq`` (``[R, 448]`` fp32) is the dequantized NoPE the kernel sees.
@@ -292,7 +291,7 @@ def _random_csr(
     kv_tile_size: int = _KV_TILE_SIZE,
     device: torch.device,
     seed: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Random CSR with deterministic tile-boundary nnz on the first rows.
 
     Length distribution: ``randint(0, total_rows)`` -- no artificial cap, so a
@@ -339,13 +338,13 @@ def _random_csr(
 
 def _dense_csr(
     n: int, total_rows: int, *, device: torch.device
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     indptr = torch.arange(0, (n + 1) * total_rows, total_rows, dtype=torch.int32)
     indices = torch.arange(total_rows, dtype=torch.int32).repeat(n)
     return indptr.to(device), indices.to(device)
 
 
-def _empty_csr(n: int, *, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def _empty_csr(n: int, *, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(n + 1, dtype=torch.int32, device=device),
         torch.zeros(0, dtype=torch.int32, device=device),
@@ -511,7 +510,7 @@ _PRECS = ("bf16", "fp16", "fp8")
 _PREC_TO_DTYPE = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 
-def _get_tolerances(prec: str) -> Tuple[float, float]:
+def _get_tolerances(prec: str) -> tuple[float, float]:
     if prec == "fp16":
         return 1e-2, 1e-2
     if prec == "fp8":
@@ -539,7 +538,7 @@ def run_pa_sparse_prefill_opus(
     seed: int = 0,
     verify: bool = True,
     bench: bool = True,
-) -> Optional[dict]:
+) -> dict | None:
     assert prec in _PRECS, f"unknown prec {prec!r}"
     if _skip_if_unsupported(d=d):
         return None

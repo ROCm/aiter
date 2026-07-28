@@ -7,7 +7,6 @@ from enum import Enum
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import gemm_a8wfp4
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils import types
-from typing import Union
 
 # Debug
 DEBUG = False
@@ -50,8 +49,8 @@ def generate_gemm_a8wfp4_inputs(
     M: int,
     N: int,
     K: int,
-    a_dtype: Union[torch.dtype, str],
-    out_dtype: Union[torch.dtype, str],
+    a_dtype: torch.dtype | str,
+    out_dtype: torch.dtype | str,
     output: bool = False,
     layout: str = "TN",
 ):

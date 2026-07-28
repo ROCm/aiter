@@ -2,7 +2,6 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor, empty, empty_like, autograd
-from typing import Tuple, Union
 from ..jit.core import compile_ops
 
 MD_NAME = "module_rope"
@@ -1137,7 +1136,7 @@ class RoPE(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads: Tensor) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads: Tensor) -> tuple[Tensor | None, ...]:
         (freqs,) = ctx.saved_tensors
         return (
             rope_bwd(
@@ -1181,7 +1180,7 @@ class RoPECached(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cos, sin = ctx.saved_tensors
         return (
             rope_cached_bwd(
@@ -1218,7 +1217,7 @@ class RoPETHD(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cu_seqlens, freqs = ctx.saved_tensors
         return (
             rope_thd_bwd(
@@ -1269,7 +1268,7 @@ class RoPE2D(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[Tensor | None, ...]:
         cos_height, sin_height, cos_width, sin_width = ctx.saved_tensors
         return (
             rope_2d_bwd(

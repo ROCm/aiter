@@ -23,7 +23,6 @@ import functools
 import os
 from contextlib import contextmanager
 from enum import Enum
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -3095,7 +3094,7 @@ def compile_mixed_moe_gemm2(
     inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,

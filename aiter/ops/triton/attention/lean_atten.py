@@ -18,7 +18,6 @@ TO be added features:
 """
 
 import torch
-from typing import Optional
 from bisect import bisect_right
 import math
 import triton
@@ -48,8 +47,8 @@ def persistent_lean_attention(
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
     RAGGED_BATCH: bool = False,
-    config: Optional[dict] = None,
-    program_count: Optional[int] = None,
+    config: dict | None = None,
+    program_count: int | None = None,
 ):
     """
     Lean Attention using stream-K tiling for efficient CU utilization.

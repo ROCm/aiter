@@ -8,7 +8,6 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
-from typing import Union
 
 e5m2_type, e4m3_type = get_fp8_dtypes()
 
@@ -18,7 +17,7 @@ def generate_batched_gemm_a16w8_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[torch.dtype, str],
+    dtype: torch.dtype | str,
     has_bias: bool,
     output: bool,
     layout: str = "TN",

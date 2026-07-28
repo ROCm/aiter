@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 
 import triton
 import torch
@@ -234,9 +233,9 @@ def dynamic_mxfp4_quant(
 
 def dynamic_mxfp8_quant(
     x: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
     quant_dtype: torch.dtype = torch.float8_e4m3fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Per-1x32 MXFP8 quantization (e8m0 scale + FP8 e4m3 values).
 
@@ -299,9 +298,9 @@ def dynamic_mxfp8_quant(
 def fp8_legacy_to_mxfp8(
     x_fnuz: torch.Tensor,
     x_scale_fp32: torch.Tensor,
-    y_fn: Optional[torch.Tensor] = None,
-    y_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    y_fn: torch.Tensor | None = None,
+    y_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Transcode (FP8 e4m3fnuz, fp32 1x128 scale) -> (FP8 e4m3fn, e8m0 1x32 scale)
     in a single Triton launch. Replaces the Python dequant+requant cascade
@@ -359,7 +358,7 @@ def fp8_legacy_to_mxfp8(
 
 def dynamic_nvfp4_quant(
     x: torch.Tensor,
-    global_scale: Optional[torch.Tensor] = None,
+    global_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize a tensor to MX FP4 format.

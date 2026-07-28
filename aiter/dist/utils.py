@@ -38,23 +38,14 @@ from functools import lru_cache, partial, wraps
 from platform import uname
 from typing import (
     Any,
-    AsyncGenerator,
-    Awaitable,
-    Callable,
-    Dict,
     Generic,
-    Hashable,
-    List,
     Literal,
-    Optional,
-    OrderedDict,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
     Union,
     overload,
 )
+from collections import OrderedDict
+from collections.abc import AsyncGenerator, Awaitable, Callable, Hashable
 from uuid import uuid4
 
 import numpy as np
@@ -316,7 +307,7 @@ class LRUCache(Generic[T]):
 
     def __init__(self, capacity: int):
         self.cache: OrderedDict[Hashable, T] = OrderedDict()
-        self.pinned_items: Set[Hashable] = set()
+        self.pinned_items: set[Hashable] = set()
         self.capacity = capacity
 
     def __contains__(self, key: Hashable) -> bool:
@@ -339,8 +330,8 @@ class LRUCache(Generic[T]):
     def touch(self, key: Hashable) -> None:
         self.cache.move_to_end(key)
 
-    def get(self, key: Hashable, default_value: Optional[T] = None) -> Optional[T]:
-        value: Optional[T]
+    def get(self, key: Hashable, default_value: T | None = None) -> T | None:
+        value: T | None
         if key in self.cache:
             value = self.cache[key]
             self.cache.move_to_end(key)
@@ -365,7 +356,7 @@ class LRUCache(Generic[T]):
     def _unpin(self, key: Hashable) -> None:
         self.pinned_items.remove(key)
 
-    def _on_remove(self, key: Hashable, value: Optional[T]):
+    def _on_remove(self, key: Hashable, value: T | None):
         pass
 
     def remove_oldest(self, remove_pinned=False):
@@ -390,9 +381,9 @@ class LRUCache(Generic[T]):
         while len(self.cache) > self.capacity:
             self.remove_oldest()
 
-    def pop(self, key: Hashable, default_value: Optional[T] = None) -> Optional[T]:
+    def pop(self, key: Hashable, default_value: T | None = None) -> T | None:
         run_on_remove = key in self.cache
-        value: Optional[T] = self.cache.pop(key, default_value)
+        value: T | None = self.cache.pop(key, default_value)
         # remove from pinned items
         if key in self.pinned_items:
             self._unpin(key)
@@ -600,8 +591,8 @@ async def iterate_with_cancellation(
 
 async def merge_async_iterators(
     *iterators: AsyncGenerator[T, None],
-    is_cancelled: Optional[Callable[[], Awaitable[bool]]] = None,
-) -> AsyncGenerator[Tuple[int, T], None]:
+    is_cancelled: Callable[[], Awaitable[bool]] | None = None,
+) -> AsyncGenerator[tuple[int, T], None]:
     """Merge multiple asynchronous iterators into a single iterator.
 
     This method handle the case where some iterators finish before others.
@@ -639,7 +630,7 @@ async def merge_async_iterators(
                 await it.aclose()
 
 
-async def collect_from_async_generator(iterator: AsyncGenerator[T, None]) -> List[T]:
+async def collect_from_async_generator(iterator: AsyncGenerator[T, None]) -> list[T]:
     """Collect all items from an async generator into a list."""
     items = []
     async for item in iterator:
@@ -742,7 +733,7 @@ def get_open_port() -> int:
             return s.getsockname()[1]
 
 
-def find_process_using_port(port: int) -> Optional[psutil.Process]:
+def find_process_using_port(port: int) -> psutil.Process | None:
     for conn in psutil.net_connections():
         if conn.laddr.port == port:
             try:
@@ -752,7 +743,7 @@ def find_process_using_port(port: int) -> Optional[psutil.Process]:
     return None
 
 
-def update_environment_variables(envs: Dict[str, str]):
+def update_environment_variables(envs: dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
@@ -764,7 +755,7 @@ def update_environment_variables(envs: Dict[str, str]):
         os.environ[k] = v
 
 
-def chunk_list(lst: List[T], chunk_size: int):
+def chunk_list(lst: list[T], chunk_size: int):
     """Yield successive chunk_size chunks from lst."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i : i + chunk_size]
@@ -797,8 +788,8 @@ def _generate_random_fp8(
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -827,19 +818,19 @@ def create_kv_caches_with_random_flash(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     seed_everything(seed)
 
     torch_dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     key_value_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
     scale = head_size**-0.5
 
-    key_caches: List[torch.Tensor] = []
-    value_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
 
     for _ in range(num_layers):
         key_value_cache = torch.empty(
@@ -862,11 +853,11 @@ def create_kv_caches_with_random(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -880,7 +871,7 @@ def create_kv_caches_with_random(
     scale = head_size**-0.5
     x = 16 // torch.tensor([], dtype=torch_dtype).element_size()
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -892,7 +883,7 @@ def create_kv_caches_with_random(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -937,7 +928,7 @@ def is_pin_memory_available() -> bool:
 
 class DeviceMemoryProfiler:
 
-    def __init__(self, device: Optional[torch.types.Device] = None):
+    def __init__(self, device: torch.types.Device | None = None):
         self.device = device
 
     def current_memory_usage(self) -> float:
@@ -964,11 +955,11 @@ class DeviceMemoryProfiler:
 
 
 def make_ndarray_with_pad(
-    x: List[List[T]],
+    x: list[list[T]],
     pad: T,
     dtype: npt.DTypeLike,
     *,
-    max_len: Optional[int] = None,
+    max_len: int | None = None,
 ) -> npt.NDArray:
     """
     Make a padded array from 2D inputs.
@@ -989,12 +980,12 @@ def make_ndarray_with_pad(
 
 
 def make_tensor_with_pad(
-    x: List[List[T]],
+    x: list[list[T]],
     pad: T,
     dtype: torch.dtype,
     *,
-    max_len: Optional[int] = None,
-    device: Optional[Union[str, torch.device]] = None,
+    max_len: int | None = None,
+    device: str | torch.device | None = None,
     pin_memory: bool = False,
 ) -> torch.Tensor:
     """
@@ -1016,7 +1007,7 @@ def make_tensor_with_pad(
 def async_tensor_h2d(
     data: list,
     dtype: torch.dtype,
-    target_device: Union[str, torch.device],
+    target_device: str | torch.device,
     pin_memory: bool,
 ) -> torch.Tensor:
     """Asynchronously create a tensor and copy it from host to device."""
@@ -1032,10 +1023,10 @@ def get_dtype_size(dtype: torch.dtype) -> int:
 # `collections` helpers
 def is_list_of(
     value: object,
-    typ: Type[T],
+    typ: type[T],
     *,
     check: Literal["first", "all"] = "first",
-) -> TypeIs[List[T]]:
+) -> TypeIs[list[T]]:
     if not isinstance(value, list):
         return False
 
@@ -1048,7 +1039,7 @@ def is_list_of(
 
 
 JSONTree = Union[
-    Dict[str, "JSONTree[T]"], List["JSONTree[T]"], Tuple["JSONTree[T]", ...], T
+    dict[str, "JSONTree[T]"], list["JSONTree[T]"], tuple["JSONTree[T]", ...], T
 ]
 """A nested JSON structure where the leaves need not be JSON-serializable."""
 
@@ -1056,22 +1047,22 @@ JSONTree = Union[
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: Dict[str, JSONTree[T]],
-) -> Dict[str, JSONTree[U]]: ...
+    value: dict[str, JSONTree[T]],
+) -> dict[str, JSONTree[U]]: ...
 
 
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: List[JSONTree[T]],
-) -> List[JSONTree[U]]: ...
+    value: list[JSONTree[T]],
+) -> list[JSONTree[U]]: ...
 
 
 @overload
 def json_map_leaves(
     func: Callable[[T], U],
-    value: Tuple[JSONTree[T], ...],
-) -> Tuple[JSONTree[U], ...]: ...
+    value: tuple[JSONTree[T], ...],
+) -> tuple[JSONTree[U], ...]: ...
 
 
 @overload
@@ -1092,7 +1083,7 @@ def json_map_leaves(func: Callable[[T], U], value: JSONTree[T]) -> JSONTree[U]:
         return func(value)
 
 
-def flatten_2d_lists(lists: List[List[T]]) -> List[T]:
+def flatten_2d_lists(lists: list[list[T]]) -> list[T]:
     """Flatten a list of lists to a single list."""
     return [item for sublist in lists for item in sublist]
 
@@ -1186,8 +1177,8 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 def deprecate_kwargs(
     *kws: str,
-    is_deprecated: Union[bool, Callable[[], bool]] = True,
-    additional_message: Optional[str] = None,
+    is_deprecated: bool | Callable[[], bool] = True,
+    additional_message: str | None = None,
 ) -> Callable[[F], F]:
     deprecated_kws = set(kws)
 
@@ -1221,7 +1212,7 @@ def deprecate_kwargs(
 
 
 @lru_cache(maxsize=2)
-def get_cuda_visible_devices(return_str=False) -> List[Any]:
+def get_cuda_visible_devices(return_str=False) -> list[Any]:
     """Get the value of the CUDA_VISIBLE_DEVICES environment variable."""
     cuda_visible_devices = os.environ.get("HIP_VISIBLE_DEVICES", None)
     if cuda_visible_devices:
@@ -1241,7 +1232,7 @@ def get_cuda_visible_devices(return_str=False) -> List[Any]:
 
 
 @lru_cache(maxsize=8)
-def _cuda_device_count_stateless(cuda_visible_devices: Optional[str] = None) -> int:
+def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
     # Note: cuda_visible_devices is not used, but we keep it as an argument for
     # LRU Cache purposes.
 
@@ -1341,7 +1332,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         return super().parse_args(processed_args, namespace)
 
     @staticmethod
-    def _pull_args_from_config(args: List[str]) -> List[str]:
+    def _pull_args_from_config(args: list[str]) -> list[str]:
         """Method to pull arguments specified in the config file
         into the command-line args variable.
 
@@ -1407,7 +1398,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         return args
 
     @staticmethod
-    def _load_config_file(file_path: str) -> List[str]:
+    def _load_config_file(file_path: str) -> list[str]:
         """Loads a yaml file and returns the key value pairs as a
         flattened list with argparse like pattern
         ```yaml
@@ -1431,9 +1422,9 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
             )
 
         # only expecting a flat dictionary of atomic types
-        processed_args: List[str] = []
+        processed_args: list[str] = []
 
-        config: Dict[str, Union[int, str]] = {}
+        config: dict[str, int | str] = {}
         try:
             with open(file_path, "r") as config_file:
                 config = yaml.safe_load(config_file)
@@ -1511,11 +1502,11 @@ def supports_kw(
 
 
 def resolve_mm_processor_kwargs(
-    init_kwargs: Optional[Dict[str, Any]],
-    inference_kwargs: Optional[Dict[str, Any]],
+    init_kwargs: dict[str, Any] | None,
+    inference_kwargs: dict[str, Any] | None,
     callable: Callable[..., object],
     allow_var_kwargs: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Applies filtering to eliminate invalid mm_processor_kwargs, i.e.,
     those who are not explicit keywords to the given callable (of one is
     given; otherwise no filtering is done), then merges the kwarg dicts,
@@ -1546,9 +1537,9 @@ def resolve_mm_processor_kwargs(
 
 def get_allowed_kwarg_only_overrides(
     callable: Callable[..., object],
-    overrides: Optional[Dict[str, Any]],
+    overrides: dict[str, Any] | None,
     allow_var_kwargs: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Given a callable which has one or more keyword only params and a dict
     mapping param names to values, drop values that can be not be kwarg

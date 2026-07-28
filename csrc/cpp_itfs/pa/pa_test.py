@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import List, Optional, Tuple, Union
 import aiter
 from aiter.test_common import benchmark, perftest, checkAllclose
 import random
@@ -24,8 +23,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -54,11 +53,11 @@ def kv_cache_factory(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -69,7 +68,7 @@ def kv_cache_factory(
 
     x = 16 // torch_dtype.itemsize
     k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    k_caches: List[torch.Tensor] = []
+    k_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         k_cache = torch.empty(size=k_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -79,7 +78,7 @@ def kv_cache_factory(
         k_caches.append(k_cache)
 
     v_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    v_caches: List[torch.Tensor] = []
+    v_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         v_cache = torch.empty(size=v_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -168,7 +167,7 @@ def pertoken_quant_kvcache_symm(
     v_cache: torch.Tensor,
     quant_dtype: torch.dtype,  # e.g. torch.float8_e4m3fnuz
     scale_dtype: torch.dtype = torch.float32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = k_cache.shape[0]
     num_heads = k_cache.shape[1]
     head_dim = v_cache.shape[2]
@@ -270,7 +269,7 @@ def asm_V_shuffle(VC):
 def test_pa_mtp(
     ctx_lens: int,
     batch_size: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     dtype: torch.dtype,
@@ -311,7 +310,7 @@ def test_pa_mtp(
     seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
     # Create the block tables.
-    block_tables_lst: List[List[int]] = []
+    block_tables_lst: list[list[int]] = []
     for _ in range(batch_size):
         block_table = [
             random.randint(0, num_blocks - 1) for _ in range(num_blocks_per_seq)

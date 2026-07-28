@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -14,7 +13,7 @@ _LOGGER = AiterTritonLogger()
 
 
 def routing_sigmoid_top1(
-    x, w, topk, fused_shared_experts=False, config: Optional[dict[str, any]] = None
+    x, w, topk, fused_shared_experts=False, config: dict[str, any] | None = None
 ):
     """
     Computes top-1 MoE routing with sigmoid activation for expert selection.

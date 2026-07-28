@@ -9,7 +9,6 @@ import argparse
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -324,7 +323,7 @@ def _run_profile(
     m: int,
     hidden_size: int,
     with_graph: bool,
-    init_method: Optional[str] = None,
+    init_method: str | None = None,
     *,
     run_correctness: bool = False,
     breakdown: bool = False,
@@ -390,7 +389,7 @@ def test_ar_mhc_post_only_profile(
     m: int,
     hidden_size: int,
     with_graph: bool = False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
     run_correctness: bool = False,
     breakdown: bool = False,
     compare_stages: bool = False,

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Union
 import torch
 import triton
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -61,12 +60,12 @@ def fused_gemm_a8w8_blockscale_mul_add(
     w,
     x_scales,
     w_scales,
-    a: Union[torch.Tensor, float, int],
-    b: Union[torch.Tensor, float, int],
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    fuse_type: Optional[int] = 0,
+    a: torch.Tensor | float | int,
+    b: torch.Tensor | float | int,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    fuse_type: int | None = 0,
 ):
     """
     Computes matrix multiplication Y = X @ W^T with FP8 activations and FP8 weights.

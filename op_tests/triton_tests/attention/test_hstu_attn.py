@@ -1,6 +1,5 @@
 import pytest
 import torch
-from typing import Optional
 
 from aiter.ops.triton.attention.hstu_attention import (
     _AttentionFunction,
@@ -72,9 +71,9 @@ def sanity_check_attention(
     seq_offsets: torch.Tensor,
     invalid_attn_mask_type: str,
     dropout_pr: float,
-    seq2_offsets: Optional[torch.Tensor] = None,
-    attn_bias: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    seq2_offsets: torch.Tensor | None = None,
+    attn_bias: torch.Tensor | None = None,
+    max_attn_len: int | None = None,
     contextual_seq_len: int = 0,
 ) -> None:
     _, H, _ = q.shape

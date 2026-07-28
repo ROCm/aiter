@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Dict
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
@@ -38,23 +37,23 @@ def flash_attn_onekernel_backward(
     dv: torch.Tensor,
     dbias: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float,
-    philox_seed: Optional[int] = 0,
-    philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
-    USE_INT64_STRIDES: Optional[bool] = False,
-    sink: Optional[torch.Tensor] = None,
-    dsink: Optional[torch.Tensor] = None,
-    config: Optional[Dict[str, any]] = None,
+    philox_seed: int | None = 0,
+    philox_offset: int | None = 0,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    descale_do: torch.Tensor | None = None,
+    USE_INT64_STRIDES: bool | None = False,
+    sink: torch.Tensor | None = None,
+    dsink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
     sliding_window: int = 0,
 ):
     """

@@ -41,7 +41,6 @@ import re
 import statistics
 import subprocess
 import sys
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -251,7 +250,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
         )
         return
 
-    pending: Optional[str] = None
+    pending: str | None = None
     attributed: dict = {}
     orphan = 0
     shape_done_re = re.compile(r"^SHAPE_DONE:(\d+)\s*$")
@@ -506,7 +505,7 @@ def run_single_shape(args) -> None:
 # ----------------------------------------------------------------------------
 
 
-def _box_table(headers, rows, align: Optional[list] = None) -> str:
+def _box_table(headers, rows, align: list | None = None) -> str:
     """Render a list of header-string + row-tuples into a box-drawn table.
 
     align: per-column alignment, "l" (left, default) or "r" (right).
@@ -856,7 +855,7 @@ def run_sweep(args) -> None:
 # ----------------------------------------------------------------------------
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="bench_conv2d",
         description="Benchmark aiter.ops.triton.conv.conv2d (single shape or sweep).",
@@ -962,7 +961,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if args.single_shape:
         run_single_shape(args)

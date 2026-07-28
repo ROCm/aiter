@@ -2,7 +2,6 @@ from typing import Literal
 import torch
 import triton
 import triton.language as tl
-from typing import Optional
 from aiter.utility import dtypes
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_rms_mxfp4_quant_kernel,
@@ -23,12 +22,12 @@ def fused_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
     x2_epsilon: float = 0.0,
-    res1: Optional[torch.Tensor] = None,
-    shuffle: Optional[bool] = False,
-    scale_shuffle_padding: Optional[bool] = False,
+    res1: torch.Tensor | None = None,
+    shuffle: bool | None = False,
+    scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
 ):
     """
@@ -194,11 +193,11 @@ def fused_flatten_mxfp4_quant(
 def fused_reduce_act_mul_and_mxfp4_quant(
     x: torch.Tensor,
     activation: Literal["silu", "gelu", "gelu_tanh"],
-    x2: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
     scaling_mode: str = "even",
     shuffle: bool = False,
     scale_shuffle_padding: bool = False,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: float | None = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization to MX FP4 format.
@@ -371,13 +370,13 @@ def fused_reduce_rms_mxfp4_quant(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
     x1_epsilon: float,
-    x2: Optional[torch.Tensor] = None,
-    x2_weight: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
+    x2_weight: torch.Tensor | None = None,
     x2_epsilon: float = 0.0,
-    x3: Optional[torch.Tensor] = None,
-    res1: Optional[torch.Tensor] = None,
-    shuffle: Optional[bool] = False,
-    scale_shuffle_padding: Optional[bool] = False,
+    x3: torch.Tensor | None = None,
+    res1: torch.Tensor | None = None,
+    shuffle: bool | None = False,
+    scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
     dtype=None,
     out3=None,

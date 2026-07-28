@@ -17,7 +17,6 @@ See ``fused_compress_attn_hca.py`` for the original wave64 documentation.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
 
 import torch
 
@@ -1111,13 +1110,13 @@ def flydsl_hca_compress_attn_gfx1250(
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
-    kv_compressed_scratch: Optional[torch.Tensor] = None,
+    kv_compressed_scratch: torch.Tensor | None = None,
     quant: bool = False,
-    k_rope_cache: Optional[torch.Tensor] = None,
+    k_rope_cache: torch.Tensor | None = None,
     quant_group_size: int = 64,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """HCA-only 2-kernel compress + norm+rope+scatter (V4-Pro Main path).
 

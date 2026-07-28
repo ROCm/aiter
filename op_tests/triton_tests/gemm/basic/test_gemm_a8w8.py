@@ -13,7 +13,6 @@ from aiter.ops.triton.gluon.gemm_a8w8 import (
 )
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from typing import Union
 
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.utils._triton import arch_info
@@ -85,8 +84,8 @@ def generate_gemm_a8w8_inputs(
     M: int,
     N: int,
     K: int,
-    in_dtype: Union[torch.dtype, str],
-    out_dtype: Union[torch.dtype, str],
+    in_dtype: torch.dtype | str,
+    out_dtype: torch.dtype | str,
     layout: str = "TN",
     output: bool = False,
     shuffle: bool = False,

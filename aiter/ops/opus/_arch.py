@@ -35,14 +35,14 @@ Detection order (shared by both helpers):
 
 import logging
 import os
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 logger = logging.getLogger("aiter.ops.opus._arch")
 
 
 def _detect_arch(
     supported: Iterable[str],
-) -> Tuple[bool, Optional[str]]:
+) -> tuple[bool, str | None]:
     """Probe the active GPU arch against ``supported`` without raising.
 
     Parameters
@@ -98,7 +98,7 @@ def _check_arch(
     supported: Iterable[str],
     *,
     feature: str,
-    hint: Optional[str] = None,
+    hint: str | None = None,
 ) -> None:
     """Raise ImportError if :func:`_detect_arch` reports an unsupported arch.
 

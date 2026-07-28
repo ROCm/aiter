@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from ..utility.mx_types import MxScaleRoundMode
@@ -406,11 +406,11 @@ def get_triton_quant(qType):
 @torch_compile_guard()
 def per_token_quant_hip(
     x: Tensor,
-    scale: Optional[Tensor] = None,
+    scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
-    num_rows: Optional[Tensor] = None,
+    num_rows: Tensor | None = None,
     num_rows_factor: int = 1,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -439,7 +439,7 @@ def per_token_quant_hip(
 @torch_compile_guard()
 def per_group_quant_hip(
     x: Tensor,
-    scale: Optional[Tensor] = None,
+    scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
@@ -488,7 +488,7 @@ def per_1x32_mx_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
 ):
@@ -602,7 +602,7 @@ def per_1x32_f4_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
 ):
     """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
@@ -629,7 +629,7 @@ def per_tensor_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
 ):
     assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
@@ -696,7 +696,7 @@ def moe_smooth_per_token_scaled_quant(
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
     block_m: int,
-    local_expert_hash: Optional[torch.Tensor] = None,
+    local_expert_hash: torch.Tensor | None = None,
     shuffle_scale: bool = False,
     transpose_out: bool = False,
     is_balanced: bool = False,
@@ -756,9 +756,9 @@ def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
     scales: torch.Tensor,
-    scale_ub: Optional[torch.Tensor] = None,
+    scale_ub: torch.Tensor | None = None,
     shuffle_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None: ...
 
@@ -770,7 +770,7 @@ def dynamic_per_group_scaled_quant(
     scales: torch.Tensor,
     group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
@@ -798,7 +798,7 @@ def dynamic_per_group_scaled_quant_fp4(
     scales: torch.Tensor,
     group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None:
     """Backward-compat fp4x2-only forwarder; delegates to
@@ -814,11 +814,11 @@ def smooth_per_token_scaled_quant(
     input: torch.Tensor,
     scales: torch.Tensor,
     smooth_scale: torch.Tensor,
-    smooth_scale_map: Optional[torch.Tensor] = None,
+    smooth_scale_map: torch.Tensor | None = None,
     shuffle_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
-    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    smooth_scale_map_hash: torch.Tensor | None = None,
     enable_ps: bool = True,
 ) -> None: ...
 
@@ -831,7 +831,7 @@ def moe_smooth_per_token_scaled_quant_v1(
     smooth_scale: torch.Tensor,
     smooth_scale_map: torch.Tensor,
     shuffle_scale: bool = False,
-    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    smooth_scale_map_hash: torch.Tensor | None = None,
     transpose_out: bool = False,
 ) -> None:
     """
@@ -901,7 +901,7 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     token_num: int,
     block_m: int,
     group_size: int = 32,
-    sorted_weights: Optional[torch.Tensor] = None,
+    sorted_weights: torch.Tensor | None = None,
 ) -> None:
     """
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
@@ -1041,10 +1041,10 @@ def fused_dynamic_mx_quant_moe_sort(
     topk: int,  # stage1 and stage2: same topk value
     block_size: int,
     quant_dtype: torch.dtype = dtypes.fp4x2,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-    sorted_weights: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
     Returns ``(out, scale)`` where:
@@ -1156,10 +1156,10 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     token_num: int,
     topk: int,  # stage1 and stage2: same topk value
     block_size: int,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-    sorted_weights: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
     Forces ``quant_dtype=dtypes.fp4x2``; same dispatch + behaviour as the
@@ -1187,10 +1187,10 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     token_num: int,
     topk: int,
     block_size: int,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-    sorted_weights: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
     Forces ``quant_dtype=dtypes.fp8``; same dispatch + behaviour as the
@@ -1268,7 +1268,7 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
-    out_scale: Optional[torch.Tensor] = None,
+    out_scale: torch.Tensor | None = None,
     group_size: int = 128,
 ) -> None:
     """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate.

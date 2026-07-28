@@ -11,7 +11,6 @@ support reduce-scatter and all-gather operations. All core iris functions
 
 import logging
 import math
-from typing import Optional
 
 import torch
 import iris
@@ -26,7 +25,7 @@ def calculate_heap_size(
     M: int,
     N: int,
     dtype: "torch.dtype",
-    world_size: Optional[int] = None,
+    world_size: int | None = None,
     quant_mode: str = "none",
     all_gather: bool = True,
     overhead_factor: float = 1.2,

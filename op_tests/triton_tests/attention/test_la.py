@@ -5,7 +5,6 @@ import sys
 import pytest
 import torch
 import math
-from typing import Union, List
 from aiter.ops.triton.attention.lean_atten import (
     _persistent_lean_attention,
     persistent_lean_attention,
@@ -19,13 +18,13 @@ DEBUG_MODE = False
 def get_lean_attn_inputs(
     batch: int,
     n_ctx_q: int,
-    n_ctx: List[int],
+    n_ctx: list[int],
     block_n: int,
     hq: int,
     hk: int,
     d: int,
     total_programs: int,
-    init_dtype: Union[torch.dtype, str],
+    init_dtype: torch.dtype | str,
 ):
     assert batch == len(n_ctx)
     try:

@@ -16,7 +16,6 @@ import triton.language as tl
 
 from dataclasses import dataclass
 from aiter.ops.flydsl.utils import is_flydsl_available
-from typing import Optional
 
 if not torch.cuda.is_available():
     pytest.skip("ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -263,9 +262,9 @@ def fused_sigmoid_gating_delta_rule_update(
     b: torch.Tensor,
     initial_state_source: torch.Tensor,
     initial_state_indices: torch.Tensor,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     use_qk_l2norm_in_kernel: bool = True,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
     is_kda: bool = False,
 ):
     """

@@ -22,7 +22,7 @@ convenient for use when we just need to call a few functions.
 
 import ctypes
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # this line makes it possible to directly load `libcudart.so` using `ctypes`
 import torch  # noqa
@@ -47,10 +47,10 @@ class cudaIpcMemHandle_t(ctypes.Structure):
 class Function:
     name: str
     restype: Any
-    argtypes: List[Any]
+    argtypes: list[Any]
 
 
-def find_loaded_library(lib_name) -> Optional[str]:
+def find_loaded_library(lib_name) -> str | None:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
     the file `/proc/self/maps` contains the memory maps of the process, which includes the
@@ -121,13 +121,13 @@ class CudaRTLibrary:
 
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
-    path_to_library_cache: Dict[str, Any] = {}
+    path_to_library_cache: dict[str, Any] = {}
 
     # class attribute to store the mapping from library path
     #  to the corresponding dictionary
-    path_to_dict_mapping: Dict[str, Dict[str, Any]] = {}
+    path_to_dict_mapping: dict[str, dict[str, Any]] = {}
 
-    def __init__(self, so_file: Optional[str] = None):
+    def __init__(self, so_file: str | None = None):
         if so_file is None:
             so_file = find_loaded_library("libcudart")
             assert so_file is not None, "libcudart is not loaded in the current process"

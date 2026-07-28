@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Tuple
 
 import torch
 import triton
@@ -117,14 +116,14 @@ def _fused_rmsnorm(
 
 def _fused_rmsnorm_add_fake(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.empty_like(x), torch.empty_like(x)
 
 
 @torch_compile_guard(gen_fake=_fused_rmsnorm_add_fake)
 def _fused_rmsnorm_add(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, res1: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     out1, out_res1 = _fused_rmsnorm_add_core(x, weight, epsilon, res1)
     return out1, out_res1
 

@@ -23,7 +23,6 @@
 import os
 import math
 from functools import lru_cache
-from typing import Optional
 
 import torch
 import triton
@@ -191,7 +190,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     max_model_len: int,
     ChunkQ: int = 64,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
 ):
     if TotalCuCount is None:
@@ -418,7 +417,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     context_lens: torch.Tensor,
     max_model_len: int,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
 ):
     if TotalCuCount is None:
@@ -460,7 +459,7 @@ def deepgemm_fp8_paged_mqa_logits(
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
 ):

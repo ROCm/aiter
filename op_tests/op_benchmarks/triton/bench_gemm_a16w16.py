@@ -18,7 +18,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
     get_caller_name_no_ext,
 )
-from typing import Optional
 
 
 def bench_gemm_fn(
@@ -29,7 +28,7 @@ def bench_gemm_fn(
     layout: str,
     backend: str,
     atomic: bool = False,
-    activation: Optional[str] = None,
+    activation: str | None = None,
     cudagraph: bool = False,
     **kwargs,
 ):

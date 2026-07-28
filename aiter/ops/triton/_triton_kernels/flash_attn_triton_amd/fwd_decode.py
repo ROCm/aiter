@@ -2,7 +2,7 @@ import warnings
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
+from typing import Literal
 from .common import apply_rotary
 from .utils import (
     DEBUG,
@@ -949,27 +949,27 @@ def attention_forward_decode_triton_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k_new: Optional[torch.Tensor],
-    v_new: Optional[torch.Tensor],
+    k_new: torch.Tensor | None,
+    v_new: torch.Tensor | None,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
     sm_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     layout: Literal["bshd"],
-    cache_seqlens: Optional[torch.Tensor],
-    cache_batch_idx: Optional[torch.Tensor],
-    block_table: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    cache_seqlens: torch.Tensor | None,
+    cache_batch_idx: torch.Tensor | None,
+    block_table: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
+    seqlens_rotary: torch.Tensor | None = None,
 ):
     # Validate layout at entry
     if layout != "bshd":

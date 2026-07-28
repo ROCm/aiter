@@ -1,6 +1,5 @@
 import importlib
 import inspect
-from typing import Optional
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -10,8 +9,8 @@ def gemm_tune_check(
     func: callable,
     N: int,
     K: int,
-    M: Optional[int] = None,
-    shuffle: Optional[bool] = None,
+    M: int | None = None,
+    shuffle: bool | None = None,
 ):
     """
     This function returns if a AITER Triton GEMM is tunned for a specific shape

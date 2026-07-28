@@ -18,7 +18,6 @@
 import os
 import pickle
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -435,7 +434,7 @@ class IPCBufferPool:
         self._group = group
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
-        self._buffers: Dict[str, IPCBuffer] = {}
+        self._buffers: dict[str, IPCBuffer] = {}
         self._ipc_handle_fn = ipc_handle_fn or ops.get_meta_buffer_ipc_handle
         self._graph_count_fn = graph_count_fn or ops.get_graph_buffer_count
         self._graph_ipc_meta_fn = graph_ipc_meta_fn or ops.get_graph_buffer_ipc_meta
@@ -496,14 +495,14 @@ class IPCBufferPool:
 
     # ---- Eager mode: named buffer IPC meta ----
 
-    def get_ipc_meta(self, key: str) -> Tuple[List, List]:
+    def get_ipc_meta(self, key: str) -> tuple[list, list]:
         """Broadcast IPC handles for the named buffer across all ranks."""
         buf = self._buffers[key]
         return self._broadcast_ipc(buf.data_ptr)
 
     # ---- Graph mode: external buffer IPC meta ----
 
-    def get_external_ipc_meta(self, tensor: torch.Tensor) -> Tuple[List, List]:
+    def get_external_ipc_meta(self, tensor: torch.Tensor) -> tuple[list, list]:
         """Broadcast IPC handles for an arbitrary external tensor."""
         return self._broadcast_ipc(tensor.data_ptr())
 
@@ -531,13 +530,13 @@ class IPCBufferPool:
 
     # ---- Private IPC primitives ----
 
-    def _broadcast_ipc(self, data_ptr: int) -> Tuple[List, List]:
+    def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
         handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 
-    def _gather_ipc_meta(self, shard_data) -> Tuple[List, List]:
+    def _gather_ipc_meta(self, shard_data) -> tuple[list, list]:
         """Exchange IPC metadata (handle + offset) across all ranks via TCP store.
 
         Each rank writes its serialised *shard_data* under a unique key, then
@@ -696,7 +695,7 @@ class CustomAllreduce:
     def __init__(
         self,
         group: ProcessGroup,
-        device: Union[int, str, torch.device],
+        device: int | str | torch.device,
         max_size=1024 * 1024 * 1024,  # 2GB bf16/half
         enable_register_for_capturing: bool = True,
     ) -> None:
@@ -1086,7 +1085,7 @@ class CustomAllreduce:
         self,
         inp: torch.Tensor,
         *,
-        out: Optional[torch.Tensor] = None,
+        out: torch.Tensor | None = None,
         use_new: bool = True,
         open_fp8_quant: bool = False,
         registered_input: bool = False,
@@ -1115,7 +1114,7 @@ class CustomAllreduce:
 
     def custom_all_reduce(
         self, input: torch.Tensor, use_new: bool = True, open_fp8_quant: bool = False
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1226,7 +1225,7 @@ class CustomAllreduce:
 
     def custom_reduce_scatter(
         self, input: torch.Tensor, output: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled or this shape/dim is unsupported,
         # this will be None and the caller is expected to fall back to an
         # external reduce_scatter implementation (NCCL / pynccl / torch.dist).
@@ -1328,9 +1327,7 @@ class CustomAllreduce:
         torch.int16: torch.float16,
     }
 
-    def custom_all_gather(
-        self, inp: torch.Tensor, dim: int = 0
-    ) -> Optional[torch.Tensor]:
+    def custom_all_gather(self, inp: torch.Tensor, dim: int = 0) -> torch.Tensor | None:
         orig_dtype = inp.dtype
         view_dtype = self._INT_TO_FP_VIEW.get(orig_dtype) or orig_dtype
 
@@ -1360,9 +1357,9 @@ class CustomAllreduce:
         inp: torch.Tensor,
         res_inp: torch.Tensor,
         *,
-        res_out: Optional[torch.Tensor] = None,
-        out: Optional[torch.Tensor] = None,
-        scale_out: Optional[torch.Tensor] = None,
+        res_out: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+        scale_out: torch.Tensor | None = None,
         w: torch.Tensor,
         eps: float,
         registered: bool = False,
@@ -1460,7 +1457,7 @@ class CustomAllreduce:
         use_1stage: bool,
         out_hidden_dim: int = 0,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # when custom allreduce is disabled, this will be None
         if self.disabled or not self.should_custom_ar(input):
             return None
@@ -1512,7 +1509,7 @@ class CustomAllreduce:
         out_hidden_dim: int = 0,
         prefill_support: bool = False,
         gemma_norm: bool = False,
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         # Let the C++ wrapper pack supported last-dim sliced views directly
         # into the registered IPC buffer so eager and graph paths both avoid
         # materializing an intermediate contiguous tensor in Python.

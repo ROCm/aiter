@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
@@ -30,13 +29,13 @@ def _is_gluon_available():
 def batched_gemm_bf16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    splitK: Optional[int] = None,
-    YQ: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    splitK: int | None = None,
+    YQ: torch.Tensor | None = None,
+    config: dict | None = None,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes batched 16 bit matrix multiplication Y[i] = X[i] @ W[i]^T with optional bias.

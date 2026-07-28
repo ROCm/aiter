@@ -2,7 +2,6 @@
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/test_flash_mla_decoding.py
 import random
 import dataclasses
-from typing import Optional, Tuple
 
 import torch
 import pytest
@@ -24,7 +23,7 @@ class Param:
     is_varlen: bool
     is_causal: bool
     is_fp8: bool
-    topk: Optional[int] = None
+    topk: int | None = None
     test_performance: bool = True
     is_all_indices_invalid: bool = False
     have_zero_seqlen_k: bool = False
@@ -38,13 +37,13 @@ class Param:
 
 def generate_test_data(
     t: Param,
-) -> Tuple[
+) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    Optional[torch.Tensor],
-    Optional[torch.Tensor],
+    torch.Tensor | None,
+    torch.Tensor | None,
 ]:
     """
     Generate test data from a given configuration
@@ -160,8 +159,8 @@ def reference_torch(
     dv: int,
     scale: float,
     is_causal: bool,
-    indices: Optional[torch.Tensor] = None,  # [batch_size, s_q, topk]
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    indices: torch.Tensor | None = None,  # [batch_size, s_q, topk]
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     A reference implementation in PyTorch
     """
@@ -181,8 +180,8 @@ def reference_torch(
         dv: int,
         scale: float,
         is_causal,
-        indices: Optional[torch.Tensor],  # [s_q, topk]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        indices: torch.Tensor | None,  # [s_q, topk]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         h_q = query.size(0)
         h_kv = kv.size(0)
         s_q = query.shape[-2]

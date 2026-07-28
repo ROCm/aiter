@@ -13,7 +13,6 @@ release to ease migration from the old aggregate entry.
 """
 
 import warnings
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -28,8 +27,8 @@ def deepgemm_ck(
     WQ: Tensor,
     Y: Tensor,
     group_layout: Tensor,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
 ) -> Tensor: ...
 
 
@@ -38,8 +37,8 @@ def deepgemm(
     WQ: Tensor,
     Y: Tensor,
     group_layout: Tensor,
-    x_scale: Optional[Tensor] = None,
-    w_scale: Optional[Tensor] = None,
+    x_scale: Tensor | None = None,
+    w_scale: Tensor | None = None,
 ):
     return deepgemm_ck(XQ, WQ, Y, group_layout, x_scale, w_scale)
 

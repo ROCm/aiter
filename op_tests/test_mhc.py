@@ -13,7 +13,6 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 import argparse
 import pandas as pd
-from typing import Optional
 
 try:
     from aiter.ops.mhc import mhc_fused_post_pre_large_m
@@ -371,7 +370,7 @@ def mhc_pre_ref(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     test_hc_head: bool = False,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
@@ -437,7 +436,7 @@ def mhc_pre_norm_split_hip(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     post_mix, res_mix, layer_input = aiter.mhc_pre(
@@ -730,7 +729,7 @@ def mhc_post_pre_ref(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unfused torch reference: mhc_post then mhc_pre."""

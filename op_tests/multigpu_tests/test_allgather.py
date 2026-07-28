@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -42,7 +41,7 @@ def run_allgather(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -101,7 +100,7 @@ def call_ccl_allgather_naive(
     x,
     use_custom=True,
     loop_time=1,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -137,7 +136,7 @@ def allgather_acctest(
     shape,
     dtype,
     use_custom=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -186,7 +185,7 @@ def allgather_perftest(
     withGraph=False,
     use_custom=False,
     dim=0,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     print(f"run perf test, use custom allgather {use_custom}")
     os.environ["MASTER_ADDR"] = "127.0.0.1"

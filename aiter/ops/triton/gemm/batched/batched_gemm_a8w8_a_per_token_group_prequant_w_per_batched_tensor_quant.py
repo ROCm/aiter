@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
@@ -15,13 +14,13 @@ def batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
     WQ: torch.Tensor,
     w_scale: torch.Tensor,
     group_size: int = 128,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    splitK: Optional[int] = None,
-    YQ: Optional[torch.Tensor] = None,
-    transpose_bm: Optional[bool] = False,
-    transpose_bm_in: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    splitK: int | None = None,
+    YQ: torch.Tensor | None = None,
+    transpose_bm: bool | None = False,
+    transpose_bm_in: bool | None = False,
+    config: dict | None = None,
 ):
     """
     Computes batched 8 bit matrix multiplication Y[i] = X[i] @ W[i]^T with active activation quantization.

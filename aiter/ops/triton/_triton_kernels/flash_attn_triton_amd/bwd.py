@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 import warnings
-from typing import Literal, Optional
+from typing import Literal
 from .utils import (
     DEBUG,
     AUTOTUNE,
@@ -4356,23 +4356,23 @@ def attention_backward_triton_impl(
     dv: torch.Tensor,
     delta: torch.Tensor,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
     layout: Literal["bshd", "bhsd", "thd"],
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    max_seqlen_q: int | None,
+    max_seqlen_k: int | None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
     dropout_p: float = 0.0,
-    philox_seed: Optional[int] = None,
-    philox_offset: Optional[int] = None,
+    philox_seed: int | None = None,
+    philox_offset: int | None = None,
     use_exp2: bool = True,
     mode: Literal["fused", "fused_atomic", "split"] = "fused",
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     window_size_left: int = -1,
     window_size_right: int = -1,
 ):

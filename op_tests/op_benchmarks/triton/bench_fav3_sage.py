@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Literal, Optional, Tuple, List, Dict, Any, Union
+from typing import Literal, Any
 import csv
 import json
 import torch
@@ -80,7 +80,7 @@ def layout_preprocess(
     return q, k, v
 
 
-def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
     """
     Load captured input tensors from disk.
 
@@ -105,8 +105,8 @@ def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
 
 
 def _mask_array_to_tensor(
-    mask_arr: List, device: torch.device
-) -> Tuple[torch.Tensor, int, int, int]:
+    mask_arr: list, device: torch.device
+) -> tuple[torch.Tensor, int, int, int]:
     """Convert a mask array (2D or 3D list) to tensor and infer BATCH, num_q_blocks, num_kv_blocks."""
     if not mask_arr:
         raise ValueError("mask array is empty")
@@ -135,13 +135,11 @@ def _array_ndim(arr) -> int:
 
 
 def load_block_mask_from_json(
-    path: Optional[str],
+    path: str | None,
     device: torch.device,
-) -> Union[
-    None,
-    Tuple[torch.Tensor, int, int, int],
-    List[Tuple[torch.Tensor, int, int, int]],
-]:
+) -> (
+    None | tuple[torch.Tensor, int, int, int] | list[tuple[torch.Tensor, int, int, int]]
+):
     """
     Load block mask(s) from a JSON file.
 
@@ -195,7 +193,7 @@ def make_block_attn_mask(
     N_CTX_Q: int,
     N_CTX_K: int,
     device: torch.device,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     """
     Build block_attn_mask for single-shape benchmark flow.
 
@@ -242,14 +240,14 @@ def make_block_attn_mask(
 
 
 def sparse_flops_from_lut(
-    block_lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     BATCH: int,
     N_CTX_Q: int,
     N_CTX_K: int,
     HQ: int,
     D_HEAD: int,
     D_HEAD_V: int,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     """Return (sparse_flops, total_flops_dense). Uses config BLOCK_M, BLOCK_N."""
     kv_block_indices, lut_start, lut_count = block_lut
     num_sparse_pairs = lut_count.sum().item()
@@ -294,7 +292,7 @@ def run_aiter_fp8_flash_attn(
     k: torch.Tensor,
     v: torch.Tensor,
     has_descale: bool = False,
-    scale: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
 ):
     scale = scale
     q, k, v, q_descale, k_descale, v_descale = fp8_quantize(q, k, v, scale=scale)
@@ -356,9 +354,9 @@ def fav3_fp8_forward_func(
     q: torch.Tensor,  # High precision (BF16/FP32)
     k: torch.Tensor,  # High precision (BF16/FP32)
     v: torch.Tensor,  # High precision (BF16/FP32)
-    softmax_scale: Optional[float],
+    softmax_scale: float | None,
     causal: bool,
-    window_size: Tuple[int, int],
+    window_size: tuple[int, int],
     attention_chunk: int,
     softcap: float,
     sm_margin: int,
@@ -446,7 +444,7 @@ def fav2_forward_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float,
-    softmax_scale: Optional[float],
+    softmax_scale: float | None,
     causal: bool,
     return_lse: bool,
     return_attn_probs: bool,
@@ -469,10 +467,10 @@ def fav3_sage_forward_func(
     v: torch.Tensor,
     causal: bool,
     layout: Literal["bshd", "bhsd"],
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     hadamard_rotation: bool = False,
-    R: Optional[torch.Tensor] = None,
-    BLOCK_R: Optional[int] = None,
+    R: torch.Tensor | None = None,
+    BLOCK_R: int | None = None,
 ):
     head_dim = q.shape[-1]
     softmax_scale = head_dim**-0.5
@@ -558,7 +556,7 @@ def create_benchmark_configs(args):
 
 def create_benchmark_configs_masks(
     args,
-    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+    masks_list: list[tuple[torch.Tensor, int, int, int]],
 ):
     """Create Benchmark configs for list-of-masks flow: one x_val per mask index."""
     dtype = arg_to_torch_dtype[args.dtype]
@@ -617,7 +615,7 @@ def create_benchmark_configs_masks(
     return configs
 
 
-def create_benchmark_configs_from_captured(inputs: List[Dict[str, Any]], args):
+def create_benchmark_configs_from_captured(inputs: list[dict[str, Any]], args):
     """
     Create triton.testing.Benchmark configurations from captured inputs.
 
@@ -755,8 +753,8 @@ def bench_kernel(
     v,
     args,
     provider,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-    block_attn_mask: Optional[torch.Tensor] = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    block_attn_mask: torch.Tensor | None = None,
 ):
     # Default softmax scale
     if args.layout == "bshd":
@@ -1198,7 +1196,7 @@ def run_benchmark_block_sparse_repetitions(args):
 
 def run_benchmark_masks_list(
     args,
-    masks_list: List[Tuple[torch.Tensor, int, int, int]],
+    masks_list: list[tuple[torch.Tensor, int, int, int]],
 ):
     """Run benchmark for each mask in the list; each mask defines (BATCH, N_CTX_Q, N_CTX_K) from its shape."""
     torch.manual_seed(20)

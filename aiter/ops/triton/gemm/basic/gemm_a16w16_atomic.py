@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16_atomic import (
@@ -18,9 +17,9 @@ _LOGGER = AiterTritonLogger()
 def gemm_a16w16_atomic_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
@@ -33,9 +32,9 @@ def gemm_a16w16_atomic_fake_tensor(
 def gemm_a16w16_atomic_(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T using atomic operations for split-K reduction.
@@ -111,9 +110,9 @@ def gemm_a16w16_atomic_(
 def gemm_a16w16_atomic(
     x: torch.Tensor,
     w: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16w16_atomic_(x, w, dtype, y, config_hashable)

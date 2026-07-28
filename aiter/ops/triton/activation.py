@@ -1,4 +1,4 @@
-from typing import Literal, Optional
+from typing import Literal
 import triton
 import torch
 import aiter
@@ -202,7 +202,7 @@ def act_mul_and_fp8_group_quant(
 
 def fused_silu_mul(
     x: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused SiLU-and-mul along the last dimension (same pattern as MoE silu-fused GEMM).

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
-from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -50,7 +49,7 @@ class _GroupedA8W4Config:
     m_warp: int
     n_warp: int
     num_buffers: int
-    waves_per_eu: Optional[int]
+    waves_per_eu: int | None
     out_dtype: str
     use_tdm_store: bool
     inst_prefetch: bool

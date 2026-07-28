@@ -1,6 +1,5 @@
 import torch
 import triton
-from typing import Optional
 from aiter.ops.triton._triton_kernels.fusions.fused_mul_add import _fused_mul_add_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -11,7 +10,7 @@ def fused_mul_add(
     x: torch.Tensor,
     a: torch.Tensor | float | int,
     b: torch.Tensor | float | int,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     """
     Computes elementwise multiplicated and addtion: out = x * a + b

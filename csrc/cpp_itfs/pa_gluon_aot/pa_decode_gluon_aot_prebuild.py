@@ -4,7 +4,6 @@
 import sys
 import argparse
 import random
-from typing import Optional, Tuple, Union, Dict
 import subprocess
 import multiprocessing
 import concurrent.futures
@@ -85,8 +84,8 @@ def run_gluon_kernel(
     exp_sums: torch.Tensor,
     max_logits: torch.Tensor,
     temporary_output: torch.Tensor,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    sinks: Optional[torch.Tensor] = None,
+    alibi_slopes: torch.Tensor | None = None,
+    sinks: torch.Tensor | None = None,
     use_aot_impl: bool = False,
 ) -> None:
     """Run Gluon FP8/BF16/FP16 kernel for paged attention.
@@ -147,7 +146,7 @@ def run_gluon_kernel(
 def run_pa_gluon_test(
     context_length: int,
     batch_size: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     compute_type: torch.dtype,
@@ -159,7 +158,7 @@ def run_pa_gluon_test(
     use_aot_impl: bool,
     quant_q: bool,
     quant_kv: bool,
-) -> Dict[str, Union[float, str]]:
+) -> dict[str, float | str]:
     """Test paged attention decode with gluon implementations."""
     results = {}
     data_type = compute_type

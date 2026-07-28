@@ -15,7 +15,6 @@ from op_tests.triton_tests.quant.test_quant_mxfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
-from typing import Optional
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -173,8 +172,8 @@ def ref_masked_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query_len = q.shape[0]
     kv_len = k.shape[0]
@@ -211,10 +210,10 @@ def torch_mla_extend(
     block_tables,
     qk_lora_rank,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
-    out_scale: Optional[torch.Tensor] = None,
-    o_dtype: Optional[torch.dtype] = torch.bfloat16,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
+    o_dtype: torch.dtype | None = torch.bfloat16,
 ):
     _, block_size, num_kv_heads, qk_head_dim = kv_buffer.shape
     num_seqs = cu_seqlens_q.shape[0] - 1

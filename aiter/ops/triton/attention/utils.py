@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
 import torch
 
 from aiter.ops.triton._triton_kernels.attention.block_lut import (
@@ -12,10 +11,10 @@ from aiter.ops.triton._triton_kernels.attention.block_lut import (
 
 def block_attn_mask_to_ragged_lut(
     block_attn_mask: torch.Tensor,
-    num_heads: Optional[int] = None,
+    num_heads: int | None = None,
     return_none_if_dense: bool = False,
     BLOCK_KB: int = 128,
-) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
     """
     Convert a dense block attention mask to a ragged look-up table of KV block
     indices per (batch, head, q_block). Used for block-sparse attention with no

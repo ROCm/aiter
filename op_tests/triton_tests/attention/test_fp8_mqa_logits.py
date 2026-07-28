@@ -1,7 +1,6 @@
 # tests are adapted from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py
 import torch
 import pytest
-from typing import Tuple
 from aiter.ops.triton.utils.types import get_fp8_dtypes
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 
@@ -23,8 +22,8 @@ def ceil_to_ue8m0(x: torch.Tensor):
 
 
 def per_custom_dims_cast_to_fp8(
-    x: torch.Tensor, dims: Tuple, use_ue8m0: bool
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    x: torch.Tensor, dims: tuple, use_ue8m0: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
     x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
     sf = x_amax / fp8_max

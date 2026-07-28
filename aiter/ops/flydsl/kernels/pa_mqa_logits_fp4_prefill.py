@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
 
 import torch
 import triton
@@ -677,10 +676,10 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    n_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Ragged-prefill FP4 paged MQA logits (gfx950)."""
     total_tokens, heads, head_dim_packed = q_fp4.shape

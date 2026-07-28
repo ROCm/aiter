@@ -3,7 +3,6 @@
 
 import torch
 import pytest
-from typing import Dict
 
 from aiter.ops.triton.moe.moe_op import (
     fused_moe as triton_moe,
@@ -292,7 +291,7 @@ def torch_e2e_moe(
     return c
 
 
-def get_default_config() -> Dict[str, int]:
+def get_default_config() -> dict[str, int]:
     config = {
         "BLOCK_SIZE_M": 64,
         "BLOCK_SIZE_N": 64,
@@ -302,7 +301,7 @@ def get_default_config() -> Dict[str, int]:
     return config
 
 
-def get_default_config_moe_e2e(persistent: bool) -> Dict[str, int]:
+def get_default_config_moe_e2e(persistent: bool) -> dict[str, int]:
     if persistent:
         return {
             "BLOCK_SIZE_M": 64,

@@ -11,7 +11,6 @@ from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
 import torch.nn.functional as F
-from typing import Union
 
 
 def is_gluon_supported():
@@ -23,7 +22,7 @@ def generate_batched_gemm_a16w16_inputs(
     M: int,
     N: int,
     K: int,
-    dtype: Union[torch.dtype, str],
+    dtype: torch.dtype | str,
     output: bool,
     layout: str = "TN",
 ):

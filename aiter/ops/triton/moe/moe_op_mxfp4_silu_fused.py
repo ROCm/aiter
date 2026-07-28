@@ -4,7 +4,7 @@
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Dict
+from typing import Any
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.moe.moe_op_mxfp4_silu_fused import (
     _fused_moe_kernel_mxfp4_silu,
@@ -32,7 +32,7 @@ def fused_moe_mxfp4_silu(
     top_k: int,
     swizzle_mx_a: bool,
     swizzle_mx_b: bool,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     compute_type: tl.dtype,
 ) -> None:
     """

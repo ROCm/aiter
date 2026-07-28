@@ -15,7 +15,8 @@ import time
 import traceback
 import types
 import typing
-from typing import Any, Callable, List, Optional
+from typing import Any, Optional
+from collections.abc import Callable
 
 from packaging.version import Version, parse
 
@@ -50,8 +51,8 @@ aiter_lib = None
 def mp_lock(
     lockPath: str,
     MainFunc: Callable,
-    FinalFunc: Optional[Callable] = None,
-    WaitFunc: Optional[Callable] = None,
+    FinalFunc: Callable | None = None,
+    WaitFunc: Callable | None = None,
 ):
     """
     Using FileBaton for multiprocessing.
@@ -1484,9 +1485,9 @@ def _ctypes_call(func, fc_name, md_name):
 
 def compile_ops(
     _md_name: str,
-    fc_name: Optional[str] = None,
-    gen_func: Optional[Callable[..., dict[str, Any]]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    fc_name: str | None = None,
+    gen_func: Callable[..., dict[str, Any]] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
     ffi_type: str = "pybind",
     develop: bool = False,
 ):
@@ -1619,7 +1620,7 @@ def compile_ops(
                         except Exception:
                             aiter_tensor_t = object
                         namespace = {
-                            "List": List,
+                            "List": list,
                             "Optional": Optional,
                             "torch": torch,
                             "typing": typing,
@@ -1702,7 +1703,7 @@ def compile_ops(
                                 return int
 
                             origin = typing.get_origin(hint)
-                            if origin in (list, List):
+                            if origin in (list, list):
                                 return (
                                     "list",
                                     tuple(

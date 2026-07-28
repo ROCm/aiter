@@ -4,7 +4,6 @@
 import os
 import torch
 import torch.distributed as dist
-from typing import Optional
 import argparse
 import pandas as pd
 from aiter import dtypes
@@ -35,7 +34,7 @@ def reduce_scatter(
     x,
     dim=0,
     use_custom=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     """Per-rank worker. Runs reduce_scatter on x with the given dim and
     returns (output, per-call latency in us)."""

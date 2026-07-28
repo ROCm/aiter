@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
@@ -22,11 +21,11 @@ def gemm_a16w8_blockscale(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    prequant: Optional[bool] = False,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    prequant: bool | None = False,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -153,11 +152,11 @@ def gemm_a16w8_blockscale_preshuffle(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    prequant: Optional[bool] = False,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    prequant: bool | None = False,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.

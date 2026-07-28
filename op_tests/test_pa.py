@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
-from typing import List, Optional, Tuple, Union
 import torch
 import aiter
 from aiter import dtypes
@@ -42,8 +41,8 @@ ck_naive_quant_algo = [
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -72,11 +71,11 @@ def kv_cache_factory(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -87,7 +86,7 @@ def kv_cache_factory(
 
     x = 16 // torch_dtype.itemsize
     k_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    k_caches: List[torch.Tensor] = []
+    k_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         k_cache = torch.empty(size=k_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -97,7 +96,7 @@ def kv_cache_factory(
         k_caches.append(k_cache)
 
     v_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    v_caches: List[torch.Tensor] = []
+    v_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         v_cache = torch.empty(size=v_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -144,7 +143,7 @@ def ref_masked_attention(
     nkvhead,
     k_scale=torch.Tensor,  # [1] or [nkvhead, 1, seq_lenth]
     v_scale=torch.Tensor,  # [1] or [nkvhead, 1, seq_lenth]
-    attn_mask: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
     dtype=None,
 ) -> torch.Tensor:
     p_scale = 1.0
@@ -182,7 +181,7 @@ def pertoken_quant_kvcache_symm(
     v_cache: torch.Tensor,
     quant_dtype: torch.dtype,  # e.g. dtypes.fp8
     scale_dtype: torch.dtype = dtypes.fp32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = k_cache.shape[0]
     num_heads = k_cache.shape[1]
     head_dim = v_cache.shape[2]
@@ -521,7 +520,7 @@ def dump_input(
     kv_cache_dtype: str,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
     out_golden,
@@ -587,7 +586,7 @@ def asm_V_shuffle(VC):
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     block_size: int,
@@ -626,7 +625,7 @@ def test_paged_attention(
         seq_lens = torch.tensor(seq_lens, dtype=torch.int)
 
         # Create the block tables.
-        block_tables_lst: List[List[int]] = []
+        block_tables_lst: list[list[int]] = []
         for _ in range(num_seqs):
             block_table = [
                 random.randint(0, num_blocks - 1) for _ in range(max_num_blocks_per_seq)

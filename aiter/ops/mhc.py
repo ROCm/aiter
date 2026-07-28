@@ -7,7 +7,6 @@ import torch
 import functools
 from aiter import dtypes
 from torch import Tensor
-from typing import Optional
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
@@ -294,7 +293,7 @@ def mhc_pre_fake(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -319,7 +318,7 @@ def mhc_pre(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
     is_fn_pack_bf16: int = 0,
@@ -435,7 +434,7 @@ def mhc_fused_post_pre_fake(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,
@@ -465,7 +464,7 @@ def mhc_fused_post_pre_large_m(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -529,7 +528,7 @@ def mhc_fused_post_pre(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,

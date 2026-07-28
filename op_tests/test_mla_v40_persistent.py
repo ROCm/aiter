@@ -27,7 +27,6 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Tuple, Union
 
 import pandas as pd
 import torch
@@ -79,7 +78,7 @@ V4_PACK_OFF_PAD = V4_DIM_NOPE + V4_DIM_SCALE_DUP  # 462
 # so the same DUMP_MLA_METADATA env switch works here too).
 # ---------------------------------------------------------------------------
 def dump_mla_metadata_v1_txt(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     *,
     batch: int,
     q_seq_len: int,
@@ -170,7 +169,7 @@ def cast_scale_inv_to_ue8m0_pow2(scales_inv: torch.Tensor) -> torch.Tensor:
 
 def quantize_v4_nope_bpad8(
     nope_fp32: torch.Tensor,  # [..., V4_DIM_NOPE]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Per-tile (64 elt) E8M0 quantization. Returns (nope_fp8, scale_e8m0,
     nope_dq_bf16):
@@ -208,7 +207,7 @@ def quantize_v4_nope_bpad8(
 
 def quantize_v4_q(
     q: torch.Tensor,  # [total_q, nhead, V4_DIM_QK]  bf16
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantize Q the same way the ASM kernel sees it: nope FP8 + bpad8 E8M0
     scales, rope kept BF16. Returns (q_nope_fp8, q_nope_scale_e8m0,
@@ -263,7 +262,7 @@ def pack_v4_nope_scale(
 
 def unpack_v4_nope_scale(
     packed: torch.Tensor,  # [..., 512]   FP8
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse of pack_v4_nope_scale; recovers (nope_fp8, scale_e8m0).
     Reads the *first* of each duplicated scale byte pair."""
     pb = packed.view(torch.uint8)
@@ -280,7 +279,7 @@ def unpack_v4_nope_scale(
 def init_v4_kv_cache(
     num_page: int,
     page_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build a paged KV cache from a single fp32 source. Returns both the
     "golden" pure-bf16 buffer (no fp8 anywhere) and the kernel-shaped
@@ -337,7 +336,7 @@ def ref_masked_attention_v4(
     is_causal: bool = True,
     causal_diagonal: int = None,
     attn_sink: torch.Tensor = None,  # optional [h_q] fp32 per-head sink logit
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     attn = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q, s_k = query.shape[0], key.shape[0]

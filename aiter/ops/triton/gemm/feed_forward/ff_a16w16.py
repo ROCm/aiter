@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
@@ -11,11 +10,11 @@ def ff_a16w16_nogate(
     x,
     w_up,
     w_down,
-    dtype: Optional[float] = torch.bfloat16,
-    intermediate: Optional[torch.Tensor] = None,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
+    dtype: float | None = torch.bfloat16,
+    intermediate: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
 ):
     """
     Full feed-forward block with gating (e.g swiglu).
@@ -61,11 +60,11 @@ def ff_a16w16_gated(
     x,
     w_up,
     w_down,
-    dtype: Optional[float] = torch.bfloat16,
-    intermediate: Optional[torch.Tensor] = None,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
+    dtype: float | None = torch.bfloat16,
+    intermediate: torch.Tensor | None = None,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
 ):
     """
     Full feed-forward block with gating (e.g swiglu).

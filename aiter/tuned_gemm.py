@@ -17,7 +17,6 @@
 
 import functools
 import os
-from typing import Optional
 
 import aiter
 import pandas as pd
@@ -183,7 +182,7 @@ def is_skinny_default_shape(
     N: int,
     K: int,
     dtype,
-    cu_num: Optional[int] = None,
+    cu_num: int | None = None,
 ):
     if isinstance(dtype, str):
         dtype = eval(dtype)
@@ -334,11 +333,11 @@ def save_shapes(
 def gen_gemm_a16w16_fake_tensor(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
@@ -352,11 +351,11 @@ def gen_gemm_a16w16_fake_tensor(
 def gemm_a16w16(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
 ) -> Tensor:
     bpreshuffle = False
     if hasattr(B, "is_shuffled") and B.is_shuffled is True:
@@ -420,13 +419,13 @@ def skinny_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     import aiter as ops
 
@@ -455,13 +454,13 @@ def hipb_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     if otype is None:
         otype = inp.dtype
@@ -478,13 +477,13 @@ def torch_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     assert not bpreshuffle, "bpreshuffle is not supported in torch_gemm!"
     if inp.dtype == dtypes.fp8:
@@ -517,13 +516,13 @@ def asm_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     kernelName = config.get("kernelName") if config else None
     splitK = config.get("splitK") if config else None
@@ -537,13 +536,13 @@ def flydsl_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
     bpreshuffle=False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     assert (
         scale_a is None and scale_b is None and scale_c is None
@@ -593,13 +592,13 @@ def opus_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
 ):
     if _opus_tune is None:
         logger.warning(
@@ -650,13 +649,13 @@ def triton_gemm(
     inp: Tensor,
     weights: Tensor,
     solidx: int,
-    bias: Optional[Tensor] = None,
-    otype: Optional[torch.dtype] = None,
-    scale_a: Optional[Tensor] = None,
-    scale_b: Optional[Tensor] = None,
-    scale_c: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = False,
-    config: Optional[dict] = None,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
 ):
     from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
@@ -706,11 +705,11 @@ class TunedGemm:
         self,
         inp: Tensor,
         weights: Tensor,
-        bias: Optional[Tensor] = None,
-        otype: Optional[torch.dtype] = None,
-        scale_a: Optional[Tensor] = None,
-        scale_b: Optional[Tensor] = None,
-        scale_c: Optional[Tensor] = None,
+        bias: Tensor | None = None,
+        otype: torch.dtype | None = None,
+        scale_a: Tensor | None = None,
+        scale_b: Tensor | None = None,
+        scale_c: Tensor | None = None,
     ):
 
         out = gemm_a16w16(

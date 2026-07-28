@@ -3,7 +3,6 @@
 
 import torch
 from torch import Tensor
-from typing import Optional
 import functools
 import pandas as pd
 from ..jit.core import (
@@ -22,7 +21,7 @@ def gen_batched_gemm_a8w8_fake_tensors(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = 0,
 ) -> Tensor:
     return out
@@ -39,7 +38,7 @@ def batched_gemm_a8w8(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = 0,
 ) -> Tensor: ...
 
@@ -121,9 +120,9 @@ def batched_gemm_a8w8_CK(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype=dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ):
     assert dtype in [
         dtypes.bf16,

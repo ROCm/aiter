@@ -40,7 +40,6 @@ module when that lands.
 """
 
 import logging
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -57,7 +56,7 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -80,7 +79,7 @@ def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -253,10 +252,10 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return Y
 
@@ -271,10 +270,10 @@ def _opus_gemm_bf16_dispatch(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -449,12 +448,12 @@ def _finalize_output(Y: Tensor, reshape_out_to_2d: bool) -> Tensor:
 def gemm_a16w16_opus(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     *,
-    kernelId: Optional[int] = None,
-    splitK: Optional[int] = None,
-    out: Optional[Tensor] = None,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
 ) -> Tensor:
     """Shape-driven opus a16w16 GEMM.
 

@@ -2,7 +2,7 @@ import warnings
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
+from typing import Literal
 from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
     AUTOTUNE,
@@ -1447,38 +1447,38 @@ def attention_forward_prefill_triton_impl(
     v: torch.Tensor,
     o: torch.Tensor,
     softmax_lse: torch.Tensor,
-    sd_mask: Optional[torch.Tensor],
+    sd_mask: torch.Tensor | None,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     layout: Literal["bshd", "bhsd", "thd"],
     # varlen
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlens_q: int,
     max_seqlens_k: int,
     # dropout
     dropout_p: float,
-    philox_seed: Optional[int],
-    philox_offset: Optional[int],
+    philox_seed: int | None,
+    philox_offset: int | None,
     # misc
     return_scores: bool,
     use_exp2: bool,
     # fp8
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     # seqused for FA v3
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
     # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
+    seqlens_rotary: torch.Tensor | None = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"

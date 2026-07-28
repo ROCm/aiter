@@ -4,7 +4,8 @@ from packaging import version
 from packaging.version import Version
 import importlib
 import types
-from typing import Any, Callable, Optional, Union, List, get_args, get_origin
+from typing import Any, Optional, Union, get_args, get_origin
+from collections.abc import Callable
 
 aiter_lib = None
 
@@ -90,7 +91,7 @@ NONE_WRAPPED_OP = [
 ]
 
 
-def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> str:
+def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
     import inspect
 
     import torch
@@ -132,14 +133,14 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
         elif param_type == Optional[torch.Generator]:
             type_str = "Generator?"
         elif (
-            get_origin(param_type) in (list, List)
+            get_origin(param_type) in (list, list)
             and get_args(param_type)[0] is torch.Tensor
         ):
             if is_mutates:
                 type_str = f"Tensor(a{idx}!)[]"
             else:
                 type_str = "Tensor[]"
-        elif get_origin(param_type) in (list, List) and get_args(param_type)[0] is int:
+        elif get_origin(param_type) in (list, list) and get_args(param_type)[0] is int:
             type_str = "int[]"
         elif param_type == Optional[torch.dtype]:
             type_str = "ScalarType?"
@@ -201,10 +202,10 @@ def generate_schema(func, mutates_args: Union[list[str], str] = "unknown") -> st
 
 
 def torch_compile_guard(
-    mutates_args: Union[list[str], str] = "unknown",
+    mutates_args: list[str] | str = "unknown",
     device: str = "cpu",
-    calling_func_: Optional[Callable[..., Any]] = None,
-    gen_fake: Optional[Callable[..., Any]] = None,
+    calling_func_: Callable[..., Any] | None = None,
+    gen_fake: Callable[..., Any] | None = None,
 ):
     def decorator(func):
         # In core.py, we calling wrapper, but actually we need use aiter.op func

@@ -7,7 +7,6 @@ import aiter
 from aiter.test_common import checkAllclose, perftest, benchmark
 from aiter import per_tensor_quant
 from aiter.utility import dtypes
-from typing import List
 import argparse
 import triton
 import triton.language as tl
@@ -184,7 +183,7 @@ def run_torch_mrope_3d_rms_set_kv_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section: List[int],
+    mrope_section: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,
@@ -330,7 +329,7 @@ def run_fused_mrope_3d_rms_set_kv_shuffle(
     num_heads_v: int,
     head_size: int,
     is_neox_style: bool,
-    mrope_section: List[int],
+    mrope_section: list[int],
     is_interleaved: bool,
     eps: float,
     q_out: Tensor,

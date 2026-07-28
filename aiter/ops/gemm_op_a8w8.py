@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -64,7 +63,7 @@ def gen_gemm_a8w8_ck_fake_tensors(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor:
     return Out
@@ -79,7 +78,7 @@ def gemm_a8w8_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
     splitK: int = 0,
 ) -> torch.Tensor: ...
 
@@ -232,8 +231,8 @@ def _gemm_a8w8_asm(
     x_scale: Tensor,  # A_scale:[M, 1] f32
     w_scale: Tensor,  # B_scale:[1, N] f32
     Out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    kernelName: str | None = None,
+    bias: Tensor | None = None,  # bias:[1, N] f32
     bpreshuffle: bool = True,
     splitK: int = -1,
 ) -> None: ...
@@ -246,9 +245,9 @@ def gemm_a8w8_asm(
     w_scale: Tensor,
     Out: Tensor,
     kernelName: str = "",
-    bias: Optional[Tensor] = None,
-    bpreshuffle: Optional[bool] = True,
-    splitK: Optional[int] = None,
+    bias: Tensor | None = None,
+    bpreshuffle: bool | None = True,
+    splitK: int | None = None,
 ) -> Tensor:
     _gemm_a8w8_asm(
         XQ,
@@ -372,11 +371,11 @@ def _gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = -1,
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     bpreshuffle: int = 1,
-    zero_bias_buf: Optional[Tensor] = None,
+    zero_bias_buf: Tensor | None = None,
 ) -> None: ...
 
 
@@ -399,11 +398,11 @@ def gemm_a8w8_blockscale_bpreshuffle_asm(
     out: Tensor,
     A_scale: Tensor,
     B_scale: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
-    bpreshuffle: Optional[bool] = True,
-    zero_bias_buf: Optional[Tensor] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
+    bpreshuffle: bool | None = True,
+    zero_bias_buf: Tensor | None = None,
 ) -> Tensor:
     if bias is None and zero_bias_buf is None:
         zero_bias_buf = get_zero_bias_buf(B)
@@ -550,9 +549,9 @@ def gemm_a8w8_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
@@ -563,9 +562,9 @@ def gemm_a8w8(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -640,9 +639,9 @@ def gemm_a8w8_CK(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ) -> Tensor:
     # assert dtype in [
     #     dtypes.bf16,
@@ -676,7 +675,7 @@ def gemm_a8w8_bpreshuffle_fake(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -689,7 +688,7 @@ def gemm_a8w8_bpreshuffle(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
@@ -1221,7 +1220,7 @@ def _mxfp8_mxfp8_gemm_asm(
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 

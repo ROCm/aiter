@@ -18,7 +18,7 @@ from torch import Tensor
 import triton
 import triton.language as tl
 import logging
-from typing import Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 # Import shared implementations
 from aiter.ops.triton.comms.reduce_scatter import _reduce_scatter_impl
@@ -231,11 +231,11 @@ def reduce_scatter_rmsnorm_quant_all_gather(
     quant_mode: str = "none",
     do_allgather: bool = True,
     # Pre-allocated buffers (optional, for reuse across iterations)
-    rs_buffer: Optional[Tensor] = None,
-    norm_buffer: Optional[Tensor] = None,
-    fp8_out: Optional[Tensor] = None,
-    gather_out: Optional[Tensor] = None,
-) -> tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    rs_buffer: Tensor | None = None,
+    norm_buffer: Tensor | None = None,
+    fp8_out: Tensor | None = None,
+    gather_out: Tensor | None = None,
+) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
     """
     Fused reduce-scatter + RMSNorm + quantization + all-gather operation.
 

@@ -1,5 +1,4 @@
 from functools import cache
-from typing import Optional
 import torch
 import triton
 import aiter
@@ -590,10 +589,10 @@ def fused_flatten_fp8_group_quant(
 def fused_reduce_act_mul_fp8_group_quant(
     x: torch.Tensor,
     activation: str = "silu",
-    x2: Optional[torch.Tensor] = None,
+    x2: torch.Tensor | None = None,
     group_size=128,
     dtype_quant=fp8_dtype,
-    dtype: Optional[float] = torch.bfloat16,
+    dtype: float | None = torch.bfloat16,
 ):
     """
     Apply reduction along the first dimension and apply the activation function + per-token group quantization.

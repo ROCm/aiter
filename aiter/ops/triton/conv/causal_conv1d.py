@@ -6,7 +6,6 @@ from aiter.ops.triton._triton_kernels.conv.causal_conv1d import (
     PAD_SLOT_ID,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from typing import List, Optional, Union
 
 _LOGGER = AiterTritonLogger()
 
@@ -14,13 +13,13 @@ _LOGGER = AiterTritonLogger()
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
-    bias: Union[torch.Tensor, None],
+    bias: torch.Tensor | None,
     conv_states: torch.Tensor,
     query_start_loc: torch.Tensor,
-    seq_lens_cpu: List[int],
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = "silu",
+    seq_lens_cpu: list[int],
+    cache_indices: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    activation: str | None = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
     **kwargs,
@@ -192,12 +191,12 @@ def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
     weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation: Union[bool, str, None] = None,
-    cache_seqlens: Optional[torch.Tensor] = None,
-    conv_state_indices: Optional[torch.Tensor] = None,
-    num_accepted_tokens: Optional[torch.Tensor] = None,
-    intermediate_conv_window: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    activation: bool | str | None = None,
+    cache_seqlens: torch.Tensor | None = None,
+    conv_state_indices: torch.Tensor | None = None,
+    num_accepted_tokens: torch.Tensor | None = None,
+    intermediate_conv_window: torch.Tensor | None = None,
     pad_slot_id: int = PAD_SLOT_ID,
     metadata=None,
     validate_data=False,

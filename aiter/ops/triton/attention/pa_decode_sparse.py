@@ -10,8 +10,6 @@ This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 where each token's K range is an unordered subset of a unified KV pool.
 """
 
-from typing import Optional
-
 import torch
 import triton
 
@@ -42,12 +40,12 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,
-    block_h: Optional[int] = None,
-    kv_splits: Optional[int] = None,
-    has_invalid: Optional[bool] = True,
-    skip_reduce: Optional[bool] = False,
-    USE_EXP2: Optional[bool] = None,
+    kv_scales: torch.Tensor | None = None,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool | None = True,
+    skip_reduce: bool | None = False,
+    USE_EXP2: bool | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 

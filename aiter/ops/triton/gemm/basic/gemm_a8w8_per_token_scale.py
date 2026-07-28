@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_per_token_scale import (
@@ -18,8 +17,8 @@ def gemm_a8w8_per_token_scale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
     config=None,
 ):
     """

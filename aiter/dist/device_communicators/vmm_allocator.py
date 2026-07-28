@@ -15,9 +15,6 @@ import socket
 import struct
 import array
 import threading
-from typing import List
-
-from aiter import logger
 
 
 def load_hip_runtime() -> ctypes.CDLL:
@@ -155,7 +152,7 @@ class VMMBuffer:
 
         self._set_access([device_id])
 
-    def _set_access(self, device_ids: List[int]):
+    def _set_access(self, device_ids: list[int]):
         for dev in device_ids:
             desc = _hipMemAccessDesc(_DEVICE, dev, _READ_WRITE)
             _check(
@@ -187,7 +184,7 @@ class VMMBuffer:
         fd: int,
         alloc_size: int,
         local_device_id: int,
-        access_device_ids: List[int],
+        access_device_ids: list[int],
     ) -> "VMMBuffer":
         obj = object.__new__(cls)
         obj._device_id = local_device_id
@@ -289,8 +286,8 @@ def vmm_exchange(
     local_buf: VMMBuffer,
     store,
     ranks_tag: str,
-    all_device_ids: List[int],
-) -> List[int]:
+    all_device_ids: list[int],
+) -> list[int]:
     """Exchange a VMMBuffer across all ranks and return device pointers.
 
     Each rank exports its buffer as an fd, sends it to every other rank via
