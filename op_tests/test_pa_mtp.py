@@ -9,7 +9,7 @@ import pandas as pd
 import torch
 
 import aiter
-from aiter import dtypes, pertoken_quant
+from aiter import dtypes, paged_attn, pertoken_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 torch.set_default_device("cuda")
@@ -269,7 +269,7 @@ def run_aiter_hip(
     q_scale=None,
     output_dtype=dtypes.bf16,
 ):
-    return aiter.paged_attn.PagedAttention.forward_decode(
+    return paged_attn.PagedAttention.forward_decode(
         query,
         k_cache,
         v_cache,
