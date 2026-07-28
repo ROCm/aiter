@@ -23,6 +23,9 @@ torch.set_default_device("cuda")
 
 F32_MIN_NORMAL = 2.0 ** (-126)
 
+# E8M0 stores a biased exponent, so the encoding of 2^0 is the bias itself.
+E8M0_ONE = 0x7F
+
 
 def _finalize_scale(scaled: torch.Tensor, zero_mask: torch.Tensor) -> torch.Tensor:
     """Common tail: pow2-quantize a fp32 tensor to E8M0-representable range."""
@@ -324,9 +327,17 @@ def test_gui_shuffle_scale_w2_k_pad(inter_tp, float_dtype):
     out_auto = shuffle_scale_a16w4(s2d, E, False)
     assert out_auto.shape == (E * hidden_tp, k_groups_padded)
 
+    # The k-groups added by padding describe weights that are not there, so
+    # their scale has to be neutral -- 2^0. In e8m0 that is the bias itself,
+    # 0x7F; zero would mean 2^-127. Pre-pad by hand with the neutral value and
+    # the result has to match what shuffle_scale pads internally.
     k_ = s2d.shape[1]
     k_padded = (k_ + 7) // 8 * 8
-    pre = torch.zeros(s2d.shape[0], k_padded, dtype=s2d.dtype, device=s2d.device)
+    pre = torch.empty(s2d.shape[0], k_padded, dtype=s2d.dtype, device=s2d.device)
+    if pre.element_size() == 1:
+        pre.view(torch.uint8).fill_(E8M0_ONE)
+    else:
+        pre.fill_(1)
     pre[:, :k_] = s2d
     out_explicit = shuffle_scale(
         pre, experts_cnt=E, is_guinterleave=True, gate_up=False
