@@ -40,9 +40,9 @@ from flydsl.expr.vector import full
 # both as an aiter package submodule (production: ``aiter.ops.flydsl.kernels``)
 # and as a bare sibling.
 try:
-    from . import jagged_dense_bmm as _fwd  # package-relative (aiter import path)
+    from . import jagged_dense_bmm_gen as _fwd  # package-relative (aiter import path)
 except ImportError:  # bare sibling import (kernels dir on sys.path[0])
-    import jagged_dense_bmm as _fwd
+    import jagged_dense_bmm_gen as _fwd
 
 BLOCK_K = _fwd.BLOCK_K
 BLOCK_M = _fwd.BLOCK_M
@@ -722,8 +722,12 @@ GJ_STAGES_A_default = GJ_STAGES_A
 # configure_dim + grad_jagged / grad_dense_bias and read SPLIT) working        #
 # unchanged. Single-D: configure_dim rebinds the active build.                 #
 # =========================================================================== #
-K = _fwd.K
-N = _fwd.N
+# The gen forward (jagged_dense_bmm_gen) is parametrized per-call and exposes no
+# module-level K/N/N_BLOCKS. Seed the single-D
+# facade with a default D matching that forward's old K=N default; configure_dim(D)
+# rebinds it. The production dispatch path bypasses this facade entirely.
+K = getattr(_fwd, "K", BLOCK_N)
+N = getattr(_fwd, "N", BLOCK_N)
 SPLIT = _split_for(K)
 _active: "Backward | None" = None
 
@@ -739,9 +743,12 @@ def configure_dim(D):
     _active = build_backward(D, split=None, gj_stages_a=GJ_STAGES_A, coarsen_m=COARSEN_M)
     K = N = D
     SPLIT = _active.split
-    # Keep the (non-gen) forward module's K/N in sync for any legacy co-launch.
-    _fwd.K = _fwd.N = D
-    _fwd.N_BLOCKS = D // BLOCK_N
+    # Keep a non-gen forward module's K/N in sync for any legacy co-launch.
+    # The gen forward is parametrized per-call and has no such globals, so only
+    # sync when they already exist.
+    if hasattr(_fwd, "K"):
+        _fwd.K = _fwd.N = D
+        _fwd.N_BLOCKS = D // BLOCK_N
     return D
 
 

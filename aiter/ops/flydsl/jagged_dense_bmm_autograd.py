@@ -36,7 +36,7 @@ from typing import Optional
 import torch
 
 from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
-from .jagged_dense_bmm_dispatch_v2 import jagged_dense_bmm_dispatched
+from .jagged_dense_bmm_dispatch import jagged_dense_bmm_dispatched
 from .kernels.jagged_dense_bmm_gen import BLOCK_M as _FWD_BLOCK_M
 
 __all__ = ["jagged_dense_bmm_autograd"]
