@@ -212,8 +212,8 @@ def run_case(
         checkAllclose(
             fly_output.float(),
             hip_output.float(),
-            rtol=1e-2,
-            atol=1e-2,
+            rtol=0.0,
+            atol=0.0,
             msg=f"{name} vs reference",
         )
 
