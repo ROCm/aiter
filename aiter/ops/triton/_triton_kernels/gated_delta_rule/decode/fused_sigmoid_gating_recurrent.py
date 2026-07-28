@@ -59,6 +59,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     o,
     h0_source,
     h0_indices,
+    stride_h0_n,
+    stride_h0_hv,
+    stride_h0_k,
+    stride_h0_v,
     cu_seqlens,
     scale,
     T,
@@ -115,10 +119,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + idx * stride_h0_n
+                + i_hv * stride_h0_hv
+                + o_k[:, None] * stride_h0_k
+                + o_v[None, :] * stride_h0_v
             )
             b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
@@ -186,10 +190,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         if idx >= 0:
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
-                + i_hv * K * V
-                + o_k[:, None] * V
-                + o_v[None, :]
+                + idx * stride_h0_n
+                + i_hv * stride_h0_hv
+                + o_k[:, None] * stride_h0_k
+                + o_v[None, :] * stride_h0_v
             )
             tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
 
@@ -210,11 +214,21 @@ def fused_sigmoid_gating_delta_rule_update(
     scale: Optional[float] = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: Optional[torch.Tensor] = None,
+    state_layout: str = "hkv",
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
     This function uses a single fused kernel that combines both sigmoid gating computation
     and the recurrent delta rule update for better performance.
+
+    Args:
+        state_layout: memory layout of the last two dims of ``initial_state_source``.
+            - ``"hkv"`` (default): ``[N, HV, K, V]`` (K-major) -- the historical
+              aiter layout. Byte-identical to the previous hardcoded arithmetic.
+            - ``"hvk"``: ``[N, HV, V, K]`` (V-major). Lets callers whose recurrent
+              state pool is V-major (e.g. SGLang's ``MambaPool``, allocated as
+              ``[num_slots, HV, V, K]``) pass their state tensor directly, with no
+              transpose-copy. The kernel reads/writes it in place via ``h0_indices``.
     """
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -222,6 +236,18 @@ def fused_sigmoid_gating_delta_rule_update(
     BK = triton.next_power_of_2(K)
     NK = triton.cdiv(K, BK)
     assert NK == 1, "NK > 1 is not supported yet"
+
+    # Strides of the recurrent-state pool for the (slot, head, K, V) axes.
+    # Default "hkv" reproduces the historical hardcoded [N, HV, K, V] arithmetic
+    # exactly; "hvk" supports a V-major [N, HV, V, K] pool with no transpose-copy.
+    if state_layout == "hkv":
+        stride_h0_n, stride_h0_hv, stride_h0_k, stride_h0_v = HV * K * V, K * V, V, 1
+    elif state_layout == "hvk":
+        stride_h0_n, stride_h0_hv, stride_h0_k, stride_h0_v = HV * V * K, V * K, 1, K
+    else:
+        raise ValueError(
+            f"Unknown state_layout {state_layout!r}, expected 'hkv' or 'hvk'"
+        )
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -246,6 +272,10 @@ def fused_sigmoid_gating_delta_rule_update(
         o=o,
         h0_source=initial_state_source,
         h0_indices=initial_state_indices,
+        stride_h0_n=stride_h0_n,
+        stride_h0_hv=stride_h0_hv,
+        stride_h0_k=stride_h0_k,
+        stride_h0_v=stride_h0_v,
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
