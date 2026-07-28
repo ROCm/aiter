@@ -235,7 +235,7 @@ def _memory_worker_cap(default_workers: int) -> int:
         import psutil
 
         avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return default_workers
     return min(default_workers, max(1, int(avail_gb / per_gb)))
 
@@ -330,7 +330,7 @@ def _run_file_pool(
             try:
                 with open(out_path) as f:
                     result = json.load(f)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 result = None
         if result is None:
             label = specs[idx][2]
@@ -375,7 +375,7 @@ def _run_file_pool(
             try:
                 if proc.is_alive():
                     proc.kill()
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
     if retries_used:

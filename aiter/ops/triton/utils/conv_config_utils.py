@@ -5,14 +5,13 @@ import copy
 import functools
 import json
 import os
-from typing import Optional, Tuple
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 USE_LRU_CACHE = True
 
-STANDARD_M_BOUNDS: Tuple[int, ...] = (
+STANDARD_M_BOUNDS: tuple[int, ...] = (
     4,
     8,
     16,
@@ -75,8 +74,8 @@ def _load_config_file(
 @functools.lru_cache(maxsize=512 if USE_LRU_CACHE else 0)
 def _get_conv_config_cached(
     config_name: str,
-    shape_key: Optional[str],
-    M: Optional[int],
+    shape_key: str | None,
+    M: int | None,
 ) -> dict:
     """Three-tier walk: literal shape entry -> M_LEQ bucket -> 'any'."""
     if not hasattr(_get_conv_config_cached, "_file_cache"):
@@ -120,8 +119,8 @@ def _get_conv_config_cached(
 
 def get_conv_config(
     config_name: str,
-    shape_key: Optional[str] = None,
-    M: Optional[int] = None,
+    shape_key: str | None = None,
+    M: int | None = None,
 ) -> dict:
     """Load a conv kernel config for the running GPU arch.
 
