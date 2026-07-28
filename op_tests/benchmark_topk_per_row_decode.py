@@ -541,7 +541,7 @@ def run_shape(
             (shape.num_rows, shape.k), dtype=torch.int32, device=device
         )
 
-        def invoke() -> None:
+        def invoke(kernel: Kernel = kernel, indices: torch.Tensor = indices) -> None:
             run_kernel(
                 kernel,
                 logits,
