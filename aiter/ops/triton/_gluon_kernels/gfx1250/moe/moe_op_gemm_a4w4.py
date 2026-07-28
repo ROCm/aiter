@@ -102,6 +102,48 @@ def unshuffle_weights_gfx1250(
     )
 
 
+@gluon.jit
+def l2_prefetch_tiles_gfx1250(
+    x_desc,
+    x_scales_desc,
+    w_desc,
+    w_scales_desc,
+    offs_x_m,
+    offs_w_n,
+    offs_w_n_scale,
+    pred,
+    GatherIndx,
+    K_STEP: gl.constexpr,
+    X_SCALES_TDM: gl.constexpr,
+):
+    if GatherIndx is None:
+        gl.amd.gfx1250.tdm.prefetch(
+            x_desc,
+            [offs_x_m, K_STEP * x_desc.block_shape[1]],
+            pred=pred,
+            speculative=True,
+        )
+        if X_SCALES_TDM:
+            gl.amd.gfx1250.tdm.prefetch(
+                x_scales_desc,
+                [offs_x_m, K_STEP * x_scales_desc.block_shape[1]],
+                pred=pred,
+                speculative=True,
+            )
+    gl.amd.gfx1250.tdm.prefetch(
+        w_desc,
+        [offs_w_n, K_STEP * w_desc.block_shape[1]],
+        pred=pred,
+        speculative=True,
+    )
+    gl.amd.gfx1250.tdm.prefetch(
+        w_scales_desc,
+        [offs_w_n_scale, K_STEP * w_scales_desc.block_shape[1]],
+        pred=pred,
+        speculative=True,
+    )
+
+
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a4w4_gfx1250(
     Y,
@@ -401,31 +443,18 @@ def _moe_gemm_a4w4_gfx1250(
     for i in gl.static_range(L2_PREFETCH_DISTANCE):
         pref_idx = NUM_BUFFERS + i
         pref_pred = pref_idx < num_k_iter
-        if GatherIndx is None:
-            gl.amd.gfx1250.tdm.prefetch(
-                x_desc,
-                [offs_x_m, pref_idx * PACKED_BLOCK_K_X],
-                pred=pref_pred,
-                speculative=True,
-            )
-            if X_SCALES_TDM:
-                gl.amd.gfx1250.tdm.prefetch(
-                    x_scales_desc,
-                    [offs_x_m, pref_idx * MX_SCALE_BLOCK_K],
-                    pred=pref_pred,
-                    speculative=True,
-                )
-        gl.amd.gfx1250.tdm.prefetch(
-            w_desc,
-            [offs_w_n, pref_idx * W_BLOCK_K],
+        l2_prefetch_tiles_gfx1250(
+            x_desc=x_desc,
+            x_scales_desc=x_scales_desc,
+            w_desc=w_desc,
+            w_scales_desc=w_scales_desc,
+            offs_x_m=offs_x_m,
+            offs_w_n=offs_w_n,
+            offs_w_n_scale=offs_w_n_scale,
             pred=pref_pred,
-            speculative=True,
-        )
-        gl.amd.gfx1250.tdm.prefetch(
-            w_scales_desc,
-            [offs_w_n_scale, pref_idx * PACKED_MX_BLOCK],
-            pred=pref_pred,
-            speculative=True,
+            GatherIndx=GatherIndx,
+            K_STEP=pref_idx,
+            X_SCALES_TDM=X_SCALES_TDM,
         )
 
     # prologue: fill NUM_BUFFERS LDS slots via TDM
@@ -488,7 +517,9 @@ def _moe_gemm_a4w4_gfx1250(
         )
         if X_SCALES_TDM:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                x_scales_desc, add_offsets=[0, MX_SCALE_BLOCK_K], clamp_bounds=CLAMP_BOUNDS
+                x_scales_desc,
+                add_offsets=[0, MX_SCALE_BLOCK_K],
+                clamp_bounds=CLAMP_BOUNDS,
             )
         w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_desc, add_offsets=[0, W_BLOCK_K], clamp_bounds=CLAMP_BOUNDS
@@ -611,7 +642,9 @@ def _moe_gemm_a4w4_gfx1250(
         )
         if X_SCALES_TDM:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                x_scales_desc, add_offsets=[0, MX_SCALE_BLOCK_K], clamp_bounds=CLAMP_BOUNDS
+                x_scales_desc,
+                add_offsets=[0, MX_SCALE_BLOCK_K],
+                clamp_bounds=CLAMP_BOUNDS,
             )
         w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_desc, add_offsets=[0, W_BLOCK_K], clamp_bounds=CLAMP_BOUNDS
@@ -625,31 +658,18 @@ def _moe_gemm_a4w4_gfx1250(
         if L2_PREFETCH_DISTANCE > 0:
             pref_idx = load_idx + L2_PREFETCH_DISTANCE - 1
             pref_pred = pref_idx < num_k_iter
-            if GatherIndx is None:
-                gl.amd.gfx1250.tdm.prefetch(
-                    x_desc,
-                    [offs_x_m, (L2_PREFETCH_DISTANCE - 1) * PACKED_BLOCK_K_X],
-                    pred=pref_pred,
-                    speculative=True,
-                )
-                if X_SCALES_TDM:
-                    gl.amd.gfx1250.tdm.prefetch(
-                        x_scales_desc,
-                        [offs_x_m, (L2_PREFETCH_DISTANCE - 1) * MX_SCALE_BLOCK_K],
-                        pred=pref_pred,
-                        speculative=True,
-                    )
-            gl.amd.gfx1250.tdm.prefetch(
-                w_desc,
-                [offs_w_n, (L2_PREFETCH_DISTANCE - 1) * W_BLOCK_K],
+            l2_prefetch_tiles_gfx1250(
+                x_desc=x_desc,
+                x_scales_desc=x_scales_desc,
+                w_desc=w_desc,
+                w_scales_desc=w_scales_desc,
+                offs_x_m=offs_x_m,
+                offs_w_n=offs_w_n,
+                offs_w_n_scale=offs_w_n_scale,
                 pred=pref_pred,
-                speculative=True,
-            )
-            gl.amd.gfx1250.tdm.prefetch(
-                w_scales_desc,
-                [offs_w_n_scale, (L2_PREFETCH_DISTANCE - 1) * PACKED_MX_BLOCK],
-                pred=pref_pred,
-                speculative=True,
+                GatherIndx=GatherIndx,
+                K_STEP=L2_PREFETCH_DISTANCE - 1,
+                X_SCALES_TDM=X_SCALES_TDM,
             )
 
         # wait for next tile to be filled
