@@ -35,7 +35,6 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, rocdl
 from flydsl.expr import math as fly_math
 from flydsl.expr.typing import T
 
@@ -85,35 +84,54 @@ def _pointer_buffer_tensor(ptr, dtype, shape, stride):
     return fx.rocdl.make_buffer_tensor(_pointer_view(ptr, dtype, shape, stride))
 
 
-def _pointer_buffer_resource(ptr, dtype, shape, stride):
-    """Build a raw buffer descriptor (legacy under cleanup-skill §2).
+def _f32_copy_atom(vec: int):
+    """Map VEC f32 elements onto the widest legal buffer copy atom.
 
-    Two operations remain on this raw path; both were carried through a real
-    public-layout-API migration attempt, gated on correctness/ISA/perf:
-
-    * Partial-output gather (``load_o_elems`` / ``_o3d_vec_load``): an
-      ``fx.gather`` migration was numerically exact and preserved the packed
-      load width, but ``pred=`` lowers to a per-call wavefront-divergent
-      branch (exec-mask save/branch/restore) in FlyDSL 0.2.4, costing 9-20%
-      on the serving wrapper metrics. Expressible, but not at an acceptable
-      cost in this hot per-split path.
-    * ``indptr`` CSR-sentinel scalar load (``_scalar_indptr``): a true §2
-      hard boundary. The layout-view/buffer-tensor API has no route to a
-      wave-uniform ``s_buffer_load`` -- only the raw
-      ``buffer_ops.buffer_load(..., is_scalar=True)`` path emits it, and the
-      one available substitute regresses to a per-lane VGPR load plus a
-      broadcast.
-
-    The split-K f32 scratch and final-output store paths that previously used
-    this helper now go through ``_pointer_buffer_tensor`` + ``copy_atom_call``.
-
-    Retained per §2 (scalar-base/per-thread-offset ops where no layout form
-    preserves the required ISA) and reported per §10.6 (surface remaining
-    legacy raw-descriptor use).
+    VEC in {1, 2, 4} map directly onto one BufferCopy{32,64,128}b atom
+    (4/8/16 bytes/thread). VEC == 8 is 32 bytes/thread -- wider than the
+    128-bit atom ceiling, and FlyDSL 0.2.4 has no single atom for it -- so it
+    splits into two BufferCopy128b atoms over adjacent 4-wide chunks. This
+    mirrors the 2x-dwordx4 composition ``fused_compress_attn.py``'s
+    ``_load_f32_vec`` already uses for VEC=8 f32.
     """
-    return buffer_ops.create_buffer_resource(
-        _pointer_view(ptr, dtype, shape, stride), max_size=True
-    )
+    chunk = vec if vec <= 4 else 4
+    if fx.const_expr(chunk == 1):
+        op = fx.rocdl.BufferCopy32b()
+    elif fx.const_expr(chunk == 2):
+        op = fx.rocdl.BufferCopy64b()
+    else:
+        op = fx.rocdl.BufferCopy128b()
+    return fx.make_copy_atom(op, fx.Float32), chunk, vec // chunk
+
+
+def _chunk_tile_idx(tid, n_chunks, c):
+    """Tile index of chunk ``c`` within the VEC-wide fragment owned by ``tid``."""
+    if fx.const_expr(n_chunks == 1):
+        return tid
+    return tid * fx.Int32(n_chunks) + fx.Int32(c)
+
+
+def _load_partial_out(buf, row, head_idx, tid, vec):
+    """Read VEC fp32 elements from ``buf[row, head_idx, tid*VEC : +VEC]``.
+
+    The load counterpart of ``_store_final_out``: ``row`` and ``head_idx`` are
+    runtime values, so the whole 3-D address is expressed as a layout slice
+    rather than a manually computed flat offset, and each chunk stays one
+    packed buffer transaction. Callers keep their own row clamp -- the address
+    handed in here is already in bounds -- so no per-call predicate is needed.
+    """
+    atom, chunk, n_chunks = _f32_copy_atom(vec)
+    reg_layout = fx.make_layout(chunk, 1)
+    row_tiled = fx.logical_divide(fx.slice(buf, (row, head_idx, None)), reg_layout)
+    elems = []
+    for c in fx.range_constexpr(n_chunks):
+        frag = fx.make_rmem_tensor(reg_layout, fx.Float32)
+        fx.copy_atom_call(
+            atom, fx.slice(row_tiled, (None, _chunk_tile_idx(tid, n_chunks, c))), frag
+        )
+        v = frag.load()
+        elems.extend(v[i] for i in fx.range_constexpr(chunk))
+    return elems
 
 
 def _out_copy_atom(vec: int, out_numeric_t):
@@ -309,23 +327,10 @@ def compile_mla_reduce(
         num_thread_group: fx.Int32,  # NTG (persistent unflatten / seq stride)
     ):
         out_numeric_t = _out_numeric_t(out_dtype)
-        c_VEC = VEC
 
-        def load_o_elems(row_idx, head_idx, col_idx):
+        def load_o_elems(row_idx, head_idx):
             """Load VEC fp32 elements as a python list of scalars."""
-            offset = row_idx * (H * Dv) + head_idx * Dv + col_idx
-            if fx.const_expr(VEC == 1):
-                return [
-                    fx.Float32(
-                        buffer_ops.buffer_load(
-                            partial_output_rsrc, offset, vec_width=1, dtype=T.f32
-                        )
-                    )
-                ]
-            v = buffer_ops.buffer_load(
-                partial_output_rsrc, offset, vec_width=VEC, dtype=T.f32
-            )
-            return _vector_elements(v, fx.Float32, VEC)
+            return _load_partial_out(partial_output_buf, row_idx, head_idx, tid, VEC)
 
         def store_o_elems(row_idx, head_idx, elems_f32):
             """Cast VEC fp32 scalars to out_t and emit one packed store."""
@@ -334,13 +339,10 @@ def compile_mla_reduce(
             )
 
         tid = fx.thread_idx.x
-        col = tid * c_VEC
         lane = tid % WARP
         wave = tid // WARP
 
-        # Legacy raw descriptor: the layout-API gather costs a divergent
-        # branch per split (see _pointer_buffer_resource).
-        partial_output_rsrc = _pointer_buffer_resource(
+        partial_output_buf = _pointer_buffer_tensor(
             partial_output,
             fx.Float32,
             (num_partial_rows, H, Dv),
@@ -383,9 +385,14 @@ def compile_mla_reduce(
             (H, 1),
         )
 
-        # Hard §2 boundary: only the raw descriptor emits s_buffer_load for
-        # this wave-uniform CSR read (see _pointer_buffer_resource).
-        indptr_rsrc = _pointer_buffer_resource(
+        # Plain layout view, deliberately not a buffer tensor: a buffer tensor
+        # addresses through a V# descriptor, which forces a per-lane vector
+        # load even for a uniform index, whereas indexing a plain pointer view
+        # lets the backend select the scalar s_load for these wave-uniform CSR
+        # reads. Indices here (num_reduce_tile, tile, tile+1) are bounded by
+        # the launch geometry, not by buffer contents, so dropping the
+        # descriptor's bounds clamp does not widen the OOB surface.
+        indptr_scalar = _pointer_view(
             reduce_indptr,
             fx.Int32,
             (num_reduce_tile + 1,),
@@ -394,10 +401,7 @@ def compile_mla_reduce(
 
         def _scalar_indptr(idx):
             """Load a wave-uniform CSR pointer through the scalar memory path."""
-            val = buffer_ops.buffer_load(
-                indptr_rsrc, idx, vec_width=1, dtype=T.i32, is_scalar=True
-            )
-            return fx.Int32(rocdl.readfirstlane(T.i32, val))
+            return fx.Int32(indptr_scalar[idx])
 
         c_H = fx.Int32(H)
         last = _scalar_indptr(num_reduce_tile)
@@ -489,7 +493,7 @@ def compile_mla_reduce(
 
             def load_split_o(split_i32, local_seq, direct_pmap: bool = False):
                 row_idx, in_bounds = gather_row(split_i32, local_seq, direct_pmap)
-                loaded = load_o_elems(row_idx, head, col)
+                loaded = load_o_elems(row_idx, head)
                 zero = fx.Float32(0.0)
                 return [in_bounds.select(v, zero) for v in loaded]
 
@@ -651,7 +655,7 @@ def compile_mla_reduce(
                             pmap_raw = pmap_elements[j]
                         pmap_j = in_split.select(pmap_raw, pmap0)
                         row_idx, in_bounds = row_from_pmap(pmap_j, local_seq)
-                        os_raw = load_o_elems(row_idx, head, col)
+                        os_raw = load_o_elems(row_idx, head)
                         valid = in_split & in_bounds
                         os_list.append(os_raw)
                         valids.append(valid)
@@ -1046,42 +1050,16 @@ def compile_mla_reduce_splitk(
     )
     default_stream = fx.Stream(None)
 
-    def _f32_copy_atom():
-        """Map VEC f32 scratch elements onto the widest legal buffer copy atom.
-
-        VEC in {1, 2, 4} map directly onto one BufferCopy{32,64,128}b atom
-        (4/8/16 bytes/thread). VEC == 8 is 32 bytes/thread -- wider than the
-        128-bit atom ceiling, and FlyDSL 0.2.4 has no single atom for it --
-        so it is split into two BufferCopy128b atoms over adjacent 4-wide
-        chunks of the row. This mirrors the 2x-dwordx4 composition
-        ``fused_compress_attn.py``'s ``_load_f32_vec`` already uses for
-        VEC=8 f32 (there via two raw ``buffer_ops.buffer_load`` calls; here
-        via ``copy_atom_call`` against a layout view).
-        """
-        chunk = VEC if VEC <= 4 else 4
-        if fx.const_expr(chunk == 1):
-            op = fx.rocdl.BufferCopy32b()
-        elif fx.const_expr(chunk == 2):
-            op = fx.rocdl.BufferCopy64b()
-        else:
-            op = fx.rocdl.BufferCopy128b()
-        return fx.make_copy_atom(op, fx.Float32), chunk, VEC // chunk
-
-    def _f32_chunk_tile_idx(tid, n_chunks, c):
-        if fx.const_expr(n_chunks == 1):
-            return tid
-        return tid * fx.Int32(n_chunks) + fx.Int32(c)
-
     def _f32_vec_load(buf, row, tid):
         """Load VEC f32 scratch elements at (row, tid*VEC) via a buffer
         tensor layout view + copy atom(s). See ``_f32_copy_atom`` for the
         VEC == 8 two-atom composition."""
-        atom, chunk, n_chunks = _f32_copy_atom()
+        atom, chunk, n_chunks = _f32_copy_atom(VEC)
         reg_layout = fx.make_layout(chunk, 1)
         row_tiled = fx.logical_divide(fx.slice(buf, (row, None)), reg_layout)
         elems = []
         for c in fx.range_constexpr(n_chunks):
-            idx = _f32_chunk_tile_idx(tid, n_chunks, c)
+            idx = _chunk_tile_idx(tid, n_chunks, c)
             r = fx.make_rmem_tensor(reg_layout, fx.Float32)
             fx.copy_atom_call(atom, fx.slice(row_tiled, (None, idx)), r)
             v = r.load()
@@ -1091,26 +1069,14 @@ def compile_mla_reduce_splitk(
     def _f32_vec_store(buf, row, tid, elems):
         """Store VEC f32 scratch elements at (row, tid*VEC); see
         ``_f32_vec_load``."""
-        atom, chunk, n_chunks = _f32_copy_atom()
+        atom, chunk, n_chunks = _f32_copy_atom(VEC)
         reg_layout = fx.make_layout(chunk, 1)
         row_tiled = fx.logical_divide(fx.slice(buf, (row, None)), reg_layout)
         for c in fx.range_constexpr(n_chunks):
-            idx = _f32_chunk_tile_idx(tid, n_chunks, c)
+            idx = _chunk_tile_idx(tid, n_chunks, c)
             r = fx.make_rmem_tensor(reg_layout, fx.Float32)
             r.store(_make_vector(elems[c * chunk : (c + 1) * chunk], fx.Float32))
             fx.copy_atom_call(atom, r, fx.slice(row_tiled, (None, idx)))
-
-    def _o3d_vec_load(rsrc, row_idx, head_idx, col_idx):
-        """Keep the runtime 3-D gather on buffer_load for VEC-wide ISA parity."""
-        offset = row_idx * fx.Int32(H * Dv) + head_idx * fx.Int32(Dv) + col_idx
-        if fx.const_expr(VEC == 1):
-            return [
-                fx.Float32(
-                    buffer_ops.buffer_load(rsrc, offset, vec_width=1, dtype=T.f32)
-                )
-            ]
-        v = buffer_ops.buffer_load(rsrc, offset, vec_width=VEC, dtype=T.f32)
-        return _vector_elements(v, fx.Float32, VEC)
 
     @flyc.kernel(known_block_size=[NUM_THREADS, 1, 1])
     def sk_partial_kernel(
@@ -1122,12 +1088,10 @@ def compile_mla_reduce_splitk(
         sk_ml: fx.Pointer,  # fp32 [num_slots*K, 2]   (out: m_j, l_j)
         num_partial_rows: fx.Int32,
     ):
-        c_VEC = VEC
         tid = fx.thread_idx.x
-        col = tid * c_VEC
         sk_grid = fx.grid_dim.x
 
-        partial_output_rsrc = _pointer_buffer_resource(
+        partial_output_buf = _pointer_buffer_tensor(
             partial_output,
             fx.Float32,
             (num_partial_rows, H, Dv),
@@ -1203,7 +1167,7 @@ def compile_mla_reduce_splitk(
             pmap_v = g_pmap[split_i32]
             in_b = (pmap_v >= fx.Int32(0)) & (pmap_v < num_partial_rows)
             safe_row = in_b.select(pmap_v, fx.Int32(0))
-            os = _o3d_vec_load(partial_output_rsrc, safe_row, head, col)
+            os = _load_partial_out(partial_output_buf, safe_row, head, tid, VEC)
             lse = g_pl[safe_row, head]
             lse = in_b.select(lse, neg_inf)
             new_m = fx.Float32(m).maximumf(lse)
