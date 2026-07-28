@@ -134,7 +134,7 @@ torch::Tensor batched_gemm_bf16(
               "Weights and activations should both be bf16!");
   if (bias != std::nullopt)
     TORCH_CHECK(bias.value().dtype() == Y.dtype(),
-                "Out amd bias should have the same dtype!");
+                "Out and bias should have the same dtype!");
 
   int B = XQ.size(0);
   int M = XQ.size(1);

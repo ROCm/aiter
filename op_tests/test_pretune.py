@@ -63,6 +63,13 @@ EXPECTED = [
         False,
     ),
     (
+        # cktile variant: falls back to parent script
+        "module_gemm_a8w8_cktile_tune",
+        "csrc/ck_gemm_a8w8/gemm_a8w8_tune.py",
+        "AITER_CONFIG_GEMM_A8W8_FILE",
+        False,
+    ),
+    (
         "module_gemm_a8w8_blockscale_tune",
         "csrc/ck_gemm_a8w8_blockscale/gemm_a8w8_blockscale_tune.py",
         "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
