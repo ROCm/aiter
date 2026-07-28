@@ -425,7 +425,7 @@ def main() -> None:
         "--tokens",
         type=int,
         nargs="+",
-        default=[256, 4096, 32768, 30584, 29136, 20317, 10885, 64, 63],
+        default=[63, 64, 256, 4096, 10885, 20317, 29136, 30584, 32768],
     )
     parser.add_argument("--num-q-heads", type=int, nargs="+", default=[64])
     parser.add_argument("--num-kv-heads", type=int, nargs="+", default=[4])
