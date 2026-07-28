@@ -306,7 +306,7 @@ def test_runtime_dispatch_key():
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  runtime dispatch tests require a live GPU ({e})")
         return
 
@@ -383,7 +383,7 @@ def test_runtime_dispatch_key():
             if path:
                 try:
                     os.unlink(path)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
 
 
@@ -457,7 +457,7 @@ def test_write_name_keyed_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
 
@@ -467,7 +467,7 @@ def test_blockscale_kernel_name_forwarding():
     try:
         import aiter.ops.gemm_op_a8w8 as a8w8_mod
         from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  could not import gemm_op_a8w8 ({e})")
         return
 
@@ -476,7 +476,7 @@ def test_blockscale_kernel_name_forwarding():
 
         gfx = get_gfx_runtime()
         cu_num = get_cu_num()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  forwarding tests require a live GPU for gfx detection ({e})")
         return
 
@@ -484,7 +484,7 @@ def test_blockscale_kernel_name_forwarding():
     # below short-circuit before any kernel actually runs.
     try:
         import torch
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  SKIP  torch unavailable ({e})")
         return
 
@@ -673,7 +673,7 @@ def test_blockscale_kernel_name_forwarding():
         for p in csv_paths:
             try:
                 os.unlink(p)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
 
@@ -730,7 +730,7 @@ def test_write_lookup_header():
         if path:
             try:
                 os.unlink(path)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
 

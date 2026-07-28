@@ -1120,7 +1120,7 @@ if __name__ == "__main__":
             from aiter.jit.utils.chip_info import get_gfx_runtime
 
             target_arches = {get_gfx_runtime().lower()}
-        except Exception:
+        except Exception:  # noqa: BLE001
             target_arches = None
 
     if target_arches is not None:

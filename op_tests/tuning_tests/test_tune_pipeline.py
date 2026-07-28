@@ -39,7 +39,7 @@ def _get_platform_dtypes():
         from aiter.jit.utils.chip_info import get_gfx
 
         gfx = get_gfx()
-    except Exception:
+    except Exception:  # noqa: BLE001
         gfx = "gfx942"
     if gfx in ("gfx950", "gfx1250"):
         return "torch.float8_e4m3fn", "QuantType.per_1x128"

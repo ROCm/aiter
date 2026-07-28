@@ -207,7 +207,7 @@ class HsacoLauncher:
         """Cleanup on destruction"""
         try:
             self.unload_module()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
 
@@ -258,7 +258,7 @@ def launch_triton_kernel(
 
         return 0
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.info(f"Error launching kernel: {e}")
         import traceback
 

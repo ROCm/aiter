@@ -75,7 +75,7 @@ def _opus_needs_ws_prewarm() -> bool:
         return False
     try:
         return get_gfx() in _OPUS_WS_ARCHS
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -127,7 +127,8 @@ def _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype):
             )
         s.synchronize()
         _opus_ws_warmed_sigs.add(sig)
-    except Exception as e:  # don't break eager callers; capture would re-surface it
+    # Don't break eager callers; capture would re-surface it.
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"opus split-K workspace prewarm on the graph capture stream failed "
             f"({type(e).__name__}: {e}); HIP graph capture of this opus shape may "

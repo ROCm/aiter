@@ -62,7 +62,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group=self.cpu_group,
                     device=self.device,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to initialize PyNcclCommunicator for group "
                     f"{self.unique_name}. Exception: {e}"
@@ -529,7 +529,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else:
                         out, res_out, scale_out = result
                     fused_ok = True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(

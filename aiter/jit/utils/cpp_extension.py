@@ -90,7 +90,7 @@ def get_hip_version():
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     # The fallbacks below previously hard-coded /opt/rocm, so they never
     # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
@@ -116,7 +116,7 @@ def get_hip_version():
                     [rocm_hipconfig, "--version"], text=True
                 )
                 return output
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
     # Fallback: read HIP version from a header / info file under each root.
     for root in rocm_roots:
@@ -440,7 +440,7 @@ def get_compiler_abi_compatibility_and_version(
                 versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
             )
             version = ["0", "0", "0"] if match is None else list(match.groups())
-    except Exception:
+    except Exception:  # noqa: BLE001
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
         return (False, Version("0.0.0"))
@@ -1194,12 +1194,12 @@ def check_compiler_is_gcc(compiler):
         version_string = subprocess.check_output(
             [compiler, "-v"], stderr=subprocess.STDOUT, env=env
         ).decode(*SUBPROCESS_DECODE_ARGS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             version_string = subprocess.check_output(
                 [compiler, "--version"], stderr=subprocess.STDOUT, env=env
             ).decode(*SUBPROCESS_DECODE_ARGS)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
     # Check for 'gcc' or 'g++' for sccache wrapper
     pattern = re.compile("^COLLECT_GCC=(.*)$", re.MULTILINE)
@@ -1457,7 +1457,7 @@ def is_ninja_available():
     """Return ``True`` if the `ninja <https://ninja-build.org/>`_ build system is available on the system, ``False`` otherwise."""
     try:
         subprocess.check_output(["ninja", "--version"])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     else:
         return True

@@ -160,7 +160,7 @@ def clean():
                         mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
                     except:
                         pass
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Resource cleanup warning: {e}")
 
 
@@ -192,7 +192,7 @@ if __name__ == "__main__":
                 break
             else:
                 break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Process creation failed: {e}")
             retries += 1
             clean()

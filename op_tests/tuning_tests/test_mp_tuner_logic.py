@@ -77,7 +77,7 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
                 else:
                     consecutive_timeouts = 0
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error_type = type(e).__name__
             is_mapping_error = error_type == "KeyError"
 

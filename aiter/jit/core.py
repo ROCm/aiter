@@ -636,7 +636,7 @@ def _needs_arch_rebuild(md_name):
     # force a JIT rebuild for the native arch instead.
     try:
         cur = get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
     so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
@@ -680,7 +680,7 @@ def clone_3rdparty(third_party: str) -> None:
                         return (major > required_major) or (
                             major == required_major and minor >= required_minor
                         )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.warning(f"Failed to check git version: {e}")
                 return False
 
@@ -1047,7 +1047,7 @@ def _get_ck_exclude_modules():
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             config_data = json.load(f)
-    except Exception:
+    except Exception:  # noqa: BLE001
         config_data = {}
 
     # Pattern-matched CK modules

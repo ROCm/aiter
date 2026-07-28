@@ -10,7 +10,7 @@ def _ck_targets_flag() -> str:
         from chip_info import get_gfx
 
         gfx = get_gfx()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
     if gfx.startswith("gfx9"):
         return ""

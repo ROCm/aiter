@@ -21,7 +21,7 @@ def _is_gfx1201() -> bool:
         return False
     try:
         arch = torch.cuda.get_device_properties(0).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return arch.lower().split(":")[0].startswith("gfx1201")
 

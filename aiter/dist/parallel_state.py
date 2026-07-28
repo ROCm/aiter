@@ -2189,7 +2189,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
                     shm = shared_memory.SharedMemory(name=name)
                 if shm.buf[: len(magic_message)] == magic_message:
                     is_in_the_same_node[rank] = 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("Error ignored in is_in_the_same_node: %s", e)
     finally:
         if shm:
@@ -2231,7 +2231,7 @@ def is_global_first_rank() -> bool:
         # Fallback to torch's global rank
         return torch.distributed.get_rank() == 0
 
-    except Exception:
+    except Exception:  # noqa: BLE001
         # If anything goes wrong, assume this is the first rank
         return True
 

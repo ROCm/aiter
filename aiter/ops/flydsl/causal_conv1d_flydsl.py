@@ -571,7 +571,7 @@ def causal_conv1d_split_qkv_flydsl_fn(
     if compiled is None:
         try:
             launcher._fast_compiled = flyc.compile(launcher, *launch_args)
-        except Exception:
+        except Exception:  # noqa: BLE001
             launcher._fast_compiled = False  # fall back permanently
             launcher(*launch_args)
     elif compiled is not False:

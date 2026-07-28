@@ -16,7 +16,7 @@ try:
     from csrc.cpp_itfs.pa.pa_ps import (
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
     )
-except Exception:
+except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 

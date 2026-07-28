@@ -134,7 +134,7 @@ def _install_stubs():
             continue
         try:
             importlib.import_module(name)
-        except Exception:
+        except Exception:  # noqa: BLE001
             sys.modules[name] = mod
 
 

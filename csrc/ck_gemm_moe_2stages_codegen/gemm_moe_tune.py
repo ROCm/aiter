@@ -263,7 +263,7 @@ def tensor_compare_diagnostics(
                 )
             parts.append("top=[" + "; ".join(example_text) + "]")
         return ", ".join(parts)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return f"diagnostic_error={type(exc).__name__}:{exc}"
 
 
@@ -3924,7 +3924,7 @@ class FmoeTuner(TunerCommon):
                             "status": f"error:{e}",
                         }
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {
                         "shape": shape_str,
@@ -4487,7 +4487,7 @@ class FmoeTuner(TunerCommon):
                             bm_int,
                         )
                         us_sort_cache[bm] = round(us_sort, 4)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         print(
                             f"  moe_sorting benchmark failed for block_m={bm_int}: {e}"
                         )
@@ -4674,7 +4674,7 @@ class FmoeTuner(TunerCommon):
                             "  -> FLAT confirmed (or within noise); "
                             "keeping additive-fairness ranking"
                         )
-                except Exception as _e2e_err:
+                except Exception as _e2e_err:  # noqa: BLE001
                     print(
                         f"  e2e head-to-head skipped/failed ({_e2e_err}); "
                         "falling back to additive fairness"
@@ -5001,7 +5001,7 @@ class GroupedFmoeTuner(FmoeTuner):
                     )
                     if best is None or us < float(best["us"]):
                         best = candidate
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     failures.append(f"tile_m={candidate['tile_m']}: {exc}")
                     print(f"[grouped] candidate failed: {failures[-1]}", flush=True)
             if best is None:
@@ -5294,7 +5294,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
                 if best is None or us < float(best["us"]):
                     best = candidate
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
                 )
@@ -5320,7 +5320,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = int(getattr(args, "mp", 1) or 1)
         try:
             ngpu = torch.cuda.device_count()
-        except Exception:
+        except Exception:  # noqa: BLE001
             ngpu = 1
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
 
@@ -5389,7 +5389,7 @@ def _mxfp4_tune_shape_worker(payload):
             flush=True,
         )
         return tuner._tune_one_shape(row, args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Catastrophic (non per-candidate) failure: record as a failed shape so
         # the pool keeps going instead of aborting the whole run.
         best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)

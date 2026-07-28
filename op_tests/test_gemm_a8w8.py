@@ -56,7 +56,7 @@ def is_shape_tuned(
                 _TUNED_SHAPES_CACHE[tuned_file] = set(
                     df[mask][["M", "N", "K", "q_dtype_w"]].apply(tuple, axis=1)
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Warning: Could not load tuned shapes: {e}")
                 _TUNED_SHAPES_CACHE[tuned_file] = set()
         else:

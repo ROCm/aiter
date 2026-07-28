@@ -527,7 +527,7 @@ def run_benchmark(run: BenchRun):
                 device,
                 run,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  [SKIP] {e}", flush=True)
             value = None
         finally:
@@ -807,7 +807,7 @@ def run_benchmark(run: BenchRun):
 
     try:
         bench_mha.run(print_data=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"\n[WARN] benchmark failed: {e}", flush=True)
     finally:
         csv.summary()

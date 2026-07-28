@@ -652,7 +652,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
 
         if get_gfx_runtime().lower() == "gfx1250":
             return _gfx1250_select_candidates(M, N, K, cu_num)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     # Step 1: structural tile-align fallback for non-splitk pipelines.
@@ -687,7 +687,7 @@ def candidate_kids_for_shape(M, N, K, bias, cu_num):
             if (getattr(_klist.get(kid), "arch_prefix", "") or "gfx950").lower()
             == _run_arch
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass  # unknown arch -> keep legacy multi-arch behaviour
 
     # Step 6: drop known-bad kids permanently.
@@ -766,7 +766,7 @@ def _ensure_kids_compiled(candidate_kids):
 
         _run_arch = get_gfx_runtime().lower()
         _heuristic = heuristic_kids_for_arch({_run_arch})
-    except Exception:
+    except Exception:  # noqa: BLE001
         _heuristic = HEURISTIC_DEFAULT_KIDS  # unknown -> multi-arch fallback
     required = candidate_kids | _heuristic
 
@@ -855,7 +855,7 @@ def _ensure_kids_compiled(candidate_kids):
                 _entries = getattr(_jev, "entries", None)
                 if isinstance(_entries, dict):
                     _entries.pop("module_deepgemm_opus", None)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
         # Synchronously drive the rebuild in this (parent) process so that mp_tuner's spawn-ed children
@@ -881,7 +881,7 @@ def _ensure_kids_compiled(candidate_kids):
             )
             if "module_deepgemm_opus" not in _jit_core.rebuilded_list:
                 _jit_core.rebuilded_list.append("module_deepgemm_opus")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             _build_exc = exc
             import traceback
 
@@ -898,7 +898,7 @@ def _ensure_kids_compiled(candidate_kids):
                 )
                 if os.path.exists(_so):
                     os.remove(_so)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         finally:
             # Restore in-process flag for the parent (mp_tuner children
@@ -976,7 +976,7 @@ try:
         for kid, k in a16w16_all_kernels.items()
         if (getattr(k, "arch_prefix", "") or "gfx950").lower() == _run_arch
     )
-except Exception:
+except Exception:  # noqa: BLE001
     # rocminfo unavailable -> fall back to enumerating everything so the
     # legacy multi-arch behaviour is preserved on build-only hosts.
     a16w16_kernel_ids = sorted(a16w16_all_kernels.keys())
@@ -1133,7 +1133,7 @@ def _quiet_aiter_logger_once():
         return
     try:
         logger.setLevel(logging.WARNING)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -1283,7 +1283,7 @@ def _install_opus_perftest_once():
         import aiter.test_common as _tc
 
         _tc.run_perftest = _opus_run_perftest
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(
             f"OpusGemmA16W16Tuner: failed to install custom run_perftest "
             f"({e}); falling back to stock version (expect empty-trace us=0 "
@@ -1757,7 +1757,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
             from aiter.jit.utils.chip_info import get_gfx_runtime
 
             _is_gfx1250 = get_gfx_runtime().lower() == "gfx1250"
-        except Exception:
+        except Exception:  # noqa: BLE001
             _is_gfx1250 = False
 
         # --kid filter (debug): parse the CSV list once.

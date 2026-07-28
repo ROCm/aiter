@@ -139,7 +139,7 @@ try:
             num_stages=conf.pop("num_stages", 1),
             num_warps=conf.pop("num_warps", 4),
         )
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     logger.warning(f"FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: {e}")
 
 # Unified debug level:

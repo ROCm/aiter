@@ -61,7 +61,7 @@ if not AITER_TRITON_ONLY and is_develop_mode():
 
         if Version(pkg_version("flydsl")) != Version(FLYDSL_VERSION.split("==")[1]):
             raise ImportError("version mismatch")
-    except Exception:
+    except Exception:  # noqa: BLE001
         subprocess.check_call(
             [
                 sys.executable,
@@ -85,7 +85,7 @@ def _is_triton_installed():
     ]:
         try:
             return pkg, pkg_version(pkg)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
     return None
 
@@ -107,7 +107,7 @@ def _torch_version_below(min_version):
         return Version(torch.__version__.split("+")[0].split("dev")[0]) < Version(
             min_version
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -136,7 +136,7 @@ else:
         )
     try:
         _run_install_triton()
-    except Exception:
+    except Exception:  # noqa: BLE001
         print("[aiter] Skipping triton install via .github/scripts/install_triton.sh")
 
 
@@ -230,7 +230,7 @@ def _load_modules_from_config():
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
     if isinstance(data, dict):
         return list(data.keys())
@@ -276,7 +276,7 @@ if PREBUILD_KERNELS != 0:
     has_torch = True
     try:
         import torch as _
-    except Exception:
+    except Exception:  # noqa: BLE001
         has_torch = False
 
     if not has_torch:
@@ -353,7 +353,7 @@ if PREBUILD_KERNELS != 0:
         for f in glob.glob(f"{core.get_user_jit_dir()}/*.so"):
             try:
                 os.remove(f)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
         def build_one_module(one_opt_args):

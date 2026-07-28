@@ -279,7 +279,7 @@ def get_mhc_fused_post_pre_config(
     num_cu = get_cu_num()
     try:
         arch = get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         arch = "unknown"
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     return policy(m, hidden_size, num_cu)

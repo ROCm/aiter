@@ -21,7 +21,7 @@ def get_gfx():
         from aiter.jit.utils.chip_info import get_gfx as _get_gfx
 
         return _get_gfx()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "gfx942"
 
 

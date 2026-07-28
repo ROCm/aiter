@@ -75,7 +75,7 @@ def _load_grouped_config_rows():
             from aiter.jit.core import AITER_CONFIGS
 
             cfg_path = AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE
-        except Exception:
+        except Exception:  # noqa: BLE001
             cfg_path = ""
     cached = _GROUPED_CONFIG_CACHE.get(cfg_path)
     if cached is not None:

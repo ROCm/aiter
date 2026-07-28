@@ -34,7 +34,7 @@ def _is_gluon_available():
     try:
         arch = get_arch()
         return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

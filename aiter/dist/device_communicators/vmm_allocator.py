@@ -320,7 +320,7 @@ def vmm_exchange(
     def _do_recv(src_rank, path):
         try:
             received_fds[src_rank] = _recv_fd(path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             recv_errors[src_rank] = e
 
     threads = []

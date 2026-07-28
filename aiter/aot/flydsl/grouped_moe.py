@@ -610,7 +610,7 @@ def compile_one_config(**job):
         elapsed = time.time() - t0
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Catch everything and return cleanly with compile_time=None: the AOT pool
         # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
         # NOT retry it. An escaping exception crashes the worker (exitcode != 0),

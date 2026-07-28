@@ -80,7 +80,7 @@ try:
     )
 
     _opus_all_kernels = dict(_opus_kernels_list)
-except Exception as _opus_exc:
+except Exception as _opus_exc:  # noqa: BLE001
     _opus_gemm_a16w16_tune = None
     _opus_all_kernels = None
     _opus_splitk_kids = frozenset()
@@ -97,7 +97,7 @@ try:
     if _gradlib_path not in sys.path:
         sys.path.insert(0, os.path.abspath(_gradlib_path))
     from GemmTuner import Gemm as HipblasltGemm
-except Exception as _hipb_exc:
+except Exception as _hipb_exc:  # noqa: BLE001
     HipblasltGemm = None
     HIPBLASLT_TUNE_ERROR = str(_hipb_exc)
 
@@ -542,7 +542,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                     else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_err_ratio_desc})"
                 )
                 results.append({"shape": shape_str, "e2e_us": us, "status": status})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {"shape": shape_str, "e2e_us": -1, "status": f"error:{e}"}
                 )
@@ -1016,7 +1016,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 if libtype == "hipblaslt":
                     try:
                         kernelName = aiter.getHipblasltKernelName(int(kernelId))
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         kernelName = "None"
                 else:
                     kernelName = "None"

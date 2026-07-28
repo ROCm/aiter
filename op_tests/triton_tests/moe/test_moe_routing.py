@@ -909,7 +909,7 @@ def bench_routing():
         import os
 
         os.system("proton-viewer -m time/ms routing.hatchet")
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
 

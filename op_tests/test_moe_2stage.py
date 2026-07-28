@@ -849,7 +849,7 @@ def _iter_csv_cases():
                 continue
         try:
             kwargs = _row_to_kwargs(row)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             aiter.logger.warning(
                 "skip row token=%s dim=(%s,%s): parse error %s",
                 row.get("token"),

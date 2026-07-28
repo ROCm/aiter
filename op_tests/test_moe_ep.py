@@ -807,7 +807,7 @@ if summary_table:
         _df = pd.DataFrame(summary_table)
         print("\nmoe_ep_mxfp4 summary (markdown):")
         print(_df.to_markdown(index=False))
-    except Exception as _e:
+    except Exception as _e:  # noqa: BLE001
         print(f"[summary] pandas unavailable ({_e}); raw rows:")
         for _row in summary_table:
             print(_row)

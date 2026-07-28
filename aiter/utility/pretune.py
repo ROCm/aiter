@@ -372,7 +372,7 @@ def run_pretune_modules(
             run_pretune(
                 mod, cfg, core, csrc_dir, repo_dir, build_one_module=build_one_module
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
@@ -474,7 +474,7 @@ def _main() -> None:
         seen_keys.add(key)
         try:
             run_pretune(mod, cfg, core, csrc_dir, repo_dir, libtype=args.libtype)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             print(f"[pretune] {mod} failed: {exc}. Continuing.")
 
 

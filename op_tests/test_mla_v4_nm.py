@@ -38,7 +38,7 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 def _on_gfx950():
     try:
         return get_gfx() == "gfx950"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

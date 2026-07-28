@@ -33,7 +33,7 @@ fp8 = dtypes.fp8
 def _is_gfx950():
     try:
         return get_gfx() == "gfx950"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

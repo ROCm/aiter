@@ -232,7 +232,7 @@ def precompute_miopen_solvers(shapes, dtype: torch.dtype) -> None:
             file=sys.stderr,
         )
         return
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"[miopen-detect] WARNING: subprocess failed ({e!r}); "
             f"MIOpen solver column will be empty.",
@@ -812,7 +812,7 @@ def run_sweep(args) -> None:
                 bias=not args.no_bias,
                 measure_repack=True,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  {name:<24} ERROR: {type(e).__name__}: {e}", file=sys.stderr)
             continue
         miopen = (

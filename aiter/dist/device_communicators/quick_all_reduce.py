@@ -33,7 +33,7 @@ try:
     if regime_str in QuickReduceRegime.__members__:
         ops.qr_max_size()
         quick_ar = True
-except Exception:
+except Exception:  # noqa: BLE001
     # For CPUs and CUDA
     quick_ar = False
 
@@ -44,7 +44,7 @@ def qr_rocm_arch_available():
         gcn_arch = getattr(props, "gcnArchName", "")
         supported_archs = ["gfx94", "gfx95"]
         return any(gfx in gcn_arch for gfx in supported_archs)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
         return False
 

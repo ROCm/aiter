@@ -128,7 +128,7 @@ def _detect_gpu_model(device_index=0):
     """GPU model substring (e.g. ``"mi355x"``) for tuning-file selection."""
     try:
         name = torch.cuda.get_device_properties(device_index).name.lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     m = re.search(r"\bmi\d+\w*", name)
     return m.group(0) if m else None
@@ -142,7 +142,7 @@ def resolve_tuning_config_path(
     if gpu_arch is None:
         try:
             gpu_arch = str(get_rocm_arch() or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             gpu_arch = None
     if gpu_model is None:
         gpu_model = _detect_gpu_model()

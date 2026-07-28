@@ -115,7 +115,7 @@ def gfx_from_cu_num(cu_num) -> str:
         return gfx
     try:
         return get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "gfx942"
 
 

@@ -23,7 +23,7 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 def _is_gluon_available():
     try:
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

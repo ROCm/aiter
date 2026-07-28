@@ -654,7 +654,7 @@ def run_bench(args: BenchArgs, metric: Metric) -> float | None:
                 "Out of resources while benchmarking %s. %s", args.to_log_str(), e
             )
 
-    except (Exception, SystemExit) as e:
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         logger.error(
             "Unexpected error while benchmarking %s. %s: %s",
             args.to_log_str(),
@@ -848,7 +848,7 @@ def load_models(filename: str = "model_shapes.json") -> list[Model]:
                         use_sink=use_sink_raw,
                         sliding_window_left=sliding_window_left_raw,
                     )
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     logger.error(
                         "Skipping invalid %s entry #%d for model '%s'. %s: %s",
                         backend_name,

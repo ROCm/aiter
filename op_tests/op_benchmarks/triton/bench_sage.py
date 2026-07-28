@@ -1493,7 +1493,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
             ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
             tflops = total_flops / ms * 1e-9
             rows.append((kernel_name, ms, tflops))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("Skipping %s: %s", kernel_name, e)
             rows.append((kernel_name, float("nan"), float("nan")))
 

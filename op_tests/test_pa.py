@@ -715,7 +715,7 @@ def test_paged_attention(
                 out_aiter_common,
                 msg=f"golden vs aiter_common:{time_aiter_common:>8.2f} us......",
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Could not test aiter_common: {e}")
 
     for quant_algo_, cache_type_ in [

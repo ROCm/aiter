@@ -61,7 +61,7 @@ def _detect_arch():
                 name = line.split()[-1].strip()
                 if name.startswith("gfx"):
                     return name
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     return "native"
 
@@ -75,7 +75,7 @@ def _find_hipcc():
         return subprocess.check_output(
             ["which", "hipcc"], stderr=subprocess.DEVNULL, text=True
         ).strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     return "hipcc"
 

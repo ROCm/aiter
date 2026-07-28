@@ -92,7 +92,7 @@ def _deepgemm_num_1d_blocks_per_group(
         from aiter.jit.utils.chip_info import get_cu_num
 
         num_sms = max(1, int(get_cu_num()))
-    except Exception:
+    except Exception:  # noqa: BLE001
         num_sms = 128
     best, min_usage = 8, 2**31
     for cand in (8, 16):

@@ -24,7 +24,7 @@ if TRITON_GE_36:
             from aiter.ops.triton._gluon_kernels.gfx1250.attention.fp8_mqa_logits import (
                 _gluon_fp8_mqa_logits_kernel,
             )
-    except Exception:
+    except Exception:  # noqa: BLE001
         _gluon_fp8_mqa_logits_kernel = None
 
 

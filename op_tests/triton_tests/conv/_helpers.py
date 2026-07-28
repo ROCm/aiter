@@ -506,7 +506,7 @@ def run_random_fuzzing(
                 method=method,
                 activation=activation,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
             suite.results.append(
                 TestResult(

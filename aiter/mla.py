@@ -1217,7 +1217,7 @@ def mla_prefill_reduce(
                 output,
                 tile_q,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
 
     # torch implementation, just for reference

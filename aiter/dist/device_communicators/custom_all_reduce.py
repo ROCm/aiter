@@ -50,7 +50,7 @@ def _detect_gfx1250() -> bool:
             return False
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         return "gfx1250" in getattr(props, "gcnArchName", "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -229,7 +229,7 @@ try:
     else:
         ops.meta_size()
     custom_ar = True
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     # For CPUs
     custom_ar = False
     logger.warning(f"Custom allreduce is disabled: {e}")

@@ -46,7 +46,7 @@ def _hip_blockscale_supported() -> bool:
     """True if the prebuilt HIP CK blockscale module covers the running arch (else triton)."""
     try:
         return get_gfx() in _BLOCKSCALE_HIP_PREBUILT_ARCHES
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -55,7 +55,7 @@ def _ck_a8w8_supported() -> bool:
     arches (e.g. RDNA gfx11/gfx12) must fall back to the Triton kernel."""
     try:
         return get_gfx().startswith("gfx9")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 

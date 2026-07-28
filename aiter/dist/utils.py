@@ -248,7 +248,7 @@ class rpd_trace:
                 connection.commit()
         except sqlite3.OperationalError as e:
             print(f"SQLite operational error: {e}")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"An error occurred while creating the filename: {e}")
 
 
@@ -649,7 +649,7 @@ def get_ip() -> str:
     try:
         s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     # try ipv6
@@ -659,7 +659,7 @@ def get_ip() -> str:
         # https://developers.google.com/speed/public-dns/docs/using#addresses
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     warnings.warn(

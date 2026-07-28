@@ -609,7 +609,7 @@ def call_function(
         else:
             print(f"Out of resources while benchmarking {handler.to_str()}. {e}")
 
-    except (Exception, SystemExit) as e:
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         print(
             f"Unexpected error while benchmarking {handler.to_str()}. {type(e).__name__}: {e}"
         )

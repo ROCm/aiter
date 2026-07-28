@@ -91,7 +91,7 @@ class PyNcclCommunicator:
             return
         try:
             self.nccl = NCCLLibrary(library_path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Failed to load NCCL library: {e}")
             # disable because of missing NCCL library
             # e.g. in a non-GPU environment

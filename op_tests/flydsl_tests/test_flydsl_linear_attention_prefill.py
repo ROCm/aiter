@@ -47,7 +47,7 @@ try:
     )
 
     _HAS_VLLM_K5 = True
-except Exception:
+except Exception:  # noqa: BLE001
     chunk_gated_delta_rule_fwd_h_vllm = None
     _HAS_VLLM_K5 = False
 

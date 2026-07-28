@@ -40,7 +40,7 @@ def _is_gfx12_runtime() -> bool:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", "")
         return arch.split(":")[0].startswith("gfx12") if arch else False
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

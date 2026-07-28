@@ -111,7 +111,7 @@ def test_a16w16_csv_sweep(csv_path: str, batch: int = 1):
             tflops = 2.0 * batch * M * N * K / us / 1e6
             print(f"[PASS] {tag} | {us:.1f}us | {tflops:.2f} TFLOPs | err={err}")
             passed += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"[FAIL] {tag} | {type(e).__name__}: {e}")
             failed += 1
     print(f"\nSummary: {passed} passed, {failed} failed out of {len(shapes)}")

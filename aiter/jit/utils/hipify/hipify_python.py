@@ -814,7 +814,7 @@ class Trie:
                 try:
                     recurse = self._pattern(node.children[char])
                     alt.append(self.quote(char) + recurse)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     cc.append(self.quote(char))
             else:
                 q = 1

@@ -28,7 +28,7 @@ def addressable_lds_bytes_for_gfx(gfx: str) -> int:
 def _default_cuda_device_index():
     try:
         return int(torch.cuda.current_device())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -42,7 +42,7 @@ def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) ->
         return addressable_lds_bytes_for_gfx(
             getattr(props, "gcnArchName", fallback_gfx)
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return addressable_lds_bytes_for_gfx(fallback_gfx)
 
 
@@ -60,7 +60,7 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
     else:
         try:
             device = int(device)
-        except Exception:
+        except Exception:  # noqa: BLE001
             device = None
 
     if device is None:

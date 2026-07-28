@@ -1503,7 +1503,7 @@ class TunerCommon:
                 self.tune_summary(tuning_status)
             except SystemExit as e:
                 tune_exit = e
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 summary_exc = e
                 logger.error(
                     f"tune_summary failed (tuning may still have written results): {e}",

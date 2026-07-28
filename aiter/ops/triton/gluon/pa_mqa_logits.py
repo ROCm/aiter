@@ -47,7 +47,7 @@ try:
         tiles_per_warp=[1, 1],
     )
     _Use_2d_instr_shape_mfma_layout = tl.constexpr(True)
-except Exception:
+except Exception:  # noqa: BLE001
     _Use_2d_instr_shape_mfma_layout = tl.constexpr(False)
 
 

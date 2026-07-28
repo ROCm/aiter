@@ -79,7 +79,7 @@ def clean_directory_except_so(directory_path):
                 try:
                     os.remove(file_path)
                     # print(f"Deleted file: {file_path}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"Error deleting file {file_path}: {e}")
 
         # Process directories (after files have been processed)
@@ -92,7 +92,7 @@ def clean_directory_except_so(directory_path):
                     if item.endswith(".so"):
                         has_so_files = True
                         break
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Error accessing directory {dir_path}: {e}")
                 continue
 
@@ -101,7 +101,7 @@ def clean_directory_except_so(directory_path):
                 try:
                     shutil.rmtree(dir_path)
                     # print(f"Deleted directory: {dir_path}")
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001
                     print(f"Error deleting directory {dir_path}: {e}")
 
 

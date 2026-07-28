@@ -82,7 +82,7 @@ def _detect_arch(
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         gfx = get_gfx_runtime().lower()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(
             "opus: arch probe could not query rocminfo (%s). "
             "Treating as unknown; downstream host dispatcher will catch "

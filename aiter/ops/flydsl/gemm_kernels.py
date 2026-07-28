@@ -964,7 +964,7 @@ def _get_compile_fn():
 
         _flydsl_compile_fn = compile_preshuffle_gemm
         logger.info("[FlyDSL] loaded preshuffle GEMM compiler")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.info(
             f"[FlyDSL] preshuffle GEMM not available, will fall back to CK/CKTile: {e}"
         )

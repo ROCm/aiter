@@ -47,7 +47,7 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_IMPORT_ERROR = None
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     flydsl_qk_norm_rope_quant = None
     _FLYDSL_IMPORT_ERROR = e
 
@@ -335,7 +335,7 @@ def test_fused_qk_norm_rope_group_quant(
                 quant_group_size=(G if q_fp8 else None),
                 scale_dtype=("e8m0" if q_fp8 else "fp32"),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             fly_us = float("nan")
 
     # --- Bandwidth (effective): read q+kv+kw, write Q + K (nope+scale+rope) ---
@@ -574,7 +574,7 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
                 swa_block_tables=swa_block_tables,
                 swa_block_size=block_size,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             fly_us = float("nan")
     ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
 

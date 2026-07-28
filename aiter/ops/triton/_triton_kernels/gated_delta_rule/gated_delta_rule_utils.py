@@ -433,7 +433,7 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
         return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
             "multiprocessor_count"
         ]
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         # Maybe we use a NPU device.
         if triton.runtime.driver.active.get_current_target().backend == "npu":
             return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
@@ -447,7 +447,7 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
 def get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         _cpu_device_warning()
         return "cpu"
 
@@ -513,7 +513,7 @@ def get_all_max_shared_mem():
             ]
             for i in range(device_torch_lib.device_count())
         ]
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         _cpu_device_warning()
         return [-1]
 
@@ -538,7 +538,7 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]
         return max_shared_memory >= Backend.get_shared_memory(arch)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

@@ -29,7 +29,7 @@ def _is_gluon_available():
     """Check if the gluon backend is available for the current GPU architecture."""
     try:
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

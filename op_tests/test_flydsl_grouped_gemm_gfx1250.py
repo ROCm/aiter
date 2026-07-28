@@ -93,7 +93,7 @@ def _require_gfx1250() -> None:
         return
     try:
         from flydsl.runtime.device import get_rocm_arch
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"FlyDSL not importable: {exc}")
     arch = get_rocm_arch()
     if "gfx1250" not in arch.lower():
@@ -108,7 +108,7 @@ def is_gfx1250() -> bool:
         from flydsl.runtime.device import get_rocm_arch
 
         return "gfx1250" in get_rocm_arch().lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

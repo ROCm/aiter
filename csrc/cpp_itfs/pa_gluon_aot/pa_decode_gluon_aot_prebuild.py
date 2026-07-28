@@ -902,7 +902,7 @@ def get_so_files_size_and_count():
             print(
                 f"The total size of so files in aiter build directory: {total_size_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the total size of so files in aiter build directory: {e}"
         )
@@ -920,7 +920,7 @@ def get_so_files_size_and_count():
             print(
                 f"The number of so files in aiter build directory: {number_of_so_files}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(
             f"Warning: Could not get the number of so files in aiter build directory: {e}"
         )

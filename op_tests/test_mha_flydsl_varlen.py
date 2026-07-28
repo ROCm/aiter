@@ -469,7 +469,7 @@ if __name__ == "__main__":
             collected.append(ret)
             if ok:
                 n_pass += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  [seqs={seqs} causal={causal} lse={return_lse}] ERROR: {e}")
             import traceback
 

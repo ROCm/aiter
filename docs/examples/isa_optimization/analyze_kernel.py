@@ -183,7 +183,7 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
             for name, vgpr, agpr, sgpr, lds in c.fetchall():
                 display = name[:48]
                 print(f"  {display:<50s} {vgpr:>6d} {agpr:>6d} {sgpr:>6d} {lds:>8d}")
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     conn.close()
