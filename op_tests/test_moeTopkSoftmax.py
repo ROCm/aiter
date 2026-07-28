@@ -704,8 +704,9 @@ for token in args.token:
     fused_front_width = gate_up_width + num_experts + routed_width
     backing = torch.randn((token, fused_front_width), dtype=dtypes.bf16)
     gating_output = backing[:, gate_up_width : gate_up_width + num_experts]
+    # stride(0) is the thing under test. Do not also assert non-contiguity:
+    # at token=1 the row stride is unreachable, so the slice is contiguous.
     assert gating_output.stride(0) == fused_front_width
-    assert not gating_output.is_contiguous()
     ret = test_biased_grouped_topk(
         token,
         num_experts,
