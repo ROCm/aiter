@@ -1,7 +1,7 @@
 {
     "M_LEQ_16": {
-        "BLOCK_SIZE_M": 4,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
@@ -13,7 +13,7 @@
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
@@ -25,7 +25,7 @@
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
@@ -37,7 +37,7 @@
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_N": 256,
         "BLOCK_SIZE_K": 128,
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
