@@ -837,6 +837,11 @@ def run_csv_scenario(args) -> None:
             print(f"[csv] row {idx}: skipped ({exc})", flush=True)
             continue
 
+        # topk == -1 marks an EP row; run_moe is single-rank and has no EP setup.
+        if topk == -1:
+            print(f"[csv] row {idx}: skipped topk=-1 (EP row)", flush=True)
+            continue
+
         # The grouped kernels need K/inter >= 512 (tile_k=256 -> two K tiles).
         if model_dim < 512 or inter_dim < 512:
             print(
