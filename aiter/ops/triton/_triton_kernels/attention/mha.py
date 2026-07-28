@@ -75,13 +75,17 @@ def _compute_alibi_block(
 @triton.jit
 def _attn_fwd_inner(
     acc,
+    acc_t,
     l_i,
     m_i,
     q,
     q_pe,
+    qt,
     k_ptrs,
     k_pe_ptrs,
+    kt_ptrs,
     v_ptrs,
+    vt_ptrs,
     stride_kn,
     stride_vk,
     stride_sn,
@@ -110,6 +114,7 @@ def _attn_fwd_inner(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
     BLOCK_DMODEL_PE: tl.constexpr,  # it's zero or a power of 2
+    BLOCK_DMODEL_TAIL: tl.constexpr,  # zero (single-block) or a power of 2
     SM_SCALE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     MASK_STEPS: tl.constexpr,
@@ -123,6 +128,14 @@ def _attn_fwd_inner(
 ):
     RCP_LN2: tl.constexpr = 1.4426950408889634
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
+    # Split-D tail: when BLOCK_DMODEL_TAIL>0 the head_dim is covered as a
+    # power-of-2 main block (BLOCK_DMODEL_POW2) plus a power-of-2 tail block,
+    # instead of padding to next_pow2. Tail D indices live in
+    # [BLOCK_DMODEL_POW2, BLOCK_DMODEL_POW2+BLOCK_DMODEL_TAIL); valid up to the
+    # real head_dim (BLOCK_DMODEL).
+    HAS_TAIL: tl.constexpr = BLOCK_DMODEL_TAIL > 0
+    if HAS_TAIL:
+        tail_offs_d = BLOCK_DMODEL_POW2 + tl.arange(0, BLOCK_DMODEL_TAIL)
 
     # loop over k, v, and update accumulator
 
@@ -146,8 +159,12 @@ def _attn_fwd_inner(
                 (BLOCK_DMODEL + BLOCK_DMODEL_PE),
                 seqlen_k,
             )
+        if HAS_TAIL:
+            kt = _load_fn(kt_ptrs, tail_offs_d, k_offs_n, BLOCK_DMODEL, seqlen_k)
         if PRELOAD_V:
             v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+            if HAS_TAIL:
+                vt = _load_fn(vt_ptrs, k_offs_n, tail_offs_d, seqlen_k, BLOCK_DMODEL)
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -180,6 +197,8 @@ def _attn_fwd_inner(
         if HAS_PE:
             qk = tl.dot(q_pe, k_pe, acc=qk)
         qk = tl.dot(q, k, acc=qk)
+        if HAS_TAIL:
+            qk = tl.dot(qt, kt, acc=qk)
         if IS_FP8:
             qk = qk * (qk_scale * descale_q * descale_k)
         else:
@@ -244,12 +263,16 @@ def _attn_fwd_inner(
             # (no rescaling needed since max didn't change).
             alpha = tl.where(m_i == m_ij, 1.0, alpha)
         acc = acc * alpha[:, None]
+        if HAS_TAIL:
+            acc_t = acc_t * alpha[:, None]
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
         if not PRELOAD_V:
             v = _load_fn(v_ptrs, k_offs_n, k_offs_k, seqlen_k, BLOCK_DMODEL)
+            if HAS_TAIL:
+                vt = _load_fn(vt_ptrs, k_offs_n, tail_offs_d, seqlen_k, BLOCK_DMODEL)
         if IS_FP8:
             scale_p, descale_p = _compute_fp8_scaling_factors(p, FP8_MAX)
             acc += (
@@ -257,10 +280,15 @@ def _attn_fwd_inner(
             )
         else:
             acc = tl.dot(p.to(v.type.element_ty), v, acc=acc)
+            if HAS_TAIL:
+                acc_t = tl.dot(p.to(vt.type.element_ty), vt, acc=acc_t)
 
         k_ptrs += BLOCK_N * stride_kn
         if HAS_PE:
             k_pe_ptrs += BLOCK_N * stride_kn
+        if HAS_TAIL:
+            kt_ptrs += BLOCK_N * stride_kn
+            vt_ptrs += BLOCK_N * stride_vk
         v_ptrs += BLOCK_N * stride_vk
         if RETURN_SCORES:
             sd_mask_ptrs += BLOCK_N * stride_sn
@@ -269,7 +297,7 @@ def _attn_fwd_inner(
             dropout_mask_ptrs += BLOCK_N * stride_sn
             philox_ptrs += BLOCK_N * stride_sn
 
-    return acc, l_i, m_i
+    return acc, acc_t, l_i, m_i
 
 
 _attn_fwd_repr = make_kernel_repr(
@@ -352,6 +380,7 @@ def _attn_fwd(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DMODEL_POW2: tl.constexpr,
     BLOCK_DMODEL_PE: tl.constexpr,  # it's zero or a power of 2
+    BLOCK_DMODEL_TAIL: tl.constexpr,  # zero (single-block) or a power of 2
     RETURN_SCORES: tl.constexpr,
     ENABLE_DROPOUT: tl.constexpr,
     IS_FP8: tl.constexpr,
@@ -383,6 +412,12 @@ def _attn_fwd(
     HAS_PE: tl.constexpr = BLOCK_DMODEL_PE > 0
     if HAS_PE:
         offs_pe = BLOCK_DMODEL + tl.arange(0, BLOCK_DMODEL_PE)
+    # Split-D tail: cover head_dim as BLOCK_DMODEL_POW2 (main) + BLOCK_DMODEL_TAIL
+    # (tail) instead of padding to next_pow2. Tail D indices start right after
+    # the main block; valid lanes are those < BLOCK_DMODEL (real head_dim).
+    HAS_TAIL: tl.constexpr = BLOCK_DMODEL_TAIL > 0
+    if HAS_TAIL:
+        offs_dt = BLOCK_DMODEL_POW2 + tl.arange(0, BLOCK_DMODEL_TAIL)
 
     # NOTE:
     # Workaround for int64 strides, In the absence of strides being int64, parts of the offset
@@ -598,6 +633,18 @@ def _attn_fwd(
     else:
         q_pe_ptrs = None
 
+    if HAS_TAIL:
+        qt_offs = (
+            off_z * stride_qz
+            + qh_off
+            + cu_seqlens_q_start * stride_qm
+            + offs_m[:, None] * stride_qm
+            + offs_dt[None, :] * stride_qk
+        )
+        qt_ptrs = q_ptr + qt_offs
+    else:
+        qt_ptrs = None
+
     k_offs = (
         off_z * stride_kz
         + kh_off
@@ -618,6 +665,18 @@ def _attn_fwd(
     else:
         k_pe_ptrs = None
 
+    if HAS_TAIL:
+        kt_offs = (
+            off_z * stride_kz
+            + kh_off
+            + cu_seqlens_k_start * stride_kn
+            + offs_dt[:, None] * stride_kk
+            + offs_n[None, :] * stride_kn
+        )
+        kt_ptrs = k_ptr + kt_offs
+    else:
+        kt_ptrs = None
+
     v_offs = (
         off_z * stride_vz
         + vh_off
@@ -626,6 +685,17 @@ def _attn_fwd(
         + offs_d[None, :] * stride_vk
     )
     v_ptrs = v_ptr + v_offs
+    if HAS_TAIL:
+        vt_offs = (
+            off_z * stride_vz
+            + vh_off
+            + cu_seqlens_k_start * stride_vn
+            + offs_n[:, None] * stride_vn
+            + offs_dt[None, :] * stride_vk
+        )
+        vt_ptrs = v_ptr + vt_offs
+    else:
+        vt_ptrs = None
 
     # alibi slopes
     if alibi_slopes_ptr is not None:
@@ -675,6 +745,10 @@ def _attn_fwd(
     m_i = tl.full([BLOCK_M], m_i_value, dtype=tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_POW2], dtype=tl.float32)
+    if HAS_TAIL:
+        acc_t = tl.zeros([BLOCK_M, BLOCK_DMODEL_TAIL], dtype=tl.float32)
+    else:
+        acc_t = None
     if BLOCK_DMODEL == BLOCK_DMODEL_POW2:
         q_mask = offs_m[:, None] < seqlen_q
     else:
@@ -690,6 +764,11 @@ def _attn_fwd(
     else:
         q_pe = None
     q = tl.load(q_ptrs, mask=q_mask, other=0.0, cache_modifier=q_cache_mod)
+    if HAS_TAIL:
+        qt_mask = (offs_m[:, None] < seqlen_q) & (offs_dt[None, :] < BLOCK_DMODEL)
+        qt = tl.load(qt_ptrs, mask=qt_mask, other=0.0, cache_modifier=q_cache_mod)
+    else:
+        qt = None
     if IS_FP8:
         descale_q = tl.load(descale_q_ptr + off_z * stride_descale_q_z + off_q_head)
         descale_k = tl.load(descale_k_ptr + off_z * stride_descale_k_z + off_k_head)
@@ -733,6 +812,9 @@ def _attn_fwd(
         k_ptrs += skipped_blocks * BLOCK_N * stride_kn
         if HAS_PE:
             k_pe_ptrs += skipped_blocks * BLOCK_N * stride_kn
+        if HAS_TAIL:
+            kt_ptrs += skipped_blocks * BLOCK_N * stride_kn
+            vt_ptrs += skipped_blocks * BLOCK_N * stride_vn
         v_ptrs += skipped_blocks * BLOCK_N * stride_vn
         if RETURN_SCORES:
             s_dmask_ptrs += skipped_blocks * BLOCK_N * stride_sd_n
@@ -743,15 +825,19 @@ def _attn_fwd(
     # value because there is no masking. Similarly we do not need padding.
     if n_full_blocks > 0:
         block_max = block_min + n_full_blocks * BLOCK_N
-        acc, l_i, m_i = _attn_fwd_inner(
+        acc, acc_t, l_i, m_i = _attn_fwd_inner(
             acc,
+            acc_t,
             l_i,
             m_i,
             q,
             q_pe,
+            qt,
             k_ptrs,
             k_pe_ptrs,
+            kt_ptrs,
             v_ptrs,
+            vt_ptrs,
             stride_kn,
             stride_vn,
             stride_sd_n,
@@ -780,6 +866,7 @@ def _attn_fwd(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             BLOCK_DMODEL_PE,
+            BLOCK_DMODEL_TAIL,
             sm_scale,
             False,
             MASK_STEPS=False,
@@ -803,20 +890,27 @@ def _attn_fwd(
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
         if HAS_PE:
             k_pe_ptrs += n_full_blocks * BLOCK_N * stride_kn
+        if HAS_TAIL:
+            kt_ptrs += n_full_blocks * BLOCK_N * stride_kn
+            vt_ptrs += n_full_blocks * BLOCK_N * stride_vn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vn
         if RETURN_SCORES:
             s_dmask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
         if ENABLE_DROPOUT:
             dropout_mask_ptrs += n_full_blocks * BLOCK_N * stride_sd_n
-        acc, l_i, m_i = _attn_fwd_inner(
+        acc, acc_t, l_i, m_i = _attn_fwd_inner(
             acc,
+            acc_t,
             l_i,
             m_i,
             q,
             q_pe,
+            qt,
             k_ptrs,
             k_pe_ptrs,
+            kt_ptrs,
             v_ptrs,
+            vt_ptrs,
             stride_kn,
             stride_vn,
             stride_sd_n,
@@ -845,6 +939,7 @@ def _attn_fwd(
             BLOCK_DMODEL,
             BLOCK_DMODEL_POW2,
             BLOCK_DMODEL_PE,
+            BLOCK_DMODEL_TAIL,
             sm_scale,
             IS_CAUSAL,
             MASK_STEPS=True,
@@ -860,9 +955,13 @@ def _attn_fwd(
     # This helps the compiler do Newton Raphson on l_i vs on acc which is much larger.
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
+    if HAS_TAIL:
+        acc_t = acc_t * l_recip
     if ENABLE_DROPOUT:
         dropout_scale = 1 / (1 - dropout_p)
         acc = acc * dropout_scale
+        if HAS_TAIL:
+            acc_t = acc_t * dropout_scale
     # If seqlen_q > seqlen_k but the delta is not a multiple of BLOCK_M,
     # then we have one block with a row of all NaNs which come from computing
     # softmax over a row of all -infs (-inf - inf = NaN). We check for that here
@@ -879,6 +978,14 @@ def _attn_fwd(
             out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
             z = 0.0
             acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+            if HAS_TAIL:
+                out_ptrs_mask_t = (
+                    mask_m_offsets[:, None]
+                    >= tl.full((BLOCK_DMODEL_TAIL,), causal_start_idx, dtype=tl.int32)[
+                        None, :
+                    ]
+                )
+                acc_t = tl.where(out_ptrs_mask_t, acc_t, z.to(acc_t.type.element_ty))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
@@ -928,6 +1035,20 @@ def _attn_fwd(
         out_mask = out_mask & (offs_d[None, :] < BLOCK_DMODEL)
     op = acc.to(out_ptr.dtype.element_ty)
     tl.store(out_ptr + offs_out, op, mask=out_mask)
+    if HAS_TAIL:
+        offs_out_t = (
+            off_z * stride_oz
+            + off_q_head * stride_oh
+            + cu_seqlens_q_start * stride_om
+            + offs_m[:, None] * stride_om
+            + offs_dt[None, :] * stride_on
+        )
+        out_mask_t = tl.full([BLOCK_M, 1], 1, dtype=tl.int1)
+        if overflow_size > 0:
+            out_mask_t = out_mask_t & (offs_m[:, None] < seqlen_q)
+        out_mask_t = out_mask_t & (offs_dt[None, :] < BLOCK_DMODEL)
+        op_t = acc_t.to(out_ptr.dtype.element_ty)
+        tl.store(out_ptr + offs_out_t, op_t, mask=out_mask_t)
 
 
 @functools.lru_cache(maxsize=1024)
