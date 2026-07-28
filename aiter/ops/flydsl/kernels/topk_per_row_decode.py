@@ -470,7 +470,7 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
         num_rows: fx.Int32,
         stride0: fx.Int32,
         stride1: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008 - immutable DSL sentinel
     ):
         grid_x = arith.index_cast(T.index, num_rows)
         topk_per_row_decode_radix_unordered_kernel(
