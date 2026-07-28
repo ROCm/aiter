@@ -11,6 +11,8 @@ from aiter.fused_moe import moe_sorting
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from dataclasses import dataclass
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 
 
 @dataclass
@@ -64,6 +66,27 @@ def get_tune_space():
 
 
 @cache
+def _get_compiled_sorted_sum_kernel(TOPK, N):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_sorted_sum
+
+    return compile_sorted_sum(
+        TOPK=TOPK,
+        N=N,
+    )
+
+
+@cache
+def _get_compiled_invert_sorted_ids_kernel(TOPK):
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+        compile_invert_sorted_ids,
+    )
+
+    return compile_invert_sorted_ids(
+        TOPK=TOPK,
+    )
+
+
+@cache
 def _get_compiled_sum_kernel(TOPK, N):
     from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import compile_sum
 
@@ -108,11 +131,37 @@ def _get_compiled_kernel(
     )
 
 
+_TORCH_TO_FX = {
+    torch.bfloat16: fx.BFloat16,
+    torch.float32: fx.Float32,
+    torch.int32: fx.Int32,
+    torch.float8_e4m3fnuz: fx.Uint8,
+    torch.float8_e4m3fn: fx.Uint8,
+}
+
+
+def _ptr(t):
+    return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
+
+
 def _launch(kernel_fn, *args):
     """Launch a flydsl JIT-compiled kernel using flyc.compile pattern.
     Appends the current CUDA stream as the last argument."""
     stream = torch.cuda.current_stream()
-    _run_compiled(kernel_fn, *args, stream)
+    prepared_args = [
+        _ptr(arg) if isinstance(arg, torch.Tensor) else arg for arg in args
+    ]
+    _run_compiled(kernel_fn, *prepared_args, stream)
+
+
+def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
+    assert scale is None
+    assert num_rows is None
+    fmax = torch.finfo(quant_dtype).max
+    xs = x.float().abs().amax() / fmax
+    xq = (x.float() / xs).clamp(-fmax, fmax).to(quant_dtype)
+    xs = xs.reshape(1).to(torch.float32)
+    return xq, xs
 
 
 def fused_moe_gfx942(
@@ -189,13 +238,19 @@ def fused_moe_gfx942(
         # prefill_1x4 gateup input: native-fp8 needs a quantized activation plus its per-token
         # scale; bf16 passes the activation through with a dummy scale (unused by bf16 path).
         if weight_dtype_str == "fp8":
-            quant_func = aiter.get_hip_quant(aiter.QuantType.per_Token)
+            quant_func = (
+                aiter.get_hip_quant(aiter.QuantType.per_Token)
+                if quant_type == QuantType.per_Token
+                else aiter.get_hip_quant(aiter.QuantType.per_Tensor)
+            )
             gateup_in, a_scale = quant_func(
                 hidden_states,
                 scale=None,
                 quant_dtype=w1.dtype,
                 num_rows=None,
             )
+            if quant_type == QuantType.per_Tensor:
+                a_scale = a_scale.repeat(B, 1).contiguous()
             a_scale = a_scale.to(torch.float32).contiguous()
         else:
             gateup_in = hidden_states
@@ -217,6 +272,7 @@ def fused_moe_gfx942(
             act_quant_type_str=act_quant_type_str,
         )
         task_num = int(sorted_expert_ids.shape[0])
+
         _launch(
             gateup_kernel,
             gateup_in,
@@ -251,7 +307,9 @@ def fused_moe_gfx942(
             )
 
         gemm2_out = torch.empty(
-            [B, TOPK, N2], dtype=hidden_states.dtype, device=hidden_states.device
+            [sorted_expert_ids.shape[0] * kcfgs.BLOCK_M, N2],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
         )
 
         # Compile and launch down kernel (splitk; consumes the bf16 gateup output directly,
@@ -268,6 +326,7 @@ def fused_moe_gfx942(
             alg="prefill_1x4",
             E=E,
         )
+
         _launch(
             down_kernel,
             down_in,
@@ -286,10 +345,13 @@ def fused_moe_gfx942(
             B,
             task_num,
         )
+        loc_ids = torch.empty([B, TOPK], dtype=torch.int32, device=hidden_states.device)
 
-        sum_kernel = _get_compiled_sum_kernel(TOPK=TOPK, N=N2)
-        _launch(sum_kernel, gemm2_out, cur_out, B)
-        #cur_out = torch.sum(gemm2_out, dim=1)
+        invert_sorted_ids = _get_compiled_invert_sorted_ids_kernel(TOPK)
+        _launch(invert_sorted_ids, sorted_ids, loc_ids, sorted_ids.shape[0], B)
+
+        sum_kernel = _get_compiled_sorted_sum_kernel(TOPK=TOPK, N=N2)
+        _launch(sum_kernel, loc_ids, gemm2_out, cur_out, B)
 
         return cur_out
 

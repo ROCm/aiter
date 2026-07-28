@@ -2007,7 +2007,11 @@ def compile_gemm(
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
             arg_p_input = fxh.view_as_torch_tensor(p_input, (M, TOPK, K), weight_dtype)
-            arg_p_output = fxh.view_as_torch_tensor(p_output, (M, TOPK, N))
+            arg_p_output = fxh.view_as_torch_tensor(
+                _as_ptr(p_output, fx.BFloat16)
+                + fx.Int64(e_idx) * (BLOCK_TILE_SIZE_M * N),
+                (BLOCK_TILE_SIZE_M, N),
+            )
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
                 _as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
                 (BLOCK_TILE_SIZE_M,),
@@ -2033,6 +2037,7 @@ def compile_gemm(
             )
 
             arg_p_weight = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
+            arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False)
 
             sorted_ids_buf = fx.rocdl.make_buffer_tensor(
                 arg_p_sorted_ids, max_size=False
@@ -2232,16 +2237,11 @@ def compile_gemm(
             )
             col_tensor = fx.flat_divide(col_tensor, (BLOCK_M, BLOCK_N))
 
-            tcopyLDS, _ = flyobj.get_tiled_copy_coalesced_mn(
+            tcopyLDS, cp_ldsc = flyobj.get_tiled_copy_coalesced_mn(
                 ldsC[None, None, 0], copy_atom_bits=128, num_threads=256
             )
 
             thrv_ldsC = tcopyLDS.partition_S(ldsC)
-
-            thrv_dst_col = tcopyLDS.partition_D(col_tensor)
-            frag_row = fxh.load_fragment(tcopyLDS.partition_S(row_tensor))
-
-            cp_atom_128b = flyobj.get_universal_copy_atom(fx.BFloat16, 128)
 
             copy_atom_ = flyobj.get_universal_copy_atom(fragC_bf16.dtype, 64)
             tcopy = flyobj.get_tiled_mma_copy(copy_atom_, mm, "C")
@@ -2256,53 +2256,14 @@ def compile_gemm(
                 fragC_bf16.store(f32_to_bf16(vec_f32))
                 fx.copy(copy_atom_, fragC_bf16r, thrv_ldsCt[None, None, None, ldsc_idx])
 
+            arg_p_output = fx.flat_divide(arg_p_output, (BLOCK_M, BLOCK_N))
+            cp_atom_out_128b = flyobj.get_buffer_copy_atom(fx.BFloat16, 128)
+            thrv_out = tcopyLDS.partition_D(arg_p_output)
             fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
-            # prepare pointers for each token
-            frag_row_addr = fx.make_fragment_like(frag_row, fx.Int64)
-            frag_topk = fx.make_fragment_like(frag_row, fx.Uint32)
-            for raddr, row, ftopk in fxh.all_elements(
-                frag_row_addr, frag_row, frag_topk
-            ):
-                sorted_id = row[0].to(fx.Uint32)
-                topk = sorted_id >> 24
-                token_id = sorted_id & 0x7FFFFF  # workaround for backend bug
-                ftopk[0] = topk
-                offset_64bit = fx.Uint64(token_id) * (TOPK * N) + fx.Uint64(topk * N)
-                raddr[0] = fx.ptrtoint(fx.get_iter(arg_p_output) + offset_64bit)
-
             def postprocess_store2vmem(n, ldsc_idx):
-                fx.copy(cp_atom_128b, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
-
-                for src, row_addr, col, ftopk in fxh.all_elements(
-                    fragOut,
-                    frag_row_addr,
-                    thrv_dst_col[None, None, None, 0, n],
-                    frag_topk,
-                ):
-                    atom_C = fxh.atom_tensor(
-                        fx.inttoptr(fx.get_iter(arg_p_output).type, row_addr[0]),
-                        fx.Int64(col[0].to_py_value()),
-                        128,
-                    )
-                    if fx.const_expr(1):
-                        dummy = llvm.inline_asm(
-                            ir.Type.parse("i64"),
-                            [
-                                ftopk[0].ir_value(),
-                                fx.ptrtoint(fx.get_iter(atom_C)).ir_value(),
-                                src.load().ir_value(),
-                            ],
-                            f"v_cmp_lt_i32_e64 vcc, $1, {int(TOPK)}\n\t"
-                            f"s_and_saveexec_b64 $0, vcc \n\t"
-                            f"global_store_dwordx4 $2, $3, off\n\t"
-                            f"s_or_b64 exec, exec, $0\n\t",
-                            "=s,v,v,v,~{vcc}",
-                            has_side_effects=True,
-                        )
-                    else:
-                        if ftopk[0] < TOPK:
-                            fx.copy(cp_atom_128b, src, atom_C)
+                fx.copy(cp_ldsc, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
+                fx.copy(cp_atom_out_128b, fragOut, thrv_out[None, None, None, 0, n])
 
             """
             apply per-token scale & weights, cvt-bf16, write-fragC to LDS
@@ -2577,57 +2538,102 @@ def compile_gemm(
     return launch_splitk
 
 
-def compile_sum(TOPK, N):
+def compile_sorted_sum(TOPK, N):
     num_threads = 64
 
-    @flyc.kernel(
-        known_block_size=[num_threads, 1, 1]
-    )  # known_block_size at compile time
-    def kernel(A: fx.Tensor, B: fx.Tensor):
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    def sorted_sum(loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer):
         batch = fx.block_idx.x
         tid = fx.thread_idx.x
-        copy_bits = 128
-        # copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
-        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), A.dtype)
+        # preload all TOPK locations
+        loc_ids += batch * TOPK
+        token_locs = [loc_ids[topk] for topk in fx.range_constexpr(TOPK)]
 
-        A = fx.make_view(
-            fx.get_iter(A) + fx.Int64(batch) * (TOPK * N),
-            fx.make_layout((N, TOPK), (1, N)),
-        )
-        B = fx.make_view(fx.get_iter(B) + fx.Int64(batch) * (N), fx.make_layout(N, 1))
-        A = fx.rocdl.make_buffer_tensor(
-            A,
-            max_size=False,
-            num_records_bytes=fx.Int64(N) * (TOPK * A.dtype.width // 8),
-        )
+        copy_bits = 128
+        copy_atom = fx.make_copy_atom(fx.UniversalCopy(copy_bits), A.dtype)
+        copy_atom_b = fx.make_copy_atom(fx.rocdl.BufferCopy(copy_bits), B.dtype)
+
+        col_tensor = fx.make_view(0, fx.make_layout(N, 1))
+        B = fx.make_view(B + fx.Int64(batch) * (N), fx.make_layout(N, 1))
         B = fx.rocdl.make_buffer_tensor(
             B,
             max_size=False,
             num_records_bytes=fx.Int64(N) * (B.dtype.width // 8),
         )
-        # all_copy_atoms only partions the first mode, extra modes are considered as batch/broadcast dimension
-        for dst, src in fxh.all_copy_atoms(
-            B, A, atom_bits=copy_bits, num_threads=num_threads
-        ):
-            frag = fx.make_fragment_like(src)
-            fx.copy(copy_atom, src, frag)
 
-            vec_sum = frag[None, 0].load().to(fx.Float32)
+        token_ptrs = [
+            (A + fx.Int64(token_locs[topk]) * N) for topk in fx.range_constexpr(TOPK)
+        ]
+
+        def load_atom(topk_id, off):
+            atom = fxh.atom_tensor(token_ptrs[topk_id], fx.Int32(off), copy_bits)
+            frag = fx.make_fragment_like(atom)
+            fx.copy(copy_atom, atom, frag)
+            return frag
+
+        # all_copy_atoms only partions the first mode, extra modes are considered as batch/broadcast dimension
+        for dst, col in fxh.all_copy_atoms(
+            B, col_tensor, atom_bits=copy_bits, num_threads=num_threads
+        ):
+            column = col[0].to_py_value()
+            frag = [load_atom(topk, column) for topk in fx.range_constexpr(TOPK)]
+
+            vec_sum = frag[0].load().to(fx.Float32)
             for m in fx.range_constexpr(1, TOPK):
-                vec = frag[None, m].load().to(fx.Float32)
+                vec = frag[m].load().to(fx.Float32)
                 vec_sum += vec
 
             # store out
             vec_sum = vec_sum.to(dst.dtype)
+
             frag = fx.make_fragment_like(dst)
             frag.store(vec_sum)
-            fx.copy(copy_atom, frag, dst)
+            fx.copy(copy_atom_b, frag, dst)
 
     @flyc.jit
-    def sum(A: fx.Tensor, B: fx.Tensor, batch_size: fx.Int32, stream):
+    def launch(
+        loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer, batch_size: fx.Int32, stream
+    ):
         assert A.dtype == B.dtype
-        kernel(A, B).launch(
+        sorted_sum(loc_ids, A, B).launch(
             grid=(batch_size, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
 
-    return sum
+    return launch
+
+
+def compile_invert_sorted_ids(TOPK):
+    num_threads = 64
+
+    @flyc.kernel(known_block_size=[num_threads, 1, 1])
+    def invert_sorted_ids(
+        sorted_ids: fx.Pointer,
+        invert: fx.Pointer,
+        num_ids: fx.Uint32,
+        batch_size: fx.Uint32,
+    ):
+        batch = fx.block_idx.x
+        tid = fx.thread_idx.x
+        slot = batch * num_threads + tid
+        if slot < num_ids:
+            sid = sorted_ids[slot].to(fx.Uint32)
+            tok_id = sid & 0xFFFFFF
+            top_id = sid >> 24
+            idx = tok_id * TOPK + top_id
+            if top_id < TOPK and tok_id < batch_size:
+                invert[idx] = fx.Uint32(slot)
+
+    @flyc.jit
+    def launch(
+        sorted_ids: fx.Pointer,
+        invert: fx.Pointer,
+        num_ids: fx.Uint32,
+        batch_size: fx.Uint32,
+        stream,
+    ):
+        grid_size = div_up(num_ids, num_threads)
+        invert_sorted_ids(sorted_ids, invert, num_ids, batch_size).launch(
+            grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream
+        )
+
+    return launch
