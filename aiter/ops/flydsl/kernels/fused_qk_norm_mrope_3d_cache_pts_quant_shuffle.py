@@ -49,6 +49,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from aiter.utility import dtypes as aiter_dtypes
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
@@ -313,6 +314,9 @@ def _build_kv_kernel(
     WAVES_PER_BLOCK = KV_THREADS // WAVE
     PHASE1_ITERS = _ceil_div(block_size, WAVES_PER_BLOCK)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
+    CACHE_IS_FNUZ = cache_is_fp8 and aiter_dtypes.fp8 == getattr(
+        torch, "float8_e4m3fnuz", None
+    )
 
     STAGE_ELEMS = block_size * D
     K_TOTAL_RUNS = (D // x) * block_size
@@ -409,6 +413,17 @@ def _build_kv_kernel(
         def quant_pair_fp8(v0, v1, scale):
             s0 = v0 / scale
             s1 = v1 / scale
+            if const_expr(CACHE_IS_FNUZ):
+                # On gfx942, v_cvt_pk_fp8_f32 encodes values that round to
+                # negative zero as 0x80. In e4m3fnuz that byte is NaN, so
+                # match the established qk_norm_rope_quant conversion path
+                # by mapping tiny negative inputs to +0 before conversion.
+                zero = fx.Float32(0.0)
+                neg_underflow = fx.Float32(-(2.0**-8))
+                s0_tiny_neg = (s0 < zero) and (s0 > neg_underflow)
+                s1_tiny_neg = (s1 < zero) and (s1 > neg_underflow)
+                s0 = s0_tiny_neg.select(zero, s0)
+                s1 = s1_tiny_neg.select(zero, s1)
             packed = fx.Int32(fx.rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, fx.Int32(0), 0))
             byte0 = packed.to(fx.Int8)
             byte1 = (packed >> fx.Int32(8)).to(fx.Int8)
@@ -906,18 +921,13 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         )
     if k_cache.dtype != v_cache.dtype:
         raise TypeError("k_cache/v_cache must have the same dtype")
-    fp8_dtypes = tuple(
-        dtype
-        for dtype in (
-            getattr(torch, "float8_e4m3fn", None),
-            getattr(torch, "float8_e4m3fnuz", None),
-        )
-        if dtype is not None
-    )
-    cache_is_fp8 = k_cache.dtype in fp8_dtypes
+    cache_is_fp8 = k_cache.dtype == aiter_dtypes.fp8
     cache_is_bf16 = k_cache.dtype == torch.bfloat16
     if not cache_is_fp8 and not cache_is_bf16:
-        raise TypeError("k_cache/v_cache must be a 1-byte FP8 dtype or torch.bfloat16")
+        raise TypeError(
+            "k_cache/v_cache must use the architecture-native AITER FP8 dtype "
+            f"({aiter_dtypes.fp8}) or torch.bfloat16, got {k_cache.dtype}"
+        )
     expected_x = _RUN_BYTES // k_cache.element_size()
     if x != expected_x:
         raise ValueError(
