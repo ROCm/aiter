@@ -57,21 +57,21 @@ Notes:
     - VGPR analysis is not applicable since this uses CK kernels, not Triton kernels
 """
 
-import sys
-import os
 import argparse
 import itertools
+import os
+import sys
 
 import torch
+import triton
+
 import aiter
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
-    get_dtype_bytes,
     get_caller_name_no_ext,
+    get_dtype_bytes,
+    get_model_configs,
 )
-
-import triton
 
 # Suppress verbose aiter logging
 os.environ.setdefault("AITER_LOG_LEVEL", "ERROR")

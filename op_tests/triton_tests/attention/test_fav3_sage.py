@@ -1,25 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-import pytest
 import logging
-import numpy as np
 import math
-from aiter.test_mha_common import (
-    attention_ref,
-    attention_ref_block_sparse,
-)
+
+import numpy as np
+import pytest
+import torch
+
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_wrapper_func,
     get_sage_fwd_configs,
 )
-from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.test_mha_common import (
+    attention_ref,
+    attention_ref_block_sparse,
+)
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -111,9 +113,7 @@ def fp8_assert_close(
     max_abs_idx = torch.argmax(abs_diff).item()
     max_rel_idx = torch.argmax(rel_diff).item()
 
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(  # noqa: E731
-        flat_idx, shape
-    )
+    flat_to_idx = lambda flat_idx, shape: np.unravel_index(flat_idx, shape)
 
     max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
     max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
@@ -372,7 +372,7 @@ def test_sage_int8_hadamard_preserves_float_logits(dtype=torch.bfloat16):
     BATCH, SEQLEN, NUM_HEADS = 1, 32, 4
 
     torch.manual_seed(7)
-    q, k, v = input_helper(
+    q, k, _v = input_helper(
         BATCH,
         NUM_HEADS,
         NUM_HEADS,

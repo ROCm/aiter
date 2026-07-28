@@ -1,8 +1,10 @@
 import os
-import triton
-from triton.testing import runtime
+from collections.abc import Callable
+
 import torch
+import triton
 import triton.language as tl
+from triton.testing import runtime
 
 
 @triton.jit
@@ -11,10 +13,9 @@ def split_dummy(d_ptr):
     x = tl.load(d_ptr + pid)
     x = x + 1
     tl.store(d_ptr + pid, x)
-    return
 
 
-def run_profile(fn: callable, n_run: int = 250):
+def run_profile(fn: Callable, n_run: int = 250):
     di = runtime.driver.active.get_device_interface()
     cache = runtime.driver.active.get_empty_cache_for_benchmark()
     for _ in range(n_run):
@@ -111,15 +112,15 @@ def read_screen_file(filename, case_data):
 
 def pre_pruning_rules(M: int, N: int, K: int, config_list: list[int], verbose: bool):
     (
-        BLOCK_SIZE_M,
-        BLOCK_SIZE_N,
+        _BLOCK_SIZE_M,
+        _BLOCK_SIZE_N,
         BLOCK_SIZE_K,
         GROUP_SIZE_M,
-        num_warps,
+        _num_warps,
         num_stages,
-        waves_per_eu,
-        matrix_instr_nonkdim,
-        cache_modifier,
+        _waves_per_eu,
+        _matrix_instr_nonkdim,
+        _cache_modifier,
         NUM_KSPLIT,
     ) = config_list
     # remove cases
