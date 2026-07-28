@@ -1997,8 +1997,6 @@ def compile_gemm(
         p_a_scale: fx.Pointer,  # input fp8 scale (per-token ptpc / per-tensor)
         M: fx.Int32,
     ):
-        tid = fx.gpu.thread_idx.x
-        blk_n = fx.gpu.block_idx.x  # always 0
         e_idx = fx.gpu.block_idx.y
 
         flyobj.bid = e_idx
@@ -2039,9 +2037,7 @@ def compile_gemm(
             arg_p_weight = fx.rocdl.make_buffer_tensor(arg_p_weight, max_size=False)
             arg_p_output = fx.rocdl.make_buffer_tensor(arg_p_output, max_size=False)
 
-            sorted_ids_buf = fx.rocdl.make_buffer_tensor(
-                arg_p_sorted_ids, max_size=False
-            )
+            fx.rocdl.make_buffer_tensor(arg_p_sorted_ids, max_size=False)
 
             BLOCK_M = BLOCK_TILE_SIZE_M
             BLOCK_N = 64
@@ -2108,7 +2104,6 @@ def compile_gemm(
             weight = fx.flat_divide(arg_p_weight, (BLOCK_N, BLOCK_K))
             ldsA = fx.flat_divide(ldsA0, (BLOCK_M, BLOCK_K))
 
-            nBM = 1
             nBN = fxh.div_up(N, BLOCK_N)
             nBK = fxh.div_up(K, BLOCK_K)
 
@@ -2228,7 +2223,7 @@ def compile_gemm(
                     for fc, fpc in fxh.all_elements(fragC, fragPCS):
                         fc.store(fc.load() * fpc.load())
 
-            row_tensor = fx.make_view(
+            fx.make_view(
                 fx.get_iter(arg_p_sorted_ids),
                 fx.make_layout((BLOCK_M, BLOCK_N), (1, 0)),
             )
@@ -2538,9 +2533,9 @@ def compile_gemm(
     return launch_splitk
 
 
-import torch
-import functools
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+import torch  # noqa: E402
+import functools  # noqa: E402
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled  # noqa: E402
 
 _TORCH_TO_FX = {
     torch.bfloat16: fx.BFloat16,
@@ -2555,6 +2550,7 @@ _TORCH_TO_FX = {
 def _ptr(t):
     return flyc.from_c_void_p(_TORCH_TO_FX[t.dtype], t.data_ptr())
 
+
 @functools.cache
 def sorted_sum(TOPK, N):
     num_threads = 64
@@ -2562,7 +2558,6 @@ def sorted_sum(TOPK, N):
     @flyc.kernel(known_block_size=[num_threads, 1, 1])
     def sorted_sum_kernel(loc_ids: fx.Pointer, A: fx.Pointer, B: fx.Pointer):
         batch = fx.block_idx.x
-        tid = fx.thread_idx.x
         # preload all TOPK locations
         loc_ids += batch * TOPK
         token_locs = [loc_ids[topk] for topk in fx.range_constexpr(TOPK)]
@@ -2617,7 +2612,9 @@ def sorted_sum(TOPK, N):
             grid=(batch_size, 1, 1), block=(num_threads, 1, 1), stream=stream
         )
 
-    def callable(loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int):
+    def callable(
+        loc_ids: torch.Tensor, A: torch.Tensor, B: torch.Tensor, batch_size: int
+    ):
         stream = torch.cuda.current_stream()
         _run_compiled(
             launch,
@@ -2630,6 +2627,7 @@ def sorted_sum(TOPK, N):
 
     return callable
 
+
 @functools.cache
 def invert_sorted_ids(TOPK):
     num_threads = 64
@@ -2638,13 +2636,18 @@ def invert_sorted_ids(TOPK):
     def invert_sorted_ids_kernel(
         sorted_ids: fx.Pointer,
         invert: fx.Pointer,
+        p_num_valid: fx.Pointer,
         num_ids: fx.Uint32,
         batch_size: fx.Uint32,
     ):
         batch = fx.block_idx.x
         tid = fx.thread_idx.x
         slot = batch * num_threads + tid
-        if slot < num_ids:
+        # Scan only the down-written region [0, num_valid): the tail of sorted_ids
+        # (>= num_valid) is uninitialized, and its garbage would racily map real
+        # tokens onto unwritten gemm2_out rows. Read the bound on-device (no host sync).
+        num_valid = p_num_valid[0].to(fx.Uint32)
+        if slot < num_valid:
             sid = sorted_ids[slot].to(fx.Uint32)
             tok_id = sid & 0xFFFFFF
             top_id = sid >> 24
@@ -2656,26 +2659,36 @@ def invert_sorted_ids(TOPK):
     def launch(
         sorted_ids: fx.Pointer,
         invert: fx.Pointer,
+        p_num_valid: fx.Pointer,
         num_ids: fx.Uint32,
         batch_size: fx.Uint32,
         stream,
     ):
         grid_size = div_up(num_ids, num_threads)
-        invert_sorted_ids_kernel(sorted_ids, invert, num_ids, batch_size).launch(
-            grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream
-        )
+        invert_sorted_ids_kernel(
+            sorted_ids, invert, p_num_valid, num_ids, batch_size
+        ).launch(grid=(grid_size, 1, 1), block=(num_threads, 1, 1), stream=stream)
 
-    def callable(sorted_ids: torch.Tensor, invert: torch.Tensor, num_ids: int, batch_size: int):
+    def callable(
+        sorted_ids: torch.Tensor,
+        invert: torch.Tensor,
+        num_valid: torch.Tensor,
+        num_ids: int,
+        batch_size: int,
+    ):
         stream = torch.cuda.current_stream()
         _run_compiled(
             launch,
             _ptr(sorted_ids),
             _ptr(invert),
+            _ptr(num_valid),
             fx.Uint32(num_ids),
             fx.Uint32(batch_size),
             stream,
         )
+
     return callable
+
 
 @functools.cache
 def flydsl_absmax():
@@ -2704,7 +2717,6 @@ def flydsl_absmax():
             max_size=False,
         )
         vmax = fx.Float32(0.0)
-        fm_fast = fx.arith.FastMathFlags.fast
 
         num_values = copy_bits // A.dtype.width
         div_tensor = fx.logical_divide(A, fx.make_layout(num_values, 1))
@@ -2811,7 +2823,7 @@ def flydsl_quant_per_tensor(torch_dtype):
         num_values = copy_bits // A.dtype.width
         div_tensorA = fx.logical_divide(A, fx.make_layout(num_values, 1))
         div_tensorB = fx.logical_divide(B, fx.make_layout(num_values, 1))
-        num_atoms = fx.Int32(fxh.div_up(neles, num_values))
+        fx.Int32(fxh.div_up(neles, num_values))
         num_atoms_full = fx.Int32(neles // num_values)
         i0 = fx.thread_idx.x
         clamp_lo = fx.Float32(-fmax)

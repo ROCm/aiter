@@ -123,7 +123,7 @@ def _launch(kernel_fn, *args):
     _run_compiled(kernel_fn, *prepared_args, stream)
 
 
-from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (  # noqa: E402
     flydsl_absmax,
     flydsl_quant_per_tensor,
     sorted_sum,
@@ -329,7 +329,14 @@ def fused_moe_gfx942(
         )
         loc_ids = torch.empty([B, TOPK], dtype=torch.int32, device=hidden_states.device)
 
-        invert_sorted_ids(TOPK)(sorted_ids, loc_ids, sorted_ids.shape[0], B)
+        # invert_sorted_ids scans only [0, num_valid) (bound read on-device, no host
+        # sync): the tail of sorted_ids (>= num_valid) is uninitialized, and its garbage
+        # can racily map real tokens onto unwritten gemm2_out rows, producing NaN in the
+        # sorted_sum gather. num_valid_ids[0] is the down kernel's write boundary; the
+        # full sorted size only sizes the launch grid.
+        invert_sorted_ids(TOPK)(
+            sorted_ids, loc_ids, num_valid_ids, sorted_ids.shape[0], B
+        )
         sorted_sum(TOPK, N2)(loc_ids, gemm2_out, cur_out, B)
 
         return cur_out
@@ -395,7 +402,7 @@ def fused_moe_gfx942(
         )
         return cur_out
 
-    elif 2 <= B <= 32:
+    elif 2 <= B <= 256:
         BLOCK_M = kcfgs.BLOCK_M
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, cur_out = (
             moe_sorting(

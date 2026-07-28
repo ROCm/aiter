@@ -4879,7 +4879,7 @@ class FmoeTuner(TunerCommon):
                     target_fused_moe=partial(
                         target_fused_moe, config_string=config_string
                     ),
-                    config_string = config_string,
+                    config_string=config_string,
                 )
             except Exception as e:
                 print(f"{RED}Error with config {config_string}: {e}{END}")
