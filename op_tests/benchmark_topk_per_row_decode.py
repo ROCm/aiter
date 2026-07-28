@@ -68,7 +68,7 @@ def arch_name() -> str:
         from aiter.jit.utils.chip_info import get_gfx
 
         return get_gfx()
-    except Exception:
+    except Exception:  # noqa: BLE001 - label only; never fail a run over it
         return props.name
 
 
