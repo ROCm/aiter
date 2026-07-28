@@ -230,6 +230,17 @@ def select_3d_config(
         ), "TILE_SIZE needs to be divisible by block_size"
         NUM_BLOCKS_GATHER_PER_TILE = TILE_SIZE // block_size
 
+    # gfx120x has a 64 KiB per-workgroup LDS limit. With the two-stage
+    # pipeline, K and V tiles at head_size=256 and TILE_SIZE=64 consume the
+    # full 64 KiB before Triton's scratch allocation, so compilation fails
+    # with a 65,792-byte shared-memory request. Keep two stages where the
+    # tiles leave headroom and fall back to one stage only at the limit.
+    rdna_lds_bytes = (
+        2 * TILE_SIZE * triton.next_power_of_2(head_size) * kv_cache_dtype.itemsize
+    )
+    if DEVICE_ARCH in ("gfx1200", "gfx1201") and rdna_lds_bytes >= 64 * 1024:
+        attn_stages = 1
+
     # gfx1151 (RDNA3.5) decode is memory-latency-bound at bs=1: the default 2
     # warps/workgroup leave unified_attention at only ~31% of the LPDDR5X
     # bandwidth roofline. 8 warps/workgroup reach ~59% (1.5-1.9x on bf16 decode)

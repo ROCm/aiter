@@ -6,20 +6,58 @@ from typing import Optional
 import pytest
 import torch
 
+import aiter.ops.triton.attention.unified_attention as unified_attention_module
 from aiter.ops.triton.attention.unified_attention import (
-    unified_attention,
     is_2d_gluon_available,
+    select_3d_config,
+    unified_attention,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.test_common import checkAllclose
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+
+
+@pytest.mark.parametrize(
+    "device_arch, head_size, block_size, q_dtype, kv_cache_dtype, expected_num_stages",
+    [
+        ("gfx1200", 256, 64, torch.bfloat16, torch.bfloat16, 1),
+        ("gfx1201", 256, 64, torch.bfloat16, torch.bfloat16, 1),
+        ("gfx1201", 256, 64, e4m3_dtype, e4m3_dtype, 2),
+        ("gfx1201", 256, 64, torch.bfloat16, e4m3_dtype, 2),
+        ("gfx1201", 256, 32, torch.bfloat16, torch.bfloat16, 2),
+        ("gfx1201", 128, 64, torch.bfloat16, torch.bfloat16, 2),
+        ("gfx1151", 256, 64, torch.bfloat16, torch.bfloat16, 2),
+    ],
+)
+def test_select_3d_config_respects_rdna_lds_limit(
+    monkeypatch,
+    device_arch: str,
+    head_size: int,
+    block_size: int,
+    q_dtype: torch.dtype,
+    kv_cache_dtype: torch.dtype,
+    expected_num_stages: int,
+) -> None:
+    monkeypatch.setattr(unified_attention_module, "DEVICE_ARCH", device_arch)
+
+    attn_config, _ = select_3d_config(
+        head_size=head_size,
+        block_size=block_size,
+        max_seqlen_k=8192,
+        target_num_prgms=64,
+        num_2d_prgms=8,
+        q_dtype=q_dtype,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+    assert attn_config["num_stages"] == expected_num_stages
 
 
 def shuffle_kv_cache(
