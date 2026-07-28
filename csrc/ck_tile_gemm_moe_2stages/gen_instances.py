@@ -8,16 +8,6 @@ import shutil
 import sys
 from pathlib import Path
 
-from chip_info import get_gfx, get_gfx_list
-from moe_cktile2stages_common import (
-    act_dict,
-    dtype_dict,
-    get_gemm1_kernels_list,
-    get_gemm2_kernels_list,
-    get_heuristic_dispatch_template,
-    kernelInstance,
-)
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
 if os.path.exists(os.path.join(AITER_CORE_DIR, "aiter_meta")):
@@ -27,6 +17,15 @@ else:
         f"{this_dir}/../../aiter/jit/utils"
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
+from chip_info import get_gfx, get_gfx_list
+from moe_cktile2stages_common import (
+    act_dict,
+    dtype_dict,
+    get_gemm1_kernels_list,
+    get_gemm2_kernels_list,
+    get_heuristic_dispatch_template,
+    kernelInstance,
+)
 
 
 class cktile_moe_2stage_gemm_codegen:
