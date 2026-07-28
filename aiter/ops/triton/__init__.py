@@ -126,6 +126,7 @@ _BACKWARD_COMPAT_MAP = {
     "quant_moe": "moe.quant_moe",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
+    "fused_gate_add_layernorm_scale_shift": "normalization.fused_gate_add_layernorm_scale_shift",
     "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
