@@ -75,7 +75,9 @@ def build_moe_g2l_lut_module():
         # standalone torch ``_ep_nvt * topk`` elementwise launch on the decode hot
         # path; the route / psum-remap / quant kernels consume nvr_out as-is.
         if tid == c0:
-            nvt_val = buffer_ops.buffer_load(ptr_rsrc(nvt), c0, vec_width=1, dtype=T.i32)
+            nvt_val = buffer_ops.buffer_load(
+                ptr_rsrc(nvt), c0, vec_width=1, dtype=T.i32
+            )
             buffer_ops.buffer_store(nvt_val * topk, ptr_rsrc(nvr_out), c0)
 
         # Fold the route atomic-counter zero-init into this pre-route kernel:
