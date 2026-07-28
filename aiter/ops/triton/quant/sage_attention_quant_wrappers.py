@@ -388,13 +388,9 @@ def sage_quant_f4f4(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    # V: fp4 (E2M1) col-major LDS pack. AITER_F4F4_MXFP4_V toggles two-level mxfp4 V (per-channel
-    # descale + per-block E8M0 for the scaled PV MFMA) vs. the default per-channel-only fp4 V. The
-    # env must match how fwd_hd128_f4f4.co was built (the kernel's _MXFP4_V gates the scaled PV MFMA).
-    if os.environ.get("AITER_F4F4_MXFP4_V", "0") != "0":
-        v_fp4_view, v_descale = _pack_v_mxfp4_colmajor(v_bshd)
-    else:
-        v_fp4_view, v_descale = _pack_v_fp4_colmajor(v_bshd)
+    # V: mxfp4 (E2M1 + per-(dv, 32-kv-block) E8M0) col-major LDS pack. f4f4 is always mxfp4-V -- the
+    # kernel's scaled PV MFMA reads the E8M0 image appended to the v_descale buffer tail.
+    v_fp4_view, v_descale = _pack_v_mxfp4_colmajor(v_bshd)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 
