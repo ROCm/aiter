@@ -27,10 +27,6 @@ from typing import Optional
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, memref, scf
-from flydsl._mlir.dialects.arith import CmpIPredicate
-from flydsl._mlir.extras import types as _mT
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import range_constexpr
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -2460,7 +2456,7 @@ def compile_mixed_moe_gemm1(
                 sk_n_offset = [0]
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    _fused, row_byte_base = row_ctx
+                    fused, row_byte_base = row_ctx
                     if const_expr(need_quant and not is_splitk):
                         frag_vals = []
                         for i in range_constexpr(e_vec):
@@ -3078,7 +3074,7 @@ def compile_mixed_moe_gemm1(
     return launch_mixed_moe_gemm1
 
 
-@functools.cache
+@functools.lru_cache(maxsize=None)
 def compile_mixed_moe_gemm2(
     *,
     model_dim: int,
@@ -3099,7 +3095,7 @@ def compile_mixed_moe_gemm2(
     inter_dim_pad: int = 0,
     persist_m: int = 4,
     sort_block_m: int = 0,
-    waves_per_eu: int | None = None,
+    waves_per_eu: Optional[int] = None,
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
     b_nt: int = 0,
@@ -4772,7 +4768,7 @@ def compile_mixed_moe_gemm2(
                     return llvm.inttoptr(ptr_ty, i64_raw)
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                    _fused, row_byte_base, row_byte_off_i32 = row_ctx
+                    fused, row_byte_base, row_byte_off_i32 = row_ctx
                     if const_expr(not bool(accumulate)):
                         col_idx = col_g0
                         byte_off_col = col_idx * arith.constant(
