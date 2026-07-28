@@ -1,18 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
 
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
-from aiter.test_common import (
-    checkAllclose,
-    benchmark,
-    run_perftest,
-    perftest,
-)
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-import pandas as pd
-import argparse
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    perftest,
+    run_perftest,
+)
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -51,7 +55,7 @@ def test_fuse(
     # from aiter.fused_moe import fused_topk
     # return fused_topk(hidden_states, gating_output, topk, renormalize)
 
-    M, expert = gating_output.shape
+    M, _expert = gating_output.shape
     topk_weights = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
     )
@@ -77,7 +81,7 @@ def test_asm(
     topk: int,
     renormalize: bool,
 ):
-    M, expert = gating_output.shape
+    M, _expert = gating_output.shape
     topk_weights = torch.empty_strided(
         (M, topk), (topk + 10, 1), dtype=dtypes.fp32, device=gating_output.device
     )
@@ -103,7 +107,7 @@ def test_topk_softmax(dtype, token, E, topk, renormalize=True):
     gating_output = torch.randn((token, E + 10), dtype=dtype, device="cuda")
     # making gating_output as strided tensor for testing
     gating_output = gating_output[:, :E]
-    (topk_weights_a, topk_ids_a), avg_a = test_nofuse(gating_output, topk, renormalize)
+    (topk_weights_a, topk_ids_a), _avg_a = test_nofuse(gating_output, topk, renormalize)
     id_ref, _ref = torch.sort(topk_ids_a)
     w_ref = topk_weights_a.gather(1, _ref)
 
@@ -397,7 +401,7 @@ def test_grouped_topk(
     w_ref = w_ref * scale_factor
     w_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.fp32)
     id_aiter = torch.empty_strided((token, topk), (topk + 10, 1), dtype=dtypes.i32)
-    is_softmax = True if scoring_func == "softmax" else False
+    is_softmax = scoring_func == "softmax"
     _, us_aiter = run_perftest(
         aiter.grouped_topk,
         gating_output,
@@ -700,8 +704,9 @@ for token in args.token:
     fused_front_width = gate_up_width + num_experts + routed_width
     backing = torch.randn((token, fused_front_width), dtype=dtypes.bf16)
     gating_output = backing[:, gate_up_width : gate_up_width + num_experts]
+    # stride(0) is the thing under test. Do not also assert non-contiguity:
+    # at token=1 the row stride is unreachable, so the slice is contiguous.
     assert gating_output.stride(0) == fused_front_width
-    assert not gating_output.is_contiguous()
     ret = test_biased_grouped_topk(
         token,
         num_experts,

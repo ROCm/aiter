@@ -28,14 +28,14 @@ kv_seqlen that is a multiple of 256.
 import argparse
 import itertools
 import math
-from typing import List
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 
@@ -105,7 +105,7 @@ def run_torch(q, k, v, cu_q, cu_k, *, is_causal, sink):
 # ---------------------------------------------------------------------------
 
 
-def make_varlen_packed(seqlens: List[int], hq, hk, d, dv, init="randn", seed=0):
+def make_varlen_packed(seqlens: list[int], hq, hk, d, dv, init="randn", seed=0):
     """Build packed THD q/k/v + cu_seqlens for the given per-batch seqlens.
 
     Equal q/k seqlens per batch (standard varlen self-attention).

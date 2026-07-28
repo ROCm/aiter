@@ -169,7 +169,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest(num_iters=TEST_NUM_ITERS)
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
-    m, k = x.shape
+    m, _k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)

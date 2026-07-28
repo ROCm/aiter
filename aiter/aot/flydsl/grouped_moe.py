@@ -439,23 +439,23 @@ def compile_one_config(**job):
         )
         warp_tile_m = job["tile_m"] // job["m_warp"]
         contiguous = bool(job.get("grouped_contiguous_m", False))
-        common = dict(
-            model_dim=job["model_dim"],
-            inter_dim=job["inter_dim"],
-            experts=job["experts"],
-            max_m=job["max_m"],
-            tile_m=job["tile_m"],
-            tile_n=job["tile_n"],
-            tile_k=job["tile_k"],
-            m_warp=job["m_warp"],
-            n_warp=job["n_warp"],
-            out_dtype=job["out_dtype"],
-            num_buffers=job["num_buffers"],
-            grouped_persistent_m=job["grouped_persistent_m"],
-            grouped_contiguous_m=contiguous,
-            persistent_workers=job["persistent_workers"],
-            expert_sched_mode=job["expert_sched_mode"],
-        )
+        common = {
+            "model_dim": job["model_dim"],
+            "inter_dim": job["inter_dim"],
+            "experts": job["experts"],
+            "max_m": job["max_m"],
+            "tile_m": job["tile_m"],
+            "tile_n": job["tile_n"],
+            "tile_k": job["tile_k"],
+            "m_warp": job["m_warp"],
+            "n_warp": job["n_warp"],
+            "out_dtype": job["out_dtype"],
+            "num_buffers": job["num_buffers"],
+            "grouped_persistent_m": job["grouped_persistent_m"],
+            "grouped_contiguous_m": contiguous,
+            "persistent_workers": job["persistent_workers"],
+            "expert_sched_mode": job["expert_sched_mode"],
+        }
         if contiguous:
             act_lead = 1
             ub = job["token_num"] * job["topk"] + job["experts"] * (job["tile_m"] - 1)
@@ -610,7 +610,7 @@ def compile_one_config(**job):
         elapsed = time.time() - t0
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
         return {**job, "compile_time": elapsed, "compile_arch": aot_arch}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Catch everything and return cleanly with compile_time=None: the AOT pool
         # keys off exitcode 0 + compile_time=None to mark "produced no kernel" and
         # NOT retry it. An escaping exception crashes the worker (exitcode != 0),

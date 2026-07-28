@@ -3,13 +3,13 @@
 
 from typing import Any
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
-    decode_attention_fwd_grouped_rope,
     _get_config,
+    decode_attention_fwd_grouped_rope,
 )
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,

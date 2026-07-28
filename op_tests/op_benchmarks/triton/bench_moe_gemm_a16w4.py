@@ -1,22 +1,24 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import chain
-from pathlib import Path
-import triton.profiler as proton
-import torch
 import argparse
 import csv
-from aiter.ops.triton.moe.moe_routing.routing import routing
+import inspect
+import tempfile
+from itertools import chain
+from pathlib import Path
+
+import torch
+import triton.profiler as proton
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-import tempfile
+from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
-import inspect
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 
 def parse_profile(profile_path, useful_op_regex, reps):
@@ -206,7 +208,7 @@ def bench_mlp_single_weight_init(
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):
         logits = gemm_a16w16(xg, wg.T, bg)
-        rdata, gather_indx, scatter_indx = routing(logits, n_expts_act)
+        rdata, gather_indx, _scatter_indx = routing(logits, n_expts_act)
         x = moe_gemm_a16w4(
             x,
             w1,

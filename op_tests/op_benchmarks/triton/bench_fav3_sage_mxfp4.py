@@ -1,49 +1,45 @@
 from __future__ import annotations
-from typing import List, Dict, Any
-import csv
-import torch
-import os
-import glob
-import sys
-import argparse
-import triton
-import logging
-import aiter
 
+import argparse
+import csv
+import glob
+import logging
+import os
+import sys
+from typing import Any
+
+import torch
+import triton
+
+import aiter
 from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
+    fav3_sage_mxfp4_func,
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
-    fav3_sage_mxfp4_func,
 )
-
 from aiter.ops.triton.attention.utils import (
     block_attn_mask_to_ragged_lut,
 )
-
-from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
-    sage_quant_mxfp4,
-)
-
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
+    sage_quant_mxfp4,
 )
-
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_block_sparse,
-)
-from op_tests.triton_tests.attention.test_fav3_sage import (
-    compare_accuracy,
-    check_attention_outputs,
-    input_helper,
 )
 from op_tests.op_benchmarks.triton.bench_fav3_sage import (
     fav2_forward_func,
     sparse_flops_from_lut,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.attention.test_fav3_sage import (
+    check_attention_outputs,
+    compare_accuracy,
+    input_helper,
 )
 
 # Configuration
@@ -637,7 +633,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
     """
     Load captured input tensors from disk.
     Args:
@@ -751,11 +747,12 @@ def main():
 
     assert args.BLOCK_R <= args.d, "Rotation block size should be <= d"
 
-    if getattr(args, "block_sparsity", None) is not None:
-        if not (0 <= args.block_sparsity <= 1):
-            raise ValueError(
-                f"-block_sparsity must be in [0, 1], got {args.block_sparsity}"
-            )
+    if getattr(args, "block_sparsity", None) is not None and not (
+        0 <= args.block_sparsity <= 1
+    ):
+        raise ValueError(
+            f"-block_sparsity must be in [0, 1], got {args.block_sparsity}"
+        )
 
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")

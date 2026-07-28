@@ -4,7 +4,6 @@
 # user interface
 
 import functools
-from typing import Optional
 
 import torch
 
@@ -38,7 +37,7 @@ def topk_gating(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: Optional[torch.Tensor] = None,
+    correction_bias: torch.Tensor | None = None,
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
@@ -293,12 +292,12 @@ def _top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
     k: int = 2048,
-    workspace: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -348,7 +347,7 @@ def top_k_per_row_prefill(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
@@ -381,7 +380,7 @@ def top_k_per_row_prefill_fast(
     rowStarts: torch.Tensor,
     rowEnds: torch.Tensor,
     indices: torch.Tensor,
-    values: Optional[torch.Tensor],
+    values: torch.Tensor | None,
     numRows: int,
     stride0: int,
     stride1: int,
@@ -398,7 +397,7 @@ def _top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
-    workspace: Optional[torch.Tensor] = None,
+    workspace: torch.Tensor | None = None,
 ) -> None: ...
 
 
