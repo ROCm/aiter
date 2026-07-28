@@ -79,21 +79,24 @@ def custom_group_worker(
     if withGraph:
         # capture and time each op separately
         graph_ar = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_ar, stream=gc.stream):
-                out_ar = custom_all_reduce(x_ar)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_ar, stream=gc.stream
+        ):
+            out_ar = custom_all_reduce(x_ar)
         out_ar.fill_(0)
 
         graph_ag = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_ag, stream=gc.stream):
-                out_ag = custom_all_gather(x_ag)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_ag, stream=gc.stream
+        ):
+            out_ag = custom_all_gather(x_ag)
         out_ag.fill_(0)
 
         graph_rs = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_rs, stream=gc.stream):
-                out_rs = custom_reduce_scatter(x_rs)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_rs, stream=gc.stream
+        ):
+            out_rs = custom_reduce_scatter(x_rs)
         out_rs.fill_(0)
 
         @perftest()
@@ -203,21 +206,24 @@ def multi_group_worker(
 
         if withGraph:
             graph_ar = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_ar, stream=gc.stream):
-                    out_ar = custom_all_reduce(x_ar, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_ar, stream=gc.stream
+            ):
+                out_ar = custom_all_reduce(x_ar, group=gname)
             out_ar.fill_(0)
 
             graph_ag = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_ag, stream=gc.stream):
-                    out_ag = custom_all_gather(x_ag, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_ag, stream=gc.stream
+            ):
+                out_ag = custom_all_gather(x_ag, group=gname)
             out_ag.fill_(0)
 
             graph_rs = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_rs, stream=gc.stream):
-                    out_rs = custom_reduce_scatter(x_rs, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_rs, stream=gc.stream
+            ):
+                out_rs = custom_reduce_scatter(x_rs, group=gname)
             out_rs.fill_(0)
 
             @perftest()

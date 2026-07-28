@@ -620,10 +620,11 @@ def _so_offload_archs(so_path):
 
     archs = set()
     try:
-        with open(so_path, "rb") as f:
-            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
-                    archs.add(m.group(1).decode())
+        with open(so_path, "rb") as f, mmap.mmap(
+            f.fileno(), 0, access=mmap.ACCESS_READ
+        ) as mm:
+            for m in re.finditer(rb"amdhsa--(gfx[0-9a-z]+)", mm):
+                archs.add(m.group(1).decode())
     except (OSError, ValueError, OverflowError):
         pass
     return archs

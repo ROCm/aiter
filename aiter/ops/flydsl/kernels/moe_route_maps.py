@@ -82,7 +82,7 @@ def build_moe_route_maps_module():
         topk: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -154,7 +154,7 @@ def build_moe_topids_to_rows_module():
         numel: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)

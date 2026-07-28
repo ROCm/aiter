@@ -200,17 +200,18 @@ def _call_get_asm_tasks(tuner, m, n, k, asm_kernels):
         False,
     )
     run_kwargs = {"num_warmup": 0, "num_iters": 1}
-    with patch("gemm_a16w16_tune.get_asm_kernels", return_value=asm_kernels):
-        with patch("gemm_a16w16_tune.get_gfx", return_value="gfx942"):
-            return tuner._get_asm_tasks(
-                info_keys,
-                False,
-                dtypes.bf16,
-                dtypes.fp32,
-                False,
-                False,
-                run_kwargs,
-            )
+    with patch("gemm_a16w16_tune.get_asm_kernels", return_value=asm_kernels), patch(
+        "gemm_a16w16_tune.get_gfx", return_value="gfx942"
+    ):
+        return tuner._get_asm_tasks(
+            info_keys,
+            False,
+            dtypes.bf16,
+            dtypes.fp32,
+            False,
+            False,
+            run_kwargs,
+        )
 
 
 # ---------------------------------------------------------------------------

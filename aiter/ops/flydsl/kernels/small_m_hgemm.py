@@ -1388,7 +1388,7 @@ def compile_small_m_hgemm_kernel(
         m: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         if const_expr(WAVES_PER_EU > 0):

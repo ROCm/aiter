@@ -574,7 +574,7 @@ def _build_compress_forward_kernel(
         kv_compressed: fx.Tensor,
         kv_compressed_row_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
@@ -986,7 +986,7 @@ def _build_norm_rope_scatter_kernel(
         krope_block_stride: fx.Int32,
         krope_token_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         # grid = ceil(cap / KW): KW plan rows packed per block.
         cap_raw = _to_raw(plan_capacity)

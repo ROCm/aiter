@@ -150,7 +150,7 @@ def build_moe_scatter_copy_token_module(row_bytes: int):
         dst: fx.Pointer,
         dst_src: fx.Pointer,
         num_dst: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

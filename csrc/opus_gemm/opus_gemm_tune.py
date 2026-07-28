@@ -431,11 +431,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if N % 16 != 0:
             return True
-        if not k_inst.has_oob and (
-            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
-        ):
-            return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
 
     if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
         waves_per_wg = k_inst.BLOCK_SIZE // 64
@@ -557,11 +556,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        if not k_inst.has_oob and (
-            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
-        ):
-            return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
         # mono_tile is divisible-only (has_oob=False is intrinsic; the

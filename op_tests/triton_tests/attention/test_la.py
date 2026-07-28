@@ -621,12 +621,7 @@ def main():
     # # Compare result
     atol = 1.4e-1 if init_dtype == "fp8" else 1e-2
     rtol = 1e-2 if init_dtype == "fp8" else 3e-3
-    try:
-        torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
-    except AssertionError:
-        #     print("Assertion failed! Showing mismatches:")
-        #     # print_mismatches(ref_out, la_out, atol, rtol)
-        raise  # Re-raise the exception after printing mismatches
+    torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 
     # torch.testing.assert_close(ref_out, la_out, atol=atol, rtol=rtol)
 

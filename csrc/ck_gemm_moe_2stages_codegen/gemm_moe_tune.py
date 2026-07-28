@@ -442,28 +442,25 @@ class FmoeTuner(TunerCommon):
                 device=a1_qt.device,
             )
             tmp_out = out
-        try:
-            ck_moe_stage1_fwd(
-                a1_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                sorted_ids,
-                sorted_expert_ids,
-                num_valid_ids,
-                tmp_out,
-                topk,
-                kernelName,
-                w1_scale,
-                a1_scale,
-                blockM,
-                sorted_weights,
-                q_type,
-                act_type,
-                splitk if is_splitk else 0,
-                dst_type=dtype if is_splitk else None,
-            )
-        except Exception:
-            raise
+        ck_moe_stage1_fwd(
+            a1_qt,
+            w1_qt_shffle_ck,
+            w2_qt_shffle_ck,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            tmp_out,
+            topk,
+            kernelName,
+            w1_scale,
+            a1_scale,
+            blockM,
+            sorted_weights,
+            q_type,
+            act_type,
+            splitk if is_splitk else 0,
+            dst_type=dtype if is_splitk else None,
+        )
         if is_splitk:
             out = torch.empty(
                 (token_num, topk, inter_dim),

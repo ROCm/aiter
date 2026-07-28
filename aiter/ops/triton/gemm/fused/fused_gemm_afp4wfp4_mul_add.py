@@ -19,7 +19,6 @@ from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 

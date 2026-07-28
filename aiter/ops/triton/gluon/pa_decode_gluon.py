@@ -4941,7 +4941,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         stride_logits_group,
         batch_size,
         num_kv_heads,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -5129,6 +5129,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 query_group_size=query_group_size,
                 head_size=head_size,
                 context_partition_num=context_partition_num,
+                # Was the `fx.Stream(None)` parameter default; passed explicitly
+                # now that the default is gone. fx.Stream(None) is the default queue.
+                stream=fx.Stream(None),
             )
             return
         except ImportError:

@@ -17,7 +17,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
 
 

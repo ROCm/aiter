@@ -26,7 +26,6 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 

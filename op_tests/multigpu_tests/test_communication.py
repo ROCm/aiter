@@ -40,11 +40,9 @@ def run_commun_fwd(tp_size, pp_size, gpuID, input, withGraph=False):
 
         if withGraph:
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    # run inplace here, to test accuracy, we need this
-                    x.copy_(input)
-                    out = aiter.all_reduce_asm(x)
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                x.copy_(input)
+                out = aiter.all_reduce_asm(x)
             torch.cuda.synchronize()
             out.fill_(0)
             dist.barrier()
@@ -123,11 +121,10 @@ def run_all_reduce_rmsnorm(
                 return graph.replay()
 
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out = aiter.all_reduce_rmsnorm(
-                        input, residual_in, weight, bias, epsilon
-                    )
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out, residual_out = aiter.all_reduce_rmsnorm(
+                    input, residual_in, weight, bias, epsilon
+                )
             torch.cuda.synchronize()
             out.fill_(0)
             residual_out.fill_(0)
@@ -185,11 +182,10 @@ def run_all_reduce_rmsnorm_quant(
                 return graph.replay()
 
             graph = torch.cuda.CUDAGraph()
-            with graph_capture() as gc:
-                with torch.cuda.graph(graph, stream=gc.stream):
-                    out, residual_out, ysacle = aiter.all_reduce_rmsnorm_quant(
-                        input, residual_in, xscale, weight, bias, epsilon
-                    )
+            with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+                out, residual_out, ysacle = aiter.all_reduce_rmsnorm_quant(
+                    input, residual_in, xscale, weight, bias, epsilon
+                )
             torch.cuda.synchronize()
             out.fill_(0)
             residual_out.fill_(0)

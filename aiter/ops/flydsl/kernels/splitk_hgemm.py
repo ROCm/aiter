@@ -1106,7 +1106,7 @@ def compile_hgemm_kernel(
         m: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME

@@ -306,7 +306,7 @@ def build_moe_gather_reduce_module(
         out: fx.Pointer,
         num_tokens: fx.Int32,
         slice_stride_dw: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
