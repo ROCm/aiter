@@ -1,0 +1,9 @@
+[
+ ["s_setreg_imm32_b32 hwreg(HW_REG_WAVE_SCHED_MODE, 0, 2), 2"],
+ ["s_bitcmp1_b32 s51, 0", "s_wait_tensorcnt 0x0", "s_cselect_b32 s45, 0, 0x9a00"],
+ ["s_add_co_i32 s2, 0, 0x9a00", "s_add_co_i32 s3, 0, 0x12b80"],
+ ["s_clause 0x3", "global_load_b128 v[0:3], v[50:51], off"],
+ ["ds_store_b64 v64, v[14:15]"],
+ ["tensor_store_from_lds s[24:27], s[16:23]"],
+ ["s_endpgm"]
+]

@@ -807,6 +807,15 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
             _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
             _tdm_kw["num_buffers2"] = _as_int(cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"])
+        # Env overrides for TDM tile/buffer sweeps (AITER_TDM_TILE_M=..., etc).
+        # Presence-checked so a sweep can pin one knob without editing the CSV.
+        for _k in ("tile_m", "tile_n", "tile_k", "num_buffers",
+                   "tile_m2", "tile_n2", "tile_k2", "num_buffers2"):
+            _ev = os.environ.get("AITER_TDM_" + _k.upper())
+            if _ev:
+                _tdm_kw[_k] = int(_ev)
+        if _tdm_kw:
+            _grouped_dbg(f"tdm kwargs: {_tdm_kw}")
         return _grouped_a8w4_tdm_moe(
             hidden_states, w1, w2, topk_weight, topk_ids,
             E=E, model_dim=model_dim, inter_dim=inter_dim, dtype=dtype,

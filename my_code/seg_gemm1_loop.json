@@ -1,0 +1,26 @@
+{
+  "interval-print-limit": "6",
+  "interval information": [
+    {"key": "desc", "value": "K-tile iteration 1 (loop body)"},
+    {"key": "desc", "value": "K-tile iteration 2 (loop body)"},
+    {"key": "desc", "value": "K-tile iteration 3 (loop body)"}
+  ],
+  "kernel versions": [
+    {
+      "key": "version",
+      "value": "gemm1",
+      "baseline": true,
+      "specific_part": {"interval_name": "K-tile iteration 1 (loop body)", "long_lat_thr": 100},
+      "config": {
+        "sample points": [
+          {"point1": {"instruction": ["s_bitcmp1_b32 s51, 0", "s_wait_tensorcnt 0x0", "s_cselect_b32 s45, 0, 0x9a00"]}},
+          {"point2": {"instruction": ["s_bitcmp1_b32 s51, 0", "s_wait_tensorcnt 0x0", "s_cselect_b32 s45, 0, 0x9a00"]}},
+          {"point3": {"instruction": ["s_bitcmp1_b32 s51, 0", "s_wait_tensorcnt 0x0", "s_cselect_b32 s45, 0, 0x9a00"]}},
+          {"point4": {"instruction": ["s_bitcmp1_b32 s51, 0", "s_wait_tensorcnt 0x0", "s_cselect_b32 s45, 0, 0x9a00"]}}
+        ],
+        "se": "*", "sm": "*", "sl": "*", "wv": "*",
+        "trace_dir": "gemm_a8w4_att/thread_trace/gemm1/rpf_v3/ui_output_agent_3886_dispatch_4133"
+      }
+    }
+  ]
+}
