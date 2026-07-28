@@ -322,10 +322,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         # head-major, so pass it through directly. The wrapper accepts
         # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
-            chunk_gated_delta_rule_fwd_h_flydsl,
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )
 
-        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl(
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             k=k,
             w=w,
             u=u,

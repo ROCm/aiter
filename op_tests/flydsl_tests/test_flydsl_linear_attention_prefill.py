@@ -396,8 +396,8 @@ _PREFILL_GROUPS = [
         Hv=64,
         tps=[8],
         full_prompt_lens=[8192],
-        # max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
-        max_num_batched_tokens=[65536],
+        max_num_batched_tokens=[8192, 16384, 24576, 32768, 40960, 49152, 57344, 65536],
+        # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
         model_name="varlen-16k-aws",

@@ -141,14 +141,39 @@ def _f32x4_to_bf16x4_rne_portable(vec_f32x4):
     return vector.bitcast(T.vec(4, T.bf16), hi16)
 
 
-def _f32x4_to_bf16x4_rne(vec_f32x4):
-    """Arch-aware RNE f32x4 -> bf16x4.
+def _f32x4_to_bf16x4_trunc(vec_f32x4):
+    """Truncating f32x4 -> bf16x4: keep the high 16 bits, NO rounding bias.
 
-    Uses the native ``v_cvt_pk_bf16_f32`` convert on gfx950 (CDNA4) and a
-    portable integer software RNE everywhere else (gfx942 / CDNA3 has no
-    ``v_cvt_pk_bf16_f32``). Called at trace time, so dispatching on
+    Matches HIP's ``float_to_bf16`` (``__builtin_bit_cast<uint32_t>(x) >> 16``)
+    exactly, so outputs are bit-identical to the HIP/C++ K5 kernel. Arch-
+    independent (pure integer shift; no ``v_cvt_pk_bf16_f32``).
+    """
+    i32x4 = T.vec(4, T.i32)
+    x = vector.bitcast(i32x4, vec_f32x4)
+    c16 = arith.constant_vector(16, i32x4)
+    hi = arith.shrui(x, c16)
+    hi16 = arith.trunci(T.vec(4, T.i16), hi)
+    return vector.bitcast(T.vec(4, T.bf16), hi16)
+
+
+# fp32->bf16 output-conversion mode. When True (default), use bit-truncation to
+# match HIP's ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``) so flydsl-hip
+# outputs are bit-identical to the HIP/C++ K5 kernel. When False, use RNE
+# (~0.5 ulp closer to the FP32 reference, but NOT bit-matching HIP).
+_BF16_CONVERT_TRUNC = True
+
+
+def _f32x4_to_bf16x4_rne(vec_f32x4):
+    """Arch-aware fp32x4 -> bf16x4 output conversion.
+
+    With ``_BF16_CONVERT_TRUNC`` (default) this truncates to match HIP exactly.
+    Otherwise it uses the native ``v_cvt_pk_bf16_f32`` RNE convert on gfx950
+    (CDNA4) and a portable integer software RNE everywhere else (gfx942 / CDNA3
+    has no ``v_cvt_pk_bf16_f32``). Called at trace time, so dispatching on
     ``get_rocm_arch()`` here selects the right lowering per compile.
     """
+    if _BF16_CONVERT_TRUNC:
+        return _f32x4_to_bf16x4_trunc(vec_f32x4)
     if "gfx950" in get_rocm_arch():
         return _f32x4_to_bf16x4_rne_gfx950(vec_f32x4)
     return _f32x4_to_bf16x4_rne_portable(vec_f32x4)
@@ -268,7 +293,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
     _K5_KERNEL_REVISION = (
-        121  # SCHED_GFX942 精细版：sched_barrier(mask_mfma) 保留 MFMA 跨 ks 重叠
+        122  # fp32->bf16 输出改用截断(_BF16_CONVERT_TRUNC)对齐 hip float_to_bf16
     )
 
     GPU_ARCH = get_rocm_arch()
