@@ -227,7 +227,7 @@ def torch_compile_guard(
             aiter_lib = Library("aiter", "FRAGMENT") if aiter_lib is None else aiter_lib
             schema = ""
             if calling_func.__name__ in MANUAL_SCHEMA_OPS:
-                schema = generate_schema(calling_func)
+                schema = generate_schema(calling_func, mutates_args=mutates_args)
             else:
                 sig = inspect.signature(calling_func)
                 if hasattr(torch.library, "infer_schema"):

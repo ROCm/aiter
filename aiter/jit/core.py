@@ -15,7 +15,7 @@ import time
 import traceback
 import types
 import typing
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Union
 
 from packaging.version import Version, parse
 
@@ -1489,6 +1489,7 @@ def compile_ops(
     gen_fake: Optional[Callable[..., Any]] = None,
     ffi_type: str = "pybind",
     develop: bool = False,
+    mutates_args: Union[str, List[str]] = "unknown",
 ):
     def decorator(func):
         loadName = fc_name if fc_name is not None else func.__name__
@@ -1500,7 +1501,9 @@ def compile_ops(
             def ctypes_wrapper(*args, **kwargs):
                 return ctypes_caller(*args, **kwargs)
 
-            @torch_compile_guard(device="cuda", calling_func_=func)
+            @torch_compile_guard(
+                device="cuda", calling_func_=func, mutates_args=mutates_args
+            )
             def ctypes_custom_wrapper(*args, **kwargs):
                 return ctypes_wrapper(*args, **kwargs)
 
@@ -1779,7 +1782,12 @@ def compile_ops(
                     )
                 return op(*args, **kwargs)
 
-            @torch_compile_guard(device="cuda", gen_fake=gen_fake, calling_func_=func)
+            @torch_compile_guard(
+                device="cuda",
+                gen_fake=gen_fake,
+                calling_func_=func,
+                mutates_args=mutates_args,
+            )
             def custom_wrapper(*args, **kwargs):
                 return wrapper(*args, **kwargs)
 
