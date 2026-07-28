@@ -1696,6 +1696,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_opus_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_opus_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/mla_decode_fwd_opus.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/mla_decode_fwd_16mx8_32nx1_fp8fp8_ps_opus.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/mla_fp8fp8_def.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_topk_plain": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/topk_plain_pybind.cu'",

@@ -1855,3 +1855,26 @@ def mla_decode_stage1_opus_fwd_ds32(
     q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
     kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
 ) -> None: ...
+
+
+@compile_ops("module_opus_mla")
+def mla_decode_fwd_opus_stage1(
+    q: torch.Tensor,  # [B, H, 576]           fp8 (merged nope+rope)
+    kv: torch.Tensor,  # [total_tokens, 576]   fp8 (merged nope+rope)
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]   fp32
+    out: torch.Tensor,  # final [B, H, 512] bf16
+    final_lse: torch.Tensor,
+    q_scale: torch.Tensor,  # float[1] per-tensor descale
+    kv_scale: torch.Tensor,  # float[1] per-tensor descale
+) -> None: ...
