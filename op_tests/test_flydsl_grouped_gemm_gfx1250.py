@@ -43,7 +43,7 @@ from aiter.fused_moe import (
     torch_moe_stage1,
     torch_moe_stage2,
 )
-from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_common import GateMode, apply_gate_up
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
 from aiter.utility import dtypes, fp4_utils
@@ -316,7 +316,6 @@ def _run_grouped_via_fused_moe(
     model_dim: int,
     inter_dim: int,
     data_format: str,  # "a4w4" | "a8w4"
-    layout: str = "gguu",  # "gguu" -> SEPARATED | "gugu" -> INTERLEAVE
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
     situ_beta: float = 4.0,
@@ -331,11 +330,10 @@ def _run_grouped_via_fused_moe(
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
-    ``layout`` selects the stage1 weight physical layout:
-    ``gguu`` (gate rows then up rows, default) pairs with ``GateMode.SEPARATED``;
-    ``gugu`` (gate/up row-interleaved, gpt-oss style) pairs with
-    ``GateMode.INTERLEAVE``. The PyTorch reference always evaluates the
-    GGUU logical weights, so both paths share the same numerical result.
+    Stage1 weights are always laid out GUGU (gate/up row-interleaved) paired
+    with ``GateMode.INTERLEAVE``, which is the only layout the felix TDM grouped
+    GEMM reads. The PyTorch reference evaluates the GGUU logical weights, so the
+    numerical result is unchanged.
 
     Correctness is always checked against the reference. ``bench`` selects the
     path that is validated and timed: when set, the output comes from
@@ -347,8 +345,6 @@ def _run_grouped_via_fused_moe(
     """
     if data_format not in ("a4w4", "a8w4"):
         raise ValueError(f"data_format must be a4w4 or a8w4, got {data_format!r}")
-    if layout not in ("gguu", "gugu"):
-        raise ValueError(f"layout must be gguu or gugu, got {layout!r}")
 
     K = model_dim
     inter = inter_dim
@@ -387,37 +383,30 @@ def _run_grouped_via_fused_moe(
     topk_w = topk_w.to(torch.bfloat16)
 
     # ---- prep grouped GEMM inputs ----
-    # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
-    # has no GUGU/GGUU concept (single N=hidden GEMM).
-    if layout == "gugu":
-        bias1_phys = _gguu_to_gugu_rows(bias1)
-        gate_mode = GateMode.INTERLEAVE
-    else:
-        bias1_phys = bias1
-        gate_mode = GateMode.SEPARATED
+    # Stage1 weight/scale/bias are rearranged to the physical GUGU layout;
+    # stage2 has no GUGU concept (single N=hidden GEMM).
+    bias1_phys = _gguu_to_gugu_rows(bias1)
+    gate_mode = GateMode.INTERLEAVE
 
-    # Arch-aware stage weight shuffle: GUGU interleaves gate/up rows internally
-    # (moe_shuffle_weight), so pass the logical GGUU weight either way.
+    # moe_shuffle_weight interleaves gate/up rows internally, so it takes the
+    # logical GGUU weight.
     w1_grouped = moe_shuffle_weight(
         w1_logical,
         experts_cnt=experts,
-        is_guinterleave=(layout == "gugu"),
+        is_guinterleave=True,
         gate_up=True,
     )
     w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
-    if layout == "gugu":
-        # GUGU B-scale is always built the production way: feed the RAW GGUU
-        # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
-        # gate/up rows then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4
-        # end to end) -- the weights/bias are row-interleaved above.
-        w1_scale = moe_shuffle_scale(
-            w1_scale_raw.contiguous(),
-            experts_cnt=experts,
-            is_guinterleave=True,
-            gate_up=True,
-        )
-    else:
-        w1_scale = moe_shuffle_scale(w1_scale_raw.contiguous(), experts_cnt=experts)
+    # GUGU B-scale is built the production way: feed the RAW GGUU scale to
+    # moe_shuffle_scale(is_guinterleave=True), which interleaves gate/up rows
+    # then folds n32k4 (aiter.ops.shuffle.shuffle_scale_n32k4 end to end) --
+    # the weights/bias are row-interleaved above.
+    w1_scale = moe_shuffle_scale(
+        w1_scale_raw.contiguous(),
+        experts_cnt=experts,
+        is_guinterleave=True,
+        gate_up=True,
+    )
     w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
 
     if data_format == "a4w4":
@@ -537,7 +526,6 @@ def run_moe(
     topk: int = 2,
     model_dim: int = 512,
     inter_dim: int = 512,
-    layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
     situ_beta: float = 4.0,
@@ -566,7 +554,7 @@ def run_moe(
         ActivationType.Swiglu: "swiglu",
         ActivationType.Situv2: "situv2",
     }[activation]
-    tag = f"{data_format} {layout} {act}"
+    tag = f"{data_format} {act}"
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
     run_only = run_only_env() if check_aot_cache else nullcontext()
@@ -578,7 +566,6 @@ def run_moe(
             model_dim=model_dim,
             inter_dim=inter_dim,
             data_format=data_format,
-            layout=layout,
             activation=activation,
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
@@ -641,24 +628,20 @@ def run_moe(
     return metrics
 
 
-# model_dim=512 (not the 256 default): the grouped mxscale kernel needs
+# model_dim=512 (not the 256 default): the grouped kernel needs
 # num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
-@pytest.mark.parametrize("layout", ["gguu", "gugu"])
-def test_grouped_a4w4_silu_matches_torch_ref(layout):
+def test_grouped_a4w4_silu_matches_torch_ref():
     run_moe(
         "a4w4",
-        layout=layout,
         activation=ActivationType.Silu,
         model_dim=512,
         inter_dim=512,
     )
 
 
-@pytest.mark.parametrize("layout", ["gguu", "gugu"])
-def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
+def test_grouped_a4w4_swiglu_matches_torch_ref():
     run_moe(
         "a4w4",
-        layout=layout,
         activation=ActivationType.Swiglu,
         model_dim=512,
         inter_dim=512,
@@ -666,10 +649,6 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
 
 
 def test_situv2_activation_matches_torch():
-    from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
-        _apply_gate_up,
-    )
-
     torch.manual_seed(0)
     gate = torch.randn(4, 32)
     up = torch.randn(4, 32)
@@ -681,7 +660,7 @@ def test_situv2_activation_matches_torch():
         * linear_beta
         * torch.tanh(up / linear_beta)
     )
-    actual = _apply_gate_up(
+    actual = apply_gate_up(
         gate,
         up,
         "situv2",
@@ -691,21 +670,23 @@ def test_situv2_activation_matches_torch():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("layout", ["gguu", "gugu"])
-def test_grouped_a4w4_situv2_matches_torch_ref(layout):
+@pytest.mark.skip(
+    reason="SiTUv2 has no grouped kernel since the fused stage1 epilogue was "
+    "removed; the TDM path runs it as silu. See TODO(situv2) in "
+    "grouped_moe_gfx1250."
+)
+def test_grouped_a4w4_situv2_matches_torch_ref():
     run_moe(
         "a4w4",
-        layout=layout,
         activation=ActivationType.Situv2,
         model_dim=512,
         inter_dim=512,
     )
 
 
-@pytest.mark.parametrize("layout", ["gguu", "gugu"])
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
-def test_grouped_a4w4_swiglu_limit_clamps(layout, activation):
-    run_moe("a4w4", layout=layout, activation=activation, swiglu_limit=1.0)
+def test_grouped_a4w4_swiglu_limit_clamps(activation):
+    run_moe("a4w4", activation=activation, swiglu_limit=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -718,27 +699,21 @@ def _mock_grouped_gemm() -> None:
     scale preshuffle, m-tile map, gather-reduce) run on any arch (e.g. gfx942
     via AITER_FORCE_GFX1250=1):
 
-    1. Replace the grouped WMMA GEMM compilers with no-op launchers -- the GEMM
-       executes nothing; stage outputs are left as-is.
+    1. Replace the felix TDM grouped GEMM with a no-op -- the GEMM executes
+       nothing; stage outputs are left as-is.
     2. Route the fp4 a1/a2 quant through the Triton implementation, since the
        HIP ``per_1x32_f4_quant_hip`` has no fp4x2 output support off gfx1250.
 
     The library imports all these names at call time, so patching the source
     modules is enough -- no library edits required.
     """
-    import aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 as gk
+    import aiter.ops.flydsl.batched_gemm_mxfp4 as bg
     import aiter.ops.quant as q
 
-    def _noop_compile(*_a, **_k):
-        return lambda *_a, **_k: None
+    def _noop_gemm(*_a, **_k):
+        return None
 
-    for _name in (
-        "compile_moe_grouped_gemm1_a8w4_masked",
-        "compile_moe_grouped_gemm2_a8w4_masked",
-        "compile_moe_grouped_gemm1_mxfp4_masked",
-        "compile_moe_grouped_gemm2_mxfp4_masked",
-    ):
-        setattr(gk, _name, _noop_compile)
+    bg.flydsl_grouped_gemm_a8w4_masked = _noop_gemm
 
     q.per_1x32_f4_quant_hip = q.per_1x32_f4_quant_triton
 
@@ -823,7 +798,7 @@ def run_csv_scenario(args) -> None:
     """Sweep every setting in a tuned_grouped_fmoe-style CSV.
 
     Each CSV row (token, model_dim, inter_dim, expert, topk, act_type,
-    q_dtype_a, stage1_weight_layout) becomes one ``run_moe`` case. The GEMM
+    q_dtype_a) becomes one ``run_moe`` case. The GEMM
     tuned config is looked up from the same CSV by the kernel via the problem
     shape, so simply running each shape exercises its tuned setting.
 
@@ -856,7 +831,6 @@ def run_csv_scenario(args) -> None:
             inter_dim = int(rec["inter_dim"])
             experts = int(rec["expert"])
             topk = int(rec["topk"])
-            layout = rec["stage1_weight_layout"].strip() or "gguu"
             data_format = _csv_data_format(rec["q_dtype_a"])
             activation = activation_override or _csv_activation(rec["act_type"])
         except (KeyError, ValueError) as exc:
@@ -874,7 +848,7 @@ def run_csv_scenario(args) -> None:
 
         act = "swiglu" if activation == ActivationType.Swiglu else "silu"
         print(
-            f"\n===== csv row {idx}: {data_format} {layout} {act} "
+            f"\n===== csv row {idx}: {data_format} {act} "
             f"tokens={tokens} model_dim={model_dim} inter_dim={inter_dim} "
             f"experts={experts} topk={topk} =====",
             flush=True,
@@ -885,7 +859,6 @@ def run_csv_scenario(args) -> None:
         try:
             metrics = run_moe(
                 data_format,
-                layout=layout,
                 experts=experts,
                 tokens=tokens,
                 topk=topk,
@@ -909,7 +882,6 @@ def run_csv_scenario(args) -> None:
                 {
                     "row": idx,
                     "data_format": data_format,
-                    "layout": layout,
                     "act": act,
                     "tokens": tokens,
                     "model_dim": model_dim,
@@ -931,7 +903,6 @@ def run_csv_scenario(args) -> None:
             {
                 "row": idx,
                 "data_format": data_format,
-                "layout": layout,
                 "act": act,
                 "tokens": tokens,
                 "model_dim": model_dim,
@@ -952,7 +923,7 @@ def run_csv_scenario(args) -> None:
     failed = [r for r in rows if not r["pass"]]
     if failed:
         details = "; ".join(
-            f"row={r['row']} {r['data_format']} {r['layout']} {r['act']} "
+            f"row={r['row']} {r['data_format']} {r['act']} "
             f"tokens={r['tokens']} "
             + (
                 f"error={r['error']}"
@@ -988,13 +959,6 @@ def main() -> None:
         f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
-    parser.add_argument(
-        "--layout",
-        choices=("gguu", "gugu"),
-        default="gguu",
-        help="stage1 weight physical layout. gguu pairs with "
-        "GateMode.SEPARATED (default), gugu with INTERLEAVE.",
-    )
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument(
         "--tokens",
@@ -1026,16 +990,6 @@ def main() -> None:
         help="run with zero stage1/stage2 bias tensors",
     )
     parser.add_argument(
-        "--wst",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="enable/disable wave-specialized TDM (WST) for the grouped gemm1 "
-        "and gemm2 (4 TDM streams -> 4 loader waves). --wst enables, --no-wst "
-        "disables (default). Sets AITER_GROUPED_GEMM_WAVE_SPECIALIZED. Applies "
-        "where valid: gemm2 (non-fused single-B) always; gemm1 only for gugu "
-        "(gguu is dual-B and ignores it).",
-    )
-    parser.add_argument(
         "--const-init",
         type=float,
         nargs="?",
@@ -1063,10 +1017,6 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
-    # Toggle wave-specialized TDM for the grouped gemm1 and gemm2 (read by
-    # grouped_moe; applied where valid).
-    _wst = "1" if args.wst else "0"
-    os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
 
@@ -1103,7 +1053,6 @@ def main() -> None:
         # sweep; the failure is recorded and reported after the table.
         metrics = run_moe(
             args.data_format,
-            layout=args.layout,
             experts=args.experts,
             tokens=args.tokens,
             topk=args.topk,
@@ -1124,7 +1073,6 @@ def main() -> None:
         rows.append(
             {
                 "data_format": args.data_format,
-                "layout": args.layout,
                 "act": args.act,
                 "init": "random" if args.const_init is None else "const",
                 "experts": args.experts,
@@ -1147,7 +1095,7 @@ def main() -> None:
     failed = [r for r in rows if not r["pass"]]
     if failed:
         details = "; ".join(
-            f"tokens={r['tokens']} layout={r['layout']} act={r['act']} "
+            f"tokens={r['tokens']} act={r['act']} "
             f"logits_diff={r['logits_diff']:.4e} rel_l2={r['rel_l2']:.4e}"
             for r in failed
         )

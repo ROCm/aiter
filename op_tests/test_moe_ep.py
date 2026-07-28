@@ -676,37 +676,22 @@ def test_fmoe_ep_mxfp4(
         # (a8w4 -> q_dtype_a=fp8), per_1x32 mxfp4 weights.
         w1_u8 = w1_qt.view(torch.uint8)
         w2_u8 = w2_qt.view(torch.uint8)
-        _tdm_gugu = os.environ.get("AITER_EP_TDM_GUGU", "0") in (
-            "1",
-            "true",
-            "True",
-            "yes",
+        # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
+        # felix TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
+        # row-interleaved ([g0,u0,g1,u1,...]) inside moe_shuffle_weight/scale,
+        # matching test_flydsl_grouped_gemm_gfx1250.py.
+        w1_a = moe_shuffle_weight(
+            w1_u8, experts_cnt=total_local, is_guinterleave=True, gate_up=True
         )
-        if _tdm_gugu:
-            # gugu (INTERLEAVE) stage1 layout so the EP path is routed through the
-            # felix TDM batched GEMM (_grouped_a8w4_tdm_moe, gugu-only). gate/up are
-            # row-interleaved ([g0,u0,g1,u1,...]) inside moe_shuffle_weight/scale,
-            # matching test_flydsl_grouped_gemm_gfx1250.py --layout gugu. Also needs
-            # AITER_GROUPED_A8W4_TDM_EP=1 (default) for the EP TDM dispatch.
-            w1_a = moe_shuffle_weight(
-                w1_u8, experts_cnt=total_local, is_guinterleave=True, gate_up=True
-            )
-            w2_a = shuffle_weight(w2_u8, layout=(16, 16))
-            w1_s = moe_shuffle_scale(
-                w1_scale.contiguous(),
-                experts_cnt=total_local,
-                is_guinterleave=True,
-                gate_up=True,
-            )
-            w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
-            gate_mode = GateMode.INTERLEAVE.value
-        else:
-            # Default: SEPARATED (gguu) -> grouped mxscale masked GEMM path.
-            w1_a = shuffle_weight(w1_u8, layout=(16, 16))
-            w2_a = shuffle_weight(w2_u8, layout=(16, 16))
-            w1_s = moe_shuffle_scale(w1_scale.contiguous(), experts_cnt=total_local)
-            w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
-            gate_mode = GateMode.SEPARATED.value
+        w2_a = shuffle_weight(w2_u8, layout=(16, 16))
+        w1_s = moe_shuffle_scale(
+            w1_scale.contiguous(),
+            experts_cnt=total_local,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
+        gate_mode = GateMode.INTERLEAVE.value
         act = ActivationType.Silu
         os.environ["AITER_FORCE_A8W4"] = "1"
         os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")

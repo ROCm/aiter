@@ -642,13 +642,16 @@ def fused_moe_(
     if is_flydsl_available():
         try:
             from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                _maybe_grouped_gfx1250_a8w4_moe,
+                grouped_gemm_gfx1250_a8w4,
             )
         except ImportError:
-            _maybe_grouped_gfx1250_a8w4_moe = None
+            grouped_gemm_gfx1250_a8w4 = None
 
-        if _maybe_grouped_gfx1250_a8w4_moe is not None:
-            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+        # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
+        # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
+        # weights fall through to the generic MoE below.
+        if grouped_gemm_gfx1250_a8w4 is not None and gate_mode == GateMode.INTERLEAVE:
+            grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
                 hidden_states,
                 w1,
                 w2,
@@ -671,7 +674,6 @@ def fused_moe_(
                 intermediate_pad=intermediate_pad,
                 bias1=bias1,
                 bias2=bias2,
-                gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
                 num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),

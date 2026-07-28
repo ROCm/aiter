@@ -307,9 +307,9 @@ def emit_cvt_pk8_fp8_f32(vals, recip, *, rocdl, vector, T):
 def emit_cvt_pk4_fp8_f32(vals, recip, *, rocdl, vector, T):
     """Pack 4 pre-activated f32 values into 4 fp8 e4m3 bytes (i32).
 
-    The 4-wide counterpart of :func:`emit_cvt_pk8_fp8_f32`, used by the gugu
-    (gate/up interleaved) stage1 epilogue where each sub-tile de-interleaves
-    to 4 output columns per lane.
+    The 4-wide counterpart of :func:`emit_cvt_pk8_fp8_f32`, for a gate/up
+    interleaved stage1 epilogue where each sub-tile de-interleaves to 4 output
+    columns per lane.
 
     Args:
         vals:   list of 4 f32 IR values (activated GEMM output columns).

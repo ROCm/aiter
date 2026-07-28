@@ -250,7 +250,7 @@ def shuffle_scale_n32k4(
     Within a 32-row super-row the column is ``remain_k*128 + row32*4 + r`` so each
     lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
     one contiguous ds_load_b32.  Consumed by the gfx1250 grouped MoE GEMM
-    (see kernels/gemm_mxscale_gfx1250.py).
+    (see flydsl/batched_gemm_mxfp4.py).
 
     ``is_guinterleave`` selects the stage1 gate/up packing (``N == 2*inter_dim``):
 
