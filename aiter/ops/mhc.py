@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 
 import torch
-import functools
-from aiter import dtypes
 from torch import Tensor
-from typing import Optional
+
+from aiter import dtypes
+
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
@@ -278,7 +279,7 @@ def get_mhc_fused_post_pre_config(
     num_cu = get_cu_num()
     try:
         arch = get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         arch = "unknown"
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     return policy(m, hidden_size, num_cu)
@@ -294,7 +295,7 @@ def mhc_pre_fake(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -319,7 +320,7 @@ def mhc_pre(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,  # if 0, only do pre for hc_head
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     large_m_splitk: bool = False,
     is_fn_pack_bf16: int = 0,
@@ -435,7 +436,7 @@ def mhc_fused_post_pre_fake(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,
@@ -465,16 +466,14 @@ def mhc_fused_post_pre_large_m(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     is_fn_pack_bf16: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """gfx950 large-M post+pre (M > 1024): upstream ``mhc_post`` + ``mhc_pre``."""
     m = residual_in.size(0)
 
-    if post_layer_mix.ndim == 3:
-        post_layer_mix = post_layer_mix.contiguous()
-    elif not post_layer_mix.is_contiguous():
+    if post_layer_mix.ndim == 3 or not post_layer_mix.is_contiguous():
         post_layer_mix = post_layer_mix.contiguous()
     if not comb_res_mix.is_contiguous():
         comb_res_mix = comb_res_mix.contiguous()
@@ -529,7 +528,7 @@ def mhc_fused_post_pre(
     hc_sinkhorn_eps: float = 1e-6,
     hc_post_mult_value: float = 1.0,
     sinkhorn_repeat: int = 20,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
     force_fused: bool = False,
     is_fn_pack_bf16: int = 0,

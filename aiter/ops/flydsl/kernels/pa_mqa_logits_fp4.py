@@ -5,14 +5,12 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
@@ -677,11 +675,11 @@ def flydsl_pa_mqa_logits_fp4(
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: Optional[int] = None,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    total_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    parallel_unit_num: int | None = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    total_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Decode/varctx FP4 paged MQA logits (gfx950).
 

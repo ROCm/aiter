@@ -1,10 +1,12 @@
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
-from aiter import dtypes
 import argparse
-import pandas as pd
 import random
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
 
@@ -83,7 +85,6 @@ def run_torch_fused(
     is_nope_first,
     out_dtype,
 ):
-    #
     q_pe_reshaped = q_pe.unsqueeze(0)
     num_tokens = k_pe.shape[0]
     qk_rope_head_dim = k_pe.shape[-1]
@@ -385,7 +386,7 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    (ref_kv_cache, ref_q_out), ref_us = run_torch_fused(
+    (ref_kv_cache, ref_q_out), _ref_us = run_torch_fused(
         q_pe,
         k_pe,
         q_nope,

@@ -680,7 +680,7 @@ def _build_kernel(
                     )
                     phase2_state = yield (list(new_m) + list(new_kv) + list(new_w))
 
-                m_final, kv_final, w_final = _split_state(phase2_state)
+                _m_final, kv_final, w_final = _split_state(phase2_state)
             else:
                 # Phase 2 with single-iter prefetch, restructured to avoid a
                 # per-iter clamp on the speculative k+1 load.
@@ -1400,7 +1400,7 @@ def _build_kernel(
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(
@@ -2426,7 +2426,7 @@ def _build_kernel_ksplit(
         block_table: fx.Tensor,
         block_table_seq_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         k = kernel(
