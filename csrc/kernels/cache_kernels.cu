@@ -4260,8 +4260,31 @@ void fused_qk_rope_concat_and_cache_mla(
                                           kv_c.size(1) == 1 && k_pe.size(1) == 1 &&
                                           kv_c_contiguous && k_pe_contiguous);
   
-  const bool is_prefill_gqa = (kv_c.dim() == 3 && k_pe.dim() == 3 && 
+  const bool is_prefill_gqa = (kv_c.dim() == 3 && k_pe.dim() == 3 &&
                                kv_c.size(1) > 1);
+
+  // compute_all_q_rope (DCP: RoPE all queries incl. padded slot=-1) is
+  // implemented ONLY in the per-head (option 1) and opt (option 2) decode
+  // kernels. Every other dispatch target -- the general decode kernel (option
+  // 3) and the prefill kernels -- still hard-returns on slot_idx < 0 and would
+  // silently drop padded-token q_out. Reject any config that would land there
+  // instead of computing wrong results. Conditions mirror the dispatch below.
+  if (compute_all_q_rope) {
+    const bool on_decode_path = is_decode || is_decode_single_kv_head;
+    const bool hits_per_head =
+        is_nope_first && kv_lora_rank <= OPTIMIZED_KV_LORA_RANK &&
+        block_size == 1 && rot_dim == OPTIMIZED_ROT_DIM &&
+        num_tokens < MAX_TOKENS_PER_HEAD;
+    const bool hits_opt =
+        rot_dim == OPTIMIZED_ROT_DIM &&
+        kv_lora_rank * num_heads >= MIN_SIZE_FOR_OPT &&
+        kv_lora_rank == OPTIMIZED_KV_LORA_RANK;
+    AITER_CHECK(on_decode_path && (hits_per_head || hits_opt),
+                "compute_all_q_rope is only supported by the per-head/opt MLA decode "
+                "kernels: decode path with kv_lora_rank=512 and rot_dim=64, and either "
+                "num_tokens<256 (per-head) or kv_lora_rank*num_heads>=2048 (opt). "
+                "Other dispatch targets (general decode / prefill) do not honor the flag.");
+  }
   // ============================================================================
   // DECODE PATH (per-token processing)
   // ============================================================================
