@@ -567,7 +567,7 @@ def run_shape(
             correctness = "pass" if ok else "fail"
             if compare_note != "ok":
                 note = f"{note}; {compare_note}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - a bad combo must not abort the sweep
             latency = "na"
             latency_std = "na"
             correctness = "error"
