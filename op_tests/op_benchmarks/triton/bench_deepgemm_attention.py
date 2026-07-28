@@ -398,7 +398,9 @@ def run_benchmark(args: argparse.Namespace):
 
             padded_str = "T" if args.padding else "F"
             os.makedirs(aot_kernel_dir, exist_ok=True)
-            aot_name = f"paged_mqa_logits{"_preshuffle" if args.kv_preshuffle else ""}{"_varctx" if EnableVarCtxOpt else ""}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
+            # Inner quotes must differ from the outer ones: reusing them is PEP 701
+            # (Python 3.12+) and leaves this module unparseable on 3.10/3.11.
+            aot_name = f"paged_mqa_logits{'_preshuffle' if args.kv_preshuffle else ''}{'_varctx' if EnableVarCtxOpt else ''}_{heads}x{ChunkK}x{index_dim}_B{blocksize}P{padded_str}W{WavePerEU}"
 
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
