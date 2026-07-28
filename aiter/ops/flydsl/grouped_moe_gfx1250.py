@@ -527,12 +527,10 @@ def _grouped_a8w4_tdm_moe(
             ep_wire_nbytes=int(ep_wire_nbytes),
             ep_slot_stride=int(ep_max_tok) * int(ep_topk),
             ep_arena_handle=int(ep_arena_handle),
-            ep_tdm_gather=(
-                1
-                if os.environ.get("AITER_EP_P2P_TDMGATHER", "0")
-                in ("1", "true", "True", "yes", "on")
-                else 0
-            ),
+            # The felix TDM GEMM2 fused epilogue always scatters via TDM
+            # gather-store (buffer_store path removed). comb_inp is pow2-padded to
+            # match (see DispatchCombineConfig.tdm_gather_scatter).
+            ep_tdm_gather=1,
             ep_rowmap=ep_rowmap,
         )
         if ep_scatter

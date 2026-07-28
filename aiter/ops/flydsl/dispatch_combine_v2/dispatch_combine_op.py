@@ -266,11 +266,14 @@ class EpDispatchCombineConfig:
 
     @property
     def tdm_gather_scatter(self):
-        """gemm2-fused P2P scatter via TDM gather-store (AITER_EP_P2P_TDMGATHER).
-        Requires a pow2-padded comb_inp slot so the per-slot stride divides the
-        4GB-aligned per-rank symmetric window (lets gemm2 fold (pe,slot) into a
-        single TDM gather row index). Off by default -> comb_inp layout unchanged."""
-        return self.is_fused and os.environ.get("AITER_EP_P2P_TDMGATHER", "0") in (
+        """gemm2-fused P2P scatter via TDM gather-store. The felix TDM GEMM2's
+        fused epilogue always scatters via the TDM gather-store, which requires a
+        pow2-padded comb_inp slot so the per-slot stride divides the 4GB-aligned
+        per-rank symmetric window (lets gemm2 fold (pe,slot) into a single TDM
+        gather row index). Tied to the same switch that selects the felix TDM
+        GEMM2 (AITER_EP_SCATTER_TDM, default on); set it to 0 to fall back onto
+        the grouped/contiguous mxscale gemm2 (unpadded buffer_store scatter)."""
+        return self.is_fused and os.environ.get("AITER_EP_SCATTER_TDM", "1") in (
             "1",
             "true",
             "True",

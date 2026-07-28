@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -101,9 +102,10 @@ def launch_gemm_a8w4_tdm(
     )
     _ = cache_tag
     if ep_p2p_write:
-        # The fused P2P scatter epilogue is a per-row buffer_store into peers'
-        # symmetric memory; it replaces the contiguous 2D TDM tensor-store and
-        # is only defined for the bf16/f16 down-proj (stage1_act=0, no quant-out).
+        # The fused P2P scatter epilogue scatters each (route-weighted) output row
+        # into peers' symmetric comb_inp via a TDM gather-store; it replaces the
+        # contiguous 2D TDM tensor-store and is only defined for the bf16/f16
+        # down-proj (stage1_act=0, no quant-out).
         if stage1_act != 0:
             raise ValueError("ep_p2p_write is gemm2-only (stage1_act must be 0)")
         if stage1_quant_out:
@@ -237,12 +239,19 @@ def launch_gemm_a8w4_tdm(
         # Per-expert A-data OOB: bound to the owning expert's valid-row 
         mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
-        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
+        _smem = fx.SharedAllocator(static=False)
+        base_ptr = _smem.allocate(ARENA_B)._ptr
 
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
         stC_idx = ptr_to_idx(base_ptr)
+
+        # Persistent (survives the mainloop) LDS slot for the prefetched rowmap:
+        # tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped off the SAME
+        # allocator so it is disjoint from the reused A/B/C arena above.
+        if const_expr(ep_p2p_write):
+            rowmap_lds_idx = ptr_to_idx(_smem.allocate(tile_m * 8)._ptr)
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -402,6 +411,40 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
+            if const_expr(ep_p2p_write):
+                # Prologue prefetch: pull this tile's (dst_i32, weight_f32) rowmap
+                # slice into LDS. Coalesced buffer_load -> loadcnt (a SEPARATE
+                # counter from the mainloop's tensorcnt A/B double-buffer, so it
+                # does not perturb the pipeline's exact tensor_wait counts). One
+                # batched wait here replaces the epilogue's serialized per-row
+                # buffer_load + s_wait_loadcnt chain.
+                _pf_rsrc = buffer_ops.create_buffer_resource(
+                    arg_ep_rowmap, max_size=True
+                )
+                _pf_need_mask = (tile_m % block != 0) or (block > tile_m)
+                _pf_vals = []
+                for _pb in range_constexpr(0, tile_m, block):
+                    _pf_row = tid + _pb
+                    _pf_gr = blk_m + _pf_row
+                    _pf_v = buffer_ops.buffer_load(
+                        _pf_rsrc, _pf_gr * 2, vec_width=2, dtype=T.i32
+                    )
+                    _pf_vals.append((_pf_row, _pf_v))
+                rocdl.s_wait_loadcnt(0)
+                for _pf_row, _pf_v in _pf_vals:
+                    if const_expr(_pf_need_mask):
+                        _pf_ok = arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            _pf_row,
+                            arith.constant(tile_m, type=T.i32),
+                        )
+                        _pf_if = scf.IfOp(_pf_ok, results_=[], has_else=False)
+                        with ir.InsertionPoint(_pf_if.then_block):
+                            lds_store_b64_raw(rowmap_lds_idx, _pf_row * 8, _pf_v)
+                            scf.YieldOp([])
+                    else:
+                        lds_store_b64_raw(rowmap_lds_idx, _pf_row * 8, _pf_v)
+                workgroup_barrier()
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
             # Post-compute issue (double-buffered) wins for decode (small tile_m)
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
@@ -449,14 +492,13 @@ def launch_gemm_a8w4_tdm(
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             if const_expr(ep_p2p_write):
-                # EP gemm2-fused scatter resources (staging weight + P2P store).
-                # Defined here (epilogue scope) so they never cross the dynamic
+                # EP gemm2-fused scatter: symmetric-heap window for the TDM
+                # gather-store. The rowmap (dst/weight) is read from LDS (prefetched
+                # in the prologue), so no rowmap buffer resource is needed here.
+                # Defined in epilogue scope so it never crosses the dynamic
                 # `if expert < n_experts` / mainloop scf.if boundaries.
                 import mori.cco.device.flydsl as _cco
 
-                ep_map_rsrc = buffer_ops.create_buffer_resource(
-                    arg_ep_rowmap, max_size=True
-                )
                 ep_win = _cco.Window(fx.Int64(ep_arena_handle))
 
             # -- Activate + stage to LDS --
@@ -545,10 +587,11 @@ def launch_gemm_a8w4_tdm(
                                 # Pre-multiply each output row by its route weight
                                 # (ep_rowmap[grouped_row].col1, f32) BEFORE truncating
                                 # to bf16; the combine kernel does an unweighted sum.
-                                _gr = blk_m + row_rel
-                                _wf = buffer_ops.buffer_load(
-                                    ep_map_rsrc, _gr * 2 + 1, vec_width=1, dtype=T.f32
-                                )
+                                # Weight comes from the prologue-prefetched rowmap in
+                                # LDS (byte 4 of the 8-byte [dst|weight] slot).
+                                _wf = _AV(
+                                    lds_load_b32_raw(rowmap_lds_idx, row_rel * 8 + 4)
+                                ).bitcast(T.f32)
                                 hv = Vec.from_elements(
                                     [acc[i] * _wf for i in range_constexpr(8)],
                                     fx.Float32,
@@ -590,9 +633,10 @@ def launch_gemm_a8w4_tdm(
                         for i in range_constexpr(_GRP):
                             r = base_row + i
                             if const_expr(r < tile_m):
-                                gr = blk_m + r
-                                dstp = buffer_ops.buffer_load(
-                                    ep_map_rsrc, gr * 2, vec_width=1, dtype=T.i32
+                                # dst read from the prologue-prefetched rowmap in LDS
+                                # (byte 0 of the 8-byte [dst|weight] slot).
+                                dstp = _AV(
+                                    lds_load_b32_raw(rowmap_lds_idx, arith.index(r * 8))
                                 )
                                 pe = dstp // ep_slot_stride
                                 slot = dstp % ep_slot_stride
@@ -626,82 +670,6 @@ def launch_gemm_a8w4_tdm(
                         )
                         tensor_store_gather(desc)
                 tdm_ops.tensor_wait(0)
-            elif const_expr(ep_p2p_write):
-                # EP gemm2-fused scatter (Direction-D): the whole (route-weighted)
-                # [tile_m x STORE_N] tile now sits row-major in LDS. Instead of a
-                # local TDM store, P2P each valid output row as coalesced 8-bf16
-                # (b128) chunks into its origin peer's comb_inp slot. Flatten
-                # (row, chunk) over ALL block threads so every lane issues a remote
-                # store each pass; consecutive lanes of one row hit consecutive
-                # remote columns -> coalesced. Rows past the expert's valid range
-                # (mn_oob) or with a sentinel dst (dropped/padding) are skipped.
-                # No per-CTA release fence: stores drain in the background and the
-                # combine kernel's cross-device barrier enforces visibility.
-                elem_bytes = 2
-                _nchunks = STORE_N // 8  # 8 bf16 (b128) per chunk
-                _nchunks_idx = arith.index(_nchunks)
-                _total = tile_m * _nchunks
-                _tid_idx = arith.index_cast(T.index, tid)
-                _blk_m_idx = arith.index_cast(T.index, blk_m)
-                for _base in range_constexpr(0, _total, block):
-                    _remaining = _total - _base
-                    _f = arith.index(_base) + _tid_idx
-                    _row = _f // _nchunks_idx
-                    _chunk = _f - _row * _nchunks_idx
-                    _row_i32 = arith.index_cast(T.i32, _row)
-                    grouped_row = _blk_m_idx + _row
-                    _dst_idx = arith.index_cast(T.i32, grouped_row * arith.index(2))
-                    dst_packed = buffer_ops.buffer_load(
-                        ep_map_rsrc, _dst_idx, vec_width=1, dtype=T.i32
-                    )
-                    row_valid = arith.cmpi(
-                        arith.CmpIPredicate.slt, _row_i32, mn_oob
-                    )
-                    dst_valid = arith.cmpi(
-                        arith.CmpIPredicate.sge,
-                        dst_packed,
-                        arith.constant(0, type=T.i32),
-                    )
-                    store_valid = arith.andi(row_valid, dst_valid)
-                    if _remaining < block:
-                        _lane_ok = arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            arith.index_cast(T.i32, _tid_idx),
-                            arith.constant(_remaining, type=T.i32),
-                        )
-                        store_valid = arith.andi(store_valid, _lane_ok)
-                    origin_pe = dst_packed // ep_slot_stride
-                    slot = dst_packed % ep_slot_stride
-                    # Address the store WITHIN the peer's comb_inp region: descriptor
-                    # base = the peer's comb_inp base (origin_pe), num_records = the
-                    # region size, and the per-lane byte offset = slot row + column
-                    # tile + 8-bf16 chunk. This bounds every store to the region so a
-                    # stray (row/col) offset is HW-dropped instead of page-faulting;
-                    # a row's lanes share ONE descriptor (base) and only differ by the
-                    # chunk in the VGPR offset -> still coalesced.
-                    peer_base = fx.Int64(ep_win.lsa_ptr(origin_pe, ep_off_comb_inp))
-                    _chunk_i32 = arith.index_cast(T.i32, _chunk)
-                    _voff_bytes = (
-                        slot * ep_wire_nbytes
-                        + blk_n * elem_bytes
-                        + _chunk_i32 * (8 * elem_bytes)
-                    )
-                    _lds_byte = (
-                        _row * arith.index(STORE_N) + _chunk * arith.index(8)
-                    ) * arith.index(elem_bytes)
-                    _if = scf.IfOp(store_valid, results_=[], has_else=False)
-                    with ir.InsertionPoint(_if.then_block):
-                        _v = lds_load_b128_raw(stC_idx, _lds_byte)
-                        buffer_ops.buffer_store(
-                            _v,
-                            buffer_ops.create_buffer_resource_from_addr(
-                                peer_base,
-                                num_records_bytes=ep_slot_stride * ep_wire_nbytes,
-                            ),
-                            _voff_bytes,
-                            offset_is_bytes=True,
-                        )
-                        scf.YieldOp([])
             else:
                 # -- Shared LDS -> TDM store to global --
                 if const_expr(stage1_act):
