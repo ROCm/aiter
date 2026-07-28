@@ -58,7 +58,6 @@ def run_preshuffle_gemm_a8_gfx1250(
     tile_k: int,
     *,
     num_buffers: int = 2,
-    waves_per_eu: int = 0,
     m_warp: int = 2,
     n_warp: int = 2,
     cluster_m: int = 1,

@@ -5,7 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
@@ -70,7 +70,7 @@ def launch_gemm_a8w8_ptpc(
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
     PITCH = ((STAGE_A + STAGE_B + 1023) // 1024) * 1024
 
-    out_elem = T.f16 if out_is_f16 else T.bf16
+    out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
     check_smem_capacity(ARENA_B, str(get_hip_arch()))
@@ -92,8 +92,6 @@ def launch_gemm_a8w8_ptpc(
         i32_lda: fx.Int32,
         i32_ldc: fx.Int32,
     ):
-        rocdl.disable_xdl_arb_stall()
-
         K_TILES = i32_k // tile_k
         k64 = fx.Int64(i32_k)
         lda64 = fx.Int64(i32_lda)
@@ -365,38 +363,39 @@ def launch_gemm_a8w8_ptpc(
                 compute_ktile_row(buf, prefetch_kt)
 
         def epilogue_apply_ptpc_scale():
-            accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
-            sa_rsrc = buffer_ops.create_buffer_resource(
+            accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+            sa_buf = fx.rocdl.make_buffer_tensor(
                 arg_scale_a, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
             )
-            sb_rsrc = buffer_ops.create_buffer_resource(
+            sb_buf = fx.rocdl.make_buffer_tensor(
                 arg_scale_b, max_size=False, num_records_bytes=i32_n * fx.Int32(4)
             )
+            sa_lay, sb_lay = fx.make_layout(1, 1), fx.make_layout(4, 1)
+            sa_tiles = fx.logical_divide(sa_buf, sa_lay)
+            sb_tiles = fx.logical_divide(sb_buf, sb_lay)
+            sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+            sb_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+
+            def _load(atom, tiles, lay, tile_idx):
+                r = fx.make_rmem_tensor(lay, fx.Float32)
+                fx.copy_atom_call(atom, fx.slice(tiles, (None, tile_idx)), r)
+                return r.load()
+
             sa = []
             for wm in range_constexpr(wmma_m_rep):
                 row = blk_m + wmb + wm * 16 + lane16
-                sv = buffer_ops.buffer_load(sa_rsrc, row, vec_width=1, dtype=T.f32)
+                sv = _load(sa_atom, sa_tiles, sa_lay, row)[0]
                 sa.append(Vec.from_elements([sv] * 8))
+            col4 = bid_y * (tile_n // 4) + wave_n * (warp_tile_n // 4) + kgrp * 2
             sb = []
             for wn in range_constexpr(wmma_n_rep):
-                col0 = blk_n + wnb + wn * 16 + kgrp * 8
-                lo = Vec(
-                    buffer_ops.buffer_load(sb_rsrc, col0, vec_width=4, dtype=T.f32)
-                )
-                hi = Vec(
-                    buffer_ops.buffer_load(
-                        sb_rsrc, col0 + fx.Int32(4), vec_width=4, dtype=T.f32
-                    )
-                )
-                sb.append(
-                    Vec.from_elements(
-                        [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]]
-                    )
-                )
+                lo = _load(sb_atom, sb_tiles, sb_lay, col4 + wn * 4)
+                hi = _load(sb_atom, sb_tiles, sb_lay, col4 + wn * 4 + 1)
+                sb.append(lo.shuffle(hi, list(range(8))))
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
-                    accs[idx] = (Vec(accs[idx]) * sb[wn] * sa[wm]).ir_value()
+                    accs[idx] = accs[idx] * sb[wn] * sa[wm]
             return accs
 
         if const_expr(use_cluster):
@@ -424,11 +423,11 @@ def launch_gemm_a8w8_ptpc(
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = fx.trunc_f(T.vec(8, out_elem), accs[wm * wmma_n_rep + wn])
-                i8v = fx.vector.bitcast(T.vec(16, T.i8), h)
-                fx.ptr_store(i8v, base_ptr + (row_rel * tile_n + col_rel) * 2)
+                h = accs[wm * wmma_n_rep + wn].to(out_cls)
+                fx.ptr_store(
+                    h.bitcast(fx.Int8), base_ptr + (row_rel * tile_n + col_rel) * 2
+                )
         workgroup_barrier(use_cluster=False)
-        oc = fx.Float16 if out_is_f16 else fx.BFloat16
         c_off_rt = blk_m64 * ldc64 + blk_n64
         gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
         atomC = fx.rocdl.make_tdm_atom(
@@ -439,7 +438,9 @@ def launch_gemm_a8w8_ptpc(
             early_timeout=False,
         )
         fx.copy(
-            atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC
+            atomC,
+            _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, tile_n), (tile_n, 1)),
+            gtC,
         )
         tdm_ops.tensor_wait(0)
 
