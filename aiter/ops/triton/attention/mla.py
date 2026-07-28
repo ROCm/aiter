@@ -68,6 +68,7 @@ def select_3d_config(
     q_dtype,
     kv_dtype,
     shuffled_kv_cache,
+    BLOCK_M,
 ):
     attn_num_warps = 2
     reduce_num_warps = 2
@@ -78,7 +79,8 @@ def select_3d_config(
     if IS_DEVICE_ARCH_GFX12:
         # If we cannot infer max_seqlen_k during graph capture
         maybe_guess_max_seqlen_k = 128000 if max_seqlen_k == 0 else max_seqlen_k
-        attn_num_warps = 2
+        if BLOCK_M > 32:
+            attn_num_warps = 4
         reduce_num_warps = 4
         attn_waves_per_eu = 1
         reduce_waves_per_eu = 1
@@ -337,7 +339,7 @@ def mla_decode_fwd(
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
 
-    MAX_BLOCK_M = 16
+    MAX_BLOCK_M = 64
     if num_queries_per_kv <= 16:
         BLOCK_M = 16
     else:
@@ -366,6 +368,7 @@ def mla_decode_fwd(
         q_dtype,
         kv_buffer_dtype,
         shuffled_kv_cache,
+        BLOCK_M,
     )
 
     NUM_SEGMENTS = attn_config["NUM_SEGMENTS_PER_SEQ"]
