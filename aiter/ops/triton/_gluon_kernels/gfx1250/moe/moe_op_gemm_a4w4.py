@@ -262,12 +262,18 @@ def _moe_gemm_a4w4_gfx1250(
     if GatherIndx is None:
         X += start_m.to(index_type) * stride_x_m
     else:
+        if GatherIndx.dtype.element_ty == gl.uint16:
+            oob_idx = num_tokens.to(gl.uint16)
+        else:
+            oob_idx = num_tokens
         offs_x_m = PACKED_BLOCK_M_X * block_id + gl.arange(
             0, PACKED_BLOCK_M_X, layout=GATHER_IDX_LAYOUT
         )
+        mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
         GatherIndx += start_m
         offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     # B pointers
     W += expt_id.to(index_type) * stride_w_e
