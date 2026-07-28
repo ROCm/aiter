@@ -217,8 +217,11 @@ def _build_q_kernel(
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
-                xn0 = x0 * rstd * w0
-                xn1 = x1 * rstd * w1
+                # The production kernel stores RMSNorm output in vec_t<T>
+                # (T=bf16) before applying RoPE. Preserve that rounding point
+                # so values near an FP8 bin boundary follow the same path.
+                xn0 = (x0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
+                xn1 = (x1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
                 cos_v, sin_v = mrope_cos_sin(tid, tok, positions_t, cos_sin_t)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
@@ -248,8 +251,10 @@ def _build_q_kernel(
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
-                xn0 = x0s[k] * rstd * w0
-                xn1 = x1s[k] * rstd * w1
+                # Match the bf16 RMSNorm materialization in the production
+                # kernel before the fp32 RoPE arithmetic.
+                xn0 = (x0s[k] * rstd * w0).to(fx.BFloat16).to(fx.Float32)
+                xn1 = (x1s[k] * rstd * w1).to(fx.BFloat16).to(fx.Float32)
                 cos_v, sin_v = mrope_cos_sin(col, tok, positions_t, cos_sin_t)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
@@ -515,14 +520,24 @@ def _build_kv_kernel(
                             if const_expr(gemma_norm):
                                 w0 = w0 + fx.Float32(1.0)
                                 w1 = w1 + fx.Float32(1.0)
-                            xn0 = k0s[p] * rstd * w0
-                            xn1 = k1s[p] * rstd * w1
+                            # Production materializes the weighted RMSNorm
+                            # result as bf16 before RoPE.
+                            xn0 = (k0s[p] * rstd * w0).to(fx.BFloat16).to(
+                                fx.Float32
+                            )
+                            xn1 = (k1s[p] * rstd * w1).to(fx.BFloat16).to(
+                                fx.Float32
+                            )
                             cos_v, sin_v = mrope_cos_sin(
                                 col, tok, positions_t, cos_sin_t
                             )
                             o0 = xn0 * cos_v - xn1 * sin_v
                             o1 = xn1 * cos_v + xn0 * sin_v
                             if const_expr(cache_is_fp8):
+                                # Production assigns RoPE output to vec_t<bf16>
+                                # before converting that vector to FP8.
+                                o0 = o0.to(fx.BFloat16).to(fx.Float32)
+                                o1 = o1.to(fx.BFloat16).to(fx.Float32)
                                 kb0, kb1 = quant_pair_fp8(o0, o1, k_scale)
                             else:
                                 kb0 = o0.to(fx.BFloat16)
