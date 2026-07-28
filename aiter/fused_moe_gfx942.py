@@ -228,18 +228,12 @@ def fused_moe_gfx942(
 
         if weight_dtype_str == "fp8":
             assert qtype_str in ["ptpc", "per_tensor"]
-            if qtype_str == "ptpc":
-                down_in, down_in_scale = quant_func(
-                    gemm1_out.view(B * TOPK, -1),
-                    scale=None,
-                    quant_dtype=w2.dtype,
-                    num_rows=None,
-                )
-            elif qtype_str == "per_tensor":
-                fmax = torch.finfo(w2.dtype).max
-                down_in_scale = down_in.float().abs().amax() / fmax
-                down_in = (down_in.float() / down_in_scale).clamp(-fmax, fmax).to(w2.dtype)
-                down_in_scale = down_in_scale.reshape(1).to(torch.float32)
+            down_in, down_in_scale = quant_func(
+                gemm1_out.view(B * TOPK, -1),
+                scale=None,
+                quant_dtype=w2.dtype,
+                num_rows=None,
+            )
         else:
             down_in = gemm1_out
             down_in_scale = torch.empty(1, dtype=torch.float32, device=hidden_states.device)

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
 import os
 
 
@@ -2003,7 +2006,9 @@ def compile_gemm(
 
         if e_idx * BLOCK_TILE_SIZE_M < max_valid_id:
             arg_p_sorted_ids = fxh.view_as_torch_tensor(
-                _as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M, (BLOCK_TILE_SIZE_M,), fx.Int32
+                _as_ptr(p_sorted_ids) + e_idx * BLOCK_TILE_SIZE_M,
+                (BLOCK_TILE_SIZE_M,),
+                fx.Int32,
             )
             arg_p_sorted_weights = fxh.view_as_torch_tensor(
                 _as_ptr(p_sorted_weights) + e_idx * BLOCK_TILE_SIZE_M,
@@ -2053,8 +2058,12 @@ def compile_gemm(
                 fx.static(swz),
                 fx.make_ordered_layout((BLOCK_M, BLOCK_N, 2), (1, 0, 2)),
             )
+            layoutCt = fx.make_composed_layout(
+                fx.static(swz),
+                fx.make_ordered_layout((BLOCK_N, BLOCK_M, 2), (0, 1, 2))
+            )
             ldsC = lds.C.peek().view(layoutC)
-            ldsCt = fx.select(ldsC, [1, 0, 2])
+            ldsCt = lds.C.peek().view(layoutCt)
 
             # cp_atom = flyobj.get_universal_copy_atom(arg_p_input.dtype, 128)
             tcopy, cp_atom = flyobj.get_tiled_copy_coalesced_mn(
@@ -2223,25 +2232,38 @@ def compile_gemm(
 
             fragOut = fx.make_fragment_like(thrv_ldsC[None, None, None, 0])
 
+            # prepare pointers for each token
+            frag_row_addr = fx.make_fragment_like(frag_row, fx.Int64)
+            frag_topk = fx.make_fragment_like(frag_row, fx.Uint32)
+            for raddr, row, ftopk in fxh.all_elements(
+                frag_row_addr, frag_row, frag_topk
+            ):
+                sorted_id = row[0].to(fx.Uint32)
+                topk = sorted_id >> 24
+                token_id = sorted_id & 0x7FFFFF  # workaround for backend bug
+                ftopk[0] = topk
+                offset_64bit = fx.Uint64(token_id) * (TOPK * N) + fx.Uint64(topk * N)
+                raddr[0] = fx.ptrtoint(fx.get_iter(arg_p_output) + offset_64bit)
+
             def postprocess_store2vmem(n, ldsc_idx):
                 fx.copy(cp_atom_128b, thrv_ldsC[None, None, None, ldsc_idx], fragOut)
 
-                for src, row, col in fxh.all_elements(
+                for src, row_addr, col, ftopk in fxh.all_elements(
                     fragOut,
-                    frag_row,
+                    frag_row_addr,
                     thrv_dst_col[None, None, None, 0, n],
+                    frag_topk,
                 ):
-                    sorted_id = row[0].bitcast(fx.Uint32)
-                    topk = sorted_id >> 24
                     atom_C = fxh.atom_tensor(
-                        arg_p_output, (sorted_id & 0xFFFFFF, topk, col[0]), 128
+                        fx.inttoptr(fx.get_iter(arg_p_output).type, row_addr[0]),
+                        fx.Int64(col[0].to_py_value()),
+                        128,
                     )
                     if fx.const_expr(1):
-                        valid = topk < TOPK
                         dummy = llvm.inline_asm(
                             ir.Type.parse("i64"),
                             [
-                                topk.ir_value(),
+                                ftopk[0].ir_value(),
                                 fx.ptrtoint(fx.get_iter(atom_C)).ir_value(),
                                 src.load().ir_value(),
                             ],
@@ -2253,7 +2275,7 @@ def compile_gemm(
                             has_side_effects=True,
                         )
                     else:
-                        if topk < TOPK:
+                        if ftopk[0] < TOPK:
                             fx.copy(cp_atom_128b, src, atom_C)
 
             """
@@ -2280,7 +2302,7 @@ def compile_gemm(
                 num_mfma_inst = (BLOCK_M // 16) * (
                     K // (16 if weight_dtype.width == 16 else 32)
                 )
-                num_stores = (BLOCK_M // (256 // (BLOCK_N//8)))
+                num_stores = BLOCK_M // (256 // (BLOCK_N // 8))
                 num_loads = K // ((4 * 8) if weight_dtype.width == 16 else (4 * 16))
 
                 # print(num_loads, num_stores, num_mfma_inst)
