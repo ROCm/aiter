@@ -2,7 +2,9 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import flydsl.expr as fx
-from flydsl.compiler.ast_rewriter import ASTRewriter
+import flydsl.compiler as flyc
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Vector as Vec, as_ir_value
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl._mlir.dialects import llvm, rocdl
 from flydsl._mlir import ir
@@ -21,20 +23,7 @@ def div_e(x, y):
     return x // y
 
 
-def fly_ast_rewrite(member):
-    """Apply ASTRewriter.transform to a class member callable.
-
-    Supports plain instance methods and descriptor-wrapped members
-    (staticmethod/classmethod).
-    """
-    if isinstance(member, staticmethod):
-        return staticmethod(ASTRewriter.transform(member.__func__))
-    if isinstance(member, classmethod):
-        return classmethod(ASTRewriter.transform(member.__func__))
-    return ASTRewriter.transform(member)
-
-
-@fly_ast_rewrite
+@flyc.jit
 def split_works(num_works, num_workers, worker_id, align=1):
     num_work_items = num_works // align
     num_items_per_worker = num_work_items // num_workers
@@ -303,6 +292,26 @@ def _as_ptr(p, dtype=None):
         return p
 
 
+def atomic_add_bf16(ptr_base, reg_vec):
+    """Pairwise global atomic-add of a bf16 vector.
+
+    UniversalAtomic(Add) does not lower to global_atomic_pk_add_bf16,
+    so emit the packed-bf16 atomic RMW by hand (2 bf16 per op).
+    """
+    for i in range_constexpr(reg_vec.numel // 2):
+        pair = Vec.from_elements([reg_vec[i * 2], reg_vec[i * 2 + 1]], fx.BFloat16)
+        addr = fx.ptrtoint(ptr_base + i * 2)
+        llvm_ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(addr))
+        llvm.AtomicRMWOp(
+            llvm.AtomicBinOp.fadd,
+            llvm_ptr,
+            pair,
+            llvm.AtomicOrdering.monotonic,
+            syncscope="agent",
+            alignment=4,
+        )
+
+
 def make_1d_coord_tensor(target, target_mode_index, iter0):
     shape = get_d1_shape(target)
     stride = [
@@ -459,7 +468,7 @@ class FlyObjCache:
     def get_retile(self, thrcopy, frag):
         return thrcopy.retile(frag)
 
-    @fly_ast_rewrite
+    @flyc.jit
     def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
         assert abc in ["A", "B", "C"]
         if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
