@@ -189,82 +189,10 @@ def _e2m1_code(y):
 
 
 @triton.jit
-def sage_quant_v_fp4_colmajor_kernel(
-    v_ptr,  # V [b, h_kv, S, D] (any strides -- a permuted view is fine, no copy needed)
-    out_ptr,  # uint8 [b, h_kv, nT*8192] col-major fp4 operand blocks
-    desc_ptr,  # fp32 [b, h_kv, D]  per-channel descale = amax_over_S / 6
-    kperm_ptr,  # int32 [64]  'meas' kv-col permutation (col kk holds token kperm[kk])
-    stride_vb,
-    stride_vh,
-    stride_vs,
-    stride_vd,
-    stride_ob,
-    stride_oh,
-    stride_db,
-    stride_dh,
-    h_kv,
-    nT,
-    S,
-):
-    """Pack per-channel fp4 (E2M1) V into the f4f4 kernel's col-major LDS operand layout:
-    per 128-kv tile, 8 blocks of 1024 B (u = 2*n + k; n = head-dim 32-block 0..3, k = kv
-    64-half 0..1); each block is 64 kv-cols x 16 nibble-bytes (even chan -> low nibble, odd
-    chan -> high nibble). ONE program packs a whole 128-kv tile (all 8 u-blocks, static
-    loop) -- 8x fewer, larger programs than the per-block grid, so launch/scheduling
-    overhead drops and the 8 blocks' loads pipeline. Cosine-equivalent to the numpy
-    packer; only exact E2M1 tie-midpoints may differ by one code (arbitrary, cosine-neutral)."""
-    pid = tl.program_id(0)
-    t = pid % nT
-    bh = pid // nT
-    bb = bh // h_kv
-    hh = bh % h_kv
-
-    kk = tl.arange(0, 64)
-    tok_in_half = tl.load(kperm_ptr + kk)  # [64]
-    jj = tl.arange(0, 16)
-    ooff = kk[:, None] * 16 + jj[None, :]
-    vbase = v_ptr + bb * stride_vb + hh * stride_vh
-    dbase = desc_ptr + bb * stride_db + hh * stride_dh
-    obase0 = out_ptr + bb * stride_ob + hh * stride_oh + t * 8192
-    # Ragged S: only the final 128-tile can run past the real seqlen, so predicate the
-    # V loads on just that tile (a uniform per-program branch) -- all earlier tiles use
-    # plain unmasked loads. Lets the caller skip pre-padding V to a 128-multiple with no
-    # per-load mask cost on the common case. (S multiple of 128 -> last tile all-valid.)
-    is_last = t == nT - 1
-    for u in tl.static_range(8):
-        n = u // 2  # head-dim 32-block
-        k = u % 2   # kv 64-half
-        token = t * 128 + k * 64 + tok_in_half  # [64] absolute kv token in S
-        chan_lo = n * 32 + 2 * jj  # [16] even channels -> low nibble
-        chan_hi = n * 32 + 2 * jj + 1  # [16] odd channels -> high nibble
-        row = token[:, None] * stride_vs  # [64,1]
-        a_lo = vbase + row + chan_lo[None, :] * stride_vd
-        a_hi = vbase + row + chan_hi[None, :] * stride_vd
-        if is_last:
-            tok_mask = (token < S)[:, None]  # [64,1]
-            v_lo = tl.load(a_lo, mask=tok_mask, other=0.0).to(tl.float32)
-            v_hi = tl.load(a_hi, mask=tok_mask, other=0.0).to(tl.float32)
-        else:
-            v_lo = tl.load(a_lo).to(tl.float32)
-            v_hi = tl.load(a_hi).to(tl.float32)
-        d_lo = tl.load(dbase + chan_lo)  # [16]
-        d_hi = tl.load(dbase + chan_hi)
-
-        y_lo = v_lo / d_lo[None, :]
-        y_hi = v_hi / d_hi[None, :]
-
-        code_lo = _e2m1_code(y_lo)
-        code_hi = _e2m1_code(y_hi)
-        byte = (code_lo | (code_hi << 4)).to(tl.uint8)  # [64,16]
-
-        tl.store(obase0 + u * 1024 + ooff, byte)
-
-
-@triton.jit
 def sage_quant_v_mxfp4_colmajor_kernel(
     v_ptr,      # V [b, h_kv, S, D]
     out_ptr,    # uint8 [b, h_kv, nT*8192]  col-major fp4 blocks (BLOCK-normalized codes)
-    e_ptr,      # uint8 [b, h_kv, nT, 2(k), 2(kblk), 128(D)]  E8M0 (+127) per (dv-channel, k, kblk)
+    e_ptr,      # uint8 v_descale [b, h_kv, nT*512]  E8M0 (+127) image in kernel LDS-gather byte order
     kperm_ptr,  # int32 [64]  'meas' kv-col permutation
     stride_vb,
     stride_vh,
@@ -279,9 +207,12 @@ def sage_quant_v_mxfp4_colmajor_kernel(
     S,
 ):
     """MXFP4 V pack (fused Triton): per-(dv-channel, 32-kv-block) E8M0 computed DIRECTLY on V, block-
-    normalized E2M1 codes in the SAME col-major LDS layout as sage_quant_v_fp4_colmajor_kernel, plus
-    the E8M0 image (e_ptr, then reshaped host-side to the v_descale tail). One program per 128-kv tile;
-    the 32-kv block for MFMA K-block kblk is cols [kblk*32, kblk*32+32) (kperm order). Tail-masked."""
+    normalized E2M1 codes in the f4f4 kernel's col-major LDS operand layout (per 128-kv tile, 8 blocks
+    of 1024 B; u = 2*n + k, n = head-dim 32-block 0..3, k = kv 64-half 0..1; each block is 64 kv-cols x
+    16 nibble-bytes, even chan -> low nibble / odd -> high), plus the E8M0 image written straight into
+    e_ptr in the kernel's LDS-gather byte order (v_descale, no host permutation). One program per
+    128-kv tile; the 32-kv block for MFMA K-block kblk is cols [kblk*32, kblk*32+32) (kperm order).
+    Tail-masked."""
     pid = tl.program_id(0)
     t = pid % nT
     bh = pid // nT
@@ -332,16 +263,19 @@ def sage_quant_v_mxfp4_colmajor_kernel(
         code_hi = _e2m1_code(v_hi / tl.exp2(E_hi_col))
         byte = (code_lo | (code_hi << 4)).to(tl.uint8)
         tl.store(obase0 + u * 1024 + ooff, byte)
-        # E8M0 image bytes: e[t,k,kblk,chan] = clamp(E+127, 0, 255)
-        e_tk = ebase + k * (2 * 128)
+        # E8M0 image bytes, stored DIRECTLY in the kernel's LDS-gather byte layout (no host
+        # permutation): byte(k,L,n) = E8M0[dv=n*32+L%32, kvblk=k*2+L//32] at offset k*256 + L*4 + n.
+        # For channel c = 2*jj (lo) / 2*jj+1 (hi) of head-dim group n, dv=n*32+c so dv//32==n,
+        # dv%32==c -> within-(k,kblk) byte = c*4 + n (a [4x32]->[32x4] transpose of the channel axis).
+        e_tk = ebase + k * 256
         e_lo_0 = tl.minimum(tl.maximum(E_lo_0 + 127.0, 0.0), 255.0).to(tl.uint8)
         e_lo_1 = tl.minimum(tl.maximum(E_lo_1 + 127.0, 0.0), 255.0).to(tl.uint8)
         e_hi_0 = tl.minimum(tl.maximum(E_hi_0 + 127.0, 0.0), 255.0).to(tl.uint8)
         e_hi_1 = tl.minimum(tl.maximum(E_hi_1 + 127.0, 0.0), 255.0).to(tl.uint8)
-        tl.store(e_tk + 0 * 128 + chan_lo, e_lo_0)
-        tl.store(e_tk + 0 * 128 + chan_hi, e_hi_0)
-        tl.store(e_tk + 1 * 128 + chan_lo, e_lo_1)
-        tl.store(e_tk + 1 * 128 + chan_hi, e_hi_1)
+        tl.store(e_tk + 0 * 128 + 8 * jj + n, e_lo_0)       # kblk0 lo: (2jj)*4   + n
+        tl.store(e_tk + 0 * 128 + 8 * jj + 4 + n, e_hi_0)   # kblk0 hi: (2jj+1)*4 + n
+        tl.store(e_tk + 1 * 128 + 8 * jj + n, e_lo_1)       # kblk1 lo
+        tl.store(e_tk + 1 * 128 + 8 * jj + 4 + n, e_hi_1)   # kblk1 hi
 
 
 @triton.jit

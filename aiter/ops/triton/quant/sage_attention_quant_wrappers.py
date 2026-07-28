@@ -8,7 +8,6 @@ from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import (
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
-    sage_quant_v_fp4_colmajor_kernel,
     sage_quant_v_mxfp4_colmajor_kernel,
     sage_quant_kernel,
     _rot_k_only_kernel,
@@ -217,77 +216,12 @@ def _f4f4_v_kperm(device):
     return kp
 
 
-def _pack_v_fp4_colmajor(v_bshd):
-    """Per-channel fp4 (E2M1) col-major LDS V pack -- the V half of the f4f4 quantizer.
-
-    Shared by ``sage_quant_f4f4`` (fresh Q/K/V quant) and by the mxfp4-comms attention
-    path (where Q/K arrive already fp4-packed, so only V is (re)packed post-gather).
-
-    v_bshd: bf16/float [b, sk, h_kv, 128] (arbitrary sk; non-contiguous ok -- only its
-    strides are read). Returns (v_fp4_view, v_descale) where v_fp4_view is a strided
-    [b, kv_pad, h_kv, 128] uint8 view (kv_pad = sk rounded up to 128) over a
-    [b, h_kv, nT*8192] + 64 B backing buffer (seq stride 64). The f4f4 kernel consumes it
-    directly -- do NOT call .contiguous() on it (that drops the col-major LDS layout).
-    descale is f32 per-channel amax over kv / 6 (E2M1 max).
-
-    The f4f4 kernel only supports a 128-multiple KV length, so the view is returned at the
-    PADDED length kv_pad (the tail tokens are zero); the caller pads Q/K to match and
-    slices the attention output back to the true sk. The 128-rounding is done *inside* the
-    pack kernel (it masks tokens >= kv_len -> 0 and writes a full 128-rounded buffer), so
-    V is never pre-padded: no bf16 torch.cat copy, and the per-channel amax runs on the
-    true (unpadded) V. Accepts the input dtype directly (bf16 typical) -- only the amax is
-    promoted to float32; the pack kernel reads v's dtype (no fp32 upcast)."""
-    b, kv_len, h_kv, head_dim = v_bshd.shape
-    assert head_dim == 128, head_dim
-    tile = 128
-    kv_pad = ((kv_len + tile - 1) // tile) * tile  # round up to a full 128-token tile
-    nT = kv_pad // tile
-    v_tok = v_bshd.permute(0, 2, 1, 3)  # [b, h_kv, kv_len, 128] (true length; kernel masks the tail)
-    amax = v_tok.abs().amax(dim=-2).to(torch.float32)  # [b, h_kv, d]
-    # descale = amax/6 (E2M1 max), clamped off 0 to avoid 0/0 in the pack (zero channels
-    # decode to 0 regardless of the scale). clamp+div is a plain epilogue that fuses into
-    # the amax reduction, so there's no separate descale kernel.
-    v_descale = (amax.clamp(min=1e-8) / 6.0).contiguous()
-    kperm = _f4f4_v_kperm(v_bshd.device)
-    # Allocate the packed buffer with 64 B of trailing slack up front (avoids a
-    # full-buffer torch.cat copy): the strided view's last-token window (seq stride
-    # 64 < 128) must stay in storage bounds. packed is a view of the leading bytes.
-    numel = b * h_kv * nT * 8192
-    buf = torch.empty(numel + 64, dtype=torch.uint8, device=v_bshd.device)
-    buf[numel:].zero_()
-    packed = buf[:numel].view(b, h_kv, nT * 8192)
-    grid = (b * h_kv * nT,)  # one program per 128-kv tile (packs all 8 u-blocks)
-    sage_quant_v_fp4_colmajor_kernel[grid](
-        v_tok,
-        packed,
-        v_descale,
-        kperm,
-        v_tok.stride(0),
-        v_tok.stride(1),
-        v_tok.stride(2),
-        v_tok.stride(3),
-        packed.stride(0),
-        packed.stride(1),
-        v_descale.stride(0),
-        v_descale.stride(1),
-        h_kv,
-        nT,
-        kv_len,  # true seqlen; the kernel masks tokens >= kv_len (writes 0) to 128-round
-        num_warps=1,  # 1 warp/tile (64 threads ~ the 64-token block) benchmarks fastest
-        num_stages=1,
-    )
-    v_fp4_view = torch.as_strided(
-        buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
-    )
-    return v_fp4_view, v_descale
-
-
 def _pack_v_mxfp4_colmajor(v_bshd):
-    """Fused-Triton MXFP4 V pack for f4f4 (env AITER_F4F4_MXFP4_V): PURE microscaling -- one Triton
-    kernel per 128-kv tile computes the
-    per-(dv-channel, 32-kv-block) E8M0 on V, block-normalizes + E2M1-packs the col-major blocks, and
-    emits the E8M0 image -- no multi-GB torch intermediates, ragged tail masked (no pre-pad copy).
-    The cheap E8M0-image reshape (small) stays host-side. Returns the same (v_fp4_view, v_descale)."""
+    """Fused-Triton MXFP4 V pack for f4f4: PURE microscaling -- one Triton kernel per 128-kv tile
+    computes the per-(dv-channel, 32-kv-block) E8M0 on V, block-normalizes + E2M1-packs the col-major
+    blocks, and writes the E8M0 image straight into v_descale in the kernel's LDS-gather byte order --
+    no host-side permutation, no multi-GB torch intermediates, ragged tail masked (no pre-pad copy).
+    Returns (v_fp4_view, v_descale)."""
     b, kv_len, h_kv, head_dim = v_bshd.shape
     assert head_dim == 128, head_dim
     tile = 128
@@ -301,28 +235,19 @@ def _pack_v_mxfp4_colmajor(v_bshd):
     buf = torch.empty(numel + 64, dtype=torch.uint8, device=dev)
     buf[numel:].zero_()
     packed = buf[:numel].view(b, h_kv, nT * 8192)
-    escratch = torch.empty(b, h_kv, nT, 2, 2, 128, dtype=torch.uint8, device=dev)  # E8M0+127 per (t,k,kblk,dv)
+    # E8M0 image, uint8 [b, h_kv, nT*512] -- no 512 B fp32 per-channel header (f4f4 is pure MX; the
+    # kernel reads it at byte offset kv*4 with per-(b,h) stride kv_seq_len*4). The Triton kernel writes
+    # the E8M0 straight into this buffer in the kernel's LDS-gather byte order (no host permutation).
+    v_descale = torch.empty(b, h_kv, nT * 512, dtype=torch.uint8, device=dev)
     grid = (b * h_kv * nT,)
     sage_quant_v_mxfp4_colmajor_kernel[grid](
-        v_tok, packed, escratch, kperm,
+        v_tok, packed, v_descale, kperm,
         v_tok.stride(0), v_tok.stride(1), v_tok.stride(2), v_tok.stride(3),
         packed.stride(0), packed.stride(1),
-        escratch.stride(0), escratch.stride(1),
+        v_descale.stride(0), v_descale.stride(1),
         h_kv, nT, kv_len,
         num_warps=1, num_stages=1,
     )
-    # E8M0 image: reshape escratch[t,k,kblk,dv] -> eimg byte(t,k,L,n) = E8M0[dv=n*32+L%32, kvblk=k*2+L//32].
-    Lr = torch.arange(64, device=dev)
-    kblk_L = (Lr // 32).long()
-    chan_L = (Lr % 32).long()
-    eimg = torch.empty(b, h_kv, nT, 2, 64, 4, dtype=torch.uint8, device=dev)
-    for n in range(4):
-        dv = (n * 32 + chan_L).long()
-        for k in range(2):
-            eimg[:, :, :, k, :, n] = escratch[:, :, :, k, kblk_L, dv]
-    # E8M0 image only, as uint8 [b, h_kv, nT*512] -- no 512 B fp32 per-channel header (f4f4 is pure
-    # MX; the kernel reads the E8M0 image at byte offset kv*4 with per-(b,h) stride kv_seq_len*4).
-    v_descale = eimg.reshape(b, h_kv, nT * 512).contiguous()
     v_fp4_view = torch.as_strided(
         buf, (b, kv_pad, h_kv, 128), (h_kv * kv_pad * 64, 64, kv_pad * 64, 1)
     )
