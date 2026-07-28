@@ -577,5 +577,6 @@ def tensor_dump(x: torch.Tensor, name: str, dir="./"):
 def tensor_load(filename: str):
     DWs = np.fromfile(filename, dtype=np.uint32)
     metafile = ".".join(filename.split(".")[:-1]) + ".meta"
-    shape, dtype = [eval(line.strip()) for line in open(metafile)]
+    with open(metafile) as fh:
+        shape, dtype = [eval(line.strip()) for line in fh]
     return torch.tensor(DWs).view(dtype).view(shape)

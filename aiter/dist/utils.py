@@ -1,3 +1,4 @@
+# NOTE: vendored from vLLM; `envs` / `current_platform` / `enable_trace_function_call` live in vllm modules that were not carried over, so these helpers are unusable here as-is.
 """
 * Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
 * Copyright (C) 2024-2025, The vLLM team.
@@ -517,7 +518,7 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
 
-    if current_platform.is_cuda_alike():
+    if current_platform.is_cuda_alike():  # noqa: F821
         torch.cuda.manual_seed_all(seed)
 
     if is_xpu():
@@ -536,7 +537,7 @@ def get_vllm_instance_id() -> str:
     Instance id represents an instance of the VLLM. All processes in the same
     instance should have the same instance id.
     """
-    return envs.VLLM_INSTANCE_ID or f"vllm-instance-{random_uuid()}"
+    return envs.VLLM_INSTANCE_ID or f"vllm-instance-{random_uuid()}"  # noqa: F821
 
 
 @cache
@@ -932,7 +933,7 @@ class DeviceMemoryProfiler:
 
     def current_memory_usage(self) -> float:
         # Return the memory usage in bytes.
-        if current_platform.is_cuda_alike():
+        if current_platform.is_cuda_alike():  # noqa: F821
             torch.cuda.reset_peak_memory_stats(self.device)
             mem = torch.cuda.max_memory_allocated(self.device)
         elif is_xpu():
@@ -1112,7 +1113,7 @@ def find_library(lib_name: str) -> str:
     # libcuda.so.1 (libc6,x86-64) => /lib/x86_64-linux-gnu/libcuda.so.1
     locs = [line.split()[-1] for line in libs.splitlines() if lib_name in line]
     # `LD_LIBRARY_PATH` searches the library in the user-defined paths
-    env_ld_library_path = envs.LD_LIBRARY_PATH
+    env_ld_library_path = envs.LD_LIBRARY_PATH  # noqa: F821
     if not locs and env_ld_library_path:
         locs = [
             os.path.join(dir, lib_name)
@@ -1131,7 +1132,7 @@ def find_nccl_library() -> str:
     After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
     found by `ctypes` automatically.
     """
-    so_file = envs.VLLM_NCCL_SO_PATH
+    so_file = envs.VLLM_NCCL_SO_PATH  # noqa: F821
 
     # manually load the nccl library
     if so_file:
@@ -1154,7 +1155,7 @@ def enable_trace_function_call_for_thread() -> None:
     if enabled via the VLLM_TRACE_FUNCTION environment variable
     """
 
-    if envs.VLLM_TRACE_FUNCTION:
+    if envs.VLLM_TRACE_FUNCTION:  # noqa: F821
         tmp_dir = tempfile.gettempdir()
         filename = (
             f"VLLM_TRACE_FUNCTION_for_process_{os.getpid()}"
@@ -1163,7 +1164,7 @@ def enable_trace_function_call_for_thread() -> None:
         ).replace(" ", "_")
         log_path = os.path.join(tmp_dir, "vllm", get_vllm_instance_id(), filename)
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        enable_trace_function_call(log_path)
+        enable_trace_function_call(log_path)  # noqa: F821
 
 
 # `functools` helpers

@@ -187,7 +187,8 @@ def _make_untune_csv(tune_file: str, shape_keys: list) -> str:
         )
 
     shapes = merged[present].drop_duplicates().reset_index(drop=True)
-    tmp = tempfile.NamedTemporaryFile(
+    # delete=False on purpose: the path outlives the handle.
+    tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".csv", prefix="aiter_pretune_", delete=False
     )
     shapes.to_csv(tmp.name, index=False)

@@ -280,7 +280,8 @@ def test_gen_instances_filter(
 
 
 def _make_temp_csv(content: str) -> str:
-    f = tempfile.NamedTemporaryFile(
+    # delete=False on purpose: the path outlives the handle.
+    f = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".csv", delete=False, prefix="test_gemm_codegen_"
     )
     f.write(textwrap.dedent(content).strip() + "\n")
@@ -416,7 +417,10 @@ def test_write_name_keyed_lookup_header():
 
     path = None
     try:
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )  # noqa: SIM115
         path = f.name
         f.close()
         write_name_keyed_lookup_header(
@@ -698,13 +702,17 @@ def test_write_lookup_header():
 
     path = None
     try:
-        f = tempfile.NamedTemporaryFile(mode="w", suffix=".h", delete=False)
+        # delete=False on purpose: the path outlives the handle.
+        f = tempfile.NamedTemporaryFile(  # noqa: SIM115
+            mode="w", suffix=".h", delete=False
+        )  # noqa: SIM115
         path = f.name
         f.close()
         write_lookup_header(
             path, kernels_dict, LOOKUP_head, LOOKUP_template, LOOKUP_end
         )
-        content = open(path).read()
+        with open(path) as fh:
+            content = fh.read()
 
         _check(
             "non-batched key: gfx string quoted in C++ initializer",

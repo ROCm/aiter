@@ -9,11 +9,16 @@ GPU-initiated communication via the Iris library.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import iris
 import triton
 import triton.language as tl
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from .iris import IrisCommContext
+
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True

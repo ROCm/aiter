@@ -4926,7 +4926,8 @@ class GroupedFmoeTuner(FmoeTuner):
         return hidden, w1_arg, w2_arg, topk_weight, topk_ids, w1_scale, w2_scale
 
     def _write_candidate_config(self, candidate):
-        tmp = tempfile.NamedTemporaryFile(
+        # delete=False on purpose: the path outlives the handle.
+        tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
             mode="w",
             suffix=".csv",
             prefix="aiter_grouped_candidate_",

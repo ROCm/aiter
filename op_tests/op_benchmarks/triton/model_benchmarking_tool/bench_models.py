@@ -598,13 +598,8 @@ def call_function(
             hw_limit = int(match.group(2))
             ratio: float = required / hw_limit
             print(
-                "Out of LDS on %s: %d / %d (%.1fx)"
-                % (
-                    handler.to_str(),
-                    required,
-                    hw_limit,
-                    ratio,
-                )
+                f"Out of LDS on {handler.to_str()}: {required} / {hw_limit} "
+                f"({ratio:.1f}x)"
             )
         else:
             print(f"Out of resources while benchmarking {handler.to_str()}. {e}")

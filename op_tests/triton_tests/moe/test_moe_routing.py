@@ -88,8 +88,8 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
