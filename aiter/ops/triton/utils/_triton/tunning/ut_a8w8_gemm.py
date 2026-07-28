@@ -37,7 +37,7 @@ for config in config_list:
     if config is not None:
         compute_splitk_params(config, K)
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a8w8(x, weight_triton, x_scale, w_scale, None, dtype, y, config=config)

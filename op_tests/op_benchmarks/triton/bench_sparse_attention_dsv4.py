@@ -222,7 +222,7 @@ def run_prefill_bench(args, device: str):
             + num_queries * num_heads * HEAD_DIM * 2
         )
 
-        def _perf(ms):
+        def _perf(ms, bytes_moved=bytes_moved, flops=flops):
             return flops / (ms * 1e-3) / 1e12, bytes_moved / (ms * 1e-3) / 1e9
 
         tri_ms = _time_backend(

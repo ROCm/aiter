@@ -231,7 +231,7 @@ def benchmark_gmm(
                 kwargs["grid_dim"] = grid_dim
 
             p50_ms, p20_ms, p80_ms = triton.testing.do_bench(
-                lambda: kernel_wrapper(**kwargs),
+                lambda kwargs=kwargs: kernel_wrapper(**kwargs),
                 quantiles=quantiles,
             )
 

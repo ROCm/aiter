@@ -37,7 +37,7 @@ x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(
 for config in config_list:
     assert config is None or config["BLOCK_SIZE_K"] == 128
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a16w8_blockscale_preshuffle(

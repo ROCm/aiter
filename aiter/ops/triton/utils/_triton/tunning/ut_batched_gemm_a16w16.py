@@ -40,7 +40,7 @@ for config in config_list:
         config = config.copy()
         config["SPLITK_BLOCK_SIZE"] = triton.cdiv(input_shape[2], config["NUM_KSPLIT"])
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         batched_gemm_bf16(x, weight, bias, dtype, YQ=y, config=config)

@@ -37,7 +37,7 @@ x, w, _, _, w_scales, _, y = generate_gemm_a16wfp4_inputs(
 
 for config in config_list:
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         # Signature: gemm_a16wfp4(x, w, w_scales, atomic_add, dtype, y, config)

@@ -3402,7 +3402,7 @@ def compile_mxscale_gemm(
                     )
                 _tail_as_idx = as_full_idx if tdm_as_in_prologue else None
 
-                def _as_idx_for(cs):
+                def _as_idx_for(cs, _tail_as_idx=_tail_as_idx):
                     return _tail_as_idx if tdm_as_in_prologue else stages_as_idx[cs]
 
                 if const_expr(_outstanding == -1):
@@ -3499,7 +3499,9 @@ def compile_mxscale_gemm(
                                 + loop_iters * arith.index(num_buffers * tile_k)
                             )
 
-                            def _tail_mid_nws(_ls=_load_stage, _ab=_tail_ab):
+                            def _tail_mid_nws(
+                                _ls=_load_stage, _ab=_tail_ab, _tail_load_k=_tail_load_k
+                            ):
                                 _desc_a = make_desc_a(stages_a_mem[_ls], _tail_load_k)
                                 _desc_b = make_desc_b(stages_b_mem[_ls], _tail_load_k)
                                 if const_expr(stage1_dual_b):

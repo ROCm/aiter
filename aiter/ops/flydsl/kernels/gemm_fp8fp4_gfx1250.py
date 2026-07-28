@@ -2197,7 +2197,7 @@ def compile_fp8fp4_gemm(
                 a2_box = [None]
                 a3_box = [None]
 
-                def _prefetch_a1():
+                def _prefetch_a1(a1_box=a1_box, ks=ks):
                     a1_box[0] = load_a_pair(1, ks)
 
                 first_wait_keep = _two_pair_loads + 3
@@ -2212,10 +2212,10 @@ def compile_fp8fp4_gemm(
                     rocdl.sched_barrier(0)
                     mid_compute_callback()
 
-                def _prefetch_b3():
+                def _prefetch_b3(b3_box=b3_box, ks=ks):
                     b3_box[0] = load_b_pair(3, ks)
 
-                def _prefetch_a3():
+                def _prefetch_a3(a3_box=a3_box, ks=ks):
                     a3_box[0] = load_a_pair(3, ks)
 
                 rocdl.s_wait_dscnt(_pair_loads + _fp8_pair_b_loads)
@@ -2233,7 +2233,7 @@ def compile_fp8fp4_gemm(
                     prefetch_after_first_row=_prefetch_a3,
                 )
 
-                def _prefetch_a2():
+                def _prefetch_a2(a2_box=a2_box, ks=ks):
                     a2_box[0] = load_a_pair(2, ks)
 
                 emit_panel_2x2(1, 1, a1_box[0], b1, scale_pair)

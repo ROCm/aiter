@@ -4003,7 +4003,7 @@ class FmoeTuner(TunerCommon):
             # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE below).
             _tune_only = {s for s in os.environ.get("TUNE_ONLY", "").split(",") if s}
 
-            def _want(name):
+            def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
                     return name in _tune_only
                 if _opus_only:
@@ -4592,7 +4592,22 @@ class FmoeTuner(TunerCommon):
                     # allocate a second moe_buf via torch.zeros, adding an
                     # aten::fill_ kernel that isn't on the production stream).
 
-                    def _flat_seq():
+                    def _flat_seq(
+                        _a1_scale_t=_a1_scale_t,
+                        _act_int=_act_int,
+                        _flat_kname=_flat_kname,
+                        _input=_input,
+                        _topk_ids=_topk_ids,
+                        _topk_w=_topk_w,
+                        _w1_qt_s=_w1_qt_s,
+                        _w1_scale=_w1_scale,
+                        _w2_qt_s=_w2_qt_s,
+                        _w2_scale=_w2_scale,
+                        dtype=dtype,
+                        expert=expert,
+                        model_dim=model_dim,
+                        topk=topk,
+                    ):
                         sids, sws, seids, nv, mbuf = moe_sorting(
                             _topk_ids,
                             _topk_w,
@@ -4620,7 +4635,23 @@ class FmoeTuner(TunerCommon):
                         )
                         return mbuf
 
-                    def _nf_seq():
+                    def _nf_seq(
+                        _a1_scale_t=_a1_scale_t,
+                        _act_int=_act_int,
+                        _nf_a1=_nf_a1,
+                        _nf_kname=_nf_kname,
+                        _topk_ids=_topk_ids,
+                        _topk_w=_topk_w,
+                        _w1_qt_s=_w1_qt_s,
+                        _w1_scale=_w1_scale,
+                        _w2_qt_s=_w2_qt_s,
+                        _w2_scale=_w2_scale,
+                        dtype=dtype,
+                        expert=expert,
+                        model_dim=model_dim,
+                        nf_block_m=nf_block_m,
+                        topk=topk,
+                    ):
                         sids, sws, seids, nv, mbuf = moe_sorting(
                             _topk_ids,
                             _topk_w,

@@ -2152,10 +2152,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
                 # ---- Build TDM state (zero placeholder for memload=False) ----
                 _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
-                def _mk_zero_v4i32():
+                def _mk_zero_v4i32(_zero_i32=_zero_i32):
                     return vector.broadcast(ty["v4i32"], _zero_i32)
 
-                def _mk_zero_v8i32():
+                def _mk_zero_v8i32(_zero_i32=_zero_i32):
                     return vector.broadcast(ty["v8i32"], _zero_i32)
 
                 tdm_state = {
@@ -2430,10 +2430,10 @@ def compile_fmha_fwd(*, is_causal: bool = False, return_lse: bool = False):
 
                 _zero_i32 = arith.unwrap(arith.constant(0, type=T.i32))
 
-                def _mk_zero_v4i32():
+                def _mk_zero_v4i32(_zero_i32=_zero_i32):
                     return vector.broadcast(ty["v4i32"], _zero_i32)
 
-                def _mk_zero_v8i32():
+                def _mk_zero_v8i32(_zero_i32=_zero_i32):
                     return vector.broadcast(ty["v8i32"], _zero_i32)
 
                 tdm_state = {

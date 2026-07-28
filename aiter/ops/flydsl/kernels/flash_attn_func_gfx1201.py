@@ -602,7 +602,7 @@ def build_flash_attn_func_module_primary(
             # Opt3: Prefetch next V pack while current WMMA executes
             v_base = v_buf_base(0)
 
-            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val):
+            def _load_v_rowmajor(st_kv_base_val, pks_val, dc_val, v_base=v_base):
                 d_pos = fx.Index(dc_val * D_CHUNK) + lane16
                 v_elems = []
                 for k_sub in range_constexpr(8):

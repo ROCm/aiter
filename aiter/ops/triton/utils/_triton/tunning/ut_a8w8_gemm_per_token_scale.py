@@ -32,7 +32,7 @@ x, weight, x_scale, w_scale, y = generate_gemm_a8w8_per_token_scale_inputs(
 
 for config in config_list:
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a8w8_per_token_scale(x, weight, x_scale, w_scale, dtype, y, config=config)

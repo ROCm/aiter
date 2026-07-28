@@ -42,7 +42,7 @@ for config in config_list:
         config = config.copy()
         config["SPLITK_BLOCK_SIZE"] = triton.cdiv(K, config["NUM_KSPLIT"])
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a8wfp4(x, w, y, x_scales, w_scales, dtype, config=config)

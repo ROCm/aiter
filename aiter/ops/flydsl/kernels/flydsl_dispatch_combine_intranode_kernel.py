@@ -986,7 +986,11 @@ def make_combine_kernel(
             # Bind the per-iteration resources as defaults so each definition
             # captures its own iteration's values (also silences B023).
             def _accum_step(
-                ec_abs, U, expert_rsrcs=expert_rsrcs, expert_vlds=expert_vlds
+                ec_abs,
+                U,
+                expert_rsrcs=expert_rsrcs,
+                expert_vlds=expert_vlds,
+                tok_id=tok_id,
             ):
                 vals = [[] for _ in range(U)]
                 for k_slot in range_constexpr(experts_per_token):
@@ -1016,7 +1020,7 @@ def make_combine_kernel(
                         kw["soffset_bytes"] = u * out_step
                     buffer_store(acc, rsrc_out, out_off, **kw)
 
-            def _accum_loop(end, U):
+            def _accum_loop(end, U, hdim_off=hdim_off):
                 step = U * 64
                 # Align end down to step so the main loop never overruns; tail
                 # covers the remainder (U==1 => empty tail).

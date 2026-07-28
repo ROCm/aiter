@@ -34,7 +34,7 @@ for config in config_list:
     if config is not None:
         compute_splitk_params(config, K)
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_afp8wfp8_preshuffle(

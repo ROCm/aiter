@@ -142,7 +142,7 @@ def _count_routing_mismatches(
         for t in (~match).cpu().nonzero(as_tuple=True)[0].tolist():
             thr = float(cut_cpu[t])
 
-            def _fmt(e):
+            def _fmt(e, t=t, thr=thr):
                 s = float(sel_cpu[t, e])
                 b = float(bias_cpu[e]) if has_bias else 0.0
                 return (

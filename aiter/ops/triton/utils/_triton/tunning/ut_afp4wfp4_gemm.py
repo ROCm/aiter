@@ -34,7 +34,7 @@ x, w, w_triton, x_scales, w_scales, x_scales_triton, w_scales_triton, out_dtype,
 
 for config in config_list:
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_afp4wfp4(

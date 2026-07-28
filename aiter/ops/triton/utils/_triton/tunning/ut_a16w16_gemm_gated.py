@@ -38,7 +38,7 @@ for config in config_list:
         config.pop("NUM_KSPLIT", None)
         config.pop("SPLITK_BLOCK_SIZE", None)
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a16w16_gated(x, w, dtype, y, config=config)
