@@ -524,10 +524,17 @@ def test_mhc_pre(
     ret["hip_err"] = hip_err
     ret["hip_us"] = hip_us
 
-    # bf16 (fn hi/lo pack) GEMM path: same mhc_pre but is_fn_pack_bf16=1. On gfx950 this
-    # uses the native bf16 MFMA; on gfx1250 the wave32 bf16 WMMA (UNVERIFIED); on other
-    # arches it falls back to fp32 (so err/us == the fp32 columns).
+    # bf16 GEMM path: pre-pack fn (fp32) -> int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn
+    # (fn are constant weights), then run mhc_pre with is_fn_pack_bf16=1 so the gemm
+    # bit-extracts hi/lo instead of recomputing the fp32->bf16 split per (m_block, k).
+    # On gfx950 this uses the native bf16 MFMA; gfx1250 the wave32 bf16 WMMA (UNVERIFIED).
     if fn_pack_bf16:
+        from aiter.ops.mhc import mhc_pre_convert_fn
+
+        fn_packed = torch.empty(
+            fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
+        )
+        mhc_pre_convert_fn(fn_packed, fn)
         (
             post_mix_bf16,
             comb_mix_bf16,
@@ -535,7 +542,7 @@ def test_mhc_pre(
         ), hip_bf16_us = run_perftest(
             aiter.mhc_pre,
             residual,
-            fn,
+            fn_packed,
             hc_scale,
             hc_base,
             is_fn_pack_bf16=1,
@@ -545,8 +552,6 @@ def test_mhc_pre(
             layer_input_ref, layer_input_bf16, msg="layer_input(bf16)"
         )
         ret["hip_bf16_us"] = hip_bf16_us
-        if hip_us and hip_bf16_us:
-            ret["bf16_speedup"] = hip_us / hip_bf16_us
     if fuse_rmsnorm:
         ret["hip_nofuse_us"] = hip_nofuse_us
         ret["TB/s"] = (
@@ -783,7 +788,11 @@ def mhc_post_pre_unfused_hip(
 def test_mhc_post_pre(
     m, hidden_size, hc_mult, fuse_rmsnorm=False, large_m=False, fn_pack_bf16=False
 ):
-    """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton."""
+    """Fused mhc_post + mhc_pre: HIP ``mhc_fused_post_pre`` vs ref / unfused HIP / Triton.
+
+    --fn_pack_bf16 toggles the gemm compute for ALL HIP paths (unfused, fused, large_m):
+    on -> pre-packed bf16 hi/lo MFMA (is_fn_pack_bf16=1); off -> fp32.
+    """
     if hidden_size < 512:
         aiter.logger.info(
             "skip mhc_post_pre: hidden_size=%s < 512 (big_fuse dispatch)", hidden_size
@@ -839,6 +848,24 @@ def test_mhc_post_pre(
     if fuse_rmsnorm:
         hip_kwargs["norm_weight"] = norm_weight
 
+    ret = {"fuse_rmsnorm": fuse_rmsnorm, "fn_pack_bf16": fn_pack_bf16}
+
+    # --fn_pack_bf16 toggles the gemm compute for all HIP paths: on -> pre-pack fn (fp32)
+    # into int32 (hi<<16|lo) ONCE via mhc_pre_convert_fn and run with is_fn_pack_bf16=1 so
+    # the gemm bit-extracts hi/lo (gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA,
+    # UNVERIFIED; other arches fall back to fp32); off -> plain fp32 fn.
+    if fn_pack_bf16:
+        from aiter.ops.mhc import mhc_pre_convert_fn
+
+        fn_gemm = torch.empty(
+            fn.shape[0], fn.shape[1], dtype=torch.int32, device=fn.device
+        )
+        mhc_pre_convert_fn(fn_gemm, fn)
+        pack_flag = 1
+    else:
+        fn_gemm = fn
+        pack_flag = 0
+
     (
         post_mix_unfused,
         comb_mix_unfused,
@@ -850,9 +877,10 @@ def test_mhc_post_pre(
         residual_in,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        fn_gemm,
         hc_scale,
         hc_base,
+        is_fn_pack_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -867,10 +895,11 @@ def test_mhc_post_pre(
         residual_in,
         post_layer_mix,
         comb_res_mix,
-        fn,
+        fn_gemm,
         hc_scale,
         hc_base,
         force_fused=True,
+        is_fn_pack_bf16=pack_flag,
         **hip_kwargs,
     )
 
@@ -886,43 +915,10 @@ def test_mhc_post_pre(
         layer_input_ref, layer_input_fused, msg="fused/layer_input"
     )
     checkAllclose(next_residual_ref, next_residual_fused, msg="fused/next_residual")
-    ret = {"fuse_rmsnorm": fuse_rmsnorm}
     ret["unfused_us"] = unfused_us
     ret["hip_unfused_err"] = hip_unfused_err
     ret["fused_us"] = fused_us
     ret["hip_fused_err"] = hip_fused_err
-
-    # bf16 (fn hi/lo pack) compute path: same fused kernel but is_fn_pack_bf16=1. gfx950
-    # native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); other arches fall back to
-    # fp32 (err/us == the fp32 fused columns).
-    if fn_pack_bf16:
-        (
-            post_mix_bf16,
-            comb_mix_bf16,
-            layer_input_bf16,
-            next_residual_bf16,
-        ), fused_bf16_us = run_perftest(
-            aiter.mhc_fused_post_pre,
-            layer_input,
-            residual_in,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            force_fused=True,
-            is_fn_pack_bf16=1,
-            **hip_kwargs,
-        )
-        ret["fused_bf16_err"] = checkAllclose(
-            layer_input_ref, layer_input_bf16, msg="fused/layer_input(bf16)"
-        )
-        checkAllclose(
-            next_residual_ref, next_residual_bf16, msg="fused/next_residual(bf16)"
-        )
-        ret["fused_bf16_us"] = fused_bf16_us
-        if fused_us and fused_bf16_us:
-            ret["bf16_speedup"] = fused_us / fused_bf16_us
     # print(f"next_residual_ref: {next_residual_ref}")
     # print(f"next_residual_fused: {next_residual_fused}")
 
@@ -991,9 +987,10 @@ def test_mhc_post_pre(
                 residual_in,
                 post_layer_mix,
                 comb_res_mix,
-                fn,
+                fn_gemm,
                 hc_scale,
                 hc_base,
+                is_fn_pack_bf16=pack_flag,
                 **hip_kwargs,
             )
             ret["large_m_us"] = large_m_us
@@ -1057,10 +1054,10 @@ parser.add_argument(
 parser.add_argument(
     "--fn_pack_bf16",
     action="store_true",
-    help="Also run the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1) and add "
-    "hip_bf16_err/hip_bf16_us (mhc_pre) and fused_bf16_err/fused_bf16_us + bf16_speedup "
-    "(mhc_post_pre). gfx950 native bf16 MFMA; gfx1250 wave32 bf16 WMMA (UNVERIFIED); "
-    "other arches fall back to fp32.",
+    help="Use the bf16 (fn hi/lo pack) compute path (is_fn_pack_bf16=1). For mhc_pre this "
+    "adds hip_bf16_err/hip_bf16_us alongside fp32; for mhc_post_pre it switches ALL HIP "
+    "paths (unfused, fused, large_m) from fp32 to bf16. gfx950 native bf16 MFMA; gfx1250 "
+    "wave32 bf16 WMMA (UNVERIFIED); other arches fall back to fp32.",
 )
 
 args = parser.parse_args()
