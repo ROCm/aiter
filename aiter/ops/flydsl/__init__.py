@@ -37,6 +37,11 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
+    from .moe_kernels import (
+        flydsl_moe_stage1,
+        flydsl_moe_stage2,
+    )
+    from .rmsnorm import flydsl_rmsnorm
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
@@ -59,6 +64,7 @@ if is_flydsl_available():
         "flydsl_preshuffle_gemm_a8",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_rmsnorm",
         "flydsl_hgemm",
         "flydsl_flash_attn_func",
         "flydsl_qk_norm_rope_quant",
