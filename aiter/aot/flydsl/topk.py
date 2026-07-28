@@ -179,8 +179,11 @@ def compile_one_config(
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {kernel_name}  arch={aot_arch}")
-    except Exception as e:
-        print(f"  [FAIL] compile  {kernel_name}  arch={aot_arch}: {e}")
+    except Exception as e:  # noqa: BLE001 - one config must not stop the batch
+        print(
+            f"  [FAIL] compile  {kernel_name}  arch={aot_arch}: "
+            f"{type(e).__name__}: {e}"
+        )
 
     return result
 
