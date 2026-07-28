@@ -789,7 +789,10 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    ext = ".pyd" if sys.platform == "win32" else ".so"
+    path = f"{get_user_jit_dir()}/{md_name}{ext}"
+    if os.path.exists(path):
+        os.remove(path)
 
 
 def clear_build(md_name):
@@ -815,7 +818,8 @@ def build_module(
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    lib_ext = ".pyd" if sys.platform == "win32" else ".so"
+    target_name = f"{md_name}{lib_ext}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)

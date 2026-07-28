@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+import sys
 from typing import Any, Optional, Tuple
 
 import torch
@@ -13,8 +14,14 @@ from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
+    _ck_targets_flag,
 )
 from ..utility import dtypes
+
+# On Windows with TheRock SDK (tested: gfx1151), logits (softcap) blob variants
+# fail to compile: the CK pipeline static_assert requires CK_TILE_FMHA_FWD_FAST_EXP2=1
+# but the default is 0. Exclude these variants until the root cause is resolved upstream.
+_MHA_LOGITS_BLOB_FILTER = "nlogits*" if sys.platform == "win32" else "*"
 
 
 def cmdGenFunc_mha_fwd(
@@ -50,10 +57,10 @@ def cmdGenFunc_mha_fwd(
     filter = "*"
     if q.dtype == dtypes.fp16:
         md_name += "_fp16"
-        filter += "_fp16*"
+        filter += f"_fp16*{_MHA_LOGITS_BLOB_FILTER}"
     elif q.dtype == dtypes.bf16:
         md_name += "_bf16"
-        filter += "_bf16*"
+        filter += f"_bf16*{_MHA_LOGITS_BLOB_FILTER}"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             md_name += "_fp8bf16"
@@ -97,7 +104,8 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
     ]
     return {
         "md_name": md_name,
@@ -791,12 +799,12 @@ def cmdGenFunc_mha_varlen_fwd(
         filter_fwd_splitkv2 = "*"  # get_fwd_splitkv_blobs()
         if q.dtype == dtypes.fp16:
             md_name += "_fp16"
-            filter_fwd_splitkv1 += "_fp16*"
-            filter_fwd_splitkv2 += "_fp16*"
+            filter_fwd_splitkv1 += f"_fp16*{_MHA_LOGITS_BLOB_FILTER}"
+            filter_fwd_splitkv2 += f"_fp16*{_MHA_LOGITS_BLOB_FILTER}"
         elif q.dtype == dtypes.bf16:
             md_name += "_bf16"
-            filter_fwd_splitkv1 += "_bf16*"
-            filter_fwd_splitkv2 += "_bf16*"
+            filter_fwd_splitkv1 += f"_bf16*{_MHA_LOGITS_BLOB_FILTER}"
+            filter_fwd_splitkv2 += f"_bf16*{_MHA_LOGITS_BLOB_FILTER}"
         if 0.0 < logits_soft_cap:
             md_name += "_logits"
             filter_fwd += "_logits*"
@@ -832,10 +840,12 @@ def cmdGenFunc_mha_varlen_fwd(
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+            + _ck_targets_flag()
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            + _ck_targets_flag()
         )
     return {
         "md_name": md_name,
@@ -1123,13 +1133,14 @@ def cmdGenFunc_mha_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1381,13 +1392,14 @@ def cmdGenFunc_mha_varlen_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1438,10 +1450,10 @@ def cmdGenFunc_mha_batch_prefill(
     filter_fwd = "*"  # get_fwd_blobs()
     if q.dtype == torch.float16:
         md_name += "_fp16"
-        filter_fwd += "fp16*"
+        filter_fwd += f"fp16*{_MHA_LOGITS_BLOB_FILTER}"
     elif q.dtype == torch.bfloat16:
         md_name += "_bf16"
-        filter_fwd += "bf16*"
+        filter_fwd += f"bf16*{_MHA_LOGITS_BLOB_FILTER}"
     elif q.dtype == dtypes.fp8:
         if out is None or out.dtype == dtypes.bf16:
             md_name += "_fp8bf16"
@@ -1503,6 +1515,7 @@ def cmdGenFunc_mha_batch_prefill(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        + _ck_targets_flag()
     ]
     return {
         "md_name": md_name,

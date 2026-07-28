@@ -21,7 +21,7 @@ PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
 # Single skip-C++/HIP-build gate; Windows enables it automatically.
-AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1" or IS_WINDOWS
+AITER_TRITON_ONLY = os.environ.get("AITER_TRITON_ONLY", "0") == "1"
 if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
@@ -56,7 +56,7 @@ def is_develop_mode():
     return False
 
 
-if not AITER_TRITON_ONLY and is_develop_mode():
+if not AITER_TRITON_ONLY and not IS_WINDOWS and is_develop_mode():
     try:
         from importlib.metadata import version as pkg_version
         from packaging.version import Version
@@ -470,8 +470,9 @@ else:
         "einops",
         "psutil",
         "packaging",
-        FLYDSL_VERSION,
     ]
+    if not IS_WINDOWS:
+        install_requires.append(FLYDSL_VERSION)
 
 setup(
     name=PACKAGE_NAME,
