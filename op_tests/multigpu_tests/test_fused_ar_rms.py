@@ -206,8 +206,10 @@ def get_acc_value_only(
     weight = weight.to(device)
     # dist.barrier(device_ids=[i for i in range(tp_size)])
 
-    # warmup and align all gpu
-    get_tp_group().device_group
+    # warmup and align all gpu. device_group is a plain attribute assigned in
+    # GroupCoordinator.__init__, so the access itself does nothing -- the point is
+    # get_tp_group(), which raises if the TP group was never initialised.
+    _ = get_tp_group().device_group
     torch.cuda.synchronize()
 
     for i in range(loop_time):
