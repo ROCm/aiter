@@ -17,6 +17,15 @@ from ..jit.utils.mha_recipes import (
 from ..utility import dtypes
 
 
+def _fmha_kv_byte_extent_ge_u32(
+    max_seqlen_k: int, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """True when per-head KV row byte extent reaches the 32-bit buffer-offset limit."""
+    k_bytes = int(max_seqlen_k) * int(k.stride(1)) * k.element_size()
+    v_bytes = int(max_seqlen_k) * int(v.stride(1)) * v.element_size()
+    return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
 def cmdGenFunc_mha_fwd(
     q: Tensor,
     k: Tensor,
@@ -1821,6 +1830,8 @@ def _flash_attn_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_asm():
@@ -1943,12 +1954,8 @@ def _flash_attn_forward(
             return False
         if not (hdim_q == 192 and hdim_v == 128):
             return False
-        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
-        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
-            return False
-        if seqlen_k * v.stride(1) * v.element_size() >= (1 << 32):
-            return False
-        return True
+        # Large KV (>= 4GiB per head row): hybrid buffer path in the Opus kernel.
+        return _fmha_kv_byte_extent_ge_u32(seqlen_k, k, v)
 
     def can_impl_fmha_fwd_bf16_opus():
         # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
@@ -2852,6 +2859,8 @@ def _flash_attn_varlen_forward(
         if is_fmha_v3_fp8():
             gqa_ratio = nhead_q // nhead_k
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
+        if hdim_q == 192 and hdim_v == 128:
+            ret = ret and not _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     def can_impl_fmha_fwd_with_sink_varlen_asm():
@@ -2907,6 +2916,7 @@ def _flash_attn_varlen_forward(
         ret = ret and (q_descale is None and k_descale is None and v_descale is None)
         ret = ret and (block_table is None)
         ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and _fmha_kv_byte_extent_ge_u32(max_seqlen_k, k, v)
         return ret
 
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]

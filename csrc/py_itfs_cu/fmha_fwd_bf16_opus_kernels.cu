@@ -239,14 +239,6 @@ void launch_d192_v128(aiter_tensor_t& q,
 
     kargs.B = B; kargs.N = N; kargs.N_KV = N_KV; kargs.H = H; kargs.H_KV = H_KV;
 
-    // 32-bit KV buffer-offset guard (same as D=128); N_KV bounds the per-group extent in
-    // group mode (max_seqlen_k).
-    const long long k_slice_bytes = (long long)N_KV * (long long)kargs.stride_k_n * 2LL;  // bf16
-    const long long v_slice_bytes = (long long)N_KV * (long long)kargs.stride_v_n * 2LL;
-    AITER_CHECK(k_slice_bytes < (1LL << 32) && v_slice_bytes < (1LL << 32),
-                "OPUS D_QK=192/D_V=128: K/V byte extent (k=", k_slice_bytes, " v=", v_slice_bytes,
-                ") reaches the 32-bit buffer-offset limit (2^32); reduce seqlen_kv");
-
     // Head/tail merge (causal load balance): host is the single source of truth; the
     // kernel reads the OPT_MERGE_HEADTAIL bit and never recomputes it.
     const bool small_shape = (long long)num_q_blocks * H * B < (long long)HEADTAIL_MIN_WG;
