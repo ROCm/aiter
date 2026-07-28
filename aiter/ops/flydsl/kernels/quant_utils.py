@@ -35,16 +35,21 @@ view to :func:`emit_mx_e8m0_scale` -- both round-trip through
 from __future__ import annotations
 
 from flydsl.expr import arith
-from flydsl.expr.typing import T
 from flydsl.expr.arith import CmpIPredicate
+from flydsl.expr.typing import T
+
+from aiter.utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
+)
 
 # Bare-int mirrors of MxScaleRoundMode / MxDtype (mx_quant_utils.h). Same
 # numeric values as the pybind11 enum classes, but importing them is
 # JIT-free, which is required at FlyDSL AOT time.
 from aiter.utility.mx_types import (
     MxDtypeInt as _D,
+)
+from aiter.utility.mx_types import (
     MxScaleRoundModeInt as _M,
-    MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
 )
 
 # Per-MX-dtype constants. Tuple form: (target_max_pow2, max_pos_inv_f32_bits, mbits)

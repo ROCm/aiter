@@ -16,19 +16,20 @@ Target: gfx1250, wave32, 4 waves (1TG), 1024 shared VGPRs (256 per bank).
 
 from __future__ import annotations
 
-from .fmha_schedule import (
-    GEMM1_SCHEDULE,
-    GEMM2_SCHEDULE,
-    g1_row_idx,
-    g2_row_idx,
-    PART2_EXP_START,  # ops index where pair_exp starts (=23)
-)
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import arith, rocdl, vector
-from flydsl.expr.typing import T
 from flydsl.expr.primitive import const_expr, range_constexpr
+from flydsl.expr.typing import T
+
+from .fmha_schedule import (
+    GEMM1_SCHEDULE,
+    GEMM2_SCHEDULE,
+    PART2_EXP_START,  # ops index where pair_exp starts (=23)
+    g1_row_idx,
+    g2_row_idx,
+)
 
 # run_id offset for PART2 pkfma (rid 5..8 → MSB 0..3)
 _P2_BASE = 5
@@ -834,10 +835,10 @@ def _build_lds_v_schedule(blk, su):
 def _get_lds_slots(stage, gemm_idx, cycle23, qpoint=GEMM_INST_COUNT // 4 - 1):
     # qpoint: the WMMA index where s_wait_dscnt occupies the slot.
     # GEMM1 (QK): GEMM_INST_COUNT//4-1 = 5. GEMM2 (PV): PV_GEMM_INST_COUNT//4-1 = 3.
-    if const_expr(DSWAIT_OCCUPY_WHOLE_WMMA):
-        if const_expr(stage >= 1):
-            if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-                return 0
+    if (const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1)) and const_expr(
+        gemm_idx == qpoint and not WAIT_DSCNT0
+    ):
+        return 0
     if const_expr(cycle23 == 1):
         if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
             return 0
@@ -849,13 +850,12 @@ def _get_valu_slots(
     stage, gemm_idx, cycle23, default=2, qpoint=GEMM_INST_COUNT // 4 - 1
 ):
     # qpoint: same as _get_lds_slots. Pass PV_GEMM_INST_COUNT//4-1 for GEMM2.
-    if const_expr(DSWAIT_OCCUPY_WHOLE_WMMA):
-        if const_expr(stage >= 1):
-            if const_expr(gemm_idx == qpoint and not WAIT_DSCNT0):
-                return 0
-    if const_expr(stage == 0 and cycle23 == 1):
-        if const_expr(gemm_idx in (4, 8, 12)):
-            return 0
+    if (const_expr(DSWAIT_OCCUPY_WHOLE_WMMA) and const_expr(stage >= 1)) and const_expr(
+        gemm_idx == qpoint and not WAIT_DSCNT0
+    ):
+        return 0
+    if const_expr(stage == 0 and cycle23 == 1) and const_expr(gemm_idx in (4, 8, 12)):
+        return 0
     return default
 
 
@@ -1379,7 +1379,7 @@ def _build_all_softmax_gemm2_ops(
         ops_by_rid[m] = p0_ops
 
     # PART1: 8 ops (cross-MSB)
-    p1_ops, p1_msb_assign = _build_softmax_part1_ops(ty, softmax_state, sgpr_state)
+    p1_ops, _p1_msb_assign = _build_softmax_part1_ops(ty, softmax_state, sgpr_state)
     ops_by_rid[4] = p1_ops
 
     # PART2: first half only (ops 0..PART2_SPLIT-1) for each MSB.

@@ -118,7 +118,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
             b.dtype == otype
         ), f"b={b.dtype}, expected output dtype={otype}, input dtype={dtype}"
 
-    msg_b = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
+    msg_b = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, B avg: {avg_b:<8.2f} us,B uplift: {avg_a/avg_b-1:<5.1%}, "
     err_tgemm = checkAllclose(a, b, msg=msg_b, catastrophic_check=True)
     ret["torch us"] = avg_a
     ret["tgemm us"] = avg_b
@@ -143,7 +143,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         assert (
             c.dtype == otype
         ), f"c={c.dtype}, expected output dtype={otype}, input dtype={dtype}"
-        msg_c = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
+        msg_c = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, C avg: {avg_c:<8.2f} us, C uplift: {avg_a/avg_c-1:<5.1%}, "
         err_hipb = (
             checkAllclose(a, c, msg=msg_c, catastrophic_check=True)
             if c is not None
@@ -166,11 +166,11 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         d, avg_d = run_bf16gemm_asm(
             x, wshuffle, out_asm, bias, bpreshuffle=wshuffle.is_shuffled
         )
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
+        msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-bpreshuffle avg: {avg_d:<8.2f} us, uplift: {avg_b/avg_d-1:<5.1%}"
         err_asm = checkAllclose(a, d, msg=msg, catastrophic_check=True)
         ### no shuffle
         e, avg_e = run_bf16gemm_asm(x, weight, out_asm, bias)
-        msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
+        msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, B avg: {avg_b:<8.2f} us, asm-noshuffle avg: {avg_e:<8.2f} us, uplift: {avg_b/avg_e-1:<5.1%}"
         err_asm_noshuffle = checkAllclose(a, e, msg=msg, catastrophic_check=True)
         ret["asm-bpshuff us"] = avg_d
         ret["asm-bpshuff err"] = err_asm
