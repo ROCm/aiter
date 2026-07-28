@@ -19,6 +19,7 @@ from aiter.ops.shuffle import (
     shuffle_weight,
     shuffle_weight_a16w4,
     shuffle_scale_a16w4,
+    moe_shuffle_scale,
 )
 from aiter import ActivationType
 from aiter import QuantType
@@ -376,6 +377,11 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     """1 - cosine-similarity in double; matches test_moe_2stage.calc_diff."""
     x, y = x.double(), y.double()
     denom = (x * x + y * y).sum()
+    # Under EP a single token can route entirely to non-local experts, so both
+    # ref and out are all-zero and denom==0. That is a correct (empty) result,
+    # not a mismatch — guard the division so it doesn't report a spurious NaN.
+    if denom == 0:
+        return 0.0
     return float(1 - 2 * (x * y).sum() / denom)
 
 
@@ -387,8 +393,13 @@ def test_fmoe_ep_mxfp4(
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}."""
-    if get_gfx() not in ["gfx950"]:
-        print(f"skip {quant_label}: mxfp4 requires gfx950, got {get_gfx()}")
+    _gfx = get_gfx()
+    if _gfx not in ["gfx950", "gfx1250"]:
+        print(f"skip {quant_label}: mxfp4 requires gfx950/gfx1250, got {_gfx}")
+        return
+    if _gfx == "gfx1250" and quant_label != "a8w4_mxfp4":
+        # gfx1250 grouped EP currently validated for a8w4 only.
+        print(f"skip {quant_label} on gfx1250: only a8w4_mxfp4 supported")
         return
 
     ep_id = ep - 1
@@ -458,17 +469,36 @@ def test_fmoe_ep_mxfp4(
         expert_mask=expert_mask,
     )
 
-    if quant_label == "a8w4_mxfp4":
-        # a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout —
-        # weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
+    if _gfx == "gfx1250":
+        # gfx1250 grouped GEMM path: FlyDSL grouped layout. Weights stay uint8
+        # (a8w4 -> q_dtype_a=fp8), SEPARATED gate_mode, per_1x32 mxfp4 weights.
+        w1_u8 = w1_qt.view(torch.uint8)
+        w2_u8 = w2_qt.view(torch.uint8)
+        w1_a = shuffle_weight(w1_u8, layout=(16, 16))
+        w2_a = shuffle_weight(w2_u8, layout=(16, 16))
+        w1_s = moe_shuffle_scale(w1_scale.contiguous(), experts_cnt=total_local)
+        w2_s = moe_shuffle_scale(w2_scale.contiguous(), experts_cnt=total_local)
+        act = ActivationType.Silu
+        gate_mode = GateMode.SEPARATED.value
+        os.environ["AITER_FORCE_A8W4"] = "1"
+        os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
+    elif quant_label == "a8w4_mxfp4":
+        # gfx950 a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout
+        # — weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
         # at the call site. The FlyDSL fp4 (16,16) shuffle is separated and
         # would mis-route gate/up here.
         w1_a = shuffle_weight_a16w4(w1_qt, 16, True)
         w1_s = shuffle_scale_a16w4(w1_scale, total_local, True)
         w2_a = shuffle_weight_a16w4(w2_qt, 16, False)
         w2_s = shuffle_scale_a16w4(w2_scale, total_local, False)
+        act = ActivationType.Silu
+        gate_mode = GateMode.INTERLEAVE.value
+        # Force the fp8 (a8w4) kernel regardless of token count. Below the
+        # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
+        # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
+        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     elif quant_label == "a4w4_mxfp4":
-        # a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
+        # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
         # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
         # test_moe_2stage.py:251-255 and pairs with gate_mode=SEPARATED.
         w1_a = shuffle_weight(w1_qt, layout=(16, 16))
@@ -477,25 +507,10 @@ def test_fmoe_ep_mxfp4(
         w2_s = fp4_utils.e8m0_shuffle(w2_scale)
         w1_a.is_shuffled = True
         w2_a.is_shuffled = True
-    else:
-        raise ValueError(f"unknown quant_label: {quant_label}")
-
-    # a4w4: Silu + SEPARATED -> FlyDSL fp4/fp4 (AITER_FLYDSL_FORCE=1 drops the
-    # Swiglu gate). a8w4: Silu + INTERLEAVE -> q_dtype_a auto-picker selects
-    # fp8 on gfx950 (fused_moe.py:357-361), and since the L1261 CK-Tile
-    # pre-emption requires Swiglu, Silu falls through to the
-    # swiglu_mxfp4_flydsl branch (with FLYDSL_FORCE=1) and lands on
-    # flydsl_moe1_afp8_wfp4_... Needs AITER_BF16_FP8_MOE_BOUND<=token.
-    if quant_label == "a8w4_mxfp4":
-        act = ActivationType.Silu
-        gate_mode = GateMode.INTERLEAVE.value
-        # Force the fp8 (a8w4) kernel regardless of token count. Below the
-        # default AITER_BF16_FP8_MOE_BOUND (256) the picker selects bf16/a16w4,
-        # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
-        os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
-    else:
         act = ActivationType.Silu
         gate_mode = GateMode.SEPARATED.value
+    else:
+        raise ValueError(f"unknown quant_label: {quant_label}")
     out, us = run_perftest(
         fused_moe,
         input_,
@@ -513,21 +528,29 @@ def test_fmoe_ep_mxfp4(
         num_iters=16,
     )
 
-    err = checkAllclose(
-        ref,
-        out,
-        atol=5e-2,
-        rtol=5e-2,
-        msg=f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
-        f"inter_dim={inter_dim} E={E} topk={topk}",
-    )
-
     diff = (ref - out).float()
     abs_err = diff.abs()
     abs_mean = abs_err.mean().item()
     abs_max = abs_err.max().item()
     rel_mean = (abs_err / (ref.float().abs() + 1e-6)).mean().item()
     logits_diff = _calc_diff(ref, out)
+
+    _msg = (
+        f"{quant_label} ep={ep} token={token} model_dim={model_dim} "
+        f"inter_dim={inter_dim} E={E} topk={topk}"
+    )
+    if _gfx == "gfx1250":
+        # The grouped a8w4 path quantizes activations to fp8, so the reference
+        # (bf16 activations) differs elementwise by more than atol/rtol=5e-2
+        # even without EP. Use the grouped tests' cosine criterion instead
+        # (test_flydsl_grouped_gemm_gfx1250.py: logits_diff < 0.01).
+        _logits_diff_tol = 0.01
+        err = logits_diff
+        _verdict = "PASSED" if logits_diff < _logits_diff_tol else "FAILED"
+        print(f"[aiter] {_msg} logits_diff={logits_diff:.6f} "
+              f"(tol {_logits_diff_tol}) {_verdict}")
+    else:
+        err = checkAllclose(ref, out, atol=5e-2, rtol=5e-2, msg=_msg)
 
     summary_table.append(
         {
