@@ -116,7 +116,7 @@ else:
     from .ops.mla_sparse_prefill import *
     from .ops.pa_sparse_prefill_opus import *
     from .ops.msa_attention import *
-    from .ops.pa_mqa_logits_mxfp8_opus import *
+    from .ops.opus.pa_mqa_logits_mxfp8_opus import *
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *

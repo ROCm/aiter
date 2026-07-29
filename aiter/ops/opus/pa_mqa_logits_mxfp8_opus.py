@@ -27,8 +27,8 @@ so they can be A/B compared as drop-in replacements.
 
 import torch
 
-from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx_runtime
+from ...jit.core import compile_ops
+from ...jit.utils.chip_info import get_gfx_runtime
 
 MD_NAME = "module_pa_mqa_logits_mxfp8_opus"
 
