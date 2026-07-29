@@ -20,7 +20,6 @@ from aiter.ops.flydsl.kernels.hstu_attention_fwd import (
     validate_hstu_attention_fwd,
 )
 from aiter.ops.triton.utils.common_utils import prev_power_of_2
-from aiter.utility.dtypes import str2bool
 
 from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
@@ -30,6 +29,19 @@ __all__ = [
 
 
 _GPU_ARCH = get_rocm_arch()
+
+
+def _str2bool(v: bool | str) -> bool:
+    # Local copy to avoid importing aiter.utility.dtypes at module load: that
+    # pulls in aiter.ops.enum, which triggers a JIT get_module() during the AOT
+    # build (setup.py run_aot) before the module exists -> import-time failure.
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise ValueError(f"Boolean value expected, got {v!r}.")
 
 
 # Tuned kernel configs
@@ -73,9 +85,9 @@ def _problem_key(
         int(hidden_dim),
         prev_power_of_2(int(batch)),
         prev_power_of_2(int(max_seq_len)),
-        str2bool(has_window),
-        str2bool(has_contextual),
-        str2bool(has_targets),
+        _str2bool(has_window),
+        _str2bool(has_contextual),
+        _str2bool(has_targets),
     )
 
 
