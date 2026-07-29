@@ -29,7 +29,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import _split_mfma_operands
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
@@ -284,12 +284,16 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         # lane_div_N: k-group index in the A/B frag layout.
         # lane_mod_N: output column index within the MFMA_N-wide tile.
         # lane8:      byte offset of this lane's K chunk (always 8 fp8 bytes per i64).
+        #             = (lane // MFMA_N) * 8
+        # Number of lane groups = 64 // MFMA_N:
+        #   MFMA_N=16 → 4 groups, each K-step spans 32 bytes (need 64-bit per-group load)
+        #   MFMA_N=32 → 2 groups, each K-step spans 16 bytes (fits in 128-bit load)
         lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
         lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
         lane8      = fx.Int32(arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(8))))
 
-        # fp8 operands are read 8 bytes at a time as 2 i32 dwords (v8i8
-        # buffer_load fails to lower on gfx942), bitcast to i64 for the MFMA.
+        # fp8 operands are read as i32 dwords (v8i8 buffer_load fails to lower
+        # on gfx942), then bitcast to i64 for the MFMA.
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
         kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
         sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
@@ -310,19 +314,83 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             return GTensor(logits, dtype=T.f32, shape=(-1,),
                            static_bytes_offset_i64=_idx)
 
+        # Number of lane groups per K-step tile.
+        _N_LANE_GROUPS = 64 // mfma.MFMA_N  # compile-time constant
+
+        # _is_group0: True for lanes in group 0 (lane_div_N == 0).
+        # Used by the 128-bit load path (_N_LANE_GROUPS == 2) to select lo/hi i64.
+        # Computed unconditionally; only referenced in the _N_LANE_GROUPS == 2 branch.
+        _is_group0 = arith.cmpi(arith.CmpIPredicate.eq, _to_raw(lane_div_N),
+                                 arith.constant(0, type=T.i32))
+
         def _load_pack_i64(i32_view, byte_off_i32):
+            """64-bit load: returns i64 covering this lane's 8 fp8 bytes.
+
+            byte_off_i32 must already include the lane's byte offset (lane8)
+            so the load hits the correct 8-byte chunk for this lane group.
+            """
             dword_off = fx.Int32(
                 arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
             )
             v2 = i32_view.vec_load((dword_off,), vec_size=2)
             return Vec(v2).bitcast(fx.Int64)[0].ir_value()
 
-        # def _load_pack_i64x2(i32_view, byte_off_i32):
-        #     dword_off = fx.Int32(
-        #         arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
-        #     )
-        #     v4 = i32_view.vec_load((dword_off,), vec_size=4)
-        #     return Vec(v4).bitcast(fx.Int64)[0].ir_value()
+        def _load_pack_i64x2(i32_view, byte_off_i32):
+            """128-bit load: returns (lo_i64, hi_i64) covering 16 contiguous fp8 bytes.
+
+            Valid only when there are 2 lane groups (MFMA_N=32): each K-step
+            tile is 2 groups x 8 bytes = 16 bytes, fitting in one dwordx4 load.
+              lane_div_N == 0  →  lo_i64  (bytes 0-7  relative to load base)
+              lane_div_N == 1  →  hi_i64  (bytes 8-15 relative to load base)
+            """
+            dword_off = fx.Int32(
+                arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
+            )
+            v4     = i32_view.vec_load((dword_off,), vec_size=4)
+            v2xi64 = Vec(v4).bitcast(fx.Int64)   # vec<2 x i64>
+            lo_i64 = v2xi64[0].ir_value()
+            hi_i64 = v2xi64[1].ir_value()
+            return lo_i64, hi_i64
+
+        def _load_pack_i64_swizzle(i32_view, byte_off_i32):
+            """128-bit load + permlane32.swap: each lane gets its correct 8 bytes,
+            zero wasted bandwidth.
+
+            Valid only when _N_LANE_GROUPS == 2 (MFMA_N=32).
+
+            All 64 lanes load the same 16-byte k-step tile at `byte_off_i32`
+            (no lane8 offset):
+              lo_i64 = bytes  0..7  → group 0's data
+              hi_i64 = bytes 8..15  → group 1's data
+
+            permlane32.swap exchanges hi_i64 between lane c (group 0) and
+            lane c+32 (group 1). After the swap:
+              group 0 lanes: use lo_i64              (their own bytes)
+              group 1 lanes: use swapped hi_i64      (their own bytes, now received)
+
+            The swap operates on i32; hi_i64 is split into two i32 halves,
+            each swapped independently, then reassembled.
+            """
+            lo_i64, hi_i64 = _load_pack_i64x2(i32_view, byte_off_i32)
+            # Split hi_i64 into two i32 halves for shuffle_xor.
+            hi_lo32 = arith.TruncIOp(T.i32, hi_i64).result
+            hi_hi32 = arith.TruncIOp(T.i32,
+                arith.ShRUIOp(hi_i64, arith.constant(32, type=T.i64)).result
+            ).result
+            # gpu.shuffle xor offset=32: lane c ↔ lane c^32 (group 0 ↔ group 1).
+            # width=64 (full wave). Each lane sends hi and receives its peer's hi.
+            swapped_lo32 = ArithValue(hi_lo32).shuffle_xor(32, 64)
+            swapped_hi32 = ArithValue(hi_hi32).shuffle_xor(32, 64)
+            # Reassemble received i64.
+            swapped_i64 = arith.OrIOp(
+                arith.ExtUIOp(T.i64, swapped_lo32).result,
+                arith.ShLIOp(
+                    arith.ExtUIOp(T.i64, swapped_hi32).result,
+                    arith.constant(32, type=T.i64),
+                ).result,
+            ).result
+            # Group 0 uses lo_i64 (own data); group 1 uses the received hi_i64.
+            return arith.select(_is_group0, lo_i64, swapped_i64)
 
         # ---- FN -> FNUZ in-kernel byte conversion ----
         def _fn_to_fnuz_i64(raw_i64):
@@ -360,7 +428,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
 
         # ---- Preload per-row metadata, Q frags, and weights for all RPB rows ----
         # All WPB waves preload all RPB rows' Q frags. A-operand layout is per
-        # in-wave lane (lane_mod_N, lane8), so `lane` (not `tid`) is used here.
+        # in-wave lane (lane_div_N, lane_mod_N), so `lane` (not `tid`) is used here.
         starts  = [None] * RPB
         ends    = [None] * RPB
         a_packs = [None] * RPB
@@ -383,8 +451,18 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                 )
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    d_a = _i32_add(fx.Int32(kk * mfma.MFMA_K), lane8)
-                    raw = _load_pack_i64(q_i32, _i32_add(base_a, d_a))
+                    if const_expr(_N_LANE_GROUPS == 2):
+                        # 32x32x16: 128-bit load + permlane32.swap.
+                        # All lanes load 16 bytes at base (no lane8 offset);
+                        # swap distributes the hi half to group 1, zero waste.
+                        raw = _load_pack_i64_swizzle(
+                            q_i32, _i32_add(base_a, fx.Int32(kk * mfma.MFMA_K))
+                        )
+                    else:
+                        # 16x16x32: 64-bit load with lane8 group offset.
+                        raw = _load_pack_i64(
+                            q_i32, _i32_add(base_a, _i32_add(fx.Int32(kk * mfma.MFMA_K), lane8))
+                        )
                     row_a[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
@@ -471,8 +549,18 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                 kv_scales_tile[ni] = _to_raw(fx.Float32(sc_t[col_clamped]))
                 base_b = fx.Int32(arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    d_b = _i32_add(fx.Int32(kk * mfma.MFMA_K), lane8)
-                    raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
+                    if const_expr(_N_LANE_GROUPS == 2):
+                        # 32x32x16: 128-bit load + permlane32.swap.
+                        # All lanes load 16 bytes at base (no lane8 offset);
+                        # swap distributes the hi half to group 1, zero waste.
+                        raw = _load_pack_i64_swizzle(
+                            kv_i32, _i32_add(base_b, fx.Int32(kk * mfma.MFMA_K))
+                        )
+                    else:
+                        # 16x16x32: 64-bit load with lane8 group offset.
+                        raw = _load_pack_i64(
+                            kv_i32, _i32_add(base_b, _i32_add(fx.Int32(kk * mfma.MFMA_K), lane8))
+                        )
                     b_packs[ni][kk] = _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
             # ---- Per-row MFMA + epilogue (inner loop over RPB rows) ----
