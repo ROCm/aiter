@@ -1,34 +1,33 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import multiprocessing
 import os
-from typing import Optional
+from multiprocessing import Pool, freeze_support, set_start_method
 
 import torch
 import torch.distributed as dist
-import argparse
+
 import aiter as ops
 from aiter import dtypes
-
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
-    init_distributed_environment,
-    set_custom_all_reduce,
     get_tp_group,
     graph_capture,
-    destroy_model_parallel,
-    destroy_distributed_environment,
+    init_distributed_environment,
+    set_custom_all_reduce,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import (
+    benchmark,
     checkAllclose,
     perftest,
-    benchmark,
 )
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -41,7 +40,7 @@ def allreduce_quick(
     rankID,
     x,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{rankID}")
     torch.cuda.set_device(device)
@@ -64,9 +63,8 @@ def allreduce_quick(
 
     if withGraph:
         graph = torch.cuda.CUDAGraph()
-        with graph_capture() as gc:
-            with torch.cuda.graph(graph, stream=gc.stream):
-                out = tensor_model_parallel_all_reduce(x)
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = tensor_model_parallel_all_reduce(x)
         out.fill_(0)
 
         @perftest()
@@ -98,11 +96,14 @@ def test_allreduce_quick(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
+    quantization: str = "INT4",
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
-    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    # Quantization regime: FP / FP8 / INT6 / INT4 / INT3 / NONE.
+    # INT3 is only supported on TP2 (world_size == 2).
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = quantization
     pool = Pool(processes=tp_size)
     ref = torch.zeros(shape, dtype=dtype)
     rets = []
@@ -137,9 +138,7 @@ def qr_variable_input(rank, world_size):
     torch.cuda.set_device(device)
     qr_max_size = None  # MB
     _ptr = ops.init_custom_qr(rank, world_size, qr_max_size)
-    ranks = []
-    for i in range(world_size):
-        ranks.append(i)
+    ranks = list(range(world_size))
     dist.init_process_group(
         backend="nccl",
         init_method="tcp://127.0.0.1:29500",
@@ -167,7 +166,7 @@ def qr_variable_input(rank, world_size):
             s2 = 2048
             inp1 = torch.ones((s1, s2), dtype=dtype, device=torch.cuda.current_device())
         result = torch.empty_like(inp1)
-        # FP = 0 INT8 = 1 INT6 = 2 INT4 = 3 NONE = 4
+        # FP = 0 FP8 = 1 INT6 = 2 INT4 = 3 INT3 = 4 NONE = 5
         ops.qr_all_reduce(_ptr, inp1, result, 3, cast_bf2half=True)
         try:
             if inp1[0, 0] == 0:
@@ -254,6 +253,21 @@ if __name__ == "__main__":
                 distributed_init_method=get_distributed_init_method(
                     get_ip(), get_open_port()
                 ),
+            )
+
+    # INT3 quantization is only supported on TP2 (world_size == 2).
+    for dtype in l_dtype:
+        for shape in l_shape:
+            test_allreduce_quick(
+                2,
+                1,
+                shape,
+                dtype,
+                withGraph=False,
+                distributed_init_method=get_distributed_init_method(
+                    get_ip(), get_open_port()
+                ),
+                quantization="INT3",
             )
 
     # check variable input for qr

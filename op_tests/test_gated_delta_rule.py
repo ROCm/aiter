@@ -10,11 +10,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from aiter.ops.triton.gated_delta_net import (
-    fused_recurrent_gated_delta_rule,
-    chunk_gated_delta_rule,
-    chunk_gated_delta_rule_opt,
-    chunk_gated_delta_rule_opt_vk,
+from aiter.ops.chunk_gated_delta_rule_fwd_h import (
+    chunk_gated_delta_rule_fwd_h_hip_fn,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -25,6 +22,15 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
     assert_close,
     device,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    chunk_gated_delta_rule_fwd_h_opt_vk,
+)
+from aiter.ops.triton.gated_delta_net import (
+    chunk_gated_delta_rule,
+    chunk_gated_delta_rule_opt,
+    chunk_gated_delta_rule_opt_vk,
+    fused_recurrent_gated_delta_rule,
+)
 
 
 def _is_gfx12_runtime() -> bool:
@@ -34,7 +40,7 @@ def _is_gfx12_runtime() -> bool:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", "")
         return arch.split(":")[0].startswith("gfx12") if arch else False
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -44,12 +50,12 @@ def recurrent_gated_delta_rule_ref(
     v: torch.Tensor,
     beta: torch.Tensor,
     g: torch.Tensor,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
 ):
-    q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
     )
     B, H, T, K, V = *k.shape, v.shape[-1]
     o = torch.zeros(B, H, T, V).to(v)
@@ -82,7 +88,7 @@ def chunk_gated_delta_rule_ref(
     g: torch.Tensor,
     beta: torch.Tensor,
     chunk_size: int = 64,
-    scale: float = None,
+    scale: float | None = None,
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
 ):
@@ -90,8 +96,8 @@ def chunk_gated_delta_rule_ref(
     if scale is None:
         scale = 1 / (q.shape[-1] ** 0.5)
     # Calculate padding needed to make T a multiple of BT
-    q, k, v, beta, g = map(
-        lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g]
+    q, k, v, beta, g = (
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in [q, k, v, beta, g]
     )
 
     T = q.shape[-2]
@@ -103,7 +109,7 @@ def chunk_gated_delta_rule_ref(
         v = F.pad(v, (0, 0, 0, pad_len))
         beta = F.pad(beta, (0, pad_len))
         g = F.pad(g, (0, pad_len))
-    q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
+    q, k, v, beta, g = (x.to(torch.float32) for x in [q, k, v, beta, g])
     decay = g
     chunk_size = BT
     b, h, seq_len, d_k = q.shape
@@ -117,9 +123,9 @@ def chunk_gated_delta_rule_ref(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
         diagonal=0,
     )
-    q, k, v, k_beta, decay = map(
-        lambda x: rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size),
-        [q, k, v, k_beta, decay.unsqueeze(-1)],
+    q, k, v, k_beta, decay = (
+        rearrange(x, "b h (n c) d -> b h n c d", c=chunk_size)
+        for x in [q, k, v, k_beta, decay.unsqueeze(-1)]
     )
     decay = decay.squeeze(-1).cumsum(-1)
     decay_exp = decay.exp()[..., None]
@@ -130,7 +136,7 @@ def chunk_gated_delta_rule_ref(
             attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()
         ).sum(-2)
     attn = attn + torch.eye(chunk_size, dtype=torch.float, device=q.device)
-    attn = attn
+    attn = attn  # noqa: PLW0127
     k_cumsum = attn @ v
     k_cumdecay = attn @ (k_beta * decay_exp)
     v = k_cumsum
@@ -142,7 +148,7 @@ def chunk_gated_delta_rule_ref(
         torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
         diagonal=1,
     )
-    for i in range(0, seq_len // chunk_size):
+    for i in range(seq_len // chunk_size):
         q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
         attn = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask, 0)
         v_prime = (k_cumdecay[:, :, i]) @ S
@@ -205,8 +211,8 @@ def test_fused_recurrent(
     g = F.logsigmoid(torch.rand(B, T, HV, dtype=torch.float32))
     g = g / gate_logit_normalizer
     h0 = torch.randn(B, HV, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_() for x in (q, k, v, beta, g, h0)
     )
     ref, ref_ht = recurrent_gated_delta_rule_ref(
         q=F.normalize(
@@ -301,8 +307,8 @@ def test_chunk(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule(
@@ -403,9 +409,8 @@ def test_fused_sigmoid_gating_delta_rule_update(
     initial_state_indices = torch.arange(B, dtype=torch.long)
 
     # Move to device
-    q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices = map(
-        lambda x: x.to(device),
-        (q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices),
+    q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices = (
+        x.to(device) for x in (q, k, v, b, A_log, a, dt_bias, h0, initial_state_indices)
     )
 
     # Compute reference using recurrent implementation
@@ -504,8 +509,8 @@ def test_chunk_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
     # do = torch.randn_like(v)
     # dht = torch.rand_like(h0)
@@ -616,8 +621,8 @@ def test_chunk_opt(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule_opt(
@@ -719,8 +724,8 @@ def test_chunk_opt_hip(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
     initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
 
@@ -808,8 +813,8 @@ def test_chunk_opt_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
 
     tri, tri_ht = chunk_gated_delta_rule_opt(
@@ -895,8 +900,8 @@ def test_chunk_opt_varlen_hip(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
     initial_state = h0.clone().to(state_dtype).transpose(-1, -2).contiguous()
 
@@ -934,6 +939,152 @@ def test_chunk_opt_varlen_hip(
     assert tri_ht.dtype == state_dtype
     assert_close("o", ref.float(), tri.float(), tol)
     assert_close("ht", ref_ht.float(), tri_ht.transpose(-1, -2).float(), tol)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param("triton", id="triton"),
+        pytest.param(
+            "hip",
+            id="hip",
+            marks=[
+                pytest.mark.skipif(
+                    not IS_AMD, reason="HIP backend requires an AMD device"
+                ),
+                pytest.mark.skipif(
+                    _is_gfx12_runtime(),
+                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens"),
+    [
+        pytest.param(*test, id="indice-H{}-D{}-mask_p{}-cu_seqlens{}".format(*test))
+        for test in [
+            (4, 128, 0, [0, 15]),
+            (4, 128, 0, [0, 256, 500, 1000]),
+            (4, 128, 0.5, [0, 256, 500, 1000]),
+            (4, 128, 0, [0, 15, 100, 300, 1200, 2000]),
+        ]
+    ],
+)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping test_chunk_opt_vk_indice because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_vk_indice(
+    backend: str,
+    H: int,
+    D: int,
+    mask_p: float,
+    cu_seqlens: list[int],
+    state_dtype: torch.dtype,
+):
+    """Functional test for the indexed state-pool fwd_h on both backends.
+
+    The Triton (``chunk_gated_delta_rule_fwd_h_opt_vk``) and HIP
+    (``chunk_gated_delta_rule_fwd_h_hip_fn``) entries share the same dense/indexed
+    contract: the only differences from the dense path are the per-sequence slot
+    gather (``initial_state_indices``) on read and the in-place write-back into
+    that slot. So when the pool holds the same initial states at (scattered)
+    slots, dense vs indexed must be bit-identical, and non-indexed pool slots must
+    stay untouched. The check is a same-backend self-comparison, so it does not
+    depend on the gate layout being interpreted a particular way.
+    """
+    if backend == "hip":
+        fwd_h = chunk_gated_delta_rule_fwd_h_hip_fn
+        # HIP kernel is specialized for D=128 / bf16 and reads head-major gates.
+        if D != 128:
+            pytest.skip(reason="HIP kernel requires D=128 and bfloat16")
+        extra_kwargs = {"g_head_major": True}
+    else:
+        fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
+        extra_kwargs = {}
+
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    cu_seqlens = torch.LongTensor(cu_seqlens).to(device)
+    T = int(cu_seqlens[-1])
+    N = len(cu_seqlens) - 1
+    B = 1
+
+    # fwd_h-stage inputs: k [B,T,H,K] token-major, w/u [B,H,T,K|V] head-major,
+    # g head-major [B,H,T]. Hg == H (no GQA).
+    k = torch.randn(B, T, H, D, dtype=torch.bfloat16, device=device)
+    w = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    u = torch.randn(B, H, T, D, dtype=torch.bfloat16, device=device)
+    g = F.logsigmoid(torch.rand(B, H, T, dtype=torch.float32, device=device))
+    g = g * (torch.rand_like(g) > mask_p)
+
+    # Dense per-sequence initial states [N, H, V, K] (random, so the gather is
+    # actually exercised -- a wrong slot would read different values).
+    h0 = torch.randn(N, H, D, D, dtype=state_dtype, device=device)
+
+    # --- dense reference: slot == i_n ---
+    h_ref, vnew_ref, ht_ref = fwd_h(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        **extra_kwargs,
+    )
+
+    # --- indexed pool: scatter the N states into a larger pool at unique,
+    # non-identity slots to prove the gather honours initial_state_indices ---
+    pool_size = N + 7
+    perm = torch.randperm(pool_size, device=device)
+    indices = perm[:N].to(torch.int32)
+    pool = torch.randn(pool_size, H, D, D, dtype=state_dtype, device=device)
+    pool_before = pool.clone()
+    pool[indices.long()] = h0.clone()
+
+    # Indexed pool path: passing initial_state_indices switches to slot gather +
+    # in-place write-back (final_state aliases pool).
+    h_idx, vnew_idx, ht_idx = fwd_h(
+        k=k.clone(),
+        w=w.clone(),
+        u=u.clone(),
+        g=g.clone(),
+        initial_state=pool,
+        initial_state_indices=indices,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        state_dtype=state_dtype,
+        **extra_kwargs,
+    )
+    assert ht_idx is pool  # in-place: final state aliases the pool buffer
+
+    # 1. snapshots + recomputed values are bit-identical to the dense path
+    assert torch.equal(h_idx, h_ref), "h snapshots differ between dense and indexed"
+    assert torch.equal(vnew_idx, vnew_ref), "v_new differs between dense and indexed"
+
+    # 2. in-place write-back: the final state landed in the indexed pool slots
+    # and equals the dense final state
+    assert torch.equal(
+        pool[indices.long()], ht_ref
+    ), "in-place final state at indexed slots differs from dense final_state"
+
+    # 3. non-indexed pool slots must be left exactly as they were
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices.long()] = False
+    assert torch.equal(
+        pool[untouched], pool_before[untouched]
+    ), "non-indexed pool slots were modified by the kernel"
 
 
 @pytest.mark.parametrize(
@@ -997,8 +1148,8 @@ def test_chunk_opt_vk(
     g = g / gate_logit_normalizer
     g = g * (torch.rand_like(g) > mask_p)
     h0 = torch.zeros(B, H, D, D, dtype=torch.float32)
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(True), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(True) for x in (q, k, v, beta, g, h0)
     )
 
     # opt_vk expects initial_state in [N, H, V, K] layout
@@ -1082,8 +1233,8 @@ def test_chunk_opt_vk_varlen(
     beta = torch.rand(1, T, H, dtype=dtype).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=dtype)
 
-    q, k, v, beta, g, h0 = map(
-        lambda x: x.to(device).requires_grad_(False), (q, k, v, beta, g, h0)
+    q, k, v, beta, g, h0 = (
+        x.to(device).requires_grad_(False) for x in (q, k, v, beta, g, h0)
     )
 
     # opt_vk expects initial_state in [N, H, V, K] layout

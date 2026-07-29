@@ -22,22 +22,22 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
+import os
 import pickle
 import weakref
 from collections import namedtuple
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional
 from unittest.mock import patch
 
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
-import os
-from aiter import logger
-from aiter import torch_compile_guard
+from aiter import logger, torch_compile_guard
 
 
 def supports_custom_op():
@@ -53,15 +53,15 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
-) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
+    tensor_dict: dict[str, torch.Tensor | Any],
+) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
          by its metadata.
     2. A list of tensors.
     """
-    metadata_list: List[Tuple[str, Any]] = []
-    tensor_list: List[torch.Tensor] = []
+    metadata_list: list[tuple[str, Any]] = []
+    tensor_list: list[torch.Tensor] = []
     for key, value in tensor_dict.items():
         if isinstance(value, torch.Tensor):
             # Note: we cannot use `value.device` here,
@@ -78,7 +78,7 @@ def _split_tensor_dict(
     return metadata_list, tensor_list
 
 
-_group_name_counter: Dict[str, int] = {}
+_group_name_counter: dict[str, int] = {}
 
 
 def _get_unique_name(name: str) -> str:
@@ -94,7 +94,7 @@ def _get_unique_name(name: str) -> str:
     return newname
 
 
-_groups: Dict[str, Callable[[], "GroupCoordinator"]] = {}
+_groups: dict[str, Callable[[], "GroupCoordinator"]] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
@@ -174,15 +174,22 @@ def fused_allreduce_rmsnorm_quant_fake(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale). ``out`` is per-token FP8,
+    # NOT bf16 -- declare the correct dtype so torch.compile's assert_size_stride
+    # / dtype checks agree with the runtime tensor.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
     return (
+        torch.empty_like(inp, dtype=fp8),
         torch.empty_like(res_inp),
-        torch.empty_like(inp),
-        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device()),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
     )
 
 
-@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_fake)
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_fake)
 def fused_allreduce_rmsnorm_quant_(
     inp: torch.Tensor,
     res_inp: torch.Tensor,
@@ -190,13 +197,175 @@ def fused_allreduce_rmsnorm_quant_(
     eps: float,
     group_name: str,
     prefill_support: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_out_place(
-        inp, res_inp, w, eps, prefill_support
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm
+    )
+
+
+def fused_allreduce_rmsnorm_quant_emit_bf16_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Real op returns (out_fp8, residual_out, scale, bf16) -- the 4th tensor is
+    # the pre-quantization bf16/fp16 normed activation for v32 DSA indexer GEMMs.
+    from aiter.utility.dtypes import fp8
+
+    del gemma_norm
+    return (
+        torch.empty_like(inp, dtype=fp8),
+        torch.empty_like(res_inp),
+        torch.empty(inp.shape[:-1] + (1,), dtype=torch.float32, device=inp.device),
+        torch.empty_like(res_inp),
+    )
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_emit_bf16_fake)
+def fused_allreduce_rmsnorm_quant_emit_bf16_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    prefill_support: bool = False,
+    gemma_norm: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_out_place(
+        inp, res_inp, w, eps, prefill_support, gemma_norm=gemma_norm, emit_bf16=True
+    )
+
+
+def fused_allreduce_rmsnorm_quant_per_group_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta/fake for the fused AR+RMSNorm+per-group-FP8-quant op.
+
+    Returns ``(out_fp8, residual_out, scale)``. The scale stride MUST match what
+    the real op returns AND what inductor lays out for the downstream preshuffle
+    GEMM consumer:
+      - transpose_scale=False: row-major (M, num_groups), stride (num_groups, 1)
+      - transpose_scale=True : column-major -- storage (num_groups, M) viewed
+        transposed to (M, num_groups), stride (1, M). This is the layout
+        ``gemm_a8w8_blockscale_preshuffle`` consumes, and (because the op has no
+        needs_fixed_stride_order tag on torch>=2.8) is also the layout inductor
+        re-strides the op output to; the fake must declare it to avoid an
+        assert_size_stride failure.
+    """
+    from aiter.utility.dtypes import fp8
+
+    M = inp.shape[0]
+    K = inp.shape[-1]
+    num_groups = K // group_size
+    out = torch.empty_like(inp, dtype=fp8)
+    res_out = torch.empty_like(res_inp)
+    if transpose_scale:
+        scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=inp.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((M, num_groups), dtype=torch.float32, device=inp.device)
+    return out, res_out, scale
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_per_group_fake)
+def fused_allreduce_rmsnorm_quant_per_group_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
+        inp, res_inp, w, eps, group_size, prefill_support, transpose_scale
+    )
+
+
+def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta/fake for fused AR+RMSNorm+per-group-FP8-quant with emit_bf16.
+
+    Identical to ``fused_allreduce_rmsnorm_quant_per_group_fake`` (same
+    out/residual/scale shapes and scale-stride rules -- see that docstring)
+    but returns a 4th tensor: the pre-quantization bf16/fp16 normed activation
+    for v32 DSA indexer GEMMs (mirrors the per_token emit_bf16 fake).
+    """
+    from aiter.utility.dtypes import fp8
+
+    M = inp.shape[0]
+    K = inp.shape[-1]
+    num_groups = K // group_size
+    out = torch.empty_like(inp, dtype=fp8)
+    res_out = torch.empty_like(res_inp)
+    if transpose_scale:
+        scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=inp.device
+        ).transpose(0, 1)
+    else:
+        scale = torch.empty((M, num_groups), dtype=torch.float32, device=inp.device)
+    bf16_out = torch.empty_like(res_inp)
+    return out, res_out, scale, bf16_out
+
+
+@torch_compile_guard(gen_fake=fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake)
+def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
+    inp: torch.Tensor,
+    res_inp: torch.Tensor,
+    w: torch.Tensor,
+    eps: float,
+    group_name: str,
+    group_size: int = 128,
+    prefill_support: bool = False,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
+        inp,
+        res_inp,
+        w,
+        eps,
+        group_size,
+        prefill_support,
+        transpose_scale,
+        emit_bf16=True,
     )
 
 
@@ -327,7 +496,7 @@ class GroupCoordinator:
 
     # available attributes:
     rank: int  # global rank
-    ranks: List[int]  # global ranks in the group
+    ranks: list[int]  # global ranks in the group
     world_size: int  # size of the group
     # difference between `local_rank` and `rank_in_group`:
     # if we have a group of size 4 across two nodes:
@@ -343,19 +512,19 @@ class GroupCoordinator:
     use_pynccl: bool  # a hint of whether to use PyNccl
     use_custom_allreduce: bool  # a hint of whether to use CustomAllreduce
     # communicators are only created for world size > 1
-    pynccl_comm: Optional[Any]  # PyNccl communicator
-    ca_comm: Optional[Any]  # Custom allreduce communicator
-    qr_comm: Optional[Any]  # Quick allreduce communicator
-    mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    pynccl_comm: Any | None  # PyNccl communicator
+    ca_comm: Any | None  # Custom allreduce communicator
+    qr_comm: Any | None  # Quick allreduce communicator
+    mq_broadcaster: Any | None  # shared memory broadcaster
 
     def __init__(
         self,
-        group_ranks: List[List[int]],
+        group_ranks: list[list[int]],
         local_rank: int,
-        torch_distributed_backend: Union[str, Backend],
+        torch_distributed_backend: str | Backend,
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
-        group_name: Optional[str] = None,
+        group_name: str | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -451,9 +620,7 @@ class GroupCoordinator:
         return self.ranks[(rank_in_group - 1) % world_size]
 
     @contextmanager
-    def graph_capture(
-        self, graph_capture_context: Optional[GraphCaptureContext] = None
-    ):
+    def graph_capture(self, graph_capture_context: GraphCaptureContext | None = None):
         if graph_capture_context is None:
             stream = torch.cuda.Stream()
             graph_capture_context = GraphCaptureContext(stream)
@@ -559,8 +726,26 @@ class GroupCoordinator:
         quant_type: Any = "per_token",
         group_size: int = 128,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
-        if quant_type == "per_token" and group_size == 128 and not emit_bf16:
+        # quant_type arrives already canonicalized to a string ("per_token"/
+        # "per_group"/"mxfp4") from the public API and the mxfp4 helper.
+        if quant_type == "per_token" and group_size == 128:
+            # Both paths go through torch.library-registered ops so they lower
+            # into the compiled graph (Dynamo-traceable + CUDAGraph-capturable).
+            # The emit_bf16 variant returns a 4th tensor (the pre-quant bf16
+            # normed output) for v32 DSA models whose indexer GEMMs need it.
+            if emit_bf16:
+                return fused_allreduce_rmsnorm_quant_emit_bf16_(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    group_name=self.unique_name,
+                    prefill_support=prefill_support,
+                    gemma_norm=gemma_norm,
+                )
             return fused_allreduce_rmsnorm_quant_(
                 input_,
                 residual_inp_,
@@ -568,6 +753,7 @@ class GroupCoordinator:
                 eps,
                 group_name=self.unique_name,
                 prefill_support=prefill_support,
+                gemma_norm=gemma_norm,
             )
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -580,6 +766,8 @@ class GroupCoordinator:
             quant_type=quant_type,
             group_size=group_size,
             emit_bf16=emit_bf16,
+            transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     def fused_allreduce_rmsnorm_quant_per_group(
@@ -591,17 +779,41 @@ class GroupCoordinator:
         group_size: int = 128,
         prefill_support: bool = False,
         emit_bf16: bool = False,
+        transpose_scale: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+        # Both the 3-output (fp8, residual, scale) and the 4-output emit_bf16
+        # (+ pre-quant bf16 normed activation) cases go through a
+        # torch.library-registered op so they are traceable under torch.compile
+        # / inductor (mirrors the per_token fast-path in
+        # fused_allreduce_rmsnorm_quant). Without this, the per_group call is a
+        # plain Python -> pybind chain that Dynamo cannot trace: on a fused-kernel
+        # miss it falls back to the raw pynccl all_reduce, which constructs a
+        # ctypes c_void_p and graph-breaks inside the compiled region (the
+        # backend is then invoked twice and asserts). v32 DSA models (GLM-5.x)
+        # call the emit_bf16 path from a compiled layernorm, so it must be
+        # wrapped too -- it is no longer eager-only.
+        if not emit_bf16:
+            return fused_allreduce_rmsnorm_quant_per_group_(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_name=self.unique_name,
+                group_size=group_size,
+                prefill_support=prefill_support,
+                transpose_scale=transpose_scale,
+            )
+        return fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
             input_,
             residual_inp_,
             weight_,
             eps,
-            group_size,
-            prefill_support,
-            emit_bf16=emit_bf16,
+            group_name=self.unique_name,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            transpose_scale=transpose_scale,
         )
 
     def fused_qknorm_allreduce(
@@ -690,7 +902,9 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
         prefill_support: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        gemma_norm: bool = False,
+        emit_bf16: bool = False,
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.fused_allreduce_rmsnorm_quant(
@@ -699,6 +913,32 @@ class GroupCoordinator:
             weight_,
             eps,
             prefill_support,
+            emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
+        )
+
+    def _fused_allreduce_rmsnorm_quant_per_group_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        prefill_support: bool = False,
+        transpose_scale: bool = False,
+        emit_bf16: bool = False,
+    ):
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm_quant_per_group(
+            input_,
+            residual_inp_,
+            weight_,
+            eps,
+            group_size=group_size,
+            prefill_support=prefill_support,
+            transpose_scale=transpose_scale,
+            emit_bf16=emit_bf16,
         )
 
     def _fused_qknorm_allreduce_out_place(
@@ -857,7 +1097,7 @@ class GroupCoordinator:
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-    ) -> Optional[torch.Tensor]:
+    ) -> torch.Tensor | None:
         """
         NOTE: We assume that the input tensor is on the same device across
         all the ranks.
@@ -903,7 +1143,7 @@ class GroupCoordinator:
         )
         return input_
 
-    def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
+    def broadcast_object(self, obj: Any | None = None, src: int = 0):
         """Broadcast the input object.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -928,7 +1168,7 @@ class GroupCoordinator:
             return recv[0]
 
     def broadcast_object_list(
-        self, obj_list: List[Any], src: int = 0, group: Optional[ProcessGroup] = None
+        self, obj_list: list[Any], src: int = 0, group: ProcessGroup | None = None
     ):
         """Broadcast the input object list.
         NOTE: `src` is the local rank of the source rank.
@@ -969,8 +1209,6 @@ class GroupCoordinator:
         # Send object
         torch.distributed.send(object_tensor, dst=self.ranks[dst], group=self.cpu_group)
 
-        return None
-
     def recv_object(self, src: int) -> Any:
         """Receive the input object list from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1009,11 +1247,11 @@ class GroupCoordinator:
 
     def broadcast_tensor_dict(
         self,
-        tensor_dict: Optional[Dict[str, Union[torch.Tensor, Any]]] = None,
+        tensor_dict: dict[str, torch.Tensor | Any] | None = None,
         src: int = 0,
-        group: Optional[ProcessGroup] = None,
-        metadata_group: Optional[ProcessGroup] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+        group: ProcessGroup | None = None,
+        metadata_group: ProcessGroup | None = None,
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Broadcast the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -1027,7 +1265,7 @@ class GroupCoordinator:
 
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
-            metadata_list: List[Tuple[Any, Any]] = []
+            metadata_list: list[tuple[Any, Any]] = []
             assert isinstance(
                 tensor_dict, dict
             ), f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -1091,10 +1329,10 @@ class GroupCoordinator:
 
     def send_tensor_dict(
         self,
-        tensor_dict: Dict[str, Union[torch.Tensor, Any]],
-        dst: Optional[int] = None,
+        tensor_dict: dict[str, torch.Tensor | Any],
+        dst: int | None = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
         """
@@ -1114,7 +1352,7 @@ class GroupCoordinator:
             dst = (self.rank_in_group + 1) % self.world_size
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
 
-        metadata_list: List[Tuple[Any, Any]] = []
+        metadata_list: list[tuple[Any, Any]] = []
         assert isinstance(
             tensor_dict, dict
         ), f"Expecting a dictionary, got {type(tensor_dict)}"
@@ -1144,9 +1382,9 @@ class GroupCoordinator:
 
     def recv_tensor_dict(
         self,
-        src: Optional[int] = None,
+        src: int | None = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-    ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
+    ) -> dict[str, torch.Tensor | Any] | None:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
         """
@@ -1167,7 +1405,7 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
-        tensor_dict: Dict[str, Any] = {}
+        tensor_dict: dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
@@ -1213,7 +1451,7 @@ class GroupCoordinator:
         """
         torch.distributed.barrier(group=self.cpu_group)
 
-    def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
+    def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
@@ -1226,7 +1464,7 @@ class GroupCoordinator:
             torch.distributed.send(tensor, self.ranks[dst], self.device_group)
 
     def recv(
-        self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
+        self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
@@ -1258,7 +1496,7 @@ class GroupCoordinator:
             self.mq_broadcaster = None
 
 
-_WORLD: Optional[GroupCoordinator] = None
+_WORLD: GroupCoordinator | None = None
 
 
 def get_world_group() -> GroupCoordinator:
@@ -1267,7 +1505,7 @@ def get_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: List[int], local_rank: int, backend: str
+    ranks: list[int], local_rank: int, backend: str
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1279,12 +1517,12 @@ def init_world_group(
 
 
 def init_model_parallel_group(
-    group_ranks: List[List[int]],
+    group_ranks: list[list[int]],
     local_rank: int,
     backend: str,
     use_device_communicator: bool = True,
     use_message_queue_broadcaster: bool = False,
-    group_name: Optional[str] = None,
+    group_name: str | None = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1296,7 +1534,7 @@ def init_model_parallel_group(
     )
 
 
-_TP: Optional[GroupCoordinator] = None
+_TP: GroupCoordinator | None = None
 
 
 def get_tp_group() -> GroupCoordinator:
@@ -1307,7 +1545,7 @@ def get_tp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_tensor_model_parallel_group = get_tp_group
 
-_PCP: Optional[GroupCoordinator] = None
+_PCP: GroupCoordinator | None = None
 
 
 def get_pcp_group() -> GroupCoordinator:
@@ -1325,7 +1563,7 @@ def get_prefill_context_model_parallel_rank() -> int:
     return get_pcp_group().rank_in_group if _PCP is not None else 0
 
 
-_PP: Optional[GroupCoordinator] = None
+_PP: GroupCoordinator | None = None
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -1333,7 +1571,7 @@ def get_pp_group() -> GroupCoordinator:
     return _PP
 
 
-_DP: Optional[GroupCoordinator] = None
+_DP: GroupCoordinator | None = None
 
 
 def get_dp_group() -> GroupCoordinator:
@@ -1341,7 +1579,7 @@ def get_dp_group() -> GroupCoordinator:
     return _DP
 
 
-_EP: Optional[GroupCoordinator] = None
+_EP: GroupCoordinator | None = None
 
 
 def get_ep_group() -> GroupCoordinator:
@@ -1349,7 +1587,7 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
-_DCP: Optional[GroupCoordinator] = None
+_DCP: GroupCoordinator | None = None
 
 
 def get_dcp_group() -> GroupCoordinator:
@@ -1385,29 +1623,29 @@ class CustomGroupConfig:
     """
 
     def __init__(self):
-        self._groups: Dict[str, List] = {}
+        self._groups: dict[str, list] = {}
 
     def add_group(
         self,
         name: str,
-        ranks: List,
+        ranks: list,
     ) -> "CustomGroupConfig":
         assert name not in self._groups, f"custom group '{name}' already exists"
         assert ranks, f"custom group '{name}': ranks list must not be empty"
         self._groups[name] = ranks
         return self
 
-    def data(self) -> Dict[str, List]:
+    def data(self) -> dict[str, list]:
         assert self._groups, "no custom groups have been added"
         return dict(self._groups)
 
 
-_CUSTOM: Dict[str, "GroupCoordinator"] = {}
+_CUSTOM: dict[str, "GroupCoordinator"] = {}
 
 
 def get_custom_group(
-    name: Optional[str] = None,
-) -> "Union[GroupCoordinator, Dict[str, GroupCoordinator]]":
+    name: str | None = None,
+) -> "GroupCoordinator | dict[str, GroupCoordinator]":
     """Get custom group coordinator(s).
 
     - If only one custom group is initialized, returns the GroupCoordinator
@@ -1531,11 +1769,11 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    decode_context_model_parallel_size: Optional[int] = 1,
-    backend: Optional[str] = None,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
-    custom_group_config: Optional[Dict[str, List]] = None,
+    custom_group_config: dict[str, list] | None = None,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1598,7 +1836,7 @@ def initialize_model_parallel(
         pipeline_model_parallel_size,
         prefill_context_model_parallel_size,
         tensor_model_parallel_size,
-    )  # noqa
+    )
 
     # When custom groups are provided, all communication goes through them
     # (standard ops assert via _assert_no_custom_group). Skip expensive
@@ -1707,7 +1945,6 @@ def initialize_model_parallel(
     )
 
     # Build the custom allreduce group(s) (optional).
-    global _CUSTOM
     assert not _CUSTOM, "custom allreduce group is already initialized"
     if custom_group_config is not None:
         for gname, ranks in custom_group_config.items():
@@ -1774,11 +2011,11 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
-    decode_context_model_parallel_size: Optional[int] = 1,
-    backend: Optional[str] = None,
+    decode_context_model_parallel_size: int | None = 1,
+    backend: str | None = None,
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
-    custom_group_config: Optional[Dict[str, List]] = None,
+    custom_group_config: dict[str, list] | None = None,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -1900,7 +2137,7 @@ def destroy_distributed_environment():
         torch.distributed.destroy_process_group()
 
 
-def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
+def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> list[bool]:
     """
     This is a collective operation that returns if each rank is in the same node
     as the source rank. It tests if processes are attached to the same
@@ -1952,7 +2189,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
                     shm = shared_memory.SharedMemory(name=name)
                 if shm.buf[: len(magic_message)] == magic_message:
                     is_in_the_same_node[rank] = 1
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("Error ignored in is_in_the_same_node: %s", e)
     finally:
         if shm:
@@ -1984,7 +2221,6 @@ def is_global_first_rank() -> bool:
     """
     try:
         # If world group is available, use it for the most accurate check
-        global _WORLD
         if _WORLD is not None:
             return _WORLD.is_first_rank
 
@@ -1995,7 +2231,7 @@ def is_global_first_rank() -> bool:
         # Fallback to torch's global rank
         return torch.distributed.get_rank() == 0
 
-    except Exception:
+    except Exception:  # noqa: BLE001
         # If anything goes wrong, assume this is the first rank
         return True
 

@@ -29,7 +29,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                     bool use_shuffle_layout,
                                                     int64_t block_size,
                                                     int64_t x,
-                                                    int64_t rotary_dim)
+                                                    int64_t rotary_dim,
+                                                    bool gemma_norm)
 {
     AITER_CHECK(mrope_section_.size() == 3);
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
@@ -89,7 +90,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     use_shuffle_layout,
                     block_size,
                     x,
-                    rotary_dim);
+                    rotary_dim,
+                    gemma_norm);
             }
             else
             {
@@ -134,7 +136,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             use_shuffle_layout,
                             block_size,
                             x,
-                            rotary_dim);
+                            rotary_dim,
+                            gemma_norm);
                     }
                     else
                     {
@@ -177,7 +180,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             use_shuffle_layout,
                             block_size,
                             x,
-                            rotary_dim);
+                            rotary_dim,
+                            gemma_norm);
                     }
                 }
                 else

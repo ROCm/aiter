@@ -1,5 +1,6 @@
 import copy
 import functools
+import itertools
 import json
 import os
 
@@ -51,11 +52,17 @@ def _get_gemm_config_cached(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
+    B: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
     ``get_gemm_config()`` instead, which returns a defensive deep-copy so
     callers can freely mutate the returned dict without polluting the cache.
+
+    Resolves from ``<arch>/<backend>/gemm/`` (prefix-less filenames) first;
+    ``backend=None`` tries triton then gluon. Falls back to the legacy flat
+    ``gemm/`` layout (arch-prefixed) for unmigrated configs.
     """
     # Input validation
     assert M >= 0, "M must be positive."
@@ -64,20 +71,51 @@ def _get_gemm_config_cached(
     assert bounds is None or (
         len(bounds) > 0
         and all(x > 0 for x in bounds)
-        and all(x < y for x, y in zip(bounds, bounds[1:]))
+        and all(x < y for x, y in itertools.pairwise(bounds))
     ), "When provided, bounds must be a non-empty tuple of strictly increasing positive numbers."
 
     if not hasattr(_get_gemm_config_cached, "_config_cache"):
         _get_gemm_config_cached._config_cache = {}
 
     dev = arch_info.get_arch()
-    cache_key = f"{dev}_{config_name}"
+    cache_key = f"{dev}_{config_name}" + (f"_{backend}" if backend else "")
+
+    # New layout <arch>/<backend>/gemm/ (no prefix) first, then legacy flat
+    # gemm/ (arch-prefixed) for unmigrated configs.
+    # TODO(satya): drop the legacy dirs once all configs are migrated.
+    arch_prefix = f"{dev}-"
+    if backend is None:
+        candidate_dirs = [
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/triton/gemm", ""),
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm", ""),
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+        ]
+    else:
+        candidate_dirs = [
+            (f"{AITER_TRITON_CONFIGS_PATH}/{dev}/{backend}/gemm", ""),
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{backend}",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+            (
+                f"{AITER_TRITON_CONFIGS_PATH}/gemm",
+                arch_prefix,
+            ),  # TODO(satya): legacy, remove
+        ]
+    cfg_dir, name_prefix = candidate_dirs[-1]
+    for _dir, _prefix in candidate_dirs:
+        if os.path.exists(f"{_dir}/{_prefix}{config_name}.json"):
+            cfg_dir, name_prefix = _dir, _prefix
+            break
 
     if cache_key not in _get_gemm_config_cached._config_cache:
         _get_gemm_config_cached._config_cache[cache_key] = {}
 
         # Load default config (must exist)
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}.json"
+        fpath = f"{cfg_dir}/{name_prefix}{config_name}.json"
         _load_config_file(
             _get_gemm_config_cached._config_cache,
             cache_key,
@@ -92,7 +130,7 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-{specialized_filename}.json"
+            fpath = f"{cfg_dir}/{name_prefix}{config_name}-{specialized_filename}.json"
             if _load_config_file(
                 _get_gemm_config_cached._config_cache, cache_key, fpath, spec_key
             ):
@@ -101,18 +139,35 @@ def _get_gemm_config_cached(
             config_dict_key = spec_key
 
     elif N is not None and K is not None:
-        nk_key = f"{N}_{K}"
-        if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
-            # load specialized config
-            fpath = (
-                f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
-            )
-            if _load_config_file(
-                _get_gemm_config_cached._config_cache, cache_key, fpath, nk_key
-            ):
+        # Try B-specialized config first: {dev}-{config_name}-B={B}-N={N}-K={K}.json
+        if B is not None:
+            bnk_key = f"{B}_{N}_{K}"
+            if bnk_key not in _get_gemm_config_cached._config_cache[cache_key]:
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-B={B}-N={N}-K={K}.json"
+                if _load_config_file(
+                    _get_gemm_config_cached._config_cache,
+                    cache_key,
+                    fpath,
+                    bnk_key,
+                ):
+                    config_dict_key = bnk_key
+            else:
+                config_dict_key = bnk_key
+
+        # Fall back to N/K-specialized config
+        if config_dict_key == "default":
+            nk_key = f"{N}_{K}"
+            if nk_key not in _get_gemm_config_cached._config_cache[cache_key]:
+                fpath = f"{cfg_dir}/{name_prefix}{config_name}-N={N}-K={K}.json"
+                if _load_config_file(
+                    _get_gemm_config_cached._config_cache,
+                    cache_key,
+                    fpath,
+                    nk_key,
+                ):
+                    config_dict_key = nk_key
+            else:
                 config_dict_key = nk_key
-        else:
-            config_dict_key = nk_key
 
     config_dict = _get_gemm_config_cached._config_cache[cache_key][config_dict_key]
 
@@ -146,6 +201,8 @@ def get_gemm_config(
     K: int | None = None,
     bounds: tuple[int, ...] | None = None,
     specialized_filename: str | None = None,
+    backend: str | None = None,
+    B: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Load a GEMM configuration using the standardized M_LEQ_x/M_GEQ_y/any format.
@@ -153,11 +210,12 @@ def get_gemm_config(
     This function provides a unified way to load GEMM configs across all kernels.
     It uses the following logic:
     1. Load default config file: {arch}-{config_name}.json
-    2. If N and K are provided, try to load specialized config: {arch}-{config_name}-N={N}-K={K}.json
+    2. If B, N and K are provided, try B-specialized config: {arch}-{config_name}-B={B}-N={N}-K={K}.json
+    3. If N and K are provided, try to load specialized config: {arch}-{config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {arch}-{config_name}-{specialized_filename}.json
-    3. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
-    4. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
-    5. Fall back to "any" if no bounds match
+    4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
+    5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
+    6. Fall back to "any" if no bounds match
 
     Args:
         config_name: Name of the config (example - "GEMM-A16W16")
@@ -166,13 +224,15 @@ def get_gemm_config(
         K: K dimension of the GEMM (optional)
         bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
         specialized_filename: Custom specialized filename suffix (optional)
+        backend: Backend name for per-backend config subdirectory (optional)
+        B: Batch dimension for batched GEMM (optional)
 
     Returns:
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename
+        config_name, M, N, K, bounds, specialized_filename, backend, B
     )
     return copy.deepcopy(config), is_tuned
 
@@ -233,6 +293,16 @@ def compute_splitk_params(config: dict, K: int) -> dict:
                 config["BLOCK_SIZE_K"] = config["BLOCK_SIZE_K"] // 2
 
         config["BLOCK_SIZE_K"] = max(config["BLOCK_SIZE_K"], 16)
+
+        # Round the SPLITK_BLOCK_SIZE to multiple of BLOCK_SIZE_K and update NUM_KSPLIT to again.
+        if config["NUM_KSPLIT"] > 1 and (
+            config["SPLITK_BLOCK_SIZE"] % config["BLOCK_SIZE_K"] != 0
+        ):
+            config["SPLITK_BLOCK_SIZE"] = (
+                triton.cdiv(config["SPLITK_BLOCK_SIZE"], config["BLOCK_SIZE_K"])
+                * config["BLOCK_SIZE_K"]
+            )
+            config["NUM_KSPLIT"] = triton.cdiv(K, config["SPLITK_BLOCK_SIZE"])
 
     return config
 

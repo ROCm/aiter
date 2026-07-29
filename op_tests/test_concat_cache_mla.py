@@ -1,10 +1,12 @@
-import torch
-import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark, run_perftest
-from aiter import dtypes
 import argparse
-import pandas as pd
 import random
+
+import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # torch.set_printoptions(threshold=torch.inf)
 
@@ -83,7 +85,6 @@ def run_torch_fused(
     is_nope_first,
     out_dtype,
 ):
-    #
     q_pe_reshaped = q_pe.unsqueeze(0)
     num_tokens = k_pe.shape[0]
     qk_rope_head_dim = k_pe.shape[-1]
@@ -294,6 +295,26 @@ def compute_cache(
     return cos_cache, sin_cache
 
 
+def make_q_nope(
+    num_tokens: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    dtype: torch.dtype,
+    device: str,
+    q_nope_layout: str,
+) -> torch.Tensor:
+    if q_nope_layout == "contiguous":
+        return torch.randn(
+            num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+        )
+    if q_nope_layout == "strided":
+        # Same logical shape as [T, H, D], but with head stride T * D.
+        return torch.randn(
+            num_heads, num_tokens, kv_lora_rank, dtype=dtype, device=device
+        ).transpose(0, 1)
+    raise ValueError(f"Unsupported q_nope_layout: {q_nope_layout}")
+
+
 @benchmark()
 def test_fused_rope_concat_and_cache_mla(
     kv_lora_rank: int,
@@ -308,6 +329,7 @@ def test_fused_rope_concat_and_cache_mla(
     kv_cache_dtype: str,
     q_dtype: str,
     is_neox: bool,
+    q_nope_layout: str = "contiguous",
 ):
     ret = {}
     torch.set_default_device(device)
@@ -322,8 +344,13 @@ def test_fused_rope_concat_and_cache_mla(
     k_pe = torch.randn(
         num_tokens, num_kv_heads, qk_rope_head_dim, dtype=dtype, device=device
     )
-    q_nope = torch.randn(
-        num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
+    q_nope = make_q_nope(
+        num_tokens,
+        num_heads,
+        kv_lora_rank,
+        dtype,
+        device,
+        q_nope_layout,
     )
     q_pe = torch.randn(
         num_tokens, num_heads, qk_rope_head_dim, dtype=dtype, device=device
@@ -359,7 +386,7 @@ def test_fused_rope_concat_and_cache_mla(
         device=q_nope.device,
     )
     ref_temp = torch.zeros(*kv_cache.shape, dtype=cache_dtype, device=device)
-    (ref_kv_cache, ref_q_out), ref_us = run_torch_fused(
+    (ref_kv_cache, ref_q_out), _ref_us = run_torch_fused(
         q_pe,
         k_pe,
         q_nope,
@@ -510,10 +537,30 @@ def test_fused_rope_concat_and_cache_mla(
     # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
+    q_nope_delta = (
+        q_out[..., :kv_lora_rank].to(torch.float32)
+        - ref_q_out[..., :kv_lora_rank].to(torch.float32)
+    ).abs()
+    q_rope_delta = (
+        q_out[..., kv_lora_rank:].to(torch.float32)
+        - ref_q_out[..., kv_lora_rank:].to(torch.float32)
+    ).abs()
+    q_nope_max_abs = float(q_nope_delta.max().item())
+    q_rope_max_abs = float(q_rope_delta.max().item())
+    if q_nope_max_abs != 0.0:
+        raise AssertionError(
+            "q_nope region must match reference exactly; "
+            f"layout={q_nope_layout}, stride={tuple(q_nope.stride())}, "
+            f"max_abs={q_nope_max_abs}"
+        )
     ret["fused_qk_us"] = avg_us
     # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
+    ret["hip_q_nope_max_abs"] = q_nope_max_abs
+    ret["hip_q_rope_max_abs"] = q_rope_max_abs
+    ret["q_nope_layout"] = q_nope_layout
+    ret["q_nope_stride"] = tuple(q_nope.stride())
     ####
     ret["aiter_bw(TB/s)"] = (
         num_tokens
@@ -642,6 +689,19 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-ql",
+    "--q_nope_layout",
+    type=str,
+    choices=["contiguous", "strided"],
+    nargs="*",
+    default=["contiguous"],
+    help="""q_nope logical layout.
+    contiguous: standard [T, H, D] contiguous tensor
+    strided: [H, T, D].transpose(0, 1), same shape but non-contiguous by head
+    e.g.: -ql contiguous strided""",
+)
+
+parser.add_argument(
     "-c",
     "--case",
     type=str,
@@ -684,25 +744,27 @@ if "fused_qk" in args.case:
                 for kv_cache_dtype in args.kv_dtype:
                     for is_neox in args.is_neox:
                         for q_dtype in args.q_dtype:
-                            if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                                continue
-                            if num_kv_heads > num_heads:
-                                continue
-                            ret = test_fused_rope_concat_and_cache_mla(
-                                args.kv_lora_rank,
-                                args.qk_rope_head_dim,
-                                num_token,
-                                args.block_size,
-                                num_blocks,
-                                num_heads,
-                                num_kv_heads,
-                                args.dtype,
-                                args.device,
-                                kv_cache_dtype,
-                                q_dtype,
-                                is_neox,
-                            )
-                            df.append(ret)
+                            for q_nope_layout in args.q_nope_layout:
+                                if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                                    continue
+                                if num_kv_heads > num_heads:
+                                    continue
+                                ret = test_fused_rope_concat_and_cache_mla(
+                                    args.kv_lora_rank,
+                                    args.qk_rope_head_dim,
+                                    num_token,
+                                    args.block_size,
+                                    num_blocks,
+                                    num_heads,
+                                    num_kv_heads,
+                                    args.dtype,
+                                    args.device,
+                                    kv_cache_dtype,
+                                    q_dtype,
+                                    is_neox,
+                                    q_nope_layout,
+                                )
+                                df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)

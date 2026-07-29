@@ -6,14 +6,19 @@
 
 #include "opus_gemm_arch.cuh"                      // OpusGfxArch + opus_get_arch_info / opus_get_gfx_arch
 #include "opus_build_archs.h"                      // OPUS_BUILD_HAS_GFX942 / OPUS_BUILD_HAS_GFX950
-// gfx950 dispatcher always included (carries OpusA16W16NoscaleKernel typedef +
-// a8w8 launchers used unconditionally below); a8w8 is gfx950-only today.
+#ifdef OPUS_BUILD_HAS_GFX950
 #include "gfx950/opus_gemm_arch_gfx950.cuh"        // opus_dispatch_a16w16_gfx950<T> / opus_a16w16_tune_dispatch_gfx950<T>
+#endif
 #ifdef OPUS_BUILD_HAS_GFX942
 #include "gfx942/opus_gemm_arch_gfx942.cuh"        // opus_dispatch_a16w16_gfx942<T> / opus_a16w16_tune_dispatch_gfx942<T>
 #endif
+#ifdef OPUS_BUILD_HAS_GFX1250
+#include "gfx1250/opus_gemm_arch_gfx1250.cuh"      // opus_a16w16_tune_dispatch_gfx1250<T> (tune-id entry only)
+#endif
 #include "opus_gemm_common.cuh"
+#ifdef OPUS_BUILD_HAS_GFX950
 #include "gfx950/opus_gemm_heuristic_dispatch_gfx950.cuh"  // OpusA16W16NoscaleKernel
+#endif
 #ifdef OPUS_BUILD_HAS_GFX942
 #include "gfx942/opus_gemm_heuristic_dispatch_gfx942.cuh"
 #endif
@@ -39,13 +44,27 @@ using OpusNoscaleKernel = void (*)(
 template <typename CDataType>
 OpusScaleKernel opus_dispatch_scale(int M, int N, int K)
 {
+#ifdef OPUS_BUILD_HAS_GFX950
   return opus_gemm_512x256x256x128_4x2_16x16x128_1x128x128<CDataType>;
+#else
+  (void)M;
+  (void)N;
+  (void)K;
+  return nullptr;
+#endif
 }
 
 template <typename CDataType>
 OpusNoscaleKernel opus_dispatch_a8w8(int M, int N, int K)
 {
+#ifdef OPUS_BUILD_HAS_GFX950
   return opus_gemm_512x256x256x128_2x4_16x16x128_0x0x0<CDataType>;
+#else
+  (void)M;
+  (void)N;
+  (void)K;
+  return nullptr;
+#endif
 }
 
 // a16w16 arch routers: switch on opus_get_gfx_arch() to per-arch dispatch.
@@ -54,11 +73,17 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, boo
 {
   switch (opus_get_gfx_arch())
   {
+#ifdef OPUS_BUILD_HAS_GFX950
     case OpusGfxArch::Gfx950:
       return opus_dispatch_a16w16_gfx950<CDataType>(M, N, K, batch, has_bias);
+#endif
 #ifdef OPUS_BUILD_HAS_GFX942
     case OpusGfxArch::Gfx942:
       return opus_dispatch_a16w16_gfx942<CDataType>(M, N, K, batch, has_bias);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX1250
+    case OpusGfxArch::Gfx1250:
+      return opus_dispatch_a16w16_gfx1250<CDataType>(M, N, K, batch, has_bias);
 #endif
     default:
     {
@@ -74,16 +99,22 @@ OpusA16W16NoscaleKernel opus_dispatch_a16w16(int M, int N, int K, int batch, boo
 }
 
 template <typename CDataType>
-opus_gfx950_detail::OpusA16W16TuneKernel
+OpusA16W16NoscaleKernel
 opus_a16w16_tune_dispatch(int id)
 {
   switch (opus_get_gfx_arch())
   {
+#ifdef OPUS_BUILD_HAS_GFX950
     case OpusGfxArch::Gfx950:
       return opus_a16w16_tune_dispatch_gfx950<CDataType>(id);
+#endif
 #ifdef OPUS_BUILD_HAS_GFX942
     case OpusGfxArch::Gfx942:
       return opus_a16w16_tune_dispatch_gfx942<CDataType>(id);
+#endif
+#ifdef OPUS_BUILD_HAS_GFX1250
+    case OpusGfxArch::Gfx1250:
+      return opus_a16w16_tune_dispatch_gfx1250<CDataType>(id);
 #endif
     default:
     {
@@ -124,6 +155,7 @@ void opus_gemm(
     // a8w8 / a8w8_scale launchers are gfx950-only today and don't yet flow through the arch-routed
     // dispatcher (they pick a single har...
     const auto &arch_info = opus_get_arch_info();
+#ifdef OPUS_BUILD_HAS_GFX950
     AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx950,
                 "opus_gemm: a8w8 path is only implemented for gfx950 today; "
                 "current device ", arch_info.dev,
@@ -145,6 +177,12 @@ void opus_gemm(
                   "opus_gemm a8w8 no-scale only supports fp32 output");
       opus_dispatch_a8w8<fp32_t>(M, N, K)(XQ, WQ, Y);
     }
+#else
+    AITER_CHECK(false,
+                "opus_gemm: a8w8 path requires module_deepgemm_opus to be "
+                "built with OPUS_BUILD_HAS_GFX950; current device ",
+                arch_info.dev, " has gcnArchName='", arch_info.name, "'");
+#endif
   }
   else if (XQ.dtype() == AITER_DTYPE_bf16)
   {
@@ -177,6 +215,9 @@ static constexpr int OPUS_SPLITK_KID_MIN = 200;
 static constexpr int OPUS_SPLITK_KID_MAX = 300;
 static constexpr int OPUS_GFX942_KID_OFFSET = 10000;
 static constexpr int OPUS_GFX942_SPLITK_KID_MAX = 300;
+// gfx1250 cluster/TDM split-K (fp32 workspace + reduce) kids: [20000, 21000).
+static constexpr int OPUS_GFX1250_SPLITK_KID_MIN = 20000;
+static constexpr int OPUS_GFX1250_SPLITK_KID_MAX = 21000;
 // SB a16w16 kids: gfx950 [4,10) + mirrors at +1000/.../+7000.
 static constexpr int OPUS_A16W16_SB_KID_MIN = 4;
 static constexpr int OPUS_A16W16_SB_KID_MAX = 10;
@@ -198,7 +239,9 @@ static inline bool opus_kid_is_splitk(int kid)
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_NOOOB_KID_OFFSET &&
           kid < OPUS_SPLITK_KID_MAX + OPUS_NOOOB_KID_OFFSET) ||
          (kid >= OPUS_SPLITK_KID_MIN + OPUS_GFX942_KID_OFFSET &&
-          kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET);
+          kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET) ||
+         (kid >= OPUS_GFX1250_SPLITK_KID_MIN &&
+          kid < OPUS_GFX1250_SPLITK_KID_MAX);
 }
 
 static inline bool opus_kid_is_a16w16_sb(int kid)
@@ -231,12 +274,19 @@ static inline bool opus_kid_is_gfx942_splitk(int kid)
          kid < OPUS_GFX942_SPLITK_KID_MAX + OPUS_GFX942_KID_OFFSET;
 }
 
+static inline bool opus_kid_is_gfx1250_splitk(int kid)
+{
+  return kid >= OPUS_GFX1250_SPLITK_KID_MIN && kid < OPUS_GFX1250_SPLITK_KID_MAX;
+}
+
 static inline bool opus_kid_supports_bias(int kid)
 {
   // persistent and mono-tile do not support bias (kargs lacks
   // ptr_bias/stride_bias_batch; launchers reject non-empty bias up front).
   // gfx942 splitk/SB silently ignored bias; exclude explicitly to surface
   // misuse as a clear error.
+  // gfx1250 cluster_tdm_splitk_ws DOES support bias (the reduce kernel folds
+  // it once, like gfx950 flatmm_splitk).
   return (opus_kid_is_a16w16_sb(kid) || opus_kid_is_splitk(kid))
          && !opus_kid_is_gfx942_splitk(kid);
 }
@@ -265,8 +315,9 @@ void opus_gemm_a16w16_tune(
 
   if (XQ.dtype() == AITER_DTYPE_bf16)
   {
-    // splitk kids force <fp32_t> (traits static_assert D_C=float); Y can be
-    // bf16 or fp32, the reduce kernel dispatches on Y.dtype() at runtime.
+    // All splitk kids (gfx950/gfx942/gfx1250) force <fp32_t>: the main kernel
+    // writes an fp32 workspace and a reduce kernel casts it to Y.dtype() at
+    // runtime (gfx1250 cluster_tdm_splitk_ws now follows this same pattern).
     if (opus_kid_is_splitk(kernelId))
     {
       AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16
@@ -296,6 +347,35 @@ void opus_gemm_a16w16_tune(
                 AiterDtype_to_str(XQ.dtype()),
                 ", expected bf16");
   }
+}
+
+void opus_gemm_a8w8_blockscale_bpreshuffle_tune(
+    aiter_tensor_t &XQ,
+    aiter_tensor_t &WQ,
+    std::optional<aiter_tensor_t> x_scale,
+    std::optional<aiter_tensor_t> w_scale,
+    aiter_tensor_t &Y,
+    int kernelId)
+{
+  aiter_detail::g_aiter_can_throw = true;
+  const auto &arch_info = opus_get_arch_info();
+  AITER_CHECK(arch_info.arch == OpusGfxArch::Gfx942,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune is only implemented "
+              "for gfx942 today; current device ", arch_info.dev,
+              " has gcnArchName='", arch_info.name, "'");
+  AITER_CHECK(XQ.dtype() == AITER_DTYPE_fp8 && WQ.dtype() == AITER_DTYPE_fp8,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune expects fp8 XQ/WQ");
+  AITER_CHECK(Y.dtype() == AITER_DTYPE_bf16,
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune expects bf16 Y");
+  AITER_CHECK(x_scale.has_value() && w_scale.has_value(),
+              "opus_gemm_a8w8_blockscale_bpreshuffle_tune requires x_scale and w_scale");
+
+#ifdef OPUS_BUILD_HAS_GFX942
+  opus_a8w8_tune_dispatch_gfx942(kernelId)(XQ, WQ, Y, x_scale, w_scale);
+#else
+  AITER_CHECK(false,
+              "module_deepgemm_opus was not built with OPUS_BUILD_HAS_GFX942");
+#endif
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

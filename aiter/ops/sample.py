@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
-import torch
 from torch import Generator, Tensor
 
 from ..jit.core import compile_ops
@@ -32,7 +30,7 @@ def random_sample(
     input: Tensor,
     temperatures: Tensor,
     lambd: float = 1,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
     eps: float = 1e-10,
 ) -> None: ...
 
@@ -53,7 +51,7 @@ def mixed_sample(
     input: Tensor,
     temperature: Tensor,
     lambd: float = 1.0,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
     eps: float = 1e-10,
 ) -> None: ...
 
@@ -62,6 +60,6 @@ def mixed_sample(
 def exponential(
     out: Tensor,
     lambd: float = 1,
-    generator: Optional[Generator] = None,
+    generator: Generator | None = None,
     eps: float = 1e-10,
 ) -> None: ...

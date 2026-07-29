@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
 
-import aiter.ops.triton.utils.types as types
-from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
-from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton._triton_kernels.attention.mha import _attn_fwd, _get_config
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
+from aiter.ops.triton.attention.mha_fused_bwd import flash_attn_fused_backward
+from aiter.ops.triton.attention.mha_onekernel_bwd import flash_attn_onekernel_backward
+from aiter.ops.triton.utils import types
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_FUSED_BWD_KERNEL
 _USE_FUSED_BWD_KERNEL = False
 
 
@@ -47,8 +47,8 @@ def mha_set_use_int64_strides(value: bool):
     _USE_INT64_STRIDES = value
 
 
-def _get_sliding_window_size(window_size: Tuple[int, int]) -> int:
-    return int(window_size[0]) if int(window_size[0]) >= 0 else 0
+def _get_sliding_window_size(window_size: tuple[int, int]) -> int:
+    return max(int(window_size[0]), 0)
 
 
 def _flash_attn_forward(
@@ -60,26 +60,26 @@ def _flash_attn_forward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     return_lse: bool,  # Not used
     return_softmax: bool,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    sink: Optional[torch.Tensor] = None,
-    config: Optional[dict[str, any]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], int, int]:
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_k: torch.Tensor | None = None,
+    descale_q: torch.Tensor | None = None,
+    descale_k: torch.Tensor | None = None,
+    descale_v: torch.Tensor | None = None,
+    sink: torch.Tensor | None = None,
+    config: dict[str, any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, int, int]:
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_right != -1:
+    if _MHA_IMPL != "dao_ai" and window_size_right != -1:
         raise ValueError("window_size_right is not supported yet in the Triton Backend")
-    sliding_window = window_size_left if window_size_left >= 0 else 0
+    sliding_window = max(window_size_left, 0)
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
     max_seqlen_q = int(max_seqlen_q)
@@ -88,7 +88,7 @@ def _flash_attn_forward(
     # FP8
     IS_FP8 = types._is_fp8(q)
     FP8_MAX: tl.constexpr = torch.finfo(q.dtype).max
-    is_varlen = True if cu_seqlens_q is not None else False
+    is_varlen = cu_seqlens_q is not None
 
     if IS_FP8:
         o = torch.zeros(
@@ -191,9 +191,6 @@ def _flash_attn_forward(
         assert (
             not IS_FP8
         ), "dao_ai impl does not support FP8. Use the default impl or FA3 path."
-        assert (
-            window_size_left == -1 and window_size_right == -1
-        ), "dao_ai impl does not support sliding window attention."
         if is_varlen:
             o, softmax_lse, s_dmask, _ = flash_attn_2.varlen_fwd(
                 q,
@@ -212,8 +209,8 @@ def _flash_attn_forward(
                 softmax_scale=softmax_scale,
                 zero_tensors=False,
                 causal=causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -227,8 +224,8 @@ def _flash_attn_forward(
                 dropout_p,
                 softmax_scale,
                 causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
                 softcap=0.0,
                 return_softmax=return_softmax,
             )
@@ -248,7 +245,7 @@ def _flash_attn_forward(
         if config is None:
             config = _get_config(enable_dropout, q.dtype, has_pe=pe_head_dim > 0)
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             batch * num_q_heads * triton.cdiv(seqlen_q, META["BLOCK_M"]),
         )
 
@@ -423,8 +420,8 @@ class _FlashAttnFunc(torch.autograd.Function):
                 ctx.dropout_p,
                 ctx.softmax_scale,
                 ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=ctx.deterministic,
             )
@@ -525,7 +522,7 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     sink=None,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -717,8 +714,8 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
                 softmax_scale=ctx.softmax_scale,
                 zero_tensors=False,
                 causal=ctx.causal,
-                window_size_left=-1,
-                window_size_right=-1,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
                 softcap=0.0,
                 deterministic=False,
             )
@@ -831,7 +828,7 @@ def flash_attn_varlen_func(
     block_table=None,
     out=None,
     sink=None,
-    config: Optional[dict[str, any]] = None,
+    config: dict[str, any] | None = None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -922,20 +919,20 @@ def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    k: Optional[torch.Tensor] = None,
-    v: Optional[torch.Tensor] = None,
-    cache_seqlens: Optional[Union[torch.Tensor, int]] = None,
-    softmax_scale: Optional[float] = None,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    cache_seqlens: torch.Tensor | int | None = None,
+    softmax_scale: float | None = None,
     causal: bool = True,
     window_size: tuple[int, int] = (-1, -1),
     softcap: float = 0.0,
     num_splits: int = 0,
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
-    cache_batch_idx: Optional[torch.Tensor] = None,
-    cache_leftpad: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     rotary_interleaved: bool = True,
     return_softmax_lse: bool = False,
 ):

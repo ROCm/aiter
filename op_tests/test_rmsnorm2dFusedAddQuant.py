@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
 
+import argparse
+from functools import partial
+
+import pandas as pd
 import torch
 import torch.nn.functional as F
+
 import aiter
-import argparse
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes, QuantType, get_torch_quant, get_gfx
+from aiter import QuantType, dtypes, get_gfx, get_torch_quant
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
-from functools import partial
-import pandas as pd
 
 torch.set_default_device("cuda")
 
@@ -65,11 +69,11 @@ def run_ck(
         y_scale = None
         if residual is None:
             residual_out = None
-            output = aiter.rmsnorm2d_fwd_ck(input, weight, eps)
+            output = aiter.rmsnorm2d_fwd(input, weight, eps)
         elif residual is not None:
             residual_out = torch.empty_like(input)
             output = torch.empty_like(input)
-            aiter.rmsnorm2d_fwd_with_add_ck(
+            aiter.rmsnorm2d_fwd_with_add(
                 output, input, residual, residual_out, weight, eps
             )
     elif x_scale is None:
@@ -77,12 +81,12 @@ def run_ck(
         output = torch.empty(input.shape, dtype=q_dtype)
         if residual is None:
             residual_out = None
-            aiter.rmsnorm2d_fwd_with_dynamicquant_ck(
+            aiter.rmsnorm2d_fwd_with_dynamicquant(
                 output, input, y_scale, weight, eps, model_sensitive
             )
         elif residual is not None:
             residual_out = torch.empty_like(input)
-            aiter.rmsnorm2d_fwd_with_add_dynamicquant_ck(
+            aiter.rmsnorm2d_fwd_with_add_dynamicquant(
                 output,
                 input,
                 residual,

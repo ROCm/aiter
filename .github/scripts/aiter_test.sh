@@ -78,9 +78,20 @@ for file in "${sharded_files[@]}"; do
         } | tee -a latest_test.log
         continue
     fi
+    # Persistent MLA op-tests always pass work_meta_data; disable the decode
+    # batch gate so they exercise the persistent kernel at every batch size.
+    test_cmd=(timeout 60m python3 "$file")
+    case "$file" in
+        op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
+            {
+                echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
+            } | tee -a latest_test.log
+            test_cmd=(env AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 timeout 60m python3 "$file")
+            ;;
+    esac
     # Capture start time (nanoseconds since epoch)
     start_time_ns=$(date +%s%N)
-    if ! timeout 60m python3 "$file" 2>&1 | tee -a latest_test.log; then
+    if ! "${test_cmd[@]}" 2>&1 | tee -a latest_test.log; then
         status="❌ Test failed"
         testFailed=true
         failedFiles+=("$file")
@@ -118,7 +129,8 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
         "-c 98304 -b 1 -n 16,1 -kvd fp8" \
         "-c 10000 100000 -b 1 3 4 -n 12,1 16,1 -kvd bf16 -lse" \
-        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse"; do
+        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse" \
+        "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
         if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true

@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import copy
+
+import pandas as pd
 import torch
 from torch import Tensor
+
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.utility.dtypes import get_dtype_fp8
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
-import argparse
-import pandas as pd
+from aiter.utility.dtypes import get_dtype_fp8
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -199,7 +201,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+    from aiter import reshape_and_cache, reshape_and_cache_with_pertoken_quant
 
     if kv_cache_dtype == "auto":
         reshape_and_cache(
@@ -1815,13 +1817,11 @@ def test_qk_norm_rope_cache_block_quant(
     elif total_len < num_tokens:
         seq_lens[-1] += num_tokens - total_len
     max_tpb = max(seq_lens)
-    #
     cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
     cu_q_len[0] = 0
     for i in range(batch_size):
         cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
-    #
     assert (
         cu_q_len[-1].item() == num_tokens
     ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_tokens={num_tokens}"
@@ -1973,7 +1973,6 @@ def test_qk_norm_rope_cache_block_quant(
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
     chunk_left_ctx_lens = page_size - 1
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
-    #
     chunk_qkv = torch.randn(
         (chunk_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -2013,7 +2012,6 @@ def test_qk_norm_rope_cache_block_quant(
     v_scale_chunk_ref = v_scale_ref.clone()
     k_scale_chunk = k_scale.clone()
     v_scale_chunk = v_scale.clone()
-    #
     (
         q_chunk_ref,
         k_chunk_ref,
@@ -2064,7 +2062,6 @@ def test_qk_norm_rope_cache_block_quant(
             max_tokens_per_batch=chunk_left_ctx_lens,
         )
     )
-    #
     print(
         f"chunk-prefill: torch avg: {avg_torch_chunk:.2f} us, cu avg: {avg_cu_chunk:.2f} us"
     )
@@ -2074,14 +2071,14 @@ def test_qk_norm_rope_cache_block_quant(
     # Combine prefill + chunk slots to check all pages with data
     all_slots_so_far = torch.cat([slot_mapping, chunk_slot_mapping])
     chunk_slots_edit = torch.unique(all_slots_so_far // page_size)
-    chunk_k_cache_err = checkAllclose(
+    checkAllclose(
         k_cache_ref.float()[chunk_slots_edit],
         k_cache.float()[chunk_slots_edit],
         msg="chunk k_cache",
         rtol=5e-2,
         atol=0.05,
     )
-    chunk_v_cache_err = checkAllclose(
+    checkAllclose(
         v_cache_ref.float()[chunk_slots_edit],
         v_cache.float()[chunk_slots_edit],
         msg="chunk v_cache",
@@ -3277,7 +3274,6 @@ if __name__ == "__main__":
                     num_prefill_batches=8,
                     prefill_seq_len=100,
                 )
-    #
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608
