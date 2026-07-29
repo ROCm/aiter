@@ -14,13 +14,6 @@ from aiter.jit.core import (
     AITER_CONFIG_FMOE,
     AITER_ROOT_DIR,
 )
-from aiter.jit.core import (
-    get_asm_dir,
-    AITER_CSRC_DIR,
-    AITER_CONFIG_FMOE,
-    AITER_CONFIG_GROUPED_FMOE,
-    AITER_ROOT_DIR,
-)
 from aiter.fused_moe import (
     fused_topk,
     moe_sorting,
@@ -3134,169 +3127,9 @@ class FmoeTuner(TunerCommon):
         choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
         may overlook some overheads between stages, and this e2e tune is a complement.
         """
-        results_base = self.run_config(args, target_fused_moe=None, try_extra_ref=True)
-        better_kernels = {}
-        cu_num = self.get_cu_num()
-
-        for i in range(len(self.untunedf)):
-            e2e_us = results_base[i]["e2e_us"]
-            err_ratio = results_base[i]["err_ratio"]
-            row = self.untunedf.iloc[i]
-            cu_num = int(row["cu_num"])
-            token = int(row["token"])
-            model_dim = int(row["model_dim"])
-            inter_dim = int(row["inter_dim"])
-            expert = int(row["expert"])
-            topk = int(row["topk"])
-            act_type = eval(row["act_type"])
-            dtype = eval(row["dtype"])
-            q_dtype_a = eval(row["q_dtype_a"])
-            q_dtype_w = eval(row["q_dtype_w"])
-            q_type = eval(row["q_type"])
-            q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
-            use_g1u1 = bool(row["use_g1u1"])
-            doweight_stage1 = bool(row["doweight_stage1"])
-            key = (
-                cu_num,
-                token,
-                model_dim,
-                inter_dim,
-                expert,
-                topk,
-                act_type,
-                dtype,
-                q_dtype_a,
-                q_dtype_w,
-                q_type,
-                use_g1u1,
-                doweight_stage1,
-            )
-            keyname = " ".join(map(str, row[self.keys].values))
-            better_kernels[i] = {
-                "name": keyname,
-                "key": key,
-                "row": row,
-                "kernel_name": None,
-                "e2e_us": e2e_us,
-                "err_ratio": err_ratio,
-                "e2e_us_base": e2e_us,
-                "err_ratio_base": err_ratio,
-            }
-            print(keyname, e2e_us, err_ratio)
-
         from functools import partial
 
-        def target_fused_moe(
-            hidden_states,
-            w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
-            w2,  # [expert(local_expert:EP), dim, inter_dim]
-            topk_weight,
-            topk_ids,
-            expert_mask=None,
-            activation=ActivationType.Silu,
-            quant_type=QuantType.No,
-            doweight_stage1=False,
-            w1_scale=None,
-            w2_scale=None,
-            num_local_tokens=None,
-            moe_sorting_dispatch_policy=0,
-            dtype=None,
-            config_string="",
-        ):
-            return fused_moe_asmjit_aot(
-                hidden_states,
-                w1,
-                w2,
-                topk_weight,
-                topk_ids,
-                activation,
-                quant_type,
-                w1_scale,
-                w2_scale,
-                expert_mask,
-                num_local_tokens,
-                moe_sorting_dispatch_policy,
-                config_string=config_string,
-            )
-
-        GREEN = "\033[0;32m"
-        YELLOW = "\033[1;33m"
-        RED = "\033[0;31m"
-        END = "\033[0m"
-        for config_string in get_tune_space():
-            results_cur = self.run_config(
-                args,
-                target_fused_moe=partial(target_fused_moe, config_string=config_string),
-                try_extra_ref=True,
-            )
-            block_m = 16
-            ksplit = 0
-            run_1stage = 1
-            err1 = "0%"
-            err2 = "0%"
-            kernelName1 = "fused_moe_asmjit_aot__" + config_string
-            kernelName2 = ""
-            for i in range(len(self.untunedf)):
-                k = better_kernels[i]
-                e2e_us = results_cur[i]["e2e_us"]
-                status = results_cur[i]["status"]
-                err_ratio = results_cur[i]["err_ratio"]
-                # skip invalid kernel
-                if e2e_us < 0 or status != "ok":
-                    print(
-                        f"{k['name']} {RED} {e2e_us=:.3f} {status=} {END} {kernelName1}"
-                    )
-                    continue
-                row = self.untunedf.iloc[i]
-                print(
-                    f"{k['name']} {YELLOW} {float(k['e2e_us_base']):.3f}us -> {float(e2e_us):.3f}us (err: {k['err_ratio']*100:.0f}%) {END} {kernelName1}"
-                )
-                if e2e_us < k["e2e_us"]:
-                    k["e2e_us"] = e2e_us
-                    k["err_ratio"] = err_ratio
-                    k["kernel_name"] = kernelName1
-                    tflops, bw = self.calculate((k["key"], "stage1", kernelName1, block_m, e2e_us, err1))
-                    k["results"] = block_m, ksplit, e2e_us, kernelName1, f"{err_ratio*100:.2f}%", 0.0, kernelName2, err2, e2e_us, run_1stage, tflops, bw,
-
-        tune_results = []
-
-        for i, k in better_kernels.items():
-            if k["kernel_name"] is None:
-                continue
-            tune_results.append([*k["row"].values, *k["results"]])
-            print(
-                f"{k['name']} {GREEN} {float(k['e2e_us_base']):.3f}us -> {float(k['e2e_us']):.3f}us  (err: {k['err_ratio_base']*100:.0f}% -> {k['err_ratio']*100:.0f}%)  {END} {k['kernel_name']}"
-            )
-
-        new_tunedf = pd.DataFrame(tune_results, columns=self.columns)
-        output_file = self.get_out_file(args.tune_file)
-        old_tunedf = self.get_tuned_gemm_list(output_file)
-
-        if "_tag" == old_tunedf.columns[-1]:
-            new_tunedf["_tag"] = ""
-            self.columns.append("_tag")
-
-        resultdf = self.update_tunedf(old_tunedf, new_tunedf)
-
-        if "_tag" == old_tunedf.columns[-1]:
-            self.columns.pop(-1)
-
-        resultdf.to_csv(output_file, index=False)
-        print(f"{args.tune_file} has been updated!")
-
-    def e2e_tune_gfx942(self, args):
-        """
-        Choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
-        may overlook some overheads between stages, and this e2e tune is a complement.
-
-        FlyDSL/gfx942 variant of :meth:`e2e_tune`: drives ``fused_moe_gfx942``
-        (JIT FlyDSL kernels) instead of ``fused_moe_asmjit_aot`` (AOT hsaco).
-        """
-        from aiter.fused_moe_gfx942 import (
-            fused_moe_gfx942,
-            get_tune_space as get_tune_space_gfx942,
-        )
-        from functools import partial
+        from aiter.fused_moe_gfx942 import fused_moe_gfx942, get_tune_space
 
         results_base = self.run_config(args)
         better_kernels = {}
@@ -3381,7 +3214,7 @@ class FmoeTuner(TunerCommon):
                     ),
                     config_string=config_string,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"{RED}Error with config {config_string}: {e}{END}")
                 continue
             block_m = 16
@@ -3413,7 +3246,7 @@ class FmoeTuner(TunerCommon):
                         tflops, bw = self.calculate(
                             (k["key"], "stage1", kernelName1, block_m, e2e_us, err1)
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         tflops, bw = 0, 0
                     k["results"] = (
                         block_m,

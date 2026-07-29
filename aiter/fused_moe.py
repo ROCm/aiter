@@ -5,7 +5,6 @@ import functools
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import torch
 
@@ -640,7 +639,19 @@ class MOEMetadata:
     run_1stage: bool = False
     has_bias: bool = False
     use_non_temporal_load: bool = True
-    fuse_fp4_quant: bool = False
+    fuse_quant: str = ""
+    stage2_has_bias: bool = False
+    flat: bool = False
+    # Feature flags:
+    #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
+    #  - prequant: fused_moe_2stages quantizes a1 before stage1.
+    output_aux: bool = False
+    prequant: bool = True
+    skip_inter_quant: bool = False
+    route_bucket: str = ""
+    expected_sorted_blocks: int | None = None
+    min_sorted_blocks: int | None = None
+    max_sorted_blocks: int | None = None
     stage0: Callable = None
 
 
