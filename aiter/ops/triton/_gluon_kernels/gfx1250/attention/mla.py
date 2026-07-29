@@ -2836,8 +2836,16 @@ def _mla_decode_fwd_kernel_non_pipelined(
         acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
+    # epilogue: when NUM_SEGMENTS == 1 the reduce kernel is skipped, so
+    # normalize here; when NUM_SEGMENTS > 1 the reduce kernel combines
+    # per-segment (acc, M, L) and normalizes there.
     if kv_scale_ptr is not None:
         acc = acc * kv_scale
+    if NUM_SEGMENTS_PER_SEQ == 1:
+        one_over_L = 1.0 / L[:, None]
+        acc = acc * gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
+        if out_scale_ptr is not None:
+            acc = acc * gl.load(out_scale_ptr)
 
     offs_q_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
     offs_q_d_lora_pv = gl.arange(
