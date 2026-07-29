@@ -141,7 +141,7 @@ def _mla_reduce_v1_dispatch(
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     qo_indptr,
     kv_indptr,

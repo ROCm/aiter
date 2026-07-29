@@ -1082,7 +1082,7 @@ def test_splitk_b1_s128_vs_torch_ref(K, replay=False):
 def test_splitk_b1_s128_vs_hip():
     """Split-K matches the production HIP kn_mla_reduce_v1 (Dv=512 template)."""
     _require_cuda()
-    x, dt, _out_dtype_ = _run_splitk_b1_s128()
+    x, dt, _ = _run_splitk_b1_s128()
     ref_out, ref_lse = hip_ref_like_fout(x)
     _assert_close(x.fout, x.flse, ref_out, ref_lse, dt)
 
@@ -1092,23 +1092,23 @@ def test_splitk_b1_s128_vs_hip():
 # plan_splitk reads CSR-derived values at planning time; the capture-safe variant
 # decides from host values alone, so it is legal under graph capture.
 _PLAN_SPLITK_CASES = [
-    (dict(active_tiles=1, max_splits=128), (True, 16, 16)),
-    (dict(active_tiles=1, max_splits=8), (False, 1, 0)),  # below min_splits
-    (dict(active_tiles=20, max_splits=128), (False, 1, 0)),  # saturated grid
+    ({"active_tiles": 1, "max_splits": 128}, (True, 16, 16)),
+    ({"active_tiles": 1, "max_splits": 8}, (False, 1, 0)),  # below min_splits
+    ({"active_tiles": 20, "max_splits": 128}, (False, 1, 0)),  # saturated grid
     (
-        dict(active_tiles=1, max_splits=128, max_seqlen_q=2),
+        {"active_tiles": 1, "max_splits": 128, "max_seqlen_q": 2},
         (False, 1, 0),
     ),  # prefill
 ]
 _PLAN_CAPTURE_SAFE_CASES = [
-    (dict(num_final_rows=32, num_kv_splits=128), (False, 1, 0)),  # saturated grid
-    (dict(num_final_rows=1, num_kv_splits=32), (False, 1, 0)),  # below min_splits
+    ({"num_final_rows": 32, "num_kv_splits": 128}, (False, 1, 0)),  # saturated grid
+    ({"num_final_rows": 1, "num_kv_splits": 32}, (False, 1, 0)),  # below min_splits
     (
-        dict(num_final_rows=1, num_kv_splits=304, actual_max_splits=8),
+        {"num_final_rows": 1, "num_kv_splits": 304, "actual_max_splits": 8},
         (False, 1, 0),
     ),
     (
-        dict(num_final_rows=1, num_kv_splits=304, actual_max_splits=128),
+        {"num_final_rows": 1, "num_kv_splits": 304, "actual_max_splits": 128},
         (True, 16, 16),
     ),
 ]
@@ -1514,14 +1514,18 @@ def test_mla_reduce_wrapper_rejects_invalid_pointer_abi():
 
     # (expected error, required substring, the single field that makes it invalid)
     cases = [
-        (TypeError, "partial_output", dict(po=x.po.bfloat16())),
-        (TypeError, "partial_lse", dict(pl=x.pl.bfloat16())),
-        (TypeError, "reduce_indptr", dict(indptr=x.indptr.float())),
-        (ValueError, "partial_lse", dict(pl=x.pl[:-1].contiguous())),
-        (ValueError, "packed last dimension", dict(fout=unpacked)),
-        (ValueError, "num_kv_splits", dict(num_kv_splits=LDS_MAX_SPLITS + 1)),
-        (ValueError, "actual_max_splits", dict(actual_max_splits=LDS_MAX_SPLITS + 1)),
-        (ValueError, "partial_output", dict(po=x.po.cpu())),
+        (TypeError, "partial_output", {"po": x.po.bfloat16()}),
+        (TypeError, "partial_lse", {"pl": x.pl.bfloat16()}),
+        (TypeError, "reduce_indptr", {"indptr": x.indptr.float()}),
+        (ValueError, "partial_lse", {"pl": x.pl[:-1].contiguous()}),
+        (ValueError, "packed last dimension", {"fout": unpacked}),
+        (ValueError, "num_kv_splits", {"num_kv_splits": LDS_MAX_SPLITS + 1}),
+        (
+            ValueError,
+            "actual_max_splits",
+            {"actual_max_splits": LDS_MAX_SPLITS + 1},
+        ),
+        (ValueError, "partial_output", {"po": x.po.cpu()}),
     ]
     for expected_error, text, invalid in cases:
         _assert_wrapper_rejects(expected_error, text, lambda kw=invalid: call(**kw))

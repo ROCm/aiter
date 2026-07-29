@@ -94,7 +94,7 @@ def _f32_copy_atom(vec: int):
     mirrors the 2x-dwordx4 composition ``fused_compress_attn.py``'s
     ``_load_f32_vec`` already uses for VEC=8 f32.
     """
-    chunk = vec if vec <= 4 else 4
+    chunk = min(vec, 4)
     if fx.const_expr(chunk == 1):
         op = fx.rocdl.BufferCopy32b()
     elif fx.const_expr(chunk == 2):
