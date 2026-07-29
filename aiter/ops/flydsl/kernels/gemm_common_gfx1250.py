@@ -128,6 +128,33 @@ def lds_load_b32_raw(lds_base_idx, byte_offset):
     return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
 
 
+def lds_addr_keepalive(*bases_idx):
+    """Pin the given LDS base-address registers live to this program point.
+
+    Under max VGPR pressure the allocator reuses a ds_load's base-address
+    register as the *destination* of a later ds_load once that address is dead.
+    When earlier loads off the base are still in flight, the overwrite is a WAR
+    hazard and the backend gates it with ``s_wait_alu depctr_vm_vsrc(N)``.
+    Emitting a side-effecting no-op that reads the bases extends their live
+    ranges past those later loads, so the allocator must place the later
+    destinations in fresh registers and the WAR wait disappears. Relies on
+    there being VGPR headroom (occupancy already at the floor, no spills).
+    """
+    from flydsl.expr.arith import ArithValue as _AV
+
+    ops = [_raw(arith.index_cast(T.i32, _AV(b))) for b in bases_idx]
+    if not ops:
+        return
+    llvm_dialect.InlineAsmOp(
+        res=None,
+        operands_=ops,
+        asm_string="; lds addr keepalive",
+        constraints=",".join(["v"] * len(ops)),
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+
+
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
     """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM).
 
