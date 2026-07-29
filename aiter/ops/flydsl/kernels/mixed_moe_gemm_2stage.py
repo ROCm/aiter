@@ -42,10 +42,12 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
 from flydsl._mlir.extras import types as _mT
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, rocdl
 from flydsl.expr.gpu import lds_space as _lds_space
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
