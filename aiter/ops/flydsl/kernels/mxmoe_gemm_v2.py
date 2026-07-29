@@ -241,7 +241,7 @@ def gemm2_body_v2(
     # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
     K_rt = fx.Int32(i32_inter)
     K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes (runtime)
-    kc_rt = K_rt // fx.Int32(256)  # (K//32)//4//2
+    kc_rt = (K_rt + fx.Int32(255)) // fx.Int32(256)
     K_TILES_RT = K_rt // fx.Int32(BK)  # runtime K-tile trip count
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
@@ -251,7 +251,7 @@ def gemm2_body_v2(
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_TILES_MAX = INTER_MAX // BK
-    K_SCALE_CHUNKS_MAX = INTER_MAX // 256
+    K_SCALE_CHUNKS_MAX = (INTER_MAX + 255) // 256
 
     # has_pad OOB pad-skip (const_expr-gated): K-skip sizes 16N B-weight buffer to REAL K; N-skip zeros fully-pad-N w2 tiles (col >= N_real=N_OUT-npad; PERF-ONLY). B-scale NOT shrunk.
     bq_num_records = None

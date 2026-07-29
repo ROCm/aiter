@@ -9,6 +9,8 @@ import torch
 from aiter import dtypes, logger
 from aiter.test_common import checkAllclose
 
+_TASK_START_TIMES = None
+
 
 def _is_mapping_error(exc: BaseException) -> bool:
     return isinstance(exc, KeyError)
@@ -16,6 +18,33 @@ def _is_mapping_error(exc: BaseException) -> bool:
 
 def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
+
+
+def _init_task_start_times(task_start_times):
+    global _TASK_START_TIMES
+    _TASK_START_TIMES = task_start_times
+
+
+def _run_with_start_tracking(task_index, func, args):
+    if _TASK_START_TIMES is None:
+        raise RuntimeError("Task start-time storage is not initialized")
+    _TASK_START_TIMES[task_index] = time.monotonic()
+    return func(*args)
+
+
+def _elapsed_since_task_start(task_start_times, task_index, now=None):
+    started_at = task_start_times[task_index]
+    if started_at == 0:
+        return None
+    current_time = time.monotonic() if now is None else now
+    return current_time - started_at
+
+
+def _reset_task_start_times(task_start_times, task_indices):
+    """Mark tasks as queued again, so a resubmit is not judged against the
+    timestamp its previous attempt left behind."""
+    for k in task_indices:
+        task_start_times[k] = 0
 
 
 def worker(
@@ -92,7 +121,10 @@ def worker(
             ]
             for i in range(len(ref)):
                 if isinstance(ref[i], torch.Tensor):
-                    if res[i].shape != ref[i].shape:
+                    # Skip generic reshape when a custom compare_fn is given: it
+                    # handles shape/dtype itself (e.g. v2 stage1 compares fp4-packed
+                    # uint8 res against unpacked bf16 ref -- different numel by design).
+                    if compare_fn is None and res[i].shape != ref[i].shape:
                         res[i] = res[i].view(-1)[: ref[i].numel()].view(ref[i].shape)
                     if compare_fn is not None:
                         err_ratio = compare_fn(
@@ -400,23 +432,34 @@ def mp_tuner(
     # Helper function to submit tasks to pool
     def submit_tasks(pool, gpu_map, task_indices):
         """Submit tasks to the pool and return async results as a dict"""
+        task_indices = list(task_indices)
+        _reset_task_start_times(task_start_times, task_indices)
         return {
             k: pool.apply_async(
-                work_group,
+                _run_with_start_tracking,
                 args=(
-                    gpu_map,
-                    fast_mode,
-                    err_ratio,
-                    in_datas[ref_data_index[k]],
-                    task_group[k],
-                    verbose,
+                    k,
+                    work_group,
+                    (
+                        gpu_map,
+                        fast_mode,
+                        err_ratio,
+                        in_datas[ref_data_index[k]],
+                        task_group[k],
+                        verbose,
+                    ),
                 ),
             )
             for k in task_indices
         }
 
     # Create initial pool and submit all tasks
-    pool = mp.Pool(processes=parallel_num)
+    task_start_times = mp.RawArray("d", len(task_group))
+    pool = mp.Pool(
+        processes=parallel_num,
+        initializer=_init_task_start_times,
+        initargs=(task_start_times,),
+    )
     pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
@@ -428,8 +471,6 @@ def mp_tuner(
     failed_tasks = []
     remaining_tasks = list(enumerate(rets))
 
-    # Track start time for each task
-    task_start_times = {k: time.time() for k, _ in remaining_tasks}
     check_interval = 10  # Check every 10 seconds for responsive polling
 
     timeout_msg = (
@@ -465,9 +506,14 @@ def mp_tuner(
 
         for k, async_result in remaining_tasks:
             try:
-                # Calculate appropriate timeout based on task's remaining time
-                if timeout is not None:
-                    elapsed = time.time() - task_start_times[k]
+                elapsed = _elapsed_since_task_start(task_start_times, k)
+                if elapsed is None:
+                    # The task is still queued, so it has no execution timeout yet.
+                    if not async_result.ready():
+                        consecutive_timeouts = 0
+                        continue
+                    actual_timeout = 0
+                elif timeout is not None:
                     remaining_time = timeout - elapsed
                     # Use the smaller of check_interval and remaining_time, but at least 1 second
                     actual_timeout = max(1, min(check_interval, remaining_time))
@@ -482,7 +528,7 @@ def mp_tuner(
                 result_dict[k] = task_result
                 completed_this_round.append((k, async_result))
                 consecutive_timeouts = 0
-                elapsed = time.time() - task_start_times[k]
+                elapsed = _elapsed_since_task_start(task_start_times, k)
                 if verbose:
                     print(
                         f"[Done] Task {k}/{len(rets) - 1} completed in {elapsed:.1f}s ({len(result_dict)}/{len(rets)} done)"
@@ -491,9 +537,9 @@ def mp_tuner(
             except MPTimeoutError:
                 # Check if this specific task has exceeded its timeout (only if timeout is set)
                 if timeout is not None:
-                    elapsed = time.time() - task_start_times[k]
+                    elapsed = _elapsed_since_task_start(task_start_times, k)
 
-                    if elapsed > timeout:
+                    if elapsed is not None and elapsed > timeout:
                         consecutive_timeouts += 1
 
                         error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
@@ -587,7 +633,11 @@ def mp_tuner(
             except Exception as e:  # noqa: BLE001
                 print(f"Warning: Error during pool termination: {e}", flush=True)
             # Create new pool
-            pool = mp.Pool(processes=parallel_num)
+            pool = mp.Pool(
+                processes=parallel_num,
+                initializer=_init_task_start_times,
+                initargs=(task_start_times,),
+            )
 
             # Recreate gpu_map for new processes (new PIDs)
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
@@ -600,9 +650,6 @@ def mp_tuner(
 
             # Update remaining_tasks with new async results
             remaining_tasks = [(k, new_rets_dict[k]) for k in remaining_task_indices]
-            # Reset start times for resubmitted tasks
-            for k in remaining_task_indices:
-                task_start_times[k] = time.time()
 
             # Reset pool restart flag
             pool_restart_needed = False

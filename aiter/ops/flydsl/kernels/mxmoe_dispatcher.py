@@ -30,6 +30,14 @@ def _norm_sbm(SBM, BM):
     return BM if SBM is None else SBM
 
 
+def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
+    """Host-side upper bound for non-persistent GEMM2 M tiles."""
+    routes = M_logical * topk
+    active_experts = min(routes, NE)
+    sort_blocks = (routes + active_experts * (SBM - 1) + SBM - 1) // SBM
+    return sort_blocks * (SBM // BM)
+
+
 # ---- gemm2 (down-proj) compile ----
 def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     """ck_tile GemmSpatiallyLocalTilePartitioner::GetOutputTileIndex: 1D block id -> spatially-local (m_block_idx, n_block_idx). block_1d_id/M0 runtime; N0/group_num/m01 compile-time."""
@@ -530,7 +538,12 @@ def mxfp4_moe_gemm2(
 
     if persist and cu_num <= 0:
         cu_num = get_cu_num()
+    SBM = _norm_sbm(SBM, BM)
     has_pad = inter_dim_pad > 0 or model_dim_pad > 0
+    if BN <= 0 or BN % 128 != 0:
+        raise AssertionError(f"BN must be a positive multiple of 128, got {BN}")
+    if BK not in (128, 256):
+        raise AssertionError(f"BK must be one of (128, 256), got {BK}")
     # model_dim/hidden (gemm2 N-output) is a runtime arg; validate host-side (not compile-time).
     if D_HIDDEN % BN != 0:
         raise AssertionError(
@@ -568,9 +581,12 @@ def mxfp4_moe_gemm2(
     if persist:
         # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
         grid_blocks = cu_num
+    elif n_sorted_padded is not None:
+        grid_blocks = n_sorted_padded // BM
     else:
-        grid_blocks = (
-            max_m_blocks if n_sorted_padded is None else (n_sorted_padded // BM)
+        grid_blocks = min(
+            max_m_blocks,
+            _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM),
         )
     out_scale = out  # unused by the atomic epilog; any valid device ptr is fine
     # i32_kpad (inter_dim_pad) + i32_npad (model_dim_pad) are always threaded after

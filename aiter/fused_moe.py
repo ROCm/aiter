@@ -50,6 +50,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
     parse_flydsl_v2_gemm2_kernel,
+    parse_g2_kname_any,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
@@ -737,7 +738,7 @@ def fused_moe_(
                 "(expert_mask is dropped by the output_aux sort path)."
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
-        _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        _atomic = parse_g2_kname_any(_kn2)["atomic"]
         (
             sorted_ids,
             sorted_weights,
@@ -1653,10 +1654,9 @@ def _mxfp4_a4w4_stage2_fw(
 ):
 
     device = inter_states.device
-    p2 = _parse_mxfp4_g2_kname(kernelName2)
-    BM = p2["BM"]
-    atomic = p2["atomic"]
-    mxfp4out = p2.get("mxfp4out", False)
+    # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
+    # means path B (v2 gemm2 behind the mxmoe front-end), else native mxmoe.
+    cfg = parse_g2_kname_any(kernelName2)
     # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
     # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
     inter_real = getattr(w2, "inter_real", None)
@@ -1666,6 +1666,38 @@ def _mxfp4_a4w4_stage2_fw(
     D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
     M = moe_out.shape[0]
+    if cfg["v2"]:
+        # The mxmoe intermediate (inter_states + a2_scale) is byte-compatible
+        # with gemm2_body_v2's native-BM scale-chunk layout at SBM=BM (verified
+        # for BM in {16,32,64,128} x epilog {atomic,reduce}).
+        if inter_real is not None and inter_real != D_INTER:
+            # This path does not thread the v2 gemm2's K-pad skip (has_pad +
+            # i32_kpad), so the pad columns would be accumulated instead of
+            # skipped. v2 needs K aligned only to its BK, so an unpadded shard
+            # is the intended input here.
+            raise NotImplementedError(
+                f"FlyDSL v2 stage2 requires an unpadded inter_dim shard, got "
+                f"w2.inter_real={inter_real} with D_INTER={D_INTER}. Use a "
+                f"native flydsl_mxmoe_g2 kernelName2 for pre-padded weights."
+            )
+        return _flydsl_v2_stage2_wrapper(
+            inter_states=inter_states,
+            w1=None,
+            w2=w2,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=moe_out,
+            topk=topk,
+            kernelName=kernelName2,
+            model_dim=D_HIDDEN,
+            inter_dim=D_INTER,
+            num_experts=NE,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+            block_m=block_m,
+        )
     out = _mxfp4_a4w4_stage2(
         inter_states,
         a2_scale,
@@ -1677,8 +1709,8 @@ def _mxfp4_a4w4_stage2_fw(
         sorted_weights,
         reverse_sorted,
         moe_out,
-        atomic=atomic,
-        mxfp4out=mxfp4out,
+        atomic=cfg["atomic"],
+        mxfp4out=cfg["mxfp4out"],
         kernelName2=kernelName2,
         M=M,
         max_sorted=sorted_token_ids.shape[0],
@@ -1686,10 +1718,10 @@ def _mxfp4_a4w4_stage2_fw(
         topk=topk,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
-        BM=BM,
+        BM=cfg["BM"],
         device=device,
-        use_nt=p2["use_nt"],
-        cshuffle=p2.get("cshuffle", False),
+        use_nt=cfg["use_nt"],
+        cshuffle=cfg["cshuffle"],
         inter_real=inter_real,
     )
 

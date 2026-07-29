@@ -17,7 +17,7 @@ _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _FLYDSL_V2_GEMM2_RE = re.compile(
-    r"^flydsl(?:v2_moe2|_moe2_layout)_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+    r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
 )
@@ -107,4 +107,31 @@ def parse_flydsl_v2_gemm2_kernel(name):
         "persist": bool(m.group("persist")),
         "use_nt": bool(m.group("nt")),
         "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
+    }
+
+
+def parse_g2_kname_any(kname) -> dict:
+    """Parse either gemm2 name family into the fields the stage2 dispatch needs.
+
+    ``v2`` tells path B (flydsl_moe2_layout gemm2 behind the mxmoe front-end)
+    apart from the native mxmoe gemm2; the other keys mean the same for both.
+    """
+    v2 = parse_flydsl_v2_gemm2_kernel(kname)
+    if v2 is not None:
+        return {
+            "v2": True,
+            "BM": v2["tile_m"],
+            "atomic": v2["epilog"] == "atomic",
+            "use_nt": v2["use_nt"],
+            "mxfp4out": False,
+            "cshuffle": False,
+        }
+    p2 = _parse_mxfp4_g2_kname(kname)
+    return {
+        "v2": False,
+        "BM": p2["BM"],
+        "atomic": p2["atomic"],
+        "use_nt": p2["use_nt"],
+        "mxfp4out": p2["mxfp4out"],
+        "cshuffle": p2["cshuffle"],
     }

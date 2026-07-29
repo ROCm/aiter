@@ -312,6 +312,88 @@ def get_flydsl_stage2_kernels(
     return kernels
 
 
+def build_flydslv2_gemm2_name(
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    *,
+    tm,
+    epilog,
+    persist,
+    use_nt,
+    sbm=0,
+    tn=256,
+    tk=256,
+):
+    """Build a v2 layout GEMM2 name matching ``_FLYDSL_V2_GEMM2_RE``."""
+    name = (
+        f"flydsl_moe2_layout_a{a_dtype}_w{b_dtype}_{out_dtype}_t{tm}x{tn}x{tk}_{epilog}"
+    )
+    if persist:
+        name += "_persist"
+    if use_nt:
+        name += "_nt"
+    if sbm:
+        name += f"_sbm{sbm}"
+    return name
+
+
+def get_flydsl_stage2_v2_kernels(
+    a_dtype,
+    b_dtype,
+    out_dtype,
+    block_m,
+    model_dim=None,
+    inter_dim=None,
+):
+    """Return v2 layout GEMM2 candidates, optionally filtered for a shape."""
+    kernels = {}
+    # tile_m=16 requires the native SBM16 layout: its A-scale chunks are only
+    # valid when the sort block (sbm=block_m) is also 16, so re-tiling a larger
+    # sort block down to 16 is excluded.
+    bms = [
+        b
+        for b in (16, 32, 64, 128)
+        if b <= block_m and block_m % b == 0 and (b != 16 or block_m == 16)
+    ]
+    tile_ns = [tn for tn in (128, 256) if model_dim is None or model_dim % tn == 0]
+    tile_ks = [tk for tk in (128, 256) if inter_dim is None or inter_dim % tk == 0]
+    persists = [False, True] if a_dtype == "fp4" else [False]
+    for tm in bms:
+        for tn in tile_ns:
+            for tk in tile_ks:
+                for epilog in ("atomic", "reduce"):
+                    for use_nt in (True, False):
+                        for persist in persists:
+                            name = build_flydslv2_gemm2_name(
+                                a_dtype,
+                                b_dtype,
+                                out_dtype,
+                                tm=tm,
+                                tn=tn,
+                                tk=tk,
+                                epilog=epilog,
+                                persist=persist,
+                                use_nt=use_nt,
+                                sbm=block_m,
+                            )
+                            kernels[name] = {
+                                "stage": 2,
+                                "a_dtype": a_dtype,
+                                "b_dtype": b_dtype,
+                                "out_dtype": out_dtype,
+                                "tile_m": tm,
+                                "tile_n": tn,
+                                "tile_k": tk,
+                                "epilog": epilog,
+                                "use_nt": use_nt,
+                                "persist": persist,
+                                "sort_block_m": block_m,
+                                "v2": True,
+                            }
+    return kernels
+
+
 def _register_production_variants_stage2(
     kernels: dict[str, dict], a_dtype: str, b_dtype: str, out_dtype: str
 ) -> None:

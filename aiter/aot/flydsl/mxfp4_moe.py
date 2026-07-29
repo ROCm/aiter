@@ -99,13 +99,21 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
             topk = int(row["topk"])
-            # Shape from CSV columns (not the name). Weight is stored at the
-            # padded D_INTER; D_INTER_REAL is set only for non-256-aligned shards.
+            # Shape comes from CSV columns; v2 GEMM2 aligns K to its encoded BK.
             model_dim = int(row["model_dim"])
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
+            kn2 = (row.get("kernelName2") or "").strip()
+            v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
+            if v2_g2 is not None:
+                bk = v2_g2["tile_k"]
+                v2_d_inter = ((inter_dim + bk - 1) // bk) * bk
+                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
+            else:
+                v2_d_inter = d_inter
+                v2_d_inter_real = d_inter_real
 
             kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
@@ -118,18 +126,15 @@ def parse_csv(csv_path: str):
                         "use_nt": p1["use_nt"],
                         "inline_quant": p1["inline_quant"],
                         "D_HIDDEN": model_dim,
-                        "D_INTER": d_inter,
+                        "D_INTER": v2_d_inter,
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
                     }
                 )
-
-            kn2 = (row.get("kernelName2") or "").strip()
-            v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                inter_dim_pad = d_inter - inter_dim
+                inter_dim_pad = v2_d_inter - inter_dim
                 model_dim_pad = 0
                 out_dtype = (
                     "fp8"
@@ -148,8 +153,8 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "N_OUT": model_dim,
                         "epilog": v2_g2["epilog"],
-                        "D_INTER": d_inter,
-                        "D_INTER_REAL": d_inter_real,
+                        "D_INTER": v2_d_inter,
+                        "D_INTER_REAL": v2_d_inter_real,
                         "topk": topk,
                         "SBM": v2_g2["sort_block_m"] or bm,
                         "persist": v2_g2["persist"],
