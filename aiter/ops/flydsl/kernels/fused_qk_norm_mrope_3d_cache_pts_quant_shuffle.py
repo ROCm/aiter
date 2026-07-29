@@ -185,8 +185,8 @@ def _build_q_kernel(
 
             pos_i64 = fx.Int64(positions_t[sect_idx, tok])
             pos = pos_i64.to(fx.Int32)
-            cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
-            sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
+            cos_v = fx.Float32(cos_sin_t[pos, col])
+            sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
             return cos_v, sin_v
 
         bid_x = fx.block_idx.x  # 0..H_Q-1
@@ -194,16 +194,16 @@ def _build_q_kernel(
         tok = fx.Int32(bid_t) + token_offset
         tid = fx.thread_idx.x  # 0..WAVE-1
 
-        qkv_t = GTensor(qkv, dtype=T.bf16, shape=(-1, H_Q + H_K + H_V, D))
+        qkv_t = GTensor(qkv, dtype=fx.BFloat16, shape=(-1, H_Q + H_K + H_V, D))
         positions_t = GTensor(
             positions,
-            dtype=T.i64,
+            dtype=fx.Int64,
             shape=(3, -1),
             stride=(positions_stride_0, positions_stride_1),
         )
-        cos_sin_t = GTensor(cos_sin, dtype=T.bf16, shape=(1, D))
-        qw_t = GTensor(q_norm_w, dtype=T.bf16, shape=(D,))
-        q_out_t = GTensor(q_out, dtype=T.bf16, shape=(-1, H_Q, D))
+        cos_sin_t = GTensor(cos_sin, dtype=fx.BFloat16, shape=(1, D))
+        qw_t = GTensor(q_norm_w, dtype=fx.BFloat16, shape=(D,))
+        q_out_t = GTensor(q_out, dtype=fx.BFloat16, shape=(-1, H_Q, D))
 
         if const_expr(D == 64):
             # Both half-waves reproduce production's contiguous D/32
@@ -215,28 +215,28 @@ def _build_q_kernel(
             if tid < RMS_GROUP:
                 for i in range_constexpr(PROD_VEC_SIZE):
                     norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.BFloat16(qkv_t[tok, bid_x, norm_col]).to(fx.Float32)
+                    norm_x = fx.Float32(qkv_t[tok, bid_x, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
             if tid < HALF:
-                x0 = fx.BFloat16(qkv_t[tok, bid_x, tid]).to(fx.Float32)
-                x1 = fx.BFloat16(qkv_t[tok, bid_x, tid + HALF]).to(fx.Float32)
+                x0 = fx.Float32(qkv_t[tok, bid_x, tid])
+                x1 = fx.Float32(qkv_t[tok, bid_x, tid + HALF])
             sumsq = rms_reduce_add(sumsq_local, tid)
             rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
             if tid < HALF:
-                w0 = fx.BFloat16(qw_t[tid]).to(fx.Float32)
-                w1 = fx.BFloat16(qw_t[tid + HALF]).to(fx.Float32)
+                w0 = fx.Float32(qw_t[tid])
+                w1 = fx.Float32(qw_t[tid + HALF])
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
                 # The production kernel stores RMSNorm output in vec_t<T>
                 # (T=bf16) before applying RoPE. Preserve that rounding point
                 # so values near an FP8 bin boundary follow the same path.
-                xn0 = (x0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
-                xn1 = (x1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
+                xn0 = (x0 * rstd * w0).to(fx.Float32)
+                xn1 = (x1 * rstd * w1).to(fx.Float32)
                 cos_v, sin_v = mrope_cos_sin(tid, tok, positions_t, cos_sin_t)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
-                q_out_d64_t = GTensor(q_out, dtype=T.bf16, shape=(-1, H_Q, D))
+                q_out_d64_t = GTensor(q_out, dtype=fx.BFloat16, shape=(-1, H_Q, D))
                 q_out_d64_t[tok, bid_x, tid] = o0.to(fx.BFloat16)
                 q_out_d64_t[tok, bid_x, tid + HALF] = o1.to(fx.BFloat16)
         else:
@@ -247,12 +247,12 @@ def _build_q_kernel(
             if tid < RMS_GROUP:
                 for i in range_constexpr(PROD_VEC_SIZE):
                     norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.BFloat16(qkv_t[tok, bid_x, norm_col]).to(fx.Float32)
+                    norm_x = fx.Float32(qkv_t[tok, bid_x, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
-                x0 = fx.BFloat16(qkv_t[tok, bid_x, col]).to(fx.Float32)
-                x1 = fx.BFloat16(qkv_t[tok, bid_x, col + HALF]).to(fx.Float32)
+                x0 = fx.Float32(qkv_t[tok, bid_x, col])
+                x1 = fx.Float32(qkv_t[tok, bid_x, col + HALF])
                 x0s.append(x0)
                 x1s.append(x1)
             sumsq = rms_reduce_add(sumsq_local, tid)
@@ -261,8 +261,8 @@ def _build_q_kernel(
             # ---- Pass 2: per-pair weight + RoPE + store. ----
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
-                w0 = fx.BFloat16(qw_t[col]).to(fx.Float32)
-                w1 = fx.BFloat16(qw_t[col + HALF]).to(fx.Float32)
+                w0 = fx.Float32(qw_t[col])
+                w1 = fx.Float32(qw_t[col + HALF])
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
@@ -428,8 +428,8 @@ def _build_kv_kernel(
 
             pos_i64 = fx.Int64(positions_t[sect_idx, tok])
             pos = pos_i64.to(fx.Int32)
-            cos_v = fx.BFloat16(cos_sin_t[pos, col]).to(fx.Float32)
-            sin_v = fx.BFloat16(cos_sin_t[pos, col + HALF]).to(fx.Float32)
+            cos_v = fx.Float32(cos_sin_t[pos, col])
+            sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
             return cos_v, sin_v
 
         def quant_pair_fp8(v0, v1, scale):
@@ -455,19 +455,19 @@ def _build_kv_kernel(
         blk = fx.block_idx.y  # page-block index (contiguous-slot assumption)
         t = fx.thread_idx.x  # 0..KV_THREADS-1
 
-        qkv_t = GTensor(qkv, dtype=T.bf16, shape=(-1, H_Q + 2 * H_KV, D))
+        qkv_t = GTensor(qkv, dtype=fx.BFloat16, shape=(-1, H_Q + 2 * H_KV, D))
         positions_t = GTensor(
             positions,
-            dtype=T.i64,
+            dtype=fx.Int64,
             shape=(3, -1),
             stride=(positions_stride_0, positions_stride_1),
         )
-        cos_sin_t = GTensor(cos_sin, dtype=T.bf16, shape=(1, D))
-        kw_t = GTensor(k_norm_w, dtype=T.bf16, shape=(D,))
-        slot_t = GTensor(slot_mapping, dtype=T.i64, shape=(-1,))
+        cos_sin_t = GTensor(cos_sin, dtype=fx.BFloat16, shape=(1, D))
+        kw_t = GTensor(k_norm_w, dtype=fx.BFloat16, shape=(D,))
+        slot_t = GTensor(slot_mapping, dtype=fx.Int64, shape=(-1,))
         if const_expr(cache_is_fp8):
-            kscale_t = GTensor(k_scale_ptr, dtype=T.f32, shape=(1,))
-            vscale_t = GTensor(v_scale_ptr, dtype=T.f32, shape=(1,))
+            kscale_t = GTensor(k_scale_ptr, dtype=fx.Float32, shape=(1,))
+            vscale_t = GTensor(v_scale_ptr, dtype=fx.Float32, shape=(1,))
             k_scale = fx.Float32(kscale_t[0])
             v_scale = fx.Float32(vscale_t[0])
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
@@ -515,19 +515,15 @@ def _build_kv_kernel(
                     if lane < RMS_GROUP:
                         for i in range_constexpr(PROD_VEC_SIZE):
                             norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
-                            norm_x = fx.BFloat16(
-                                qkv_t[tok, H_Q + head, norm_col]
-                            ).to(fx.Float32)
+                            norm_x = fx.Float32(qkv_t[tok, H_Q + head, norm_col])
                             sumsq_local = sumsq_local + norm_x * norm_x
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         k0 = fx.Float32(0.0)
                         k1 = fx.Float32(0.0)
                         if col < HALF:
-                            k0 = fx.BFloat16(qkv_t[tok, H_Q + head, col]).to(fx.Float32)
-                            k1 = fx.BFloat16(qkv_t[tok, H_Q + head, col + HALF]).to(
-                                fx.Float32
-                            )
+                            k0 = fx.Float32(qkv_t[tok, H_Q + head, col])
+                            k1 = fx.Float32(qkv_t[tok, H_Q + head, col + HALF])
                         k0s.append(k0)
                         k1s.append(k1)
                     sumsq = rms_reduce_add(sumsq_local, lane)
@@ -536,8 +532,8 @@ def _build_kv_kernel(
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         if col < HALF:
-                            w0 = fx.BFloat16(kw_t[col]).to(fx.Float32)
-                            w1 = fx.BFloat16(kw_t[col + HALF]).to(fx.Float32)
+                            w0 = fx.Float32(kw_t[col])
+                            w1 = fx.Float32(kw_t[col + HALF])
                             if const_expr(gemma_norm):
                                 w0 = w0 + fx.Float32(1.0)
                                 w1 = w1 + fx.Float32(1.0)
@@ -570,12 +566,12 @@ def _build_kv_kernel(
                                 if slot >= fx.Int64(0):
                                     if const_expr(cache_is_fp8):
                                         k_out_t = GTensor(
-                                            k_out, dtype=T.i8, shape=(-1, H_KV, D)
+                                            k_out, dtype=fx.Int8, shape=(-1, H_KV, D)
                                         )
                                     else:
                                         k_out_t = GTensor(
                                             k_out,
-                                            dtype=T.bf16,
+                                            dtype=fx.BFloat16,
                                             shape=(-1, H_KV, D),
                                         )
                                     k_out_t[tok, head, col] = kb0
@@ -585,12 +581,8 @@ def _build_kv_kernel(
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         if col < HALF:
-                            v0 = fx.BFloat16(qkv_t[tok, H_Q + H_KV + head, col]).to(
-                                fx.Float32
-                            )
-                            v1 = fx.BFloat16(
-                                qkv_t[tok, H_Q + H_KV + head, col + HALF]
-                            ).to(fx.Float32)
+                            v0 = fx.Float32(qkv_t[tok, H_Q + H_KV + head, col])
+                            v1 = fx.Float32(qkv_t[tok, H_Q + H_KV + head, col + HALF])
                             if const_expr(cache_is_fp8):
                                 vb0, vb1 = quant_pair_fp8(v0, v1, v_scale)
                             else:
@@ -603,12 +595,12 @@ def _build_kv_kernel(
                                 if slot >= fx.Int64(0):
                                     if const_expr(cache_is_fp8):
                                         v_out_t = GTensor(
-                                            v_out, dtype=T.i8, shape=(-1, H_KV, D)
+                                            v_out, dtype=fx.Int8, shape=(-1, H_KV, D)
                                         )
                                     else:
                                         v_out_t = GTensor(
                                             v_out,
-                                            dtype=T.bf16,
+                                            dtype=fx.BFloat16,
                                             shape=(-1, H_KV, D),
                                         )
                                     v_out_t[tok, head, col] = vb0
