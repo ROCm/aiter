@@ -12,6 +12,7 @@
 
 import argparse
 from pathlib import Path
+from typing import Any, ClassVar
 
 # ── Supported shape tuples ─────────────────────────────────────────────────
 # (NE, D_HIDDEN, D_INTER, TOPK)
@@ -34,6 +35,7 @@ SHAPES = [
     (385, 7168, 1536, 7),  # dsv4 NE=385 TOPK=7 (tp2)
     (385, 7168, 768, 7),  # dsv4 NE=385 TOPK=7 (tp4)
     (385, 7168, 512, 7),  # dsv4 NE=385 TOPK=7 (tp6/tp8)
+    (257, 6144, 512, 9),  # GLM-5.2 TP=4 (256 routed + 1 shared -> topk 8+1, H=6144)
 ]
 
 
@@ -48,7 +50,7 @@ class Instance:
     body      the launch<...> call wrapped by the extern "C" function.
     """
 
-    __slots__ = ("name", "fn_type", "include", "params", "body")
+    __slots__ = ("body", "fn_type", "include", "name", "params")
 
     def __init__(self, name, fn_type, include, params, body):
         self.name = name
@@ -367,7 +369,7 @@ class mxfp4_moe_aux_codegen:
             (inst_dir / f"{inst.name}.cu").write_text(text)
 
     # fn_type -> lookup-table macro name (one table per aux entry).
-    _MACRO = {
+    _MACRO: ClassVar[dict[str, Any]] = {
         "SortQuantFn": "GENERATE_AUX_SORT_QUANT_LOOKUP_TABLE",
         "Sort3StageFn": "GENERATE_AUX_SORT3STAGE_LOOKUP_TABLE",
         "SortOnlyZiFn": "GENERATE_AUX_SORT_ONLY_ZI_LOOKUP_TABLE",

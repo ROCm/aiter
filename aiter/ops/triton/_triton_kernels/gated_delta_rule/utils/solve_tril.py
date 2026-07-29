@@ -10,15 +10,16 @@ using Triton kernels, optimized for chunk-based operations.
 """
 
 import os
+
 import torch
 import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    input_guard,
+    IS_TMA_SUPPORTED,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
-    IS_TMA_SUPPORTED,
+    input_guard,
 )
 from .index import prepare_chunk_indices
 from .op import make_tensor_descriptor
