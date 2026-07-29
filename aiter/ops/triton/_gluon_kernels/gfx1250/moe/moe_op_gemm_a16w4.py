@@ -461,9 +461,7 @@ def _moe_gemm_a16w4(
             )
         w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
         # fp4 -> bf16 with compact per-32 e8m0 scale folded in directly.
-        w_bf16 = gl.amd.gfx1250.scaled_upcast(
-            w_packed, w_scale, gl.bfloat16, axis=1, scale_block=MX_PACK_DIVISOR
-        )
+        w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         # (N, K) -> (K, N) for the B operand of WMMA, then move to the dot-operand layout.
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
@@ -512,9 +510,7 @@ def _moe_gemm_a16w4(
                 MX_PACK_DIVISOR,
             )
         w_scale = ws_buffer_slice.load(layout=COMPACT_SCALE_LAYOUT)
-        w_bf16 = gl.amd.gfx1250.scaled_upcast(
-            w_packed, w_scale, gl.bfloat16, axis=1, scale_block=MX_PACK_DIVISOR
-        )
+        w_bf16 = gl.amd.gfx1250.scaled_upcast(w_packed, w_scale, gl.bfloat16, axis=1)
         w_kn = gl.convert_layout(w_bf16.trans(1, 0), DOT_LAYOUT_W)
         acc = gl.amd.gfx1250.wmma(x_tile, w_kn, acc)
         read_idx += 1
