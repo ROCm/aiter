@@ -150,9 +150,8 @@ def compile_moe_gemm1(
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
-        return (lambda ty: ty() if callable(ty) else ty)(
-            T.f16 if out_dtype == "f16" else T.bf16
-        )
+        ty = T.f16 if out_dtype == "f16" else T.bf16
+        return ty() if callable(ty) else ty
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
@@ -2176,11 +2175,10 @@ def compile_moe_gemm2(
     # gfx942 only has global_atomic_pk_add_bf16 → must use global atomics with raw pointer.
     _has_buffer_atomic_bf16 = str(gpu_arch).startswith(("gfx95", "gfx12"))
     _needs_global_atomic_bf16 = out_is_bf16 and not _has_buffer_atomic_bf16
-    if out_is_bf16:
-        if not supports_bf16_global_atomics(gpu_arch):
-            raise ValueError(
-                f"out_dtype='bf16' requires bf16 global atomics ({bf16_global_atomics_arch_description()}), got arch={gpu_arch!r}"
-            )
+    if out_is_bf16 and not supports_bf16_global_atomics(gpu_arch):
+        raise ValueError(
+            f"out_dtype='bf16' requires bf16 global atomics ({bf16_global_atomics_arch_description()}), got arch={gpu_arch!r}"
+        )
 
     if out_is_f32:
         # Match origin/dev_a16w4: f32 output uses scalar atomics and does NOT use the CShuffle epilogue.

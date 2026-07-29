@@ -19,13 +19,14 @@ Usage:
     python test_reduce_scatter_all_gather.py --test reduce_scatter
 """
 
-import os
-import torch
-import torch.distributed as dist
+import logging
 import multiprocessing as mp
+import os
 import sys
 import traceback
-import logging
+
+import torch
+import torch.distributed as dist
 
 import aiter
 from aiter.test_common import ensure_spawn_method
@@ -34,8 +35,8 @@ from aiter.test_common import ensure_spawn_method
 try:
     from aiter.ops.triton.comms import (
         IrisCommContext,
-        reduce_scatter,
         all_gather,
+        reduce_scatter,
     )
 
     IRIS_AVAILABLE = True
@@ -117,7 +118,7 @@ def run_reduce_scatter_test(tp_size, gpuID, M, N, heap_size=1 << 30):
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -198,7 +199,7 @@ def run_all_gather_test(tp_size, gpuID, M_shard, N, heap_size=1 << 30):
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -282,7 +283,7 @@ def run_round_trip_test(tp_size, gpuID, M, N, heap_size=1 << 30):
 
     except Exception as e:
         logger.error(
-            f"\n-->[Error on GPU {gpuID}]: {str(e)}\n"
+            f"\n-->[Error on GPU {gpuID}]: {e!s}\n"
             f"-->[Traceback]: {''.join(traceback.format_exception(*sys.exc_info()))}"
         )
         raise
@@ -531,9 +532,9 @@ if __name__ == "__main__":
         print("All tests passed!")
         print("=" * 80)
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001  blanket catch is intentional here
         print("=" * 80)
-        print(f"TEST FAILED: {str(e)}")
+        print(f"TEST FAILED: {e!s}")
         print("=" * 80)
         traceback.print_exc()
         sys.exit(1)

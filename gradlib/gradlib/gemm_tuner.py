@@ -15,21 +15,19 @@
 * limitations under the License.
 """
 
-import argparse
 import json
 import os
 from pathlib import Path
 
 import torch  # isort: split
-import aiter
-from aiter import dtypes
-import pandas as pd
+
+import gc
+import multiprocessing as mp
+import time
 
 from GemmTuner import GemmTuner
 
-import time
-import multiprocessing as mp
-import gc
+from aiter import dtypes
 
 
 def generate_mk_sets(model_dir, tp=1):
@@ -100,7 +98,7 @@ def runGemmTuner():
     ext_group.add_argument(
         "--batch_size",
         type=int,
-        default=os.getenv("GTUNE_BATCH_SIZE", 1),
+        default=os.getenv("GTUNE_BATCH_SIZE", "1"),
         help="Batch size to tune for",
     )
     ext_group.add_argument(
@@ -112,7 +110,7 @@ def runGemmTuner():
     ext_group.add_argument(
         "--tp",
         type=int,
-        default=os.getenv("GTUNE_TP", 1),
+        default=os.getenv("GTUNE_TP", "1"),
         help="Tensor parallelism to be used.",
     )
     args = gtuner.parse_args()
@@ -160,9 +158,9 @@ def clean():
                 for name in list(mp.resource_tracker._CLEANUP_FUNCS.keys()):
                     try:
                         mp.resource_tracker._CLEANUP_FUNCS.pop(name)()
-                    except:
+                    except Exception:  # noqa: BLE001,S110
                         pass
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Resource cleanup warning: {e}")
 
 
@@ -194,7 +192,7 @@ if __name__ == "__main__":
                 break
             else:
                 break
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Process creation failed: {e}")
             retries += 1
             clean()

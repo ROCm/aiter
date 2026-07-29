@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import os
 import argparse
 import itertools
+import os
+
 from gemm_moe_ck2stages_common import get_gemm1_kernels_list, get_gemm2_kernels_list
 
 STG_INSTANCE_IMPL = """// SPDX-License-Identifier: MIT

@@ -4,19 +4,19 @@
 from functools import lru_cache
 
 import torch
-
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 import triton
 import triton.language as tl
 from triton.language.extra.hip import libdevice as hip_libdevice
+
+import aiter
+from aiter.ops.triton.utils._triton import arch_info
 
 CXX_PS_REDUCE_AVAILABLE = True
 try:
     from csrc.cpp_itfs.pa.pa_ps import (
         launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_cxx,
     )
-except Exception:
+except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
@@ -24,14 +24,14 @@ FLYDSL_PS_REDUCE_AVAILABLE = True
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, gpu, rocdl, buffer_ops, range_constexpr
-    from flydsl.expr.typing import T, Int32
-    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl._mlir import ir
-    from flydsl.compiler.kernel_function import CompilationContext
     from flydsl._mlir.dialects import arith as _mlir_arith
-except Exception:
+    from flydsl.compiler.kernel_function import CompilationContext
+    from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+    from flydsl.expr.typing import Int32, T
+    from flydsl.runtime.device import get_rocm_arch as get_hip_arch
+    from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
+except Exception:  # noqa: BLE001  blanket catch is intentional here
     FLYDSL_PS_REDUCE_AVAILABLE = False
     flyc = None
     fx = None
@@ -64,7 +64,11 @@ except ImportError:
 try:
     from triton.experimental.gluon.language.amd.cdna3 import (
         sched_barrier as _amd_iglp_sched_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
         sched_group_barrier as _amd_iglp_sched_group_barrier,
+    )
+    from triton.experimental.gluon.language.amd.cdna3 import (
         set_prio as _amd_set_prio,
     )
 except ImportError:
@@ -675,8 +679,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
 
     # ==================== Attention State Initialization ====================
     # Initialize attention computation state
-    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
-    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    max_logits = max_logits_base_offsets.to(gl.float32) * 0.0 - float("inf")
+    exp_sums = max_logits_base_offsets.to(gl.float32) * 0.0
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -897,7 +901,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
         # Apply scaling to QK scores
         qk_matrix = qk_scale_value * qk_matrix
         # Apply masking to QK scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        qk_matrix = gl.where(combined_mask, qk_matrix, float(-3.4e38))
+        qk_matrix = gl.where(combined_mask, qk_matrix, (-3.4e38))
 
         # ==================== Softmax Computation ====================
         # Compute new maximum logits
@@ -922,9 +926,7 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = tl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = tl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 # Use fast reciprocal plus multiplies instead of a full divide.
@@ -1938,7 +1940,7 @@ def paged_attention_decode_sliding_window_head_1(
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
         attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Optimization: For per-token quant mode, load value_scale early and fuse its reduction
@@ -1950,9 +1952,7 @@ def paged_attention_decode_sliding_window_head_1(
             )
             valid_token_mask = qk_column_offsets < context_length
             # Mask out value_scale of invalid tokens
-            value_scale_value = gl.where(
-                valid_token_mask, value_scale_value, float(0.0)
-            )
+            value_scale_value = gl.where(valid_token_mask, value_scale_value, 0.0)
             value_scale_broadcast = tl.broadcast_to(
                 value_scale_value[None, :], attention_scores.shape
             )
@@ -2980,7 +2980,7 @@ def paged_attention_decode_sliding_window(
         attention_scores = gl.convert_layout(attention_scores, layout=qk_linear_layout)
         attention_scores = qk_scale_value * attention_scores
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -3002,9 +3002,7 @@ def paged_attention_decode_sliding_window(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = gl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = gl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 # Optimization: compute reciprocal once and reuse, use multiply instead of divide for FP8_MAX_VALUE
@@ -3605,8 +3603,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     )
 
     # Initialize attention state variables
-    max_logits = max_logits_base_offsets.to(gl.float32) * float(0.0) - float("inf")
-    exp_sums = max_logits_base_offsets.to(gl.float32) * float(0.0)
+    max_logits = max_logits_base_offsets.to(gl.float32) * 0.0 - float("inf")
+    exp_sums = max_logits_base_offsets.to(gl.float32) * 0.0
     attention_accumulator = gl.zeros(
         (QUERY_GROUP_SIZE_POW2, HEAD_SIZE_POW2), dtype=gl.float32, layout=pv_mfma_layout
     )
@@ -3844,7 +3842,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
         attention_scores = qk_scale_value * attention_scores
 
         # Apply masking to attention scores (if [0, CONTEXT_PARTITION_SIZE) are all -inf, the result will be NaN, so we use -3.4e38 other than -inf)
-        attention_scores = gl.where(boundary_mask, attention_scores, float(-3.4e38))
+        attention_scores = gl.where(boundary_mask, attention_scores, (-3.4e38))
 
         # ==================== SOFTMAX COMPUTATION ====================
         # Update running maximum for numerical stability
@@ -3868,9 +3866,7 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 # Create mask for valid tokens
                 valid_token_mask = qk_column_offsets < context_length
                 # Mask out value_scale of invalid tokens
-                value_scale_value = tl.where(
-                    valid_token_mask, value_scale_value, float(0.0)
-                )
+                value_scale_value = tl.where(valid_token_mask, value_scale_value, 0.0)
                 value_scale_max = gl.max(value_scale_value, axis=0)
                 # Scale the maximum value of value_scale to FP8_MAX_VALUE to improve the precision of P * V
                 value_scale_value = (
@@ -4945,7 +4941,7 @@ def compile_pa_decode_ps_reduce_flydsl(
         stride_logits_group,
         batch_size,
         num_kv_heads,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -5133,6 +5129,9 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 query_group_size=query_group_size,
                 head_size=head_size,
                 context_partition_num=context_partition_num,
+                # Was the `fx.Stream(None)` parameter default; passed explicitly
+                # now that the default is gone. fx.Stream(None) is the default queue.
+                stream=fx.Stream(None),
             )
             return
         except ImportError:

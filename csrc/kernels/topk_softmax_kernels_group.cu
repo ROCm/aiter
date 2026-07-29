@@ -320,6 +320,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
                     const DTYPE_I* __restrict__ correction_bias, // [num_expert]
                     float* __restrict__ topk_weights,            // [num_tokens, topk]
                     int* __restrict__ topk_ids,                  // [num_tokens, topk]
+                    const size_t stride_gating,
                     const size_t stride_tk,
                     const int num_experts,
                     const int topk,
@@ -367,7 +368,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
 
     if constexpr(!isSoftmax)
     {
-        auto const* input_ptr = gating_output + token_idx * num_experts;
+        auto const* input_ptr = gating_output + token_idx * stride_gating;
         for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         {
             vec_i tmp = reinterpret_cast<vec_i const*>(input_ptr)[e];
@@ -401,7 +402,7 @@ grouped_topk_kernel(DTYPE_I* __restrict__ gating_output,         // [num_tokens,
         for(int e = threadIdx.x; e < num_experts; e += blockDim.x)
         {
 
-            float gating = gating_output[token_idx * num_experts + e];
+            float gating = gating_output[token_idx * stride_gating + e];
             scores[e]    = gating;
             if(gating > max_val)
             {
@@ -624,6 +625,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                              const DTYPE_I* __restrict__ correction_bias, // [num_expert]
                              float* __restrict__ topk_weights,            // [num_tokens, topk]
                              int* __restrict__ topk_ids,                  // [num_tokens, topk]
+                             const size_t stride_gating,
                              const size_t stride_tk,
                              const int num_experts,
                              const int topk,
@@ -681,7 +683,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
     f32vec gating;
     if constexpr(!isSoftmax)
     {
-        auto const* input_ptr = gating_output + token_idx * num_experts;
+        auto const* input_ptr = gating_output + token_idx * stride_gating;
         // for(int e = threadIdx.x; e < num_experts_vec; e += blockDim.x)
         int e = threadIdx.x;
         {
@@ -719,7 +721,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
         {
             int e = threadIdx.x + i_ * blockDim.x;
 
-            float gating = gating_output[token_idx * num_experts + e];
+            float gating = gating_output[token_idx * stride_gating + e];
             // scores[e] = gating;
             scores_[i_] = gating;
             if(gating > max_val)
@@ -1164,6 +1166,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),                                                  \
             reinterpret_cast<float*>(topk_weights.data_ptr()),                                                        \
             reinterpret_cast<int*>(topk_ids.data_ptr()),                                                              \
+            stride_gating,                                                                         \
             stride_tk,                                                                             \
             num_experts,                                                                           \
             topk,                                                                                  \
@@ -1185,6 +1188,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
             nullptr,                                                                               \
             reinterpret_cast<float*>(topk_weights.data_ptr()),                                                        \
             reinterpret_cast<int*>(topk_ids.data_ptr()),                                                              \
+            stride_gating,                                                                         \
             stride_tk,                                                                             \
             num_experts,                                                                           \
             topk,                                                                                  \
@@ -1211,6 +1215,7 @@ grouped_topk_opt_sort_kernel(DTYPE_I* __restrict__ gating_output, // [num_tokens
                                reinterpret_cast<scalar_t*>(correction_bias.data_ptr()),              \
                                reinterpret_cast<float*>(topk_weights.data_ptr()),                    \
                                reinterpret_cast<int*>(topk_ids.data_ptr()),                          \
+                               stride_gating,                                     \
                                stride_tk,                                         \
                                num_experts,                                       \
                                topk,                                              \
@@ -1233,7 +1238,9 @@ void biased_grouped_topk(const aiter_tensor_t& gating_output,   // [num_tokens, 
     int num_tokens      = gating_output.size(0);
     int num_experts     = gating_output.size(1);
     int topk            = topk_ids.size(1);
+    size_t stride_gating = gating_output.stride(0);
     size_t stride_tk    = topk_ids.stride(0);
+    AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,
@@ -1280,8 +1287,10 @@ void grouped_topk(const aiter_tensor_t& gating_output, // [num_tokens, num_exper
     int num_tokens       = gating_output.size(0);
     int num_experts      = gating_output.size(1);
     int topk             = topk_ids.size(1);
+    size_t stride_gating = gating_output.stride(0);
     size_t stride_tk     = topk_ids.stride(0);
     const aiter_tensor_t& correction_bias = topk_ids;
+    AITER_CHECK(gating_output.stride(1) == 1, "gating_output last dimension must be contiguous");
     AITER_CHECK(topk_grp >= 1 && topk_grp <= num_expert_group,
                 "topk_grp must be in [1, num_expert_group], but got topk_grp=",
                 topk_grp,

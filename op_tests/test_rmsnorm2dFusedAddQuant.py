@@ -1,15 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: N999  camelCase module name kept: renaming would break the test
+# selection lists and FILE_TIMES bookkeeping that reference this path.
 
+import argparse
+from functools import partial
+
+import pandas as pd
 import torch
 import torch.nn.functional as F
+
 import aiter
-import argparse
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter import dtypes, QuantType, get_torch_quant, get_gfx
+from aiter import QuantType, dtypes, get_gfx, get_torch_quant
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
-from functools import partial
-import pandas as pd
 
 torch.set_default_device("cuda")
 
