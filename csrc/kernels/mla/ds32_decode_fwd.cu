@@ -53,6 +53,11 @@ void mla_decode_stage1_opus_fwd_ds32(aiter_tensor_t& q_nope,
                 "' (supported: gfx950).");
     AITER_CHECK(page_size == 1, "mla_decode_stage1_opus_fwd_ds32: only page_size==1 supported, got ",
                 page_size);
+    AITER_CHECK(q_nope.dtype() == AITER_DTYPE_fp8 && kv_nope.dtype() == AITER_DTYPE_fp8,
+                "mla_decode_stage1_opus_fwd_ds32: q_nope/kv_nope must be fp8");
+    AITER_CHECK(q_rope.dtype() == AITER_DTYPE_bf16 && kv_rope.dtype() == AITER_DTYPE_bf16,
+                "mla_decode_stage1_opus_fwd_ds32: q_rope/kv_rope must be bf16");
+
     // Scales must be E8M0 exponent bytes (uint8); the kernel reads them via
     // bit_cast<float>(e8m0 << 23). fp32 scale factors are NOT accepted here --
     // convert on the host first (e.g. mla.py _ds32_to_e8m0).
@@ -62,7 +67,10 @@ void mla_decode_stage1_opus_fwd_ds32(aiter_tensor_t& q_nope,
     AITER_CHECK(kv_scale.dtype() == AITER_DTYPE_u8,
                 "mla_decode_stage1_opus_fwd_ds32: kv_scale must be E8M0 uint8, got ",
                 AiterDtype_to_str(kv_scale.dtype()));
-
+    AITER_CHECK(kv_scale.size(-1) == T::D_SCALE_SIZE,
+                "mla_decode_stage1_opus_fwd_ds32: kv_scale last dim (scale_dim) must be ",
+                T::D_SCALE_SIZE, ", got ", kv_scale.size(-1));
+    
     const int B            = q_nope.size(0);
     const int H            = q_nope.size(1);
     const int total_tokens = kv_nope.size(0);

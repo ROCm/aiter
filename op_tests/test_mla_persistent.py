@@ -199,9 +199,10 @@ def init_3buffer_q_buffer(
     scale_indices = torch.randint(
         0, len(scale_values), size=(total_q_len, nhead, scale_dim)
     )
-    q_nope_scale_factors_fp32 = torch.tensor(
-        [scale_values[idx] for idx in scale_indices.flatten()], dtype=torch.float32
-    ).reshape(total_q_len, nhead, scale_dim)
+    _scale_values_t = torch.tensor(
+        scale_values, dtype=torch.float32, device=scale_indices.device
+    )
+    q_nope_scale_factors_fp32 = _scale_values_t[scale_indices].to(torch.float32)
 
     # Apply per-channel scaling and quantize to FP8
     q_nope_scaled_buffer = q_nope_buffer_fp32.reshape(
@@ -480,6 +481,8 @@ def torch_mla_extend_ds32(
     q_rope_bf16,  # [total_q, nhead,   qk_rope_head_dim]  bf16
     kv_nope_fp8,  # [num_page, page_size, nhead_kv, kv_lora_rank]     fp8
     kv_rope_bf16,  # [num_page, page_size, nhead_kv, qk_rope_head_dim] bf16
+    q_scale,  # [total_q, nhead,   scale_dim]
+    kv_scale,  # [num_page, page_size, nhead_kv, scale_dim]
     qo_indptr,
     kv_indptr,
     kv_indices,
@@ -492,8 +495,6 @@ def torch_mla_extend_ds32(
     dtype,
     is_causal=True,
     scale_dim=4,
-    q_scale=None,  # [total_q, nhead,   scale_dim]                     fp32
-    kv_scale=None,  # [num_page, page_size, nhead_kv, scale_dim]        fp32
 ):
     """DSA v3.2 (ds_32) golden reference. Extends torch_mla_extend by dequantizing
     the split fp8-NoPE / bf16-RoPE Q and KV buffers per the dsa_v32_splitkv.hpp
@@ -1341,8 +1342,8 @@ def test_mla(
     # """ test code for decode_update_mla_metadata_v1 """
     # torch.set_printoptions(linewidth=200)
     # print(f"{kv_indptr=}")
-    print(f"{work_indptr=}")
-    print(f"{work_info_set[:32]}")
+    # print(f"{work_indptr=}")
+    # print(f"{work_info_set[:32]}")
     # print(f"{reduce_indptr=}")
     # print(f"{reduce_final_map=}")
     # print(f"{reduce_partial_map=}")
@@ -1795,6 +1796,8 @@ def test_mla(
             q_rope_buffer_bf16,
             kv_nope_buffer_fp8,
             kv_rope_buffer_bf16,
+            q_scale_e8m0,
+            kv_scale_e8m0,
             qo_indptr,
             kv_indptr,
             kv_indices,
@@ -1807,8 +1810,6 @@ def test_mla(
             dtype=out_dtype,
             is_causal=True,
             scale_dim=scale_dim,
-            q_scale=q_scale_e8m0,
-            kv_scale=kv_scale_e8m0,
         )
 
         err = checkAllclose(
