@@ -15,11 +15,12 @@ from functools import lru_cache
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl, scf
-from flydsl.expr import arith, buffer_ops, range_constexpr, vector
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
 )
