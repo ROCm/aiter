@@ -51,6 +51,19 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
+
+def _ep_has_fake_expert_for_tuning() -> bool:
+    """Whether EP routing includes the legacy always-masked fake expert."""
+    return os.environ.get("AITER_FLYDSL_EP_NO_FAKE_EXPERT", "0") != "1"
+
+
+def _resolve_tuning_topk(
+    topk: int, *, is_ep: bool, ep_has_fake_expert: bool = True
+) -> int:
+    """Map runtime top-k to the value used by tuned-config keys."""
+    return topk - int(is_ep and ep_has_fake_expert)
+
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -496,6 +509,7 @@ def fused_moe_(
         isShuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_expert=_ep_has_fake_expert_for_tuning(),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1056,6 +1070,7 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
+    ep_has_fake_expert=True,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -1169,10 +1184,12 @@ def get_2stage_cfgs(
         cfg_2stages = get_cfg_2stages(tune_file)
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
-    # EP convention: callers append one always-masked fake-expert slot to
-    # topk_ids, so runtime `topk` is routed_topk + 1. Tuned configs are keyed
-    # on routed_topk; strip the fake slot before building the lookup key.
-    topk -= int(is_ep)
+    # Legacy EP callers append one always-masked fake-expert slot to topk_ids,
+    # so runtime `topk` is routed_topk + 1. Candidate FlyDSL EP routing can
+    # explicitly opt out and use the runtime top-k unchanged.
+    topk = _resolve_tuning_topk(
+        topk, is_ep=is_ep, ep_has_fake_expert=ep_has_fake_expert
+    )
     keys = (
         gfx,
         cu_num,
@@ -1793,6 +1810,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_expert=_ep_has_fake_expert_for_tuning(),
     )
     if (
         quant_type == QuantType.per_1x32
