@@ -9,6 +9,8 @@
         "gui_layout": true,
         "inter_dim": 2048,
         "quant_mode": "none",
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "topk": 8
       },
       "trigger": {
@@ -45,6 +47,7 @@
       "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
       "id": "sorting.multiphase.4k.masked/multiphase_builder",
       "kwargs": {
+        "has_local_tokens": false,
         "has_mask": true,
         "k4_block": 256,
         "num_experts": 256,
@@ -68,6 +71,7 @@
       "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_multiphase",
       "id": "sorting.multiphase.p0v2.unmasked.e384/multiphase_builder",
       "kwargs": {
+        "has_local_tokens": false,
         "has_mask": false,
         "k4_block": 512,
         "num_experts": 384,
@@ -91,6 +95,7 @@
       "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
       "id": "sorting.oneshot.masked/oneshot_builder",
       "kwargs": {
+        "has_local_tokens": false,
         "has_mask": true,
         "max_tokens": 8,
         "num_experts": 256,
@@ -113,6 +118,7 @@
       "builder": "aiter.ops.flydsl.kernels.moe_sorting_kernel._compile_moe_sorting_oneshot",
       "id": "sorting.oneshot.unmasked/oneshot_builder",
       "kwargs": {
+        "has_local_tokens": false,
         "has_mask": false,
         "max_tokens": 8,
         "num_experts": 256,
@@ -183,6 +189,8 @@
         "model_dim_pad": 0,
         "out_dtype": "bf16",
         "persist_m": 1,
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "tile_k": 256,
         "tile_m": 32,
         "tile_n": 128,
@@ -225,6 +233,8 @@
         "model_dim_pad": 0,
         "out_dtype": "bf16",
         "persist_m": 1,
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "tile_k": 256,
         "tile_m": 32,
         "tile_n": 128,
@@ -255,6 +265,8 @@
         "gui_layout": false,
         "inter_dim": 2048,
         "quant_mode": "fp4",
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "topk": 8
       },
       "trigger": {
@@ -290,6 +302,8 @@
         "model_dim_pad": 0,
         "out_dtype": "bf16",
         "persist_m": 1,
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "tile_k": 256,
         "tile_m": 32,
         "tile_n": 128,
@@ -320,6 +334,8 @@
         "gui_layout": true,
         "inter_dim": 2048,
         "quant_mode": "fp8",
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "topk": 8
       },
       "trigger": {
@@ -355,6 +371,8 @@
         "model_dim_pad": 0,
         "out_dtype": "bf16",
         "persist_m": 1,
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "tile_k": 256,
         "tile_m": 32,
         "tile_n": 128,
@@ -385,6 +403,8 @@
         "gui_layout": true,
         "inter_dim": 2048,
         "quant_mode": "none",
+        "situ_beta": 1.0,
+        "situ_linear_beta": 1.0,
         "topk": 8
       },
       "trigger": {

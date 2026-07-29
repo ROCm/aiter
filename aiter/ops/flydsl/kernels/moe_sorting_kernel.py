@@ -159,8 +159,7 @@ def resolve_moe_sorting_specialization(
         raise TypeError(f"has_mask must be explicit bool metadata, got {has_mask!r}")
     if not isinstance(has_local_tokens, bool):
         raise TypeError(
-            "has_local_tokens must be explicit bool metadata, "
-            f"got {has_local_tokens!r}"
+            f"has_local_tokens must be explicit bool metadata, got {has_local_tokens!r}"
         )
     sub_tokens, oneshot_max_tokens = _oneshot_token_threshold(
         num_experts,

@@ -678,6 +678,67 @@ class TestPureDecisionBoundaries(unittest.TestCase):
                 )
                 self.assertEqual(specialization.path, expected_path)
 
+    def test_upstream_mxfp4_and_local_tokens_enter_request_identity(self):
+        with _isolated_host_imports() as imports:
+            core = importlib.import_module("aiter.ops.flydsl.compile_request")
+            factories = importlib.import_module("aiter.ops.flydsl.moe_compile_requests")
+            target = core.RocmTarget(*_TARGET)
+
+            stage1_metadata = _stage1_metadata(
+                imports,
+                "flydsl_moe1_afp4_wfp4_bf16_t32x128x256",
+                {
+                    "a_dtype": "bf16",
+                    "b_dtype": "mxfp4",
+                    "act": "situv2",
+                    "situ_beta": 1.5,
+                    "situ_linear_beta": 0.75,
+                },
+            )
+            (stage1_request,) = factories.stage1_compile_requests(
+                stage1_metadata,
+                target,
+            )
+            stage1_kwargs = stage1_request.as_kwargs()
+            self.assertEqual(stage1_kwargs["situ_beta"], 1.5)
+            self.assertEqual(stage1_kwargs["situ_linear_beta"], 0.75)
+            self.assertNotIn(
+                "f32_swiglu_limit",
+                tuple(argument.name for argument in stage1_request.signature.arguments),
+            )
+
+            stage2_metadata = _stage2_metadata(
+                imports,
+                "flydsl_moe2_afp8_wfp4_bf16_t32x128x256_atomic_bnt2",
+                False,
+                {"a_dtype": "bf16", "b_dtype": "mxfp4"},
+            )
+            stage2_metadata["doweight_stage2"] = True
+            (stage2_request,) = factories.stage2_compile_requests(
+                stage2_metadata,
+                _stage2_runtime_metadata(stage2_metadata, False),
+                target,
+            )
+            self.assertEqual(stage2_request.op_id, factories.MIXED_STAGE2_GEMM_OP_ID)
+
+            plain_case = factories.MoeSortingCompileCase(8, 256, 8, False)
+            local_case = factories.MoeSortingCompileCase(
+                8,
+                256,
+                8,
+                False,
+                has_local_tokens=True,
+            )
+            plain_request = factories.sorting_compile_request(plain_case, target)
+            local_request = factories.sorting_compile_request(local_case, target)
+            self.assertFalse(plain_request.as_kwargs()["has_local_tokens"])
+            self.assertTrue(local_request.as_kwargs()["has_local_tokens"])
+            self.assertNotEqual(plain_request, local_request)
+            self.assertIn(
+                "local_tokens_tensor",
+                tuple(argument.name for argument in local_request.signature.arguments),
+            )
+
     def test_invalid_decisions_and_explicit_sorting_csv_boundary(self):
         with _isolated_host_imports() as imports, tempfile.TemporaryDirectory() as tmp:
             decisions = importlib.import_module(

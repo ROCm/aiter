@@ -215,12 +215,8 @@ def resolve_stage2_compile_decision(
 
     a_dtype = _required(builder_kwargs, "a_dtype", "Stage2")
     b_dtype = _required(builder_kwargs, "b_dtype", "Stage2")
-    if (
-        (a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"))
-        or (
-            a_dtype in ("fp4", "fp8")
-            and b_dtype in ("fp4", "mxfp4", "fp8")
-        )
+    if (a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")) or (
+        a_dtype in ("fp4", "fp8") and b_dtype in ("fp4", "mxfp4", "fp8")
     ):
         primary_family: Stage2Family = "mixed"
     elif a_dtype == "bf16" and b_dtype == "int4":

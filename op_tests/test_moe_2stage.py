@@ -1133,26 +1133,29 @@ def _iter_situv2_default_cases():
     ]
     for (quant_type, aq_dtype, wq_dtype), inter_dim in situv2_cases:
         for m in tokens:
-            yield {
-                "dtype": dtype,
-                "token": m,
-                "model_dim": model_dim,
-                "inter_dim": inter_dim,
-                "E": args.expert,
-                "topk": args.topk,
-                "actType": aiter.ActivationType.Situv2,
-                "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
-                "qType": quant_type,
-                "AQDType": aq_dtype,
-                "WQDType": wq_dtype,
-                "use_g1u1": True,
-                "doweight_stage1": False,
-                "strict_accuracy": False,
-                "check_aot_cache": False,
-                "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
-            }, extras
+            yield (
+                {
+                    "dtype": dtype,
+                    "token": m,
+                    "model_dim": model_dim,
+                    "inter_dim": inter_dim,
+                    "E": args.expert,
+                    "topk": args.topk,
+                    "actType": aiter.ActivationType.Situv2,
+                    "gateMode": _effective_gate_mode(aq_dtype, wq_dtype),
+                    "qType": quant_type,
+                    "AQDType": aq_dtype,
+                    "WQDType": wq_dtype,
+                    "use_g1u1": True,
+                    "doweight_stage1": False,
+                    "strict_accuracy": False,
+                    "check_aot_cache": False,
+                    "swiglu_limit": None,
+                    "beta": args.beta,
+                    "linear_beta": args.linear_beta,
+                },
+                extras,
+            )
 
 
 # ---------------------------------------------------------------------------
