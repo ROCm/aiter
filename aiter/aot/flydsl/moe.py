@@ -84,11 +84,8 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
-            act = (
-                "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
-            )
+            act_name = act_type.strip().split(".")[-1].lower()
+            act = act_name if act_name in ("swiglu", "situv2") else "silu"
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
