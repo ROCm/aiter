@@ -40,7 +40,7 @@ __all__ = [
 _LOW_DIRECT_PMAP_THR = 8
 
 
-_MLA_REDUCE_GFX = "gfx942"
+_MLA_REDUCE_GFX = ("gfx942", "gfx950")
 _POINTER_DSL_DTYPES = {
     torch.float32: fx.Float32,
     torch.bfloat16: fx.BFloat16,
@@ -235,9 +235,10 @@ def _validate_mla_reduce_inputs(
             f"({NUM_THREADS})"
         )
     arch = str(torch.cuda.get_device_properties(device).gcnArchName).split(":")[0]
-    if arch != _MLA_REDUCE_GFX:
+    if arch not in _MLA_REDUCE_GFX:
         raise ValueError(
-            f"flydsl_mla_reduce_v1 only supports {_MLA_REDUCE_GFX}, got {arch}"
+            "flydsl_mla_reduce_v1 supports gfx942; gfx950 is permitted but "
+            f"unvalidated; got {arch}"
         )
     _validate_actual_max_splits(actual_max_splits)
 
@@ -277,7 +278,7 @@ def flydsl_mla_reduce_v1(
     max_seqlen_q: int,
     final_output: torch.Tensor,  # bf16/fp16 [bs, H, Dv]
     final_lse: torch.Tensor | None = None,  # fp32 [bs, H] (optional)
-    num_kv_splits: int = 0,  # signature parity; grid derived from num_cu + CSR width
+    num_kv_splits: int = 0,  # HIP parity and split-K engagement budget
     actual_max_splits: int | None = None,  # true max tile width; gates DA split-K
     *,
     stream: torch.cuda.Stream | None = None,

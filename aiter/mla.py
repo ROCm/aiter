@@ -16,7 +16,7 @@ from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
-_FLYDSL_MLA_REDUCE_TARGET_GFX = "gfx942"
+_FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
 _FLYDSL_MLA_REDUCE_TARGET_DV = 512
 
@@ -34,39 +34,77 @@ def _flydsl_mla_reduce_available() -> bool:
 
 def _flydsl_mla_reduce_supported(
     partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
     final_output: torch.Tensor,
     max_seqlen_q: int,
     num_kv_splits: int,
 ) -> bool:
-    """Whether this production call is within the validated FlyDSL scope."""
-    if get_gfx() != _FLYDSL_MLA_REDUCE_TARGET_GFX or max_seqlen_q != 1:
-        return False
-    if not isinstance(partial_output, torch.Tensor) or not isinstance(
-        final_output, torch.Tensor
+    """Whether this production call is within the FlyDSL dispatch scope."""
+    if (
+        get_gfx() not in _FLYDSL_MLA_REDUCE_TARGET_GFX
+        or isinstance(max_seqlen_q, bool)
+        or max_seqlen_q != 1
     ):
         return False
-    if partial_output.ndim != 3 or final_output.ndim != 3:
+    tensors = (partial_output, partial_lse, final_output)
+    if not all(
+        isinstance(tensor, torch.Tensor) and tensor.is_contiguous()
+        for tensor in tensors
+    ):
+        return False
+    if (
+        partial_output.dtype != dtypes.fp32
+        or partial_lse.dtype != dtypes.fp32
+        or partial_output.device != final_output.device
+        or partial_lse.device != final_output.device
+    ):
+        return False
+    if partial_output.ndim == 4:
+        if (
+            partial_output.size(1) != 1
+            or partial_lse.ndim != 4
+            or tuple(partial_lse.shape)
+            != (
+                partial_output.size(0),
+                1,
+                partial_output.size(-2),
+                1,
+            )
+        ):
+            return False
+    elif partial_output.ndim == 3:
+        if partial_lse.ndim != 2 or tuple(partial_lse.shape) != (
+            partial_output.size(0),
+            partial_output.size(-2),
+        ):
+            return False
+    else:
+        return False
+    if final_output.ndim != 3:
         return False
     if (
         partial_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
-        or final_output.size(-2) != _FLYDSL_MLA_REDUCE_TARGET_H
-        or final_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
         or partial_output.size(-1) != _FLYDSL_MLA_REDUCE_TARGET_DV
+        or tuple(final_output.shape[1:])
+        != (_FLYDSL_MLA_REDUCE_TARGET_H, _FLYDSL_MLA_REDUCE_TARGET_DV)
     ):
         return False
     if final_output.dtype not in (dtypes.bf16, dtypes.fp16):
         return False
-    return isinstance(num_kv_splits, int) and (
-        num_kv_splits == 0 or num_kv_splits <= get_cu_num()
+    return (
+        isinstance(num_kv_splits, int)
+        and not isinstance(num_kv_splits, bool)
+        and (num_kv_splits == 0 or num_kv_splits <= get_cu_num())
     )
 
 
 def _flydsl_mla_reduce_enabled() -> bool:
-    """Opt-in gate for the FlyDSL MLA reduce fallback.
+    """Opt-in gate for the FlyDSL MLA reduce port.
 
     Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
     Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
-    Calls outside the validated gfx942 GLM decode scope retain the HIP path.
+    The validated scope is gfx942 H=16, Dv=512 single-token decode. Calls outside the
+    permitted ABI and shape scope use the HIP path.
     Not memoized, so the env var can be toggled at runtime; only the optional
     package availability probe above is cached.
     """
@@ -94,36 +132,41 @@ def _mla_reduce_v1_dispatch(
     final_output,
     final_lse,
 ):
-    """Dispatch the MLA decode reduce to HIP (default) or FlyDSL (opt-in).
+    """Dispatch MLA reduce to HIP (default) or FlyDSL (opt-in).
 
     Signature mirrors ``aiter.mla_reduce_v1`` (num_kv_splits at slot 7, between
     max_seqlen_q and final_output) so it is a drop-in swap. The HIP kernel uses
-    max(SM_count, num_kv_splits); 0 means "auto" (SM_count). The FlyDSL port
-    derives its grid from num_cu + CSR width, so it takes the arg for parity but
-    does not need it.
+    max(SM_count, num_kv_splits); 0 means "auto" (SM_count). FlyDSL derives its
+    regular launch grid from num_cu + CSR width and uses num_kv_splits as the
+    split-K engagement budget.
 
     The FlyDSL device-adaptive split-K gate (``actual_max_splits`` = the true
     ``max_t(n_splits)`` over active tiles) is resolved inside the FlyDSL wrapper
     from ``reduce_indptr`` via a capture-safe warmup cache, so this seam does not
     thread it. The HIP path ignores it entirely.
     """
-    if _flydsl_mla_reduce_enabled() and _flydsl_mla_reduce_supported(
-        partial_output, final_output, max_seqlen_q, num_kv_splits
-    ):
-        from aiter.ops.flydsl import flydsl_mla_reduce_v1
-
-        flydsl_mla_reduce_v1(
+    if _flydsl_mla_reduce_enabled():
+        if _flydsl_mla_reduce_supported(
             partial_output,
             partial_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
             final_output,
-            final_lse,
-            num_kv_splits=num_kv_splits,
-        )
-        return
+            max_seqlen_q,
+            num_kv_splits,
+        ):
+            from aiter.ops.flydsl import flydsl_mla_reduce_v1
+
+            flydsl_mla_reduce_v1(
+                partial_output.view(partial_output.size(0), *partial_output.shape[-2:]),
+                partial_lse.view(partial_lse.size(0), -1),
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                final_output,
+                final_lse,
+                num_kv_splits=num_kv_splits,
+            )
+            return
     aiter.mla_reduce_v1(
         partial_output,
         partial_lse,
