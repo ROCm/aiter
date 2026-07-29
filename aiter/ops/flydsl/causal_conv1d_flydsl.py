@@ -9,13 +9,13 @@ import torch
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, buffer_ops
+    from flydsl.expr import arith
     from flydsl.expr.typing import Int32, T
 
+    from aiter.ops.flydsl.kernels import buffer_ops
+
     _FLYDSL_AVAILABLE = True
-except (
-    Exception  # noqa: BLE001  blanket catch is intentional here
-):  # pragma: no cover - flydsl optional
+except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
     _FLYDSL_AVAILABLE = False
 
 
