@@ -1691,6 +1691,7 @@ namespace py = pybind11;
           py::arg("do_rotate_act") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
@@ -1721,12 +1722,16 @@ namespace py = pybind11;
           py::arg("hidden_dim"),                                                           \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_get_handle",                                                                 \
+          &aiter::qr_get_handle,                                                           \
+          "qr_get_handle(int fa, int out_ptr) -> ()",                                      \
+          py::arg("fa"),                                                                   \
+          py::arg("out_ptr"));                                                             \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs) -> ()",                              \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
