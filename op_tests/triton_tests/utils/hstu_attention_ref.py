@@ -90,7 +90,7 @@ def qkv_to_padded_dense(
     v: torch.Tensor,
     seq_offsets: torch.Tensor,
     N: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     L, H, DQ = q.shape
     DV = v.shape[2]
     padded_q = (

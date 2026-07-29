@@ -63,13 +63,13 @@ if is_flydsl_available():
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-        "flydsl_hstu_attention_fwd",
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
         "compute_varqlen_windows",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_hstu_attention_fwd",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
