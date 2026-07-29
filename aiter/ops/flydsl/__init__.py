@@ -39,6 +39,7 @@ if is_flydsl_available():
 
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
+    from .hstu_attention_kernels import flydsl_hstu_attention_fwd
     from .kernels.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
@@ -68,6 +69,7 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
+        "flydsl_hstu_attention_fwd",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
