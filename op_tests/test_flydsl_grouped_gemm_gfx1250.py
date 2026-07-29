@@ -36,7 +36,7 @@ import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
-from aiter.aot.flydsl.common import run_only_env  # noqa: E402
+from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -298,7 +298,7 @@ def _make_topk(
 
 def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
     """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU ``[g0,u0,g1,u1,...]``."""
-    E, two_inter = t.shape[:2]
+    _E, two_inter = t.shape[:2]
     inter = two_inter // 2
     g = t[:, :inter]
     u = t[:, inter:]

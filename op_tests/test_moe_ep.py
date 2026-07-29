@@ -207,8 +207,8 @@ def test_fmoe_ep(
 
         # b implement
         torch_quant = aiter.get_torch_quant(aiter.QuantType.No)
-        w1_qt, w1_scale = torch_quant(w1, quant_dtype=None)
-        w2_qt, w2_scale = torch_quant(w2, quant_dtype=None)
+        w1_qt, _w1_scale = torch_quant(w1, quant_dtype=None)
+        w2_qt, _w2_scale = torch_quant(w2, quant_dtype=None)
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
@@ -229,7 +229,7 @@ def test_fmoe_ep(
         #     )
 
         # test ck moe
-        out_ck, avg_ck = run_perftest(
+        out_ck, _avg_ck = run_perftest(
             fused_moe,
             input,
             w1_qt_aiter,
