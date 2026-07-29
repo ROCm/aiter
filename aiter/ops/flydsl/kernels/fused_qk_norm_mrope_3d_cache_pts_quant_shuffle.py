@@ -54,7 +54,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
-from .tensor_shim import GTensor, _run_compiled, ptr_arg
+from .tensor_shim import _run_compiled
 
 # --- fixed HW assumption: wave64 (gfx942 / gfx950 CDNA). gfx1250 is wave32
 # and needs a dedicated variant (mirrors qk_norm_rope_quant_gfx1250.py) --
@@ -132,15 +132,13 @@ def _build_q_kernel(
 
     @flyc.kernel(name=kname)
     def kernel(
-        qkv: fx.Pointer,  # [T, H_Q+H_K+H_V, D] bf16, contig
-        positions: fx.Pointer,  # [3, T] i64, arbitrary 2-D strides
-        cos_sin: fx.Pointer,  # [max_pos, D] bf16 (cos=[:, :D/2], sin=[:, D/2:])
-        q_norm_w: fx.Pointer,  # [D] bf16
-        q_out: fx.Pointer,  # [T, H_Q, D] bf16
+        qkv: fx.Tensor,  # [T, H_Q+H_K+H_V, D] bf16, contig
+        positions: fx.Tensor,  # [3, T] i64, arbitrary 2-D layout
+        cos_sin: fx.Tensor,  # [max_pos, D] bf16 (cos=[:, :D/2], sin=[:, D/2:])
+        q_norm_w: fx.Tensor,  # [D] bf16
+        q_out: fx.Tensor,  # [T, H_Q, D] bf16
         num_tokens: fx.Int32,
         token_offset: fx.Int32,
-        positions_stride_0: fx.Int32,
-        positions_stride_1: fx.Int32,
     ):
         # NOTE: helpers are nested inside the @flyc.kernel body, not sibling
         # functions in _build_q_kernel -- FlyDSL's AST rewriter (dynamic
@@ -194,17 +192,6 @@ def _build_q_kernel(
         tok = fx.Int32(bid_t) + token_offset
         tid = fx.thread_idx.x  # 0..WAVE-1
 
-        qkv_t = GTensor(qkv, dtype=fx.BFloat16, shape=(-1, H_Q + H_K + H_V, D))
-        positions_t = GTensor(
-            positions,
-            dtype=fx.Int64,
-            shape=(3, -1),
-            stride=(positions_stride_0, positions_stride_1),
-        )
-        cos_sin_t = GTensor(cos_sin, dtype=fx.BFloat16, shape=(1, D))
-        qw_t = GTensor(q_norm_w, dtype=fx.BFloat16, shape=(D,))
-        q_out_t = GTensor(q_out, dtype=fx.BFloat16, shape=(-1, H_Q, D))
-
         if const_expr(D == 64):
             # Both half-waves reproduce production's contiguous D/32
             # accumulation and XOR-by-16..1 reduction. Only the lower half
@@ -215,16 +202,16 @@ def _build_q_kernel(
             if tid < RMS_GROUP:
                 for i in range_constexpr(PROD_VEC_SIZE):
                     norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.Float32(qkv_t[tok, bid_x, norm_col])
+                    norm_x = fx.Float32(qkv[tok, bid_x, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
             if tid < HALF:
-                x0 = fx.Float32(qkv_t[tok, bid_x, tid])
-                x1 = fx.Float32(qkv_t[tok, bid_x, tid + HALF])
+                x0 = fx.Float32(qkv[tok, bid_x, tid])
+                x1 = fx.Float32(qkv[tok, bid_x, tid + HALF])
             sumsq = rms_reduce_add(sumsq_local, tid)
             rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
             if tid < HALF:
-                w0 = fx.Float32(qw_t[tid])
-                w1 = fx.Float32(qw_t[tid + HALF])
+                w0 = fx.Float32(q_norm_w[tid])
+                w1 = fx.Float32(q_norm_w[tid + HALF])
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
@@ -233,12 +220,11 @@ def _build_q_kernel(
                 # so values near an FP8 bin boundary follow the same path.
                 xn0 = (x0 * rstd * w0).to(fx.Float32)
                 xn1 = (x1 * rstd * w1).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(tid, tok, positions_t, cos_sin_t)
+                cos_v, sin_v = mrope_cos_sin(tid, tok, positions, cos_sin)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
-                q_out_d64_t = GTensor(q_out, dtype=fx.BFloat16, shape=(-1, H_Q, D))
-                q_out_d64_t[tok, bid_x, tid] = o0.to(fx.BFloat16)
-                q_out_d64_t[tok, bid_x, tid + HALF] = o1.to(fx.BFloat16)
+                q_out[tok, bid_x, tid] = o0.to(fx.BFloat16)
+                q_out[tok, bid_x, tid + HALF] = o1.to(fx.BFloat16)
         else:
             # ---- Pass 1: load this thread's VEC_PAIRS pairs, reduce sum-sq
             # over the full D-wide row via one wave butterfly. ----
@@ -247,12 +233,12 @@ def _build_q_kernel(
             if tid < RMS_GROUP:
                 for i in range_constexpr(PROD_VEC_SIZE):
                     norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.Float32(qkv_t[tok, bid_x, norm_col])
+                    norm_x = fx.Float32(qkv[tok, bid_x, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
-                x0 = fx.Float32(qkv_t[tok, bid_x, col])
-                x1 = fx.Float32(qkv_t[tok, bid_x, col + HALF])
+                x0 = fx.Float32(qkv[tok, bid_x, col])
+                x1 = fx.Float32(qkv[tok, bid_x, col + HALF])
                 x0s.append(x0)
                 x1s.append(x1)
             sumsq = rms_reduce_add(sumsq_local, tid)
@@ -261,8 +247,8 @@ def _build_q_kernel(
             # ---- Pass 2: per-pair weight + RoPE + store. ----
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
-                w0 = fx.Float32(qw_t[col])
-                w1 = fx.Float32(qw_t[col + HALF])
+                w0 = fx.Float32(q_norm_w[col])
+                w1 = fx.Float32(q_norm_w[col + HALF])
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
@@ -270,25 +256,34 @@ def _build_q_kernel(
                 # kernel before the fp32 RoPE arithmetic.
                 xn0 = (x0s[k] * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                 xn1 = (x1s[k] * rstd * w1).to(fx.BFloat16).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(col, tok, positions_t, cos_sin_t)
+                cos_v, sin_v = mrope_cos_sin(col, tok, positions, cos_sin)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
-                q_out_t[tok, bid_x, col] = o0.to(fx.BFloat16)
-                q_out_t[tok, bid_x, col + HALF] = o1.to(fx.BFloat16)
+                q_out[tok, bid_x, col] = o0.to(fx.BFloat16)
+                q_out[tok, bid_x, col + HALF] = o1.to(fx.BFloat16)
 
     @flyc.jit
     def launch(
-        qkv: fx.Pointer,
-        positions: fx.Pointer,
-        cos_sin: fx.Pointer,
-        q_norm_w: fx.Pointer,
-        q_out: fx.Pointer,
+        qkv: fx.Tensor,
+        positions_storage: fx.Tensor,
+        cos_sin: fx.Tensor,
+        q_norm_w: fx.Tensor,
+        q_out: fx.Tensor,
         num_tokens: fx.Int32,
         token_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
         stream: fx.Stream,
     ):
+        positions = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(positions_storage),
+                fx.make_layout(
+                    (3, num_tokens + token_offset),
+                    (positions_stride_0, positions_stride_1),
+                ),
+            )
+        )
         k = kernel(
             qkv,
             positions,
@@ -297,8 +292,6 @@ def _build_q_kernel(
             q_out,
             num_tokens,
             token_offset,
-            positions_stride_0,
-            positions_stride_1,
         )
         k.launch(
             grid=(H_Q, fx.Int64(num_tokens), 1),
@@ -368,21 +361,19 @@ def _build_kv_kernel(
 
     @flyc.kernel(name=kname, known_block_size=[KV_THREADS, 1, 1])
     def kernel(
-        qkv: fx.Pointer,  # [T, H_Q+H_K+H_V, D] bf16, contig
-        positions: fx.Pointer,  # [3, T] i64, contig (flat mid*T + tok)
-        cos_sin: fx.Pointer,  # [max_pos, D] bf16
-        k_norm_w: fx.Pointer,  # [D] bf16
-        k_cache: fx.Pointer,  # typed shuffle-layout FP8 or bf16 K cache
-        v_cache: fx.Pointer,  # typed shuffle-layout FP8 or bf16 V cache
-        slot_mapping: fx.Pointer,  # [T] i64
-        k_scale_ptr: fx.Pointer,  # [1] f32 (per-tensor scale; no host sync)
-        v_scale_ptr: fx.Pointer,  # [1] f32
-        k_out: fx.Pointer,  # [T, H_K, D] cache dtype (dummy unless emit_flat_kv)
-        v_out: fx.Pointer,  # [T, H_V, D] cache dtype (dummy unless emit_flat_kv)
+        qkv: fx.Tensor,  # [T, H_Q+H_K+H_V, D] bf16, contig
+        positions: fx.Tensor,  # [3, T] i64, arbitrary 2-D layout
+        cos_sin: fx.Tensor,  # [max_pos, D] bf16
+        k_norm_w: fx.Tensor,  # [D] bf16
+        k_cache: fx.Tensor,  # typed shuffle-layout FP8 or bf16 K cache
+        v_cache: fx.Tensor,  # typed shuffle-layout FP8 or bf16 V cache
+        slot_mapping: fx.Tensor,  # [T] i64
+        k_scale: fx.Tensor,  # [1] f32 (per-tensor scale; no host sync)
+        v_scale: fx.Tensor,  # [1] f32
+        k_out: fx.Tensor,  # [T, H_K, D] cache dtype (dummy unless emit_flat_kv)
+        v_out: fx.Tensor,  # [T, H_V, D] cache dtype (dummy unless emit_flat_kv)
         num_tokens: fx.Int32,
         page_block_offset: fx.Int32,
-        positions_stride_0: fx.Int32,
-        positions_stride_1: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
         layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
@@ -455,21 +446,9 @@ def _build_kv_kernel(
         blk = fx.block_idx.y  # page-block index (contiguous-slot assumption)
         t = fx.thread_idx.x  # 0..KV_THREADS-1
 
-        qkv_t = GTensor(qkv, dtype=fx.BFloat16, shape=(-1, H_Q + 2 * H_KV, D))
-        positions_t = GTensor(
-            positions,
-            dtype=fx.Int64,
-            shape=(3, -1),
-            stride=(positions_stride_0, positions_stride_1),
-        )
-        cos_sin_t = GTensor(cos_sin, dtype=fx.BFloat16, shape=(1, D))
-        kw_t = GTensor(k_norm_w, dtype=fx.BFloat16, shape=(D,))
-        slot_t = GTensor(slot_mapping, dtype=fx.Int64, shape=(-1,))
         if const_expr(cache_is_fp8):
-            kscale_t = GTensor(k_scale_ptr, dtype=fx.Float32, shape=(1,))
-            vscale_t = GTensor(v_scale_ptr, dtype=fx.Float32, shape=(1,))
-            k_scale = fx.Float32(kscale_t[0])
-            v_scale = fx.Float32(vscale_t[0])
+            k_scale_value = fx.Float32(k_scale[0])
+            v_scale_value = fx.Float32(v_scale[0])
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_lds = lds.k_lds
         v_lds = lds.v_lds
@@ -515,15 +494,15 @@ def _build_kv_kernel(
                     if lane < RMS_GROUP:
                         for i in range_constexpr(PROD_VEC_SIZE):
                             norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
-                            norm_x = fx.Float32(qkv_t[tok, H_Q + head, norm_col])
+                            norm_x = fx.Float32(qkv[tok, H_Q + head, norm_col])
                             sumsq_local = sumsq_local + norm_x * norm_x
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         k0 = fx.Float32(0.0)
                         k1 = fx.Float32(0.0)
                         if col < HALF:
-                            k0 = fx.Float32(qkv_t[tok, H_Q + head, col])
-                            k1 = fx.Float32(qkv_t[tok, H_Q + head, col + HALF])
+                            k0 = fx.Float32(qkv[tok, H_Q + head, col])
+                            k1 = fx.Float32(qkv[tok, H_Q + head, col + HALF])
                         k0s.append(k0)
                         k1s.append(k1)
                     sumsq = rms_reduce_add(sumsq_local, lane)
@@ -532,8 +511,8 @@ def _build_kv_kernel(
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         if col < HALF:
-                            w0 = fx.Float32(kw_t[col])
-                            w1 = fx.Float32(kw_t[col + HALF])
+                            w0 = fx.Float32(k_norm_w[col])
+                            w1 = fx.Float32(k_norm_w[col + HALF])
                             if const_expr(gemma_norm):
                                 w0 = w0 + fx.Float32(1.0)
                                 w1 = w1 + fx.Float32(1.0)
@@ -546,7 +525,7 @@ def _build_kv_kernel(
                                 fx.Float32
                             )
                             cos_v, sin_v = mrope_cos_sin(
-                                col, tok, positions_t, cos_sin_t
+                                col, tok, positions, cos_sin
                             )
                             o0 = xn0 * cos_v - xn1 * sin_v
                             o1 = xn1 * cos_v + xn0 * sin_v
@@ -555,56 +534,36 @@ def _build_kv_kernel(
                                 # before converting that vector to FP8.
                                 o0 = o0.to(fx.BFloat16).to(fx.Float32)
                                 o1 = o1.to(fx.BFloat16).to(fx.Float32)
-                                kb0, kb1 = quant_pair_fp8(o0, o1, k_scale)
+                                kb0, kb1 = quant_pair_fp8(o0, o1, k_scale_value)
                             else:
                                 kb0 = o0.to(fx.BFloat16)
                                 kb1 = o1.to(fx.BFloat16)
                             k_lds_view[token_local, col] = kb0
                             k_lds_view[token_local, col + HALF] = kb1
                             if const_expr(emit_flat_kv):
-                                slot = fx.Int64(slot_t[tok])
+                                slot = fx.Int64(slot_mapping[tok])
                                 if slot >= fx.Int64(0):
-                                    if const_expr(cache_is_fp8):
-                                        k_out_t = GTensor(
-                                            k_out, dtype=fx.Int8, shape=(-1, H_KV, D)
-                                        )
-                                    else:
-                                        k_out_t = GTensor(
-                                            k_out,
-                                            dtype=fx.BFloat16,
-                                            shape=(-1, H_KV, D),
-                                        )
-                                    k_out_t[tok, head, col] = kb0
-                                    k_out_t[tok, head, col + HALF] = kb1
+                                    k_out[tok, head, col] = kb0
+                                    k_out[tok, head, col + HALF] = kb1
 
                     # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
                     for p in range_constexpr(VEC_PAIRS):
                         col = fx.Int32(lane) + WAVE * p
                         if col < HALF:
-                            v0 = fx.Float32(qkv_t[tok, H_Q + H_KV + head, col])
-                            v1 = fx.Float32(qkv_t[tok, H_Q + H_KV + head, col + HALF])
+                            v0 = fx.Float32(qkv[tok, H_Q + H_KV + head, col])
+                            v1 = fx.Float32(qkv[tok, H_Q + H_KV + head, col + HALF])
                             if const_expr(cache_is_fp8):
-                                vb0, vb1 = quant_pair_fp8(v0, v1, v_scale)
+                                vb0, vb1 = quant_pair_fp8(v0, v1, v_scale_value)
                             else:
                                 vb0 = v0.to(fx.BFloat16)
                                 vb1 = v1.to(fx.BFloat16)
                             v_lds_view[token_local, col] = vb0
                             v_lds_view[token_local, col + HALF] = vb1
                             if const_expr(emit_flat_kv):
-                                slot = fx.Int64(slot_t[tok])
+                                slot = fx.Int64(slot_mapping[tok])
                                 if slot >= fx.Int64(0):
-                                    if const_expr(cache_is_fp8):
-                                        v_out_t = GTensor(
-                                            v_out, dtype=fx.Int8, shape=(-1, H_KV, D)
-                                        )
-                                    else:
-                                        v_out_t = GTensor(
-                                            v_out,
-                                            dtype=fx.BFloat16,
-                                            shape=(-1, H_KV, D),
-                                        )
-                                    v_out_t[tok, head, col] = vb0
-                                    v_out_t[tok, head, col + HALF] = vb1
+                                    v_out[tok, head, col] = vb0
+                                    v_out[tok, head, col + HALF] = vb1
                 else:
                     # Tail page-block padding row: no real token here (would
                     # be OOB on qkv/positions, and on k_out/v_out which are
@@ -623,7 +582,7 @@ def _build_kv_kernel(
         # block barriers. For block_size > WAVE, each lane checks multiple slots.
         mapping_valid = fx.Int32(1)
         if wid == 0:
-            base_slot = fx.Int64(slot_t[tok0])
+            base_slot = fx.Int64(slot_mapping[tok0])
             full_page = tok0 + block_size <= num_tokens
             page_aligned = (base_slot % fx.Int64(block_size)) == fx.Int64(0)
             for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
@@ -631,7 +590,7 @@ def _build_kv_kernel(
                 if token_local < block_size:
                     tok = tok0 + fx.Int32(token_local)
                     if tok < num_tokens:
-                        slot = fx.Int64(slot_t[tok])
+                        slot = fx.Int64(slot_mapping[tok])
                         expected = base_slot + fx.Int64(token_local)
                         valid = (
                             full_page
@@ -655,11 +614,15 @@ def _build_kv_kernel(
 
         if can_coalesce:
             # ---------------- Phase 2a: K coalesced write ----------------
-            block_id = fx.Int64(slot_t[tok0]) // fx.Int64(block_size)
+            block_id = fx.Int64(slot_mapping[tok0]) // fx.Int64(block_size)
             k_block_base = block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
             v_block_base = block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
-            k_cache_block = (k_cache + k_block_base).view(layout_k_cache)
-            v_cache_block = (v_cache + v_block_base).view(layout_v_cache)
+            k_cache_block = fx.Tensor(
+                fx.make_view(fx.get_iter(k_cache) + k_block_base, layout_k_cache)
+            )
+            v_cache_block = fx.Tensor(
+                fx.make_view(fx.get_iter(v_cache) + v_block_base, layout_v_cache)
+            )
             k_lds_runs = k_lds.ptr.view(layout_stage_runs)
             for it in range_constexpr(K_ITERS):
                 r = t + KV_THREADS * it
@@ -700,7 +663,7 @@ def _build_kv_kernel(
                     d = fx.get(coord_stage, 1)
                     tok = tok0 + fx.Int32(token_local)
                     if tok < num_tokens:
-                        slot = fx.Int64(slot_t[tok])
+                        slot = fx.Int64(slot_mapping[tok])
                         if slot >= fx.Int64(0):
                             block_id = slot // fx.Int64(block_size)
                             block_off = slot % fx.Int64(block_size)
@@ -710,11 +673,15 @@ def _build_kv_kernel(
                             v_block_base = block_id * fx.Int64(
                                 _v_per_block(D, block_size, x, H_KV)
                             )
-                            k_cache_block = (k_cache + k_block_base).view(
-                                layout_k_cache
+                            k_cache_block = fx.Tensor(
+                                fx.make_view(
+                                    fx.get_iter(k_cache) + k_block_base, layout_k_cache
+                                )
                             )
-                            v_cache_block = (v_cache + v_block_base).view(
-                                layout_v_cache
+                            v_cache_block = fx.Tensor(
+                                fx.make_view(
+                                    fx.get_iter(v_cache) + v_block_base, layout_v_cache
+                                )
                             )
                             k_cache_block[head, d // x, block_off, d % x] = k_lds_view[
                                 token_local, d
@@ -725,17 +692,17 @@ def _build_kv_kernel(
 
     @flyc.jit
     def launch(
-        qkv: fx.Pointer,
-        positions: fx.Pointer,
-        cos_sin: fx.Pointer,
-        k_norm_w: fx.Pointer,
-        k_cache: fx.Pointer,
-        v_cache: fx.Pointer,
-        slot_mapping: fx.Pointer,
-        k_scale_ptr: fx.Pointer,
-        v_scale_ptr: fx.Pointer,
-        k_out: fx.Pointer,
-        v_out: fx.Pointer,
+        qkv: fx.Tensor,
+        positions_storage: fx.Tensor,
+        cos_sin: fx.Tensor,
+        k_norm_w: fx.Tensor,
+        k_cache: fx.Tensor,
+        v_cache: fx.Tensor,
+        slot_mapping: fx.Tensor,
+        k_scale: fx.Tensor,
+        v_scale: fx.Tensor,
+        k_out: fx.Tensor,
+        v_out: fx.Tensor,
         num_tokens: fx.Int32,
         num_page_blocks: fx.Int32,
         page_block_offset: fx.Int32,
@@ -743,6 +710,14 @@ def _build_kv_kernel(
         positions_stride_1: fx.Int32,
         stream: fx.Stream,
     ):
+        positions = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(positions_storage),
+                fx.make_layout(
+                    (3, num_tokens), (positions_stride_0, positions_stride_1)
+                ),
+            )
+        )
         k = kernel(
             qkv,
             positions,
@@ -751,14 +726,12 @@ def _build_kv_kernel(
             k_cache,
             v_cache,
             slot_mapping,
-            k_scale_ptr,
-            v_scale_ptr,
+            k_scale,
+            v_scale,
             k_out,
             v_out,
             num_tokens,
             page_block_offset,
-            positions_stride_0,
-            positions_stride_1,
         )
         k.launch(
             grid=(H_KV, fx.Int64(num_page_blocks), 1),
@@ -1092,10 +1065,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         stream = torch.cuda.current_stream()
     fx_stream = fx.Stream(stream)
 
-    def _cache_ptr(t):
-        elem_type = fx.Int8 if cache_is_fp8 else fx.BFloat16
-        return flyc.from_c_void_p(elem_type, t.data_ptr())
-
     q_launch = _compile_q(
         num_heads_q=H_Q,
         num_heads_k=H_K,
@@ -1106,17 +1075,27 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
     )
+    # FlyDSL cannot auto-adapt a layout-dynamic tensor when none of its axes
+    # has unit stride (for example positions_storage[:, ::2]). Pass a
+    # unit-stride view of the same storage and reconstruct the original 2-D
+    # layout in the JIT launchers without copying.
+    positions_storage_elems = (
+        positions.untyped_storage().nbytes() // positions.element_size()
+        - positions.storage_offset()
+    )
+    positions_storage = positions.as_strided((positions_storage_elems,), (1,))
     positions_stride_0 = positions.stride(0)
     positions_stride_1 = positions.stride(1)
+    q_out_view = q_out.view(num_tokens, H_Q, D)
     for token_offset in range(0, num_tokens, _MAX_GRID_Y):
         chunk_tokens = min(_MAX_GRID_Y, num_tokens - token_offset)
         _run_compiled(
             q_launch,
-            ptr_arg(qkv_flat),
-            ptr_arg(positions),
-            ptr_arg(cos_sin),
-            ptr_arg(qw),
-            ptr_arg(q_out),
+            qkv_flat,
+            positions_storage,
+            cos_sin,
+            qw,
+            q_out_view,
             chunk_tokens,
             token_offset,
             positions_stride_0,
@@ -1143,23 +1122,31 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     # `tok < num_tokens` and zero-fills the corresponding LDS staging rows
     # for the out-of-range tail positions (see _build_kv_kernel).
     num_page_blocks = _ceil_div(num_tokens, block_size)
-    k_out_arg = k_out if return_kv else k_cache.new_empty(1)
-    v_out_arg = v_out if return_kv else v_cache.new_empty(1)
+    k_out_arg = (
+        k_out.view(num_tokens, H_K, D)
+        if return_kv
+        else k_cache.new_empty((1, 1, 1))
+    )
+    v_out_arg = (
+        v_out.view(num_tokens, H_V, D)
+        if return_kv
+        else v_cache.new_empty((1, 1, 1))
+    )
     for page_block_offset in range(0, num_page_blocks, _MAX_GRID_Y):
         chunk_page_blocks = min(_MAX_GRID_Y, num_page_blocks - page_block_offset)
         _run_compiled(
             kv_launch,
-            ptr_arg(qkv_flat),
-            ptr_arg(positions),
-            ptr_arg(cos_sin),
-            ptr_arg(kw),
-            _cache_ptr(k_cache),
-            _cache_ptr(v_cache),
-            ptr_arg(slot_mapping),
-            ptr_arg(per_tensor_k_scale),
-            ptr_arg(per_tensor_v_scale),
-            _cache_ptr(k_out_arg),
-            _cache_ptr(v_out_arg),
+            qkv_flat,
+            positions_storage,
+            cos_sin,
+            kw,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            per_tensor_k_scale.reshape(1),
+            per_tensor_v_scale.reshape(1),
+            k_out_arg,
+            v_out_arg,
             num_tokens,
             chunk_page_blocks,
             page_block_offset,
