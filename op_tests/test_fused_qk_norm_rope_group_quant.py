@@ -47,7 +47,7 @@ try:
     from aiter.ops.flydsl import flydsl_qk_norm_rope_quant
 
     _FLYDSL_IMPORT_ERROR = None
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     flydsl_qk_norm_rope_quant = None
     _FLYDSL_IMPORT_ERROR = e
 
@@ -335,7 +335,7 @@ def test_fused_qk_norm_rope_group_quant(
                 quant_group_size=(G if q_fp8 else None),
                 scale_dtype=("e8m0" if q_fp8 else "fp32"),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             fly_us = float("nan")
 
     # --- Bandwidth (effective): read q+kv+kw, write Q + K (nope+scale+rope) ---
@@ -350,14 +350,18 @@ def test_fused_qk_norm_rope_group_quant(
         T * NK * (nope + 2 * n_groups_k) + T * NK * RD * 2
     )  # K nope+scale + K rope bf16
     gbps = (bytes_in + bytes_out) / (us * 1e-6) / 1e9
-    ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
+    ratio = (
+        (us / fly_us)
+        if fly_us == fly_us and fly_us > 0  # noqa: PLR0124
+        else float("nan")
+    )
 
     # Only metrics here; the @benchmark decorator already echoes the call args
     # (T, H, D, RD, is_neox, q_fp8, G, NK, ...) as columns.
     return {
         "hip_us": round(us, 3),
-        "flydsl_us": (round(fly_us, 3) if fly_us == fly_us else None),
-        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),
+        "flydsl_us": (round(fly_us, 3) if fly_us == fly_us else None),  # noqa: PLR0124
+        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
         "GB/s": round(gbps, 0),
         "%peak": round(gbps / _PEAK_BW_GBPS * 100, 1),
         "err_q": err_q,
@@ -574,14 +578,20 @@ def test_fused_qk_norm_rope_group_quant_swa(T, H, D, RD, *, is_neox, q_fp8, G, G
                 swa_block_tables=swa_block_tables,
                 swa_block_size=block_size,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             fly_us = float("nan")
-    ratio = (us / fly_us) if fly_us == fly_us and fly_us > 0 else float("nan")
+    ratio = (
+        (us / fly_us)
+        if fly_us == fly_us and fly_us > 0  # noqa: PLR0124
+        else float("nan")
+    )
 
     return {
         "hip_us": round(us, 3),
-        "flydsl_bf16_us": (round(fly_us, 3) if fly_us == fly_us else None),
-        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),
+        "flydsl_bf16_us": (
+            round(fly_us, 3) if fly_us == fly_us else None  # noqa: PLR0124
+        ),
+        "hip/flydsl": (round(ratio, 3) if ratio == ratio else None),  # noqa: PLR0124
         "bs": bs,
         "num_phys_blocks": num_phys_blocks,
         "n_pad": n_pad,

@@ -2,23 +2,24 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
 from dataclasses import dataclass, fields
+
 import pytest
 import torch
-
-# Routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
-
-# SmoothQuant quantization utilities
-from aiter.ops.triton.moe.quant_moe import (
-    smoothquant_quantize,
-    quantize_weights_int8,
-)
 
 # SmoothQuant MoE utilities
 from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
     moe_gemm_int8_smoothquant,
     moe_gemm_smoothquant_torch,
     preshuffle_weights,
+)
+
+# Routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
+
+# SmoothQuant quantization utilities
+from aiter.ops.triton.moe.quant_moe import (
+    quantize_weights_int8,
+    smoothquant_quantize,
 )
 
 # ---------------
@@ -131,21 +132,17 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)

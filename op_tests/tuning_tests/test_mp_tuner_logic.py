@@ -77,7 +77,7 @@ def simulate_poll_round(remaining_tasks, task_start_times, mp_num, timeout):
                 else:
                     consecutive_timeouts = 0
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error_type = type(e).__name__
             is_mapping_error = error_type == "KeyError"
 
@@ -109,7 +109,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Should NOT break early with interleaved success")
@@ -130,7 +130,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "Should break after 4 consecutive timeouts (half of 8)")
@@ -153,7 +153,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Should NOT break: success at task 3 resets counter")
@@ -171,7 +171,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, _restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "2 GPUs: half=1, first timeout should break")
@@ -193,7 +193,7 @@ class TestConsecutiveTimeouts(unittest.TestCase):
             2: now - 200,
         }
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, _restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(broke, "Pending task resets consecutive, so no break")
@@ -213,7 +213,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         completed_ids = {k for k, _ in completed}
@@ -233,7 +233,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now - 10 for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         completed_ids = {k for k, _ in completed}
@@ -258,7 +258,7 @@ class TestKeyErrorHandling(unittest.TestCase):
         ]
         start_times = {k: now for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, dummy, restart, _broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertFalse(restart, "No restart without root cause")
@@ -280,7 +280,7 @@ class TestAcceleratorError(unittest.TestCase):
         ]
         start_times = {k: now for k, _ in remaining}
 
-        completed, dummy, restart, broke = simulate_poll_round(
+        completed, _dummy, restart, broke = simulate_poll_round(
             remaining, start_times, mp_num, timeout
         )
         self.assertTrue(broke, "AcceleratorError should break")

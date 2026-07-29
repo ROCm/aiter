@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
-from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
-    fused_gemm_a8w8_blockscale_split_cat,
-    fused_gemm_a8w8_blockscale_preshuffle_split_cat,
-)
-
-from aiter.ops.triton.utils.types import str_to_torch_dtype, get_fp8_dtypes
+import torch
 import torch.nn.functional as F
 
 from aiter.ops.shuffle import shuffle_weight
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.gemm.fused.fused_gemm_a8w8_blockscale_split_cat import (
+    fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+    fused_gemm_a8w8_blockscale_split_cat,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)
 DEVICE_ARCH = arch_info.get_arch()
@@ -180,11 +179,10 @@ def test_fused_gemm_a8w8_blockscale_split_cat(dtype, M, N, K, D, S3, layout, imp
         )
     if N % D != 0:
         pytest.skip("N must be divisible by D as N = D * (S1 + S2)")
-    if impl == "triton_shuffle":
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if impl == "triton_shuffle" and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     # deconstruct N
     S = N // D
