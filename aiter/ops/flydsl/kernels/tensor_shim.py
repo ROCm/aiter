@@ -11,8 +11,10 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl.expr import arith, buffer_ops, ptrtoint, range_constexpr, vector
+from flydsl.expr import arith, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
