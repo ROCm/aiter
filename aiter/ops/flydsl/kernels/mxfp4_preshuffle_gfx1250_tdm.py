@@ -148,7 +148,16 @@ def launch_gemm_a8w4_tdm(
     PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
 
     out_elem = T.f16 if out_is_f16 else T.bf16
-    C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
+    C_ROW_BYTES = tile_n * 2
+    C_LDS_ROW_BYTES = ((C_ROW_BYTES + 15) // 16) * 16
+    if C_LDS_ROW_BYTES % 32 == 0:
+        C_LDS_ROW_BYTES += 16
+    C_LDS_PAD_ELEMS = (
+        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if ep_tdm_gather else 0
+    )
+    C_STORE_B = (
+        (tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128
+    ) * 128
     ARENA_B = max(num_buffers * PITCH, C_STORE_B)
 
     # Quant epilogue compile-time constants.
@@ -487,6 +496,7 @@ def launch_gemm_a8w4_tdm(
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             pipeline_fence(outstanding=0)
             STORE_N = (tile_n // 2) if stage1_act else tile_n
+            LDS_STORE_N = STORE_N + C_LDS_PAD_ELEMS
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
@@ -598,7 +608,7 @@ def launch_gemm_a8w4_tdm(
                                 ).to(oc)
                             else:
                                 hv = Vec.from_elements([acc[i] for i in range_constexpr(8)], fx.Float32).to(oc)
-                            lds_store_b128_raw(stC_idx, (row_rel * STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
+                            lds_store_b128_raw(stC_idx, (row_rel * LDS_STORE_N + col_rel) * 2, hv.bitcast(fx.Int32).ir_value())
 
             # -- Shared LDS -> global --
             workgroup_barrier()
@@ -659,13 +669,13 @@ def launch_gemm_a8w4_tdm(
                             global_addr_i64=_base0,
                             lds_base_idx=stC_idx,
                             row_indices=row_indices,
-                            row_width=STORE_N,
-                            tensor_dim0=_stride_elems,
+                            row_width=LDS_STORE_N,
+                            tensor_dim0=STORE_N,
                             tensor_dim1=_oob,
                             stride=_stride_elems,
                             elem_bytes=elem_bytes,
                             index_size=32,
-                            lds_byte_offset=base_row * STORE_N * elem_bytes,
+                            lds_byte_offset=base_row * LDS_STORE_N * elem_bytes,
                             global_byte_offset=_gboff,
                         )
                         tensor_store_gather(desc)
