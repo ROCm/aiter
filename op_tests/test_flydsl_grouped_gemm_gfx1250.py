@@ -25,16 +25,15 @@ per-kernel bench that times gemm1 and gemm2 in isolation
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
 import os
 import sys
-from typing import Optional
+from contextlib import nullcontext
 
 import pytest
 import torch
 
 from aiter import ActivationType, QuantType, logger
-from aiter.aot.flydsl.common import run_only_env  # noqa: E402
+from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
     fused_moe,
     fused_topk,
@@ -43,9 +42,8 @@ from aiter.fused_moe import (
 )
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.quant import per_1x32_f4_quant
-from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
-from aiter.utility import fp4_utils
-from aiter.utility import dtypes
+from aiter.ops.shuffle import moe_shuffle_scale, moe_shuffle_weight
+from aiter.utility import dtypes, fp4_utils
 
 # Build every tensor straight on the device (like op_tests/test_moe_2stage.py) so
 # the test body has no `.cuda()` / `.float().cuda()` plumbing.
@@ -58,6 +56,21 @@ pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 AITER_MOE_EXPERT_BALANCE = (
     os.environ.get("AITER_MOE_EXPERT_BALANCE", "False").lower() == "true"
 )
+
+
+# Force topk to activate only the first n experts (ids 0..n-1). 0 = unset.
+# Takes precedence over AITER_MOE_EXPERT_BALANCE when set (> 0).
+def parse_num_expert_activated():
+    try:
+        val = int(os.environ.get("AITER_MOE_NUM_EXPERT_ACTIVATED", "0"))
+    except ValueError:
+        raise ValueError("AITER_MOE_NUM_EXPERT_ACTIVATED must be an integer")
+    if val < 0:
+        raise ValueError(f"AITER_MOE_NUM_EXPERT_ACTIVATED must be >= 0, got {val}")
+    return val
+
+
+AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
@@ -80,7 +93,7 @@ def _require_gfx1250() -> None:
         return
     try:
         from flydsl.runtime.device import get_rocm_arch
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         pytest.skip(f"FlyDSL not importable: {exc}")
     arch = get_rocm_arch()
     if "gfx1250" not in arch.lower():
@@ -95,7 +108,7 @@ def is_gfx1250() -> bool:
         from flydsl.runtime.device import get_rocm_arch
 
         return "gfx1250" in get_rocm_arch().lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -126,6 +139,8 @@ def _torch_moe_ref(
     data_format: str,
     activation: ActivationType,
     swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> torch.Tensor:
     """Two-stage MoE reference reusing ``aiter.fused_moe.torch_moe_stage{1,2}``."""
     if data_format not in ("a4w4", "a8w4"):
@@ -176,6 +191,8 @@ def _torch_moe_ref(
         # FlyDSL epilogue now applies it in either branch, so the reference
         # passes it through unconditionally to stay in sync.
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     if data_format == "a4w4":
         # Match the grouped a4w4 path again: stage2 input is MXFP4.
@@ -213,7 +230,7 @@ def _torch_moe_ref(
 # Mock data builders
 # ---------------------------------------------------------------------------
 def _pattern_packed(
-    experts: int, rows: int, k_pack: int, *, const_init: Optional[float] = None
+    experts: int, rows: int, k_pack: int, *, const_init: float | None = None
 ) -> torch.Tensor:
     """mxfp4 packed bytes ``(E, rows, k_pack) uint8`` from the global RNG."""
     if const_init is not None:
@@ -222,7 +239,7 @@ def _pattern_packed(
 
 
 def init_weight_scales(
-    experts: int, rows: int, n_blocks: int, *, const_init: Optional[float] = None
+    experts: int, rows: int, n_blocks: int, *, const_init: float | None = None
 ) -> torch.Tensor:
     """Per-block e8m0 weight scale: random small scales (drawn from the global
     RNG) so the n32k4 B-scale preshuffle layout is actually exercised."""
@@ -232,15 +249,25 @@ def init_weight_scales(
     return (r + (DEFAULT_SCALE_BYTE - 1)).to(torch.uint8)
 
 
-def _make_topk(
-    hidden_states: torch.Tensor, experts: int, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Route via ``fused_topk``: normal (random gating) by default; round-robin
-    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
-    op_tests/test_moe_2stage.py). Returns ``(topk_ids, topk_weights)`` on the
-    same device as ``hidden_states``."""
-    tokens = hidden_states.shape[0]
-    if AITER_MOE_EXPERT_BALANCE:
+def _make_routing_score(tokens: int, experts: int, topk: int) -> torch.Tensor:
+    """Build the ``(tokens, experts)`` gating score honoring the routing env
+    controls: ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest priority) activates
+    n randomly-chosen experts (round-robin balanced); ``AITER_MOE_EXPERT_BALANCE``
+    round-robins over all experts; otherwise random gating. Shared by the FlyDSL
+    (``_make_topk``) and gluon routing paths so both react to the same env."""
+    if AITER_MOE_NUM_EXPERT_ACTIVATED > 0:
+        n_act = AITER_MOE_NUM_EXPERT_ACTIVATED
+        if n_act < topk or n_act > experts or n_act > tokens * topk:
+            raise ValueError(
+                f"AITER_MOE_NUM_EXPERT_ACTIVATED={n_act} is invalid: must be in "
+                f"[topk={topk}, min(experts={experts}, tokens*topk={tokens * topk})]"
+            )
+        sel = torch.randperm(experts)[:n_act]  # random active expert ids
+        score = torch.full((tokens, experts), float("-inf"), dtype=torch.float32)
+        slot = torch.arange(tokens * topk) % n_act  # round-robin over active set
+        rows = torch.arange(tokens).repeat_interleave(topk)
+        score[rows, sel[slot]] = 1.0
+    elif AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((tokens, experts), dtype=torch.float32)
         start_col, end_col = 0, topk
         for token_id in range(tokens):
@@ -249,13 +276,26 @@ def _make_topk(
             end_col = start_col + topk
     else:
         score = torch.randn((tokens, experts), dtype=torch.float32)
+    return score
+
+
+def _make_topk(
+    hidden_states: torch.Tensor, experts: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Route via ``fused_topk``: normal (random gating) by default; round-robin
+    balanced gating when ``AITER_MOE_EXPERT_BALANCE=1`` (mirrors
+    op_tests/test_moe_2stage.py). ``AITER_MOE_NUM_EXPERT_ACTIVATED=n`` (highest
+    priority) restricts topk to the first n experts. Returns
+    ``(topk_ids, topk_weights)`` on the same device as ``hidden_states``."""
+    tokens = hidden_states.shape[0]
+    score = _make_routing_score(tokens, experts, topk)
     topk_w, topk_id = fused_topk(hidden_states, score, topk, True)
     return topk_id.to(torch.int32), topk_w
 
 
 def _gguu_to_gugu_rows(t: torch.Tensor) -> torch.Tensor:
     """``(E, 2*I, ...)`` GGUU ``[g0..g_{I-1}, u0..u_{I-1}]`` -> GUGU ``[g0,u0,g1,u1,...]``."""
-    E, two_inter = t.shape[:2]
+    _E, two_inter = t.shape[:2]
     inter = two_inter // 2
     g = t[:, :inter]
     u = t[:, inter:]
@@ -276,14 +316,16 @@ def _run_grouped_via_fused_moe(
     layout: str = "gguu",  # "gguu" -> SEPARATED | "gugu" -> INTERLEAVE
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     use_bias: bool = True,
     bench: bool = False,
     kernel_bench: bool = False,
     seed: int = 0,
     warmup: int = 5,
     iters: int = 101,
-    const_init: Optional[float] = None,
-) -> tuple[torch.Tensor, torch.Tensor, Optional[float], Optional[dict]]:
+    const_init: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
     ``layout`` selects the stage1 weight physical layout:
@@ -345,16 +387,21 @@ def _run_grouped_via_fused_moe(
     # Stage1 weight/scale/bias get rearranged to physical ``layout``; stage2
     # has no GUGU/GGUU concept (single N=hidden GEMM).
     if layout == "gugu":
-        w1_phys = _gguu_to_gugu_rows(w1_logical)
         bias1_phys = _gguu_to_gugu_rows(bias1)
         gate_mode = GateMode.INTERLEAVE
     else:
-        w1_phys = w1_logical
         bias1_phys = bias1
         gate_mode = GateMode.SEPARATED
 
-    w1_grouped = shuffle_weight(w1_phys, layout=(16, 16))
-    w2_grouped = shuffle_weight(w2_logical, layout=(16, 16))
+    # Arch-aware stage weight shuffle: GUGU interleaves gate/up rows internally
+    # (moe_shuffle_weight), so pass the logical GGUU weight either way.
+    w1_grouped = moe_shuffle_weight(
+        w1_logical,
+        experts_cnt=experts,
+        is_guinterleave=(layout == "gugu"),
+        gate_up=True,
+    )
+    w2_grouped = moe_shuffle_weight(w2_logical, experts_cnt=experts)
     if layout == "gugu":
         # GUGU B-scale is always built the production way: feed the RAW GGUU
         # scale to moe_shuffle_scale(is_guinterleave=True), which interleaves
@@ -393,6 +440,8 @@ def _run_grouped_via_fused_moe(
             gate_mode=gate_mode.value,
             dtype=dtypes.bf16,
             swiglu_limit=swiglu_limit,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
         )
 
     torch.cuda.synchronize()
@@ -401,8 +450,8 @@ def _run_grouped_via_fused_moe(
         # Kernel-bench: time gemm1 and gemm2 in isolation. One eager call
         # populates the per-stage launch callables (and yields a correct ``out`` to
         # verify); then loop each kernel alone. ``us`` (end-to-end) stays None.
-        from aiter.test_common import run_perftest
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
+        from aiter.test_common import run_perftest
 
         kernel_bench_callable: list = []
         _grouped.kernel_bench_callable = kernel_bench_callable
@@ -448,6 +497,8 @@ def _run_grouped_via_fused_moe(
         data_format=data_format,
         activation=activation,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     ).to(out.dtype)
     return out, ref, us, kernel_us
 
@@ -486,6 +537,8 @@ def run_moe(
     layout: str = "gguu",
     activation: ActivationType = ActivationType.Swiglu,
     swiglu_limit: float = 7.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     use_bias: bool = True,
     tol: float = VERIFY_TOL_A4W4,
     raise_on_fail: bool = True,
@@ -493,7 +546,7 @@ def run_moe(
     kernel_bench: bool = False,
     warmup: int = 5,
     iters: int = 101,
-    const_init: Optional[float] = None,
+    const_init: float | None = None,
     check_aot_cache: bool = True,
 ) -> dict:
     """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
@@ -505,7 +558,11 @@ def run_moe(
     for reference only.  Returns a metrics dict (with ``us`` when benched).
     """
     _require_gfx1250()
-    act = "swiglu" if activation == ActivationType.Swiglu else "silu"
+    act = {
+        ActivationType.Silu: "silu",
+        ActivationType.Swiglu: "swiglu",
+        ActivationType.Situv2: "situv2",
+    }[activation]
     tag = f"{data_format} {layout} {act}"
 
     # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
@@ -521,6 +578,8 @@ def run_moe(
             layout=layout,
             activation=activation,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             use_bias=use_bias,
             bench=bench,
             kernel_bench=kernel_bench,
@@ -598,6 +657,43 @@ def test_grouped_a4w4_swiglu_matches_torch_ref(layout):
         "a4w4",
         layout=layout,
         activation=ActivationType.Swiglu,
+        model_dim=512,
+        inter_dim=512,
+    )
+
+
+def test_situv2_activation_matches_torch():
+    from aiter.ops.flydsl.kernels.moe_grouped_gemm_mxscale_gfx1250 import (
+        _apply_gate_up,
+    )
+
+    torch.manual_seed(0)
+    gate = torch.randn(4, 32)
+    up = torch.randn(4, 32)
+    beta, linear_beta = 4.0, 25.0
+    expected = (
+        beta
+        * torch.tanh(gate / beta)
+        * torch.sigmoid(gate)
+        * linear_beta
+        * torch.tanh(up / linear_beta)
+    )
+    actual = _apply_gate_up(
+        gate,
+        up,
+        "situv2",
+        situ_beta=beta,
+        situ_linear_beta=linear_beta,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("layout", ["gguu", "gugu"])
+def test_grouped_a4w4_situv2_matches_torch_ref(layout):
+    run_moe(
+        "a4w4",
+        layout=layout,
+        activation=ActivationType.Situv2,
         model_dim=512,
         inter_dim=512,
     )
@@ -773,6 +869,8 @@ def main() -> None:
     os.environ["AITER_GROUPED_GEMM_WAVE_SPECIALIZED"] = _wst
     if not args.real_gemm:
         _mock_grouped_gemm()
+    # The >=512 floor is a FlyDSL grouped-kernel constraint (tile_k=256 needs two
+    # K tiles).
     if args.model_dim < 512 or args.inter_dim < 512:
         raise SystemExit(
             f"model_dim ({args.model_dim}) and inter_dim ({args.inter_dim}) must be "
@@ -791,6 +889,7 @@ def main() -> None:
         args.tokens = _tok
         if len(token_list) > 1:
             print(f"\n===== tokens={_tok} =====", flush=True)
+
         tol = VERIFY_TOL_A8W4 if args.data_format == "a8w4" else VERIFY_TOL_A4W4
         # raise_on_fail=False so one out-of-gate token does not abort the
         # sweep; the failure is recorded and reported after the table.

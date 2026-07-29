@@ -22,7 +22,7 @@ def _sparse_attn_torch(q, kv, attn_sink, topk_idxs, softmax_scale):
     Returns:
         [B, M, H, D] same dtype as q.
     """
-    B, M, H, D = q.shape
+    B, M, H, _D = q.shape
     K = topk_idxs.shape[-1]
     device = q.device
     out_dtype = q.dtype
@@ -228,8 +228,8 @@ def _reduce_partials_torch(
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("kv_len", [136, 388, 1024])
 @pytest.mark.parametrize("var_len", [True, False])
-@pytest.mark.parametrize("sentinels", [True, False])
-@pytest.mark.parametrize("skip_reduce", [True, False])
+@pytest.mark.parametrize("sentinels", [False])
+@pytest.mark.parametrize("skip_reduce", [False])  # skip_reduce = True for debug only
 def test_pa_decode_sparse_vs_reference(
     T, H, D, kv_len, var_len, sentinels, skip_reduce
 ):

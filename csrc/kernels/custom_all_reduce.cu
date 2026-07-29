@@ -197,7 +197,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
                                      AiterDtype dtype, float eps,
                                      int m, int input_n, int n, int out_n,
                                      bool use_1stage,
-                                     bool gemma_norm)
+                                     bool gemma_norm,
+                                     void* bf16_out = nullptr)
 {
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
@@ -240,7 +241,8 @@ static void _fused_allreduce_rmsnorm(fptr_t _fa,
             m,                                                   \
             n,                                                   \
             use_1stage,                                          \
-            gemma_norm);                                         \
+            gemma_norm,                                          \
+            reinterpret_cast<DTYPE*>(bf16_out));                 \
     }
 
     switch(dtype)
@@ -603,7 +605,8 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
                                    double eps,
                                    int64_t reg_ptr, int64_t reg_bytes,
                                    bool use_1stage,
-                                   bool gemma_norm)
+                                   bool gemma_norm,
+                                   int64_t bf16_out_ptr)
 {
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
@@ -617,20 +620,27 @@ void fused_allreduce_rmsnorm_quant(fptr_t _fa,
             "fused allreduce rmsnorm quant requires input width == weight width");
     }
 
+    // bf16_out_ptr is an opaque data pointer (0 = not requested). When non-zero
+    // the kernel also writes the pre-quantization bf16/fp16 normed output, used
+    // by v32 DSA models (e.g. GLM-5.2) whose indexer GEMMs consume bf16.
+    void* bf16_out = reinterpret_cast<void*>(bf16_out_ptr);
+
     if(reg_ptr != 0)
     {
         _copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
         _fused_allreduce_rmsnorm(_fa,
                                  (void*)reg_ptr, res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm,
+                                 bf16_out);
     }
     else
     {
         _fused_allreduce_rmsnorm(_fa,
                                  inp.data_ptr(), res_inp.data_ptr(), res_out.data_ptr(),
                                  out.data_ptr(), scale_out.data_ptr(), w.data_ptr(),
-                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm);
+                                 dtype, (float)eps, m, input_n, n, n, use_1stage, gemma_norm,
+                                 bf16_out);
     }
 }
 

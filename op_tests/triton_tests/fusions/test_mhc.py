@@ -35,9 +35,9 @@ from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_post_inputs,
     get_test_shapes,
     is_doubly_stochastic,
+    mhc_e2e_ref,
     mhc_post_torch,
     mhc_torch,
-    mhc_e2e_ref,
 )
 
 try:
@@ -625,8 +625,6 @@ def test_triton_mhc_matches_hip(M, n, C):
 
     rms_eps = 1e-6
     hc_pre_eps = 0.0
-    hc_sinkhorn_eps = 0.0
-    hc_post_mult_value = 2.0
     sinkhorn_repeat = 20
 
     x, phi, alpha_pre, alpha_post, alpha_res, bias, n_streams = generate_mhc_inputs(
@@ -740,8 +738,8 @@ def test_mhc_post_preallocated_output():
     """Verify in-place path: result is out and matches reference."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 128, 4, 1024
@@ -769,8 +767,8 @@ def test_mhc_post_squeeze_post_mix():
     """Pass post_mix as (M, n, 1) — as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
     from op_tests.triton_tests.utils.mhc_ref import (
-        mhc_post_torch,
         generate_mhc_post_inputs,
+        mhc_post_torch,
     )
 
     M, n, C = 64, 4, 512
@@ -831,7 +829,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     if n != 4:
         pytest.skip("aiter.mhc_post hardcodes hc_mult == 4")
 
-    import aiter.jit.utils.chip_info as chip_info
+    from aiter.jit.utils import chip_info
 
     arch_id = chip_info.get_gfx()
     block = _hip_post_dispatch_block(C, arch_id)

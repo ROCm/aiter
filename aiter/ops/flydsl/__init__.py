@@ -13,7 +13,7 @@ from packaging.version import Version
 from .moe_common import GateMode
 from .utils import is_flydsl_available
 
-_MIN_FLYDSL_VERSION = Version("0.1.8")
+_MIN_FLYDSL_VERSION = Version("0.2.4")
 
 __all__ = [
     "GateMode",
@@ -40,17 +40,41 @@ if is_flydsl_available():
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .hstu_attention_kernels import flydsl_hstu_attention_fwd
+    from .kernels.fp8_mqa_logits import (
+        DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
+    )
+    from .kernels.fp8_mqa_logits import (
+        KERNEL_VARIANTS as FP8_MQA_LOGITS_VARIANTS,
+    )
+    from .kernels.fp8_mqa_logits import (
+        flydsl_fp8_mqa_logits,
+    )
+    from .kernels.pa_mqa_logits_fp4 import (
+        flydsl_pa_mqa_logits_fp4,
+    )
+    from .kernels.pa_mqa_logits_fp4_prefill import (
+        compute_varqlen_windows,
+        flydsl_pa_mqa_logits_fp4_prefill,
+        flydsl_pa_mqa_logits_fp4_varqlen,
+    )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-        "flydsl_flash_attn_func",
-        "flydsl_hgemm",
         "flydsl_hstu_attention_fwd",
+        "FP8_MQA_LOGITS_DEFAULT_VARIANT",
+        "FP8_MQA_LOGITS_VARIANTS",
+        "compute_varqlen_windows",
+        "flydsl_flash_attn_func",
+        "flydsl_fp8_mqa_logits",
+        "flydsl_hgemm",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
+        "flydsl_pa_mqa_logits_fp4",
+        "flydsl_pa_mqa_logits_fp4_prefill",
+        "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
