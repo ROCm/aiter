@@ -31,18 +31,19 @@ import sys
 import time
 from pathlib import Path
 
-import torch
-
 import flydsl.compiler as flyc
+import torch
 
 # Make `aiter` importable when this file is run directly as a script.
 _REPO_ROOT = str(Path(__file__).resolve().parents[4])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched  # noqa: E402
-from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd  # noqa: E402
-from aiter.ops.flydsl.kernels.example_jagged_dense_bmm import make_seq_offsets  # noqa: E402
+from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched
+from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd
+from aiter.ops.flydsl.kernels.example_jagged_dense_bmm import (
+    make_seq_offsets,
+)
 
 # Shared tiling constants (updated by configure_dim in main via _bwd).
 BLOCK_M = _bwd.BLOCK_M
@@ -60,7 +61,9 @@ BENCH_TARGETS = ("djagged", "dense_bias")
 def make_inputs(n_groups, max_seq_len, regime, seed, device, sparsity=0.95):
     """Build forward inputs plus the upstream gradient dOut (L, N)."""
     torch.manual_seed(0)
-    seq_offsets = make_seq_offsets(n_groups, max_seq_len, regime, seed, device, sparsity=sparsity)
+    seq_offsets = make_seq_offsets(
+        n_groups, max_seq_len, regime, seed, device, sparsity=sparsity
+    )
     total_rows = int(seq_offsets[-1].item())
     jagged = torch.randn(max(total_rows, 1), K, dtype=torch.bfloat16, device=device)
     dense = torch.randn(n_groups, K, N, dtype=torch.bfloat16, device=device)
@@ -137,14 +140,18 @@ def cosine_maxabs(ref, got):
 def report(name, ref, got, cos_thresh=0.999):
     cos, max_abs = cosine_maxabs(ref, got)
     ok = cos > cos_thresh
-    print(f"  {name:<10} {'PASS' if ok else 'FAIL'}  cosine={cos:.6f}  max_abs_err={max_abs:.4f}")
+    print(
+        f"  {name:<10} {'PASS' if ok else 'FAIL'}  cosine={cos:.6f}  max_abs_err={max_abs:.4f}"
+    )
     return ok
 
 
 # --- FlyDSL validation (through the packaged wrapper) --------------------------
 
 
-def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max_seq_len):
+def run_flydsl_bwd(
+    which, jagged, dense, bias, d_out, seq_offsets, n_groups, max_seq_len
+):
     """Validate the FlyDSL backward via the packaged wrapper.
 
     The wrapper does the full backward in one call (owning configure_dim, guards,
@@ -153,7 +160,12 @@ def run_flydsl_bwd(which, jagged, dense, bias, d_out, seq_offsets, n_groups, max
     (backward needs only dOut).
     """
     d_jagged, d_dense, d_bias = jagged_dense_bmm_bwd_dispatched(
-        jagged, dense, d_out, seq_offsets, n_groups=n_groups, max_seq_len=max_seq_len,
+        jagged,
+        dense,
+        d_out,
+        seq_offsets,
+        n_groups=n_groups,
+        max_seq_len=max_seq_len,
     )
     torch.cuda.synchronize()
     full = {"djagged": d_jagged, "ddense": d_dense, "dbias": d_bias}
@@ -174,33 +186,56 @@ def _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq
 
     if "djagged" in which:
         dense_kn = dense.reshape(n_groups * K, N).contiguous()
-        d_jagged = torch.zeros(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
-        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+        d_jagged = torch.zeros(
+            total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device
+        )
+        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
+            leading_dim=1, divisibility=8
+        )
 
         def run_djagged():
-            _bwd.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
+            _bwd.grad_jagged(
+                tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream
+            )
 
         launchers["djagged"] = run_djagged
 
     if "dense_bias" in which:
         d_dense = torch.zeros(n_groups, K, N, dtype=torch.bfloat16, device=device)
         d_bias = torch.zeros(n_groups, N, dtype=torch.bfloat16, device=device)
-        dense_partials = torch.zeros(n_groups * SPLIT * K, N, dtype=torch.float32, device=device)
-        bias_partials = torch.zeros(n_groups * SPLIT, N, dtype=torch.float32, device=device)
-        tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+        dense_partials = torch.zeros(
+            n_groups * SPLIT * K, N, dtype=torch.float32, device=device
+        )
+        bias_partials = torch.zeros(
+            n_groups * SPLIT, N, dtype=torch.float32, device=device
+        )
+        tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
+            leading_dim=1, divisibility=8
+        )
         d_dense_v = d_dense.view(n_groups * K, N)
 
         def run_dense_bias():
-            _bwd.grad_dense_bias(d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
-                                 bias_partials, n_groups, max_seq_len, stream=stream)
+            _bwd.grad_dense_bias(
+                d_dense_v,
+                d_bias,
+                tJagged,
+                tDOut,
+                seq_offsets,
+                dense_partials,
+                bias_partials,
+                n_groups,
+                max_seq_len,
+                stream=stream,
+            )
 
         launchers["dense_bias"] = run_dense_bias
 
     return launchers
 
 
-def bench_flydsl_bwd(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len,
-                     warmup=10, iters=50):
+def bench_flydsl_bwd(
+    which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len, warmup=10, iters=50
+):
     """Time each FlyDSL backward target and print us/iter + TFLOP/s.
 
     dJagged and dDense are each a 2*L*K*N GEMM; the fused dense_bias target's dBias
@@ -208,7 +243,9 @@ def bench_flydsl_bwd(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq
     on 2*L*K*N. L = packed rows (sum of M_b), so skew is scored on the work it does.
     """
     L = jagged.shape[0]
-    launchers = _bench_launchers(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len)
+    launchers = _bench_launchers(
+        which, jagged, dense, d_out, seq_offsets, n_groups, max_seq_len
+    )
     print(f"timing (warmup={warmup}, iters={iters}):")
     for name in BENCH_TARGETS:
         if name not in launchers:
@@ -227,16 +264,33 @@ def bench_flydsl_bwd(which, jagged, dense, d_out, seq_offsets, n_groups, max_seq
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="jagged_dense_bmm backward: validate references + kernels")
-    p.add_argument("-b", "--n-groups", type=int, default=64, help="number of groups (batch)")
-    p.add_argument("-m", "--max-seq-len", type=int, default=512, help="max rows per group")
-    p.add_argument("-d", "--dim", type=int, default=None,
-                   help="square dense dim D (= K = N); overrides the compile-time "
-                        "constant at runtime so no source edit is needed")
+    p = argparse.ArgumentParser(
+        description="jagged_dense_bmm backward: validate references + kernels"
+    )
+    p.add_argument(
+        "-b", "--n-groups", type=int, default=64, help="number of groups (batch)"
+    )
+    p.add_argument(
+        "-m", "--max-seq-len", type=int, default=512, help="max rows per group"
+    )
+    p.add_argument(
+        "-d",
+        "--dim",
+        type=int,
+        default=None,
+        help="square dense dim D (= K = N); overrides the compile-time "
+        "constant at runtime so no source edit is needed",
+    )
     p.add_argument("--regime", choices=["uniform", "skew"], default="uniform")
     p.add_argument("--seed", type=int, default=1234, help="skew RNG seed")
-    p.add_argument("--only", default="all", help="comma list of {djagged,ddense,dbias} or 'all'")
-    p.add_argument("--bench", action="store_true", help="after validation, time each kernel + report TFLOP/s")
+    p.add_argument(
+        "--only", default="all", help="comma list of {djagged,ddense,dbias} or 'all'"
+    )
+    p.add_argument(
+        "--bench",
+        action="store_true",
+        help="after validation, time each kernel + report TFLOP/s",
+    )
     p.add_argument("--warmup", type=int, default=10, help="bench warmup iterations")
     p.add_argument("--iters", type=int, default=50, help="bench timed iterations")
     args = p.parse_args(argv)
@@ -254,15 +308,19 @@ def main(argv=None):
         K = N = args.dim
         SPLIT = _bwd.SPLIT
 
-    which = GRADS if args.only == "all" else tuple(s.strip() for s in args.only.split(","))
+    which = (
+        GRADS if args.only == "all" else tuple(s.strip() for s in args.only.split(","))
+    )
     for w in which:
         if w not in GRADS:
             print(f"unknown gradient '{w}'; choose from {GRADS} or 'all'")
             return 2
 
     device = "cuda"
-    print(f"shape: n_groups={args.n_groups}, max_seq_len={args.max_seq_len}, "
-          f"K={K}, N={N}, regime={args.regime}, split={SPLIT}")
+    print(
+        f"shape: n_groups={args.n_groups}, max_seq_len={args.max_seq_len}, "
+        f"K={K}, N={N}, regime={args.regime}, split={SPLIT}"
+    )
 
     jagged, dense, bias, d_out, seq_offsets, total_rows = make_inputs(
         args.n_groups, args.max_seq_len, args.regime, args.seed, device
@@ -277,7 +335,9 @@ def main(argv=None):
 
     # --- References must match autograd (validates the references themselves) ---
     print("reference vs autograd:")
-    ag_j, ag_d, ag_b = autograd_grads(jagged, dense, bias, d_out, seq_offsets, args.n_groups)
+    ag_j, ag_d, ag_b = autograd_grads(
+        jagged, dense, bias, d_out, seq_offsets, args.n_groups
+    )
     ref_ok = True
     ref_ok &= report("dJagged", ag_j, refs["djagged"], cos_thresh=0.99999)
     ref_ok &= report("dDense", ag_d, refs["ddense"], cos_thresh=0.99999)
@@ -305,13 +365,21 @@ def main(argv=None):
     # --- Optional timing/TFLOPs summary -------------------------------------------
     if args.bench and any_run:
         bench_which = tuple(
-            t for t in BENCH_TARGETS
+            t
+            for t in BENCH_TARGETS
             if (t == "djagged" and "djagged" in which)
             or (t == "dense_bias" and (("ddense" in which) or ("dbias" in which)))
         )
         bench_flydsl_bwd(
-            bench_which, jagged, dense, d_out, seq_offsets, args.n_groups, args.max_seq_len,
-            warmup=args.warmup, iters=args.iters,
+            bench_which,
+            jagged,
+            dense,
+            d_out,
+            seq_offsets,
+            args.n_groups,
+            args.max_seq_len,
+            warmup=args.warmup,
+            iters=args.iters,
         )
 
     return 0 if (ref_ok and kernel_ok) else 1

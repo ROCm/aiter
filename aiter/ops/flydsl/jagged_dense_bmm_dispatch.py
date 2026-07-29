@@ -15,19 +15,18 @@ import json
 import os
 import weakref
 from pathlib import Path
-from typing import Optional
 
 from .kernels.jagged_dense_bmm_gen import jagged_dense_bmm
 from .kernels.jdbba_skew_tile_map import build_tile_map_device_fused
 
 __all__ = [
+    "clear_skew_tile_map_cache",
     "jagged_dense_bmm_dispatched",
     "resolve_config",
     "shape_id",
-    "clear_skew_tile_map_cache",
 ]
 
-_DISPATCH_TABLE: Optional[dict] = None
+_DISPATCH_TABLE: dict | None = None
 _DISPATCH_CACHE: dict[tuple, dict] = {}
 
 SKEW_COMPACT_MAX_GROUPS = 4096
@@ -61,7 +60,7 @@ def _dispatch_json_paths() -> tuple[Path, ...]:
     return (Path(__file__).resolve().parent / "jagged_dense_bmm_dispatch.json",)
 
 
-def _detect_arch() -> Optional[str]:
+def _detect_arch() -> str | None:
     env = os.environ.get("FLYDSL_JAGGED_DENSE_BMM_ARCH")
     if env:
         return env
@@ -69,11 +68,11 @@ def _detect_arch() -> Optional[str]:
         from flydsl.runtime.device import get_rocm_arch
 
         return get_rocm_arch()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
-def _select_arch_section(data: dict, arch: Optional[str]) -> dict:
+def _select_arch_section(data: dict, arch: str | None) -> dict:
     by_arch = data.get("by_arch")
     if not isinstance(by_arch, dict):
         return data  # legacy flat schema (e.g. an env-var override file)
@@ -126,17 +125,13 @@ def clear_skew_tile_map_cache() -> None:
 
 
 def _skew_compact_enabled(*, uniform_seqlen: bool, n_groups: int) -> bool:
-    if uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS:
-        return False
-    return True
+    return not (uniform_seqlen or n_groups > SKEW_COMPACT_MAX_GROUPS)
 
 
 _SKEW_XCD_REMAP_SMALL_B_THRESHOLD = 120
 
 
-def _skew_compact_xcd(
-    n_groups: int, reduction_k: int
-) -> tuple[Optional[int], Optional[int]]:
+def _skew_compact_xcd(n_groups: int, reduction_k: int) -> tuple[int | None, int | None]:
     if n_groups > _SKEW_XCD_REMAP_SMALL_B_THRESHOLD or reduction_k >= 512:
         return SKEW_COMPACT_XCD_C, SKEW_COMPACT_XCD_W
     return None, None
@@ -186,9 +181,7 @@ def _config_valid(cfg: dict, *, reduction_k: int, output_n: int, n_groups: int) 
     bk = cfg.get("block_k")
     if bk is None:
         bk = 64
-    if reduction_k % bk != 0 or reduction_k // bk < 2:
-        return False
-    return True
+    return reduction_k % bk == 0 and reduction_k // bk >= 2
 
 
 def _d_bucket(reduction_k: int) -> str:
@@ -217,10 +210,10 @@ def resolve_config(
     reduction_k: int,
     output_n: int,
     max_seq_len: int,
-    xcd_c: Optional[int] = None,
-    xcd_w: Optional[int] = None,
-    use_mfma_k32: Optional[bool] = None,
-    block_k: Optional[int] = None,
+    xcd_c: int | None = None,
+    xcd_w: int | None = None,
+    use_mfma_k32: bool | None = None,
+    block_k: int | None = None,
 ) -> dict:
     key = (
         n_groups,
@@ -283,10 +276,10 @@ def jagged_dense_bmm_dispatched(
     stream=None,
     uniform_seqlen: bool = True,
     # explicit overrides (None -> dispatch table / heuristic / kernel default)
-    xcd_c: Optional[int] = None,
-    xcd_w: Optional[int] = None,
-    use_mfma_k32: Optional[bool] = None,
-    block_k: Optional[int] = None,
+    xcd_c: int | None = None,
+    xcd_w: int | None = None,
+    use_mfma_k32: bool | None = None,
+    block_k: int | None = None,
 ):
     output_n = B.shape[0] // n_groups
     reduction_k = B.shape[1]

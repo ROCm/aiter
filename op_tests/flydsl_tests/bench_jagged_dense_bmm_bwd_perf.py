@@ -61,12 +61,15 @@ if _REPO_ROOT not in sys.path:
 # forward constants dual-path, so importing it as an aiter package submodule
 # works (the old bare-sibling shim is gone).
 try:
-    import flydsl.compiler as flyc  # noqa: E402
-    from aiter.ops.flydsl import jagged_dense_bmm_bwd_dispatched as _fly_bwd_dispatched  # noqa: E402
-    from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd  # noqa: E402
+    import flydsl.compiler as flyc
+
+    from aiter.ops.flydsl import (
+        jagged_dense_bmm_bwd_dispatched as _fly_bwd_dispatched,
+    )
+    from aiter.ops.flydsl.kernels import jagged_dense_bmm_bwd as _bwd
 
     _HAS_FLYDSL = True
-except Exception as _fexc:  # pragma: no cover - environment dependent
+except Exception as _fexc:  # pragma: no cover - environment dependent  # noqa: BLE001
     _HAS_FLYDSL = False
     _FLYDSL_ERR = _fexc
 
@@ -77,7 +80,7 @@ try:
     )
 
     _HAS_TRITON = True
-except Exception as _exc:  # pragma: no cover - environment dependent
+except Exception as _exc:  # pragma: no cover - environment dependent  # noqa: BLE001
     _HAS_TRITON = False
     _TRITON_ERR = _exc
 
@@ -113,17 +116,19 @@ def _make_seq_offsets(B, Mi, regime, seed, device, sparsity=0.95):
     g = torch.Generator().manual_seed(seed)
     u = torch.rand(B, generator=g)
     t = (Mi * (u**4)).floor().to(torch.int64)
-    t[: max(1, B // 5)] = 0          # ~20% empty groups
-    t[-1] = Mi                       # one full-envelope group
+    t[: max(1, B // 5)] = 0  # ~20% empty groups
+    t[-1] = Mi  # one full-envelope group
     if B > 1:
-        t[-2] = int(0.9 * Mi)        # one near-full group
+        t[-2] = int(0.9 * Mi)  # one near-full group
     so = torch.zeros(B + 1, dtype=torch.int32)
     for i in range(B):
         so[i + 1] = so[i] + int(t[i])
     return so.to(device)
 
 
-def _make_inputs(B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda", sparsity=0.95):
+def _make_inputs(
+    B, D, Kout, Mi, regime="uniform", seed=1234, device="cuda", sparsity=0.95
+):
     """Returns the tensors the backward kernels need for the given regime.
 
     jagged (L, K), dense (B, K, N), dOut (L, N), seq_offsets (B+1,). Naming mirrors
@@ -200,9 +205,16 @@ def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     stream = torch.cuda.current_stream()
 
     if component == "all":
+
         def run_all():
             return _fly_bwd_dispatched(
-                jagged, dense, d_out, seq_offsets, n_groups=B, max_seq_len=Mi, stream=stream
+                jagged,
+                dense,
+                d_out,
+                seq_offsets,
+                n_groups=B,
+                max_seq_len=Mi,
+                stream=stream,
             )
 
         return run_all
@@ -212,8 +224,12 @@ def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     if component == "jagged":
         # dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall.
         dense_kn = dense.reshape(B * K, N).contiguous()
-        d_jagged = torch.zeros(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
-        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+        d_jagged = torch.zeros(
+            total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device
+        )
+        tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(
+            leading_dim=1, divisibility=8
+        )
 
         def run_jagged():
             _bwd.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, B, Mi, stream=stream)
@@ -227,12 +243,22 @@ def _flydsl_fn(jagged, dense, d_out, seq_offsets, B, Mi, N, K, component):
     dense_partials = torch.zeros(B * SPLIT * K, N, dtype=torch.float32, device=device)
     d_bias = torch.zeros(B, N, dtype=torch.bfloat16, device=device)
     bias_partials = torch.zeros(B * SPLIT, N, dtype=torch.float32, device=device)
-    tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+    tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
+        leading_dim=1, divisibility=8
+    )
 
     def run_dense_bias():
         _bwd.grad_dense_bias(
-            d_dense_v, d_bias, tJagged, tDOut, seq_offsets, dense_partials,
-            bias_partials, B, Mi, stream=stream
+            d_dense_v,
+            d_bias,
+            tJagged,
+            tDOut,
+            seq_offsets,
+            dense_partials,
+            bias_partials,
+            B,
+            Mi,
+            stream=stream,
         )
         return d_dense, d_bias
 
@@ -287,8 +313,10 @@ def _flops_bytes(component, L, B, D, N):
     """
     f_jag = 2.0 * L * D * N
     f_db = 2.0 * L * D * N  # dDense GEMM; dBias reduction (L*N adds) is negligible
-    m_jag = (L * N + B * D * N + L * D) * 2          # read dOut + Dense, write dJagged
-    m_db = (L * D + L * N + B * D * N + B * N) * 2   # read Jagged + dOut, write dDense + dBias
+    m_jag = (L * N + B * D * N + L * D) * 2  # read dOut + Dense, write dJagged
+    m_db = (
+        L * D + L * N + B * D * N + B * N
+    ) * 2  # read Jagged + dOut, write dDense + dBias
     if component == "jagged":
         return f_jag, m_jag
     if component == "dense_bias":
@@ -322,9 +350,13 @@ def _run_one_regime(custom, args, regime, providers, unit):
         )
 
         if provider == "triton":
-            fn = _triton_fn(jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component)
+            fn = _triton_fn(
+                jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component
+            )
         elif provider == "flydsl":
-            fn = _flydsl_fn(jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component)
+            fn = _flydsl_fn(
+                jagged, dense, d_out, seq_offsets, B, MI, N, K, args.component
+            )
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
@@ -334,7 +366,9 @@ def _run_one_regime(custom, args, regime, providers, unit):
             torch.cuda.synchronize()
             cos = _check(args.component, got, ref)
             tag = f"({regime:7s} B={B}, D={D}, Kout={KOUT}, Mi={MI})"
-            print(f"  {'PASS' if cos > 0.999 else 'FAIL'} [{provider:6s}] {tag}  cos={cos:.4f}")
+            print(
+                f"  {'PASS' if cos > 0.999 else 'FAIL'} [{provider:6s}] {tag}  cos={cos:.4f}"
+            )
 
         ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
 
@@ -350,7 +384,9 @@ def _run_one_regime(custom, args, regime, providers, unit):
             return mem / ms * 1e-6
         raise ValueError(f"Unknown metric: {args.metric}")
 
-    print(f"\n=== regime={regime}  component={args.component}  (metric={args.metric} [{unit}]) ===")
+    print(
+        f"\n=== regime={regime}  component={args.component}  (metric={args.metric} [{unit}]) ==="
+    )
     bench_fn.run(save_path="." if args.o else None, print_data=True)
 
 
@@ -375,25 +411,55 @@ def parse_args(argv=None):
         prog="Benchmark jagged_dense_bmm backward (jdbba bwd): Triton",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--metric", choices=["time", "throughput", "bandwidth"], default="time")
-    p.add_argument("--component", choices=["jagged", "dense_bias", "all"], default="all",
-                   help="which backward output(s) to score: dJagged / (dDense,dBias) / both")
-    p.add_argument("--regime", choices=["uniform", "skew", "genrec", "both"], default="uniform",
-                   help="sequence-length distribution (uniform baseline / skewed deployment / "
-                        "genrec Uniform(1,Mi)*sparsity apples-to-apples with the recsys sweeps / both)")
-    p.add_argument("--seed", type=int, default=1234, help="skew/genrec RNG seed (use 1001 to match genrec)")
-    p.add_argument("--sparsity", type=float, default=0.95,
-                   help="genrec regime: scale M_i ~ Uniform(1,Mi) by this factor (clamped >=1)")
+    p.add_argument(
+        "--metric", choices=["time", "throughput", "bandwidth"], default="time"
+    )
+    p.add_argument(
+        "--component",
+        choices=["jagged", "dense_bias", "all"],
+        default="all",
+        help="which backward output(s) to score: dJagged / (dDense,dBias) / both",
+    )
+    p.add_argument(
+        "--regime",
+        choices=["uniform", "skew", "genrec", "both"],
+        default="uniform",
+        help="sequence-length distribution (uniform baseline / skewed deployment / "
+        "genrec Uniform(1,Mi)*sparsity apples-to-apples with the recsys sweeps / both)",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="skew/genrec RNG seed (use 1001 to match genrec)",
+    )
+    p.add_argument(
+        "--sparsity",
+        type=float,
+        default=0.95,
+        help="genrec regime: scale M_i ~ Uniform(1,Mi) by this factor (clamped >=1)",
+    )
     p.add_argument("-b", type=int, default=0, help="B groups (custom shape)")
     p.add_argument("-d", type=int, default=0, help="D = reduction K (custom shape)")
     p.add_argument("-kout", type=int, default=0, help="Kout = output N (custom shape)")
-    p.add_argument("-mi", type=int, default=7680, help="max_seq_len (per-group rows in uniform; envelope in skew)")
+    p.add_argument(
+        "-mi",
+        type=int,
+        default=7680,
+        help="max_seq_len (per-group rows in uniform; envelope in skew)",
+    )
     p.add_argument("--warmup", type=int, default=25, help="do_bench warmup ms")
     p.add_argument("--rep", type=int, default=100, help="do_bench rep ms")
-    p.add_argument("-test", action="store_true", help="correctness check vs torch eager")
+    p.add_argument(
+        "-test", action="store_true", help="correctness check vs torch eager"
+    )
     p.add_argument("-o", action="store_true", help="save CSV/plot")
-    p.add_argument("--flydsl-only", action="store_true", help="score only the FlyDSL provider")
-    p.add_argument("--triton-only", action="store_true", help="score only the Triton provider")
+    p.add_argument(
+        "--flydsl-only", action="store_true", help="score only the FlyDSL provider"
+    )
+    p.add_argument(
+        "--triton-only", action="store_true", help="score only the Triton provider"
+    )
     return p.parse_args(argv)
 
 

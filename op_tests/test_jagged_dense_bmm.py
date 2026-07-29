@@ -7,18 +7,13 @@ import argparse
 import itertools
 from unittest.mock import patch
 
-import aiter
+import flydsl.compiler as flyc
 import pandas as pd
 import torch
-from aiter import dtypes
-from aiter.test_common import (
-    benchmark,
-    checkAllclose,
-    run_perftest,
-)
-from aiter.jit.utils.chip_info import get_gfx
 
-import flydsl.compiler as flyc
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     _load_dispatch_table,
     clear_skew_tile_map_cache,
@@ -26,10 +21,15 @@ from aiter.ops.flydsl.jagged_dense_bmm_dispatch import (
     resolve_config,
     shape_id,
 )
-from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import BLOCK_M as _BLOCK_M
 from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import (
     _COMPILED_CACHE,
     jagged_dense_bmm,
+)
+from aiter.ops.flydsl.kernels.jagged_dense_bmm_gen import BLOCK_M as _BLOCK_M
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
 )
 
 torch.set_default_device("cuda")
@@ -43,7 +43,7 @@ try:
     )
 
     _HAS_TRITON = True
-except Exception as _exc:  # pragma: no cover
+except Exception as _exc:  # pragma: no cover  # noqa: BLE001
     _HAS_TRITON = False
     _TRITON_ERR = _exc
 
@@ -91,20 +91,20 @@ def _build_inputs(B, D, Kout, Mi, regime, dtype, seq_offsets=None):
     out = torch.zeros(L + _BLOCK_M, N, dtype=dtype, device="cuda")
     tA = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
     tC = flyc.from_dlpack(out).mark_layout_dynamic(leading_dim=1, divisibility=8)
-    return dict(
-        jagged=jagged,
-        dense=dense,
-        bias=bias,
-        seq_offsets=seq_offsets,
-        dense_tall=dense_tall,
-        bias_flat=bias_flat,
-        out=out,
-        tA=tA,
-        tC=tC,
-        L=L,
-        N=N,
-        K=K,
-    )
+    return {
+        "jagged": jagged,
+        "dense": dense,
+        "bias": bias,
+        "seq_offsets": seq_offsets,
+        "dense_tall": dense_tall,
+        "bias_flat": bias_flat,
+        "out": out,
+        "tA": tA,
+        "tC": tC,
+        "L": L,
+        "N": N,
+        "K": K,
+    }
 
 
 @benchmark()

@@ -40,6 +40,8 @@ if is_flydsl_available():
     from .fmha_kernels import flydsl_flash_attn_func
     from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .hstu_attention_kernels import flydsl_hstu_attention_fwd
+    from .jagged_dense_bmm_autograd import jagged_dense_bmm_autograd
+    from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
     from .kernels.fp8_mqa_logits import (
         DEFAULT_VARIANT as FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
@@ -59,14 +61,10 @@ if is_flydsl_available():
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
-    from .jagged_dense_bmm_autograd import jagged_dense_bmm_autograd
-    from .jagged_dense_bmm_bwd_dispatch import jagged_dense_bmm_bwd_dispatched
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-        "jagged_dense_bmm_autograd",
-        "jagged_dense_bmm_bwd_dispatched",
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
         "compute_varqlen_windows",
@@ -81,5 +79,7 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "jagged_dense_bmm_autograd",
+        "jagged_dense_bmm_bwd_dispatched",
         # "flydsl_gdr_decode",
     ]

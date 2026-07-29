@@ -385,7 +385,7 @@ def _build_launcher(
         total_occ_tiles: int,
         n_groups: int,
         max_seq_len: int,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         if fx.const_expr(USE_MFMA_K32):
             tiled_mma = fx.make_tiled_mma(
@@ -472,7 +472,7 @@ def _drop_leaked_ir_contexts() -> None:
 
         while ir.Context.current is not None:
             ir.Context.current.__exit__(None, None, None)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - best-effort MLIR context cleanup
         pass
 
 
@@ -498,7 +498,7 @@ def jagged_dense_bmm(
     SEQ_OFFSETS,
     n_groups: int,
     max_seq_len: int,
-    stream: fx.Stream = fx.Stream(None),
+    stream: fx.Stream = fx.Stream(None),  # noqa: B008
     xcd_c: int | None = None,
     xcd_w: int | None = None,
     use_mfma_k32: bool | None = None,
