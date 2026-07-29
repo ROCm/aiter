@@ -972,9 +972,7 @@ def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
         return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
     return (
-        dtypes.fp8
-        if os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-        else dtypes.bf16
+        dtypes.fp8 if os.environ.get("AITER_SITUV2_A8W4", "0") == "1" else dtypes.bf16
     )
 
 
