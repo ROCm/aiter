@@ -226,6 +226,16 @@ def test_fmoe(
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
 
+    # Match fused_moe's runtime activation dtype. SiTUv2 can be requested as
+    # a16w4 by the caller but dispatched as a8w4 on gfx950.
+    reference_aq_dtype = AQDType
+    if actType == aiter.ActivationType.Situv2:
+        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
+            token, gateMode, qType, WQDType
+        )
+        if runtime_aq_dtype is not None:
+            reference_aq_dtype = runtime_aq_dtype
+
     # Quant-ing a
     if qType == aiter.QuantType.per_128x128:
         a1_qt, a1_scale = aiter.pertoken_quant(
@@ -233,6 +243,14 @@ def test_fmoe(
         )
         a1_qt = a1_qt.view(token, model_dim)
         a1_scale = a1_scale.squeeze(-1)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.fp8
+        and WQDType == dtypes.fp4x2
+    ):
+        a1_qt, a1_scale = per_1x32_f8_scale_f8_quant(
+            input, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif (
         (
             qType == aiter.QuantType.per_1x32
@@ -393,6 +411,14 @@ def test_fmoe(
             out1_ref.view(token, -1, 128), quant_dtype=AQDType
         )
         a2_scale = a2_scale.view(token, topk, -1)
+    elif (
+        qType == aiter.QuantType.per_1x32
+        and reference_aq_dtype == dtypes.fp8
+        and WQDType == dtypes.fp4x2
+    ):
+        a2_qt, a2_scale = per_1x32_f8_scale_f8_quant(
+            out1_ref, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
     elif (
         qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
@@ -927,6 +953,29 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
         return swiglu_limit
     return None
+
+
+def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
+    """Mirror fused_moe's SiTUv2 MXFP4 activation-dtype routing."""
+    if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
+        return None
+
+    if get_gfx() == "gfx1250":
+        return (
+            dtypes.fp8
+            if os.environ.get("AITER_FORCE_A8W4", "0") == "1"
+            else dtypes.fp4x2
+        )
+
+    if GateMode(gate_mode) == GateMode.INTERLEAVE:
+        bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
+        return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
+
+    return (
+        dtypes.fp8
+        if os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
+        else dtypes.bf16
+    )
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
