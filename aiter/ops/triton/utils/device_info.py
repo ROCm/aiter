@@ -14,7 +14,7 @@ def get_num_sms():
         from aiter.jit.utils.chip_info import get_cu_num
 
         return get_cu_num()
-    except Exception:
+    except Exception:  # noqa: BLE001
         import torch
 
         current_device_index = torch.cuda.current_device()

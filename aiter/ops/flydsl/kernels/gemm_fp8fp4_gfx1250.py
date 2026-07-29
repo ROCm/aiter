@@ -17,7 +17,6 @@ from flydsl._mlir.dialects import fly, llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     idx2crd,
@@ -29,6 +28,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_oob as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
@@ -41,6 +41,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     store_acc_vec8_to_buffer,
     store_acc_vec8_to_lds,
 )
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 from aiter.ops.flydsl.kernels.pipeline_utils import (
     make_tail_plan,
     tdm_epilogue_fence_threshold_bytes,
@@ -104,7 +105,7 @@ def compile_fp8fp4_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 2,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 2,
     cluster_m: int = 1,
     cluster_n: int = 1,
@@ -669,9 +670,8 @@ def compile_fp8fp4_gemm(
         # Enable back-to-back WMMA issue (SCHED_MODE bit[4] = DISABLE_VALU_STALL)
         rocdl.disable_xdl_arb_stall()
 
-        if const_expr(inst_prefetch):
-            if rocdl.wave_id() == fx.Int32(0):
-                _s_prefetch_inst_burst(num_pages=4)
+        if const_expr(inst_prefetch) and rocdl.wave_id() == fx.Int32(0):
+            _s_prefetch_inst_burst(num_pages=4)
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -684,7 +684,7 @@ def compile_fp8fp4_gemm(
 
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mcast_mask, b_mcast_mask = cluster.compute_mcast_masks(
+            a_mcast_mask, b_mcast_mask = compute_mcast_masks(
                 local_x, local_y, cluster_m, cluster_n
             )
         else:
@@ -2198,7 +2198,7 @@ def compile_fp8fp4_gemm(
                 a2_box = [None]
                 a3_box = [None]
 
-                def _prefetch_a1():
+                def _prefetch_a1(a1_box=a1_box, ks=ks):
                     a1_box[0] = load_a_pair(1, ks)
 
                 first_wait_keep = _two_pair_loads + 3
@@ -2213,10 +2213,10 @@ def compile_fp8fp4_gemm(
                     rocdl.sched_barrier(0)
                     mid_compute_callback()
 
-                def _prefetch_b3():
+                def _prefetch_b3(b3_box=b3_box, ks=ks):
                     b3_box[0] = load_b_pair(3, ks)
 
-                def _prefetch_a3():
+                def _prefetch_a3(a3_box=a3_box, ks=ks):
                     a3_box[0] = load_a_pair(3, ks)
 
                 rocdl.s_wait_dscnt(_pair_loads + _fp8_pair_b_loads)
@@ -2234,7 +2234,7 @@ def compile_fp8fp4_gemm(
                     prefetch_after_first_row=_prefetch_a3,
                 )
 
-                def _prefetch_a2():
+                def _prefetch_a2(a2_box=a2_box, ks=ks):
                     a2_box[0] = load_a_pair(2, ks)
 
                 emit_panel_2x2(1, 1, a1_box[0], b1, scale_pair)
@@ -3531,7 +3531,7 @@ def compile_ptpc_gemm(
     m_warp: int = 2,
     n_warp: int = 2,
     num_buffers: int = 4,
-    waves_per_eu: int = None,
+    waves_per_eu: int | None = None,
     l2_prefetch_distance: int = 0,
     cluster_m: int = 1,
     cluster_n: int = 1,

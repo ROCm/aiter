@@ -4,11 +4,13 @@
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
+
+import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
     batched_gemm_bf16 as batched_gemm_bf16_triton,
 )
@@ -17,7 +19,6 @@ from aiter.test_common import (
     checkAllclose,
     run_perftest,
 )
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 

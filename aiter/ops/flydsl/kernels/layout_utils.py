@@ -8,9 +8,9 @@ Optimisation: power-of-2 strides/shapes emit ``shrui`` / ``andi`` instead of
 ``divui`` / ``remui``, avoiding 10-15-cycle V_DIV sequences on CDNA GPUs.
 """
 
+import builtins as _builtins
 import math as _math
 import re
-import builtins as _builtins
 
 import flydsl.expr as fx
 from flydsl._mlir import ir

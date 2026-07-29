@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 

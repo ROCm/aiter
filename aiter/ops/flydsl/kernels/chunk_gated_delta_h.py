@@ -16,10 +16,13 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
-from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
+
 from .tensor_shim import GTensor, _to_raw
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
@@ -871,12 +874,11 @@ def compile_chunk_gated_delta_h(
                     # gets exactly one load. Skipped when OPT_W_ENABLED is
                     # False (BV>=32) since the batch was already issued above.
                     w_slot = kb * BT_STEPS + bt_s
-                    if const_expr(OPT_W_ENABLED):
-                        if w_slot < NUM_W_NEXT_LOADS:
-                            w_next_prefetch[w_slot] = w_.vec_load(
-                                (fx.Index(w_next_prefetch_off[w_slot]),),
-                                LOAD_VEC_WIDTH,
-                            )
+                    if const_expr(OPT_W_ENABLED) and w_slot < NUM_W_NEXT_LOADS:
+                        w_next_prefetch[w_slot] = w_.vec_load(
+                            (fx.Index(w_next_prefetch_off[w_slot]),),
+                            LOAD_VEC_WIDTH,
+                        )
 
                     k_col_tr = wid * fx.Int32(16) + tr_col_sub * fx.Int32(4)
                     bt_row_tr = (

@@ -1,15 +1,16 @@
-import torch
 import pytest
-
+import torch
 import triton
-from op_tests.triton_tests.attention.test_mla import shuffle_kv_buffer
-from aiter.ops.triton.kv_cache import cat_and_cache_mla
-from op_tests.triton_tests.attention.test_mla import dynamic_nvfp4_quant_kv_buffer
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 
+from aiter.ops.triton.kv_cache import cat_and_cache_mla
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.test_common import checkAllclose
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from op_tests.triton_tests.attention.test_mla import (
+    dynamic_nvfp4_quant_kv_buffer,
+    shuffle_kv_buffer,
+)
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -254,8 +255,8 @@ def test_cat_and_cache_mla(
     torch_k_pe = k_pe
 
     if cache_dtype == torch.bfloat16:
-        torch_k_lora = torch_k_lora
-        torch_k_pe = torch_k_pe
+        torch_k_lora = torch_k_lora  # noqa: PLW0127
+        torch_k_pe = torch_k_pe  # noqa: PLW0127
     elif cache_dtype == e4m3_dtype:
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
         torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(torch.bfloat16)
