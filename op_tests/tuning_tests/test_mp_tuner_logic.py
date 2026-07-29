@@ -11,10 +11,10 @@ Simulates async_result behavior without GPU/multiprocessing to verify:
 Run: python3 -m unittest op_tests.test_mp_tuner_logic -v
 """
 
-import time
-import unittest
 import importlib
 import multiprocessing as mp
+import time
+import unittest
 from multiprocessing import TimeoutError as MPTimeoutError
 
 
