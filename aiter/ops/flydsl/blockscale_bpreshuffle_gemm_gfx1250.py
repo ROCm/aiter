@@ -162,11 +162,11 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _launch_gemm_a8w8_bsc_col(
-        Out,
+        _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
-        a_scale.view(torch.uint8),
-        b_scale.view(torch.uint8),
+        _ptr_arg(a_scale),
+        _ptr_arg(b_scale),
         M,
         stream,
         N,

@@ -137,11 +137,11 @@ def run_preshuffle_gemm_a8_gfx1250(
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
     _launch_gemm_a8w8_ptpc(
-        Out,
+        _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
-        sa,
-        sb,
+        _ptr_arg(sa),
+        _ptr_arg(sb),
         M,
         stream,
         N,

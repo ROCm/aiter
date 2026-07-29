@@ -21,11 +21,11 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 
 @flyc.jit
 def launch_gemm_a8w8_ptpc(
-    arg_c: fx.Tensor,
+    arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -81,11 +81,11 @@ def launch_gemm_a8w8_ptpc(
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_ptpc(
-        arg_c: fx.Tensor,
+        arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -136,6 +136,9 @@ def launch_gemm_a8w8_ptpc(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
+        gC_base = fx.recast_iter(
+            fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
+        )
 
         a_off0 = blk_m64 * lda64
         b_off0 = (blk_n64 // 16) * (k64 * 16)
@@ -364,11 +367,21 @@ def launch_gemm_a8w8_ptpc(
 
         def epilogue_apply_ptpc_scale():
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+            gSA_base = fx.recast_iter(
+                fx.PointerType.get(fx.Float32.ir_type, arg_scale_a.address_space),
+                arg_scale_a,
+            )
+            gSB_base = fx.recast_iter(
+                fx.PointerType.get(fx.Float32.ir_type, arg_scale_b.address_space),
+                arg_scale_b,
+            )
+            sa_view = fx.Tensor(fx.make_view(gSA_base, fx.make_layout(i32_m, 1)))
+            sb_view = fx.Tensor(fx.make_view(gSB_base, fx.make_layout(i32_n, 1)))
             sa_buf = fx.rocdl.make_buffer_tensor(
-                arg_scale_a, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
+                sa_view, max_size=False, num_records_bytes=i32_m * fx.Int32(4)
             )
             sb_buf = fx.rocdl.make_buffer_tensor(
-                arg_scale_b, max_size=False, num_records_bytes=i32_n * fx.Int32(4)
+                sb_view, max_size=False, num_records_bytes=i32_n * fx.Int32(4)
             )
             sa_lay, sb_lay = fx.make_layout(1, 1), fx.make_layout(4, 1)
             sa_tiles = fx.logical_divide(sa_buf, sa_lay)
@@ -429,7 +442,7 @@ def launch_gemm_a8w8_ptpc(
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = blk_m64 * ldc64 + blk_n64
-        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
+        gtC = _gv(gC_base, c_off_rt, (tile_m, tile_n), (tile_n, 1))
         atomC = fx.rocdl.make_tdm_atom(
             gtC,
             [mn_oob, None],

@@ -23,11 +23,11 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
 
 @flyc.jit
 def launch_gemm_a8w8_bsc_col(
-    arg_c: fx.Tensor,
+    arg_c: fx.Pointer,
     arg_a: fx.Pointer,
     arg_b: fx.Pointer,
-    arg_scale_a: fx.Tensor,
-    arg_scale_b: fx.Tensor,
+    arg_scale_a: fx.Pointer,
+    arg_scale_b: fx.Pointer,
     i32_m: fx.Int32,
     stream: fx.Stream,
     N: fx.Int32,
@@ -85,11 +85,11 @@ def launch_gemm_a8w8_bsc_col(
 
     @flyc.kernel(known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_bsc_col(
-        arg_c: fx.Tensor,
+        arg_c: fx.Pointer,
         arg_a: fx.Pointer,
         arg_b: fx.Pointer,
-        arg_scale_a: fx.Tensor,
-        arg_scale_b: fx.Tensor,
+        arg_scale_a: fx.Pointer,
+        arg_scale_b: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         i32_k: fx.Int32,
@@ -155,7 +155,10 @@ def launch_gemm_a8w8_bsc_col(
 
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
-        gSA_base, gSB_base = fx.get_iter(arg_scale_a), fx.get_iter(arg_scale_b)
+        gC_base = fx.recast_iter(
+            fx.PointerType.get(out_cls.ir_type, arg_c.address_space), arg_c
+        )
+        gSA_base, gSB_base = arg_scale_a, arg_scale_b
 
         W_A, W_B, W_SA, W_SB = 0, 1, 2 % num_waves, 3 % num_waves
         a_off0 = blk_m64 * lda64
@@ -475,7 +478,7 @@ def launch_gemm_a8w8_bsc_col(
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = blk_m64 * ldc64 + blk_n64
-        gtC = _gv(fx.get_iter(arg_c), c_off_rt, (tile_m, tile_n), (tile_n, 1))
+        gtC = _gv(gC_base, c_off_rt, (tile_m, tile_n), (tile_n, 1))
         atomC = fx.rocdl.make_tdm_atom(
             gtC,
             [mn_oob, None],

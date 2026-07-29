@@ -149,6 +149,7 @@ def parse_csv(csv_path: str):
             n = int(row["N"])
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
+            gfx = row.get("gfx", "").strip()
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
@@ -182,6 +183,7 @@ def parse_csv(csv_path: str):
                 "n": n,
                 "k": k,
                 "cu_num": cu_num,
+                "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
                 **params,
             }
@@ -409,11 +411,11 @@ def _compile_blockscale_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8_bsc_col(
-            out,
+            _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
-            a_scale.view(torch.uint8),
-            b_scale.view(torch.uint8),
+            _ptr_view_safe(a_scale),
+            _ptr_view_safe(b_scale),
             m,
             stream,
             n,
@@ -465,11 +467,11 @@ def _compile_ptpc_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8_ptpc(
-            out,
+            _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
-            scale_a,
-            scale_b,
+            _ptr_view_safe(scale_a),
+            _ptr_view_safe(scale_b),
             m,
             stream,
             n,
@@ -488,20 +490,25 @@ def _compile_ptpc_wmma_to_cache(
         )
 
 
-def job_arch(kind: str, cu_num: int = 0) -> str:
+def job_arch(cu_num: int = 0, gfx: str = "") -> str:
     """Target arch a job would compile for -- shared by dispatch and ARCH filtering."""
-    if kind in ("blockscale_wmma", "ptpc_wmma"):
-        return "gfx1250"
-    return cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
 
 
 def compile_one_config(
-    kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
+    kernel_name: str,
+    kind: str,
+    m: int,
+    n: int,
+    k: int,
+    cu_num: int = 0,
+    gfx: str = "",
+    **kwargs,
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = job_arch(kind, cu_num)
+    aot_arch = job_arch(cu_num, gfx)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -569,7 +576,9 @@ def main():
         # GPU_ARCHS may be a ';'- or ','-separated list (e.g. "gfx942;gfx950").
         arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
         n_before = len(all_jobs)
-        all_jobs = [j for j in all_jobs if job_arch(j["kind"], j["cu_num"]) in arch_set]
+        all_jobs = [
+            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
+        ]
         print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
