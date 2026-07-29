@@ -573,6 +573,9 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            act=act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
     else:
         raise ValueError(

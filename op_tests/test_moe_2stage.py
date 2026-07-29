@@ -101,7 +101,11 @@ def test_fmoe(
     reference_intermediate_pad=0,
     ref_dtype="bf16",
 ):
-    if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
+    if (
+        get_gfx() not in ["gfx950"]
+        and qType == aiter.QuantType.per_1x32
+        and WQDType != dtypes.i4x2
+    ):
         return
     torch_quant = aiter.get_torch_quant(qType)
     # mxfp8 (a8w8): per-1x32 e8m0 microscale on both fp8 activation and fp8 weight.
@@ -923,10 +927,14 @@ _PER1X32_FP8_FP4 = (aiter.QuantType.per_1x32, dtypes.fp8, dtypes.fp4x2)
 _PER1X32_FP4_FP4 = (aiter.QuantType.per_1x32, dtypes.fp4x2, dtypes.fp4x2)
 _PER1X32_BF16_I4 = (aiter.QuantType.per_1x32, dtypes.bf16, dtypes.i4x2)
 
-# SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8 activation
-# (a4w4 fp4 act, a8w4 fp8 act). Any other quant would silently fall off the
-# FlyDSL path, so SiTUv2 is skipped for those combos.
-_SITUV2_SUPPORTED_TRIPLES = (_PER1X32_FP8_FP4, _PER1X32_FP4_FP4)
+# SiTUv2 routes to FlyDSL for per_1x32 MXFP4 and packed-int4 weights. The
+# packed-int4 path covers both direct-store (k_batch=1) and CShuffle split-K
+# (k_batch>1) stage-1 epilogues.
+_SITUV2_SUPPORTED_TRIPLES = (
+    _PER1X32_FP8_FP4,
+    _PER1X32_FP4_FP4,
+    _PER1X32_BF16_I4,
+)
 
 
 def _situv2_beta_kwargs(act_type):
@@ -1096,22 +1104,29 @@ def _iter_legacy_cases():
                             **_situv2_beta_kwargs(act_type),
                         ), extras
         elif triple == _PER1X32_BF16_I4:
-            for m in args.tokenNum:
-                yield _kw(
-                    dtype,
-                    m,
-                    model_dim,
-                    inter_dim,
-                    quant_type,
-                    aq_dtype,
-                    wq_dtype,
-                    doweight_stage1,
+            for act_type in args.act:
+                if act_type not in (
                     aiter.ActivationType.Silu,
-                ), extras
+                    aiter.ActivationType.Situv2,
+                ):
+                    continue
+                for m in args.tokenNum:
+                    yield _kw(
+                        dtype,
+                        m,
+                        model_dim,
+                        inter_dim,
+                        quant_type,
+                        aq_dtype,
+                        wq_dtype,
+                        doweight_stage1,
+                        act_type,
+                        **_situv2_beta_kwargs(act_type),
+                    ), extras
         else:
             for act_type in args.act:
-                # SiTUv2 only routes to FlyDSL on per_1x32 + fp4/fp8; skip it for
-                # every other quant so we never compare an unsupported combo.
+                # SiTUv2 routes to FlyDSL only for the supported per_1x32 weight
+                # formats, so skip every other quant combination.
                 if (
                     act_type == aiter.ActivationType.Situv2
                     and triple not in _SITUV2_SUPPORTED_TRIPLES
@@ -1135,8 +1150,12 @@ def _iter_legacy_cases():
 def _iter_situv2_default_cases():
     """Yield (kwargs, extras) exercising the SiTUv2 activation by default.
 
-    SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
-    hardcode the supported quant family instead of relying on the -a list:
+    SiTUv2 routes to FlyDSL for per_1x32 MXFP4 and packed-int4 weights. Keep the
+    default sweep on the MXFP4 direct path, because packed-int4 split-K rejects
+    SiTUv2 explicitly. The focused packed-int4 command selects k_batch=1.
+
+    The default cases hardcode the supported MXFP4 family instead of relying on
+    the -a list:
       * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
     beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
     Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
@@ -1156,6 +1175,8 @@ def _iter_situv2_default_cases():
     dtype = args.dtype[0]
     model_dim = 3072
     tokens = [16, 128]
+    beta = 0.5 if args.beta is None else args.beta
+    linear_beta = 2.0 if args.linear_beta is None else args.linear_beta
     # ((quant_type, aq_dtype, wq_dtype), inter_dim)
     situv2_cases = [
         (_PER1X32_FP8_FP4, 512),  # a8w4: fp8 act, fp4 weight (256-aligned inter_dim)
@@ -1179,8 +1200,8 @@ def _iter_situv2_default_cases():
                 "strict_accuracy": False,
                 "check_aot_cache": False,
                 "swiglu_limit": None,
-                "beta": args.beta,
-                "linear_beta": args.linear_beta,
+                "beta": beta,
+                "linear_beta": linear_beta,
             }, extras
 
 

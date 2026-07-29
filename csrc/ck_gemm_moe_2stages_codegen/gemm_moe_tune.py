@@ -3970,7 +3970,11 @@ class FmoeTuner(TunerCommon):
             q_type = eval(q_type)
             q_type = QuantType.per_1x128 if q_type == QuantType.per_128x128 else q_type
             print("\nStart tuning", line)
-            if get_gfx() not in ["gfx950"] and q_type in [aiter.QuantType.per_1x32]:
+            if (
+                get_gfx() != "gfx950"
+                and q_type == aiter.QuantType.per_1x32
+                and q_dtype_w != dtypes.i4x2
+            ):
                 print(f"{q_type} is not supported on {get_gfx()}")
                 return []
             if not use_g1u1:
