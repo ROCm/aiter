@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-from typing import Any, Optional
+from dataclasses import dataclass
 from functools import cache
+from typing import Any
 
+import flydsl.compiler as flyc
+import flydsl.expr as fx
 import torch
 
 import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
+from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (
+    flydsl_absmax,
+    flydsl_quant_per_tensor,
+    invert_sorted_ids,
+    sorted_sum,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-
-from dataclasses import dataclass
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 
 
 @dataclass
@@ -123,14 +128,6 @@ def _launch(kernel_fn, *args):
     _run_compiled(kernel_fn, *prepared_args, stream)
 
 
-from aiter.ops.flydsl.kernels.moe_gemm_2stage_gfx942 import (  # noqa: E402
-    flydsl_absmax,
-    flydsl_quant_per_tensor,
-    sorted_sum,
-    invert_sorted_ids,
-)
-
-
 def _quant_per_tensor(x, scale=None, quant_dtype=torch.float8_e4m3fn, num_rows=None):
     assert scale is None
     assert num_rows is None
@@ -154,13 +151,13 @@ def fused_moe_gfx942(
     topk_ids: torch.Tensor,
     activation: ActivationType,
     quant_type: QuantType,
-    w1_scale: Optional[torch.Tensor],
-    w2_scale: Optional[torch.Tensor],
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
     expert_mask: Any,
     num_local_tokens: Any,
     moe_sorting_dispatch_policy: int,
     config_string: str,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
 
     # decode kernel configs from kernel name
     kcfgs = Config.from_string(config_string)

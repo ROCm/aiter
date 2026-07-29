@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import flydsl.expr as fx
-import flydsl.compiler as flyc
-from flydsl.expr import range_constexpr
-from flydsl.expr.typing import Vector as Vec, as_ir_value
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
-from flydsl._mlir.dialects import llvm, rocdl
-from flydsl._mlir import ir
-
 import functools
-import types
 import inspect
+import types
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value
 
 
 def div_up(x, y):
@@ -278,18 +279,15 @@ def all_copy_atoms(*tensors, atom_bits, num_threads: int):
             yield atom_list[0]
         else:
             yield atom_list
-    return
 
 
 def _as_ptr(p, dtype=None):
     """Convert memref or pointer to a pointer/iterator suitable for fx.make_view.
     Handles both raw fx.Pointer values and memref values passed by flydsl runtime."""
-    try:
-        p = fx.get_iter(p)
-    finally:
-        if dtype is not None and p.dtype != dtype:
-            p = fx.recast_iter(dtype, p)
-        return p
+    ptr = p if isinstance(p, fx.Pointer) else fx.get_iter(p)
+    if dtype is not None and ptr.dtype != dtype:
+        ptr = fx.recast_iter(dtype, ptr)
+    return ptr
 
 
 def atomic_add_bf16(ptr_base, reg_vec):
@@ -581,9 +579,10 @@ def asm_mark(mark: str):
 
 def dump_ir(enable_debug_info=True):
     import os
+
     import flydsl
-    from flydsl.utils.env import DebugEnvManager
     from flydsl._mlir import ir
+    from flydsl.utils.env import DebugEnvManager
 
     DebugEnvManager.enable_debug_info = enable_debug_info
     DebugEnvManager.dump_asm = True

@@ -3,15 +3,14 @@
 
 import os
 
-
-import flydsl.compiler as flyc  # noqa: E402
-from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
+import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, vector
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T, as_ir_value
 from flydsl.expr.typing import Vector as Vec
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
 from flydsl.expr.utils.arith import _to_raw as _raw
 
 from . import moe_gemm_2stage_gfx942_utils as fxh
@@ -2365,9 +2364,8 @@ def compile_gemm(
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
-        if const_expr(E is not None):
-            if M * TOPK <= E:
-                task_num = M * TOPK
+        if const_expr(E is not None) and M * TOPK <= E:
+            task_num = M * TOPK
         if const_expr(stage == "gateup"):
             moe_2stage_gateup_splitk(
                 p_input,
@@ -2448,9 +2446,8 @@ def compile_gemm(
     ):
         CompilationContext.get_current()
         num_n_blocks = fxh.div_up(N, BLOCK_TILE_SIZE_N)
-        if const_expr(E is not None):
-            if M * TOPK <= E:
-                task_num = M * TOPK
+        if const_expr(E is not None) and M * TOPK <= E:
+            task_num = M * TOPK
         if const_expr(stage == "gateup"):
             moe_2stage_gateup_prefill_1x4(
                 p_input,
@@ -2493,9 +2490,11 @@ def compile_gemm(
     return launch_splitk
 
 
-import torch  # noqa: E402
-import functools  # noqa: E402
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled  # noqa: E402
+import functools
+
+import torch
+
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 _TORCH_TO_FX = {
     torch.bfloat16: fx.BFloat16,
@@ -2712,7 +2711,6 @@ def flydsl_absmax():
                 syncscope="agent",
                 alignment=4,
             )
-        return
 
     @flyc.jit
     def launch(

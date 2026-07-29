@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import torch
 
@@ -1153,9 +1152,9 @@ class MOEMetadata:
     prequant: bool = True
     skip_inter_quant: bool = False
     route_bucket: str = ""
-    expected_sorted_blocks: Optional[int] = None
-    min_sorted_blocks: Optional[int] = None
-    max_sorted_blocks: Optional[int] = None
+    expected_sorted_blocks: int | None = None
+    min_sorted_blocks: int | None = None
+    max_sorted_blocks: int | None = None
     stage0: Callable = None
 
 

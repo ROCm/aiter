@@ -20,13 +20,6 @@ from aiter import (
     dtype2str_dict,
     dtypes,
 )
-from aiter.jit.core import (
-    get_asm_dir,
-    AITER_CSRC_DIR,
-    AITER_CONFIG_FMOE,
-    AITER_CONFIG_GROUPED_FMOE,
-    AITER_ROOT_DIR,
-)
 from aiter.fused_moe import (
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
@@ -4839,8 +4832,9 @@ class FmoeTuner(TunerCommon):
         Choosing best kernels based on (stage1_us + stage2_us) or (single_stage_us)
         may overlook some overheads between stages, and this e2e tune is a complement.
         """
-        from aiter.fused_moe_gfx942 import fused_moe_gfx942, get_tune_space
         from functools import partial
+
+        from aiter.fused_moe_gfx942 import fused_moe_gfx942, get_tune_space
 
         results_base = self.run_config(args)
         better_kernels = {}
@@ -4907,7 +4901,7 @@ class FmoeTuner(TunerCommon):
                     ),
                     config_string=config_string,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"{RED}Error with config {config_string}: {e}{END}")
                 continue
             block_m = 16
@@ -4942,7 +4936,7 @@ class FmoeTuner(TunerCommon):
                         tflops, bw = self.calculate(
                             (key, "stage1", kernelName1, block_m, e2e_us, err1)
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         tflops, bw = 0, 0
                     k["results"] = (
                         block_m,
