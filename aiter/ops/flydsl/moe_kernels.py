@@ -1235,6 +1235,7 @@ def flydsl_silu_and_mul_interleaved(
     )
     empty_scale = torch.empty(0, dtype=torch.uint8, device=out.device)
     empty_i32 = torch.empty(0, dtype=torch.int32, device=out.device)
+    assert empty_i32.data_ptr() == 0, "null sentinel must be a null pointer"
     empty_f32 = torch.empty(0, dtype=torch.float32, device=out.device)
     _run_compiled(
         _silu_fn,
@@ -2003,6 +2004,7 @@ def flydsl_moe_topids_to_rows(
         # Null pointer (0-element tensor -> data_ptr() == 0); the kernels read
         # null as "no truncation".
         num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
+        assert num_valid_routes.data_ptr() == 0, "null sentinel must be a null pointer"
 
     if expert_mask is not None:
         # Fused single-block path: build LUT + zero counter + route in one kernel.
@@ -2555,6 +2557,9 @@ def flydsl_moe_fused_quant_preshuffle(
         # not provided, pass a null pointer (0-element tensor -> data_ptr() == 0).
         if num_valid_routes is None:
             num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+            assert (
+                num_valid_routes_i32.data_ptr() == 0
+            ), "null sentinel must be a null pointer"
             assert num_valid_routes_i32.data_ptr() == 0, "expected a null data_ptr"
         else:
             num_valid_routes_i32 = (

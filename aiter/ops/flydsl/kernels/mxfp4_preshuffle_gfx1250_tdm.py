@@ -26,8 +26,8 @@ from .gemm_common_gfx1250 import (
     workgroup_barrier,
 )
 from .quant_utils import (
-    emit_amax_e8m0_native_scale,
-    emit_cvt_scalef32_pk8_fp8_f32,
+    emit_amax_e8m0_recip,
+    emit_cvt_pk4_fp8_f32,
 )
 
 TDM_DESCRIPTOR_VERSION = 1
@@ -560,11 +560,8 @@ def launch_gemm_a8w4_tdm(
                 is_kgrp0 = fx.Int32(kgrp) == fx.Int32(0)
                 q_dst_scale_dwpr = (i32_n // 256) * quant_wmma_rep
 
-                v2i32_ty = T.vec(2, T.i32)
                 QRPT_LOG2 = int(math.log2(QUANT_ROWS_PER_TILE))
                 N_MX_BLKS = wmma_n_rep // WN_PER_MX_BLOCK
-                # Total activated elements per wm row = N_MX_BLKS * WN_PER_MX_BLOCK * 4
-                _N_ELEM = N_MX_BLKS * WN_PER_MX_BLOCK * 4
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     row_i32 = fx.Int32(blk_m + row_rel)
@@ -593,7 +590,7 @@ def launch_gemm_a8w4_tdm(
                             range_constexpr=range_constexpr,
                         )
 
-                        scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
+                        recip, e8m0_byte = emit_amax_e8m0_recip(
                             all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
                         )
                         mx_blk_i = (
@@ -602,26 +599,24 @@ def launch_gemm_a8w4_tdm(
                         e8m0_bytes.append(e8m0_byte)
                         mx_blk_is.append(mx_blk_i)
 
-                        for half in range_constexpr(WN_PER_MX_BLOCK // 2):
-                            src_f32 = Vec.from_elements(
-                                all_vals[half * 8 : half * 8 + 8],
-                                fx.Float32,
-                            ).ir_value()
-                            packed_v2i32 = emit_cvt_scalef32_pk8_fp8_f32(
-                                src_f32, scale_f32, v2i32_ty=v2i32_ty, rocdl=rocdl
+                        # Pack fp8 payload and stage to LDS.  One dword per
+                        # sub-tile: the two v_cvt_pk_fp8_f32 inside the helper
+                        # place byte-pairs 0 and 1 explicitly, so the payload
+                        # byte order does not depend on how a wide native
+                        # instruction lays its result across the result vector.
+                        for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                            wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
+                            packed_i32 = emit_cvt_pk4_fp8_f32(
+                                all_vals[sub_wn * 4 : (sub_wn + 1) * 4],
+                                recip,
+                                rocdl=rocdl,
+                                vector=vector,
+                                T=T,
                             )
-                            for sub in range_constexpr(2):
-                                sub_wn = half * 2 + sub
-                                wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                packed_i32 = vector.extract(
-                                    packed_v2i32,
-                                    static_position=[sub],
-                                    dynamic_position=[],
-                                )
-                                col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                lds_store_b32_raw(
-                                    stC_idx, row_rel * STORE_N + col_fp8, packed_i32
-                                )
+                            col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
+                            lds_store_b32_raw(
+                                stC_idx, row_rel * STORE_N + col_fp8, packed_i32
+                            )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                     if row_rel < mn_oob and is_kgrp0:

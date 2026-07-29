@@ -1165,6 +1165,9 @@ def contiguous_psum_remap(
         # A 0-element tensor has data_ptr() == 0; the kernel reads that null
         # pointer as "no truncation".
         num_valid_routes_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        assert (
+            num_valid_routes_i32.data_ptr() == 0
+        ), "null sentinel must be a null pointer"
     else:
         num_valid_routes_i32 = (
             num_valid_routes.reshape(-1)[:1]
@@ -1269,6 +1272,9 @@ def flydsl_moe_gather_reduce(
         # A 0-element tensor has data_ptr() == 0; the kernel reads that null
         # pointer as "no truncation".
         num_valid_tokens_i32 = torch.empty(0, dtype=torch.int32, device=device)
+        assert (
+            num_valid_tokens_i32.data_ptr() == 0
+        ), "null sentinel must be a null pointer"
     else:
         num_valid_tokens_i32 = (
             num_valid_tokens.reshape(-1)[:1]

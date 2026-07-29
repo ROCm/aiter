@@ -134,10 +134,10 @@ def build_moe_contiguous_psum_module():
             with ir.InsertionPoint(start_if.else_block):
                 prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
+            start = fx.Int32(start_if.results[0])
             m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
 
             is_last = arith.cmpi(
                 CmpIPredicate.eq,
@@ -255,10 +255,10 @@ def build_moe_contiguous_psum_remap_module():
             with ir.InsertionPoint(start_if.else_block):
                 prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
+            start = fx.Int32(start_if.results[0])
             m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
             is_last = arith.cmpi(
                 CmpIPredicate.eq,
                 tid,
@@ -412,10 +412,6 @@ def build_moe_route_psum_fused_module():
         gpu.barrier()
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
-        # The atomic needs a raw addrspace(3) pointer, so the counter array's
-        # base is taken as an integer here; SharedAllocator has already folded
-        # its offset in, leaving only the per-expert element offset to add.
-        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
         tid_idx = arith.index_cast(T.index, tid)
         numel_idx = arith.index_cast(T.index, ArithValue(numel))
         stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
@@ -423,11 +419,8 @@ def build_moe_route_psum_fused_module():
         with ir.InsertionPoint(route_loop.body):
             route_i32 = arith.index_cast(i32, route_loop.induction_variable)
             e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            e_idx = arith.index_cast(T.index, e)
-            off_i64 = arith.index_cast(T.i64, fx.Index(e_idx) * fx.Index(4))
-            ptr = buffer_ops.create_llvm_ptr(
-                cnt_base_i64 + fx.Int64(off_i64), address_space=3
-            )
+            addr = fx.ptrtoint(lds_cnt + fx.Int64(e))
+            ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
             ptr = ptr._value if hasattr(ptr, "_value") else ptr
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -484,10 +477,10 @@ def build_moe_route_psum_fused_module():
             with ir.InsertionPoint(start_if.else_block):
                 prev = _lds_load(src, tid - arith.constant(1, type=i32))
                 scf.YieldOp([_raw(prev)])
-            start = ArithValue(start_if.results[0])
+            start = fx.Int32(start_if.results[0])
             m_tid = _lds_load(lds_cnt, tid)
             buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
             scf.YieldOp([])
         gpu.barrier()
 

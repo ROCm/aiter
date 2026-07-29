@@ -297,3 +297,87 @@ def emit_cvt_scalef32_pk8_fp8_f32(src_v8f32, scale_f32, *, v2i32_ty, rocdl):
         _raw(src_v8f32),
         _raw(scale_f32),
     )
+
+
+def emit_amax_e8m0_recip(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
+    """Per-lane amax over *all_vals*, shuffle-xor across kgrp halves, E8M0 scale.
+
+    The reciprocal counterpart of :func:`emit_amax_e8m0_native_scale`: both
+    reduce the amax identically, but this one returns ``2^(254-e8m0)`` so a
+    software converter can *multiply* by it, whereas the native gfx1250
+    ``v_cvt_scalef32_pk8_*`` path needs the forward scale to divide by.
+
+    Computes:
+      1. ``amax = max(|v| for v in all_vals)``  (per-lane)
+      2. Combine both kgrp halves via ``shuffle_xor(16, wave_size)``
+      3. Clamp to ``FLT_MAX`` to avoid inf in the scale
+      4. E8M0 biased exponent via :func:`emit_mx_e8m0_scale`
+      5. Reciprocal ``2^(254-e8m0) << 23`` bitcast to f32
+      6. Truncate E8M0 to i8 for storage
+
+    Args:
+        all_vals: list of f32 DSL values (activated GEMM output columns
+            for one MX block, typically 16 values = 4 sub-tiles x 4 cols).
+        wave_size: compile-time integer, wavefront width (e.g. 32).
+        dtype: MxDtype for the target format (default FP8_E4M3).
+
+    Returns:
+        ``(recip, e8m0_byte)`` — f32 reciprocal scale and i8 E8M0 byte.
+    """
+    c_flt_max = arith.constant(3.4028234663852886e38, type=T.f32)
+    c16 = arith.constant(16, type=T.i32)
+    c23 = arith.constant(23, type=T.i32)
+    c254 = arith.constant(254, type=T.i32)
+    c_wave = arith.constant(wave_size, type=T.i32)
+
+    block_amax = arith.constant(0.0, type=T.f32)
+    for v in all_vals:
+        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
+        block_amax = arith.maxnumf(block_amax, abs_v)
+    block_amax = arith.minnumf(block_amax, c_flt_max)
+    peer = block_amax.shuffle_xor(c16, c_wave)
+    block_amax = arith.maxnumf(block_amax, peer)
+
+    e8m0 = emit_mx_e8m0_scale(block_amax, dtype=dtype)
+    recip = ((c254 - e8m0) << c23).bitcast(T.f32)
+    e8m0_byte = arith.trunci(T.i8, e8m0)
+    return recip, e8m0_byte
+
+
+def emit_cvt_pk4_fp8_f32(vals, recip, *, rocdl, vector, T):
+    """Pack 4 pre-activated f32 values into 4 fp8 e4m3 bytes (i32).
+
+    Software counterpart of :func:`emit_cvt_scalef32_pk8_fp8_f32`, used by the
+    gugu (gate/up interleaved) stage1 epilogue where each sub-tile
+    de-interleaves to 4 output columns per lane.  Because it emits two
+    ``v_cvt_pk_fp8_f32`` writing byte-pairs 0 and 1 of one dword, the byte
+    order within the packed word is explicit here rather than implied by a
+    wide native instruction's lane layout.
+
+    Args:
+        vals:   list of 4 f32 IR values (activated GEMM output columns).
+        recip:  f32 IR value, ``2^(254-e8m0)`` reciprocal block scale.
+        rocdl:  the ``rocdl`` dialect module.
+        vector: kept for call-site symmetry with the pk8 helper (unused).
+        T:      the flydsl type namespace.
+
+    Returns:
+        ``i32`` IR value containing 4 packed fp8 e4m3 bytes.
+    """
+    assert len(vals) == 4, f"emit_cvt_pk4_fp8_f32 expects 4 values, got {len(vals)}"
+    c0 = arith.constant(0, type=T.i32)
+    word = rocdl.cvt_pk_fp8_f32(
+        T.i32,
+        _raw(vals[0] * recip),
+        _raw(vals[1] * recip),
+        _raw(c0),
+        0,
+    )
+    word = rocdl.cvt_pk_fp8_f32(
+        T.i32,
+        _raw(vals[2] * recip),
+        _raw(vals[3] * recip),
+        _raw(word),
+        1,
+    )
+    return word
