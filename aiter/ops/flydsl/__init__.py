@@ -10,14 +10,14 @@ whether the optional dependency exists before relying on FlyDSL kernels.
 
 from packaging.version import Version
 
-from .utils import is_flydsl_available
 from .moe_common import GateMode
+from .utils import is_flydsl_available
 
 _MIN_FLYDSL_VERSION = Version("0.1.8")
 
 __all__ = [
-    "is_flydsl_available",
     "GateMode",
+    "is_flydsl_available",
 ]
 
 if is_flydsl_available():
@@ -37,21 +37,21 @@ if is_flydsl_available():
             f"got `{installed_flydsl_version}`."
         )
 
-    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
-    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from .fmha_kernels import flydsl_flash_attn_func
+    from .gemm_kernels import flydsl_hgemm, flydsl_preshuffle_gemm_a8
     from .hstu_attention_kernels import flydsl_hstu_attention_fwd
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
-        "flydsl_preshuffle_gemm_a8",
+        "flydsl_flash_attn_func",
+        "flydsl_hgemm",
+        "flydsl_hstu_attention_fwd",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
-        "flydsl_hgemm",
-        "flydsl_flash_attn_func",
-        "flydsl_hstu_attention_fwd",
+        "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
         # "flydsl_gdr_decode",
     ]

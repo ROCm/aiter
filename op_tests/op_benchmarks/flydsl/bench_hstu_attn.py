@@ -1,8 +1,10 @@
-from aiter.ops.flydsl import flydsl_hstu_attention_fwd
-from dataclasses import dataclass
 import argparse
-import triton
+from dataclasses import dataclass
+
 import torch
+import triton
+
+from aiter.ops.flydsl import flydsl_hstu_attention_fwd
 from op_tests.flydsl_tests.test_flydsl_hstu_attention import (
     generate_hstu_attn_inputs,
 )
@@ -63,11 +65,12 @@ class FwdShape:
 
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+_DEFAULT_DEVICE = torch.device("cuda")
 
 
 def run_benchmark(
     shape: FwdShape,
-    device: torch.device = torch.device("cuda"),
+    device: torch.device = _DEFAULT_DEVICE,
     seed: int = 1001,
 ):
     torch.cuda.empty_cache()

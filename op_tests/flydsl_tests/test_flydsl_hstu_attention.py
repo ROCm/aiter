@@ -1,12 +1,15 @@
+import csv
+
 import pytest
 import torch
-import csv
 
 import aiter.ops.flydsl.hstu_attention_kernels as hstu_kernels
 from aiter.ops.flydsl.hstu_attention_kernels import (
-    flydsl_hstu_attention_fwd,
     _validate_inputs,
+    flydsl_hstu_attention_fwd,
 )
+
+_DEFAULT_DEVICE = torch.device("cuda")
 
 
 def _generate_sparse_seq_len(
@@ -55,7 +58,7 @@ def generate_hstu_attn_inputs(
     hidden_dim: int,
     target_size: int,
     dtype: torch.dtype,
-    device: torch.device = torch.device("cuda"),
+    device: torch.device = _DEFAULT_DEVICE,
     seed: int = 1001,
     sl_alpha: float = 2.0,
 ):
@@ -267,23 +270,23 @@ def test_validate_inputs_rejects_num_targets_length_mismatch():
 
 
 def _row(**overrides) -> dict:
-    row = dict(
-        arch=hstu_kernels._GPU_ARCH,
-        dtype="bf16",
-        num_heads=4,
-        head_dim=128,
-        hidden_dim=128,
-        batch=256,
-        max_seq_len=1024,
-        has_window="False",
-        has_contextual="False",
-        has_targets="False",
-        duration=1.0,
-        block_m=128,
-        block_n=64,
-        num_waves=4,
-        waves_per_eu=2,
-    )
+    row = {
+        "arch": hstu_kernels._GPU_ARCH,
+        "dtype": "bf16",
+        "num_heads": 4,
+        "head_dim": 128,
+        "hidden_dim": 128,
+        "batch": 256,
+        "max_seq_len": 1024,
+        "has_window": "False",
+        "has_contextual": "False",
+        "has_targets": "False",
+        "duration": 1.0,
+        "block_m": 128,
+        "block_n": 64,
+        "num_waves": 4,
+        "waves_per_eu": 2,
+    }
     row.update(overrides)
     return row
 
@@ -304,7 +307,7 @@ def test_tuned_csv_is_picked_up(tmp_path):
 
     assert len(config_map) == 1
     (config,) = config_map.values()
-    assert config == dict(block_m=128, block_n=64, num_waves=4, waves_per_eu=2)
+    assert config == {"block_m": 128, "block_n": 64, "num_waves": 4, "waves_per_eu": 2}
 
 
 def test_tuned_csv_missing_file_returns_empty(tmp_path):

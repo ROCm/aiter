@@ -234,7 +234,7 @@ def build_hstu_attention_fwd(
     assert hidden_dim % MFMA_M == 0
 
     # Arch-conditional DMA width + K LDS swizzle geometry (gfx942 dword / gfx950 dwordx4).
-    DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()
+    DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()  # noqa: RUF059
 
     elem_dtype = _dtype_to_elem_type(dtype_str)
     is_bf16 = dtype_str == "bf16"
@@ -558,7 +558,8 @@ def build_hstu_attention_fwd(
             """Issue coalesced K[kv_start] global loads to registers (non-blocking).
 
             full_tile (unmasked causal prefix): every row is provably in-seq, so the tok<seq_len
-            bounds guard is dead -- drop it, keeping only the structural row/col guards."""
+            bounds guard is dead -- drop it, keeping only the structural row/col guards.
+            """
             vecs = []
             for b in range_constexpr(NUM_BATCHES_K):
                 row = k_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_K)
@@ -620,7 +621,8 @@ def build_hstu_attention_fwd(
             """Issue coalesced V[kv_start] global loads to registers; return the vecs (non-blocking).
 
             full_tile=True (unmasked causal prefix): tok<seq_len is provably true (see
-            async_load_k_regs) -- drop the bounds guard, keeping only the structural row guard."""
+            async_load_k_regs) -- drop the bounds guard, keeping only the structural row guard.
+            """
             vecs = []
             for b in range_constexpr(NUM_BATCHES_V):
                 row = v_load_row_in_batch + fx.Int32(b * ROWS_PER_BATCH_V)
@@ -667,7 +669,8 @@ def build_hstu_attention_fwd(
         # ==== GEMM1: Q*K^T -> P (P fragment already in GEMM2 A-operand layout) ====
         def read_k_packs(ng):
             """LDS-read K A-operand packs for sub-tile ng (2D-indexed; col via the shared swizzle).
-            The swizzle uses the LOCAL row (0..BLOCK_N-1) so it matches the store's layout."""
+            The swizzle uses the LOCAL row (0..BLOCK_N-1) so it matches the store's layout.
+            """
             local_k_row = fx.Int32(ng * MFMA_M) + lane_mod_16
             packs = []
             for ks in range_constexpr(K_STEPS_K):
@@ -727,9 +730,12 @@ def build_hstu_attention_fwd(
 
                     if const_expr(apply_mask):
 
+                        # keep_col is traced and consumed within this same loop iteration
+                        # (see the comprehension below), so the loop vars it closes over are
+                        # bound at definition time -- B023's late-binding concern doesn't apply.
                         def keep_col(i):
                             """causal * window * contextual * target mask for (qg, col i)."""
-                            dist = q_row_ids[qg] - col_id[i]
+                            dist = q_row_ids[qg] - col_id[i]  # noqa: B023
                             if not causal:
                                 # Non-causal: symmetric id distance |q - col|. With the diagonal
                                 # term this admits all in-seq columns (full attention); a window
@@ -739,16 +745,18 @@ def build_hstu_attention_fwd(
                             # always attends its own token, even where to_id's shift+clamp collapses
                             # distinct ids. The window/causal distance uses to_id ids, so the id
                             # transform governs only the off-diagonal mask.
-                            keep = (q_rows_i32[qg] == col_raw[i]) | (dist > fx.Int32(0))
+                            keep = (q_rows_i32[qg] == col_raw[i]) | (  # noqa: B023
+                                dist > fx.Int32(0)
+                            )
                             if has_window:
                                 keep = keep & (dist <= fx.Int32(max_attn_len))
                             if has_contextual:
                                 # Prefix opener: logical row 0 attends the contextual prefix.
-                                ctx = (q_row_ids[qg] == fx.Int32(0)) & (
-                                    col_id[i] < max_id
+                                ctx = (q_row_ids[qg] == fx.Int32(0)) & (  # noqa: B023
+                                    col_id[i] < max_id  # noqa: B023
                                 )
                                 keep = keep | ctx
-                            keep = keep & col_in_seq[i]
+                            keep = keep & col_in_seq[i]  # noqa: B023
                             return keep
 
                         s_vals = [
@@ -790,7 +798,8 @@ def build_hstu_attention_fwd(
         def run_kv_tile(o_acc, kv_start, apply_mask=True, full_tile=False):
             """K staged global->registers->swizzled LDS (pipelineable); V register-prefetched.
 
-            full_tile: the tile is fully in-seq (unmasked causal prefix) -> load guards elided."""
+            full_tile: the tile is fully in-seq (unmasked causal prefix) -> load guards elided.
+            """
             k_vecs = async_load_k_regs(kv_start, full_tile=full_tile)
             v_vecs = async_load_v_regs(kv_start, full_tile=full_tile)
             # wait for K regs; V stays outstanding
