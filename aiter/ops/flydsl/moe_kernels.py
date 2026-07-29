@@ -13,7 +13,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 _KERNEL_PARAMS: dict[str, dict] = {}
 
-# HIP permits a much larger grid.x, but grid.y/grid.z are limited to 65535.
+# HIP limits grid.y/grid.z to 65535.
 _HIP_MAX_GRID_DIM_Y = 65535
 
 
@@ -100,15 +100,7 @@ def pick_flydsl_stage1_tile_n(inter_dim: int) -> int:
 def resolve_flydsl_grid_y_persist_m(
     num_m_blocks: int, requested_persist_m: int = 0
 ) -> int:
-    """Choose enough M blocks per workgroup to keep grid.y legal.
-
-    FlyDSL MoE maps sorted route blocks to grid.y. Large prefill requests can
-    have more than 65535 route blocks even though their tuning key is capped at
-    131072 tokens, causing ``hipModuleLaunchKernel`` to return
-    ``hipErrorInvalidValue``. Kernels with a positive ``persist_m`` loop can
-    process multiple route blocks per workgroup, so increase that loop count
-    only when needed to fit HIP's grid.y limit.
-    """
+    """Increase persist_m as needed to keep grid.y within HIP's limit."""
     num_m_blocks = max(int(num_m_blocks), 0)
     requested_persist_m = max(int(requested_persist_m), 1)
     required_persist_m = max(
@@ -120,7 +112,7 @@ def resolve_flydsl_grid_y_persist_m(
 def requires_flydsl_stage2_reduce(
     token_num: int, model_dim: int, element_size: int
 ) -> bool:
-    """Whether atomic stage2 output exceeds buffer atomics' 32-bit byte range."""
+    """Return whether stage2 atomic output exceeds 32-bit byte offsets."""
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
@@ -1741,10 +1733,7 @@ def flydsl_moe_stage2(
         and not return_per_slot
         and requires_flydsl_stage2_reduce(token_num, model_dim, 2)
     ):
-        # Atomic output uses a single buffer resource with 32-bit byte offsets.
-        # Route through per-slot output + reduction once the final [M, N]
-        # destination exceeds 4 GiB, otherwise high token rows are silently
-        # dropped. Both supported output dtypes (bf16/f16) are two bytes.
+        # Buffer atomics use 32-bit offsets; reduce outputs larger than 4 GiB.
         mode = "reduce"
 
     accumulate = mode != "reduce" and not return_per_slot
@@ -1804,8 +1793,7 @@ def flydsl_moe_stage2(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # The fp8 path does not use the CU-persistent implementation, but its
-        # positive persist_m loop can still keep grid.y within HIP's limit.
+        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:
