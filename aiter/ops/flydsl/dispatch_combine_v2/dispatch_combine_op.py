@@ -584,16 +584,25 @@ class EpDispatchCombineOp:
                 _b, _w = (int(x) for x in _bw.split(","))
                 combine_specs = [(_b, _w)]
             elif cfg.is_fused:
-                # The fused combine is just an xdb cross-device barrier + a light
-                # per-(token,k) topk sum. At low token counts the barrier dominates
-                # and prefers FEW resident blocks (2x16); at high token counts the
-                # per-token sum wants more blocks (8x16). Precompile both and pick
-                # by token count at runtime (_combine_fused). Measured on EP4:
-                # bs16 2x16 beats 8x16 by ~1.7%, bs128 8x16 beats 2x16 by ~3.7%.
-                combine_specs = [(2, 16), (8, 16)]
-                self._fused_comb_lo = (2, 16)
-                self._fused_comb_hi = (8, 16)
-                self._fused_comb_thresh = 32
+                # The fused combine is an xdb cross-device barrier + a light
+                # per-(token,k) topk sum. The sum is HBM-bandwidth bound, so at any
+                # non-trivial token count it wants a BIG grid that fills all CUs
+                # (gfx1250 has 256 CUs) -- the old 8-block grid used ~3% of the GPU
+                # and ran at ~460 GB/s; a 512-block grid + _UNROLL=1 (low VGPR ->
+                # high occupancy) hits ~4200 GB/s read (bs2048), ~7x faster. At tiny
+                # token counts the barrier dominates and prefers FEW blocks (2x16).
+                # Precompile both and pick by token count at runtime (_combine_fused).
+                # Token-adaptive tiers (count_upper_bound, (block, warp)); last is
+                # the catch-all. Tiny counts are barrier-bound and want few blocks;
+                # once the per-token sum dominates the grid must fill all 256 CUs.
+                # A single big grid (512x16) over-splits mid counts (each warp gets
+                # < the vec4 chunk), so mid tiers keep warps_per_tok sane.
+                self._fused_comb_tiers = [
+                    (32, (2, 16)),
+                    (192, (64, 16)),
+                    (None, (512, 16)),
+                ]
+                combine_specs = [s for _, s in self._fused_comb_tiers]
             else:
                 combine_specs = [(_b, _w)]
         self._dispatch_specs = dispatch_specs
@@ -1060,13 +1069,15 @@ class EpDispatchCombineOp:
         stream = fx.Stream(torch.cuda.current_stream())
         count = routing.cur_rank_num_token
         # Token-adaptive geometry: few blocks (barrier-bound) at low token counts,
-        # more blocks (sum-bound) at high token counts. Falls back to _pick when a
-        # single spec is compiled (e.g. SCATTER_COMB_BW pinned).
-        _thresh = getattr(self, "_fused_comb_thresh", None)
-        if _thresh is not None and self._fused_comb_lo in self._combine_variants:
-            comb_spec = (
-                self._fused_comb_lo if count <= _thresh else self._fused_comb_hi
-            )
+        # more blocks (sum/BW-bound) at high token counts. Falls back to _pick when
+        # a single spec is compiled (e.g. SCATTER_COMB_BW pinned).
+        _tiers = getattr(self, "_fused_comb_tiers", None)
+        if _tiers is not None:
+            comb_spec = _tiers[-1][1]
+            for _ub, _spec in _tiers:
+                if _ub is not None and count <= _ub:
+                    comb_spec = _spec
+                    break
         else:
             _, comb_spec = self._pick(count)
         self.combine_out.zero_()

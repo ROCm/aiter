@@ -1405,15 +1405,9 @@ def make_combine_fused_reduce(
         xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
         # ── Stage A: cross-device barrier — wait until all peers' gemm2 P2P writes
-        # into our comb_inp are globally visible (same xdb handshake as combine;
-        # inlined because FlyDSL rewrites dynamic `if` only in the kernel body). ──
-        fx.barrier()
-        if tid == 0:
-            P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
+        # into our comb_inp are globally visible. Block-0-only xdb handshake, then
+        # signal other blocks via comb_bar (same as make_combine Stage 1; #487). ──
         if grid_thread_id < npes:
-            P.spin_until_eq_i32(fx.Int64(addr_comb_bar), block_num)
-            P.fence_system_acquire()
-            buffer_store(arith.constant(0), rsrc_comb_bar, 0)
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
@@ -1422,14 +1416,23 @@ def make_combine_fused_reduce(
             P.atomic_add_global(
                 fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
             )
-        if tid < npes:
+        if grid_thread_id < npes:
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
-            ) + fx.Int64(tid) * fx.Int64(8)
+            ) + fx.Int64(grid_thread_id) * fx.Int64(8)
             P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
-            P.fence_system_acquire()
-        fx.barrier()
-        P.fence_system_acquire()
+        if bid == 0:
+            fx.barrier()
+            if tid == 0:
+                P.store_i32_system(
+                    fx.Int64(addr_comb_bar), arith.constant(0), arith.constant(1)
+                )
+        if bid != 0:
+            if tid == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), 0)
+            fx.barrier()
+            if tid == 0:
+                P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
 
         # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
         comb_inp_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_inp))
@@ -1467,28 +1470,58 @@ def make_combine_fused_reduce(
                     acc = acc + to_acc(v)
                 buffer_store(from_acc(acc), rsrc_out, out_base + off)
 
-            # vec4 (4 i32/lane) local reads + per-i32 sum + vec4 store, WAVE-strided.
-            _v4eff = eff // arith.constant(4)
-            for _u in range(lane, _v4eff, WAVE):
-                _off = unit_base + _u * arith.constant(4)
-                _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
-                for k_slot in range_constexpr(topk):
-                    _vv = P.load_v4i32_nt(expert_addrs[k_slot], _off)
-                    for _j in range_constexpr(4):
-                        _e = vector.extract(_vv, static_position=[_j])
-                        _accs[_j] = _accs[_j] + to_acc(_e)
-                _res = vector.from_elements(
-                    T.VectorType.get([4], T.i32()),
-                    [
-                        from_acc(_accs[0]),
-                        from_acc(_accs[1]),
-                        from_acc(_accs[2]),
-                        from_acc(_accs[3]),
-                    ],
-                )
-                buffer_store(_res, rsrc_out, out_base + _off)
-            for _u in range(_v4eff * arith.constant(4) + lane, eff, WAVE):
-                _one(unit_base + _u)
+            # Inner-unrolled vec4: issue _UNROLL x topk v4 loads FIRST (load-first,
+            # high MLP to hide the 6 strided comb_inp streams), then reduce + vec4
+            # store. Mirrors make_combine's load-first scheduling (#484). Tail units
+            # (< STEP_V4) fall back to the scalar _one path.
+            # _UNROLL=1 keeps VGPR low so the grid can fill all CUs (occupancy),
+            # which matters far more than per-wave MLP here: the reduce is HBM-BW
+            # bound, and a big grid (block_num ~= #CUs) is what saturates HBM. A
+            # deep unroll (4) blew VGPR to ~200 and capped occupancy, throttling
+            # load issue (s_clause). Overridable via SCATTER_COMB_UNROLL for tuning.
+            _UNROLL = int(_os.environ.get("SCATTER_COMB_UNROLL", "1"))
+            VEC = 4
+            STEP_CHUNK = WAVE * VEC  # 128 i32 elems/round across the wave
+            STEP_V4 = _UNROLL * STEP_CHUNK  # _UNROLL * 128
+            main_end = (eff // arith.constant(STEP_V4)) * arith.constant(STEP_V4)
+            for u in range(lane * VEC, main_end, STEP_V4):
+                base = unit_base + u
+                _pre = []
+                for _r in range_constexpr(_UNROLL):
+                    _off_r = base + _r * STEP_CHUNK
+                    _pre.append(
+                        [
+                            P.load_v4i32_nt(expert_addrs[k_slot], _off_r)
+                            for k_slot in range_constexpr(topk)
+                        ]
+                    )
+                for _r in range_constexpr(_UNROLL):
+                    _off = base + _r * STEP_CHUNK
+                    _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
+                    for k_slot in range_constexpr(topk):
+                        for _j in range_constexpr(VEC):
+                            _accs[_j] = _accs[_j] + to_acc(
+                                vector.extract(_pre[_r][k_slot], static_position=[_j])
+                            )
+                    _res = vector.from_elements(
+                        T.VectorType.get([4], T.i32()),
+                        [
+                            from_acc(_accs[0]),
+                            from_acc(_accs[1]),
+                            from_acc(_accs[2]),
+                            from_acc(_accs[3]),
+                        ],
+                    )
+                    buffer_store(_res, rsrc_out, out_base + _off)
+            for u in range(main_end + lane, eff, WAVE):
+                _one(unit_base + u)
+
+        # Epilogue: block 0 waits for every other block (comb_bar increments from
+        # Stage A), then resets comb_bar for the next call (#494 race fix).
+        if global_warp_id == 0:
+            if lane == 0:
+                P.spin_until_gt_i32(fx.Int64(addr_comb_bar), block_num - 1)
+                buffer_store(arith.constant(0), rsrc_comb_bar, 0)
 
     @flyc.jit
     def run(
