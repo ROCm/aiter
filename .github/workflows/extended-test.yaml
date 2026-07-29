@@ -1,0 +1,142 @@
+name: Extended Test
+
+run-name: Extended test for PR #${{ github.event.pull_request.number }}
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled]
+
+permissions:
+  contents: read
+  statuses: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  DISPATCH_EVENT_TYPE: aiter-pr-test
+
+jobs:
+  dispatch:
+    name: Dispatch extended tests
+    if: >-
+      github.event.pull_request.head.repo.fork == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (
+        contains(github.event.pull_request.title, 'gfx1250') ||
+        contains(github.event.pull_request.title, 'GFX1250') ||
+        contains(github.event.pull_request.labels.*.name, 'ci:extended-test')
+      ) &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ci:extended-test')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Build dispatch payload
+        env:
+          AITER_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_TYPE: ${{ env.DISPATCH_EVENT_TYPE }}
+          TRIGGER_REASON: ${{ contains(github.event.pull_request.labels.*.name, 'ci:extended-test') && 'label' || 'title' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          payload = {
+              "event_type": os.environ["EVENT_TYPE"],
+              "client_payload": {
+                  "aiter_repo": os.environ["AITER_REPOSITORY"],
+                  "pr_number": int(os.environ["PR_NUMBER"]),
+                  "pr_title": os.environ["PR_TITLE"],
+                  "head_repo": os.environ["HEAD_REPOSITORY"],
+                  "head_ref": os.environ["HEAD_REF"],
+                  "head_sha": os.environ["HEAD_SHA"],
+                  "base_ref": os.environ["BASE_REF"],
+                  "base_sha": os.environ["BASE_SHA"],
+                  "trigger_reason": os.environ["TRIGGER_REASON"],
+                  "source_workflow_run_id": os.environ["GITHUB_RUN_ID"],
+                  "source_workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                  "triggering_actor": os.environ["GITHUB_TRIGGERING_ACTOR"],
+              },
+          }
+
+          with open("dispatch-payload.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f)
+          PY
+
+      - name: Trigger extended tests
+        env:
+          TARGET_REPOSITORY: ${{ secrets.EXTENDED_TEST_DISPATCH_REPOSITORY }}
+          TOKEN: ${{ secrets.EXTENDED_TEST_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TARGET_REPOSITORY}" ]; then
+            echo "::error::Missing EXTENDED_TEST_DISPATCH_REPOSITORY secret"
+            exit 1
+          fi
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::Missing EXTENDED_TEST_DISPATCH_TOKEN secret"
+            exit 1
+          fi
+
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${TARGET_REPOSITORY}/dispatches" \
+            --data @dispatch-payload.json
+
+      - name: Wait for extended test result
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AITER_REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          STATUS_CONTEXT: extended-tests/aiter
+          WAIT_TIMEOUT_MINUTES: ${{ vars.EXTENDED_TEST_WAIT_TIMEOUT_MINUTES || '180' }}
+        run: |
+          set -euo pipefail
+          deadline="$(( $(date +%s) + WAIT_TIMEOUT_MINUTES * 60 ))"
+
+          while [ "$(date +%s)" -lt "${deadline}" ]; do
+            curl -fsS \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${AITER_REPOSITORY}/commits/${HEAD_SHA}/statuses?per_page=100" \
+              -o statuses.json
+
+            state="$(python3 -c 'import json, os; statuses = json.load(open("statuses.json", encoding="utf-8")); context = os.environ["STATUS_CONTEXT"]; print(next((status.get("state", "") for status in statuses if status.get("context") == context), ""))')"
+
+            case "${state}" in
+              success)
+                echo "Extended test status: success"
+                exit 0
+                ;;
+              failure|error)
+                echo "Extended test status: ${state}"
+                exit 1
+                ;;
+              pending)
+                echo "Extended test status: pending"
+                ;;
+              "")
+                echo "Extended test status is not available yet"
+                ;;
+              *)
+                echo "Extended test status: ${state}"
+                ;;
+            esac
+
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for extended test status"
+          exit 1
