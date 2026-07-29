@@ -587,7 +587,7 @@ class TDMGatherKVLoader:
             gl.int32
         )
         gl.amd.gfx1250.tdm.async_gather(
-            self.k_desc, src_row_indices, 0, self.k_shared.index(buffer_id)
+            self.k_desc, src_row_indices, self.k_shared.index(buffer_id)
         )
 
     @gluon.jit
@@ -596,7 +596,7 @@ class TDMGatherKVLoader:
             gl.int32
         )
         gl.amd.gfx1250.tdm.async_gather(
-            self.v_desc, src_row_indices, 0, self.v_shared.index(buffer_id)
+            self.v_desc, src_row_indices, self.v_shared.index(buffer_id)
         )
 
     @gluon.jit

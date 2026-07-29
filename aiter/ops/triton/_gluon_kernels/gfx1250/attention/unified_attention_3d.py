@@ -1348,7 +1348,6 @@ class AttentionProgram:
             gl.amd.gfx1250.tdm.async_gather(
                 self.k_desc,
                 src_row_indices,
-                0,
                 self.k_shared.index(buffer_id),
             )
 
@@ -1385,7 +1384,6 @@ class AttentionProgram:
             gl.amd.gfx1250.tdm.async_gather(
                 self.v_desc,
                 src_row_indices,
-                0,
                 self.v_shared.index(buffer_id),
             )
 
