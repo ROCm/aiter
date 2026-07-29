@@ -11,18 +11,14 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int32, T
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    STensor,
     ptr_rsrc,
 )
 
@@ -34,6 +30,42 @@ MAX_G2L_EXPERTS = 512
 # The per-block LDS counter array is sized to this; the dispatcher falls back to
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
+
+
+@fx.struct
+class _RouteCntStorage:
+    """LDS for the two-level route kernel.
+
+    ``cnt`` is the per-bucket counter that routes bump with LDS atomics before
+    a single device atomic publishes each bucket's base. The trailing 16 is the
+    array's byte alignment.
+    """
+
+    cnt: fx.Array[fx.Int32, MAX_ROUTE_BUCKETS, 16]
+
+
+@fx.struct
+class _RouteG2LStorage:
+    """LDS for the fused global->local LUT + route kernel.
+
+    ``lds0``/``lds1`` are ping-pong buffers for the Hillis-Steele scan over the
+    expert mask; ``lut`` holds the resulting global->local map, kept in LDS so
+    the route phase needs no global LUT buffer.
+    """
+
+    lds0: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+    lds1: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+    lut: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+
+
+def _lds_load(ptr, idx):
+    """Scalar i32 load from an LDS pointer at element offset ``idx``."""
+    return fx.ptr_load(ptr + fx.Int64(idx))
+
+
+def _lds_store(ptr, val, idx):
+    """Scalar i32 store to an LDS pointer at element offset ``idx``."""
+    fx.ptr_store(val, ptr + fx.Int64(idx))
 
 
 def build_moe_route_maps_module():
@@ -95,10 +127,6 @@ def build_moe_route_maps_module():
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_maps_kernel(
             topk_ids, atomic_buffer, topids_to_rows, rows_to_tokens, numel, topk, max_m
@@ -338,12 +366,6 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
     device-atomic kernel). Requires ``E <= MAX_ROUTE_BUCKETS`` (LDS capacity);
     the caller falls back to the plain kernel otherwise.
     """
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_route_g2l_lds_smem"
-    )
-    cnt_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = cnt_off + MAX_ROUTE_BUCKETS * 4
 
     @flyc.kernel(
         name="moe_route_g2l_lds",
@@ -371,13 +393,10 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             ArithValue(fx.block_idx.x) * arith.constant(BLOCK_THREADS, type=i32) + tid
         )
 
-        lds_base = allocator.get_base()
-        cnt_base_idx = buffer_ops.extract_base_index(lds_base)
-        lds_cnt = STensor(
-            SmemPtr(lds_base, cnt_off, T.i32, shape=(MAX_ROUTE_BUCKETS,)),
-            dtype=T.i32,
-            shape=(MAX_ROUTE_BUCKETS,),
-        )
+        lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
+        # The LDS atomic below needs a raw addrspace(3) pointer; SharedAllocator
+        # has already folded the array's offset into this base.
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
 
         tk_rsrc = ptr_rsrc(topk_ids)
         g2l_rsrc = ptr_rsrc(g2l_lut)
@@ -396,7 +415,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         zero_loop = scf.ForOp(tid_idx, nbk_idx, stride_idx)
         with ir.InsertionPoint(zero_loop.body):
             b = arith.index_cast(i32, zero_loop.induction_variable)
-            lds_cnt[fx.Index(ArithValue(b))] = c0
+            _lds_store(lds_cnt, fx.Int32(c0), ArithValue(b))
             scf.YieldOp([])
         gpu.barrier()
 
@@ -442,12 +461,10 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         rank_if = scf.IfOp(in_range, results_=[i32], has_else=True)
         with ir.InsertionPoint(rank_if.then_block):
             e_idx = arith.index_cast(T.index, eff_e)
-            addr = (
-                fx.Index(cnt_base_idx)
-                + fx.Index(cnt_off)
-                + fx.Index(e_idx) * fx.Index(4)
+            off_i64 = arith.index_cast(T.i64, fx.Index(e_idx) * fx.Index(4))
+            lds_ptr = buffer_ops.create_llvm_ptr(
+                cnt_base_i64 + fx.Int64(off_i64), address_space=3
             )
-            lds_ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
             lds_ptr = lds_ptr._value if hasattr(lds_ptr, "_value") else lds_ptr
             my = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -469,7 +486,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         flush_loop = scf.ForOp(tid_idx, nbk_idx, stride_idx)
         with ir.InsertionPoint(flush_loop.body):
             b = arith.index_cast(i32, flush_loop.induction_variable)
-            cnt = lds_cnt[fx.Index(ArithValue(b))]
+            cnt = _lds_load(lds_cnt, ArithValue(b))
             nz = arith.cmpi(CmpIPredicate.ne, cnt, c0)
             base_if = scf.IfOp(nz, results_=[i32], has_else=True)
             with ir.InsertionPoint(base_if.then_block):
@@ -489,14 +506,14 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
                 scf.YieldOp([base_v])
             with ir.InsertionPoint(base_if.else_block):
                 scf.YieldOp([c0])
-            lds_cnt[fx.Index(ArithValue(b))] = ArithValue(base_if.results[0])
+            _lds_store(lds_cnt, fx.Int32(base_if.results[0]), ArithValue(b))
             scf.YieldOp([])
         gpu.barrier()
 
         # Phase 3: final row = base[eff_e] + intra-block rank + eff_e*max_m.
         _if_final = scf.IfOp(in_range)
         with ir.InsertionPoint(_if_final.then_block):
-            base = lds_cnt[fx.Index(ArithValue(eff_e))]
+            base = _lds_load(lds_cnt, ArithValue(eff_e))
             slot = ArithValue(base) + ArithValue(my_rank)
             row = slot + ArithValue(eff_e) * ArithValue(max_m)
             buffer_ops.buffer_store(row, out_rsrc, route)
@@ -517,10 +534,6 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         gx = arith.index_cast(T.index, grid_blocks)
         route_kernel(
             topk_ids,
@@ -564,16 +577,6 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
     Requires E_global <= MAX_G2L_EXPERTS (single-workgroup scan); the caller
     falls back to the two-kernel path otherwise.
     """
-    gpu_arch = get_rocm_arch()
-    allocator = SmemAllocator(
-        None, arch=gpu_arch, global_sym_name="moe_route_g2l_fused_smem"
-    )
-    lds0_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds0_off + MAX_G2L_EXPERTS * 4
-    lds1_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds1_off + MAX_G2L_EXPERTS * 4
-    lut_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lut_off + MAX_G2L_EXPERTS * 4
 
     @flyc.kernel(
         name="moe_route_g2l_fused",
@@ -599,22 +602,10 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         c1 = arith.constant(1, type=i32)
         tid = ArithValue(fx.thread_idx.x)
 
-        lds_base = allocator.get_base()
-        lds0 = STensor(
-            SmemPtr(lds_base, lds0_off, T.i32, shape=(MAX_G2L_EXPERTS,)),
-            dtype=T.i32,
-            shape=(MAX_G2L_EXPERTS,),
-        )
-        lds1 = STensor(
-            SmemPtr(lds_base, lds1_off, T.i32, shape=(MAX_G2L_EXPERTS,)),
-            dtype=T.i32,
-            shape=(MAX_G2L_EXPERTS,),
-        )
-        lds_lut = STensor(
-            SmemPtr(lds_base, lut_off, T.i32, shape=(MAX_G2L_EXPERTS,)),
-            dtype=T.i32,
-            shape=(MAX_G2L_EXPERTS,),
-        )
+        lds = fx.SharedAllocator().allocate(_RouteG2LStorage).peek()
+        lds0 = lds.lds0.ptr
+        lds1 = lds.lds1.ptr
+        lds_lut = lds.lut.ptr
 
         m_rsrc = ptr_rsrc(expert_mask)
         ctr_rsrc = ptr_rsrc(counter)
@@ -633,7 +624,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         with ir.InsertionPoint(_if_load.then_block):
             m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             nz = arith.cmpi(CmpIPredicate.ne, m, c0)
-            lds0[fx.Index(tid)] = ArithValue(arith.select(nz, c1, c0))
+            _lds_store(lds0, fx.Int32(arith.select(nz, c1, c0)), tid)
             scf.YieldOp([])
 
         gpu.barrier()
@@ -646,17 +637,17 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
                 continue
             _if_scan = scf.IfOp(in_range)
             with ir.InsertionPoint(_if_scan.then_block):
-                val = src[fx.Index(tid)]
+                val = _lds_load(src, tid)
                 has_prev = arith.cmpi(
                     CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
                 )
                 prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
                 with ir.InsertionPoint(prev_if.then_block):
-                    prev = src[fx.Index(tid - arith.constant(offset, type=i32))]
+                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
                     scf.YieldOp([_raw(prev)])
                 with ir.InsertionPoint(prev_if.else_block):
                     scf.YieldOp([c0])
-                dst[fx.Index(tid)] = ArithValue(val) + ArithValue(prev_if.results[0])
+                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
                 scf.YieldOp([])
             gpu.barrier()
             src, dst = dst, src
@@ -664,12 +655,12 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         # lut[i] = enabled ? incl_prefix[i]-1 : E ; keep in LDS for phase B.
         _if_lut = scf.IfOp(in_range)
         with ir.InsertionPoint(_if_lut.then_block):
-            incl = src[fx.Index(tid)]
+            incl = _lds_load(src, tid)
             m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
             nz2 = arith.cmpi(CmpIPredicate.ne, m2, c0)
             local = ArithValue(incl) - c1
             le = arith.select(nz2, _raw(local), _raw(ArithValue(E)))
-            lds_lut[fx.Index(tid)] = ArithValue(le)
+            _lds_store(lds_lut, fx.Int32(le), tid)
             scf.YieldOp([])
 
         gpu.barrier()
@@ -707,7 +698,7 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             # expert ids, which would otherwise OOB-read lds_lut. oob is forced to
             # the drop path below regardless of the clamped lookup result.
             ge = arith.select(is_oob, c0, _raw(ge_raw))
-            le = lds_lut[fx.Index(ArithValue(ge))]
+            le = _lds_load(lds_lut, ArithValue(ge))
             is_drop_lut = arith.cmpi(CmpIPredicate.eq, le, ArithValue(E))
             is_drop = arith.ori(is_drop_lut, is_oob)
             eff_e = arith.select(is_drop, c0, _raw(le))
@@ -758,10 +749,6 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         E: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         route_fused_kernel(
             expert_mask,
             topk_ids,
