@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""A/B performance harness: FlyDSL vs Triton FP8 MQA logits (gfx942).
+"""A/B performance harness: FlyDSL vs Triton FP8 MQA logits (gfx942/gfx950).
 
 Times Triton plus one or more FlyDSL kernel *variants* (kernel versions) on
 identical inputs and prints one table per shape, with each variant as a row
@@ -14,9 +14,10 @@ all registered variants). Each becomes its own row, e.g. ``fly:mfma``.
 
 Operand-dtype control (``--dtype-combo``):
 
-  * ``fnuz/fnuz`` (default) -- same-type fp8 on both Q and K
+  * ``fnuz/fnuz`` (default) -- same-type fp8 on both Q and K (gfx942)
+  * ``fn/fn``  -- same-type fp8 on both Q and K (gfx950)
   * ``fn/fnuz`` -- the live DeepSeek-V4 indexer combo (Q=e4m3fn, K=e4m3fnuz).
-  * ``all`` -- run both combos side by side.
+  * ``all`` -- run all combos side by side.
 
 Examples:
     # default DeepSeek-ish shape, baseline FlyDSL variant vs Triton
@@ -64,6 +65,7 @@ from aiter.ops.triton._triton_kernels.attention.fp8_mqa_logits import (
 from aiter.ops.triton.utils.types import e4m3_dtype
 from triton.runtime.errors import OutOfResources as TritonOutOfResources
 from aiter.ops.flydsl import is_flydsl_available
+from flydsl.runtime.device import get_rocm_arch
 
 # Import the standalone GEAK v4 kernel.
 _GEAK_V4_PATH = os.path.join(
@@ -163,11 +165,14 @@ def _triton_logits_fallback(Q, KV, kv_scales, weights, cu_starts, cu_ends,
     return logits
 
 
-# FP8 dtype combos for benchmarking. On gfx942 the native MFMA format is FNUZ;
-# the DeepSeek-V4 indexer uses q=FN, k=FNUZ ("fn/fnuz"). 
+# FP8 dtype combos for benchmarking. 
+# On gfx942 the native MFMA format is FNUZ; On gfx950, the native format is FN.
+# The DeepSeek-V4 indexer uses q=FN, k=FNUZ ("fn/fnuz") on gfx942 unless the data types are fixed in vLLM.
+# For gfx950, we can assume that the only relevant combination is FN/FN.
 DTYPE_COMBOS = {
     "fnuz/fnuz": (e4m3_dtype, e4m3_dtype),
     "fn/fnuz": (torch.float8_e4m3fn, e4m3_dtype),
+    "fn/fn": (torch.float8_e4m3fn, torch.float8_e4m3fn),
 }
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     per_custom_dims_cast_to_fp8,
@@ -181,7 +186,6 @@ from op_tests.op_benchmarks.triton._bench_timing import (
 # Timing strategies the bench can report. "eager" = per-call latency (device +
 # host bubble); "graph" = HIP graph-replay steady state (host overhead stripped).
 TIMING_MODES = ("eager", "graph")
-
 
 def calculate_tflops(start_inds, end_inds, num_heads_q, head_dim, time_ms):
     time_s = time_ms * 1e-3
@@ -301,7 +305,7 @@ def _median_ms(result):
 #     serving the dense logits are never materialized at once.
 PRESET_SHAPES = [
     # H = 64
-    (1, 1024, 1024, 64, 128),
+    # (1, 1024, 1024, 64, 128),
     # (1, 1024, 1000, 64, 128),
     # (1, 1000, 1024, 64, 128),
     # (1, 2048, 2048, 64, 128),
@@ -314,8 +318,8 @@ PRESET_SHAPES = [
     # (1, 4096, 8192, 64, 128),
     # (1, 8192, 4096, 64, 128),
     # (1, 8192, 8192, 64, 128),
-    (1, 16384, 16384, 64, 128),
-    (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
+    # (1, 16384, 16384, 64, 128),
+    # (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
     # # H = 128
     # (1, 1024, 1024, 128, 128),
     # (1, 2048, 2048, 128, 128),
@@ -367,11 +371,16 @@ def _available_variants():
         FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
 
+    arch = get_rocm_arch()
+    is_gfx942 = arch == "gfx942"
+
     variants = list(FP8_MQA_LOGITS_VARIANTS)
-    if _geak_v4_mod is not None:
-        variants.append("geak_v4")
-    if _geak_v5_mod is not None:
-        variants.append("geak_v5")
+    if is_gfx942:
+        # The GEAK optimized kernel is valid only for gfx942
+        if _geak_v4_mod is not None:
+            variants.append("geak_v4")
+        if _geak_v5_mod is not None:
+            variants.append("geak_v5")
     return tuple(variants), FP8_MQA_LOGITS_DEFAULT_VARIANT
 
 

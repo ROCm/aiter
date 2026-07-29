@@ -99,7 +99,7 @@ class MfmaAtom:
 def _mfma32x32x16_fp8_fp8_wrapper(result_type, operands, *, loc=None, ip=None):
     """Wrap the raw ODS ``mfma_f32_32x32x16_fp8_fp8`` to match the
     ``(result_type, operands_list)`` convention used by ``flydsl.expr.rocdl``."""
-    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands, loc=loc)
+    a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands)
     return _ods_mfma32x32x16(result_type, a, b, c, cbsz, abid, blgp,
                               loc=loc, ip=ip).result
 
