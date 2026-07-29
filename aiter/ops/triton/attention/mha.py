@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
