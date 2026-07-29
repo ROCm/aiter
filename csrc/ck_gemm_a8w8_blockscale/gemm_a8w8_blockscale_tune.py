@@ -411,20 +411,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         for i in range(kernels_num):
             kernel = kernel_list[i]
             maxsplitK = (
-                0
-                if preshuffleB
-                else (
-                    aiter.compute_gemm_SplitK(
-                        M,
-                        N,
-                        K,
-                        kernel.MPerBLOCK,
-                        kernel.NPerBLOCK,
-                        kernel.KPerBLOCK,
-                    )
-                    if useSplitK
-                    else 0
+                aiter.compute_gemm_SplitK(
+                    M,
+                    N,
+                    K,
+                    kernel.MPerBLOCK,
+                    kernel.NPerBLOCK,
+                    kernel.KPerBLOCK,
                 )
+                if useSplitK
+                else 0
             )
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "ck", preshuffleB)

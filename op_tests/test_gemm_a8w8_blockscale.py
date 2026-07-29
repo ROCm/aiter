@@ -13,7 +13,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from aiter import dtypes
-from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
+from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_blockscale_bpreshuffle_ck,
+    gemm_a8w8_blockscale_ck,
+    gemm_a8w8_blockscale_cktile,
+)
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 from einops import rearrange
@@ -207,9 +211,41 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
         catastrophic_check=True,
     )
 
+    # CK bpreshuffle path: same comparison, with the preshuffled weight and the
+    # transposed x_scale that this entry point expects.
+    weight_shuffled = shuffle_weight(weight, layout=(16, 16))
+    x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
+    Y_base_bps = torch.empty((m, n), dtype=dtype, device="cuda")
+    Y_split_bps = torch.empty((m, n), dtype=dtype, device="cuda")
+    gemm_a8w8_blockscale_bpreshuffle_ck(
+        x, weight_shuffled, x_scale_t, w_scale, Y_base_bps, splitK=0
+    )
+    gemm_a8w8_blockscale_bpreshuffle_ck(
+        x, weight_shuffled, x_scale_t, w_scale, Y_split_bps, splitK=splitK
+    )
+    bps_err = checkAllclose(
+        Y_base_bps,
+        Y_split_bps,
+        msg=f"ck bpreshuffle splitK={splitK} vs splitK=0",
+        rtol=1e-2,
+        atol=1e-2,
+        catastrophic_check=True,
+    )
+
+    # Matching outputs alone would also hold for an entry point that accepted a
+    # splitK and ignored it, so check that the value reaches the kernel layer.
+    try:
+        gemm_a8w8_blockscale_bpreshuffle_ck(
+            x, weight_shuffled, x_scale_t, w_scale, Y_split_bps, splitK=31
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("bpreshuffle entry accepted an out-of-range splitK")
+
     print(
         f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
-        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}, bpreshuffle_err={bps_err:.4g}"
     )
 
 

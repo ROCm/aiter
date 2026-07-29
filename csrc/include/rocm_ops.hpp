@@ -754,6 +754,7 @@ namespace py = pybind11;
           py::arg("x_scale"),                   \
           py::arg("w_scale"),                   \
           py::arg("Out"),                       \
+          py::arg("splitK")     = 0,            \
           py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \

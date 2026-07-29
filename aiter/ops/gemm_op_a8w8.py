@@ -294,6 +294,7 @@ def gemm_a8w8_blockscale_bpreshuffle_ck(
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
     Out: torch.Tensor,
+    splitK: int = 0,
     kernelName: str = "",
 ) -> torch.Tensor: ...
 
@@ -952,7 +953,13 @@ def gemm_a8w8_blockscale_bpreshuffle(
             )
         elif libtype == "ck":
             return gemm_a8w8_blockscale_bpreshuffle_ck(
-                XQ, WQ, x_scale, w_scale, Y, kernelName=kernelName
+                XQ,
+                WQ,
+                x_scale,
+                w_scale,
+                Y,
+                splitK=int(config.get("splitK", 0)),
+                kernelName=kernelName,
             )
         elif libtype == "asm":
             splitK = config["splitK"]
