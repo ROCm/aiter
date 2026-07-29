@@ -58,6 +58,7 @@ void launch_mhc_post_raw(hipStream_t stream,
                          int hidden_size,
                          int x_stride,
                          int residual_stride,
+                         int residual_hc_stride,
                          int store_nt = -1);
 void mhc_fused_post_pre_gemm_sqrsum(
     torch::Tensor& gemm_out_mul,    // (split_k, m, hc_mult3)

@@ -170,7 +170,8 @@ void run_ar_mhc_post_split(CustomAllreduce* fa,
                         m,
                         hidden_size,
                         hidden_size,
-                        residual_stride);
+                        residual_stride,
+                        hidden_size); // this path assumes a packed residual
 }
 
 template <typename T>
