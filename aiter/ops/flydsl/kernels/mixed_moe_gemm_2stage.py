@@ -48,6 +48,7 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
@@ -225,13 +226,13 @@ def compile_mixed_moe_gemm1(
 
     def x_elem_type():
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f8
+            return default_f8_type() if is_f8_a else T.i8
+        return default_f8_type()
 
     def w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f8
+        return default_f8_type()
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -349,7 +350,7 @@ def compile_mixed_moe_gemm1(
         ping_buffer_bytes = x_region_bytes
 
     def x_lds_elem():
-        return T.f8
+        return default_f8_type()
 
     lds_pong_offset = allocator_pong._align(allocator_pong.ptr, 16)
     allocator_pong.ptr = lds_pong_offset + pong_buffer_bytes
@@ -497,7 +498,7 @@ def compile_mixed_moe_gemm1(
             # the kernel uses only the wrapped maximumf/negation ops.
             swiglu_neg_limit = -f32_swiglu_limit
 
-            x_elem = T.f8
+            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -3194,13 +3195,13 @@ def compile_mixed_moe_gemm2(
 
     def x_elem_type():
         if const_expr(is_f4_b):
-            return T.f8 if is_f8_a else T.i8
-        return T.f8
+            return default_f8_type() if is_f8_a else T.i8
+        return default_f8_type()
 
     def w_elem_type():
         if const_expr(is_f4_b):
             return T.i8
-        return T.f8
+        return default_f8_type()
 
     def scale_elem_type():
         return T.i32
@@ -3264,7 +3265,7 @@ def compile_mixed_moe_gemm2(
     lds_total_elems = lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
 
     def x_lds_elem():
-        return T.f8
+        return default_f8_type()
 
     lds_alloc_bytes = int(lds_total_elems) * int(a_elem_bytes)
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
@@ -3294,7 +3295,7 @@ def compile_mixed_moe_gemm2(
             n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
             size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
-            x_elem = T.f8
+            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -5089,13 +5090,13 @@ def compile_mixed_moe_gemm1_a16w4(
         if is_a16w4_stage1:
             return T.bf16
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            return default_f8_type() if is_f8_a else T.i8
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     def _w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_b else (T.i8 if is_int8 else default_f8_type())
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -5103,7 +5104,7 @@ def compile_mixed_moe_gemm1_a16w4(
     def x_lds_elem():
         if is_a16w4_stage1:
             return T.bf16
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     # ---- K dimension & split-K validation ----
     if is_a16w4_stage1:
@@ -7325,13 +7326,13 @@ def compile_mixed_moe_gemm2_a16w4(
         if is_a16w4:
             return T.bf16
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            return default_f8_type() if is_f8_a else T.i8
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     def _w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_b else (T.i8 if is_int8 else default_f8_type())
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
@@ -7394,7 +7395,7 @@ def compile_mixed_moe_gemm2_a16w4(
     def x_lds_elem():
         if is_a16w4:
             return T.bf16
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     _w_elem_pack_py = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim) // _w_elem_pack_py

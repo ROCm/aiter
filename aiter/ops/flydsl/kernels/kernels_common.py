@@ -4,6 +4,7 @@ Keep helper naming consistent with other kernel helpers (e.g. `mfma_preshuffle_p
 but this module is intentionally small and MLIR-dialect facing.
 """
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     arith as _std_arith,
@@ -40,6 +41,36 @@ def get_warp_size(arch=None):
     if arch_l.startswith(("gfx10", "gfx11", "gfx12")):
         return 32
     return 32 if is_rdna_arch(arch) else 64
+
+
+def default_f8_type() -> ir.Type:
+    """Select the E4M3 f8 type compatible with the current GPU arch.
+
+    - gfx95* (MI350): FP8 E4M3FN (OCP)
+    - gfx12*: FP8 E4M3FN (OCP)
+    - gfx94* (MI300): FP8 E4M3FNUZ
+
+    Raises ``RuntimeError`` on gfx11* (RDNA3/RDNA3.5): these chips have no
+    native FP8 instructions, so FP8 compute would surface as a late LLVM
+    "cannot select" error. Fail early with a clear message instead.
+
+    Replaces the ``T.f8`` shortcut removed from ``flydsl.expr.typing`` in
+    flydsl 0.3.0 (upstream moved arch-specific FP8 selection into the kernel
+    layer); mirrors that helper here for the vendored kernels.
+    """
+    arch = ""
+    try:
+        arch = str(get_rocm_arch())
+    except Exception:
+        arch = ""
+    if "gfx95" in arch or "gfx12" in arch:
+        return fx.Float8E4M3FN.ir_type
+    if arch.startswith("gfx11"):
+        raise RuntimeError(
+            f"default_f8_type(): no native FP8 support on {arch}; "
+            "FP8 instructions are available on gfx94*, gfx95*, and gfx12*."
+        )
+    return fx.Float8E4M3FNUZ.ir_type
 
 
 def dtype_to_elem_type(dtype_str: str):
