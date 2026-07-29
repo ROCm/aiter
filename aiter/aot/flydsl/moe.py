@@ -83,11 +83,11 @@ def parse_csv(csv_path: str):
             doweight_stage1 = bool(int(row.get("doweight_stage1", "0")))
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
-            act_type = row.get("act_type", "")
+            act_type = row.get("act_type", "").strip().split(".")[-1].lower()
             act = (
                 "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
+                if act_type == "swiglu"
+                else ("situv2" if act_type == "situv2" else "silu")
             )
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
