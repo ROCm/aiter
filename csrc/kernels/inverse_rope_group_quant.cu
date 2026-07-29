@@ -29,6 +29,13 @@ static constexpr MxDtype kHwFp8E4m3 =
 template <int N>
 using ic = std::integral_constant<int, N>;
 
+// scale_shuffle = false: row-major [S, G, Ks], unit stride on Ks.
+// scale_shuffle = true:  MFMA tile-shuffled for V_MFMA_SCALE_F32_16x16x128_F8.
+//     Storage: [G, S_pad, Ks_pad] with 256-byte tiles of [32_M, 8_K].
+//     Tile-internal byte = lane*4 + iter, where
+//       lane = (k%4)*16 + (m%16)
+//       iter = ((m/16)&1) + ((k/4)&1)*2
+
 template <typename scalar_t,
           int HEAD_DIM,
           int RD,
@@ -48,9 +55,12 @@ __global__ void inverse_rope_group_quant_kernel(
     int G,
     int D,
     int scale_n,
+    bool scale_shuffle,
     int64_t scale_stride_s,
     int64_t scale_stride_g,
     int64_t scale_stride_k,
+    int S_pad,
+    int Ks_pad,
     int max_position)
 {
     constexpr int THREADS_PER_GROUP = GROUP_SIZE / THREAD_DATA_SIZE;
@@ -117,8 +127,17 @@ __global__ void inverse_rope_group_quant_kernel(
     // --- Output buffer ---
     auto out_buffer = opus::make_gmem<opus::fp8_t>(
         x_fp8, static_cast<int64_t>(S) * G * D * sizeof(opus::fp8_t));
-    const int64_t scale_row_idx = static_cast<int64_t>(s) * scale_stride_s +
-                                  static_cast<int64_t>(g) * scale_stride_g;
+
+    const int64_t scale_row_base =
+        scale_shuffle
+            ? static_cast<int64_t>(g) * S_pad * Ks_pad
+            : (static_cast<int64_t>(s) * scale_stride_s +
+               static_cast<int64_t>(g) * scale_stride_g);
+
+    // Shuffle mode: precompute per-thread invariants (s-dependent, loop-invariant).
+    const int shuf_tile_m = s >> 5;
+    const int shuf_s_mod16 = s & 15;
+    const int shuf_m_half = (s >> 4) & 1;
 
     // --- Per-group: rope -> amax -> scale -> quantize -> store ---
 #pragma unroll
@@ -216,8 +235,22 @@ __global__ void inverse_rope_group_quant_kernel(
 
         if(lane_in_group == 0)
         {
-            x_scale[scale_row_idx + static_cast<int64_t>(k_group) * scale_stride_k] =
-                s8.byte;
+            if(scale_shuffle)
+            {
+                const int tile_k = k_group >> 3;
+                const int64_t tile_base =
+                    (static_cast<int64_t>(shuf_tile_m) * (Ks_pad >> 3) + tile_k) << 8;
+                const int lane_idx = (k_group & 3) * 16 + shuf_s_mod16;
+                const int iter = shuf_m_half + (((k_group >> 2) & 1) << 1);
+                x_scale[scale_row_base + tile_base + lane_idx * 4 + iter] =
+                    s8.byte;
+            }
+            else
+            {
+                x_scale[scale_row_base +
+                        static_cast<int64_t>(k_group) * scale_stride_k] =
+                    s8.byte;
+            }
         }
 
         // --- Quantize and store ---
@@ -258,11 +291,12 @@ void inverse_rope_group_quant(
     aiter_tensor_t& sin_cache,
     int64_t num_groups,
     int64_t quant_group_size,
-    bool transpose_scale)
+    bool scale_shuffle)
 {
     AITER_CHECK(o.dim() == 3, "o must be [S,H,head_dim]");
     AITER_CHECK(x_fp8.dim() == 3, "x_fp8 must be [S,G,D]");
-    AITER_CHECK(x_scale.dim() == 3, "x_scale must be [S,G,scale_n]");
+    AITER_CHECK(x_scale.dim() == 3,
+                "x_scale must be 3D ([S,G,Ks] or [G,S_pad,Ks_pad])");
     AITER_CHECK(o.dtype() == AITER_DTYPE_bf16 || o.dtype() == AITER_DTYPE_fp16,
                 "o must be bf16/fp16, got ", AiterDtype_to_str(o.dtype()));
     AITER_CHECK(x_fp8.dtype() == AITER_DTYPE_fp8, "x_fp8 must be fp8");
@@ -303,22 +337,20 @@ void inverse_rope_group_quant(
                 "template path supports HEAD_DIM=512, RD=64; got ",
                 head_dim, ",", rd);
     const int scale_n = D / static_cast<int>(quant_group_size);
-    AITER_CHECK(x_scale.size(0) == S && x_scale.size(1) == G &&
-                    x_scale.size(2) >= scale_n,
-                "x_scale shape mismatch");
-
-    if(transpose_scale)
+    if(scale_shuffle)
     {
-        AITER_CHECK(x_scale.stride(0) == 1 && x_scale.stride(2) == S,
-                    "transpose_scale expects column-major x_scale [G, scale_n, S]; "
-                    "got strides ", x_scale.stride(0), ",", x_scale.stride(1),
-                    ",", x_scale.stride(2));
+        CHECK_CONTIGUOUS(x_scale);
+        AITER_CHECK(x_scale.size(0) == G, "scale_shuffle: x_scale dim0 must be G");
+        AITER_CHECK(x_scale.size(1) >= S && x_scale.size(1) % 32 == 0,
+                    "scale_shuffle: x_scale dim1 (S_pad) must be >= S and %32==0");
+        AITER_CHECK(x_scale.size(2) >= scale_n && x_scale.size(2) % 8 == 0,
+                    "scale_shuffle: x_scale dim2 (Ks_pad) must be >= Ks and %8==0");
     }
     else
     {
-        AITER_CHECK(x_scale.stride(2) == 1,
-                    "row-major x_scale must have unit stride along scale_n; "
-                    "got stride ", x_scale.stride(2));
+        AITER_CHECK(x_scale.size(0) == S && x_scale.size(1) == G &&
+                        x_scale.size(2) >= scale_n,
+                    "x_scale shape mismatch, expected [S, G, Ks]");
     }
     AITER_CHECK(rd > 0 && rd <= head_dim && (rd % 2) == 0, "invalid rotary dim");
     AITER_CHECK(positions.size(0) >= S, "positions length must be >= S");
@@ -327,6 +359,9 @@ void inverse_rope_group_quant(
     const hipStream_t stream = getCurrentHIPStream();
 
     constexpr int BLOCK_M = 16;
+
+    const int Ks_pad = scale_shuffle ? ((scale_n + 7) / 8) * 8 : scale_n;
+    const int S_pad = scale_shuffle ? ((S + 31) / 32) * 32 : S;
 
     auto launch = [&](auto group_tag, auto tds_tag, auto kpb_tag)
     {
@@ -358,8 +393,9 @@ void inverse_rope_group_quant(
                         reinterpret_cast<const int64_t*>(positions.data_ptr()),
                         reinterpret_cast<const scalar_opus_t*>(cos_cache.data_ptr()),
                         reinterpret_cast<const scalar_opus_t*>(sin_cache.data_ptr()),
-                        S, H, G, D, scale_n,
+                        S, H, G, D, scale_n, scale_shuffle,
                         x_scale.stride(0), x_scale.stride(1), x_scale.stride(2),
+                        S_pad, Ks_pad,
                         static_cast<int>(cos_cache.size(0)));
             });
         }

@@ -52,9 +52,9 @@ AMAX_FLOOR = 1e-8
 
 # One row of the perf table: `once` is called for the correctness check, `bench`
 # is the timed call, `ref` is the (dq, scale_byte) reference it is checked
-# against, `scale_transposed` is the layout `once`'s scale should have, and
+# against, `scale_shuffle` is the layout `once`'s scale should have, and
 # `tol` / `scale_tol` are its (rtol, atol) pairs.
-Cand = namedtuple("Cand", "once bench ref scale_transposed tol scale_tol")
+Cand = namedtuple("Cand", "once bench ref scale_shuffle tol scale_tol")
 
 # The fused op is a bit-for-bit match against the torch reference, so its scale
 # bytes are compared exactly and its dequantized values only carry fp8 rounding.
@@ -95,19 +95,29 @@ def _scale_bytes(scale):
     return scale if scale.dtype == dtypes.u8 else scale.view(dtypes.u8)
 
 
-def _check_scale_layout(scale, s, transpose_scale, name):
-    """Assert the scale buffer's strides really are the layout that was asked for.
+def _unshuffle_mfma_scale(scale_shuffled, S, G, Ks):
+    """Unshuffle mfma-layout scale [G, S_pad, Ks_pad] -> logical [S, G, Ks]."""
+    flat = _scale_bytes(scale_shuffled).flatten().cpu()
+    S_pad = scale_shuffled.shape[1]
+    Ks_pad = scale_shuffled.shape[2]
+    out = torch.zeros(S, G, Ks, dtype=dtypes.u8)
+    for s in range(S):
+        for g in range(G):
+            for k in range(Ks):
+                tile_m = s // 32
+                tile_k = k // 8
+                tile_base = (tile_m * (Ks_pad // 8) + tile_k) * 256
+                lane = (k % 4) * 16 + (s % 16)
+                it = ((s // 16) & 1) + (((k // 4) & 1) << 1)
+                idx = g * S_pad * Ks_pad + tile_base + lane * 4 + it
+                out[s, g, k] = flat[idx]
+    return out.to(scale_shuffled.device)
 
-    Logical shape is [s, g, ks] either way, so comparing values alone cannot tell
-    the layouts apart -- only the strides can. Under transpose_scale the storage is
-    group-major [g, ks, s], which makes each group's [s, ks] slice compact
-    column-major, i.e. what a preshuffled-B blockscale GEMM reads.
-    """
-    if transpose_scale:
-        assert scale.stride(0) == 1 and scale.stride(2) == s, (
-            f"{name}: expected column-major scale (storage [g, ks, s]), "
-            f"got strides {scale.stride()}"
-        )
+
+def _check_scale_layout(scale, s, scale_shuffle, name):
+    """Assert the scale buffer's shape match the requested layout."""
+    if scale_shuffle:
+        assert scale.is_contiguous(), f"{name}: shuffled scale must be contiguous"
     else:
         assert (
             scale.stride(2) == 1
@@ -135,18 +145,16 @@ def _make_inputs(s, h, head_dim, rd, dtype, seed=0):
     return o, positions, cos, sin
 
 
-def _alloc_outputs(s, g, d, group_size, transpose_scale):
-    """Pre-allocate (x_fp8, x_scale) the way the wrapper would.
-
-    Mirrors aiter/ops/inverse_rope_group_quant.py: under transpose_scale the
-    scale is stored group-major [g, ks, s] and viewed back as [s, g, ks].
-    """
+def _alloc_outputs(s, g, d, group_size, scale_shuffle=False):
+    """Pre-allocate (x_fp8, x_scale) the way the wrapper would."""
     from aiter.utility.dtypes import get_dtype_fp8
 
     x_fp8 = torch.empty((s, g, d), dtype=get_dtype_fp8())
     ks = d // group_size
-    if transpose_scale:
-        x_scale = torch.empty((g, ks, s), dtype=dtypes.fp8_e8m0).permute(2, 0, 1)
+    if scale_shuffle:
+        s_pad = ((s + 31) // 32) * 32
+        ks_pad = ((ks + 7) // 8) * 8
+        x_scale = torch.full((g, s_pad, ks_pad), 0x7F, dtype=dtypes.fp8_e8m0)
     else:
         x_scale = torch.empty((s, g, ks), dtype=dtypes.fp8_e8m0)
     return x_fp8, x_scale
@@ -267,23 +275,17 @@ def test_inverse_rope_group_quant(
 ):
     d = h * head_dim // g
     scale_n = d // group_size
-    transpose_scale = scale_layout == "col"
+    shuffle = scale_layout == "shuffle"
 
     o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
 
     ref = run_torch(o, positions, cos, sin, g, group_size, rd)
     ref_rt = run_torch(o, positions, cos, sin, g, group_size, rd, roundtrip=True)
 
-    # The op is not handed output buffers in the model path
-    # (atom/model_ops/v4_kernels/inverse_rope_group_quant.py forwards exactly
-    # these args), so it allocates its own x_fp8 + x_scale. transpose_scale only
-    # changes the scale's strides (column-major, group-major storage; the same
-    # thing atom's per_1x128 transpose_scale does), not its logical [s, g, ks]
-    # shape, so both layouts share one reference; _check_scale_layout pins strides.
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "transpose_scale": transpose_scale,
+        "scale_shuffle": shuffle,
     }
 
     def fused():
@@ -295,7 +297,7 @@ def test_inverse_rope_group_quant(
     # being norm-preserving, cannot push values out of range -- but it does leave
     # the buffer rotated n times, so correctness runs on a fresh copy instead.
     unfused_scratch = o.clone()
-    unfused_out = _alloc_outputs(s, g, d, group_size, transpose_scale=False)
+    unfused_out = _alloc_outputs(s, g, d, group_size, scale_shuffle=False)
 
     def unfused_bench():
         return run_unfused(
@@ -311,13 +313,11 @@ def test_inverse_rope_group_quant(
             g,
             group_size,
             rd,
-            _alloc_outputs(s, g, d, group_size, transpose_scale=False),
+            _alloc_outputs(s, g, d, group_size, scale_shuffle=False),
         )
 
-    # The unfused baseline always writes a row-major scale (see run_unfused), so
-    # its cells repeat across both scale_layout rows.
     funcs = {
-        "cpp": Cand(fused, fused, ref, transpose_scale, FUSED_TOL, FUSED_SCALE_TOL),
+        "cpp": Cand(fused, fused, ref, shuffle, FUSED_TOL, FUSED_SCALE_TOL),
         "unfused": Cand(
             unfused_once, unfused_bench, ref_rt, False, UNFUSED_TOL, UNFUSED_SCALE_TOL
         ),
@@ -343,8 +343,11 @@ def test_inverse_rope_group_quant(
         ref_dq, ref_scale = cand.ref
         x_fp8, x_scale = cand.once()
         _, us = run_perftest(cand.bench)
-        _check_scale_layout(x_scale, s, cand.scale_transposed, name)
-        scale_u8 = _scale_bytes(x_scale)
+        _check_scale_layout(x_scale, s, cand.scale_shuffle, name)
+        if cand.scale_shuffle:
+            scale_u8 = _unshuffle_mfma_scale(x_scale, s, g, scale_n)
+        else:
+            scale_u8 = _scale_bytes(x_scale)
         dq = (
             x_fp8.to(dtypes.fp32).reshape(s, g, scale_n, group_size)
             * _e8m0_byte_to_scale(scale_u8)[..., None]
@@ -382,16 +385,14 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
     Not part of the perf table: this is a pass/fail check that the host-side
     dispatch tier and the pre-allocated buffers survive capture/replay.
     """
-    transpose_scale = scale_layout == "col"
+    shuffle = scale_layout == "shuffle"
     d = h * head_dim // g
     o, positions, cos, sin = _make_inputs(s, h, head_dim, rd, dtype)
-    # Pre-allocate so the captured region owns no allocations and the buffers
-    # replay in place.
-    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, transpose_scale)
+    x_fp8, x_scale = _alloc_outputs(s, g, d, group_size, scale_shuffle=shuffle)
     kwargs = {
         "num_groups": g,
         "quant_group_size": group_size,
-        "transpose_scale": transpose_scale,
+        "scale_shuffle": shuffle,
         "x_fp8": x_fp8,
         "x_scale": x_scale,
     }
@@ -424,7 +425,7 @@ def check_graph(s, h, g, head_dim, rd, group_size, dtype, scale_layout):
         sin,
         num_groups=g,
         quant_group_size=group_size,
-        transpose_scale=transpose_scale,
+        scale_shuffle=shuffle,
     )
     torch.cuda.synchronize()
 
@@ -539,14 +540,13 @@ def main():
         "-l",
         "--scale-layout",
         type=str,
-        choices=["row", "col"],
+        choices=["row", "shuffle"],
         nargs="*",
-        default=["row", "col"],
-        help="""e8m0 scale storage, both logically [s, g, ks]:
+        default=["row", "shuffle"],
+        help="""e8m0 scale storage:
         row = contiguous [s, g, ks],
-        col = column-major, storage [g, ks, s] (atom per_1x128 transpose_scale,
-              the layout the preshuffled-B blockscale GEMM reads).
-        e.g.: -l col""",
+        shuffle = V_MFMA_SCALE_F32_16x16x128_F8 tile-shuffled [g, s_pad, ks_pad].
+        e.g.: -l shuffle""",
     )
     parser.add_argument(
         "--graph",

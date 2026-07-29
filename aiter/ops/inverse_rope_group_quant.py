@@ -29,7 +29,7 @@ def _inverse_rope_group_quant_kernel(
     sin_cache: Tensor,
     num_groups: int,
     quant_group_size: int = 128,
-    transpose_scale: bool = False,
+    scale_shuffle: bool = False,
 ) -> None: ...
 
 
@@ -40,7 +40,7 @@ def inverse_rope_group_quant(
     sin_cache: Tensor,
     num_groups: int,
     quant_group_size: int = 128,
-    transpose_scale: bool = False,
+    scale_shuffle: bool = False,
     x_fp8: Tensor | None = None,
     x_scale: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
@@ -49,19 +49,15 @@ def inverse_rope_group_quant(
     Args:
         o: ``[S, H, head_dim]`` bf16/fp16 attention output before inverse RoPE.
         positions: ``[S]`` absolute positions.
-        cos_cache/sin_cache: ``[max_pos, rd//2]``; a caller holding the singleton
-            batch/head dims (ATOM's ``_V4RoPE``) reshapes at the call site, so
-            this op stays framework-agnostic.
+        cos_cache/sin_cache: ``[max_pos, rd//2]``.
         num_groups: output-LoRA local groups ``G``.
         quant_group_size: quant block along ``D``; V4 wo_a path uses 128.
-        transpose_scale: store the scale column-major, which is what the
-            preshuffled-B blockscale GEMM reads; plain ``gemm_a8w8_blockscale``
-            wants it false. Only the scale moves, ``x_fp8`` stays row-major.
+        scale_shuffle: when True, emit scale in MFMA tile-shuffled layout
+            ``[G, S_pad, Ks_pad]`` for ``V_MFMA_SCALE_F32_16x16x128_F8``.
+            When False, emit row-major ``[S, G, Ks]``.
 
     Returns:
-        ``(x_fp8, x_scale)`` with logical shapes ``[S, G, D]`` and
-        ``[S, G, D/group]``. Under ``transpose_scale`` the scale's storage is
-        ``[G, D/group, S]``, so ``x_scale[:, g, :]`` is compact column-major.
+        ``(x_fp8, x_scale)``.
     """
     assert o.dim() == 3, f"o must be [S,H,Dh], got {tuple(o.shape)}"
     S, H, head_dim = o.shape
@@ -87,16 +83,15 @@ def inverse_rope_group_quant(
         x_fp8 = torch.empty((S, num_groups, D), dtype=get_dtype_fp8(), device=o.device)
     scale_groups = D // quant_group_size
     if x_scale is None:
-        if transpose_scale:
-            # Group-major [G, Ks, S] rather than [Ks, S, G] so each group's
-            # [S, Ks] slice is itself compact column-major: wo_a runs one GEMM
-            # per group, and a group-minor layout would hand it strides
-            # (G, S*G) instead.
-            x_scale = torch.empty(
-                (num_groups, scale_groups, S),
+        if scale_shuffle:
+            S_pad = ((S + 31) // 32) * 32
+            Ks_pad = ((scale_groups + 7) // 8) * 8
+            x_scale = torch.full(
+                (num_groups, S_pad, Ks_pad),
+                0x7F,
                 dtype=dtypes.fp8_e8m0,
                 device=o.device,
-            ).permute(2, 0, 1)
+            )
         else:
             x_scale = torch.empty(
                 (S, num_groups, scale_groups),
@@ -113,6 +108,6 @@ def inverse_rope_group_quant(
         sin_cache,
         num_groups,
         quant_group_size,
-        transpose_scale,
+        scale_shuffle,
     )
     return x_fp8, x_scale
