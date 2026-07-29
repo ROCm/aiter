@@ -54,12 +54,23 @@ needs_gfx950 = pytest.mark.skipif(
 # ===========================================================================
 # Vendored BF16 Triton decode reference.
 #
-# Verbatim copy of the split-K sparse paged-decode kernels from ATOM
+# Copy of the split-K sparse paged-decode kernels from ATOM
 # (atom/model_ops/v4_kernels/paged_decode.py) so this test is fully
 # self-contained — no cross-repo import. Used purely as an independent
 # cross-check for the bf16 math path (split-K Triton vs this file's pure-torch
-# golden). The only local change vs the source is `_cu_count`, which queries
-# the CU count via torch (dropping ATOM's aiter device-info import).
+# golden).
+#
+# The @triton.jit kernel bodies are verbatim. Two local changes on the host
+# side:
+#   * `_cu_count` queries the CU count via torch (dropping ATOM's aiter
+#     device-info import).
+#   * the single `sparse_attn_v4_paged_decode` host function is split into
+#     `_triton_decode_plan` (config + buffer alloc) / `_triton_launch_stage1`
+#     (attention) / `_triton_launch_stage2` (cross-split reduce), so the perf
+#     driver can time stage1 and stage1+stage2 separately and line those up
+#     against the asm kernel-only vs kernel+merge numbers.
+#     `_sparse_attn_v4_paged_decode_triton` recomposes them into the original
+#     single-call API, so callers see no behavioural change.
 #
 # Contract (from the source docstring):
 #   q:          [T, H, D] bf16/fp16
@@ -474,7 +485,7 @@ def _paged_decode_reduce_kernel(
     )
 
 
-def _sparse_attn_v4_paged_decode_triton(
+def _triton_decode_plan(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     kv_indices: torch.Tensor,
@@ -484,10 +495,18 @@ def _sparse_attn_v4_paged_decode_triton(
     block_h: int = None,
     kv_splits: int = None,
     block_k: int = None,
-) -> torch.Tensor:
-    """V4 sparse decode Triton implementation: split-K with FUSED fast path,
-    exp2 softmax. bf16/fp16 KV only (the vendored fp8 dequant path is present
-    in the kernels but unused here — kv_scales is never supplied)."""
+) -> dict:
+    """Resolve the launch config and allocate every buffer the Triton decode
+    writes — WITHOUT launching a kernel.
+
+    Everything here is host-side setup (grid geometry, split count, partial
+    buffers). Pulling it out of the timed region matters: the perf driver
+    times `_triton_launch_stage1` / `_triton_launch_stage2` only, so the
+    reported us are kernel time, not Python.
+
+    Returns a plan dict consumed by the two stage launchers. `plan["out"]`
+    is the destination tensor (written by stage1 when kv_splits==1, else by
+    stage2)."""
     if not q.is_cuda:
         raise RuntimeError("Triton sparse_attn_v4_paged_decode requires CUDA/HIP")
     if q.dtype not in (torch.bfloat16, torch.float16):
@@ -521,42 +540,34 @@ def _sparse_attn_v4_paged_decode_triton(
     # bf16 path: supply a 1-element dummy fp32 kv_scales so the launch signature
     # stays uniform (QUANT_KV=False elides the dequant code at compile time).
     kv_scales_arg = q.new_empty(1, dtype=torch.float32)
-    ks_stride_n_arg = 1
-    num_groups_arg = 1
+
+    plan = dict(
+        q=q,
+        unified_kv=unified_kv,
+        kv_indices=kv_indices,
+        kv_indptr=kv_indptr,
+        attn_sink=attn_sink,
+        out=out,
+        kv_scales=kv_scales_arg,
+        ks_stride_n=1,
+        num_groups=1,
+        T=T,
+        H=H,
+        D=D,
+        block_h=block_h,
+        block_d=block_d,
+        block_k=block_k,
+        n_head_blocks=n_head_blocks,
+        kv_splits=kv_splits,
+        qk_scale=qk_scale,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
 
     if kv_splits == 1:
-        grid_fused = (T, n_head_blocks)
-        _paged_decode_fused_kernel[grid_fused](
-            q,
-            unified_kv,
-            kv_scales_arg,
-            kv_indices,
-            kv_indptr,
-            attn_sink,
-            out,
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            unified_kv.stride(0),
-            unified_kv.stride(1),
-            ks_stride_n_arg,
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            qk_scale,
-            _TRITON_LOG2E,
-            H,
-            D,
-            BLOCK_H=block_h,
-            BLOCK_D=block_d,
-            BLOCK_K=block_k,
-            QUANT_KV=False,
-            GROUP_SIZE=_FP8_GROUP_SIZE,
-            NUM_GROUPS=num_groups_arg,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
-        return out
+        # Fused single-kernel path: stage1 folds the sink and normalizes on its
+        # own, so there is no stage2 (mirrors the asm out_16_nosplit path).
+        return plan
 
     m_partial = torch.empty(
         (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
@@ -566,13 +577,83 @@ def _sparse_attn_v4_paged_decode_triton(
         (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
     )
 
-    grid_split = (T, n_head_blocks, kv_splits)
+    # Reduce-kernel D tiling: depends only on (T, H, D, CU count), so it is
+    # config — resolve it here rather than between the two launches.
+    base_grid_t_h = T * H
+    target_reduce_wg = 2 * _cu_count()
+    if base_grid_t_h >= target_reduce_wg:
+        d_chunk = block_d
+    else:
+        d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
+        d_chunks_needed = min(d_chunks_needed, block_d // 32)
+        d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
+
+    plan.update(
+        m_partial=m_partial,
+        l_partial=l_partial,
+        acc_partial=acc_partial,
+        d_chunk=d_chunk,
+    )
+    return plan
+
+
+def _triton_launch_stage1(plan: dict) -> None:
+    """Stage 1 — the attention kernel.
+
+    kv_splits == 1 -> `_paged_decode_fused_kernel`: online softmax + inline
+    sink + normalize, writing the FINAL result into plan["out"] (stage2 is a
+    no-op).
+    kv_splits  > 1 -> `_paged_decode_split_kernel`: per-split fp32 (m, l, acc)
+    partials; the result is only complete after stage2.
+
+    This is the triton counterpart of the raw asm kernel call (`asm_k`)."""
+    q = plan["q"]
+    unified_kv = plan["unified_kv"]
+
+    if plan["kv_splits"] == 1:
+        out = plan["out"]
+        _paged_decode_fused_kernel[(plan["T"], plan["n_head_blocks"])](
+            q,
+            unified_kv,
+            plan["kv_scales"],
+            plan["kv_indices"],
+            plan["kv_indptr"],
+            plan["attn_sink"],
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            unified_kv.stride(0),
+            unified_kv.stride(1),
+            plan["ks_stride_n"],
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            plan["qk_scale"],
+            _TRITON_LOG2E,
+            plan["H"],
+            plan["D"],
+            BLOCK_H=plan["block_h"],
+            BLOCK_D=plan["block_d"],
+            BLOCK_K=plan["block_k"],
+            QUANT_KV=False,
+            GROUP_SIZE=_FP8_GROUP_SIZE,
+            NUM_GROUPS=plan["num_groups"],
+            num_warps=plan["num_warps"],
+            num_stages=plan["num_stages"],
+        )
+        return
+
+    m_partial = plan["m_partial"]
+    l_partial = plan["l_partial"]
+    acc_partial = plan["acc_partial"]
+    grid_split = (plan["T"], plan["n_head_blocks"], plan["kv_splits"])
     _paged_decode_split_kernel[grid_split](
         q,
         unified_kv,
-        kv_scales_arg,
-        kv_indices,
-        kv_indptr,
+        plan["kv_scales"],
+        plan["kv_indices"],
+        plan["kv_indptr"],
         m_partial,
         l_partial,
         acc_partial,
@@ -581,7 +662,7 @@ def _sparse_attn_v4_paged_decode_triton(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
-        ks_stride_n_arg,
+        plan["ks_stride_n"],
         m_partial.stride(0),
         m_partial.stride(1),
         m_partial.stride(2),
@@ -592,35 +673,43 @@ def _sparse_attn_v4_paged_decode_triton(
         acc_partial.stride(1),
         acc_partial.stride(2),
         acc_partial.stride(3),
-        H,
-        D,
-        kv_splits,
-        qk_scale,
-        BLOCK_H=block_h,
-        BLOCK_D=block_d,
-        BLOCK_K=block_k,
+        plan["H"],
+        plan["D"],
+        plan["kv_splits"],
+        plan["qk_scale"],
+        BLOCK_H=plan["block_h"],
+        BLOCK_D=plan["block_d"],
+        BLOCK_K=plan["block_k"],
         QUANT_KV=False,
         GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        NUM_GROUPS=plan["num_groups"],
+        num_warps=plan["num_warps"],
+        num_stages=plan["num_stages"],
     )
 
-    base_grid_t_h = T * H
-    target_reduce_wg = 2 * _cu_count()
-    if base_grid_t_h >= target_reduce_wg:
-        d_chunk = block_d
-    else:
-        d_chunks_needed = max(1, target_reduce_wg // base_grid_t_h)
-        d_chunks_needed = min(d_chunks_needed, block_d // 32)
-        d_chunk = max(32, triton.next_power_of_2(block_d // d_chunks_needed))
-    grid_reduce = (T, H, (D + d_chunk - 1) // d_chunk)
+
+def _triton_launch_stage2(plan: dict) -> None:
+    """Stage 2 — cross-split reduce: combine the KV_SPLITS partials, fold
+    attn_sink, normalize, write plan["out"].
+
+    No-op when kv_splits == 1 (the fused stage1 already wrote the final
+    result). This is the triton counterpart of the asm wrapper's stage2
+    merge (`merge` = asm_tot - asm_k)."""
+    if plan["kv_splits"] == 1:
+        return
+
+    m_partial = plan["m_partial"]
+    l_partial = plan["l_partial"]
+    acc_partial = plan["acc_partial"]
+    out = plan["out"]
+    d_chunk = plan["d_chunk"]
+    grid_reduce = (plan["T"], plan["H"], (plan["D"] + d_chunk - 1) // d_chunk)
     _paged_decode_reduce_kernel[grid_reduce](
         m_partial,
         l_partial,
         acc_partial,
-        attn_sink,
-        kv_indptr,
+        plan["attn_sink"],
+        plan["kv_indptr"],
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -636,15 +725,53 @@ def _sparse_attn_v4_paged_decode_triton(
         out.stride(1),
         out.stride(2),
         _TRITON_LOG2E,
-        H,
-        D,
-        kv_splits,
-        BLOCK_D=block_d,
+        plan["H"],
+        plan["D"],
+        plan["kv_splits"],
+        BLOCK_D=plan["block_d"],
         D_CHUNK=d_chunk,
-        BLOCK_K=block_k,
+        BLOCK_K=plan["block_k"],
         num_warps=4,
     )
-    return out
+
+
+def _triton_run_stages(plan: dict) -> torch.Tensor:
+    """Both stages back to back — the end-to-end triton decode, counterpart of
+    the full asm wrapper (`asm_tot`)."""
+    _triton_launch_stage1(plan)
+    _triton_launch_stage2(plan)
+    return plan["out"]
+
+
+def _sparse_attn_v4_paged_decode_triton(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    block_h: int = None,
+    kv_splits: int = None,
+    block_k: int = None,
+) -> torch.Tensor:
+    """V4 sparse decode Triton implementation: split-K with FUSED fast path,
+    exp2 softmax. bf16/fp16 KV only (the vendored fp8 dequant path is present
+    in the kernels but unused here — kv_scales is never supplied).
+
+    Same API/behaviour as the ATOM source; internally it is now plan + stage1
+    + stage2 (see the vendoring note at the top of this section)."""
+    plan = _triton_decode_plan(
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        block_h=block_h,
+        kv_splits=kv_splits,
+        block_k=block_k,
+    )
+    return _triton_run_stages(plan)
 
 
 # ---------------------------------------------------------------------------
@@ -1103,7 +1230,7 @@ def _torch_attn_decode_fp8_dequant_ref(
     )
 
 
-def _triton_attn_decode_bf16(
+def _triton_decode_plan_bf16(
     q_bf16,  # [total_q, num_heads, D=512] bf16
     kv_bf16,  # [num_page, page_size=1, num_kv_heads=1, D=512] bf16
     qo_indptr,  # [batch+1]  q rows per sequence (cumulative)
@@ -1112,8 +1239,12 @@ def _triton_attn_decode_bf16(
     sm_scale,
     attn_sink,  # [num_heads] fp32
 ):
-    """BF16 Triton reference via the sibling ATOM split-K decode kernel
-    (`_sparse_attn_v4_paged_decode_triton`).
+    """Host-side layout bridge + `_triton_decode_plan`, no kernel launch.
+
+    Split out of `_triton_attn_decode_bf16` so the perf driver can hoist the
+    (expensive, host-only) index fan-out below — a `.cpu()` sync, a Python
+    per-token loop and a `torch.cat` — OUT of the timed region. Timing it
+    would charge the triton path for work the asm path does not do.
 
     Layout bridge: aiter's decode shares ONE kv span across all q tokens of a
     sequence (qo_indptr maps batch->q rows, kv_indptr maps batch->pages). The
@@ -1124,7 +1255,8 @@ def _triton_attn_decode_bf16(
     kv_last_page_lens==1): a batch's token count == its page count == the full
     span, so there is no partial last page to trim.
 
-    Returns out [total_q, num_heads, D] bf16 (V dim == head dim for MLA).
+    Returns the plan dict; `plan["out"]` is [total_q, num_heads, D] bf16
+    (V dim == head dim for MLA) once the stages have run.
     """
     total_q, num_heads, d = q_bf16.shape
     device = q_bf16.device
@@ -1153,7 +1285,7 @@ def _triton_attn_decode_bf16(
         kv_indices_tok = torch.zeros(0, dtype=torch.int32, device=device)
     kv_indptr_tok = torch.tensor(tok_indptr, dtype=torch.int32, device=device)
 
-    return _sparse_attn_v4_paged_decode_triton(
+    return _triton_decode_plan(
         q_bf16,
         unified_kv,
         kv_indices_tok,
@@ -1161,6 +1293,32 @@ def _triton_attn_decode_bf16(
         attn_sink,
         float(sm_scale),
     )
+
+
+def _triton_attn_decode_bf16(
+    q_bf16,
+    kv_bf16,
+    qo_indptr,
+    kv_indptr,
+    kv_page_indices,
+    sm_scale,
+    attn_sink,
+):
+    """BF16 Triton reference, end to end (plan + stage1 + stage2). See
+    `_triton_decode_plan_bf16` for the layout bridge.
+
+    Returns out [total_q, num_heads, D] bf16 (V dim == head dim for MLA).
+    """
+    plan = _triton_decode_plan_bf16(
+        q_bf16,
+        kv_bf16,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        sm_scale,
+        attn_sink,
+    )
+    return _triton_run_stages(plan)
 
 
 def _asm_attn_decode_bf16(
@@ -1375,6 +1533,10 @@ def _run_one_point(
     run_perftest, then compare the last iter's output against the two torch
     references. Mirrors the merged accuracy+perf pattern in test_mla.py:382-413.
 
+    Returns a dict of timings (us): asm stage1 (`us_asm_kernel`) / stage2
+    merge / end-to-end, the matching triton stage1 / reduce / end-to-end, the
+    torch fp8 reference, and the split count the triton heuristic resolved to.
+
     Why num_rotate_args=1: skips both device_memory_profiling and the
     copy.deepcopy(args) fan-out in aiter/test_common.py:46-71, so the
     pre-allocated logits/lse buffers are reused across all iters. Without
@@ -1546,13 +1708,21 @@ def _run_one_point(
         num_rotate_args=1,
     )
 
-    # ---- timed call (1b): BF16 triton decode ----
+    # ---- timed call (1b): BF16 triton decode, per stage ----
     # The vendored ATOM split-K triton kernel, fed the SAME bf16 q/kv (no FP8
-    # quant). Timed so the summary can report triton vs asm throughput side by
-    # side. Runs BEFORE the asm calls so nothing executes between the asm write
-    # to logits_buf and the out_asm read below. Consumes inputs["q_bf16"] etc.
-    out_triton, us_triton = run_perftest(
-        _triton_attn_decode_bf16,
+    # quant). Timed in TWO measurements that mirror the asm split below:
+    #   triton_s1  = stage1 attention kernel only        <-> asm_k
+    #   triton_tot = stage1 + stage2 cross-split reduce  <-> asm_tot
+    # so triton_reduce = triton_tot - triton_s1 is comparable to the asm
+    # wrapper's stage2 merge cost. When the heuristic resolves kv_splits==1 the
+    # fused kernel is used, stage2 is a no-op and triton_reduce ~= 0.
+    #
+    # The plan (index fan-out + buffer alloc) is built ONCE, outside the timed
+    # region — it is host-only work with a device sync that the asm path does
+    # not do, so timing it would flatter the asm comparison.
+    # Runs BEFORE the asm calls so nothing executes between the asm write
+    # to logits_buf and the out_asm read below.
+    triton_plan = _triton_decode_plan_bf16(
         inputs["q_bf16"],
         inputs["kv_bf16"],
         inputs["qo_indptr"],
@@ -1560,6 +1730,18 @@ def _run_one_point(
         inputs["kv_page_indices"],
         sm_scale,
         inputs["sink"],
+    )
+    triton_splits = triton_plan["kv_splits"]
+    _ret, us_triton_s1 = run_perftest(
+        _triton_launch_stage1,
+        triton_plan,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=1,
+    )
+    out_triton, us_triton = run_perftest(
+        _triton_run_stages,
+        triton_plan,
         num_iters=num_iters,
         num_warmup=num_warmup,
         num_rotate_args=1,
@@ -1707,8 +1889,12 @@ def _run_one_point(
     flops = q_seq_logical * total_kv * gqa_ratio * (_QUANT_D + V_HEAD_DIM) * 2
     us_asm = us_asm_kernel  # used by the caller in the summary
     merge_us = us_asm_total - us_asm_kernel
+    triton_reduce_us = us_triton - us_triton_s1
     speedup = us_ref / us_asm if us_asm > 0 else float("inf")
-    triton_speedup = us_triton / us_asm if us_asm > 0 else float("inf")
+
+    def _ratio(num, den):
+        return num / den if den > 0 else float("inf")
+
     print(
         f"[v4 nm perf]     iters={num_iters}: "
         f"asm_k={us_asm_kernel:.2f} us ({flops / us_asm_kernel / 1e6:.2f} TFLOPS) "
@@ -1716,11 +1902,30 @@ def _run_one_point(
         f"fp8_ref={us_ref:.2f} us, speedup(kernel)={speedup:.1f}x"
     )
     print(
-        f"[v4 nm perf]     triton={us_triton:.2f} us "
-        f"({flops / us_triton / 1e6:.2f} TFLOPS), "
-        f"asm_k vs triton = {triton_speedup:.2f}x"
+        f"[v4 nm perf]     triton(splits={triton_splits}): "
+        f"s1={us_triton_s1:.2f} us ({flops / us_triton_s1 / 1e6:.2f} TFLOPS) "
+        f"reduce={triton_reduce_us:.2f} us  total={us_triton:.2f} us "
+        f"({flops / us_triton / 1e6:.2f} TFLOPS)"
     )
-    return us_asm, us_ref, us_triton, us_asm_total
+    # Stage-matched comparisons: asm stage1 kernel vs triton stage1 attention,
+    # and full wrapper vs full triton (both include their stage2 reduce/merge).
+    print(
+        f"[v4 nm perf]     stage1: triton_s1/asm_k = "
+        f"{_ratio(us_triton_s1, us_asm_kernel):.2f}x | "
+        f"stage2: triton_reduce/asm_merge = "
+        f"{_ratio(triton_reduce_us, merge_us):.2f}x | "
+        f"total:  triton_tot/asm_tot = {_ratio(us_triton, us_asm_total):.2f}x"
+    )
+    return dict(
+        us_asm_kernel=us_asm_kernel,
+        us_asm_total=us_asm_total,
+        us_asm_merge=merge_us,
+        us_ref=us_ref,
+        us_triton_s1=us_triton_s1,
+        us_triton_total=us_triton,
+        us_triton_reduce=triton_reduce_us,
+        triton_splits=triton_splits,
+    )
 
 
 @needs_gfx950
@@ -2795,7 +3000,7 @@ if __name__ == "__main__":
             f"\n========== batch={batch} kv_seq_lens={kv_seq_lens} "
             f"q_seq_logical={q_seq_logical} =========="
         )
-        us_asm, us_ref, us_triton, us_asm_total = _run_one_point(
+        perf = _run_one_point(
             batch=batch,
             kv_seq_lens=kv_seq_lens,
             q_seq_logical=q_seq_logical,
@@ -2808,30 +3013,23 @@ if __name__ == "__main__":
             out_16_nosplit=args.out_16_nosplit,
         )
         perf_rows.append(
-            (
-                batch,
-                kv_seq_lens,
-                q_seq_logical,
-                args.gqa_ratio,
-                args.attn_sink,
-                us_asm,
-                us_ref,
-                us_triton,
-                us_asm_total,
-            )
+            (batch, kv_seq_lens, q_seq_logical, args.gqa_ratio, args.attn_sink, perf)
         )
 
-    print("\n[v4 nm perf summary] (us; speedup = other / asm_tot, end-to-end)")
-    print("  asm_k = kernel only; asm_tot = kernel + stage2 merge (end-to-end)")
-    print("  triton/torch are end-to-end, so speedup uses asm_tot for a fair compare")
+    print("\n[v4 nm perf summary] (us)")
+    print("  asm_k / tri_s1  = stage1 only (attention kernel; no cross-split merge)")
+    print("  asm_tot / tri_t = end-to-end  (stage1 + stage2 reduce/merge)")
+    print("  ratios are triton/asm at the SAME stage; torch/asm is end-to-end")
     print(
         f"  {'batch':>6} {'kv_seq':>8} {'q_seq':>6} {'gqa':>5} {'sink':>6} "
-        f"{'asm_k us':>10} {'asm_tot us':>11} {'triton us':>10} {'torch us':>10} "
-        f"{'triton/asm':>11} {'torch/asm':>10}"
+        f"{'asm_k':>9} {'asm_tot':>9} {'tri_s1':>9} {'tri_t':>9} {'torch':>10} "
+        f"{'s1 tri/asm':>11} {'tot tri/asm':>12} {'torch/asm':>10}"
     )
-    for b, k, q, g, s, ua, ur, ut, uat in perf_rows:
+    for b, k, q, g, s, p in perf_rows:
+        ak, at = p["us_asm_kernel"], p["us_asm_total"]
+        t1, tt, ur = p["us_triton_s1"], p["us_triton_total"], p["us_ref"]
         print(
             f"  {b:>6d} {k:>8d} {q:>6d} {g:>5d} {str(s):>6} "
-            f"{ua:>10.2f} {uat:>11.2f} {ut:>10.2f} "
-            f"{ur:>10.2f} {ut / uat:>10.1f}x {ur / uat:>9.1f}x"
+            f"{ak:>9.2f} {at:>9.2f} {t1:>9.2f} {tt:>9.2f} {ur:>10.2f} "
+            f"{t1 / ak:>10.2f}x {tt / at:>11.2f}x {ur / at:>9.1f}x"
         )
