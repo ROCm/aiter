@@ -97,7 +97,12 @@ def _buffer_load_vec(
 class PreshuffleScaleLayout:
     """Container returned by `make_preshuffle_scale_layout`.
 
-    The scale layout is ``(c_mn1, c_k1, 4, 16) : (stride_n0, stride_k0, stride_klane, 1)``.
+    Default layout:
+        ``(c_mn1, c_k1, KLane=4, NLane=16) : (stride_n0, stride_k0, stride_klane, 1)``
+
+    KLane-inner layout (``klane_inner=True``):
+        ``(c_mn1, c_k1, NLane=16, KLane=4) : (stride_n0, stride_k0, stride_nlane, 1)``
+
     Callers compute flat index directly with plain arith::
 
         idx = mni * stride_n0 + ku * stride_k0 + k_lane * stride_klane + n_lane
@@ -107,6 +112,7 @@ class PreshuffleScaleLayout:
     stride_n0: object
     stride_k0: object
     stride_klane: object
+    stride_nlane: object = None
 
 
 def make_preshuffle_scale_layout(
@@ -118,11 +124,16 @@ def make_preshuffle_scale_layout(
     k_pack: int = 2,
     elem_bytes: int = 4,
     scale_block_size: int = 32,
+    klane_inner: bool = False,
 ) -> PreshuffleScaleLayout:
     """Build scale layout matching aiter/CK preshuffle for FP4/FP8 microscale.
 
     Layout shape: ``(c_mn1, c_k1, 4, 16)`` where
     ``c_mn1 = c_mn / 16 / mn_pack`` and ``c_k1 = (c_k / scale_block_size) / 4 / k_pack``.
+
+    When *klane_inner* is True the KLane dimension is innermost (stride 1)
+    and NLane has stride 4, matching the ``(c_mn1, c_k1, NLane=16, KLane=4)``
+    layout used by the klane-inner preshuffle permutation.
     """
     c16 = fx.Index(16)
     c4 = fx.Index(4)
@@ -135,26 +146,41 @@ def make_preshuffle_scale_layout(
             f"elem_bytes of scale must be {mn_pack} * {k_pack}, got {elem_bytes!r}"
         )
 
-    stride_klane = c16
-    stride_k0 = c4 * stride_klane
-    stride_n0 = c_k1 * stride_k0
+    if klane_inner:
+        stride_klane = fx.Index(1)  # KLane innermost
+        stride_nlane = c4  # c4 = fx.Index(4)
+        stride_k0 = c16 * c4  # = 64
+        stride_n0 = c_k1 * stride_k0
+    else:
+        stride_klane = c16  # KLane at stride 16
+        stride_nlane = fx.Index(1)  # NLane innermost
+        stride_k0 = c4 * stride_klane  # = 64
+        stride_n0 = c_k1 * stride_k0
 
     c_mn1_i32 = arith.index_cast(T.i32, c_mn1)
     c_k1_i32 = arith.index_cast(T.i32, c_k1)
     stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
     stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
     stride_klane_i32 = arith.index_cast(T.i32, stride_klane)
+    stride_nlane_i32 = arith.index_cast(T.i32, stride_nlane)
 
-    layout_scale = fx.make_layout(
-        (c_mn1_i32, c_k1_i32, 4, 16),
-        stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
-    )
+    if klane_inner:
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 16, 4),  # NLane=16, KLane=4
+            stride=(stride_n0_i32, stride_k0_i32, stride_nlane_i32, stride_klane_i32),
+        )
+    else:
+        layout_scale = fx.make_layout(
+            (c_mn1_i32, c_k1_i32, 4, 16),  # KLane=4, NLane=16
+            stride=(stride_n0_i32, stride_k0_i32, stride_klane_i32, 1),
+        )
 
     return PreshuffleScaleLayout(
         layout_scale=layout_scale,
         stride_n0=stride_n0,
         stride_k0=stride_k0,
         stride_klane=stride_klane,
+        stride_nlane=stride_nlane,
     )
 
 
@@ -174,12 +200,19 @@ def make_preshuffle_b_layout(
     kpack_bytes: int = 16,
     elem_bytes: int = 1,
     k_major: bool = False,
+    klane_inner: bool = False,
 ) -> PreshuffleBLayout:
     """Build B layout matching aiter/CK preshuffle for A8 MFMA kernels.
 
     When *k_major* is True the block-level order is K-major (``k_blk`` outermost),
     matching the ``(0,3,1,4,2,5)`` shuffle permutation.  The default N-major
     order (``k_major=False``) matches the legacy ``(0,1,3,4,2,5)`` permutation.
+
+    When *klane_inner* is True the KLane dwords are contiguous within each
+    16-byte KPack, producing shape ``(N0, K0, L_sub=4, NLane=16, 16)`` with
+    strides ``(n0, 1024, 16, 64, 1)``.  This matches the klane-inner
+    preshuffle permutation where the shuffle+layout changes place KLane
+    innermost for dwordx4 loads.
     """
     if kpack_bytes not in (8, 16):
         raise ValueError(f"kpack_bytes must be 8 or 16, got {kpack_bytes!r}")
@@ -197,6 +230,40 @@ def make_preshuffle_b_layout(
         if elem_bytes == 1
         else (c_kpack // arith.constant(int(elem_bytes), index=True))
     )
+
+    if klane_inner:
+        # KLane-inner layout: (N0, K0, L_sub=4, NLane=16, kpack)
+        # Strides:            (n0,  1024,       16,       64,    1)
+        #
+        # KLane dwords are contiguous within each 16-byte KPack.
+        # dim2 (L_sub) has stride kpack (16); dim3 (NLane) has stride
+        # L_sub_extent * kpack (4*16 = 64); K0 stride = NLane_extent *
+        # stride_nlane (16*64 = 1024).
+        c64 = fx.Index(64)
+        c4 = fx.Index(4)
+        c_k0 = c_k_bytes // c64
+        klane_dim = 4
+
+        stride_dim2 = c_kpack_elems  # L_sub stride = kpack (16)
+        stride_dim3 = c4 * c_kpack_elems  # NLane stride = 4*16 = 64
+        stride_k0 = c16 * stride_dim3  # K0 stride = 16*64 = 1024
+        stride_n0 = c_k0 * stride_k0
+
+        kpack_elems_static = (
+            kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
+        )
+        n0_i32 = arith.index_cast(T.i32, n0)
+        c_k0_i32 = arith.index_cast(T.i32, c_k0)
+        stride_n0_i32 = arith.index_cast(T.i32, stride_n0)
+        stride_k0_i32 = arith.index_cast(T.i32, stride_k0)
+        stride_dim2_i32 = arith.index_cast(T.i32, stride_dim2)
+        stride_dim3_i32 = arith.index_cast(T.i32, stride_dim3)
+
+        stride_b = (stride_n0_i32, stride_k0_i32, stride_dim2_i32, stride_dim3_i32, 1)
+        layout_b = fx.make_layout(
+            (n0_i32, c_k0_i32, klane_dim, 16, kpack_elems_static), stride_b
+        )
+        return PreshuffleBLayout(layout_b=layout_b, kpack_bytes=kpack_bytes)
 
     stride_nlane = c_kpack_elems
 
@@ -784,7 +851,6 @@ __all__ = [
     "lds_store_8b_xor16",
     "lds_store_16b_xor16",
     "load_b_pack_k32",
-    "load_b_raw_mxfp4_dwordx4",
     "load_b_raw_w4a16",
     "load_b_raw_w4a16_groupwise",
     "make_preshuffle_b_layout",
@@ -792,7 +858,6 @@ __all__ = [
     "split_row_major_2d",
     "swizzle_xor16",
     "tile_chunk_coord_i32",
-    "unpack_b_mxfp4_bf16",
     "unpack_b_w4a16",
     "unpack_b_w4a16_groupwise",
     "xcd_remap_bx_by",
@@ -947,6 +1012,11 @@ def unpack_b_w4a16_groupwise(packed32, scale_val, arith, vector, use_gfx950_cvt=
     )
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# MXFP4 (FP4 E2M1 + E8M0 microscaling) helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 def _cvt_scalef32_pk_bf16_fp4(packed_i32, scale_f32, byte_idx, arith, vector):
     """GFX950 hardware: v_cvt_scalef32_pk_bf16_fp4.
 
@@ -995,40 +1065,37 @@ def _fp4x4_in_i32_to_bf16x4_i64(packed4, arith, vector, scale_f32=None):
     v1 = vector.from_elements(vec1_i32_t, [packed4])
     i8x4 = vector.bitcast(vec4_i8, v1)
 
-    c1 = arith.constant(1, type=T.i32)
-    c3_shift = arith.constant(3, type=T.i32)
-    c7 = arith.constant(7, type=T.i32)
-    c22 = arith.constant(22, type=T.i32)
-    c23 = arith.constant(23, type=T.i32)
-    c31 = arith.constant(31, type=T.i32)
-    c126 = arith.constant(126, type=T.i32)
-    c_zero = arith.constant(0, type=T.i32)
-    c_half_bits = arith.constant(0x3F000000, type=T.i32)  # 0.5f
+    c1 = fx.Int32(1)
+    c3_shift = fx.Int32(3)
+    c7 = fx.Int32(7)
+    c22 = fx.Int32(22)
+    c23 = fx.Int32(23)
+    c31 = fx.Int32(31)
+    c126 = fx.Int32(126)
+    c_zero = fx.Int32(0)
+    c_half_bits = fx.Int32(0x3F000000)  # 0.5f
 
     f32_vals = []
     for i in range(4):
         nibble_i8 = vector.extract(i8x4, static_position=[i], dynamic_position=[])
         n = arith.extui(T.i32, nibble_i8)
 
-        sign_bit = arith.andi(arith.shrui(n, c3_shift), c1)
-        unsigned_val = arith.andi(n, c7)
-        exp_field = arith.shrui(unsigned_val, c1)
-        mant_field = arith.andi(unsigned_val, c1)
+        sign_bit = (n >> c3_shift) & c1
+        unsigned_val = n & c7
+        exp_field = unsigned_val >> c1
+        mant_field = unsigned_val & c1
 
-        f32_norm = arith.ori(
-            arith.shli(arith.addi(exp_field, c126), c23),
-            arith.shli(mant_field, c22),
-        )
+        f32_norm = ((exp_field + c126) << c23) | (mant_field << c22)
 
-        is_zero = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c_zero)
-        is_subnorm = arith.cmpi(arith.CmpIPredicate.eq, unsigned_val, c1)
+        is_zero = arith.cmpi(CmpIPredicate.eq, unsigned_val, c_zero)
+        is_subnorm = arith.cmpi(CmpIPredicate.eq, unsigned_val, c1)
 
         f32_bits = arith.select(
             is_zero,
             c_zero,
             arith.select(is_subnorm, c_half_bits, f32_norm),
         )
-        f32_bits = arith.ori(f32_bits, arith.shli(sign_bit, c31))
+        f32_bits = f32_bits | (sign_bit << c31)
 
         v = arith.bitcast(T.f32, f32_bits)
         if scale_f32 is not None:
@@ -1057,12 +1124,12 @@ def load_b_raw_mxfp4(
     arg_b,
     b_rsrc,
     layout_b,
-    base_k: ir.Value,
+    base_k,
     ku: int,
-    n_blk: ir.Value,
-    n_intra: ir.Value,
-    lane_div_16: ir.Value,
-    elem_type: ir.Type,
+    n_blk,
+    n_intra,
+    lane_div_16,
+    elem_type,
     kpack_bytes: int = 16,
 ):
     """Load 4 bytes of packed FP4 from a kpack=16 preshuffle layout.
@@ -1082,16 +1149,16 @@ def load_b_raw_mxfp4(
     if kpack_bytes != 16:
         raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
 
-    c128 = arith.constant(128, index=True)
-    c4 = arith.constant(4, index=True)
+    c128 = fx.Index(128)
+    c4 = fx.Index(4)
 
     k0_base = base_k // c128
-    k0 = k0_base + arith.constant(ku // 4, index=True)
-    klane_hw = arith.constant(ku % 4, index=True)
+    k0 = k0_base + fx.Index(ku // 4)
+    klane_hw = fx.Index(ku % 4)
     byte_offset = lane_div_16 * c4
 
-    coord_pack = (n_blk, k0, klane_hw, n_intra, arith.constant(0, index=True))
-    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+    coord_pack = (n_blk, k0, klane_hw, n_intra, fx.Index(0))
+    idx_pack = crd2idx(coord_pack, layout_b)
     idx_bytes = idx_pack + byte_offset
 
     b4 = _buffer_load_vec(
@@ -1120,11 +1187,11 @@ def load_b_raw_mxfp4_dwordx4(
     arg_b,
     b_rsrc,
     layout_b,
-    base_k: ir.Value,
-    n_blk: ir.Value,
-    n_intra: ir.Value,
-    lane_div_16: ir.Value,
-    elem_type: ir.Type,
+    base_k,
+    n_blk,
+    n_intra,
+    lane_div_16,
+    elem_type,
     kpack_bytes: int = 16,
     cache_modifier: int = 0,
 ):
@@ -1139,11 +1206,11 @@ def load_b_raw_mxfp4_dwordx4(
     if kpack_bytes != 16:
         raise ValueError(f"MXFP4 requires kpack_bytes=16, got {kpack_bytes!r}")
 
-    c128 = arith.constant(128, index=True)
+    c128 = fx.Index(128)
     k0 = base_k // c128
 
-    coord_pack = (n_blk, k0, lane_div_16, n_intra, arith.constant(0, index=True))
-    idx_pack = crd2idx(tuple(fx.Int32(c) for c in coord_pack), layout_b)
+    coord_pack = (n_blk, k0, lane_div_16, n_intra, fx.Index(0))
+    idx_pack = crd2idx(coord_pack, layout_b)
 
     b16 = _buffer_load_vec(
         buffer_ops,
@@ -1154,8 +1221,31 @@ def load_b_raw_mxfp4_dwordx4(
         vec_elems=16,
         elem_bytes=1,
         offset_in_bytes=True,
+        cache_modifier=cache_modifier,
     )
     return vector.bitcast(T.vec(4, T.i32), b16)
+
+
+def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None, use_hw_cvt=True):
+    """Unpack 8 FP4 E2M1 nibbles (packed in i32) to 2 x i64 (8 bf16).
+
+    Each byte of *packed32* holds two FP4 nibbles: low nibble = K_even,
+    high nibble = K_even+1.  We unpack the lower 2 bytes (4 consecutive
+    nibbles) into b0 and the upper 2 bytes into b1.
+
+    *scale_f32* is the decoded E8M0 block-scale (as f32).
+
+    When *use_hw_cvt* is True (default), uses the GFX950 hardware
+    instruction ``v_cvt_scalef32_pk_bf16_fp4`` which converts 2 FP4
+    nibbles -> 2 bf16 (with scale) in a single VALU cycle.
+
+    Returns ``(b0, b1)`` -- two i64 values, each containing 4 bf16 for
+    one ``mfma_f32_16x16x16bf16_1k`` call.
+    """
+    if use_hw_cvt and scale_f32 is not None:
+        return _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32)
+
+    return _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32)
 
 
 def _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32):
@@ -1180,51 +1270,27 @@ def _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32):
 
 def _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32):
     """Software fallback for non-GFX950 targets."""
-    c_0f = arith.constant(0x0F, type=T.i32)
-    c4 = arith.constant(4, type=T.i32)
-    c8 = arith.constant(8, type=T.i32)
-    c12 = arith.constant(12, type=T.i32)
-    c16 = arith.constant(16, type=T.i32)
-    c20 = arith.constant(20, type=T.i32)
-    c24 = arith.constant(24, type=T.i32)
-    c28 = arith.constant(28, type=T.i32)
+    c_0f = fx.Int32(0x0F)
+    c4 = fx.Int32(4)
+    c8 = fx.Int32(8)
+    c12 = fx.Int32(12)
+    c16 = fx.Int32(16)
+    c20 = fx.Int32(20)
+    c24 = fx.Int32(24)
+    c28 = fx.Int32(28)
 
     n0 = packed32 & c_0f
-    n1 = arith.shrui(packed32, c4) & c_0f
-    n2 = arith.shrui(packed32, c8) & c_0f
-    n3 = arith.shrui(packed32, c12) & c_0f
-    first = n0 | arith.shli(n1, c8) | arith.shli(n2, c16) | arith.shli(n3, c24)
+    n1 = (packed32 >> c4) & c_0f
+    n2 = (packed32 >> c8) & c_0f
+    n3 = (packed32 >> c12) & c_0f
+    first = n0 | (n1 << c8) | (n2 << c16) | (n3 << c24)
 
-    n4 = arith.shrui(packed32, c16) & c_0f
-    n5 = arith.shrui(packed32, c20) & c_0f
-    n6 = arith.shrui(packed32, c24) & c_0f
-    n7 = arith.shrui(packed32, c28) & c_0f
-    second = n4 | arith.shli(n5, c8) | arith.shli(n6, c16) | arith.shli(n7, c24)
+    n4 = (packed32 >> c16) & c_0f
+    n5 = (packed32 >> c20) & c_0f
+    n6 = (packed32 >> c24) & c_0f
+    n7 = (packed32 >> c28) & c_0f
+    second = n4 | (n5 << c8) | (n6 << c16) | (n7 << c24)
 
     b0 = _fp4x4_in_i32_to_bf16x4_i64(first, arith, vector, scale_f32=scale_f32)
     b1 = _fp4x4_in_i32_to_bf16x4_i64(second, arith, vector, scale_f32=scale_f32)
     return (b0, b1)
-
-
-def unpack_b_mxfp4_bf16(packed32, arith, vector, scale_f32=None, use_hw_cvt=True):
-    """Unpack 8 FP4 E2M1 nibbles (packed in i32) to 2 x i64 (8 bf16).
-
-    Each byte of *packed32* holds two FP4 nibbles: low nibble = K_even,
-    high nibble = K_even+1.  For ``mfma_f32_16x16x16bf16_1k`` the B
-    operand needs 4 consecutive K values per i64.  So we unpack the
-    lower 2 bytes (4 consecutive nibbles) into b0 and the upper 2 bytes
-    into b1.
-
-    *scale_f32* is the decoded E8M0 block-scale (as f32).
-
-    When *use_hw_cvt* is True (default), uses the GFX950 hardware
-    instruction ``v_cvt_scalef32_pk_bf16_fp4`` which converts 2 FP4
-    nibbles to 2 bf16 (with scale) in a single VALU cycle.  This
-    replaces ~144 VALU of the software fallback with 4 instructions.
-
-    Returns ``(b0, b1)`` -- two i64 values, each containing 4 bf16 for
-    one ``mfma_f32_16x16x16bf16_1k`` call.
-    """
-    if use_hw_cvt and scale_f32 is not None:
-        return _unpack_b_mxfp4_bf16_hw(packed32, arith, vector, scale_f32)
-    return _unpack_b_mxfp4_bf16_sw(packed32, arith, vector, scale_f32)
