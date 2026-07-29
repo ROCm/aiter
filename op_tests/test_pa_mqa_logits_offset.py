@@ -74,7 +74,7 @@ def _make_inputs(batch_size, next_n, context_len):
     return q_fp8, kv_cache, weights, context_lens, block_tables
 
 
-def _run(q, kv, w, ctx_lens, block_tables, out_width):
+def _run(q, kv, w, ctx_lens, block_tables, out_width, block_size=BLOCK_SIZE):
     rows = q.shape[0] * q.shape[1]
     out = torch.full((rows, out_width), SENTINEL, dtype=torch.float32, device=dev)
     deepgemm_fp8_paged_mqa_logits(
@@ -86,7 +86,7 @@ def _run(q, kv, w, ctx_lens, block_tables, out_width):
         block_tables,
         out_width,
         Preshuffle=True,
-        KVBlockSize=BLOCK_SIZE,
+        KVBlockSize=block_size,
         ChunkK=256,
         WavePerEU=2,
     )
@@ -111,7 +111,7 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
     # under test: the real failing layout (wide dense logits, stride 1<<20).
     wide = _run(q, kv, w, ctx_lens, block_tables, WIDE_MAX_MODEL_LEN)
 
-    # (1) every row must be written — directly catches the silent tail drop.
+    # (1) every row must be written -- directly catches the silent tail drop.
     unwritten = (wide == SENTINEL).all(dim=1)
     first_untouched = int(unwritten.nonzero()[0]) if bool(unwritten.any()) else None
     assert not bool(unwritten.any()), (
@@ -119,13 +119,77 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
         f"(first_untouched_row={first_untouched}); expected all rows written."
     )
 
-    # (2) values must be bit-identical to the compact reference — the tail rows
+    # (2) values must be bit-identical to the compact reference -- the tail rows
     # (>=512) are the ones the overflow used to corrupt.
     valid = wide[:, :CONTEXT_LEN]
     assert torch.equal(valid, ref), "wide-output logits differ from compact reference"
     assert torch.equal(
         valid[512:], ref[512:]
     ), "rows >= 512 (past the 2**31 offset boundary) differ from the reference"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a ROCm GPU")
+def test_paged_mqa_logits_large_kv_stride_matches_compact_reference():
+    block_size = 64
+    heads = 64
+    physical_block = 2992
+    stride_k_seq = 1435968
+    assert physical_block * stride_k_seq > 2**32
+
+    torch.manual_seed(SEED)
+    q = torch.randint(
+        1,
+        64,
+        (1, 1, heads, HEAD_DIM),
+        dtype=torch.uint8,
+        device=dev,
+    ).view(dtypes.fp8)
+    weights = torch.ones((1, heads), dtype=torch.float32, device=dev)
+    context_lens = torch.tensor([block_size], dtype=torch.int32, device=dev)
+
+    compact = torch.empty(
+        (1, block_size, 1, HEAD_DIM + 4), dtype=torch.uint8, device=dev
+    )
+    compact_flat = compact.view(1, -1)
+    value_bytes = block_size * HEAD_DIM
+    compact_flat[:, :value_bytes] = torch.randint(
+        1,
+        64,
+        (1, value_bytes),
+        dtype=torch.uint8,
+        device=dev,
+    )
+    compact_flat[:, value_bytes:].view(torch.float32).fill_(1.0)
+
+    strided = torch.empty_strided(
+        (physical_block + 1, block_size, 1, HEAD_DIM + 4),
+        (stride_k_seq, HEAD_DIM + 4, HEAD_DIM + 4, 1),
+        dtype=torch.uint8,
+        device=dev,
+    )
+    strided[physical_block].copy_(compact[0])
+
+    compact_out = _run(
+        q,
+        compact,
+        weights,
+        context_lens,
+        torch.tensor([[0]], dtype=torch.int32, device=dev),
+        block_size,
+        block_size,
+    )
+    strided_out = _run(
+        q,
+        strided,
+        weights,
+        context_lens,
+        torch.tensor([[physical_block]], dtype=torch.int32, device=dev),
+        block_size,
+        block_size,
+    )
+
+    assert torch.isfinite(strided_out).all()
+    assert torch.equal(strided_out, compact_out)
 
 
 if __name__ == "__main__":
