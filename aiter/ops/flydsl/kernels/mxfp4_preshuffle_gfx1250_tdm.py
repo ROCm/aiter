@@ -260,7 +260,8 @@ def launch_gemm_a8w4_tdm(
         # tile_m rows x 8 bytes (dst_i32 | weight_bits_i32). Bumped off the SAME
         # allocator so it is disjoint from the reused A/B/C arena above.
         if const_expr(ep_p2p_write):
-            rowmap_lds_idx = ptr_to_idx(_smem.allocate(tile_m * 8)._ptr)
+            _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
+            rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
 
         def buf_ptr(s):
             return base_ptr + s * PITCH
@@ -421,39 +422,26 @@ def launch_gemm_a8w4_tdm(
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             if const_expr(ep_p2p_write):
-                # Prologue prefetch: pull this tile's (dst_i32, weight_f32) rowmap
-                # slice into LDS. Coalesced buffer_load -> loadcnt (a SEPARATE
-                # counter from the mainloop's tensorcnt A/B double-buffer, so it
-                # does not perturb the pipeline's exact tensor_wait counts). One
-                # batched wait here replaces the epilogue's serialized per-row
-                # buffer_load + s_wait_loadcnt chain.
-                _pf_rsrc = buffer_ops.create_buffer_resource(
-                    arg_ep_rowmap, max_size=True
+                # Build the rowmap (dst_i32, weight_f32) TDM descriptor: a
+                # (tile_m, 2) i32 slice at global row blk_m -> the persistent
+                # rowmap LDS region. The load is ISSUED at the drain tail (below),
+                # where the A/B TDM engine is idle, so it overlaps the last WMMA on
+                # the now-free HBM without perturbing the mainloop's exact
+                # tensor_wait counts. ext=mn_oob clamps to this expert's valid rows
+                # (padding rows are left unloaded and masked in the epilogue). The
+                # mainloop-exit pipeline_fence(0) drains + barriers it before the
+                # epilogue reads dst/weight from LDS.
+                _rm_i32 = fx.get_iter(arg_ep_rowmap)
+                _rm_gt = global_view(
+                    _rm_i32, blk_m64 * fx.Int64(2), (tile_m, 2), (2, 1)
                 )
-                _pf_need_mask = (tile_m % block != 0) or (block > tile_m)
-                _pf_vals = []
-                for _pb in range_constexpr(0, tile_m, block):
-                    _pf_row = tid + _pb
-                    _pf_gr = blk_m + _pf_row
-                    _pf_v = buffer_ops.buffer_load(
-                        _pf_rsrc, _pf_gr * 2, vec_width=2, dtype=T.i32
-                    )
-                    _pf_vals.append((_pf_row, _pf_v))
-                rocdl.s_wait_loadcnt(0)
-                for _pf_row, _pf_v in _pf_vals:
-                    if const_expr(_pf_need_mask):
-                        _pf_ok = arith.cmpi(
-                            arith.CmpIPredicate.slt,
-                            _pf_row,
-                            arith.constant(tile_m, type=T.i32),
-                        )
-                        _pf_if = scf.IfOp(_pf_ok, results_=[], has_else=False)
-                        with ir.InsertionPoint(_pf_if.then_block):
-                            lds_store_b64_raw(rowmap_lds_idx, _pf_row * 8, _pf_v)
-                            scf.YieldOp([])
-                    else:
-                        lds_store_b64_raw(rowmap_lds_idx, _pf_row * 8, _pf_v)
-                workgroup_barrier()
+                _rm_atom = fx.rocdl.make_tdm_atom(
+                    _rm_gt, [mn_oob, None], strides=[fx.Int64(2), None],
+                    num_warps=num_waves,
+                )
+                _rm_dst = lds_view(
+                    fx.recast_iter(p32_shared, _rowmap_lds_ptr), (tile_m, 2), (2, 1)
+                )
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
             # Post-compute issue (double-buffered) wins for decode (small tile_m)
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
@@ -476,6 +464,10 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
+                    if const_expr(ep_p2p_write and j == num_buffers - 1):
+                        # A/B TDM drained (outstanding==0 above); issue the rowmap
+                        # TDM here so it overlaps this last WMMA on the idle HBM.
+                        fx.copy(_rm_atom, _rm_gt, _rm_dst)
                     compute_ktile(buf, None)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
@@ -491,6 +483,10 @@ def launch_gemm_a8w4_tdm(
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
+                    if const_expr(ep_p2p_write and j == num_buffers - 2):
+                        # A/B TDM drained (outstanding==0 above); issue the rowmap
+                        # TDM here so it overlaps this last WMMA on the idle HBM.
+                        fx.copy(_rm_atom, _rm_gt, _rm_dst)
                     compute_ktile(buf, None)
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
