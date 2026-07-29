@@ -25,7 +25,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 
-from aiter.ops.pa_mqa_logits_mxfp8_opus import (
+from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import (
     compute_prefill_schedule,
     compute_varqlen_windows,
     pa_mqa_logits_mxfp8_prefill,
@@ -352,41 +352,11 @@ def run_varqlen_case(
 #    and the ATOM cp_gather + Triton fp8_mqa_logits path). ──
 
 
-def _time_graph(fn, iters=100, warmup=20, k_in_graph=25):
-    """Serving-like back-to-back timing: capture K kernels into ONE graph so each
-    replay runs K kernels gap-free on the GPU (host can't inject idle between
-    them -> no dispatch-gap clock throttling), then time replays with cuda events.
-    Returns avg us per single kernel."""
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(5):
-            fn()
-    torch.cuda.current_stream().wait_stream(s)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        for _ in range(k_in_graph):
-            fn()
-    for _ in range(warmup):
-        g.replay()
-    torch.cuda.synchronize()
-    st, en = torch.cuda.Event(True), torch.cuda.Event(True)
-    reps = max(1, iters // k_in_graph)
-    st.record()
-    for _ in range(reps):
-        g.replay()
-    en.record()
-    torch.cuda.synchronize()
-    return st.elapsed_time(en) * 1000.0 / (reps * k_in_graph)  # ms -> us per kernel
-
-
 def run_bench(bs, n_q, ctx, heads=64, head_dim=128, kv_block_size=64, block_k=256,
-              parallel_unit_num=512, iters=100, warmup=20, seed=0, graph=False):
+              parallel_unit_num=512, iters=100, warmup=20, seed=0):
     from aiter.test_common import run_perftest
 
     def measure(fn):
-        if graph:
-            return _time_graph(fn, iters, warmup)
         return run_perftest(fn, num_iters=iters, num_warmup=warmup)[1]
 
     # uniform workload: bs batches, each n_q query rows over window [0, ctx).
@@ -431,7 +401,7 @@ def run_bench(bs, n_q, ctx, heads=64, head_dim=128, kv_block_size=64, block_k=25
     print(
         f"\n=== bench: bs={bs} n_q={n_q} ctx={ctx} total_tokens={total_tokens} "
         f"n_ctas={n_ctas} tiles/row={(ctx + block_k - 1)//block_k} "
-        f"mode={'graph' if graph else 'eager'} (cos_bf16={cos_bf16:.5f}) ==="
+        f"(cos_bf16={cos_bf16:.5f}) ==="
     )
     rows = [("ours fp8 paged (single kernel)", us_ours)]
 
@@ -525,12 +495,16 @@ def main():
     ap.add_argument("--ctx", type=int, default=5120)
     ap.add_argument("--n_q", type=int, default=256)
     ap.add_argument("--pun", type=int, default=512)
-    ap.add_argument("--graph", action="store_true", help="time with CUDA graph instead of eager")
     args = ap.parse_args()
 
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() != "gfx950":
+        print(f"[skip] pa_mqa_logits_mxfp8 only supports gfx950 (current: {get_arch()}).")
+        return 0
+
     if args.bench:
-        return run_bench(args.bs, args.n_q, args.ctx, parallel_unit_num=args.pun,
-                         graph=args.graph)
+        return run_bench(args.bs, args.n_q, args.ctx, parallel_unit_num=args.pun)
 
     print("=== MXFP8 paged MQA logits (opus, gfx950) ===")
     rc = 0
@@ -551,6 +525,8 @@ def main():
     rc |= run_varqlen_case(4, [4, 4, 4, 4], [256, 800, 2048, 4096], seed=24)
     # fully ragged per-batch query length (no single next_n)
     rc |= run_varqlen_case(3, [1, 3, 2], [200, 1500, 800], seed=26)
+    # empty batch (qlen=0) mixed with non-empty batches
+    rc |= run_varqlen_case(3, [2, 0, 3], [384, 256, 640], seed=28)
 
     print("  ALL PASS" if rc == 0 else "  SOME FAILED")
     return rc
