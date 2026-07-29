@@ -257,11 +257,7 @@ __device__ __forceinline__ void store_kv_fp4_preshuffle(
     }
 }
 
-template <typename DTYPE_I,
-          typename DTYPE_O,
-          int dim,
-          int vec_size = 16,
-          int logical_warp_size = opus::get_warp_size()>
+template <typename DTYPE_I, typename DTYPE_O, int dim, int vec_size = 16>
 __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__ out,
                                                             opus::e8m0_t* __restrict__ scale,
                                                             DTYPE_I const* __restrict__ input,
@@ -272,9 +268,9 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                                                             const bool shuffle_scale,
                                                             const int32_t group_size)
 {
-    static_assert(vec_size * logical_warp_size % dim == 0,
-                  "vec_size * logical_warp_size must be divisible by dim");
-    constexpr int m_block     = vec_size * logical_warp_size / dim;
+    constexpr int warp_size = opus::get_warp_size();
+    static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
+    constexpr int m_block     = vec_size * warp_size / dim;
     constexpr float dim_rsqrt = rotate_dim_rsqrt<dim>();
     const int m_oob = (m - blockIdx.x * m_block) < m_block ? (m - blockIdx.x * m_block) : m_block;
 
@@ -404,36 +400,6 @@ __global__ void hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__
                                                         m, head_num, stride, out_stride, shuffle_scale, group_size); \
                                             });
 
-#define ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(                                              \
-    dim, fp4quant, vec_size, logical_warp_size, name)                                             \
-    const int32_t m_block = vec_size * logical_warp_size / dim;                                   \
-    dim3 const grid((m + m_block - 1) / m_block);                                                  \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                  \
-                                            [&] {                                                  \
-                                                using DTYPE_I =                                   \
-                                                    typename aiter::hip2opus<scalar_t>::type;      \
-                                                using DTYPE_O = std::conditional_t<                \
-                                                    fp4quant, opus::fp4_t, DTYPE_I>;               \
-                                                hadamard_rotate_activation_fp4quant_kernel<        \
-                                                    DTYPE_I,                                      \
-                                                    DTYPE_O,                                      \
-                                                    dim,                                          \
-                                                    vec_size,                                     \
-                                                    logical_warp_size>                             \
-                                                    <<<grid, dim3(block_size), 0, stream>>>(       \
-                                                        reinterpret_cast<DTYPE_O*>(out.data_ptr()),\
-                                                        reinterpret_cast<opus::e8m0_t*>(           \
-                                                            scale_ptr),                            \
-                                                        reinterpret_cast<DTYPE_I*>(                \
-                                                            input.data_ptr()),                     \
-                                                        m,                                        \
-                                                        head_num,                                 \
-                                                        stride,                                   \
-                                                        out_stride,                               \
-                                                        shuffle_scale,                            \
-                                                        group_size);                              \
-                                            });
-
 void rotate_activation_fp4quant(aiter_tensor_t& out,
                                 aiter_tensor_t& scale,
                                         const aiter_tensor_t& input,
@@ -497,16 +463,7 @@ void rotate_activation_fp4quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, true, 32, 32, "rotate_activation_fp4quant");
-        }
-        else
-        {
-            ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, true, 16, 64, "rotate_activation_fp4quant");
-        }
+        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 32, "rotate_activation_fp4quant");
     }
     else
     {
@@ -546,16 +503,7 @@ void rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, false, 32, 32, "rotate_activation");
-        }
-        else
-        {
-            ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, false, 16, 64, "rotate_activation");
-        }
+        ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 32, "rotate_activation");
     }
     else
     {
@@ -564,12 +512,7 @@ void rotate_activation(aiter_tensor_t& out,
 }
 
 
-template <typename DTYPE_I,
-          typename DTYPE_O,
-          bool do_rotate_act,
-          int dim,
-          int vec_size = 16,
-          int logical_warp_size = opus::get_warp_size()>
+template <typename DTYPE_I, typename DTYPE_O, bool do_rotate_act, int dim, int vec_size = 16>
 __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restrict__ out,
                                                                         opus::e8m0_t* __restrict__ scale,
                                                                         DTYPE_I const* __restrict__ input,
@@ -584,10 +527,10 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                                         const bool shuffle_scale,
                                                                         const int32_t group_size)
 {
-    static_assert(vec_size * logical_warp_size % dim == 0,
-                  "vec_size * logical_warp_size must be divisible by dim");
+    constexpr int warp_size = opus::get_warp_size();
+    static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
     static_assert(vec_size % 2 == 0, "vec_size must be even for adjacent-pair rope");
-    constexpr int m_block     = vec_size * logical_warp_size / dim;
+    constexpr int m_block     = vec_size * warp_size / dim;
     constexpr float dim_rsqrt = rotate_dim_rsqrt<dim>();
 
     using halfxvec_t  = opus::vector_t<DTYPE_I, vec_size>;
@@ -759,58 +702,6 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                         m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size); \
                                             });
 
-#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP_(                                              \
-    dim, do_rotate_act_val, fp4quant, vec_size, logical_warp_size, name)                              \
-    AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim"); \
-    AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");                  \
-    const int32_t m_block = vec_size * logical_warp_size / dim;                                       \
-    dim3 const grid((m + m_block - 1) / m_block);                                                       \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                      \
-                                            [&] {                                                      \
-                                                using DTYPE_I =                                       \
-                                                    typename aiter::hip2opus<scalar_t>::type;          \
-                                                using DTYPE_O = std::conditional_t<                    \
-                                                    fp4quant, opus::fp4_t, DTYPE_I>;                   \
-                                                rope_hadamard_rotate_activation_fp4quant_kernel<        \
-                                                    DTYPE_I,                                          \
-                                                    DTYPE_O,                                          \
-                                                    do_rotate_act_val,                                \
-                                                    dim,                                              \
-                                                    vec_size,                                         \
-                                                    logical_warp_size>                                 \
-                                                    <<<grid, dim3(block_size), 0, stream>>>(           \
-                                                        reinterpret_cast<DTYPE_O*>(out.data_ptr()),     \
-                                                        reinterpret_cast<opus::e8m0_t*>(scale_ptr),     \
-                                                        reinterpret_cast<DTYPE_I const*>(              \
-                                                            input.data_ptr()),                         \
-                                                        reinterpret_cast<DTYPE_I const*>(              \
-                                                            cos.data_ptr()),                           \
-                                                        reinterpret_cast<DTYPE_I const*>(              \
-                                                            sin.data_ptr()),                           \
-                                                        reinterpret_cast<int64_t const*>(              \
-                                                            positions.data_ptr()),                     \
-                                                        m,                                            \
-                                                        head_num,                                     \
-                                                        rope_dim,                                     \
-                                                        stride,                                       \
-                                                        out_stride,                                   \
-                                                        shuffle_scale,                                \
-                                                        group_size);                                  \
-                                            });
-
-#define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(                                             \
-    dim, fp4quant, vec_size, logical_warp_size, name)                                                 \
-    if(do_rotate_act)                                                                                 \
-    {                                                                                                 \
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP_(                                             \
-            dim, true, fp4quant, vec_size, logical_warp_size, name);                                  \
-    }                                                                                                 \
-    else                                                                                              \
-    {                                                                                                 \
-        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP_(                                             \
-            dim, false, fp4quant, vec_size, logical_warp_size, name);                                  \
-    }
-
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
     if (do_rotate_act) { \
         ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_(dim, true, fp4quant, vec_size, name); \
@@ -905,16 +796,8 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, true, 32, 32, "rope_rotate_activation_fp4quant");
-        }
-        else
-        {
-            ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, true, 16, 64, "rope_rotate_activation_fp4quant");
-        }
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, true, 32,
+            "rope_rotate_activation_fp4quant");
     }
     else
     {
@@ -986,16 +869,8 @@ void rope_rotate_activation(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, false, 32, 32, "rope_rotate_activation");
-        }
-        else
-        {
-            ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL_WARP(
-                1024, false, 16, 64, "rope_rotate_activation");
-        }
+        ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(1024, false, 32,
+            "rope_rotate_activation");
     }
     else
     {
@@ -1008,11 +883,7 @@ void rope_rotate_activation(aiter_tensor_t& out,
 // and `out_scale` (fp32 [m, dim/group_size]) receives per-(row, 1xGROUP) scales.
 // Ported from origin/main's RQ_FP8 path (PR #3820) into a dedicated kernel so it
 // does not share codegen with the packed-fp4 kernel above.
-template <typename DTYPE_I,
-          bool do_rotate_act,
-          int dim,
-          int vec_size = 16,
-          int logical_warp_size = opus::get_warp_size()>
+template <typename DTYPE_I, bool do_rotate_act, int dim, int vec_size = 16>
 __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __restrict__ out,
                                                                 DTYPE_I const* __restrict__ input,
                                                                 DTYPE_I const* __restrict__ cos,
@@ -1026,10 +897,10 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
                                                                 const int32_t out_stride,
                                                                 const int32_t group_size)
 {
-    static_assert(vec_size * logical_warp_size % dim == 0,
-                  "vec_size * logical_warp_size must be divisible by dim");
+    constexpr int warp_size = opus::get_warp_size();
+    static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
     static_assert(vec_size % 2 == 0, "vec_size must be even for adjacent-pair rope");
-    constexpr int m_block     = vec_size * logical_warp_size / dim;
+    constexpr int m_block     = vec_size * warp_size / dim;
     constexpr float dim_rsqrt = rotate_dim_rsqrt<dim>();
 
     using floatxvec_t = opus::vector_t<float, vec_size>;
@@ -1171,44 +1042,6 @@ __global__ void rope_hadamard_rotate_activation_fp8quant_kernel(opus::fp8_t* __r
                                                         m, head_num, rope_dim, stride, out_stride, group_size); \
                                             });
 
-#define ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP_(                                              \
-    dim, do_rotate_act_val, vec_size, logical_warp_size, name)                                          \
-    AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim");     \
-    AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");                     \
-    const int32_t m_block = vec_size * logical_warp_size / dim;                                          \
-    dim3 const grid((m + m_block - 1) / m_block);                                                        \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                        \
-                                            [&] {                                                        \
-                                                using DTYPE_I = typename aiter::hip2opus<scalar_t>::type; \
-                                                rope_hadamard_rotate_activation_fp8quant_kernel<        \
-                                                    DTYPE_I,                                            \
-                                                    do_rotate_act_val,                                  \
-                                                    dim,                                                \
-                                                    vec_size,                                           \
-                                                    logical_warp_size>                                   \
-                                                    <<<grid, dim3(block_size), 0, stream>>>(             \
-                                                        reinterpret_cast<opus::fp8_t*>(out.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(input.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
-                                                        reinterpret_cast<int64_t const*>(positions.data_ptr()), \
-                                                        reinterpret_cast<float*>(out_scale.data_ptr()), \
-                                                        m, head_num, rope_dim, stride, out_stride, group_size); \
-                                            });
-
-#define ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP(                                               \
-    dim, vec_size, logical_warp_size, name)                                                             \
-    if(do_rotate_act)                                                                                   \
-    {                                                                                                   \
-        ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP_(                                              \
-            dim, true, vec_size, logical_warp_size, name);                                              \
-    }                                                                                                   \
-    else                                                                                                \
-    {                                                                                                   \
-        ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP_(                                              \
-            dim, false, vec_size, logical_warp_size, name);                                              \
-    }
-
 #define ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL(dim, vec_size, name) \
     if (do_rotate_act) { \
         ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_(dim, true, vec_size, name); \
@@ -1280,16 +1113,7 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP(
-                1024, 32, 32, "rope_rotate_activation_fp8quant");
-        }
-        else
-        {
-            ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL_WARP(
-                1024, 16, 64, "rope_rotate_activation_fp8quant");
-        }
+        ROPE_ROTATE_ACTIVATION_FP8QUANT_KERNEL_IMPL(1024, 32, "rope_rotate_activation_fp8quant");
     }
     else
     {
@@ -1297,12 +1121,7 @@ void rope_rotate_activation_fp8quant(aiter_tensor_t& out,
     }
 }
 
-template <typename DTYPE_I,
-          typename DTYPE_O,
-          bool do_rotate_act,
-          int dim,
-          int vec_size = 16,
-          int logical_warp_size = opus::get_warp_size()>
+template <typename DTYPE_I, typename DTYPE_O, bool do_rotate_act, int dim, int vec_size = 16>
 __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTYPE_O* __restrict__ kvcache,
                                                                         opus::e8m0_t* __restrict__ scale,
                                                                         DTYPE_I const* __restrict__ input,
@@ -1321,10 +1140,10 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                                                         const int32_t group_size)
 {
     constexpr int32_t k_tiles = dim / 128;
-    static_assert(vec_size * logical_warp_size % dim == 0,
-                  "vec_size * logical_warp_size must be divisible by dim");
+    constexpr int warp_size = opus::get_warp_size();
+    static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
     static_assert(vec_size % 2 == 0, "vec_size must be even for adjacent-pair rope");
-    constexpr int m_block     = vec_size * logical_warp_size / dim;
+    constexpr int m_block     = vec_size * warp_size / dim;
     constexpr float dim_rsqrt = rotate_dim_rsqrt<dim>();
 
     using halfxvec_t  = opus::vector_t<DTYPE_I, vec_size>;
@@ -1564,55 +1383,6 @@ __global__ void norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel(DTY
                                                         group_size); \
                                             });
 
-#define NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP_(                                 \
-    dim, do_rotate_act_val, fp4quant, vec_size, logical_warp_size, name)                               \
-    AITER_CHECK(vec_size * block_size % dim == 0, "vec_size * block_size must be divisible by dim");    \
-    AITER_CHECK(rope_dim % vec_size == 0, "rope_dim must be divisible by vec_size");                    \
-    const int32_t m_block = vec_size * logical_warp_size / dim;                                        \
-    dim3 const grid((m + m_block - 1) / m_block);                                                       \
-    AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), name,                                      \
-                                            [&] {                                                      \
-                                                using DTYPE_I = typename aiter::hip2opus<scalar_t>::type; \
-                                                using DTYPE_O = std::conditional_t<fp4quant, opus::fp4_t, DTYPE_I>; \
-                                                norm_rope_hadamard_rotate_activation_fp4quant_kvcache_kernel< \
-                                                    DTYPE_I,                                          \
-                                                    DTYPE_O,                                          \
-                                                    do_rotate_act_val,                                \
-                                                    dim,                                              \
-                                                    vec_size,                                         \
-                                                    logical_warp_size>                                 \
-                                                    <<<grid, dim3(block_size), 0, stream>>>(           \
-                                                        reinterpret_cast<DTYPE_O*>(kvcache.data_ptr()), \
-                                                        reinterpret_cast<opus::e8m0_t*>(scale_ptr),     \
-                                                        reinterpret_cast<DTYPE_I const*>(input.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(norm_weight.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
-                                                        reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
-                                                        reinterpret_cast<int64_t const*>(positions.data_ptr()), \
-                                                        slot_mapping_ptr,                             \
-                                                        epsilon,                                      \
-                                                        m,                                            \
-                                                        head_num,                                     \
-                                                        rope_dim,                                     \
-                                                        stride,                                       \
-                                                        kv_block_size,                                \
-                                                        shuffle_scale,                                \
-                                                        group_size);                                  \
-                                            });
-
-#define NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP(                                  \
-    dim, fp4quant, vec_size, logical_warp_size, name)                                                 \
-    if(do_rotate_act)                                                                                   \
-    {                                                                                                   \
-        NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP_(                                 \
-            dim, true, fp4quant, vec_size, logical_warp_size, name);                                    \
-    }                                                                                                   \
-    else                                                                                                \
-    {                                                                                                   \
-        NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP_(                                 \
-            dim, false, fp4quant, vec_size, logical_warp_size, name);                                    \
-    }
-
 #define NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
     if (do_rotate_act) { \
         NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_(dim, true, fp4quant, vec_size, name); \
@@ -1744,16 +1514,8 @@ void rmsnorm_rope_rotate_activation_fp4quant_kvcache(aiter_tensor_t& kvcache,
     }
     else if(dim == 1024)
     {
-        if(block_size == 32)
-        {
-            NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP(
-                1024, true, 32, 32, "rmsnorm_rope_rotate_activation_fp4quant_kvcache");
-        }
-        else
-        {
-            NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL_WARP(
-                1024, true, 16, 64, "rmsnorm_rope_rotate_activation_fp4quant_kvcache");
-        }
+        NORM_ROPE_ROTATE_ACTIVATION_FP4QUANT_KVCACHE_KERNEL_IMPL(
+            1024, true, 32, "rmsnorm_rope_rotate_activation_fp4quant_kvcache");
     }
     else
     {
