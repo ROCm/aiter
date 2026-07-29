@@ -65,20 +65,12 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    ptrtoint,
-    range_constexpr,
-    rocdl,
-    vector,
-)
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.ops.flydsl.kernels.tensor_shim import (

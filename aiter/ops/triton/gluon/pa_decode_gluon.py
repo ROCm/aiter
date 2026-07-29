@@ -27,11 +27,13 @@ try:
     from flydsl._mlir import ir
     from flydsl._mlir.dialects import arith as _mlir_arith
     from flydsl.compiler.kernel_function import CompilationContext
-    from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, rocdl
+    from flydsl.expr import arith, gpu, range_constexpr, rocdl
     from flydsl.expr.typing import Int32, T
     from flydsl.runtime.device import get_rocm_arch as get_hip_arch
     from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-except Exception:  # noqa: BLE001  blanket catch is intentional here
+
+    from aiter.ops.flydsl.kernels import buffer_ops
+except Exception:  # noqa: BLE001
     FLYDSL_PS_REDUCE_AVAILABLE = False
     flyc = None
     fx = None

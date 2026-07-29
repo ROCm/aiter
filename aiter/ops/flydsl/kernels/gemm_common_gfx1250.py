@@ -3,7 +3,7 @@
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, buffer_ops, gpu, rocdl, tdm_ops, vector
+from flydsl.expr import arith, gpu, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
@@ -12,6 +12,8 @@ from flydsl.utils.smem_allocator import (
     get_mlir_type_size,
     get_op_result_or_value,
 )
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 
 def get_lds_memref(lds_ptr):

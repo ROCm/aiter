@@ -53,11 +53,13 @@ from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import (
     CompilationContext,
 )
-from flydsl.expr import arith, buffer_ops, gpu, rocdl, vector
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import const_expr
 from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from ..tensor_shim import _run_compiled
 from .fmha_core_loop import (

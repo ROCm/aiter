@@ -9,9 +9,10 @@ from flydsl._mlir.dialects import arith as _std_arith
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import buffer_ops
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def format_kernel_name(name: str) -> str:

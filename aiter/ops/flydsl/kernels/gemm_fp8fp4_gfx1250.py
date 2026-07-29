@@ -17,7 +17,6 @@ from flydsl._mlir.dialects import fly, llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     idx2crd,
@@ -29,6 +28,7 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_oob as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
@@ -41,6 +41,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     store_acc_vec8_to_buffer,
     store_acc_vec8_to_lds,
 )
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 from aiter.ops.flydsl.kernels.pipeline_utils import (
     make_tail_plan,
     tdm_epilogue_fence_threshold_bytes,
@@ -683,7 +684,7 @@ def compile_fp8fp4_gemm(
 
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mcast_mask, b_mcast_mask = cluster.compute_mcast_masks(
+            a_mcast_mask, b_mcast_mask = compute_mcast_masks(
                 local_x, local_y, cluster_m, cluster_n
             )
         else:
