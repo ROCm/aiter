@@ -13,19 +13,22 @@ byte-identical so the V4 nm-asm sparse-attn reader sees one layout).
 from contextlib import contextmanager
 from functools import lru_cache
 
-from flydsl.expr import arith, range_constexpr, vector, buffer_ops
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import rocdl, scf
+from flydsl.expr import arith, buffer_ops, range_constexpr, vector
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
-from .tensor_shim import _to_raw
-from .quant_utils import emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
-    MxDtypeInt as _MxD,
     MX_DEFAULT_ROUND_MODE as _MX_DEFAULT_MODE,
 )
+from aiter.utility.mx_types import (
+    MxDtypeInt as _MxD,
+)
+
+from .quant_utils import emit_mx_e8m0_scale
+from .tensor_shim import _to_raw
 
 
 @contextmanager

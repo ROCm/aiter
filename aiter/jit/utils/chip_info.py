@@ -49,8 +49,7 @@ def _detect_native() -> list[str]:
         rocminfo = executable_path("rocminfo")
         result = subprocess.run(
             [rocminfo],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             check=True,
         )
@@ -141,7 +140,7 @@ def gfx_from_cu_num(cu_num) -> str:
         return gfx
     try:
         return get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "gfx942"
 
 
@@ -163,7 +162,7 @@ def get_gfx_list() -> list[str]:
 
 @torch_compile_guard()
 def get_cu_num_custom_op() -> int:
-    cu_num = int(os.getenv("CU_NUM", 0))
+    cu_num = int(os.getenv("CU_NUM", "0"))
     if cu_num == 0:
         if sys.platform == "win32":
             import torch
@@ -174,7 +173,7 @@ def get_cu_num_custom_op() -> int:
         try:
             rocminfo = executable_path("rocminfo")
             result = subprocess.run(
-                [rocminfo], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                [rocminfo], capture_output=True, text=True, check=False
             )
             output = result.stdout
             devices = re.split(r"Agent\s*\d+", output)
@@ -186,8 +185,8 @@ def get_cu_num_custom_op() -> int:
                         if match:
                             gpu_compute_units.append(int(match.group(1)))
                         break
-        except Exception as e:
-            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {str(e)}")
+        except Exception as e:  # noqa: BLE001  blanket catch is intentional here
+            raise RuntimeError(f"Get GPU Compute Unit from rocminfo failed {e!s}")
         assert len(set(gpu_compute_units)) == 1
         cu_num = gpu_compute_units[0]
     return cu_num

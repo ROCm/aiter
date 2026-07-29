@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
 import sys
+
+import torch
+
+from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},
@@ -24,7 +26,7 @@ def get_dtype_fp8():
             from ..jit.utils.chip_info import get_gfx_runtime
 
             gfx = get_gfx_runtime()
-    except Exception:
+    except Exception:  # noqa: BLE001
         gfx = "unknown"
     return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 

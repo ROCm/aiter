@@ -17,7 +17,6 @@ import subprocess
 import sys
 import sysconfig
 import warnings
-from typing import Dict, List, Optional, Tuple, Union
 
 import setuptools
 try:
@@ -45,11 +44,11 @@ SUBPROCESS_DECODE_ARGS = ("oem",) if IS_WINDOWS else ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
 MINIMUM_MSVC_VERSION = (19, 0, 24215)
 
-VersionRange = Tuple[Tuple[int, ...], Tuple[int, ...]]
-VersionMap = Dict[str, VersionRange]
+VersionRange = tuple[tuple[int, ...], tuple[int, ...]]
+VersionMap = dict[str, VersionRange]
 
 
-def _nt_quote_args(args: Optional[List[str]]) -> List[str]:
+def _nt_quote_args(args: list[str] | None) -> list[str]:
     """Quote command-line arguments using Windows command-line rules."""
     if not args:
         return []
@@ -65,18 +64,18 @@ def _nt_quote_args(args: Optional[List[str]]) -> List[str]:
 MINIMUM_CLANG_VERSION = (3, 3, 0)
 
 __all__ = [
+    "BuildExtension",
+    "CUDAExtension",
+    "CppExtension",
+    "check_compiler_is_gcc",
     "check_compiler_ok_for_platform",
     "get_compiler_abi_compatibility_and_version",
-    "BuildExtension",
-    "CppExtension",
-    "CUDAExtension",
+    "get_cxx_compiler",
     "include_paths",
+    "is_ninja_available",
     "library_paths",
     "load",
-    "is_ninja_available",
     "verify_ninja_availability",
-    "get_cxx_compiler",
-    "check_compiler_is_gcc",
 ]
 
 
@@ -106,7 +105,7 @@ def get_hip_version():
         hipconfig = executable_path("hipconfig")
         output = subprocess.check_output([hipconfig, "--version"], text=True)
         return output
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     # The fallbacks below previously hard-coded /opt/rocm, so they never
     # helped users whose ROCm lives elsewhere.  Resolve the ROCm root the
@@ -132,7 +131,7 @@ def get_hip_version():
                     [rocm_hipconfig, "--version"], text=True
                 )
                 return output
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
     # Fallback: read HIP version from a header / info file under each root.
     for root in rocm_roots:
@@ -154,7 +153,7 @@ def get_hip_version():
     raise RuntimeError("ROCm version file not found")
 
 
-def _find_rocm_home() -> Optional[str]:
+def _find_rocm_home() -> str | None:
     """Find the ROCm install path."""
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
@@ -201,7 +200,7 @@ def _find_rocm_home() -> Optional[str]:
     return rocm_home
 
 
-def _find_rocm_devel_include() -> Optional[str]:
+def _find_rocm_devel_include() -> str | None:
     """Locate the header tree shipped by the rocm-sdk-devel pip package.
 
     The rocm-sdk split-package layout puts runtime bits in `_rocm_sdk_core`
@@ -274,9 +273,7 @@ with compiling PyTorch from source.
 HIP_VERSION = get_hip_version()
 ROCM_HOME = _find_rocm_home()
 HIP_HOME = _join_rocm_home("hip") if ROCM_HOME else None
-IS_HIP_EXTENSION = (
-    True if ((ROCM_HOME is not None) and (HIP_VERSION is not None)) else False
-)
+IS_HIP_EXTENSION = bool(ROCM_HOME is not None and HIP_VERSION is not None)
 ROCM_VERSION = None
 if HIP_VERSION is not None:
     ROCM_VERSION = tuple(int(v) for v in HIP_VERSION.split(".")[:2])
@@ -353,7 +350,7 @@ PLAT_TO_VCVARS = {
 }
 
 
-def _get_vc_env(vc_arch: str) -> Dict[str, str]:
+def _get_vc_env(vc_arch: str) -> dict[str, str]:
     try:
         from setuptools._distutils import _msvccompiler
 
@@ -374,7 +371,7 @@ def _is_binary_build() -> bool:
     return not BUILT_FROM_SOURCE_VERSION_PATTERN.match(torch.version.__version__)
 
 
-def _accepted_compilers_for_platform() -> List[str]:
+def _accepted_compilers_for_platform() -> list[str]:
     # gnu-c++ and gnu-cc are the conda gcc compilers
     return ["g++", "gcc", "gnu-c++", "gnu-cc", "clang++", "clang"]
 
@@ -445,7 +442,7 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
 
 def get_compiler_abi_compatibility_and_version(
     compiler, torch_exclude=False
-) -> Tuple[bool, Version]:
+) -> tuple[bool, Version]:
     """
     Determine if the given compiler is ABI-compatible with PyTorch alongside its version.
 
@@ -457,9 +454,8 @@ def get_compiler_abi_compatibility_and_version(
         A tuple that contains a boolean that defines if the compiler is (likely) ABI-incompatible with PyTorch,
         followed by a `Version` string that contains the compiler version separated by dots.
     """
-    if not torch_exclude:
-        if not _is_binary_build():
-            return (True, Version("0.0.0"))
+    if not torch_exclude and not _is_binary_build():
+        return (True, Version("0.0.0"))
     if os.environ.get("TORCH_DONT_CHECK_COMPILER_ABI") in [
         "ON",
         "1",
@@ -498,7 +494,7 @@ def get_compiler_abi_compatibility_and_version(
             compiler_info.decode(*SUBPROCESS_DECODE_ARGS).strip(),
         )
         version = ["0", "0", "0"] if match is None else list(match.groups())
-    except Exception:
+    except Exception:  # noqa: BLE001
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
         return (False, Version("0.0.0"))
@@ -619,7 +615,6 @@ class BuildExtension(build_ext):
         if self.compiler.compiler_type == "msvc":
             self.compiler._cpp_extensions += [".cu", ".cuh"]
             original_compile = self.compiler.compile
-            original_spawn = self.compiler.spawn
         else:
             original_compile = self.compiler._compile
 
@@ -1040,7 +1035,7 @@ def CUDAExtension(name, sources, *args, **kwargs):
     return setuptools.Extension(name, sources, *args, **kwargs)
 
 
-def include_paths(cuda: bool = False) -> List[str]:
+def include_paths(cuda: bool = False) -> list[str]:
     """
     Get the include paths required to build a C++ or CUDA extension.
 
@@ -1076,7 +1071,7 @@ def include_paths(cuda: bool = False) -> List[str]:
     return paths
 
 
-def library_paths(cuda: bool = False) -> List[str]:
+def library_paths(cuda: bool = False) -> list[str]:
     """
     Get the library paths required to build a C++ or CUDA extension.
 
@@ -1103,14 +1098,14 @@ def library_paths(cuda: bool = False) -> List[str]:
 
 def load(
     name,
-    sources: Union[str, List[str]],
+    sources: str | list[str],
     extra_cflags=None,
     extra_cuda_cflags=None,
     extra_ldflags=None,
     extra_include_paths=None,
     build_directory=None,
     verbose=False,
-    with_cuda: Optional[bool] = None,
+    with_cuda: bool | None = None,
     is_python_module=True,
     is_standalone=False,
     keep_intermediates=True,
@@ -1254,12 +1249,12 @@ def check_compiler_is_gcc(compiler):
         version_string = subprocess.check_output(
             [compiler, "-v"], stderr=subprocess.STDOUT, env=env
         ).decode(*SUBPROCESS_DECODE_ARGS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             version_string = subprocess.check_output(
                 [compiler, "--version"], stderr=subprocess.STDOUT, env=env
             ).decode(*SUBPROCESS_DECODE_ARGS)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
     # Check for 'gcc' or 'g++' for sccache wrapper
     pattern = re.compile("^COLLECT_GCC=(.*)$", re.MULTILINE)
@@ -1268,9 +1263,9 @@ def check_compiler_is_gcc(compiler):
         return False
     compiler_path = os.path.realpath(results[0].strip())
     # On RHEL/CentOS c++ is a gcc compiler wrapper
-    if os.path.basename(compiler_path) == "c++" and "gcc version" in version_string:
-        return True
-    return False
+    return bool(
+        os.path.basename(compiler_path) == "c++" and "gcc version" in version_string
+    )
 
 
 def _jit_compile(
@@ -1282,7 +1277,7 @@ def _jit_compile(
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module,
     is_standalone,
     keep_intermediates=True,
@@ -1417,7 +1412,7 @@ def _jit_compile(
 
 
 def _write_ninja_file_and_compile_objects(
-    sources: List[str],
+    sources: list[str],
     objects,
     cflags,
     post_cflags,
@@ -1426,7 +1421,7 @@ def _write_ninja_file_and_compile_objects(
     cuda_dlink_post_cflags,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
 ) -> None:
     verify_ninja_availability()
 
@@ -1464,14 +1459,14 @@ def _write_ninja_file_and_compile_objects(
 
 def _write_ninja_file_and_build_library(
     name,
-    sources: List[str],
+    sources: list[str],
     extra_cflags,
     extra_cuda_cflags,
     extra_ldflags,
     extra_include_paths,
     build_directory: str,
     verbose: bool,
-    with_cuda: Optional[bool],
+    with_cuda: bool | None,
     is_python_module: bool,
     is_standalone: bool = False,
     torch_exclude: bool = False,
@@ -1516,8 +1511,8 @@ def _write_ninja_file_and_build_library(
 def is_ninja_available():
     """Return ``True`` if the `ninja <https://ninja-build.org/>`_ build system is available on the system, ``False`` otherwise."""
     try:
-        subprocess.check_output("ninja --version".split())
-    except Exception:
+        subprocess.check_output(["ninja", "--version"])
+    except Exception:  # noqa: BLE001
         return False
     else:
         return True
@@ -1588,7 +1583,7 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
     return extra_ldflags
 
 
-def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
+def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
     # If cflags is given, there may already be user-provided arch flags in it
     # (from `extra_compile_args`)
     if cflags is not None:
@@ -1613,7 +1608,7 @@ def _get_rocm_arch_flags(cflags: Optional[List[str]] = None) -> List[str]:
     return flags
 
 
-def _get_num_workers(verbose: bool) -> Optional[int]:
+def _get_num_workers(verbose: bool) -> int | None:
     max_jobs = os.environ.get("MAX_JOBS")
     if max_jobs is not None and max_jobs.isdigit():
         max_jobs = int(max_jobs)

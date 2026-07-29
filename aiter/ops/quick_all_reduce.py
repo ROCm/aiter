@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
+
 from ..jit.core import (
     compile_ops,
 )
@@ -12,7 +12,7 @@ MD_NAME = "module_quick_all_reduce"
 
 @compile_ops("module_quick_all_reduce")
 def init_custom_qr(
-    rank: int, world_size: int, qr_max_size: Optional[int] = None
+    rank: int, world_size: int, qr_max_size: int | None = None
 ) -> int: ...
 
 

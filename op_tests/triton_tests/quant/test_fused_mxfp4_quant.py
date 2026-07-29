@@ -1,23 +1,24 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
+
+from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
     fused_flatten_mxfp4_quant,
-    fused_rms_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
-    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_rms_mxfp4_quant,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
+from aiter.utility.fp4_utils import dynamic_mxfp4_quant, moe_mxfp4_sort
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    SCALE_GROUP_SIZE,
+    e8m0_to_f32,
+    mxfp4_to_f32,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    mxfp4_to_f32,
-    e8m0_to_f32,
-    SCALE_GROUP_SIZE,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
-from aiter.ops.quant import per_1x32_f4_quant_hip
-from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
 
 def rmsnorm(input, weight, eps=1e-6):
