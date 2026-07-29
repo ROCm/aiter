@@ -1213,7 +1213,7 @@ def test_mla(
             q_nope_buffer_fp8,
             q_nope_scale_factors_fp32,
             q_rope_buffer_bf16,
-            q_nope_buffer_fp32,
+            _,
         ) = init_3buffer_q_buffer(
             total_q, nhead, qk_nope_head_dim, qk_rope_head_dim, scale_dim
         )
@@ -1791,7 +1791,7 @@ def test_mla(
         out_asm = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
         q_scale_e8m0 = _ds32_to_e8m0(q_nope_scale_factors_fp32)
         kv_scale_e8m0 = _ds32_to_e8m0(kv_nope_scale_factors_fp32)
-        out_ref_fp8, lse_ref_fp8 = torch_mla_extend_ds32(
+        out_ref_fp8, _lse_ref_fp8 = torch_mla_extend_ds32(
             q_nope_buffer_fp8,
             q_rope_buffer_bf16,
             kv_nope_buffer_fp8,
@@ -1819,7 +1819,7 @@ def test_mla(
         )
         us_asm_decode = 1e12
 
-        (attn_logits, attn_lse), us_asm_decode = run_perftest(
+        (_attn_logits, _attn_lse), us_asm_decode = run_perftest(
             aiter.mla.mla_decode_fwd_ds32,
             q_nope_buffer_fp8,
             q_rope_buffer_bf16,
