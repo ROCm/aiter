@@ -84,11 +84,19 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
-            act = (
-                "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
-            )
+            # Mirror the runtime activation mapping in
+            # ``fused_moe._flydsl_stage1_wrapper`` (Swiglu -> "swiglu",
+            # Situv2 -> "situv2", else "silu"). ``act`` feeds the FlyDSL stage1
+            # compile cache key, so collapsing Situv2 into "silu" here would
+            # write an AOT artifact under a key the runtime never looks up,
+            # causing a FLYDSL_RUNTIME_RUN_ONLY cache miss.
+            act_name = act_type.strip().split(".")[-1].lower()
+            if act_name == "swiglu":
+                act = "swiglu"
+            elif act_name == "situv2":
+                act = "situv2"
+            else:
+                act = "silu"
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
