@@ -1,0 +1,1 @@
+{"config":{"SBM":64},"identity":{"device":{"arch":"gfx950","compute_units":256,"name":"AMD Instinct MI355X"},"key":{"autotune_schema":7,"experts":384,"inter_dim":3072,"max_tok":2048,"model_dim":7168,"npes":8,"sbm_candidates":"32,64,128","topk":6,"tune_tokens":2048},"name":"mega-moe-v2-joint-sbm"},"version":1}
