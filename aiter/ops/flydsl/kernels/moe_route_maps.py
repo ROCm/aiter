@@ -9,19 +9,18 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, ptrtoint
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 BLOCK_THREADS = 256
@@ -84,7 +83,7 @@ def build_moe_route_maps_module():
         topk: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -156,7 +155,7 @@ def build_moe_topids_to_rows_module():
         numel: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         gx = arith.index_cast(T.index, grid_blocks)
         launch = route_kernel(topk_ids, atomic_buffer, topids_to_rows, numel, max_m)

@@ -2,19 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
-
-import torch
-import numpy as np
-import flydsl.compiler as flyc
-from itertools import product
 from abc import ABC, abstractmethod
+from itertools import product
 
+import flydsl.compiler as flyc
+import numpy as np
+import torch
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl._mlir import ir
+from flydsl.expr import arith, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
-from flydsl.expr import buffer_ops, range_constexpr, vector, arith, ptrtoint
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 # Global toggle for the amdgpu-kernarg-preload compile hint used by the flydsl
 # kernels. Enabled by default; set AITER_FLYDSL_KERNARG_PRELOAD=0 to disable it
@@ -87,18 +87,14 @@ def get_dtype_in_kernel(dtype: str):
 def get_dtype_vec_size(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 8
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 8
 
 
 def get_dtype_bytes(dtype: str):
     if dtype == "f32":
         return 4
-    elif dtype == "f16":
-        return 2
-    elif dtype == "bf16":
+    elif dtype == "f16" or dtype == "bf16":
         return 2
 
 

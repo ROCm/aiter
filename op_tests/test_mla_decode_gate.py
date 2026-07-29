@@ -18,13 +18,13 @@ import os
 import pytest
 
 from aiter import dtypes
-from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_decode
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.mla import _persistent_mla_decode_max_batch, _use_persistent_mla_decode
 
 try:
     from unittest.mock import patch
 except ImportError:  # pragma: no cover
-    from mock import patch
+    from unittest.mock import patch
 
 bf16 = dtypes.bf16
 fp8 = dtypes.fp8
@@ -33,7 +33,7 @@ fp8 = dtypes.fp8
 def _is_gfx950():
     try:
         return get_gfx() == "gfx950"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

@@ -10,21 +10,23 @@ This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 where each token's K range is an unordered subset of a unified KV pool.
 """
 
-from typing import Optional
-
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
+)
+from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse as gluon_pa_decode_sparse,
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
-)
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -42,12 +44,12 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,
-    block_h: Optional[int] = None,
-    kv_splits: Optional[int] = None,
-    has_invalid: Optional[bool] = True,
-    skip_reduce: Optional[bool] = False,
-    USE_EXP2: Optional[bool] = None,
+    kv_scales: torch.Tensor | None = None,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool | None = True,
+    skip_reduce: bool | None = False,
+    USE_EXP2: bool | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -178,6 +180,9 @@ def pa_decode_sparse(
         kv_splits = triton.next_power_of_2(kv_splits)
 
     if use_gluon:
+        _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+        _lds_cap = max(1, _lds_budget // (block_d * 4))
+        kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
         if kv_splits > 8:
             reduce_num_warps = 4
             reduce_waves_per_eu = 1
