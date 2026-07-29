@@ -48,6 +48,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    resolve_flydsl_stage1_tile_n,
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
@@ -413,6 +414,9 @@ def _precompile_to_cache(
         sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
 
         if stage == 1:
+            if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
+                tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
+
             a = _make_a_user(_user_a_shape())
             w1_shape = _user_w1_shape()
             w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
