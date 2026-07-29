@@ -400,11 +400,6 @@ def _atom_wmma_init(ty, src_a, src_b, bank_dst):
         src_a,
         src_b,
         zero,
-        signA=False,
-        signB=False,
-        modC=0,
-        reuseA=False,
-        reuseB=False,
     )
     banked = set_vgpr_bank(result.result, bank_dst)
     _sched_barrier(0)
@@ -420,11 +415,6 @@ def _atom_wmma_accum(ty, src_a, src_b, acc, bank_dst):
         src_a,
         src_b,
         acc,
-        signA=False,
-        signB=False,
-        modC=0,
-        reuseA=False,
-        reuseB=False,
     )
     banked = set_vgpr_bank(result.result, bank_dst)
     _sched_barrier(0)
