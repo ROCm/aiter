@@ -88,6 +88,25 @@ def _if_else(if_op):
                 scf.YieldOp([])
 
 
+def _stage1_activation_module_tag(
+    act: str, situ_beta: float, situ_linear_beta: float
+) -> str:
+    """Return a filesystem-safe cache-key suffix for stage1 activation code."""
+    if act == "silu":
+        return "_silu"
+
+    def float_tag(value: float) -> str:
+        return (
+            float(value)
+            .hex()
+            .replace("-", "m")
+            .replace("+", "p")
+            .replace(".", "d")
+        )
+
+    return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -320,11 +339,12 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    (
+    _act_tag = _stage1_activation_module_tag(act, situ_beta, situ_linear_beta)
+    module_name = (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"{_gs_tag}{scale_tag}{_split_k_tag}"
-        f"_abi3"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
+        f"{_gs_tag}{scale_tag}{_split_k_tag}{_act_tag}"
+        f"_abi4"  # also mask sentinel token ids on loads (X/scale_x) to avoid illegal address faults
     ).replace("-", "_")
 
     # ── LDS sizing (pure Python; no MLIR Context needed) ─────────────────────
@@ -352,7 +372,7 @@ def compile_moe_gemm1(
 
     if True:
 
-        @flyc.kernel
+        @flyc.kernel(name=module_name)
         def moe_gemm1(
             arg_out: fx.Pointer,
             arg_x: fx.Pointer,
