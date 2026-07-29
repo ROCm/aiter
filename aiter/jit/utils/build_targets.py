@@ -28,8 +28,8 @@ GFX_MAP = {
     18: "gfx1250",
 }
 
-# Maps gfx arch to the default (SPX / full-GPU) CU count used when no live GPU is
-# present at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
+# Maps gfx arch to the default physical CU count used when no live GPU is present
+# at build time (e.g. CI nodes with GPU_ARCHS set but no device visible).
 # For live GPU builds, get_cu_num() is used instead and correctly reflects the
 # actual visible CU count, including non-SPX partition modes (DPX / QPX / CPX)
 # and binned variants (e.g. MI308X is gfx942 but has fewer CUs than MI300X).
@@ -43,10 +43,21 @@ GFX_CU_NUM_MAP = {
     "gfx1101": 60,  # Radeon RX 7800 XT
     "gfx1102": 32,  # Radeon RX 7600
     "gfx1103": 12,  # Radeon 780M
-    "gfx1151": 20,  # Strix Halo / Radeon 8060S
+    "gfx1151": 40,  # Strix Halo / Radeon 8060S
     "gfx1201": 64,  # Radeon RX 9070 XT / Radeon AI PRO R9700
     "gfx1250": 256,  # Gfx1250
 }
+
+
+def torch_processor_count_to_cu(gfx: str, processor_count: int) -> int:
+    """Normalize PyTorch's Windows GPU count to physical compute units.
+
+    TheRock PyTorch reports RDNA ``multi_processor_count`` in work-group
+    processors (WGPs), with two CUs per WGP. Other architectures already report
+    the physical CU count used by rocminfo and AITER's tuning tables.
+    """
+    count = int(processor_count)
+    return count * 2 if gfx.lower().startswith(("gfx11", "gfx12")) else count
 
 
 def _parse_gpu_archs_env(gfx_env: str) -> list[str]:

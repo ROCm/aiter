@@ -159,27 +159,28 @@ def _find_rocm_home() -> Optional[str]:
     # Guess #1
     rocm_home = os.environ.get("ROCM_HOME") or os.environ.get("ROCM_PATH")
     if rocm_home is None:
-        # Guess #2: rocm-sdk-devel pip package ships a self-contained ROCm
-        # tree under site-packages/_rocm_sdk_devel/. Prefer this over a
-        # hipcc-on-PATH lookup because the venv's bin/hipcc is a python
-        # wrapper, not a real binary — realpath() can't recover the SDK
-        # root from it.
-        try:
-            spec = importlib.util.find_spec("_rocm_sdk_devel")
-        except (ImportError, ValueError):
-            spec = None
-        if spec is not None and spec.submodule_search_locations:
+        # Guess #2: TheRock split wheels install the runtime/toolchain under
+        # _rocm_sdk_core, while older layouts may expose a self-contained tree
+        # through _rocm_sdk_devel. Prefer the core runtime when both exist.
+        # This must precede PATH lookup because wheel-provided hipcc is not
+        # necessarily added to PATH.
+        for package_name in ("_rocm_sdk_core", "_rocm_sdk_devel"):
+            try:
+                spec = importlib.util.find_spec(package_name)
+            except (ImportError, ValueError):
+                spec = None
+            if spec is None or not spec.submodule_search_locations:
+                continue
             candidate = spec.submodule_search_locations[0]
             hipconfig_names = (
-                ("hipconfig.exe", "hipconfig")
-                if IS_WINDOWS
-                else ("hipconfig",)
+                ("hipconfig.exe", "hipconfig") if IS_WINDOWS else ("hipconfig",)
             )
             if any(
                 os.path.exists(os.path.join(candidate, "bin", name))
                 for name in hipconfig_names
             ) and os.path.exists(os.path.join(candidate, "lib")):
                 rocm_home = candidate
+                break
     if rocm_home is None:
         # Guess #3
         hipcc_path = shutil.which("hipcc")
@@ -406,6 +407,9 @@ def check_compiler_ok_for_platform(compiler: str) -> bool:
         True if the compiler is gcc/g++ on Linux or clang/clang++ on macOS,
         and always True for Windows.
     """
+    if IS_WINDOWS:
+        return True
+
     found_compiler = shutil.which(compiler)
     if not found_compiler:
         return False
@@ -479,26 +483,34 @@ def get_compiler_abi_compatibility_and_version(
     try:
         if IS_LINUX:
             minimum_required_version = MINIMUM_GCC_VERSION
-            versionstr = subprocess.check_output(
+            compiler_info = subprocess.check_output(
                 [compiler, "-dumpfullversion", "-dumpversion"]
             )
-            match = re.search(
-                r"(\d+)\.(\d+)\.(\d+)",
-                versionstr.decode(*SUBPROCESS_DECODE_ARGS).strip(),
+        elif IS_WINDOWS:
+            minimum_required_version = MINIMUM_MSVC_VERSION
+            compiler_info = subprocess.check_output(
+                compiler, stderr=subprocess.STDOUT
             )
-            version = ["0", "0", "0"] if match is None else list(match.groups())
+        else:
+            return (True, Version("0.0.0"))
+        match = re.search(
+            r"(\d+)\.(\d+)\.(\d+)",
+            compiler_info.decode(*SUBPROCESS_DECODE_ARGS).strip(),
+        )
+        version = ["0", "0", "0"] if match is None else list(match.groups())
     except Exception:
         _, error, _ = sys.exc_info()
         warnings.warn(f"Error checking compiler version for {compiler}: {error}")
         return (False, Version("0.0.0"))
 
-    if tuple(map(int, version)) >= minimum_required_version:
-        return (True, Version(".".join(version)))
+    numeric_version = [re.sub(r"\D", "", component) for component in version]
+    if tuple(map(int, numeric_version)) >= minimum_required_version:
+        return (True, Version(".".join(numeric_version)))
 
-    compiler = f'{compiler} {".".join(version)}'
+    compiler = f'{compiler} {".".join(numeric_version)}'
     warnings.warn(ABI_INCOMPATIBILITY_WARNING.format(compiler))
 
-    return (False, Version(".".join(version)))
+    return (False, Version(".".join(numeric_version)))
 
 
 class BuildExtension(build_ext):
@@ -1781,9 +1793,9 @@ def _write_ninja_file_to_build_library(
             + COMMON_HIP_FLAGS
             + COMMON_HIPCC_FLAGS
             + ["-std=c++20"]
+            + extra_cuda_cflags
         )
         cuda_flags += _get_rocm_arch_flags(cuda_flags)
-        cuda_flags += extra_cuda_cflags
         if IS_WINDOWS:
             cuda_flags = _nt_quote_args(cuda_flags)
 

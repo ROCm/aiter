@@ -15,6 +15,7 @@ try:
         _parse_gpu_archs_env,
         filter_tune_df,
         get_build_targets_env,
+        torch_processor_count_to_cu,
     )
 except ImportError:
     # core.py also imports this module directly after adding utils/ to sys.path.
@@ -25,6 +26,7 @@ except ImportError:
         _parse_gpu_archs_env,
         filter_tune_df,
         get_build_targets_env,
+        torch_processor_count_to_cu,
     )
 
 logger = logging.getLogger("aiter")
@@ -166,7 +168,9 @@ def get_cu_num_custom_op() -> int:
         if sys.platform == "win32":
             import torch
 
-            return int(torch.cuda.get_device_properties(0).multi_processor_count)
+            props = torch.cuda.get_device_properties(0)
+            gfx = props.gcnArchName.split(":", 1)[0]
+            return torch_processor_count_to_cu(gfx, props.multi_processor_count)
         try:
             rocminfo = executable_path("rocminfo")
             result = subprocess.run(

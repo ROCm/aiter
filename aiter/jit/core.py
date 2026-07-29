@@ -466,6 +466,11 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+    if sys.platform == "win32":
+        # TheRock's offload-arch helper cannot reliably resolve "native" on
+        # Windows. PyTorch already exposes the live gfx name, so emit that
+        # explicit target and avoid combining a derived arch with "native".
+        archs = [get_gfx_runtime() if arch == "native" else arch for arch in archs]
     # List of allowed architectures
     allowed_archs = [
         "native",
