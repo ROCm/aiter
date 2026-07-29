@@ -7,7 +7,13 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
+from ..jit.core import (
+    CK_DIR,
+    AITER_META_DIR,
+    ENABLE_CK,
+    compile_ops,
+    is_experimental_enabled,
+)
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..jit.utils.mha_recipes import (
@@ -3545,6 +3551,10 @@ def flash_attn_varlen_func(
         nhead_q = q.shape[-2]
         nhead_k = k.shape[-2]
         if hdim_q not in (64, 128) or hdim_v != hdim_q:
+            return False
+        # Experimental FlyDSL m16x8 kernel owns the 128/128 path when enabled;
+        # yield so it reaches flydsl_flash_attn_varlen_func below.
+        if hdim_q == 128 and is_experimental_enabled():
             return False
         if nhead_q % nhead_k != 0:
             return False

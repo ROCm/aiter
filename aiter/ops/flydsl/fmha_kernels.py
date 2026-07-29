@@ -29,10 +29,15 @@ import torch.nn.functional as F
 
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
+from .kernels.fmha_gfx1250.fmha_fwd_prefill_m16x8 import (
+    flash_attn_varlen_m16x8,
+    flash_attn_batch_m16x8,
+)
 
 __all__ = [
     "flydsl_flash_attn_func",
     "flydsl_flash_attn_varlen_func",
+    "flydsl_flash_attn_batch_func",
 ]
 
 
@@ -235,13 +240,19 @@ def flydsl_flash_attn_varlen_func(
     otherwise returns None so the caller falls through to Triton/CK.
     """
     from ...jit.utils.chip_info import get_gfx
+    from ...jit.core import is_experimental_enabled
 
     # FlyDSL handles only plain MHA. Any unsupported feature (bias, alibi, sink,
     # dropout, sliding window, paging, probs/deterministic) falls through to
     # CK/Triton instead of being silently dropped.
+    #
+    # qk_hdim==192 is the production d192 kernel; qk_hdim==128 is the new (empty)
+    # m16x8 kernel, gated behind AITER_ENABLE_EXPERIMENTAL.
+    qk_hdim = q.shape[-1]
+    _allowed_hdim = (192, 128) if is_experimental_enabled() else (192,)
     supported = (
         get_gfx() == "gfx1250"
-        and q.shape[-1] == 192
+        and qk_hdim in _allowed_hdim
         and v.shape[-1] == 128
         and q.dtype == torch.bfloat16
         and dropout_p == 0.0
@@ -256,9 +267,27 @@ def flydsl_flash_attn_varlen_func(
     if not supported:
         return None
 
-    # gfx1250 — varlen THD, D_qk=192 D_v=128, bf16
+    # gfx1250 — varlen THD, D_v=128, bf16
     if out is None:
         out = torch.empty_like(q[:, :, : v.shape[-1]])
+
+    if qk_hdim == 128:
+        # New clean-DSL 8-wave prefill kernel (m16x8), D_qk=D_v=128.
+        return flash_attn_varlen_m16x8(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            out=out,
+            return_lse=return_lse,
+        )
+
+    # D_qk=192 D_v=128
     return flash_attn_varlen_d192_gfx1250(
         q,
         k,
@@ -267,6 +296,62 @@ def flydsl_flash_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        out=out,
+        return_lse=return_lse,
+    )
+
+
+def flydsl_flash_attn_batch_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    return_lse: bool = False,
+    dropout_p: float = 0.0,
+    window_size=(-1, -1),
+    bias=None,
+    alibi_slopes=None,
+    deterministic=False,
+    return_attn_probs=False,
+    sink=None,
+    out=None,
+):
+    """FlyDSL MHA forward, batched BSHD ``[B, S, H, D]`` layout.
+
+    Routes to the dedicated BSHD m16x8 kernel (uniform ``seq_len``, no
+    ``cu_seqlens`` — CUDA-graph safe). Returns the result if FlyDSL can handle
+    this configuration, otherwise returns ``None`` so the caller falls through
+    to Triton/CK.
+    """
+    from ...jit.utils.chip_info import get_gfx
+    from ...jit.core import is_experimental_enabled
+
+    # BSHD routes only to the new (empty) m16x8 kernel — gated on experimental.
+    supported = (
+        is_experimental_enabled()
+        and get_gfx() == "gfx1250"
+        and q.dim() == 4
+        and q.shape[-1] == 128
+        and v.shape[-1] == 128
+        and q.dtype == torch.bfloat16
+        and dropout_p == 0.0
+        and tuple(window_size[:2]) == (-1, -1)
+        and bias is None
+        and alibi_slopes is None
+        and sink is None
+        and not deterministic
+        and not return_attn_probs
+    )
+    if not supported:
+        return None
+
+    return flash_attn_batch_m16x8(
+        q,
+        k,
+        v,
         softmax_scale=softmax_scale,
         causal=causal,
         out=out,
