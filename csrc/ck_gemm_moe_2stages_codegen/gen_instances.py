@@ -3,6 +3,7 @@
 import argparse
 import itertools
 import os
+
 from gemm_moe_ck2stages_common import (
     ACT_OP_MAP,
     get_gemm1_kernels_list,
