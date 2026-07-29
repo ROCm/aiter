@@ -143,31 +143,26 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id)
                              opus::tuple{lane_id / threads_d, warp_id % T::smem_n_rpt}));
 }
 
-// Per-thread KV page fetch for the ROPE b32 load. Same (token-in-group, n-group)
-// -> g_kv_indices index as the nope/read side (tig*smem_n_rpt + group), but the
-// token-in-group is produced with the rope load geometry: 16 lanes/token
-// (threads_d_ld) and 2 warps per n-group (warps_per_grp), each warp owning
-// toks_per_warp = smem_n_per_wave / warps_per_grp consecutive tokens. This keeps
-// rope-LDS token (group,tig) holding the exact global token nope's does.
 template <class T>
 __device__ inline auto make_layout_kv_indices_rope(int warp_id, int lane_id)
 {
-    constexpr int threads_d_ld  = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE_LD; // 16
-    constexpr int warps_per_grp = T::NUM_WARPS / T::smem_n_rpt;            // 2
-    constexpr int toks_per_warp = T::smem_n_per_wave / warps_per_grp;      // 4
+    constexpr int threads_d = T::D_128B_ROPE_SIZE / T::VEC_KV_ROPE_LD; // 64 / 4 =16
 
-    constexpr auto kv_indices_shape =
-        opus::make_tuple(opus::number<T::smem_n_per_wave>{}, opus::number<T::smem_n_rpt>{}, 1_I);
+    constexpr auto kv_indices_shape = opus::make_tuple(
+        opus::number<T::KV_TILE_SIZE * threads_d / T::WARP_SIZE / T::smem_n_rpt>{}, // 2
+        opus::number<T::WARP_SIZE / threads_d>{},                                   // 4
+        opus::number<T::smem_n_rpt>{},                                              // 4
+        1_I);                                                                       // 1
 
-    constexpr auto kv_indices_dim =
-        opus::make_tuple(opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
-
-    const int tig = (warp_id / T::smem_n_rpt) * toks_per_warp + lane_id / threads_d_ld;
+    constexpr auto kv_indices_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
         kv_indices_shape,
         opus::unfold_x_stride(kv_indices_dim, kv_indices_shape, opus::tuple{1_I}),
-        opus::unfold_p_coord(kv_indices_dim, opus::tuple{tig, warp_id % T::smem_n_rpt}));
+        opus::unfold_p_coord(
+            kv_indices_dim,
+            opus::tuple{warp_id / T::smem_n_rpt, lane_id / threads_d, warp_id % T::smem_n_rpt}));
 }
 
 // Global -> LDS map for the K nope sub-range (d in [0, 512), fp8). The token
@@ -274,45 +269,35 @@ __device__ inline auto make_layout_gk_rope(int lane_id)
 template <typename T>
 __device__ inline auto make_layout_sk_rope(int warp_id)
 {
-    // Two warps cooperate per n-group (b32 load covers only 4 tokens/warp):
-    // warp%smem_n_rpt selects the n-group line, warp/smem_n_rpt selects the
-    // token-half inside that line (stride = toks_per_warp * D_128B_ROPE_SIZE).
-    constexpr int warps_per_grp = T::NUM_WARPS / T::smem_n_rpt;       // 2
-    constexpr int toks_per_warp = T::smem_n_per_wave / warps_per_grp; // 4
-    constexpr int line          = T::smem_linear_wave_rope + T::smem_padding_rope;
-    constexpr int half_stride   = toks_per_warp * T::D_128B_ROPE_SIZE; // 4*64 = 256
+    constexpr auto sk_block_shape =
+        opus::make_tuple(opus::number<T::NUM_WARPS>{}, opus::number<T::VEC_KV_ROPE_LD>{});
 
-    constexpr auto sk_block_shape = opus::make_tuple(opus::number<T::smem_d_rpt_rope>{},
-                                                     opus::number<T::smem_n_rpt>{},
-                                                     opus::number<warps_per_grp>{},
-                                                     opus::number<T::VEC_KV_ROPE_LD>{});
-
-    constexpr auto sk_block_dim = opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-                                                   opus::make_tuple(opus::p_dim{}),
-                                                   opus::make_tuple(opus::y_dim{}));
+    constexpr auto sk_block_dim =
+        opus::make_tuple(opus::make_tuple(opus::p_dim{}), opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout(
         sk_block_shape,
-        opus::unfold_x_stride(sk_block_dim,
-                              sk_block_shape,
-                              opus::tuple{opus::number<line>{}, opus::number<half_stride>{}, 1_I}),
-        opus::unfold_p_coord(sk_block_dim,
-                             opus::tuple{warp_id % T::smem_n_rpt, warp_id / T::smem_n_rpt}));
+        opus::unfold_x_stride(
+            sk_block_dim,
+            sk_block_shape,
+            opus::tuple{opus::number<T::smem_linear_wave_rope + T::smem_padding_rope>{}, 1_I}),
+        opus::unfold_p_coord(sk_block_dim, opus::tuple{warp_id}));
 }
 
 // LDS -> register map for the K rope A-operand (fed to the plain fp8 16x16x32 MFMA).
 template <typename T>
 __device__ inline auto make_layout_rk_rope(int lane_id)
 {
-    constexpr auto rk_block_shape = opus::make_tuple(opus::number<T::smem_n_rpt>{},
-                                                     opus::number<T::GEMM0_E_N>{},
-                                                     opus::number<T::W_N / T::smem_n_rpt>{},
-                                                     opus::number<T::WARP_SIZE / T::W_N>{},
-                                                     opus::number<T::VEC_KV_ROPE>{});
+    constexpr auto rk_block_shape = opus::make_tuple(opus::number<T::GEMM0_E_N>{},           // 2
+                                                     opus::number<T::smem_n_rpt>{},          // 4
+                                                     opus::number<T::W_N / T::smem_n_rpt>{}, // 2
+                                                     opus::number<T::WARP_SIZE / T::W_N>{},  // 4
+                                                     opus::number<T::VEC_KV_ROPE>{});        // 8
 
-    constexpr auto rk_block_dim = opus::make_tuple(opus::make_tuple(opus::p_dim{}),
-                                                   opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
-                                                   opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+    constexpr auto rk_block_dim =
+        opus::make_tuple(opus::make_tuple(opus::y_dim{}, opus::p_dim{}), // 4
+                         opus::make_tuple(opus::p_dim{}),
+                         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     auto lane_id_n = lane_id % T::W_N;
 
@@ -618,14 +603,15 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
     // Double-buffer slot stride (in elements) for each smem region.
     constexpr auto kv_slot_off = number<T::smem_kv_bytes() / sizeof(D_K)>{};
 
-    auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
-    auto u_gk_nope    = make_layout_gk_nope<T>(warp_id, lane_id);
-    auto u_sk_nope    = make_layout_sk_nope<T>(warp_id);
-    auto u_rk_nope    = make_layout_rk_nope<T>(lane_id);
-    auto u_gk_rope    = make_layout_gk_rope<T>(lane_id);
-    auto u_sk_rope    = make_layout_sk_rope<T>(warp_id);
-    auto u_rk_rope    = make_layout_rk_rope<T>(lane_id);
-    auto u_rv         = make_layout_rv<T>(lane_id);
+    auto u_kv_indices      = make_layout_kv_indices<T>(warp_id, lane_id);
+    auto u_kv_indices_rope = make_layout_kv_indices_rope<T>(warp_id, lane_id);
+    auto u_gk_nope         = make_layout_gk_nope<T>(warp_id, lane_id);
+    auto u_sk_nope         = make_layout_sk_nope<T>(warp_id);
+    auto u_rk_nope         = make_layout_rk_nope<T>(lane_id);
+    auto u_gk_rope         = make_layout_gk_rope<T>(lane_id);
+    auto u_sk_rope         = make_layout_sk_rope<T>(warp_id);
+    auto u_rk_rope         = make_layout_rk_rope<T>(lane_id);
+    auto u_rv              = make_layout_rv<T>(lane_id);
 
     auto mfma0_nope =
         make_mfma<D_K, D_Q, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
@@ -686,7 +672,10 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
     auto load_kv_page = [&](int tile_idx) {
         return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0];
     };
-
+    int kv_page_rope[4];
+    auto load_kv_page_rope = [&](int tile_idx) {
+        return load(g_kv_indices, u_kv_indices_rope, tile_idx * T::KV_TILE_SIZE)[0];
+    };
     auto kv_page_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
 
     // auto async_load_kv = [&](auto slot_n, int kv_page) {
@@ -699,11 +688,11 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
     //         number<sl*(T::smem_kv_bytes() / sizeof(D_K))>{});
     // };
 
-    auto async_load_kv = [&](auto slot_off, int kv_page) {
+    auto async_load_kv = [&](auto slot_off, int kv_page, int kv_page_rope) {
         async_load<T::VEC_KV_NOPE>(
             g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(kv_page), u_sk_nope + slot_off);
         async_load<T::VEC_KV_ROPE_LD>(
-            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page), u_sk_rope + slot_off);
+            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page_rope), u_sk_rope + slot_off);
     };
 
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto noff) {
@@ -763,17 +752,21 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
     };
 
     // Prologue
-    kv_page[2] = load_kv_page(tile_begin);
-    async_load_kv(0_I, kv_page[2]);
+    kv_page[2]      = load_kv_page(tile_begin);
+    kv_page_rope[2] = load_kv_page_rope(tile_begin);
+    async_load_kv(0_I, kv_page[2], kv_page_rope[2]);
     __builtin_amdgcn_s_waitcnt(0);
     __builtin_amdgcn_sched_barrier(0);
     __builtin_amdgcn_s_barrier();
 
-    kv_page[0] = load_kv_page(tile_begin + 1);
-    async_load_kv(kv_slot_off, kv_page[0]);
+    kv_page[0]      = load_kv_page(tile_begin + 1);
+    kv_page_rope[0] = load_kv_page_rope(tile_begin + 1);
+    async_load_kv(kv_slot_off, kv_page[0], kv_page_rope[0]);
     __builtin_amdgcn_sched_barrier(0);
 
-    kv_page[1]  = load_kv_page(tile_begin + 2);
+    kv_page[1]      = load_kv_page(tile_begin + 2);
+    kv_page_rope[1] = load_kv_page_rope(tile_begin + 2);
+
     v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
     v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
     s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
@@ -797,7 +790,8 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
     __builtin_amdgcn_sched_barrier(0);
 
     // Main loop
-    for(int j = tile_begin + 1; j < tile_end - 3; j += 2)
+    int j = tile_begin + 1;
+    for(; j < tile_end - 3; j += 2)
     {
         // Cluster 0
         s_waitcnt_vmcnt(0_I);
@@ -807,8 +801,9 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         v_k_nope[0]     = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + slot_id * kv_slot_off);
         v_k_nope[1] =
             load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + slot_id * kv_slot_off + sk_nope_slice(1_I));
-        async_load_kv(nxt_slot_id * kv_slot_off, kv_page[1]);
-        kv_page[2] = load_kv_page(j + 2);
+        async_load_kv(nxt_slot_id * kv_slot_off, kv_page[1], kv_page_rope[1]);
+        kv_page[2]      = load_kv_page(j + 2);
+        kv_page_rope[2] = load_kv_page_rope(j + 2);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
 
@@ -858,8 +853,9 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + nxt_slot_id * kv_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(
             s_k_nope, u_rk_nope + nxt_slot_id * kv_slot_off + sk_nope_slice(1_I));
-        async_load_kv(pre_slot_id * kv_slot_off, kv_page[2]);
-        kv_page[3] = load_kv_page(j + 3);
+        async_load_kv(pre_slot_id * kv_slot_off, kv_page[2], kv_page_rope[2]);
+        kv_page[3]      = load_kv_page(j + 3);
+        kv_page_rope[3] = load_kv_page_rope(j + 3);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + 1>{});
         // __builtin_amdgcn_sched_barrier(0);
@@ -907,8 +903,10 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
 
-        kv_page[0] = kv_page[2];
-        kv_page[1] = kv_page[3];
+        kv_page[0]      = kv_page[2];
+        kv_page[1]      = kv_page[3];
+        kv_page_rope[0] = kv_page_rope[2];
+        kv_page_rope[1] = kv_page_rope[3];
     }
 
     // Epilogue
@@ -918,7 +916,7 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_vmcnt(0_I);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + kv_slot_off);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + kv_slot_off + sk_nope_slice(1_I));
-        async_load_kv(2 * kv_slot_off, kv_page[1]);
+        async_load_kv(2 * kv_slot_off, kv_page[1], kv_page_rope[1]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
         // __builtin_amdgcn_sched_barrier(0);
@@ -1053,8 +1051,9 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_vmcnt(0_I);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + off_b);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + off_b + sk_nope_slice(1_I));
-        async_load_kv(off_c, kv_page[1]);
-        kv_page[2] = load_kv_page(tile_end - 1);
+        async_load_kv(off_c, kv_page[1], kv_page_rope[1]);
+        kv_page[2]      = load_kv_page(tile_end - 1);
+        kv_page_rope[2] = load_kv_page_rope(tile_end - 1);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
 
         // Cluster 1
@@ -1094,7 +1093,7 @@ __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_vmcnt(0_I);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + off_c);
         v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + off_c + sk_nope_slice(1_I));
-        async_load_kv(off_d, kv_page[2]);
+        async_load_kv(off_d, kv_page[2], kv_page_rope[2]);
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         __builtin_amdgcn_sched_barrier(0);
 
@@ -1224,14 +1223,15 @@ __device__ void mla_decode_fwd_simple(mla_kargs kargs,
     auto s_k_nope = make_smem(reinterpret_cast<D_K*>(smem_kv));
     auto s_k_rope = make_smem(reinterpret_cast<D_K*>(smem_kv + T::smem_k_nope_bytes));
 
-    auto u_kv_indices = make_layout_kv_indices<T>(warp_id, lane_id);
-    auto u_gk_nope    = make_layout_gk_nope<T>(warp_id, lane_id);
-    auto u_sk_nope    = make_layout_sk_nope<T>(warp_id);
-    auto u_rk_nope    = make_layout_rk_nope<T>(lane_id);
-    auto u_gk_rope    = make_layout_gk_rope<T>(lane_id);
-    auto u_sk_rope    = make_layout_sk_rope<T>(warp_id);
-    auto u_rk_rope    = make_layout_rk_rope<T>(lane_id);
-    auto u_rv         = make_layout_rv<T>(lane_id);
+    auto u_kv_indices      = make_layout_kv_indices<T>(warp_id, lane_id);
+    auto u_kv_indices_rope = make_layout_kv_indices_rope<T>(warp_id, lane_id);
+    auto u_gk_nope         = make_layout_gk_nope<T>(warp_id, lane_id);
+    auto u_sk_nope         = make_layout_sk_nope<T>(warp_id);
+    auto u_rk_nope         = make_layout_rk_nope<T>(lane_id);
+    auto u_gk_rope         = make_layout_gk_rope<T>(lane_id);
+    auto u_sk_rope         = make_layout_sk_rope<T>(warp_id);
+    auto u_rk_rope         = make_layout_rk_rope<T>(lane_id);
+    auto u_rv              = make_layout_rv<T>(lane_id);
 
     auto mfma0_nope =
         make_mfma<D_K, D_Q, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
@@ -1280,6 +1280,9 @@ __device__ void mla_decode_fwd_simple(mla_kargs kargs,
 
     auto load_kv_page = [&](int tile_idx) {
         return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0];
+    };
+    auto load_kv_page_rope = [&](int tile_idx) {
+        return load(g_kv_indices, u_kv_indices_rope, tile_idx * T::KV_TILE_SIZE)[0];
     };
 
     auto kv_page_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
@@ -1331,11 +1334,11 @@ __device__ void mla_decode_fwd_simple(mla_kargs kargs,
         o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
     };
 
-    auto async_load_kv = [&](int soff, int page) {
+    auto async_load_kv = [&](int soff, int page, int page_rope) {
         async_load<T::VEC_KV_NOPE>(
             g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(page), u_sk_nope + soff);
         async_load<T::VEC_KV_ROPE_LD>(
-            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(page), u_sk_rope + soff);
+            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(page_rope), u_sk_rope + soff);
     };
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
@@ -1350,7 +1353,7 @@ __device__ void mla_decode_fwd_simple(mla_kargs kargs,
     };
 
     // Prologue: prefetch the first tile's K into slot 0.
-    async_load_kv(0, load_kv_page(tile_begin));
+    async_load_kv(0, load_kv_page(tile_begin), load_kv_page_rope(tile_begin));
 
     for(int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx)
     {
@@ -1367,7 +1370,7 @@ __device__ void mla_decode_fwd_simple(mla_kargs kargs,
         if(tile_idx + 1 < tile_end)
         {
             const int noff = ((tile_idx + 1 - tile_begin) & 1) * kv_slot_off;
-            async_load_kv(noff, load_kv_page(tile_idx + 1));
+            async_load_kv(noff, load_kv_page(tile_idx + 1), load_kv_page_rope(tile_idx + 1));
         }
 
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + soff);

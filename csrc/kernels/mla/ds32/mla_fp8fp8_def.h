@@ -131,20 +131,26 @@ struct mla_16mx8_32nx1_fp8fp8_ps_traits
 
     // ----- K rope LDS geometry (fp8). rope d = 64 fits in a single sub-line
     //       so we treat one 64-wide "128B-like" chunk per row. -----
-    static constexpr int D_128B_ROPE_SIZE      = D_ROPE_SIZE;                        // 64
-    static constexpr int smem_linear_wave_rope = smem_n_per_wave * D_128B_ROPE_SIZE; // 8*64 = 512
-    static constexpr int smem_d_rpt_rope       = 1;
-    static constexpr int smem_padding_rope     = 32 / sizeof(D_K); // 16
+    static constexpr int D_128B_ROPE_SIZE      = D_ROPE_SIZE; // 64
+    static constexpr int smem_linear_wave_rope = WARP_SIZE * VEC_KV_ROPE_LD / sizeof(D_K);
+    ; // 4*64 = 256
+    static constexpr int smem_d_rpt_rope   = 1;
+    static constexpr int smem_padding_rope = 16 / sizeof(D_K); // 16
+    // New rope layout: one warp per LDS line (4 tokens/line), NUM_WARPS lines
+    // total. The read (make_layout_rk_rope) reaches lines 4..7 via the GEMM0_E_N
+    // stride, and the store (make_layout_sk_rope) writes lines 0..7 via warp_id,
+    // so the region must hold NUM_WARPS lines, not smem_n_rpt.
     static constexpr size_t smem_k_rope_bytes =
-        smem_n_rpt * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_rope) * sizeof(D_K);
+        NUM_WARPS * smem_d_rpt_rope * (smem_linear_wave_rope + smem_padding_rope) * sizeof(D_K);
 
     // V is NOT dequantized and NOT re-stored: it is transpose-read (fp8) straight
     // out of the K-nope LDS, so the per-slot KV footprint is just K (nope+rope).
     static constexpr size_t smem_kv_bytes() { return smem_k_nope_bytes + smem_k_rope_bytes; }
 
     // fp8 nope + fp8 rope: one dwordx4 (16 fp8) per thread each -> 2 + 1 loads.
-    static constexpr int kv_buffer_nope_load_insts =
-        (KV_TILE_SIZE * D_NOPE_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE) + 1; // 2 + 1 = 3
+    static constexpr int kv_buffer_load_insts =
+        (KV_TILE_SIZE * D_NOPE_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE) +
+        (KV_TILE_SIZE * D_ROPE_SIZE) / (BLOCK_SIZE * VEC_KV_ROPE_LD); // 2 + 1 = 3
     static constexpr int k_nope_ds_read_insts =
         (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
     static constexpr int k_rope_ds_read_insts =
