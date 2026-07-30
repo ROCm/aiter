@@ -5,6 +5,8 @@ import triton.experimental.gluon.language as gl
 from triton.language.core import _aggregate as aggregate
 import pytest
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton._triton_kernels.attention.unified_attention import reduce_segments
 import os
 from aiter.ops.triton.utils.types import e4m3_dtype
 import triton.language as tl
@@ -547,16 +549,12 @@ class AsyncKVLoader:
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             blk = i
         else:
-            # Decode-only: clamp to the last column so the loop's j+2 prefetch
-            # never reads past the (padded) block table; the over-read tile is
-            # loaded but never consumed. Prefill keeps the original unclamped load
-            # so its inner loop is byte-identical.
+            # clamp to the last column so the loop's j+2 prefetch
+            # never reads past the (padded) block table
             if self.cfg.ALL_DECODE:
                 i = gl.minimum(i, self.cfg.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
-        # Block-base byte offset. For >2 GB caches (not USE_LOAD_BUFFER_OP) this is
-        # the one term that can exceed int32 — widen the *index* (the stride is now a
-        # baked-in constexpr); the per-tile k_base_offset stays small so int32 is fine.
+        # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
             return blk * self.cfg.stride_k_cache_0
         else:
@@ -567,11 +565,9 @@ class AsyncKVLoader:
 class AsyncGatherKVLoader:
     """Async CDNA4 KV loader supporting TILE_SIZE != BLOCK_SIZE.
 
-    Per-element block-table lookups gather KV from the physical block(s) each
-    element of the tile belongs to. Works for TILE_SIZE > BLOCK_SIZE (a tile
-    spans several pages) and TILE_SIZE < BLOCK_SIZE (several tiles share a page
-    at different within-block offsets) — the seq-offset -> (page, within-block)
-    math below is agnostic to the tile/page ratio.
+    Works for:
+        TILE_SIZE > BLOCK_SIZE
+        TILE_SIZE < BLOCK_SIZE
     """
 
     cfg: AttentionConfig
@@ -1056,21 +1052,19 @@ class AttentionProgram:
         cur_batch_query_len,
         NUM_SPLITS: gl.constexpr,
     ):
-        """Split-KV partials: store the *un-reduced* M (raw row max), L (exp sum)
-        and acc (un-normalized PV accumulator) for this split. The cross-split
-        reduction (flash rescale by exp2((M_s - max_s M)*QK_scale)) is done later.
+        """Split-KV partials: store the un-reduced M (row max), L (exp sum) and acc
+        (un-normalized PV accumulator) for this split. The cross-split reduction is
+        done later by the shared Triton `reduce_segments`.
 
         Buffers are contiguous:
             partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
             partial_m/l : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS]
         """
         cfg: gl.constexpr = self.cfg
-        # M-space: the CDNA4 sink softmax (softmax_part0_cdna4) keeps the running
-        # max in QK-scaled space, while the non-sink path and the split reduction
-        # expect the raw row-max. Convert back so partials are always stored in
-        # raw-score space.
-        if cfg.USE_SINKS:
-            M = M / self.QK_scale
+        # The CDNA4 sink softmax (softmax_part0_cdna4) already keeps the running max in
+        # QK-scaled space; the non-sink path keeps the raw row-max, so scale it here.
+        if not cfg.USE_SINKS:
+            M = M * self.QK_scale
         layout: gl.constexpr = cfg.pv_layout
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
@@ -1094,9 +1088,6 @@ class AttentionProgram:
         )
         gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
 
-        # M, L: [BLOCK_M]. NOTE: plain (non-bounds-checked) stores — the caller's
-        # partial buffers' token dim must be padded past max(query_offset_0) so the
-        # masked decode lanes' offsets stay in range.
         ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
         ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
         gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
@@ -1106,16 +1097,7 @@ class AttentionProgram:
 
 @gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
-    """Single-buffered (32 KB LDS) loop for decode.
-
-    Keeps one K + one V tile in LDS (half the double-buffered footprint) so two
-    workgroups fit per CU (occupancy 2). There is no in-workgroup load/compute
-    overlap; the cross-workgroup overlap from the extra resident WG replaces it.
-    A thread_barrier at the end of each tile frees the buffer before the next
-    tile's async copy overwrites it (WAR hazard the double-buffer path avoids by
-    swapping slots).
-    """
-    for j in range(pgm.tile_start, pgm.tile_end - 1):
+    for j in range(pgm.tile_start, pgm.safe_tile_end):
         blk = kv_loader.load_block_ids(j)
         kv_loader.load_k_to_shared(blk, buffer_id=0)
         kv_loader.load_v_to_shared(blk, buffer_id=0)
@@ -1128,6 +1110,20 @@ def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
         p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
         v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=0)
         acc = pgm.compute_pv(p, v, acc)
+
+    if not pgm.cfg.ALL_DECODE:
+        for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            blk = kv_loader.load_block_ids(j)
+            kv_loader.load_k_to_shared(blk, buffer_id=0)
+            kv_loader.load_v_to_shared(blk, buffer_id=0)
+            k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=0)
+            S = pgm.compute_qk(k)
+            S = pgm.apply_mask_qk(S, j)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+            v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=0)
+            acc = pgm.compute_pv(p, v, acc)
 
     # Last tile is always masked
     j = pgm.tile_end - 1
@@ -1286,10 +1282,6 @@ def kernel_unified_attention_2d(
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
-    # Grid order is derived from ALL_DECODE (no separate knob). Decode launches a
-    # seq-fastest grid (q-block on dim 0) to match Triton's 3d decode order for
-    # better KV locality; prefill launches kv_head-fastest (matches Triton 2d).
-    # The host must launch the grid in the matching order.
     if ALL_DECODE:
         q_block_global_idx = gl.num_programs(0) - 1 - gl.program_id(0)
         kv_head_idx = gl.program_id(1)
@@ -1333,9 +1325,6 @@ def kernel_unified_attention_2d(
         block_table_stride,
     )
 
-    # KV/block-table strides are constexpr (baked in via cfg); the one term that can
-    # exceed int32 for >2 GB caches (the block-base) is widened inside the loader.
-    # Output strides stay runtime, so widen them to int64 for >2 GB outputs.
     if not USE_STORE_BUFFER_OP:
         output_stride_0 = output_stride_0.to(gl.int64)
         output_stride_1 = output_stride_1.to(gl.int64)
@@ -1356,9 +1345,7 @@ def kernel_unified_attention_2d(
         if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
             return
     else:
-        # Decode fast path: one program per sequence, no binary search.
-        # Grid dim 1 must be launched with num_seqs blocks. Assumes 1 query/seq,
-        # so token index == seq index == cu_seqlens[seq].
+        # Decode fast path: one program per sequence, no binary search
         seq_idx = q_block_global_idx
         q_block_local_idx: gl.int32 = 0
         cur_batch_query_len: gl.int32 = 1
@@ -1434,14 +1421,11 @@ def kernel_unified_attention_2d(
         NUM_SPLITS,
     )
 
-    # This split owns no tiles (more splits than active tiles). The partial
-    # buffers are pre-filled with neutral values (M=-inf, L=0, acc=0) so the
-    # later reduction simply ignores it.
+    # This split owns no tiles
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
         return
 
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
-    # (TILE_SIZE > BLOCK_SIZE spans pages; TILE_SIZE < BLOCK_SIZE sub-slices a page).
     if TILE_SIZE == BLOCK_SIZE:
         KVLoader: gl.constexpr = AsyncKVLoader
     else:
@@ -1471,8 +1455,7 @@ def kernel_unified_attention_2d(
         )
         query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
         # Split-KV: only split 0 seeds M with the sink logit so it is counted
-        # exactly once across the cross-split reduction; other splits start at
-        # -inf (their initial L=1.0 is then zeroed by the first alpha=exp2(-inf)).
+        # exactly once
         if NUM_SPLITS == 1 or split_idx == 0:
             M = gl.amd.cdna4.buffer_load(
                     ptr=sink_ptr,
@@ -1498,16 +1481,11 @@ def kernel_unified_attention_2d(
     gl.static_assert((NUM_BUFFERS == 1) | (NUM_BUFFERS == 2), "NUM_BUFFERS must be 1 or 2")
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     if NUM_BUFFERS == 1:
-        # Single-buffered 32 KB LDS path (occupancy 2). Decode-only: the loop only
-        # masks the last tile, which requires the safe region to be [start, end-1)
-        # (true for decode; causal prefill needs the double-buffered safe/masked split).
-        gl.static_assert(ALL_DECODE, "NUM_BUFFERS==1 (single-buffer) path is decode-only")
         M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
     else:
         M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
 
     if NUM_SPLITS > 1:
-        # Split-KV: emit un-reduced partials; the reduction happens separately.
         pgm.store_partial(
             M,
             L,
@@ -1541,6 +1519,19 @@ def kernel_unified_attention_2d(
         output_stride_1,
     )
 
+def _select_num_splits(num_seqs, num_kv_heads, num_tiles, num_warps):
+    if num_tiles <= 4:
+        return 1
+    SIMDS_PER_CU = 4
+    _SPLIT_WORK_THRESHOLD = 64
+    target_wgs = get_num_sms() * SIMDS_PER_CU // max(1, num_warps)
+    base_wgs = max(1, num_seqs * num_kv_heads)
+    splits = round(target_wgs / base_wgs)
+    if splits < max(3, _SPLIT_WORK_THRESHOLD // num_tiles):
+        return 1
+    return max(1, min(num_tiles, splits))
+
+
 def unified_attention(
     q,
     k,
@@ -1561,6 +1552,7 @@ def unified_attention(
     sinks,
     output_scale=None,
     num_kv_blocks=1,
+    num_splits=None,
 ):
     """
     Run the unified attention kernel with a paged KV cache.
@@ -1598,82 +1590,66 @@ def unified_attention(
     # num_kv_blocks > 1 => TILE_SIZE > page_size, handled by AsyncGatherKVLoader.
     BLOCK_SIZE = k.shape[1]
     NUM_KV_HEADS = k.shape[2]
+    ALL_DECODE = max_seqlen_q == 1
+    SLIDING_WINDOW = 1 + window_size[0]
+    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
 
-    # waves_per_eu is dtype-independent; high values fall off a codegen cliff on Triton
-    # 3.7/3.8 in every configuration measured, so both branches below sit under it.
-    #   HEAD_SIZE>=128: 2 for both phases. The fp8-specific 3 this used to pick was
-    #     neutral on 3.6/3.7 but a cliff on 3.8 (mean 1.5x slower decode / 2.0x prefill,
-    #     worst cell 2.3x), flipping fp8 prefill from winning to losing vs Triton.
-    #   HEAD_SIZE<128 (calibrated at 64): decode 1, prefill 3. The 4 this used to pick is
-    #     the *worst* of {1,2,3,4} on 3.7/3.8 — mean 1.17x slower decode and 1.44x slower
-    #     prefill on 3.8 (worst cell 1.9x), hitting bf16 and fp8 alike.
-    # Measured over decode+prefill x bf16+fp8 x Triton 3.6.0/3.7.0/3.8.0; see
-    # bench_gluon_ua/{tune_hs64.py, perf_scan_triton_36_37_38_7_28/,
-    # perf_scan_hs64_triton_36_37_38_7_28/}.
     if HEAD_SIZE < 128:
-        waves_per_eu = 1 if max_seqlen_q == 1 else 3
+        waves_per_eu = 1 if ALL_DECODE else 3
+    elif HEAD_SIZE >= 256 and ALL_DECODE and Q_FP8:
+        waves_per_eu = 1
     else:
         waves_per_eu = 2
-    # Decode: 16x16 MFMA with BLOCK_M=16 — matches the GQA query-per-KV packing,
-    # halves row-waste, fewer VGPRs; memory-bound so MFMA throughput is moot.
-    # Prefill: 32x32 MFMA with BLOCK_M=128 — compute-bound, ~2x MFMA throughput.
-    if max_seqlen_q == 1:
-        if Q_FP8:  # fp8 dot; KV_FP8 alone keeps the bf16 dot (fp8 KV converts on load)
-            # fp8 decode runs the 32x32 tile (v_mfma_scale_f32_32x32x64_f8f6f4), not the
-            # 16x16 one the bf16 path uses. The 16x16 fp8 dot (...16x16x128_f8f6f4) does
-            # not lower at the K_WIDTH=16 this kernel sets — ConvertTritonAMDGPUToLLVM
-            # fails on Triton 3.6.0/3.7.0/3.8.0 alike, for NUM_BUFFERS 1 or 2 and BLOCK_M
-            # 16 or 32. K_WIDTH=32 (the instruction's 32 elements/lane) does compile, but
-            # the results are wrong — 91% relative-mean error vs a bf16 reference where
-            # 32x32 gives 2.6% (pure fp8 quantization) — so the dot-operand element order
-            # does not match what the instruction expects, and enabling 16x16 fp8 needs a
-            # layout fix, not a K_WIDTH bump. The upside is small anyway: measured 16x16 is
-            # only 1.00-1.04x faster than 32x32 here, decode being memory-bound. So 32x32
-            # stands despite wasting M rows when num_queries_per_kv < 32.
-            # Double-buffered: the single-buffer path is only validated for 16x16.
-            num_warps, block_m, mfma_dim, num_buffers = 1, 32, 32, 2
+    if ALL_DECODE:
+        if Q_FP8:
+            mfma_dim = 32
+            num_buffers = 1 if HEAD_SIZE >= 256 else 2
         else:
-            # decode: 16x16/BM16. Single-buffered 32KB LDS (occupancy 2 — memory-bound)
-            # only pays off once the KV tile is large enough for halving LDS to buy that
-            # occupancy; at HEAD_SIZE=64 the tile is already half the size and nb=2 wins
-            # on all three Triton versions (7% bf16, 24% fp8).
-            num_warps, block_m, mfma_dim = 1, 16, 16
+            mfma_dim = 16
             num_buffers = 1 if HEAD_SIZE >= 128 else 2
+        # BLOCK_M must hold a whole query group: BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
+        # has to be >= 1
+        min_warps = 2 if (HEAD_SIZE >= 256 and not Q_FP8) else 1
+        block_m = max(mfma_dim * min_warps,
+                      triton.next_power_of_2(NUM_Q_HEADS // NUM_KV_HEADS))
+        num_warps = block_m // mfma_dim
     else:
-        # prefill: 32x32/BM128, double-buffered (compute-bound, overlap load w/ MFMA)
-        num_warps, block_m, mfma_dim, num_buffers = 4, 128, 32, 2
-    assert num_buffers in (1, 2, 3), "num_buffers should be 1 (single-buffer decode), 2, or 3"
+        num_warps, block_m, mfma_dim = 4, 128, 32
+        num_buffers = 1 if (HEAD_SIZE >= 256 and not Q_FP8) else 2
 
     TILE_SIZE = BLOCK_SIZE * num_kv_blocks
     BLOCK_M = block_m
-    SLIDING_WINDOW = 1 + window_size[0]
-    ALL_DECODE = max_seqlen_q == 1
-    NUM_QUERIES_PER_KV = NUM_Q_HEADS // NUM_KV_HEADS
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-    # ALL_DECODE uses the kernel's one-program-per-sequence fast path (seq_idx =
-    # program id, no binary search), so grid dim 1 must be exactly NUM_SEQS.
     if ALL_DECODE:
         total_query_blocks = NUM_SEQS
     else:
         total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
-    # # Exact block count
-    # TODO: this requires editing the binary search 
-    # q_lens = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    # q_lens_cpu = q_lens.cpu()
-    # total_query_blocks = sum((q_lens_cpu[i].item() + BLOCK_Q - 1) // BLOCK_Q for i in range(NUM_SEQS))
     assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    # USE_LOAD_BUFFER_OP = False
-    # USE_STORE_BUFFER_OP = False
-    # Decode: seq-fastest grid (matches Triton's 3d decode order, better KV locality
-    # for memory-bound decode). Prefill keeps kv_head-fastest (matches Triton 2d).
-    # The kernel derives the program-id mapping from ALL_DECODE, so the launch order
-    # must follow it.
+    num_tiles = max(1, triton.cdiv(max_seqlen_k, TILE_SIZE))
+    if not ALL_DECODE:
+        num_splits = 1
+    elif num_splits is None:
+        num_splits = _select_num_splits(NUM_SEQS, NUM_KV_HEADS, num_tiles, NUM_WARPS)
+    else:
+        num_splits = max(1, min(num_tiles, num_splits))
+    if num_splits > 1:
+        partial_acc = torch.empty(
+            (q.shape[0], NUM_Q_HEADS, num_splits, HEAD_SIZE), dtype=torch.float32, device=q.device
+        )
+        partial_m = torch.empty(
+            (q.shape[0], NUM_Q_HEADS, num_splits), dtype=torch.float32, device=q.device
+        )
+        partial_l = torch.empty_like(partial_m)
+    else:
+        partial_acc = partial_m = partial_l = None
     grid = (total_query_blocks, NUM_KV_HEADS) if ALL_DECODE else (NUM_KV_HEADS, total_query_blocks)
+    if num_splits > 1:
+        grid = grid + (num_splits,)
     attn_kernel = kernel_unified_attention_2d[grid](
         query_ptr=q,
         key_cache_ptr=k,
@@ -1722,7 +1698,35 @@ def unified_attention(
         CAUSAL=causal,
         REMOVE_INDIRECT_ACCESS=remove_indirect_access,
         NUM_BUFFERS=num_buffers,
+        NUM_SPLITS=num_splits,
+        partial_m_ptr=partial_m,
+        partial_l_ptr=partial_l,
+        partial_acc_ptr=partial_acc,
     )
+
+    if num_splits > 1:
+        reduce_segments[(q.shape[0], NUM_Q_HEADS)](
+            output_ptr=out,
+            segm_output_ptr=partial_acc,
+            segm_max_ptr=partial_m,
+            segm_expsum_ptr=partial_l,
+            seq_lens_ptr=seqused_k,
+            num_seqs=NUM_SEQS,
+            num_query_heads=NUM_Q_HEADS,
+            out_scale_ptr=output_scale,
+            output_stride_0=out.stride(0),
+            output_stride_1=out.stride(1),
+            block_table_stride=block_table.stride(0),
+            HEAD_SIZE=HEAD_SIZE,
+            HEAD_SIZE_PADDED=triton.next_power_of_2(HEAD_SIZE),
+            query_start_len_ptr=cu_seqlens_q,
+            BLOCK_Q=BLOCK_Q,
+            TILE_SIZE=TILE_SIZE,
+            NUM_SEGMENTS_PER_SEQ=num_splits,
+            num_warps=2,
+            waves_per_eu=2,
+            num_stages=1,
+        )
 
     if PRINT_IRS and getattr(unified_attention, "print", False) == False:
         setattr(unified_attention, "print", True)
