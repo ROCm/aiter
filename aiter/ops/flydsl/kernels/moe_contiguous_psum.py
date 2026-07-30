@@ -29,6 +29,12 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 
 MAX_EXPERTS_PER_BLOCK = 512
 
+# The ep_rowmap remap+scatter is grid-strided across this many blocks. Each block
+# re-derives the tiny per-expert prefix sum in LDS (barrier-free across blocks), so
+# no cross-block sync is needed. Sized to fill the 256-CU gfx1250; the grid-stride
+# loop stays correct for any token count.
+EP_REMAP_NBLK = 256
+
 
 def build_moe_contiguous_psum_module():
     """JIT launcher: tile-aligned prefix sum over per-expert counts."""
@@ -462,6 +468,14 @@ def build_moe_contiguous_psum_remap_ep_module():
             gpu.barrier()
             src, dst = dst, src
 
+        bid = ArithValue(fx.block_idx.x)
+        blk_sz = ArithValue(arith.constant(MAX_EXPERTS_PER_BLOCK, type=i32))
+        gtid = bid * blk_sz + tid
+        is_blk0 = arith.cmpi(CmpIPredicate.eq, _raw(bid), arith.constant(0, type=i32))
+        # Multi-block: every block keeps its exclusive per-expert starts in LDS so the
+        # grid-strided scatter reads starts from LDS (never global -> no cross-block
+        # barrier). Only block 0 writes the global starts/psum/contiguous_m outputs.
+        starts_lds = dst  # spare ping-pong buffer now holds the exclusive starts
         _if_store = scf.IfOp(in_expert)
         with ir.InsertionPoint(_if_store.then_block):
             is_first = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
@@ -472,38 +486,37 @@ def build_moe_contiguous_psum_remap_ep_module():
                 prev = src[fx.Index(tid - arith.constant(1, type=i32))]
                 scf.YieldOp([_raw(prev)])
             start = ArithValue(start_if.results[0])
-            m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
-            is_last = arith.cmpi(
-                CmpIPredicate.eq,
-                tid,
-                ArithValue(experts) - arith.constant(1, type=i32),
-            )
-            _if_last = scf.IfOp(is_last)
-            with ir.InsertionPoint(_if_last.then_block):
-                final_cur = src[fx.Index(tid)]
-                gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
-                cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
-                buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
+            starts_lds[fx.Index(tid)] = start
+            _if_g = scf.IfOp(is_blk0)
+            with ir.InsertionPoint(_if_g.then_block):
+                m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+                buffer_ops.buffer_store(start, s_rsrc, tid)
+                buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+                is_last = arith.cmpi(
+                    CmpIPredicate.eq,
+                    tid,
+                    ArithValue(experts) - arith.constant(1, type=i32),
+                )
+                _if_last = scf.IfOp(is_last)
+                with ir.InsertionPoint(_if_last.then_block):
+                    final_cur = src[fx.Index(tid)]
+                    gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
+                    cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
+                    buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
+                    scf.YieldOp([])
                 scf.YieldOp([])
             scf.YieldOp([])
 
         gpu.barrier()
 
-        tid_idx = arith.index_cast(T.index, tid)
-        stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
+        gtid_idx = arith.index_cast(T.index, _raw(gtid))
+        gstride_idx = arith.index(EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK)
 
-        # EP Phase 1: init ep_rowmap[0:cap_rows] = (-1, 0) before any scatter.
-        cap_idx = arith.index_cast(T.index, ArithValue(cap_rows))
-        init_loop = scf.ForOp(tid_idx, cap_idx, stride_idx)
-        with ir.InsertionPoint(init_loop.body):
-            row_i32 = arith.index_cast(i32, init_loop.induction_variable)
-            base = ArithValue(row_i32) * ArithValue(two)
-            buffer_ops.buffer_store(neg1, ep_rsrc, _raw(base))
-            buffer_ops.buffer_store(zero, ep_rsrc, _raw(base + ArithValue(one)))
-            scf.YieldOp([])
-        gpu.barrier()
+        # EP Phase 1 init (ep_rowmap[:] = (-1, 0)) is now a parallel HW memset the
+        # host wrapper issues BEFORE this launch (one int64 fill over the whole
+        # (cap_rows+1, 2) map), replacing what used to be an O(cap_rows) serial loop.
+        # The memset is ordered before this kernel on the stream, so the grid-strided
+        # scatter below only overwrites the kept rows.
 
         nvr = ArithValue(
             buffer_ops.buffer_load(
@@ -518,7 +531,7 @@ def build_moe_contiguous_psum_remap_ep_module():
         max_tok_v = ArithValue(max_tok)
         slot_stride_v = ArithValue(slot_stride)
         # Fused remap + ep_rowmap scatter over valid routes ([0, nvr)).
-        remap_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
+        remap_loop = scf.ForOp(gtid_idx, nvr_idx, gstride_idx)
         with ir.InsertionPoint(remap_loop.body):
             route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
             row = ArithValue(
@@ -527,8 +540,8 @@ def build_moe_contiguous_psum_remap_ep_module():
             m = ArithValue(route_max_m)
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            final_row = ArithValue(start) + slot
+            start = ArithValue(starts_lds[fx.Index(expert)])
+            final_row = start + slot
             buffer_ops.buffer_store(final_row, rows_rsrc, route_i32)
             # ep_rowmap scatter: only kept local routes (gather_w != 0).
             route = ArithValue(route_i32)
@@ -600,7 +613,7 @@ def build_moe_contiguous_psum_remap_ep_module():
             max_tok,
             slot_stride,
         ).launch(
-            grid=(arith.index(1), 1, 1),
+            grid=(arith.index(EP_REMAP_NBLK), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )

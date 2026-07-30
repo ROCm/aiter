@@ -2127,6 +2127,12 @@ def contiguous_psum_remap(
         ).contiguous()
     if ep is not None:
         launch = _get_compiled_contiguous_psum_remap_ep()
+        # ep_rowmap init moved out of the single-workgroup kernel: a parallel HW
+        # memset of the whole (cap_rows+1, 2) i32 map to (-1, 0) via one int64 fill
+        # (low i32 = -1 = 0xFFFFFFFF, high i32 = 0). Ordered before the launch on the
+        # current stream (graph-capturable), so the kernel's scatter overwrites only
+        # the kept rows. Replaces the old O(cap_rows) serial loop inside the kernel.
+        ep["ep_rowmap"].view(torch.int64).fill_(0xFFFFFFFF)
         launch(
             ptr_arg(masked_m_i32),
             ptr_arg(topids_flat),
