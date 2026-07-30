@@ -150,6 +150,7 @@ class _FHMoEAOTBackend:
         bias=None,
         stream=None,
         swiglu_limit=float("inf"),
+        pass_swiglu_limit: bool = True,
     ):
         from aiter.ops.flydsl.fhmoe import _s1_args_fhmoe
 
@@ -174,6 +175,7 @@ class _FHMoEAOTBackend:
             bias=bias,
             stream=stream,
             swiglu_limit=swiglu_limit,
+            pass_swiglu_limit=pass_swiglu_limit,
             shared_w=shared_w.view(-1),
             shared_w_scale=shared_w_scale.view(-1),
         )

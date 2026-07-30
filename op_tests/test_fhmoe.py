@@ -904,6 +904,40 @@ def test_fhmoe_aot_jobs_preserve_xcd_swizzling():
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
 
 
+def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from aiter.aot.flydsl import fhmoe as aot_fhmoe
+    from aiter.ops.flydsl import fhmoe as ops_fhmoe
+
+    tensor = torch.empty(0)
+    forwarded = {}
+
+    monkeypatch.setattr(aot_fhmoe, "_shared_weight", lambda *_: tensor)
+    monkeypatch.setattr(aot_fhmoe, "_shared_scale", lambda *_: tensor)
+
+    def build_args(*args, **kwargs):
+        forwarded.update(kwargs)
+        return args
+
+    monkeypatch.setattr(ops_fhmoe, "_s1_args_fhmoe", build_args)
+
+    result = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=8).build_stage1_args(
+        *((tensor,) * 10),
+        1,
+        2,
+        3,
+        4,
+        "cpu",
+        swiglu_limit=10.0,
+        pass_swiglu_limit=False,
+    )
+
+    assert result
+    assert forwarded["swiglu_limit"] == 10.0
+    assert forwarded["pass_swiglu_limit"] is False
+
+
 @pytest.mark.parametrize(
     ("case", "message"),
     (
