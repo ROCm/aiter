@@ -469,6 +469,14 @@ int mha_fwd_calculate_num_splits(const mha_fwd_args& a)
                                     static_cast<int>(get_num_cu_func()));
 }
 
+// Calculate the workspace size in bytes for the current fwd config.
+size_t mha_fwd_workspace_size(const mha_fwd_args& a)
+{
+    if(a.num_splits <= 0)
+        return 0;
+    return a.num_splits * a.batch * a.nhead_q * a.seqlen_q * (kHeadDim + 1) * sizeof(float);
+}
+
 // Execute the native gfx942 split-K kernel using caller-provided workspace.
 // Returns -1.f for any unsupported config; 1.f on success.
 static float fmha_fwd_native_gfx942(const mha_fwd_args& a, const ck_tile::stream_config& s)
@@ -488,6 +496,8 @@ static float fmha_fwd_native_gfx942(const mha_fwd_args& a, const ck_tile::stream
     const int Sq      = a.seqlen_q;
     const int Sk      = a.seqlen_k;
     const int Hq      = a.nhead_q;
+
+    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
 
     // Pre-multiply scale by log2(e) — the kernel's softmax is base-2.
     static constexpr float kLog2e = 1.4426950408889634f;
@@ -554,7 +564,7 @@ float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 
 #if FAV_NATIVE_ON
     // Dispatch to the native split-K kernel when the caller has pre-validated the
-    // config via mha_fwd_get_num_splits() and provided a workspace buffer.
+    // config via mha_fwd_calculate_num_splits() and provided a workspace buffer.
     // No implicit fallback: if the caller set num_splits > 0 it expects this path.
     if(args.num_splits > 0 && args.splitkv_workspace_ptr != nullptr)
         return fmha_fwd_native_gfx942(args, s);
