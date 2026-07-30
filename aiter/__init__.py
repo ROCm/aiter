@@ -121,6 +121,7 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
     from .ops.mha import *
+    from .ops.mha_batch_prefill_asm import *
     from .ops.gradlib import *
     from .ops.trans_ragged_layout import *
     from .ops.sample import *
@@ -137,7 +138,6 @@ else:
     from . import mla  # noqa: F401
 
     # isort: on
-
 # Import Triton-based communication primitives from ops.triton.comms (optional, only if Iris is available)
 try:
     from .ops.triton.comms import (
