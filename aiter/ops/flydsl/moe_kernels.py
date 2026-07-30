@@ -1472,7 +1472,7 @@ def flydsl_moe_stage1(
     gate_up_interleave = gate_mode == "interleave"
 
     dev = a.device
-    _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+    _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4", "fp4bf16")
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
     # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
     # or memfault). Downgrade to a divisor (128). Applies to both a16w4
@@ -1557,7 +1557,6 @@ def flydsl_moe_stage1(
         bias = bias.to(torch.float32)
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
-    # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
     use_mx_gemm = b_dtype in ("fp4", "fp8")
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim

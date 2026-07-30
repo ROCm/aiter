@@ -512,7 +512,26 @@ def _precompile_to_cache(
                 else torch.empty(0, dtype=torch.uint8, device=dev)
             )
 
-            if use_mx_gemm:
+            if b_dtype in ("fp4bf16", "int4"):
+                _stage2_out_dummy = torch.empty(0, dtype=torch.uint8, device=dev)
+                args = (
+                    _ptr_view_safe(_kernel_out.view(-1)),
+                    _ptr_view_safe(_stage2_out_dummy),
+                    _ptr_view_safe(a.view(-1)),
+                    _ptr_view_safe(w1.view(-1)),
+                    _ptr_view_safe(flat_a_scale),
+                    _ptr_view_safe(flat_w_scale),
+                    _ptr_view_safe(sorted_token_ids),
+                    _ptr_view_safe(sorted_expert_ids),
+                    _ptr_view_safe(sw_arg),
+                    _ptr_view_safe(num_valid_ids),
+                    tokens,
+                    _n_in if b_dtype == "int4" else inter_dim * 2,
+                    _k_in,
+                    _grid_y,
+                    0,
+                )
+            elif use_mx_gemm:
                 args = _s1_args_fp4(
                     _kernel_out.view(-1),
                     a.view(-1),
