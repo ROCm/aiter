@@ -1076,6 +1076,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             w_scale,
             dtype=dtype,
             config=_fallback_cfg,
+            is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
     if tuned_file is None:
         tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
@@ -1103,6 +1104,7 @@ def gemm_a8w8_blockscale_bpreshuffle(
             w_scale,
             dtype=dtype,
             backend=backend,
+            is_x_scale_tranposed=x_scale.stride(0) != 1,
         )
     if config is not None:
         libtype = config["libtype"]

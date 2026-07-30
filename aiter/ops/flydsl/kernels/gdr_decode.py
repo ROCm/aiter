@@ -16,8 +16,10 @@ from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects import (
     vector as mlir_vector,
 )
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import (
     GTensor,

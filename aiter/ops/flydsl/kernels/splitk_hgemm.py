@@ -8,17 +8,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    vector,
-)
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .tensor_shim import GTensor, get_dtype_in_kernel
 
