@@ -9,7 +9,9 @@ import aiter
 from aiter import dtypes
 from aiter.fused_moe import (
     _fused_decode_sort_quant,
+    _is_fused_decode_compact_scale_enabled,
     _is_fused_decode_sort_quant_enabled,
+    get_2stage_cfgs,
     moe_sorting,
 )
 from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
@@ -210,6 +212,53 @@ def test_fused_decode_sort_quant_returns_sorted_scale(tokens):
     activation_scale = result[-1]
     assert activation_scale.shape[0] == result[0].shape[0]
     assert activation_scale.shape[1] == HIDDEN // 32
+    compact_result = _fused_decode_sort_quant(
+        hidden,
+        topk_ids,
+        topk_weights,
+        model_dim=HIDDEN,
+        global_experts=384,
+        block_m=BLOCK_M,
+        moebuf_dtype=torch.bfloat16,
+        accumulate=True,
+        compact_scale=True,
+    )
+    compact_scale = compact_result[-1]
+    assert compact_scale.shape == (tokens, HIDDEN // 32)
+
+
+@pytest.mark.parametrize("experts, topk", [(384, 8), (256, 8)])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 16, 32, 64, 128])
+def test_compact_scale_gate_covers_every_tuned_decode_row(
+    monkeypatch, experts, topk, tokens
+):
+    """Compact scales must engage on the tuned row for every decode M.
+
+    The tuner picks multi-K-wave (``k_wave`` 2/4) stage-1 rows at M <= 8. Those
+    rows are slower in isolation with compact scales but faster end to end,
+    because the sorted-scale expansion launch disappears -- so the gate must not
+    exclude them.
+    """
+    if aiter.get_gfx() != "gfx950":
+        pytest.skip("fused sort+quant is gfx950-only")
+    monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_COMPACT_SCALE", "auto")
+    metadata = get_2stage_cfgs(
+        tokens,
+        HIDDEN,
+        256,
+        experts,
+        topk,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Silu,
+        False,
+        0,
+        0,
+    )
+    assert _is_fused_decode_compact_scale_enabled(metadata, tokens)
 
 
 @pytest.mark.parametrize(

@@ -70,6 +70,7 @@ _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 _FUSED_DECODE_SORT_QUANT_ENV = "SGLANG_AITER_FUSED_DECODE_SORT_QUANT"
+_FUSED_DECODE_COMPACT_SCALE_ENV = "SGLANG_AITER_FUSED_DECODE_COMPACT_SCALE"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(256, 8), (384, 8), (385, 9)}
@@ -170,6 +171,7 @@ def _fused_decode_sort_quant(
     block_m: int,
     moebuf_dtype: torch.dtype,
     accumulate: bool,
+    compact_scale: bool = False,
 ):
     """Return standard sorted metadata plus the pre-quantized stage-1 input."""
     device = hidden_states.device
@@ -210,13 +212,15 @@ def _fused_decode_sort_quant(
         activation_scale_token,
         global_experts,
     )
-    activation_scale = mxfp4_moe_sort_fwd(
-        activation_scale_token,
-        sorted_ids=sorted_ids,
-        num_valid_ids=num_valid_ids,
-        token_num=tokens,
-        cols=model_dim,
-    )
+    activation_scale = activation_scale_token
+    if not compact_scale:
+        activation_scale = mxfp4_moe_sort_fwd(
+            activation_scale_token,
+            sorted_ids=sorted_ids,
+            num_valid_ids=num_valid_ids,
+            token_num=tokens,
+            cols=model_dim,
+        )
     return (
         sorted_ids,
         sorted_weights,
@@ -225,6 +229,33 @@ def _fused_decode_sort_quant(
         moe_buf,
         activation_quant,
         activation_scale,
+    )
+
+
+def _is_fused_decode_compact_scale_enabled(
+    metadata: "MOEMetadata", tokens: int
+) -> bool:
+    mode = os.environ.get(_FUSED_DECODE_COMPACT_SCALE_ENV, "").strip().lower()
+    if not mode:
+        mode = os.environ.get(_FUSED_DECODE_SORT_QUANT_ENV, "").strip().lower()
+    if mode not in ("auto", "1", "true", "on", "yes"):
+        return False
+    stage1 = getattr(metadata.stage1, "func", metadata.stage1)
+    if stage1 is not _flydsl_stage1_wrapper:
+        return False
+    kernel_name = getattr(metadata.stage1, "keywords", {}).get("kernelName", "")
+    parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+    return bool(
+        parsed is not None
+        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and parsed.get("a_dtype") == "fp4"
+        and parsed.get("tile_m") == 32
+        and parsed.get("tile_k") == 256
+        and parsed.get("k_batch", 1) == 1
+        # Any k_wave is eligible. Compact addressing costs 5-12% in stage 1 on
+        # the multi-K-wave rows (which the tuner picks at M <= 8), but dropping
+        # the ~4us mxfp4_moe_sort_fwd launch more than pays for it against a
+        # 30-65us layer -- see the k_wave table in the PR description.
     )
 
 
@@ -906,6 +937,9 @@ def fused_moe_(
         hidden_pad=hidden_pad,
         ksplit=metadata.ksplit,
     )
+    fused_compact_scale = fused_sort_quant and _is_fused_decode_compact_scale_enabled(
+        metadata, hidden_states.shape[0]
+    )
     if metadata.output_aux:
         # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
         # not thread expert_mask into moe_sorting below -- EP masking would be
@@ -955,6 +989,7 @@ def fused_moe_(
             block_m=block_size_M,
             moebuf_dtype=dtype,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            compact_scale=fused_compact_scale,
         )
         local_topk_ids = None
     else:
@@ -1056,6 +1091,7 @@ def fused_moe_(
             reverse_sorted=sort_reverse_sorted,
             prequantized_a1=prequantized_a1,
             prequantized_a1_scale=prequantized_a1_scale,
+            prequantized_a1_scale_compact=fused_compact_scale,
         )
 
 
@@ -1390,6 +1426,7 @@ def _flydsl_stage1_wrapper(
     out_scale_sorted=None,
     bias1=None,
     topk_ids=None,
+    a1_scale_compact: bool = False,
     swiglu_limit: float | None = None,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
@@ -1410,6 +1447,30 @@ def _flydsl_stage1_wrapper(
     else:
         act = "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
+    tile_n = parsed["tile_n"]
+    waves_per_eu = parsed.get("waves_per_eu", 3)
+    b_nt = parsed.get("b_nt", 2)
+    xcd_swizzle = parsed.get("xcd_swizzle", 0)
+    if a1_scale_compact and parsed.get("k_wave", 1) == 1:
+        tokens = hidden_states.shape[0]
+        # Compact-scale variants need a different balance between N-wave
+        # parallelism and scale-gather latency for the original single-K-wave
+        # kernels. Multi-K-wave rows are already explicitly tuned; preserve
+        # their tile/wave parameters while enabling compact scale addressing.
+        if tokens == 8:
+            waves_per_eu = 2
+            b_nt = 2
+            xcd_swizzle = 0
+        elif tokens in (16, 32):
+            tile_n = 128
+            waves_per_eu = 2
+            b_nt = 2
+            xcd_swizzle = 0
+        elif tokens == 64:
+            tile_n = 128
+            waves_per_eu = 4
+            b_nt = 2
+            xcd_swizzle = 0
     return aiter.ops.flydsl.flydsl_moe_stage1(
         a=hidden_states,
         w1=w1,
@@ -1419,7 +1480,7 @@ def _flydsl_stage1_wrapper(
         out=out,
         topk=topk,
         tile_m=parsed["tile_m"],
-        tile_n=parsed["tile_n"],
+        tile_n=tile_n,
         tile_k=parsed["tile_k"],
         a_dtype=parsed["a_dtype"],
         b_dtype=parsed["b_dtype"],
@@ -1432,15 +1493,16 @@ def _flydsl_stage1_wrapper(
         sorted_weights=sorted_weights,
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
-        waves_per_eu=parsed.get("waves_per_eu", 3),
-        b_nt=parsed.get("b_nt", 2),
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
         gate_mode=parsed.get("gate_mode", "separated"),
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
         bias=_normalize_bias_for_kernel(bias1),
         topk_ids=topk_ids,
         a_scale_one=_a_scale_one,
-        xcd_swizzle=parsed.get("xcd_swizzle", 0),
+        a_scale_compact=a1_scale_compact,
+        xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
     )
@@ -2724,6 +2786,7 @@ def fused_moe_2stages(
     reverse_sorted=None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    prequantized_a1_scale_compact: bool = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2881,6 +2944,7 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
         )
+        extra_stage1_args["a1_scale_compact"] = prequantized_a1_scale_compact
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
