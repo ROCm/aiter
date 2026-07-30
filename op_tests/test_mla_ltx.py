@@ -365,18 +365,12 @@ def co_name(
         return _CO_OVERRIDE
     base = HARNESS.csv_dispatch_keys()
     lse_flag = 1 if (lse and persistent) else 0
-    if not persistent and lse:
-        lse_flag = 1
     ps = 1 if persistent else 0
     cprr_flag = _CPRR if cprr is None else cprr
     for row in _load_asm_csv(aiter_root):
         if any(row.get(k) != v for k, v in base.items()):
             continue
-        if (
-            row["ps"] == ps
-            and row["lse"] == lse_flag
-            and row["cprr"] == int(cprr_flag)
-        ):
+        if row["ps"] == ps and row["lse"] == lse_flag and row["cprr"] == int(cprr_flag):
             return str(row["co_name"])
     raise KeyError(
         f"no csv row {HARNESS.summary()} ps={ps} lse={lse_flag} cprr={int(cprr_flag)}"
@@ -762,7 +756,9 @@ def test_mla_ltx(
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
         if _SKIP_REF:
-            err = float(torch.isnan(result).any().item() or torch.isinf(result).any().item())
+            err = float(
+                torch.isnan(result).any().item() or torch.isinf(result).any().item()
+            )
         else:
             err = checkAllclose(
                 ref.to(dtypes.fp32),
