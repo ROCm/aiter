@@ -31,6 +31,11 @@ namespace py = pybind11;
         .value("Silu", ActivationType::Silu)                                                \
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
+        .value("Situv2", ActivationType::Situv2)                                            \
+        .export_values();                                                                   \
+    pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
+        .value("V32", MlaVersion::V32)                                                      \
+        .value("V40", MlaVersion::V40)                                                      \
         .export_values();                                                                   \
     pybind11::enum_<aiter::MxScaleRoundMode>(m, "MxScaleRoundMode")                         \
         .value("RoundDown", aiter::MxScaleRoundMode::RoundDown)                             \
@@ -45,6 +50,7 @@ namespace py = pybind11;
         .export_values();                                                                   \
     pybind11::implicitly_convertible<int, QuantType>();                                     \
     pybind11::implicitly_convertible<int, ActivationType>();                                \
+    pybind11::implicitly_convertible<int, MlaVersion>();                                    \
     pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                       \
     pybind11::implicitly_convertible<int, aiter::MxDtype>();                                \
     m.attr("kDefaultMxScaleRoundMode") = static_cast<int>(aiter::kDefaultMxScaleRoundMode); \
@@ -293,6 +299,17 @@ namespace py = pybind11;
           py::arg("kernelId") = 0,            \
           py::arg("splitK")   = 0);
 
+#define OPUS_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_TUNE_PYBIND \
+    m.def("opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          &opus_gemm_a8w8_blockscale_bpreshuffle_tune,    \
+          "opus_gemm_a8w8_blockscale_bpreshuffle_tune",   \
+          py::arg("XQ"),                                  \
+          py::arg("WQ"),                                  \
+          py::arg("x_scale"),                             \
+          py::arg("w_scale"),                             \
+          py::arg("Y"),                                   \
+          py::arg("kernelId"));
+
 #define OPUS_GEMM_WORKSPACE_INIT_PYBIND                              \
     m.def("opus_gemm_workspace_init",                                \
           &opus_gemm_workspace_init,                                 \
@@ -439,7 +456,8 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));                                                \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -1295,6 +1313,7 @@ namespace py = pybind11;
           py::arg("topk_indices"),                                             \
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
+          py::arg("softmax_workspace"),                                        \
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
@@ -1397,7 +1416,9 @@ namespace py = pybind11;
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
           py::arg("dispatch_policy")   = 0,            \
-          py::arg("local_topk_ids")    = std::nullopt);
+          py::arg("local_topk_ids")    = std::nullopt, \
+          py::arg("m_indices")         = std::nullopt, \
+          py::arg("reverse_sorted")    = std::nullopt);
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_opus_fwd",                \
@@ -1428,15 +1449,21 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("softmax_scale"));
 
-#define FMHA_FWD_HD128_BF16_OPUS_PYBIND                             \
-    m.def("fmha_fwd_hd128_bf16_opus_fwd",                          \
-          &fmha_fwd_hd128_bf16_opus_fwd,                           \
-          py::arg("q"),                            \
-          py::arg("k"),                            \
-          py::arg("v"),                            \
-          py::arg("out"),                          \
-          py::arg("causal"),                       \
-          py::arg("softmax_scale"));
+#define FMHA_FWD_BF16_OPUS_PYBIND                                  \
+    m.def("fmha_fwd_bf16_opus_fwd",                                \
+          &fmha_fwd_bf16_opus_fwd,                                 \
+          py::arg("q"),                                            \
+          py::arg("k"),                                            \
+          py::arg("v"),                                            \
+          py::arg("out"),                                          \
+          py::arg("causal"),                                       \
+          py::arg("softmax_scale"),                                \
+          py::arg("seqstart_q")     = std::nullopt,                \
+          py::arg("seqstart_k")     = std::nullopt,                \
+          py::arg("seqstart_q_pad") = std::nullopt,                \
+          py::arg("seqstart_k_pad") = std::nullopt,                \
+          py::arg("max_seqlen_q")   = 0,                           \
+          py::arg("max_seqlen_k")   = 0);
 
 #define NORM_PYBIND                                \
     m.def("layernorm2d_fwd",                       \
@@ -1603,34 +1630,69 @@ namespace py = pybind11;
           py::arg("gate_up")        = false,                             \
           py::arg("shuffle_weight") = false);
 
-#define DSV4_ROTATE_QUANT_PYBIND                                                             \
-    m.def("rotate_activation_fp4quant_inplace",                                              \
-          &aiter::rotate_activation_fp4quant_inplace,                                        \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("group_size") = 32);                                                       \
-    m.def("rotate_activation", &aiter::rotate_activation, py::arg("out"), py::arg("input")); \
-    m.def("rope_rotate_activation_fp4quant_inplace",                                         \
-          &aiter::rope_rotate_activation_fp4quant_inplace,                                   \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("cos"),                                                                    \
-          py::arg("sin"),                                                                    \
-          py::arg("positions"),                                                              \
-          py::arg("rope_dim"),                                                               \
-          py::arg("group_size") = 32);                                                       \
-    m.def("rope_rotate_activation",                                                          \
-          &aiter::rope_rotate_activation,                                                    \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("cos"),                                                                    \
-          py::arg("sin"),                                                                    \
-          py::arg("positions"),                                                              \
-          py::arg("rope_dim"),                                                               \
-          py::arg("out_scale") = std::nullopt,                                               \
-          py::arg("group_size") = 128);
+#define DSV4_ROTATE_QUANT_PYBIND                                         \
+    m.def("rotate_activation_fp4quant",                                  \
+          &aiter::rotate_activation_fp4quant,                            \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true);                              \
+    m.def("rotate_activation",                                           \
+          &aiter::rotate_activation,                                     \
+          py::arg("out"),                                                \
+          py::arg("input"));                                             \
+    m.def("rope_rotate_activation_fp4quant",                             \
+          &aiter::rope_rotate_activation_fp4quant,                       \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true,                               \
+          py::arg("do_rotate_act") = true);                              \
+    m.def("rope_rotate_activation",                                      \
+          &aiter::rope_rotate_activation,                                \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("do_rotate_act") = true);                             \
+    m.def("rope_rotate_activation_fp8quant",                             \
+          &aiter::rope_rotate_activation_fp8quant,                       \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("group_size") = 128,                                   \
+          py::arg("do_rotate_act") = true);                              \
+    m.def("rmsnorm_rope_rotate_activation_fp4quant_kvcache",             \
+          &aiter::rmsnorm_rope_rotate_activation_fp4quant_kvcache,       \
+          py::arg("kvcache"),                                            \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("norm_weight"),                                        \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("slot_mapping"),                                       \
+          py::arg("epsilon"),                                            \
+          py::arg("rope_dim"),                                           \
+          py::arg("kv_block_size") = 16,                                 \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true,                               \
+          py::arg("do_rotate_act") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
@@ -1646,12 +1708,31 @@ namespace py = pybind11;
           py::arg("out"),                                                                  \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_all_reduce_rmsnorm",                                                         \
+          &aiter::qr_all_reduce_rmsnorm,                                                    \
+          "qr_all_reduce_rmsnorm(int fa, Tensor inp, Tensor residual_inp, "                 \
+          "Tensor residual_out, Tensor out, Tensor weight, float eps, int hidden_dim, "     \
+          "int quant_level, bool cast_bf2half) -> ()",                                     \
+          py::arg("fa"),                                                                   \
+          py::arg("inp"),                                                                  \
+          py::arg("residual_inp"),                                                         \
+          py::arg("residual_out"),                                                         \
+          py::arg("out"),                                                                  \
+          py::arg("weight"),                                                               \
+          py::arg("eps"),                                                                  \
+          py::arg("hidden_dim"),                                                           \
+          py::arg("quant_level"),                                                          \
+          py::arg("cast_bf2half") = false);                                                \
+    m.def("qr_get_handle",                                                                 \
+          &aiter::qr_get_handle,                                                           \
+          "qr_get_handle(int fa, int out_ptr) -> ()",                                      \
+          py::arg("fa"),                                                                   \
+          py::arg("out_ptr"));                                                             \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs) -> ()",                              \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
@@ -1774,32 +1855,10 @@ namespace py = pybind11;
           py::arg("q_out"),                                \
           py::arg("index_q_out"),                          \
           py::arg("index_slot_mapping"),                   \
-          py::arg("asm_layout")    = false);                \
-    m.def("fused_qknorm_idxrqknorm_fp8",     \
-          &aiter::fused_qknorm_idxrqknorm_fp8, \
-          py::arg("qkv"),                                  \
-          py::arg("q_norm_weight"),                        \
-          py::arg("k_norm_weight"),                        \
-          py::arg("cos_sin_cache"),                        \
-          py::arg("positions"),                            \
-          py::arg("num_heads"),                            \
-          py::arg("num_kv_heads"),                         \
-          py::arg("rotary_dim"),                           \
-          py::arg("eps"),                                  \
-          py::arg("index_q_norm_weight"),                  \
-          py::arg("index_k_norm_weight"),                  \
-          py::arg("num_index_heads"),                       \
-          py::arg("slot_mapping"),                         \
-          py::arg("kv_cache_k"),                           \
-          py::arg("kv_cache_v"),                           \
-          py::arg("index_cache"),                          \
-          py::arg("block_size"),                           \
-          py::arg("q_out"),                                \
-          py::arg("index_q_out"),                          \
-          py::arg("index_slot_mapping"),                   \
-          py::arg("kv_cache_dtype"),                       \
-          py::arg("k_scale"),                              \
-          py::arg("v_scale"),                              \
+          py::arg("kv_cache_dtype") = "auto",              \
+          py::arg("index_cache_dtype") = "auto",           \
+          py::arg("k_scale") = std::nullopt,                \
+          py::arg("v_scale") = std::nullopt,                \
           py::arg("asm_layout")    = false)
 
 #define FUSED_QKNORM_ROPE_CACHE_QUANT_PYBIND                    \
@@ -1918,7 +1977,8 @@ namespace py = pybind11;
             py::arg("q_rope_buff")       = std::nullopt,                                \
             py::arg("swa_nope_scale_buff") = std::nullopt,                              \
             py::arg("swa_rope_buff")     = std::nullopt,                                \
-            py::arg("state_slot_mapping") = std::nullopt,                               \
+            py::arg("swa_block_tables")   = std::nullopt,                               \
+            py::arg("swa_block_size")     = 0,                                          \
             py::arg("batch_id_per_token") = std::nullopt);                              \
     m.def("fused_kv_norm_rope_group_quant",                                             \
             &aiter::fused_kv_norm_rope_group_quant,                                     \
@@ -2081,33 +2141,36 @@ namespace py = pybind11;
           py::arg("numRows"),                    \
           py::arg("stride0"));
 
-#define MLA_METADATA_PYBIND                              \
-    m.def("get_mla_metadata_v1",                         \
-          &get_mla_metadata_v1,                          \
-          "get_mla_metadata_v1",                         \
-          py::arg("seqlens_qo_indptr"),                  \
-          py::arg("seqlens_kv_indptr"),                  \
-          py::arg("kv_last_page_lens"),                  \
-          py::arg("num_heads_per_head_k"),               \
-          py::arg("num_heads_k"),                        \
-          py::arg("is_causal"),                          \
-          py::arg("work_metadata_ptrs"),                 \
-          py::arg("work_info_set"),                      \
-          py::arg("work_indptr"),                        \
-          py::arg("reduce_indptr"),                      \
-          py::arg("reduce_final_map"),                   \
-          py::arg("reduce_partial_map"),                 \
-          py::arg("page_size")           = 1,            \
-          py::arg("kv_granularity")      = 16,           \
-          py::arg("max_seqlen_qo")       = -1,           \
-          py::arg("uni_seqlen_qo")       = -1,           \
-          py::arg("fast_mode")           = true,         \
-          py::arg("topk")                = -1,           \
-          py::arg("max_split_per_batch") = -1,           \
-          py::arg("intra_batch_mode")    = false,        \
-          py::arg("dtype_q")             = std::nullopt, \
-          py::arg("dtype_kv")            = std::nullopt, \
-          py::arg("is_cp_round_robin")   = false);         \
+#define MLA_METADATA_PYBIND                               \
+    m.def("get_mla_metadata_v1",                          \
+          &get_mla_metadata_v1,                           \
+          "get_mla_metadata_v1",                          \
+          py::arg("seqlens_qo_indptr"),                   \
+          py::arg("seqlens_kv_indptr"),                   \
+          py::arg("kv_last_page_lens"),                   \
+          py::arg("num_heads_per_head_k"),                \
+          py::arg("num_heads_k"),                         \
+          py::arg("is_causal"),                           \
+          py::arg("work_metadata_ptrs"),                  \
+          py::arg("work_info_set"),                       \
+          py::arg("work_indptr"),                         \
+          py::arg("reduce_indptr"),                       \
+          py::arg("reduce_final_map"),                    \
+          py::arg("reduce_partial_map"),                  \
+          py::arg("page_size")           = 1,             \
+          py::arg("kv_granularity")      = 16,            \
+          py::arg("max_seqlen_qo")       = -1,            \
+          py::arg("uni_seqlen_qo")       = -1,            \
+          py::arg("fast_mode")           = true,          \
+          py::arg("topk")                = -1,            \
+          py::arg("max_split_per_batch") = -1,            \
+          py::arg("intra_batch_mode")    = false,         \
+          py::arg("is_cp_round_robin")   = false,         \
+          py::arg("mla_version")         = MlaVersion::V32,\
+          py::arg("dtype_q_nope")        = std::nullopt,  \
+          py::arg("dtype_q_rope")        = std::nullopt,  \
+          py::arg("dtype_kv_nope")       = std::nullopt,  \
+          py::arg("dtype_kv_rope")       = std::nullopt); \
     m.def("get_mla_metadata_v1_no_redundant", &get_mla_metadata_v1_no_redundant);
 
 #define PA_METADATA_PYBIND                       \
@@ -2222,18 +2285,27 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("gemma_norm") = false);    \
 
-#define GATED_RMSNORM_QUANT_PYBIND               \
-    m.def("gated_rmsnorm_fp8_group_quant",       \
-          &aiter::gated_rmsnorm_fp8_group_quant, \
-          py::arg("out"),                        \
-          py::arg("scale"),                      \
-          py::arg("x"),                          \
-          py::arg("z"),                          \
-          py::arg("weight"),                     \
-          py::arg("epsilon"),                    \
-          py::arg("group_size"),                 \
-          py::arg("transpose_scale") = false,    \
-          "Fused Gated RMSNorm + FP8 Group Quantization");
+#define GATED_RMSNORM_QUANT_PYBIND                   \
+    m.def("gated_rmsnorm_fp8_group_quant",           \
+          &aiter::gated_rmsnorm_fp8_group_quant,     \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          py::arg("group_size"),                     \
+          py::arg("transpose_scale") = false,        \
+          "Fused Gated RMSNorm + FP8 Group Quantization"); \
+    m.def("gated_rmsnorm_fp8_per_token_quant",       \
+          &aiter::gated_rmsnorm_fp8_per_token_quant, \
+          py::arg("out"),                            \
+          py::arg("scale"),                          \
+          py::arg("x"),                              \
+          py::arg("z"),                              \
+          py::arg("weight"),                         \
+          py::arg("epsilon"),                        \
+          "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                              \
     m.def("mhc_pre_gemm_sqrsum",                \
@@ -2327,6 +2399,7 @@ namespace py = pybind11;
           py::arg("g"),                             \
           py::arg("gk"),                            \
           py::arg("initial_state"),                 \
+          py::arg("initial_state_indices"),         \
           py::arg("cu_seqlens"),                    \
           py::arg("chunk_offsets"),                 \
           py::arg("h"),                             \
@@ -2397,20 +2470,122 @@ namespace py = pybind11;
           py::arg("scale"),                                           \
           py::arg("use_qk_l2norm_in_kernel"),                         \
           py::arg("output"));
-#define MLA_HK_PYBIND                   \
-    m.def("hk_mla_decode_fwd",          \
-          &hk_mla_decode_fwd,           \
-          "hk_mla_decode_fwd",          \
-          py::arg("query"),             \
-          py::arg("kv_buffer"),         \
-          py::arg("qo_indptr"),         \
-          py::arg("kv_indptr"),         \
-          py::arg("kv_page_indices"),   \
-          py::arg("kv_last_page_lens"), \
-          py::arg("work_indptr"),       \
-          py::arg("work_info_set"),     \
-          py::arg("max_seqlen_q"),      \
-          py::arg("softmax_scale"),     \
-          py::arg("split_output"),      \
-          py::arg("split_lse"),         \
-          py::arg("final_output"));
+
+#define MXFP4_MOE_AUX_PYBIND                                              \
+    m.def("mxfp4_moe_sort_quant",                                         \
+          &mxfp4_moe_sort_quant_kernel,                                   \
+          py::arg("a_input"),                                             \
+          py::arg("topk_ids"),                                            \
+          py::arg("topk_weight"),                                         \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("sorted_expert_ids"),                                   \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("a_quant"),                                             \
+          py::arg("a_scale"),                                             \
+          py::arg("m_indices"),                                           \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_sort",                                               \
+          &mxfp4_moe_sort_kernel,                                         \
+          py::arg("topk_ids"),                                            \
+          py::arg("topk_weight"),                                         \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("sorted_expert_ids"),                                   \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("m_indices"),                                           \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("bf16_zero_workspace"),                                 \
+          py::arg("M_logical"),                                           \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("D_INTER"),                                            \
+          py::arg("MB"),                                                  \
+          py::arg("prologue"));                                           \
+    m.def("mxfp4_moe_quant",                                              \
+          &mxfp4_moe_quant_kernel,                                        \
+          py::arg("a_input"),                                             \
+          py::arg("a_quant"),                                             \
+          py::arg("a_scale"),                                             \
+          py::arg("bf16_zero_out"),                                       \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_sort_scales",                                        \
+          &mxfp4_moe_sort_scales_kernel,                                  \
+          py::arg("a_scale"),                                             \
+          py::arg("sorted_token_ids"),                                    \
+          py::arg("cumsum_tensor"),                                       \
+          py::arg("a_scale_sorted_shuffled"),                             \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"),                                                  \
+          py::arg("max_sorted"));                                         \
+    m.def("mxfp4_moe_scatter_reduce",                                     \
+          &mxfp4_moe_scatter_reduce_kernel,                               \
+          py::arg("flat_out"),                                            \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("out"),                                                 \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));                                                 \
+    m.def("mxfp4_moe_scatter_reduce_q",                                   \
+          &mxfp4_moe_scatter_reduce_q_kernel,                             \
+          py::arg("flat_out_q"),                                          \
+          py::arg("flat_out_scale"),                                      \
+          py::arg("reverse_sorted"),                                      \
+          py::arg("sorted_weights"),                                      \
+          py::arg("out"),                                                 \
+          py::arg("NE"),                                                  \
+          py::arg("TOPK"),                                                \
+          py::arg("D_HIDDEN"),                                            \
+          py::arg("MB"));
+
+#define MLA_HK_V32_PYBIND                   \
+      m.def("hk_mla_v32_decode_fwd",        \
+            &hk_mla_v32_decode_fwd,         \
+            "hk_mla_v32_decode_fwd",        \
+            py::arg("query"),               \
+            py::arg("kv_buffer"),           \
+            py::arg("qo_indptr"),           \
+            py::arg("kv_indptr"),           \
+            py::arg("kv_page_indices"),     \
+            py::arg("kv_last_page_lens"),   \
+            py::arg("work_indptr"),         \
+            py::arg("work_info_set"),       \
+            py::arg("max_seqlen_q"),        \
+            py::arg("softmax_scale"),       \
+            py::arg("split_output"),        \
+            py::arg("split_lse"),           \
+            py::arg("final_output"));
+
+#define MLA_HK_V40_PYBIND                                 \
+      m.def("hk_mla_v40_decode_fwd",                      \
+            &hk_mla_v40_decode_fwd,                       \
+            "hk_mla_v40_decode_fwd",                      \
+            py::arg("query"),                             \
+            py::arg("query_rope"),                        \
+            py::arg("kv_buffer"),                         \
+            py::arg("kv_buffer_rope"),                    \
+            py::arg("qo_indptr"),                         \
+            py::arg("kv_page_indices"),                   \
+            py::arg("kv_last_page_lens"),                 \
+            py::arg("work_indptr"),                       \
+            py::arg("work_info_set"),                     \
+            py::arg("max_seqlen_q"),                      \
+            py::arg("softmax_scale"),                     \
+            py::arg("split_output"),                      \
+            py::arg("split_lse"),                         \
+            py::arg("final_output"),                      \
+            py::arg("attn_sink") = py::none());

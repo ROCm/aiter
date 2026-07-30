@@ -1,9 +1,10 @@
-import triton
 import torch
+import triton
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
-    _topk,
-    _hash_routing,
     _grouped_topk,
+    _hash_routing,
+    _topk,
 )
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
 

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
 OPUS_A8W4_STAGE2_KERNEL = "opus_moe_stage2_a8w4_decode"
@@ -12,7 +10,11 @@ _DEFAULT_SORT_BLOCK_M = 32
 
 
 def _value_is_empty(value) -> bool:
-    return value is None or value != value or str(value).strip() in ("", "nan", "None")
+    return (
+        value is None
+        or value != value  # noqa: PLR0124
+        or str(value).strip() in ("", "nan", "None")
+    )
 
 
 def _cfg_first(cfg: dict, *names: str):
@@ -28,7 +30,7 @@ def _cfg_int(value, default: int = 0) -> int:
     return int(float(value))
 
 
-def _cfg_optional_int(value) -> Optional[int]:
+def _cfg_optional_int(value) -> int | None:
     if _value_is_empty(value):
         return None
     return int(float(value))
@@ -81,8 +83,8 @@ def stage2_cfg_values(cfg: dict, block_m) -> dict[str, object]:
         opus_a8w4_kid_block_m,
         opus_a8w4_kid_from_name,
         opus_a8w4_kid_reduce_block_n,
-        opus_a8w4_reduce_block_n_from_name,
         opus_a8w4_kid_uses_route,
+        opus_a8w4_reduce_block_n_from_name,
     )
 
     sort_block_m = _cfg_int(block_m, _DEFAULT_SORT_BLOCK_M)
@@ -226,8 +228,8 @@ def opus_a8w4_stage2_wrapper(
     topk_ids=None,
     block_m: int = _DEFAULT_SORT_BLOCK_M,
     kernel_id: int = -1,
-    stage2_block_m: Optional[int] = None,
-    stage2_reduce_block_n: Optional[int] = None,
+    stage2_block_m: int | None = None,
+    stage2_reduce_block_n: int | None = None,
     route_out: bool = False,
     **_kwargs,
 ):
@@ -249,32 +251,14 @@ def opus_a8w4_stage2_wrapper(
         )
     from .moe_stage2_a8w4_meta import (
         OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
-        opus_a8w4_shape_family_for_shape,
     )
 
-    shape_family = opus_a8w4_shape_family_for_shape(
-        model_dim=w2.shape[1],
-        inter_dim=inter_states.shape[2],
-        expert=w2.shape[0],
-        topk=topk,
-    )
-    if shape_family is None:
-        raise ValueError(
-            "Opus A8W4 stage2 does not have a shape family for "
-            f"inter_states={tuple(inter_states.shape)}, w2={tuple(w2.shape)}, "
-            f"topk={topk}"
-        )
-    if int(inter_dim_pad) not in (0, shape_family.inter_dim_pad):
-        raise ValueError(
-            "Opus A8W4 stage2 inter_dim_pad is derived from shape family "
-            f"{shape_family.name}; expected 0 or {shape_family.inter_dim_pad}, "
-            f"got {inter_dim_pad}"
-        )
+    actual_inter_dim_pad = int(inter_dim_pad)
     kernel_contract = OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT
     expected_w2 = (
         w2.shape[0],
         w2.shape[1],
-        shape_family.logical_inter_dim // kernel_contract.fp4_values_per_byte,
+        inter_states.shape[2] // kernel_contract.fp4_values_per_byte,
     )
     if tuple(w2.shape) != expected_w2:
         raise ValueError(
@@ -304,7 +288,7 @@ def opus_a8w4_stage2_wrapper(
             num_valid_ids,
             block_m=kernel_block_m,
             kernel_id=int(kernel_id),
-            inter_dim_pad=shape_family.inter_dim_pad,
+            inter_dim_pad=actual_inter_dim_pad,
             return_per_slot=True,
         )
         if route_out.dtype == torch.uint8:  # MXFP8 route_out
@@ -330,7 +314,7 @@ def opus_a8w4_stage2_wrapper(
         out=out,
         block_m=kernel_block_m,
         kernel_id=int(kernel_id),
-        inter_dim_pad=shape_family.inter_dim_pad,
+        inter_dim_pad=actual_inter_dim_pad,
     )
 
 

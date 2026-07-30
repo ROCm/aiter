@@ -3,13 +3,15 @@
 
 
 import os
+
 import torch
 from torch.distributed import ProcessGroup
 
-from aiter import logger, get_hip_quant
+from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
@@ -20,10 +22,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
-    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", "-1"))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
-        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
     )
 
     def __init__(
@@ -60,7 +62,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group=self.cpu_group,
                     device=self.device,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to initialize PyNcclCommunicator for group "
                     f"{self.unique_name}. Exception: {e}"
@@ -129,6 +131,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 from .all2all import MoriAll2AllManager
 
                 self._all2all_manager = MoriAll2AllManager(self.cpu_group)
+            elif self.all2all_backend == "flydsl":
+                from .all2all import FlyDSLAll2AllManager
+
+                self._all2all_manager = FlyDSLAll2AllManager(self.cpu_group)
             elif self.all2all_backend == "flashinfer_all2allv":
                 from .all2all import FlashInferAllToAllManager
 
@@ -252,6 +258,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
             if self._ar_1stage_override is not None
             else (total_bytes <= total_bytes_limit)
         )
+        qr_comm = self.qr_comm
+        if (
+            not use_1stage
+            and not use_general_path
+            and x_pad_to_multiple == 0
+            and input_n == n
+            and not gemma_norm
+            and qr_comm is not None
+            and not qr_comm.disabled
+            and qr_comm.should_quick_allreduce_rmsnorm(input_, res_inp_, weight_, n)
+        ):
+            out, res_out = qr_comm.quick_all_reduce_rmsnorm(
+                input_, res_inp_, weight_, eps, n
+            )
+            assert out is not None
+            assert res_out is not None
+            return out, res_out
+
         if (
             not use_general_path
             and can_use_custom_ar
@@ -505,7 +529,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else:
                         out, res_out, scale_out = result
                     fused_ok = True
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(

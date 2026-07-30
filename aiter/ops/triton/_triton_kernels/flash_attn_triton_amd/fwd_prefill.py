@@ -1,14 +1,16 @@
 import warnings
+from typing import Literal
+
 import torch
 import triton
 import triton.language as tl
-from typing import Literal, Optional
-from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
+
+from .common import apply_rotary, compute_alibi_block, compute_fp8_scaling_factors
 from .utils import (
     AUTOTUNE,
-    AutotuneMode,
     DEBUG,
     FWD_CONF_OVERRIDE,
+    AutotuneMode,
     get_arch,
     is_fp8,
     remap_xcd,
@@ -37,20 +39,7 @@ def get_fwd_prefill_configs(mode: AutotuneMode):
         if FWD_CONF_OVERRIDE:
             return [FWD_CONF_OVERRIDE]
         arch = get_arch()
-        if arch.name == "gfx950":
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 128,
-                        "BLOCK_N": 64,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-        elif arch.name == "gfx942":
+        if arch.name == "gfx950" or arch.name == "gfx942":
             return [
                 triton.Config(
                     {
@@ -329,7 +318,7 @@ def _attn_fwd_inner(
     seqlen_delta_qk = seqlen_k - seqlen_q
 
     # loop over k, v, and update accumulator
-    for start_n in range(block_min, block_max, BLOCK_N):
+    for start_n in tl.range(block_min, block_max, BLOCK_N, num_stages=1):
         # get ptrs
         k_ptrs = k_base_ptrs + start_n * stride_kn
         v_ptrs = v_base_ptrs + start_n * stride_vk
@@ -366,12 +355,11 @@ def _attn_fwd_inner(
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=ACCUMULATOR_TYPE)
 
         # Apply extra token masking for partial blocks (only when APPLY_MASK=True)
-        if APPLY_MASK:
-            if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
-                boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
-                size_n = start_n + offs_n[None, :]
-                mask = size_n < boundary_m[:, None]
-                qk = tl.where(mask, qk, float("-inf"))
+        if APPLY_MASK and ((n_extra_tokens != 0) and (start_n + BLOCK_N == block_max)):
+            boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
+            size_n = start_n + offs_n[None, :]
+            mask = size_n < boundary_m[:, None]
+            qk = tl.where(mask, qk, float("-inf"))
 
         # -- compute qk ----
         if IS_FP8:
@@ -1447,38 +1435,38 @@ def attention_forward_prefill_triton_impl(
     v: torch.Tensor,
     o: torch.Tensor,
     softmax_lse: torch.Tensor,
-    sd_mask: Optional[torch.Tensor],
+    sd_mask: torch.Tensor | None,
     sm_scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
     layout: Literal["bshd", "bhsd", "thd"],
     # varlen
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_q: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlens_q: int,
     max_seqlens_k: int,
     # dropout
     dropout_p: float,
-    philox_seed: Optional[int],
-    philox_offset: Optional[int],
+    philox_seed: int | None,
+    philox_offset: int | None,
     # misc
     return_scores: bool,
     use_exp2: bool,
     # fp8
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     # seqused for FA v3
-    seqused_q: Optional[torch.Tensor] = None,
-    seqused_k: Optional[torch.Tensor] = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
     # rotary (optional)
-    rotary_cos: Optional[torch.Tensor] = None,
-    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
     rotary_interleaved: bool = False,
-    seqlens_rotary: Optional[torch.Tensor] = None,
+    seqlens_rotary: torch.Tensor | None = None,
 ):
     # get params, strides and shape
     IS_VARLEN = layout == "thd"
@@ -1500,8 +1488,8 @@ def attention_forward_prefill_triton_impl(
     if IS_VARLEN:
         # shape
         total_seqlen_q, nheads_q, head_size_q = q.shape
-        total_seqlen_k, nheads_k, head_size_k = k.shape
-        total_seqlen_v, nheads_v, head_size_v = v.shape
+        _total_seqlen_k, nheads_k, head_size_k = k.shape
+        _total_seqlen_v, nheads_v, head_size_v = v.shape
 
         # assert shapes
         assert (
@@ -1919,7 +1907,7 @@ def attention_forward_prefill_triton_impl(
         IS_VARLEN=IS_VARLEN,
         BLOCK_DMODEL_QK=padded_d_model_qk,
         BLOCK_DMODEL_V=padded_d_model_v,
-        USE_BIAS=False if bias is None else True,
+        USE_BIAS=not bias is None,
         USE_ALIBI=use_alibi,
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,

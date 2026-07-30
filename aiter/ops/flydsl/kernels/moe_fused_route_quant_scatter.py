@@ -62,23 +62,27 @@ from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, ptrtoint, range_constexpr, const_expr, rocdl, vector, gpu
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc, MOE_KERNARG_PRELOAD_COUNT
-
+from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
+)
+from aiter.utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
+)
 from aiter.utility.mx_types import (
     MxDtypeInt as _MxDtype,
-    MX_DEFAULT_ROUND_MODE as _ROUND_MODE,
 )
 
 BLOCK_THREADS = 256
@@ -527,7 +531,7 @@ def build_moe_fused_route_quant_scatter_module(
         f"_{quant_mode}_{L.native_tag}_{base_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32
         counter: fx.Pointer,  # (E,) int32, init 0
@@ -706,7 +710,7 @@ def build_moe_fused_route_quant_scatter_module(
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -730,8 +734,8 @@ def build_moe_fused_route_quant_scatter_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -798,7 +802,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         f"_{quant_mode}_{L.native_tag}_{base_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[block_threads, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (topk,) int32
         counter: fx.Pointer,  # (E,) int32 out
@@ -939,7 +943,7 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         expert_row_base: fx.Pointer,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(k_groups, type=T.i32))
@@ -960,8 +964,8 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1044,7 +1048,7 @@ def build_moe_fused_quant_preshuffle_module(
         f"_{quant_mode}_{L.native_tag}_{skip_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         grouped_in: fx.Pointer,  # (n_rows*feat_dim,) bf16
         grouped_payload: fx.Pointer,  # (n_rows*payload_bytes_per_row,) uint8 out
@@ -1179,7 +1183,7 @@ def build_moe_fused_quant_preshuffle_module(
         n_rows: fx.Int32,
         max_m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         grid_x = arith.index_cast(T.index, grid_blocks)
         fused_kernel(
@@ -1197,8 +1201,8 @@ def build_moe_fused_quant_preshuffle_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1254,7 +1258,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}"
     )
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         grouped_in: fx.Pointer,  # flat grouped activations
         grouped_payload: fx.Pointer,
@@ -1397,7 +1401,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         route_max_m: fx.Int32,
         numel: fx.Int32,
         grid_route_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(block_iters, type=T.i32))
@@ -1417,8 +1421,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 
@@ -1521,7 +1525,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
     # inline-asm coherent global load/store miscompiles here).
     _is_gfx12 = str(L.arch).startswith("gfx12")
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
     def fused_kernel(
         topk_ids: fx.Pointer,  # (numel,) int32
         count: fx.Pointer,  # (E,) int32 in/out (init 0) -> masked_m
@@ -1820,7 +1824,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         tile_m: fx.Int32,
         num_workers: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):
@@ -1850,8 +1854,8 @@ def build_moe_fused_route_psum_quant_scatter_module(
 
     launch_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
-            "amdgpu-kernarg-preload-count": MOE_KERNARG_PRELOAD_COUNT,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
 

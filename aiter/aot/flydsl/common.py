@@ -5,17 +5,18 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import enum
 import json
 import multiprocessing
-from multiprocessing.connection import wait as wait_for_sentinels
+import os
 import shutil
 import tempfile
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-import enum
-import os
-from typing import Any, Callable, Iterator
+from multiprocessing.connection import wait as wait_for_sentinels
+from typing import Any
 
 _DEFAULT_KERNEL_TIMEOUT = 1200.0
 _DEFAULT_MAX_WORKERS = 64
@@ -29,6 +30,7 @@ class OpKind(enum.Enum):
     construction errors instead of silently routing to the wrong code path."""
 
     MOE = "moe"
+    MXFP4_MOE = "mxfp4_moe"
     GEMM = "gemm"
     GROUPED_MOE = "grouped_moe"
     CHUNK_GDN_H = "chunk_gdn_h"
@@ -136,6 +138,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     parent process, just shifted once out of every child."""
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
+    elif kind is OpKind.MXFP4_MOE:
+        from .mxfp4_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
         from .gemm import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GROUPED_MOE:
@@ -150,6 +154,8 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
     if kind is OpKind.MOE:
         from .moe import compile_one_config
+    elif kind is OpKind.MXFP4_MOE:
+        from .mxfp4_moe import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
     elif kind is OpKind.GROUPED_MOE:
@@ -224,7 +230,7 @@ def _memory_worker_cap(default_workers: int) -> int:
         import psutil
 
         avail_gb = psutil.virtual_memory().available / (1024**3)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return default_workers
     return min(default_workers, max(1, int(avail_gb / per_gb)))
 
@@ -319,7 +325,7 @@ def _run_file_pool(
             try:
                 with open(out_path) as f:
                     result = json.load(f)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 result = None
         if result is None:
             label = specs[idx][2]
@@ -364,7 +370,7 @@ def _run_file_pool(
             try:
                 if proc.is_alive():
                     proc.kill()
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
 
     if retries_used:

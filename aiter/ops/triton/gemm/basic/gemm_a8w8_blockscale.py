@@ -1,23 +1,32 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
+import math
+import os
+
 import torch
 import triton
-import math
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
-    _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
-    _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
-    _get_config,
-)
+from packaging.version import Version
+
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_kernel as triton_gemm_a8w8_blockscale_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _gemm_a8w8_blockscale_preshuffle_kernel as triton_gemm_a8w8_blockscale_preshuffle_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8_blockscale import (
+    _get_config,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
+_FORCE_GFX1250_EX = os.environ.get("AITER_FORCE_GFX1250_EX", "0") == "1"
+_TRITON_VERSION = Version(triton.__version__)
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 
@@ -27,7 +36,7 @@ def _is_gluon_available():
     try:
         arch = get_arch()
         return any(s in arch for s in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -36,12 +45,12 @@ def gemm_a8w8_blockscale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -116,7 +125,7 @@ def gemm_a8w8_blockscale(
     ), "GROUP_K must equal BLOCK_SIZE_K"
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -246,13 +255,13 @@ def gemm_a8w8_blockscale_preshuffle(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
-    is_x_scale_tranposed: Optional[bool] = True,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
+    is_x_scale_tranposed: bool | None = True,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes 8 bit matrix multiplication Y = X @ W^T using block-wise quantization scales.
@@ -298,6 +307,20 @@ def gemm_a8w8_blockscale_preshuffle(
     if config is None:
         config, _ = _get_config(M, N, K, True, backend=backend)
 
+    # Triton 3.6 fails TritonAMDGPUConvertToBufferOps for gfx950 preshuffle
+    # configs with three pipeline stages. Keep the tuned tile and split-K.
+    if (
+        backend == "triton"
+        and get_arch() == "gfx950"
+        and _TRITON_VERSION < Version("3.7.0")
+        and config.get("num_stages", 1) > 2
+    ):
+        config["num_stages"] = 2
+
+    kernel_type_from_config = config.pop("kernel_type", None)
+    if kernel_type_from_config is not None:
+        kernel_type = kernel_type_from_config
+
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
@@ -335,8 +358,11 @@ def gemm_a8w8_blockscale_preshuffle(
         config["GROUP_K"] == config["BLOCK_SIZE_K"]
     ), "GROUP_K must equal BLOCK_SIZE_K"
 
+    if _FORCE_GFX1250_EX:
+        config["BLOCK_SIZE_K"] = 64
+
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

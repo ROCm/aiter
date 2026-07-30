@@ -1,6 +1,7 @@
-from csrc.cpp_itfs.utils import compile_hsaco_from_triton, run_hsaco
-from aiter.aot.test.matmul_fp16 import matmul_fp16
 import torch
+
+from aiter.aot.test.matmul_fp16 import matmul_fp16
+from csrc.cpp_itfs.utils import compile_hsaco_from_triton, run_hsaco
 
 if __name__ == "__main__":
     compile_hsaco_from_triton(
