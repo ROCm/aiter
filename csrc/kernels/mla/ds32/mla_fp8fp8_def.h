@@ -60,12 +60,14 @@ template <int Q_TILE_SIZE_  = 16,
           int NUM_WARPS_    = 8,
           typename D_Q_     = fp8_t,
           typename D_K_     = fp8_t,
-          typename D_OUT_   = bf16_t>
+          typename D_OUT_   = bf16_t,
+          bool CAUSAL_      = false>
 struct mla_16mx8_32nx1_fp8fp8_ps_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool CAUSAL      = CAUSAL_;
 
     static constexpr int WARP_SIZE  = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
