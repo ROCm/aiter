@@ -11,8 +11,10 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
     _moe_gemm_a4w4,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
+    _moe_gemm_a4w4_decode,
     _moe_gemm_a4w4_prefill,
-    get_moe_a4w4_layouts,
+    get_moe_a4w4_layouts_decode,
+    get_moe_a4w4_layouts_prefill,
 )
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -134,10 +136,20 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_xcds = 1
 
     if block_m == 16:
-        block_n = 512
+        # decode kernel: keep the LDS footprint small enough for real occupancy.
+        # block_n must stay a multiple of 32 * num_warps (the 32x16x128 wmma is
+        # transposed, so one warp round covers 32 columns per warp).
         block_k = 512
-        num_buffers = 2
         num_warps = 4
+        if n <= 1536:
+            block_n = 128
+            num_buffers = 3
+        elif n <= 3072:
+            block_n = 128
+            num_buffers = 2
+        else:
+            block_n = 256
+            num_buffers = 1
     elif block_m == 32:
         block_n = 512
         block_k = 512
@@ -340,7 +352,77 @@ def moe_gemm_a4w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    if use_gluon and get_arch() == "gfx1250":
+    if use_gluon and get_arch() == "gfx1250" and block_m == 16:
+        assert (
+            config["split_k"] == 1
+        ), "Split-k is not supported for Gluon backend on gfx1250"
+        # decode reads the activation scales via TDM only
+        num_ctas = 1 if gather_indx is not None else config["num_ctas"]
+        layouts = get_moe_a4w4_layouts_decode(
+            BLOCK_M=config["block_m"],
+            BLOCK_N=config["block_n"],
+            BLOCK_K=config["block_k"],
+            num_warps=config["num_warps"],
+            num_ctas=num_ctas,
+            ACTIVATION_REDUCTION_N=reduction_n_matmul,
+            PRESHUFFLE_WEIGHTS=preshuffle_weights,
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            GatherIndx=gather_indx,
+        )
+        # launch gluon kernel
+        _moe_gemm_a4w4_decode[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            x_scales,
+            x_scales.stride(0),
+            x_scales.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            num_tokens,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            SPLIT_K=config["split_k"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SWIZZLE_MX_SCALE=swizzle_mx_scale,
+            PRESHUFFLE_WEIGHTS=preshuffle_weights,
+            NUM_BUFFERS=config["num_buffers"],
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            CLAMP_BOUNDS=K % config["block_k"] != 0,
+            **layouts,
+            num_ctas=num_ctas,
+            num_warps=config["num_warps"],
+        )
+    elif use_gluon and get_arch() == "gfx1250":
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
@@ -350,7 +432,7 @@ def moe_gemm_a4w4(
             K % config["block_k"] != 0
         )
         # layouts
-        layouts = get_moe_a4w4_layouts(
+        layouts = get_moe_a4w4_layouts_prefill(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
             BLOCK_K=config["block_k"],
@@ -413,7 +495,6 @@ def moe_gemm_a4w4(
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
-            L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
             **layouts,
