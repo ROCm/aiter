@@ -415,7 +415,6 @@ def moe_gemm_a4w4(
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             L2_PREFETCH_DISTANCE=config["l2_prefetch_distance"],
             X_SCALES_TDM=x_scales_tdm,
-            EVEN_K=K % config["block_k"] == 0,
             CLAMP_BOUNDS=clamp_bounds,
             **layouts,
             num_ctas=1 if gather_indx is not None else config["num_ctas"],
