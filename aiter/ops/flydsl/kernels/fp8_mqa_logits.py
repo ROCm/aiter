@@ -30,11 +30,14 @@ import torch
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import _split_mfma_operands
+from flydsl.expr.rocdl import _split_mfma_operands, _unwrap_mfma_operand
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf, vector as mlir_vector
 from flydsl._mlir.dialects.rocdl import mfma_f32_32x32x16_fp8_fp8 as _ods_mfma32x32x16
+from flydsl._mlir.dialects.rocdl import (
+    mfma_scale_f32_32x32x64_f8f6f4 as _ods_mfma_scale32x32x64,
+)
 from flydsl._mlir import ir
 from flydsl.runtime.device import get_rocm_arch
 
@@ -50,6 +53,27 @@ arch = get_rocm_arch()
 # Adding a new MFMA shape only requires a new MfmaAtom instance and a new
 # entry in _VARIANT_BUILDERS; the kernel builder is fully generic.
 # --------------------------------------------------------------------------- #
+
+def _make_operands_dense(a, b, acc):
+    """Default ``MfmaAtom.make_operands``: dense-MFMA 6-operand convention
+    ``[a, b, c, cbsz, abid/blgp, blgp]`` (all zero besides the fragments)."""
+    return [a, b, acc, 0, 0, 0]
+
+
+def _make_operands_scaled_identity(a, b, acc):
+    """``MfmaAtom.make_operands`` for the CDNA4 scaled MFMA atoms (K=128/64).
+
+    These instructions always carry ``scaleA``/``scaleB`` UE8M0 operands as
+    part of their encoding; passing a compile-time identity scale (UE8M0
+    bias-127, i.e. every byte == 127 -> multiplier 1.0) makes the hardware
+    microscale a no-op. The kernel's own ``kv_scale`` is applied in f32
+    after the MFMA (scale-hoisted), so this is the only scale these atoms
+    need. NOTE: the identity encoding is standard OCP MX (bias 127) but not
+    yet empirically re-verified on this instruction -- see the smoke test.
+    """
+    scale = arith.constant(0x7F7F7F7F, type=T.i32)
+    return [a, b, acc, 0, 0, 0, scale, 0, scale]
+
 
 @dataclass(frozen=True)
 class MfmaAtom:
@@ -82,8 +106,22 @@ class MfmaAtom:
         groups in blocks of 4, giving
         ``static_offsets = (0,1,2,3,8,9,10,11,16,17,18,19,24,25,26,27)``
         and ``group_stride = 4`` (empirically verified on gfx942/CDNA3).
+        The CDNA4 scaled atoms (16x16x128, 32x32x64) reuse these fields
+        verbatim from their K=32/K=16 siblings: ``tv_layout_c`` (read via
+        standalone ``fly.MmaAtomType`` introspection) is identical across
+        the K variants for a given (M, N) -- it depends only on the output
+        tile shape, not the reduction depth.
     acc_head_group_stride : int
-        Multiplier for the lane-group index (always 4 on gfx942 fp8 MFMA).
+        Multiplier for the lane-group index (always 4 on gfx942/gfx950 fp8 MFMA).
+    frag_bytes : int
+        Bytes of A/B fragment data owned by one lane, one K-step. 8 for the
+        dense K=32/K=16 atoms (i64, one buffer_load). 32 for the CDNA4 scaled
+        K=128/K=64 atoms (vector<8xi32>, two dwordx4 buffer_loads).
+    make_operands : Callable
+        Builds the ``fn`` operand list from ``(a_frag, b_frag, acc)``.
+        Dense atoms use ``_make_operands_dense`` (6-elem); the CDNA4 scaled
+        atoms use ``_make_operands_scaled_identity`` (9-elem, appends an
+        identity UE8M0 scale pair).
     """
     name: str
     MFMA_M: int
@@ -94,6 +132,8 @@ class MfmaAtom:
     shuffle_offsets: tuple
     acc_head_static_offsets: tuple  # length == ACC_ELEMS
     acc_head_group_stride: int
+    frag_bytes: int = 8
+    make_operands: Callable = _make_operands_dense
 
 
 def _mfma32x32x16_fp8_fp8_wrapper(result_type, operands, *, loc=None, ip=None):
@@ -102,6 +142,28 @@ def _mfma32x32x16_fp8_fp8_wrapper(result_type, operands, *, loc=None, ip=None):
     a, b, c, cbsz, abid, blgp = _split_mfma_operands(operands)
     return _ods_mfma32x32x16(result_type, a, b, c, cbsz, abid, blgp,
                               loc=loc, ip=ip).result
+
+
+def _mfma32x32x64_fp8_fp8_scale_wrapper(result_type, operands, *, loc=None, ip=None):
+    """Wrap the raw ODS ``mfma_scale_f32_32x32x64_f8f6f4`` to match the
+    ``(result_type, operands_list)`` convention. ``operands`` follows the
+    9-elem scaled-MFMA convention: ``[a, b, c, cbsz, blgp, opselA, scaleA,
+    opselB, scaleB]`` (no ``abid``, unlike the dense atoms). Mirrors the
+    ready-made ``rocdl.mfma_scale_f32_16x16x128_f8f6f4`` friendly wrapper,
+    for which no 32x32x64 equivalent ships with FlyDSL yet."""
+    a = _unwrap_mfma_operand(operands[0])
+    b = _unwrap_mfma_operand(operands[1])
+    c = _unwrap_mfma_operand(operands[2])
+    cbsz = int(operands[3]) if len(operands) > 3 else 0
+    blgp = int(operands[4]) if len(operands) > 4 else 0
+    opselA = int(operands[5]) if len(operands) > 5 else 0
+    scaleA = _unwrap_mfma_operand(operands[6]) if len(operands) > 6 else a
+    opselB = int(operands[7]) if len(operands) > 7 else 0
+    scaleB = _unwrap_mfma_operand(operands[8]) if len(operands) > 8 else b
+    return _ods_mfma_scale32x32x64(
+        result_type, a, b, c, cbsz, blgp, opselA, scaleA, opselB, scaleB,
+        loc=loc, ip=ip,
+    ).result
 
 
 #: 16×16 output tile, K=32 fp8 elements/step.  Acc: vec<4 x f32>.
@@ -136,6 +198,45 @@ _MFMA32 = MfmaAtom(
         24, 25, 26, 27,# ii=12..15:head = g*4 + 24..27
     ),
     acc_head_group_stride=4,
+)
+
+#: gfx950/CDNA4 scaled MFMA: 16x16 output tile, K=128 fp8f6f4 elements/step.
+#: Acc: vec<4 x f32> (same layout as _MFMA16 -- tv_layout_c depends only on
+#: M,N). Fragment: vector<8xi32> (32 bytes/lane), 4x _MFMA16's 8-byte frag,
+#: tracking the 4x K increase. Requires native FN operands (this instruction
+#: rejects FNUZ) and head_size % 128 == 0 (enforced by the generic D%K assert
+#: in _build_kernel_mfma_r_w).
+_MFMA16_K128 = MfmaAtom(
+    name="16x16x128",
+    MFMA_M=16, MFMA_N=16, MFMA_K=128,
+    ACC_ELEMS=4,
+    fn=rocdl.mfma_scale_f32_16x16x128_f8f6f4,
+    shuffle_offsets=(16, 32),
+    acc_head_static_offsets=(0, 1, 2, 3),
+    acc_head_group_stride=4,
+    frag_bytes=32,
+    make_operands=_make_operands_scaled_identity,
+)
+
+#: gfx950/CDNA4 scaled MFMA: 32x32 output tile, K=64 fp8f6f4 elements/step.
+#: Acc: vec<16 x f32> (same layout as _MFMA32). Fragment: vector<8xi32>
+#: (32 bytes/lane), 4x _MFMA32's 8-byte frag. Requires native FN operands
+#: (rejects FNUZ); works for both head_size 64 and 128.
+_MFMA32_K64 = MfmaAtom(
+    name="32x32x64",
+    MFMA_M=32, MFMA_N=32, MFMA_K=64,
+    ACC_ELEMS=16,
+    fn=_mfma32x32x64_fp8_fp8_scale_wrapper,
+    shuffle_offsets=(32,),
+    acc_head_static_offsets=(
+        0, 1, 2, 3,    # ii=0..3:  head = g*4 + 0..3
+        8, 9, 10, 11,  # ii=4..7:  head = g*4 + 8..11
+        16, 17, 18, 19,# ii=8..11: head = g*4 + 16..19
+        24, 25, 26, 27,# ii=12..15:head = g*4 + 24..27
+    ),
+    acc_head_group_stride=4,
+    frag_bytes=32,
+    make_operands=_make_operands_scaled_identity,
 )
 
 
@@ -291,6 +392,13 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
         lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
         lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
         lane8      = fx.Int32(arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(8))))
+        # lane_frag_off: generalized per-lane-group byte offset for the wide
+        # (frag_bytes=32) CDNA4 scaled atoms -- same role as lane8, just
+        # scaled to the wider fragment (each lane group owns frag_bytes
+        # contiguous bytes per K-step instead of 8).
+        lane_frag_off = fx.Int32(
+            arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(mfma.frag_bytes)))
+        )
 
         # fp8 operands are read as i32 dwords (v8i8 buffer_load fails to lower
         # on gfx942), then bitcast to i64 for the MFMA.
@@ -351,6 +459,24 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
             lo_i64 = v2xi64[0].ir_value()
             hi_i64 = v2xi64[1].ir_value()
             return lo_i64, hi_i64
+
+        def _load_pack_i32x8(i32_view, byte_off_i32):
+            """256-bit-equivalent load: returns a ``vector<8xi32>`` ir.Value
+            covering this lane's 32 fp8 bytes (frag_bytes=32 CDNA4 scaled atoms).
+
+            Hardware buffer_load tops out at dwordx4 (128 bits), so the
+            fragment is split into two consecutive dwordx4 loads and
+            concatenated via vector.shuffle. byte_off_i32 must already
+            include the lane's byte offset (lane_frag_off) so the load hits
+            the correct 32-byte chunk for this lane group.
+            """
+            dword_off = fx.Int32(
+                arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
+            )
+            v4_lo = i32_view.vec_load((dword_off,), vec_size=4)
+            dword_off_hi = _i32_add(dword_off, fx.Int32(4))
+            v4_hi = i32_view.vec_load((dword_off_hi,), vec_size=4)
+            return Vec(v4_lo).shuffle(v4_hi, list(range(8))).ir_value()
 
         def _load_pack_i64_swizzle(i32_view, byte_off_i32):
             """128-bit load + permlane32.swap: each lane gets its correct 8 bytes,
@@ -451,7 +577,16 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                 )
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    if const_expr(_N_LANE_GROUPS == 2):
+                    if const_expr(mfma.frag_bytes == 32):
+                        # CDNA4 scaled atoms (16x16x128/32x32x64): 256-bit
+                        # fragment via two dwordx4 loads, offset by this
+                        # lane group's frag_bytes-wide chunk. Native FN
+                        # operands -- never FN->FNUZ converted.
+                        raw = _load_pack_i32x8(
+                            q_i32,
+                            _i32_add(base_a, _i32_add(fx.Int32(kk * mfma.MFMA_K), lane_frag_off)),
+                        )
+                    elif const_expr(_N_LANE_GROUPS == 2):
                         # 32x32x16: 128-bit load + permlane32.swap.
                         # All lanes load 16 bytes at base (no lane8 offset);
                         # swap distributes the hi half to group 1, zero waste.
@@ -549,7 +684,16 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                 kv_scales_tile[ni] = _to_raw(fx.Float32(sc_t[col_clamped]))
                 base_b = fx.Int32(arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    if const_expr(_N_LANE_GROUPS == 2):
+                    if const_expr(mfma.frag_bytes == 32):
+                        # CDNA4 scaled atoms (16x16x128/32x32x64): 256-bit
+                        # fragment via two dwordx4 loads, offset by this
+                        # lane group's frag_bytes-wide chunk. Native FN
+                        # operands -- never FN->FNUZ converted.
+                        raw = _load_pack_i32x8(
+                            kv_i32,
+                            _i32_add(base_b, _i32_add(fx.Int32(kk * mfma.MFMA_K), lane_frag_off)),
+                        )
+                    elif const_expr(_N_LANE_GROUPS == 2):
                         # 32x32x16: 128-bit load + permlane32.swap.
                         # All lanes load 16 bytes at base (no lane8 offset);
                         # swap distributes the hi half to group 1, zero waste.
@@ -582,7 +726,7 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
                         for kk in range_constexpr(K_STEPS):
                             acc = mfma_fn(
                                 _mfma_res_ty,
-                                [a_packs[j][mi][kk], b_packs[ni][kk], acc, 0, 0, 0],
+                                mfma.make_operands(a_packs[j][mi][kk], b_packs[ni][kk], acc),
                             )
                         for ii in range_constexpr(mfma.ACC_ELEMS):
                             score   = Vec(acc)[ii].ir_value()
@@ -698,6 +842,20 @@ def _mfma32_bkv(bkv, r, w):
         mfma=_MFMA32, rows_per_block=r, waves_per_block=w,
     )
 
+def _mfma16k128_bkv(bkv, r, w):
+    """Helper: lambda for a gfx950 16x16x128-scaled-fp8 variant with given bkv/r/w."""
+    return lambda **kw: _build_kernel_mfma_r_w(
+        **{**kw, "block_kv": bkv},
+        mfma=_MFMA16_K128, rows_per_block=r, waves_per_block=w,
+    )
+
+def _mfma32k64_bkv(bkv, r, w):
+    """Helper: lambda for a gfx950 32x32x64-scaled-fp8 variant with given bkv/r/w."""
+    return lambda **kw: _build_kernel_mfma_r_w(
+        **{**kw, "block_kv": bkv},
+        mfma=_MFMA32_K64, rows_per_block=r, waves_per_block=w,
+    )
+
 _VARIANT_BUILDERS = {
     # --- 16x16x32 fp8 variants (bkv=64) ---
     "mfma16x16x32_bkv64_r1_w1":   _mfma16_bkv(64,  1, 1),
@@ -717,6 +875,20 @@ _VARIANT_BUILDERS = {
     "mfma32x32x16_bkv128_r2_w1":  _mfma32_bkv(128, 2, 1),
     "mfma32x32x16_bkv128_r2_w2":  _mfma32_bkv(128, 2, 2),
 }
+
+if arch == "gfx950":
+    # CDNA4 scaled MFMA atoms (K=128/64) -- gfx950-only: these instructions
+    # require native FN operands (reject FNUZ) and don't exist on gfx942.
+    _VARIANT_BUILDERS.update({
+        "mfma16x16x128_bkv128_r1_w1": _mfma16k128_bkv(128, 1, 1),
+        "mfma16x16x128_bkv128_r2_w1": _mfma16k128_bkv(128, 2, 1),
+        "mfma16x16x128_bkv128_r1_w2": _mfma16k128_bkv(128, 1, 2),
+        "mfma16x16x128_bkv128_r2_w2": _mfma16k128_bkv(128, 2, 2),
+        "mfma32x32x64_bkv128_r1_w1":  _mfma32k64_bkv(128, 1, 1),
+        "mfma32x32x64_bkv128_r2_w1":  _mfma32k64_bkv(128, 2, 1),
+        "mfma32x32x64_bkv128_r1_w2":  _mfma32k64_bkv(128, 1, 2),
+        "mfma32x32x64_bkv128_r2_w2":  _mfma32k64_bkv(128, 2, 2),
+    })
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
 DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2"
