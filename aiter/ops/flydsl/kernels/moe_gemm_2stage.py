@@ -66,33 +66,6 @@ from .mfma_preshuffle_pipeline import (
 from .tensor_shim import _run_compiled
 
 
-def _barrier(vmcnt=63, lgkmcnt=63):
-    """Emit s_waitcnt + s_barrier via inline asm.
-
-    Bypasses LLVM SIInsertWaitcnts which would insert a conservative
-    s_waitcnt vmcnt(0) lgkmcnt(0) before every S_BARRIER MI.
-    vmcnt=63 / lgkmcnt=63 means "don't wait on this counter".
-    """
-    parts = []
-    needs_waitcnt = vmcnt < 63 or lgkmcnt < 63
-    if needs_waitcnt:
-        wc = []
-        if vmcnt < 63:
-            wc.append(f"vmcnt({vmcnt})")
-        if lgkmcnt < 63:
-            wc.append(f"lgkmcnt({lgkmcnt})")
-        parts.append("s_waitcnt " + " ".join(wc))
-    parts.append("s_barrier")
-    llvm.InlineAsmOp(
-        res=None,
-        operands_=[],
-        asm_string="\n".join(parts),
-        constraints="",
-        has_side_effects=True,
-        is_align_stack=False,
-    )
-
-
 @contextmanager
 def _if_then(if_op):
     """Compat helper for SCF IfOp then-region across old/new Python APIs."""
@@ -436,6 +409,12 @@ def compile_moe_gemm1(
             inter_in = arith.index_cast(T.index, i32_inter_in)
             k_in = arith.index_cast(T.index, i32_k_in)
             size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
+
+            _swiglu_limit = fx.Float32(_swiglu_eff_limit)
+            _swiglu_neg_limit = fx.Float32(-_swiglu_eff_limit)
+            _swiglu_one = fx.Float32(1.0)
+            _swiglu_alpha_neg_log2e = fx.Float32(1.702 * (-1.4426950408889634))
+
             # i32 versions for layout construction (fly.make_shape requires i32/i64)
             tokens_i32_v = i32_tokens_in
             k_i32_v = i32_k_in
@@ -480,11 +459,6 @@ def compile_moe_gemm1(
                 den = 1.0 + emu
                 sig = rocdl.rcp(T.f32, den)
                 return x * sig
-
-            _swiglu_limit = fx.Float32(_swiglu_eff_limit)
-            _swiglu_neg_limit = fx.Float32(-_swiglu_eff_limit)
-            _swiglu_one = fx.Float32(1.0)
-            _swiglu_alpha_neg_log2e = fx.Float32(1.702 * (-1.4426950408889634))
 
             def swiglu_apply(gate_scaled, up_scaled):
                 """DSv3-style SwiGLU: g * sigmoid(1.702 * g) * (u + 1) with clamping.
@@ -686,8 +660,8 @@ def compile_moe_gemm1(
 
                     def _mxfp4_extract_e8m0_f32(packed_i32, byte_pos_idx):
                         shift = arith.index_cast(T.i32, byte_pos_idx) * fx.Int32(8)
-                        byte_i32 = arith.shrui(packed_i32, shift) & fx.Int32(0xFF)
-                        scale_bits = arith.shli(byte_i32, fx.Int32(23))
+                        byte_i32 = (packed_i32 >> shift) & fx.Int32(0xFF)
+                        scale_bits = byte_i32 << fx.Int32(23)
                         return arith.bitcast(T.f32, scale_bits)
 
                     def _mxfp4_load_scale_vec4(scale_ku_idx, mni_val):
@@ -3231,8 +3205,8 @@ def compile_moe_gemm2(
 
                     def _mxfp4_extract_e8m0_f32(packed_i32, byte_pos_idx):
                         shift = arith.index_cast(T.i32, byte_pos_idx) * fx.Int32(8)
-                        byte_i32 = arith.shrui(packed_i32, shift) & fx.Int32(0xFF)
-                        scale_bits = arith.shli(byte_i32, fx.Int32(23))
+                        byte_i32 = (packed_i32 >> shift) & fx.Int32(0xFF)
+                        scale_bits = byte_i32 << fx.Int32(23)
                         return arith.bitcast(T.f32, scale_bits)
 
                     def _mxfp4_load_scale_vec4(scale_ku_idx, mni_val):

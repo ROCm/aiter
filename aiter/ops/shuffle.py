@@ -225,7 +225,8 @@ def shuffle_weight_a16w4(
         experts_cnt, N_full, K_pk = src.shape
         KPack = 16
         KLane = 64 // NLane
-        L_sub = 4  # KPack = L_sub * L_sub = 16
+        L_sub = 4
+        assert KPack == L_sub * L_sub
         if gate_up:
             N = N_full // 2
             N0 = N // NLane
