@@ -22,8 +22,28 @@ from aiter.ops.quant import (
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
+
+def _running_on_gfx950() -> bool:
+    """True only on a live ROCm gfx950 device.
+
+    Everything under test lowers to the scalef32 fp4-cvt instructions, which
+    exist only on gfx950 and trap elsewhere -- so gating on
+    ``torch.cuda.is_available()`` alone would let this suite run, and fault, on
+    NVIDIA or on an earlier CDNA part. ``get_gfx_runtime`` rather than
+    ``get_gfx`` because the latter honours ``GPU_ARCHS`` and can name an arch
+    that is not the one installed.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        return False
+    try:
+        return aiter.get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        # Unrecognized arch, or no rocminfo to ask -- either way, not gfx950.
+        return False
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="ROCm/CUDA device is required"
+    not _running_on_gfx950(), reason="a ROCm gfx950 device is required"
 )
 
 HIDDEN = 7168
@@ -239,8 +259,6 @@ def test_compact_scale_gate_covers_every_tuned_decode_row(
     because the sorted-scale expansion launch disappears -- so the gate must not
     exclude them.
     """
-    if aiter.get_gfx() != "gfx950":
-        pytest.skip("fused sort+quant is gfx950-only")
     monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_COMPACT_SCALE", "auto")
     metadata = get_2stage_cfgs(
         tokens,
@@ -277,8 +295,6 @@ def test_fused_decode_sort_quant_gate(monkeypatch, experts, topk, tokens, expect
     ``AITER_CHECK`` aborts the process instead of raising, so an unsupported
     shape reaching the op is fatal -- this gate is the only guard.
     """
-    if aiter.get_gfx() != "gfx950":
-        pytest.skip("fused sort+quant is gfx950-only")
     monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_SORT_QUANT", "auto")
     hidden, topk_ids, topk_weights = _make_inputs(tokens, min(experts, 384), topk)
     assert (
@@ -305,6 +321,46 @@ def test_fused_decode_sort_quant_gate(monkeypatch, experts, topk, tokens, expect
     )
 
 
+@pytest.mark.parametrize(
+    "runtime_arch", ["gfx942", None], ids=["unsupported", "detection_failure"]
+)
+def test_fused_decode_sort_quant_gate_uses_runtime_arch(monkeypatch, runtime_arch):
+    """Runtime dispatch must ignore a potentially different build target."""
+    monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_SORT_QUANT", "auto")
+    if runtime_arch is None:
+
+        def detect_runtime_arch():
+            raise RuntimeError("runtime architecture unavailable")
+
+    else:
+
+        def detect_runtime_arch():
+            return runtime_arch
+
+    monkeypatch.setattr("aiter.fused_moe.get_gfx_runtime", detect_runtime_arch)
+    hidden, topk_ids, topk_weights = _make_inputs(8, 384, 8)
+
+    assert not _is_fused_decode_sort_quant_enabled(
+        hidden,
+        topk_ids,
+        topk_weights,
+        global_experts=384,
+        block_m=BLOCK_M,
+        quant_type=aiter.QuantType.per_1x32,
+        q_dtype_a=dtypes.fp4x2,
+        q_dtype_w=dtypes.fp4x2,
+        activation=aiter.ActivationType.Silu,
+        is_g1u1=True,
+        expert_mask=None,
+        num_local_tokens=None,
+        need_local_topk_ids=False,
+        run_1stage=False,
+        stage1_is_flydsl=True,
+        hidden_pad=0,
+        ksplit=0,
+    )
+
+
 @pytest.mark.parametrize("experts, topk", ROUTE_VARIANTS)
 def test_fused_sort_quant_is_cuda_graph_replay_safe(experts, topk):
     hidden, topk_ids, topk_weights = _make_inputs(4, experts, topk)
@@ -327,10 +383,6 @@ def test_fused_sort_quant_is_cuda_graph_replay_safe(experts, topk):
 @pytest.mark.parametrize("out_dtype", ["bf16", "fp4"])
 @pytest.mark.parametrize("k_wave", [1, 2, 4])
 def test_flydsl_compact_scale_consumer_matches_conventional_layout(k_wave, out_dtype):
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
-    if arch != "gfx950":
-        pytest.skip("compact-scale FlyDSL consumer is currently gfx950-only")
-
     # Use Kimi's production K dimension. In particular, kw4 traverses seven
     # K tiles per wave and exercises the compact-scale main loop plus odd tail.
     tokens, hidden_size, inter_dim, experts, topk = 8, HIDDEN, 128, 16, 4

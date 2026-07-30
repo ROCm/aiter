@@ -12,6 +12,9 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 
+#include <string>
+#include <vector>
+
 void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           aiter_tensor_t& topk_weights,
                           aiter_tensor_t& sorted_token_ids,
@@ -358,6 +361,36 @@ __global__ void __launch_bounds__(kThreads) moe_sort_quant_kernel(
     }
 }
 
+// The activation quantization above lowers to v_cvt_scalef32_pk_fp4_bf16, which
+// is part of the fp4-cvt-scale instruction set introduced with gfx950 (CDNA4).
+// Earlier CDNA parts have no FP4 convert instruction at all, so there is no
+// gfx942 equivalent to substitute -- and the MXFP4 MoE GEMM that consumes this
+// kernel's output is gfx950-only for the same reason, so a software-emulated
+// fallback would produce bytes nothing downstream could use. Reject other
+// architectures on the host instead, so an unsupported call reports an error
+// rather than executing the __builtin_trap() the device path compiles to.
+//
+// Cached per device: this sits on the decode path and hipGetDeviceProperties is
+// not cheap enough to call per launch.
+inline bool is_fp4_cvt_capable(int device_id)
+{
+    static const std::vector<char> capable = [] {
+        int count = 0;
+        HIP_CALL(hipGetDeviceCount(&count));
+        std::vector<char> caps(static_cast<size_t>(count), 0);
+        for(int i = 0; i < count; ++i)
+        {
+            hipDeviceProp_t prop;
+            HIP_CALL(hipGetDeviceProperties(&prop, i));
+            caps[static_cast<size_t>(i)] =
+                std::string(prop.gcnArchName).find("gfx950") != std::string::npos;
+        }
+        return caps;
+    }();
+    return device_id >= 0 && device_id < static_cast<int>(capable.size()) &&
+           capable[static_cast<size_t>(device_id)] != 0;
+}
+
 } // namespace aiter::mxfp4_moe
 
 void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
@@ -374,6 +407,25 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
 {
     using namespace aiter::mxfp4_moe;
 
+    const int device_id = hidden_states.device_id;
+    AITER_CHECK(is_fp4_cvt_capable(device_id),
+                __func__,
+                ": requires gfx950; the fp4 activation quantization uses the "
+                "scalef32 fp4-cvt instructions, which no earlier architecture has");
+    // An off-device tensor would otherwise be dereferenced by the kernel under
+    // this call's HipDeviceGuard and fault, or silently read another device's
+    // memory. moe_buf is exempt when empty: the zeroing pass skips it entirely.
+    AITER_CHECK(topk_ids.device_id == device_id && topk_weights.device_id == device_id &&
+                    sorted_token_ids.device_id == device_id &&
+                    sorted_weights.device_id == device_id &&
+                    sorted_expert_ids.device_id == device_id &&
+                    num_valid_ids.device_id == device_id &&
+                    (moe_buf.numel() == 0 || moe_buf.device_id == device_id) &&
+                    activation_quant.device_id == device_id &&
+                    activation_scale_token.device_id == device_id,
+                __func__,
+                ": all tensors must be on the same device");
+
     AITER_CHECK(hidden_states.dtype() == AITER_DTYPE_bf16,
                 __func__,
                 ": hidden_states must be BF16");
@@ -381,6 +433,13 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                     topk_weights.dtype() == AITER_DTYPE_fp32,
                 __func__,
                 ": expected int32 topk_ids and fp32 topk_weights");
+    AITER_CHECK(sorted_token_ids.dtype() == AITER_DTYPE_i32 &&
+                    sorted_weights.dtype() == AITER_DTYPE_fp32 &&
+                    sorted_expert_ids.dtype() == AITER_DTYPE_i32 &&
+                    num_valid_ids.dtype() == AITER_DTYPE_i32,
+                __func__,
+                ": expected int32 sorted_token_ids, fp32 sorted_weights, int32 "
+                "sorted_expert_ids, and int32 num_valid_ids");
     const int topk = topk_ids.dim() == 2 ? static_cast<int>(topk_ids.size(1)) : 0;
 
 #define AITER_MXFP4_SORT_QUANT_MATCH(NUM_EXPERTS, TOPK) \
@@ -430,6 +489,13 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                     num_valid_ids.numel() >= 2,
                 __func__,
                 ": incompatible fused sort/quant tensor sizes");
+    AITER_CHECK(moe_buf.numel() == 0 ||
+                    ((moe_buf.dtype() == AITER_DTYPE_bf16 ||
+                      moe_buf.dtype() == AITER_DTYPE_fp16) &&
+                     moe_buf.numel() >=
+                         static_cast<int64_t>(tokens) * kHiddenSize),
+                __func__,
+                ": moe_buf must be empty or contain at least M*7168 BF16/FP16 elements");
 
     AITER_CHECK(sorted_token_ids.numel() >= required_sorted &&
                     sorted_weights.numel() >= required_sorted &&

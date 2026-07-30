@@ -128,10 +128,14 @@ def _is_fused_decode_sort_quant_enabled(
     """
     if not _fused_decode_sort_quant_requested():
         return False
+    try:
+        runtime_is_gfx950 = get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        return False
     tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
     topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
     return (
-        get_gfx() == "gfx950"
+        runtime_is_gfx950
         and hidden_states.dtype == dtypes.bf16
         and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
         and hidden_states.shape[1] == 7168
@@ -2819,8 +2823,15 @@ def fused_moe_2stages(
         has_stage2_bias=bias2 is not None,
     )
     if prequantized_a1 is not None:
-        assert quant_type == QuantType.per_1x32
-        assert prequantized_a1_scale is not None
+        if quant_type != QuantType.per_1x32:
+            raise ValueError(
+                "prequantized_a1 is only supported for QuantType.per_1x32, "
+                f"got {quant_type}"
+            )
+        if prequantized_a1_scale is None:
+            raise ValueError(
+                "prequantized_a1_scale must be supplied alongside prequantized_a1"
+            )
         a1 = prequantized_a1
         a1_scale = prequantized_a1_scale
     elif not metadata.prequant:
