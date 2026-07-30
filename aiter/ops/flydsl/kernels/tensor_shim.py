@@ -27,6 +27,13 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
     os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
 )
 
+# Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
+# kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+# to enable it.
+AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+)
+
 
 def ptr_rsrc(ptr):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""

@@ -536,7 +536,7 @@ def build_moe_route_psum_fused_module():
 
     launch_route_psum_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }

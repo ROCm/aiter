@@ -29,6 +29,7 @@ from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
+from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
 TDM_DESCRIPTOR_VERSION = 1
 
@@ -726,5 +727,5 @@ def launch_gemm_a8w4_tdm(
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
-    "amdgpu-expert-scheduling-mode": True,
+    "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
 }
