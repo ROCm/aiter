@@ -396,9 +396,7 @@ def _compile_blockscale_wmma_to_cache(
 
     import torch
 
-    from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_gfx1250 import (
-        launch_gemm_a8w8_bsc_col,
-    )
+    from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
 
     dev = torch.device("cpu")
     k_blocks = (k + 127) // 128
@@ -410,7 +408,7 @@ def _compile_blockscale_wmma_to_cache(
     stream = fx.Stream(0)
 
     with compile_only_env():
-        launch_gemm_a8w8_bsc_col(
+        launch_gemm_a8w8(
             _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
@@ -432,6 +430,7 @@ def _compile_blockscale_wmma_to_cache(
             num_buffers,
             cluster_m,
             cluster_n,
+            True,
         )
 
 
@@ -455,7 +454,7 @@ def _compile_ptpc_wmma_to_cache(
 
     import torch
 
-    from aiter.ops.flydsl.kernels.gemm_a8w8_ptpc_gfx1250 import launch_gemm_a8w8_ptpc
+    from aiter.ops.flydsl.kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
 
     dev = torch.device("cpu")
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -466,7 +465,7 @@ def _compile_ptpc_wmma_to_cache(
     stream = fx.Stream(0)
 
     with compile_only_env():
-        launch_gemm_a8w8_ptpc(
+        launch_gemm_a8w8(
             _ptr_view_safe(out),
             _ptr_view_safe(xq),
             _ptr_view_safe(wq),
@@ -476,6 +475,7 @@ def _compile_ptpc_wmma_to_cache(
             stream,
             n,
             k,
+            0,
             xq.stride(0),
             out.stride(0),
             tile_m,
@@ -487,6 +487,7 @@ def _compile_ptpc_wmma_to_cache(
             num_buffers,
             cluster_m,
             cluster_n,
+            False,
         )
 
 
