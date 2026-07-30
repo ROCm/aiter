@@ -28,7 +28,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~1271<br>TFLOPS<br>(4Kx4Kx4K)</td><td>—</td><td>TBD</td>
 </tr>
 <tr>
-  <td rowspan="6"><code>mla_gluon</code></td><td rowspan="6">MLA</td><td rowspan="6">CDNA4</td>
+  <td rowspan="5"><code>mla_gluon</code></td><td rowspan="5">MLA</td><td rowspan="5">CDNA4</td>
   <td rowspan="2" nowrap>(bh64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size in {64, 128, 256}<br>nhead in {64, 128}<br>PAGE_SIZE=1<br>BLOCK_H=BLOCK_N=64</td>
   <td>python op_tests/test_mla.py \<br>-c 16384 -b 64 128 \<br>-n 64,1 128,1 \<br>-d bf16 -kvd bf16</td>
   <td>~563<br>TFLOPS</td><td>~477<br>TFLOPS</td><td>—</td>
@@ -41,11 +41,6 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td nowrap>(bh16bn128)<br>Q: bf16, KV: fp8, Out: bf16<br>batch_size = 1<br>nhead &le; 16<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=128</td>
   <td>python op_tests/test_mla.py \<br>-c 10000000 -b 1 -n 16,1 \<br>-d bf16 -kvd fp8</td>
   <td>~4.58<br>TB/s</td><td>—</td><td>—</td>
-</tr>
-<tr>
-  <td nowrap>(bh12bn64)<br>Q: bf16, KV: bf16, Out: bf16<br>batch_size = 1<br>nhead = 12<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=64<br>splits capped at 112</td>
-  <td>python op_tests/op_benchmarks/<br>triton/bench_mla_gluon_h12.py</td>
-  <td>See benchmark<br>output</td><td>—</td><td>—</td>
 </tr>
 <tr>
   <td rowspan="2" nowrap>(bh16bn64)<br>Q: bf16, KV: bf16<br>Out: bf16 (+fp32 lse<br>with -lse)<br>nhead &le; 16<br>batch_size &ge; 1<br>NUM_KV_SPLITS=<br>max(1,min(256//B,<br>cdiv(seq,64)))<br>(B*splits &le; 256)<br>PAGE_SIZE=1<br>BLOCK_H=16, BLOCK_N=64</td>
