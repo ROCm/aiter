@@ -10,7 +10,7 @@ import re
 import torch
 from torch import Tensor
 
-_launch_gemm_a8w8_bsc_col = None
+_launch_gemm_a8w8 = None
 _ptr_arg = None
 _fx = None
 
@@ -22,15 +22,15 @@ _MAX_SPLIT_K = 1
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8_bsc_col, _ptr_arg, _fx
-    if _launch_gemm_a8w8_bsc_col is not None:
+    global _launch_gemm_a8w8, _ptr_arg, _fx
+    if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a8w8_blockscale_gfx1250 import launch_gemm_a8w8_bsc_col
+    from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
     from .kernels.tensor_shim import ptr_arg
 
-    _launch_gemm_a8w8_bsc_col = launch_gemm_a8w8_bsc_col
+    _launch_gemm_a8w8 = launch_gemm_a8w8
     _ptr_arg = ptr_arg
     _fx = fx_mod
 
@@ -46,8 +46,7 @@ def _require_e8m0_scale(scale: Tensor, shape: tuple[int, int], name: str) -> Ten
         )
     if scale.dtype != dtypes.fp8_e8m0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] {name} must be fp8_e8m0, "
-            f"got {scale.dtype}"
+            f"[FlyDSL gfx1250 blockscale] {name} must be fp8_e8m0, got {scale.dtype}"
         )
     return scale
 
@@ -161,7 +160,7 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8_bsc_col(
+    _launch_gemm_a8w8(
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -183,6 +182,7 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
         nb,
         cluster_m,
         cluster_n,
+        True,
     )
     return Out
 
