@@ -27,7 +27,7 @@ def check_support(dtype, kv_dtype, nhead):
 
 def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
-) -> None:
+) -> dict[str, float | bool]:
     x, y = x.double(), y.double()
     ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
@@ -37,6 +37,12 @@ def cal_diff(
         assert cos_diff < 3e-2
     else:
         assert cos_diff < 1e-5
+    return {
+        f"{name}:RMSE": RMSE,
+        f"{name}:cos_diff": cos_diff,
+        f"{name}:amax_diff": amax_diff,
+        f"{name}:finite": bool(torch.isfinite(y).all().item()),
+    }
 
 
 def ref_masked_attention(
@@ -235,7 +241,8 @@ def test_mla(
     # the lazy "tile area" gate and the per-call ctx so decode-scale ctx_lens
     # (1M+) never trigger the O(N^2) ref.
     if (
-        (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
+        not args.decode_only
+        and (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
         and batch_size * ctx_lens * nhead < 256 * 8192 * 16
         and ctx_lens <= 16384
         and total_qo <= prefill_ref_token_cap
@@ -331,7 +338,8 @@ def test_mla(
     # and would OOM the host. Mirror the normal-prefill gate's explicit
     # ctx_lens <= 16384 cap to skip the ref for those configs.
     if (
-        (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
+        not args.decode_only
+        and (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
         and total_qo <= prefill_ref_token_cap
@@ -587,7 +595,14 @@ def test_mla(
             out_gluon,
             msg=f"mla_decode-absorb    [golden vs gluon_{name}]: {us_decode:>8.2f} us......",
         )
-        cal_diff(out_ref, out_gluon, f"out_gluon_{name}", use_fp8=(name == "bh16bn128"))
+        ret.update(
+            cal_diff(
+                out_ref,
+                out_gluon,
+                f"out_gluon_{name}",
+                use_fp8=(name == "bh16bn128"),
+            )
+        )
         if return_lse and lse is not None:
             checkAllclose(
                 lse_ref,
@@ -855,6 +870,11 @@ parser.add_argument(
     help="""Enable/disable causal masking. Default: True.
     --causal / --no-causal""",
 )
+parser.add_argument(
+    "--decode-only",
+    action="store_true",
+    help="Skip unrelated MHA/MLA prefill checks and run decode validation only.",
+)
 
 
 args = parser.parse_args()
@@ -886,5 +906,8 @@ for nhead, decode_qlen in args.nhead:
             df.append(ret)
     df = pd.DataFrame(df)
     # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
+    try:
+        df_md = df.to_markdown(index=False)
+    except ImportError:
+        df_md = df.to_string(index=False)
     aiter.logger.info("mla summary (markdown):\n%s", df_md)
