@@ -807,6 +807,9 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
         fhmoe_fields.isdisjoint(inspect.signature(api).parameters)
         for api in ordinary_apis
     )
+    assert {"situ_beta", "situ_linear_beta", "k_batch_intra_block"} <= set(
+        inspect.signature(flydsl_moe_stage1).parameters
+    )
     assert {"shared_w1", "shared_w1_scale", "shared_expert_id"} <= set(
         inspect.signature(flydsl_fhmoe_stage1).parameters
     )
