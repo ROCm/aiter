@@ -92,3 +92,6 @@ aiter/ops/opus/configs/
 # vim swaps
 *.swo
 *.swp
+!/my_code/**/*.att
+/my_code/**/*.db
+
