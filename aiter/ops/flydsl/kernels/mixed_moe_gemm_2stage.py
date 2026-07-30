@@ -1093,9 +1093,7 @@ def compile_mixed_moe_gemm1(
                     as1_vec = vector.from_elements(T.vec(1, T.i32), [as1_const])
 
                 def load_compact_a_scale_dword(base_k, ku):
-                    row0_vec = vector.load_op(
-                        T.vec(1, T.i32), lds_tid, [lane_mod_16]
-                    )
+                    row0_vec = vector.load_op(T.vec(1, T.i32), lds_tid, [lane_mod_16])
                     row1_vec = vector.load_op(
                         T.vec(1, T.i32),
                         lds_tid,
@@ -1109,12 +1107,8 @@ def compile_mixed_moe_gemm1(
                     )
                     token0_raw = arith.andi(fused0, mask24)
                     token1_raw = arith.andi(fused1, mask24)
-                    token0_valid = arith.cmpi(
-                        CmpIPredicate.ult, token0_raw, tokens_i32
-                    )
-                    token1_valid = arith.cmpi(
-                        CmpIPredicate.ult, token1_raw, tokens_i32
-                    )
+                    token0_valid = arith.cmpi(CmpIPredicate.ult, token0_raw, tokens_i32)
+                    token1_valid = arith.cmpi(CmpIPredicate.ult, token1_raw, tokens_i32)
                     token0 = arith.select(
                         token0_valid, token0_raw, arith.constant(0, type=T.i32)
                     )
@@ -1203,9 +1197,7 @@ def compile_mixed_moe_gemm1(
                                 )
                     return a_scale_tile
 
-                def prefetch_b_scale_tile(
-                    base_k, ku_packed_limit=k_unroll_packed
-                ):
+                def prefetch_b_scale_tile(base_k, ku_packed_limit=k_unroll_packed):
                     gate_b_scale = []
                     up_b_scale = (
                         [] if (not mock_gate_only and not gate_up_interleave) else None
@@ -2111,8 +2103,7 @@ def compile_mixed_moe_gemm1(
                         )
                         if const_expr(a_scale_compact):
                             gate_bs_ping, up_bs_ping = prefetch_b_scale_tile(
-                                k_tail1
-                                // arith.constant(pack_K * 128, index=True)
+                                k_tail1 // arith.constant(pack_K * 128, index=True)
                             )
                             a_scale_ping = None
                         else:
@@ -2121,8 +2112,7 @@ def compile_mixed_moe_gemm1(
                                 gate_bs_ping,
                                 up_bs_ping,
                             ) = prefetch_ab_scale_tile(
-                                k_tail1
-                                // arith.constant(pack_K * 128, index=True)
+                                k_tail1 // arith.constant(pack_K * 128, index=True)
                             )
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
@@ -2148,9 +2138,7 @@ def compile_mixed_moe_gemm1(
                         a_scale_ping = prefetch_a_scale_tile(
                             k_tail1 // arith.constant(pack_K * 128, index=True),
                             ku_packed_limit=(
-                                tail_ku_packed
-                                if pad_ku_skip > 0
-                                else k_unroll_packed
+                                tail_ku_packed if pad_ku_skip > 0 else k_unroll_packed
                             ),
                         )
                     acc_gate, acc_up, epilogue_pf = compute_tile(
