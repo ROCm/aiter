@@ -2084,6 +2084,19 @@ namespace py = pybind11;
           py::arg("conv_state_indices") = torch::Tensor(),                     \
           py::arg("pad_slot_id")        = -1);
 
+#define MHA_FWD_NATIVE_SPLITKV_PYBIND                                          \
+    m.def("mha_fwd_native_splitkv",                                            \
+          &aiter::mha_fwd_native_splitkv,                                      \
+          "Native HIP D64 BF16 split-K FMHA forward (producer + combine).",    \
+          py::arg("q"),                                                        \
+          py::arg("k"),                                                        \
+          py::arg("v"),                                                        \
+          py::arg("out"),                                                      \
+          py::arg("softmax_scale"),                                            \
+          py::arg("causal"),                                                   \
+          py::arg("return_lse"),                                               \
+          py::arg("num_splits"));
+
 #define FUSED_SPLIT_GDR_UPDATE_PYBIND                                 \
     m.def("fused_split_gdr_update",                                   \
           &aiter::fused_split_gdr_update,                             \

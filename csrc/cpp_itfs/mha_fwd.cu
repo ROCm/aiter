@@ -3,6 +3,9 @@
 #if FAV3_ON
 #include "asm_fmha_v3_fwd_configs.hpp"
 #endif
+#if FAV_NATIVE_ON
+#include "mha_native_launch.h"  // launch_msk{0,1}_split, launch_combine; pulls in runner/params.hpp
+#endif
 #include <memory>
 #include <string>
 
@@ -365,9 +368,208 @@ float fmha_fwd_ck(mha_fwd_args a, const ck_tile::stream_config& s)
 }
 #endif
 
+#if FAV_NATIVE_ON
+// Split-count heuristic for the native D64 BF16 split-K kernel on gfx942.
+// Mirrors the Python heuristic in aiter/ops/mha.py::_native_splitkv_heuristic.
+// Tile geometry constants come from runner/params.hpp (kM0=128, kN0=64).
+static int native_splitkv_heuristic(int batch, int nhead_q, int seqlen_q, int seqlen_k,
+                                    int num_cu)
+{
+    auto snap = [](int x) -> int {
+        int g = 0;
+        for(int c : {2, 4, 8, 16})
+            if(c <= x) g = c;
+        return g;
+    };
+    const int sq_tile = kM0;       // 128 query rows per block (from params.hpp)
+    const int kv_tile = kN0;       // 64  key   cols per block
+    const int sqt     = (seqlen_q + sq_tile - 1) / sq_tile;
+    const int skvt    = (seqlen_k + kv_tile - 1) / kv_tile;
+    const int nwg     = batch * nhead_q * sqt;
+
+    const int kvdiv  = (nwg < 24) ? 10 : 28;
+    const int kv_cap = snap(skvt / kvdiv);
+
+    if(nwg < num_cu)
+    {
+        const int occ_cap = snap(static_cast<int>(3.5f * num_cu / nwg));
+        return (occ_cap < kv_cap) ? occ_cap : kv_cap;
+    }
+    if(batch >= 2)
+        return 0;
+
+    const float over = static_cast<float>(nwg) / num_cu;
+    if(skvt < static_cast<int>(10.f * over) && over < 30.f)
+        return 0;
+
+    int g = (nhead_q <= 8) ? 4 : 2;
+    if(over >= 30.f)
+    {
+        const int ext = snap(skvt / 160);
+        if(ext > g) g = ext;
+    }
+    return (kv_cap > 0) ? ((g < kv_cap) ? g : kv_cap) : 0;
+}
+
+bool native_splitkv_check_eligigibility(const mha_fwd_args& a)
+{
+    // Shape / geometry / scalar-config eligibility guards.
+    // Pointer-presence checks (q_descale_ptr, sink_ptr) are intentionally
+    // omitted here: the caller may not have allocated those buffers yet at
+    // planning time. fmha_fwd_native_gfx942() validates them.
+    if(get_gpu_arch() != "gfx942")
+        return false;
+    if(a.data_type != "bf16")
+        return false;
+    if(a.hdim_q != 64 || a.hdim_v != 64)
+        return false;
+    if(a.is_group_mode)  // varlen not supported
+        return false;
+    if(a.bias_type != 0)
+        return false;
+    if(a.p_drop > 0.f)
+        return false;
+    if(a.sink_size != 0)  // scalar check only; sink_ptr not checked here
+        return false;
+    // Only full causal (mask_type 1 or 2) or no mask (mask_type 0).
+    // SWA (window_size_left != -1) falls through to ASM/CK.
+    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
+    if(a.mask_type != 0 && !causal)
+        return false;
+    // Guard against fully-masked rows: bottom-right causal with sq > sk.
+    if(a.window_size_left != -1 || (a.window_size_right != 0 && a.window_size_right != -1))
+        return false;
+    if(causal && a.seqlen_q > a.seqlen_k)
+        return false;
+    // Native split-K implements bottom-right causal only (mask_shift = sk - sq).
+    // Top-left (mask_type==1) coincides with bottom-right only when sq == sk.
+    if(a.mask_type == 1 && a.seqlen_q != a.seqlen_k)
+        return false;
+    if(a.nhead_q <= 0 || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
+        return false;
+
+    return true;
+}
+
+// Query whether the native split-K path is applicable and how many splits
+// to use. All eligibility guards live here so callers can pre-check without launching.
+//
+// Return values:
+//   -1  native split-K is not feasible (arch / dtype / geometry / mask guards failed)
+//    0  feasible but the heuristic judges it not beneficial for this shape
+//   >0  optimal split count G; caller should allocate
+//       G * batch * nhead_q * seqlen_q * (kHeadDim + 1) * sizeof(float) bytes
+//       and pass them as mha_fwd_args::num_splits / ::splitkv_workspace_ptr.
+int mha_fwd_calculate_num_splits(const mha_fwd_args& a)
+{
+    if (!native_splitkv_check_eligigibility(a))
+        return -1;
+
+    // All guards passed — let the heuristic decide (0 = feasible but not beneficial).
+    return native_splitkv_heuristic(a.batch, a.nhead_q, a.seqlen_q, a.seqlen_k,
+                                    static_cast<int>(get_num_cu_func()));
+}
+
+// Calculate the workspace size in bytes for the current fwd config.
+size_t mha_fwd_workspace_size(const mha_fwd_args& a)
+{
+    if(a.num_splits <= 0)
+        return 0;
+    return a.num_splits * a.batch * a.nhead_q * a.seqlen_q * (kHeadDim + 1) * sizeof(float);
+}
+
+// Execute the native gfx942 split-K kernel using caller-provided workspace.
+// Returns -1.f for any unsupported config; 1.f on success.
+static float fmha_fwd_native_gfx942(const mha_fwd_args& a, const ck_tile::stream_config& s)
+{
+    if (!native_splitkv_check_eligigibility(a))
+        return -1.f;
+    // Also check pointer-presence.
+    if(a.q_descale_ptr || a.k_descale_ptr || a.v_descale_ptr)
+        return -1.f;
+    if(a.sink_ptr || a.sink_size != 0)
+        return -1.f;
+    if(a.num_splits <= 0 || !a.splitkv_workspace_ptr)
+        return -1.f;
+
+    const int G       = a.num_splits;
+    const int B       = a.batch;
+    const int Sq      = a.seqlen_q;
+    const int Sk      = a.seqlen_k;
+    const int Hq      = a.nhead_q;
+
+    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
+
+    // Pre-multiply scale by log2(e) — the kernel's softmax is base-2.
+    static constexpr float kLog2e = 1.4426950408889634f;
+    const float scale_b2 = a.scale_s * kLog2e;
+
+    // Carve scratch_o and scratch_lse from the caller-provided workspace.
+    // Layout: [ scratch_o: G*B*Hq*Sq*kHeadDim fp32 ][ scratch_lse: G*B*Hq*Sq fp32 ]
+    const size_t scratch_o_bytes = static_cast<size_t>(G) * B * Hq * Sq * kHeadDim * sizeof(float);
+    char*  ws          = static_cast<char*>(a.splitkv_workspace_ptr);
+    float* scratch_o   = reinterpret_cast<float*>(ws);
+    float* scratch_lse = reinterpret_cast<float*>(ws + scratch_o_bytes);
+
+    const hipStream_t stream = s.stream_id_;
+
+    FmhaFwdParams base{};
+    base.q   = reinterpret_cast<const __hip_bfloat16*>(a.q_ptr);
+    base.k   = reinterpret_cast<const __hip_bfloat16*>(a.k_ptr);
+    base.v   = reinterpret_cast<const __hip_bfloat16*>(a.v_ptr);
+    base.o   = reinterpret_cast<__hip_bfloat16*>(a.o_ptr);
+    base.lse = nullptr;  // producers write scratch_lse; combine writes final lse
+    base.seqlen_q = Sq; base.seqlen_k = Sk;
+    base.nhead_q  = Hq; base.nhead_k  = a.nhead_k;
+    base.scale    = scale_b2;
+    base.stride_q = a.stride_q;       base.nhead_stride_q = a.nhead_stride_q; base.batch_stride_q = a.batch_stride_q;
+    base.stride_k = a.stride_k;       base.nhead_stride_k = a.nhead_stride_k; base.batch_stride_k = a.batch_stride_k;
+    base.stride_v = a.stride_v;       base.nhead_stride_v = a.nhead_stride_v; base.batch_stride_v = a.batch_stride_v;
+    base.stride_o = a.stride_o;       base.nhead_stride_o = a.nhead_stride_o; base.batch_stride_o = a.batch_stride_o;
+    base.seqstart_q = nullptr; base.seqstart_k = nullptr;
+
+    FmhaFwdSplitParams sp{};
+    sp.base        = base;
+    sp.scratch_o   = scratch_o;
+    sp.scratch_lse = scratch_lse;
+    sp.num_splits  = G;
+    sp.split_idx   = 0;  // vestigial: device decodes split from blockIdx.z
+
+    const int m_tiles = (Sq + kM0 - 1) / kM0;
+    dim3 grid_prod(Hq, m_tiles, B * G);
+    if(causal) launch_msk1_split(sp, grid_prod, stream);
+    else        launch_msk0_split(sp, grid_prod, stream);
+
+    FmhaFwdCombineParams cp{};
+    cp.scratch_o   = scratch_o;
+    cp.scratch_lse = scratch_lse;
+    cp.o           = reinterpret_cast<__hip_bfloat16*>(a.o_ptr);
+    cp.lse         = reinterpret_cast<float*>(a.lse_ptr);  // nullptr → skip LSE write
+    cp.num_splits  = G;
+    cp.seqlen_q    = Sq;
+    cp.nhead_q     = Hq;
+    cp.stride_o = a.stride_o; cp.nhead_stride_o = a.nhead_stride_o; cp.batch_stride_o = a.batch_stride_o;
+    cp.scale    = scale_b2;
+    cp.o_fp32   = nullptr;
+
+    dim3 grid_comb(Hq, m_tiles, B);
+    launch_combine(cp, grid_comb, stream);
+
+    return 1.f;
+}
+#endif
+
 float mha_fwd(mha_fwd_args args, const ck_tile::stream_config& s)
 {
     float ret = -1;
+
+#if FAV_NATIVE_ON
+    // Dispatch to the native split-K kernel when the caller has pre-validated the
+    // config via mha_fwd_calculate_num_splits() and provided a workspace buffer.
+    // No implicit fallback: if the caller set num_splits > 0 it expects this path.
+    if(args.num_splits > 0 && args.splitkv_workspace_ptr != nullptr)
+        return fmha_fwd_native_gfx942(args, s);
+#endif
 
 #if FAV3_ON
     ret = fmha_fwd_v3(args, s);
