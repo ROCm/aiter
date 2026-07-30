@@ -89,7 +89,7 @@ __device__ __forceinline__ void combine_split(
     //   scratch_lse(g,b,h,R)   =  (((g*B + b)*Hq + h)*Sq + R
     // The per-g stride lets us step plane to plane by adding a constant; we keep
     // the explicit form for clarity (this pass is not perf-critical).
-    const long bh_row    = (long)((b * Hq + h) * Sq + R);   // (b,h,R) within a plane
+    const long bh_row    = (((long)b * Hq + h) * Sq + R);   // (b,h,R) within a plane
     const long g_stride_lse = (long)B * Hq * Sq;            // elements between LSE planes
     const long g_stride_o   = g_stride_lse * kD;            // elements between O planes
 
@@ -115,7 +115,7 @@ __device__ __forceinline__ void combine_split(
     // bf16 store rounds, in its OWN CONTIGUOUS natural-order layout [B][Hq][Sq][64]
     // (NOT the strided bf16 o_row_base). It lets a caller check the reweight at
     // ~1e-5 to catch reweight-weight bugs the bf16 (~1e-3) store tolerance hides.
-    const long of_base = (((long)(b * Hq + h) * Sq + R) * kD);
+    const long of_base = ((((long)b * Hq + h) * Sq + R) * kD);
 
     if (G == 1) {
         const float* o0 = p.scratch_o + bh_row * kD;   // plane 0, this (b,h,R)
