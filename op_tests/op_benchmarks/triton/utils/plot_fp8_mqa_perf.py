@@ -200,7 +200,7 @@ def make_bar_chart(results: list[dict], out_png: Path, title_extra: str = ""):
         _bar_label(ax, bar, tag, COLORS["flydsl"])
 
     ax.set_xticks(x)
-    ax.set_xticklabels(shape_labels, fontsize=8)
+    ax.set_xticklabels(shape_labels, fontsize=8, rotation=45, ha="right")
     ax.set_ylabel("TFLOPs", fontsize=11)
     title = "FP8 MQA Logits — Triton/Gluon vs Best FlyDSL Kernel"
     if title_extra:
