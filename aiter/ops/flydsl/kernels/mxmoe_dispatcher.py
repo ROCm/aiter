@@ -144,7 +144,7 @@ def compile_gemm2_a4w4_port(
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
-        g2_bf16_lds = (os.environ.get("MXFP4_G2_BF16_LDS", 0) == "1")
+        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
