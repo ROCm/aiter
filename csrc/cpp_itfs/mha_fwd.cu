@@ -410,6 +410,46 @@ static int native_splitkv_heuristic(int batch, int nhead_q, int seqlen_q, int se
     return (kv_cap > 0) ? ((g < kv_cap) ? g : kv_cap) : 0;
 }
 
+bool native_splitkv_check_eligigibility(const mha_fwd_args& a)
+{
+    // Shape / geometry / scalar-config eligibility guards.
+    // Pointer-presence checks (q_descale_ptr, sink_ptr) are intentionally
+    // omitted here: the caller may not have allocated those buffers yet at
+    // planning time. fmha_fwd_native_gfx942() validates them.
+    if(get_gpu_arch() != "gfx942")
+        return false;
+    if(a.data_type != "bf16")
+        return false;
+    if(a.hdim_q != 64 || a.hdim_v != 64)
+        return false;
+    if(a.is_group_mode)  // varlen not supported
+        return false;
+    if(a.bias_type != 0)
+        return false;
+    if(a.p_drop > 0.f)
+        return false;
+    if(a.sink_size != 0)  // scalar check only; sink_ptr not checked here
+        return false;
+    // Only full causal (mask_type 1 or 2) or no mask (mask_type 0).
+    // SWA (window_size_left != -1) falls through to ASM/CK.
+    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
+    if(a.mask_type != 0 && !causal)
+        return false;
+    // Guard against fully-masked rows: bottom-right causal with sq > sk.
+    if(a.window_size_left != -1 || (a.window_size_right != 0 && a.window_size_right != -1))
+        return false;
+    if(causal && a.seqlen_q > a.seqlen_k)
+        return false;
+    // Native split-K implements bottom-right causal only (mask_shift = sk - sq).
+    // Top-left (mask_type==1) coincides with bottom-right only when sq == sk.
+    if(a.mask_type == 1 && a.seqlen_q != a.seqlen_k)
+        return false;
+    if(a.nhead_q <= 0 || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
+        return false;
+
+    return true;
+}
+
 // Query whether the native split-K path is applicable and how many splits
 // to use. All eligibility guards live here so callers can pre-check without launching.
 //
@@ -421,39 +461,7 @@ static int native_splitkv_heuristic(int batch, int nhead_q, int seqlen_q, int se
 //       and pass them as mha_fwd_args::num_splits / ::splitkv_workspace_ptr.
 int mha_fwd_calculate_num_splits(const mha_fwd_args& a)
 {
-    // Shape / geometry / scalar-config eligibility guards.
-    // Pointer-presence checks (q_descale_ptr, sink_ptr) are intentionally
-    // omitted here: the caller may not have allocated those buffers yet at
-    // planning time. fmha_fwd_native_gfx942() re-validates everything.
-    if(get_gpu_arch() != "gfx942")
-        return -1;
-    if(a.data_type != "bf16")
-        return -1;
-    if(a.hdim_q != 64 || a.hdim_v != 64)
-        return -1;
-    if(a.is_group_mode)  // varlen not supported
-        return -1;
-    if(a.bias_type != 0)
-        return -1;
-    if(a.p_drop > 0.f)
-        return -1;
-    if(a.sink_size != 0)  // scalar check only; sink_ptr not checked here
-        return -1;
-    // Only full causal (mask_type 1 or 2) or no mask (mask_type 0).
-    // SWA (window_size_left != -1) falls through to ASM/CK.
-    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
-    if(a.mask_type != 0 && !causal)
-        return -1;
-    if(a.window_size_left != -1 || (a.window_size_right != 0 && a.window_size_right != -1))
-        return -1;
-    // Guard against fully-masked rows: bottom-right causal with sq > sk.
-    if(causal && a.seqlen_q > a.seqlen_k)
-        return -1;
-    // Native split-K implements bottom-right causal only (mask_shift = sk - sq).
-    // Top-left (mask_type==1) coincides with bottom-right only when sq == sk.
-    if(a.mask_type == 1 && a.seqlen_q != a.seqlen_k)
-        return -1;
-    if(a.nhead_q <= 0 || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
+    if (!native_splitkv_check_eligigibility(a))
         return -1;
 
     // All guards passed — let the heuristic decide (0 = feasible but not beneficial).
@@ -465,33 +473,12 @@ int mha_fwd_calculate_num_splits(const mha_fwd_args& a)
 // Returns -1.f for any unsupported config; 1.f on success.
 static float fmha_fwd_native_gfx942(const mha_fwd_args& a, const ck_tile::stream_config& s)
 {
-    // Eligibility guard mirrors mha_fwd_get_num_splits() plus pointer-presence checks there.
-    if(get_gpu_arch() != "gfx942")
+    if (!native_splitkv_check_eligigibility(a))
         return -1.f;
-    if(a.data_type != "bf16")
-        return -1.f;
-    if(a.hdim_q != 64 || a.hdim_v != 64)
-        return -1.f;
-    if(a.is_group_mode)
-        return -1.f;
-    if(a.bias_type != 0)
-        return -1.f;
-    if(a.p_drop > 0.f)
-        return -1.f;
+    // Also check pointer-presence.
     if(a.q_descale_ptr || a.k_descale_ptr || a.v_descale_ptr)
         return -1.f;
     if(a.sink_ptr || a.sink_size != 0)
-        return -1.f;
-    const bool causal = (a.mask_type == 1 || a.mask_type == 2);
-    if(a.mask_type != 0 && !causal)
-        return -1.f;
-    if(a.window_size_left != -1 || (a.window_size_right != 0 && a.window_size_right != -1))
-        return -1.f;
-    if(causal && a.seqlen_q > a.seqlen_k)
-        return -1.f;
-    if(a.mask_type == 1 && a.seqlen_q != a.seqlen_k)
-        return -1.f;
-    if(a.nhead_q <= 0 || a.nhead_k <= 0 || a.nhead_q % a.nhead_k != 0)
         return -1.f;
     if(a.num_splits <= 0 || !a.splitkv_workspace_ptr)
         return -1.f;

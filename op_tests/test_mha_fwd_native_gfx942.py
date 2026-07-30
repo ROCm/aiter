@@ -18,8 +18,6 @@ Coverage:
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -60,17 +58,17 @@ def _cmp(a: torch.Tensor, b: torch.Tensor, *, rtol: float = 1e-2, atol: float = 
 
 def _make_args_for_get_num_splits(q, k, causal: bool) -> dict:
     """Build the keyword-argument dict that aiter.mha_fwd_get_num_splits() expects."""
-    return dict(
-        q=q,
-        k=k,
-        v=k,  # same layout as k; only shape/strides matter for the eligibility check
-        dropout_p=0.0,
-        softmax_scale=q.size(-1) ** -0.5,
-        is_causal=causal,
-        window_size_left=-1,
-        window_size_right=0 if causal else -1,
-        sink_size=0,
-    )
+    return {
+        "q": q,
+        "k": k,
+        "v": k,  # same layout as k; only shape/strides matter for the eligibility check
+        "dropout_p": 0.0,
+        "softmax_scale": q.size(-1) ** -0.5,
+        "is_causal": causal,
+        "window_size_left": -1,
+        "window_size_right": 0 if causal else -1,
+        "sink_size": 0,
+    }
 
 
 def _workspace_bytes(num_splits: int, q: torch.Tensor, k: torch.Tensor) -> int:
