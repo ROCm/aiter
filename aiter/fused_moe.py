@@ -3508,6 +3508,7 @@ def fused_topk(
             (256, 6),
             (256, 8),
             (384, 8),
+            (640, 8),
         ]
         and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
         and gating_output.is_contiguous()
