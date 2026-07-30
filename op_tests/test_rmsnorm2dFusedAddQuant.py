@@ -276,7 +276,53 @@ def test_rmsnorm(
     return ret
 
 
+def test_fp4_rmsnorm_quant_respects_packed_output_bounds():
+    """Guard against FP4 stores crossing the packed output row boundary."""
+    if get_gfx() != "gfx950":
+        return
+
+    m, n = 2, 3584
+    guard_value = 0xA5
+    input = torch.ones((m, n), dtype=torch.bfloat16)
+    weight = torch.ones(n, dtype=torch.bfloat16)
+    scale = torch.empty(
+        ((m + 255) // 256 * 256, (n // 32 + 7) // 8 * 8),
+        dtype=dtypes.fp8_e8m0,
+    )
+
+    for add_residual in (False, True):
+        output_storage = torch.empty((m + 1, n // 2), dtype=dtypes.fp4x2)
+        output = output_storage[:m]
+        guard_row = output_storage[m:].view(torch.uint8)
+        guard_row.fill_(guard_value)
+
+        if add_residual:
+            residual = torch.ones_like(input)
+            residual_out = torch.empty_like(input)
+            aiter.add_rmsnorm_quant(
+                output,
+                input,
+                residual,
+                residual_out,
+                scale,
+                weight,
+                1e-5,
+                32,
+                True,
+            )
+        else:
+            aiter.rmsnorm_quant(output, input, scale, weight, 1e-5, 32, True)
+
+        torch.cuda.synchronize()
+        changed_bytes = torch.count_nonzero(guard_row != guard_value).item()
+        assert changed_bytes == 0, (
+            f"{'add_' if add_residual else ''}rmsnorm_quant wrote "
+            f"{changed_bytes} bytes past an FP4 output row"
+        )
+
+
 if __name__ == "__main__":
+    test_fp4_rmsnorm_quant_respects_packed_output_bounds()
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         prog="test_rmsnorm2dFusedSQuant",
