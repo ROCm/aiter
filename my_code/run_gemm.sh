@@ -5,7 +5,7 @@ export AITER_FORCE_GFX1250=1
 
 # Overridable from the caller: HIP_VISIBLE_DEVICES=1 FLYDSL_DUMP_IR=0 bash my_code/run_gemm.sh
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
-export FLYDSL_DUMP_IR="${FLYDSL_DUMP_IR:-1}"
+export FLYDSL_DUMP_IR="${FLYDSL_DUMP_IR:-0}"
 export FLYDSL_DUMP_DIR="${FLYDSL_DUMP_DIR:-./my_code/flydsl_dump}"
 
 
