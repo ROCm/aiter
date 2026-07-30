@@ -17,9 +17,10 @@ from flydsl._mlir.dialects import (
 from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
-from flydsl.expr import buffer_ops
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 
 def get_warp_size(arch=None):
