@@ -16,7 +16,6 @@ _KERNEL_PATH = os.path.abspath(
         "aiter",
         "ops",
         "flydsl",
-        "kernels",
         "gemm_a16w16_gfx1250.py",
     )
 )
@@ -44,7 +43,7 @@ if not _flydsl_available():
 
 def _load_kernel():
     """Load the kernel module by file path to skip aiter.ops.flydsl.__init__."""
-    spec = importlib.util.spec_from_file_location("_flydsl_a16w16_kernel", _KERNEL_PATH)
+    spec = importlib.util.spec_from_file_location("_flydsl_a16w16_wrapper", _KERNEL_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.gemm_a16w16
