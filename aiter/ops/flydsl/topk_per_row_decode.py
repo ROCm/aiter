@@ -537,12 +537,19 @@ def flydsl_top_k_per_row_decode(
             f"flydsl_top_k_per_row_decode_workspace_size)"
         )
 
-    if stream is None:
+    # A caller that leaves stream unset gets the stream torch.cuda.stream() would
+    # switch to anyway, so entering that context manager below buys nothing while
+    # still paying a current_stream() and two set_stream() calls per launch.
+    stream_is_current = stream is None
+    if stream_is_current:
         stream = torch.cuda.current_stream(logits.device)
 
     if workspace_zero:
-        with torch.cuda.stream(stream):
+        if stream_is_current:
             workspace.zero_()
+        else:
+            with torch.cuda.stream(stream):
+                workspace.zero_()
 
     with torch.cuda.device(logits.device.index):
         _run_compiled(
