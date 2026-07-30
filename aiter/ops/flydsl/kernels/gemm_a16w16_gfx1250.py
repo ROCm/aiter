@@ -22,6 +22,8 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
 
+from aiter.ops.flydsl.kernels import buffer_ops
+
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
@@ -29,49 +31,6 @@ _SCHED_ALLOW_SALU = 1 << 2
 
 def _align_up(n, a):
     return ((n + a - 1) // a) * a
-
-
-def _i32_const(v):
-    return _raw(arith.constant(int(v), type=T.i32))
-
-
-def _to_i32_offset(offset):
-    if isinstance(offset, int):
-        return _i32_const(offset)
-    offset = arith.unwrap(offset)
-    if not isinstance(offset.type, ir.IntegerType) or offset.type.width != 32:
-        return _raw(arith.index_cast(T.i32, offset))
-    return offset
-
-
-def _buffer_load(rsrc, offset, vec_width=1, dtype=None):
-    if dtype is None:
-        dtype = T.f32
-    off = _to_i32_offset(offset)
-    off = _raw(arith.muli(off, _i32_const(dtype.width // 8)))
-    result_type = dtype if vec_width == 1 else T.vec(vec_width, dtype)
-    return rocdl.RawPtrBufferLoadOp(
-        result_type, rsrc, off, _i32_const(0), _i32_const(0)
-    ).result
-
-
-def _buffer_store(data, rsrc, offset, offset_is_bytes=False):
-    data = arith.unwrap(data)
-    off = _to_i32_offset(offset)
-    if not offset_is_bytes:
-        data_type = data.type
-        element_type = (
-            data_type.element_type if hasattr(data_type, "element_type") else data_type
-        )
-        off = _raw(arith.muli(off, _i32_const(element_type.width // 8)))
-    rocdl.RawPtrBufferStoreOp(data, rsrc, off, _i32_const(0), _i32_const(0))
-
-
-def _make_buffer_rsrc(tensor, num_records_bytes=None):
-    buf_tensor = fx.rocdl.make_buffer_tensor(
-        tensor, max_size=True, num_records_bytes=num_records_bytes
-    )
-    return fx.rocdl.get_buffer_rsrc(fx.get_iter(buf_tensor))
 
 
 def apply_activation_scalar(val, activation: str):
@@ -254,9 +213,13 @@ def compile_gemm_a16w16(
         m_idx = arith.index_cast(T.index, i32_m.ir_value())
         n_stride = arith.index_cast(T.index, i32_n.ir_value())
         y_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
-        y_rsrc = _make_buffer_rsrc(arg_y, num_records_bytes=y_nrec)
+        y_rsrc = fx.rocdl.get_buffer_rsrc(
+            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), y_nrec)
+        )
         if const_expr(add_bias):
-            bias_rsrc = _make_buffer_rsrc(arg_bias)
+            bias_rsrc = fx.rocdl.get_buffer_rsrc(
+                fx.rocdl.make_buffer_ptr(fx.get_iter(arg_bias))
+            )
 
         lds_base_ptr = fx.SharedAllocator(static=True).allocate(lds_arena_bytes)._ptr
         big_a_mem = fx.recast_iter(_fx_elem, fx.add_offset(lds_base_ptr, unified_a_off))
@@ -486,7 +449,7 @@ def compile_gemm_a16w16(
                     )
                     elems = []
                     for half in range_constexpr(2):
-                        bv = _buffer_load(
+                        bv = buffer_ops.buffer_load(
                             bias_rsrc,
                             col_i32 + arith.constant(half * 4, type=T.i32),
                             vec_width=4,
@@ -545,7 +508,7 @@ def compile_gemm_a16w16(
                                     zero_i32,
                                 )
                         else:
-                            _buffer_store(
+                            buffer_ops.buffer_store(
                                 h_vec.bitcast(fx.Int32).ir_value(),
                                 y_rsrc,
                                 c_off_bytes,
@@ -574,7 +537,7 @@ def compile_gemm_a16w16(
                                 fx.Float32,
                             ).ir_value()
                             col = col_base + arith.index(half * 4)
-                            _buffer_store(vec4, y_rsrc, row * n_stride + col)
+                            buffer_ops.buffer_store(vec4, y_rsrc, row * n_stride + col)
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
