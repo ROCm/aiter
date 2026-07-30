@@ -106,6 +106,7 @@ def _mla_gluon(
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
+    DYNAMIC_KV_SPLITS: gl.constexpr,
     RETURN_LSE: gl.constexpr,
     QLEN: gl.constexpr,  # MTP query length; 1 for plain decode
     # --- dsv4-prefill knobs ---
@@ -160,10 +161,35 @@ def _mla_gluon(
     # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
     # Trade-off: at seqs just above the wrapper minimum the last CU does up to
     # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+    active_kv_splits = NUM_KV_SPLITS
+    if DYNAMIC_KV_SPLITS:
+        # CUDA Graph capture freezes Python-side constexpr decisions. Select the
+        # measured h12 bucket from the runtime sequence length instead, while
+        # retaining a fixed 112-workgroup launch and workspace shape.
+        active_kv_splits = gl.where(
+            cur_batch_seq_len <= 4096,
+            16,
+            gl.where(
+                cur_batch_seq_len <= 16384,
+                48,
+                gl.where(
+                    cur_batch_seq_len <= 65536,
+                    64,
+                    gl.where(cur_batch_seq_len <= 131072, 96, 112),
+                ),
+            ),
+        )
+        active_kv_splits = gl.minimum(
+            active_kv_splits, gl.cdiv(cur_batch_seq_len, BLOCK_N)
+        )
+        active_kv_splits = gl.minimum(active_kv_splits, NUM_KV_SPLITS)
+        if split_kv_id >= active_kv_splits:
+            return
+
+    kv_len_per_split = cur_batch_seq_len // active_kv_splits
     split_kv_start = kv_len_per_split * split_kv_id
     split_kv_end = split_kv_start + kv_len_per_split
-    if split_kv_id == NUM_KV_SPLITS - 1:
+    if split_kv_id == active_kv_splits - 1:
         split_kv_end = cur_batch_seq_len
     num_iter = gl.cdiv(split_kv_end - split_kv_start, BLOCK_N)
     start_n = split_kv_start
@@ -761,6 +787,7 @@ def _mla_softmax_reducev_kernel(
     HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
+    DYNAMIC_KV_SPLITS: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -775,7 +802,26 @@ def _mla_softmax_reducev_kernel(
     else:
         batch_page_start = tl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
-    kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
+    active_kv_splits = NUM_KV_SPLITS
+    if DYNAMIC_KV_SPLITS:
+        active_kv_splits = tl.where(
+            cur_batch_seq_len <= 4096,
+            16,
+            tl.where(
+                cur_batch_seq_len <= 16384,
+                48,
+                tl.where(
+                    cur_batch_seq_len <= 65536,
+                    64,
+                    tl.where(cur_batch_seq_len <= 131072, 96, 112),
+                ),
+            ),
+        )
+        active_kv_splits = tl.minimum(
+            active_kv_splits, tl.cdiv(cur_batch_seq_len, 64)
+        )
+        active_kv_splits = tl.minimum(active_kv_splits, NUM_KV_SPLITS)
+    kv_len_per_split = cur_batch_seq_len // active_kv_splits
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     offs_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h + offs_d_ckv
@@ -787,8 +833,17 @@ def _mla_softmax_reducev_kernel(
 
     LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
     for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
-        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
+        split_is_active = split_kv_id < active_kv_splits
+        logits = tl.load(
+            Logits + offs_l + split_kv_id * stride_l_s,
+            mask=split_is_active,
+            other=0.0,
+        )
+        logits_1 = tl.load(
+            Mid_lse + offs_ml + split_kv_id * stride_ml_s,
+            mask=split_is_active,
+            other=-float("inf"),
+        )
 
         n_e_max = tl.maximum(logits_1, e_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
@@ -919,6 +974,7 @@ def mla_gluon(
 
     PAGE_SIZE = 1
 
+    DYNAMIC_KV_SPLITS = False
     if REGIME == "bh64":
         BLOCK_H, BLOCK_N = 64, 64
         NUM_XCDS = get_num_xcds()
@@ -979,25 +1035,16 @@ def mla_gluon(
                     triton.cdiv(min_kv_seq_len, BLOCK_N),
                 ),
             )
-            if REGIME == "bh12bn64" and batch_size == 1:
-                # Keep only a small set of compile-time variants while matching
-                # the measured sweet spots for unique, scattered physical pages.
-                # At 100K, 96 splits is ~35% faster than 256 (66 us vs 102 us).
-                if min_kv_seq_len <= 4096:
-                    split_cap = 16
-                elif min_kv_seq_len <= 16384:
-                    split_cap = 48
-                elif min_kv_seq_len <= 65536:
-                    split_cap = 64
-                elif min_kv_seq_len <= 131072:
-                    split_cap = 96
-                else:
-                    split_cap = 112
-                NUM_KV_SPLITS = max(
-                    1, min(split_cap, triton.cdiv(min_kv_seq_len, BLOCK_N))
-                )
+            if REGIME == "bh12bn64":
+                # Launch and allocate for the largest bucket. Stage-1 and
+                # stage-2 derive the active 16/48/64/96/112 split count from
+                # device-side sequence metadata, so CUDA Graph capture cannot
+                # freeze this path at the caller's default min_kv_seq_len=1.
+                NUM_KV_SPLITS = max(1, min(112, 256 // batch_size))
+                DYNAMIC_KV_SPLITS = True
         if num_kv_splits is not None:
             NUM_KV_SPLITS = int(num_kv_splits)
+            DYNAMIC_KV_SPLITS = False
             assert 1 <= NUM_KV_SPLITS <= min_kv_seq_len, (
                 "mla_gluon num_kv_splits override must be in "
                 f"[1, {min_kv_seq_len}], got {NUM_KV_SPLITS}"
@@ -1132,6 +1179,7 @@ def mla_gluon(
         NUM_XCDS=NUM_XCDS,
         NHEAD=nhead,
         REGIME=REGIME,
+        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
         RETURN_LSE=return_lse,
         QLEN=qlen,
         HAS_PE=has_pe,
@@ -1170,6 +1218,7 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
+        DYNAMIC_KV_SPLITS=DYNAMIC_KV_SPLITS,
         num_warps=8,
     )
 
