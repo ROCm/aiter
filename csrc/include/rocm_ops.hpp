@@ -456,7 +456,8 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));                                                \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -2245,6 +2246,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND;                 \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \

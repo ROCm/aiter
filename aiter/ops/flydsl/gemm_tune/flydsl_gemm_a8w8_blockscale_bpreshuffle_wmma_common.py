@@ -31,7 +31,7 @@ _TILE_M_OPTS = (16, 32, 64, 128, 256)
 _TILE_N_OPTS = (32, 64, 128, 256, 512, 1024)
 _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
-_WARP_OPTS = ((1, 2), (1, 4), (2, 1), (2, 2), (4, 1))
+_WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
 _SPLIT_K = (1,)
 
@@ -175,8 +175,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
         return False
-    if ki.tile_m > M:
-        return False
+    # M may be ragged; the kernel handles partial M tiles via OOB clamping,
+    # so tile_m > M is legal (and needed for small-M decode shapes).
 
     m_blocks = _ceil_div(M, ki.tile_m)
     n_blocks = N // ki.tile_n
