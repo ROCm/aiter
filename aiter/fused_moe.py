@@ -49,6 +49,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    _select_mxfp4_a4w4_kernels,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
@@ -62,8 +63,8 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #   auto (default) / adaptive -> use the adaptive branch. NO shape fallback: the
 #     kernel is codegen'd for a fixed shape set (SHAPES in
 #     csrc/kernels/mxfp4_moe/moe_aux/codegen/gen_instances.py) and an un-codegen'd
-#     shape hits TORCH_CHECK. Safe only because output_aux is set only for
-#     tuned-CSV rows routed to the port (exactly the codegen'd shapes).
+#     shape hits TORCH_CHECK. The MXFP4 replacement capability check must match
+#     that generated shape set before setting output_aux.
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
@@ -293,7 +294,7 @@ def _flydsl_moe_sorting(
     num_local_tokens,
     accumulate=True,
 ):
-    """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    """FlyDSL sorting dispatch -- called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
@@ -310,7 +311,7 @@ def _flydsl_moe_sorting(
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # buffer entirely -- the caller owns the [M, topk, model_dim] intermediate.
     if (expert_mask is not None) or accumulate:
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
@@ -732,8 +733,15 @@ def fused_moe_(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
                 "(expert_mask is dropped by the output_aux sort path)."
             )
-        _kn2 = metadata.stage2.keywords.get("kernelName2", "")
-        _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        _stage2_kwargs = metadata.stage2.keywords
+        _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
+        if _is_mxfp4_kname(_kn2):
+            _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        else:
+            _g2_params = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(_kn2)
+            if _g2_params is None:
+                raise ValueError(f"Invalid FlyDSL GEMM2 kernel name: {_kn2}")
+            _atomic = _g2_params.get("mode", "atomic") != "reduce"
         (
             sorted_ids,
             sorted_weights,
@@ -1317,6 +1325,36 @@ def _empty_u8(device):
     return torch.empty((0,), dtype=torch.uint8, device=device)
 
 
+def _unsort_mxfp4_intermediate(
+    inter_sorted_quant,
+    sorted_token_ids,
+    token_num,
+    topk,
+    num_valid_ids=None,
+):
+    """Scatter expert-sorted packed FP4 rows back to dense token-slot order."""
+    sorted_rows = inter_sorted_quant.view(inter_sorted_quant.shape[0], -1)
+    packed_ids = sorted_token_ids.view(-1)
+    row_count = min(sorted_rows.shape[0], packed_ids.numel())
+    packed_ids = packed_ids[:row_count]
+    token_ids = packed_ids & 0xFFFFFF
+    slot_ids = packed_ids >> 24
+    valid = (token_ids < token_num) & (slot_ids < topk)
+    if num_valid_ids is not None:
+        actual_rows = num_valid_ids.view(-1)[0]
+        valid = valid & (
+            torch.arange(row_count, device=packed_ids.device) < actual_rows
+        )
+    dense_rows = torch.zeros(
+        (token_num * topk, sorted_rows.shape[1]),
+        dtype=sorted_rows.dtype,
+        device=sorted_rows.device,
+    )
+    dense_indices = (token_ids[valid] * topk + slot_ids[valid]).to(torch.int64)
+    dense_rows.index_copy_(0, dense_indices, sorted_rows[:row_count][valid])
+    return dense_rows.view(token_num, topk, sorted_rows.shape[1])
+
+
 def _mxfp4_a4w4_stage1(
     hidden_states,
     w1,
@@ -1383,7 +1421,7 @@ def _mxfp4_a4w4_stage1(
     inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=torch.uint8)
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
-    inter_sorted_shuffled_scale = _ia(
+    inter_sorted_shuffled_scale = torch.zeros(
         (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
     )
 
@@ -1590,6 +1628,8 @@ def _mxfp4_a4w4_stage1_fw(
     D_INTER = w1.shape[1] // 2
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
+    if m_indices is None:
+        m_indices = (sorted_token_ids & 0xFFFFFF).contiguous()
     a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
     a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
@@ -1598,7 +1638,7 @@ def _mxfp4_a4w4_stage1_fw(
         if (moe_buf is not None and moe_buf.numel() > 0 and not inline_quant)
         else _empty_bf16(device)
     )
-    return _mxfp4_a4w4_stage1(
+    inter_sorted_quant, inter_sorted_scale = _mxfp4_a4w4_stage1(
         hidden_states,
         w1,
         w1_scale,
@@ -1622,6 +1662,14 @@ def _mxfp4_a4w4_stage1_fw(
         use_nt=p1["use_nt"],
         interleave=interleave,
     )
+    inter_dense_quant = _unsort_mxfp4_intermediate(
+        inter_sorted_quant,
+        sorted_token_ids,
+        M,
+        topk,
+        num_valid_ids,
+    )
+    return inter_dense_quant, inter_sorted_scale
 
 
 def _mxfp4_a4w4_stage2_fw(
@@ -1697,6 +1745,51 @@ def _mxfp4_scale_u8(scale):
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
+
+
+def _can_use_mxfp4_a4w4_backend(
+    *,
+    gfx,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    is_shuffled,
+    is_ep,
+    has_stage2_bias,
+    flydsl_available,
+    replacement_enabled,
+):
+    """Return whether the complete MXFP4 sort/GEMM1/GEMM2 path is compatible."""
+    return (
+        replacement_enabled
+        and flydsl_available
+        and gfx == "gfx950"
+        and activation == ActivationType.Silu
+        and dtype == torch.bfloat16
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and q_type == QuantType.per_1x32
+        and use_g1u1
+        and not doweight_stage1
+        and is_shuffled
+        and not is_ep
+        and not has_stage2_bias
+        and model_dim % 256 == 0
+        and aiter.is_mxfp4_moe_shape_supported(
+            expert,
+            model_dim,
+            inter_dim,
+            topk,
+        )
+    )
 
 
 @functools.lru_cache(maxsize=2048)
@@ -1983,6 +2076,57 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+
+    if _can_use_mxfp4_a4w4_backend(
+        gfx=gfx,
+        activation=activation,
+        dtype=dtype,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        q_type=q_type,
+        use_g1u1=use_g1u1,
+        doweight_stage1=doweight_stage1,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        expert=expert,
+        topk=topk,
+        is_shuffled=is_shuffled,
+        is_ep=is_ep,
+        has_stage2_bias=has_stage2_bias,
+        flydsl_available=is_flydsl_available(),
+        replacement_enabled=os.environ.get("AITER_MXFP4_GEMM1_REPLACEMENT", "1").lower()
+        not in ("0", "false"),
+    ):
+        has_tuned_replacement = _is_mxfp4_kname(kernelName1) and str(
+            kernelName2
+        ).startswith("flydsl_moe2_")
+        if has_tuned_replacement:
+            block_m = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+        else:
+            replacement = _select_mxfp4_a4w4_kernels(
+                token=token,
+                expert=expert,
+                topk=topk,
+            )
+            block_m = replacement["BM"]
+            kernelName1 = replacement["kernelName1"]
+            kernelName2 = replacement["kernelName2"]
+        ksplit = 0
+        run_1stage = False
+        run_1stage_xbf16 = False
+        cfg_flat = False
+        cfg = {
+            "block_m": block_m,
+            "ksplit": 0,
+            "kernelName1": kernelName1,
+            "kernelName2": kernelName2,
+            "run_1stage": False,
+        }
+        logger.info(
+            "[fused_moe] replacing mixed A4W4 GEMM1 with MXFP4 backend "
+            f"({kernelName1=}, {kernelName2=})"
+        )
+
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2016,11 +2160,21 @@ def get_2stage_cfgs(
                 kernelName1=kernelName1,
                 interleave=(gate_mode == GateMode.INTERLEAVE),
             ),
-            stage2=functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernelName2),
+            stage2=(
+                functools.partial(
+                    _mxfp4_a4w4_stage2_fw,
+                    kernelName2=kernelName2,
+                )
+                if _is_mxfp4_kname(kernelName2)
+                else functools.partial(
+                    _flydsl_stage2_wrapper,
+                    kernelName=kernelName2,
+                )
+            ),
             block_m=_bm,
             ksplit=int(ksplit),
             fuse_quant="fp4",
-            output_aux=True,
+            output_aux=False,
             prequant=False,
         )
 

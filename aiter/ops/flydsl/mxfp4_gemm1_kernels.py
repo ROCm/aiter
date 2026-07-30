@@ -11,10 +11,20 @@ from aiter.ops.flydsl import moe_kernels as _moe_kernels
 _SUPPORTED = {
     (32, True, False),
     (32, False, False),
+    (64, True, False),
     (64, False, False),
     (128, False, False),
     (16, True, True),
 }
+
+
+def _effective_use_nt(*, n_tokens, topk, NE, BM, use_nt, inline_quant):
+    """Keep BM32 streaming loads only while each expert averages under one M tile."""
+    if use_nt and not inline_quant and BM == 32:
+        total_m_blocks = (int(n_tokens) * int(topk) + BM - 1) // BM
+        if total_m_blocks >= int(NE):
+            return False
+    return use_nt
 
 
 @functools.cache
@@ -93,6 +103,14 @@ def flydsl_mxfp4_gemm1(
     xcd_swizzle=0,
     stream=None,
 ):
+    use_nt = _effective_use_nt(
+        n_tokens=n_tokens,
+        topk=topk,
+        NE=NE,
+        BM=BM,
+        use_nt=use_nt,
+        inline_quant=inline_quant,
+    )
     _assert_supported(
         NE=NE,
         D_HIDDEN=D_HIDDEN,

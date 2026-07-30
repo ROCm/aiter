@@ -18,6 +18,38 @@ _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 
 
+def _select_mxfp4_a4w4_kernels(*, token: int, expert: int, topk: int) -> dict:
+    """Select the canonical MXFP4 GEMM1/GEMM2 pair for a routed-M shape."""
+    routed_rows = int(token) * int(topk)
+    expert = int(expert)
+    average_rows = (routed_rows + expert - 1) // expert
+
+    if int(token) <= 128:
+        block_m = 16
+    elif average_rows <= 32:
+        block_m = 32
+    elif average_rows <= 64:
+        block_m = 64
+    else:
+        block_m = 128
+
+    total_m_blocks = (routed_rows + block_m - 1) // block_m
+    use_nt = block_m in (16, 32, 64) and total_m_blocks < expert
+    xcd_swizzle = 2 if block_m == 64 and use_nt else 0
+
+    g1 = f"{_MXMOE_PREFIX[1]}{block_m}x256x256"
+    if block_m == 16:
+        g1 += "_f16in_nt"
+    elif use_nt:
+        g1 += "_nt"
+    if xcd_swizzle:
+        g1 += f"_xcd{xcd_swizzle}"
+
+    g2 = f"flydsl_moe2_afp4_wfp4_bf16_t{block_m}x128x256_reduce"
+
+    return {"BM": block_m, "kernelName1": g1, "kernelName2": g2}
+
+
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
     kname = (kname or "").replace("_FLYDSL", "")
     pfx = _MXMOE_PREFIX[stage]

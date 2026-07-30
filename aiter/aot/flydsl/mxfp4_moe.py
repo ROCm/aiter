@@ -62,7 +62,9 @@ def parse_csv(csv_path: str):
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
+        _select_mxfp4_a4w4_kernels,
     )
+    from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_shape_supported
 
     jobs = []
     seen = set()
@@ -85,7 +87,37 @@ def parse_csv(csv_path: str):
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
 
-            kn1 = (row.get("kernelName1") or "").strip()
+            use_replacement = (
+                row.get("gfx") == "gfx950"
+                and row.get("act_type") == "ActivationType.Silu"
+                and row.get("dtype") == "torch.bfloat16"
+                and row.get("q_dtype_a") == "torch.float4_e2m1fn_x2"
+                and row.get("q_dtype_w") == "torch.float4_e2m1fn_x2"
+                and row.get("q_type") == "QuantType.per_1x32"
+                and int(row.get("use_g1u1") or 0) == 1
+                and int(row.get("doweight_stage1") or 0) == 0
+                and is_mxfp4_moe_shape_supported(
+                    expert,
+                    model_dim,
+                    inter_dim,
+                    topk,
+                )
+            )
+            replacement = (
+                _select_mxfp4_a4w4_kernels(
+                    token=int(row["token"]),
+                    expert=expert,
+                    topk=topk,
+                )
+                if use_replacement
+                else None
+            )
+
+            kn1 = (
+                replacement["kernelName1"]
+                if replacement is not None
+                else (row.get("kernelName1") or "").strip()
+            )
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
                 _add(
@@ -103,7 +135,11 @@ def parse_csv(csv_path: str):
                     }
                 )
 
-            kn2 = (row.get("kernelName2") or "").strip()
+            kn2 = (
+                replacement["kernelName2"]
+                if replacement is not None
+                else (row.get("kernelName2") or "").strip()
+            )
             if _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 if p2["mxfp4out"] and not _MXFP4_INTERMEDIATE:
