@@ -250,18 +250,21 @@ def launch_gemm_a8w4_tdm(
             elem_ty=fx.Int32.ir_type, address_space=shared, alignment=16
         )
         if const_expr(WAVE_SPEC):
-            waves = [
-                (0, 1),
-                (2, 3),
-                (4, 5) if WS8 else (0, 1),
-                (6, 7) if WS8 else (2, 3),
-            ]
+            if const_expr(WS8):
+                # 8 waves: each tensor loaded cooperatively by a dedicated wave pair.
+                waves = [(0, 1), (2, 3), (4, 5), (6, 7)]
+            else:
+                # 4 waves (ported from gemm_mxscale wave_specialized_tdm): one whole
+                # tensor per single wave -- wave0=A, wave1=B, wave2=A-scale,
+                # wave3=B-scale. Each loader wave issues one full-tile descriptor
+                # (num_warps=1), so every wave tracks exactly one outstanding TDM.
+                waves = [(0,), (1,), (2,), (3,)]
             nw = 1
         else:
             waves, nw = [(None,)] * 4, num_waves
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
+        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave stride pad_iv pad_am oob")
         jobs = []
 
         def add_tdm_loads(
@@ -280,6 +283,7 @@ def launch_gemm_a8w4_tdm(
             pad=None,
         ):
             seg = outer // len(wv)
+            piv, pam = (pad[0], pad[1]) if pad else (0, 0)
             for i in range_constexpr(len(wv)):
                 gt = global_view(
                     g_base,
@@ -288,23 +292,10 @@ def launch_gemm_a8w4_tdm(
                     (inner, 1),
                 )
                 ext = None if oob is None else oob - i * seg
-                pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
-                atom = fx.rocdl.make_tdm_atom(
-                    gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw
-                )
-                jobs.append(
-                    Job(
-                        atom,
-                        gt,
-                        on_i32,
-                        lds_off + i * seg * lds_row,
-                        lds_row,
-                        inner,
-                        seg,
-                        k_adv,
-                        wv[i],
-                    )
-                )
+                pad_kw = dict(pad_interval=pad[0], pad_amount=pad[1]) if pad else {}
+                atom = fx.rocdl.make_tdm_atom(gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw)
+                jobs.append(Job(atom, gt, on_i32, lds_off + i * seg * lds_row, lds_row, inner, seg,
+                                k_adv, wv[i], g_stride, piv, pam, ext))
 
         add_tdm_loads(
             gA_base,
@@ -360,7 +351,63 @@ def launch_gemm_a8w4_tdm(
             wv=waves[3],
         )
 
+        # 4-wave warp-spec: collapse the 4 per-tensor loads into ONE tensor_load_2d
+        # whose 2D descriptor is selected per wave (wave0=A, 1=B, 2=A-scale,
+        # 3=B-scale), mirroring gemm_mxscale's wave_specialized_tdm. This emits a
+        # single tensor_load_to_lds in the ISA instead of one branch per tensor.
+        FOURW = const_expr(WAVE_SPEC and not WS8)
+        if const_expr(FOURW):
+            is_a = wave == fx.Int32(0)
+            is_b = wave == fx.Int32(1)
+            is_as = wave == fx.Int32(2)
+
+            def wave_sel(a, b, c, d):  # pick this wave's value (else B-scale)
+                return is_a.select(a, is_b.select(b, is_as.select(c, d)))
+
+            def make_dgroup1(inner, outer, stride0, elem_bytes, pad_iv, pad_am, oob):
+                # GROUP1 (vec<8xi32>) for num_warps=1 (one whole tensor per wave):
+                # dim0=inner (innermost), dim1=outer (outermost). Same bit layout as
+                # tdm_ops.make_tensor_descriptor_2d.
+                dsc = int(math.log2(elem_bytes))
+                if const_expr(bool(pad_iv) and bool(pad_am)):
+                    enc_iv, enc_am = tdm_ops.compute_padding_encoding(pad_iv, pad_am, elem_bytes * 8)
+                    pad_en = 1
+                else:
+                    enc_iv, enc_am, pad_en = 0, 0, 0
+                g0 = fx.Int32((dsc << 16) | (pad_en << 20) | (enc_iv << 22) | (enc_am << 25))
+                g1 = fx.Int32((inner & 0xFFFF) << 16)
+                if const_expr(oob is None):
+                    g2 = fx.Int32(((inner >> 16) & 0xFFFF) | ((outer & 0xFFFF) << 16))
+                    g3 = fx.Int32(((outer >> 16) & 0xFFFF) | (inner << 16))
+                else:
+                    # Runtime tensor_dim1 = max(0, oob); the outer tile-start is already
+                    # folded into the descriptor's global address (outer_off == 0).
+                    rows = (oob > fx.Int32(0)).select(oob, fx.Int32(0))
+                    g2 = fx.Int32((inner >> 16) & 0xFFFF) | ((rows & fx.Int32(0xFFFF)) << 16)
+                    g3 = ((rows >> 16) & fx.Int32(0xFFFF)) | fx.Int32(inner << 16)
+                g4 = fx.Int32(outer & 0xFFFF)
+                g5 = fx.Int32(stride0 & 0xFFFFFFFF)
+                return Vec.from_elements([g0, g1, g2, g3, g4, g5, fx.Int32(0), fx.Int32(0)])
+
+            # Per-tensor invariants (jobs order A, B, A-scale, B-scale). Global bases
+            # stay as fx values so the per-issue math below works whether kt/s are
+            # compile-time (prologue/drain) or runtime (steady k-loop).
+            glb_base = [fx.Int64(fx.ptrtoint(fx.get_iter(j.gt))) for j in jobs]  # tile byte base
+            lds_within = [(j.lds_off * 4 if j.on_i32 else j.lds_off) for j in jobs]  # LDS byte off in slot
+            k_bytes = [j.k_adv for j in jobs]  # per-k-tile global byte advance
+            dgroup1 = wave_sel(*[make_dgroup1(j.inner, j.outer, j.stride, 4 if j.on_i32 else 1,
+                                              j.pad_iv, j.pad_am, j.oob) for j in jobs])
+
         def issue(s, kt):
+            if const_expr(FOURW):
+                addr = wave_sel(*[glb_base[t] + fx.Int64(kt * k_bytes[t]) for t in range(4)])
+                lo = fx.Int32(addr)
+                hi = fx.Int32(addr >> 32) | fx.Int32(1 << 31)  # type field = 2 in [31:30]
+                slot = ptr_to_idx(buf_ptr(s))
+                lds = wave_sel(*[fx.Int32(slot + lds_within[t]) for t in range(4)])
+                dgroup0 = Vec.from_elements([fx.Int32(1), lds, lo, hi])
+                tdm_ops.tensor_load_2d(tdm_ops.TDMDescriptor2D(dgroup0, dgroup1))
+                return
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
             so4 = s * (PITCH // 4)
             for j in jobs:
@@ -526,6 +573,8 @@ def launch_gemm_a8w4_tdm(
 
         def pf_load(p, bases, ksl):
             ba, bb, bsa, bsb = bases
+            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             for wm in range_constexpr(wmma_m_rep):
                 pf_act[p][wm].store(load_a(ba, wm, ksl))
             for wn in range_constexpr(wmma_n_rep):
@@ -533,8 +582,6 @@ def launch_gemm_a8w4_tdm(
             # Pack all scales into one wide rmem vector store. from_elements
             # consumes the ds-reads exactly like load_a/load_b's shuffle, so the
             # backend tracks the ds->pack dependency; no manual wait here.
-            sa_v = [load_sa(bsa, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
-            sb_v = [load_sb(bsb, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             pf_sc[p].store(Vec.from_elements(sa_v + sb_v))
             # Keep ALL four region base-address registers live past the scale
             # ds_loads so the allocator can't reuse them as scale destinations
@@ -584,7 +631,10 @@ def launch_gemm_a8w4_tdm(
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
-            TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
+            # Per-wave outstanding-TDM count. Both wave-spec schemes issue exactly
+            # one TDM op per wave per stage (8-wave: one pair-half; 4-wave: one whole
+            # tensor), so TDM_PER=1; non-spec has all 4 waves cooperate on all 4.
+            TDM_PER = 1 if WAVE_SPEC else 4
             # Post-compute issue (double-buffered) wins for decode (small tile_m)
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
