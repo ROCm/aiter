@@ -22,8 +22,7 @@ _KERNEL_PATH = os.path.abspath(
         "aiter",
         "ops",
         "flydsl",
-        "kernels",
-        "gemm_a8w8_blockscale_gfx1250.py",
+        "gemm_a8w8_blockscale_f32_gfx1250.py",
     )
 )
 
@@ -51,7 +50,7 @@ if not _flydsl_available():
 def _load_kernel():
     """Load kernel module by file path to bypass aiter.ops.flydsl package init."""
     spec = importlib.util.spec_from_file_location(
-        "_flydsl_a8w8_blockscale_kernel", _KERNEL_PATH
+        "_flydsl_a8w8_blockscale_wrapper", _KERNEL_PATH
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
