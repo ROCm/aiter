@@ -3,8 +3,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """
 Parse a FlyDSL vs Triton FP8 MQA Logits benchmark markdown report and produce:
-  1. A bar chart (Triton vs best FlyDSL kernel) saved as PNG.
+  1. A bar chart (Triton vs best FlyDSL Direct Load vs best FlyDSL LDS Staged) saved as PNG.
   2. A summary markdown table with one row per shape.
+
+FlyDSL kernels are split into two categories by name:
+  - LDS staged: kernel name contains "_lds2"
+  - Direct load: all other FlyDSL kernels
 
 Usage:
     python plot_fp8_mqa_perf.py bench-results.md [--out-png foo.png] [--out-md foo.md]
@@ -70,8 +74,13 @@ def _parse_speedup(cell: str) -> float | None:
     return None
 
 
+def _is_lds(impl_tag: str) -> bool:
+    """Return True if the kernel tag identifies an LDS-staged variant."""
+    return "_lds2" in impl_tag
+
+
 def parse_md(path: Path) -> list[dict]:
-    """Return one dict per shape section with the Triton row and the best FlyDSL row."""
+    """Return one dict per shape section with Triton, best Direct-Load, and best LDS rows."""
     text = path.read_text()
     sections = _SHAPE_RE.split(text)
     # sections = [preamble, label1, body1, label2, body2, ...]
@@ -84,7 +93,8 @@ def parse_md(path: Path) -> list[dict]:
         body = sections[i + 1]
 
         triton_row = None
-        best_flydsl = None  # (tflops, impl, verify, vs_triton_raw)
+        best_dl = None   # best Direct-Load FlyDSL: (tflops, impl, verify)
+        best_lds = None  # best LDS-staged FlyDSL:  (tflops, impl, verify)
 
         for line in body.splitlines():
             m = _ROW_RE.match(line.strip())
@@ -109,35 +119,39 @@ def parse_md(path: Path) -> list[dict]:
                     "verify": verify,
                 }
             elif impl.startswith("flydsl:"):
-                if best_flydsl is None or tflops > best_flydsl["tflops"]:
-                    speedup = _parse_speedup(vs_triton_raw)
-                    best_flydsl = {
-                        "impl": impl[len("flydsl:"):],  # strip "flydsl:" prefix
-                        "tflops": tflops,
-                        "verify": verify,
-                        "speedup": speedup,
-                    }
+                tag = impl[len("flydsl:"):]  # strip "flydsl:" prefix
+                entry = {"impl": tag, "tflops": tflops, "verify": verify}
+                if _is_lds(tag):
+                    if best_lds is None or tflops > best_lds["tflops"]:
+                        best_lds = entry
+                else:
+                    if best_dl is None or tflops > best_dl["tflops"]:
+                        best_dl = entry
 
         if triton_row is None:
             continue  # no triton baseline, skip section
 
-        # Recompute speedup from raw tflops for precision (vs_triton cell is rounded)
-        if best_flydsl is not None:
-            best_flydsl["speedup"] = (
-                best_flydsl["tflops"] / triton_row["tflops"]
-                if triton_row["tflops"] > 0
-                else None
-            )
+        # Recompute speedups from raw tflops for precision
+        def _speedup(entry):
+            if entry is None or triton_row["tflops"] <= 0:
+                return None
+            return entry["tflops"] / triton_row["tflops"]
 
         results.append(
             {
                 "shape": shape_label,
                 "triton_tflops": triton_row["tflops"],
                 "triton_verify": triton_row["verify"],
-                "best_impl": best_flydsl["impl"] if best_flydsl else None,
-                "best_tflops": best_flydsl["tflops"] if best_flydsl else None,
-                "best_verify": best_flydsl["verify"] if best_flydsl else None,
-                "speedup": best_flydsl["speedup"] if best_flydsl else None,
+                # Direct-load best
+                "dl_impl": best_dl["impl"] if best_dl else None,
+                "dl_tflops": best_dl["tflops"] if best_dl else None,
+                "dl_verify": best_dl["verify"] if best_dl else None,
+                "dl_speedup": _speedup(best_dl),
+                # LDS-staged best
+                "lds_impl": best_lds["impl"] if best_lds else None,
+                "lds_tflops": best_lds["tflops"] if best_lds else None,
+                "lds_verify": best_lds["verify"] if best_lds else None,
+                "lds_speedup": _speedup(best_lds),
             }
         )
 
@@ -149,8 +163,9 @@ def parse_md(path: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 COLORS = {
-    "triton": "#4878CF",  # blue
-    "flydsl": "#D65F5F",  # red/salmon
+    "triton": "#4878CF",   # blue
+    "flydsl_dl": "#D65F5F",  # red/salmon  – direct load
+    "flydsl_lds": "#59A14F",  # green       – LDS staged
 }
 
 
@@ -172,47 +187,55 @@ def _bar_label(ax, bar, text: str, color: str):
 def make_bar_chart(results: list[dict], out_png: Path, title_extra: str = ""):
     n = len(results)
     x = np.arange(n)
-    w = 0.35
+    w = 0.25  # narrower to fit 3 bars
 
     triton_vals = np.array([r["triton_tflops"] for r in results])
-    flydsl_vals = np.array(
-        [r["best_tflops"] if r["best_tflops"] is not None else 0.0 for r in results]
+    dl_vals = np.array(
+        [r["dl_tflops"] if r["dl_tflops"] is not None else 0.0 for r in results]
+    )
+    lds_vals = np.array(
+        [r["lds_tflops"] if r["lds_tflops"] is not None else 0.0 for r in results]
     )
     shape_labels = [r["shape"] for r in results]
 
-    fig, ax = plt.subplots(figsize=(max(14, n * 1.6), 7))
+    fig, ax = plt.subplots(figsize=(max(14, n * 1.8), 7))
 
     bars_triton = ax.bar(
-        x - w / 2, triton_vals, w, label="Triton", color=COLORS["triton"], alpha=0.9, zorder=3
+        x - w, triton_vals, w, label="Triton", color=COLORS["triton"], alpha=0.9, zorder=3
     )
-    bars_flydsl = ax.bar(
-        x + w / 2, flydsl_vals, w, label="Best FlyDSL", color=COLORS["flydsl"], alpha=0.9, zorder=3
+    bars_dl = ax.bar(
+        x, dl_vals, w, label="Best FlyDSL Direct Load", color=COLORS["flydsl_dl"], alpha=0.9, zorder=3
+    )
+    bars_lds = ax.bar(
+        x + w, lds_vals, w, label="Best FlyDSL LDS Staged", color=COLORS["flydsl_lds"], alpha=0.9, zorder=3
     )
 
     for bar, val in zip(bars_triton, triton_vals):
         _bar_label(ax, bar, f"{val:.0f}", COLORS["triton"])
 
-    for bar, r in zip(bars_flydsl, results):
-        if r["speedup"] is not None:
-            tag = f"x{r['speedup']:.2f}"
-        else:
-            tag = "N/A"
-        _bar_label(ax, bar, tag, COLORS["flydsl"])
+    for bar, r in zip(bars_dl, results):
+        tag = f"x{r['dl_speedup']:.2f}" if r["dl_speedup"] is not None else "N/A"
+        _bar_label(ax, bar, tag, COLORS["flydsl_dl"])
+
+    for bar, r in zip(bars_lds, results):
+        tag = f"x{r['lds_speedup']:.2f}" if r["lds_speedup"] is not None else "N/A"
+        _bar_label(ax, bar, tag, COLORS["flydsl_lds"])
 
     ax.set_xticks(x)
     ax.set_xticklabels(shape_labels, fontsize=8, rotation=45, ha="right")
     ax.set_ylabel("TFLOPs", fontsize=11)
-    title = "FP8 MQA Logits — Triton/Gluon vs Best FlyDSL Kernel"
+    title = "FP8 MQA Logits — Triton vs Best FlyDSL Direct Load vs Best FlyDSL LDS Staged"
     if title_extra:
         title += f"\n{title_extra}"
     ax.set_title(title, fontsize=10)
     ax.yaxis.grid(True, alpha=0.3, zorder=0)
     ax.set_axisbelow(True)
-    ax.set_ylim(0, max(triton_vals.max(), flydsl_vals.max()) * 1.22)
+    ax.set_ylim(0, max(triton_vals.max(), dl_vals.max(), lds_vals.max()) * 1.22)
 
     legend_handles = [
-        mpatches.Patch(color=COLORS["triton"], label="Triton (bar = abs TFLOPs)"),
-        mpatches.Patch(color=COLORS["flydsl"], label="Best FlyDSL (tag = speedup vs Triton)"),
+        mpatches.Patch(color=COLORS["triton"], label="Triton (tag = abs TFLOPs)"),
+        mpatches.Patch(color=COLORS["flydsl_dl"], label="Best FlyDSL Direct Load (tag = speedup vs Triton)"),
+        mpatches.Patch(color=COLORS["flydsl_lds"], label="Best FlyDSL LDS Staged (tag = speedup vs Triton)"),
     ]
     ax.legend(handles=legend_handles, fontsize=9, loc="upper left")
 
@@ -234,19 +257,26 @@ def make_md_table(results: list[dict], out_md: Path, png_path: Path, src_md: Pat
         "",
         f"![Bar chart]({png_path.name})",
         "",
-        "| Shape | Triton TFLOPs | FlyDSL TFLOPs | Best FlyDSL kernel | Verification (against Triton/Gluon) | Perf change |",
+        "| Shape | Triton TFLOPs | FlyDSL TFLOPs | Best FlyDSL kernel | Verification | Speedup vs Triton |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for r in results:
         triton = f"{r['triton_tflops']:.1f}"
-        flydsl = f"{r['best_tflops']:.1f}" if r["best_tflops"] is not None else "N/A"
-        kernel = r["best_impl"] if r["best_impl"] else "N/A"
-        verify = r["best_verify"] if r["best_verify"] else "N/A"
-        if r["speedup"] is not None:
-            perf = f"x{r['speedup']:.2f}"
-        else:
-            perf = "N/A"
-        lines.append(f"| {r['shape']} | {triton} | {flydsl} | {kernel} | {verify} | {perf} |")
+        # Pick whichever of DL / LDS is faster.
+        candidates = [
+            (r["dl_tflops"], r["dl_impl"], r["dl_verify"], r["dl_speedup"]),
+            (r["lds_tflops"], r["lds_impl"], r["lds_verify"], r["lds_speedup"]),
+        ]
+        best_tf, best_k, best_v, best_sp = max(
+            ((tf, k, v, sp) for tf, k, v, sp in candidates if tf is not None),
+            key=lambda t: t[0],
+            default=(None, None, None, None),
+        )
+        fly_tf = f"{best_tf:.1f}" if best_tf is not None else "N/A"
+        fly_k = best_k if best_k else "N/A"
+        fly_v = best_v if best_v else "N/A"
+        fly_sp = f"x{best_sp:.2f}" if best_sp is not None else "N/A"
+        lines.append(f"| {r['shape']} | {triton} | {fly_tf} | {fly_k} | {fly_v} | {fly_sp} |")
 
     out_md.write_text("\n".join(lines) + "\n")
     print(f"Saved summary: {out_md}")
@@ -259,7 +289,7 @@ def make_md_table(results: list[dict], out_md: Path, png_path: Path, src_md: Pat
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Plot Triton vs best FlyDSL from a benchmark markdown report."
+        description="Plot Triton vs best FlyDSL Direct Load vs best FlyDSL LDS Staged."
     )
     parser.add_argument("input_md", type=Path, help="Benchmark markdown results file")
     parser.add_argument(

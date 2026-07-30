@@ -12,7 +12,7 @@ the baseline, ``"scalar"`` the correctness-first fallback, and new versions can
 be added there. Pick which to benchmark with ``--flydsl-variants`` (default:
 all registered variants). Each becomes its own row, e.g. ``fly:mfma``.
 
-Operand-dtype control (``--dtype-combo``):
+Operand-dtype control (``--dtype``):
 
   * ``fnuz/fnuz`` (default) -- same-type fp8 on both Q and K (gfx942)
   * ``fn/fn``  -- same-type fp8 on both Q and K (gfx950)
@@ -31,13 +31,13 @@ Examples:
 
     # verify FlyDSL against Triton output directly (lighter, no torch ref OOM)
     python .../bench_flydsl_vs_triton_fp8_mqa_logits.py \
-        --verification triton --dtype-combo all
+        --verification triton --dtype all
 
     # DeepSeek-V4 combo
-    python .../bench_flydsl_vs_triton_fp8_mqa_logits.py --dtype-combo fn/fnuz
+    python .../bench_flydsl_vs_triton_fp8_mqa_logits.py --dtype fn/fnuz
 
     # both combos side by side
-    python .../bench_flydsl_vs_triton_fp8_mqa_logits.py --dtype-combo all
+    python .../bench_flydsl_vs_triton_fp8_mqa_logits.py --dtype all
 """
 import argparse
 import functools
@@ -305,32 +305,32 @@ def _median_ms(result):
 #     serving the dense logits are never materialized at once.
 PRESET_SHAPES = [
     # H = 64
-    # (1, 1024, 1024, 64, 128),
-    # (1, 1024, 1000, 64, 128),
-    # (1, 1000, 1024, 64, 128),
-    # (1, 2048, 2048, 64, 128),
-    # (1, 4096, 4096, 64, 128),
-    # (1, 1024, 4096, 64, 128),
-    # (1, 4096, 1024, 64, 128),
-    # #(1, 4096, 16384, 64, 128),
-    # #(1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
-    # # H = 64, long-ISL prefill (square; run without --verify, see note above)
-    # (1, 4096, 8192, 64, 128),
-    # (1, 8192, 4096, 64, 128),
-    # (1, 8192, 8192, 64, 128),
-    # (1, 16384, 16384, 64, 128),
-    # (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
-    # # H = 128
-    # (1, 1024, 1024, 128, 128),
-    # (1, 2048, 2048, 128, 128),
-    # (1, 4096, 4096, 128, 128),
-    # (1, 1024, 4096, 128, 128),
-    # #(1, 4096, 16384, 128, 128),
-    # #(1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
-    # # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
-    # (1, 8192, 8192, 128, 128),
-    # (1, 16384, 16384, 128, 128),
-    # (1, 32768, 32768, 128, 128),
+    (1, 1024, 1024, 64, 128),
+    (1, 1024, 1000, 64, 128),
+    (1, 1000, 1024, 64, 128),
+    (1, 2048, 2048, 64, 128),
+    (1, 4096, 4096, 64, 128),
+    (1, 1024, 4096, 64, 128),
+    (1, 4096, 1024, 64, 128),
+    (1, 4096, 16384, 64, 128),
+    (1, 4096, 16000, 64, 128),  # non-aligned s_kv (tail)
+    # H = 64, long-ISL prefill
+    (1, 4096, 8192, 64, 128),
+    (1, 8192, 4096, 64, 128),
+    (1, 8192, 8192, 64, 128),
+    (1, 16384, 16384, 64, 128),
+    (1, 32768, 32768, 64, 128),  # ~32k: practical ceiling for the geak variant
+    # H = 128
+    (1, 1024, 1024, 128, 128),
+    (1, 2048, 2048, 128, 128),
+    (1, 4096, 4096, 128, 128),
+    (1, 1024, 4096, 128, 128),
+    (1, 4096, 16384, 128, 128),
+    (1, 4096, 16000, 128, 128),  # non-aligned s_kv (tail)
+    # H = 128, long-ISL prefill (mirrors the H=64 long-ISL group above)
+    (1, 8192, 8192, 128, 128),
+    (1, 16384, 16384, 128, 128),
+    (1, 32768, 32768, 128, 128),
 
     # Basic set of DS4 shapes
     (1, 4096, 4096, 64, 128),
@@ -794,7 +794,18 @@ def _gpu_info():
     hip = getattr(getattr(torch, "version", None), "hip", None)
     if hip:
         info.append(("HIP", hip))
-    info.append(("flydsl", "available" if is_flydsl_available() else "unavailable"))
+    if is_flydsl_available():
+        try:
+            import flydsl as _flydsl
+            _fver = getattr(_flydsl, "__version__", None)
+            if _fver is None:
+                import importlib.metadata as _im
+                _fver = _im.version("flydsl")
+        except Exception:
+            _fver = "unknown"
+        info.append(("flydsl", _fver))
+    else:
+        info.append(("flydsl", "unavailable"))
     return info
 
 
@@ -981,6 +992,14 @@ def _resolve_shapes(args):
 
     return [(i + 1, s) for i, s in enumerate(PRESET_SHAPES)]
 
+def _default_dtype_combo() -> str:
+    """Return the default dtype combo for the current GPU arch."""
+    arch = get_rocm_arch()
+    if arch == "gfx950":
+        return "fn/fn"
+    if arch == "gfx942":
+        return "fnuz/fnuz"
+    raise SystemExit(f"[error] unknown GPU arch {arch!r}; cannot select default dtype combo.")
 
 def main():
     p = argparse.ArgumentParser(
@@ -1024,9 +1043,9 @@ def main():
     )
     p.add_argument("--clean_logits", type=int, default=1)
     p.add_argument(
-        "--dtype-combo",
+        "--dtype",
         type=str,
-        default="fnuz/fnuz",
+        default=_default_dtype_combo(),
         metavar="COMBO",
         help=(
             "comma-separated fp8 operand-dtype combos to benchmark. Each combo "
@@ -1103,7 +1122,7 @@ def main():
     args.modes = TIMING_MODES if args.mode == "all" else (args.mode,)
 
     # Resolve dtype combos.
-    raw_combos = args.dtype_combo
+    raw_combos = args.dtype
     if raw_combos == "all":
         args.dtype_combos = list(DTYPE_COMBOS)
     else:
