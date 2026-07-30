@@ -1040,7 +1040,14 @@ def mla_gluon(
                 # stage-2 derive the active 16/48/64/96/112 split count from
                 # device-side sequence metadata, so CUDA Graph capture cannot
                 # freeze this path at the caller's default min_kv_seq_len=1.
-                NUM_KV_SPLITS = max(1, min(112, 256 // batch_size))
+                # Keep the upstream MTP/head-block workgroup budget intact.
+                NUM_KV_SPLITS = max(
+                    1,
+                    min(
+                        112,
+                        256 // (batch_size * qlen * NUM_M_BLOCKS),
+                    ),
+                )
                 DYNAMIC_KV_SPLITS = True
         if num_kv_splits is not None:
             NUM_KV_SPLITS = int(num_kv_splits)

@@ -29,9 +29,9 @@ def cal_diff(
     x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool = False
 ) -> dict[str, float | bool]:
     x, y = x.double(), y.double()
-    ((x - y) * (x - y)).mean().sqrt().item()
+    RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
-    (x - y).abs().max().item()
+    amax_diff = (x - y).abs().max().item()
     # print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
     if use_fp8:
         assert cos_diff < 3e-2
@@ -188,9 +188,7 @@ def test_mla(
         kv_indices = torch.randperm(num_page, dtype=torch.int)[:n_kv_idx]
         page_layout = "scattered-unique"
     ret["config:page_layout"] = page_layout
-    ret["config:num_kv_splits"] = (
-        "auto" if split_per_batch is None else split_per_batch
-    )
+    ret["config:num_kv_splits"] = "auto" if split_per_batch is None else split_per_batch
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -354,7 +352,9 @@ def test_mla(
     # ctx_lens <= 16384 cap to skip the ref for those configs.
     if (
         not args.decode_only
-        and (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
+        and (
+            dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
+        )
         and batch_size * ctx_lens * nhead < 32 * 8192 * 16
         and ctx_lens <= 16384
         and total_qo <= prefill_ref_token_cap
