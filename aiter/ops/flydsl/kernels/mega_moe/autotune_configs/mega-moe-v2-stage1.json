@@ -1,0 +1,2616 @@
+{
+  "entries": {
+    "04beae1758531f22c4f4c9044eea0c20c71674f2799973107f1bc4314b6e64d7": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 1024,
+          "fuse_mtpr": 128,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 128
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "0777f3e391b2f419de12248b4946741e0a2eea2d986a16b9eacb88a9e03812e9": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 4,
+        "pipe_weights": false,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 16
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "08dcd07c5a2ca09be88cec073dfe1f56b5db4c5fb6bee3f648f97100163757f2": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": 0,
+        "cooperative_payload_copy": false,
+        "grid_mult": 3,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "098e7d9020d8ee0f8ce62eb072aa46ab9c5cd9f9df8d6d980376fe15b288fa6c": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 1024,
+          "fuse_mtpr": 128,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 128
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "0e86bc2dee1821c4360ff0dc7d93bbad7eee006752bcd514cb7240c1a50f179f": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 65536,
+          "fuse_mtpr": 8192,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 8192
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "0feee221012285d615b5507189bdbbb1138e91cbbe3ba4a18326ad56777e91b4": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 128,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 8
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "141ab2f62a62daddedd3979fa50eeb24a84e94814f5fa60be08d9d9d3b9b96cd": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": 3,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "1fc3777c475045229cfa6fca950013b3abe09faf02cbdca053133d121f286f21": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 65536,
+          "fuse_mtpr": 8192,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 8192
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "21c82bb2a5730c6697e1e587464708580c74d1eb8741e5fff1afff2ff77b694e": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 3,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 16
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "2272462eebf1eef0c90457302cc73271fac1aeddfe2ae7f9a1f22c56489b2910": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "25ab7c19a374766e55f1e715981a58dc74ef2aee58bf079450714b9fab3bc287": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 128,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "27b7d5daccb56e18799fd9141169a768465f4dd695a275ee8c282f4756bb6a52": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 16384,
+          "fuse_mtpr": 2048,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 2048
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "2835f02ac9de860b585b45dfb35020c7d2c4325799fc9759fcf41a743d74eb48": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 128,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "297aa4555257b9536ed0d8807921c6c1ce3fed91bbbf13ffba893426a8dc1f01": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 224,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "35ed12eb261aff2595827eef491db36d693d4c8fb34db34747682bc95d759280": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 1
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "4394784633c179cded19253c90852ddebb640ed17608da8189e4f619ff89b081": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": 0,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 192,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "43a8697a139a85a0eae5994c95bda0692af22a6bb8f508a4dc124d172bad03ca": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": 3,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "49cd46b6241be10fbeececf34e107e524a7b14901739b594cc9504cfa7dee77f": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 8
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "4b4b76621ab3357f3f410b2fa3fc41875187d2bdb0c2c2a9e2e85fe3cbed48b1": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 512,
+          "fuse_mtpr": 64,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 64
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "4ecd7f99649546d388b9771eb43e4cc8b37ce15c29d3abf39efdac830c04eef4": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 224,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 1024,
+          "fuse_mtpr": 128,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 128
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "4ff5a66133eba31e8ce686d333f8ae88c46a02d139f3a60418bef6f0c7d9bc91": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 3,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 208,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 128,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 512,
+          "fuse_mtpr": 64,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 64
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "51353f54eeb315c8c22a90d4040b710443e89160019657ee00ced5de6a14b61c": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 131072,
+          "fuse_mtpr": 16384,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 16384
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "5a8c81fdb65bbf62561ae35e54f966b871739f57b8ab468ab3083efd1eae502b": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 4,
+        "pipe_weights": false,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 4
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "5e7d11815b5f71aa0a2e89b62fb9e3464806554e4da329f1521efabde40512f1": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "60d935aed8601d0ec857cc6f1e33d4bd16dc5b0287125be0df3cce5bcda82000": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 1
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "6341abc16868682892965ecb11b6412edca8646b6c184a36279f9e1e1c6fc1d1": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "6bcde6478c96589b8ded807f372f4459610da1bcb530b7177e2c5bd7e486275b": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 4,
+        "pipe_weights": false,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 256,
+          "fuse_mtpr": 32,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 32
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "6ca371bdf15a4c4f65739f36fbb45450422e916296ad24d9d2e2c54e318739b6": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "6d351039cf9bbcf86cfdaa14ed8144dc02649924cd8fceff0fbf29700e7cadaf": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 32768,
+          "fuse_mtpr": 4096,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 4096
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "757c04e95ce1586669a5d81b20e12e54273c0baaa8148a21e0e82d9cd059b5d4": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 32768,
+          "fuse_mtpr": 4096,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 4096
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "7925c00d05d6a696d9bf6c145b670ed4594f6cb0dc3ac560068122ac04f1f900": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 4
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "7f1196ebf0e279076a18208779f64ea49a0c4298ca7a4422db8662c8e484def1": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 16384,
+          "fuse_mtpr": 2048,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 2048
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "8463c9e05837b80a903bdb4d92d0cc4bff99467edecac2b9a380be2ec2062e39": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 262144,
+          "fuse_mtpr": 32768,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 32768
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "88561bc76a3b1d86376990c8ce77b9abaa19a07811ba64131ddab0d92160325a": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": 0,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 192,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "8b5b3e0d456f5ffb194b4a6bb0589c6ddcdd8750e0f6391340dd7554b8970bbe": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": 0,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 160,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "902abdfbe436cd0d6c618bf30831c7470d48412a45879ac6ff778d49447f0fa9": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 2048,
+          "fuse_mtpr": 256,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 256
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "94196060f35df8c314a708549320e2a1a36324e9542808f3cc166b7774a37d28": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 128,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 4
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "96dba2657db4287411d0f84d57883a093565e58c740f34f1daeaffebb4f2af1f": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 131072,
+          "fuse_mtpr": 16384,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 16384
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "9c1ee671009db32f5c7a03ef70620023ac14c678d5682e43ab9d07ec0bd717ae": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 16384,
+          "fuse_mtpr": 2048,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 2048
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "a084b24fa60b3be98497f5af24b6650d280856338f49e3618923559670f518dc": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 128,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "a207aed53129d7bdcc2b8d8541efc61a8d0ec6dce75bb27ca0b6c0001fc53573": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 256,
+          "fuse_mtpr": 32,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 32
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "a5f24d04fc0e93cc4f14d172df8a8c5ff08524d3524588b661972e57cb0687a3": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 4,
+        "pipe_weights": false,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 512,
+          "fuse_mtpr": 64,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 64
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "a691f739878b6b38153d80312f4cf52613df47350aa6f80bf2ee7dceba1fd28e": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 16384,
+          "fuse_mtpr": 2048,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 2048
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "aa7342267320ceb5ffc3f05ce0ed9ceebf4a7faf2e39d4c71bfc64ba463dad43": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 262144,
+          "fuse_mtpr": 32768,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 32768
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "afe8e6722aaee59f7fc2dd97b46bb4d8de83e96eab2533595b293e9d46cc522c": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 224,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "b835908c2e465b5825e3b1bd8d477bc4cd6e8d9877ad7beb8a9248592cccda8a": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 224,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 1024,
+          "fuse_mtpr": 128,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 128,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 128
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "c6996aee905c9fc186591c1a6c4fcce896110f2df239163576925368822cbfcc": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 160,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 8
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "d1dc0a88d9aa6b2192a4621ce6589f0e02ed50d176249b78935f593a4839f1e5": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 2,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 128,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 4096,
+          "fuse_mtpr": 512,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 512
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "d1f1e48a26c6b2c5e8be7eb445ed989909ebc75a5f5eeb354b54605ff9b8a780": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 192,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 8192,
+          "fuse_mtpr": 1024,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 1024
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "e02747f5052a9de60c7fa07ff9d9bb2734329d29cf85eb1b5f37e77ea3e9ead5": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 96,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 128,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 1
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 16
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "e0fddb246b69e6f038d9d6d576e348713cdda4d64f5361bc6b425098d8403292": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 3,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 32,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 128,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 1024,
+          "fuse_mtpr": 128,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 128
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "e669ee89dcec7e5aded90274171e68abc331ee5211c55ab907843e0b543f2f9f": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 65536,
+          "fuse_mtpr": 8192,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 8192
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "ee8f4c9084b47070e9e0ad7be8b335e5615e30cdcc1c0cd6f746fbabfd0f0b34": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 131072,
+          "fuse_mtpr": 16384,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 16384
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "f2db02e87e937b1b46f7e867e7c20af70052db77a0fdf3559bbb73e2999f60c1": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 4,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 32,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 128,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 256,
+          "fuse_mtpr": 32,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 32
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "f44756be4ce54a20c399969341ee825619ecf9164516804de48377460dd2dad2": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": true,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 128,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": false,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 32768,
+          "fuse_mtpr": 4096,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "128",
+          "tune_tokens": 4096
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "f6de94f9cfb8d926e7e76f5eeef7947ed286fa8384189d382d3ee438fc5aa3c6": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": true,
+        "num_dispatch_cu": 32,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 64,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 16384,
+          "fuse_mtpr": 2048,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 64,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "64",
+          "tune_tokens": 2048
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "fa4662075b6f9df0f87bca0cba5947b710101c6060aea2dc7abd0e0a2a426726": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": -1,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 8,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 512,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": false,
+          "fuse_cap": 262144,
+          "fuse_mtpr": 32768,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 32768
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    },
+    "fd4ffe030e47dea9721f87e6ef30d4093c50fd09634632e664699744f62232f5": {
+      "config": {
+        "active_expert_producer": false,
+        "async_a_copy": false,
+        "b_nt": 0,
+        "cooperative_payload_copy": false,
+        "grid_mult": 1,
+        "mfma_amajor": false,
+        "num_dispatch_cu": 64,
+        "num_waves": 4,
+        "pipe_weights": true,
+        "sort_block_m": 32,
+        "swizzle_a": true,
+        "tile_k": 256,
+        "tile_n": 256,
+        "use_tile_resource": true,
+        "waves_per_eu_hint": 2
+      },
+      "identity": {
+        "device": {
+          "arch": "gfx950",
+          "compute_units": 256,
+          "name": "AMD Instinct MI355X"
+        },
+        "key": {
+          "autotune_schema": 19,
+          "dispatch_constraint": -1,
+          "experts_per_rank": 48,
+          "fixed_slot_dispatch": true,
+          "fuse_cap": 128,
+          "fuse_mtpr": 16,
+          "fuse_npes": 8,
+          "fuse_scale_dim": 224,
+          "fuse_topk": 6,
+          "grid_constraint": -1,
+          "inter_dim": 3072,
+          "metadata_block_m": 32,
+          "model_dim": 7168,
+          "num_cu": 256,
+          "tile_m_constraint": "32",
+          "tune_tokens": 1
+        },
+        "name": "mega-moe-v2-stage1"
+      }
+    }
+  },
+  "name": "mega-moe-v2-stage1",
+  "version": 1
+}

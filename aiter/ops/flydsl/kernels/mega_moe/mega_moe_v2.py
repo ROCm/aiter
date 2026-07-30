@@ -108,13 +108,13 @@ class MegaMoEV2:
         self._v2_grid_mult = None if stage1_grid_mult is None else int(stage1_grid_mult)
         if stage1_tile_m_values is None:
             token_capacity = int(max_tok_per_rank if tune_tokens is None else tune_tokens)
-            stage1_tile_m_values = (32,) if token_capacity <= 256 else (32, 64, 128)
+            stage1_tile_m_values = (32,) if token_capacity < 256 else (32, 64, 128)
         self._v2_tile_m_values = tuple(sorted({int(tile_m) for tile_m in stage1_tile_m_values}))
         if not self._v2_tile_m_values or any(tile_m not in (32, 64, 128) for tile_m in self._v2_tile_m_values):
             raise ValueError("stage1_tile_m_values must contain only 32, 64, and/or 128")
         capacity_tile_m = max(self._v2_tile_m_values)
         max_buffer_bytes = self.epr * self.world_size * self.mtpr * max(self.model_dim, self.inter_dim * 2)
-        compact = max_buffer_bytes >= 3_000_000_000 or self.epr > 64
+        compact = self.max_recv >= 2048 or max_buffer_bytes >= 3_000_000_000 or self.epr > 64
         self._s1_fixed_slot = not compact
         self._s1_scale_dim = self.model_dim // 32
         # fmt: off
@@ -188,7 +188,7 @@ class MegaMoEV2:
             "work_tail": torch.zeros(1, dtype=torch.int32, device=self.dev),
             "expert_tile_end": torch.empty(self.epr, dtype=torch.int32, device=self.dev),
             "active_experts": torch.empty(total_experts, dtype=torch.int32, device=self.dev),
-            "active_count": torch.zeros(1, dtype=torch.int32, device=self.dev),
+            "active_count": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
         }
         workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
@@ -267,6 +267,7 @@ class MegaMoEV2:
             tile_m = int(joint_config.kwargs["SBM"])
         tuner = self._s1_mega if tile_m is None else self._s1_mega_by_tile[int(tile_m)]
         tile_m_values = self._v2_tile_m_values if tile_m is None else (int(tile_m),)
+        metadata_block_m = self.sort_block_m if tile_m is None else int(tile_m)
         # fmt: off
         tuner(self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
             op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
@@ -276,7 +277,7 @@ class MegaMoEV2:
             stream, model_dim=self.model_dim, inter_dim=self.inter_dim,
             rank=self.rank, experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
-            fixed_slot_dispatch=self._s1_fixed_slot, metadata_block_m=self.sort_block_m,
+            fixed_slot_dispatch=self._s1_fixed_slot, metadata_block_m=metadata_block_m,
             num_cu=self._s1_num_cu,
             tune_tokens=cur_tok, dispatch_constraint=-1 if self._v2_dispatch_cu is None else self._v2_dispatch_cu,
             grid_constraint=-1 if self._v2_grid_mult is None else self._v2_grid_mult,

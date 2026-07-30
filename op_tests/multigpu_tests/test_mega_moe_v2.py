@@ -85,6 +85,7 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
     w1.mul_(model_dim**-0.25)
     w1_q, w1_scale = quantize(w1, quant_dtype=dtypes.fp4x2)
     w1_q = w1_q.view(local_experts, 2 * inter_dim, model_dim // 2)
+    w1_scale_ref = w1_scale.view(local_experts, 2 * inter_dim, model_dim // 32)
     del w1
     w1_kernel = shuffle_weight_a16w4(w1_q, 16, True).contiguous()
     w1_scale_kernel = shuffle_scale_a16w4(w1_scale, local_experts, True).contiguous()
@@ -98,11 +99,12 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
     w2.mul_(inter_dim**-0.25)
     w2_q, w2_scale = quantize(w2, quant_dtype=dtypes.fp4x2)
     w2_q = w2_q.view(local_experts, model_dim, inter_dim // 2)
+    w2_scale_ref = w2_scale.view(local_experts, model_dim, inter_dim // 32)
     del w2
     w2_kernel = shuffle_weight_a16w4(w2_q, 16, False).contiguous()
     w2_scale_kernel = shuffle_scale_a16w4(w2_scale, local_experts, False).contiguous()
     torch.cuda.empty_cache()
-    return w1_kernel, w1_scale_kernel, w2_kernel, w2_scale_kernel, w1_q, w1_scale, w2_q, w2_scale
+    return w1_kernel, w1_scale_kernel, w2_kernel, w2_scale_kernel, w1_q, w1_scale_ref, w2_q, w2_scale_ref
 
 
 def _dequant_expert(weight, scale, rows, cols):

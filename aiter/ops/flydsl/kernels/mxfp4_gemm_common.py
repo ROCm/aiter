@@ -6,6 +6,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import arith
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -64,7 +65,7 @@ def _lds_swizzle_mask(row):
 
 
 def _fabs_f32(x):
-    return fx.Float32(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(x)], [], []))
+    return fmath.absf(x)
 
 
 def _e8m0_roundup(amax_f32):
@@ -195,8 +196,8 @@ def flat_buffer_view(
     """Flat buffer-tensor view over a RAW i64 addr; fold=True folds wave-uniform base to a VGPR voffset, fold=False keeps per-lane offset + num_records_bytes for OOB-zero."""
     ptr_ty = fx.PointerType.get(elem_ty, fx.AddressSpace.Global, align)
     if fold:
-        base = fx.rocdl.readfirstlane(T.i32, _raw(base_elems))
-        off_i64 = fx.Int64(arith.ExtUIOp(T.i64, _raw(base)).result)
+        base = fx.Int32(fx.rocdl.readfirstlane(T.i32, base_elems))
+        off_i64 = fx.Uint32(base).to(fx.Uint64).bitcast(fx.Int64)
         base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg) + off_i64 * fx.Int64(elem_bytes))
     else:
         base_iter = fx.inttoptr(ptr_ty, fx.Int64(arg))
