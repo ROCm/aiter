@@ -114,7 +114,10 @@ def _run_autograd_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
     c_j, c_d, c_b = _cos(jf.grad, gj_e), _cos(df.grad, gd_e), _cos(bf.grad, gb_e)
     ok = min(c_j, c_d, c_b) > _COS_THRESH
     tag = f"[autograd] B={B} D={D} Mi={Mi} {regime:6s} L={L}"
-    return ok, f"[{'PASS' if ok else 'FAIL'}] {tag}  grad cos(dJ={c_j:.5f}, dD={c_d:.5f}, dB={c_b:.5f})"
+    return (
+        ok,
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  grad cos(dJ={c_j:.5f}, dD={c_d:.5f}, dB={c_b:.5f})",
+    )
 
 
 def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
@@ -141,9 +144,17 @@ def _run_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95, label=""):
     # Report the ACTUAL per-shape build config (not module globals, which no longer
     # track it — the build bakes D + knobs as closure constants).
     cfg = resolve_config(n_groups=B, reduction_k=D, output_n=D, max_seq_len=Mi)
-    bw = _bwd.build_backward(D, split=cfg["split"], gj_stages_a=cfg["gj_stages_a"], coarsen_m=cfg["coarsen_m"])
+    bw = _bwd.build_backward(
+        D,
+        split=cfg["split"],
+        gj_stages_a=cfg["gj_stages_a"],
+        coarsen_m=cfg["coarsen_m"],
+    )
     tag = f"{label}B={B} D={D} Mi={Mi} {regime:6s} L={L} gj={cfg['gj_stages_a']} split={bw.split}"
-    return ok, f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})"
+    return (
+        ok,
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})",
+    )
 
 
 def _run_reduce_path_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
@@ -174,7 +185,10 @@ def _run_reduce_path_case(D, B, Mi, regime, *, seed=1234, sparsity=0.95):
     ok = min(c_dj, c_dd, c_db) > _COS_THRESH
     ncols = (N + (N if N <= 256 else 256) - 1) // (N if N <= 256 else 256)
     tag = f"[reduce-path] B={B} D={D} Mi={Mi} {regime:6s} split=2 NRED_COL_TILES={ncols} L={L}"
-    return ok, f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})"
+    return (
+        ok,
+        f"[{'PASS' if ok else 'FAIL'}] {tag}  cos(dJ={c_dj:.5f}, dD={c_dd:.5f}, dB={c_db:.5f})",
+    )
 
 
 def _worker(D: int) -> int:
@@ -189,18 +203,22 @@ def _worker(D: int) -> int:
     cfg = resolve_config(n_groups=1024, reduction_k=D, output_n=D, max_seq_len=7680)
     res_ok = cfg["gj_stages_a"] == expected_gj
     ok &= res_ok
-    print(f"[{'PASS' if res_ok else 'FAIL'}] resolve winner D={D}: gj_stages_a={cfg['gj_stages_a']} "
-          f"(expected {expected_gj})")
+    print(
+        f"[{'PASS' if res_ok else 'FAIL'}] resolve winner D={D}: gj_stages_a={cfg['gj_stages_a']} "
+        f"(expected {expected_gj})"
+    )
 
     # The memoized build resolves the D-derived SPLIT (2 @ D<=256, 1 @ D>256).
     expected_split = 2 if D <= 256 else 1
     bw = _bwd.build_backward(D, split=None, gj_stages_a=expected_gj, coarsen_m=None)
     split_ok = bw.split == expected_split
     ok &= split_ok
-    print(f"[{'PASS' if split_ok else 'FAIL'}] build_backward(D={D}).split={bw.split} (expected {expected_split})")
+    print(
+        f"[{'PASS' if split_ok else 'FAIL'}] build_backward(D={D}).split={bw.split} (expected {expected_split})"
+    )
 
     # (2) headline correctness (all three grads).
-    for (B, Mi, regime) in _HEADLINE:
+    for B, Mi, regime in _HEADLINE:
         case_ok, msg = _run_case(D, B, Mi, regime)
         ok &= case_ok
         print(msg)
@@ -208,20 +226,29 @@ def _worker(D: int) -> int:
     # (3) regression guard (D=512 only): must run to completion without faulting.
     if D == 512:
         r = _REGRESSION
-        case_ok, msg = _run_case(D, r["B"], r["Mi"], r["regime"], seed=r["seed"],
-                                 sparsity=r["sparsity"], label="[regression] ")
+        case_ok, msg = _run_case(
+            D,
+            r["B"],
+            r["Mi"],
+            r["regime"],
+            seed=r["seed"],
+            sparsity=r["sparsity"],
+            label="[regression] ",
+        )
         ok &= case_ok
         print(msg)
 
     # (4) end-to-end autograd (out.backward()) vs eager grads. D=256 only: D=512 is
     # blocked at large L by the FORWARD int32-offset overflow (separate forward fix).
     if D <= 256:
-        for (B, Mi, regime) in [(120, 512, "genrec"), (120, 512, "skew")]:
+        for B, Mi, regime in [(120, 512, "genrec"), (120, 512, "skew")]:
             case_ok, msg = _run_autograd_case(D, B, Mi, regime)
             ok &= case_ok
             print(msg)
     else:
-        print(f"[SKIP] autograd D={D}: forward int32-overflow at large L (separate forward fix)")
+        print(
+            f"[SKIP] autograd D={D}: forward int32-overflow at large L (separate forward fix)"
+        )
 
     print(f"\nD={D} RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -235,19 +262,23 @@ def _orchestrate() -> int:
     overall = True
     for D in (256, 512):
         print(f"\n===== D={D} (same process, multi-D) =====")
-        overall &= (_worker(D) == 0)
+        overall &= _worker(D) == 0
 
     # Forced split=2 reduce-path coverage: the SPLIT>=2 reduce kernels with
     # NRED_COL_TILES>=2 are unreachable via the D-derived policy (SPLIT=1 @ D>256;
     # NRED_COL_TILES=1 @ D<=256). D=512 -> full last tile; D=384 -> partial last
     # tile (guards the col < N store bound). Same process (multi-D build).
     print("\n===== forced split=2 reduce path (NRED_COL_TILES>=2) =====")
-    for (D, B, Mi, regime) in [(512, 120, 512, "genrec"), (384, 120, 512, "genrec")]:
+    for D, B, Mi, regime in [(512, 120, 512, "genrec"), (384, 120, 512, "genrec")]:
         case_ok, msg = _run_reduce_path_case(D, B, Mi, regime)
         overall &= case_ok
         print(msg)
 
-    print("\n==================== OVERALL:", "PASS" if overall else "FAIL", "====================")
+    print(
+        "\n==================== OVERALL:",
+        "PASS" if overall else "FAIL",
+        "====================",
+    )
     return 0 if overall else 1
 
 
@@ -256,6 +287,7 @@ def _orchestrate() -> int:
 # cleanly otherwise; the `__main__` script path below is unchanged for manual   #
 # GPU runs. Each per-D worker is its own test so a failure localizes to a D.     #
 # --------------------------------------------------------------------------- #
+
 
 def _backend_ready() -> bool:
     """True iff a ROCm/CUDA device and an importable flydsl are both present."""
@@ -294,8 +326,12 @@ def test_jdbba_bwd_reduce_path(D):
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="jdbba backward dispatch test")
-    p.add_argument("--worker-d", type=int, default=None,
-                   help="internal: run all cases for this single D in-process")
+    p.add_argument(
+        "--worker-d",
+        type=int,
+        default=None,
+        help="internal: run all cases for this single D in-process",
+    )
     args = p.parse_args(argv)
     if args.worker_d is not None:
         return _worker(args.worker_d)

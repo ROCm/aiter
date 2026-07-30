@@ -27,7 +27,7 @@ compiled kernels). Per-shape scheduling is resolved from a JSON
 dispatch table (``jagged_dense_bmm_bwd_dispatch.json``, arch-keyed-v1, same loader
 shape as the forward's): the tunables are
 ``split`` (None → the kernel's ``2 if D<=256 else 1`` rule), ``coarsen_m`` (None →
-module default 2), and ``gj_stages_a`` (None → heuristic ``1 if D<=256 else 2``. 
+module default 2), and ``gj_stages_a`` (None → heuristic ``1 if D<=256 else 2``.
 Resolution order is
 explicit kwarg > exact shape-id winner > D-bucketed heuristic. There is no MFMA
 "atom" knob: the experimental fp16 32×32×8 path was removed, so bf16 16×16×16 is
@@ -67,9 +67,9 @@ __all__ = [
 # default", so a winner that omits a key doesn't override it. No "atom" key: the
 # fp16 path is gone, bf16 16x16x16 is the only schedule.
 _SCHEMA_DEFAULTS = {
-    "split": None,         # None -> D-derived (2 if D<=256 else 1)
-    "coarsen_m": None,     # None -> module default (2)
-    "gj_stages_a": None,   # None -> heuristic (1 if D<=256 else 2)
+    "split": None,  # None -> D-derived (2 if D<=256 else 1)
+    "coarsen_m": None,  # None -> module default (2)
+    "gj_stages_a": None,  # None -> heuristic (1 if D<=256 else 2)
 }
 
 _DISPATCH_TABLE: Optional[dict] = None
@@ -132,7 +132,9 @@ def _load_dispatch_table() -> dict:
     return _DISPATCH_TABLE
 
 
-def shape_id(*, n_groups: int, reduction_k: int, output_n: int, max_seq_len: int) -> str:
+def shape_id(
+    *, n_groups: int, reduction_k: int, output_n: int, max_seq_len: int
+) -> str:
     """Per-shape key, same format as the forward. For the backward K == N == D, so
     ``reduction_k == output_n == D``."""
     return f"B{n_groups}D{reduction_k}K{output_n}N{max_seq_len}"
@@ -181,13 +183,23 @@ def resolve_config(
     """
     explicit = {"split": split, "coarsen_m": coarsen_m, "gj_stages_a": gj_stages_a}
     table = _load_dispatch_table()
-    sid = shape_id(n_groups=n_groups, reduction_k=reduction_k, output_n=output_n, max_seq_len=max_seq_len)
+    sid = shape_id(
+        n_groups=n_groups,
+        reduction_k=reduction_k,
+        output_n=output_n,
+        max_seq_len=max_seq_len,
+    )
     entry = table["winners"].get(sid)
-    cfg = _normalize_cfg(entry) if entry is not None else _heuristic_cfg(reduction_k=reduction_k)
+    cfg = (
+        _normalize_cfg(entry)
+        if entry is not None
+        else _heuristic_cfg(reduction_k=reduction_k)
+    )
     for k, v in explicit.items():
         if v is not None:
             cfg[k] = int(v)
     return cfg
+
 
 # fp32 split-reduction scratch, cached per (n_groups, D, split, device). The
 # partials passes fully overwrite every slot they later reduce (empty groups
@@ -213,8 +225,12 @@ def _get_scratch(n_groups: int, K: int, N: int, split: int, device: torch.device
     cached = _SCRATCH_CACHE.get(key)
     if cached is None:
         if split >= 2:
-            dense_partials = torch.empty(n_groups * split * K, N, dtype=torch.float32, device=device)
-            bias_partials = torch.empty(n_groups * split, N, dtype=torch.float32, device=device)
+            dense_partials = torch.empty(
+                n_groups * split * K, N, dtype=torch.float32, device=device
+            )
+            bias_partials = torch.empty(
+                n_groups * split, N, dtype=torch.float32, device=device
+            )
         else:
             dense_partials = torch.empty(1, N, dtype=torch.float32, device=device)
             bias_partials = torch.empty(1, N, dtype=torch.float32, device=device)
@@ -224,10 +240,10 @@ def _get_scratch(n_groups: int, K: int, N: int, split: int, device: torch.device
 
 
 def jagged_dense_bmm_bwd_dispatched(
-    jagged: torch.Tensor,        # (L, K)          bf16, packed rows
-    dense: torch.Tensor,         # (n_groups, K, N) bf16
-    d_out: torch.Tensor,         # (L, N)          bf16, upstream gradient
-    seq_offsets: torch.Tensor,   # (n_groups + 1,) int32, prefix-sum row offsets
+    jagged: torch.Tensor,  # (L, K)          bf16, packed rows
+    dense: torch.Tensor,  # (n_groups, K, N) bf16
+    d_out: torch.Tensor,  # (L, N)          bf16, upstream gradient
+    seq_offsets: torch.Tensor,  # (n_groups + 1,) int32, prefix-sum row offsets
     n_groups: Optional[int] = None,
     max_seq_len: Optional[int] = None,
     stream=None,
@@ -284,11 +300,19 @@ def jagged_dense_bmm_bwd_dispatched(
     # heuristic), then build (memoized) the launchers specialized to this shape.
     # For the backward K == N == D.
     cfg = resolve_config(
-        n_groups=n_groups, reduction_k=D, output_n=D, max_seq_len=max_seq_len,
-        split=split, gj_stages_a=gj_stages_a, coarsen_m=coarsen_m,
+        n_groups=n_groups,
+        reduction_k=D,
+        output_n=D,
+        max_seq_len=max_seq_len,
+        split=split,
+        gj_stages_a=gj_stages_a,
+        coarsen_m=coarsen_m,
     )
     bw = _bwd.build_backward(
-        D, split=cfg["split"], gj_stages_a=cfg["gj_stages_a"], coarsen_m=cfg["coarsen_m"]
+        D,
+        split=cfg["split"],
+        gj_stages_a=cfg["gj_stages_a"],
+        coarsen_m=cfg["coarsen_m"],
     )
 
     BLOCK_M = _bwd.BLOCK_M  # D-independent module constant
@@ -317,16 +341,28 @@ def jagged_dense_bmm_bwd_dispatched(
     dense_kn = dense.reshape(n_groups * K, N).contiguous()
     d_jagged = torch.empty(total_rows + BLOCK_M, K, dtype=torch.bfloat16, device=device)
     tDJ = flyc.from_dlpack(d_jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
-    bw.grad_jagged(tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream)
+    bw.grad_jagged(
+        tDJ, tDOut, dense_kn, seq_offsets, n_groups, max_seq_len, stream=stream
+    )
 
     # --- dDense (+ fused dBias): split-reduction over the sequence axis m. ---
     d_dense = torch.empty(n_groups, K, N, dtype=torch.bfloat16, device=device)
     d_bias = torch.empty(n_groups, N, dtype=torch.bfloat16, device=device)
     dense_partials, bias_partials = _get_scratch(n_groups, K, N, SPLIT, device)
-    tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(leading_dim=1, divisibility=8)
+    tJagged = flyc.from_dlpack(jagged).mark_layout_dynamic(
+        leading_dim=1, divisibility=8
+    )
     bw.grad_dense_bias(
-        d_dense.view(n_groups * K, N), d_bias, tJagged, tDOut, seq_offsets,
-        dense_partials, bias_partials, n_groups, max_seq_len, stream=stream,
+        d_dense.view(n_groups * K, N),
+        d_bias,
+        tJagged,
+        tDOut,
+        seq_offsets,
+        dense_partials,
+        bias_partials,
+        n_groups,
+        max_seq_len,
+        stream=stream,
     )
 
     return d_jagged[:total_rows], d_dense, d_bias
