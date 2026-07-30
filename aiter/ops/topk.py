@@ -463,6 +463,27 @@ _FLYDSL_TOPK_DECODE_DISABLED = (
     os.environ.get("AITER_DISABLE_FLYDSL_TOPK_DECODE", "0") in _TRUTHY_ENV
 )
 
+# Opt-in dispatch counters so a benchmark can prove which kernel actually ran
+# (a serving A/B is worthless if the FlyDSL path was never reached). Off by
+# default: the hot path stays free of the two increments below.
+_FLYDSL_TOPK_COUNT = os.environ.get("AITER_FLYDSL_TOPK_COUNT", "0") in _TRUTHY_ENV
+topk_decode_dispatch_counts = {"flydsl": 0, "hip": 0}
+
+if _FLYDSL_TOPK_COUNT:
+    import atexit
+
+    def _dump_topk_decode_dispatch_counts():
+        # Each serving worker prints its own tally at shutdown, so a benchmark
+        # log proves whether the FlyDSL path was reached (flydsl>0) or the run
+        # silently stayed on HIP.
+        print(
+            f"[aiter] topk_decode_dispatch_counts pid={os.getpid()} "
+            f"{topk_decode_dispatch_counts}",
+            flush=True,
+        )
+
+    atexit.register(_dump_topk_decode_dispatch_counts)
+
 # Sweep overrides, applied to every arch so a benchmark can walk a threshold
 # without editing the table. Env is read once at import (as elsewhere in aiter,
 # e.g. rotary_embedding.py) because this gate runs on every decode step; tests
@@ -643,6 +664,8 @@ def top_k_per_row_decode(
     misreading it.
     """
     if _should_use_flydsl_decode(logits, next_n, numRows, stride0, stride1, k):
+        if _FLYDSL_TOPK_COUNT:
+            topk_decode_dispatch_counts["flydsl"] += 1
         from .flydsl.topk_per_row_decode import flydsl_top_k_per_row_decode
 
         if workspace is None:
@@ -662,6 +685,8 @@ def top_k_per_row_decode(
             workspace=workspace,
         )
 
+    if _FLYDSL_TOPK_COUNT:
+        topk_decode_dispatch_counts["hip"] += 1
     # Decode always takes the ob path (see topk_per_row_kernels.cu), and the C++
     # side ignores the workspace argument there.
     # The original mb dispatch is commented out below for reference:
