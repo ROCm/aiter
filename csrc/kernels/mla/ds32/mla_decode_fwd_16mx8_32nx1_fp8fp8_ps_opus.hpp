@@ -782,11 +782,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         async_load_kv(
             2 * kv_slot_off, load_kv_page(tile_begin + 2), load_kv_page_rope(tile_begin + 2));
     }
-
+    __builtin_amdgcn_sched_barrier(0);
     if constexpr(STAGGER)
     {
-        __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
+        stage_end();
     }
     // Page index that the first phase prefetches. Indices past the end are clamped to 0
     // by the buffer descriptor and land in a slot nobody reads.
@@ -803,17 +802,12 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, 0_I);
     compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, 0_I);
     mask_oob_scores(v_s[0], tile_begin);
-    stage_end();
-    // The first phase reads tile_begin+1 out of LDS right after the barrier below, so
-    // every wave must have drained its own stores before that barrier -- including the
-    // group that takes the stagger barrier first.
-
     static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
     m_row = max(m_row, attn_row_max<T>(v_s[0]));
     attn_sub_row<T>(v_s[0], m_row);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0])::);
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+    // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end();
 
     auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
@@ -903,6 +897,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // the last tile's scores sit in a buffer picked by the tile count's parity. Its LDS
     // slot and its mask were already handled by the phase (or by the prologue when the
     // request is a single tile).
+    // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end();
 
     // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
@@ -914,7 +909,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         l_row += attn_row_sum<T>(vs_last);
         v_p = cast<D_K>(vs_last);
     };
-    if(((tile_end - tile_begin) & 1) == 0)
+    if(((tile_end) & 1) == 0)
         epilogue_tail(v_s[1]);
     else
         epilogue_tail(v_s[0]);
