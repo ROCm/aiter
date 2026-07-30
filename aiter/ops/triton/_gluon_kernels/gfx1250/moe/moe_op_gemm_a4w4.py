@@ -843,7 +843,10 @@ def _moe_gemm_a4w4_prefill(
         )
     w_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=WMxScale,
-        shape=(N // PRESHUFFLE_FACTOR_WS, gl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR_WS),
+        shape=(
+            N // PRESHUFFLE_FACTOR_WS,
+            gl.cdiv(K, MX_PACK_DIVISOR) * PRESHUFFLE_FACTOR_WS,
+        ),
         strides=(stride_w_mx_n, stride_w_mx_k),
         block_shape=(SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS),
         layout=SHARED_LAYOUT_W_SCALES,
@@ -929,7 +932,9 @@ def _moe_gemm_a4w4_prefill(
             w_desc, add_offsets=[0, SHUFFLED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
         )
         w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            w_scales_desc, add_offsets=[0, SHUFFLED_BLOCK_K_WS], clamp_bounds=CLAMP_BOUNDS
+            w_scales_desc,
+            add_offsets=[0, SHUFFLED_BLOCK_K_WS],
+            clamp_bounds=CLAMP_BOUNDS,
         )
 
         load_idx += 1
@@ -1044,7 +1049,9 @@ def _moe_gemm_a4w4_prefill(
             w_desc, add_offsets=[0, SHUFFLED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
         )
         w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            w_scales_desc, add_offsets=[0, SHUFFLED_BLOCK_K_WS], clamp_bounds=CLAMP_BOUNDS
+            w_scales_desc,
+            add_offsets=[0, SHUFFLED_BLOCK_K_WS],
+            clamp_bounds=CLAMP_BOUNDS,
         )
         load_idx += 1
 
