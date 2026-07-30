@@ -2246,6 +2246,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND;                 \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \
