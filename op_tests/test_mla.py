@@ -145,6 +145,7 @@ def test_mla(
     return_lse=False,
     is_causal=True,
     sequential_page_indices=False,
+    random_page_indices=False,
 ):
     ret = {}
 
@@ -168,14 +169,28 @@ def test_mla(
         seq_lens_kv.fill_(ctx_lens)
         seq_lens_qo.fill_(ctx_lens)
     kv_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_kv, dim=0)
-    if sequential_page_indices:
-        # page_id == logical token index; needs pool >= ctx and byte offset can exceed 2^32
+    if sequential_page_indices or not random_page_indices:
+        # Sequential and production-like scattered layouts require one unique
+        # physical page per logical token.
         num_page = max(num_page, kv_indptr[-1].item() + 10000)
     n_kv_idx = kv_indptr[-1].item() + 10000
     if sequential_page_indices:
         kv_indices = torch.arange(n_kv_idx, dtype=torch.int)
-    else:
+        page_layout = "sequential"
+    elif random_page_indices:
+        # Legacy stress layout: pages are sampled with replacement.
         kv_indices = torch.randint(0, num_page, (n_kv_idx,), dtype=torch.int)
+        page_layout = "random-with-replacement"
+    else:
+        # vLLM block tables map active logical pages to distinct physical
+        # pages. A permutation preserves that property while scattering
+        # adjacent logical tokens across the full KV pool.
+        kv_indices = torch.randperm(num_page, dtype=torch.int)[:n_kv_idx]
+        page_layout = "scattered-unique"
+    ret["config:page_layout"] = page_layout
+    ret["config:num_kv_splits"] = (
+        "auto" if split_per_batch is None else split_per_batch
+    )
     qo_indptr[1 : batch_size + 1] = torch.cumsum(seq_lens_qo, dim=0)
     max_seqlen_qo = seq_lens_qo.max().item()
     max_seqlen_kv = seq_lens_kv.max().item()
@@ -526,6 +541,7 @@ def test_mla(
             use_2d_view=use_2d_view,
             min_kv_seq_len=ctx_lens,
             return_lse=return_lse,
+            num_kv_splits=split_per_batch,
         )
 
         err = checkAllclose(
@@ -588,6 +604,7 @@ def test_mla(
             kv_scale=1.0,
             min_kv_seq_len=ctx_lens,
             return_lse=return_lse,
+            num_kv_splits=split_per_batch,
         )
 
         err = checkAllclose(
@@ -860,8 +877,14 @@ parser.add_argument(
 parser.add_argument(
     "--sequential-page-indices",
     action="store_true",
-    help="""Use kv_indices[i]=i (sequential physical page id) instead of random pages.
+    help="""Use kv_indices[i]=i (sequential physical page id) instead of scattered pages.
     Expands KV pool to cover ctx length (tests 64-bit page_idx * stride).""",
+)
+parser.add_argument(
+    "--random-page-indices",
+    action="store_true",
+    help="""Sample physical pages with replacement (legacy stress layout).
+    The default is a production-like unique, scattered page permutation.""",
 )
 parser.add_argument(
     "--causal",
@@ -878,6 +901,10 @@ parser.add_argument(
 
 
 args = parser.parse_args()
+if args.sequential_page_indices and args.random_page_indices:
+    parser.error(
+        "--sequential-page-indices and --random-page-indices are mutually exclusive"
+    )
 
 for nhead, decode_qlen in args.nhead:
     df = []
@@ -902,6 +929,7 @@ for nhead, decode_qlen in args.nhead:
                 return_lse=args.return_lse,
                 is_causal=args.causal,
                 sequential_page_indices=args.sequential_page_indices,
+                random_page_indices=args.random_page_indices,
             )
             df.append(ret)
     df = pd.DataFrame(df)

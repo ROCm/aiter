@@ -21,9 +21,8 @@
 #                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
 #   REGIME='bh12bn64'  - Kimi K3 TP8 specialization of bh16bn64 for exactly
 #                        12 heads. The MFMA tile remains 16x16 (CDNA4 has no
-#                        12-row MFMA), but batch=1 uses a measured 112-way KV
-#                        split instead of 256. This lengthens each stage-1
-#                        pipeline and cuts stage-2 traffic/launch work.
+#                        12-row MFMA), with a context-bucketed 16-112 way KV
+#                        split policy measured using scattered physical pages.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
@@ -981,11 +980,21 @@ def mla_gluon(
                 ),
             )
             if REGIME == "bh12bn64" and batch_size == 1:
-                # gfx950 Kimi K3 100K sweep: 112 splits is ~34% faster than
-                # 256 (81 us vs 123 us) by amortizing the three-stage
-                # pipeline and shrinking the split-reduction intermediates.
+                # Keep only a small set of compile-time variants while matching
+                # the measured sweet spots for unique, scattered physical pages.
+                # At 100K, 96 splits is ~35% faster than 256 (66 us vs 102 us).
+                if min_kv_seq_len <= 4096:
+                    split_cap = 16
+                elif min_kv_seq_len <= 16384:
+                    split_cap = 48
+                elif min_kv_seq_len <= 65536:
+                    split_cap = 64
+                elif min_kv_seq_len <= 131072:
+                    split_cap = 96
+                else:
+                    split_cap = 112
                 NUM_KV_SPLITS = max(
-                    1, min(112, triton.cdiv(min_kv_seq_len, BLOCK_N))
+                    1, min(split_cap, triton.cdiv(min_kv_seq_len, BLOCK_N))
                 )
         if num_kv_splits is not None:
             NUM_KV_SPLITS = int(num_kv_splits)
