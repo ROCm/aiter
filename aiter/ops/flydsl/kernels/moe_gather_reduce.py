@@ -137,7 +137,6 @@ def build_moe_gather_reduce_module(
         bid = fx.block_idx.x
         tid = fx.thread_idx.x
 
-        f32 = T.f32
         i32 = T.i32
         vec_i32_ty = T.vec(VEC, i32)
         # Route-weight native dtype. "f32" lets the host pass raw fp32 route

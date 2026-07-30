@@ -12,7 +12,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops

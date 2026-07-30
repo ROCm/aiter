@@ -12,7 +12,7 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
