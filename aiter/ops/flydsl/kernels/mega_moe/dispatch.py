@@ -183,6 +183,7 @@ def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected
 ):
     """Finalize local fixed slots as soon as every source publishes this destination."""
+    assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
     crfa = buffer_ops.create_buffer_resource_from_addr
     rdisp = crfa(addr_disp)
 

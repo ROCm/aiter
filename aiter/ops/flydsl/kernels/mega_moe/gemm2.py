@@ -2,8 +2,6 @@
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 """GEMM2 compute for fused MegaMoE v2 stage2."""
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import _to_raw as _raw
@@ -27,32 +25,6 @@ from ..mxfp4_gemm_common import (
     lds_swizzle_mask_f8,
     lds_vec_load,
 )
-
-
-def bq_view(
-    arg_bq,
-    row_elems,
-    KH4,
-    K_TILES_TOTAL,
-    K_HALVES,
-    num_records_bytes=None,
-):
-    """View one preshuffled B N-tile as i32<4:1>, optionally bounded to real K."""
-    col_base = rocdl.readfirstlane(T.i32, _raw(row_elems) * fx.Int32(KH4))
-    i32_ptr_ty = fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=16)
-    off_i64 = fx.Int64(col_base)
-    base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_bq) + off_i64 * fx.Int64(4))
-    # i32 strides: klane 64, nlane 4, K-tile K_HALVES*256, half 256, kpack4 1.
-    shape = (4, 16, K_TILES_TOTAL, K_HALVES, 4)
-    view = fx.Tensor(
-        fx.make_view(
-            base_iter,
-            fx.make_layout(shape, (64, 4, K_HALVES * 256, 256, 1)),
-        )
-    )
-    if num_records_bytes is not None:
-        return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_records_bytes)
-    return fx.rocdl.make_buffer_tensor(view, max_size=False)
 
 
 def scale_view(arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None):
@@ -224,16 +196,13 @@ def gemm2_compute_v2(
     kbs_per_expert_dw = (N_OUT_rt // fx.Int32(32)) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
-    K_TILES_MAX = INTER_MAX // BK
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
 
-    # Padded shapes bound B to real K and zero weight tiles beyond real N.
-    bq_num_records = None
+    # Padded shapes mask weight tiles beyond the real K/N extents.
     N_real = None
     if const_expr(has_pad):
         K_real = K_rt - fx.Int32(i32_kpad)
         halves_real = (K_real + fx.Int32(127)) // fx.Int32(128)
-        bq_num_records = halves_real * fx.Int32(1024)
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # Map each compute block to its SBM-padded expert metadata row.
@@ -355,21 +324,6 @@ def gemm2_compute_v2(
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
     bq_rsrc = buffer_ops.create_buffer_resource_from_addr(arg_bq)
 
-    def make_bq_view(j):
-        col = n_block_idx * BN + wave * (BN // 4) + j * 16
-        nrec = bq_num_records
-        if const_expr(has_pad):
-            # N-skip: fully-pad-N tile (col >= 16-aligned N_real) -> 0 records so weight loads OOB -> 0.
-            nrec = (col < N_real).select(bq_num_records, fx.Int32(0))
-        return bq_view(
-            arg_bq,
-            e * N_OUT_rt + col,
-            KH4,
-            K_TILES_MAX,
-            kHalves,
-            num_records_bytes=nrec,
-        )
-
     bq_base_dw = [
         rocdl.readfirstlane(
             T.i32,
@@ -389,7 +343,7 @@ def gemm2_compute_v2(
         for mw in range_constexpr(nPairs)
     ]
 
-    frag_tmpl = make_bq_view(0)[0, 0, 0, 0, None]  # i32<4:1> (16B = 32 fp4)
+    frag_tmpl = fx.make_rmem_tensor(4, Int32)
     # B-scale word template shares the A-scale layout (sc_frag_tmpl).
 
     def issue_b_load_into(bqf, bsf, kt_rt):
@@ -659,29 +613,7 @@ def get_gemm2_autotune_configs(a_dtype="fp8"):
         dict(BN=256, BK=256, use_nt=True, g2_bhoist=True, g2_ascale_pf=True, g2_spart=202, persist=False),
     ]
     bn_values = (128, 256)
-    bn_env = os.environ.get("MEGA_G2_BN_VALUES")
-    if bn_env:
-        bn_values = tuple(int(value) for value in bn_env.split(","))
-        if not bn_values or any(value not in (128, 256) for value in bn_values):
-            raise ValueError("MEGA_G2_BN_VALUES must contain comma-separated values from {128, 256}")
     persist_cu_values = (8, 16, 32, 64, 128, 240, 256)
-    persist_cu_env = os.environ.get("MEGA_G2_PERSIST_CU_VALUES")
-    if persist_cu_env:
-        persist_cu_values = tuple(int(value) for value in persist_cu_env.split(","))
-        if not persist_cu_values or any(value <= 0 or value > 256 for value in persist_cu_values):
-            raise ValueError("MEGA_G2_PERSIST_CU_VALUES must contain comma-separated values in [1, 256]")
-    persist_strided_values = (False,)
-    persist_strided_env = os.environ.get("MEGA_G2_PERSIST_STRIDED")
-    if persist_strided_env is not None:
-        if persist_strided_env not in ("0", "1"):
-            raise ValueError("MEGA_G2_PERSIST_STRIDED must be '0' or '1'")
-        persist_strided_values = (persist_strided_env == "1",)
-    bf16_lds_values = (False,)
-    bf16_lds_env = os.environ.get("MEGA_G2_BF16_LDS")
-    if bf16_lds_env is not None:
-        if bf16_lds_env not in ("0", "1"):
-            raise ValueError("MEGA_G2_BF16_LDS must be '0' or '1'")
-        bf16_lds_values = (bf16_lds_env == "1",)
     cfgs.extend(
         dict(
             BN=bn,
@@ -692,63 +624,42 @@ def get_gemm2_autotune_configs(a_dtype="fp8"):
             g2_spart=402,
             persist=True,
             persist_cu=slots,
-            **({"persist_strided": True} if persist_strided else {}),
-            **({"g2_bf16_lds": True} if g2_bf16_lds else {}),
         )
         for bn in bn_values
         for use_nt in (True, False)
         for slots in persist_cu_values
-        for persist_strided in persist_strided_values
-        for g2_bf16_lds in bf16_lds_values
     )
-    if persist_strided_env is None and bf16_lds_env is None and 240 in persist_cu_values:
-        cfgs.extend(
-            dict(
-                BN=bn,
-                BK=256,
-                use_nt=use_nt,
-                g2_bhoist=True,
-                g2_ascale_pf=True,
-                g2_spart=402,
-                persist=True,
-                persist_cu=240,
-                persist_strided=True,
-            )
-            for bn in bn_values
-            for use_nt in (True, False)
+    cfgs.extend(
+        dict(
+            BN=bn,
+            BK=256,
+            use_nt=use_nt,
+            g2_bhoist=True,
+            g2_ascale_pf=True,
+            g2_spart=402,
+            persist=True,
+            persist_cu=240,
+            persist_strided=True,
         )
-    if bf16_lds_env is None and 128 in bn_values:
-        cfgs.extend(
-            dict(
-                BN=128,
-                BK=256,
-                use_nt=use_nt,
-                g2_bhoist=True,
-                g2_ascale_pf=True,
-                g2_spart=402,
-                persist=True,
-                persist_cu=slots,
-                persist_strided=persist_strided_values[0],
-                g2_bf16_lds=True,
-            )
-            for use_nt in (True, False)
-            for slots in persist_cu_values
-            if slots in (64, 128, 240, 256)
+        for bn in bn_values
+        for use_nt in (True, False)
+    )
+    cfgs.extend(
+        dict(
+            BN=128,
+            BK=256,
+            use_nt=use_nt,
+            g2_bhoist=True,
+            g2_ascale_pf=True,
+            g2_spart=402,
+            persist=True,
+            persist_cu=slots,
+            persist_strided=False,
+            g2_bf16_lds=True,
         )
-    no_persist = os.environ.get("MEGA_G2_NO_PERSIST") == "1"
-    force_persist = os.environ.get("MEGA_G2_FORCE_PERSIST") == "1"
-    if no_persist and force_persist:
-        raise ValueError("MEGA_G2_NO_PERSIST and MEGA_G2_FORCE_PERSIST cannot both be enabled")
-    if no_persist:
-        cfgs = [config for config in cfgs if not config["persist"]]
-    elif force_persist:
-        cfgs = [config for config in cfgs if config["persist"]]
-    force_use_nt = os.environ.get("MEGA_G2_FORCE_USE_NT")
-    if force_use_nt is not None:
-        if force_use_nt not in ("0", "1"):
-            raise ValueError("MEGA_G2_FORCE_USE_NT must be '0' or '1'")
-        use_nt = force_use_nt == "1"
-        cfgs = [config for config in cfgs if config["use_nt"] == use_nt]
+        for use_nt in (True, False)
+        for slots in (64, 128, 240, 256)
+    )
     # BK128 is inaccurate here; BM128 at BN256 fits gfx950's 160 KiB block LDS.
     return [dict(config, BM=BM) for BM in (16, 32, 64, 128) for config in cfgs]
 
@@ -793,21 +704,13 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
 
 
 def _resolve_g2_knobs(g2_bhoist, g2_ascale_pf, g2_spart, g2_bf16_lds, use_reduce):
-    """Env-default the gemm2 perf knobs (explicit arg wins), matching aiter compile_gemm2_a4w4_port."""
-    if g2_bhoist is None:
-        g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
-    g2_bhoist = bool(g2_bhoist)
-    if g2_ascale_pf is None:
-        g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
-    g2_ascale_pf = bool(g2_ascale_pf)
-    if g2_spart is None:
-        g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    g2_spart = int(g2_spart)
+    """Resolve explicit GEMM2 knobs against deterministic defaults."""
+    g2_bhoist = True if g2_bhoist is None else bool(g2_bhoist)
+    g2_ascale_pf = True if g2_ascale_pf is None else bool(g2_ascale_pf)
+    g2_spart = 402 if g2_spart is None else int(g2_spart)
     g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
     if g2_spart > 0 and (g2_group_num < 1 or g2_m01 < 1):
         raise AssertionError(f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)")
-    if g2_bf16_lds is None:
-        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce
-    g2_bf16_lds = bool(g2_bf16_lds) and use_reduce
+    g2_bf16_lds = (True if g2_bf16_lds is None else bool(g2_bf16_lds)) and use_reduce
     return g2_bhoist, g2_ascale_pf, g2_spart, g2_group_num, g2_m01, g2_bf16_lds

@@ -290,6 +290,7 @@ class AScaleLoader:
     def stage(self, lds_ascale, tile_row_base_i32):
         """Coalesced gmem->LDS copy of this tile's e8m0 A-scale block [sort_block_m, n_scale]. Call before K-loop."""
         total = self._sort_block_m * self._n_scale
+        assert total % 16 == 0, "A-scale tile must contain whole 16-byte copy chunks"
         base = tile_row_base_i32 * fx.Int32(self._n_scale)
         n16 = total // 16
 

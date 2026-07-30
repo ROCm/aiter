@@ -230,8 +230,7 @@ class FlyDSLDispatchCombineConfig:
     max_num_inp_token_per_rank: int
     num_experts_per_rank: int
     num_experts_per_token: int
-    dispatch_dtype: torch.dtype = torch.bfloat16
-    combine_dtype: torch.dtype = torch.bfloat16
+    data_type: torch.dtype | None = None
     # User-pinned launch geometry, resolved ONCE per op (not per call):
     # pinned value (block_num+warp must be set together) > tuning table >
     # ``default_*`` fallback above. None => not pinned.
@@ -246,14 +245,49 @@ class FlyDSLDispatchCombineConfig:
     scale_type_size: int = 0
     enable_std_moe: bool = False
     zero_copy: bool = False
-    combine_quant_type: str = "none"
-    stage2_p2p_quant: str = "none"
+    quant_type: str | None = None
     max_total_recv_tokens: int = 0
-    # Also allocate expert-major buffers for fused stage1.
+    max_token_type_size: int = 0
+    dispatch_dtype: torch.dtype | None = None
+    combine_dtype: torch.dtype | None = None
+    combine_quant_type: str | None = None
+    stage2_p2p_quant: str = "none"
     enable_group_major: bool = False
     gm_unit_size: int = 0
     gm_scheme: str = "fixedslot"
     gm_compact: bool = False
+
+    def __post_init__(self):
+        if self.data_type is not None:
+            if self.dispatch_dtype not in (None, self.data_type) or self.combine_dtype not in (None, self.data_type):
+                raise ValueError("data_type conflicts with dispatch_dtype or combine_dtype")
+        self.dispatch_dtype = self.dispatch_dtype or self.data_type or torch.bfloat16
+        self.combine_dtype = self.combine_dtype or self.data_type or torch.bfloat16
+        self.data_type = self.dispatch_dtype if self.dispatch_dtype == self.combine_dtype else None
+        if self.quant_type is not None and self.combine_quant_type not in (None, self.quant_type):
+            raise ValueError("quant_type conflicts with combine_quant_type")
+        self.combine_quant_type = self.combine_quant_type or self.quant_type or "none"
+        self.quant_type = self.combine_quant_type
+
+    @property
+    def is_fp4(self):
+        return self.data_type == torch.float4_e2m1fn_x2
+
+    @property
+    def elem_size(self):
+        return _dtype_elem_size(self.data_type or self.dispatch_dtype)
+
+    @property
+    def token_bytes(self):
+        return _token_bytes_for(self.data_type or self.dispatch_dtype, self.hidden_dim)
+
+    @property
+    def token_view_dim(self):
+        return _token_view_dim_for(self.data_type or self.dispatch_dtype, self.hidden_dim)
+
+    @property
+    def max_token_bytes(self):
+        return self.hidden_dim * self.max_token_type_size if self.max_token_type_size > 0 else self.token_bytes
 
     @property
     def dispatch_is_fp4(self):
@@ -576,8 +610,9 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # Size combine input for both sender-major and fused dest_lid*topk layouts.
         mr_worst_inp = max(mr_worst, mt * k)
 
-        disp_tb = cfg.dispatch_token_bytes
-        comb_tb = cfg.combine_token_bytes
+        legacy_tb = cfg.hidden_dim * cfg.max_token_type_size if cfg.max_token_type_size > 0 else 0
+        disp_tb = max(cfg.dispatch_token_bytes, legacy_tb)
+        comb_tb = max(cfg.combine_token_bytes, legacy_tb)
         tok_i16_mr = (mr * disp_tb + 1) // 2  # dispatch output (dispatch_dtype)
         tok_i16_mr_worst = (mr_worst_inp * comb_tb + 1) // 2  # combine input, worst-case (combine_dtype)
         tok_i16_mt = (mt * comb_tb + 1) // 2  # combine output (combine_dtype)
@@ -647,6 +682,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             raise ValueError(f"num_experts_per_rank must be positive, got {cfg.num_experts_per_rank}")
         if cfg.num_experts_per_token <= 0:
             raise ValueError(f"num_experts_per_token must be positive, got {cfg.num_experts_per_token}")
+        if cfg.max_token_type_size < 0:
+            raise ValueError(f"max_token_type_size must be non-negative, got {cfg.max_token_type_size}")
         # k <= 64: ballot only covers 64 warp lanes.
         if cfg.num_experts_per_token > 64:
             raise ValueError(f"num_experts_per_token={cfg.num_experts_per_token} exceeds the warp-lane budget (64)")

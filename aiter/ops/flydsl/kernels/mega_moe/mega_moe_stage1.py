@@ -11,6 +11,7 @@ import flydsl.expr as fx
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch
 
 from ...utils import autotune_compat as autotune
 from ...utils import do_bench_collective
@@ -26,7 +27,11 @@ from .dispatch import (
     emit_dispatch_plan,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
-from .stage1_configs import get_stage1_autotune_configs, prune_stage1_autotune_configs
+from .stage1_configs import (
+    get_stage1_autotune_configs,
+    prune_stage1_autotune_configs,
+    stage1_config_is_valid,
+)
 
 _AUTOTUNE_SCHEMA = 19
 _SC0_CACHE = 1
@@ -65,6 +70,9 @@ def compile_mega_moe_stage1(
     cooperative_payload_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
 ):
+    arch = str(get_rocm_arch() or "")
+    if not arch.startswith("gfx95"):
+        raise RuntimeError(f"MegaMoE v2 stage1 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
     NUM_WAVES = int(num_waves)
     assert NUM_WAVES > 1, "planner needs one communication wave and at least one grouping wave"
     assert 1 <= waves_per_eu_hint <= 4
@@ -130,8 +138,10 @@ def compile_mega_moe_stage1(
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
 
+    dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     kernel_name = (
-        f"megamoe_stage1_t{sort_block_m}x{tile_n}x{tile_k}_w{NUM_WAVES}_gm{grid_mult}"
+        f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
+        f"_w{NUM_WAVES}_gm{grid_mult}"
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
         f"aa{int(async_a_copy)}_aep{int(active_expert_producer)}cpc{int(cooperative_payload_copy)}"
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
@@ -422,10 +432,17 @@ def make_stage1_autotuner(dispatch_cu=None, grid_mult=None, tile_m_values=(32,))
         "fuse_scale_dim", "fixed_slot_dispatch", "metadata_block_m", "num_cu", "tune_tokens",
         "dispatch_constraint", "grid_constraint", "tile_m_constraint", "autotune_schema",
     ]
+    artifact_key = [
+        "model_dim", "inter_dim", "experts_per_rank", "fuse_npes", "fuse_topk", "fuse_scale_dim",
+        "fixed_slot_dispatch", "metadata_block_m", "num_cu", "tune_tokens", "dispatch_constraint",
+        "grid_constraint", "tile_m_constraint", "autotune_schema",
+    ]
     tuner = autotune(
         configs=configs, key=key, warmup=2, rep=7,
         prune_configs_by=prune_stage1_autotune_configs, do_bench=do_bench_collective,
         default=default, artifact_name="mega-moe-v2-stage1", artifact_bundle=True,
+        artifact_key=artifact_key, artifact_nearest_key="tune_tokens",
+        artifact_validator=stage1_config_is_valid,
     )(_run_stage1_config)
     tuner.schema = _AUTOTUNE_SCHEMA
     return tuner

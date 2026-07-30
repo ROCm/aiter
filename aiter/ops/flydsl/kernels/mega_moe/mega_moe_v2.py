@@ -26,6 +26,7 @@ __all__ = ["MegaMoEV2"]
 _JOINT_AUTOTUNE_SCHEMA = 7
 _STAGE2_P2P_QUANT_TYPES = ("auto", "none", "fp8_blockwise_1x32")
 _AUTO_FP8_MIN_TOKENS = 1024
+_COMPACT_DISPATCH_MIN_MTPR = 256
 _AUTOTUNE_CONFIG_DIR = Path(__file__).with_name("autotune_configs")
 if _AUTOTUNE_CONFIG_DIR.is_dir():
     os.environ.setdefault("FLYDSL_AUTOTUNE_CONFIG_DIR", str(_AUTOTUNE_CONFIG_DIR))
@@ -41,8 +42,8 @@ def _resolve_stage2_p2p_quant(mode, run_tokens):
 def _run_joint_sbm_config(owner, x, scales, wts, topk_ids, stream, slice_output, *, SBM, tune_tokens,
     model_dim, inter_dim, experts, topk, rank, npes, max_tok, sbm_candidates, autotune_schema):
     del model_dim, inter_dim, experts, topk, rank, npes, max_tok, sbm_candidates, autotune_schema
-    owner._run_fused_stage1(x, wts, scales, topk_ids, stream=stream, tile_m=SBM)
-    owner._joint_output = owner._run_stage2(int(tune_tokens), stream, slice_output)
+    sorted_block_m = owner._run_fused_stage1(x, wts, scales, topk_ids, stream=stream, tile_m=SBM)
+    owner._joint_output = owner._run_stage2(int(tune_tokens), stream, slice_output, sorted_block_m)
 
 
 @functools.lru_cache(maxsize=None)
@@ -52,9 +53,14 @@ def _make_joint_sbm_autotuner(tile_m_values):
         "tune_tokens", "model_dim", "inter_dim", "experts", "topk", "npes", "max_tok",
         "sbm_candidates", "autotune_schema",
     ]
+    artifact_key = [
+        "tune_tokens", "model_dim", "inter_dim", "experts", "topk", "npes",
+        "sbm_candidates", "autotune_schema",
+    ]
     return autotune(
         configs=configs, key=key, warmup=2, rep=7, do_bench=do_bench_collective,
         default=configs[0], artifact_name="mega-moe-v2-joint-sbm", artifact_bundle=True,
+        artifact_key=artifact_key, artifact_nearest_key="tune_tokens",
     )(_run_joint_sbm_config)
 # fmt: on
 
@@ -113,8 +119,7 @@ class MegaMoEV2:
         if not self._v2_tile_m_values or any(tile_m not in (32, 64, 128) for tile_m in self._v2_tile_m_values):
             raise ValueError("stage1_tile_m_values must contain only 32, 64, and/or 128")
         capacity_tile_m = max(self._v2_tile_m_values)
-        max_buffer_bytes = self.epr * self.world_size * self.mtpr * max(self.model_dim, self.inter_dim * 2)
-        compact = self.max_recv >= 2048 or max_buffer_bytes >= 3_000_000_000 or self.epr > 64
+        compact = self.mtpr >= _COMPACT_DISPATCH_MIN_MTPR or self.epr > 64
         self._s1_fixed_slot = not compact
         self._s1_scale_dim = self.model_dim // 32
         # fmt: off
@@ -284,6 +289,7 @@ class MegaMoEV2:
             tile_m_constraint=",".join(str(v) for v in tile_m_values), autotune_schema=tuner.schema)
         # fmt: on
         self._s1_active_tile_m = int(tuner.last_config.kwargs["sort_block_m"])
+        return self._s1_active_tile_m
 
     def quantize(self, x_bf16):
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
@@ -299,8 +305,8 @@ class MegaMoEV2:
         # fmt: on
         return self._joint_output
 
-    def _run_stage2(self, run_tokens, stream, slice_output):
-        ret = self._run_fused_stage2(run_tokens, stream)
+    def _run_stage2(self, run_tokens, stream, slice_output, sorted_block_m):
+        ret = self._run_fused_stage2(run_tokens, sorted_block_m, stream)
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
         if out_tok is None:
             cfg = self.comb_cfg
@@ -366,6 +372,7 @@ class MegaMoEV2:
                 "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * p2p_row_nbytes,
                 "HIDDEN_MAX": int(comb_cfg.hidden_dim), "INTER_MAX": int(self.inter_dim), "cu_num": int(cu_num),
                 "autotune_schema": tuner.schema, "p2p_quant_type": p2p_quant,
+                "fixed_slot_dispatch": bool(self._s1_fixed_slot),
             }
         initial_quant = _resolve_stage2_p2p_quant(self._stage2_p2p_quant, 0)
         self._g2_tuner = self._g2_tuners[initial_quant]
@@ -374,10 +381,9 @@ class MegaMoEV2:
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
 
-    def _run_fused_stage2(self, run_tokens, stream=None):
+    def _run_fused_stage2(self, run_tokens, sorted_block_m, stream=None):
         comb_op = self.comb_op
         op = self._s1_op
-        active_tile_m = self._s1_active_tile_m
         if stream is None:
             stream = torch.cuda.current_stream()
         s_fx = fx.Stream(stream.cuda_stream)
@@ -392,7 +398,7 @@ class MegaMoEV2:
             fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
             fx.Int64(op.tile_row_base.data_ptr()), comb_op._fx_p2p_comb_inp, self._s1_nvm,
             self._g2v2_inter, self._g2v2_hidden, s_fx,
-            tune_tokens=int(run_tokens), SBM=active_tile_m, **self._g2_invariants)
+            tune_tokens=int(run_tokens), SBM=int(sorted_block_m), **self._g2_invariants)
         # fmt: on
         return comb_op.combine_no_stage1(
             self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,

@@ -10,6 +10,7 @@ import flydsl.expr as fx
 from flydsl.autotune import Config
 from flydsl.expr import buffer_ops, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Int8, T
+from flydsl.runtime.device import get_rocm_arch
 
 from ...utils import autotune_compat as autotune
 from ...utils import do_bench_collective
@@ -272,9 +273,13 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     max_tok: int, recv_cap: int = None, comb_inp_nbytes: int = None, BM: int = 32, BN: int = 256, BK: int = 256,
     use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8", SBM: int = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
-    g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none"):
+    g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
+    fixed_slot_dispatch: bool = False):
 # fmt: on
     """Compile fused GEMM2 and weighted cross-rank P2P scatter."""
+    arch = str(get_rocm_arch() or "")
+    if not arch.startswith("gfx95"):
+        raise RuntimeError(f"MegaMoE v2 stage2 requires CDNA4 (gfx95x), got {arch or 'unknown'}")
     assert max_tok > 0 and (max_tok & (max_tok - 1)) == 0, "max_tok must be power of two"
     assert model_dim % BN == 0 and HIDDEN_MAX % BN == 0
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}"
@@ -315,8 +320,10 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
     class SharedStorage:
         buf: fx.Array[Int8, lds_bytes, 16]
 
+    dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     kernel_name = (
-        f"megamoe_stage2_t{BM}x{BN}x{BK}_sbm{SBM}_{a_dtype}_nt{int(use_nt)}"
+        f"megamoe_stage2_{dispatch_path}_t{BM}x{BN}x{BK}"
+        f"_sbm{SBM}_{a_dtype}_nt{int(use_nt)}"
         f"_p{int(persist)}cu{cu_num}s{int(persist_strided)}_pad{int(has_pad)}"
         f"_bh{int(g2_bhoist)}apf{int(g2_ascale_pf)}sp{g2_group_num}x{g2_m01}"
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
@@ -492,7 +499,7 @@ def _run_gemm2_config(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cums
     model_dim, inter_dim, experts, topk, rank, npes, max_tok, recv_cap, comb_inp_nbytes, BM, SBM,
     HIDDEN_MAX, INTER_MAX, cu_num, tune_tokens, autotune_schema, BN=256, BK=256, use_nt=True,
     g2_bhoist=True, g2_ascale_pf=True, g2_spart=402, persist=False, persist_cu=0,
-    persist_strided=False, g2_bf16_lds=False, p2p_quant_type="none"):
+    persist_strided=False, g2_bf16_lds=False, p2p_quant_type="none", fixed_slot_dispatch=False):
     # fmt: on
     """Compile or reuse one Stage2 autotune candidate and launch it."""
     del tune_tokens, autotune_schema
@@ -503,7 +510,7 @@ def _run_gemm2_config(arg_aq, arg_ascale, arg_bq, arg_bscale, arg_eids, arg_cums
         use_nt=use_nt, HIDDEN_MAX=HIDDEN_MAX, INTER_MAX=INTER_MAX, SBM=SBM, persist=persist,
         cu_num=launch_cu_num, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
         g2_spart=g2_spart, persist_strided=persist_strided, g2_bf16_lds=g2_bf16_lds,
-        p2p_quant_type=p2p_quant_type,
+        p2p_quant_type=p2p_quant_type, fixed_slot_dispatch=fixed_slot_dispatch,
     )
     max_m_blocks = (row_capacity + BM - 1) // BM
     grid_blocks = launch_cu_num if persist else max_m_blocks
@@ -542,10 +549,15 @@ def make_gemm2_autotuner(a_dtype: str = "fp8", p2p_quant_type: str = "none"):
         "recv_cap", "comb_inp_nbytes", "SBM", "HIDDEN_MAX", "INTER_MAX", "cu_num",
         "autotune_schema", "p2p_quant_type",
     ]
+    artifact_key = [
+        "tune_tokens", "model_dim", "inter_dim", "experts", "topk", "npes", "SBM",
+        "HIDDEN_MAX", "INTER_MAX", "cu_num", "autotune_schema", "p2p_quant_type",
+    ]
     tuner = autotune(
         configs=configs, key=key, warmup=3, rep=10,
         prune_configs_by=_prune_gemm2_configs, do_bench=do_bench_collective,
         default=default, artifact_name="mega-moe-v2-stage2", artifact_bundle=True,
+        artifact_key=artifact_key, artifact_nearest_key="tune_tokens",
     )(_run_gemm2_config)
     tuner.schema = _AUTOTUNE_SCHEMA
     return tuner

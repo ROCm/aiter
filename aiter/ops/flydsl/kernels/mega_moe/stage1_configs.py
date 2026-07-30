@@ -2,8 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 Stage1 autotune candidates and pruning."""
 
-import os
-
 from flydsl.autotune import Config
 
 _SHAPES = (
@@ -263,27 +261,6 @@ def _candidate_variants(shape):
 
 def get_stage1_autotune_configs(dispatch_cu=None, grid_mult=None, tile_m_values=(32,)):
     tile_m_values = {int(value) for value in tile_m_values}
-    if os.environ.get("MEGA_S1_NOTUNE") == "1":
-        # Pin one valid Stage1 config when isolating Stage2 performance.
-        return [
-            Config(
-                sort_block_m=max(tile_m_values),
-                tile_n=256,
-                tile_k=256,
-                num_waves=4,
-                grid_mult=4 if grid_mult is None else int(grid_mult),
-                pipe_weights=True,
-                mfma_amajor=True,
-                swizzle_a=True,
-                async_a_copy=False,
-                active_expert_producer=False,
-                cooperative_payload_copy=False,
-                num_dispatch_cu=64 if dispatch_cu is None else int(dispatch_cu),
-                use_tile_resource=True,
-                waves_per_eu_hint=2,
-                b_nt=-1,
-            )
-        ]
     configs = []
     seen = set()
     for sort_block_m, tile_n, num_waves in _SHAPES:
@@ -319,9 +296,7 @@ def get_stage1_autotune_configs(dispatch_cu=None, grid_mult=None, tile_m_values=
     return configs
 
 
-def prune_stage1_autotune_configs(configs, sig_args):
-    """Prune invalid and batch-irrelevant configs before collective compilation."""
-    tokens = int(sig_args["tune_tokens"])
+def stage1_config_is_valid(config, sig_args):
     model_dim = int(sig_args["model_dim"])
     inter_dim = int(sig_args["inter_dim"])
     num_cu = int(sig_args["num_cu"])
@@ -331,50 +306,55 @@ def prune_stage1_autotune_configs(configs, sig_args):
     fuse_mtpr = int(sig_args["fuse_mtpr"])
     experts_per_rank = int(sig_args["experts_per_rank"])
     fixed_slot_dispatch = bool(sig_args["fixed_slot_dispatch"])
+    values = config.kwargs
+    block_m = int(values["sort_block_m"])
+    tile_n = int(values["tile_n"])
+    tile_k = int(values["tile_k"])
+    num_waves = int(values["num_waves"])
+    grid_mult = int(values["grid_mult"])
+    dispatch_cu = int(values["num_dispatch_cu"])
+    use_tile_resource = bool(values["use_tile_resource"])
+    direct_fixed_slot = (
+        fixed_slot_dispatch
+        and fuse_npes == 8
+        and experts_per_rank == 48
+        and fuse_cap == ((fuse_npes * fuse_mtpr + block_m - 1) // block_m) * block_m
+    )
+    num_acc_n = tile_n // num_waves // 16
+    m_repeat = block_m // 16
+    lds_pool = max(2 * block_m * tile_k, 2 * block_m * tile_n)
+    max_rows = fuse_npes * fuse_mtpr * fuse_topk + experts_per_rank * block_m
+    return not (
+        (direct_fixed_slot and (values["active_expert_producer"] or values["cooperative_payload_copy"]))
+        or model_dim % tile_k
+        or (2 * inter_dim) % tile_n
+        or tile_n % (num_waves * 32)
+        or block_m % 32
+        or m_repeat * num_acc_n * 4 > 256
+        or lds_pool + block_m * (model_dim // 32) > 160 * 1024
+        or not 0 < dispatch_cu < num_cu
+        or num_cu * grid_mult - 1 - dispatch_cu <= 0
+        or (max_rows * model_dim >= 1 << 32 and not use_tile_resource)
+        or (max_rows * inter_dim >= 1 << 32 and not use_tile_resource)
+    )
+
+
+def prune_stage1_autotune_configs(configs, sig_args):
+    """Prune invalid and batch-irrelevant configs before collective compilation."""
+    tokens = int(sig_args["tune_tokens"])
+    fuse_mtpr = int(sig_args["fuse_mtpr"])
     out = []
     for config in configs:
         values = config.kwargs
         block_m = int(values["sort_block_m"])
         tile_n = int(values["tile_n"])
-        tile_k = int(values["tile_k"])
         num_waves = int(values["num_waves"])
         grid_mult = int(values["grid_mult"])
         dispatch_cu = int(values["num_dispatch_cu"])
         b_nt = int(values["b_nt"])
-        use_tile_resource = bool(values["use_tile_resource"])
-        direct_fixed_slot = (
-            fixed_slot_dispatch
-            and fuse_npes == 8
-            and experts_per_rank == 48
-            and fuse_cap == ((fuse_npes * fuse_mtpr + block_m - 1) // block_m) * block_m
-        )
-        if b_nt == (3 if fuse_mtpr <= 512 else 0):
+        if b_nt == (3 if fuse_mtpr <= 512 else 0) or not stage1_config_is_valid(config, sig_args):
             continue
-        if direct_fixed_slot and (values["active_expert_producer"] or values["cooperative_payload_copy"]):
-            continue
-        num_acc_n = tile_n // num_waves // 16
-        m_repeat = block_m // 16
-        lds_pool = max(2 * block_m * tile_k, 2 * block_m * tile_n)
-        lds_scale = block_m * (model_dim // 32)
-        max_rows = fuse_npes * fuse_mtpr * fuse_topk + experts_per_rank * block_m
-        payload_bytes = max_rows * model_dim
-        output_bytes = max_rows * inter_dim
-        if (
-            model_dim % tile_k
-            or (2 * inter_dim) % tile_n
-            or tile_n % (num_waves * 32)
-            or block_m % 32
-            or m_repeat * num_acc_n * 4 > 256
-            or lds_pool + lds_scale > 160 * 1024
-            or not 0 < dispatch_cu < num_cu
-            or num_cu * grid_mult - 1 - dispatch_cu <= 0
-            or (payload_bytes >= 1 << 32 and not use_tile_resource)
-            or (output_bytes >= 1 << 32 and not use_tile_resource)
-        ):
-            continue
-        if os.environ.get("MEGA_S1_NOTUNE") == "1":
-            keep = True
-        elif tokens <= 64:
+        if tokens <= 64:
             # Keep explicit M64/M128 joint-SBM sweeps valid for small batches.
             keep = tile_n <= 512 and grid_mult <= 4 and dispatch_cu >= 32 and not (block_m > 32 and b_nt == 0)
         elif tokens <= 1024:

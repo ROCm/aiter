@@ -194,10 +194,10 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     state = {}
 
     def stage1():
-        moe._run_fused_stage1(x_q, weights, scale, ids)
+        state["sbm"] = moe._run_fused_stage1(x_q, weights, scale, ids)
 
     def stage2():
-        state["output"] = moe._run_stage2(tokens, None, True)
+        state["output"] = moe._run_stage2(tokens, None, True, state["sbm"])
 
     def end_to_end():
         state["output"] = moe(x, weights, ids)
