@@ -12,7 +12,7 @@ try:
     _triton_version = Version(triton.__version__.split("+")[0])
     _min_version = Version("3.6.0")
     if _triton_version < _min_version:
-        if int(os.environ.get("AITER_USE_SYSTEM_TRITON", 0)):
+        if int(os.environ.get("AITER_USE_SYSTEM_TRITON", "0")):
             warnings.warn(
                 f"[aiter] AITER_USE_SYSTEM_TRITON=1: "
                 f"aiter gluon kernels require triton>=3.6.0, found {triton.__version__}. "

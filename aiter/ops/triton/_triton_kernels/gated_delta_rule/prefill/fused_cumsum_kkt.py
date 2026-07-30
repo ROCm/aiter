@@ -3,8 +3,8 @@ import triton
 import triton.language as tl
 
 from ..gated_delta_rule_utils import (
-    RCP_LN2,
     IS_AMD,
+    RCP_LN2,
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )

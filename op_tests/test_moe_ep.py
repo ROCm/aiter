@@ -1,34 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import (
-    checkAllclose,
-    run_perftest,
-    perftest,
-)
-from aiter.fused_moe import (
-    fused_topk,
-    fused_moe,
-    torch_moe,
-)
-
-from aiter.fused_moe_bf16_asm import asm_moe
-from aiter.ops.shuffle import (
-    shuffle_weight,
-    shuffle_weight_a16w4,
-    shuffle_scale_a16w4,
-)
-from aiter import ActivationType
-from aiter import QuantType
-from aiter.ops.flydsl.moe_common import GateMode
-from aiter import pertoken_quant
-from aiter import dtypes
-from aiter import get_gfx
-from aiter.utility import fp4_utils
 import argparse
 import os
+
+import torch
+
+import aiter
+from aiter import ActivationType, QuantType, dtypes, get_gfx, pertoken_quant
+from aiter.fused_moe import (
+    fused_moe,
+    fused_topk,
+    torch_moe,
+)
+from aiter.fused_moe_bf16_asm import asm_moe
+from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
+)
+from aiter.test_common import (
+    checkAllclose,
+    perftest,
+    run_perftest,
+)
+from aiter.utility import fp4_utils
 
 BLOCK_SIZE_M = 32
 MAX_TOKENS = 4096 * 4
@@ -208,8 +205,8 @@ def test_fmoe_ep(
 
         # b implement
         torch_quant = aiter.get_torch_quant(aiter.QuantType.No)
-        w1_qt, w1_scale = torch_quant(w1, quant_dtype=None)
-        w2_qt, w2_scale = torch_quant(w2, quant_dtype=None)
+        w1_qt, _w1_scale = torch_quant(w1, quant_dtype=None)
+        w2_qt, _w2_scale = torch_quant(w2, quant_dtype=None)
         w1_qt = w1_qt_aiter = w1_qt.view(w1.shape)
         w2_qt = w2_qt_aiter = w2_qt.view(w2.shape)
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
@@ -230,7 +227,7 @@ def test_fmoe_ep(
         #     )
 
         # test ck moe
-        out_ck, avg_ck = run_perftest(
+        out_ck, _avg_ck = run_perftest(
             fused_moe,
             input,
             w1_qt_aiter,
@@ -810,7 +807,7 @@ if summary_table:
         _df = pd.DataFrame(summary_table)
         print("\nmoe_ep_mxfp4 summary (markdown):")
         print(_df.to_markdown(index=False))
-    except Exception as _e:
+    except Exception as _e:  # noqa: BLE001
         print(f"[summary] pandas unavailable ({_e}); raw rows:")
         for _row in summary_table:
             print(_row)

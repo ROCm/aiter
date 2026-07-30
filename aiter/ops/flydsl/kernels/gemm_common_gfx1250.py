@@ -3,7 +3,7 @@
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import scf
-from flydsl.expr import arith, buffer_ops, gpu, rocdl, tdm_ops, vector
+from flydsl.expr import arith, gpu, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
@@ -12,6 +12,8 @@ from flydsl.utils.smem_allocator import (
     get_mlir_type_size,
     get_op_result_or_value,
 )
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 
 def get_lds_memref(lds_ptr):
@@ -277,19 +279,19 @@ def store_acc_vec8_to_buffer(
 
 
 __all__ = [
-    # LDS helpers
-    "get_lds_memref",
     # Raw LLVM path
     "extract_lds_base_idx",
+    # LDS helpers
+    "get_lds_memref",
+    "issue_tdm_loads",
     "lds_load_b128_raw",
     "lds_transpose_load_raw",
-    # Pipeline
-    "workgroup_barrier",
     "pipeline_fence",
     "pipeline_fence_signal",
     "pipeline_fence_wait",
-    "issue_tdm_loads",
+    "store_acc_vec8_to_buffer",
     # Epilogue
     "store_acc_vec8_to_lds",
-    "store_acc_vec8_to_buffer",
+    # Pipeline
+    "workgroup_barrier",
 ]
