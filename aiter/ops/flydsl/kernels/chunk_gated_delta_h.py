@@ -18,8 +18,10 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import GTensor, _to_raw
 

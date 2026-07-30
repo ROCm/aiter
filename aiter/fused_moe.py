@@ -3151,7 +3151,10 @@ def torch_moe_stage2(
             w2 = fp4_utils.mxfp4_to_f32(w2)
         w2_scale = fp4_utils.e8m0_to_f32(w2_scale)
         if a2_scale is not None:
-            hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
+            if hidden_states.dtype == dtypes.fp8:  # a8w4 mxfp8 activation
+                hidden_states = hidden_states.to(ctype)
+            else:
+                hidden_states = fp4_utils.mxfp4_to_f32(hidden_states)
             a2_scale = fp4_utils.e8m0_to_f32(a2_scale)
         else:  # a16w4 / mxfp8 (bf16 reference activation)
             hidden_states = hidden_states.to(ctype)
@@ -3505,6 +3508,7 @@ def fused_topk(
             (256, 6),
             (256, 8),
             (384, 8),
+            (640, 8),
         ]
         and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
         and gating_output.is_contiguous()

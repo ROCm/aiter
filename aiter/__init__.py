@@ -121,6 +121,7 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
     from .ops.mha import *
+    from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401
     from .ops.gradlib import *
     from .ops.trans_ragged_layout import *
     from .ops.sample import *
