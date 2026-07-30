@@ -9,15 +9,14 @@
     "reduction_k == output_n == D (square dense). Resolution: explicit kwarg >",
     "winners exact match > fallback.by_d_bucket (D<=256 -> d_le_256, else",
     "d_gt_256). The only shape-varying win today is gj_stages_a: =1 at D=256",
-    "(grad_jagged -2.6% direct / -3.4% autograd) and =2 at D=512 (=1 is",
-    "noise/marginally slower there) -- see docs/2026-07-03_mvonstra-amd_bench.md.",
+    "and =2 at D=512 (=1 is marginally slower there).",
     "Same JSON on both archs: the backward has no arch-specific atom (the fp16",
     "32x32x8 path was removed), so gfx942 and gfx950 share the schedule."
   ],
   "by_arch": {
     "gfx942": {
       "gfx": "gfx942",
-      "source": "2026-07-03_mvonstra-amd_bench.md (GJ_STAGES_A A/B), 2026-07-01 optimization log",
+      "source": "gj_stages_a A/B tuning on gfx942",
       "winners": {
         "B120D256K256N7680": {"gj_stages_a": 1},
         "B120D512K512N7680": {"gj_stages_a": 2},

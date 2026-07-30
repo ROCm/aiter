@@ -86,12 +86,12 @@ DDENSE_NROW_GROUPS = DDENSE_THREADS // DDENSE_BN
 
 # Default schedule knobs (baked into a build unless the caller overrides). See
 # build_backward for how they specialize per shape.
-#  * COARSEN_M: grad_jagged M-coarsening. At the production shape (B=1024, Mi=7680)
-#    the per-row dJagged GEMM launches a huge grid of *tiny* workgroups (each WG
-#    does only NRED_TILES=4 MFMA K-steps), dispatch/latency-bound (~4% occupancy,
-#    ~82% SPI). Coarsening makes each WG process COARSEN_M consecutive BLOCK_M
-#    output tiles (grid M-dim shrinks by COARSEN_M), so WGs live longer and the SPI
-#    dispatches fewer WGs. COARSEN_M=1 reproduces the original kernel/grid exactly.
+#  * COARSEN_M: grad_jagged M-coarsening. At large deployment shapes (B=1024,
+#    Mi=7680) the per-row dJagged GEMM launches a huge grid of *tiny* workgroups
+#    (each WG does only NRED_TILES=4 MFMA K-steps) and is dispatch/latency-bound.
+#    Coarsening makes each WG process COARSEN_M consecutive BLOCK_M output tiles
+#    (grid M-dim shrinks by COARSEN_M), so WGs live longer and fewer are
+#    dispatched. COARSEN_M=1 is the un-coarsened grid (one BLOCK_M tile per WG).
 #  * GJ_STAGES_A: grad_jagged A-staging depth. The double-buffered sA is
 #    BLOCK_M*BLOCK_K*GJ_STAGES_A bf16 = 32 KB at 2 stages, which caps grad_jagged at
 #    <=2 WG/CU (LDS-bound). =1 single-buffers it -> 16 KB -> up to 4 WG/CU, at the
@@ -216,7 +216,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
             if start_m < M_b:
                 # Rebase A (dOut, N cols/row) and C (dJagged, K cols/row) to this group's
                 # local row 0; select B's (K, N) slice for group off_b.
-                # int64 element offsets: at the North-Star shape (B=1024, Mi=7680)
+                # int64 element offsets: at the largest deployment shape (B=1024, Mi=7680)
                 # seq_start reaches ~L ≈ 7.86M, so seq_start*K (or *N) ≈ 4G overflows
                 # int32 once K/N ≥ 512, silently wrapping the (d)Jagged/dOut base pointer
                 # (the masked store then writes to a wrong/read-only page). seq_start*K
@@ -228,7 +228,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 C_g = fx.make_view(fx.add_offset(fx.get_iter(C), fx.make_int_tuple(c_row_off)), fx.get_layout(C))
                 # int32 (NOT int64 like a_row_off/c_row_off above): the dense base
                 # offset is bounded by off_b*K*N <= n_groups*D^2, not by L. At the
-                # North-Star (n_groups=1024, D=512) that is 1024*512*512 ≈ 2.7e8 <<
+                # largest shape (n_groups=1024, D=512) that is 1024*512*512 ≈ 2.7e8 <<
                 # 2^31, so it cannot overflow -- unlike the L-scaled jagged/dOut
                 # offsets, which do reach ~4G. (Would only trip at n_groups*D^2 >= 2^31,
                 # e.g. n_groups >= 8192 at D=512.)
@@ -287,8 +287,8 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
                 def run_pipeline_stage(read_stage, next_k, read_next=True):
                     write_stage = read_stage ^ 1
                     # B stays register-double-buffered (no LDS cost) on read/write_stage.
-                    # A's LDS stage folds modulo GJ_STAGES_A: at 2 stages this is the
-                    # original ping-pong; at 1 stage (B2) it collapses to a single buffer.
+                    # A's LDS stage folds modulo GJ_STAGES_A: 2 stages ping-pong across
+                    # two buffers; 1 stage collapses to a single buffer.
                     a_read = read_stage % GJ_STAGES_A
                     a_write = write_stage % GJ_STAGES_A
                     if fx.const_expr(read_next):
@@ -386,7 +386,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
 
         bm = (max_seq_len + BLOCK_M - 1) // BLOCK_M
         bm_coarse = (bm + COARSEN_M - 1) // COARSEN_M  # M row-tiles per WG = COARSEN_M
-        gj_smem = BLOCK_M * BLOCK_K * GJ_STAGES_A * 2  # bf16 sA staging (B2: 32 KB at 2 stages)
+        gj_smem = BLOCK_M * BLOCK_K * GJ_STAGES_A * 2  # bf16 sA staging (32 KB at 2 stages)
         grad_jagged_kernel(dJagged, dOut, DENSE, SEQ_OFFSETS, tiled_mma, tiled_copy_g2s_A).launch(
             grid=(bm_coarse * KOUT_BLOCKS, 1, n_groups), block=(256, 1, 1), smem=gj_smem, stream=stream
         )
@@ -457,7 +457,7 @@ def build_backward(D, split=None, gj_stages_a=None, coarsen_m=None):
 
         # Group-rebased buffers bounded to M_b rows: any local row >= M_b zero-fills
         # (CDNA OOB-load == 0), so tail rows contribute 0 to the contraction.
-        # base_byte_offset MUST be computed in int64: at the North-Star shape seq_start
+        # base_byte_offset MUST be computed in int64: at the largest deployment shape seq_start
         # reaches ~L ≈ 7.86M rows, so seq_start*K*2 ≈ 4 GB overflows int32 (silently
         # wrapping the descriptor base). num_records_bytes stays in-range (per-group,
         # M_b ≤ Mi) so an int32 product is fine there.

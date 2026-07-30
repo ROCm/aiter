@@ -51,7 +51,7 @@ for _p in (_REPO_ROOT, _TEST_DIR):
 
 # Headline correctness cases per D: (B, Mi, regime). Mi is kept modest (correctness
 # is shape-topology-dependent, not Mi-magnitude-dependent) to bound the eager
-# reference cost; the North-Star Mi is exercised via resolve_config only. Covers
+# reference cost; the largest deployment Mi is exercised via resolve_config only. Covers
 # B in {120, 1024} and all three regimes (uniform / genrec / skew); uniform is run
 # at B=120 only (uniform is topology-trivial, so B=1024 adds no new coverage).
 _HEADLINE = [
@@ -214,7 +214,7 @@ def _worker(D: int) -> int:
         print(msg)
 
     # (4) end-to-end autograd (out.backward()) vs eager grads. D=256 only: D=512 is
-    # blocked at large L by the FORWARD int32-offset overflow (integration plan Risks).
+    # blocked at large L by the FORWARD int32-offset overflow (separate forward fix).
     if D <= 256:
         for (B, Mi, regime) in [(120, 512, "genrec"), (120, 512, "skew")]:
             case_ok, msg = _run_autograd_case(D, B, Mi, regime)
@@ -228,8 +228,8 @@ def _worker(D: int) -> int:
 
 
 def _orchestrate() -> int:
-    """Phase 4: run BOTH D in ONE process. The backward now bakes D + knobs into a
-    memoized per-shape build (jagged_dense_bmm_bwd.build_backward), so multiple D
+    """Run BOTH D in ONE process. The backward bakes D + knobs into a memoized
+    per-shape build (jagged_dense_bmm_bwd.build_backward), so multiple D
     coexist — no single-D-per-process constraint, no per-D subprocess isolation,
     no cache clearing. Running D=256 then D=512 here IS the multi-D regression."""
     overall = True

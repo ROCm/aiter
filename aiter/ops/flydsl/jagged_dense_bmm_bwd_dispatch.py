@@ -4,13 +4,13 @@
 """Host wrapper for the FlyDSL ``jagged_dense_bmm`` BACKWARD kernels.
 
 Companion to the forward's ``jagged_dense_bmm_dispatch.py``. It folds all the
-host-side glue the backward needs (previously inlined in every bench / example /
-recsys-harness driver) into one place:
+host-side glue the backward needs (previously inlined in every bench / example
+driver) into one place:
 
     - building (memoized) the per-shape backward launchers via
       ``jagged_dense_bmm_bwd.build_backward(D, split, gj_stages_a, coarsen_m)``,
       which bakes D and the schedule knobs in as closure constants — so MULTIPLE
-      D coexist in one process (Phase 4; no single-D-per-process constraint, no
+      D coexist in one process (no single-D-per-process constraint, no
       module-global snapshot, and no cache-collision hazard on the knobs);
     - fp32 split-reduction scratch allocation (cached per (n_groups, D, device));
     - the ``BLOCK_M``-padded ``dJagged`` output (so a partial tail-tile store
@@ -308,7 +308,7 @@ def jagged_dense_bmm_bwd_dispatched(
     # buffers). They use torch.empty, NOT torch.zeros: the kernels fully overwrite
     # every returned element (grad_jagged writes all L packed rows over all K cols;
     # grad_dense_bias writes every (b,k,n)/(b,n), storing an explicit 0 for empty
-    # groups), so a zero-init memset (multi-GB at the North-Star shape) would be
+    # groups), so a zero-init memset (multi-GB at the largest deployment shape) would be
     # pure overhead. The d_jagged padding rows [L:L+BLOCK_M] are never returned.
 
     # --- dJagged: RHS is Dense[b] in its plain (K, N) layout, flattened tall. ---

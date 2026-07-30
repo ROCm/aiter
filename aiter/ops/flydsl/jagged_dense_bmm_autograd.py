@@ -24,9 +24,9 @@ LAYOUT RECONCILIATION (the one place fwd↔bwd layouts are bridged):
 CONSTRAINTS (inherited from the backward):
   * D = K = N is a compile-time constant pinned per process (single-D-per-process).
   * D=512 is currently blocked at large L by the FORWARD's int32 offset overflow
-    (L≈7.9M) -- a separate forward-kernel fix (see the integration plan Risks).
-    The backward already guards that offset; only the forward faults. So this
-    autograd op is validated at D=256 today; D=512 training awaits the forward fix.
+    (L≈7.9M) -- a separate forward-kernel fix. The backward already guards that
+    offset; only the forward faults. So this autograd op is validated at D=256
+    today; D=512 training awaits the forward fix.
 """
 
 from __future__ import annotations
