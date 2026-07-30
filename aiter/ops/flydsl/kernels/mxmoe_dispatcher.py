@@ -39,38 +39,58 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
 
 
 # ---- gemm2 (down-proj) compile ----
-def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
+def _udiv_i32(a, c):
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
+
+
+def _umod_i32(a, c):
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
+
+
+def _spart_output_tile_index(
+    block_1d_id, M0, N0, group_num, m01, *, use_unsigned=False
+):
     """ck_tile GemmSpatiallyLocalTilePartitioner::GetOutputTileIndex: 1D block id -> spatially-local (m_block_idx, n_block_idx). block_1d_id/M0 runtime; N0/group_num/m01 compile-time."""
     gn = fx.Int32(group_num)
     n0 = fx.Int32(N0)
     m01c = fx.Int32(m01)
+    div = _udiv_i32 if use_unsigned else lambda a, b: a // b
 
     # group_size = ceil(M0*N0 / GroupNum); big_group_num = GroupNum - (group_size*GroupNum - M0*N0)
     mn = M0 * n0
-    group_size = (mn + gn - fx.Int32(1)) // gn
+    group_size = div(mn + gn - fx.Int32(1), gn)
     big_group_num = gn - (group_size * gn - mn)
 
-    group_id_y = block_1d_id // gn
-    group_id_x = block_1d_id - group_id_y * gn
+    group_id_y = div(block_1d_id, gn)
+    if use_unsigned:
+        group_id_x = _umod_i32(block_1d_id, gn)
+    else:
+        group_id_x = block_1d_id - group_id_y * gn
 
     # remap = group_id_x <= big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
     remap_a = group_id_x * group_size + group_id_y
     remap_b = group_id_x * group_size + big_group_num - group_id_x + group_id_y
     remap = (group_id_x <= big_group_num).select(remap_a, remap_b)
 
-    idx_M0 = remap // n0
+    idx_M0 = div(remap, n0)
     idx_N0 = remap - idx_M0 * n0
 
     # M0_tmp = M0 / M01 ; M0_mod_M01 = M0 - M0_tmp*M01 ; M01_adapt = (idx_M0 < M0 - M0_mod) ? M01 : M0_mod
-    M0_tmp = M0 // m01c
-    M0_mod = M0 - M0_tmp * m01c
+    M0_tmp = div(M0, m01c)
+    if use_unsigned:
+        M0_mod = _umod_i32(M0, m01c)
+    else:
+        M0_mod = M0 - M0_tmp * m01c
     M01_adapt = (idx_M0 < (M0 - M0_mod)).select(m01c, M0_mod)
 
-    idx_M00 = idx_M0 // m01c
-    idx_M01 = idx_M0 - idx_M00 * m01c
+    idx_M00 = div(idx_M0, m01c)
+    if use_unsigned:
+        idx_M01 = _umod_i32(idx_M0, m01c)
+    else:
+        idx_M01 = idx_M0 - idx_M00 * m01c
     idx_local = idx_N0 + idx_M01 * n0
 
-    N_out = idx_local // M01_adapt
+    N_out = div(idx_local, M01_adapt)
     loc_mod = idx_local - N_out * M01_adapt
 
     m_block_idx = loc_mod + idx_M00 * m01c
@@ -96,6 +116,7 @@ def compile_gemm2_a4w4_port(
     g2_bhoist=None,
     g2_ascale_pf=None,
     g2_spart=None,
+    g2_spart_opt=None,
     g2_bf16_lds=None,
     out_dtype="bf16",
 ):
@@ -139,6 +160,9 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
+    if g2_spart_opt is None:
+        g2_spart_opt = os.environ.get("MXFP4_G2_SPART_OPT", "1") == "1"
+    g2_spart_opt = bool(g2_spart_opt) and g2_spart > 0 and not persist
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
@@ -177,10 +201,11 @@ def compile_gemm2_a4w4_port(
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
+    spartopt_tag = "_spartopt" if g2_spart_opt else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{spartopt_tag}{bf16lds_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -238,7 +263,9 @@ def compile_gemm2_a4w4_port(
                 )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
-        def run_unit(unit_bx):
+        def run_unit(
+            unit_bx, precomputed_m_block_idx=None, precomputed_n_block_idx=None
+        ):
             gemm2_body_v2(
                 lds_base_i32,
                 arg_ascale,
@@ -258,6 +285,8 @@ def compile_gemm2_a4w4_port(
                 i32_hidden,
                 i32_kpad,
                 i32_npad,
+                precomputed_m_block_idx,
+                precomputed_n_block_idx,
                 BM=BM,
                 BN=BN,
                 BK=BK,
@@ -295,12 +324,22 @@ def compile_gemm2_a4w4_port(
 
             if fx.Int32(bx_i32) < bound:
                 m_block_idx, n_block_idx = _spart_output_tile_index(
-                    bx_i32, total_m_blocks, num_n_blocks, g2_group_num, g2_m01
+                    bx_i32,
+                    total_m_blocks,
+                    num_n_blocks,
+                    g2_group_num,
+                    g2_m01,
+                    use_unsigned=g2_spart_opt,
                 )
-                unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
-                issue_all_a_loads(m_block_idx * fx.Int32(BM))
-                rocdl.sched_barrier(0)
-                run_unit(unit_bx)
+                if const_expr(g2_spart_opt):
+                    issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    run_unit(fx.Int32(0), m_block_idx, n_block_idx)
+                else:
+                    unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
+                    issue_all_a_loads(m_block_idx * fx.Int32(BM))
+                    rocdl.sched_barrier(0)
+                    run_unit(unit_bx)
         else:
             # Persistent-m: fixed cu_num*num_n_blocks grid; each block grid-strides m-tiles by cu_num (aiter `_persist`).
             m_tile0 = bx_i32 // fx.Int32(num_n_blocks)
@@ -449,6 +488,8 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
+    g2_spart_opt = os.environ.get("MXFP4_G2_SPART_OPT", "1") == "1"
+    g2_spart_opt = bool(g2_spart_opt) and g2_spart > 0 and not persist
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     key = (
         BM,
@@ -468,6 +509,7 @@ def get_g2(
         g2_bhoist,
         g2_ascale_pf,
         g2_spart,
+        g2_spart_opt,
         g2_bf16_lds,
         out_dtype,
     )
@@ -491,6 +533,7 @@ def get_g2(
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
+            g2_spart_opt=g2_spart_opt,
             g2_bf16_lds=g2_bf16_lds,
             out_dtype=out_dtype,
         )

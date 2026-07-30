@@ -182,6 +182,21 @@ def issue_a_load_lds_dt(
         )
 
 
+def _resolve_tile_coords(
+    bx_i32,
+    num_n_blocks,
+    precomputed_m_block_idx=None,
+    precomputed_n_block_idx=None,
+):
+    if (precomputed_m_block_idx is None) != (precomputed_n_block_idx is None):
+        raise AssertionError("precomputed tile coordinates must be provided together")
+    if precomputed_m_block_idx is not None:
+        return precomputed_m_block_idx, precomputed_n_block_idx
+    m_block_idx = bx_i32 // num_n_blocks
+    n_block_idx = bx_i32 - m_block_idx * num_n_blocks
+    return m_block_idx, n_block_idx
+
+
 @flyc.jit
 def gemm2_body_v2(
     lds_base_i32,
@@ -202,6 +217,8 @@ def gemm2_body_v2(
     i32_hidden,
     i32_kpad,
     i32_npad,
+    precomputed_m_block_idx=None,
+    precomputed_n_block_idx=None,
     *,
     BM,
     BN=256,
@@ -263,8 +280,12 @@ def gemm2_body_v2(
         N_real = N_OUT_rt - fx.Int32(i32_npad)
 
     # block -> (m_block_idx, n_block_idx); e = sorted_expert_ids[SBM-padded sort block] (SBM==BM: sort_block==m_block_idx).
-    m_block_idx = bx_i32 // num_n_blocks
-    n_block_idx = bx_i32 - m_block_idx * num_n_blocks
+    m_block_idx, n_block_idx = _resolve_tile_coords(
+        bx_i32,
+        num_n_blocks,
+        precomputed_m_block_idx,
+        precomputed_n_block_idx,
+    )
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
     if const_expr(SBM == BM):
         e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
