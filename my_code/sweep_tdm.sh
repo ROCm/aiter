@@ -68,7 +68,12 @@ run g1_nb4            16 256 256 4      16 512 128 2
 # B: halve tile_n to buy buffer depth while keeping >=2 blocks/CU
 run g1_n128_nb3       16 128 256 3      16 512 128 2
 run g1_n128_nb4       16 128 256 4      16 512 128 2
-run g1_n128_nb6       16 128 256 6      16 512 128 2
+# NOT run: 16 128 256 6 -- wedges the GPU (MES stops answering REMOVE_QUEUE, ASIC
+# reset then fails, machine needs a reboot). Reproduced twice. Root cause unknown:
+# compile is fine (7.7s) and a standalone kernel issuing 20 TDM ops with
+# s_wait_tensorcnt 0x10 runs clean, so it is not TDM over-subscription alone.
+# Not worth chasing -- this tile_n=128 line tops out at 496us vs 378us for
+# g1_m64_nb3. Do not re-add without a containment plan.
 # C: bigger tile_k lengthens the per-tile compute window
 run g1_k512_nb2       16 256 512 2      16 512 128 2
 run g1_n128_k512_b3   16 128 512 3      16 512 128 2
