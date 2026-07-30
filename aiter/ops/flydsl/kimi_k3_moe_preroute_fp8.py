@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Kimi-K3 B1 pre-route projections with row-scaled FP8 weights."""
+
+from __future__ import annotations
+
+import functools
+import math
+
+import torch
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+_BATCH_SIZE = 1
+_HIDDEN_SIZE = 7168
+_ROUTED_SIZE = 3584
+_SHARED_GATE_UP_SIZE = 1536
+_SHARED_INTERMEDIATE_SIZE = _SHARED_GATE_UP_SIZE // 2
+
+
+def is_kimi_k3_moe_preroute_fp8_available() -> bool:
+    """Return whether the fixed-shape gfx950 FlyDSL kernels can be built."""
+
+    return is_flydsl_available() and get_gfx_runtime() == "gfx950"
+
+
+def _same_device(*tensors: torch.Tensor) -> bool:
+    return len({tensor.device for tensor in tensors}) == 1
+
+
+def supports_kimi_k3_moe_dual_projection_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+) -> bool:
+    """Return whether the fixed Kimi-K3 dual-projection path is supported."""
+
+    tensors = (
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+    )
+    return (
+        all(tensor.is_cuda for tensor in tensors)
+        and hidden.dtype == torch.bfloat16
+        and routed_weight.dtype == torch.float8_e4m3fn
+        and routed_scale.dtype == torch.float32
+        and shared_weight.dtype == torch.float8_e4m3fn
+        and shared_scale.dtype == torch.float32
+        and tuple(hidden.shape) == (_BATCH_SIZE, _HIDDEN_SIZE)
+        and tuple(routed_weight.shape) == (_ROUTED_SIZE, _HIDDEN_SIZE)
+        and tuple(routed_scale.shape) == (_ROUTED_SIZE,)
+        and tuple(shared_weight.shape) == (_SHARED_GATE_UP_SIZE, _HIDDEN_SIZE)
+        and tuple(shared_scale.shape) == (_SHARED_GATE_UP_SIZE,)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and _same_device(*tensors)
+        and is_kimi_k3_moe_preroute_fp8_available()
+    )
+
+
+@functools.cache
+def _dual_projection_launcher():
+    from aiter.ops.flydsl.kernels.kimi_k3_dual_projection_fp8_gfx950 import (
+        build_kimi_k3_b1_dual_projection_fp8_module,
+    )
+
+    return build_kimi_k3_b1_dual_projection_fp8_module(
+        rows_per_wave=2,
+        cu_count=248,
+        waves_per_eu=0,
+        weight_cache_modifier=2,
+        hidden_to_lds=True,
+    )
+
+
+def kimi_k3_moe_dual_projection_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project one BF16 token with two row-scaled FP8 weight matrices."""
+
+    if not supports_kimi_k3_moe_dual_projection_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+    ):
+        raise ValueError("unsupported Kimi-K3 dual-projection inputs")
+
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    routed_output = hidden.new_empty((_BATCH_SIZE, _ROUTED_SIZE))
+    shared_output = hidden.new_empty((_BATCH_SIZE, _SHARED_GATE_UP_SIZE))
+    _dual_projection_launcher()(
+        ptr_arg(hidden),
+        ptr_arg(routed_weight),
+        ptr_arg(routed_scale),
+        ptr_arg(shared_weight),
+        ptr_arg(shared_scale),
+        ptr_arg(routed_output),
+        ptr_arg(shared_output),
+        stream=torch.cuda.current_stream(hidden.device),
+    )
+    return routed_output, shared_output
+
+
+def supports_kimi_k3_shared_down_fp8(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> bool:
+    """Return whether the fused Kimi-K3 SiTU/shared-down path is supported."""
+
+    tensors = (gate_up, weight, weight_scale)
+    return (
+        gate_up.is_cuda
+        and gate_up.dtype == torch.bfloat16
+        and tuple(gate_up.shape) == (_BATCH_SIZE, _SHARED_GATE_UP_SIZE)
+        and gate_up.is_contiguous()
+        and supports_kimi_k3_shared_down_fp8_weight(
+            weight,
+            weight_scale,
+            device=gate_up.device,
+        )
+        and _same_device(*tensors)
+    )
+
+
+def supports_kimi_k3_shared_down_fp8_weight(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    device: torch.device | None = None,
+) -> bool:
+    """Return whether a shared-down weight pair has the kernel's contract."""
+
+    tensors = (weight, weight_scale)
+    return (
+        all(tensor.is_cuda for tensor in tensors)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.dtype == torch.float32
+        and tuple(weight.shape) == (_HIDDEN_SIZE, _SHARED_INTERMEDIATE_SIZE)
+        and tuple(weight_scale.shape) == (_HIDDEN_SIZE,)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and _same_device(*tensors)
+        and (device is None or weight.device == device)
+        and is_kimi_k3_moe_preroute_fp8_available()
+    )
+
+
+@functools.cache
+def _shared_down_launcher(
+    situ_beta: float,
+    situ_linear_beta: float,
+):
+    from aiter.ops.flydsl.kernels.kimi_k3_shared_down_fp8_gfx950 import (
+        build_kimi_k3_b1_shared_down_fp8_module,
+    )
+
+    return build_kimi_k3_b1_shared_down_fp8_module(
+        rows_per_wave=1,
+        cu_count=248,
+        waves_per_eu=0,
+        weight_cache_modifier=0,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+
+
+def kimi_k3_shared_down_fp8(
+    gate_up: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    *,
+    situ_beta: float,
+    situ_linear_beta: float,
+) -> torch.Tensor:
+    """Apply SiTU and project with a row-scaled FP8 weight matrix."""
+
+    if (
+        not math.isfinite(situ_beta)
+        or not math.isfinite(situ_linear_beta)
+        or situ_beta <= 0.0
+        or situ_linear_beta <= 0.0
+    ):
+        raise ValueError("SiTU beta values must be finite and positive")
+    if not supports_kimi_k3_shared_down_fp8(
+        gate_up,
+        weight,
+        weight_scale,
+    ):
+        raise ValueError("unsupported Kimi-K3 shared-down inputs")
+
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    output = gate_up.new_empty((_BATCH_SIZE, _HIDDEN_SIZE))
+    _shared_down_launcher(
+        float(situ_beta),
+        float(situ_linear_beta),
+    )(
+        ptr_arg(gate_up),
+        ptr_arg(weight),
+        ptr_arg(weight_scale),
+        ptr_arg(output),
+        stream=torch.cuda.current_stream(gate_up.device),
+    )
+    return output
