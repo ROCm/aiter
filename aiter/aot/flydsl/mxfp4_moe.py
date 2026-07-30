@@ -41,6 +41,7 @@ def _job_key(job: dict) -> tuple:
             job["NE"],
             job["topk"],
             job["xcd_swizzle"],
+            job["a_dtype"],
         )
     return (
         2,
@@ -132,6 +133,7 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
+                        "a_dtype": "fp4",
                     }
                 )
 
@@ -197,6 +199,7 @@ def _compile_stage1(job):
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        a_dtype=job["a_dtype"],
         stream=0,
     )
 

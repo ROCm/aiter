@@ -16,6 +16,16 @@ _SUPPORTED = {
     (128, False, False),
     (16, True, True),
 }
+_SUPPORTED_BY_DTYPE = {
+    "fp4": _SUPPORTED,
+    "fp8": {
+        (32, True, False),
+        (32, False, False),
+        (64, False, False),
+        (128, False, False),
+        (16, True, True),
+    },
+}
 
 
 def _effective_use_nt(*, n_tokens, topk, NE, BM, use_nt, inline_quant):
@@ -40,6 +50,7 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    a_dtype="fp4",
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -55,12 +66,28 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        a_dtype=a_dtype,
     )
 
 
 def _assert_supported(
-    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, BN=256, BK=256
+    *,
+    NE,
+    D_HIDDEN,
+    D_INTER,
+    topk,
+    BM,
+    use_nt,
+    inline_quant,
+    BN=256,
+    BK=256,
+    a_dtype="fp4",
 ):
+    if a_dtype not in _SUPPORTED_BY_DTYPE:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires a_dtype in {tuple(_SUPPORTED_BY_DTYPE)}, "
+            f"got {a_dtype!r}"
+        )
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -70,10 +97,11 @@ def _assert_supported(
             f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "
             f"got D_INTER={D_INTER}"
         )
-    if (BM, use_nt, inline_quant) not in _SUPPORTED:
+    if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
-            f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+            f"(a_dtype={a_dtype}, BM={BM}, use_nt={use_nt}, "
+            f"inline_quant={inline_quant})"
         )
 
 
@@ -101,6 +129,7 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    a_dtype="fp4",
     stream=None,
 ):
     use_nt = _effective_use_nt(
@@ -121,6 +150,7 @@ def flydsl_mxfp4_gemm1(
         inline_quant=inline_quant,
         BN=BN,
         BK=BK,
+        a_dtype=a_dtype,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -136,6 +166,7 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        a_dtype,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(

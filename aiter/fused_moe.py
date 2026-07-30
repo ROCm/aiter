@@ -1449,6 +1449,7 @@ def _mxfp4_a4w4_stage1(
         topk=topk,
         interleave=interleave,
         xcd_swizzle=_xcd1,
+        a_dtype="fp4",
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
