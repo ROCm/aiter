@@ -247,47 +247,70 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
     }
 
 
+def m2bucket(m):
+    if m <= 8:
+        return "tiny"
+    if m <= 32:
+        return "small"
+    if m <= 128:
+        return "medium"
+    if m <= 256:
+        return "medium2"
+    if m <= 512:
+        return "large"
+    return "xlarge"
+
+
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_warps = 4
     num_buffers = 3
     split_k = 1
-    block_k = 512
     use_persistent = False
     persistent_iters = 0
 
     if block_m == 16:
-        block_k = 512
-        num_warps = 4
         if k <= 768:
             use_persistent = True
             persistent_iters = 3
-            block_n = 128
-            block_k = 256
-            num_buffers = 2
-        elif n <= 1536:
-            block_n = 128
-            num_buffers = 3
-        elif n <= 3072:
-            block_n = 128
-            num_buffers = 2
+        bucket = m2bucket(m)
+        tuned = _get_a8w4_dispatch(get_arch())
+        key = f"bm{block_m}_n{n}_k{k}_{bucket}"
+        if key in tuned:
+            cfg = tuned[key]
+            block_n, block_k, num_buffers = (
+                cfg["block_n"],
+                cfg["block_k"],
+                cfg["num_buffers"],
+            )
         else:
-            block_n = 256
-            num_buffers = 1
+            block_k = 512
+            if k <= 768:
+                block_n = 128
+                block_k = 256
+                num_buffers = 2
+            elif n <= 1536:
+                block_n = 128
+                num_buffers = 3
+            elif n <= 3072:
+                block_n = 128
+                num_buffers = 2
+            else:
+                block_n = 256
+                num_buffers = 1
 
     elif block_m == 32:
+        block_k = 512
         if n <= 1024:
             block_n = 128
-            num_warps = 4
         else:
             block_n = 256
-            num_warps = 4
 
     else:
         block_n = 256
         block_k = 256
-        num_warps = 4
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
 
