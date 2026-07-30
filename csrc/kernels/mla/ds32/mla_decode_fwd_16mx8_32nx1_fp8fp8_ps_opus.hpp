@@ -561,6 +561,372 @@ __device__ inline void attn_mask_causal_kv_tile(V& v_s,
 }
 
 template <class Traits, bool OddTail, class VQN, class VQR, class VO>
+__device__ void mla_decode_fwd_pipelined_2(mla_kargs kargs,
+                                           int kv_ind_ptr_s,
+                                           int valid_kv_len,
+                                           int tile_begin,
+                                           int tile_end,
+                                           char* smem_kv,
+                                           VQN& v_q_nope,
+                                           VQR& v_q_rope,
+                                           int scale_q,
+                                           VO& v_o,
+                                           typename Traits::D_ACC& m_row,
+                                           typename Traits::D_ACC& l_row,
+                                           float temperature_scale,
+                                           int causal_diagonal,
+                                           int nhead,
+                                           bool causal_multi)
+{
+    using namespace opus;
+    using T     = opus::remove_cvref_t<Traits>;
+    using D_Q   = typename T::D_Q;
+    using D_K   = typename T::D_K;
+    using D_V   = typename T::D_V;
+    using D_ACC = typename T::D_ACC;
+    using D_OUT = typename T::D_OUT;
+
+    int lane_id = thread_id_x() % T::WARP_SIZE;
+    asm volatile("" : "+v"(lane_id));
+    const int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+    const int stagger = warp_id / 4;
+
+    auto g_k_nope = make_gmem(reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr),
+                              kargs.total_tokens * kargs.stride_kv_page * sizeof(D_K));
+    auto g_k_rope = make_gmem(reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr) + T::D_NOPE_SIZE,
+                              kargs.total_tokens * kargs.stride_kv_page * sizeof(D_K));
+    auto g_kv_indices = make_gmem(kargs.kv_indices + kv_ind_ptr_s, valid_kv_len * sizeof(int));
+
+    auto s_k_nope = make_smem(reinterpret_cast<D_K*>(smem_kv));
+    auto s_k_rope = make_smem(reinterpret_cast<D_K*>(smem_kv + T::smem_k_nope_bytes));
+
+    // Double-buffer slot stride (in elements) for each smem region.
+    constexpr auto kv_slot_off = number<T::smem_kv_bytes() / sizeof(D_K)>{};
+
+    auto u_kv_indices      = make_layout_kv_indices<T>(warp_id, lane_id);
+    auto u_kv_indices_rope = make_layout_kv_indices_rope<T>(warp_id, lane_id);
+    auto u_gk_nope         = make_layout_gk_nope<T>(warp_id, lane_id);
+    auto u_sk_nope         = make_layout_sk_nope<T>(warp_id);
+    auto u_rk_nope         = make_layout_rk_nope<T>(lane_id);
+    auto u_gk_rope         = make_layout_gk_rope<T>(lane_id);
+    auto u_sk_rope         = make_layout_sk_rope<T>(warp_id);
+    auto u_rk_rope         = make_layout_rk_rope<T>(lane_id);
+    auto u_rv              = make_layout_rv<T>(lane_id);
+
+    auto mfma0_nope =
+        make_mfma<D_K, D_Q, D_ACC>(number<T::W_M>{}, number<T::W_N>{}, number<T::W_K_NOPE>{});
+    auto mma0_rope = make_tiled_mma<D_K, D_Q, D_ACC>(seq<T::GEMM0_E_M, T::GEMM0_E_N, 1_I>{},
+                                                     seq<1_I, 1_I, 1_I>{},
+                                                     seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+                                                     mfma_adaptor_swap_ab{});
+    auto mma1 = make_tiled_mma<D_K, D_K, D_ACC>(seq<T::GEMM1_E_M, T::GEMM1_E_N, T::GEMM1_E_K>{},
+                                                seq<T::T_M, T::T_N, T::T_K>{},
+                                                seq<T::W_M, T::W_N, T::W_K_ROPE>{},
+                                                mfma_adaptor_swap_ab{});
+
+    constexpr int SCALE_NONE = 127;
+
+    using k_nope_tile_t = vector_t<D_K, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
+    using s_tile_t      = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
+    vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
+    vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_ROPE / T::WARP_SIZE> v_k_rope[2];
+    // Two score buffers so the softmax VALU of the current tile can run alongside
+    // the QK/PV MFMA of the adjacent tile (see the cluster staging below).
+    typename decltype(mma0_rope)::vtype_c v_s[2];
+    typename decltype(mma1)::vtype_a v_p;
+    typename decltype(mma1)::vtype_b v_v[2];
+
+    auto v_q_nope_slices =
+        reinterpret_cast<vector_t<D_Q, T::W_M * T::W_K_NOPE / T::WARP_SIZE>*>(&v_q_nope);
+    auto v_q_rope_slices =
+        reinterpret_cast<vector_t<D_Q, T::W_M * T::W_K_ROPE / T::WARP_SIZE>*>(&v_q_rope);
+    auto v_o_slices =
+        reinterpret_cast<vector_t<D_ACC, T::Q_TILE_SIZE * T::SLICE_D / T::WARP_SIZE>*>(&v_o);
+
+    auto sk_nope_slice = [](auto slice_idx) {
+        constexpr int s = decltype(slice_idx)::value;
+        return number<s * T::smem_n_rpt*(T::smem_linear_wave_nope + T::smem_padding_32B_nope)>{};
+    };
+    auto sk_rope_slice = [](auto slice_idx) {
+        constexpr int s = decltype(slice_idx)::value;
+        return number<s * T::SLICE_D>{};
+    };
+    auto sv_slice = [](auto slice_idx) {
+        constexpr int s               = decltype(slice_idx)::value;
+        constexpr int slices_per_drpt = T::W_K_NOPE / T::SLICE_D;
+        constexpr int drpt            = s / slices_per_drpt;
+        constexpr int dim_in_blk      = s % slices_per_drpt;
+        return number<drpt * T::smem_n_rpt*(T::smem_linear_wave_nope + T::smem_padding_32B_nope) +
+                      dim_in_blk * T::SLICE_D>{};
+    };
+
+    constexpr index_t s_len      = vector_traits<typename decltype(mma0_rope)::vtype_c>::size();
+    constexpr index_t s_half_len = s_len / 2;
+
+    constexpr D_ACC RESCALE_THRESHOLD = 8.0f;
+    D_ACC rescale_m                   = 1.0f;
+    D_ACC row_max;
+    bool below_thresh, all_below;
+
+    auto load_kv_page = [&](int tile_idx) {
+        return load(g_kv_indices, u_kv_indices, tile_idx * T::KV_TILE_SIZE)[0];
+    };
+    auto load_kv_page_rope = [&](int tile_idx) {
+        return load(g_kv_indices, u_kv_indices_rope, tile_idx * T::KV_TILE_SIZE)[0];
+    };
+    auto kv_page_offset = [&](int token_idx) { return token_idx * kargs.stride_kv_page; };
+
+    auto async_load_kv = [&](auto slot_off, int kv_page, int kv_page_rope) {
+        async_load<T::VEC_KV_NOPE>(
+            g_k_nope, s_k_nope.ptr, u_gk_nope + kv_page_offset(kv_page), u_sk_nope + slot_off);
+        async_load<T::VEC_KV_ROPE_LD>(
+            g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page_rope), u_sk_rope + slot_off);
+    };
+
+    auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto noff) {
+        clear(s);
+        static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
+            constexpr int idx  = ek.value;
+            constexpr int slot = idx & 1;
+            auto s_tile        = reinterpret_cast<s_tile_t*>(&s);
+            auto k_nope_tile   = reinterpret_cast<k_nope_tile_t*>(&k[slot]);
+            s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], SCALE_NONE, SCALE_NONE);
+            s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], SCALE_NONE, SCALE_NONE);
+            if constexpr(idx + 2 < T::GEMM0_NOPE_E_K)
+            {
+                k[slot] = load<T::VEC_KV_NOPE>(s_k_nope,
+                                               u_rk_nope + noff + sk_nope_slice(number<idx + 2>{}));
+                s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
+            }
+            else if constexpr(idx + 1 < T::GEMM0_NOPE_E_K)
+            {
+                s_waitcnt_lgkmcnt(0_I);
+            }
+        });
+    };
+    auto compute_qk_rope = [&](auto& s, auto& q, auto& k, auto noff) {
+        k[0] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff);
+        k[1] = load<T::VEC_KV_ROPE>(s_k_rope, u_rk_rope + noff + sk_rope_slice(1_I));
+        s_waitcnt_lgkmcnt(number<T::k_rope_ds_read_insts>{});
+        s = mma0_rope(q[0], k[0], s);
+        s_waitcnt_lgkmcnt(0_I);
+        s = mma0_rope(q[1], k[1], s);
+    };
+    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto noff) {
+        static_for<T::NUM_D_SLICES - 2>([&](auto i) {
+            constexpr int idx  = i.value;
+            constexpr int slot = idx & 1;
+            o[idx]             = mma1(p, v[slot], o[idx]);
+            v[slot] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + noff + sv_slice(number<idx + 2>{}));
+            s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+            __builtin_amdgcn_sched_barrier(0);
+        });
+        o[T::NUM_D_SLICES - 2] = mma1(p, v[(T::NUM_D_SLICES - 2) & 1], o[T::NUM_D_SLICES - 2]);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_sched_barrier(0);
+        o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
+    };
+
+    const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
+
+    auto mask_oob_scores = [&](auto& s, int tile_idx) {
+        const bool partial = (tile_idx + 1) * T::KV_TILE_SIZE > valid_kv_len;
+        const bool is_last = (tile_idx == tile_end - 1);
+        if(partial || (causal_multi && is_last))
+        {
+            attn_mask_causal_kv_tile<T>(
+                s, valid_kv_len, tile_idx, causal_diagonal, nhead, neg_inf_v);
+        }
+    };
+
+    auto stage_end = [&]() {
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
+    };
+
+    // Tile t lives in LDS slot (t - tile_begin) & 3. Four slots are the minimum for a
+    // distance-2 prefetch: tile t-1 (PV pending), t (QK now), t+1 (fetched) and t+2
+    // (being fetched) are all resident during a phase.
+    auto slot_of = [&](int tile_idx) { return (tile_idx - tile_begin) & 3; };
+
+    // --- Prologue: prime slots 0..2 ---
+    // A phase consumes one tile and therefore issues exactly one prefetch, so the first
+    // three tiles have to be in flight before the first phase runs.
+    int cur_page      = load_kv_page(tile_begin);
+    int cur_page_rope = load_kv_page_rope(tile_begin);
+    async_load_kv(0_I, cur_page, cur_page_rope);
+    __builtin_amdgcn_s_waitcnt(0);
+    __builtin_amdgcn_sched_barrier(0);
+    __builtin_amdgcn_s_barrier();
+
+    if(tile_begin + 1 < tile_end)
+    {
+        async_load_kv(kv_slot_off, load_kv_page(tile_begin + 1), load_kv_page_rope(tile_begin + 1));
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    if(tile_begin + 2 < tile_end)
+    {
+        async_load_kv(
+            2 * kv_slot_off, load_kv_page(tile_begin + 2), load_kv_page_rope(tile_begin + 2));
+    }
+
+    if(stagger)
+    {
+        __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_s_barrier();
+    }
+    // Page index that the first phase prefetches. Indices past the end are clamped to 0
+    // by the buffer descriptor and land in a slot nobody reads.
+    cur_page          = load_kv_page(tile_begin + 3);
+    cur_page_rope     = load_kv_page_rope(tile_begin + 3);
+    int nxt_page      = cur_page;
+    int nxt_page_rope = cur_page_rope;
+
+    v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope);
+    v_k_nope[1] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + sk_nope_slice(1_I));
+    s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
+    stage_end();
+
+    compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, 0_I);
+    compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, 0_I);
+    mask_oob_scores(v_s[0], tile_begin);
+    stage_end();
+    // The first phase reads tile_begin+1 out of LDS right after the barrier below, so
+    // every wave must have drained its own stores before that barrier -- including the
+    // group that takes the stagger barrier first.
+
+    static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
+    m_row = max(m_row, attn_row_max<T>(v_s[0]));
+    attn_sub_row<T>(v_s[0], m_row);
+    attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
+    asm volatile("" : "+v"(v_s[0])::);
+    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+    stage_end();
+
+    auto run_phase = [&](auto& vs_cur, auto& vs_prev, int cur_slot, int prev_slot, int t) {
+        // stage0 [mem]: K(t) was published by the barrier that closed the previous
+        // stage, so it can be read straight away. Fetch the page index that the *next*
+        // phase prefetches, which gives the gmem index load a full phase of slack.
+        // Everything older than the prefetch just issued has landed, so the barrier
+        // below publishes tile t+1 for the next phase's stage0 read.
+        s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+        __builtin_amdgcn_sched_barrier(0);
+        v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + cur_slot * kv_slot_off);
+        v_k_nope[1] =
+            load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + cur_slot * kv_slot_off + sk_nope_slice(1_I));
+        nxt_page      = load_kv_page(t + 3);
+        nxt_page_rope = load_kv_page_rope(t + 3);
+        s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
+        stage_end();
+
+        // stage1 [compute]: gemm0 su0(t) [12 MFMA]; softmax-tail(t-1) exp slice [8 EXP].
+        __builtin_amdgcn_s_setprio(1);
+        compute_qk_nope(vs_cur, v_q_nope_slices, v_k_nope, cur_slot * kv_slot_off);
+        compute_qk_rope(vs_cur, v_q_rope_slices, v_k_rope, cur_slot * kv_slot_off);
+        attn_exp2_slice<T, s_half_len, s_half_len>(vs_prev);
+        l_row += attn_row_sum<T>(vs_prev);
+        v_p = cast<D_K>(vs_prev);
+        stage_end();
+
+        // stage2 [mem]: read V(t-1); prefetch tile t+2 into the slot tile t-2 vacated
+        // (its PV ran in the previous phase, two barriers back, which also absorbs the
+        // one-stage stagger skew). Mask S(t) here, before stage3 folds it into softmax.
+        v_v[0] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + prev_slot * kv_slot_off);
+        v_v[1] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + prev_slot * kv_slot_off + sv_slice(1_I));
+        async_load_kv(((cur_slot + 2) & 3) * kv_slot_off, cur_page, cur_page_rope);
+        mask_oob_scores(vs_cur, t);
+        s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+        stage_end();
+
+        // stage3 [compute]: gemm1 su0(t - 1) [12 MFMA]; softmax-head(t) exp slice [8 EXP].
+        __builtin_amdgcn_s_setprio(1);
+        compute_pv(v_p, v_v, v_o_slices, prev_slot * kv_slot_off);
+        static_for<s_len>([&](auto i) { vs_cur[i.value] *= temperature_scale; });
+        row_max      = attn_row_max<T>(vs_cur);
+        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+        all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+        row_max      = all_below ? m_row : max(m_row, row_max);
+        attn_sub_row<T>(vs_cur, row_max);
+        attn_exp2_slice<T, 0, s_half_len>(vs_cur);
+        asm volatile("" : "+v"(vs_cur)::);
+        __builtin_amdgcn_sched_barrier(0);
+        if(!all_below)
+        {
+            rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
+            l_row *= rescale_m;
+            m_row = row_max;
+            scale_output_tile<T>(v_o, rescale_m);
+        }
+        __builtin_amdgcn_s_setprio(0);
+        stage_end();
+
+        cur_page      = nxt_page;
+        cur_page_rope = nxt_page_rope;
+    };
+
+    // One phase per tile after the first: gemm0+head(t) and tail+gemm1(t-1). Pairs are
+    // unrolled so the two score buffers alternate without a runtime index.
+    int t = tile_begin + 1;
+    for(; t + 1 < tile_end; t += 2)
+    {
+        __builtin_amdgcn_sched_barrier(0);
+        // ping: gemm0+head(t) -> v_s[1], tail+gemm1(t-1) from v_s[0]
+        run_phase(v_s[1], v_s[0], slot_of(t), slot_of(t - 1), t);
+        __builtin_amdgcn_sched_barrier(0);
+        // pong: gemm0+head(t+1) -> v_s[0], tail+gemm1(t) from v_s[1]
+        run_phase(v_s[0], v_s[1], slot_of(t + 1), slot_of(t), t + 1);
+        __builtin_amdgcn_sched_barrier(0);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    if(t < tile_end) // even tile count: one unpaired phase left
+    {
+        __builtin_amdgcn_sched_barrier(0);
+        run_phase(v_s[1], v_s[0], slot_of(t), slot_of(t - 1), t);
+        __builtin_amdgcn_sched_barrier(0);
+    }
+
+    // --- Epilogue: softmax-tail + gemm1 of the last tile ---
+    // Phase t writes v_s[1] when (t - tile_begin) is odd and v_s[0] when it is even, so
+    // the last tile's scores sit in a buffer picked by the tile count's parity. Its LDS
+    // slot and its mask were already handled by the phase (or by the prologue when the
+    // request is a single tile).
+    stage_end();
+
+    // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
+    // this part depends on the parity; keeping the V read and the PV outside the branch
+    // is what keeps the 128-VGPR v_o off scratch -- inlining a compute_pv into both
+    // arms makes the allocator route v_o through the branch merge.
+    auto epilogue_tail = [&](auto& vs_last) {
+        attn_exp2_slice<T, s_half_len, s_half_len>(vs_last);
+        l_row += attn_row_sum<T>(vs_last);
+        v_p = cast<D_K>(vs_last);
+    };
+    if(((tile_end - tile_begin) & 1) == 0)
+        epilogue_tail(v_s[1]);
+    else
+        epilogue_tail(v_s[0]);
+    stage_end();
+
+    // stage1 [mem]: read V(T-1) su0
+    const int last_slot = slot_of(tile_end - 1);
+    v_v[0]              = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + last_slot * kv_slot_off);
+    v_v[1] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + last_slot * kv_slot_off + sv_slice(1_I));
+    s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+    stage_end();
+
+    // stage2 [compute]: gemm1 su0
+    compute_pv(v_p, v_v, v_o_slices, last_slot * kv_slot_off);
+    __builtin_amdgcn_sched_barrier(0);
+
+    // Stagger: the group that skipped the prologue barrier does its extra one here.
+    if(!stagger)
+    {
+        __builtin_amdgcn_s_barrier();
+    }
+}
+
+template <class Traits, bool OddTail, class VQN, class VQR, class VO>
 __device__ void mla_decode_fwd_pipelined(mla_kargs kargs,
                                          int kv_ind_ptr_s,
                                          int valid_kv_len,
@@ -1459,62 +1825,23 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
     clear(v_o);
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
-    if(num_kv_tiles <= 2)
-    {
-        mla_decode_fwd_simple<Traits>(kargs,
-                                      kv_ind_ptr_s,
-                                      valid_kv_len,
-                                      0,
-                                      num_kv_tiles,
-                                      smem_kv,
-                                      v_q_nope,
-                                      v_q_rope,
-                                      v_o,
-                                      m_row,
-                                      l_row,
-                                      qk_scale,
-                                      causal_diagonal,
-                                      nhead,
-                                      causal_multi);
-    }
-    else if(num_kv_tiles & 1)
-    {
-        mla_decode_fwd_pipelined<Traits, true>(kargs,
-                                               kv_ind_ptr_s,
-                                               valid_kv_len,
-                                               0,
-                                               num_kv_tiles,
-                                               smem_kv,
-                                               v_q_nope,
-                                               v_q_rope,
-                                               0,
-                                               v_o,
-                                               m_row,
-                                               l_row,
-                                               qk_scale,
-                                               causal_diagonal,
-                                               nhead,
-                                               causal_multi);
-    }
-    else
-    {
-        mla_decode_fwd_pipelined<Traits, false>(kargs,
-                                                kv_ind_ptr_s,
-                                                valid_kv_len,
-                                                0,
-                                                num_kv_tiles,
-                                                smem_kv,
-                                                v_q_nope,
-                                                v_q_rope,
-                                                0,
-                                                v_o,
-                                                m_row,
-                                                l_row,
-                                                qk_scale,
-                                                causal_diagonal,
-                                                nhead,
-                                                causal_multi);
-    }
+
+    mla_decode_fwd_pipelined_2<Traits, false>(kargs,
+                                              kv_ind_ptr_s,
+                                              valid_kv_len,
+                                              0,
+                                              num_kv_tiles,
+                                              smem_kv,
+                                              v_q_nope,
+                                              v_q_rope,
+                                              0,
+                                              v_o,
+                                              m_row,
+                                              l_row,
+                                              qk_scale,
+                                              causal_diagonal,
+                                              nhead,
+                                              causal_multi);
 
     D_ACC o_scale = (l_row > D_ACC(0.0f)) ? (descale_k / l_row) : D_ACC(0.0f);
     scale_output_tile<T>(v_o, o_scale);
@@ -1566,11 +1893,10 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
 
     const int work_id = block_id_x();
 
-    // 3 LDS slots: the round-robin deep pipeline keeps 3 K (nope+rope) slots so a
-    // tile's slot stays resident from its QK until its PV while tile+2 is prefetched
-    // into the third slot. 3 * ~18.6KB = ~56KB < 64KB, still 1 block/CU (same as the
-    // 2-slot version). The non-pipelined path just uses the first slot.
-    __shared__ char smem_kv[3 * T::smem_kv_bytes()];
+    // 4 LDS slots: with a distance-2 prefetch a phase keeps tile t-1 (PV pending), t
+    // (QK now), t+1 (fetched) and t+2 (in flight) resident at the same time. 4 * ~18.6KB
+    // = ~74.5KB, which fits gfx950's LDS at 2 blocks/CU. Non-pipelined paths use slot 0.
+    __shared__ char smem_kv[4 * T::smem_kv_bytes()];
 
     const int work_idx_start = kargs.work_indptr[work_id];
     const int work_idx_end   = kargs.work_indptr[work_id + 1];
@@ -1582,7 +1908,11 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
 
     for(int w = work_idx_start; w < work_idx_end; ++w)
     {
+        // Fences LDS reuse across work items: every wave has finished the previous
+        // request's V reads before this one's async loads start writing the slots.
+        __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0);
 
         mla_decode_fwd_one_req<Traits>(kargs, w, smem_kv, temperature_scale);
     }
