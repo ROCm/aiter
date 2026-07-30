@@ -9,6 +9,19 @@ SCRIPT_RELATIVE_PATH="${SCRIPT_RELATIVE_PATH:-my_code/${SCRIPT_NAME}}"
 TRACE_ROOT="${TRACE_ROOT:-my_code}"
 # The command keeps one tokens=4096 shape; GEMM_TEST_CMD can be overridden by the caller.
 GEMM_TEST_CMD="${GEMM_TEST_CMD:-python op_tests/test_flydsl_grouped_gemm_gfx1250.py   --scenario bench --data-format a8w4 --layout gugu   --experts 384 --tokens  4096 --topk 6 --iters 100   --model-dim 7168 --inter-dim 768 --act silu --real-gemm --no-check-aot}"
+# TDM tile/buffer overrides (grouped_moe_gfx1250.py reads these; unset -> tuned CSV).
+# Defaults trace the g1_m64_nb3 winner: gemm1 64x256x256_b3, gemm2 left at the CSV
+# 16x512x128_b2. tile_m=64 == rows/expert, so the weight slab is read once, and it
+# also turns on wave specialization (2 TDM in flight per wave instead of 4).
+AITER_TDM_TILE_M="${AITER_TDM_TILE_M:-64}"
+AITER_TDM_TILE_N="${AITER_TDM_TILE_N:-256}"
+AITER_TDM_TILE_K="${AITER_TDM_TILE_K:-256}"
+AITER_TDM_NUM_BUFFERS="${AITER_TDM_NUM_BUFFERS:-3}"
+AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2:-16}"
+AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2:-512}"
+AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2:-128}"
+AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2:-2}"
+HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-1}"
 
 usage() {
     echo "Usage: ${SCRIPT_NAME} <output-dir-name> [--git] [--am]" >&2
@@ -64,6 +77,8 @@ container_main() {
         echo "host_git_branch: ${HOST_GIT_BRANCH:-unknown}"
         echo "host_git_commit: ${HOST_GIT_COMMIT:-unknown}"
         echo "HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-unset}"
+        echo "gemm1 tile: ${AITER_TDM_TILE_M}x${AITER_TDM_TILE_N}x${AITER_TDM_TILE_K} nb=${AITER_TDM_NUM_BUFFERS}"
+        echo "gemm2 tile: ${AITER_TDM_TILE_M2}x${AITER_TDM_TILE_N2}x${AITER_TDM_TILE_K2} nb=${AITER_TDM_NUM_BUFFERS2}"
         echo "python: $(command -v python || true)"
         python --version || true
         echo "rocprofv3: $(command -v rocprofv3 || true)"
@@ -244,16 +259,6 @@ if db_path:
     except Exception as exc:
         db_error = str(exc)
 
-expected = {
-    "GEMM1": (
-        "gemm_a8w4_tdm_t16x256x256_w1x4_b2_e384_"
-        "afp8_outbf16_silu_bias1_qout0_qrep1_v1"
-    ),
-    "GEMM2": (
-        "gemm_a8w4_tdm_t16x512x128_w1x4_b2_e384_"
-        "afp8_outbf16_noact_bias1_qout0_qrep1_v1"
-    ),
-}
 rows_by_name = {}
 raw_names_by_name = {}
 for row in rows:
@@ -261,7 +266,30 @@ for row in rows:
     rows_by_name[normalized] = row
     raw_names_by_name[normalized] = row[0]
 
-missing = [label for label, name in expected.items() if name not in rows_by_name]
+# Discover the two grouped-GEMM kernels by shape instead of hardcoding one tile
+# config: the names carry tile_m/n/k and num_buffers, so any AITER_TDM_* override
+# (or a future tuned CSV row) is picked up without editing this script.
+# gemm1 is the silu/swiglu stage, gemm2 the noact down-projection.
+GEMM_RE = re.compile(r"^gemm_a8w4_tdm_t(\d+)x(\d+)x(\d+)_w\d+x\d+_b(\d+)_e\d+_")
+
+candidates = [n for n in rows_by_name if GEMM_RE.match(n)]
+acted = [n for n in candidates if "_silu_" in n or "_swiglu_" in n]
+plain = [n for n in candidates if n not in acted]
+
+expected = {}
+if acted:
+    # Normal case: stage1 fuses the activation, stage2 is noact.
+    expected["GEMM1"] = max(acted, key=lambda n: rows_by_name[n][1])
+    rest = [n for n in candidates if n != expected["GEMM1"]]
+    if rest:
+        expected["GEMM2"] = max(rest, key=lambda n: rows_by_name[n][1])
+elif len(plain) >= 2:
+    # Both stages noact: stage1 is the one whose K matches model_dim (the larger
+    # tile_k side); fall back to dispatch order via total time.
+    ordered = sorted(plain, key=lambda n: -rows_by_name[n][2])
+    expected["GEMM1"], expected["GEMM2"] = ordered[0], ordered[1]
+
+missing = [label for label in ("GEMM1", "GEMM2") if label not in expected]
 
 with open(summary_path, "w", encoding="utf-8") as out:
     out.write(f"db_path={db_path or 'not_found'}\n")
@@ -388,11 +416,22 @@ YAML
         GPU_ARCHS=gfx1250
         ENABLE_CK=0
         AITER_MOE_EXPERT_BALANCE=true
-        AITER_LOG_MORE=0
+        AITER_LOG_MORE=1
         AITER_FORCE_GFX1250=1
         AITER_GROUPED_A8W4_TDM=1
         FLYDSL_DUMP_IR=0
+        AITER_TDM_TILE_M="${AITER_TDM_TILE_M}"
+        AITER_TDM_TILE_N="${AITER_TDM_TILE_N}"
+        AITER_TDM_TILE_K="${AITER_TDM_TILE_K}"
+        AITER_TDM_NUM_BUFFERS="${AITER_TDM_NUM_BUFFERS}"
+        AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2}"
+        AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2}"
+        AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2}"
+        AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2}"
     )
+
+    # A stale cache would silently trace a previously-built tile config.
+    rm -rf "${HOME}/.flydsl/cache"/* 2>/dev/null || true
 
     set +e
     run_and_log \
@@ -540,10 +579,16 @@ docker_env=(
     -e GEMM_TEST_CMD="${GEMM_TEST_CMD}"
     -e HOST_GIT_BRANCH="${host_git_branch}"
     -e HOST_GIT_COMMIT="${host_git_commit}"
+    -e AITER_TDM_TILE_M="${AITER_TDM_TILE_M}"
+    -e AITER_TDM_TILE_N="${AITER_TDM_TILE_N}"
+    -e AITER_TDM_TILE_K="${AITER_TDM_TILE_K}"
+    -e AITER_TDM_NUM_BUFFERS="${AITER_TDM_NUM_BUFFERS}"
+    -e AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2}"
+    -e AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2}"
+    -e AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2}"
+    -e AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2}"
+    -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
 )
-if [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]; then
-    docker_env+=(-e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}")
-fi
 
 set +e
 docker exec -i "${docker_env[@]}" "${CONTAINER_NAME}" \
