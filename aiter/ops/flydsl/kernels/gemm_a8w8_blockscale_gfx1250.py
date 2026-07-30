@@ -21,46 +21,8 @@ from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
 
-
-def _i32_const(v):
-    return _raw(arith.constant(int(v), type=T.i32))
-
-
-def _to_i32_offset(offset):
-    if isinstance(offset, int):
-        return _i32_const(offset)
-    offset = arith.unwrap(offset)
-    if not isinstance(offset.type, ir.IntegerType) or offset.type.width != 32:
-        return _raw(arith.index_cast(T.i32, offset))
-    return offset
-
-
-def _buffer_load(rsrc, offset, dtype):
-    off = _to_i32_offset(offset)
-    off = _raw(arith.muli(off, _i32_const(dtype.width // 8)))
-    return rocdl.RawPtrBufferLoadOp(
-        dtype, rsrc, off, _i32_const(0), _i32_const(0)
-    ).result
-
-
-def _buffer_store(data, rsrc, offset, offset_is_bytes=False):
-    data = arith.unwrap(data)
-    off = _to_i32_offset(offset)
-    if not offset_is_bytes:
-        data_type = data.type
-        element_type = (
-            data_type.element_type if hasattr(data_type, "element_type") else data_type
-        )
-        off = _raw(arith.muli(off, _i32_const(element_type.width // 8)))
-    rocdl.RawPtrBufferStoreOp(data, rsrc, off, _i32_const(0), _i32_const(0))
-
-
-def _make_buffer_rsrc(tensor, num_records_bytes):
-    buf_tensor = fx.rocdl.make_buffer_tensor(
-        tensor, max_size=True, num_records_bytes=num_records_bytes
-    )
-    return fx.rocdl.get_buffer_rsrc(fx.get_iter(buf_tensor))
-
+from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import store_acc_vec8_to_buffer
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
@@ -75,33 +37,8 @@ def _align_up(n, a):
 
 def lds_load_b128(lds_i8_ptr, byte_off):
     return arith.unwrap(
-        fx.ptr_load(
-            fx.add_offset(lds_i8_ptr, byte_off),
-            result_type=ir.VectorType.get([4], ir.IntegerType.get_signless(32)),
-        )
+        fx.ptr_load(fx.add_offset(lds_i8_ptr, byte_off), result_type=T.vec(4, T.i32))
     )
-
-
-def lds_load_f32(lds_f32_ptr, elem_off):
-    return arith.unwrap(fx.ptr_load(fx.add_offset(lds_f32_ptr, elem_off)))
-
-
-def store_acc_vec8_to_buffer(
-    acc_vec8, c_rsrc, addr, out_elem=None, offset_is_bytes=False
-):
-    if out_elem is not None:
-        h_vec = arith.trunc_f(T.vec(8, out_elem), acc_vec8)
-        i32_vec = fx.Vector(h_vec).bitcast(fx.Int32).ir_value()
-        _buffer_store(i32_vec, c_rsrc, addr, offset_is_bytes=offset_is_bytes)
-        return 1
-    for half in range(2):
-        vals = [fx.Vector(acc_vec8)[half * 4 + vi] for vi in range(4)]
-        vec4 = fx.Vector.from_elements(vals, fx.Float32).ir_value()
-        if isinstance(addr, (list, tuple)):
-            _buffer_store(vec4, c_rsrc, addr[half])
-        else:
-            _buffer_store(vec4, c_rsrc, addr)
-    return 2
 
 
 def compile_gemm_a8w8_blockscale(
@@ -260,14 +197,16 @@ def compile_gemm_a8w8_blockscale(
         n_idx = arith.index_cast(T.index, i32_n.ir_value())
 
         y_total_bytes = m_idx * n_idx * arith.index(elem_bytes_d)
-        y_buf = _make_buffer_rsrc(arg_y, num_records_bytes=y_total_bytes)
+        y_buf = fx.rocdl.get_buffer_rsrc(
+            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), y_total_bytes)
+        )
 
         num_n_scale_blocks = (n_idx + arith.index(scale_block_n - 1)) / arith.index(
             scale_block_n
         )
         w_scale_total_bytes = num_n_scale_blocks * arith.index(scale_k) * arith.index(4)
-        w_scale_buf = _make_buffer_rsrc(
-            arg_w_scale, num_records_bytes=w_scale_total_bytes
+        w_scale_buf = fx.rocdl.get_buffer_rsrc(
+            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_w_scale), w_scale_total_bytes)
         )
 
         scale_zero = arith.constant(0.0, type=T.f32)
@@ -334,7 +273,9 @@ def compile_gemm_a8w8_blockscale(
                     off = (
                         slot_off + row * arith.index(scales_per_tile) + arith.index(sc)
                     )
-                    out.append(lds_load_f32(big_x_scale_mem, off))
+                    out.append(
+                        arith.unwrap(fx.ptr_load(fx.add_offset(big_x_scale_mem, off)))
+                    )
             return out
 
         def _issue_w_chunk(chunk):
@@ -350,7 +291,7 @@ def compile_gemm_a8w8_blockscale(
             idx = wave_n_block * arith.index(scale_k) + lane_id_full + offset
             if const_expr(split_k > 1):
                 idx = idx + split_kb_base
-            return _buffer_load(w_scale_buf, idx, T.f32)
+            return buffer_ops.buffer_load(w_scale_buf, idx, vec_width=1, dtype=T.f32)
 
         def _w_readlane(kb_i32):
             if const_expr(NUM_W_CHUNKS == 1):
@@ -381,7 +322,6 @@ def compile_gemm_a8w8_blockscale(
             )
 
         def _b_lane_base(wn):
-            # warp_n_base is the starting N-element index; each rep advances by WMMA_N=16
             stripe_offset = (
                 (warp_n_base + arith.index(wn * WMMA_N))
                 / arith.index(WMMA_N)
@@ -418,7 +358,6 @@ def compile_gemm_a8w8_blockscale(
                 ks = sc_base * wmma_steps_per_scale + ks_inner
                 a_t = a_frags[ks * wmma_m_rep + wm]
                 b_t = b_frags[ks * wmma_n_rep + wn]
-                # ISA operand order: (B, A, C), reversed from math.
                 fx.gemm(wmma_atom, temp_t, b_t, a_t, temp_t)
             return arith.unwrap(temp_t.load())
 
@@ -594,8 +533,6 @@ def compile_gemm_a8w8_blockscale(
             num_warps=num_warps,
         )
 
-        # (atom, global view, LDS region, shape, LDS row stride); slot bytes are
-        # shape[0]*row and the imm_offset multiplier is shape[1]. Issue order = X, W, XS.
         _TDM_SPECS = (
             (atom_x, gX, unified_a_off, (tile_m, tile_k), lds_a_stride_bytes),
             (
