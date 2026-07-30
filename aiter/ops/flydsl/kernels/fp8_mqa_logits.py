@@ -819,7 +819,9 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
                                 mfma: MfmaAtom,
                                 convert_q_fn: bool = False,
                                 convert_kv_fn: bool = False,
-                                swizzle: bool = False):
+                                swizzle: bool = False,
+                                num_buffers: int = 2,
+                                prefetch_depth: int = 2):
     """LDS double-buffered variant (gfx950 scaled atoms only).
 
     Parallel to ``_build_kernel_mfma_r_w`` but stages KV through a 2-slot LDS
@@ -830,10 +832,10 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
     Work partition (the key difference vs the direct-load builder):
       * All ``WPB`` waves cooperatively load ONE ``BKV``-wide K-tile into LDS and
         all read it -- so waves no longer own disjoint columns. Instead each wave
-        owns a disjoint group of ``RPB`` query ROWS and iterates over ALL
+        owns a disjoint group of ``RPW`` query ROWS and iterates over ALL
         ``N_TILES`` columns of the shared LDS tile.
-      * A block owns ``ROWS_PER_BLOCK = RPB * WPB`` query rows (wave ``w`` owns
-        rows ``[w*RPB, (w+1)*RPB)``). KV reuse factor becomes ``RPB * WPB``.
+      * A block owns ``ROWS_PER_BLOCK = RPW * WPB`` query rows (wave ``w`` owns
+        rows ``[w*RPW, (w+1)*RPW)``). KV reuse factor becomes ``RPW * WPB``.
 
     The epilogue (per-lane scalar ReLU/weight + ``shuffle_xor`` butterfly +
     predicated store) is kept identical to the direct-load builder.
@@ -841,10 +843,10 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
     H   = num_heads
     D   = head_size
     BKV = block_kv
-    RPB = rows_per_block
+    RPW = rows_per_block  # rows per WAVE here (block owns RPW*WPB rows)
     WPB = waves_per_block
     MR_BLOCK_THREADS = 64 * WPB
-    ROWS_PER_BLOCK = RPB * WPB
+    ROWS_PER_BLOCK = RPW * WPB
 
     assert mfma.frag_bytes == 32, (
         "_build_kernel_mfma_lds_pipe currently supports only the CDNA4 scaled "
@@ -853,15 +855,27 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
     assert H % mfma.MFMA_M == 0
     assert BKV % mfma.MFMA_N == 0
     assert D % mfma.MFMA_K == 0
-    assert RPB >= 1 and WPB >= 1
+    assert RPW >= 1 and WPB >= 1
 
     N_TILES = BKV // mfma.MFMA_N
     M_TILES = H   // mfma.MFMA_M
     K_STEPS = D   // mfma.MFMA_K
 
-    # LDS double buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
+    # LDS multi-buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
     # column index). Addressed as i32 dwords for the vector reads.
-    NUM_BUFFERS = 2
+    #
+    # Pipeline depth is set by PREFETCH_DEPTH (tiles kept in flight during the
+    # per-tile compute).  The tile-i+PREFETCH_DEPTH prefetch targets slot
+    # (i+PD)%NB; when NB > PD that slot differs from the one being read (slot
+    # i%NB), so the reader-before-writer barrier ("barrier B") can be dropped.
+    # NB == PD (e.g. the legacy 2-buffer/depth-2 case) reuses the just-read slot
+    # and still needs barrier B.
+    NUM_BUFFERS    = num_buffers
+    PREFETCH_DEPTH = prefetch_depth
+    assert NUM_BUFFERS >= PREFETCH_DEPTH >= 1, (
+        f"need num_buffers({NUM_BUFFERS}) >= prefetch_depth({PREFETCH_DEPTH}) >= 1"
+    )
+    _need_barrier_b = NUM_BUFFERS <= PREFETCH_DEPTH
     SLOT_BYTES  = BKV * D                 # fp8, 1 byte/elem
     SLOT_I32    = SLOT_BYTES // 4
     DMA_BYTES   = 16                       # dwordx4 async load per lane
@@ -899,7 +913,7 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
 
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
-        f"_bkv{BKV}_r{RPB}_w{WPB}_lds2{'_swizzled' if swizzle else ''}_flydsl"
+        f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{'_swizzled' if swizzle else ''}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -940,7 +954,7 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
         # First row owned by THIS wave.
         wave_row0 = _i32_add(
             block_row0,
-            fx.Int32(arith.muli(_to_raw(wave), _to_raw(fx.Int32(RPB)))),
+            fx.Int32(arith.muli(_to_raw(wave), _to_raw(fx.Int32(RPW)))),
         )
 
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
@@ -1032,12 +1046,12 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
                     fx.Int32(0), fx.Int32(0), fx.Int32(1),
                 )
 
-        # ---- Preload this wave's RPB rows: window, Q A-frags, weights ----
-        starts  = [None] * RPB
-        ends    = [None] * RPB
-        a_packs = [None] * RPB
-        w_frag  = [None] * RPB
-        for j in range_constexpr(RPB):
+        # ---- Preload this wave's RPW rows: window, Q A-frags, weights ----
+        starts  = [None] * RPW
+        ends    = [None] * RPW
+        a_packs = [None] * RPW
+        w_frag  = [None] * RPW
+        for j in range_constexpr(RPW):
             row = _i32_add(wave_row0, fx.Int32(j))
             s = fx.Int32(cs_t[row])
             e = fx.Int32(ce_t[row])
@@ -1108,12 +1122,12 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
             _to_raw(fx.Int32(BKV)),
         )
 
-        # ---- Prologue: prefetch tile 0 -> buf 0, tile 1 -> buf 1 ----
-        _dma_kv_tile_to_lds(fx.Int32(0), fx.Int32(tile_start))
-        _dma_kv_tile_to_lds(
-            fx.Int32(SLOT_BYTES),
-            fx.Int32(arith.addi(tile_start, _to_raw(fx.Int32(BKV)))),
-        )
+        # ---- Prologue: prefetch tiles 0..PREFETCH_DEPTH-1 into buffers ----
+        for _p in range_constexpr(PREFETCH_DEPTH):
+            _dma_kv_tile_to_lds(
+                fx.Int32((_p % NUM_BUFFERS) * SLOT_BYTES),
+                fx.Int32(arith.addi(tile_start, _to_raw(fx.Int32(_p * BKV)))),
+            )
 
         # ---- Steady-state software pipeline over BKV tiles ----
         lo   = _to_raw(fx.Index(fx.Int32(0)))
@@ -1125,13 +1139,14 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
             col0 = arith.addi(
                 tile_start, arith.muli(_to_raw(t), _to_raw(fx.Int32(BKV)))
             )
-            parity = arith.remui(_to_raw(t), _to_raw(fx.Int32(2)))
-            slot_byte  = arith.muli(parity, _to_raw(fx.Int32(SLOT_BYTES)))
-            slot_dword = arith.muli(parity, _to_raw(fx.Int32(SLOT_I32)))
+            slot_idx = arith.remui(_to_raw(t), _to_raw(fx.Int32(NUM_BUFFERS)))
+            slot_byte  = arith.muli(slot_idx, _to_raw(fx.Int32(SLOT_BYTES)))
+            slot_dword = arith.muli(slot_idx, _to_raw(fx.Int32(SLOT_I32)))
 
-            # Wait for the current tile (keep the already-issued next tile in
-            # flight), then sync so every wave sees the full LDS tile.
-            rocdl.s_waitcnt(NUM_ASYNC_LOADS)
+            # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
+            # i.e. the current tile is complete; then sync so every wave sees the
+            # full LDS tile.
+            rocdl.s_waitcnt((PREFETCH_DEPTH - 1) * NUM_ASYNC_LOADS)
             gpu.barrier()
 
             # Read all B-frags for this tile from LDS into registers.
@@ -1186,19 +1201,26 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
                     )
                     b_packs[ni][kk] = lds_st.vec_load((read_dword,), vec_size=8)
 
-            # Readers done -> safe to overwrite this slot with tile i+2.
-            gpu.barrier()
+            # Prefetch tile i+PREFETCH_DEPTH into slot (i+PD)%NB.  When NB>PD that
+            # slot != the just-read slot, so no reader-before-writer barrier is
+            # needed (the slot's last reader was iteration i-(NB-PD), already
+            # past this iteration's barrier).  NB==PD reuses the read slot and
+            # requires barrier B first.
+            if const_expr(_need_barrier_b):
+                gpu.barrier()
+            t_next = arith.addi(_to_raw(t), _to_raw(fx.Int32(PREFETCH_DEPTH)))
+            next_slot_byte = arith.muli(
+                arith.remui(t_next, _to_raw(fx.Int32(NUM_BUFFERS))),
+                _to_raw(fx.Int32(SLOT_BYTES)),
+            )
             col0_next = arith.addi(
                 tile_start,
-                arith.muli(
-                    arith.addi(_to_raw(t), _to_raw(fx.Int32(2))),
-                    _to_raw(fx.Int32(BKV)),
-                ),
+                arith.muli(t_next, _to_raw(fx.Int32(BKV))),
             )
-            _dma_kv_tile_to_lds(fx.Int32(slot_byte), fx.Int32(col0_next))
+            _dma_kv_tile_to_lds(fx.Int32(next_slot_byte), fx.Int32(col0_next))
 
-            # ---- Per-row MFMA + epilogue (this wave's RPB rows, all columns) ----
-            for j in range_constexpr(RPB):
+            # ---- Per-row MFMA + epilogue (this wave's RPW rows, all columns) ----
+            for j in range_constexpr(RPW):
                 row = _i32_add(wave_row0, fx.Int32(j))
                 out_row_t = _make_out_row_t(row)
                 for ni in range_constexpr(N_TILES):
@@ -1337,22 +1359,26 @@ def _mfma32k64_bkv(bkv, r, w):
         mfma=_MFMA32_K64, rows_per_block=r, waves_per_block=w,
     )
 
-def _mfma32k64_lds_bkv(bkv, r, w, sw=False):
-    """Helper: lambda for a gfx950 32x32x64-scaled-fp8 LDS double-buffered
+def _mfma32k64_lds_bkv(bkv, r, w, sw=False, nb=2, pd=2):
+    """Helper: lambda for a gfx950 32x32x64-scaled-fp8 LDS multi-buffered
     variant with given bkv/r/w (all WPB waves share one LDS K-tile).
-    ``sw=True`` enables the XOR bank-conflict swizzle."""
+    ``sw=True`` enables the XOR bank-conflict swizzle; ``nb``/``pd`` set the
+    number of LDS buffers and the prefetch depth (nb>pd drops barrier B)."""
     return lambda **kw: _build_kernel_mfma_lds_pipe(
         **{**kw, "block_kv": bkv},
         mfma=_MFMA32_K64, rows_per_block=r, waves_per_block=w, swizzle=sw,
+        num_buffers=nb, prefetch_depth=pd,
     )
 
-def _mfma16k128_lds_bkv(bkv, r, w, sw=False):
-    """Helper: lambda for a gfx950 16x16x128-scaled-fp8 LDS double-buffered
+def _mfma16k128_lds_bkv(bkv, r, w, sw=False, nb=2, pd=2):
+    """Helper: lambda for a gfx950 16x16x128-scaled-fp8 LDS multi-buffered
     variant with given bkv/r/w (all WPB waves share one LDS K-tile).
-    ``sw=True`` enables the XOR bank-conflict swizzle."""
+    ``sw=True`` enables the XOR bank-conflict swizzle; ``nb``/``pd`` set the
+    number of LDS buffers and the prefetch depth (nb>pd drops barrier B)."""
     return lambda **kw: _build_kernel_mfma_lds_pipe(
         **{**kw, "block_kv": bkv},
         mfma=_MFMA16_K128, rows_per_block=r, waves_per_block=w, swizzle=sw,
+        num_buffers=nb, prefetch_depth=pd,
     )
 
 _VARIANT_BUILDERS = {
@@ -1406,6 +1432,11 @@ if arch == "gfx950":
         "mfma16x16x128_bkv128_r2_w2_lds2": _mfma16k128_lds_bkv(128, 2, 2, sw=True),
         "mfma16x16x128_bkv128_r2_w4_lds2": _mfma16k128_lds_bkv(128, 2, 4, sw=True),
         "mfma16x16x128_bkv256_r2_w2_lds2": _mfma16k128_lds_bkv(256, 2, 2, sw=True),
+        # 3-buffer / depth-2 pipeline. 
+        # Same in-flight depth as _lds2 but decoupled reader/writer. 
+        "mfma32x32x64_bkv64_r2_w2_lds3":  _mfma32k64_lds_bkv(64,  2, 2, sw=True, nb=3, pd=2),
+        "mfma32x32x64_bkv64_r2_w4_lds3":  _mfma32k64_lds_bkv(64,  2, 4, sw=True, nb=3, pd=2),
+        "mfma32x32x64_bkv128_r2_w4_lds3": _mfma32k64_lds_bkv(128, 2, 4, sw=True, nb=3, pd=2),
     })
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
@@ -1570,14 +1601,14 @@ def flydsl_fp8_mqa_logits(
     # end == 0) so the kernel writes nothing for them; the output is sliced back
     # to the original seq_len after the launch.
     # Parse BKV, RPB and WPB from variant tag "mfma<shape>_bkv<B>_r<N>_w<M>".
-    # For _lds2 variants all WPB waves share one LDS K-tile and partition rows,
+    # For _lds<N> variants all WPB waves share one LDS K-tile and partition rows,
     # so a block owns RPB*WPB rows -> seq_len must be padded to that multiple.
     _tag_match = re.match(r"mfma\d+x\d+x\d+_bkv(\d+)_r(\d+)_w(\d+)", variant)
     _BKV = int(_tag_match.group(1)) if _tag_match else 128
     _RPB = int(_tag_match.group(2)) if _tag_match else 1
     _WPB = int(_tag_match.group(3)) if _tag_match else 1
-    _is_lds2 = "_lds2" in variant
-    _rows_per_block_eff = _RPB * _WPB if _is_lds2 else _RPB
+    _is_lds = re.search(r"_lds\d", variant) is not None
+    _rows_per_block_eff = _RPB * _WPB if _is_lds else _RPB
     seq_len_padded = (
         (seq_len + _rows_per_block_eff - 1) // _rows_per_block_eff
     ) * _rows_per_block_eff
