@@ -33,7 +33,7 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import fly, llvm
+from flydsl._mlir.dialects import fly
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -460,26 +460,10 @@ def build_hstu_attention_fwd(
         c_zero_f = fx.Float32(0.0)
 
         def _exp2(x):
-            return fx.Float32(
-                llvm.call_intrinsic(
-                    compute_type,
-                    "llvm.amdgcn.exp2.f32",
-                    [x.ir_value()],
-                    [],
-                    [],
-                )
-            )
+            return fx.Float32(fx.rocdl.exp2(compute_type, x.ir_value()))
 
         def _rcp(x):
-            return fx.Float32(
-                llvm.call_intrinsic(
-                    compute_type,
-                    "llvm.amdgcn.rcp.f32",
-                    [x.ir_value()],
-                    [],
-                    [],
-                )
-            )
+            return fx.Float32(fx.rocdl.rcp(compute_type, x.ir_value()))
 
         def silu_scale_batch(s_list):
             """silu(alpha*s) via the -log2e base change, stage-batched for ILP. Returns
@@ -686,9 +670,7 @@ def build_hstu_attention_fwd(
                 # k_col = ks*MFMA_K + lane_div_16*MFMA_LANE_K, in MFMA_LANE_K-group units.
                 k_col_grp = fx.Int32(ks * (MFMA_K // MFMA_LANE_K)) + lane_div_16
                 packs.append(
-                    k_smem[
-                        local_k_row, k_swz_grp(local_k_row, k_col_grp), None
-                    ].load()
+                    k_smem[local_k_row, k_swz_grp(local_k_row, k_col_grp), None].load()
                 )
             return packs
 
@@ -850,9 +832,9 @@ def build_hstu_attention_fwd(
             loop_results = acc_init
             # Unmasked prefix [kv_tile_start, unmasked_end) -- empty range unless CAUSAL_SPLIT.
             for kv_tile, it in range(
-                fx.Index(kv_tile_start),
-                fx.Index(unmasked_end),
-                fx.Index(1),
+                fx.Int32(kv_tile_start),
+                fx.Int32(unmasked_end),
+                fx.Int32(1),
                 init=acc_init,
             ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
@@ -863,9 +845,9 @@ def build_hstu_attention_fwd(
 
             # Masked remainder [unmasked_end, n_tiles).
             for kv_tile, it in range(
-                fx.Index(unmasked_end),
-                fx.Index(n_tiles),
-                fx.Index(1),
+                fx.Int32(unmasked_end),
+                fx.Int32(n_tiles),
+                fx.Int32(1),
                 init=loop_results,
             ):  # ty: ignore
                 it_list = list(it) if isinstance(it, (list, tuple)) else [it]
