@@ -61,7 +61,7 @@ def default_f8_type() -> ir.Type:
     arch = ""
     try:
         arch = str(get_rocm_arch())
-    except Exception:
+    except Exception:  # noqa: BLE001
         arch = ""
     if "gfx95" in arch or "gfx12" in arch:
         return fx.Float8E4M3FN.ir_type

@@ -471,7 +471,11 @@ def compile_moe_gemm1(
                     (
                         T.bf16
                         if is_bf16
-                        else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
+                        else (
+                            T.f16
+                            if is_f16
+                            else (T.i8 if is_int8 else default_f8_type())
+                        )
                     ),
                     shape=(lds_total_elems,),
                 )
