@@ -9,10 +9,8 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Int32, T
 
@@ -59,6 +57,18 @@ class _RouteG2LStorage:
     lut: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
 
 
+def _slot_ptr(base_i64, elem_idx, address_space=1):
+    """Raw LLVM pointer to i32 element ``elem_idx`` of the buffer at ``base_i64``.
+
+    The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
+    ops do not produce, so the byte address is formed by hand here.
+    """
+    ptr = buffer_ops.create_llvm_ptr(
+        base_i64 + fx.Int64(elem_idx) * 4, address_space=address_space
+    )
+    return ptr._value if hasattr(ptr, "_value") else ptr
+
+
 def _lds_load(ptr, idx):
     """Scalar i32 load from an LDS pointer at element offset ``idx``."""
     return fx.ptr_load(ptr + fx.Int64(idx))
@@ -83,38 +93,31 @@ def build_moe_route_maps_module():
         max_m: Int32,
     ):
         i32 = T.i32
-        route = ArithValue(fx.block_idx.x) * arith.constant(
-            BLOCK_THREADS, type=i32
-        ) + ArithValue(fx.thread_idx.x)
-        in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
-        _if = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if.then_block):
+        # Raw i32 constant: llvm.atomicrmw takes ir.Value operands, not fx types.
+        c1_i32 = arith.constant(1, type=i32)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
+        in_range = route < fx.Uint32(numel)
+        if in_range:
             topk_rsrc = ptr_rsrc(topk_ids)
             c_rsrc = ptr_rsrc(topids_to_rows)
             a_rsrc = ptr_rsrc(rows_to_tokens)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
 
-            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-            e_idx = arith.index_cast(T.index, e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
-
+            ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
-                arith.constant(1, type=i32),
+                c1_i32,
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,
             ).result
 
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, c_rsrc, route)
-            token = arith.divui(route, ArithValue(topk))
+            token = route // fx.Uint32(topk)
             buffer_ops.buffer_store(token, a_rsrc, row)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_route_maps(
@@ -159,32 +162,26 @@ def build_moe_topids_to_rows_module():
         max_m: Int32,
     ):
         i32 = T.i32
-        route = ArithValue(fx.block_idx.x) * arith.constant(
-            BLOCK_THREADS, type=i32
-        ) + ArithValue(fx.thread_idx.x)
-        in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
-        _if = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if.then_block):
+        # Raw i32 constant: llvm.atomicrmw takes ir.Value operands, not fx types.
+        c1_i32 = arith.constant(1, type=i32)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
+        in_range = route < fx.Uint32(numel)
+        if in_range:
             topk_rsrc = ptr_rsrc(topk_ids)
             out_rsrc = ptr_rsrc(topids_to_rows)
 
             e = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
-            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-            e_idx = arith.index_cast(T.index, e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
+            ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
                 ptr,
-                arith.constant(1, type=i32),
+                c1_i32,
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,
             ).result
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, out_rsrc, route)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_topids_to_rows(
@@ -247,9 +244,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         f32 = T.f32
         c0 = arith.constant(0, type=i32)
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
-        route = ArithValue(fx.block_idx.x) * arith.constant(
-            BLOCK_THREADS, type=i32
-        ) + ArithValue(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         # Dynamic EP token count: the dispatch buffer is padded to a static numel
         # but only the first ``num_valid_routes`` (= total_recv*topk) routes are
         # valid. Routes >= nvr are the dead-tail padding rows (rows >= total_recv)
@@ -259,47 +254,40 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         # truncation is disabled the caller passes numel here, so nothing is oob.
         nvr_rsrc = ptr_rsrc(num_valid_routes)
         nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
-        in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(nvr))
-        _if = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if.then_block):
+        in_range = route < fx.Uint32(nvr)
+        if in_range:
             topk_rsrc = ptr_rsrc(topk_ids)
             g2l_rsrc = ptr_rsrc(g2l_lut)
             out_rsrc = ptr_rsrc(topids_to_rows)
             wi_rsrc = ptr_rsrc(weight_in)
             w_rsrc = ptr_rsrc(gather_w)
 
-            ge = buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
-            le = buffer_ops.buffer_load(
-                g2l_rsrc, ArithValue(ge), vec_width=1, dtype=i32
+            ge = fx.Uint32(
+                buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
             )
-            is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
+            le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
+            is_drop = le == fx.Uint32(n_buckets)
             # Dropped routes fold to bucket 0 but still take a unique slot.
-            eff_e = arith.select(is_drop, arith.constant(0, type=i32), le)
+            eff_e = is_drop.select(fx.Uint32(0), le)
 
             # Fused weight cast+mask: read f32 route weight, write weight_dtype
             # (kept -> cast, dropped -> 0). Folds the host topk_weight.to(bf16)
             # copy and the dropped-weight masked_fill into this route pass.
             w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
             w_cast = arith.trunc_f(wdt, w_f32)
-            w_out = arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
+            w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
             buffer_ops.buffer_store(w_out, w_rsrc, route)
 
-            base_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-            e_idx = arith.index_cast(T.index, eff_e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
-                ptr,
+                _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), eff_e),
                 arith.constant(1, type=i32),
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,
             ).result
-            row = ArithValue(slot) + ArithValue(eff_e) * ArithValue(max_m)
+            row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, out_rsrc, route)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_topids_to_rows_g2l(
@@ -389,10 +377,8 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
         c0 = arith.constant(0, type=i32)
         c1 = arith.constant(1, type=i32)
-        tid = ArithValue(fx.thread_idx.x)
-        route = (
-            ArithValue(fx.block_idx.x) * arith.constant(BLOCK_THREADS, type=i32) + tid
-        )
+        tid = fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
 
         lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
         # The LDS atomic below needs a raw addrspace(3) pointer; SharedAllocator
@@ -408,16 +394,12 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         nvr_rsrc = ptr_rsrc(num_valid_routes)
         nvr = buffer_ops.buffer_load(nvr_rsrc, c0, vec_width=1, dtype=i32)
 
-        tid_idx = arith.index_cast(T.index, tid)
-        nbk_idx = arith.index_cast(T.index, ArithValue(n_buckets))
-        stride_idx = arith.index(BLOCK_THREADS)
+        n_buckets_i32 = fx.Uint32(n_buckets)
+        nvr_i32 = fx.Uint32(nvr)
 
         # Phase 0: zero the per-block LDS bucket counter ([0, n_buckets)).
-        zero_loop = scf.ForOp(tid_idx, nbk_idx, stride_idx)
-        with ir.InsertionPoint(zero_loop.body):
-            b = arith.index_cast(i32, zero_loop.induction_variable)
-            _lds_store(lds_cnt, fx.Int32(c0), ArithValue(b))
-            scf.YieldOp([])
+        for b in range(tid, n_buckets_i32, BLOCK_THREADS):
+            _lds_store(lds_cnt, fx.Int32(0), fx.Uint32(b))
         gpu.barrier()
 
         # Phase 1: classify each route, cast/mask its weight, and take an
@@ -425,100 +407,71 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         # >= nvr (EP dead-tail padding) are skipped: no LDS increment, and their
         # topids_to_rows/gather_w slots are left unwritten (every downstream
         # consumer is bounded by the same nvr/nvt), matching the fused kernel.
-        in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(nvr))
-        oob = arith.cmpi(CmpIPredicate.uge, route, ArithValue(nvr))
+        in_range = route < nvr_i32
+        oob = route >= nvr_i32
 
         # Load the global expert id only for valid routes (dead-tail rows may
         # carry -1/stale ids that would OOB-read g2l_lut); oob folds to 0.
-        ge_if = scf.IfOp(in_range, results_=[i32], has_else=True)
-        with ir.InsertionPoint(ge_if.then_block):
-            ge_v = buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
-            scf.YieldOp([_raw(ge_v)])
-        with ir.InsertionPoint(ge_if.else_block):
-            scf.YieldOp([c0])
-        ge = ge_if.results[0]
+        ge = fx.Uint32(0)
+        if in_range:
+            ge = fx.Uint32(
+                buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+            )
 
-        le = buffer_ops.buffer_load(g2l_rsrc, ArithValue(ge), vec_width=1, dtype=i32)
-        is_drop_lut = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
-        is_drop = arith.ori(is_drop_lut, oob)
-        eff_e = arith.select(is_drop, c0, _raw(le))
+        le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
+        is_drop = (le == n_buckets_i32) | oob
+        eff_e = is_drop.select(fx.Uint32(0), le)
 
         # Fused weight cast+mask (kept -> cast(f32->wdt), dropped -> 0).
-        w_if = scf.IfOp(in_range, results_=[f32], has_else=True)
-        with ir.InsertionPoint(w_if.then_block):
-            w_v = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
-            scf.YieldOp([_raw(w_v)])
-        with ir.InsertionPoint(w_if.else_block):
-            scf.YieldOp([_raw(arith.constant(0.0, type=f32))])
-        w_f32 = w_if.results[0]
-        w_cast = arith.trunc_f(wdt, w_f32)
-        w_out = arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
-
-        _if_ws = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_ws.then_block):
-            buffer_ops.buffer_store(w_out, w_rsrc, route)
-            scf.YieldOp([])
-
-        rank_if = scf.IfOp(in_range, results_=[i32], has_else=True)
-        with ir.InsertionPoint(rank_if.then_block):
-            e_idx = arith.index_cast(T.index, eff_e)
-            off_i64 = arith.index_cast(T.i64, fx.Index(e_idx) * fx.Index(4))
-            lds_ptr = buffer_ops.create_llvm_ptr(
-                cnt_base_i64 + fx.Int64(off_i64), address_space=3
+        w_f32 = fx.Float32(0.0)
+        if in_range:
+            w_f32 = fx.Float32(
+                buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
             )
-            lds_ptr = lds_ptr._value if hasattr(lds_ptr, "_value") else lds_ptr
-            my = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                lds_ptr,
-                c1,
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            ).result
-            scf.YieldOp([my])
-        with ir.InsertionPoint(rank_if.else_block):
-            scf.YieldOp([c0])
-        my_rank = rank_if.results[0]
+        w_cast = arith.trunc_f(wdt, _raw(w_f32))
+        w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
+
+        my_rank = fx.Uint32(0)
+        if in_range:
+            buffer_ops.buffer_store(w_out, w_rsrc, route)
+            my_rank = fx.Uint32(
+                llvm.AtomicRMWOp(
+                    llvm.AtomicBinOp.add,
+                    _slot_ptr(cnt_base_i64, eff_e, address_space=3),
+                    c1,
+                    llvm.AtomicOrdering.monotonic,
+                    syncscope="workgroup",
+                    alignment=4,
+                ).result
+            )
 
         gpu.barrier()
 
         # Phase 2: one device-scope atomic per non-empty bucket to claim this
         # block's base offset; overwrite the LDS count in place with the base.
-        flush_loop = scf.ForOp(tid_idx, nbk_idx, stride_idx)
-        with ir.InsertionPoint(flush_loop.body):
-            b = arith.index_cast(i32, flush_loop.induction_variable)
-            cnt = _lds_load(lds_cnt, ArithValue(b))
-            nz = arith.cmpi(CmpIPredicate.ne, cnt, c0)
-            base_if = scf.IfOp(nz, results_=[i32], has_else=True)
-            with ir.InsertionPoint(base_if.then_block):
-                cbase_idx = arith.index_cast(T.index, ptrtoint(atomic_buffer))
-                b_idx = arith.index_cast(T.index, ArithValue(b))
-                gaddr = fx.Index(cbase_idx) + fx.Index(b_idx) * fx.Index(4)
-                gptr = buffer_ops.create_llvm_ptr(gaddr, address_space=1)
-                gptr = gptr._value if hasattr(gptr, "_value") else gptr
-                base_v = llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    gptr,
-                    _raw(cnt),
-                    llvm.AtomicOrdering.monotonic,
-                    syncscope="agent",
-                    alignment=4,
-                ).result
-                scf.YieldOp([base_v])
-            with ir.InsertionPoint(base_if.else_block):
-                scf.YieldOp([c0])
-            _lds_store(lds_cnt, fx.Int32(base_if.results[0]), ArithValue(b))
-            scf.YieldOp([])
+        for b in range(tid, n_buckets_i32, BLOCK_THREADS):
+            cnt = _lds_load(lds_cnt, fx.Uint32(b))
+            nz = cnt != 0
+            base_v = fx.Int32(0)
+            if nz:
+                base_v = fx.Int32(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), b),
+                        _raw(cnt),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    ).result
+                )
+            _lds_store(lds_cnt, base_v, fx.Uint32(b))
         gpu.barrier()
 
         # Phase 3: final row = base[eff_e] + intra-block rank + eff_e*max_m.
-        _if_final = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_final.then_block):
-            base = _lds_load(lds_cnt, ArithValue(eff_e))
-            slot = ArithValue(base) + ArithValue(my_rank)
-            row = slot + ArithValue(eff_e) * ArithValue(max_m)
+        if in_range:
+            base = fx.Uint32(_lds_load(lds_cnt, eff_e))
+            row = base + my_rank + eff_e * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, out_rsrc, route)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_route_g2l_lds(
@@ -601,7 +554,8 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         wdt = {"bf16": T.bf16, "f16": T.f16}[weight_dtype]
         c0 = arith.constant(0, type=i32)
         c1 = arith.constant(1, type=i32)
-        tid = ArithValue(fx.thread_idx.x)
+        tid = fx.Uint32(fx.thread_idx.x)
+        e_count = fx.Uint32(E)
 
         lds = fx.SharedAllocator().allocate(_RouteG2LStorage).peek()
         lds0 = lds.lds0.ptr
@@ -613,20 +567,16 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
 
         # Zero the (E,) route counter (global); barrier below orders it before the
         # phase-B atomics (single block, so no cross-block hazard).
-        in_bucket = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(E))
-        _if_ctr = scf.IfOp(in_bucket)
-        with ir.InsertionPoint(_if_ctr.then_block):
+        in_bucket = tid < e_count
+        if in_bucket:
             buffer_ops.buffer_store(c0, ctr_rsrc, tid)
-            scf.YieldOp([])
 
         # Phase A: load mask -> 0/1 into LDS.
-        in_range = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(n))
-        _if_load = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_load.then_block):
+        in_range = tid < fx.Uint32(n)
+        if in_range:
             m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            nz = arith.cmpi(CmpIPredicate.ne, m, c0)
-            _lds_store(lds0, fx.Int32(arith.select(nz, c1, c0)), tid)
-            scf.YieldOp([])
+            nz = m != c0
+            _lds_store(lds0, fx.Int32(nz.select(c1, c0)), tid)
 
         gpu.barrier()
 
@@ -636,33 +586,22 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         for offset in range_constexpr(1, MAX_G2L_EXPERTS):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
-            _if_scan = scf.IfOp(in_range)
-            with ir.InsertionPoint(_if_scan.then_block):
+            if in_range:
                 val = _lds_load(src, tid)
-                has_prev = arith.cmpi(
-                    CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
-                )
-                prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
-                with ir.InsertionPoint(prev_if.then_block):
-                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
-                    scf.YieldOp([_raw(prev)])
-                with ir.InsertionPoint(prev_if.else_block):
-                    scf.YieldOp([c0])
-                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
-                scf.YieldOp([])
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
         # lut[i] = enabled ? incl_prefix[i]-1 : E ; keep in LDS for phase B.
-        _if_lut = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_lut.then_block):
+        if in_range:
             incl = _lds_load(src, tid)
             m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            nz2 = arith.cmpi(CmpIPredicate.ne, m2, c0)
-            local = ArithValue(incl) - c1
-            le = arith.select(nz2, _raw(local), _raw(ArithValue(E)))
-            _lds_store(lds_lut, fx.Int32(le), tid)
-            scf.YieldOp([])
+            nz2 = m2 != c0
+            _lds_store(lds_lut, nz2.select(fx.Uint32(incl) - 1, e_count), tid)
 
         gpu.barrier()
 
@@ -686,35 +625,27 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         # route buffers (contiguous_psum_remap, preshuffle route-ksplit,
         # gather-reduce) is bounded by the same nvr/nvt, so the dead tail is never
         # read. When truncation is disabled the caller passes numel == nvr.
-        tid_idx = arith.index_cast(T.index, tid)
-        nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
-        stride_idx = arith.index(MAX_G2L_EXPERTS)
-        route_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
-        with ir.InsertionPoint(route_loop.body):
-            route = arith.index_cast(i32, route_loop.induction_variable)
-            is_oob = arith.cmpi(CmpIPredicate.uge, route, ArithValue(nvr))
-            ge_raw = buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+        nvr_i32 = fx.Uint32(nvr)
+        for route in range(tid, nvr_i32, MAX_G2L_EXPERTS):
+            is_oob = fx.Uint32(route) >= nvr_i32
+            ge_raw = fx.Uint32(
+                buffer_ops.buffer_load(tk_rsrc, route, vec_width=1, dtype=i32)
+            )
             # Clamp oob routes' global id to 0 BEFORE the LDS LUT lookup: dead-tail
             # dispatch rows (route >= num_valid_routes) may carry -1 / stale garbage
             # expert ids, which would otherwise OOB-read lds_lut. oob is forced to
             # the drop path below regardless of the clamped lookup result.
-            ge = arith.select(is_oob, c0, _raw(ge_raw))
-            le = _lds_load(lds_lut, ArithValue(ge))
-            is_drop_lut = arith.cmpi(CmpIPredicate.eq, le, ArithValue(E))
-            is_drop = arith.ori(is_drop_lut, is_oob)
-            eff_e = arith.select(is_drop, c0, _raw(le))
+            ge = is_oob.select(fx.Uint32(0), ge_raw)
+            le = fx.Uint32(_lds_load(lds_lut, ge))
+            is_drop = (le == e_count) | is_oob
+            eff_e = is_drop.select(fx.Uint32(0), le)
 
             # Fused weight cast+mask: kept -> cast(f32->wdt), dropped -> 0.
             w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
             w_cast = arith.trunc_f(wdt, w_f32)
-            w_out = arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
+            w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
             buffer_ops.buffer_store(w_out, w_rsrc, route)
 
-            base_idx = arith.index_cast(T.index, ptrtoint(counter))
-            e_idx = arith.index_cast(T.index, eff_e)
-            addr = fx.Index(base_idx) + fx.Index(e_idx) * fx.Index(4)
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
-            ptr = ptr._value if hasattr(ptr, "_value") else ptr
             # oob (dead-tail) routes must NOT claim a real slot: incrementing the
             # counter would inflate masked_m[0] by the whole padding tail,
             # reshuffling the contiguous GEMM layout so valid rows land in cells
@@ -722,18 +653,17 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             # for oob so masked_m matches the trimmed (total_recv) case exactly;
             # the row then points at an already-written bucket-0 cell and folds
             # away via gather_w=0. Normal expert-mask drops still take a slot.
-            incr = arith.select(is_oob, c0, _raw(c1))
+            incr = _raw(is_oob.select(c0, c1))
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
-                ptr,
+                _slot_ptr(fx.Int64(ptrtoint(counter)), eff_e),
                 incr,
                 llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
                 alignment=4,
             ).result
-            row = ArithValue(slot) + ArithValue(eff_e) * ArithValue(max_m)
+            row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, out_rsrc, route)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_route_g2l_fused(

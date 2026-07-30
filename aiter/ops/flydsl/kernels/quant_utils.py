@@ -149,7 +149,7 @@ def emit_mx_e8m0_scale(
         working_i32 = working.bitcast(T.i32)
         mantissa = working_i32 & c0x7FFFFF_i32
         biased_exp = (working_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = arith.cmpi(CmpIPredicate.ne, mantissa, c0_i32)
+        mant_nonzero = mantissa != c0_i32
         exp_field = arith.select(
             mant_nonzero,
             biased_exp + c1_i32,
@@ -170,7 +170,7 @@ def emit_mx_e8m0_scale(
         amax_i32 = local_max.bitcast(T.i32)
         mantissa = amax_i32 & c0x7FFFFF_i32
         biased_exp = (amax_i32 >> c23_i32) & c0xFF_i32
-        mant_nonzero = arith.cmpi(CmpIPredicate.ne, mantissa, c0_i32)
+        mant_nonzero = mantissa != c0_i32
         biased_exp_bumped = arith.select(
             mant_nonzero,
             biased_exp + c1_i32,
@@ -247,8 +247,8 @@ def emit_f32_to_e2m1(qx_f32):
     normal_x = qx_abs + c0xC11FFFFF_i32 + mant_odd
     normal_x = normal_x >> c22_i32
 
-    e2m1 = arith.select(normal_mask, normal_x, c0x7_i32)
-    e2m1 = arith.select(denormal_mask, denormal_x, e2m1)
+    e2m1 = normal_mask.select(normal_x, c0x7_i32)
+    e2m1 = denormal_mask.select(denormal_x, e2m1)
     return (s >> c28_i32) | e2m1
 
 
