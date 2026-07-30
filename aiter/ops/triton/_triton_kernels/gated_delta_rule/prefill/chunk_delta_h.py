@@ -14,21 +14,21 @@ import torch
 import triton
 import triton.language as tl
 
+from ..gated_delta_rule_utils import (
+    IS_AMD,
+    IS_NVIDIA_HOPPER,
+    RCP_LN2,
+    USE_CUDA_GRAPH,
+    autotune_cache_kwargs,
+    check_shared_mem,
+    gated_delta_rule_autotune_configs,
+)
 from ..utils import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
     prepare_rebased_cu_seqlens,
 )
 from ..utils.op import exp
-from ..gated_delta_rule_utils import (
-    RCP_LN2,
-    IS_AMD,
-    IS_NVIDIA_HOPPER,
-    USE_CUDA_GRAPH,
-    autotune_cache_kwargs,
-    check_shared_mem,
-    gated_delta_rule_autotune_configs,
-)
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
@@ -1105,7 +1105,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         if IS_VARLEN:
             g += (i_h * T_flat + bos).to(tl.int64)
         else:
-            g += (((i_n * H + i_h) * T_flat)).to(tl.int64)
+            g += ((i_n * H + i_h) * T_flat).to(tl.int64)
 
     if USE_INITIAL_STATE:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))

@@ -203,17 +203,17 @@ def build_reduce_problem(
     )
     final_lse = torch.empty(num_out_rows, num_heads, dtype=torch.float32, device=device)
 
-    return dict(
-        partial_output=partial_output,
-        partial_lse=partial_lse,
-        reduce_indptr=reduce_indptr,
-        reduce_final_map=reduce_final_map,
-        reduce_partial_map=reduce_partial_map,
-        final_output=final_output,
-        final_lse=final_lse,
-        max_seqlen_q=qo_len,
-        num_out_rows=num_out_rows,
-    )
+    return {
+        "partial_output": partial_output,
+        "partial_lse": partial_lse,
+        "reduce_indptr": reduce_indptr,
+        "reduce_final_map": reduce_final_map,
+        "reduce_partial_map": reduce_partial_map,
+        "final_output": final_output,
+        "final_lse": final_lse,
+        "max_seqlen_q": qo_len,
+        "num_out_rows": num_out_rows,
+    }
 
 
 def run_case(splits_per_tile, num_heads, head_dim, out_dtype, qo_len=1):

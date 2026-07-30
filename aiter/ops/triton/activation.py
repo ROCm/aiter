@@ -1,13 +1,15 @@
-from typing import Literal, Optional
-import triton
+from typing import Literal
+
 import torch
+import triton
+
 import aiter
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.activation import (
-    _act_mul_and_dynamic_mxfp4_quant_kernel,
     _act_mul_and_dynamic_fp8_group_quant_kernel,
+    _act_mul_and_dynamic_mxfp4_quant_kernel,
     fused_silu_mul_kernel,
 )
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 fp8_dtype = aiter.dtypes.fp8
 
@@ -202,7 +204,7 @@ def act_mul_and_fp8_group_quant(
 
 def fused_silu_mul(
     x: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused SiLU-and-mul along the last dimension (same pattern as MoE silu-fused GEMM).

@@ -2,12 +2,13 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 from torch import Tensor
+
 from ..jit.core import compile_ops
 
 MD_NAME = "module_pos_encoding"
 
 
-@compile_ops("module_pos_encoding")
+@compile_ops("module_pos_encoding", develop=True)
 def rotary_embedding_fwd(
     positions: Tensor,
     query: Tensor,
@@ -20,7 +21,7 @@ def rotary_embedding_fwd(
 ) -> None: ...
 
 
-@compile_ops("module_pos_encoding")
+@compile_ops("module_pos_encoding", develop=True)
 def batched_rotary_embedding(
     positions: Tensor,
     query: Tensor,

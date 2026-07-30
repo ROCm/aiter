@@ -25,6 +25,7 @@ It supports page size = 1.
 
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -504,7 +505,7 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
+    for split_kv_id in range(NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 OPUS_A8W4_OUT_MODE_ATOMIC = 0
 OPUS_A8W4_OUT_MODE_BF16 = 1
@@ -65,9 +64,9 @@ class OpusA8W4Stage2Instance:
     min_blocks_per_cu: int = 0
     cachectl_b: int = 0
     cachectl_wscale: int = 0
-    route_reduce: Optional[str] = None
-    min_tuner_token: Optional[int] = None
-    max_tuner_token: Optional[int] = None
+    route_reduce: str | None = None
+    min_tuner_token: int | None = None
+    max_tuner_token: int | None = None
     mode_default: bool = False
 
     @property
@@ -100,15 +99,13 @@ class OpusA8W4Stage2Instance:
             params["reduce_block_n"] = route_reduce.block_n
         return params
 
-    def supports_tuner_token(self, token: Optional[int]) -> bool:
+    def supports_tuner_token(self, token: int | None) -> bool:
         if token is None:
             return True
         token = int(token)
         if self.min_tuner_token is not None and token < self.min_tuner_token:
             return False
-        if self.max_tuner_token is not None and token > self.max_tuner_token:
-            return False
-        return True
+        return not (self.max_tuner_token is not None and token > self.max_tuner_token)
 
 
 @dataclass(frozen=True)
@@ -116,7 +113,7 @@ class OpusA8W4RouteReduceInstance:
     name: str
     block_n: int
     threads: int
-    suffix: Optional[str] = None
+    suffix: str | None = None
     auto_model_dims: tuple[int, ...] = ()
 
 
@@ -212,8 +209,8 @@ def _atomic_stage2_instance(
     cachectl_b: int = 0,
     cachectl_wscale: int = 0,
     pace_route_blocks_to_pow2: bool = False,
-    min_tuner_token: Optional[int] = None,
-    max_tuner_token: Optional[int] = None,
+    min_tuner_token: int | None = None,
+    max_tuner_token: int | None = None,
     mode_default: bool = False,
 ) -> OpusA8W4Stage2Instance:
     return OpusA8W4Stage2Instance(
@@ -245,8 +242,8 @@ def _route_stage2_instance(
     route_reduce: str,
     min_blocks_per_cu: int = 0,
     cachectl_b: int = 0,
-    min_tuner_token: Optional[int] = None,
-    max_tuner_token: Optional[int] = None,
+    min_tuner_token: int | None = None,
+    max_tuner_token: int | None = None,
     mode_default: bool = False,
 ) -> OpusA8W4Stage2Instance:
     return OpusA8W4Stage2Instance(
@@ -399,8 +396,8 @@ OPUS_A8W4_MODE_DEFAULT_BY_MODE_BLOCK_M = _build_mode_default_by_mode_block_m()
 
 
 def opus_a8w4_route_reduce(
-    name: Optional[str],
-) -> Optional[OpusA8W4RouteReduceInstance]:
+    name: str | None,
+) -> OpusA8W4RouteReduceInstance | None:
     if name is None:
         return None
     return OPUS_A8W4_ROUTE_REDUCE_BY_NAME.get(str(name))
@@ -409,7 +406,7 @@ def opus_a8w4_route_reduce(
 def opus_a8w4_effective_inter_dim(
     logical_inter_dim: int,
     inter_dim_pad: int,
-) -> Optional[int]:
+) -> int | None:
     logical_inter_dim = int(logical_inter_dim)
     inter_dim_pad = int(inter_dim_pad)
     if inter_dim_pad < 0 or logical_inter_dim <= inter_dim_pad:
@@ -434,7 +431,7 @@ def opus_a8w4_scale_cols_for_effective_inter_dim(effective_inter_dim: int) -> in
     return ((k_tiles + 1) // 2) * k.scale_groups_per_row_pack
 
 
-def _opus_a8w4_stage2_instance(kid: int) -> Optional[OpusA8W4Stage2Instance]:
+def _opus_a8w4_stage2_instance(kid: int) -> OpusA8W4Stage2Instance | None:
     return OPUS_A8W4_STAGE2_BY_KID.get(int(kid))
 
 
@@ -442,7 +439,7 @@ def opus_a8w4_base_name(name: str) -> str:
     return _OPUS_A8W4_REDUCE_BLOCK_N_RE.sub("", str(name).strip())
 
 
-def opus_a8w4_reduce_block_n_from_name(name) -> Optional[int]:
+def opus_a8w4_reduce_block_n_from_name(name) -> int | None:
     m = _OPUS_A8W4_REDUCE_BLOCK_N_RE.search(str(name).strip())
     if m is None:
         return None
@@ -450,7 +447,7 @@ def opus_a8w4_reduce_block_n_from_name(name) -> Optional[int]:
     return int(m.group(1)) if route_reduce is None else route_reduce.block_n
 
 
-def opus_a8w4_kid_from_name(name) -> Optional[int]:
+def opus_a8w4_kid_from_name(name) -> int | None:
     name = str(name).strip()
     inst = OPUS_A8W4_STAGE2_BY_NAME.get(name)
     if inst is None:
@@ -496,7 +493,7 @@ def opus_a8w4_kid_block_m(kid: int) -> int:
     return _require_a8w4_stage2_instance(kid).block_m
 
 
-def opus_a8w4_kid_reduce_block_n(kid: int) -> Optional[int]:
+def opus_a8w4_kid_reduce_block_n(kid: int) -> int | None:
     route_reduce = opus_a8w4_route_reduce(
         _require_a8w4_stage2_instance(kid).route_reduce
     )
@@ -521,7 +518,7 @@ def opus_a8w4_best_atomic_kid(
 
 
 def get_opus_a8w4_stage2_kernels(
-    token: Optional[int] = None,
+    token: int | None = None,
 ) -> dict[str, dict[str, object]]:
     return {
         inst.tuner_name: inst.tuner_params()

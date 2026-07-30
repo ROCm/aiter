@@ -43,20 +43,21 @@ to use the legacy single-kernel ``flydsl_fused_compress_attn``.
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Optional
-
-import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-from .tensor_shim import _to_raw, _run_compiled
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
@@ -575,7 +576,7 @@ def _build_compress_forward_kernel(
         kv_compressed: fx.Tensor,
         kv_compressed_row_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
         idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
@@ -987,7 +988,7 @@ def _build_norm_rope_scatter_kernel(
         krope_block_stride: fx.Int32,
         krope_token_stride: fx.Int32,
         plan_capacity: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         # grid = ceil(cap / KW): KW plan rows packed per block.
         cap_raw = _to_raw(plan_capacity)
@@ -1118,13 +1119,13 @@ def flydsl_hca_compress_attn(
     ratio: int,
     head_dim: int,
     rope_head_dim: int,
-    kv_compressed_scratch: Optional[torch.Tensor] = None,
+    kv_compressed_scratch: torch.Tensor | None = None,
     quant: bool = False,
-    k_rope_cache: Optional[torch.Tensor] = None,
+    k_rope_cache: torch.Tensor | None = None,
     quant_group_size: int = 64,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> None:
     """HCA-only 2-kernel compress + norm+rope+scatter (V4-Pro Main path).
 
@@ -1382,10 +1383,10 @@ def flydsl_hca_compress_forward(
     ape: torch.Tensor,  # [ratio, head_dim] f32
     ratio: int,
     head_dim: int,
-    kv_compressed_out: Optional[torch.Tensor] = None,
-    k_split_num_waves: Optional[int] = None,
-    slice_size: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    kv_compressed_out: torch.Tensor | None = None,
+    k_split_num_waves: int | None = None,
+    slice_size: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """HCA pool ONLY (Kernel A): softmax-pool ratio source positions (state-cache
     ring + ragged input + ape) -> ``kv_compressed[num_compress, head_dim]`` fp32.
