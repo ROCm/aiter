@@ -670,7 +670,11 @@ namespace py = pybind11;
     m.def("wvSplitKQ",                                                                          \
           &aiter::wvSplitKQ,                                                                    \
           "wvSplitKQ(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, Tensor scale_b, " \
-          "int CuCount) -> ()");
+          "int CuCount) -> ()");                                                                \
+    m.def("wvSplitKQ_pertoken",                                                                 \
+          &aiter::wvSplitKQ_pertoken,                                                           \
+          "wvSplitKQ_pertoken(Tensor in_a, Tensor in_b, Tensor! out_c, Tensor scale_a, "        \
+          "Tensor scale_b, int CuCount) -> ()");
 
 #define GEMM_A16W16_ASM_PYBIND                   \
     m.def("gemm_a16w16_asm",                     \
