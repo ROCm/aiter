@@ -69,6 +69,164 @@ _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_FUSED_DECODE_SORT_QUANT_ENV = "SGLANG_AITER_FUSED_DECODE_SORT_QUANT"
+# (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
+# sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
+_FUSED_DECODE_SORT_QUANT_ROUTES = {(256, 8), (384, 8), (385, 9)}
+_FUSED_DECODE_SORT_QUANT_MAX_M = 128
+
+
+def _fused_decode_sort_quant_requested() -> bool:
+    mode = os.environ.get(_FUSED_DECODE_SORT_QUANT_ENV, "").strip().lower()
+    return mode in ("auto", "1", "true", "on", "yes")
+
+
+_fused_decode_sort_quant_warned = False
+
+
+def _warn_fused_decode_sort_quant_bypassed() -> None:
+    global _fused_decode_sort_quant_warned
+    if _fused_decode_sort_quant_warned or not _fused_decode_sort_quant_requested():
+        return
+    _fused_decode_sort_quant_warned = True
+    logger.warning(
+        f"[fused_moe] {_FUSED_DECODE_SORT_QUANT_ENV} is set but the tuned stage-1 "
+        "kernel uses the aux-sort a4w4 path, which already fuses activation "
+        "quantization into GEMM1; the fused sort+quant kernel is not used."
+    )
+
+
+def _is_fused_decode_sort_quant_enabled(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    global_experts: int,
+    block_m: int,
+    quant_type: QuantType,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    activation: ActivationType,
+    is_g1u1: bool,
+    expert_mask: torch.Tensor | None,
+    num_local_tokens: torch.Tensor | None,
+    need_local_topk_ids: bool,
+    run_1stage: bool,
+    stage1_is_flydsl: bool,
+    hidden_pad: int,
+    ksplit: int,
+) -> bool:
+    """Gate the direct-scale HIP route-sort/quant kernel to supported decode.
+
+    The shape bounds mirror the kernel's own contract (``model_dim=7168``,
+    ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
+    route). The remaining conditions are integration requirements: they
+    describe the stage-1 path whose activation quantization this kernel
+    replaces. ``1``/``true``/``on``/``yes`` behave like ``auto`` so a
+    microbenchmark can pin the path; none of them widen it.
+    """
+    if not _fused_decode_sort_quant_requested():
+        return False
+    tokens = hidden_states.shape[0] if hidden_states.ndim == 2 else 0
+    topk = topk_ids.shape[1] if topk_ids.ndim == 2 else 0
+    return (
+        get_gfx() == "gfx950"
+        and hidden_states.dtype == dtypes.bf16
+        and 1 <= tokens <= _FUSED_DECODE_SORT_QUANT_MAX_M
+        and hidden_states.shape[1] == 7168
+        and hidden_states.is_contiguous()
+        and topk_ids.dtype == dtypes.i32
+        and (global_experts, topk) in _FUSED_DECODE_SORT_QUANT_ROUTES
+        and topk_ids.shape[0] == tokens
+        and topk_ids.is_contiguous()
+        and topk_weights.dtype == dtypes.fp32
+        and topk_weights.is_contiguous()
+        and block_m == 32
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and is_g1u1
+        and expert_mask is None
+        and num_local_tokens is None
+        and not need_local_topk_ids
+        and not run_1stage
+        and stage1_is_flydsl
+        and hidden_pad == 0
+        # ksplit > 1 makes fused_moe_2stages hand stage 1 unquantized BF16
+        # activations (the kernel quantizes inline), so prequantizing here
+        # would feed the wrong dtype.
+        and ksplit <= 1
+    )
+
+
+def _fused_decode_sort_quant(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    model_dim: int,
+    global_experts: int,
+    block_m: int,
+    moebuf_dtype: torch.dtype,
+    accumulate: bool,
+):
+    """Return standard sorted metadata plus the pre-quantized stage-1 input."""
+    device = hidden_states.device
+    tokens = hidden_states.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(global_experts, route_count)
+    max_sorted = (
+        (route_count + active_experts * (block_m - 1) + block_m - 1)
+        // block_m
+        * block_m
+    )
+    max_blocks = (max_sorted + block_m - 1) // block_m
+    sorted_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
+    sorted_expert_ids = torch.empty(max_blocks, dtype=dtypes.i32, device=device)
+    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
+    moe_buf = (
+        torch.empty((tokens, model_dim), dtype=moebuf_dtype, device=device)
+        if accumulate
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
+    activation_quant = torch.empty(
+        (tokens, model_dim // 2), dtype=dtypes.fp4x2, device=device
+    )
+    activation_scale_token = torch.empty(
+        (tokens, model_dim // 32), dtype=dtypes.fp8_e8m0, device=device
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+        global_experts,
+    )
+    activation_scale = mxfp4_moe_sort_fwd(
+        activation_scale_token,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=tokens,
+        cols=model_dim,
+    )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_expert_ids,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale,
+    )
+
 
 # Opt-in kernel-bench hook: a caller sets a list here to collect (name, callable)
 # per-kernel launches in fused_moe_2stages ("stage1"/"stage2"); None in production
@@ -722,6 +880,32 @@ def fused_moe_(
 
     sort_m_indices = None
     sort_reverse_sorted = None
+    prequantized_a1 = None
+    prequantized_a1_scale = None
+    if metadata.output_aux:
+        # The a4w4 aux-sort families already fuse activation quantization into
+        # GEMM1, so the fused sort+quant kernel has nothing left to save. Say so
+        # once: otherwise enabling the env var looks like it did nothing.
+        _warn_fused_decode_sort_quant_bypassed()
+    fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        global_experts=global_E,
+        block_m=block_size_M,
+        quant_type=quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        activation=activation,
+        is_g1u1=isG1U1,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+        need_local_topk_ids=need_local_topk_ids,
+        run_1stage=metadata.run_1stage,
+        stage1_is_flydsl=stage1_func is _flydsl_stage1_wrapper,
+        hidden_pad=hidden_pad,
+        ksplit=metadata.ksplit,
+    )
     if metadata.output_aux:
         # The a4w4 FlyDSL port routes through the adaptive/aux sort, which does
         # not thread expert_mask into moe_sorting below -- EP masking would be
@@ -751,6 +935,26 @@ def fused_moe_(
             block_size_M,
             accumulate=_atomic,
             output_aux=True,
+        )
+        local_topk_ids = None
+    elif fused_sort_quant:
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            prequantized_a1,
+            prequantized_a1_scale,
+        ) = _fused_decode_sort_quant(
+            hidden_states,
+            topk_ids,
+            topk_weight,
+            model_dim=model_dim,
+            global_experts=global_E,
+            block_m=block_size_M,
+            moebuf_dtype=dtype,
+            accumulate=not stage2_uses_route_reduce(metadata.stage2),
         )
         local_topk_ids = None
     else:
@@ -850,6 +1054,8 @@ def fused_moe_(
             expert_mask=expert_mask,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
+            prequantized_a1=prequantized_a1,
+            prequantized_a1_scale=prequantized_a1_scale,
         )
 
 
@@ -2516,6 +2722,8 @@ def fused_moe_2stages(
     expert_mask=None,
     m_indices=None,
     reverse_sorted=None,
+    prequantized_a1: torch.Tensor | None = None,
+    prequantized_a1_scale: torch.Tensor | None = None,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -2547,7 +2755,12 @@ def fused_moe_2stages(
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
     )
-    if not metadata.prequant:
+    if prequantized_a1 is not None:
+        assert quant_type == QuantType.per_1x32
+        assert prequantized_a1_scale is not None
+        a1 = prequantized_a1
+        a1_scale = prequantized_a1_scale
+    elif not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
     elif (

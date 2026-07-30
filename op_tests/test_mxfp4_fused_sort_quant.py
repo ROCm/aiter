@@ -7,7 +7,11 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.fused_moe import moe_sorting
+from aiter.fused_moe import (
+    _fused_decode_sort_quant,
+    _is_fused_decode_sort_quant_enabled,
+    moe_sorting,
+)
 from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort, per_1x32_f4_quant_hip
 
 pytestmark = pytest.mark.skipif(
@@ -181,6 +185,68 @@ def test_fused_sort_quant_matches_opus_and_generic_quant(tokens, experts, topk):
         compact_scale.view(torch.uint8),
         rtol=0,
         atol=0,
+    )
+
+
+@pytest.mark.parametrize("tokens", [2, 4])
+def test_fused_decode_sort_quant_returns_sorted_scale(tokens):
+    hidden, topk_ids, topk_weights = _make_inputs(tokens, 384, 8)
+    result = _fused_decode_sort_quant(
+        hidden,
+        topk_ids,
+        topk_weights,
+        model_dim=HIDDEN,
+        global_experts=384,
+        block_m=BLOCK_M,
+        moebuf_dtype=torch.bfloat16,
+        accumulate=True,
+    )
+    activation_scale = result[-1]
+    assert activation_scale.shape[0] == result[0].shape[0]
+    assert activation_scale.shape[1] == HIDDEN // 32
+
+
+@pytest.mark.parametrize(
+    "experts, topk, tokens, expected",
+    [
+        pytest.param(384, 8, 100, True, id="non_power_of_2_m_accepted"),
+        pytest.param(256, 8, 8, True, id="e256_route_accepted"),
+        pytest.param(384, 6, 8, False, id="uninstantiated_topk"),
+        pytest.param(512, 8, 8, False, id="uninstantiated_experts"),
+        pytest.param(384, 8, 129, False, id="m_above_kernel_contract"),
+    ],
+)
+def test_fused_decode_sort_quant_gate(monkeypatch, experts, topk, tokens, expected):
+    """The gate must reject anything the kernel is not instantiated for.
+
+    ``AITER_CHECK`` aborts the process instead of raising, so an unsupported
+    shape reaching the op is fatal -- this gate is the only guard.
+    """
+    if aiter.get_gfx() != "gfx950":
+        pytest.skip("fused sort+quant is gfx950-only")
+    monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_SORT_QUANT", "auto")
+    hidden, topk_ids, topk_weights = _make_inputs(tokens, min(experts, 384), topk)
+    assert (
+        _is_fused_decode_sort_quant_enabled(
+            hidden,
+            topk_ids,
+            topk_weights,
+            global_experts=experts,
+            block_m=BLOCK_M,
+            quant_type=aiter.QuantType.per_1x32,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            activation=aiter.ActivationType.Silu,
+            is_g1u1=True,
+            expert_mask=None,
+            num_local_tokens=None,
+            need_local_topk_ids=False,
+            run_1stage=False,
+            stage1_is_flydsl=True,
+            hidden_pad=0,
+            ksplit=0,
+        )
+        is expected
     )
 
 
