@@ -2,8 +2,9 @@
 Grid: C in {16,32,64,128} x ctx in {1024,8192} x heads in {64/8 GQA, 8/1 MQA}.
 Both impls: triton (3d attn + reduce, heuristic split) and gluon (2d, right-sized
 split; S=1 => non-split, no reduce). Records time (us/iter), TFLOP/s, GB/s.
-Writes scan_<major.minor.patch>.json. Run once per version (dir-swap between)."""
-import sys, math, json
+Writes scan_<major.minor.patch>.json into $SCAN_DIR (default: this folder).
+Run once per version (PYTHONPATH-shadow or dir-swap between)."""
+import os, sys, math, json
 import triton
 sys.path.insert(0, "/app/aiter/bench_gluon_ua")
 import torch
@@ -57,7 +58,7 @@ def scan_one(C, ctx, Hq, Hkv):
         # correctness pass (prescaled M); timed pass uses raw M -> identical reduce cost
         B.launch_glu_2d(q, k, v, og, cu, seqk, bt, scale, 16, TILE, 1, wpe,
                         NUM_SPLITS=Sg, ALL_DECODE=True, partials=(sm, se, so), MFMA_DIM=16, NUM_BUFFERS=2)
-        B.launch_reduce(og, cu, seqk, bt, TILE, Sg, r_nw, 16 // nqpk, (so, sm * (RCP * scale), se))
+        B.launch_reduce(og, cu, seqk, bt, TILE, Sg, r_nw, 16 // nqpk, (so, sm, se))
         torch.cuda.synchronize()
         xc = (ot.float() - og.float()).abs().max().item()
         def gf():
@@ -85,6 +86,7 @@ for ctx in CTXS:
         for C in CS:
             scan_one(C, ctx, Hq, Hkv)
 
-path = f"/app/aiter/bench_gluon_ua/scan_{VER}.json"
+SCAN_DIR = os.environ.get("SCAN_DIR", "/app/aiter/bench_gluon_ua")
+path = f"{SCAN_DIR}/scan_{VER}.json"
 json.dump(records, open(path, "w"), indent=0)
 print("wrote", path)

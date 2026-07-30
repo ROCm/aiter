@@ -31,7 +31,7 @@ def run(C, ctx, Hq, Hkv):
         so, sm, se = B.alloc_segm(C, Hq, S); og = torch.empty_like(q)
         B.launch_glu_2d(q, k, v, og, cu, seqk, bt, scale, 16, TILE, 1, wpe,
                         NUM_SPLITS=S, ALL_DECODE=True, partials=(sm, se, so), MFMA_DIM=16, NUM_BUFFERS=1)
-        B.launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, 16 // nqpk, (so, sm * (RCP * scale), se))
+        B.launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, 16 // nqpk, (so, sm, se))
         torch.cuda.synchronize(); xc = (ot.float() - og.float()).abs().max().item()
         def gf():
             B.launch_glu_2d(q, k, v, og, cu, seqk, bt, scale, 16, TILE, 1, wpe,

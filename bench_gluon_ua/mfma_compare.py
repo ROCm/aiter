@@ -26,7 +26,7 @@ DECODE = [
 
 def reduce_gluon(so, sm, se, out, cu, seqk, bt, TILE, S, r_nw, BQ, scale):
     # triton reduce needs prescaled (log2) max; gluon stores raw max
-    B.launch_reduce(out, cu, seqk, bt, TILE, S, r_nw, BQ, (so, sm * (RCP_LN2 * scale), se))
+    B.launch_reduce(out, cu, seqk, bt, TILE, S, r_nw, BQ, (so, sm, se))
 
 
 def run_prefill(sh, rows):

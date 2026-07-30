@@ -18,6 +18,7 @@ Buffers use torch.empty (like the original 3d dispatch).
 Run:  python bench_gluon_ua/bench_ua.py     # writes bench_gluon_ua/results.md
 """
 import math
+import os
 import torch
 import triton
 
@@ -36,7 +37,7 @@ from torch.profiler import profile, ProfilerActivity
 DEV = "cuda"
 DT = torch.bfloat16
 RCP_LN2 = 1.4426950408889634
-HEAD_SIZE = 128
+HEAD_SIZE = int(os.environ.get("UA_HEAD_SIZE", 128))  # 128 default; 64 for the HS64 scan
 CU = get_num_sms()
 TARGET_PRGMS = CU * 4
 WARMUP, ITERS, FLUSH_MB = 8, 30, 512
@@ -70,11 +71,13 @@ SEGM_TOK_PAD = 256
 
 
 # ---------------------------------------------------------------- input setup
-def make_paged_kv(ctx_per_seq, num_seqs, block_size, Hkv):
+def make_paged_kv(ctx_per_seq, num_seqs, block_size, Hkv, dtype=DT):
     nb_per_seq = ctx_per_seq // block_size
     num_blocks = nb_per_seq * num_seqs
-    k = torch.randn(num_blocks, block_size, Hkv, HEAD_SIZE, dtype=DT, device=DEV) * 0.5
-    v = torch.randn(num_blocks, block_size, Hkv, HEAD_SIZE, dtype=DT, device=DEV) * 0.5
+    # fp8 caches are built in fp32 then cast (torch.randn has no fp8 kernel).
+    gen_dt = torch.float32 if dtype.itemsize == 1 else dtype
+    k = (torch.randn(num_blocks, block_size, Hkv, HEAD_SIZE, dtype=gen_dt, device=DEV) * 0.5).to(dtype)
+    v = (torch.randn(num_blocks, block_size, Hkv, HEAD_SIZE, dtype=gen_dt, device=DEV) * 0.5).to(dtype)
     bt = torch.zeros(num_seqs, nb_per_seq + BT_PAD, dtype=torch.int32, device=DEV)
     bt[:, :nb_per_seq] = torch.arange(num_blocks, dtype=torch.int32, device=DEV).view(num_seqs, nb_per_seq)
     return k, v, bt
@@ -89,13 +92,15 @@ def alloc_segm(nt, Hq, S):
 
 
 # ---------------------------------------------------------------- launchers
-def launch_tri_2d(q, k, v, out, cu, seqk, bt, scale, BM, BQ, TILE, nw, ns, wpe):
+def launch_tri_2d(q, k, v, out, cu, seqk, bt, scale, BM, BQ, TILE, nw, ns, wpe,
+                  descales=(None, None, None), K_WIDTH=8):
     nt, Hq, D = q.shape; NKV = k.shape[2]; NS = seqk.shape[0]; nqpk = Hq // NKV
     tqb = nt // BQ + NS
+    qd, kd, vd = descales
     tri_2d[(NKV, tqb)](
         output_ptr=out, query_ptr=q, key_cache_ptr=k, value_cache_ptr=v, sink_ptr=None,
         block_tables_ptr=bt, seq_lens_ptr=seqk, alibi_slopes_ptr=None, qq_bias_ptr=None,
-        scale=scale, q_descale_ptr=None, k_descale_ptr=None, v_descale_ptr=None,
+        scale=scale, q_descale_ptr=qd, k_descale_ptr=kd, v_descale_ptr=vd,
         out_scale_ptr=None, softcap=0.0, num_query_heads=Hq, num_queries_per_kv=nqpk,
         block_table_stride=bt.stride(0), query_stride_0=q.stride(0), query_stride_1=q.stride(1),
         output_stride_0=out.stride(0), output_stride_1=out.stride(1), qq_bias_stride_0=0,
@@ -107,14 +112,41 @@ def launch_tri_2d(q, k, v, out, cu, seqk, bt, scale, BM, BQ, TILE, nw, ns, wpe):
         stride_v_cache_0=v.stride(0), stride_v_cache_1=v.stride(1),
         stride_v_cache_2=v.stride(2), stride_v_cache_3=v.stride(3),
         query_start_len_ptr=cu, num_seqs=NS, ALL_DECODE=False, SHUFFLED_KV_CACHE=False,
-        K_WIDTH=8, BLOCK_M=BM, BLOCK_Q=BQ, TILE_SIZE=TILE,
+        K_WIDTH=K_WIDTH, BLOCK_M=BM, BLOCK_Q=BQ, TILE_SIZE=TILE,
         num_warps=nw, num_stages=ns, waves_per_eu=wpe,
     )
 
 
+MAX_INT32 = 2**31 - 1
+
+
+def buffer_op_flags(k, out):
+    """(USE_LOAD_BUFFER_OP, USE_STORE_BUFFER_OP) exactly as the gfx950 gluon wrapper
+    derives them -- see `unified_attention()`:
+
+        kv_size = k.nelement() * k.element_size()
+        USE_LOAD_BUFFER_OP  = kv_size <= MAX_INT32
+        USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
+
+    Buffer ops address through a 32-bit descriptor offset, so they are only valid while
+    the tensor fits. Hardcoding them on for a larger cache silently returns garbage AND
+    looks fast, which is the worst possible failure mode for a benchmark: a 17 GB KV
+    cache (C128 ctx8192, 64 kv heads, HS128) measured 103% relative error at an
+    impossible 12.3 TB/s, vs 0.40% at 6.6 TB/s with them off. MHA shapes reach the limit
+    8x sooner than GQA-8 ones, since the cache scales with num_kv_heads. Always route
+    through this helper rather than passing literals, so the benchmarks keep measuring
+    the code path production would actually take.
+    """
+    return (k.nelement() * k.element_size() <= MAX_INT32,
+            out.nelement() * out.element_size() <= MAX_INT32)
+
+
 def launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
-                  NUM_SPLITS=1, ALL_DECODE=False, partials=None, MFMA_DIM=32, NUM_BUFFERS=2):
+                  NUM_SPLITS=1, ALL_DECODE=False, partials=None, MFMA_DIM=32, NUM_BUFFERS=2,
+                  descales=(None, None, None)):
     nt, Hq, D = q.shape; NKV = k.shape[2]; NS = seqk.shape[0]; nqpk = Hq // NKV
+    qd, kd, vd = descales
+    use_load_buf, use_store_buf = buffer_op_flags(k, out)
     BQ = BM // nqpk
     # ALL_DECODE fast path launches one block per sequence (no BLOCK_Q packing).
     tqb = NS if ALL_DECODE else nt // BQ + NS
@@ -122,12 +154,12 @@ def launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
     # the kv_head-fastest 2d order. The kernel derives the mapping from ALL_DECODE.
     grid = (tqb, NKV, NUM_SPLITS) if ALL_DECODE else (NKV, tqb, NUM_SPLITS)
     pm, pl, pa = (None, None, None) if partials is None else partials
-    glu_2d[grid](
+    return glu_2d[grid](
         query_ptr=q, key_cache_ptr=k, value_cache_ptr=v, sink_ptr=None, output_ptr=out,
         block_tables_ptr=bt, seq_lens_ptr=seqk, query_start_len_ptr=cu,
         query_stride_0=q.stride(0), query_stride_1=q.stride(1),
         output_stride_0=out.stride(0), output_stride_1=out.stride(1),
-        k_descale_ptr=None, v_descale_ptr=None, q_descale_ptr=None, out_scale_ptr=None,
+        k_descale_ptr=kd, v_descale_ptr=vd, q_descale_ptr=qd, out_scale_ptr=None,
         USE_SINKS=False, SLIDING_WINDOW=0, num_blocks=k.shape[0],
         stride_k_cache_0=k.stride(0), stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2), stride_k_cache_3=k.stride(3),
@@ -136,22 +168,24 @@ def launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
         block_table_stride=bt.stride(0), num_seqs=NS, SCALE=scale,
         NUM_QUERY_HEADS=Hq, NUM_KV_HEADS=NKV, BLOCK_SIZE=k.shape[1],
         TILE_SIZE=TILE, HEAD_SIZE=D, BLOCK_Q=BQ, BLOCK_M=BM,
-        ARCH_NAME="gfx950", waves_per_eu=wpe, USE_LOAD_BUFFER_OP=True,
-        USE_STORE_BUFFER_OP=True, num_warps=nw, ALL_DECODE=ALL_DECODE,
+        ARCH_NAME="gfx950", waves_per_eu=wpe, USE_LOAD_BUFFER_OP=use_load_buf,
+        USE_STORE_BUFFER_OP=use_store_buf, num_warps=nw, ALL_DECODE=ALL_DECODE,
         CAUSAL=True, REMOVE_INDIRECT_ACCESS=False, NUM_BUFFERS=NUM_BUFFERS, MFMA_DIM=MFMA_DIM,
         NUM_SPLITS=NUM_SPLITS,
         partial_m_ptr=pm, partial_l_ptr=pl, partial_acc_ptr=pa,
     )
 
 
-def launch_tri_3d(q, k, v, cu, seqk, bt, scale, BM, BQ, TILE, nw, S, wpe, nstg, segm):
+def launch_tri_3d(q, k, v, cu, seqk, bt, scale, BM, BQ, TILE, nw, S, wpe, nstg, segm,
+                  descales=(None, None, None), K_WIDTH=8, IS_Q_FP8=False, IS_KV_FP8=False):
     nt, Hq, D = q.shape; NKV = k.shape[2]; NS = seqk.shape[0]; nqpk = Hq // NKV
     so, sm, se = segm
+    qd, kd, vd = descales
     tri_3d[(NS, NKV, S)](
         segm_output_ptr=so, segm_max_ptr=sm, segm_expsum_ptr=se,
         query_ptr=q, key_cache_ptr=k, value_cache_ptr=v, sink_ptr=None,
         block_tables_ptr=bt, seq_lens_ptr=seqk, alibi_slopes_ptr=None, qq_bias_ptr=None,
-        scale=scale, q_descale_ptr=None, k_descale_ptr=None, v_descale_ptr=None,
+        scale=scale, q_descale_ptr=qd, k_descale_ptr=kd, v_descale_ptr=vd,
         out_scale_ptr=None, softcap=0.0, num_query_heads=Hq, num_queries_per_kv=nqpk,
         block_table_stride=bt.stride(0), query_stride_0=q.stride(0), query_stride_1=q.stride(1),
         qq_bias_stride_0=0, BLOCK_SIZE=k.shape[1], HEAD_SIZE=D,
@@ -162,7 +196,8 @@ def launch_tri_3d(q, k, v, cu, seqk, bt, scale, BM, BQ, TILE, nw, S, wpe, nstg, 
         stride_v_cache_0=v.stride(0), stride_v_cache_1=v.stride(1),
         stride_v_cache_2=v.stride(2), stride_v_cache_3=v.stride(3),
         query_start_len_ptr=cu, BLOCK_Q=BQ, num_seqs=NS, BLOCK_M=BM,
-        ALL_DECODE=True, SHUFFLED_KV_CACHE=False, K_WIDTH=8, IS_Q_FP8=False, IS_KV_FP8=False,
+        ALL_DECODE=True, SHUFFLED_KV_CACHE=False, K_WIDTH=K_WIDTH,
+        IS_Q_FP8=IS_Q_FP8, IS_KV_FP8=IS_KV_FP8,
         TILE_SIZE=TILE, NUM_SEGMENTS_PER_SEQ=S, num_warps=nw,
         waves_per_eu=wpe, num_stages=nstg,
     )
@@ -203,17 +238,17 @@ def pick(res, *subs):
 
 
 # ---------------------------------------------------------------- flops / bytes
-def prefill_flops_bytes(B, N, Hq, Hkv):
+def prefill_flops_bytes(B, N, Hq, Hkv, e=2):
+    """e = bytes per Q/KV element (2 = bf16, 1 = fp8)."""
     pairs = N * (N + 1) / 2
     flops = B * 4 * Hq * HEAD_SIZE * pairs
-    e = 2
     byts = B * (2 * N * Hq * HEAD_SIZE * e + 2 * N * Hkv * HEAD_SIZE * e)
     return flops, byts
 
 
-def decode_flops_bytes(C, ctx, Hq, Hkv):
+def decode_flops_bytes(C, ctx, Hq, Hkv, e=2):
+    """e = bytes per Q/KV element (2 = bf16, 1 = fp8)."""
     flops = 4 * C * Hq * HEAD_SIZE * ctx
-    e = 2
     byts = 2 * C * ctx * Hkv * HEAD_SIZE * e + 2 * C * Hq * HEAD_SIZE * e
     return flops, byts
 
@@ -296,7 +331,7 @@ def run_decode(sh):
     launch_glu_2d(q, k, v, q.clone(), cu, seqk, bt, scale, g_BM, TILE, g_nw, wpe,
                   NUM_SPLITS=S, ALL_DECODE=True, partials=(sm, se, so), MFMA_DIM=g_mfma, NUM_BUFFERS=1)
     og = torch.empty_like(q)
-    launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, g_BQ, (so, sm * (RCP_LN2 * scale), se))
+    launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, g_BQ, (so, sm, se))
     torch.cuda.synchronize()
     xcheck = (ot.float() - og.float()).abs().max().item()
 

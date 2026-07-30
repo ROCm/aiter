@@ -11,6 +11,7 @@ DEV, DT, HS, RCP = B.DEV, B.DT, B.HEAD_SIZE, B.RCP_LN2
 def glu(q, k, v, out, cu, seqk, bt, scale, TILE, S, nb, partials, capture=False):
     NKV = k.shape[2]; NS = seqk.shape[0]; nqpk = q.shape[1] // NKV
     sm, se, so = partials
+    lb, sb = B.buffer_op_flags(k, out)
     ck = B.glu_2d[(NS, NKV, S)](
         query_ptr=q, key_cache_ptr=k, value_cache_ptr=v, sink_ptr=None, output_ptr=out,
         block_tables_ptr=bt, seq_lens_ptr=seqk, query_start_len_ptr=cu,
@@ -23,7 +24,7 @@ def glu(q, k, v, out, cu, seqk, bt, scale, TILE, S, nb, partials, capture=False)
         block_table_stride=bt.stride(0), num_seqs=NS, SCALE=scale,
         NUM_QUERY_HEADS=q.shape[1], NUM_KV_HEADS=NKV, BLOCK_SIZE=TILE, TILE_SIZE=TILE, HEAD_SIZE=HS,
         BLOCK_Q=16 // nqpk, BLOCK_M=16, ARCH_NAME="gfx950", waves_per_eu=2,
-        USE_LOAD_BUFFER_OP=True, USE_STORE_BUFFER_OP=True, num_warps=1, ALL_DECODE=True,
+        USE_LOAD_BUFFER_OP=lb, USE_STORE_BUFFER_OP=sb, num_warps=1, ALL_DECODE=True,
         CAUSAL=True, REMOVE_INDIRECT_ACCESS=False, NUM_BUFFERS=nb, MFMA_DIM=16,
         NUM_SPLITS=S, partial_m_ptr=sm, partial_l_ptr=se, partial_acc_ptr=so)
     if capture:
@@ -50,7 +51,7 @@ def run(C, ctx, Hq, Hkv, occ=False):
     for nb in (2, 1):
         so, sm, se = B.alloc_segm(C, Hq, S); og = torch.empty_like(q)
         occres = glu(q, k, v, og, cu, seqk, bt, scale, TILE, S, nb, (sm, se, so), capture=occ)
-        B.launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, 16 // nqpk, (so, sm * (RCP * scale), se))
+        B.launch_reduce(og, cu, seqk, bt, TILE, S, r_nw, 16 // nqpk, (so, sm, se))
         torch.cuda.synchronize()
         xc = (ot.float() - og.float()).abs().max().item()
         def gf():

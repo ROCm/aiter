@@ -56,7 +56,7 @@ def decode_nb2(C, ctx, Hq, Hkv):
         # correctness with prescaled M; timed run uses raw M (reduce cost identical)
         B.launch_glu_2d(q, k, v, og, cu, seqk, bt, scale, 16, TILE, 1, wpe,
                         NUM_SPLITS=Sg, ALL_DECODE=True, partials=(sm, se, so), MFMA_DIM=16, NUM_BUFFERS=2)
-        B.launch_reduce(og, cu, seqk, bt, TILE, Sg, r_nw, 16 // nqpk, (so, sm * (RCP * scale), se))
+        B.launch_reduce(og, cu, seqk, bt, TILE, Sg, r_nw, 16 // nqpk, (so, sm, se))
         torch.cuda.synchronize()
         xc = (ot.float() - og.float()).abs().max().item()
         def gf():

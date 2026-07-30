@@ -28,6 +28,7 @@ def main():
 
     # gluon current decode default: single-buffer, MFMA=16, BM=16, nw=1
     so, sm, se = B.alloc_segm(C, Hq, S); og = torch.empty_like(q)
+    lb, sb = B.buffer_op_flags(k, og)
     ckg = B.glu_2d[(C, Hkv, S)](
         query_ptr=q, key_cache_ptr=k, value_cache_ptr=v, sink_ptr=None, output_ptr=og,
         block_tables_ptr=bt, seq_lens_ptr=seqk, query_start_len_ptr=cu,
@@ -40,7 +41,7 @@ def main():
         block_table_stride=bt.stride(0), num_seqs=C, SCALE=scale,
         NUM_QUERY_HEADS=Hq, NUM_KV_HEADS=Hkv, BLOCK_SIZE=TILE, TILE_SIZE=TILE, HEAD_SIZE=HS,
         BLOCK_Q=16 // nqpk, BLOCK_M=16, ARCH_NAME="gfx950", waves_per_eu=2,
-        USE_LOAD_BUFFER_OP=True, USE_STORE_BUFFER_OP=True, num_warps=1, ALL_DECODE=True,
+        USE_LOAD_BUFFER_OP=lb, USE_STORE_BUFFER_OP=sb, num_warps=1, ALL_DECODE=True,
         CAUSAL=True, REMOVE_INDIRECT_ACCESS=False, NUM_BUFFERS=1, MFMA_DIM=16,
         NUM_SPLITS=S, partial_m_ptr=sm, partial_l_ptr=se, partial_acc_ptr=so)
     show(ckg, "gluon decode (nb1/16x16)", 1)

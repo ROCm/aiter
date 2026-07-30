@@ -1,8 +1,8 @@
 """Aggregate scan_<ver>.json (3.6.0 / 3.7.0 / 3.8.0) into perf_scan.md.
 Per-metric tables (time / BW / TFLOP/s), a speedup table, and the split counts."""
-import json
+import json, os
 
-BASE = "/app/aiter/bench_gluon_ua"
+BASE = os.environ.get("SCAN_DIR", "/app/aiter/bench_gluon_ua")
 VERS = ["3.6.0", "3.7.0", "3.8.0"]
 VLABEL = {"3.6.0": "3.6.0", "3.7.0": "3.7.0", "3.8.0": "3.8.0 (ToT)"}
 IMPLS = ["triton", "gluon"]
