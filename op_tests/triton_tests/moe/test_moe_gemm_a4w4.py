@@ -201,6 +201,12 @@ class Case:
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
             Case(4096, 3072, 3072, 128, 4),
             Case(8192, 7168, 4096, 256, 8),
+            # gfx1250 gluon preshuffled weights
+            Case(16, 4096, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 512, 7168, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(16, 1024, 1024, 128, 4, preshuffle_weights=True),
+            Case(1024, 7168, 2048, 256, 8, hbm_swizzling=True, preshuffle_weights=True),
+            Case(256, 1024, 1024, 8, 4, preshuffle_weights=True),
         ]
     ],
 )
@@ -246,9 +252,10 @@ def test_op(
             pytest.skip("Preshuffling weights is only supported on gfx1250")
         if backend != "gluon":
             pytest.skip("Preshuffling weights is only supported on gluon backend")
-        if n % 16 != 0 or k % 32 != 0:
+        if n % 16 != 0 or (k // 2) % 32 != 0:
             pytest.skip(
-                "Preshuffling weights requires n divisible by 16 and k divisible by 32"
+                f"Preshuffling weights requires n divisible by 16 and k//2 divisible "
+                f"by 32, got n={n}, k//2={k // 2}"
             )
 
     # skip gluon backend if not supported
