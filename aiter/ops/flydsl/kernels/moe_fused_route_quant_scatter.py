@@ -270,18 +270,16 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     payload_bytes_per_row = c.payload_bytes_per_row
     dst_payload = []
     for dst in c.dests:
-        row_addr = c.payload_base + arith.extui(
-            T.i64, dst.payload_row_i32
-        ) * arith.constant(payload_bytes_per_row, type=T.i64)
+        row_addr = (
+            c.payload_base + fx.Uint64(dst.payload_row_i32) * payload_bytes_per_row
+        )
         dst_payload.append(
             buffer_ops.create_buffer_resource_from_addr(
                 row_addr, num_records_bytes=payload_bytes_per_row
             )
         )
 
-    hidden_row_addr = c.hidden_base + arith.extui(
-        T.i64, c.feat_row_i32
-    ) * arith.constant(c.feat_bytes_per_row, type=T.i64)
+    hidden_row_addr = c.hidden_base + fx.Uint64(c.feat_row_i32) * c.feat_bytes_per_row
     hidden_rsrc = buffer_ops.create_buffer_resource_from_addr(
         hidden_row_addr, num_records_bytes=c.feat_bytes_per_row
     )
@@ -296,6 +294,10 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             mx_block,
             arith.constant(c.mx_blocks_per_row, type=i32),
         )
+        # Raw scf.if, not a Python `if`: the AST rewriter only transforms
+        # @flyc.kernel / @flyc.jit bodies, and this is a plain module-level
+        # emitter called from them, so `if block_in_range:` here would be a
+        # host-side truthiness test rather than an scf.if.
         _if_block = scf.IfOp(block_in_range)
         with ir.InsertionPoint(_if_block.then_block):
             if const_expr(c.use_pk8):
@@ -432,7 +434,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # destination row in ``c.dests``. Current kernels pass one destination;
             # the list keeps the store side generic without changing quant math.
             # The block-scale's dword/byte position depends only on ``mx_block``.
-            scale_dword = arith.divui(mx_block, c.c4_i32)
+            scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
             byte_in_dword = mx_block - scale_dword * c.c4_i32
             e8m0_byte = arith.trunci(T.i8, e8m0_scale)
             for di, dst in enumerate(c.dests):
@@ -446,7 +448,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 )
 
                 # one e8m0 byte per block, written by the block's lead lane.
-                _if_lead = scf.IfOp(c.is_block_lead)
+                _if_lead = scf.IfOp(_raw(c.is_block_lead))
                 with ir.InsertionPoint(_if_lead.then_block):
                     dst_scale_dword = (
                         dst.scale_row_dword_base + scale_dword * c.c_wmma_rep
@@ -596,19 +598,18 @@ def build_moe_fused_route_quant_scatter_module(
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_max_m = arith.constant(max_m, type=i32)
 
-        tid = ArithValue(fx.thread_idx.x)
-        bid = ArithValue(fx.block_idx.x)
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave  # tid % wave_size
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
-        _if_route = scf.IfOp(route_in_range)
-        with ir.InsertionPoint(_if_route.then_block):
+        route_in_range = fx.Uint32(route) < fx.Uint32(numel)
+        if route_in_range:
             topk_ids_rsrc = ptr_rsrc(topk_ids)
             # expert id for this route (uniform across the warp)
-            expert = ArithValue(
+            expert = fx.Uint32(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
 
@@ -620,8 +621,8 @@ def build_moe_fused_route_quant_scatter_module(
             if const_expr(use_g2l):
                 g2l_rsrc = ptr_rsrc(g2l_lut)
                 le = buffer_ops.buffer_load(g2l_rsrc, expert, vec_width=1, dtype=i32)
-                is_drop = arith.cmpi(CmpIPredicate.eq, le, ArithValue(n_buckets))
-                expert = ArithValue(arith.select(is_drop, c0_i32, le))
+                is_drop = le == fx.Uint32(n_buckets)
+                expert = fx.Uint32(is_drop.select(c0_i32, le))
                 # Fused weight cast+mask (warp-uniform: every lane writes the same
                 # value to gather_w[route], redundant but race-free). Reads f32
                 # weight_in and writes weight_dtype (kept -> cast, dropped -> 0),
@@ -630,7 +631,7 @@ def build_moe_fused_route_quant_scatter_module(
                 gather_w_rsrc = ptr_rsrc(gather_w)
                 w_f32 = buffer_ops.buffer_load(wi_rsrc, route, vec_width=1, dtype=f32)
                 w_cast = arith.trunc_f(wdt, w_f32)
-                w_out = arith.select(is_drop, arith.constant(0.0, type=wdt), w_cast)
+                w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
                 buffer_ops.buffer_store(w_out, gather_w_rsrc, route)
 
             # Lane 0 claims the within-expert slot via atomicAdd, then broadcasts
@@ -639,18 +640,14 @@ def build_moe_fused_route_quant_scatter_module(
             # branch here.
             slot_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
-                counter_base = arith.index_cast(T.index, ptrtoint(counter))
-                expert_idx = arith.index_cast(T.index, expert)
-                counter_addr = fx.Index(counter_base) + fx.Index(expert_idx) * fx.Index(
-                    4
-                )
+                counter_addr = fx.Int64(ptrtoint(counter)) + fx.Int64(expert) * 4
                 counter_ptr = buffer_ops.create_llvm_ptr(counter_addr, address_space=1)
                 counter_ptr = (
                     counter_ptr._value
                     if hasattr(counter_ptr, "_value")
                     else counter_ptr
                 )
-                slot_on_lane0 = ArithValue(
+                slot_on_lane0 = fx.Uint32(
                     llvm.AtomicRMWOp(
                         llvm.AtomicBinOp.add,
                         counter_ptr,
@@ -662,15 +659,14 @@ def build_moe_fused_route_quant_scatter_module(
                 )
             # readlane needs raw ir.Value operands in this FlyDSL build (the
             # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
-            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
-            slot = ArithValue(slot)
+            slot = fx.Uint32(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
 
             # Destination row = per-expert base + within-expert slot. Masked
             # layout fuses the former Python-side arange(E)*max_m into this
             # kernel; contiguous-M still loads starts[e] from expert_row_base.
             if const_expr(use_expert_row_base):
                 erb_rsrc = ptr_rsrc(expert_row_base)
-                row_base = ArithValue(
+                row_base = fx.Uint32(
                     buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
                 )
             else:
@@ -679,7 +675,7 @@ def build_moe_fused_route_quant_scatter_module(
             if const_expr(topk_is_pow2):
                 token = route >> c_topk_shift
             else:
-                token = arith.divui(route, c_topk)
+                token = fx.Uint32(route) // fx.Uint32(c_topk)
 
             # topids_to_rows[route] = grouped_row (lane 0 only; warp-uniform value)
             if lane == 0:
@@ -690,22 +686,22 @@ def build_moe_fused_route_quant_scatter_module(
             #     grouped_row so the same math serves both output layouts). Since
             #     every expert base is a multiple of rows_per_tile, tiling by the
             #     global row reproduces the per-expert byte layout exactly. ---
-            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-            wmma_row = arith.divui(row_in_tile, c16_i32)
+            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             # dst dword base for out_row; scale_dword*wmma_rep added per block.
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
-            hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
+            payload_base = fx.Int64(ptrtoint(grouped_payload))
+            hidden_base = fx.Int64(ptrtoint(hidden))
             scale_rsrc = ptr_rsrc(grouped_scale)
 
             # this lane's position inside its MX block group
-            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+            is_block_lead = lane_in_block == c0_i32
 
             c = SimpleNamespace(
                 i32=i32,
@@ -746,7 +742,6 @@ def build_moe_fused_route_quant_scatter_module(
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_block_loop(c)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_fused(
@@ -892,19 +887,18 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
         c_max_m = arith.constant(max_m, type=i32)
 
-        tid = ArithValue(fx.thread_idx.x)
-        bid = ArithValue(fx.block_idx.x)
-        k_group = ArithValue(fx.block_idx.y)
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
+        k_group = fx.Uint32(fx.block_idx.y)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, ArithValue(numel))
-        _if_route = scf.IfOp(route_in_range)
-        with ir.InsertionPoint(_if_route.then_block):
+        route_in_range = fx.Uint32(route) < fx.Uint32(numel)
+        if route_in_range:
             topk_ids_rsrc = ptr_rsrc(topk_ids)
-            expert = ArithValue(
+            expert = fx.Uint32(
                 buffer_ops.buffer_load(topk_ids_rsrc, route, vec_width=1, dtype=i32)
             )
 
@@ -912,18 +906,18 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
             # token. Therefore each selected expert receives exactly one route:
             # slot=0, counter[expert]=1. This is the key small-token fast path;
             # the generic kernel remains available for non-single-token cases.
-            slot = ArithValue(c0_i32)
+            slot = fx.Uint32(0)
 
-            is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
-            is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-            is_lane0_k0 = arith.andi(is_lane0, is_k0)
+            is_lane0 = lane == c0_i32
+            is_k0 = k_group == c0_i32
+            is_lane0_k0 = is_lane0 & is_k0
             if is_lane0_k0:
                 counter_rsrc = ptr_rsrc(counter)
                 buffer_ops.buffer_store(c1_i32, counter_rsrc, expert)
 
             if const_expr(use_expert_row_base):
                 erb_rsrc = ptr_rsrc(expert_row_base)
-                row_base = ArithValue(
+                row_base = fx.Uint32(
                     buffer_ops.buffer_load(erb_rsrc, expert, vec_width=1, dtype=i32)
                 )
             else:
@@ -934,20 +928,20 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
                 topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
                 buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route)
 
-            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-            wmma_row = arith.divui(row_in_tile, c16_i32)
+            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
-            hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
+            payload_base = fx.Int64(ptrtoint(grouped_payload))
+            hidden_base = fx.Int64(ptrtoint(hidden))
             scale_rsrc = ptr_rsrc(grouped_scale)
 
-            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+            is_block_lead = lane_in_block == c0_i32
 
             c = SimpleNamespace(
                 i32=i32,
@@ -988,7 +982,6 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_one_k_group(c, k_group)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_fused(
@@ -1138,26 +1131,25 @@ def build_moe_fused_quant_preshuffle_module(
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
 
-        tid = ArithValue(fx.thread_idx.x)
-        bid = ArithValue(fx.block_idx.x)
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave  # tid % wave_size
         # one warp per grouped row (no routing: row == grouped row).
         row = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
-        row_in_range = arith.cmpi(CmpIPredicate.ult, row, ArithValue(n_rows))
-        _if_row = scf.IfOp(row_in_range)
-        with ir.InsertionPoint(_if_row.then_block):
-            m = ArithValue(max_m)
-            expert = ArithValue(arith.divui(row, m))
+        row_in_range = fx.Uint32(row) < fx.Uint32(n_rows)
+        if row_in_range:
+            m = fx.Uint32(max_m)
+            expert = fx.Uint32(row) // m
             slot = row - expert * m  # row within expert
 
             def _emit_row():
                 # --- per-row scale-preshuffle geometry (uniform; row pos == slot) ---
-                scale_tile = arith.divui(slot, c_rows_per_tile)
+                scale_tile = fx.Uint32(slot) // fx.Uint32(c_rows_per_tile)
                 row_in_tile = slot - scale_tile * c_rows_per_tile
-                wmma_row = arith.divui(row_in_tile, c16_i32)
+                wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
                 row_lane16 = row_in_tile - wmma_row * c16_i32
                 out_row = scale_tile * c16_i32 + row_lane16
                 scale_row_dword_base = (
@@ -1166,13 +1158,13 @@ def build_moe_fused_quant_preshuffle_module(
                     + wmma_row
                 )
 
-                payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
-                hidden_base = arith.index_cast(T.i64, ptrtoint(grouped_in))
+                payload_base = fx.Int64(ptrtoint(grouped_payload))
+                hidden_base = fx.Int64(ptrtoint(grouped_in))
                 scale_rsrc = ptr_rsrc(grouped_scale)
 
-                block_in_wave = arith.divui(lane, c_lanes_per_block)
+                block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
                 lane_in_block = lane - block_in_wave * c_lanes_per_block
-                is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+                is_block_lead = lane_in_block == c0_i32
 
                 c = SimpleNamespace(
                     i32=i32,
@@ -1219,17 +1211,14 @@ def build_moe_fused_quant_preshuffle_module(
                 # masked_m[expert], so quantizing them is pure waste. With high
                 # capacity-factor padding this elides most of the work.
                 masked_rsrc = ptr_rsrc(masked_m)
-                valid = ArithValue(
+                valid = fx.Uint32(
                     buffer_ops.buffer_load(masked_rsrc, expert, vec_width=1, dtype=i32)
                 )
-                slot_valid = arith.cmpi(CmpIPredicate.ult, slot, valid)
-                _if_valid = scf.IfOp(slot_valid)
-                with ir.InsertionPoint(_if_valid.then_block):
+                slot_valid = fx.Uint32(slot) < fx.Uint32(valid)
+                if slot_valid:
                     _emit_row()
-                    scf.YieldOp([])
             else:
                 _emit_row()
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_fused(
@@ -1354,8 +1343,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         c_source_topk = arith.constant(source_topk, type=i32)
         c_source_topk_shift = arith.constant(source_topk_shift, type=i32)
 
-        tid = ArithValue(fx.thread_idx.x)
-        bid = ArithValue(fx.block_idx.x)
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave
@@ -1366,59 +1355,46 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # are dead-tail padding rows of the dispatch buffer -> skip the gather+quant.
         # When truncation is disabled the caller passes a null pointer, which must
         # not be dereferenced, so the load is predicated rather than unconditional.
-        num_valid_routes_addr = arith.index_cast(T.i64, ptrtoint(num_valid_routes))
-        num_valid_routes_is_null = arith.cmpi(
-            CmpIPredicate.eq, num_valid_routes_addr, arith.constant(0, type=T.i64)
-        )
-        _if_valid_routes = scf.IfOp(
-            num_valid_routes_is_null, results_=[i32], has_else=True
-        )
-        with ir.InsertionPoint(_if_valid_routes.then_block):
-            scf.YieldOp([ArithValue(numel)])
-        with ir.InsertionPoint(_if_valid_routes.else_block):
-            scf.YieldOp(
-                [
-                    buffer_ops.buffer_load(
-                        ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
-                    )
-                ]
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        valid_route_count = fx.Uint32(numel)
+        if num_valid_routes_is_set:
+            valid_route_count = fx.Uint32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(num_valid_routes), c0_i32, vec_width=1, dtype=i32
+                )
             )
-        valid_route_count = ArithValue(_if_valid_routes.results[0])
-        route_in_range = arith.cmpi(CmpIPredicate.ult, route, valid_route_count)
-        _if_route = scf.IfOp(route_in_range)
-        with ir.InsertionPoint(_if_route.then_block):
+        route_in_range = fx.Uint32(route) < fx.Uint32(valid_route_count)
+        if route_in_range:
             rows_rsrc = ptr_rsrc(topids_to_rows)
-            row = ArithValue(
+            row = fx.Uint32(
                 buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
             )
             if const_expr(remap_rows):
-                m = ArithValue(route_max_m)
-                expert = ArithValue(arith.divui(row, m))
+                m = fx.Uint32(route_max_m)
+                expert = fx.Uint32(row) // m
                 slot = row - expert * m
                 starts_rsrc = ptr_rsrc(row_starts)
                 row = (
-                    ArithValue(
+                    fx.Uint32(
                         buffer_ops.buffer_load(
                             starts_rsrc, expert, vec_width=1, dtype=i32
                         )
                     )
                     + slot
                 )
-                is_lane0 = arith.cmpi(CmpIPredicate.eq, lane, c0_i32)
+                is_lane0 = lane == c0_i32
                 if const_expr(ksplit):
-                    k_group = ArithValue(fx.block_idx.y)
-                    is_k0 = arith.cmpi(CmpIPredicate.eq, k_group, c0_i32)
-                    store_cond = arith.andi(is_lane0, is_k0)
+                    k_group = fx.Uint32(fx.block_idx.y)
+                    is_k0 = k_group == c0_i32
+                    store_cond = is_lane0 & is_k0
                 else:
                     store_cond = is_lane0
-                _if_store = scf.IfOp(store_cond)
-                with ir.InsertionPoint(_if_store.then_block):
+                if store_cond:
                     buffer_ops.buffer_store(row, rows_rsrc, route)
-                    scf.YieldOp([])
 
-            scale_tile = arith.divui(row, c_rows_per_tile)
+            scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = row - scale_tile * c_rows_per_tile
-            wmma_row = arith.divui(row_in_tile, c16_i32)
+            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
@@ -1427,18 +1403,18 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 if const_expr(source_topk_is_pow2):
                     source_row = route >> c_source_topk_shift
                 else:
-                    source_row = arith.divui(route, c_source_topk)
+                    source_row = fx.Uint32(route) // fx.Uint32(c_source_topk)
                 feat_row_i32 = source_row
             else:
                 feat_row_i32 = row
 
             scale_rsrc = ptr_rsrc(grouped_scale)
-            payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
-            hidden_base = arith.index_cast(T.i64, ptrtoint(grouped_in))
+            payload_base = fx.Int64(ptrtoint(grouped_payload))
+            hidden_base = fx.Int64(ptrtoint(grouped_in))
 
-            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+            is_block_lead = lane_in_block == c0_i32
 
             qc = SimpleNamespace(
                 i32=i32,
@@ -1479,11 +1455,10 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 scale_rsrc=scale_rsrc,
             )
             if const_expr(ksplit):
-                k_group_val = ArithValue(fx.block_idx.y)
+                k_group_val = fx.Uint32(fx.block_idx.y)
                 _emit_quant_one_k_group(qc, k_group_val)
             else:
                 _emit_quant_block_loop(qc)
-            scf.YieldOp([])
 
     _grid_y_dim = block_iters if ksplit else 1
 
@@ -1675,15 +1650,13 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 rocdl.s_waitcnt(0)
 
         def _elem_ptr(tensor, elem_idx_i32):
-            base = arith.index_cast(T.index, ptrtoint(tensor))
-            idx = arith.index_cast(T.index, elem_idx_i32)
-            addr = fx.Index(base) + idx * fx.Index(4)
+            addr = fx.Int64(ptrtoint(tensor)) + fx.Int64(elem_idx_i32) * 4
             p = buffer_ops.create_llvm_ptr(addr, address_space=1)
             return p._value if hasattr(p, "_value") else p
 
         def _atomic_add(tensor, elem_idx_i32, addend):
             ptr = _elem_ptr(tensor, elem_idx_i32)
-            return ArithValue(
+            return fx.Uint32(
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.add,
                     ptr,
@@ -1694,13 +1667,13 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 ).result
             )
 
-        tid = ArithValue(fx.thread_idx.x)
-        bid = ArithValue(fx.block_idx.x)
+        tid = fx.Uint32(fx.thread_idx.x)
+        bid = fx.Uint32(fx.block_idx.x)
 
         warp_in_block = tid // c_wave
         lane = tid - warp_in_block * c_wave  # tid % wave_size
         route0 = bid * c_warps_per_block + warp_in_block  # first route this warp owns
-        stride = ArithValue(num_workers) * c_warps_per_block
+        stride = fx.Uint32(num_workers) * c_warps_per_block
 
         topk_ids_rsrc = ptr_rsrc(topk_ids)
         count_rsrc = ptr_rsrc(count)
@@ -1709,47 +1682,34 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # Strided warp-per-route histogram into ``count`` (== masked_m). Loop bounds
         # are warp-uniform (lane-independent) so the post-phase gpu.barrier() is hit
         # by every thread of the block.
-        route0_idx = arith.index_cast(T.index, route0)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
-        stride_idx = arith.index_cast(T.index, stride)
-        loop1 = scf.ForOp(route0_idx, numel_idx, stride_idx)
-        with ir.InsertionPoint(loop1.body):
-            route_i32 = arith.index_cast(i32, loop1.induction_variable)
-            expert = ArithValue(
+        numel_i32 = fx.Uint32(numel)
+        for route_i32 in range(route0, numel_i32, stride):
+            expert = fx.Uint32(
                 buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
             )
             if lane == 0:
                 _atomic_add(count, expert, c1_i32)
-            scf.YieldOp([])
 
         # ===================== Barrier A + Phase 2: prefix sum ==================
         gpu.barrier()
         _wait_mem()
         rocdl.sched_barrier(0)
 
-        is_block_leader = arith.cmpi(CmpIPredicate.eq, tid, c0_i32)
-        _if_leader = scf.IfOp(is_block_leader)
-        with ir.InsertionPoint(_if_leader.then_block):
+        is_block_leader = tid == c0_i32
+        if is_block_leader:
             my_arrival = _atomic_add(barrier, c0_i32, c1_i32)
-            nwm1 = ArithValue(num_workers) - c1_i32
-            is_last = arith.cmpi(CmpIPredicate.eq, my_arrival, nwm1)
-            is_not_last = arith.cmpi(CmpIPredicate.ne, my_arrival, nwm1)
+            nwm1 = fx.Uint32(num_workers) - 1
+            is_last = my_arrival == nwm1
+            is_not_last = my_arrival != nwm1
 
             # Last arriver: every block has bumped ``count`` (its atomics committed
             # to L2 before its arrival atomic). Serial tile-aligned prefix sum,
             # mirroring moe_contiguous_psum, reading ``count`` coherently.
-            _if_last = scf.IfOp(is_last)
-            with ir.InsertionPoint(_if_last.then_block):
-                tile_v = ArithValue(tile_m)
+            if is_last:
+                tile_v = fx.Uint32(tile_m)
                 tile_minus_1 = tile_v - c1_i32
-                e_upper = arith.index_cast(T.index, ArithValue(experts))
-                c0_idx = arith.index(0)
-                c1_idx = arith.index(1)
-                ploop = scf.ForOp(c0_idx, e_upper, c1_idx, [c0_i32])
-                with ir.InsertionPoint(ploop.body):
-                    e = ploop.induction_variable
-                    cur = ploop.inner_iter_args[0]
-                    e_i32 = arith.index_cast(i32, e)
+                cur = fx.Uint32(0)
+                for e_i32 in range(c0_i32, fx.Uint32(experts), 1):
                     # This serial prefix sum runs in a single thread of the global
                     # last-arriver block, after the cross-block barrier guarantees
                     # every block's count atomics are committed.
@@ -1769,43 +1729,29 @@ def build_moe_fused_route_psum_quant_scatter_module(
                     # producer/consumer pattern that is reliably L2-coherent on
                     # gfx1250; the inline-asm coherent store can linger in this
                     # block's L0 and not be visible to Phase 3 readers in time.
-                    cnt = ArithValue(
+                    cnt = fx.Uint32(
                         buffer_ops.buffer_load(
                             count_rsrc, e_i32, vec_width=1, dtype=i32
                         )
                     )
-                    q = arith.divui(cnt + tile_minus_1, tile_v)
-                    aligned = ArithValue(q) * tile_v
+                    aligned = (cnt + tile_minus_1) // tile_v * tile_v
                     _atomic_add(starts, e_i32, _raw(cur))
-                    _atomic_add(psum, e_i32, _raw(ArithValue(cur) + cnt))
-                    next_cur = ArithValue(cur) + ArithValue(aligned)
-                    scf.YieldOp([next_cur])
+                    _atomic_add(psum, e_i32, _raw(cur + cnt))
+                    cur = cur + aligned
                 # Ensure starts/psum land in L2 before the release flag is visible,
                 # then publish the release with an agent-scope atomic (the inline-asm
                 # coherent store/load barrier is unreliable on gfx1250 -- readers can
                 # observe the flag set before starts/psum are visible).
                 _wait_mem()
                 _atomic_add(barrier, c1_i32, c1_i32)
-                scf.YieldOp([])
 
             # Other blocks: spin on the release flag until the last block publishes.
-            _if_nl = scf.IfOp(is_not_last)
-            with ir.InsertionPoint(_if_nl.then_block):
-                init_cur = arith.constant(0, type=i32)
-                w = scf.WhileOp([i32], [init_cur])
-                before = ir.Block.create_at_start(w.before, [i32])
-                after = ir.Block.create_at_start(w.after, [i32])
-                with ir.InsertionPoint(before):
-                    cur_w = before.arguments[0]
-                    need_wait = arith.cmpi(CmpIPredicate.eq, cur_w, c0_i32)
-                    scf.ConditionOp(need_wait, [cur_w])
-                with ir.InsertionPoint(after):
+            if is_not_last:
+                rel = fx.Uint32(0)
+                while rel == 0:
                     # Coherent read via agent-scope atomic add of 0 (reliable on
                     # gfx1250, unlike the inline-asm coherent load).
                     rel = _atomic_add(barrier, c1_i32, c0_i32)
-                    scf.YieldOp([_raw(rel)])
-                scf.YieldOp([])
-            scf.YieldOp([])
 
         # All threads converge here; the leader has observed the release flag, so
         # ``starts`` is committed and visible to coherent reads in Phase 3.
@@ -1820,15 +1766,13 @@ def build_moe_fused_route_psum_quant_scatter_module(
         # sum: it can return a stale 0 instead of the published row base, which
         # scatters the first route of an expert into row 0).
         starts_rd_rsrc = ptr_rsrc(starts)
-        payload_base = arith.index_cast(T.i64, ptrtoint(grouped_payload))
-        hidden_base = arith.index_cast(T.i64, ptrtoint(hidden))
+        payload_base = fx.Int64(ptrtoint(grouped_payload))
+        hidden_base = fx.Int64(ptrtoint(hidden))
         scale_rsrc = ptr_rsrc(grouped_scale)
         topids_to_rows_rsrc = ptr_rsrc(topids_to_rows)
 
-        loop3 = scf.ForOp(route0_idx, numel_idx, stride_idx)
-        with ir.InsertionPoint(loop3.body):
-            route_i32 = arith.index_cast(i32, loop3.induction_variable)
-            expert = ArithValue(
+        for route_i32 in range(route0, numel_i32, stride):
+            expert = fx.Uint32(
                 buffer_ops.buffer_load(topk_ids_rsrc, route_i32, vec_width=1, dtype=i32)
             )
 
@@ -1841,27 +1785,27 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 rowbase_on_lane0 = buffer_ops.buffer_load(
                     starts_rd_rsrc, _raw(expert), vec_width=1, dtype=i32
                 )
-            slot = ArithValue(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
-            row_base = ArithValue(
+            slot = fx.Uint32(rocdl.readlane(i32, _raw(slot_on_lane0), _raw(c0_i32)))
+            row_base = fx.Uint32(
                 rocdl.readlane(i32, _raw(rowbase_on_lane0), _raw(c0_i32))
             )
             grouped_row = slot + row_base
-            token = arith.divui(route_i32, c_topk)
+            token = fx.Uint32(route_i32) // fx.Uint32(c_topk)
 
             if lane == 0:
                 buffer_ops.buffer_store(grouped_row, topids_to_rows_rsrc, route_i32)
 
             # per-row scale-preshuffle geometry from the global grouped_row.
-            scale_tile = arith.divui(grouped_row, c_rows_per_tile)
+            scale_tile = fx.Uint32(grouped_row) // fx.Uint32(c_rows_per_tile)
             row_in_tile = grouped_row - scale_tile * c_rows_per_tile
-            wmma_row = arith.divui(row_in_tile, c16_i32)
+            wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)
             row_lane16 = row_in_tile - wmma_row * c16_i32
             out_row = scale_tile * c16_i32 + row_lane16
             scale_row_dword_base = out_row * c_dst_scale_dwords_per_row + wmma_row
 
-            block_in_wave = arith.divui(lane, c_lanes_per_block)
+            block_in_wave = fx.Uint32(lane) // fx.Uint32(c_lanes_per_block)
             lane_in_block = lane - block_in_wave * c_lanes_per_block
-            is_block_lead = arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32)
+            is_block_lead = lane_in_block == c0_i32
 
             c = SimpleNamespace(
                 i32=i32,
@@ -1902,7 +1846,6 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 scale_rsrc=scale_rsrc,
             )
             _emit_quant_block_loop(c)
-            scf.YieldOp([])
 
     @flyc.jit
     def launch_fused(
