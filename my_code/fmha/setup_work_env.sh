@@ -20,9 +20,9 @@ set -euo pipefail
 # export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -i ~/.ssh/id_rsa.hyg -o IdentitiesOnly=yes}"
 export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -i /data/yanguahe/code/id_rsa.hyg -o IdentitiesOnly=yes}"
 # export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/pytorch:rocm7.1_ubuntu24.04_py3.12_pytorch_release_2.8.0}"
-# export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/fw-bringup:gfx1250-atom-dev-team-20260626}"
+export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/fw-bringup:gfx1250-atom-dev-team-20260626}"
 # export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/fw-bringup:satya_rocprofv3_2026_06_01}"
-export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/fw-bringup:gfx1250-atom-dev-20260713-ep4_flydsl}"
+# export DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/fw-bringup:gfx1250-atom-dev-20260713-ep4_flydsl}"
 export PERF_TEST_CMD="${PERF_TEST_CMD:-}"
 export FLYDSL_BUILD_JOBS="${FLYDSL_BUILD_JOBS:-128}"
 export HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
@@ -141,8 +141,9 @@ CLONE_REPO_REFS=(
     ""
 
     # FlyDSL
-    ""
+    # ""
     # "v0.1.8"
+    "v0.2.4"
 
     # triton
     ""
@@ -453,6 +454,8 @@ checkout_repo_branch() {
     fi
 
     echo "  -> Current branch is $current_branch, switching to requested branch $repo_branch..."
+    echo "  -> Discarding local changes (git reset --hard) before switching..."
+    git reset --hard
     if git show-ref --verify --quiet "refs/heads/$repo_branch"; then
         git checkout "$repo_branch"
     elif git show-ref --verify --quiet "refs/remotes/origin/$repo_branch"; then
@@ -483,6 +486,8 @@ checkout_repo_ref() {
         die "Cannot resolve commit/tag '$repo_ref' in $(pwd)."
     fi
 
+    echo "  -> Discarding local changes (git reset --hard) before switching..."
+    git reset --hard
     git checkout "$repo_ref"
     echo "  -> Checked out ref $repo_ref."
 }

@@ -1,0 +1,11 @@
+alias gst='git status'
+alias gsth='git status | head'
+alias gstt='git status | tail'
+alias glog='git log | head'
+alias gb='git branch'
+alias gc='git checkout'
+alias fomm='git fetch origin master:master'
+alias rebhm='git rebase HEAD^ HEAD --onto=master'
+alias phhd='git push origin HEAD:refs/for/master'
+
+export GIT_SSH_COMMAND='ssh -i /data/yanguahe/code/id_rsa.hyg -o IdentitiesOnly=yes'
