@@ -996,7 +996,7 @@ def _run_perf_comparison(args: PrefillArgs):
     context_lens = args.resolve_context_lens()
     k, _w_orig, _u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(context_lens, args=args)
     ofs = args.output_final_state
-    total_tokens = int(cu[-1].item())
+    total_tokens = int(cu[-1].item()) if cu is not None else sum(context_lens)
 
     us_fly = _bench_fn(
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
