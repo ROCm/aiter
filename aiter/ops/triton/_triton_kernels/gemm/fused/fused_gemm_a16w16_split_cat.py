@@ -126,6 +126,10 @@ def _fused_gemm_a16w16_split_cat(
                 other=0.0,
                 cache_modifier=cache_modifier,
             )
+        # A may be fp8 (the MLA fp8 KV latent fed in without a prior dequant);
+        # upconvert to the weight dtype before the dot. For a bf16/fp16 A this
+        # is a no-op, so the original a16w16 path is unchanged.
+        a = a.to(b.dtype)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_SIZE_K * stride_a_k
         b_ptrs += BLOCK_SIZE_K * stride_b_k
