@@ -12,7 +12,13 @@ from aiter.fused_moe import (
     _is_fused_decode_sort_quant_enabled,
     moe_sorting,
 )
-from aiter.ops.quant import fused_dynamic_mxfp4_quant_moe_sort, per_1x32_f4_quant_hip
+from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
+from aiter.ops.quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
+    mxfp4_moe_sort_fwd,
+    per_1x32_f4_quant_hip,
+)
+from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="ROCm/CUDA device is required"
@@ -267,3 +273,140 @@ def test_fused_sort_quant_is_cuda_graph_replay_safe(experts, topk):
 
     assert int(fused[3][1].item()) == 4
     torch.testing.assert_close(fused[4], torch.zeros_like(fused[4]))
+
+
+@pytest.mark.parametrize("out_dtype", ["bf16", "fp4"])
+@pytest.mark.parametrize("k_wave", [1, 2, 4])
+def test_flydsl_compact_scale_consumer_matches_conventional_layout(k_wave, out_dtype):
+    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "").split(":")[0]
+    if arch != "gfx950":
+        pytest.skip("compact-scale FlyDSL consumer is currently gfx950-only")
+
+    # Use Kimi's production K dimension. In particular, kw4 traverses seven
+    # K tiles per wave and exercises the compact-scale main loop plus odd tail.
+    tokens, hidden_size, inter_dim, experts, topk = 8, HIDDEN, 128, 16, 4
+    torch.manual_seed(20260715)
+    hidden = (
+        torch.randn((tokens, hidden_size), dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    topk_ids = torch.stack(
+        [
+            torch.randperm(experts, dtype=torch.int32, device="cuda")[:topk]
+            for _ in range(tokens)
+        ]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
+    sorted_ids, _, sorted_experts, num_valid_ids, _ = moe_sorting(
+        topk_ids,
+        topk_weights,
+        experts,
+        hidden_size,
+        dtypes.bf16,
+        BLOCK_M,
+    )
+
+    activation_quant, compact_scale = per_1x32_f4_quant_hip(hidden, shuffle=False)
+    conventional_scale = mxfp4_moe_sort_fwd(
+        compact_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=tokens,
+        cols=hidden_size,
+    )
+
+    quantize = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+    weight = (
+        torch.randn(
+            (experts, 2 * inter_dim, hidden_size),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        * 0.1
+    )
+    weight_quant, weight_scale = quantize(weight, quant_dtype=dtypes.fp4x2)
+    weight_quant = weight_quant.view(experts, 2 * inter_dim, hidden_size // 2)
+    weight_quant = shuffle_weight_a16w4(weight_quant, 16, True)
+    weight_scale = shuffle_scale_a16w4(weight_scale, experts, True)
+
+    kwargs = {
+        "a": activation_quant,
+        "w1": weight_quant,
+        "sorted_token_ids": sorted_ids,
+        "sorted_expert_ids": sorted_experts,
+        "num_valid_ids": num_valid_ids,
+        "out": None,
+        "topk": topk,
+        "tile_m": 32,
+        "tile_n": 32,
+        "tile_k": 256,
+        "a_dtype": "fp4",
+        "b_dtype": "fp4",
+        "out_dtype": out_dtype,
+        "act": "silu",
+        "w1_scale": weight_scale,
+        "sorted_weights": None,
+        "use_async_copy": True,
+        "waves_per_eu": 3,
+        "b_nt": 2,
+        "gate_mode": "separated",
+        "k_wave": k_wave,
+    }
+    reference = flydsl_moe_stage1(
+        a1_scale=conventional_scale,
+        a_scale_compact=False,
+        **kwargs,
+    )
+    compact = flydsl_moe_stage1(
+        a1_scale=compact_scale,
+        a_scale_compact=True,
+        **kwargs,
+    )
+    torch.cuda.synchronize()
+
+    def assert_outputs_equal(actual, expected):
+        if out_dtype == "bf16":
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            return
+
+        actual_out, actual_scale = actual
+        expected_out, expected_scale = expected
+        torch.testing.assert_close(
+            actual_out.view(torch.uint8),
+            expected_out.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        num_sorted = int(num_valid_ids[0].item())
+        valid_rows = sorted_ids[:num_sorted].bitwise_and(0x00FFFFFF) != tokens
+        scale_cols = inter_dim // 32
+        padded_scale_cols = (scale_cols + 7) // 8 * 8
+        row = valid_rows.nonzero().flatten().unsqueeze(1)
+        col = torch.arange(scale_cols, device="cuda").unsqueeze(0)
+        scale_positions = (
+            (row >> 5) * (padded_scale_cols * 32)
+            + (col >> 3) * 256
+            + (col & 3) * 64
+            + (row & 15) * 4
+            + ((col >> 2) & 1) * 2
+            + ((row >> 4) & 1)
+        ).flatten()
+        torch.testing.assert_close(
+            actual_scale.view(torch.uint8).flatten()[scale_positions],
+            expected_scale.view(torch.uint8).flatten()[scale_positions],
+            rtol=0,
+            atol=0,
+        )
+
+    assert_outputs_equal(compact, reference)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = flydsl_moe_stage1(
+            a1_scale=compact_scale,
+            a_scale_compact=True,
+            **kwargs,
+        )
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert_outputs_equal(replayed, reference)
