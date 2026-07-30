@@ -695,7 +695,7 @@ def test_mla(
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == torch.bfloat16
-        and nhead <= 16
+        and nhead <= 96
         and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
@@ -803,7 +803,7 @@ parser.add_argument(
     "--nhead",
     type=dtypes.str2tuple,
     choices=(
-        [(nh, q) for nh in (4, 8, 12, 16) for q in range(1, 18)]
+        [(nh, q) for nh in (4, 8, 12, 16, 96) for q in range(1, 18)]
         + [
             (32, 1),
             (32, 2),

@@ -40,19 +40,14 @@ from flydsl._mlir.dialects import (
     llvm as _llvm,
 )
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-)
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from flydsl.expr.utils.arith import _to_raw as _raw
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .kernels_common import dtype_to_elem_type
 from .tensor_shim import _run_compiled

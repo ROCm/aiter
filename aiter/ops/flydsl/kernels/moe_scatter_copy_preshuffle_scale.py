@@ -66,10 +66,11 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, range_constexpr, vector
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,

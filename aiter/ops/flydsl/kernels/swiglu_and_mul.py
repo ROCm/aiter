@@ -24,9 +24,11 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, range_constexpr
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 BLOCK_THREADS = 256
 NLANE = 16
