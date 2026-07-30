@@ -26,11 +26,12 @@ import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.gemm_mxscale_gfx1250 import (
     compile_a8w4_gemm,
     compile_mxfp4_gemm,

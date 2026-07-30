@@ -15,7 +15,6 @@ from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     idx2crd,
@@ -24,13 +23,14 @@ from flydsl.expr import (
     range_constexpr,
     rocdl,
     tdm_ops,
-    vector,
 )
 from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr, check_smem_capacity
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     extract_lds_base_idx,
     get_lds_memref,
@@ -45,6 +45,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     store_acc_vec8_to_buffer,
     store_acc_vec8_to_lds,
 )
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 from aiter.ops.flydsl.kernels.pipeline_utils import (
     make_tail_plan,
     tdm_epilogue_fence_threshold_bytes,
@@ -880,8 +881,8 @@ def compile_mxscale_gemm(
                 _oob_a_row_bound = group_m_base + arith.index_cast(T.index, valid_m_i32)
 
             if const_expr(use_cluster):
-                local_x, local_y = gpu.compute_cluster_position()
-                a_mcast_mask, b_mcast_mask = gpu.compute_mcast_masks(
+                local_x, local_y = cluster.compute_cluster_position()
+                a_mcast_mask, b_mcast_mask = compute_mcast_masks(
                     local_x, local_y, cluster_m, cluster_n
                 )
             else:

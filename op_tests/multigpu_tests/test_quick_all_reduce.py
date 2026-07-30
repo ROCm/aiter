@@ -13,6 +13,7 @@ import torch.distributed as dist
 import aiter as ops
 from aiter import dtypes
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
+from aiter.dist.device_communicators.quick_all_reduce import qr_exchange_handles
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -147,11 +148,8 @@ def qr_variable_input(rank, world_size):
     )
     cpu_group = torch.distributed.new_group(ranks, backend="nccl")
 
-    handle = ops.qr_get_handle(_ptr)
     world_size = dist.get_world_size(group=cpu_group)
-    handles = [None] * world_size
-    dist.all_gather_object(handles, handle, group=cpu_group)
-    ops.qr_open_handles(_ptr, handles)
+    qr_exchange_handles(_ptr, world_size, cpu_group)
 
     num = 1
     s1 = 1024
