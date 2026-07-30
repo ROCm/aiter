@@ -585,22 +585,22 @@ class EpDispatchCombineOp:
                 combine_specs = [(_b, _w)]
             elif cfg.is_fused:
                 # The fused combine is an xdb cross-device barrier + a light
-                # per-(token,k) topk sum. The sum is HBM-bandwidth bound, so at any
-                # non-trivial token count it wants a BIG grid that fills all CUs
-                # (gfx1250 has 256 CUs) -- the old 8-block grid used ~3% of the GPU
-                # and ran at ~460 GB/s; a 512-block grid + _UNROLL=1 (low VGPR ->
-                # high occupancy) hits ~4200 GB/s read (bs2048), ~7x faster. At tiny
-                # token counts the barrier dominates and prefers FEW blocks (2x16).
-                # Precompile both and pick by token count at runtime (_combine_fused).
-                # Token-adaptive tiers (count_upper_bound, (block, warp)); last is
-                # the catch-all. Tiny counts are barrier-bound and want few blocks;
-                # once the per-token sum dominates the grid must fill all 256 CUs.
-                # A single big grid (512x16) over-splits mid counts (each warp gets
-                # < the vec4 chunk), so mid tiers keep warps_per_tok sane.
+                # per-(token,k) topk sum. That sum is *tiny* (tens of MB) so the
+                # kernel is dominated by the cross-BLOCK grid barrier (block 0 signals
+                # every block via comb_bar, then waits for all of them to report). That
+                # handshake serializes with block_num, so once block_num exceeds what
+                # co-resides on the 256-CU GPU the kernel falls off a cliff: at bs512 a
+                # 512-block grid ran ~1255 us/call vs ~94 us/call for a 16-block grid
+                # (~13x). The reduce is not big enough to be HBM bound here, so the
+                # right geometry is the FEWEST blocks that still saturate HBM --
+                # empirically 8-32 blocks across bs128..bs2048 (best per_layer, and
+                # scatter_fused then beats gather). Token-adaptive tiers
+                # (count_upper_bound, (block, warp)); block count grows very gently
+                # with tokens and stays small. Override via SCATTER_COMB_BW to retune.
                 self._fused_comb_tiers = [
-                    (32, (2, 16)),
-                    (192, (64, 16)),
-                    (None, (512, 16)),
+                    (256, (8, 16)),
+                    (1024, (16, 16)),
+                    (None, (32, 16)),
                 ]
                 combine_specs = [s for _, s in self._fused_comb_tiers]
             else:
