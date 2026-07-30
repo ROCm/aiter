@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP8 MQA logits (DeepSeek lightning indexer) -- FlyDSL gfx942 kernel.
+"""FP8 MQA logits (DeepSeek lightning indexer) -- FlyDSL gfx942/gfx950 kernel.
 
 Compute for each query row ``m`` and KV position ``n``
 inside that row's window ``[cu_starts[m], cu_ends[m])``::
@@ -29,19 +29,22 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.rocdl import _split_mfma_operands, _unwrap_mfma_operand
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
 from flydsl._mlir.dialects import scf, vector as mlir_vector
+from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl._mlir.dialects.rocdl import mfma_f32_32x32x16_fp8_fp8 as _ods_mfma32x32x16
 from flydsl._mlir.dialects.rocdl import (
     mfma_scale_f32_32x32x64_f8f6f4 as _ods_mfma_scale32x32x64,
 )
 from flydsl._mlir import ir
+from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.runtime.device import get_rocm_arch
+from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import GTensor, _run_compiled, _to_raw
+from .tensor_shim import GTensor, STensor, _run_compiled, _to_raw
 
 Vec = fx.Vector
 
@@ -811,6 +814,484 @@ def _build_kernel_mfma_r_w(*, num_heads: int, head_size: int, block_kv: int,
     return launch_fp8_mqa_logits_mfma_r_w
 
 
+def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int,
+                                rows_per_block: int, waves_per_block: int,
+                                mfma: MfmaAtom,
+                                convert_q_fn: bool = False,
+                                convert_kv_fn: bool = False,
+                                swizzle: bool = False):
+    """LDS double-buffered variant (gfx950 scaled atoms only).
+
+    Parallel to ``_build_kernel_mfma_r_w`` but stages KV through a 2-slot LDS
+    double buffer filled by async global->LDS DMA (``raw_ptr_buffer_load_lds``),
+    with an explicit software pipeline (prefetch tile 0/1, then per-tile
+    ``s_waitcnt`` + prefetch(i+2) + compute).
+
+    Work partition (the key difference vs the direct-load builder):
+      * All ``WPB`` waves cooperatively load ONE ``BKV``-wide K-tile into LDS and
+        all read it -- so waves no longer own disjoint columns. Instead each wave
+        owns a disjoint group of ``RPB`` query ROWS and iterates over ALL
+        ``N_TILES`` columns of the shared LDS tile.
+      * A block owns ``ROWS_PER_BLOCK = RPB * WPB`` query rows (wave ``w`` owns
+        rows ``[w*RPB, (w+1)*RPB)``). KV reuse factor becomes ``RPB * WPB``.
+
+    The epilogue (per-lane scalar ReLU/weight + ``shuffle_xor`` butterfly +
+    predicated store) is kept identical to the direct-load builder.
+    """
+    H   = num_heads
+    D   = head_size
+    BKV = block_kv
+    RPB = rows_per_block
+    WPB = waves_per_block
+    MR_BLOCK_THREADS = 64 * WPB
+    ROWS_PER_BLOCK = RPB * WPB
+
+    assert mfma.frag_bytes == 32, (
+        "_build_kernel_mfma_lds_pipe currently supports only the CDNA4 scaled "
+        "atoms (frag_bytes=32)."
+    )
+    assert H % mfma.MFMA_M == 0
+    assert BKV % mfma.MFMA_N == 0
+    assert D % mfma.MFMA_K == 0
+    assert RPB >= 1 and WPB >= 1
+
+    N_TILES = BKV // mfma.MFMA_N
+    M_TILES = H   // mfma.MFMA_M
+    K_STEPS = D   // mfma.MFMA_K
+
+    # LDS double buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
+    # column index). Addressed as i32 dwords for the vector reads.
+    NUM_BUFFERS = 2
+    SLOT_BYTES  = BKV * D                 # fp8, 1 byte/elem
+    SLOT_I32    = SLOT_BYTES // 4
+    DMA_BYTES   = 16                       # dwordx4 async load per lane
+    assert SLOT_BYTES % (MR_BLOCK_THREADS * DMA_BYTES) == 0, (
+        f"SLOT_BYTES={SLOT_BYTES} must be divisible by "
+        f"MR_BLOCK_THREADS*DMA_BYTES={MR_BLOCK_THREADS * DMA_BYTES}"
+    )
+    NUM_ASYNC_LOADS = SLOT_BYTES // (MR_BLOCK_THREADS * DMA_BYTES)
+
+    # XOR swizzle (bank-conflict avoidance), aligned with the Gluon reference's
+    # padded+swizzled shared K layout.  The slot stores [BKV, D] fp8 HEAD_SIZE-
+    # contiguous, so per column the D bytes are DW_PER_COL i32 dwords.  A B-frag
+    # read gathers a fixed CHUNK_DW-dword slice of the head dim across the 32/16
+    # lanes of a KV-column group; since the per-column stride D/4 is a multiple
+    # of the 32 LDS banks, every lane hits the same banks (up to 32-way
+    # conflict).  XOR-ing the within-column chunk index with a function of the
+    # column index n scatters the NC chunks across the banks, cutting the
+    # conflict by NC (=D/frag_bytes) while keeping each frag read (and each
+    # 16B DMA write) contiguous, because the XOR mask is a multiple of CHUNK_DW.
+    #   phys_dword(n, c) = n*DW_PER_COL + (c XOR ((n & (NC-1)) * CHUNK_DW))
+    DW_PER_COL = D // 4                    # i32 dwords per KV column (head dim)
+    CHUNK_DW   = mfma.frag_bytes // 4      # dwords per B-frag read (=8)
+    NC         = DW_PER_COL // CHUNK_DW    # chunks per column (D/frag_bytes)
+    if swizzle:
+        assert NC >= 2, (
+            f"swizzle needs D/frag_bytes>=2 (D={D}, frag_bytes={mfma.frag_bytes})"
+        )
+
+    fm_fast = arith.FastMathFlags.fast
+    mfma_fn = mfma.fn
+
+    allocator = SmemAllocator(None, arch=arch)
+    lds_off = allocator._align(allocator.ptr, 128)
+    allocator.ptr = lds_off + NUM_BUFFERS * SLOT_BYTES
+
+    _kname = (
+        f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
+        f"_bkv{BKV}_r{RPB}_w{WPB}_lds2{'_swizzled' if swizzle else ''}_flydsl"
+    )
+
+    @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
+    def kernel(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        kv_scales: fx.Tensor,
+        weights: fx.Tensor,
+        cu_starts: fx.Tensor,
+        cu_ends: fx.Tensor,
+        logits: fx.Tensor,
+        seq_len: fx.Int32,          # padded to a multiple of ROWS_PER_BLOCK
+        seq_len_kv: fx.Int32,
+        stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,
+    ):
+        f32_0 = arith.constant(0.0, type=T.f32)
+        _mfma_res_ty = Vec.make_type(mfma.ACC_ELEMS, fx.Float32)
+
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        # Block bid (reversed) owns rows [block_row0, block_row0+ROWS_PER_BLOCK).
+        n_blocks = fx.Int32(arith.ceildivui(
+            _to_raw(seq_len), _to_raw(fx.Int32(ROWS_PER_BLOCK))
+        ))
+        block_row0 = fx.Int32(arith.muli(
+            _to_raw(n_blocks - bid - fx.Int32(1)),
+            _to_raw(fx.Int32(ROWS_PER_BLOCK)),
+        ))
+
+        wave = fx.Int32(arith.divui(_to_raw(tid), _to_raw(fx.Int32(64))))
+        lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
+        lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
+        lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(mfma.MFMA_N))))
+        lane_frag_off = fx.Int32(
+            arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(mfma.frag_bytes)))
+        )
+        # First row owned by THIS wave.
+        wave_row0 = _i32_add(
+            block_row0,
+            fx.Int32(arith.muli(_to_raw(wave), _to_raw(fx.Int32(RPB)))),
+        )
+
+        q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
+        kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
+        kv_rsrc = kv_i32.rsrc
+        sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
+        w_t = GTensor(weights, dtype=T.f32, shape=(-1, H))
+        cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
+        ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
+        _stride_i64 = arith.extui(T.i64, _to_raw(stride_logits_s))
+
+        def _make_out_row_t(row_i32):
+            _ri64 = arith.extui(T.i64, _to_raw(row_i32))
+            _byte = arith.muli(arith.muli(_ri64, _stride_i64),
+                               arith.constant(4, type=T.i64))
+            _idx  = arith.index_cast(T.index, _byte)
+            return GTensor(logits, dtype=T.f32, shape=(-1,),
+                           static_bytes_offset_i64=_idx)
+
+        def _load_pack_i32x8(i32_view, byte_off_i32):
+            dword_off = fx.Int32(
+                arith.divui(_to_raw(byte_off_i32), _to_raw(fx.Int32(4)))
+            )
+            v4_lo = i32_view.vec_load((dword_off,), vec_size=4)
+            dword_off_hi = _i32_add(dword_off, fx.Int32(4))
+            v4_hi = i32_view.vec_load((dword_off_hi,), vec_size=4)
+            return Vec(v4_lo).shuffle(v4_hi, list(range(8))).ir_value()
+
+        # ---- LDS region + async-DMA base pointer ----
+        base_ptr = allocator.get_base()
+        region_ptr = SmemPtr(base_ptr, lds_off, T.i32,
+                             shape=(NUM_BUFFERS * SLOT_I32,))
+        lds_st = STensor(region_ptr, T.i32, shape=(NUM_BUFFERS * SLOT_I32,))
+        lds_base_idx = memref_dialect.extract_aligned_pointer_as_index(lds_st.memptr)
+        lds_ptr0 = buffer_ops.create_llvm_ptr(
+            fx.Int64(lds_base_idx), address_space=3
+        )
+
+        def _dma_kv_tile_to_lds(slot_byte_i32, col0_i32):
+            """Cooperatively async-copy KV[col0:col0+BKV, :] into LDS slot.
+
+            All MR_BLOCK_THREADS threads participate; thread ``tid`` at load ``i``
+            writes LDS byte ``(i*MR_BLOCK_THREADS + tid)*DMA_BYTES`` (relative to
+            the slot), reading the matching linear byte of the row-major tile.
+            OOB columns are clamped to ``seq_len_kv-1`` (harmless -- masked out in
+            the epilogue by the per-row window predicate).
+            """
+            wave_slot_i32 = arith.addi(
+                _to_raw(slot_byte_i32),
+                arith.muli(_to_raw(wave), _to_raw(fx.Int32(64 * DMA_BYTES))),
+            )
+            wave_slot_scalar = rocdl.readfirstlane(
+                fx.Int64.ir_type, arith.extui(T.i64, wave_slot_i32)
+            )
+            lds_ptr = buffer_ops.get_element_ptr(lds_ptr0, wave_slot_scalar)
+            for i in range_constexpr(NUM_ASYNC_LOADS):
+                lin_bytes = arith.muli(
+                    arith.addi(_to_raw(fx.Int32(i * MR_BLOCK_THREADS)), _to_raw(tid)),
+                    _to_raw(fx.Int32(DMA_BYTES)),
+                )
+                row_local = arith.divui(lin_bytes, _to_raw(fx.Int32(D)))
+                d_off = arith.subi(
+                    lin_bytes, arith.muli(row_local, _to_raw(fx.Int32(D)))
+                )
+                if const_expr(swizzle):
+                    # The DMA writes lane-contiguously to physical byte lin_bytes,
+                    # so to store the swizzled tile we fetch the *logical* element
+                    # that maps to this physical slot: invert the within-column
+                    # XOR (mask in bytes = (n & (NC-1)) * frag_bytes).
+                    _mask_b = arith.muli(
+                        arith.andi(row_local, _to_raw(fx.Int32(NC - 1))),
+                        _to_raw(fx.Int32(mfma.frag_bytes)),
+                    )
+                    d_off = arith.xori(d_off, _mask_b)
+                col = arith.addi(_to_raw(col0_i32), row_local)
+                col_cl = arith.minsi(
+                    col, _to_raw(fx.Int32(seq_len_kv) - fx.Int32(1))
+                )
+                voffset = arith.addi(
+                    arith.muli(col_cl, _to_raw(fx.Int32(D))), d_off
+                )
+                if const_expr(i > 0):
+                    lds_ptr = buffer_ops.get_element_ptr(
+                        lds_ptr,
+                        static_byte_offset=MR_BLOCK_THREADS * DMA_BYTES,
+                    )
+                rocdl.raw_ptr_buffer_load_lds(
+                    kv_rsrc, lds_ptr, fx.Int32(DMA_BYTES), fx.Int32(voffset),
+                    fx.Int32(0), fx.Int32(0), fx.Int32(1),
+                )
+
+        # ---- Preload this wave's RPB rows: window, Q A-frags, weights ----
+        starts  = [None] * RPB
+        ends    = [None] * RPB
+        a_packs = [None] * RPB
+        w_frag  = [None] * RPB
+        for j in range_constexpr(RPB):
+            row = _i32_add(wave_row0, fx.Int32(j))
+            s = fx.Int32(cs_t[row])
+            e = fx.Int32(ce_t[row])
+            starts[j] = fx.Int32(arith.maxsi(_to_raw(s), _to_raw(fx.Int32(0))))
+            ends[j]   = fx.Int32(arith.minsi(_to_raw(e), _to_raw(fx.Int32(seq_len_kv))))
+
+            row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
+            for mi in range_constexpr(M_TILES):
+                h_a    = _i32_add(fx.Int32(mi * mfma.MFMA_M), lane_mod_N)
+                row_h  = _i32_add(
+                    fx.Int32(arith.muli(_to_raw(row), _to_raw(fx.Int32(H)))), h_a
+                )
+                base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
+                for kk in range_constexpr(K_STEPS):
+                    row_a[mi][kk] = _load_pack_i32x8(
+                        q_i32,
+                        _i32_add(base_a, _i32_add(fx.Int32(kk * mfma.MFMA_K), lane_frag_off)),
+                    )
+            a_packs[j] = row_a
+
+            row_w = [[None] * mfma.ACC_ELEMS for _ in range_constexpr(M_TILES)]
+            for mi in range_constexpr(M_TILES):
+                for ii in range_constexpr(mfma.ACC_ELEMS):
+                    static_off = mfma.acc_head_static_offsets[ii]
+                    h_w = _i32_add(
+                        fx.Int32(mi * mfma.MFMA_M + static_off),
+                        fx.Int32(arith.muli(
+                            _to_raw(lane_div_N),
+                            _to_raw(fx.Int32(mfma.acc_head_group_stride)),
+                        )),
+                    )
+                    row_w[mi][ii] = _to_raw(fx.Float32(w_t[row, h_w]))
+            w_frag[j] = row_w
+
+        # ---- Union KV window across ALL block rows (all waves cooperate) ----
+        u_start = None
+        u_end   = None
+        for jj in range_constexpr(ROWS_PER_BLOCK):
+            rr = _i32_add(block_row0, fx.Int32(jj))
+            ss = arith.maxsi(_to_raw(fx.Int32(cs_t[rr])), _to_raw(fx.Int32(0)))
+            ee = arith.minsi(_to_raw(fx.Int32(ce_t[rr])), _to_raw(fx.Int32(seq_len_kv)))
+            if jj == 0:
+                u_start = ss
+                u_end   = ee
+            else:
+                u_start = arith.minsi(u_start, ss)
+                u_end   = arith.maxsi(u_end, ee)
+        tile_start = arith.muli(
+            arith.divui(u_start, _to_raw(fx.Int32(BKV))),
+            _to_raw(fx.Int32(BKV)),
+        )
+        tile_end = u_end
+
+        # KV-column split across grid.y (identical to the direct-load builder).
+        by = fx.block_idx.y
+        win_tiles = arith.ceildivui(
+            arith.subi(tile_end, tile_start), _to_raw(fx.Int32(BKV))
+        )
+        split_cols = arith.muli(
+            arith.ceildivui(win_tiles, _to_raw(num_splits)),
+            _to_raw(fx.Int32(BKV)),
+        )
+        tile_start = arith.addi(tile_start, arith.muli(_to_raw(by), split_cols))
+        tile_end = arith.minsi(arith.addi(tile_start, split_cols), tile_end)
+
+        n_tiles = arith.ceildivui(
+            arith.maxsi(arith.subi(tile_end, tile_start), _to_raw(fx.Int32(0))),
+            _to_raw(fx.Int32(BKV)),
+        )
+
+        # ---- Prologue: prefetch tile 0 -> buf 0, tile 1 -> buf 1 ----
+        _dma_kv_tile_to_lds(fx.Int32(0), fx.Int32(tile_start))
+        _dma_kv_tile_to_lds(
+            fx.Int32(SLOT_BYTES),
+            fx.Int32(arith.addi(tile_start, _to_raw(fx.Int32(BKV)))),
+        )
+
+        # ---- Steady-state software pipeline over BKV tiles ----
+        lo   = _to_raw(fx.Index(fx.Int32(0)))
+        hi   = _to_raw(fx.Index(fx.Int32(n_tiles)))
+        step = _to_raw(fx.Index(fx.Int32(1)))
+        tile_loop = scf.ForOp(lo, hi, step, [])
+        with ir.InsertionPoint(tile_loop.body):
+            t = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
+            col0 = arith.addi(
+                tile_start, arith.muli(_to_raw(t), _to_raw(fx.Int32(BKV)))
+            )
+            parity = arith.remui(_to_raw(t), _to_raw(fx.Int32(2)))
+            slot_byte  = arith.muli(parity, _to_raw(fx.Int32(SLOT_BYTES)))
+            slot_dword = arith.muli(parity, _to_raw(fx.Int32(SLOT_I32)))
+
+            # Wait for the current tile (keep the already-issued next tile in
+            # flight), then sync so every wave sees the full LDS tile.
+            rocdl.s_waitcnt(NUM_ASYNC_LOADS)
+            gpu.barrier()
+
+            # Read all B-frags for this tile from LDS into registers.
+            b_packs        = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
+            cols           = [None] * N_TILES
+            kv_scales_tile = [None] * N_TILES
+            for ni in range_constexpr(N_TILES):
+                col = arith.addi(
+                    arith.addi(col0, _to_raw(fx.Int32(ni * mfma.MFMA_N))),
+                    _to_raw(lane_mod_N),
+                )
+                cols[ni] = fx.Int32(col)
+                col_cl = fx.Int32(
+                    arith.minsi(col, _to_raw(fx.Int32(seq_len_kv) - fx.Int32(1)))
+                )
+                kv_scales_tile[ni] = _to_raw(fx.Float32(sc_t[col_cl]))
+                col_local = arith.addi(
+                    _to_raw(fx.Int32(ni * mfma.MFMA_N)), _to_raw(lane_mod_N)
+                )
+                for kk in range_constexpr(K_STEPS):
+                    if const_expr(swizzle):
+                        # phys_dword = n*DW_PER_COL
+                        #            + ((c_bytes/4) XOR ((n & (NC-1)) * CHUNK_DW))
+                        c_dword = arith.divui(
+                            arith.addi(
+                                _to_raw(fx.Int32(kk * mfma.MFMA_K)),
+                                _to_raw(lane_frag_off),
+                            ),
+                            _to_raw(fx.Int32(4)),
+                        )
+                        _mask_dw = arith.muli(
+                            arith.andi(col_local, _to_raw(fx.Int32(NC - 1))),
+                            _to_raw(fx.Int32(CHUNK_DW)),
+                        )
+                        swz_c = arith.xori(c_dword, _mask_dw)
+                        frag_dword = arith.addi(
+                            arith.muli(col_local, _to_raw(fx.Int32(DW_PER_COL))),
+                            swz_c,
+                        )
+                    else:
+                        frag_byte = arith.addi(
+                            arith.addi(
+                                arith.muli(col_local, _to_raw(fx.Int32(D))),
+                                _to_raw(fx.Int32(kk * mfma.MFMA_K)),
+                            ),
+                            _to_raw(lane_frag_off),
+                        )
+                        frag_dword = arith.divui(frag_byte, _to_raw(fx.Int32(4)))
+
+                    read_dword = arith.index_cast(
+                        T.index, arith.addi(slot_dword, frag_dword)
+                    )
+                    b_packs[ni][kk] = lds_st.vec_load((read_dword,), vec_size=8)
+
+            # Readers done -> safe to overwrite this slot with tile i+2.
+            gpu.barrier()
+            col0_next = arith.addi(
+                tile_start,
+                arith.muli(
+                    arith.addi(_to_raw(t), _to_raw(fx.Int32(2))),
+                    _to_raw(fx.Int32(BKV)),
+                ),
+            )
+            _dma_kv_tile_to_lds(fx.Int32(slot_byte), fx.Int32(col0_next))
+
+            # ---- Per-row MFMA + epilogue (this wave's RPB rows, all columns) ----
+            for j in range_constexpr(RPB):
+                row = _i32_add(wave_row0, fx.Int32(j))
+                out_row_t = _make_out_row_t(row)
+                for ni in range_constexpr(N_TILES):
+                    col      = cols[ni]
+                    kv_scale = kv_scales_tile[ni]
+                    col_sum  = _to_raw(f32_0)
+                    for mi in range_constexpr(M_TILES):
+                        acc = Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32)
+                        for kk in range_constexpr(K_STEPS):
+                            acc = mfma_fn(
+                                _mfma_res_ty,
+                                mfma.make_operands(a_packs[j][mi][kk], b_packs[ni][kk], acc),
+                            )
+                        for ii in range_constexpr(mfma.ACC_ELEMS):
+                            score   = Vec(acc)[ii].ir_value()
+                            relu    = arith.maximumf(score, _to_raw(f32_0))
+                            wsc     = arith.MulFOp(relu, w_frag[j][mi][ii], fastmath=fm_fast).result
+                            col_sum = arith.AddFOp(col_sum, wsc, fastmath=fm_fast).result
+                    col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
+
+                    for sh in mfma.shuffle_offsets:
+                        peer    = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
+                        col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
+
+                    in_window = arith.andi(
+                        _to_raw(arith.cmpi(
+                            arith.CmpIPredicate.sge,
+                            _to_raw(col),
+                            _to_raw(starts[j]),
+                        )),
+                        _to_raw(arith.cmpi(
+                            arith.CmpIPredicate.slt,
+                            _to_raw(col),
+                            _to_raw(ends[j]),
+                        )),
+                    )
+                    is_writer = arith.andi(
+                        _to_raw(arith.cmpi(
+                            arith.CmpIPredicate.eq,
+                            _to_raw(lane_div_N),
+                            _to_raw(fx.Int32(0)),
+                        )),
+                        in_window,
+                    )
+                    with ir.InsertionPoint(scf.IfOp(is_writer).then_block):
+                        out_row_t[col] = fx.Float32(col_sum)
+                        scf.YieldOp([])
+
+            scf.YieldOp([])
+
+    @flyc.jit
+    def launch_fp8_mqa_logits_mfma_lds_pipe(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        kv_scales: fx.Tensor,
+        weights: fx.Tensor,
+        cu_starts: fx.Tensor,
+        cu_ends: fx.Tensor,
+        logits: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+
+        n_blocks = arith.ceildivui(
+            _to_raw(seq_len), _to_raw(fx.Int32(ROWS_PER_BLOCK))
+        )
+        gx = arith.index_cast(T.index, n_blocks)
+        gy = arith.index_cast(T.index, _to_raw(num_splits))
+        kernel._func.__name__ = _kname
+        kernel(
+            Q,
+            KV,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            logits,
+            seq_len,
+            seq_len_kv,
+            stride_logits_s,
+            num_splits,
+        ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
+
+    return launch_fp8_mqa_logits_mfma_lds_pipe
+
+
 # --------------------------------------------------------------------------- #
 # Kernel-variant registry.
 #
@@ -856,6 +1337,24 @@ def _mfma32k64_bkv(bkv, r, w):
         mfma=_MFMA32_K64, rows_per_block=r, waves_per_block=w,
     )
 
+def _mfma32k64_lds_bkv(bkv, r, w, sw=False):
+    """Helper: lambda for a gfx950 32x32x64-scaled-fp8 LDS double-buffered
+    variant with given bkv/r/w (all WPB waves share one LDS K-tile).
+    ``sw=True`` enables the XOR bank-conflict swizzle."""
+    return lambda **kw: _build_kernel_mfma_lds_pipe(
+        **{**kw, "block_kv": bkv},
+        mfma=_MFMA32_K64, rows_per_block=r, waves_per_block=w, swizzle=sw,
+    )
+
+def _mfma16k128_lds_bkv(bkv, r, w, sw=False):
+    """Helper: lambda for a gfx950 16x16x128-scaled-fp8 LDS double-buffered
+    variant with given bkv/r/w (all WPB waves share one LDS K-tile).
+    ``sw=True`` enables the XOR bank-conflict swizzle."""
+    return lambda **kw: _build_kernel_mfma_lds_pipe(
+        **{**kw, "block_kv": bkv},
+        mfma=_MFMA16_K128, rows_per_block=r, waves_per_block=w, swizzle=sw,
+    )
+
 _VARIANT_BUILDERS = {
     # --- 16x16x32 fp8 variants (bkv=64) ---
     "mfma16x16x32_bkv64_r1_w1":   _mfma16_bkv(64,  1, 1),
@@ -880,6 +1379,7 @@ if arch == "gfx950":
     # CDNA4 scaled MFMA atoms (K=128/64) -- gfx950-only: these instructions
     # require native FN operands (reject FNUZ) and don't exist on gfx942.
     _VARIANT_BUILDERS.update({
+        # Direct load variants (all waves load their own KV tile, no LDS sharing). WPB>=1 only.
         "mfma16x16x128_bkv128_r1_w1": _mfma16k128_bkv(128, 1, 1),
         "mfma16x16x128_bkv128_r2_w1": _mfma16k128_bkv(128, 2, 1),
         "mfma16x16x128_bkv128_r1_w2": _mfma16k128_bkv(128, 1, 2),
@@ -888,10 +1388,28 @@ if arch == "gfx950":
         "mfma32x32x64_bkv128_r2_w1":  _mfma32k64_bkv(128, 2, 1),
         "mfma32x32x64_bkv128_r1_w2":  _mfma32k64_bkv(128, 1, 2),
         "mfma32x32x64_bkv128_r2_w2":  _mfma32k64_bkv(128, 2, 2),
+        # LDS double-buffered variants (all WPB waves share one LDS K-tile,
+        # waves partition rows -> block owns RPB*WPB rows). WPB>=2 only (the
+        # whole point is cross-wave KV reuse via the shared LDS tile).
+        # --- 32x32x64 (MFMA_N=32) ---
+        "mfma32x32x64_bkv64_r1_w2_lds2":  _mfma32k64_lds_bkv(64,  1, 2, sw=True),
+        "mfma32x32x64_bkv64_r2_w2_lds2":  _mfma32k64_lds_bkv(64,  2, 2, sw=True),
+        "mfma32x32x64_bkv64_r2_w4_lds2":  _mfma32k64_lds_bkv(64,  2, 4, sw=True),
+        "mfma32x32x64_bkv128_r1_w2_lds2": _mfma32k64_lds_bkv(128, 1, 2, sw=True),
+        "mfma32x32x64_bkv128_r2_w2_lds2": _mfma32k64_lds_bkv(128, 2, 2, sw=True),
+        "mfma32x32x64_bkv128_r2_w4_lds2": _mfma32k64_lds_bkv(128, 2, 4, sw=True),
+        "mfma32x32x64_bkv256_r1_w2_lds2": _mfma32k64_lds_bkv(256, 1, 2, sw=True),
+        "mfma32x32x64_bkv256_r2_w2_lds2": _mfma32k64_lds_bkv(256, 2, 2, sw=True),
+        # --- 16x16x128 (MFMA_N=16, needs D>=128) ---
+        "mfma16x16x128_bkv64_r2_w2_lds2":  _mfma16k128_lds_bkv(64,  2, 2, sw=True),
+        "mfma16x16x128_bkv128_r1_w2_lds2": _mfma16k128_lds_bkv(128, 1, 2, sw=True),
+        "mfma16x16x128_bkv128_r2_w2_lds2": _mfma16k128_lds_bkv(128, 2, 2, sw=True),
+        "mfma16x16x128_bkv128_r2_w4_lds2": _mfma16k128_lds_bkv(128, 2, 4, sw=True),
+        "mfma16x16x128_bkv256_r2_w2_lds2": _mfma16k128_lds_bkv(256, 2, 2, sw=True),
     })
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2"
+DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2" if arch == "gfx942" else "mfma32x32x64_bkv128_r2_w2"
 
 def _auto_variant(seq_len, seq_len_kv):
     """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
@@ -946,7 +1464,7 @@ def compile_fp8_mqa_logits(
     """
     if paged:
         raise NotImplementedError(
-            "Paged FlyDSL fp8_mqa_logits is Phase 2 and not implemented yet."
+            "Paged FlyDSL fp8_mqa_logits is not implemented."
         )
     if variant not in _VARIANT_BUILDERS:
         raise ValueError(
@@ -1051,11 +1569,18 @@ def flydsl_fp8_mqa_logits(
     # every block owns exactly RPB rows.  Padded rows get empty windows (start ==
     # end == 0) so the kernel writes nothing for them; the output is sliced back
     # to the original seq_len after the launch.
-    # Parse BKV and RPB from variant tag "mfma<shape>_bkv<B>_r<N>_w<M>".
-    _tag_match = re.match(r"mfma\d+x\d+x\d+_bkv(\d+)_r(\d+)_w\d+", variant)
+    # Parse BKV, RPB and WPB from variant tag "mfma<shape>_bkv<B>_r<N>_w<M>".
+    # For _lds2 variants all WPB waves share one LDS K-tile and partition rows,
+    # so a block owns RPB*WPB rows -> seq_len must be padded to that multiple.
+    _tag_match = re.match(r"mfma\d+x\d+x\d+_bkv(\d+)_r(\d+)_w(\d+)", variant)
     _BKV = int(_tag_match.group(1)) if _tag_match else 128
     _RPB = int(_tag_match.group(2)) if _tag_match else 1
-    seq_len_padded = ((seq_len + _RPB - 1) // _RPB) * _RPB
+    _WPB = int(_tag_match.group(3)) if _tag_match else 1
+    _is_lds2 = "_lds2" in variant
+    _rows_per_block_eff = _RPB * _WPB if _is_lds2 else _RPB
+    seq_len_padded = (
+        (seq_len + _rows_per_block_eff - 1) // _rows_per_block_eff
+    ) * _rows_per_block_eff
     if seq_len_padded != seq_len:
         pad = seq_len_padded - seq_len
         Q = torch.cat([Q, Q.new_zeros((pad, num_heads, head_size))], dim=0)
@@ -1084,7 +1609,7 @@ def flydsl_fp8_mqa_logits(
         )[:, :seq_len_kv]
 
     num_splits = _auto_num_splits(
-        seq_len_padded, seq_len_kv, _RPB, _BKV, Q.device.index
+        seq_len_padded, seq_len_kv, _rows_per_block_eff, _BKV, Q.device.index
     )
 
     if stream is None:
