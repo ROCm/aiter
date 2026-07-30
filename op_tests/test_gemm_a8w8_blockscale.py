@@ -116,6 +116,17 @@ def test_gemm(dtype, m, n, k, ck_preshuffle=True, use_flydsl=False):
     b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
+    if ck_preshuffle:
+        x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
+        b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
+            x, gemm_weight, x_scale_strided, w_scale, dtype
+        )
+        checkAllclose(
+            a,
+            b_strided,
+            msg="ck strided x_scale",
+            catastrophic_check=True,
+        )
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
@@ -169,7 +180,7 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 @perftest(num_iters=TEST_NUM_ITERS)
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
-    m, k = x.shape
+    m, _k = x.shape
     n, _ = weight.shape
     out = torch.empty((m, n), dtype=dtype, device=x.device)
     return aiter.gemm_a8w8_blockscale_bpreshuffle_asm(x, weight, out, x_scale, w_scale)

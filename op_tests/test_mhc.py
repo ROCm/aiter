@@ -2,18 +2,19 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
-from aiter.test_common import (
-    checkAllclose,
-    benchmark,
-    run_perftest,
-)
+import argparse
+
+import pandas as pd
 import torch
+
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
-import argparse
-import pandas as pd
-from typing import Optional
+from aiter.test_common import (
+    benchmark,
+    checkAllclose,
+    run_perftest,
+)
 
 try:
     from aiter.ops.mhc import mhc_fused_post_pre_large_m
@@ -74,6 +75,7 @@ def mhc_pre_tilelang(
         layer_input: shape (..., hidden_size), dtype torch.bfloat16
     """
     import math
+
     import tilelang
     import tilelang.language as T
 
@@ -371,7 +373,7 @@ def mhc_pre_ref(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     test_hc_head: bool = False,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     hc_mult = residual.shape[-2]
@@ -437,7 +439,7 @@ def mhc_pre_norm_split_hip(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     post_mix, res_mix, layer_input = aiter.mhc_pre(
@@ -529,8 +531,8 @@ def test_mhc_pre(
     # arches it falls back to fp32 (so err/us == the fp32 columns).
     if fn_pack_bf16:
         (
-            post_mix_bf16,
-            comb_mix_bf16,
+            _post_mix_bf16,
+            _comb_mix_bf16,
             layer_input_bf16,
         ), hip_bf16_us = run_perftest(
             aiter.mhc_pre,
@@ -581,9 +583,10 @@ def mhc_post_tilelang(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    import math
+
     import tilelang
     import tilelang.language as T
-    import math
 
     @tilelang.jit(
         pass_configs={
@@ -730,7 +733,7 @@ def mhc_post_pre_ref(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    norm_weight: Optional[torch.Tensor] = None,
+    norm_weight: torch.Tensor | None = None,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Unfused torch reference: mhc_post then mhc_pre."""
@@ -897,8 +900,8 @@ def test_mhc_post_pre(
     # fp32 (err/us == the fp32 fused columns).
     if fn_pack_bf16:
         (
-            post_mix_bf16,
-            comb_mix_bf16,
+            _post_mix_bf16,
+            _comb_mix_bf16,
             layer_input_bf16,
             next_residual_bf16,
         ), fused_bf16_us = run_perftest(

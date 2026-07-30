@@ -1,14 +1,16 @@
+import ctypes
+
 from jinja2 import Template
+
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
-    transfer_hsaco,
     AITER_CORE_DIR,
+    CK_DIR,
+    compile_template_op,
     get_default_func_name,
     not_built,
     run_lib,
-    CK_DIR,
+    transfer_hsaco,
 )
-import ctypes
 
 MD_NAME = "asm_moe"
 with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/moe/asm_moe.cpp.jinja", "r") as f:
@@ -47,8 +49,8 @@ def select_tile(
     max_num_m_blocks: int,
     num_cu: int,
     a16: bool = False,
-    fc_scale_blkn: int = None,
-    fc_scale_blkk: int = None,
+    fc_scale_blkn: int | None = None,
+    fc_scale_blkk: int | None = None,
 ):
     if a16:
         if gate_fusion == "g1u1":
@@ -91,19 +93,7 @@ def select_tile(
                         f"Unsupported inter_dim {inter_dim}, which should be divisible by 128, 256 or 512"
                     )
                 return selected_tile
-            elif input_dtype == "uint8_t":
-                selected_tile = get_heuristic_tile(
-                    inter_dim,
-                    max_num_m_blocks,
-                    [512, 448, 384, 320, 256, 192, 128],
-                    num_cu,
-                )
-                if selected_tile == 0:
-                    raise ValueError(
-                        f"Unsupported inter_dim {inter_dim}, which should be divisible by 128, 192, 256, 320, 384, 448 or 512"
-                    )
-                return selected_tile
-            elif input_dtype == "__hip_fp8_e4m3_fnuz":
+            elif input_dtype == "uint8_t" or input_dtype == "__hip_fp8_e4m3_fnuz":
                 selected_tile = get_heuristic_tile(
                     inter_dim,
                     max_num_m_blocks,
@@ -375,7 +365,8 @@ def asm_moe(
     workspace=None,
 ):
     import torch
-    from csrc.cpp_itfs.torch_utils import torch_to_hip_types, torch_to_c_types
+
+    from csrc.cpp_itfs.torch_utils import torch_to_c_types, torch_to_hip_types
 
     E, dim, inter_dim = w2.shape
     global_E = E
@@ -399,10 +390,9 @@ def asm_moe(
                 f"Unsupported w1.dtype {w1.dtype}, which should be {torch.float8_e4m3_fnuz} or {torch.int8} and w1.shape[1] should be {inter_dim} or {inter_dim*2}"
             )
     else:
-        if fc1_smooth_scale is not None:
-            if expert_mask is not None:
-                local_expert_hash = expert_mask.cumsum(0, dtype=torch.int32)
-                local_expert_hash[local_expert_hash > 0] -= 1
+        if fc1_smooth_scale is not None and expert_mask is not None:
+            local_expert_hash = expert_mask.cumsum(0, dtype=torch.int32)
+            local_expert_hash[local_expert_hash > 0] -= 1
 
         if inter_dim * lastdim_mul == w1.shape[1]:
             gate_fusion = "g1u0"
