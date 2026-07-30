@@ -17,7 +17,6 @@ import json
 from dataclasses import dataclass, field
 
 import flydsl.expr as fx
-import mori.ir.flydsl as mori_shmem
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import arith
@@ -28,8 +27,10 @@ __all__ = [
     "atomic_add_global_at",
     "atomic_add_system",
     "atomic_xchg_global_at",
+    "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
+    "fence_release",
     "fence_system_acquire",
     "fence_system_release",
     "load_i64_global",
@@ -64,41 +65,34 @@ def store_i64_global_system(addr_i64, val):
     _llvm_d.StoreOp(arith.unwrap(val), gptr, alignment=8, ordering=_llvm_d.AtomicOrdering.release, syncscope="one-as")
 
 
-def _legacy_fence():
-    # Self-PE skips transport quiet while retaining Mori's system-scope seq_cst fence.
-    mori_shmem.fence_thread_pe_qp(mori_shmem.my_pe(), 0)
+def fence_acquire(syncscope):
+    """Emit an acquire fence for the selected AMDGPU memory scope."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.acquire, syncscope=syncscope)
+
+
+def fence_release(syncscope):
+    """Emit a release fence for the selected AMDGPU memory scope."""
+    _llvm_d.FenceOp(_llvm_d.AtomicOrdering.release, syncscope=syncscope)
 
 
 def fence_system_acquire():
     """System-scope acquire fence."""
-    if hasattr(fx.rocdl, "fence_acquire"):
-        fx.rocdl.fence_acquire(fx.rocdl.SyncScope.OneAs)
-    else:
-        _legacy_fence()
+    fence_acquire(fx.rocdl.SyncScope.OneAs)
 
 
 def fence_system_release():
     """System-scope release fence."""
-    if hasattr(fx.rocdl, "fence_release"):
-        fx.rocdl.fence_release(fx.rocdl.SyncScope.OneAs)
-    else:
-        _legacy_fence()
+    fence_release(fx.rocdl.SyncScope.OneAs)
 
 
 def fence_agent_acquire():
     """Agent-scope acquire fence."""
-    if hasattr(fx.rocdl, "fence_acquire"):
-        fx.rocdl.fence_acquire(fx.rocdl.SyncScope.AgentOneAs)
-    else:
-        _legacy_fence()
+    fence_acquire(fx.rocdl.SyncScope.AgentOneAs)
 
 
 def fence_agent_release():
     """Agent-scope release fence."""
-    if hasattr(fx.rocdl, "fence_release"):
-        fx.rocdl.fence_release(fx.rocdl.SyncScope.AgentOneAs)
-    else:
-        _legacy_fence()
+    fence_release(fx.rocdl.SyncScope.AgentOneAs)
 
 
 def load_i64_global(addr_i64):
