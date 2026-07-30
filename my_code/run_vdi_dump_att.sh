@@ -10,17 +10,20 @@ TRACE_ROOT="${TRACE_ROOT:-my_code}"
 # The command keeps one tokens=4096 shape; GEMM_TEST_CMD can be overridden by the caller.
 GEMM_TEST_CMD="${GEMM_TEST_CMD:-python op_tests/test_flydsl_grouped_gemm_gfx1250.py   --scenario bench --data-format a8w4 --layout gugu   --experts 384 --tokens  4096 --topk 6 --iters 100   --model-dim 7168 --inter-dim 768 --act silu --real-gemm --no-check-aot}"
 # TDM tile/buffer overrides (grouped_moe_gfx1250.py reads these; unset -> tuned CSV).
-# Defaults trace the g1_m64_nb3 winner: gemm1 64x256x256_b3, gemm2 left at the CSV
-# 16x512x128_b2. tile_m=64 == rows/expert, so the weight slab is read once, and it
-# also turns on wave specialization (2 TDM in flight per wave instead of 4).
+# Defaults trace the g2_m64_nb3 sweep winner (e2e 1255.7us vs 2072.9 baseline):
+# gemm1 64x256x256_b3, gemm2 64x512x128_b3. tile_m=64 == rows/expert, so each tile
+# covers a whole expert and the weight slab is read once instead of 4x; it also
+# turns on wave specialization (2 TDM in flight per wave instead of 4). tile_m2
+# must match tile_m: align_m is max(tile_m, tile_m2), so leaving gemm2 at 16 makes
+# it re-read weights 4x over an already-64-aligned buffer (534us vs 282us).
 AITER_TDM_TILE_M="${AITER_TDM_TILE_M:-64}"
 AITER_TDM_TILE_N="${AITER_TDM_TILE_N:-256}"
 AITER_TDM_TILE_K="${AITER_TDM_TILE_K:-256}"
 AITER_TDM_NUM_BUFFERS="${AITER_TDM_NUM_BUFFERS:-3}"
-AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2:-16}"
+AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2:-64}"
 AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2:-512}"
 AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2:-128}"
-AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2:-2}"
+AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2:-3}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-1}"
 
 usage() {
