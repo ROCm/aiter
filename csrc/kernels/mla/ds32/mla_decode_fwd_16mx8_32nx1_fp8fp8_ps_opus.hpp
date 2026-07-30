@@ -572,7 +572,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                          char* smem_kv,
                          VQN& v_q_nope,
                          VQR& v_q_rope,
-                         int scale_q,
                          VO& v_o,
                          typename Traits::D_ACC& m_row,
                          typename Traits::D_ACC& l_row,
@@ -753,6 +752,11 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     auto stage_end = [&]() {
         __builtin_amdgcn_sched_barrier(0);
+        // __builtin_amdgcn_s_barrier();
+        // __builtin_amdgcn_sched_barrier(0);
+    };
+    auto stage_end_2 = [&]() {
+        __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
         __builtin_amdgcn_sched_barrier(0);
     };
@@ -817,6 +821,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         // Everything older than the prefetch just issued has landed, so the barrier
         // below publishes tile t+1 for the next phase's stage0 read.
         s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+        stage_end_2();
         __builtin_amdgcn_sched_barrier(0);
         v_k_nope[0] = load<T::VEC_KV_NOPE>(s_k_nope, u_rk_nope + cur_slot * kv_slot_off);
         v_k_nope[1] =
@@ -897,9 +902,9 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // the last tile's scores sit in a buffer picked by the tile count's parity. Its LDS
     // slot and its mask were already handled by the phase (or by the prologue when the
     // request is a single tile).
-    // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
+    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
     stage_end();
-
+    stage_end_2();
     // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
     // this part depends on the parity; keeping the V read and the PV outside the branch
     // is what keeps the 128-VGPR v_o off scratch -- inlining a compute_pv into both
@@ -1003,7 +1008,6 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
                                               smem_kv,
                                               v_q_nope,
                                               v_q_rope,
-                                              0,
                                               v_o,
                                               m_row,
                                               l_row,
@@ -1014,16 +1018,12 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
     scale_output_tile<T>(v_o, o_scale);
     pin_output_tile(v_o);
 
-    int lane_id_o = thread_id_x() % T::WARP_SIZE;
-    asm volatile("" : "+v"(lane_id_o));
-    int warp_id_o = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
-
     if(slot < 0)
     {
         const int o_gmem_offset = q_len_ptr_s * kargs.stride_o_b;
         auto g_o                = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                              q_len * kargs.stride_o_b * sizeof(D_OUT));
-        auto u_o                = make_layout_o<T>(warp_id_o, lane_id_o, kargs.stride_o_h);
+        auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
         auto v_o_out            = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
     }
@@ -1032,10 +1032,10 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
         const int oa_offset = slot * kargs.stride_o_b;
         auto g_oa           = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
                               q_len * kargs.stride_o_b * sizeof(D_ACC));
-        auto u_oa           = make_layout_o<T>(warp_id_o, lane_id_o, T::D_NOPE_SIZE);
+        auto u_oa           = make_layout_o<T>(warp_id, lane_id, T::D_NOPE_SIZE);
         store<T::VEC_O>(g_oa, v_o, u_oa);
 
-        if(lane_id_o < T::W_M)
+        if(lane_id < T::W_M)
         {
             const int lse_offset = slot * kargs.H;
             auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_accum) + lse_offset,
@@ -1043,7 +1043,7 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
             constexpr float INV_LOG2_E = 0.69314718055994531f; // 1 / LOG2_E == ln(2)
             const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
                                                     : opus::numeric_limits<D_ACC>::lowest();
-            g_lse.store(lse, warp_id_o * T::Q_TILE_SIZE + lane_id_o);
+            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
         }
     }
 }
@@ -1077,13 +1077,15 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
     {
         // Fences LDS reuse across work items: every wave has finished the previous
         // request's V reads before this one's async loads start writing the slots.
+        // __builtin_amdgcn_sched_barrier(0);
+        // __builtin_amdgcn_s_barrier();
+        // __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_sched_barrier(0);
-        __builtin_amdgcn_s_barrier();
-        __builtin_amdgcn_sched_barrier(0);
-        if(warp_id / 4)
-            mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_kv, temperature_scale);
-        __builtin_amdgcn_sched_barrier(0);
-        if(!(warp_id / 4))
-            mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_kv, temperature_scale);
+        mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_kv, temperature_scale);
+        // if(warp_id / 4)
+        //     mla_decode_fwd_one_req<Traits, true>(kargs, w, smem_kv, temperature_scale);
+        // __builtin_amdgcn_sched_barrier(0);
+        // if(!(warp_id / 4))
+        //     mla_decode_fwd_one_req<Traits, false>(kargs, w, smem_kv, temperature_scale);
     }
 }
