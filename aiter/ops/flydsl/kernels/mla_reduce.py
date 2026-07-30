@@ -1016,8 +1016,8 @@ def _get_splitk_scratch(num_slots: int, K: int, Dv: int, device_index: int):
     import torch
 
     dev = torch.device("cuda", device_index)
-    sk_acc = torch.zeros(num_slots * K, Dv, dtype=torch.float32, device=dev)
-    sk_ml = torch.zeros(num_slots * K, 2, dtype=torch.float32, device=dev)
+    sk_acc = torch.empty(num_slots * K, Dv, dtype=torch.float32, device=dev)
+    sk_ml = torch.empty(num_slots * K, 2, dtype=torch.float32, device=dev)
     return sk_acc, sk_ml
 
 
