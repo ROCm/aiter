@@ -4,7 +4,7 @@ jobs:
   kernel_exclude_regex:
   kernel_iteration_range: "[1]"
   output_file: out
-  output_directory: my_code/.run_vdi_dump_att_gemm_a8w4_m64nb3_att_47573/thread_trace/gemm1/rpf_v3
+  output_directory: my_code/.run_vdi_dump_att_gemm_a8w4_m64nb3_att_98416/thread_trace/gemm1/rpf_v3
   output_format: [csv]
   truncate_kernels: false
   sys_trace: false
