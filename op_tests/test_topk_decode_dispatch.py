@@ -29,13 +29,21 @@ from aiter.ops import topk as topk_mod
 ARCH = "gfx950"
 MIN_WIDTH, MAX_ROWS = 32768, 16
 K = 512
+KS = frozenset({512, 2048})
 
 
 @pytest.fixture
 def gates(monkeypatch):
-    """Pin the gate table so the assertions do not move with the host's arch."""
+    """Pin the gate table so the assertions do not move with the host's arch.
+
+    These are deliberately generic values that exercise the gate *machinery*, not
+    the shipped gfx950 thresholds -- those are asserted directly in
+    test_shipped_gfx950_gate below, which reads the real table.
+    """
     monkeypatch.setattr(
-        topk_mod, "_FLYDSL_TOPK_DECODE_GATES", {ARCH: (MIN_WIDTH, MAX_ROWS)}
+        topk_mod,
+        "_FLYDSL_TOPK_DECODE_GATES",
+        {ARCH: topk_mod._DecodeGate(MIN_WIDTH, MAX_ROWS, KS)},
     )
     monkeypatch.setattr(topk_mod, "_FLYDSL_TOPK_DECODE_ARCHS", frozenset({ARCH}))
     monkeypatch.setattr(topk_mod, "_FLYDSL_TOPK_DECODE_DISABLED", False)
@@ -94,6 +102,28 @@ def test_rows_gate(gates, rows, expected):
 )
 def test_k_gate(gates, k, expected):
     assert routed(k=k) is expected
+
+
+def test_excluded_rows_fall_back(gates, monkeypatch):
+    """A row inside [1, max_rows] but listed as excluded must route HIP."""
+    monkeypatch.setattr(
+        topk_mod,
+        "_FLYDSL_TOPK_DECODE_GATES",
+        {ARCH: topk_mod._DecodeGate(MIN_WIDTH, MAX_ROWS, KS, frozenset({2}))},
+    )
+    assert routed(rows=1) is True
+    assert routed(rows=2) is False  # carved out
+    assert routed(rows=4) is True
+
+
+def test_shipped_gfx950_gate():
+    """Pin the real gfx950 window to the SILOTIGER-699 conclusion so a silent edit
+    to the table trips here. This reads the shipped constants, not the fixture."""
+    gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx950"]
+    assert gate.min_width == 131072
+    assert gate.max_rows == 16
+    assert gate.ks == frozenset({2048})
+    assert gate.excluded_rows == frozenset({2})
 
 
 def test_unlisted_arch_falls_back(gates, monkeypatch):
@@ -186,6 +216,33 @@ def test_both_branches_match_torch_topk(rows, width, seq_len, k):
     assert bool(((indices >= 0) & (indices < seq_len)).all())
     expected = torch.topk(logits[:, :seq_len], k, dim=1).indices
     assert torch.equal(indices.long().sort(dim=1).values, expected.sort(dim=1).values)
+
+
+@pytestmark_gpu
+def test_hip_and_flydsl_agree_on_a_gated_shape():
+    """The two kernels must return the same index set for an identical in-gate
+    call -- not merely each match torch. Forces each branch directly rather than
+    letting the gate pick, so a divergence between them cannot hide behind routing.
+    """
+    if get_gfx_runtime() not in topk_mod._FLYDSL_TOPK_DECODE_GATES:
+        pytest.skip("no FlyDSL gates for this arch")
+    from aiter.ops.flydsl.topk_per_row_decode import flydsl_top_k_per_row_decode
+
+    rows, width, seq_len, k = 4, 131072, 70000, 2048
+    logits, seq_lens, indices = make_inputs(rows, width, seq_len, k)
+    s0, s1 = logits.stride(0), logits.stride(1)
+
+    hip_idx = torch.empty_like(indices).fill_(-1)
+    topk_mod._top_k_per_row_decode(logits, 1, seq_lens, hip_idx, rows, s0, s1, k, None)
+    fly_idx = torch.empty_like(indices).fill_(-1)
+    flydsl_top_k_per_row_decode(
+        logits, 1, seq_lens, fly_idx, rows, s0, s1, k, ordered=False, workspace=None
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(
+        hip_idx.long().sort(dim=1).values, fly_idx.long().sort(dim=1).values
+    )
 
 
 @pytestmark_gpu

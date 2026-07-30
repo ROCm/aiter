@@ -5,6 +5,7 @@
 
 import functools
 import os
+from typing import NamedTuple
 
 import torch
 
@@ -413,10 +414,13 @@ def _top_k_per_row_decode(
 
 _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 
-# Per-arch gates for the FlyDSL tiered decode kernel: (min_padded_width, max_rows).
-# The window does not transfer between archs: the kernel's grid-trim, batch-cap,
-# row-proportional and early-stop tuning is gfx950-only, so gfx942 runs a frozen
-# configuration and keeps the lowest width it has evidence for (65K and up).
+
+# Per-arch gates for the FlyDSL tiered decode kernel. Each arch carries its whole
+# admission window -- min padded width, max rows, the k set it has wins for, and any
+# individual rows it must exclude -- because the safe window does not transfer
+# between archs: the kernel's grid-trim, batch-cap, row-proportional and early-stop
+# tuning is gfx950-only, so gfx942 runs a frozen configuration and keeps the lowest
+# width it has evidence for (65K and up).
 #
 # Note what the width gate can and cannot see. Callers hand us a score buffer sized
 # to the model's max context, not to the request's -- vLLM's sparse indexer builds
@@ -425,17 +429,25 @@ _TRUTHY_ENV = ("1", "true", "True", "yes", "YES")
 # this a long-context model", not "is this a long request", and it is deliberately
 # the former: a padded buffer is itself what puts the HIP kernel behind, since HIP
 # slows down with the buffer width while the FlyDSL kernel tracks seqLens.
-# gfx950's numbers come from a width-163840 sweep (33 of 36 cells ahead, rows 1-8);
-# rows 16 stays ahead in 5 of 6, and rows 32 and up trade short-context wins for
-# long-context losses, so the row cap sits at 16.
-_FLYDSL_TOPK_DECODE_GATES = {
-    "gfx950": (32768, 16),
-    "gfx942": (65536, 8),
-}
+#
+# gfx950's window is the largest that loses no cell in the eager width-sweep, which
+# is the regime vLLM pays whenever a decode batch overflows its CUDA-graph capture
+# limit and falls back to eager submission; every captured cell only does better.
+# Below 131072 the host submit path (~19us) sinks short-context cells the kernel
+# would otherwise win; k=512 still carries losses at full width, so only k=2048
+# ships; and rows==2 is the one admitted row that stays behind at width even as
+# rows 1 and 4-16 pull ahead, so it is carved out by hand.
+class _DecodeGate(NamedTuple):
+    min_width: int
+    max_rows: int
+    ks: frozenset
+    excluded_rows: frozenset = frozenset()
 
-# Only k values with measured wins. The AOT config covers {256, 512, 1024, 2048}
-# for both cu_num 304 and 256, so this can widen once the others are benchmarked.
-_FLYDSL_TOPK_DECODE_KS = frozenset({512, 2048})
+
+_FLYDSL_TOPK_DECODE_GATES = {
+    "gfx950": _DecodeGate(131072, 16, frozenset({2048}), frozenset({2})),
+    "gfx942": _DecodeGate(65536, 8, frozenset({512, 2048})),
+}
 
 # Narrows the table above, e.g. AITER_FLYDSL_TOPK_ARCHS=gfx950 leaves gfx942 on
 # HIP. Listing an arch that has no row in the table does not enable it: adding an
@@ -459,11 +471,19 @@ _FLYDSL_TOPK_MIN_WIDTH_ENV = os.environ.get("AITER_FLYDSL_TOPK_MIN_WIDTH")
 _FLYDSL_TOPK_MAX_ROWS_ENV = os.environ.get("AITER_FLYDSL_TOPK_MAX_ROWS")
 if _FLYDSL_TOPK_MIN_WIDTH_ENV or _FLYDSL_TOPK_MAX_ROWS_ENV:
     _FLYDSL_TOPK_DECODE_GATES = {
-        _arch: (
-            int(_FLYDSL_TOPK_MIN_WIDTH_ENV) if _FLYDSL_TOPK_MIN_WIDTH_ENV else _width,
-            int(_FLYDSL_TOPK_MAX_ROWS_ENV) if _FLYDSL_TOPK_MAX_ROWS_ENV else _rows,
+        _arch: _gate._replace(
+            min_width=(
+                int(_FLYDSL_TOPK_MIN_WIDTH_ENV)
+                if _FLYDSL_TOPK_MIN_WIDTH_ENV
+                else _gate.min_width
+            ),
+            max_rows=(
+                int(_FLYDSL_TOPK_MAX_ROWS_ENV)
+                if _FLYDSL_TOPK_MAX_ROWS_ENV
+                else _gate.max_rows
+            ),
         )
-        for _arch, (_width, _rows) in _FLYDSL_TOPK_DECODE_GATES.items()
+        for _arch, _gate in _FLYDSL_TOPK_DECODE_GATES.items()
     }
 
 
@@ -496,11 +516,12 @@ def _should_use_flydsl_decode(
     gate = _FLYDSL_TOPK_DECODE_GATES.get(arch)
     if gate is None:
         return False
-    min_width, max_rows = gate
 
-    if numRows > max_rows or k not in _FLYDSL_TOPK_DECODE_KS:
+    if numRows > gate.max_rows or numRows in gate.excluded_rows:
         return False
-    if logits.ndim != 2 or logits.shape[1] < min_width:
+    if k not in gate.ks:
+        return False
+    if logits.ndim != 2 or logits.shape[1] < gate.min_width:
         return False
 
     # HIP drops stride1 entirely and never validates next_n, so a call that works
