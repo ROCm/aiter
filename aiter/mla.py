@@ -145,28 +145,27 @@ def _mla_reduce_v1_dispatch(
     from ``reduce_indptr`` via a capture-safe warmup cache, so this seam does not
     thread it. The HIP path ignores it entirely.
     """
-    if _flydsl_mla_reduce_enabled():
-        if _flydsl_mla_reduce_supported(
-            partial_output,
-            partial_lse,
-            final_output,
-            max_seqlen_q,
-            num_kv_splits,
-        ):
-            from aiter.ops.flydsl import flydsl_mla_reduce_v1
+    if _flydsl_mla_reduce_enabled() and _flydsl_mla_reduce_supported(
+        partial_output,
+        partial_lse,
+        final_output,
+        max_seqlen_q,
+        num_kv_splits,
+    ):
+        from aiter.ops.flydsl import flydsl_mla_reduce_v1
 
-            flydsl_mla_reduce_v1(
-                partial_output.view(partial_output.size(0), *partial_output.shape[-2:]),
-                partial_lse.view(partial_lse.size(0), -1),
-                reduce_indptr,
-                reduce_final_map,
-                reduce_partial_map,
-                max_seqlen_q,
-                final_output,
-                final_lse,
-                num_kv_splits=num_kv_splits,
-            )
-            return
+        flydsl_mla_reduce_v1(
+            partial_output.view(partial_output.size(0), *partial_output.shape[-2:]),
+            partial_lse.view(partial_lse.size(0), -1),
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            max_seqlen_q,
+            final_output,
+            final_lse,
+            num_kv_splits=num_kv_splits,
+        )
+        return
     aiter.mla_reduce_v1(
         partial_output,
         partial_lse,
