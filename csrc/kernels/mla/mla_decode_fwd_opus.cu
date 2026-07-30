@@ -22,7 +22,12 @@
 #include "mla.h"
 #include "aiter_hip_common.h"
 
-using OpusTraits = mla_16mx8_32nx1_fp8fp8_ps_traits<16, 32, 8, fp8_t, fp8_t, bf16_t>;
+// Causal is a compile-time specialization: a request only needs the causal
+// diagonal when it carries more than one query token, so a pure decode launch
+// (max_seqlen_q == 1) picks the build that masks out-of-bounds columns only.
+template <bool CAUSAL>
+using OpusTraitsC = mla_16mx8_32nx1_fp8fp8_ps_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL>;
+using OpusTraits  = OpusTraitsC<false>;
 
 // q       : [B, H, D_HEAD]           fp8 (merged nope+rope, d = 576)
 // kv      : [total_tokens, D_HEAD]   fp8 (merged nope+rope, d = 576)
@@ -106,6 +111,14 @@ void mla_decode_fwd_opus_stage1(torch::Tensor& q,
     kargs.softmax_scale  = static_cast<float>(softmax_scale);
 
     auto stream = at::cuda::getCurrentHIPStream().stream();
-    mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<T>
-        <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+    if(max_seqlen_q > 1)
+    {
+        mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<OpusTraitsC<true>>
+            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+    }
+    else
+    {
+        mla_decode_fwd_16mx8_32nx1_fp8fp8_opus_kernel<OpusTraitsC<false>>
+            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+    }
 }
