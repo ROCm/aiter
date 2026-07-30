@@ -1983,6 +1983,25 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+    # WORKAROUND: the CK 2-stage MoE writes nothing at block_m=32 and returns an
+    # identically zero output tensor. Reproduced on gfx942 for bf16/QuantType.No
+    # and fp8/QuantType.per_Token; see op_tests/test_moe_blockm_invariance.py.
+    # The fault depends on block_m alone, not on the token count: forcing
+    # block_m=32 at token=64, a size that is otherwise correct, also yields zeros.
+    #
+    # The clamp sits after both the heuristic and the tuned-CSV branch because
+    # either can select 32, and 469 of the 617 rows in configs/tuned_fmoe.csv pin
+    # block_m=32 with run_1stage=0. 1stage and asm paths are unaffected.
+    if not run_1stage:
+        _min_block_m = int(os.environ.get("AITER_MIN_BLOCK_M", "64"))
+        if block_m < _min_block_m:
+            logger.warning(
+                f"[fused_moe] block_m={block_m} raised to {_min_block_m}: the CK "
+                "2-stage kernel emits all-zero output below 64. Set "
+                "AITER_MIN_BLOCK_M=32 to restore the original selection."
+            )
+            block_m = _min_block_m
+
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
