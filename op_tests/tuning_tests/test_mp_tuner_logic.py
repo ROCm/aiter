@@ -370,5 +370,28 @@ class TestTaskStartTimeReset(unittest.TestCase):
         self.assertEqual(list(slots), [0, 22.0, 0])
 
 
+class TestWorkerErrorRatio(unittest.TestCase):
+
+    def test_nonfinite_error_ratio_is_rejected(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(
+            merge_error_ratio,
+            "worker must reject non-finite comparator error ratios",
+        )
+        for observed in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(observed=observed):
+                self.assertEqual(merge_error_ratio(0.0, observed), 1.0)
+
+    def test_finite_error_ratio_keeps_maximum(self):
+        tuner = importlib.import_module("aiter.utility.mp_tuner")
+        merge_error_ratio = getattr(tuner, "_merge_error_ratio", None)
+
+        self.assertIsNotNone(merge_error_ratio)
+        self.assertEqual(merge_error_ratio(0.1, 0.2), 0.2)
+        self.assertEqual(merge_error_ratio(0.2, 0.1), 0.2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

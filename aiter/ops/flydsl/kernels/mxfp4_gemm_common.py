@@ -63,9 +63,9 @@ def _lds_swizzle_mask(row):
     return (row & fx.Int32(14)) << fx.Int32(3)
 
 
-def lds_swizzle_mask_f8(row):
-    """lds_swizzle_mask<ROW_BYTES=256>(row) = (row & 15) << 4 (fp8 A tile)."""
-    return (row & 15) << 4
+def lds_swizzle_mask_f8(row, row_bytes):
+    """XOR16 swizzle for an FP8 LDS row whose width is 128 or 256 bytes."""
+    return (row & (row_bytes // 16 - 1)) << 4
 
 
 def lds_dma_dst(base_i32, byte_off_i32, elem_ty=None, align=16):

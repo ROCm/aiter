@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+import math
 import multiprocessing as mp
 import time
 from multiprocessing import TimeoutError as MPTimeoutError
@@ -45,6 +46,12 @@ def _reset_task_start_times(task_start_times, task_indices):
     timestamp its previous attempt left behind."""
     for k in task_indices:
         task_start_times[k] = 0
+
+
+def _merge_error_ratio(current, observed):
+    if not math.isfinite(observed):
+        return 1.0
+    return max(current, observed)
 
 
 def worker(
@@ -148,7 +155,7 @@ def worker(
                             max_abs_delta=max_abs_delta,
                             catastrophic_check=catastrophic_check,
                         )
-                    max_err_ratio = max(max_err_ratio, err_ratio)
+                    max_err_ratio = _merge_error_ratio(max_err_ratio, err_ratio)
     except RuntimeError as e:
         if "CUDA" in str(e) or "HIP" in str(e) or "out of memory" in str(e).lower():
             if printLog:
