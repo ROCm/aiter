@@ -93,7 +93,16 @@ run g1_m64_n128_nb3   64 128 256 3      16 512 128 2
 run g1_m64_n128_nb4   64 128 256 4      16 512 128 2
 run g1_m32_nb3        32 256 256 3      16 512 128 2
 run g1_m128_nb2      128 256 256 2      16 512 128 2
+# G: combine the per-GEMM winners (m64_nb3 for gemm1, nb3 for gemm2 -- never yet
+#    measured together), and probe tile_k=512 on top of tile_m=64.
+run best_m64_g2nb3    64 256 256 3      16 512 128 3
+run best_m64b2_g2nb3  64 256 256 2      16 512 128 3
+run g1_m64_k512_nb2   64 256 512 2      16 512 128 3
+run g1_m64_nb4        64 256 256 4      16 512 128 3
+# gemm2 tile_m must stay 16: tile_m2=64 would raise align_m and add empty tiles,
+# but check whether matching it to gemm1 helps now that gemm1 is 3x faster.
+run g2_m64_nb3        64 256 256 3      64 512 128 3
 
 echo
 echo "================ SUMMARY ================"
-column -t -s $'\t' "$SUM"
+column -t -s $'\t' "$SUM" 2>/dev/null || cat "$SUM"
