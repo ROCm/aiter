@@ -1,14 +1,14 @@
 import torch
-from triton.experimental import gluon
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
+from triton.experimental import gluon
 
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]
@@ -776,9 +776,8 @@ def _moe_gemm_a4w4_prefill(
                 )
             ) % M
         else:
-            offs_x_m_scales = (
-                gl.convert_layout(offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES))
-                % num_tokens
+            offs_x_m_scales = gl.convert_layout(
+                offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES)
             )
         offs_x_k_scales = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)

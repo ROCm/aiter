@@ -193,8 +193,8 @@ def bench_mlp_single_weight_init(
     wg, _ = quantize(wg, "bf16")
     w1, w1_scale = quantize(w1, w_dtype)
     w2, w2_scale = quantize(w2, w_dtype)
-    w1_scale, _swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
-    w2_scale, _swizzle_mx_scale2 = check_and_shuffle_scales(
+    w1_scale, swizzle_mx_scale1 = check_and_shuffle_scales(w1_scale, dim2 // TP, dim1)
+    w2_scale, swizzle_mx_scale2 = check_and_shuffle_scales(
         w2_scale, dim1, dim2 // TP // 2
     )
 
