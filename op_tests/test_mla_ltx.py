@@ -3,26 +3,26 @@
 
 """MLA decode: large page_id, KV byte offset, and >4GB pools (gfx950 asm).
 
-Compares torch golden vs mla_decode_fwd (.co from hsa/<gfx>/mla/mla_asm.csv).
+Compares torch golden vs mla_decode_fwd (gfx950 asm).
 Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
+  python op_tests/test_mla_ltx.py
+    # default on gfx950: PR global-load .co sweep (8 presets, ps, boundary+page16m)
+  python op_tests/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
   python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
-  python op_tests/test_mla_ltx.py --preset-group co_fix --suites boundary page16m --ctx 4
   python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
   MLA_PAGE_OOB_NUM_PAGES=3800000 python op_tests/test_mla_ltx.py --suites over4g
-  # omit --suites to run all case groups
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import itertools
 import os
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
 
 import pandas as pd
 import torch
@@ -51,13 +51,8 @@ PAGE_ID_16M = 16_000_000
 SEED_CHUNK_PAGES = 262_144
 SEQ_PAGE_BASE = -1  # sequential kv_indices 0..ctx-1
 
-SUB_KV_KERNEL = SUB_KV_TILE  # legacy alias for bench_mla_ckv.py
-
 # Built in main(); read by @benchmark test_mla_ltx.
 _KV_POOL: tuple[torch.Tensor, int] | None = None
-_CPRR: bool = False
-_CO_OVERRIDE: str | None = None
-_SKIP_REF: bool = False
 
 
 def _parse_nhead_decode_qlen(value: int | tuple | str) -> tuple[int, int]:
@@ -78,7 +73,7 @@ def _csv_type_name(dtype) -> str:
         return "fp8"
     if dtype in (dtypes.bf16, torch.bfloat16):
         return "bf16"
-    raise ValueError(f"unsupported dtype for mla_asm.csv: {dtype}")
+    raise ValueError(f"unsupported dtype: {dtype}")
 
 
 def _dtype_element_size(dtype) -> int:
@@ -108,16 +103,6 @@ class Harness:
     def bytes_per_page(self) -> int:
         return QK_HEAD_DIM * _dtype_element_size(self.kv_dtype)
 
-    def csv_dispatch_keys(self) -> dict[str, object]:
-        return {
-            "qType": _csv_type_name(self.q_dtype),
-            "kvType": _csv_type_name(self.kv_dtype),
-            "Gqa": self.nhead,
-            "qSeqLen": self.decode_qlen,
-            "prefill": 0,
-            "causal": 0,
-        }
-
     def summary(self) -> str:
         q = _csv_type_name(self.q_dtype)
         kv = _csv_type_name(self.kv_dtype)
@@ -140,7 +125,6 @@ class Harness:
 
 
 # (q_dtype, kv_dtype, nhead/Gqa, decode_qlen/qSeqLen)
-# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=0, cprr=0).
 PresetConfig = tuple[torch.dtype, torch.dtype, int, int]
 
 PRESETS: dict[str, PresetConfig] = {
@@ -168,99 +152,23 @@ PRESETS: dict[str, PresetConfig] = {
 }
 DEFAULT_PRESET = "qh16_fp8_q1"
 
-
-@dataclass(frozen=True)
-class CoFixRun:
-    """One d9d7bd3-related .co under test (preset + ps/lse/cprr routing)."""
-
-    preset: str
-    persistent: bool
-    lse: bool
-    cprr: bool = False
-    co_override: str | None = None
-    skip_ref: bool = False
-
-
-# Modified gfx950 .co from poc_kl_merg d9d7bd3 rebuild (ctx must be >= decode_qlen).
-CO_FIX_RUNS: tuple[CoFixRun, ...] = (
-    # bf16 nhead16,q4 in test_mla uses coex0_mask1 (_ps), not qh16_qseqlen4_gqaratio16_*
-    CoFixRun("qh32_bf16_q4", True, False),
-    CoFixRun("qh32_bf16_q4", True, True),
-    CoFixRun("qh32_bf16_q4", True, False, cprr=True, skip_ref=True),
-    CoFixRun("qh32_bf16_q4", True, True, cprr=True, skip_ref=True),
-    CoFixRun("qh64_bf16_q1", False, False),
-    CoFixRun("qh64_bf16_q1", True, False),
-    CoFixRun("qh64_bf16_q1", True, True),
-    CoFixRun("qh64_bf16_q1", True, False, cprr=True, skip_ref=True),
-    CoFixRun("qh64_bf16_q1", True, True, cprr=True, skip_ref=True),
-    CoFixRun("qh16_fp8_q1", False, False),
-    CoFixRun("qh16_fp8_q4", False, False),
-    CoFixRun(
-        "qh16_fp8_q4",
-        True,
-        False,
-        co_override="mla_a8w8_qh16_qseqlen4_gqaratio16_ps.co",
-    ),
-    CoFixRun(
-        "qh16_fp8_q4",
-        True,
-        False,
-        co_override="mla_a8w8_qh16_qseqlen4_gqaratio16_v3_ps.co",
-    ),
-    CoFixRun("qh16_fp8_q4", True, True),
-    CoFixRun("qh32_fp8_q2", True, False),
-    CoFixRun("qh32_fp8_q2", True, True),
-    CoFixRun("qh32_fp8_q4", True, False),
-    CoFixRun("qh32_fp8_q4", True, True),
-    CoFixRun("qh8_fp8_q4", True, False),
-    CoFixRun("qh8_fp8_q4", True, True),
-    CoFixRun("qh64_fp8_q1", True, False),
-    CoFixRun("qh64_fp8_q1", True, True),
+# PR #4452 global-load .co: decode presets reachable via ps+lse off (skip cprr;
+# skip qh16_fp8_q4 nps -> unrefreshed qh64_qseqlen4 alias in mla_asm.csv).
+GLOBAL_LOAD_PRESETS: tuple[str, ...] = (
+    "qh32_bf16_q4",
+    "qh64_bf16_q1",
+    "qh16_fp8_q1",
+    "qh16_fp8_q4",
+    "qh32_fp8_q2",
+    "qh32_fp8_q4",
+    "qh8_fp8_q4",
+    "qh64_fp8_q1",
 )
 
 
 def _default_ctx(h: Harness) -> int:
     """Kernels need ctx >= decode_qlen; use 4 for q1/q2 smoke on ltx suites."""
     return max(4, h.decode_qlen)
-
-
-def _csv_name_to_dtype(name: str) -> torch.dtype:
-    if name == "fp8":
-        return dtypes.fp8
-    if name == "bf16":
-        return dtypes.bf16
-    raise ValueError(f"unsupported csv dtype {name!r}")
-
-
-def decode_presets_from_csv(
-    aiter_root: Path | None = None,
-) -> dict[str, PresetConfig]:
-    """Unique decode configs in mla_asm.csv (prefill=0, causal=0, qSeqLen>=1)."""
-    seen: set[tuple[str, str, int, int]] = set()
-    out: dict[str, PresetConfig] = {}
-    for row in _load_asm_csv(aiter_root):
-        if row["prefill"] != 0 or row["causal"] != 0:
-            continue
-        q_seq = int(row["qSeqLen"])
-        if q_seq < 1:
-            continue
-        q_type = str(row["qType"])
-        kv_type = str(row["kvType"])
-        if q_type == "bf16" and kv_type == "fp8":
-            continue
-        gqa = int(row["Gqa"])
-        key = (q_type, kv_type, gqa, q_seq)
-        if key in seen:
-            continue
-        seen.add(key)
-        name = f"qh{gqa}_{q_type}_q{q_seq}"
-        out[name] = (
-            _csv_name_to_dtype(q_type),
-            _csv_name_to_dtype(kv_type),
-            gqa,
-            q_seq,
-        )
-    return out
 
 
 def apply_config(
@@ -275,34 +183,10 @@ def apply_config(
         )
     global HARNESS
     HARNESS = Harness(q_dtype, kv_dtype, nhead, decode_qlen)
-    _sync_module_aliases()
-
-
-def apply_preset(name: str, decode_qlen: int | None = None) -> None:
-    if name not in PRESETS:
-        raise ValueError(f"unknown preset {name!r}, choose from {list(PRESETS)}")
-    q, kv, n, qlen = PRESETS[name]
-    apply_config(q, kv, n, decode_qlen if decode_qlen is not None else qlen)
-
-
-_apply_preset = apply_preset
 
 
 _q0, _kv0, _n0, _ql0 = PRESETS[DEFAULT_PRESET]
 HARNESS = Harness(_q0, _kv0, _n0, _ql0)
-NHEAD = HARNESS.nhead
-USE_FP8 = HARNESS.use_fp8
-BYTES_PER_PAGE = HARNESS.bytes_per_page
-PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-
-
-def _sync_module_aliases() -> None:
-    global NHEAD, USE_FP8, BYTES_PER_PAGE, PAGE_ID_FIRST_OVER_4G, DECODE_QLEN
-    NHEAD = HARNESS.nhead
-    USE_FP8 = HARNESS.use_fp8
-    BYTES_PER_PAGE = HARNESS.bytes_per_page
-    PAGE_ID_FIRST_OVER_4G = HARNESS.page_id_first_over_4g()
-    DECODE_QLEN = HARNESS.decode_qlen
 
 
 def _point_cases_for(h: Harness) -> list[PointCase]:
@@ -323,61 +207,12 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
         PointCase(PAGE_ID_16M, ctx, "page_id_16m", "page16m"),
         PointCase(PAGE_ID_16M, SUB_KV_TILE, "page_id_16m_ctx128", "page16m"),
         PointCase(1 << 24, ctx, "page_id_2p24", "page16m"),
+        PointCase(19_000_000, ctx, "page_id_19m", "page16m"),
     ]
 
 
 _POINT_CASES = _point_cases_for(HARNESS)
 _SEQUENTIAL_CASES = [(HARNESS.mega_ctx_len(), "sequential_mega_over4g", "mega")]
-
-_AML_ASM_CACHE: dict[str, list[dict[str, object]]] = {}
-
-
-def _aiter_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _co_dir(aiter_root: Path | None = None) -> Path:
-    root = aiter_root or _aiter_root()
-    return root / "hsa" / get_gfx() / "mla"
-
-
-def _load_asm_csv(aiter_root: Path | None = None) -> list[dict[str, object]]:
-    path = _co_dir(aiter_root) / "mla_asm.csv"
-    key = str(path.resolve())
-    if key not in _AML_ASM_CACHE:
-        ints = {"Gqa", "ps", "qSeqLen", "prefill", "causal", "lse", "cprr"}
-        with path.open(newline="") as f:
-            _AML_ASM_CACHE[key] = [
-                {k: (int(v) if k in ints else v) for k, v in row.items()}
-                for row in csv.DictReader(f)
-            ]
-    return _AML_ASM_CACHE[key]
-
-
-def co_name(
-    persistent: bool,
-    lse: bool,
-    *,
-    cprr: bool | None = None,
-    aiter_root: Path | None = None,
-) -> str:
-    if _CO_OVERRIDE:
-        return _CO_OVERRIDE
-    base = HARNESS.csv_dispatch_keys()
-    lse_flag = 1 if (lse and persistent) else 0
-    ps = 1 if persistent else 0
-    cprr_flag = _CPRR if cprr is None else cprr
-    for row in _load_asm_csv(aiter_root):
-        if any(row.get(k) != v for k, v in base.items()):
-            continue
-        if row["ps"] == ps and row["lse"] == lse_flag and row["cprr"] == int(cprr_flag):
-            return str(row["co_name"])
-    raise KeyError(
-        f"no csv row {HARNESS.summary()} ps={ps} lse={lse_flag} cprr={int(cprr_flag)}"
-    )
-
-
-_co_name = co_name
 
 
 def ref_masked_attention(query, key, value, scale, dtype, is_causal=True):
@@ -544,15 +379,6 @@ def run_asm_mla_decode(
     if HARNESS.use_fp8:
         kw["q_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
-    g_kv_indptr = None
-    cp_world_size = 1
-    cp_rank = 0
-    if _CPRR:
-        cp_world_size = 2
-        local_len = int(kv_indptr[1].item() - kv_indptr[0].item())
-        g_kv_indptr = torch.tensor(
-            [0, local_len * cp_world_size], dtype=torch.int, device="cuda"
-        )
     if persistent:
         kw["num_kv_splits"] = max_split
         kw.update(_build_persistent_metadata(qo_indptr, kv_indptr, kv_lens, max_split))
@@ -565,83 +391,12 @@ def run_asm_mla_decode(
         kv_indices,
         kv_lens,
         HARNESS.decode_qlen,
-        g_kv_indptr=g_kv_indptr,
-        cp_world_size=cp_world_size,
-        cp_rank=cp_rank,
+        g_kv_indptr=None,
+        cp_world_size=1,
+        cp_rank=0,
         **kw,
     )
     return out
-
-
-def mla_decode_asm(
-    kv_buffer,
-    num_pages,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    *,
-    persistent: bool,
-    return_lse: bool,
-    max_split: int,
-):
-    qlen = HARNESS.decode_qlen
-    q = torch.randn((qlen, HARNESS.nhead, QK_HEAD_DIM), dtype=torch.bfloat16)
-    ref = run_torch_mla_decode(q, kv_buffer, qo_indptr, kv_indptr, kv_indices)
-    out = torch.empty((qlen, HARNESS.nhead, V_HEAD_DIM), dtype=torch.bfloat16).fill_(-1)
-    run_asm_mla_decode(
-        q,
-        kv_buffer,
-        num_pages,
-        out,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, out
-
-
-_decode = mla_decode_asm
-
-
-def run_point(
-    kv_buffer, num_pages, page_base, ctx_len, *, persistent, return_lse, max_split
-):
-    qo, kv_i, kv_x = _make_indptr(ctx_len, page_base)
-    ref, asm = mla_decode_asm(
-        kv_buffer,
-        num_pages,
-        qo,
-        kv_i,
-        kv_x,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, asm, kv_x
-
-
-_run_mla_decode_point = run_point
-
-
-def run_sequential(kv_buffer, num_pages, ctx_len, *, persistent, return_lse, max_split):
-    qo, kv_i, kv_x = _make_indptr(ctx_len, None)
-    ref, asm = mla_decode_asm(
-        kv_buffer,
-        num_pages,
-        qo,
-        kv_i,
-        kv_x,
-        persistent=persistent,
-        return_lse=return_lse,
-        max_split=max_split,
-    )
-    return ref, asm, kv_x
-
-
-_run_mla_decode_sequential = run_sequential
 
 
 def _page_offset(page_id: int) -> int:
@@ -748,25 +503,19 @@ def test_mla_ltx(
 
     ret = {
         "gfx": get_gfx(),
-        "co": co_name(bool(persistent), bool(return_lse)),
         "label": label,
         "kv_off": kv_off,
         "off_gt_4g": int(kv_off >= (1 << 32)),
     }
     for name, fn in candidates.items():
         result, us = run_perftest(fn)
-        if _SKIP_REF:
-            err = float(
-                torch.isnan(result).any().item() or torch.isinf(result).any().item()
-            )
-        else:
-            err = checkAllclose(
-                ref.to(dtypes.fp32),
-                result.to(dtypes.fp32),
-                rtol=3e-2,
-                atol=3e-2,
-                msg=f"{name}: mla_ltx {label}",
-            )
+        err = checkAllclose(
+            ref.to(dtypes.fp32),
+            result.to(dtypes.fp32),
+            rtol=3e-2,
+            atol=3e-2,
+            msg=f"{name}: mla_ltx {label}",
+        )
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
@@ -796,69 +545,6 @@ def _parse_lse(values: list[str]) -> list[bool]:
         else:
             raise ValueError(f"unknown lse mode {v!r}")
     return out
-
-
-def _summarize_co_fix_rows(all_rows: list[dict]) -> pd.DataFrame:
-    """Aggregate per-.co pass/fail for co_fix sweeps (9 cases = boundary+page16m, ctx=4)."""
-    if not all_rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(all_rows)
-    records: list[dict] = []
-    group_cols = [
-        "co_fix_preset",
-        "co",
-        "persistent",
-        "return_lse",
-        "co_fix_cprr",
-    ]
-    for key, grp in df.groupby(group_cols, sort=False):
-        preset, co, ps, lse, cprr = key
-        errs = grp["asm err"].astype(float)
-        n = len(grp)
-        n_pass = int((errs == 0).sum())
-        n_fail = n - n_pass
-        records.append(
-            {
-                "preset": preset,
-                "co": co,
-                "ps": int(ps),
-                "lse": int(lse),
-                "cprr": int(cprr),
-                "cases": n,
-                "pass": n_pass,
-                "fail": n_fail,
-                "status": "PASS" if n_fail == 0 else "FAIL",
-                "max_err": float(errs.max()) if n else 0.0,
-            }
-        )
-    return pd.DataFrame(records)
-
-
-def _resolve_co_fix_matrix(aiter_root: Path | None = None) -> pd.DataFrame:
-    """Offline: map CO_FIX_RUNS -> .co (no GPU)."""
-    rows: list[dict] = []
-    for run in CO_FIX_RUNS:
-        apply_preset(run.preset)
-        if run.co_override:
-            co = run.co_override
-        else:
-            co = co_name(
-                run.persistent,
-                run.lse,
-                cprr=run.cprr,
-                aiter_root=aiter_root,
-            )
-        rows.append(
-            {
-                "preset": run.preset,
-                "co": co,
-                "ps": int(run.persistent),
-                "lse": int(run.lse),
-                "cprr": int(run.cprr),
-                "skip_ref": int(run.skip_ref),
-            }
-        )
-    return pd.DataFrame(rows)
 
 
 def _sweep_rows(
@@ -915,6 +601,21 @@ def _sweep_rows(
 
 
 def main():
+    if len(sys.argv) == 1 and get_gfx() in SUPPORTED_GFX:
+        sys.argv.extend(
+            [
+                "--preset",
+                *GLOBAL_LOAD_PRESETS,
+                "--suites",
+                "boundary",
+                "page16m",
+                "--ctx",
+                "4",
+                "--lse",
+                "off",
+            ]
+        )
+
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("mla_ltx unsupported on %s; skipping", get_gfx())
         return
@@ -925,28 +626,11 @@ def main():
         description="MLA decode large page_id / >4GB KV pool (gfx950 asm)",
     )
     parser.add_argument(
-        "--preset-group",
-        dest="preset_group",
-        choices=["co_fix"],
-        default=None,
-        help="run bundled preset sweeps (co_fix = d9d7bd3 rebuilt .co set)",
-    )
-    parser.add_argument(
-        "--list-co-fix",
-        action="store_true",
-        help="print CO_FIX_RUNS -> .co matrix and exit (no GPU)",
-    )
-    parser.add_argument(
-        "--co-fix-report",
-        default=None,
-        help="write co_fix aggregate CSV to this path (with --preset-group co_fix)",
-    )
-    parser.add_argument(
         "--preset",
         nargs="*",
         default=[],
         choices=sorted(PRESETS.keys()),
-        help="named decode configs from mla_asm.csv (overrides -d/-kvd/-n when set)",
+        help="named decode configs (overrides -d/-kvd/-n when set)",
     )
     parser.add_argument(
         "--suites",
@@ -1027,18 +711,9 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.list_co_fix:
-        df = _resolve_co_fix_matrix()
-        print(df.to_markdown(index=False))
-        return
-
     persistent_modes = _parse_persistent(args.persistent)
     lse_modes = _parse_lse(args.lse)
     ctx_overrides = args.ctx if args.ctx else [0]
-
-    if args.preset_group == "co_fix":
-        _run_co_fix_group(args)
-        return
 
     if args.preset:
         config_rows = [PRESETS[name] for name in args.preset]
@@ -1115,90 +790,6 @@ def main():
             del _KV_POOL
             _KV_POOL = None
             torch.cuda.empty_cache()
-
-
-def _run_co_fix_group(args) -> None:
-    """Sweep CO_FIX_RUNS (d9d7bd3 .co) with ctx>=decode_qlen (default ctx=4)."""
-    global _POINT_CASES, _SEQUENTIAL_CASES, _KV_POOL, _CPRR, _CO_OVERRIDE, _SKIP_REF
-    suites = args.suites or ["boundary", "page16m"]
-    ctx_override = args.ctx[0] if args.ctx and args.ctx[0] > 0 else 4
-    all_rows: list[dict] = []
-
-    for run in CO_FIX_RUNS:
-        apply_preset(run.preset)
-        _CPRR = run.cprr
-        _CO_OVERRIDE = run.co_override
-        _SKIP_REF = run.skip_ref
-        _POINT_CASES = _point_cases_for(HARNESS)
-        _SEQUENTIAL_CASES = []
-        points = _filter_points(suites)
-        seq: list[tuple[int, str]] = []
-
-        co = co_name(run.persistent, run.lse)
-        aiter.logger.info(
-            "co_fix preset=%s co=%s ps=%s lse=%s cprr=%s ctx=%d skip_ref=%s",
-            run.preset,
-            co,
-            run.persistent,
-            run.lse,
-            run.cprr,
-            ctx_override,
-            run.skip_ref,
-        )
-
-        num_pages = int(
-            os.environ.get(
-                "MLA_PAGE_OOB_NUM_PAGES",
-                str(_need_num_pages(points, seq, ctx_override)),
-            )
-        )
-        try:
-            _KV_POOL = (
-                _build_kv_pool(num_pages, _seed_ranges(points, seq, ctx_override)),
-                num_pages,
-            )
-        except torch.cuda.OutOfMemoryError as e:
-            aiter.logger.warning("co_fix OOM preset=%s: %s", run.preset, e)
-            continue
-
-        q, kv, n, qlen = PRESETS[run.preset]
-        rows = _sweep_rows(
-            points,
-            seq,
-            ctx_override,
-            q,
-            kv,
-            n,
-            qlen,
-            [run.persistent],
-            [run.lse],
-            args.num_kv_splits,
-        )
-        for row in rows:
-            row["co_fix_preset"] = run.preset
-            row["co_fix_cprr"] = int(run.cprr)
-        all_rows.extend(rows)
-        del _KV_POOL
-        _KV_POOL = None
-        torch.cuda.empty_cache()
-
-    _CPRR = False
-    _CO_OVERRIDE = None
-    _SKIP_REF = False
-    if all_rows:
-        df = pd.DataFrame(all_rows)
-        agg = _summarize_co_fix_rows(all_rows)
-        aiter.logger.info("co_fix detail (markdown):\n%s", df.to_markdown(index=False))
-        aiter.logger.info(
-            "co_fix aggregate (markdown):\n%s", agg.to_markdown(index=False)
-        )
-        if args.co_fix_report:
-            report = Path(args.co_fix_report)
-            report.parent.mkdir(parents=True, exist_ok=True)
-            agg.to_csv(report, index=False)
-            detail = report.with_name(report.stem + "_detail.csv")
-            df.to_csv(detail, index=False)
-            aiter.logger.info("co_fix report: %s", report)
 
 
 if __name__ == "__main__":
