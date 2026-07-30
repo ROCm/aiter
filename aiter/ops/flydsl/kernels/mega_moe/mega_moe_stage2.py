@@ -545,7 +545,7 @@ def make_gemm2_autotuner(a_dtype: str = "fp8", p2p_quant_type: str = "none"):
     tuner = autotune(
         configs=configs, key=key, warmup=3, rep=10,
         prune_configs_by=_prune_gemm2_configs, do_bench=do_bench_collective,
-        default=default, artifact_name="mega-moe-v2-stage2",
+        default=default, artifact_name="mega-moe-v2-stage2", artifact_bundle=True,
     )(_run_gemm2_config)
     tuner.schema = _AUTOTUNE_SCHEMA
     return tuner

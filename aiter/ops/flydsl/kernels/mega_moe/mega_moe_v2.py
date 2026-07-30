@@ -54,7 +54,7 @@ def _make_joint_sbm_autotuner(tile_m_values):
     ]
     return autotune(
         configs=configs, key=key, warmup=2, rep=7, do_bench=do_bench_collective,
-        default=configs[0], artifact_name="mega-moe-v2-joint-sbm",
+        default=configs[0], artifact_name="mega-moe-v2-joint-sbm", artifact_bundle=True,
     )(_run_joint_sbm_config)
 # fmt: on
 

@@ -425,7 +425,7 @@ def make_stage1_autotuner(dispatch_cu=None, grid_mult=None, tile_m_values=(32,))
     tuner = autotune(
         configs=configs, key=key, warmup=2, rep=7,
         prune_configs_by=prune_stage1_autotune_configs, do_bench=do_bench_collective,
-        default=default, artifact_name="mega-moe-v2-stage1",
+        default=default, artifact_name="mega-moe-v2-stage1", artifact_bundle=True,
     )(_run_stage1_config)
     tuner.schema = _AUTOTUNE_SCHEMA
     return tuner
