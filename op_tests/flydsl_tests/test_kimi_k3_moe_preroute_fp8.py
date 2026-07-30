@@ -9,8 +9,10 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.kimi_k3_moe_preroute_fp8 import (
     is_kimi_k3_moe_preroute_fp8_available,
     kimi_k3_moe_dual_projection_fp8,
+    kimi_k3_moe_tri_projection_fp8,
     kimi_k3_shared_down_fp8,
     supports_kimi_k3_moe_dual_projection_fp8,
+    supports_kimi_k3_moe_tri_projection_fp8,
     supports_kimi_k3_shared_down_fp8,
     supports_kimi_k3_shared_down_fp8_weight,
 )
@@ -55,6 +57,14 @@ def test_support_predicates_fail_closed_on_cpu():
         scale,
         fp8,
         scale,
+    )
+    assert not supports_kimi_k3_moe_tri_projection_fp8(
+        hidden,
+        fp8,
+        scale,
+        fp8,
+        scale,
+        hidden,
     )
     assert not supports_kimi_k3_shared_down_fp8(hidden, fp8, scale)
     assert not supports_kimi_k3_shared_down_fp8_weight(fp8, scale)
@@ -112,6 +122,11 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
         device=device,
         dtype=torch.bfloat16,
     )
+    router_bf16 = torch.randn(
+        (896, 7168),
+        device=device,
+        dtype=torch.bfloat16,
+    )
     routed_weight, routed_scale = _quantize_rows(routed_bf16)
     shared_up_weight, shared_up_scale = _quantize_rows(shared_up_bf16)
     shared_down_weight, shared_down_scale = _quantize_rows(shared_down_bf16)
@@ -122,6 +137,14 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
         routed_scale,
         shared_up_weight,
         shared_up_scale,
+    )
+    tri_routed, tri_gate_up, router_logits = kimi_k3_moe_tri_projection_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_up_weight,
+        shared_up_scale,
+        router_bf16,
     )
     shared = kimi_k3_shared_down_fp8(
         gate_up,
@@ -152,6 +175,16 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
 
     assert _relative_rmse(routed, routed_ref) < 0.035
     assert _relative_rmse(gate_up, gate_up_ref) < 0.035
+    torch.testing.assert_close(tri_routed, routed, atol=0, rtol=0)
+    torch.testing.assert_close(tri_gate_up, gate_up, atol=0, rtol=0)
+    router_ref = F.linear(hidden, router_bf16).float()
+    assert _relative_rmse(router_logits, router_ref) < 0.01
+    torch.testing.assert_close(
+        router_logits.topk(16, dim=-1).indices,
+        router_ref.topk(16, dim=-1).indices,
+        atol=0,
+        rtol=0,
+    )
     assert _relative_rmse(shared, shared_ref) < 0.06
     assert F.cosine_similarity(shared.float(), shared_ref.float()).item() > 0.998
 

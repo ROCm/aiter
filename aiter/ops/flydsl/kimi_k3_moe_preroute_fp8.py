@@ -18,6 +18,7 @@ _HIDDEN_SIZE = 7168
 _ROUTED_SIZE = 3584
 _SHARED_GATE_UP_SIZE = 1536
 _SHARED_INTERMEDIATE_SIZE = _SHARED_GATE_UP_SIZE // 2
+_ROUTER_SIZE = 896
 
 
 def is_kimi_k3_moe_preroute_fp8_available() -> bool:
@@ -112,6 +113,90 @@ def kimi_k3_moe_dual_projection_fp8(
         stream=torch.cuda.current_stream(hidden.device),
     )
     return routed_output, shared_output
+
+
+def supports_kimi_k3_moe_tri_projection_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> bool:
+    """Return whether the mixed-precision tri-projection is supported."""
+
+    return (
+        supports_kimi_k3_moe_dual_projection_fp8(
+            hidden,
+            routed_weight,
+            routed_scale,
+            shared_weight,
+            shared_scale,
+        )
+        and router_weight.is_cuda
+        and router_weight.device == hidden.device
+        and router_weight.dtype == torch.bfloat16
+        and tuple(router_weight.shape) == (_ROUTER_SIZE, _HIDDEN_SIZE)
+        and router_weight.is_contiguous()
+    )
+
+
+@functools.cache
+def _tri_projection_launcher():
+    from aiter.ops.flydsl.kernels.kimi_k3_tri_projection_fp8_gfx950 import (
+        build_kimi_k3_b1_tri_projection_fp8_module,
+    )
+
+    return build_kimi_k3_b1_tri_projection_fp8_module(
+        rows_per_wave=1,
+        cu_count=248,
+        waves_per_eu=0,
+        weight_cache_modifier=2,
+        hidden_to_lds=True,
+    )
+
+
+def kimi_k3_moe_tri_projection_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Project routed, shared, and FP32 router outputs in one wide grid."""
+
+    if not supports_kimi_k3_moe_tri_projection_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+        router_weight,
+    ):
+        raise ValueError("unsupported Kimi-K3 tri-projection inputs")
+
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    routed_output = hidden.new_empty((_BATCH_SIZE, _ROUTED_SIZE))
+    shared_output = hidden.new_empty((_BATCH_SIZE, _SHARED_GATE_UP_SIZE))
+    router_output = hidden.new_empty(
+        (_BATCH_SIZE, _ROUTER_SIZE),
+        dtype=torch.float32,
+    )
+    _tri_projection_launcher()(
+        ptr_arg(hidden),
+        ptr_arg(routed_weight),
+        ptr_arg(routed_scale),
+        ptr_arg(shared_weight),
+        ptr_arg(shared_scale),
+        ptr_arg(router_weight),
+        ptr_arg(routed_output),
+        ptr_arg(shared_output),
+        ptr_arg(router_output),
+        stream=torch.cuda.current_stream(hidden.device),
+    )
+    return routed_output, shared_output, router_output
 
 
 def supports_kimi_k3_shared_down_fp8(
