@@ -120,7 +120,6 @@ def compile_gemm2_a4w4_port(
     route_out_fp8 = out_dtype == "fp8"
     if route_out_fp8 and not use_reduce:
         raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
-    # gemm2 perf knobs (default ON; env override, explicit arg wins): kstages=2 double-buffers B one tile ahead; bhoist hoists that prefetch above the LDS barrier; ascale_pf prefetches A-scale; spart = SpatiallyLocalTilePartitioner remap GroupNum*100+M01 (402; 0=naive).
     if g2_kstages is None:
         g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     if g2_kstages not in (1, 2):
@@ -145,8 +144,8 @@ def compile_gemm2_a4w4_port(
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
     is_f8 = a_dtype == "fp8"
     if g2_bf16_lds is None:
-        g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and use_reduce
-    g2_bf16_lds = bool(g2_bf16_lds) and use_reduce
+        g2_bf16_lds = (os.environ.get("MXFP4_G2_BF16_LDS", 0) == "1")
+    g2_bf16_lds = bool(g2_bf16_lds)
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
     aStages = 2 if g2_bf16_lds else 3
@@ -450,7 +449,7 @@ def get_g2(
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
-    g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "1") == "1" and epilog == "reduce"
+    g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     key = (
         BM,
         BN,
