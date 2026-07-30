@@ -1218,10 +1218,6 @@ void topk_softplus(aiter_tensor_t& topk_weights,
     AITER_CHECK(topk <= num_experts,
                 "topk (", topk, ") exceeds num_experts (", num_experts, ")");
 
-    if(sf_code == SCORE_SOFTMAX)
-    {
-        need_renorm = false;
-    }
 
     dim3 grid(num_tokens);
     dim3 block(get_warp_size_func());
