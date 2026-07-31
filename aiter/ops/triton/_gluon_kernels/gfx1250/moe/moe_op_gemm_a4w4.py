@@ -747,7 +747,7 @@ def _moe_gemm_a4w4_prefill(
         mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
         GatherIndx += start_m
-        offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     # B pointers
@@ -766,14 +766,12 @@ def _moe_gemm_a4w4_prefill(
     if GatherIndx is None:
         XMxScale += start_m.to(index_type) * stride_x_mx_m
     if not X_SCALES_TDM:
-        offs_x_m_scales = (
-            PACKED_BLOCK_M_X * block_id
-            + gl.arange(
-                0,
-                PACKED_BLOCK_M_X,
-                layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
-            )
-        ) % M
+        offs_x_m_scales = PACKED_BLOCK_M_X * block_id + gl.arange(
+            0,
+            PACKED_BLOCK_M_X,
+            layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
+        )
+        offs_x_m_scales = offs_x_m_scales % M
         if GatherIndx is not None:
             offs_x_m_scales = gl.load(GatherIndx + offs_x_m_scales) // N_EXPTS_ACT
         offs_x_k_scales = gl.arange(
@@ -781,8 +779,8 @@ def _moe_gemm_a4w4_prefill(
         )
         x_scales_ptrs = (
             XMxScale
-            + offs_x_m_scales[:, None] * stride_x_mx_m
-            + offs_x_k_scales[None, :] * stride_x_mx_k
+            + offs_x_m_scales.to(index_type)[:, None] * stride_x_mx_m
+            + offs_x_k_scales.to(index_type)[None, :] * stride_x_mx_k
         )
 
     # B scale pointers
@@ -1101,11 +1099,6 @@ def _moe_gemm_a4w4_prefill(
         cur_x_scales = next_x_scales
         cur_w_scales = next_w_scales
 
-    offs_m = BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    mask_m = offs_m < M
-
     # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
@@ -1223,7 +1216,11 @@ def _moe_gemm_a4w4_prefill(
 
     # apply gammas
     if Gammas is not None:
-        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_m, mask=mask_m, other=0.0
+        )
         out *= gammas[:, None]
 
     # write-back via TDM store: registers -> shared memory -> global memory
@@ -1400,7 +1397,7 @@ def _moe_gemm_a4w4_decode(
         mask_idx = offs_x_m < M
         offs_x_m = offs_x_m % M
         GatherIndx += start_m
-        offs_x_m = gl.amd.gfx1250.buffer_load(GatherIndx, offs_x_m) // N_EXPTS_ACT
+        offs_x_m = gl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
         offs_x_m = gl.where(mask_idx, offs_x_m, oob_idx)
 
     # B pointers
@@ -1669,11 +1666,6 @@ def _moe_gemm_a4w4_decode(
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.wait()
 
-    offs_m = BLOCK_M * block_id + gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )
-    mask_m = offs_m < M
-
     # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
@@ -1780,7 +1772,11 @@ def _moe_gemm_a4w4_decode(
 
     # apply gammas
     if Gammas is not None:
-        gammas = gl.load(Gammas + start_m + offs_m, mask=mask_m, other=0.0)
+        offs_m = BLOCK_M * block_id + gl.arange(0, BLOCK_M)
+        mask_m = offs_m < M
+        gammas = gl.amd.gfx1250.buffer_load(
+            Gammas + start_m, offs_m, mask=mask_m, other=0.0
+        )
         out *= gammas[:, None]
 
     # write-back via TDM store: registers -> shared memory -> global memory
