@@ -4,23 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton._triton_kernels.activation import (
-    _get_activation_from_str,
-)
-from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
-    _fused_flatten_mxfp4_quant,
-    _fused_reduce_act_mul_and_dynamic_mxfp4_quant_kernel,
-    _fused_reduce_rms_mxfp4_quant_kernel,
-    _fused_dynamic_mxfp4_quant_moe_sort_kernel,
-)
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.activation import (
     _get_activation_from_str,
-    _fused_rms_mxfp4_quant_kernel,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_dynamic_mxfp4_quant_moe_sort_kernel,
@@ -29,6 +17,7 @@ from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (
     _fused_reduce_rms_mxfp4_quant_kernel,
     _fused_rms_mxfp4_quant_kernel,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
 
@@ -160,20 +149,20 @@ def fused_rms_mxfp4_quant(
         out_res1_stride_m,
         out1_stride_m,
     )
-    _common_kwargs = dict(
-        BLOCK_SIZE_M=BLOCK_SIZE_M,
-        BLOCK_SIZE_N=BLOCK_SIZE_N,
-        BLOCK_SIZE_N2=BLOCK_SIZE_N2,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        HAS_SECOND_INPUT=(x2 is not None),
-        FIRST_INPUT_RES=(res1 is not None),
-        FIRST_INPUT_OUT=output_unquantized_inp1,
-        SCALE_N=SCALE_N_valid,
-        SCALE_M_PAD=(SCALE_M if use_scale_shuffle_padding else 1),
-        SCALE_N_PAD=SCALE_N,
-        SHUFFLE=shuffle,
-        SHUFFLE_PAD=use_scale_shuffle_padding,
-    )
+    _common_kwargs = {
+        "BLOCK_SIZE_M": BLOCK_SIZE_M,
+        "BLOCK_SIZE_N": BLOCK_SIZE_N,
+        "BLOCK_SIZE_N2": BLOCK_SIZE_N2,
+        "MXFP4_QUANT_BLOCK_SIZE": MXFP4_QUANT_BLOCK_SIZE,
+        "HAS_SECOND_INPUT": (x2 is not None),
+        "FIRST_INPUT_RES": (res1 is not None),
+        "FIRST_INPUT_OUT": output_unquantized_inp1,
+        "SCALE_N": SCALE_N_valid,
+        "SCALE_M_PAD": (SCALE_M if use_scale_shuffle_padding else 1),
+        "SCALE_N_PAD": SCALE_N,
+        "SHUFFLE": shuffle,
+        "SHUFFLE_PAD": use_scale_shuffle_padding,
+    }
 
     if use_gluon:
         # Aim for at least 32 CTAs to keep all WGPs fed.
