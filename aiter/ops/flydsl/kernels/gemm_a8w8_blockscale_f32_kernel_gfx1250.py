@@ -6,6 +6,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
+from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
@@ -17,10 +18,6 @@ B_CYCLE_BYTES = 16 * 16
 B_KSTEP_BYTES = WMMA_K * 16
 
 
-def _align_up(n, a):
-    return ((n + a - 1) // a) * a
-
-
 def lds_load_b128(lds_i8_ptr, byte_off):
     return fx.ptr_load(fx.add_offset(lds_i8_ptr, byte_off), result_type=T.vec(4, T.i32))
 
@@ -30,12 +27,10 @@ def _vec(v):
 
 
 def _byte_off_i32(elem_off, elem_bytes):
-    """Element offset -> i32 byte offset; rocdl raw-buffer ops take bytes."""
     return (fx.Int32(elem_off) * elem_bytes).ir_value()
 
 
 def buffer_load_f32(rsrc, elem_off):
-    """Scalar f32 buffer load at an element offset (hardware OOB-checked)."""
     zero = fx.Int32(0).ir_value()
     return rocdl.raw_ptr_buffer_load(
         T.f32, rsrc, _byte_off_i32(elem_off, 4), zero, zero
@@ -43,11 +38,6 @@ def buffer_load_f32(rsrc, elem_off):
 
 
 def store_acc_vec8_to_buffer(acc_vec8, c_rsrc, addr, out_dt=None, byte_addr=False):
-    """Write one 8-element f32 accumulator to global memory.
-
-    Half output (out_dt set): convert -> bitcast(vec<4xi32>) -> one store.
-    f32 output: two vec<4xf32> stores, `addr` a pair of element offsets.
-    """
     zero = fx.Int32(0).ir_value()
     acc = _vec(acc_vec8)
 
@@ -95,7 +85,6 @@ def compile_gemm_a8w8_blockscale(
     _req(out_dtype in ("bf16", "fp16", "f32"), f"bad out_dtype {out_dtype!r}")
     _req(2 <= num_buffers <= 8, f"num_buffers must be in [2, 8], got {num_buffers}")
     _req(split_k >= 1, f"split_k must be >= 1, got {split_k}")
-    # One readlane feeds the whole wave, so the W-scale must be wave-uniform.
     _req(warp_tile_n <= scale_block_n, f"warp_tile_n {warp_tile_n} > {scale_block_n}")
     _req_multiples(
         (
@@ -138,7 +127,6 @@ def compile_gemm_a8w8_blockscale(
     num_k_tiles, scale_k = split_k_chunk // tile_k, K // scale_block_k
     scale_k_per_split = split_k_chunk // scale_block_k
 
-    # W-scale
     NUM_W_CHUNKS = (scale_k_per_split + 31) // 32
     USES_W_CHUNK_PREFETCH = NUM_W_CHUNKS > 1
 
@@ -158,13 +146,13 @@ def compile_gemm_a8w8_blockscale(
     xs_row_bytes = scales_per_tile * 4
     lds_x_scale_data_bytes = tile_m * xs_row_bytes
 
-    unified_a_off = 0
-    unified_b_off = _align_up(unified_a_off + num_buffers * lds_a_data_bytes, 16)
-    unified_x_scale_off = _align_up(unified_b_off + num_buffers * lds_b_data_bytes, 16)
-    lds_arena_bytes = _align_up(
-        unified_x_scale_off + num_buffers * lds_x_scale_data_bytes, 16
-    )
-    check_smem_capacity(lds_arena_bytes, gpu_arch)
+    @fx.struct
+    class SharedStorage:
+        a: fx.Array[fx.Uint8, num_buffers * lds_a_data_bytes, 16]
+        b: fx.Array[fx.Uint8, num_buffers * lds_b_data_bytes, 16]
+        xs: fx.Array[fx.Uint8, num_buffers * lds_x_scale_data_bytes, 16]
+
+    check_smem_capacity(dsl_size_of(SharedStorage), gpu_arch)
 
     _TDMS_PER_TILE = 3  # X + W + X-scale
     PROLOGUE_FILL = num_buffers if variant == "compute_bound" else num_buffers - 1
@@ -231,15 +219,12 @@ def compile_gemm_a8w8_blockscale(
 
         scale_zero = fx.Float32(0.0)
 
-        lds_base_ptr = fx.SharedAllocator(static=True).allocate(lds_arena_bytes)._ptr
+        lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
 
-        def _lds_region_ptr(byte_off):
-            return fx.add_offset(lds_base_ptr, byte_off)
-
-        def _slot_byte_off(buf_idx, region_off, slot_bytes):
+        def _slot_byte_off(buf_idx, slot_bytes):
             if const_expr(isinstance(buf_idx, int)):
-                return region_off + buf_idx * slot_bytes
-            return fx.Uint64(buf_idx) * slot_bytes + region_off
+                return buf_idx * slot_bytes
+            return fx.Uint64(buf_idx) * slot_bytes
 
         def _imm64(k_tile, mul):
             if const_expr(isinstance(k_tile, int)):
@@ -257,14 +242,14 @@ def compile_gemm_a8w8_blockscale(
             )
 
         def _issue_tile(buf_idx, k_tile):
-            for atom, gt, roff, shape, row in _TDM_SPECS:
+            for atom, gt, base, shape, row in _TDM_SPECS:
                 fx.copy(
                     atom,
                     gt,
                     fx.Tensor(
                         fx.make_view(
-                            _lds_region_ptr(
-                                _slot_byte_off(buf_idx, roff, shape[0] * row)
+                            fx.add_offset(
+                                base, _slot_byte_off(buf_idx, shape[0] * row)
                             ),
                             fx.make_layout(shape, (row, 1)),
                         )
@@ -290,8 +275,8 @@ def compile_gemm_a8w8_blockscale(
             if const_expr(isinstance(chunk, int)):
                 offset = fx.Uint64(chunk * 32)
             else:
-                c, hi = fx.Uint32(chunk), fx.Uint32(NUM_W_CHUNKS - 1)
-                offset = fx.Uint64((c < hi).select(c, hi) * 32)
+                hi = fx.Uint32(NUM_W_CHUNKS - 1)
+                offset = fx.Uint64((chunk < hi).select(chunk, hi) * 32)
             idx = wave_n_block * scale_k + lane_id_full + offset
             if const_expr(split_k > 1):
                 idx = idx + split_kb_base
@@ -305,7 +290,7 @@ def compile_gemm_a8w8_blockscale(
             return rocdl.readlane(T.f32, chosen.ir_value(), (kb & 31).ir_value())
 
         def _advance_w_chunks(next_compute_idx):
-            next_chunk = (fx.Uint32(next_compute_idx) * scales_per_tile) >> 5
+            next_chunk = (next_compute_idx * scales_per_tile) >> 5
             need_advance = next_chunk != fx.Uint32(cur_chunk_idx)
             new_cur = need_advance.select(
                 fx.Float32(bulk_w_prefetch), fx.Float32(bulk_w_cur)
@@ -383,16 +368,15 @@ def compile_gemm_a8w8_blockscale(
             return w_raw
 
         def issue_w_raw_scales_masked(future_tile):
-            ft = fx.Uint32(future_tile)
-            valid = ft < num_k_tiles
-            safe_tile = valid.select(ft, fx.Uint32(0))
+            valid = future_tile < num_k_tiles
+            safe_tile = valid.select(future_tile, fx.Uint32(0))
             raw_w = issue_w_raw_scales(fx.Uint64(safe_tile) * tile_k)
             return [valid.select(fx.Float32(v), scale_zero) for v in raw_w]
 
         def _slot_off(buffer_idx, data_bytes):
             if const_expr(isinstance(buffer_idx, int)):
                 return fx.Uint64(buffer_idx * data_bytes)
-            return fx.Uint64(fx.Int32(buffer_idx) * data_bytes)  # mul in i32, widen
+            return fx.Uint64(buffer_idx * data_bytes)  # mul in i32, widen
 
         def _a_step_frags(slot_off_a, ks):
             return [
@@ -468,16 +452,11 @@ def compile_gemm_a8w8_blockscale(
                     global_accs[idx] = apply_scale(temp, scale, global_accs[idx])
             return global_accs
 
-        big_a_mem, big_b_mem = (
-            _lds_region_ptr(unified_a_off),
-            _lds_region_ptr(unified_b_off),
-        )
+        big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
         blk_m64, blk_n64 = fx.Int64(blk_m), fx.Int64(blk_n)
         split_k_base64 = fx.Int64(split_k_base)
-        x_base_bytes = blk_m64 * fx.Int64(K) + split_k_base64
-        w_base_bytes = (blk_n64 // fx.Int64(16)) * fx.Int64(
-            K * 16
-        ) + split_k_base64 * fx.Int64(16)
+        x_base_bytes = blk_m64 * K + split_k_base64
+        w_base_bytes = (blk_n64 // 16) * (K * 16) + split_k_base64 * 16
 
         gX = _byte_view(arg_x, x_base_bytes, (tile_m, tile_k), (tile_k, 1))
         gW = _byte_view(
@@ -486,7 +465,7 @@ def compile_gemm_a8w8_blockscale(
         atom_x = fx.rocdl.make_tdm_atom(
             gX,
             [None, None],
-            strides=[fx.Int64(K), None],
+            strides=[K, None],
             num_warps=num_warps,
             pad_interval=tile_k,
             pad_amount=LDS_PAD_A_BYTES,
@@ -494,38 +473,28 @@ def compile_gemm_a8w8_blockscale(
         atom_w = fx.rocdl.make_tdm_atom(
             gW,
             [None, None],
-            strides=[fx.Int64(K * 16), None],
+            strides=[K * 16, None],
             num_warps=num_warps,
         )
 
-        # ── X-scale TDM descriptor + LDS staging (hoisted) ──────────────────
-        big_x_scale_mem = fx.recast_iter(
-            fx.Float32, _lds_region_ptr(unified_x_scale_off)
-        )
+        # X-scale TDM descriptor + LDS staging (hoisted)
+        big_x_scale_mem = fx.recast_iter(fx.Float32, lds.xs.ptr)
 
-        xs_base_bytes = blk_m64 * fx.Int64(scale_k * 4) + fx.Int64(
-            split_kb_base
-        ) * fx.Int64(4)
+        xs_base_bytes = blk_m64 * (scale_k * 4) + fx.Int64(split_kb_base) * 4
         gXS = _byte_view(
             arg_x_scale, xs_base_bytes, (tile_m, xs_row_bytes), (xs_row_bytes, 1)
         )
         atom_xs = fx.rocdl.make_tdm_atom(
             gXS,
             [None, None],
-            strides=[fx.Int64(scale_k * 4), None],
+            strides=[scale_k * 4, None],
             num_warps=num_warps,
         )
 
         _TDM_SPECS = (
-            (atom_x, gX, unified_a_off, (tile_m, tile_k), lds_a_stride_bytes),
-            (
-                atom_w,
-                gW,
-                unified_b_off,
-                (tile_n // 16, tile_k * 16),
-                lds_b_stride_bytes,
-            ),
-            (atom_xs, gXS, unified_x_scale_off, (tile_m, xs_row_bytes), xs_row_bytes),
+            (atom_x, gX, big_a_mem, (tile_m, tile_k), lds_a_stride_bytes),
+            (atom_w, gW, big_b_mem, (tile_n // 16, tile_k * 16), lds_b_stride_bytes),
+            (atom_xs, gXS, lds.xs.ptr, (tile_m, xs_row_bytes), xs_row_bytes),
         )
 
         wave_n_block = (blk_n + warp_n_base) // scale_block_n
@@ -579,7 +548,6 @@ def compile_gemm_a8w8_blockscale(
         else:
             prefetch_w_raw = zero_w_raw
 
-        # Accumulator init
         accs = [acc_zero] * n_accs
         load_idx_init, compute_idx_init = fx.Uint32(PROLOGUE_FILL), fx.Uint32(0)
 
@@ -615,7 +583,6 @@ def compile_gemm_a8w8_blockscale(
                     cur_compute_idx % num_buffers if FRAGS_IN_COMPUTE else None
                 )
 
-                # Main loop
                 if const_expr(variant == "compute_bound"):
                     cur_accs = compute_wmma(
                         cur_accs, cur_a, cur_b, cur_x_raw, cur_w_raw, buf=cur_buf_i32
@@ -672,10 +639,10 @@ def compile_gemm_a8w8_blockscale(
                 bulk_w_cur, bulk_w_prefetch, cur_chunk_idx = results[-5:-2]
             accs = list(results[:N_ACCS])
         else:
-            accs = list(accs)
             final_compute_idx = fx.Uint32(0)
 
-        # EPILOGUE - scf.for drain, small carry (accs + tile idx, frags reloaded fresh); descending tensorcnt via range_constexpr if-ladder; DRAIN_COUNT tiles, no new TDMs.
+        # EPILOGUE — drain DRAIN_COUNT tiles, no new TDMs. Carries only accs +
+        # tile idx; frags are reloaded fresh so nothing else crosses the loop.
         drain_init = list(accs) + [final_compute_idx]
         for _drain_i, dstate in range(0, DRAIN_COUNT, 1, init=drain_init):
             accs_d = list(dstate[:N_ACCS])
@@ -704,7 +671,6 @@ def compile_gemm_a8w8_blockscale(
             dresults = yield list(accs_d) + [cur_dci_d + 1]
         accs = list(dresults[:N_ACCS])
 
-        # Step 4: convert f32 accs to out_dtype, buffer_store to Y.
         if const_expr(num_buffers > 2):
             rocdl.sched_barrier(0)
 

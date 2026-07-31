@@ -8,22 +8,51 @@ Scales are f32 and applied after each WMMA
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 _compile_gemm_a8w8_blockscale = None
+_run_compiled = None
+_fx = None
 
 
 def _lazy_import():
     """Defer the kernel import so ``import aiter`` does not pull in flydsl."""
-    global _compile_gemm_a8w8_blockscale
+    global _compile_gemm_a8w8_blockscale, _run_compiled, _fx
     if _compile_gemm_a8w8_blockscale is not None:
         return
-    # Absolute (not relative) so this module also works when loaded by file path.
+    import flydsl.expr as fx
+
     from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_f32_kernel_gfx1250 import (
         compile_gemm_a8w8_blockscale,
     )
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled as run_compiled
 
     _compile_gemm_a8w8_blockscale = compile_gemm_a8w8_blockscale
+    _run_compiled = run_compiled
+    _fx = fx
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_launcher(*cfg):
+    keys = (
+        "K",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "m_warp",
+        "n_warp",
+        "scale_block_k",
+        "scale_block_n",
+        "num_buffers",
+        "waves_per_eu",
+        "out_dtype",
+        "variant",
+        "kernarg_preload",
+        "split_k",
+    )
+    return _compile_gemm_a8w8_blockscale(**dict(zip(keys, cfg)))
 
 
 def gemm_a8w8_blockscale(
@@ -99,25 +128,27 @@ def gemm_a8w8_blockscale(
     else:
         y_buf = _alloc((M, N), dtype=dtype, device=x.device)
 
-    launcher = _compile_gemm_a8w8_blockscale(
-        K=K,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        m_warp=m_warp,
-        n_warp=n_warp,
-        scale_block_k=scale_block_k,
-        scale_block_n=scale_block_n,
-        num_buffers=num_buffers,
-        waves_per_eu=waves_per_eu,
-        out_dtype=out_dtype_str,
-        variant=variant,
-        kernarg_preload=kernarg_preload,
-        split_k=split_k,
+    launcher = _cached_launcher(
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        scale_block_k,
+        scale_block_n,
+        num_buffers,
+        waves_per_eu,
+        out_dtype_str,
+        variant,
+        kernarg_preload,
+        split_k,
     )
 
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
-    launcher(y_buf, x, w, x_scale, w_scale, M, N_stride, stream=stream)
+    _run_compiled(
+        launcher, y_buf, x, w, x_scale, w_scale, M, N_stride, _fx.Stream(stream)
+    )
 
     result = y_buf[:, :N] if N_stride != N else y_buf
     if _splitk_f32_accum:
