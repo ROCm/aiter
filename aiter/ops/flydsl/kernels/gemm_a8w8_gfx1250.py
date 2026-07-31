@@ -15,7 +15,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
 
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
-    lds_load_b128_raw,
+    make_lds_copy_ops,
     pipeline_fence,
     workgroup_barrier,
 )
@@ -145,6 +145,8 @@ def launch_gemm_a8w8(
         def _lv(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
+        lds_load_b128, _ = make_lds_copy_ops(128)
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gC_base = fx.recast_iter(
@@ -247,7 +249,7 @@ def launch_gemm_a8w8(
         def load_a(buf, wm, ks):
             row = wmb + wm * 16 + lane16
             b0 = fx.index_cast(T.index, row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
@@ -258,7 +260,7 @@ def launch_gemm_a8w8(
                 T.index,
                 STAGE_A + nbl * B_LDS_ROW + ks * 2048 + kgrp * 256 + lane16 * 16,
             )
-            v = [Vec(lds_load_b128_raw(buf, b0 + 512 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 512 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
