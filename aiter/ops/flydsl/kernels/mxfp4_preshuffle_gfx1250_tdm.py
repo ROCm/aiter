@@ -16,13 +16,16 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
+    batched_situv2,
     fused_silu_swiglu_elem,
+    fused_situv2_elem,
     lds_load_b32_raw,
     lds_load_b128_raw,
     lds_store_b32_raw,
     lds_store_b64_raw,
     lds_store_b128_raw,
     pipeline_fence,
+    situv2_consts,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -62,6 +65,10 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
+    f32_situ_beta: fx.Float32 = 1.0,
+    f32_situ_inv_beta: fx.Float32 = 1.0,
+    f32_situ_linear_beta: fx.Float32 = 1.0,
+    f32_situ_inv_linear_beta: fx.Float32 = 1.0,
 ):
     cache_tag = (
         K,
@@ -153,6 +160,10 @@ def launch_gemm_a8w4_tdm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_inv_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
+        f32_situ_inv_linear_beta: fx.Float32,
     ):
         # rocdl.disable_xdl_arb_stall()
 
@@ -547,6 +558,19 @@ def launch_gemm_a8w4_tdm(
             STORE_N = (tile_n // 2) if stage1_act else tile_n
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
+            is_situv2 = stage1_act == 3
+            # Uniform across the tile, so fold the betas once here rather than
+            # per element. Only materialised on the SiTUv2 path.
+            situ_c = (
+                situv2_consts(
+                    f32_situ_beta,
+                    f32_situ_inv_beta,
+                    f32_situ_linear_beta,
+                    f32_situ_inv_linear_beta,
+                )
+                if const_expr(is_situv2)
+                else None
+            )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             # -- Activate + stage to LDS --
@@ -586,13 +610,20 @@ def launch_gemm_a8w4_tdm(
                             for p in range_constexpr(4):
                                 pairs.append((acc[2 * p], acc[2 * p + 1]))
 
-                        all_vals = batched_silu_swiglu(
-                            pairs,
-                            swiglu=is_swiglu,
-                            limit_f32=f32_swiglu_limit,
-                            neg_limit_f32=neg_limit,
-                            range_constexpr=range_constexpr,
-                        )
+                        if const_expr(is_situv2):
+                            all_vals = batched_situv2(
+                                pairs,
+                                consts=situ_c,
+                                range_constexpr=range_constexpr,
+                            )
+                        else:
+                            all_vals = batched_silu_swiglu(
+                                pairs,
+                                swiglu=is_swiglu,
+                                limit_f32=f32_swiglu_limit,
+                                neg_limit_f32=neg_limit,
+                                range_constexpr=range_constexpr,
+                            )
 
                         scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                             all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
@@ -655,8 +686,17 @@ def launch_gemm_a8w4_tdm(
                                 )
                             ).to(fx.Float32)
                         if const_expr(stage1_act):
-                            hv = Vec.from_elements(
-                                [
+                            if const_expr(is_situv2):
+                                act_vals = [
+                                    fused_situv2_elem(
+                                        acc[2 * p],
+                                        acc[2 * p + 1],
+                                        consts=situ_c,
+                                    )
+                                    for p in range_constexpr(4)
+                                ]
+                            else:
+                                act_vals = [
                                     fused_silu_swiglu_elem(
                                         acc[2 * p],
                                         acc[2 * p + 1],
@@ -665,9 +705,8 @@ def launch_gemm_a8w4_tdm(
                                         neg_limit_f32=neg_limit,
                                     )
                                     for p in range_constexpr(4)
-                                ],
-                                fx.Float32,
-                            ).to(oc)
+                                ]
+                            hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
                             lds_store_b64_raw(
                                 stC_idx,
                                 (row_rel * STORE_N + col_rel // 2) * 2,
@@ -723,6 +762,10 @@ def launch_gemm_a8w4_tdm(
         i32_m,
         N,
         f32_swiglu_limit,
+        f32_situ_beta,
+        f32_situ_inv_beta,
+        f32_situ_linear_beta,
+        f32_situ_inv_linear_beta,
     ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
 
