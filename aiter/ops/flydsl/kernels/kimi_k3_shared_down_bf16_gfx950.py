@@ -14,10 +14,11 @@ from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.extern_link import ExternFunction
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import T
-from flydsl.expr.vector import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -112,8 +113,8 @@ def build_kimi_k3_b1_shared_down_bf16_module(
     class SharedStorage:
         activated: fx.Array[fx.BFloat16, _SHARED_INTERMEDIATE_SIZE, 16]
 
-    beta_tag = f"{situ_beta:g}".replace(".", "p")
-    linear_beta_tag = f"{situ_linear_beta:g}".replace(".", "p")
+    beta_tag = f"{situ_beta:g}".replace("-", "m").replace(".", "p")
+    linear_beta_tag = f"{situ_linear_beta:g}".replace("-", "m").replace(".", "p")
     kernel_name = (
         "kimi_k3_b1_situ_shared_down_bf16_bf16_gfx950"
         f"_rpw{rows_per_wave}_cu{cu_count}_wpb{waves_per_block}"

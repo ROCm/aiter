@@ -34,7 +34,12 @@ _SHARED_WEIGHT_CACHE_MODIFIER = 2
 def is_kimi_k3_moe_preroute_bf16_available() -> bool:
     """Return whether the fixed-shape gfx950 backend can be compiled."""
 
-    return is_flydsl_available() and get_gfx_runtime() == "gfx950"
+    if not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
 
 
 def supports_kimi_k3_moe_preroute_bf16(

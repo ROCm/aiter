@@ -14,6 +14,15 @@ from aiter.ops.flydsl.kimi_k3_moe_preroute_bf16 import (
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 
+def _gfx950_flydsl_available() -> bool:
+    if not torch.cuda.is_available() or not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
+
+
 def _relative_rmse(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -42,9 +51,7 @@ def test_support_predicate_fails_closed_on_cpu():
     reason="requires a GPU runtime",
 )
 def test_backend_availability_matches_flydsl_and_architecture():
-    assert is_kimi_k3_moe_preroute_bf16_available() == (
-        is_flydsl_available() and get_gfx_runtime() == "gfx950"
-    )
+    assert is_kimi_k3_moe_preroute_bf16_available() == _gfx950_flydsl_available()
 
 
 @pytest.mark.parametrize(
@@ -73,9 +80,7 @@ def test_preroute_rejects_invalid_situ_parameters(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_flydsl_available()
-    or get_gfx_runtime() != "gfx950",
+    not _gfx950_flydsl_available(),
     reason="requires FlyDSL on gfx950",
 )
 def test_kimi_k3_preroute_bf16_matches_reference():
@@ -144,9 +149,7 @@ def test_kimi_k3_preroute_bf16_matches_reference():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_flydsl_available()
-    or get_gfx_runtime() != "gfx950",
+    not _gfx950_flydsl_available(),
     reason="requires FlyDSL on gfx950",
 )
 def test_preroute_support_predicate_rejects_contract_families():
@@ -190,9 +193,7 @@ def test_preroute_support_predicate_rejects_contract_families():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_flydsl_available()
-    or get_gfx_runtime() != "gfx950",
+    not _gfx950_flydsl_available(),
     reason="requires FlyDSL on gfx950",
 )
 def test_kimi_k3_preroute_bf16_graph_capture_and_replay():
