@@ -369,6 +369,41 @@ def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
 
+def get_wmma_m_rep(
+    tile_m: int, tile_n: int, m_warp: int, n_warp: int, label: str
+) -> int:
+    """Validate a wave grid against its tile and return the WMMA M-repeat.
+
+    The kernel splits a workgroup into ``m_warp x n_warp`` waves, so each wave
+    owns a ``(tile_m // m_warp) x (tile_n // n_warp)`` block that must be
+    WMMA-aligned. The M-repeat also fixes the preshuffled A-scale layout the
+    quant kernels have to produce, so it must be derived from the wave tile --
+    not from ``tile_m`` -- whenever ``m_warp > 1``.
+    """
+    # WMMA tile and wave geometry of the gfx1250 TDM GEMM (see
+    # kernels/mxfp4_preshuffle_gfx1250_tdm.py).
+    wmma_m, wmma_n = 16, 16
+    wave_size, max_block = 32, 1024
+
+    m_warp, n_warp = int(m_warp), int(n_warp)
+    if m_warp < 1 or n_warp < 1:
+        raise ValueError(
+            f"[grouped-moe {label}] m_warp/n_warp must be >= 1, got "
+            f"{m_warp}x{n_warp}"
+        )
+    if tile_m % (m_warp * wmma_m) or tile_n % (n_warp * wmma_n):
+        raise ValueError(
+            f"[grouped-moe {label}] tile {tile_m}x{tile_n} does not split into "
+            f"{m_warp}x{n_warp} waves of {wmma_m}x{wmma_n} WMMA tiles"
+        )
+    if m_warp * n_warp * wave_size > max_block:
+        raise ValueError(
+            f"[grouped-moe {label}] wave grid {m_warp}x{n_warp} needs "
+            f"{m_warp * n_warp * wave_size} threads > {max_block}"
+        )
+    return tile_m // m_warp // wmma_m
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states,
     w1,
@@ -390,10 +425,14 @@ def _grouped_a8w4_tdm_moe(
     tile_m=64,
     tile_n=256,
     tile_k=256,
+    m_warp=1,
+    n_warp=4,
     num_buffers=3,
     tile_m2=None,
     tile_n2=None,
     tile_k2=None,
+    m_warp2=None,
+    n_warp2=None,
     num_buffers2=None,
     data_format="a8w4",
     expert_mask=None,
@@ -419,8 +458,12 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
-    wmma_rep = tile_m // 16
-    wmma_rep2 = tile_m2 // 16
+    if m_warp2 is None:
+        m_warp2 = m_warp
+    if n_warp2 is None:
+        n_warp2 = n_warp
+    wmma_rep = get_wmma_m_rep(tile_m, tile_n, m_warp, n_warp, "gemm1")
+    wmma_rep2 = get_wmma_m_rep(tile_m2, tile_n2, m_warp2, n_warp2, "gemm2")
     _align_m = max(tile_m, tile_m2)
     contiguous_m = max(
         _align_m, _tdm_align_up(token_num * topk + E * _align_m - topk, _align_m)
@@ -551,6 +594,8 @@ def _grouped_a8w4_tdm_moe(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
@@ -578,6 +623,8 @@ def _grouped_a8w4_tdm_moe(
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
@@ -612,6 +659,8 @@ def _grouped_a8w4_tdm_moe(
         tile_m=tile_m2,
         tile_n=tile_n2,
         tile_k=tile_k2,
+        m_warp=m_warp2,
+        n_warp=n_warp2,
         out_is_f16=out_is_f16,
         a_is_fp4=_a_is_fp4,
         stage1_act=0,
@@ -639,6 +688,8 @@ def _grouped_a8w4_tdm_moe(
                         tile_m=tile_m,
                         tile_n=tile_n,
                         tile_k=tile_k,
+                        m_warp=m_warp,
+                        n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,
@@ -670,6 +721,8 @@ def _grouped_a8w4_tdm_moe(
                         tile_m=tile_m,
                         tile_n=tile_n,
                         tile_k=tile_k,
+                        m_warp=m_warp,
+                        n_warp=n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,
@@ -697,6 +750,8 @@ def _grouped_a8w4_tdm_moe(
                     tile_m=tile_m2,
                     tile_n=tile_n2,
                     tile_k=tile_k2,
+                    m_warp=m_warp2,
+                    n_warp=n_warp2,
                     out_is_f16=out_is_f16,
                     a_is_fp4=_a_is_fp4,
                     stage1_act=0,
@@ -929,10 +984,14 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tile_m"] = _as_int(cfg_row.get("tile_m"), tile_m)
             _tdm_kw["tile_n"] = _as_int(cfg_row.get("tile_n"), int(n_warp) * 64)
             _tdm_kw["tile_k"] = _as_int(cfg_row.get("tile_k"), 256)
+            _tdm_kw["m_warp"] = _as_int(cfg_row.get("m_warp"), 1)
+            _tdm_kw["n_warp"] = _as_int(cfg_row.get("n_warp"), n_warp)
             _tdm_kw["num_buffers"] = _as_int(cfg_row.get("num_buffers"), num_buffers)
             _tdm_kw["tile_m2"] = _as_int(cfg_row.get("tile_m2"), _tdm_kw["tile_m"])
             _tdm_kw["tile_n2"] = _as_int(cfg_row.get("tile_n2"), _tdm_kw["tile_n"])
             _tdm_kw["tile_k2"] = _as_int(cfg_row.get("tile_k2"), _tdm_kw["tile_k"])
+            _tdm_kw["m_warp2"] = _as_int(cfg_row.get("m_warp2"), _tdm_kw["m_warp"])
+            _tdm_kw["n_warp2"] = _as_int(cfg_row.get("n_warp2"), _tdm_kw["n_warp"])
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
@@ -940,7 +999,8 @@ def grouped_gemm_gfx1250_a8w4(
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
         # AITER_TDM_TILE_M / _TILE_N / _TILE_K / _NUM_BUFFERS (+ *_M2/_N2/_K2/
-        # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles.
+        # _NUM_BUFFERS2) to sweep the felix TDM batched GEMM tiles, and
+        # AITER_TDM_M_WARP / _N_WARP (+ *_M_WARP2/_N_WARP2) to sweep the wave grid.
         def _tdm_env(name):
             v = os.environ.get(name)
             return int(v) if (v is not None and v != "") else None
@@ -978,6 +1038,19 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["tile_n2"] = _ov_n2 if _ov_n2 is not None else _base_n
             _tdm_kw["tile_k2"] = _ov_k2 if _ov_k2 is not None else _base_k
             _tdm_kw["num_buffers2"] = _ov_nb2 if _ov_nb2 is not None else _base_nb
+
+        # Wave grid overrides, same stage1 -> stage2 fallback as the tiles above.
+        _ov_mw = _tdm_env("AITER_TDM_M_WARP")
+        _ov_nw = _tdm_env("AITER_TDM_N_WARP")
+        _ov_mw2 = _tdm_env("AITER_TDM_M_WARP2")
+        _ov_nw2 = _tdm_env("AITER_TDM_N_WARP2")
+        if any(v is not None for v in (_ov_mw, _ov_nw, _ov_mw2, _ov_nw2)):
+            _base_mw = _ov_mw if _ov_mw is not None else _tdm_kw.get("m_warp", 1)
+            _base_nw = _ov_nw if _ov_nw is not None else _tdm_kw.get("n_warp", n_warp)
+            _tdm_kw["m_warp"] = _base_mw
+            _tdm_kw["n_warp"] = _base_nw
+            _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
+            _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
