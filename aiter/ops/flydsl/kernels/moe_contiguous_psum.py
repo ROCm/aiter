@@ -6,6 +6,10 @@
 Computes tile-aligned exclusive prefix sum of per-expert counts for the
 contiguous grouped-GEMM scheduler. Single-block parallel scan replaces
 torch.cumsum (avoids rocprim trampoline overhead for small E).
+
+The block is ``MAX_EXPERTS_PER_BLOCK`` threads wide but E is not bounded by it:
+the scan sweeps the experts in block-sized chunks and carries the running offset
+between chunks in LDS. Kimi-K3 (E=896) is the first model to exceed one chunk.
 """
 
 import flydsl.compiler as flyc
@@ -29,12 +33,14 @@ class _PsumStorage:
     """LDS for the prefix-scan kernels.
 
     ``lds0``/``lds1`` are ping-pong buffers: each Hillis-Steele step reads one
-    and writes the other, then the two swap. The trailing 16 is the byte
-    alignment of each array.
+    and writes the other, then the two swap. ``carry`` accumulates the total of
+    the chunks already scanned, so an E wider than the block still gets one
+    continuous prefix sum. The trailing 16 is the byte alignment of each array.
     """
 
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
+    carry: fx.Array[fx.Int32, 1, 16]
 
 
 @fx.struct
@@ -58,6 +64,11 @@ def _lds_load(ptr, idx):
 def _lds_store(ptr, val, idx):
     """Scalar i32 store to an LDS pointer at element offset ``idx``."""
     fx.ptr_store(val, ptr + fx.Int64(idx))
+
+
+# The chunked scan below is written out in both kernels rather than shared:
+# @flyc.kernel AST-transforms only the decorated body, so a dynamic `for`/`if`
+# does not survive being factored into a plain helper.
 
 
 def build_moe_contiguous_psum_module():
@@ -86,50 +97,69 @@ def build_moe_contiguous_psum_module():
         lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
+        carry = lds.carry.ptr
 
         m_rsrc = ptr_rsrc(masked_m)
         s_rsrc = ptr_rsrc(starts)
         p_rsrc = ptr_rsrc(psum)
         c_rsrc = ptr_rsrc(contiguous_m)
 
-        in_range = tid < fx.Uint32(experts)
-        if in_range:
-            m = fx.Uint32(buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32))
-            _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
-
+        is_lane0 = tid == fx.Uint32(0)
+        if is_lane0:
+            _lds_store(carry, fx.Int32(0), 0)
         gpu.barrier()
 
-        src = lds0
-        dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
-            if const_expr((offset & (offset - 1)) != 0):
-                continue
-            if in_range:
+        # E is not bounded by the block width: sweep the experts in block-sized
+        # chunks, offsetting each chunk by the running total of the ones before
+        # it. That total lives in LDS (``carry``) because a register would not
+        # survive the runtime chunk loop. Lanes past ``experts`` feed 0 into the
+        # scan so the last lane still holds the chunk total, and write nothing.
+        for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
+            e = fx.Uint32(base) + tid
+            in_expert = e < fx.Uint32(experts)
+            m_e = fx.Uint32(0)
+            if in_expert:
+                m_e = fx.Uint32(
+                    buffer_ops.buffer_load(m_rsrc, e, vec_width=1, dtype=i32)
+                )
+            _lds_store(lds0, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v), tid)
+            gpu.barrier()
+
+            src = lds0
+            dst = lds1
+            for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+                if const_expr((offset & (offset - 1)) != 0):
+                    continue
                 val = _lds_load(src, tid)
                 has_prev = tid >= offset
                 prev = fx.Int32(0)
                 if has_prev:
                     prev = _lds_load(src, tid - offset)
                 _lds_store(dst, val + prev, tid)
+                gpu.barrier()
+                src, dst = dst, src
+
+            base_off = _lds_load(carry, 0)
+            if in_expert:
+                is_not_first = tid != 0
+                excl = fx.Int32(0)
+                if is_not_first:
+                    excl = _lds_load(src, tid - 1)
+                start = excl + base_off
+                buffer_ops.buffer_store(start, s_rsrc, e)
+                buffer_ops.buffer_store(start + fx.Int32(m_e), p_rsrc, e)
+
+            # Fold this chunk's total in before the next one overwrites lds0.
+            chunk_total = _lds_load(src, MAX_EXPERTS_PER_BLOCK - 1)
             gpu.barrier()
-            src, dst = dst, src
+            if is_lane0:
+                _lds_store(carry, base_off + chunk_total, 0)
+            gpu.barrier()
 
-        if in_range:
-            is_not_first = tid != 0
-            start = fx.Int32(0)
-            if is_not_first:
-                start = _lds_load(src, tid - 1)
-            m_tid = fx.Int32(
-                buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
-
-            is_last = tid == fx.Uint32(experts) - 1
-            if is_last:
-                final_cur = _lds_load(src, tid)
-                gt = final_cur > fx.Int32(tile_v)
-                buffer_ops.buffer_store(gt.select(final_cur, tile_v), c_rsrc, 0)
+        if is_lane0:
+            total = _lds_load(carry, 0)
+            gt = total > fx.Int32(tile_v)
+            buffer_ops.buffer_store(gt.select(total, tile_v), c_rsrc, 0)
 
     @flyc.jit
     def launch_psum(
@@ -187,6 +217,7 @@ def build_moe_contiguous_psum_remap_module():
         lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
         lds0 = lds.lds0.ptr
         lds1 = lds.lds1.ptr
+        carry = lds.carry.ptr
 
         m_rsrc = ptr_rsrc(masked_m)
         rows_rsrc = ptr_rsrc(topids_to_rows)
@@ -194,43 +225,62 @@ def build_moe_contiguous_psum_remap_module():
         p_rsrc = ptr_rsrc(psum)
         c_rsrc = ptr_rsrc(contiguous_m)
 
-        in_expert = tid < fx.Uint32(experts)
-        if in_expert:
-            m = fx.Uint32(buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32))
-            _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
-
+        is_lane0 = tid == fx.Uint32(0)
+        if is_lane0:
+            _lds_store(carry, fx.Int32(0), 0)
         gpu.barrier()
 
-        src = lds0
-        dst = lds1
-        for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
-            if const_expr((offset & (offset - 1)) != 0):
-                continue
+        # E is not bounded by the block width: sweep the experts in block-sized
+        # chunks, offsetting each chunk by the running total of the ones before
+        # it. That total lives in LDS (``carry``) because a register would not
+        # survive the runtime chunk loop. Lanes past ``experts`` feed 0 into the
+        # scan so the last lane still holds the chunk total, and write nothing.
+        for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
+            e = fx.Uint32(base) + tid
+            in_expert = e < fx.Uint32(experts)
+            m_e = fx.Uint32(0)
             if in_expert:
+                m_e = fx.Uint32(
+                    buffer_ops.buffer_load(m_rsrc, e, vec_width=1, dtype=i32)
+                )
+            _lds_store(lds0, fx.Int32((m_e + tile_minus_1) // tile_v * tile_v), tid)
+            gpu.barrier()
+
+            src = lds0
+            dst = lds1
+            for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
+                if const_expr((offset & (offset - 1)) != 0):
+                    continue
                 val = _lds_load(src, tid)
                 has_prev = tid >= offset
                 prev = fx.Int32(0)
                 if has_prev:
                     prev = _lds_load(src, tid - offset)
                 _lds_store(dst, val + prev, tid)
-            gpu.barrier()
-            src, dst = dst, src
+                gpu.barrier()
+                src, dst = dst, src
 
-        if in_expert:
-            is_not_first = tid != 0
-            start = fx.Int32(0)
-            if is_not_first:
-                start = _lds_load(src, tid - 1)
-            m_tid = fx.Int32(
-                buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
-            is_last = tid == fx.Uint32(experts) - 1
-            if is_last:
-                final_cur = _lds_load(src, tid)
-                gt = final_cur > fx.Int32(tile_v)
-                buffer_ops.buffer_store(gt.select(final_cur, tile_v), c_rsrc, 0)
+            base_off = _lds_load(carry, 0)
+            if in_expert:
+                is_not_first = tid != 0
+                excl = fx.Int32(0)
+                if is_not_first:
+                    excl = _lds_load(src, tid - 1)
+                start = excl + base_off
+                buffer_ops.buffer_store(start, s_rsrc, e)
+                buffer_ops.buffer_store(start + fx.Int32(m_e), p_rsrc, e)
+
+            # Fold this chunk's total in before the next one overwrites lds0.
+            chunk_total = _lds_load(src, MAX_EXPERTS_PER_BLOCK - 1)
+            gpu.barrier()
+            if is_lane0:
+                _lds_store(carry, base_off + chunk_total, 0)
+            gpu.barrier()
+
+        if is_lane0:
+            total = _lds_load(carry, 0)
+            gt = total > fx.Int32(tile_v)
+            buffer_ops.buffer_store(gt.select(total, tile_v), c_rsrc, 0)
 
         gpu.barrier()
 
