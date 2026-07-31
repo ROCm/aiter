@@ -1026,11 +1026,13 @@ def test_chunk_opt_vk_indice(
         extra_kwargs = {"g_head_major": True}
     elif backend == "flydsl":
         fwd_h = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip
-        # FlyDSL mfma16_hip is likewise specialized for K=V=128 / bf16 and takes
-        # head-major [B, H, T] gates directly (no g_head_major flag needed).
+        # FlyDSL mfma16_hip is likewise specialized for K=V=128 / bf16. It now
+        # mirrors the HIP g-layout contract (default token-major), and this test
+        # feeds a 3-D head-major [B, H, T] gate, so pass g_head_major=True like
+        # the HIP backend above.
         if D != 128:
             pytest.skip(reason="FlyDSL mfma16_hip kernel requires D=128 and bfloat16")
-        extra_kwargs = {}
+        extra_kwargs = {"g_head_major": True}
     else:
         fwd_h = chunk_gated_delta_rule_fwd_h_opt_vk
         extra_kwargs = {}

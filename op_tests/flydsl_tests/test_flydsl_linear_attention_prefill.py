@@ -126,6 +126,9 @@ class PrefillArgs:
     # (otherwise invalid tokens' v_new would flow through gated_v and corrupt
     # the state update).
     use_g: bool = True
+    # g layout, matching the wrapper/HIP contract. False (default) -> token-major
+    # 3D [B, T_flat, H] (== HIP default); True -> head-major 3D [B, H, T_flat].
+    g_head_major: bool = False
 
     @property
     def Hg(self):
@@ -159,6 +162,8 @@ class PrefillArgs:
                 tag += f"_{self.trace_tag}"
             if not self.use_g:
                 tag += "_nog"
+            if self.g_head_major:
+                tag += "_ghm"
             return tag
         tag = self.model_name + "_" if self.model_name else ""
         tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
@@ -171,6 +176,8 @@ class PrefillArgs:
             tag += f"_B{self.dense_batch}"
         if not self.use_g:
             tag += "_nog"
+        if self.g_head_major:
+            tag += "_ghm"
         if not self.output_final_state:
             tag += "_nofs"
         if self.ssm_state_dtype == torch.bfloat16:
@@ -261,6 +268,8 @@ class PrefillGroup:
     dense_batch: int = 1
     # whether to provide g; False takes the g=None (USE_G=False) path (see PrefillArgs).
     use_g: bool = True
+    # g layout: False (default) token-major [B,T,H]; True head-major [B,H,T] (see PrefillArgs).
+    g_head_major: bool = False
 
 
 def expand_groups(groups):
@@ -312,6 +321,7 @@ def expand_groups(groups):
                                 bt_tag=bt_tag,
                                 dense_batch=g.dense_batch,
                                 use_g=g.use_g,
+                                g_head_major=g.g_head_major,
                             )
                         )
                     else:
@@ -367,6 +377,7 @@ def expand_groups(groups):
                                     trace_tag=tag,
                                     dense_batch=g.dense_batch,
                                     use_g=g.use_g,
+                                    g_head_major=g.g_head_major,
                                 )
                             )
     return out
@@ -403,10 +414,12 @@ _PREFILL_GROUPS = [
         is_varlen=False,
         max_num_batched_tokens="full_prompt_len",
         # dense B>1: g becomes 3D [B,H,T], validating the kernel's batch-head
-        # gate offset (g_head_base includes i_n*H*T_flat). The dense path always
-        # uses 3D g anyway; bumping B to 2 here covers the i_n>0 batch-stride
-        # branch.
+        # gate offset (g_sh_base includes i_n*H*T_flat). Bumping B to 2 covers
+        # the i_n>0 batch-stride branch. Also set g_head_major=True so this group
+        # exercises the head-major dense layout (the other dense/varlen groups
+        # cover the default token-major layout).
         dense_batch=2,
+        g_head_major=True,
     ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
     # else, so they collapse into a single group. Original rows left
@@ -482,6 +495,8 @@ _PREFILL_GROUPS = [
         max_num_batched_tokens=16384,
         head_seqlens=[4000, 6396, 8192, 9912, 10000],
         num_segments=2,
+        # head-major varlen coverage (other varlen groups use token-major).
+        g_head_major=True,
     ),
 ]
 
@@ -564,6 +579,7 @@ def _make_inputs(
     ssm_state_dtype=torch.float32,
     dense_batch=1,
     use_g=True,
+    g_head_major=False,
 ):
     if args is not None:
         tp = args.tp
@@ -576,6 +592,7 @@ def _make_inputs(
         ssm_state_dtype = args.ssm_state_dtype
         dense_batch = args.dense_batch
         use_g = args.use_g
+        g_head_major = args.g_head_major
 
     Hg = Hk_dim // tp
     H = Hv_dim // tp
@@ -595,19 +612,19 @@ def _make_inputs(
     k = torch.randn(B, T_total, Hg, K_dim, dtype=dtype, device=device) * 0.1
     w_orig = torch.randn(B, T_total, H, K_dim, dtype=dtype, device=device) * 0.1
     u_orig = torch.randn(B, T_total, H, V_dim, dtype=dtype, device=device) * 0.1
-    # g gate layout (head-major, cumsum along T; matches Triton VK / HIP / FlyDSL K5):
-    #   * use_g=False -> None (USE_G=False path, validates last-chunk padding masking)
-    #   * varlen      -> 2D [H, T_total]
-    #   * dense       -> 3D [B, H, T_total] (covers the dense B>1 batch-head
-    #                    gate offset; numerically equal to 2D when B=1)
+    # g gate: always a 3-D tensor, matching the wrapper/HIP contract. cumsum is
+    # along T; varlen has B=1 (flattened, N segments live in cu_seqlens).
+    #   * use_g=False     -> None (USE_G=False path, validates padding masking)
+    #   * g_head_major    -> head-major  [B, H, T_total]
+    #   * not g_head_major-> token-major [B, T_total, H]  (default, == HIP)
+    # The head-major base is generated first (cumsum along the last/T dim), then
+    # transposed for the token-major layout so both layouts hold the same values.
     if not use_g:
         g = None
-    elif is_varlen:
-        g = torch.randn(H, T_total, dtype=torch.float32, device=device).abs() * -0.5
-        g = g.cumsum(dim=-1)
     else:
-        g = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs() * -0.5
-        g = g.cumsum(dim=-1)
+        gh = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs() * -0.5
+        gh = gh.cumsum(dim=-1)
+        g = gh.contiguous() if g_head_major else gh.transpose(1, 2).contiguous()
 
     w_c = w_orig.permute(0, 2, 1, 3).contiguous()
     u_c = u_orig.permute(0, 2, 1, 3).contiguous()
@@ -638,6 +655,7 @@ def ref_chunk_gated_delta_rule_fwd_h(
     output_final_state=False,
     chunk_size=64,
     cu_seqlens=None,
+    g_head_major=False,
 ):
     """Reference in FP32 for correctness checking."""
     B, T, Hg_dim, K_dim = k.shape
@@ -693,13 +711,15 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     b_v = u_chunk - w_chunk @ h_state.T
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
-                    # g sequence: None(no g) / 2D[H,T](varlen) / 3D[B,H,T](dense).
+                    # g sequence for (batch b_idx, head i_h): g is always 3-D
+                    # (or None). head-major [B,H,T] -> g[b_idx, i_h];
+                    # token-major [B,T,H] -> g[b_idx, :, i_h].
                     if g is None:
                         g_seq = None
-                    elif g.dim() == 3:
+                    elif g_head_major:
                         g_seq = g[b_idx, i_h]
                     else:
-                        g_seq = g[i_h]
+                        g_seq = g[b_idx, :, i_h]
 
                     mask = torch.zeros(BT_dim, device=k.device)
                     mask[:actual_bt] = 1.0
@@ -1029,6 +1049,7 @@ class TestCorrectness:
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
+            g_head_major=args.g_head_major,
         )
         h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
             k,
@@ -1038,6 +1059,7 @@ class TestCorrectness:
             initial_state=h0,
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
+            g_head_major=args.g_head_major,
         )
 
         _assert_k5_outputs_match_ref(
@@ -1068,6 +1090,14 @@ def _run_perf_comparison(args: PrefillArgs):
     ofs = args.output_final_state
     total_tokens = int(cu[-1].item()) if cu is not None else sum(context_lens)
 
+    # ``g`` from _make_inputs follows args.g_head_major. FlyDSL takes the layout
+    # flag directly; the triton/hip reference backends here consume head-major
+    # g, so hand them a head-major view (transpose the token-major [B,T,H] back
+    # to [B,H,T]).
+    g_hm = None
+    if g is not None:
+        g_hm = g if args.g_head_major else g.transpose(1, 2).contiguous()
+
     us_fly = _bench_fn(
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         k,
@@ -1077,13 +1107,14 @@ def _run_perf_comparison(args: PrefillArgs):
         initial_state=h0,
         output_final_state=ofs,
         cu_seqlens=cu,
+        g_head_major=args.g_head_major,
     )
     us_tri = _bench_fn(
         chunk_gated_delta_rule_fwd_h_opt_vk,
         k,
         w_c,
         u_c,
-        g=g,
+        g=g_hm,
         initial_state=h0,
         output_final_state=ofs,
         cu_seqlens=cu,
@@ -1094,7 +1125,7 @@ def _run_perf_comparison(args: PrefillArgs):
             k,
             w_c,
             u_c,
-            g=g,
+            g=g_hm,
             initial_state=h0,
             output_final_state=ofs,
             cu_seqlens=cu,

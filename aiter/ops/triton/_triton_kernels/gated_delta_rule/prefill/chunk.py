@@ -317,10 +317,12 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             g_head_major=True,
         )
     elif use_chunk_flydsl:
-        # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
-        # (matches Triton VK / HIP). ``g_cumsum`` from K1+K2 is already
-        # head-major, so pass it through directly. The wrapper accepts
-        # ``use_exp2`` as a kwarg and pre-scales ``gk`` internally.
+        # ``g_cumsum`` from K1+K2 is 3-D head-major [B, H, T] (same tensor the
+        # HIP path above passes with g_head_major=True). The FlyDSL wrapper now
+        # mirrors the HIP g-layout contract (default token-major), so pass
+        # g_head_major=True explicitly to select the head-major layout. The
+        # wrapper accepts ``use_exp2`` as a kwarg and pre-scales ``gk``
+        # internally.
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
         )
@@ -337,6 +339,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            g_head_major=True,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(

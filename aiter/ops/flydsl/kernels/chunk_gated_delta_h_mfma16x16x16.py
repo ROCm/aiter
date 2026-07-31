@@ -201,6 +201,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     G_IS_LOG2_SCALED: bool = False,
     USE_STATE_INDICES: bool = False,
     SCHED_GFX942: bool = False,
+    G_HEAD_MAJOR: bool = False,
 ):
     """Compile the GDN K5 kernel.
 
@@ -300,7 +301,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
     # fp32->bf16 output truncates (_BF16_CONVERT_TRUNC) to match hip float_to_bf16
-    _K5_KERNEL_REVISION = 122
+    # rev123: g offset generalized to head-major/token-major via G_HEAD_MAJOR
+    _K5_KERNEL_REVISION = 123
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -605,18 +607,28 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         if const_expr(STORE_FINAL_STATE):
             ht_base = state_nh * fx.Int32(V * K)
 
-        # g head base offset (head-major, stride-1 along T).
-        #   varlen: g is [H, T_flat], token = bos + rel_row (bos is the global
-        #     token offset within the concatenated sequence) -> base =
-        #     i_h*T_flat + bos.
-        #   dense : g is [B, H, T_flat], so the batch-dim stride i_n*H must be
-        #     included; the old code used i_h*T_flat + bos(=i_n*T_val), which
-        #     dropped i_n*H*T_flat and read the wrong rows when B>1.
+        # g gate offset. Mirrors the HIP kernel's load_g_value:
+        #   idx = i_n*g_stride_b + i_h*g_stride_h + token*g_stride_t
+        # with the strides derived from the layout:
+        #   head-major  [B, H, T_flat] -> g_stride_h=T_flat, g_stride_t=1
+        #   token-major [B, T_flat, H] -> g_stride_h=1,      g_stride_t=H
+        # varlen (B==1, flattened): batch stride is 0 and token is the global
+        #   token (bos + rel_row), so bos*g_stride_t is folded into the base.
+        #   dense: batch stride is H*T_flat (same element count for both
+        #   layouts) and token is the in-sequence relative row.
+        # The base below excludes the per-token term; callers add
+        #   token * g_stride_t (token = last_idx_raw / safe_row, relative).
         if const_expr(USE_G):
-            if const_expr(IS_VARLEN):
-                g_head_base = i_h * T_flat + bos
+            if const_expr(G_HEAD_MAJOR):
+                g_stride_h = T_flat
+                g_stride_t = fx.Int32(1)
             else:
-                g_head_base = (i_n * fx.Int32(H) + i_h) * T_flat
+                g_stride_h = fx.Int32(1)
+                g_stride_t = fx.Int32(H)
+            if const_expr(IS_VARLEN):
+                g_sh_base = i_h * g_stride_h + bos * g_stride_t
+            else:
+                g_sh_base = (i_n * fx.Int32(H)) * T_flat + i_h * g_stride_h
 
         # -- MFMA lane mapping for 16x16 tiles --
         lane_n = lane % fx.Int32(16)
@@ -807,7 +819,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     u_prefetch.append(v_[fx.Index(u_off)])
 
             if const_expr(USE_G):
-                g_last = g_[fx.Index(g_head_base + last_idx_raw)]
+                g_last = g_[fx.Index(g_sh_base + last_idx_raw * g_stride_t)]
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
                     abs_row = (
@@ -818,7 +830,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     )
                     in_bounds = abs_row < T_local
                     safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                    g_row_pf.append((g_[fx.Index(g_head_base + safe_row)], in_bounds))
+                    g_row_pf.append(
+                        (g_[fx.Index(g_sh_base + safe_row * g_stride_t)], in_bounds)
+                    )
 
             # -- GEMM1: b_v = w @ h_state, with w_next prefetch interleaved.
             # u/g/w_next loads are all in flight; 64 MFMA hide HBM latency.

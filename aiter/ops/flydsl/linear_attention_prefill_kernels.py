@@ -690,6 +690,7 @@ def _get_or_compile_mfma16_hip(
     g_log2_scaled=False,
     use_state_indices=False,
     sched_gfx942=False,
+    g_head_major=False,
 ):
     """Compile (and cache) the mfma16 / HIP-aligned K5 kernel: 16x16x16 bf16
     MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
@@ -735,6 +736,7 @@ def _get_or_compile_mfma16_hip(
         G_IS_LOG2_SCALED=g_log2_scaled,
         USE_STATE_INDICES=use_state_indices,
         SCHED_GFX942=sched_gfx942,
+        G_HEAD_MAJOR=g_head_major,
     )
 
 
@@ -755,6 +757,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     num_decode_tokens: int = 0,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
+    g_head_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
@@ -886,6 +889,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         g_log2_scaled=g_log2_scaled,
         use_state_indices=use_state_indices,
         sched_gfx942=_IS_GFX942,
+        g_head_major=g_head_major,
     )
 
     # Null-arg placeholder for the @flyc.jit slots ignored on this path. Sized
@@ -909,12 +913,29 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     fs_dtype = resolved_state_dtype if output_final_state else None
     save_vn = save_new_value
 
-    # G contiguity guard (stride-1 along T; head-major [B, H, T_flat]).
-    if g is not None and not g.is_contiguous():
-        raise AssertionError(
-            "FlyDSL K5: ``g`` must be contiguous (head-major [B, H, T_flat] "
-            f"or [H, T_flat]); got strides={g.stride()}, shape={tuple(g.shape)}."
-        )
+    # g layout validation, strictly matching the HIP kernel's contract
+    # (aiter.ops.chunk_gated_delta_rule_fwd_h._normalize_g_tensor): g must be a
+    # 3-D tensor whose shape exactly matches the selected layout --
+    #   g_head_major=True  -> head-major  [B, H, T_flat]
+    #   g_head_major=False -> token-major [B, T_flat, H]   (default, == HIP)
+    # In varlen mode the batch dim is 1 (flattened input, N segments live in
+    # cu_seqlens), so B is k.shape[0] (==1). g=None keeps the USE_G=False path.
+    if g is not None:
+        if g.dtype != torch.float32:
+            g = g.to(torch.float32)
+        if g.dim() != 3:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: `g` must be 3-D, got shape "
+                f"{tuple(g.shape)}."
+            )
+        expected_g_shape = (B, H, T_flat) if g_head_major else (B, T_flat, H)
+        if tuple(g.shape) != expected_g_shape:
+            layout = "head-major [B, H, T]" if g_head_major else "token-major [B, T, H]"
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: `g` shape mismatch, expected "
+                f"{expected_g_shape} for {layout} layout, got {tuple(g.shape)}."
+            )
+        g = g.contiguous()
 
     # gk pre-scaling to log2 space (mirrors the Triton VK wrapper).
     if gk is not None:
