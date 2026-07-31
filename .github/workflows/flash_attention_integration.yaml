@@ -495,7 +495,9 @@ jobs:
 
           # Install test dependencies
           RUN pip install --upgrade pip
-          RUN pip install pytest pytest-rerunfailures pytest-timeout einops
+          # psutil: flash-attention's setup.py imports it on the NATIVE build path (the Triton jobs
+          # never reach that code), and --no-build-isolation means pip will not fetch build deps.
+          RUN pip install pytest pytest-rerunfailures pytest-timeout einops psutil
 
           # Clone and install flash-attention (CK backend)
           # Override aiter submodule with local checkout
