@@ -457,6 +457,16 @@ def _ref_down_reduce(
     return ref
 
 
+_DUMMY_SCALE_BUF = None  # lazily allocated 1-byte dummy for non-FP4 paths
+
+
+def _dummy_scale_ptr():
+    global _DUMMY_SCALE_BUF
+    if _DUMMY_SCALE_BUF is None:
+        _DUMMY_SCALE_BUF = torch.zeros(1, dtype=torch.uint8, device="cuda")
+    return _ptr(_DUMMY_SCALE_BUF)
+
+
 def _run_down_kernel(
     exe,
     y_out,
@@ -470,12 +480,15 @@ def _run_down_kernel(
     hidden,
     experts,
     w_scale: float = 1.0,
+    w_scale_ptr=None,  # FP4 block-scale tensor pointer; None → dummy
 ):
     stream = torch.cuda.current_stream()
+    scale_ptr = _ptr(w_scale_ptr) if w_scale_ptr is not None else _dummy_scale_ptr()
     exe(
         _ptr(y_out),
         _ptr(inter_states),
         _ptr(w_down),
+        scale_ptr,
         _ptr(router_ids),
         _ptr(router_wts),
         B,
@@ -747,6 +760,7 @@ def _run_e2e(
         _ptr(y_out),
         _ptr(inter_out),
         _ptr(w_down),
+        _dummy_scale_ptr(),    # dummy block-scale ptr (BF16 path)
         _ptr(router_ids),
         _ptr(router_wts),
         B,
@@ -1039,6 +1053,81 @@ def test_down_reduce_fp8w_dot2path(shape_name, hidden, inter, topk, experts, B):
         atol=0.1,
         rtol=0.1,
         pass_pct=90.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FP4 (MXFP4) weight down_reduce tests (gfx950 only, dot2 path, block_k=32)
+# ---------------------------------------------------------------------------
+
+
+def _pack_fp4_vec(t_deq: torch.Tensor) -> torch.Tensor:
+    """Pack float32 E2M1 FP4 values into uint8 (2 FP4 per byte), vectorised."""
+    _FP4_REP = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    flat = t_deq.float().reshape(-1)
+    signs = (flat < 0).to(torch.uint8) * 8
+    codes = ((flat.abs().unsqueeze(-1) - _FP4_REP).abs().argmin(dim=-1)).to(torch.uint8) | signs
+    return ((codes[1::2] << 4) | codes[0::2]).byte()
+
+
+def _fp4_round_vec(t: torch.Tensor) -> torch.Tensor:
+    _FP4_REP = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    sign = t.float().sign()
+    t_abs = t.float().abs().clamp(0, 6).reshape(-1)
+    out = torch.empty_like(t_abs)
+    chunk = 1 << 20
+    for s in range(0, t_abs.numel(), chunk):
+        e = min(s + chunk, t_abs.numel())
+        out[s:e] = _FP4_REP[((t_abs[s:e].unsqueeze(-1) - _FP4_REP).abs().argmin(dim=-1))]
+    return out.reshape(t.shape) * sign
+
+
+@pytest.mark.parametrize("shape_name,hidden,inter,topk,experts", SHAPES)
+@pytest.mark.parametrize("B", [1, 2])
+def test_down_reduce_fp4w_dot2path(shape_name, hidden, inter, topk, experts, B):
+    """MXFP4 weight down_reduce, block_k=32 e8m0 scales, dot2 — gfx950 only."""
+    if not _is_gfx950():
+        pytest.skip(f"FP4 down_reduce requires gfx950, got {_rocm_arch()}")
+    block_k = 32
+
+    torch.manual_seed(42)
+    inter_states = (
+        torch.randn(B * topk, inter, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    wd_f32 = torch.randn(experts * hidden, inter) * 0.1
+    wd_deq = _fp4_round_vec(wd_f32)
+    wd_fp4 = _pack_fp4_vec(wd_deq).cuda()
+    # Scale = 1.0 for all blocks: e8m0 byte 127 = biased exp 127 → 2^0 = 1.0
+    w_scale = torch.full(
+        (experts * hidden, inter // block_k), 127, dtype=torch.uint8, device="cuda"
+    )
+
+    router_ids = torch.randint(0, experts, (B * topk,), dtype=torch.int32, device="cuda")
+    router_wts_raw = torch.rand(B * topk, dtype=torch.float32, device="cuda")
+    router_wts = (
+        router_wts_raw.view(B, topk)
+        / router_wts_raw.view(B, topk).sum(dim=1, keepdim=True)
+    ).reshape(-1)
+
+    # Reference: use the dequantised FP4 weights
+    ref = _ref_gate_up_fp8_from_w_down_fp8(
+        inter_states, wd_deq.cuda(), router_ids, router_wts, B, topk, inter, hidden
+    )
+    y_out = torch.zeros(B, hidden, dtype=torch.float32, device="cuda")
+
+    exe = compile_wd_moe_down_reduce(
+        hidden=hidden, inter=inter, experts=experts, topk=topk,
+        use_dot2=True, h_per_warp=2, w_dtype="fp4",
+    )
+    _run_down_kernel(
+        exe, y_out, inter_states, wd_fp4, router_ids, router_wts,
+        B, topk, inter, hidden, experts,
+        w_scale_ptr=w_scale,
+    )
+
+    _check(
+        ref, y_out, f"{shape_name} B={B} down fp4w",
+        atol=0.2, rtol=0.1, pass_pct=90.0,
     )
 
 

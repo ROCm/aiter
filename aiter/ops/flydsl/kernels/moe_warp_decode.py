@@ -1153,10 +1153,10 @@ def compile_wd_moe_down_reduce(
         )
     if k_batch < 1:
         raise ValueError(f"k_batch must be >= 1, got {k_batch}")
-    if w_dtype not in ("bf16", "fp8"):
-        raise ValueError(f"w_dtype must be 'bf16' or 'fp8', got {w_dtype}")
-    if w_dtype == "fp8" and not use_dot2:
-        raise ValueError("FP8 down_reduce requires use_dot2=True (gfx950)")
+    if w_dtype not in ("bf16", "fp8", "fp4"):
+        raise ValueError(f"w_dtype must be 'bf16', 'fp8', or 'fp4', got {w_dtype}")
+    if w_dtype in ("fp8", "fp4") and not use_dot2:
+        raise ValueError(f"w_dtype='{w_dtype}' down_reduce requires use_dot2=True (gfx950)")
     if n_waves < 1:
         raise ValueError(f"n_waves must be >= 1, got {n_waves}")
     if n_waves > 1 and k_batch > 1:
@@ -1170,7 +1170,10 @@ def compile_wd_moe_down_reduce(
         )
 
     _use_fp8_w = w_dtype == "fp8"
+    _use_fp4_w = w_dtype == "fp4"
+    _block_k = 32  # FP4 MXFP4 block size (elements per e8m0 scale)
     _k_fp8_words = k_vector // 4  # FP8: 4 elements per i32
+    _k_fp4_words = 1               # FP4: 1 i32 = 8 FP4 per lane per k_step
     # LDS inter_states caching only applies to the f32 scalar path.
     # In the dot2 path, x_word reads come from the inner scf.ForOp which
     # currently sources from global memory; adding LDS reads there requires
@@ -1188,23 +1191,28 @@ def compile_wd_moe_down_reduce(
     dot2_tag = "_dot2" if use_dot2 else "_f32"
     h2_tag = "_h2" if h_per_warp == 2 else ""
     kb_tag = f"_kb{k_batch}" if k_batch > 1 else ""
-    fp8_tag = "_fp8w" if _use_fp8_w else ""
+    w_tag = "_fp8w" if _use_fp8_w else ("_fp4w" if _use_fp4_w else "")
     lds_tag = f"_lds{n_waves}" if _use_lds else ""
     module_name = (
         f"wd_down_h{hidden}_i{inter}_e{experts}_topk{topk}"
-        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}{fp8_tag}{lds_tag}"
+        f"_kv{k_vector}{dot2_tag}{h2_tag}{kb_tag}{w_tag}{lds_tag}"
     )
 
     _k_pairs = k_vector // 2
     _k_step = _WAVE_SIZE * k_vector  # INTER elements per loop iteration
     _n_k_steps = inter // _k_step
     _n_k_steps_per_batch = _n_k_steps // k_batch  # k-steps per split-K workgroup
+    # FP4 scale blocks per k_step per lane: each lane covers k_vector=8 FP4 elements;
+    # block_k=32 → 8 elements < 32, so each lane sees ONE scale per k_step.
+    # The scale index within the weight row = (K*_k_step + lane*k_vector) // block_k.
+    _scales_per_row = inter // _block_k  # columns in scale tensor per row
 
     @flyc.kernel(name=module_name, known_block_size=[_block_threads, 1, 1])
     def _kernel(
         arg_y_out: fx.Pointer,  # [B, HIDDEN] f32, zero-init
         arg_inter: fx.Pointer,  # [B*TOPK, INTER] bf16
-        arg_w_down: fx.Pointer,  # [E*HIDDEN, INTER] bf16 or fp8
+        arg_w_down: fx.Pointer,  # [E*HIDDEN, INTER] bf16/fp8/fp4
+        arg_w_scale: fx.Pointer,  # [E*HIDDEN, INTER//block_k] e8m0 uint8 (FP4 only; unused otherwise)
         arg_router_ids: fx.Pointer,  # [B*TOPK] i32
         arg_router_wts: fx.Pointer,  # [B*TOPK] f32
         i32_B: fx.Int32,
@@ -1212,7 +1220,7 @@ def compile_wd_moe_down_reduce(
         i32_INTER: fx.Int32,
         i32_HIDDEN: fx.Int32,
         i32_E: fx.Int32,
-        f32_w_scale: fx.Float32,  # FP8 per-tensor scale (unused/1.0 for BF16)
+        f32_w_scale_pt: fx.Float32,  # FP8 per-tensor scale (unused/1.0 for BF16/FP4)
     ):
         f32 = T.f32
         i32 = T.i32
@@ -1222,6 +1230,7 @@ def compile_wd_moe_down_reduce(
         TOPK_i32 = i32_TOPK.ir_value()
         INTER_i32 = i32_INTER.ir_value()
         HIDDEN_i32 = i32_HIDDEN.ir_value()
+        w_scale_pt = f32_w_scale_pt.ir_value()  # FP8 per-tensor scale
 
         # ── Buffer resources ─────────────────────────────────────────────────
         def _rsrc(ptr, nbytes_i32):
@@ -1239,6 +1248,10 @@ def compile_wd_moe_down_reduce(
         # y_out: [B, HIDDEN] f32 — use -1 sentinel (unbounded) since B*HIDDEN can be large
         y_rsrc = _rsrc(arg_y_out, arith.constant(-1, type=i32))
         # w_down: per-row resources built per slot below (E*HIDDEN*INTER can exceed i32)
+        # w_scale: [E*HIDDEN, INTER//block_k] e8m0 uint8 (FP4 only)
+        # Total bytes: E * HIDDEN * (INTER // block_k) — but since E*HIDDEN*scales may overflow i32,
+        # use -1 sentinel for the scale resource too.
+        scale_rsrc = _rsrc(arg_w_scale, arith.constant(-1, type=i32))
 
         # ── Block → (wave_id, lane_id, out_j_0, token_b) ────────────────────
         # n_waves=1: single-wave blocks; thread_id == lane_id.
@@ -1280,11 +1293,12 @@ def compile_wd_moe_down_reduce(
         HIDDEN_i64 = arith.extsi(i64, HIDDEN_i32)
         INTER_i64 = arith.extsi(i64, INTER_i32)
         out_j0_i64 = arith.extsi(i64, out_j_0)
-        # Row size: INTER*2 bytes for BF16, INTER bytes for FP8.
-        _w_elem_bytes = 1 if _use_fp8_w else 2
+        # Row size: INTER*2 bytes for BF16, INTER bytes for FP8, INTER//2 bytes for FP4.
+        _w_elem_bytes = 2 if not (_use_fp8_w or _use_fp4_w) else 1
         row_nb = INTER_i32 * arith.constant(_w_elem_bytes, type=i32)
-
-        w_scale = f32_w_scale.ir_value()
+        if _use_fp4_w:
+            row_nb = INTER_i32 // arith.constant(2, type=i32)  # FP4: 2 elements per byte
+        w_scale = w_scale_pt  # FP8 per-tensor scale (also used in FP8 down path)
 
         # Outer for: slot = 0..TOPK
         # Carries: [total_acc_0] for h_per_warp=1,
@@ -1312,15 +1326,25 @@ def compile_wd_moe_down_reduce(
             expert_i64 = arith.extsi(i64, expert_e)
 
             # Build per-row w_down resources for each output channel this wave owns.
-            # Byte offset: element_byte = 2 (BF16) or 1 (FP8).
+            # Byte offset: element_byte = 2 (BF16), 1 (FP8), 0.5 (FP4: INTER//2 bytes).
             w_row_rsrcs: list = []
+            scale_row_rsrcs: list = []  # per-output-channel scale rows (FP4 only)
+            # Pre-init so AST rewriter sees w_row_byte_off defined in both branches.
+            w_row_byte_off = arith.constant(0, type=i64)
             for h in range_constexpr(h_per_warp):
                 out_jh_i64 = arith.addi(out_j0_i64, arith.constant(h, type=i64))
-                w_row_byte_off = (
-                    (expert_i64 * HIDDEN_i64 + out_jh_i64)
-                    * INTER_i64
-                    * arith.constant(_w_elem_bytes, type=i64)
-                )
+                if _use_fp4_w:
+                    # FP4: row is INTER//2 bytes
+                    w_row_byte_off = (
+                        (expert_i64 * HIDDEN_i64 + out_jh_i64)
+                        * (INTER_i64 // arith.constant(2, type=i64))
+                    )
+                else:
+                    w_row_byte_off = (
+                        (expert_i64 * HIDDEN_i64 + out_jh_i64)
+                        * INTER_i64
+                        * arith.constant(_w_elem_bytes, type=i64)
+                    )
                 w_base = arith.addi(
                     arith.index_cast(i64, fx.ptrtoint(arg_w_down)), w_row_byte_off
                 )
@@ -1329,6 +1353,22 @@ def compile_wd_moe_down_reduce(
                         w_base, num_records_bytes=row_nb
                     )
                 )
+                if _use_fp4_w:
+                    # Scale row: [INTER // block_k] uint8 values for this output channel
+                    sc_row_byte_off = (
+                        (expert_i64 * HIDDEN_i64 + out_jh_i64)
+                        * arith.constant(_scales_per_row, type=i64)
+                    )
+                    sc_base = arith.addi(
+                        arith.index_cast(i64, fx.ptrtoint(arg_w_scale)), sc_row_byte_off
+                    )
+                    scale_row_rsrcs.append(
+                        buffer_ops.create_buffer_resource_from_addr(
+                            sc_base, num_records_bytes=arith.constant(_scales_per_row, type=i32)
+                        )
+                    )
+                else:
+                    scale_row_rsrcs.append(scale_rsrc)  # placeholder (unused)
 
             inter_row_base = flat_slot * INTER_i32
 
@@ -1382,9 +1422,72 @@ def compile_wd_moe_down_reduce(
                     lane_k = arith.addi(k_batch_base, k_base_c) + lane_kV
 
                     # ── Phase A: issue ALL loads for this k-step ─────────────
-                    # Pre-init so AST rewriter resolves `slots` from both branches.
+                    # Pre-init so AST rewriter resolves `slots` from all branches.
                     slots: list = [zero_f32] * h_per_warp
-                    if _use_fp8_w:
+                    if _use_fp4_w:
+                        # ── FP4 MXFP4 path: per-block e8m0 scales, 4-acc drain ─
+                        # Matches CK's dot0..dot3 + dot2_drain4 pattern.
+                        # k_vector=8 FP4 elements → 1 i32 per lane per k_step.
+                        # Each lane's 8 elements are covered by ONE scale block
+                        # (block_k=32 > k_vector=8).
+                        # Scale index = (K*_k_step + lane*k_vector) // block_k
+                        #             = K * (_k_step // block_k) + lane * (k_vector // block_k)
+                        # With k_vector=8, block_k=32: lane offset = 0 (since 8//32=0).
+                        # So scale_idx = K * (_k_step // _block_k) + lane // (_block_k // k_vector)
+                        #              = K * 16 + lane // 4
+                        c_eight = arith.constant(8, type=i32)
+                        c_32 = arith.constant(32, type=i32)
+                        fp4_lane_off = lane_k // c_eight  # i32 word index in FP4 row
+                        scale_col = k_step_i32 * arith.constant(_k_step // _block_k, type=i32) \
+                                    + lane_i32 // arith.constant(_block_k // k_vector, type=i32)
+
+                        # Load FP4 weight words + scales for each h channel
+                        w_fp4_loads: list = []  # [h] — i32 FP4 words
+                        scale_loads: list = []  # [h] — i8 e8m0 scale bytes
+                        for h in range_constexpr(h_per_warp):
+                            w_fp4_loads.append(buffer_ops.buffer_load(
+                                w_row_rsrcs[h], fp4_lane_off, vec_width=1, dtype=i32
+                            ))
+                            scale_loads.append(buffer_ops.buffer_load(
+                                scale_row_rsrcs[h], scale_col, vec_width=1, dtype=T.i8
+                            ))
+
+                        # Load x pairs (BF16) — shared across h
+                        x_fp4_loads: list = []  # [sel] — one x per FP4 sel pair
+                        for sel in range_constexpr(4):
+                            pair_elem = arith.constant(sel * 2, type=i32)
+                            x_off = (inter_row_base + lane_k + pair_elem) // c_two
+                            x_fp4_loads.append(buffer_ops.buffer_load(
+                                inter_rsrc, x_off, vec_width=1, dtype=i32
+                            ))
+
+                        _vmcnt0()
+
+                        # Convert e8m0 → f32: scale = 2^(biased_exp - 127) via bitcast
+                        # e8m0 byte encodes a biased exponent; shift to bit [30:23] of f32.
+                        scale_f32_vals: list = []
+                        for h in range_constexpr(h_per_warp):
+                            sc_byte = arith.extui(i32, scale_loads[h])
+                            sc_f32 = arith.bitcast(f32, arith.shli(sc_byte, arith.constant(23, type=i32)))
+                            scale_f32_vals.append(sc_f32)
+
+                        # Pre-convert FP4→BF16 with per-block scale (before dot2 to prevent aliasing)
+                        wbf16_fp4: list = []  # [h * 4 + sel]
+                        for h in range_constexpr(h_per_warp):
+                            for sel in range_constexpr(4):
+                                wbf16_fp4.append(_fp4x2_to_bf16(w_fp4_loads[h], scale_f32_vals[h], sel))
+
+                        # 4 independent dot2s per h (CK pattern: no s_nop between, one drain at end)
+                        for h in range_constexpr(h_per_warp):
+                            partial = zero_f32
+                            for sel in range_constexpr(4):
+                                xw = x_fp4_loads[sel]
+                                partial = arith.addf(
+                                    partial, _dot2_batched(zero_f32, xw, wbf16_fp4[h * 4 + sel])
+                                )
+                            slots[h] = partial
+                        rocdl.s_nop(2)  # single drain covers all dot2 write→read hazards
+                    elif _use_fp8_w:
                         c_four = arith.constant(4, type=i32)
                         # x: loaded once per (wi, sel) — shared between h=0,h=1
                         # w: loaded once per (wi, h) — separate for each output channel
@@ -1538,6 +1641,7 @@ def compile_wd_moe_down_reduce(
         arg_y_out: fx.Pointer,
         arg_inter: fx.Pointer,
         arg_w_down: fx.Pointer,
+        arg_w_scale: fx.Pointer,   # [E*HIDDEN, INTER//block_k] e8m0 uint8 (FP4); dummy otherwise
         arg_router_ids: fx.Pointer,
         arg_router_wts: fx.Pointer,
         i32_B: fx.Int32,
@@ -1545,7 +1649,7 @@ def compile_wd_moe_down_reduce(
         i32_INTER: fx.Int32,
         i32_HIDDEN: fx.Int32,
         i32_E: fx.Int32,
-        f32_w_scale: fx.Float32,
+        f32_w_scale_pt: fx.Float32,  # FP8 per-tensor scale; 1.0 otherwise
         stream: fx.Stream,
     ):
         idx = ir.IndexType.get()
@@ -1562,6 +1666,7 @@ def compile_wd_moe_down_reduce(
             arg_y_out,
             arg_inter,
             arg_w_down,
+            arg_w_scale,
             arg_router_ids,
             arg_router_wts,
             i32_B,
@@ -1569,7 +1674,7 @@ def compile_wd_moe_down_reduce(
             i32_INTER,
             i32_HIDDEN,
             i32_E,
-            f32_w_scale,
+            f32_w_scale_pt,
         ).launch(
             grid=(grid_x, grid_y, 1),
             block=(n_waves * _WAVE_SIZE, 1, 1),
