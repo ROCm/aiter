@@ -971,15 +971,19 @@ def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
         bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
         return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
 
-    return (
-        dtypes.fp8 if os.environ.get("AITER_SITUV2_A8W4", "0") == "1" else dtypes.bf16
-    )
+    if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+        return dtypes.fp8
+    if os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+        return dtypes.fp4x2
+    return dtypes.bf16
 
 
 def _runtime_swiglu_mxfp4_q_dtype_a(
     token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
 ):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
+    if act_type == aiter.ActivationType.Situv2:
+        return _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype)
     if act_type != aiter.ActivationType.Swiglu:
         return None
     if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
