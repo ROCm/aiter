@@ -15,7 +15,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
 
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
-    lds_load_b128_raw,
+    make_lds_copy_ops,
     pipeline_fence,
     workgroup_barrier,
 )
@@ -145,6 +145,8 @@ def launch_gemm_a8w8(
         def _lv(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
+        lds_load_b128, _ = make_lds_copy_ops(128)
+
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gC_base = fx.recast_iter(
@@ -247,7 +249,7 @@ def launch_gemm_a8w8(
         def load_a(buf, wm, ks):
             row = wmb + wm * 16 + lane16
             b0 = fx.index_cast(T.index, row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
@@ -258,7 +260,7 @@ def launch_gemm_a8w8(
                 T.index,
                 STAGE_A + nbl * B_LDS_ROW + ks * 2048 + kgrp * 256 + lane16 * 16,
             )
-            v = [Vec(lds_load_b128_raw(buf, b0 + 512 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 512 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
             return v01.shuffle(v23, list(range(16)))
@@ -415,39 +417,47 @@ def launch_gemm_a8w8(
                 )
             return None, None
 
+        QUAD_PREFETCH_EARLY = (not is_bsc) and K_WS >= 2
+
         def compute_ktile_quad(buf, pbuf, prefetch_kt):
             b_left = _load_b_half(buf, 0, 0)
             sb_k, sa_k = _load_scales(pbuf, 0)
             for ks in range_constexpr(K_WS):
                 nxt_ks = ks + 1 if const_expr(ks + 1 < K_WS) else None
+                pf = ks == 0 and prefetch_kt is not None
                 a_top = [
                     _rmem(16, load_a(buf, wm, ks)) for wm in range_constexpr(HALF_M)
                 ]
                 if const_expr(is_bsc):
                     rocdl.s_wait_dscnt(DS_A * HALF_M + 2 * DS_B * HALF_N)
-                else:
-                    rocdl.s_wait_dscnt(0)
                 rocdl.sched_barrier(0)
                 _emit_block(0, 0, a_top, b_left, sa_k, sb_k)
+                if const_expr(pf and QUAD_PREFETCH_EARLY):
+                    rocdl.sched_barrier(0)
+                    issue(prefetch_kt % num_buffers, prefetch_kt)
+                    rocdl.sched_barrier(0)
                 a_bot = [
                     _rmem(16, load_a(buf, HALF_M + wm, ks))
                     for wm in range_constexpr(HALF_M)
                 ]
                 b_right = _load_b_half(buf, HALF_N, ks)
-                rocdl.s_wait_dscnt(DS_A * HALF_M + DS_B * HALF_N)
+                if const_expr(is_bsc):
+                    rocdl.s_wait_dscnt(DS_A * HALF_M + DS_B * HALF_N)
                 _emit_block(HALF_M, 0, a_bot, b_left, sa_k, sb_k)
-                if const_expr(ks == 0 and prefetch_kt is not None):
+                if const_expr(pf and not QUAD_PREFETCH_EARLY):
                     rocdl.sched_barrier(0)
                     issue(prefetch_kt % num_buffers, prefetch_kt)
                     rocdl.sched_barrier(0)
                 if const_expr(nxt_ks is not None):
                     nxt_b_left = _load_b_half(buf, 0, nxt_ks)
                     nxt_sb_k, nxt_sa_k = _load_scales(pbuf, nxt_ks)
-                rocdl.s_wait_dscnt(
-                    DS_B * HALF_N if const_expr(nxt_ks is None) else _BS_DS
-                )
+                if const_expr(is_bsc):
+                    rocdl.s_wait_dscnt(
+                        DS_B * HALF_N if const_expr(nxt_ks is None) else _BS_DS
+                    )
                 _emit_block(0, HALF_N, a_top, b_right, sa_k, sb_k)
-                rocdl.s_wait_dscnt(0)
+                if const_expr(is_bsc):
+                    rocdl.s_wait_dscnt(0)
                 _emit_block(HALF_M, HALF_N, a_bot, b_right, sa_k, sb_k)
                 rocdl.sched_barrier(0)
                 if const_expr(nxt_ks is not None):
