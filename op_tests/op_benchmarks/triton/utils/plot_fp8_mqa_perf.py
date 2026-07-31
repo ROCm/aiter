@@ -7,7 +7,7 @@ Parse a FlyDSL vs Triton FP8 MQA Logits benchmark markdown report and produce:
   2. A summary markdown table with one row per shape.
 
 FlyDSL kernels are split into two categories by name:
-  - LDS staged: kernel name contains "_lds2"
+  - LDS staged: kernel name contains "_lds<N>" (e.g. _lds2, _lds3)
   - Direct load: all other FlyDSL kernels
 
 Usage:
@@ -75,8 +75,13 @@ def _parse_speedup(cell: str) -> float | None:
 
 
 def _is_lds(impl_tag: str) -> bool:
-    """Return True if the kernel tag identifies an LDS-staged variant."""
-    return "_lds2" in impl_tag
+    """Return True if the kernel tag identifies an LDS-staged variant.
+
+    Matches any ``_lds<N>`` suffix (``_lds2``, ``_lds3``, ...) so new buffer
+    counts are classified as LDS-staged, mirroring the kernel host's
+    ``re.search(r"_lds\\d", variant)``.
+    """
+    return re.search(r"_lds\d", impl_tag) is not None
 
 
 def parse_md(path: Path) -> list[dict]:
@@ -187,55 +192,72 @@ def _bar_label(ax, bar, text: str, color: str):
 def make_bar_chart(results: list[dict], out_png: Path, title_extra: str = ""):
     n = len(results)
     x = np.arange(n)
-    w = 0.25  # narrower to fit 3 bars
-
-    triton_vals = np.array([r["triton_tflops"] for r in results])
-    dl_vals = np.array(
-        [r["dl_tflops"] if r["dl_tflops"] is not None else 0.0 for r in results]
-    )
-    lds_vals = np.array(
-        [r["lds_tflops"] if r["lds_tflops"] is not None else 0.0 for r in results]
-    )
     shape_labels = [r["shape"] for r in results]
+
+    def _col(key):
+        # Missing category -> NaN so the bar is not drawn (no zero-height stub).
+        return np.array(
+            [r[key] if r[key] is not None else np.nan for r in results],
+            dtype=float,
+        )
+
+    triton_vals = _col("triton_tflops")
+    dl_vals = _col("dl_tflops")
+    lds_vals = _col("lds_tflops")
+
+    # Only keep a category series if at least one shape has a kernel for it; a
+    # wholly-empty category contributes no bar, tag, or legend entry.
+    #   (label, values, color, speedup_key)  speedup_key=None -> Triton (abs TFLOPs)
+    series = [("Triton", triton_vals, COLORS["triton"], None)]
+    if np.isfinite(dl_vals).any():
+        series.append(
+            ("Best FlyDSL Direct Load", dl_vals, COLORS["flydsl_dl"], "dl_speedup")
+        )
+    if np.isfinite(lds_vals).any():
+        series.append(
+            ("Best FlyDSL LDS Staged", lds_vals, COLORS["flydsl_lds"], "lds_speedup")
+        )
+
+    m = len(series)
+    w = 0.8 / m  # total group width 0.8, split evenly across present series
+    offsets = (np.arange(m) - (m - 1) / 2.0) * w
 
     fig, ax = plt.subplots(figsize=(max(14, n * 1.8), 7))
 
-    bars_triton = ax.bar(
-        x - w, triton_vals, w, label="Triton", color=COLORS["triton"], alpha=0.9, zorder=3
-    )
-    bars_dl = ax.bar(
-        x, dl_vals, w, label="Best FlyDSL Direct Load", color=COLORS["flydsl_dl"], alpha=0.9, zorder=3
-    )
-    bars_lds = ax.bar(
-        x + w, lds_vals, w, label="Best FlyDSL LDS Staged", color=COLORS["flydsl_lds"], alpha=0.9, zorder=3
-    )
-
-    for bar, val in zip(bars_triton, triton_vals):
-        _bar_label(ax, bar, f"{val:.0f}", COLORS["triton"])
-
-    for bar, r in zip(bars_dl, results):
-        tag = f"x{r['dl_speedup']:.2f}" if r["dl_speedup"] is not None else "N/A"
-        _bar_label(ax, bar, tag, COLORS["flydsl_dl"])
-
-    for bar, r in zip(bars_lds, results):
-        tag = f"x{r['lds_speedup']:.2f}" if r["lds_speedup"] is not None else "N/A"
-        _bar_label(ax, bar, tag, COLORS["flydsl_lds"])
+    for (label, vals, color, sp_key), off in zip(series, offsets):
+        # NaN heights are skipped by matplotlib -> no bar for missing categories.
+        bars = ax.bar(
+            x + off, vals, w, label=label, color=color, alpha=0.9, zorder=3
+        )
+        for bar, val, r in zip(bars, vals, results):
+            if not np.isfinite(val):
+                continue  # no kernel in this category for this shape: no tag
+            if sp_key is None:
+                _bar_label(ax, bar, f"{val:.0f}", color)
+            elif r[sp_key] is not None:
+                _bar_label(ax, bar, f"x{r[sp_key]:.2f}", color)
 
     ax.set_xticks(x)
     ax.set_xticklabels(shape_labels, fontsize=8, rotation=45, ha="right")
     ax.set_ylabel("TFLOPs", fontsize=11)
-    title = "FP8 MQA Logits — Triton vs Best FlyDSL Direct Load vs Best FlyDSL LDS Staged"
+    present = " vs ".join(s[0] for s in series)
+    title = f"FP8 MQA Logits — {present}"
     if title_extra:
         title += f"\n{title_extra}"
     ax.set_title(title, fontsize=10)
     ax.yaxis.grid(True, alpha=0.3, zorder=0)
     ax.set_axisbelow(True)
-    ax.set_ylim(0, max(triton_vals.max(), dl_vals.max(), lds_vals.max()) * 1.22)
+    ymax = np.nanmax(np.concatenate([s[1] for s in series]))
+    ax.set_ylim(0, ymax * 1.22)
 
     legend_handles = [
-        mpatches.Patch(color=COLORS["triton"], label="Triton (tag = abs TFLOPs)"),
-        mpatches.Patch(color=COLORS["flydsl_dl"], label="Best FlyDSL Direct Load (tag = speedup vs Triton)"),
-        mpatches.Patch(color=COLORS["flydsl_lds"], label="Best FlyDSL LDS Staged (tag = speedup vs Triton)"),
+        mpatches.Patch(
+            color=color,
+            label=f"{label} (tag = "
+            + ("abs TFLOPs" if sp_key is None else "speedup vs Triton")
+            + ")",
+        )
+        for label, _vals, color, sp_key in series
     ]
     ax.legend(handles=legend_handles, fontsize=9, loc="upper left")
 
@@ -249,7 +271,30 @@ def make_bar_chart(results: list[dict], out_png: Path, title_extra: str = ""):
 # ---------------------------------------------------------------------------
 
 
+def _cat_cells(r: dict, cat: str) -> list[str]:
+    """Return the [kernel, TFLOPs, verify, speedup] cells for one category
+    ('dl' or 'lds').  Missing category -> em-dashes (no cross-category data)."""
+    tf = r[f"{cat}_tflops"]
+    if tf is None:
+        return ["—", "—", "—", "—"]
+    k = r[f"{cat}_impl"] or "—"
+    v = r[f"{cat}_verify"] or "—"
+    sp = r[f"{cat}_speedup"]
+    return [k, f"{tf:.1f}", v, f"x{sp:.2f}" if sp is not None else "—"]
+
+
 def make_md_table(results: list[dict], out_md: Path, png_path: Path, src_md: Path):
+    # Only emit a category's columns if some shape actually has a kernel there,
+    # so Direct-Load and LDS-Staged results are never merged into one column.
+    has_dl = any(r["dl_tflops"] is not None for r in results)
+    has_lds = any(r["lds_tflops"] is not None for r in results)
+
+    header = ["Shape", "Triton TFLOPs"]
+    if has_dl:
+        header += ["Best DL kernel", "DL TFLOPs", "DL verify", "DL vs Triton"]
+    if has_lds:
+        header += ["Best LDS kernel", "LDS TFLOPs", "LDS verify", "LDS vs Triton"]
+
     lines = [
         "# FP8 MQA Logits — Triton vs Best FlyDSL Summary",
         "",
@@ -257,26 +302,16 @@ def make_md_table(results: list[dict], out_md: Path, png_path: Path, src_md: Pat
         "",
         f"![Bar chart]({png_path.name})",
         "",
-        "| Shape | Triton TFLOPs | FlyDSL TFLOPs | Best FlyDSL kernel | Verification | Speedup vs Triton |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
     ]
     for r in results:
-        triton = f"{r['triton_tflops']:.1f}"
-        # Pick whichever of DL / LDS is faster.
-        candidates = [
-            (r["dl_tflops"], r["dl_impl"], r["dl_verify"], r["dl_speedup"]),
-            (r["lds_tflops"], r["lds_impl"], r["lds_verify"], r["lds_speedup"]),
-        ]
-        best_tf, best_k, best_v, best_sp = max(
-            ((tf, k, v, sp) for tf, k, v, sp in candidates if tf is not None),
-            key=lambda t: t[0],
-            default=(None, None, None, None),
-        )
-        fly_tf = f"{best_tf:.1f}" if best_tf is not None else "N/A"
-        fly_k = best_k if best_k else "N/A"
-        fly_v = best_v if best_v else "N/A"
-        fly_sp = f"x{best_sp:.2f}" if best_sp is not None else "N/A"
-        lines.append(f"| {r['shape']} | {triton} | {fly_tf} | {fly_k} | {fly_v} | {fly_sp} |")
+        cells = [r["shape"], f"{r['triton_tflops']:.1f}"]
+        if has_dl:
+            cells += _cat_cells(r, "dl")
+        if has_lds:
+            cells += _cat_cells(r, "lds")
+        lines.append("| " + " | ".join(cells) + " |")
 
     out_md.write_text("\n".join(lines) + "\n")
     print(f"Saved summary: {out_md}")

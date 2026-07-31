@@ -425,6 +425,13 @@ def _select_impls(which, flydsl_variants):
         impls["triton"] = triton_logits
     if want_flydsl:
         for v in flydsl_variants:
+            if v == "auto":
+                # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive
+                # selection (variant=None -> _auto_variant per shape).
+                impls[FLYDSL_PREFIX + "auto"] = functools.partial(
+                    flydsl_fn, variant=None
+                )
+                continue
             if v == "geak_v4":
                 if _geak_v4_mod is None:
                     raise SystemExit(
@@ -1033,7 +1040,9 @@ def main():
         metavar="V1,V2,...",
         help=(
             "comma-separated FlyDSL kernel-version tags to benchmark, each as its "
-            "own column (default: all registered variants). See --list-variants."
+            "own column (default: all registered variants). See --list-variants. "
+            "The special tag 'auto' defers to the kernel's shape-adaptive "
+            "selection (_auto_variant), picking a variant per shape."
         ),
     )
     p.add_argument(
@@ -1148,6 +1157,8 @@ def main():
             print("FlyDSL kernel variants (default marked *):")
             for v in avail:
                 print(f"  {'*' if v == default else ' '} {v}")
+            print("    auto  (shape-adaptive: picks a variant per shape via "
+                  "_auto_variant)")
         return
 
     # Resolve the requested FlyDSL variants (comma list), defaulting to all

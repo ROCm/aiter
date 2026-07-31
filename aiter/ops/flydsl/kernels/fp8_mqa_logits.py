@@ -1448,21 +1448,54 @@ if arch == "gfx950":
     })
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2" if arch == "gfx942" else "mfma32x32x64_bkv128_r2_w2"
+DEFAULT_VARIANT = "mfma16x16x32_bkv128_r2_w2" if arch == "gfx942" else "mfma32x32x64_bkv64_r1_w2_lds3"
 
-def _auto_variant(seq_len, seq_len_kv):
-    """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
-    column tiles per wave when M and N are both large, else WPB=4 for more
-    wavefronts on small-M / short-window shapes."""
-    wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
-    return f"mfma16x16x32_bkv128_r2_w{wpb}"
+def _auto_variant(seq_len, seq_len_kv, num_heads):
+    """Pick a default variant based on the problem shape.
 
-def _resolve_variant(variant, seq_len, seq_len_kv):
+    gfx942:
+        Direct-load 16x16x32 fp8.  WPB=4 for better wavefront occupancy on
+        small or short-KV shapes; WPB=2 when both M and N are large (the extra
+        waves don't help and the wider tile improves utilisation).
+
+    gfx950:
+        LDS 3-buffer 32x32x64 scaled-fp8, bkv=64, WPB=2.  Here bkv=64 is the
+        bandwidth sweet-spot, although in same cases bkv=128 can be better. 
+        This is not worth the additional complexity in heuristics.
+
+        Row-per-wave r controls KV reuse per block (reuse = r x WPB = r x 2):
+          r=1 (reuse 2): better when the workload is small/square or
+            bandwidth is not dominant; more blocks -> better GPU utilisation.
+          r=2 (reuse 4): better when KV streaming pressure is high (long KV)
+            or the problem is large-square (many KV tiles per block amortise
+            the barrier cost).
+
+        Decision boundary (empirically determined from gfx950 benchmarks):
+          streaming  : seq_len_kv > 2 x seq_len
+          large_sq   : seq_len >= 8192 AND seq_len_kv >= seq_len
+
+        For H128 heads, the compute-to-bandwidth ratio is already 2x vs H64
+        (more MFMA work per KV tile), so r=1 is always sufficient.
+    """
+    if arch == "gfx942":
+        wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
+        return f"mfma16x16x32_bkv128_r2_w{wpb}"
+    elif arch == "gfx950":
+        if num_heads >= 128:
+            return "mfma32x32x64_bkv64_r1_w2_lds3"
+        streaming   = seq_len_kv > 2 * seq_len
+        large_sq    = seq_len >= 8192 and seq_len_kv >= seq_len
+        r = 2 if streaming or large_sq else 1
+        return f"mfma32x32x64_bkv64_r{r}_w2_lds3"
+    else:
+        raise NotImplementedError(f"auto-variant not implemented for arch {arch!r}")
+
+def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
     tag = (
         variant
         or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        or _auto_variant(seq_len, seq_len_kv)
+        or _auto_variant(seq_len, seq_len_kv, num_heads)
     )
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
@@ -1593,7 +1626,7 @@ def flydsl_fp8_mqa_logits(
         convert_q_fn = False
         convert_kv_fn = False
 
-    variant = _resolve_variant(variant, seq_len, seq_len_kv)
+    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads)
 
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
