@@ -340,7 +340,24 @@ namespace py = pybind11;
           py::arg("route_out"),                                                     \
           py::arg("out"),                                                           \
           py::arg("topk"),                                                          \
-          py::arg("block_n") = -1)
+          py::arg("block_n") = -1);                                                  \
+    m.def("opus_moe_stage1_a8w4_fwd",                                                \
+          &opus_moe_stage1_a8w4_fwd,                                                 \
+          "A8W4 Opus MoE stage1 path",                                               \
+          py::arg("hidden_states"),                                                  \
+          py::arg("w1"),                                                             \
+          py::arg("hidden_scale"),                                                   \
+          py::arg("w1_scale"),                                                       \
+          py::arg("bias"),                                                           \
+          py::arg("sorted_token_ids"),                                               \
+          py::arg("sorted_expert_ids"),                                              \
+          py::arg("num_valid_ids"),                                                  \
+          py::arg("out"),                                                            \
+          py::arg("out_scale"),                                                      \
+          py::arg("block_m"),                                                        \
+          py::arg("kernelName"),                                                     \
+          py::arg("inter_dim_pad"),                                                  \
+          py::arg("swiglu_limit"))
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
@@ -2027,6 +2044,19 @@ namespace py = pybind11;
           py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
+#define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
+    m.def("inverse_rope_group_quant",                  \
+          &aiter::inverse_rope_group_quant,            \
+          py::arg("o"),                                \
+          py::arg("x_fp8"),                            \
+          py::arg("x_scale"),                          \
+          py::arg("positions"),                        \
+          py::arg("cos_cache"),                        \
+          py::arg("sin_cache"),                        \
+          py::arg("num_groups"),                       \
+          py::arg("quant_group_size") = 128,           \
+          py::arg("scale_shuffle")    = false);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -2246,6 +2276,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND;                 \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \
