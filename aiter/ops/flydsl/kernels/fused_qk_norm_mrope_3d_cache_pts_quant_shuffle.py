@@ -874,9 +874,9 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         stream: fx.Stream to launch on; defaults to the current
             stream.
     """
-    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
+    from aiter.jit.utils.chip_info import get_gfx
 
-    if _get_gfx() == "gfx1250":
+    if get_gfx() == "gfx1250":
         raise NotImplementedError(
             "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle is wave64-"
             "only (gfx942/gfx950); gfx1250 (wave32) needs a dedicated "
@@ -934,7 +934,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"sum(mrope_section_)={sum(mrope_section_)} must equal "
             f"head_size//2={head_size // 2}"
         )
-    if block_size % x != 0:
+    if (block_size % x != 0) or (block_size == 0):
         raise ValueError(f"block_size ({block_size}) must be a multiple of x ({x})")
     if (head_size * block_size) % 16 != 0:
         raise ValueError(
@@ -952,13 +952,13 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise TypeError(f"qkv must be bf16, got {qkv.dtype}")
     if qw.dtype != aiter_dtypes.bf16 or kw.dtype != aiter_dtypes.bf16:
         raise TypeError("qw/kw must be bf16")
-    if positions.dtype != torch.int64:
+    if positions.dtype != aiter_dtypes.i64:
         raise TypeError(f"positions must be int64, got {positions.dtype}")
     if positions.shape != (3, num_tokens):
         raise ValueError(
             f"positions shape {tuple(positions.shape)} != (3, {num_tokens})"
         )
-    if slot_mapping.dtype != torch.int64:
+    if slot_mapping.dtype != aiter_dtypes.i64:
         raise TypeError(f"slot_mapping must be int64, got {slot_mapping.dtype}")
     if slot_mapping.shape != (num_tokens,):
         raise ValueError(
