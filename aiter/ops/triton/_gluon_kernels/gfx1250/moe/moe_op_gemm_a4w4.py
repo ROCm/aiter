@@ -766,20 +766,16 @@ def _moe_gemm_a4w4_prefill(
     if GatherIndx is None:
         XMxScale += start_m.to(index_type) * stride_x_mx_m
     if not X_SCALES_TDM:
-        if GatherIndx is None:
-            offs_x_m_scales = (
-                offs_x_m
-                + gl.arange(
-                    0,
-                    PACKED_BLOCK_M_X,
-                    layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
-                )
-            ) % M
-        else:
-            offs_x_m_scales = gl.convert_layout(
-                gl.where(mask_idx, offs_x_m, 0),
-                gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
+        offs_x_m_scales = (
+            PACKED_BLOCK_M_X * block_id
+            + gl.arange(
+                0,
+                PACKED_BLOCK_M_X,
+                layout=gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
             )
+        ) % M
+        if GatherIndx is not None:
+            offs_x_m_scales = gl.load(GatherIndx + offs_x_m_scales) // N_EXPTS_ACT
         offs_x_k_scales = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)
         )
