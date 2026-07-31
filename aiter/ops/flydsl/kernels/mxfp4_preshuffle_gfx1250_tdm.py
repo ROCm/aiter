@@ -729,6 +729,21 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(has_bias):
                     bias_ptr_type = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
+                if const_expr(ep_p2p_write):
+                    # Route weight per output row (ep_rowmap[grouped_row].col1, f32,
+                    # byte 4 of the prologue-prefetched 8-byte [dst|weight] slot).
+                    # The address depends on wm alone, but the C-tile store below
+                    # also writes LDS and _raw_lds_ptr builds its pointer through
+                    # inttoptr, so alias analysis cannot prove the two disjoint and
+                    # would re-read this for every wn subtile.
+                    _wf_rows = [
+                        _AV(
+                            lds_load_b32_raw(
+                                rowmap_lds_idx, (wmb + wm * 16 + lane16) * 8 + 4
+                            )
+                        ).bitcast(T.f32)
+                        for wm in range_constexpr(wmma_m_rep)
+                    ]
                 for wm in range_constexpr(wmma_m_rep):
                     row_rel = wmb + wm * 16 + lane16
                     for wn in range_constexpr(wmma_n_rep):
@@ -741,14 +756,9 @@ def launch_gemm_a8w4_tdm(
                             lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
                         else:
                             if const_expr(ep_p2p_write):
-                                # Pre-multiply each output row by its route weight
-                                # (ep_rowmap[grouped_row].col1, f32) BEFORE truncating
-                                # to bf16; the combine kernel does an unweighted sum.
-                                # Weight comes from the prologue-prefetched rowmap in
-                                # LDS (byte 4 of the 8-byte [dst|weight] slot).
-                                _wf = _AV(
-                                    lds_load_b32_raw(rowmap_lds_idx, row_rel * 8 + 4)
-                                ).bitcast(T.f32)
+                                # Weight the row BEFORE truncating to bf16; the
+                                # combine kernel does an unweighted sum.
+                                _wf = _wf_rows[wm]
                                 hv = Vec.from_elements(
                                     [acc[i] * _wf for i in range_constexpr(8)],
                                     fx.Float32,
