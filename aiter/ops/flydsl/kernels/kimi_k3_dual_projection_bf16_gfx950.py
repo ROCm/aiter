@@ -305,7 +305,7 @@ def build_kimi_k3_b1_dual_projection_bf16_module(
         shared_weight: fx.Pointer,
         routed_output: fx.Pointer,
         shared_output: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         if const_expr(waves_per_eu > 0):
