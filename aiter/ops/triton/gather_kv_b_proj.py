@@ -103,7 +103,11 @@ def gather_kv_b_proj(
     elif is_fp4_weight:
         ChunkK = 64
     else:
-        ChunkK = 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
+        ChunkK = (
+            64
+            if no_scale and k_buffer.dtype in [torch.float16, torch.bfloat16]
+            else 16 if k_buffer.dtype in [torch.float16, torch.bfloat16] else 32
+        )
 
     assert total_kv_k == total_kv_v
     assert tp_k_head_num_k == tp_k_head_num_v
@@ -112,17 +116,16 @@ def gather_kv_b_proj(
     padded_k = _next_pow2(qk_nope_head_dim)
     padded_v = _next_pow2(v_head_dim)
 
-    num_stages = 3
+    num_stages = 2
     # To avoid out of LDS limit for gfx942
     if arch_info.get_arch() in ("gfx942",) and ChunkK > 64:
         num_stages = 1
 
-    grid = (batch_size * tp_k_head_num_k,)
+    max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
     if is_fp4_weight:
         # Use the actual output token count, not kv_indices capacity. Serving
         # paths may pass a preallocated kv_indices buffer that is much larger
         # than the valid range described by kv_indptr/k_prefix.
-        max_kv_chunks = max(1, (total_kv_k + ChunkK - 1) // ChunkK)
         fp4_scale_k_granularity = 32 if weight_preshuffle else 128
         fp4_grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
         _triton_gather_kv_b_proj[fp4_grid](
@@ -154,6 +157,7 @@ def gather_kv_b_proj(
         )
         return
 
+    grid = (batch_size * tp_k_head_num_k * max_kv_chunks,)
     _triton_gather_kv_b_proj[grid](
         batch_size,
         k_buffer,
