@@ -165,7 +165,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 64],
+        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
         cga_layout=CGA_A,
     )
     WMMA_W_SCALES = gl.amd.AMDWMMALayout(
@@ -173,7 +173,7 @@ def get_moe_a4w4_layouts_prefill(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 64],
+        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
         cga_layout=CGA_B_NMAJOR,
     )
     DOT_LAYOUT_X_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
@@ -418,7 +418,7 @@ def get_moe_a4w4_layouts_decode(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 64],
+        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
         cga_layout=CGA_A,
     )
     WMMA_W_SCALES = gl.amd.AMDWMMALayout(
@@ -426,7 +426,7 @@ def get_moe_a4w4_layouts_decode(
         transposed=True,
         warp_bases=warp_bases,
         reg_bases=[],
-        instr_shape=[16, 16, 64],
+        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
         cga_layout=CGA_B_NMAJOR,
     )
     DOT_LAYOUT_X_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
@@ -1656,8 +1656,6 @@ def _moe_gemm_a4w4_decode(
             )
         wmma_idx += 1
 
-        # under multicast a TDM op writes into every CTA's LDS, so the slot just
-        # read cannot be refilled until all CTAs in the cluster are done with it
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
@@ -1669,7 +1667,6 @@ def _moe_gemm_a4w4_decode(
     # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
-        # one row, so there is no cga_layout to split (num_ctas == 1)
         SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(
             vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
