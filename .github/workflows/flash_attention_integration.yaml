@@ -557,8 +557,10 @@ jobs:
           echo "=== matching cases ==="
           tail -3 /tmp/collected.txt
 
+          # Re-rooted on $FILE: collection prints ids relative to pytest's rootdir, which here drops
+          # the `tests/` prefix, and feeding those straight back collects 0 items (exit 4).
           # awk, never `| head -8`: head closes the pipe and pipefail turns the SIGPIPE into exit 141.
-          IDS=$(awk '/::/ && ++n<=8' /tmp/collected.txt)
+          IDS=$(awk -v f="$FILE" '/::/ && ++n<=8 { sub(/^[^:]*::/, ""); print f "::" $0 }' /tmp/collected.txt)
           # Required: an empty $IDS below would run the WHOLE suite, not nothing.
           if [ -z "$IDS" ]; then
             echo "ERROR: the filter matched no cases; the upstream parametrization changed" >&2
