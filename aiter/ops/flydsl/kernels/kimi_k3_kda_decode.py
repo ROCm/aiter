@@ -34,7 +34,7 @@ _V_ITERS = _DIM // _V_GROUP_TILE
 _WAVES_PER_EU = 3
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
     """Build the fixed gfx950 BF16 Kimi-K3 decode specialization."""
 
@@ -517,7 +517,7 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         stride_gate_head: fx.Int32,
         stride_out_token: fx.Int32,
         stride_out_head: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel(
             x_mem,

@@ -48,11 +48,6 @@ if is_flydsl_available():
     from .kernels.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
-    from .kimi_k3_kda_decode import (
-        flydsl_kimi_k3_kda_decode,
-        flydsl_kimi_k3_kda_decode_with_f_b,
-        is_flydsl_kimi_k3_kda_decode_supported,
-    )
     from .kernels.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -62,6 +57,11 @@ if is_flydsl_available():
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
+    from .kimi_k3_kda_decode import (
+        flydsl_kimi_k3_kda_decode,
+        flydsl_kimi_k3_kda_decode_with_f_b,
+        is_flydsl_kimi_k3_kda_decode_supported,
+    )
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     # from .linear_attention_kernels import flydsl_gdr_decode
@@ -73,15 +73,15 @@ if is_flydsl_available():
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
-        "flydsl_moe_stage1",
-        "flydsl_moe_stage2",
         "flydsl_kimi_k3_kda_decode",
         "flydsl_kimi_k3_kda_decode_with_f_b",
-        "is_flydsl_kimi_k3_kda_decode_supported",
+        "flydsl_moe_stage1",
+        "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
         "flydsl_pa_mqa_logits_fp4_prefill",
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
+        "is_flydsl_kimi_k3_kda_decode_supported",
         # "flydsl_gdr_decode",
     ]

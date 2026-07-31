@@ -24,7 +24,7 @@ _CONV_CHANNELS = 3 * _HEADS * _DIM
 _CONV_WIDTH = 4
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _rocm_arch(device: torch.device) -> str | None:
     properties = torch.cuda.get_device_properties(device)
     arch = getattr(properties, "gcnArchName", None)

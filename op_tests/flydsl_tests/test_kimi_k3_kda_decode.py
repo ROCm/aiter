@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
     reason="gfx950 FlyDSL required",
 )
 
-from aiter.ops.flydsl.kimi_k3_kda_decode import (  # noqa: E402
+from aiter.ops.flydsl.kimi_k3_kda_decode import (
     flydsl_kimi_k3_kda_decode,
     flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
