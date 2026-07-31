@@ -333,6 +333,27 @@ def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
     )
 
 
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_fp8_ep_reduction():
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    token, topk, model_dim = 2, 4, 128
+    values = torch.tensor([1, 7, 2, 9], dtype=dtypes.fp8, device="cuda")
+    target = torch.empty(
+        (token * topk, model_dim + model_dim // 8), dtype=torch.uint8, device="cuda"
+    )
+    target[:, :model_dim] = values.repeat(token).view(torch.uint8)[:, None]
+    target[:, model_dim:] = 127  # E8M0 scale 1.0
+    expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(token, 1)
+    out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+    _run_moe_reduction(
+        target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
+    )
+    torch.testing.assert_close(out, torch.full_like(out, 3.0))
+
+
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):

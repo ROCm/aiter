@@ -1760,6 +1760,8 @@ def _flydsl_v2_stage2_wrapper(
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     block_m=None,
+    expert_mask=None,
+    topk_ids=None,
     **_kwargs,
 ):
     from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
@@ -1798,6 +1800,11 @@ def _flydsl_v2_stage2_wrapper(
                 dtype=out.dtype,
                 device=out.device,
             )
+        if expert_mask is not None:
+            # EP sorting omits remote and fake routes, so GEMM2 intentionally
+            # leaves their per-route slots unwritten. Zero them before the
+            # masked reduction to prevent speculative loads of stale NaN data.
+            target.zero_()
     mxfp4_moe_gemm2(
         inter_sorted_quant=_mxfp4_scale_u8(inter_states),
         inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
@@ -1835,6 +1842,8 @@ def _flydsl_v2_stage2_wrapper(
             token_num,
             topk,
             model_dim_runtime,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
             is_fp8=_s2_fp8_inter,
         )
     return out
@@ -2047,15 +2056,6 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
-        elif kn2.startswith("flydsl_moe2_layout_") and is_ep:
-            # v2 stage2 does not thread expert_mask into its reduce epilogue,
-            # so EP masking would be silently dropped; fall back under EP.
-            cfg = None
-            logger.warning(
-                "[fused_moe] FlyDSL v2 (flydsl_moe2_layout_*) stage2 does not "
-                "support expert-parallel yet; using default heuristics."
-            )
-
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -2842,7 +2842,14 @@ def fused_moe_2stages(
         )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
-    if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
+    if (
+        stage2_func
+        in (
+            _flydsl_stage2_wrapper,
+            _flydsl_v2_stage2_wrapper,
+        )
+        and expert_mask is not None
+    ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:

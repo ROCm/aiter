@@ -1027,10 +1027,6 @@ def _run_moe_reduction(
     reduce_out_dtype_str = None
     X = target
     if is_fp8:
-        if use_mask:
-            raise NotImplementedError(
-                "MXFP8 route-out reduce does not support EP expert_mask yet"
-            )
         _reduce_dtype_str = "fp8"
         reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
         # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer.
