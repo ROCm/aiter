@@ -87,10 +87,17 @@ def extract_lds_base_idx(smem_ptr):
 
 
 def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
+    """Materialize an LLVM LDS pointer from a pre-extracted byte base.
+
+    ``byte_offset`` may be an index value or an i32/int (e.g. a raw byte
+    expression from the caller); non-index offsets are cast to index here so
+    call sites don't have to wrap every offset in ``index_cast``.
+    """
     from flydsl._mlir.dialects import llvm as _llvm
     from flydsl.expr.arith import ArithValue as _AV
 
+    if not isinstance(_raw(byte_offset).type, ir.IndexType):
+        byte_offset = arith.index_cast(T.index, byte_offset)
     lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
     total_byte = _AV(lds_base_idx) + byte_offset
     addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
@@ -121,6 +128,34 @@ def lds_load_b32_raw(lds_base_idx, byte_offset):
     """
     ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
     return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+
+
+def lds_store_b128_raw(lds_base_idx, byte_offset, data):
+    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM).
+
+    Mirror of :func:`lds_load_b128_raw` for the store direction; used when the
+    LDS is a bump-allocated fly SharedAllocator base (no raw memref for the
+    ``vector.store`` path). ``data`` must be a 128-bit vector (``vec<4xi32>``).
+
+    Args:
+        lds_base_idx: LDS byte-base index (e.g. ``ptrtoint`` of a shared ptr).
+        byte_offset: Byte offset (index-type) relative to the base.
+        data: 128-bit value to store (``vector<4xi32>``).
+    """
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
+def lds_store_b64_raw(lds_base_idx, byte_offset, data):
+    """Store 8 bytes to LDS using a pre-extracted base index (vector<2xi32>)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
+
+
+def lds_store_b32_raw(lds_base_idx, byte_offset, data):
+    """Store 4 bytes to LDS using a pre-extracted base index (i32)."""
+    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
+    llvm_dialect.store(_raw(data), ptr_val)
 
 
 def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
@@ -278,9 +313,108 @@ def store_acc_vec8_to_buffer(
         return 2
 
 
+import math as _math
+
+LOG2E = _math.log2(_math.e)
+
+
+def fmin_f32(a, b):
+    """Scalar f32 min (maps to v_min_num_f32)."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
+
+
+def fmax_f32(a, b):
+    """Scalar f32 max (maps to v_max_num_f32)."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(arith.maxnumf(_raw(a), _raw(b)))
+
+
+def fclamp_f32(x, lo, hi):
+    """Scalar f32 clamp via v_med3_num_f32."""
+    import flydsl.expr as _fx
+
+    return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
+
+
+def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    import flydsl.expr as _fx
+
+    _one = _fx.Float32(1.0)
+    g = fmin_f32(g, limit_f32)
+    u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    if swiglu:
+        nlog2e = _fx.Float32(-1.702 * LOG2E)
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+        return g * sig * (u + _one)
+    nlog2e = _fx.Float32(-LOG2E)
+    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    return g * sig * u
+
+
+def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
+
+    Args:
+        pairs: list of (gate, up) f32 value pairs.
+        swiglu: True for swiglu, False for silu.
+        limit_f32, neg_limit_f32: clamp bounds.
+        range_constexpr: the FlyDSL ``range_constexpr`` helper.
+
+    Returns:
+        list of activated f32 values, same length as *pairs*.
+    """
+    import flydsl.expr as _fx
+
+    _one = _fx.Float32(1.0)
+    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    N = len(pairs)
+    # Stage 1: clamp + exp2
+    gs, us, exp_vals = [], [], []
+    for i in range_constexpr(N):
+        g = fmin_f32(pairs[i][0], limit_f32)
+        u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
+        gs.append(g)
+        us.append(u)
+    rocdl.sched_barrier(0)
+    for i in range_constexpr(N):
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
+        exp_vals.append(exp_val)
+    # Stage 2a: add 1+exp
+    rocdl.sched_barrier(0)
+    sum_vals = []
+    for i in range_constexpr(N):
+        sum_vals.append(_one + exp_vals[i])
+    # Stage 2b: rcp
+    rocdl.sched_barrier(0)
+    rcp_vals = []
+    for i in range_constexpr(N):
+        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
+    # Stage 3: final mul
+    rocdl.sched_barrier(0)
+    results = []
+    for i in range_constexpr(N):
+        if swiglu:
+            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+        else:
+            results.append(gs[i] * rcp_vals[i] * us[i])
+    return results
+
+
 __all__ = [
+    # Scalar math
+    "LOG2E",
+    "batched_silu_swiglu",
     # Raw LLVM path
     "extract_lds_base_idx",
+    "fmax_f32",
+    "fmin_f32",
+    "fused_silu_swiglu_elem",
     # LDS helpers
     "get_lds_memref",
     "issue_tdm_loads",

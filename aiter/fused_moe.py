@@ -647,13 +647,16 @@ def fused_moe_(
     if is_flydsl_available():
         try:
             from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                _maybe_grouped_gfx1250_a8w4_moe,
+                grouped_gemm_gfx1250_a8w4,
             )
         except ImportError:
-            _maybe_grouped_gfx1250_a8w4_moe = None
+            grouped_gemm_gfx1250_a8w4 = None
 
-        if _maybe_grouped_gfx1250_a8w4_moe is not None:
-            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+        # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
+        # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
+        # weights fall through to the generic MoE below.
+        if grouped_gemm_gfx1250_a8w4 is not None and gate_mode == GateMode.INTERLEAVE:
+            grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
                 hidden_states,
                 w1,
                 w2,
@@ -676,8 +679,8 @@ def fused_moe_(
                 intermediate_pad=intermediate_pad,
                 bias1=bias1,
                 bias2=bias2,
-                gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
+                num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
@@ -720,10 +723,9 @@ def fused_moe_(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert not metadata.flat or get_gfx() in (
-        "gfx942",
-        "gfx950",
-    ), f"FLAT fmoe asm kernels require gfx942/gfx950; got {get_gfx()}. "
+    assert (
+        not metadata.flat or get_gfx() == "gfx950"
+    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1456,12 +1458,8 @@ def _mxfp4_a4w4_stage2(
     if atomic:
         out_buf = out_dst
     else:
-        # 7168: DeepSeek-V3-class; 6144: GLM-5.2 (256 routed + 1 shared -> NE 257).
         _mx_shape_ok = (
-            BM == 128
-            and D_HIDDEN in (7168, 6144)
-            and D_INTER == 512
-            and NE in (257, 385)
+            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
         )
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
@@ -1961,7 +1959,7 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
-        str(activation),
+        activation,
         str(dtype),
         str(q_dtype_a),
         str(q_dtype_w),
@@ -3229,12 +3227,11 @@ def torch_moe_stage1(
         )
         w1 = w1.view(w1_shape)
 
-        if a1_scale is not None and a1_scale.numel() > 0:
-            a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
-            a1_scale = a1_scale.repeat(
-                1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
-            ).view(hidden_states.shape[0], -1)
-            hidden_states = hidden_states * a1_scale
+        a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
+        a1_scale = a1_scale.repeat(
+            1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
+        ).view(hidden_states.shape[0], -1)
+        hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
     elif (
@@ -3435,14 +3432,7 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
-    # Only enable split-k when each K partition owns >= 2 k-tiles
-    # (KBatch = K / (splitk * KPerBlock), KPerBlock == 256). When KBatch == 1 the
-    # CK kernel uses atomic-add but skips the output memset, accumulating onto
-    # uninitialized memory -> gibberish. This guards splitk from CSV / AITER_KSPLIT
-    # that bypass get_ksplit's KBatch >= 2 check.
-    KPerBlock = 256
-    k_batch = (hidden_states.shape[1] // splitk) // KPerBlock if splitk > 1 else 1
-    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1 and k_batch >= 2
+    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
@@ -3692,6 +3682,7 @@ def fused_topk(
             (256, 6),
             (256, 8),
             (384, 8),
+            (640, 8),
         ]
         and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
         and gating_output.is_contiguous()
