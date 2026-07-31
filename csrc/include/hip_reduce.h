@@ -2,7 +2,74 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 #include "aiter_hip_common.h"
-#include <rocprim/rocprim.hpp>
+#include <type_traits>
+
+// Cross-lane data movement used by the reductions below. The hardware
+// primitives operate on a single 32-bit lane value, so each helper applies the
+// builtin word by word, which makes them usable with any trivially copyable T
+// rather than just int / float.
+namespace aiter_dpp {
+
+// Apply a per-32-bit-word op to T. Sizes that are a multiple of 4 take the
+// bit_cast path; anything else is copied word by word, with the final partial
+// word handled by a short memcpy.
+template <typename T, typename Op>
+__device__ __forceinline__ T word_wise(const T& input, Op op)
+{
+    constexpr int words_no = (sizeof(T) + sizeof(int) - 1) / sizeof(int);
+
+    if constexpr(std::is_trivially_copyable_v<T> && (sizeof(T) % sizeof(int) == 0))
+    {
+        struct V
+        {
+            int words[words_no];
+        };
+        auto a = __builtin_bit_cast(V, input);
+#pragma unroll
+        for(int i = 0; i < words_no; i++)
+        {
+            a.words[i] = op(a.words[i]);
+        }
+        return __builtin_bit_cast(T, a);
+    }
+    else
+    {
+        T output;
+#pragma unroll
+        for(int i = 0; i < words_no; i++)
+        {
+            const size_t rest = sizeof(T) - i * sizeof(int);
+            const size_t s    = sizeof(int) < rest ? sizeof(int) : rest;
+            int word;
+            __builtin_memcpy(&word, reinterpret_cast<const char*>(&input) + i * sizeof(int), s);
+            word = op(word);
+            __builtin_memcpy(reinterpret_cast<char*>(&output) + i * sizeof(int), &word, s);
+        }
+        return output;
+    }
+}
+
+// Move data across lanes via the DPP modifier. dpp_ctrl selects the pattern
+// (quad_perm / row_mirror / row_bcast / row_xmask / row_ror ...); the mask and
+// bound_ctrl defaults mean "all rows, all banks, keep the old value for an
+// invalid source lane".
+template <typename T, int dpp_ctrl, int row_mask = 0xf, int bank_mask = 0xf, bool bound_ctrl = false>
+__device__ __forceinline__ T move_dpp(const T& input)
+{
+    return word_wise(input, [](int v) -> int {
+        return __builtin_amdgcn_mov_dpp(v, dpp_ctrl, row_mask, bank_mask, bound_ctrl);
+    });
+}
+
+// Broadcast/read input from src_lane within a logical warp of the given width.
+// width must be a power of 2 and no larger than the wavefront size.
+template <typename T>
+__device__ __forceinline__ T shuffle(const T& input, const int src_lane, const int width)
+{
+    return word_wise(input, [=](int v) -> int { return __shfl(v, src_lane, width); });
+}
+
+} // namespace aiter_dpp
 
 template <typename T, typename F>
 __device__ constexpr T wave_reduce_ds(T local, F reduce_op)
@@ -97,31 +164,29 @@ __device__ inline std::
     return __builtin_bit_cast(T, a);
 }
 
-// copied from
-// https://github.com/ROCm/rocPRIM/blob/3b6802d397c4e5266bb6ba7ea8c924d239288608/rocprim/include/rocprim/warp/detail/warp_reduce_dpp.hpp
 template <typename T, typename F, int WarpSize = WARP_SIZE, bool threadBroadcast = true>
 __device__ constexpr T wave_reduce(T local, F reduce_op)
 {
     if constexpr(WarpSize > 1)
     {
         // quad_perm:[1,0,3,2] -> 10110001
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(local), local);
     }
 
     if constexpr(WarpSize > 2)
     {
         // quad_perm:[2,3,0,1] -> 01001110
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(local), local);
     }
 
     if constexpr(WarpSize > 4)
     {
 #if defined(__GFX9__)
         // row_half_mirror
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x141>(local), local);
 #else
         // row_xmask:7
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x167>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x167>(local), local);
 #endif
     }
 
@@ -129,10 +194,10 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     {
 #if defined(__GFX9__)
         // row_mirror
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x140>(local), local);
 #else
         // row_xmask:15
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x16f>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x16f>(local), local);
 #endif
     }
 
@@ -140,9 +205,8 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     {
 #if defined(__GFX9__)
         // row_bcast:15
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x142>(local), local);
 #else
-        // local = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(local), local);
         local = reduce_op(warp_permlanex16(local), local);
 #endif
     }
@@ -151,13 +215,13 @@ __device__ constexpr T wave_reduce(T local, F reduce_op)
     if constexpr(WarpSize > 32)
     {
         // row_bcast:31
-        local = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(local), local);
+        local = reduce_op(aiter_dpp::move_dpp<T, 0x143>(local), local);
     }
 
     if constexpr(threadBroadcast && WarpSize > 16)
     {
         // Read the result from the last lane of the logical warp
-        local = rocprim::warp_shuffle(local, WarpSize - 1, WarpSize);
+        local = aiter_dpp::shuffle(local, WarpSize - 1, WarpSize);
         // local = thread_broadcast<T, WarpSize, WarpSize>(local, WarpSize - 1);
     }
 #endif
@@ -173,58 +237,57 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     }
     else if(thread_num == 2)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
     }
     else if(thread_num == 4)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(data), data);
     }
     else if(thread_num == 8)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x141>(data), data);
     }
     else if(thread_num == 16)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x141>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x140>(data), data);
     }
     else if(thread_num == 32)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(data), data);
 #if defined(__GFX9__)
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x141>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x140>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142, 0xa>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x141>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x140>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x142, 0xa>(data), data);
         if constexpr(threadBroadcast)
         {
-            data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
+            data = aiter_dpp::shuffle(data, thread_num - 1, thread_num);
             // data = thread_broadcast<T, 32, WarpSize>(data, thread_num - 1);
         }
 #else
-        // data = reduce_op(rocprim::detail::warp_swizzle<T, 0x401F>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x167>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x16f>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x167>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x16f>(data), data);
         data = reduce_op(warp_permlanex16(data), data);
 #endif
     }
 #if defined(__GFX9__)
     else if(thread_num == 64)
     {
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0xb1>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x4e>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x124>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x128>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x142>(data), data);
-        data = reduce_op(rocprim::detail::warp_move_dpp<T, 0x143>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0xb1>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x4e>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x124>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x128>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x142>(data), data);
+        data = reduce_op(aiter_dpp::move_dpp<T, 0x143>(data), data);
         if constexpr(threadBroadcast)
         {
-            data = rocprim::warp_shuffle(data, thread_num - 1, thread_num);
+            data = aiter_dpp::shuffle(data, thread_num - 1, thread_num);
             // data = thread_broadcast<T, 64, WarpSize>(data, thread_num - 1);
         }
     }
@@ -273,7 +336,7 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
             if constexpr(waveBroadcast)
             {
                 // Read the result from the last lane of the logical warp
-                local = rocprim::warp_shuffle(local, waves - 1, wave_size);
+                local = aiter_dpp::shuffle(local, waves - 1, wave_size);
             }
         }
     }
@@ -329,7 +392,7 @@ __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
         _ASM_DPP_MAX_F32(v, "row_ror:8 row_mask:0xf bank_mask:0xf");
         _ASM_DPP_MAX_F32(v, "row_bcast:15 row_mask:0xa bank_mask:0xf");
         if constexpr(threadBroadcast)
-            v = rocprim::warp_shuffle(v, thread_num - 1, thread_num);
+            v = aiter_dpp::shuffle(v, thread_num - 1, thread_num);
 #else
         v = fmaxf(v, warp_permlanex16(v));
 #endif
@@ -344,7 +407,7 @@ __device__ __forceinline__ float multithread_reduce_max_dpp(float v)
         _ASM_DPP_MAX_F32(v, "row_bcast:15 row_mask:0xf bank_mask:0xf");
         _ASM_DPP_MAX_F32(v, "row_bcast:31 row_mask:0xf bank_mask:0xf");
         if constexpr(threadBroadcast)
-            v = rocprim::warp_shuffle(v, thread_num - 1, thread_num);
+            v = aiter_dpp::shuffle(v, thread_num - 1, thread_num);
         return v;
     }
 #endif
