@@ -99,6 +99,7 @@ def _mla_gluon(
     KV_PE_OFFSET: gl.constexpr,
     USE_2D_VIEW: gl.constexpr,
     WITHIN_2GB: gl.constexpr,
+    WIDE_KV_OFFSETS: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     NHEAD: gl.constexpr,
     REGIME: gl.constexpr,
@@ -436,12 +437,12 @@ def _mla_gluon(
     if HAS_PE:
         kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(0), gl.SliceLayout(0, blocked_kpe))
         # simplify for page_size 1
-        kv_loc_pe = kv_page_number_pe
+        kv_loc_pe = kv_page_number_pe.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_pe
 
     # local load page number for slice 0
     bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N // 2, 0)
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
-    kv_loc0 = kv_page_number_0
+    kv_loc0 = kv_page_number_0.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_0
 
     # global load K_nope slice 0
     offs_n_nope0 = split_kv_start + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
@@ -468,7 +469,7 @@ def _mla_gluon(
     # local load page number for slice 1
     bufs_page_1 = bufs_page.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
-    kv_loc1 = kv_page_number_1
+    kv_loc1 = kv_page_number_1.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_1
 
     # global load K_nope slice 1
     offs_n_nope1 = offs_n_nope0 + BLOCK_N // 2
@@ -502,7 +503,7 @@ def _mla_gluon(
         # local load page number for slice 0
         bufs_page_0 = bufs_page.index(async_idx).slice(0, BLOCK_N // 2, 0)
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
-        kv_loc0 = kv_page_number_0
+        kv_loc0 = kv_page_number_0.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_0
         # global load K_nope slice 0
         offs_n_nope0 = start_n + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
@@ -520,7 +521,7 @@ def _mla_gluon(
         # local load page_number_pe
         if HAS_PE:
             kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
-            kv_loc_pe = kv_page_number_pe
+            kv_loc_pe = kv_page_number_pe.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_pe
             # global load K_pe
             offs_n_pe = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kpe))
             offs_d_kpe_1 = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(1, blocked_kpe))
@@ -543,7 +544,7 @@ def _mla_gluon(
         # local load page number for slice 1
         bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
-        kv_loc1 = kv_page_number_1
+        kv_loc1 = kv_page_number_1.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_1
         # global load K_nope slice 1
         offs_n1 = offs_n_nope0 + BLOCK_N // 2
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
@@ -595,10 +596,10 @@ def _mla_gluon(
         # local load page number
         gl.amd.cdna4.async_copy.wait_group(3 if HAS_PE else 2)
         kv_page_number = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kv))
-        kv_loc = kv_page_number
+        kv_loc = kv_page_number.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number
         if HAS_PE:
             kv_page_number_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page.index(async_idx), gl.SliceLayout(0, blocked_kpe))
-            kv_loc_pe = kv_page_number_pe
+            kv_loc_pe = kv_page_number_pe.to(gl.int64) if WIDE_KV_OFFSETS else kv_page_number_pe
         # global load K_nope
         offs_n_nope = start_n + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked_kv))
         offs_d_ckv_1 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv))
@@ -980,8 +981,15 @@ def mla_gluon(
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
-    max_kv_bytes = kv_c.shape[0] * kv_c.stride(0) * kv_c.element_size()
+    max_kv_elems = kv_c.shape[0] * kv_c.stride(0)
+    max_kv_bytes = max_kv_elems * kv_c.element_size()
     within_2gb = max_kv_bytes <= 0x80000000  # 2 GB
+    # The row base (page number * row stride) is an element count, not a byte
+    # count, and is int32 by default. A cache with more than 2**31 elements
+    # therefore wraps to a negative offset on the global_load path even though
+    # that path uses 64-bit pointers. Widen the page number in that case only,
+    # so caches that already fit keep the cheaper 32-bit address arithmetic.
+    wide_kv_offsets = max_kv_elems > 0x7FFFFFFF
 
     # Normalized Q strides: (batch, q_pos, head). For plain decode (3-D) the
     # q_pos stride is 0 and q_pos is always 0, so the kernel address math is
@@ -1098,6 +1106,7 @@ def mla_gluon(
         KV_PE_OFFSET=kv_pe_offset,
         USE_2D_VIEW=use_2d_view,
         WITHIN_2GB=within_2gb,
+        WIDE_KV_OFFSETS=wide_kv_offsets,
         NUM_XCDS=NUM_XCDS,
         NHEAD=nhead,
         REGIME=REGIME,
