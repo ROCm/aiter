@@ -456,7 +456,8 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));                                                \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -1691,6 +1692,7 @@ namespace py = pybind11;
           py::arg("do_rotate_act") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
@@ -1721,12 +1723,16 @@ namespace py = pybind11;
           py::arg("hidden_dim"),                                                           \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_get_handle",                                                                 \
+          &aiter::qr_get_handle,                                                           \
+          "qr_get_handle(int fa, int out_ptr) -> ()",                                      \
+          py::arg("fa"),                                                                   \
+          py::arg("out_ptr"));                                                             \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs) -> ()",                              \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
@@ -2021,6 +2027,19 @@ namespace py = pybind11;
           py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
+#define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
+    m.def("inverse_rope_group_quant",                  \
+          &aiter::inverse_rope_group_quant,            \
+          py::arg("o"),                                \
+          py::arg("x_fp8"),                            \
+          py::arg("x_scale"),                          \
+          py::arg("positions"),                        \
+          py::arg("cos_cache"),                        \
+          py::arg("sin_cache"),                        \
+          py::arg("num_groups"),                       \
+          py::arg("quant_group_size") = 128,           \
+          py::arg("scale_shuffle")    = false);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -2240,6 +2259,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND;                 \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \
