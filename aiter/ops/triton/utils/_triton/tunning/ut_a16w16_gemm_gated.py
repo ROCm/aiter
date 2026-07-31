@@ -1,12 +1,13 @@
 import sys
-from _utils import (
-    run_profile,
-    get_input_shape_and_config_list,
-)
 
 ############################################################
 # <import>
 import torch
+from _utils import (
+    get_input_shape_and_config_list,
+    run_profile,
+)
+
 from aiter.ops.triton.gemm.basic.gemm_a16w16_gated import gemm_a16w16_gated
 from op_tests.triton_tests.gemm.basic.test_gemm_a16w16_gated import (
     generate_gemm_a16w16_gated_inputs,
@@ -37,7 +38,7 @@ for config in config_list:
         config.pop("NUM_KSPLIT", None)
         config.pop("SPLITK_BLOCK_SIZE", None)
 
-    def fn():
+    def fn(config=config):
         ############################################################
         # <run API>
         gemm_a16w16_gated(x, w, dtype, y, config=config)

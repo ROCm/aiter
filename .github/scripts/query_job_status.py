@@ -190,8 +190,7 @@ def list_jobs_for_run(owner: str, repo: str, run_id: int, token: str):
         jobs = payload.get("jobs", [])
         if not jobs:
             return
-        for job in jobs:
-            yield job
+        yield from jobs
         page += 1
 
 
@@ -202,9 +201,7 @@ def job_name_matches(filter_name: str, actual_name: str):
         return True
     if actual_name.startswith(f"{filter_name} ("):
         return True
-    if actual_name.startswith(f"{filter_name} / "):
-        return True
-    return False
+    return bool(actual_name.startswith(f"{filter_name} / "))
 
 
 def row_to_dict(row: dict[str, Any]):
@@ -360,7 +357,7 @@ def select_primary_runner_label(labels: list[str]):
         )
     ]
     candidates = preferred or labels
-    return sorted(candidates, key=lambda value: (-len(value), value.lower()))[0]
+    return min(candidates, key=lambda value: (-len(value), value.lower()))
 
 
 def get_runner_label(row: dict[str, Any]):
@@ -459,7 +456,7 @@ def analyze_concurrency(job_rows: list[dict[str, Any]], report_time: datetime):
         durations: list[float] = []
 
         for row in label_rows:
-            created = parse_time(row.get("created_at", ""))
+            parse_time(row.get("created_at", ""))
             started = parse_time(row.get("started_at", ""))
             completed = parse_time(row.get("completed_at", ""))
 
@@ -816,7 +813,7 @@ def main():
 
     if rate_limited and rate_limit_reset_epoch:
         reset_time = datetime.fromtimestamp(rate_limit_reset_epoch, timezone.utc)
-        print("")
+        print()
         print(
             f"> NOTE: Partial data due to GitHub API rate limit. "
             f"Reset at {reset_time.isoformat()} (UTC)."

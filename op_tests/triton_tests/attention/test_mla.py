@@ -2,20 +2,20 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
+
 import pytest
 import torch
 
 from aiter.ops.triton.attention.mla import (
-    mla_prefill_fwd,
     mla_decode_fwd,
+    mla_prefill_fwd,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.types import e4m3_dtype
-from typing import Optional
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -52,7 +52,7 @@ def shuffle_kv_buffer(
         # we use (16, 16) here, noted that you must set k_width to 16 in the corresponding DotOperandLayout, the math will be equivalent.
         layout = (16, 16)
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 16
 
@@ -105,7 +105,7 @@ def dynamic_nvfp4_quant_kv_buffer(
     dtype = kv_buffer.dtype
     assert dtype == torch.bfloat16
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
 
     assert block_size >= 128
 
@@ -173,8 +173,8 @@ def ref_masked_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     query_len = q.shape[0]
     kv_len = k.shape[0]
@@ -211,10 +211,10 @@ def torch_mla_extend(
     block_tables,
     qk_lora_rank,
     scale: float,
-    q_descale: Optional[torch.Tensor] = None,
-    kv_descale: Optional[torch.Tensor] = None,
-    out_scale: Optional[torch.Tensor] = None,
-    o_dtype: Optional[torch.dtype] = torch.bfloat16,
+    q_descale: torch.Tensor | None = None,
+    kv_descale: torch.Tensor | None = None,
+    out_scale: torch.Tensor | None = None,
+    o_dtype: torch.dtype | None = torch.bfloat16,
 ):
     _, block_size, num_kv_heads, qk_head_dim = kv_buffer.shape
     num_seqs = cu_seqlens_q.shape[0] - 1

@@ -110,8 +110,6 @@ class DeviceCommunicatorBase:
         self.global_world_size = dist.get_world_size()
         self.rank_in_group = dist.get_group_rank(self.cpu_group, self.global_rank)
 
-        use_ep = False
-        all2all_backend = None
         # from vllm.config import get_current_vllm_config
 
         # config = get_current_vllm_config()

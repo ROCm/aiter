@@ -27,7 +27,6 @@ import csv
 import os
 import sys
 import time
-from typing import Optional
 
 from aiter.aot.flydsl.common import (
     collect_aot_jobs,
@@ -49,6 +48,8 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    resolve_flydsl_stage1_tile_n,
+    resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
 
@@ -84,11 +85,8 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
-            act = (
-                "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
-            )
+            act_name = act_type.strip().split(".")[-1].lower()
+            act = act_name if act_name in ("swiglu", "situv2") else "silu"
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
@@ -201,7 +199,7 @@ def _precompile_to_cache(
     # pin ``waves_per_eu`` in ``get_flydsl_stage{1,2}_kernels`` (only the
     # production-variant ``_persist_async_w4_cumul3`` does), causing
     # ``AOT cache miss`` at runtime even though the .pkl is present on disk.
-    waves_per_eu: Optional[int] = None,
+    waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
     gate_mode: str = "separated",
@@ -399,6 +397,9 @@ def _precompile_to_cache(
         sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
 
         if stage == 1:
+            if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
+                tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
+
             a = _make_a_user(_user_a_shape())
             w1_shape = _user_w1_shape()
             w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
@@ -535,6 +536,9 @@ def _precompile_to_cache(
                     ),
                     stream=0,
                     swiglu_limit=runtime_swiglu_limit(None, act),
+                    pass_swiglu_limit=not (
+                        a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+                    ),
                 )
             else:
                 args = _s1_args_std(
@@ -615,6 +619,11 @@ def _precompile_to_cache(
                 )
 
         elif stage == 2:
+            # Match flydsl_moe_stage2 runtime dispatch: tuned tables may name a
+            # tile_k that does not divide this shape (for example 256 for
+            # inter_dim=384), in which case runtime compiles the legal fallback.
+            tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
+
             # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
             if a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)
@@ -894,7 +903,7 @@ def compile_one_config(
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result

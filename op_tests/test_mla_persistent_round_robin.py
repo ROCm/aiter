@@ -15,15 +15,17 @@ Example:
         -n 16,4 -b 1 -c 13 -cpw 4
 """
 
-import torch
-import aiter
-from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter import dtypes
-import random
-import itertools
 import argparse
+import itertools
+import random
+
 import pandas as pd
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -34,9 +36,7 @@ def check_support(dtype, kv_dtype, nhead):
         return False
     if dtype == dtypes.fp8 and kv_dtype == dtypes.fp8:
         return False
-    if get_gfx() == "gfx942":
-        return False
-    return True
+    return get_gfx() != "gfx942"
 
 
 def cal_diff(
@@ -97,7 +97,7 @@ def ref_masked_attention(
     lse = attn_weights.logsumexp(dim=-1)
     m = attn_weights.max(-1).values
     attn_weights_exp = torch.exp(attn_weights - m.unsqueeze(-1))
-    l = attn_weights_exp.sum(-1)  # noqa: E741
+    l = attn_weights_exp.sum(-1)
     if is_fp8_q:
         attn_weights_fp8 = attn_weights_exp.to(dtypes.fp8)
         attn_weights_exp = attn_weights_fp8.to(torch.float)
@@ -135,7 +135,7 @@ def torch_mla_extend(
     q_scale=None,
     kv_scale=None,
 ):
-    num_page, page_size, nhead_kv, _ = kvc_cache.shape
+    _num_page, page_size, _nhead_kv, _ = kvc_cache.shape
     is_fp8_q = q.dtype == dtypes.fp8
     is_fp8_kvc = kvc_cache.dtype == dtypes.fp8
 

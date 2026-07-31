@@ -1,39 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from enum import IntEnum
+
 import torch
 import triton
 import triton.language as tl
 from torch import autograd
-from enum import IntEnum
-from typing import Tuple, Union
+
 from aiter.ops.triton._triton_kernels.rope.rope import (
-    _rope_kernel_sbhd_fwd,
-    _rope_kernel_sbhd_bwd,
-    _rope_kernel_thd_fwd,
-    _rope_kernel_thd_bwd,
-    _rope_kernel_sbhd_cached_fwd,
-    _rope_kernel_sbhd_cached_bwd,
-    _rope_kernel_thd_cached_2c_fwd,
-    _rope_kernel_thd_cached_2c_bwd,
-    _rope_kernel_cached_thd_2c_gqa_fwd,
-    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
-    _rope_kernel_cached_thd_2c_gqa_bwd,
-    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
-    _rope_fwd_2d_kernel_neox,
-    _rope_fwd_3d,
-    _get_neox_rotated_x_1D,
+    _get_gptj_rotated_x,
     _get_gptj_rotated_x_1D,
     _get_neox_rotated_x,
-    _get_gptj_rotated_x,
+    _get_neox_rotated_x_1D,
+    _rope_fwd_2d_kernel_neox,
+    _rope_fwd_3d,
+    _rope_kernel_cached_thd_2c_gqa_bwd,
+    _rope_kernel_cached_thd_2c_gqa_fwd,
+    _rope_kernel_cached_thd_2c_gqa_onehead_bwd,
+    _rope_kernel_cached_thd_2c_gqa_onehead_fwd,
+    _rope_kernel_sbhd_bwd,
+    _rope_kernel_sbhd_cached_bwd,
+    _rope_kernel_sbhd_cached_fwd,
+    _rope_kernel_sbhd_fwd,
+    _rope_kernel_thd_bwd,
+    _rope_kernel_thd_cached_2c_bwd,
+    _rope_kernel_thd_cached_2c_fwd,
+    _rope_kernel_thd_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = [
-    "_get_neox_rotated_x_1D",
+    "_get_gptj_rotated_x",
     "_get_gptj_rotated_x_1D",
     "_get_neox_rotated_x",
-    "_get_gptj_rotated_x",
+    "_get_neox_rotated_x_1D",
 ]
 
 _LOGGER = AiterTritonLogger()
@@ -1523,7 +1524,7 @@ def rope_fwd_3d(
     c_total = C // 2  # 64
     c1 = c_total - 2 * (c_total // 3)  # 22
     c2 = c_total // 3  # 21
-    c3 = c_total // 3  # 21
+    c_total // 3  # 21
     device = x.device
 
     grid_sizes = grid_sizes.to(device=device, dtype=torch.int32).contiguous()
@@ -1593,9 +1594,7 @@ class RoPE(autograd.Function):
         )
 
     @staticmethod
-    def backward(
-        ctx, output_grads: torch.Tensor
-    ) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads: torch.Tensor) -> tuple[torch.Tensor | None, ...]:
         (freqs,) = ctx.saved_tensors
         return (
             rope_bwd(
@@ -1631,7 +1630,7 @@ class RoPETHD(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cu_seqlens, freqs = ctx.saved_tensors
         return (
             rope_thd_bwd(
@@ -1676,7 +1675,7 @@ class RoPECached(autograd.Function):
         )
 
     @staticmethod
-    def backward(ctx, output_grads) -> Tuple[Union[torch.Tensor, None], ...]:
+    def backward(ctx, output_grads) -> tuple[torch.Tensor | None, ...]:
         cos, sin = ctx.saved_tensors
         return (
             rope_cached_bwd(

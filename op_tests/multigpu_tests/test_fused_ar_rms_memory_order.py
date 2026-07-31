@@ -131,7 +131,7 @@ def _run_rank(
             residual = torch.randn(shape, dtype=torch.bfloat16, device=device)
             weight = torch.randn((shape[-1],), dtype=torch.bfloat16, device=device)
 
-            def fused_call():
+            def fused_call(residual=residual, weight=weight, x=x):
                 return tensor_model_parallel_fused_allreduce_rmsnorm(
                     x, residual, weight, 1e-6
                 )

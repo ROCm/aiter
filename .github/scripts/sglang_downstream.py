@@ -183,12 +183,12 @@ def write_summary(
         summary.write(f"- Event-skipped tests: `{len(skipped)}`\n\n")
         summary.write("| Model | Test | Run on PR | Run on schedule |\n")
         summary.write("| --- | --- | --- | --- |\n")
-        for test in TESTS:
-            summary.write(
-                f"| {test['model']} | {test['test_type']} | "
-                f"{run_cell(test, 'run_on_pr')} | "
-                f"{run_cell(test, 'run_on_schedule')} |\n"
-            )
+        summary.writelines(
+            f"| {test['model']} | {test['test_type']} | "
+            f"{run_cell(test, 'run_on_pr')} | "
+            f"{run_cell(test, 'run_on_schedule')} |\n"
+            for test in TESTS
+        )
 
 
 def select_tests() -> None:

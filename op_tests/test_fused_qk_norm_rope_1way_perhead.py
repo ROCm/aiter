@@ -10,7 +10,6 @@ Compares HIP kernels against:
 """
 
 import argparse
-from typing import Optional
 
 import pandas as pd
 import pytest
@@ -104,8 +103,8 @@ def _run_qk_perhead(
     head_size: int,
     is_interleaved: bool,
     eps: float,
-    out_q: Optional[Tensor] = None,
-    out_k: Optional[Tensor] = None,
+    out_q: Tensor | None = None,
+    out_k: Tensor | None = None,
 ):
     return aiter.fused_qk_norm_rope_1way_fp8_perhead_quant(
         q,

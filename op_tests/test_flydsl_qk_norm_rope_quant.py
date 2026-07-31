@@ -257,7 +257,11 @@ def test_flydsl_qk_norm_rope_quant(
 
     # Accuracy
     if quant:
-        deq_kw = dict(D=D, quant_group_size=quant_group_size, scale_dtype=scale_dtype)
+        deq_kw = {
+            "D": D,
+            "quant_group_size": quant_group_size,
+            "scale_dtype": scale_dtype,
+        }
         got_deq = _dequant(got_q, got_qs, **deq_kw)
         ref_deq = _dequant(ref_q, ref_qs, **deq_kw)
         got_kv_deq = _dequant(got_kv, got_ks, **deq_kw)

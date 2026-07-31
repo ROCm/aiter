@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import torch
-from torch import Tensor
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from . import dtypes
 from .mx_types import (
@@ -824,13 +824,13 @@ def moe_mxfp4_sort(
         *blockscale_e8m0.stride(),
         *blockscale_e8m0_sorted.stride(),
     )
-    common_kwargs = dict(
-        token_num=token_num,
-        N_i=N_i,
-        BLOCK_SIZE_M=BLOCK_SIZE_M // 2,
-        BLOCK_SIZE_N=BLOCK_SIZE_N // 2,
-        TOPK=topk,
-    )
+    common_kwargs = {
+        "token_num": token_num,
+        "N_i": N_i,
+        "BLOCK_SIZE_M": BLOCK_SIZE_M // 2,
+        "BLOCK_SIZE_N": BLOCK_SIZE_N // 2,
+        "TOPK": topk,
+    }
 
     if token_num > _FUSED_N_THRESHOLD:
         N_TILES = triton.cdiv(N_i, BLOCK_SIZE_N)

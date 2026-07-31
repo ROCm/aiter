@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 
 import aiter as ops
+from aiter.dist.device_communicators.quick_all_reduce import qr_exchange_handles
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 
 
@@ -45,10 +46,7 @@ def _qr_rmsnorm_worker(
         group = dist.new_group(list(range(world_size)), backend="nccl")
 
         ptr = ops.init_custom_qr(rank, world_size, None)
-        handle = ops.qr_get_handle(ptr)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, handle, group=group)
-        ops.qr_open_handles(ptr, handles)
+        qr_exchange_handles(ptr, world_size, group)
 
         inp = inputs[rank].to(device)
         residual = residuals[rank].to(device)

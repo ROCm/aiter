@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter import dtypes
-from aiter.test_common import run_perftest
-from aiter import per_tensor_quant
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
-import pytest
-import pandas as pd
 import argparse
 import math
+
+import pandas as pd
+import pytest
+import torch
+
+import aiter
+from aiter import dtypes, per_tensor_quant
+from aiter.ops.mha import flash_attn_fp8_pertensor_func, flash_attn_func
+from aiter.test_common import run_perftest
 
 benchmark = {}
 

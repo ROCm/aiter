@@ -25,6 +25,7 @@ import torch
 
 import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.shuffle import (
     shuffle_mxfp8fp4_a,
     shuffle_mxfp8fp4_b,
@@ -32,7 +33,6 @@ from aiter.ops.shuffle import (
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -104,12 +104,12 @@ def _prep(intype: str, M: int, N: int, K: int, apre: int, init: str):
 
     ref = _ref(intype, A, B, sA, sB, M, N).to(dtypes.bf16)
 
-    inp = dict(
-        A=shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
-        B=shuffle_mxfp8fp4_b(B),
-        sA=shuffle_mxfp8fp4_scale(sA),
-        sB=shuffle_mxfp8fp4_scale(sB),
-    )
+    inp = {
+        "A": shuffle_mxfp8fp4_a(A) if apre else A,  # B always preshuffled, A per `apre`
+        "B": shuffle_mxfp8fp4_b(B),
+        "sA": shuffle_mxfp8fp4_scale(sA),
+        "sB": shuffle_mxfp8fp4_scale(sB),
+    }
     return inp, ref
 
 

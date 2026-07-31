@@ -8,11 +8,11 @@ from pathlib import Path
 from opus_gemm_common import OpusGemmInstance
 
 from codegen.common import (
-    WARP_SIZE,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
     W3_KERNEL_PAIRS,
+    WARP_SIZE,
     register_arch_map,
     register_emit,
 )
@@ -114,7 +114,7 @@ KERNEL_FUNC_MAP = {
     "a16w16_wave_k_coop": "gemm_a16w16_wave_k_coop_kernel",
     "a16w16_wave_k_coop_accum": "gemm_a16w16_wave_k_coop_accum_kernel",
     # gfx942 paired tags: nosplit_tag's kernel symbol; splitk_tag reuses it.
-    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS.keys()},
+    **{nosplit: f"gemm_{nosplit}_kernel" for nosplit in W3_KERNEL_PAIRS},
     **{splitk: f"gemm_{nosplit}_kernel" for nosplit, splitk in W3_KERNEL_PAIRS.items()},
 }
 

@@ -36,7 +36,6 @@ import argparse
 import csv
 import sys
 from pathlib import Path
-from typing import Dict, Tuple
 
 METRIC = "us"
 KERNEL_COLS = ("kernelName1", "kernelName2")
@@ -108,8 +107,8 @@ def _natural_key(val: str):
             return (1, val)
 
 
-Row = Dict[str, str]
-Key = Tuple[Tuple[str, str], ...]
+Row = dict[str, str]
+Key = tuple[tuple[str, str], ...]
 
 
 def _normalize_row(raw: Row) -> Row:
@@ -121,7 +120,7 @@ def _normalize_row(raw: Row) -> Row:
     }
 
 
-def _read_csv_rows(path: Path) -> Tuple[list[Row], Tuple[str, ...]]:
+def _read_csv_rows(path: Path) -> tuple[list[Row], tuple[str, ...]]:
     """Return (rows, fieldnames). Whitespace stripped from values."""
     if not path.exists():
         raise SystemExit(f"input csv not found: {path}")
@@ -136,7 +135,7 @@ def _read_csv_rows(path: Path) -> Tuple[list[Row], Tuple[str, ...]]:
     return rows, tuple(reader.fieldnames)
 
 
-def _key_cols(base_cols: Tuple[str, ...], cur_cols: Tuple[str, ...]) -> Tuple[str, ...]:
+def _key_cols(base_cols: tuple[str, ...], cur_cols: tuple[str, ...]) -> tuple[str, ...]:
     """Stable key column order across baseline/current schema drift."""
     cols = []
     seen = set()
@@ -148,8 +147,8 @@ def _key_cols(base_cols: Tuple[str, ...], cur_cols: Tuple[str, ...]) -> Tuple[st
     return tuple(cols)
 
 
-def _index_rows(rows: list[Row], key_cols: Tuple[str, ...]) -> Dict[Key, Row]:
-    indexed: Dict[Key, Row] = {}
+def _index_rows(rows: list[Row], key_cols: tuple[str, ...]) -> dict[Key, Row]:
+    indexed: dict[Key, Row] = {}
     for row in rows:
         key = tuple(sorted((c, row.get(c, "")) for c in key_cols))
         indexed[key] = row
@@ -167,7 +166,7 @@ def _parse_us(raw: Row) -> float | None:
 
 
 def _fmt_key_compact(
-    key: Key, key_cols_order: Tuple[str, ...], constants: Dict[str, str]
+    key: Key, key_cols_order: tuple[str, ...], constants: dict[str, str]
 ) -> str:
     """Format key showing only cols whose value is NOT in `constants`."""
     d = dict(key)
@@ -178,7 +177,7 @@ def _fmt_key_compact(
     return " ".join(parts) if parts else "(common)"
 
 
-def _find_constants(keys: list[Key], key_cols_order: Tuple[str, ...]) -> Dict[str, str]:
+def _find_constants(keys: list[Key], key_cols_order: tuple[str, ...]) -> dict[str, str]:
     """Return cols whose value is identical across all `keys`."""
     if not keys:
         return {}
@@ -304,7 +303,7 @@ def main() -> int:
         if c not in HIDE_DISPLAY_COLS:
             display_cols.append(c)
 
-    def _cell_value(c: str, d: Dict[str, str]) -> str:
+    def _cell_value(c: str, d: dict[str, str]) -> str:
         if c in DERIVED_TUPLE_COLS:
             srcs = DERIVED_TUPLE_COLS[c]
             return "(" + ", ".join(d.get(s, "") for s in srcs) + ")"

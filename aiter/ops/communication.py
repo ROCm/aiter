@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-from typing import Optional
 
 # from ..dist.utils import get_open_port, get_distributed_init_method, get_ip
 import torch
@@ -24,7 +23,7 @@ def init_dist_env(
     tensor_model_parallel_size: int,
     rankID: int,
     backend: str = "cpu:gloo,cuda:nccl",
-    distributed_init_method: Optional[str] = "env://",
+    distributed_init_method: str | None = "env://",
     local_rank: int = -1,
     data_parallel_size: int = 1,
     data_parallel_rank: int = 0,

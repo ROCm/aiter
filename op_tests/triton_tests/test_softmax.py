@@ -1,5 +1,6 @@
-import torch
 import pytest
+import torch
+
 from aiter.ops.triton.softmax import softmax
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 

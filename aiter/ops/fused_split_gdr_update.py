@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 
 import torch
 from torch import Tensor
@@ -52,7 +51,7 @@ def fused_split_gdr_update(
     softplus_threshold: float = 20.0,
     scale: float = -1.0,
     use_qk_l2norm_in_kernel: bool = True,
-    output: Optional[Tensor] = None,
+    output: Tensor | None = None,
 ) -> Tensor:
     """
     HIP fused split GDR decode update (ksplit4_db backend).

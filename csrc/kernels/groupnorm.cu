@@ -1,11 +1,11 @@
 #include "groupnorm.hpp"
-
-#include <c10/hip/HIPStream.h>
-#include <c10/hip/HIPGuard.h>
+#include "aiter_hip_common.h"
+#include "aiter_stream.h"
 
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
+#include <algorithm>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -273,19 +273,24 @@ __global__ void groupnorm_kernel_dispatch_down(uint32_t num_groups, uint32_t num
 
 } // namespace
 
-namespace rocm_torch_x {
+namespace aiter {
+
+namespace {
 
 template<typename T>
-torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilon,
-    const torch::Tensor x, const torch::Tensor weights, const torch::Tensor bias, hipStream_t stream)
+void launchGroupNormKernel(aiter_tensor_t& y, aiter_tensor_t& workspace,
+    const aiter_tensor_t& x, uint32_t num_groups, float epsilon,
+    const aiter_tensor_t& weights, const aiter_tensor_t& bias, hipStream_t stream)
 {
-    torch::Tensor y = torch::empty_like(x);
-    const std::vector<int64_t> & dims = x.sizes().vec();
-    int64_t numel = std::accumulate(dims.begin(), dims.end(), 1LL, std::multiplies<int64_t>());
-    int64_t numel_per_channel = numel / dims[0] / dims[1];
-    uint32_t num_channels = dims[1];
+    int ndim = x.dim();
+    int64_t numel = 1;
+    for(int i = 0; i < ndim; ++i) {
+        numel *= x.size(i);
+    }
+    int64_t numel_per_channel = numel / x.size(0) / x.size(1);
+    uint32_t num_channels = x.size(1);
 
-    uint32_t outer_size = dims[0] * num_groups;
+    uint32_t outer_size = x.size(0) * num_groups;
     int64_t inner_size = numel / outer_size;
 
     constexpr uint32_t THREADS_PER_BLOCK = 1024;
@@ -303,7 +308,10 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
     constexpr dim3 block_dim(THREADS_PER_BLOCK, 1, 1);
 
     uint32_t num_acc_slots = gridx * outer_size;
-    reserveMeanAccumulator(num_acc_slots*2, x.device());
+    AITER_CHECK(workspace.numel() >= static_cast<int64_t>(num_acc_slots) * 2,
+                "groupnorm workspace too small: need ", num_acc_slots * 2,
+                " float slots, got ", workspace.numel());
+    float* mean_acc = reinterpret_cast<float*>(workspace.data_ptr());
 
     // there are some other ways:
     //    1) use sequential atomicAdd in the first function to reduce, this may influence precision, and need an another memset kenrel
@@ -316,9 +324,9 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
         num_channels,
         numel_per_channel,
         align4,
-        static_cast<const T*>(x.data_ptr()),
-        mean_accumulator_.mutable_data_ptr<float>(),
-        mean_accumulator_.mutable_data_ptr<float>()+num_acc_slots);
+        reinterpret_cast<const T*>(x.data_ptr()),
+        mean_acc,
+        mean_acc+num_acc_slots);
     HIP_CALL(hipGetLastError());
 
     groupnorm_kernel_dispatch_down<T, THREADS_PER_BLOCK><<<grid_dim, block_dim, 0, stream>>>(
@@ -327,72 +335,49 @@ torch::Tensor GroupNorm::launchGroupNormKernel(uint32_t num_groups, float epsilo
         numel_per_channel,
         epsilon,
         align4,
-        static_cast<const T*>(x.data_ptr()),
-        static_cast<const T*>(weights.data_ptr()),
-        static_cast<const T*>(bias.data_ptr()),
-        mean_accumulator_.data_ptr<float>(),
-        mean_accumulator_.data_ptr<float>()+num_acc_slots,
-        static_cast<T*>(y.mutable_data_ptr()));
+        reinterpret_cast<const T*>(x.data_ptr()),
+        reinterpret_cast<const T*>(weights.data_ptr()),
+        reinterpret_cast<const T*>(bias.data_ptr()),
+        mean_acc,
+        mean_acc+num_acc_slots,
+        reinterpret_cast<T*>(y.data_ptr()));
     HIP_CALL(hipGetLastError());
-
-    return y;
 }
 
-std::optional<torch::Tensor> GroupNorm::Run(
-    torch::Tensor x,
+} // namespace
+
+void groupnorm_run(
+    aiter_tensor_t& y,
+    aiter_tensor_t& workspace,
+    const aiter_tensor_t& x,
     int num_groups,
-    torch::Tensor weights,
-    torch::Tensor bias,
-    float epsilon)
+    const aiter_tensor_t& weights,
+    const aiter_tensor_t& bias,
+    double epsilon)
 {
-    at::DeviceGuard device_guard(x.device());
+    HipDeviceGuard device_guard(x.device_id);
 
-    auto hip_stream = c10::hip::getCurrentHIPStream();
+    hipStream_t stream = aiter::getCurrentHIPStream();
 
-    if (x.requires_grad()) {
-        return std::nullopt;
-    }
+    AITER_CHECK(weights.numel() > 0 && bias.numel() > 0,
+                "groupnorm requires non-empty affine weight and bias");
+    // x/weights/bias contiguity is guaranteed by the Python wrapper; check defensively.
+    AITER_CHECK(x.is_contiguous(), "groupnorm input x must be contiguous");
 
-    if(weights.numel() == 0 || bias.numel() == 0) {
-        return std::nullopt;
-    }
-
-    // TODO(limou) :
-    if(!x.is_contiguous()) {
-        x = x.contiguous();
-    }
-    weights = weights.contiguous();
-    bias = bias.contiguous();
-
-    torch::Tensor y;
-    switch(x.scalar_type()) {
-        case c10::ScalarType::Float:
-            y = launchGroupNormKernel<float>(num_groups, epsilon, x, weights, bias, hip_stream.stream());
+    switch(x.dtype()) {
+        case AITER_DTYPE_fp32:
+            launchGroupNormKernel<float>(y, workspace, x, num_groups, epsilon, weights, bias, stream);
             break;
-        case c10::ScalarType::Half:
-            y = launchGroupNormKernel<__half>(num_groups, epsilon, x, weights, bias, hip_stream.stream());
+        case AITER_DTYPE_fp16:
+            launchGroupNormKernel<__half>(y, workspace, x, num_groups, epsilon, weights, bias, stream);
             break;
-        case c10::ScalarType::BFloat16:
-            y = launchGroupNormKernel<__hip_bfloat16>(num_groups, epsilon, x, weights, bias, hip_stream.stream());
+        case AITER_DTYPE_bf16:
+            launchGroupNormKernel<__hip_bfloat16>(y, workspace, x, num_groups, epsilon, weights, bias, stream);
             break;
         default:
-            return std::nullopt;
+            AITER_CHECK(false, "groupnorm unsupported dtype: ", AiterDtype_to_str(x.dtype()));
     }
-    return y;
 }
 
-void GroupNorm::reserveMeanAccumulator(uint32_t nums_to_reserve, torch::Device device)
-{
-    if(nums_to_reserve <= mean_accumulator_.numel()) {
-        return;
-    }
-    auto options = torch::TensorOptions()
-        .dtype(c10::ScalarType::Float)
-        .device(device)
-        .requires_grad(false);
-
-    mean_accumulator_ = at::empty({nums_to_reserve}, options);
-}
-
-} // rocm_torch_x
+} // namespace aiter
 

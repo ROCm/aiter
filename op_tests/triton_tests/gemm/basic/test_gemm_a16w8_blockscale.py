@@ -1,26 +1,26 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import triton
 import pytest
+import torch
+
+# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
+import torch.nn.functional as F
+import triton
+
+from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a16w8_blockscale import (
     gemm_a16w8_blockscale,
     gemm_a16w8_blockscale_preshuffle,
 )
-from aiter.ops.triton.utils.types import get_fp8_dtypes
-from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight
-
-# from op_tests.triton_tests.test_fused_fp8_quant import per_token_fp8_group_quant
-import torch.nn.functional as F
+from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
 
 block_shape = (128, 128)
 
 
 def run_torch(x, weight, w_scale, dtype=torch.bfloat16):
     block_shape_n, block_shape_k = block_shape
-    m, k = x.shape
+    _m, k = x.shape
     n = weight.shape[0]
 
     # the pre-quant version now has accuracy issues
@@ -124,11 +124,10 @@ def test_gemm(dtype, M, N, K, output, shuffle):
     prequant = False
     block_shape_n, block_shape_k = block_shape
 
-    if shuffle:
-        if N % 16 > 0 or K % 32 > 0:
-            pytest.skip(
-                "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
-            )
+    if shuffle and (N % 16 > 0 or K % 32 > 0):
+        pytest.skip(
+            "N has to be multiple of 16 and K has to be multiple of 32 for preshuffle cases"
+        )
 
     dtype = str_to_torch_dtype[dtype]
     x, weight, weight_triton, w_scale, y = generate_gemm_a16w8_blockscale_inputs(

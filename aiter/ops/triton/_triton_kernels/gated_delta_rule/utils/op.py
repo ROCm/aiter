@@ -39,7 +39,7 @@ if not IS_GATHER_SUPPORTED:
         Fallback gather operation when tl.gather is not supported.
         Returns None to make triton compiler happy.
         """
-        return None
+        return
 
 else:
     gather = tl.gather
@@ -67,4 +67,4 @@ else:
         Fallback implementation when TMA is not supported.
         Returns None to indicate TMA descriptors are unavailable.
         """
-        return None
+        return

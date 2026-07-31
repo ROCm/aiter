@@ -15,19 +15,18 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
 
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import arith
 
 __all__ = [
-    "store_i32_system",
-    "store_i64_global_system",
+    "GeometryTuningTable",
+    "atomic_add_global_at",
     "fence_system_acquire",
     "load_i64_global",
-    "atomic_add_global_at",
-    "GeometryTuningTable",
+    "store_i32_system",
+    "store_i64_global_system",
 ]
 
 
@@ -101,8 +100,8 @@ class GeometryTuningTable:
     """Per-shape token-count -> (block_num, warp_num_per_block) lookup; rounds up
     to the smallest bucket >= count (largest on overflow, mori parity)."""
 
-    dispatch: Dict[int, Tuple[int, int]] = field(default_factory=dict)
-    combine: Dict[int, Tuple[int, int]] = field(default_factory=dict)
+    dispatch: dict[int, tuple[int, int]] = field(default_factory=dict)
+    combine: dict[int, tuple[int, int]] = field(default_factory=dict)
 
     def __post_init__(self):
         for phase, tbl in (("dispatch", self.dispatch), ("combine", self.combine)):
@@ -144,9 +143,7 @@ class GeometryTuningTable:
                 and int(r["local_expert_num"]) != local_expert_num
             ):
                 return False
-            if need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy):
-                return False
-            return True
+            return not (need_zc and bool(r.get("zero_copy", False)) != bool(zero_copy))
 
         def _build(rules, want_dtype, need_zc):
             return {

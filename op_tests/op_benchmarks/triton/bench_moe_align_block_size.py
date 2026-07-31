@@ -1,15 +1,17 @@
+import argparse
+import sys
+
+import torch
 import triton
+
+from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
 )
 from op_tests.triton_tests.moe.test_moe_align_block_size import input_helper
-import torch
-import argparse
-from aiter.ops.triton.moe.moe_align_block_size import moe_align_block_size_triton
-import sys
 
 
 def model_benchmark_configs(args):
@@ -49,7 +51,7 @@ def fused_moe_align_block_size(M: int, E: int, top_k: int, block_size: int):
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    return lambda: moe_align_block_size_triton(  # noqa: E731
+    return lambda: moe_align_block_size_triton(
         topk_ids, E, block_size, sorted_ids, expert_ids, num_tokens_post_pad
     )
 

@@ -3,11 +3,16 @@
 
 import torch
 import torch.nn.functional as F
-from typing import Optional
+
 import aiter
-from aiter import logger
-from aiter import pertoken_quant, get_hip_quant
-from aiter import ActivationType, QuantType, dtypes
+from aiter import (
+    ActivationType,
+    QuantType,
+    dtypes,
+    get_hip_quant,
+    logger,
+    pertoken_quant,
+)
 from aiter.fused_moe import fused_moe
 
 BLOCK_SIZE_M = 32
@@ -238,7 +243,7 @@ def asm_moe(
                 logger.warning("FMOE fall into pure torch quant...")
                 a8, a8_scale = aiter.pertoken_quant(hidden_states, quant_dtype=w1.dtype)
         if w2.shape[2] * lastdim_mul == w1.shape[1]:
-            fmoe_func = aiter.fmoe_int8_g1u0(
+            aiter.fmoe_int8_g1u0(
                 moe_buf,
                 a8,
                 w1,
@@ -588,8 +593,8 @@ def fused_topk(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
-    topk_ids: Optional[torch.Tensor] = None,
-    topk_weights: Optional[torch.Tensor] = None,
+    topk_ids: torch.Tensor | None = None,
+    topk_weights: torch.Tensor | None = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 

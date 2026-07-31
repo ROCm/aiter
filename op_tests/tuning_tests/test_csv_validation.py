@@ -9,6 +9,8 @@ missing untuned files.
 
 import os
 import unittest
+from typing import Any, ClassVar
+
 import pandas as pd
 
 AITER_ROOT = os.path.dirname(
@@ -19,7 +21,7 @@ CONFIGS_DIR = os.path.join(AITER_ROOT, "aiter", "configs")
 
 class TestCSVValidation(unittest.TestCase):
 
-    TUNED_CSVS = {
+    TUNED_CSVS: ClassVar[dict[str, Any]] = {
         "a8w8": "a8w8_tuned_gemm.csv",
         "a8w8_bpreshuffle": "a8w8_bpreshuffle_tuned_gemm.csv",
         "a8w8_blockscale": "a8w8_blockscale_tuned_gemm.csv",

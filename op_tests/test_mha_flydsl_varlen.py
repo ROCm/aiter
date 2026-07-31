@@ -446,7 +446,7 @@ if __name__ == "__main__":
                 cu_q_t = torch.tensor(cu_q, dtype=torch.int32, device=device)
                 cu_k_t = torch.tensor(cu_k, dtype=torch.int32, device=device)
                 tri_ms = _time_fn(
-                    lambda: triton_varlen_func(
+                    lambda causal=causal, cu_k_t=cu_k_t, cu_q_t=cu_q_t, k=k, max_sk=max_sk, max_sq=max_sq, q=q, scale=scale, v=v: triton_varlen_func(
                         q=q,
                         k=k,
                         v=v,
@@ -469,7 +469,7 @@ if __name__ == "__main__":
             collected.append(ret)
             if ok:
                 n_pass += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"  [seqs={seqs} causal={causal} lse={return_lse}] ERROR: {e}")
             import traceback
 

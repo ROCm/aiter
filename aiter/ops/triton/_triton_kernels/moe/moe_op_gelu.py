@@ -4,11 +4,10 @@
 import triton
 import triton.language as tl
 
-
 from aiter.ops.triton._triton_kernels.activation import _gelu_tanh
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.moe_common import _write_zeros_to_output
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 # Source:
 # MoE Kernel adapted from VLLM
@@ -215,7 +214,7 @@ def _fused_moe_kernel(
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
         if EVEN_K:
@@ -258,7 +257,7 @@ def _fused_moe_kernel(
     elif use_fp8_w8a8:
         # if group_k > 0 and group_n > 0:
         if BLOCK_SCALE:
-            accumulator = accumulator
+            accumulator = accumulator  # noqa: PLW0127
         else:
             accumulator = accumulator * a_scale * b_scale
 
@@ -374,7 +373,7 @@ def _fused_moe_persistent_kernel(
     # Compute how many tiles are outside the padding region
     num_valid_tiles = tl.cdiv((num_tiles - tile_id), NUM_SMS)
 
-    for _ in range(0, num_valid_tiles):
+    for _ in range(num_valid_tiles):
         tile_id_remapped = remap_xcd(tile_id, num_tiles, NUM_XCDS)
         pid_m, pid_n = pid_grid(tile_id_remapped, num_pid_m, num_pid_n, GROUP_SIZE_M)
 
@@ -416,7 +415,7 @@ def _fused_moe_persistent_kernel(
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
             # Load the next block of A and B, generate a mask by checking the
             # K dimension.
             if EVEN_K:
@@ -463,7 +462,7 @@ def _fused_moe_persistent_kernel(
         elif use_fp8_w8a8:
             # if group_k > 0 and group_n > 0:
             if BLOCK_SCALE:
-                accumulator = accumulator
+                accumulator = accumulator  # noqa: PLW0127
             else:
                 accumulator = accumulator * a_scale * b_scale
 

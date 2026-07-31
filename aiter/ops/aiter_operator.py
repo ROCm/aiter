@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-from torch import Tensor
-from ..jit.core import compile_ops, AITER_CSRC_DIR
 from functools import partial
 from typing import Any
+
 import torch
+from torch import Tensor
+
+from ..jit.core import AITER_CSRC_DIR, compile_ops
 
 MD_NAME = "module_aiter_operator"
 

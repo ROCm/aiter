@@ -81,13 +81,10 @@ struct OpusMoeStage2A8W4DecodeShape
     static constexpr int A_LDS_STAGE_ELEMS = B_M * K_STEP_PACKED;
     static constexpr int A_LDS_FULL_BYTES =
         K_TILES * A_LDS_STAGE_ELEMS * static_cast<int>(sizeof(D_A));
-    static constexpr int A_LDS_FULL_RESERVED_BYTES =
-        B_M * (2 * static_cast<int>(sizeof(int32_t)) + static_cast<int>(sizeof(float)));
     static constexpr int A_LDS_STREAM_STAGES = 2;
-    // Keep the A staging buffer and route metadata within gfx950's 160 KiB
-    // workgroup LDS budget.
+    // Stream A through two LDS buffers above 64 KiB to preserve CTA residency.
     static constexpr int A_LDS_STAGES =
-        A_LDS_FULL_BYTES <= 160 * 1024 - A_LDS_FULL_RESERVED_BYTES
+        A_LDS_FULL_BYTES <= 64 * 1024
             ? K_TILES
             : A_LDS_STREAM_STAGES;
     static constexpr int SCALE_GROUP_LOGICAL_K = opus_moe::kStage2A8W4DecodeScaleGroupLogicalK;

@@ -38,7 +38,7 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 def _on_gfx950():
     try:
         return get_gfx() == "gfx950"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -154,22 +154,22 @@ def _build_inputs(
         device=device,
     )
 
-    return dict(
-        q=q,
-        qrope=qrope,
-        kv_buffer=kv_buffer,
-        kvrope=kvrope,
-        output=output,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        split_indptr=split_indptr,
-        max_seqlen_q=q_seq_logical,
-        sink=sink,
-        num_kv_splits=num_kv_splits,
-        out_16_nosplit=0,
-    )
+    return {
+        "q": q,
+        "qrope": qrope,
+        "kv_buffer": kv_buffer,
+        "kvrope": kvrope,
+        "output": output,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "split_indptr": split_indptr,
+        "max_seqlen_q": q_seq_logical,
+        "sink": sink,
+        "num_kv_splits": num_kv_splits,
+        "out_16_nosplit": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -688,19 +688,19 @@ def _build_bf16_inputs(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
         )
 
-    return dict(
-        q_bf16=q_bf16,
-        kv_bf16=kv_bf16,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        sink=sink,
-        max_seqlen_q=q_seq_logical,
-        kv_seq_lens=kv_seq_lens,
-        batch=batch,
-        q_seq_logical=q_seq_logical,
-    )
+    return {
+        "q_bf16": q_bf16,
+        "kv_bf16": kv_bf16,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "sink": sink,
+        "max_seqlen_q": q_seq_logical,
+        "kv_seq_lens": kv_seq_lens,
+        "batch": batch,
+        "q_seq_logical": q_seq_logical,
+    }
 
 
 def _run_one_point(
@@ -1559,7 +1559,7 @@ def test_v4_nm_multi_split():
     args_ign["num_kv_splits"] = 2
     args_ign["out_16_nosplit"] = 1  # ignored; derived to 0 for multi-pass
     args_ign.pop("split_indptr")
-    out_ign, lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
+    out_ign, _lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
     torch.cuda.synchronize()
     # Multi-pass returns fp32 split logits (NOT the bf16 single-pass alias).
     assert out_ign.dtype == torch.float32, (
@@ -1617,19 +1617,19 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
         device=device,
     )
 
-    return dict(
-        q=q_packed,
-        qrope=q_rope.contiguous(),
-        kv_buffer=kv_packed,
-        kvrope=kv_rope.contiguous(),
-        output=output,
-        qo_indptr=bf["qo_indptr"],
-        kv_indptr=bf["kv_indptr"],
-        kv_page_indices=bf["kv_page_indices"],
-        kv_last_page_lens=bf["kv_last_page_lens"],
-        max_seqlen_q=bf["max_seqlen_q"],
-        sink=sink,
-    )
+    return {
+        "q": q_packed,
+        "qrope": q_rope.contiguous(),
+        "kv_buffer": kv_packed,
+        "kvrope": kv_rope.contiguous(),
+        "output": output,
+        "qo_indptr": bf["qo_indptr"],
+        "kv_indptr": bf["kv_indptr"],
+        "kv_page_indices": bf["kv_page_indices"],
+        "kv_last_page_lens": bf["kv_last_page_lens"],
+        "max_seqlen_q": bf["max_seqlen_q"],
+        "sink": sink,
+    }
 
 
 @needs_gfx950
@@ -1865,6 +1865,7 @@ def _run_oob_guardpage_worker(worker_args, fault_label):
         text=True,
         timeout=300,
         preexec_fn=_no_core_dump,
+        check=False,
     )
     combined = proc.stdout + proc.stderr
     faulted = (

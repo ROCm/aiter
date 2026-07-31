@@ -3,16 +3,22 @@
 
 import torch
 import triton
-from typing import Tuple
+
 from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cat_and_cache_mla_kernel as triton_fused_qk_rope_cat_and_cache_mla_kernel,
-    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
     _fused_qk_rope_cosine_cache_llama_kernel,
+)
+from aiter.ops.triton._triton_kernels.fusions.fused_kv_cache import (
+    _fused_qk_rope_reshape_and_cache_kernel as triton_fused_qk_rope_reshape_and_cache_kernel,
 )
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_cat_and_cache_mla_kernel as gluon_fused_qk_rope_cat_and_cache_mla_kernel,
+    )
+    from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_kv_cache import (
         _fused_qk_rope_reshape_and_cache_kernel as gluon_fused_qk_rope_reshape_and_cache_kernel,
     )
 except:  # noqa: E722
@@ -20,9 +26,9 @@ except:  # noqa: E722
     gluon_fused_qk_rope_reshape_and_cache_kernel = None
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.utils._triton import arch_info
 
 _LOGGER = AiterTritonLogger()
 
@@ -49,7 +55,7 @@ def fused_qk_rope_cat_and_cache_mla_fake_tensor(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     b, qh, d_nope = q_nope.shape
     _, _, d_pe = q_pe.shape
     bk, kh, dk_nope = k_nope.shape
@@ -108,7 +114,7 @@ def fused_qk_rope_cat_and_cache_mla(
     q_out_dtype: torch.dtype = None,
     shuffled_kv_cache: bool = False,
     upcast_operand: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Perform RoPE on q_pe and k_pe and concat q_nope with q_pe and k_nope with k_pe along the last dimension
     the concatenated k_nope and k_pe are copied to kv_cache inplace
@@ -150,7 +156,7 @@ def fused_qk_rope_cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_pe // 16
         SCALE_K_WIDTH_NOPE = (
@@ -165,9 +171,9 @@ def fused_qk_rope_cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     # allow bk >= b to support prefill + decode mixed scenario
@@ -722,12 +728,12 @@ def fused_qk_rope_cosine_cache_llama(
         cos.stride(0),
         cos.stride(-1),
         *q_out.stride(),
-        key_cache.stride(0) if not flash_layout else key_cache.stride(0),
+        key_cache.stride(0),
         key_cache.stride(1) if not flash_layout else key_cache.stride(2),
         key_cache.stride(2) if not flash_layout else key_cache.stride(3),
         key_cache.stride(3) if not flash_layout else key_cache.stride(1),
         key_cache.stride(4) if not flash_layout else 0,
-        value_cache.stride(0) if not flash_layout else value_cache.stride(0),
+        value_cache.stride(0),
         value_cache.stride(1) if not flash_layout else value_cache.stride(2),
         value_cache.stride(2) if not flash_layout else value_cache.stride(3),
         value_cache.stride(3) if not flash_layout else value_cache.stride(1),

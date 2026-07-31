@@ -35,7 +35,7 @@ import enum
 import logging
 import sys
 from itertools import product
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 import triton
@@ -51,6 +51,8 @@ from op_tests.triton_tests.utils.mhc_ref import (
     generate_mhc_inputs,
     mhc_e2e_ref,
 )
+
+logger = logging.getLogger(__name__)
 
 # Optional HIP imports; --with-hip code paths fail loudly at runtime via
 # _validate_with_hip when these are None.
@@ -132,7 +134,7 @@ def get_benchmark_configs(args):
     # --with-hip: C=512 is excluded because the greedy post dispatcher selects
     # block=512 and then fails the kernel's hidden_size >= residual_block * 2 check.
     Cs = [1280, 2560, 4096, 7168]
-    return sorted(list(product(Ms, [n], Cs)), key=lambda x: (x[2], x[0]))
+    return sorted(product(Ms, [n], Cs), key=lambda x: (x[2], x[0]))
 
 
 def _compute_metrics(
@@ -236,7 +238,7 @@ class _MhcHandler:
     """Single handler for {pre, post, e2e}: three timing slices of the same
     pre -> post pipeline. ``self.op`` selects the slice."""
 
-    _X_NAMES = {
+    _X_NAMES: ClassVar[dict[str, Any]] = {
         "pre": ["M", "n", "C"],
         "post": ["M", "C"],
         "e2e": ["M", "n", "C"],
@@ -431,7 +433,7 @@ class _MhcHandler:
         t_vs_ref = (t_out.float() - x_l_plus_1).abs().max().item()
         h_vs_ref = (h_out.float() - x_l_plus_1).abs().max().item()
         if op == "post":
-            logging.info(
+            logger.info(
                 "mhc_post (M=%d, C=%d): triton-vs-ref max=%.4g  hip-vs-ref max=%.4g",
                 params["M"],
                 params["C"],
@@ -442,7 +444,7 @@ class _MhcHandler:
                 "post", t_out, h_out, M=params["M"], C=params["C"]
             )
         else:  # e2e
-            logging.info(
+            logger.info(
                 "mhc_e2e (M=%d, n=%d, C=%d): triton-vs-ref max=%.4g  hip-vs-ref max=%.4g",
                 params["M"],
                 params["n"],
@@ -705,7 +707,7 @@ def _assert_triton_matches_hip(
             printLog=True,
         )
         ok = pct <= 0.05
-        logging.log(
+        logger.log(
             logging.INFO if ok else logging.WARNING,
             "%s correctness %s at %s: bad_element_ratio=%.2f%% (atol=%g, rtol=%g)",
             name,

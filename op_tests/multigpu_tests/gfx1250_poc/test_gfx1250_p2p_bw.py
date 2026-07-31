@@ -156,7 +156,7 @@ if __name__ == "__main__":
             init_method = get_distributed_init_method(get_ip(), get_open_port())
             try:
                 latency_us = run_one(size, unroll, threads, init_method)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(
                     "size=%s unroll=%d FAILED: %s",
                     _size_str(size),

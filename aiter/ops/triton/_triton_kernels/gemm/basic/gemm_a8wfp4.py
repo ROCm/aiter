@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 _gemm_a8wfp4_repr = make_kernel_repr(
     "_gemm_a8wfp4_kernel",
@@ -131,7 +131,7 @@ def _gemm_a8wfp4_kernel(
         offs_bn = offs_bn_raw % N
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, num_k_iter):
+        for k in range(num_k_iter):
             # Load A inside the loop with correct K offset
             offs_ak = tl.arange(0, BLOCK_SIZE_K) + k * BLOCK_SIZE_K  # Add k offset
             offs_ak_split = pid_k * SPLITK_BLOCK_SIZE + offs_ak

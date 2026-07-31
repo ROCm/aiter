@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import copy
-from dataclasses import dataclass
 import os
 import sys
+from dataclasses import dataclass
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 AITER_CORE_DIR = os.path.abspath(f"{this_dir}/../../../")
@@ -15,7 +15,12 @@ else:
     )  # develop mode
 sys.path.insert(0, AITER_CORE_DIR)
 
-from chip_info import get_gfx  # noqa: E402
+from chip_info import get_gfx
+
+# CK stage1 activation op values. swiglu (OAI swiglu_oai) maps to CK act value 3;
+# value 2 is intentionally skipped (reserved for a future activation variant).
+ACT_OP_MAP = {"gelu": 0, "silu": 1, "swiglu": 3}
+ACT_OP_NAME = {v: k for k, v in ACT_OP_MAP.items()}
 
 
 @dataclass
@@ -29,7 +34,7 @@ class kernelInstanceGEMM1:
     GemmPipelineVersion: int
     Nswizzle: bool = False
     MulRoutedWeight: bool = False
-    ActOP: bool = False
+    ActOP: int = 0
     CDEElementOp: str = "TypeCast"
     QuantType: int = 1
     stage: int = 1
@@ -43,23 +48,21 @@ class kernelInstanceGEMM1:
             [
                 f"moe_ck2stages_gemm{self.stage}",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBlock,
-                            self.NPerBlock,
-                            self.KPerBlock,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBlock,
+                        self.NPerBlock,
+                        self.KPerBlock,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.MWaves, self.NWaves])),
+                ("x").join(str(x) for x in [self.MWaves, self.NWaves]),
                 self.CDEElementOp,
                 f"v{self.GemmPipelineVersion}",
                 "Nswizzle" + str(int(self.Nswizzle)),
                 "Quant" + str(self.QuantType),
                 "MulRoutedWeight" + str(int(self.MulRoutedWeight)),
-                "silu" if self.ActOP else "gelu",
+                ACT_OP_NAME[self.ActOP],
                 self.Adtype.upper(),
                 self.Bdtype.upper(),
                 self.Cdtype.upper(),
@@ -88,17 +91,15 @@ class kernelInstanceGEMM2:
             [
                 f"moe_ck2stages_gemm{self.stage}",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBlock,
-                            self.NPerBlock,
-                            self.KPerBlock,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBlock,
+                        self.NPerBlock,
+                        self.KPerBlock,
+                    ]
                 ),
-                ("x").join(map(lambda x: str(x), [self.MWaves, self.NWaves])),
+                ("x").join(str(x) for x in [self.MWaves, self.NWaves]),
                 self.CDEElementOp,
                 f"v{self.GemmPipelineVersion}",
                 "Nswizzle" + str(int(self.Nswizzle)),
@@ -376,7 +377,11 @@ def get_gemm1_kernels_list(
     splitk: bool = False,
 ) -> list:
     arch = get_gfx()
-    if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
+    if (
+        Adtype in bit16_list
+        and Bdtype in bit16_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a16w16_gfx950"
         else:
@@ -384,11 +389,15 @@ def get_gemm1_kernels_list(
     elif (
         Adtype in bit8_list
         and Bdtype in bit8_list
-        and Adtype == Adtype
+        and Adtype == Adtype  # noqa: PLR0124
         and QuantType in QuantType_list
     ):
         tag = "a8w8blkscale"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a8w8_gfx950"
         else:
@@ -408,9 +417,9 @@ def get_gemm1_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm1_kernels_dict[tag].items()}
-    for id, kernel in kernels_list.items():
+    for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
-        kernel.ActOP = ActOP == "silu"
+        kernel.ActOP = ACT_OP_MAP[ActOP]
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType
         kernel.Adtype = Adtype
@@ -447,7 +456,11 @@ def get_gemm2_kernels_list(
 ) -> list:
     arch = get_gfx()
 
-    if Adtype in bit16_list and Bdtype in bit16_list and Adtype == Adtype:
+    if (
+        Adtype in bit16_list
+        and Bdtype in bit16_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a16w16_gfx950"
         else:
@@ -455,11 +468,15 @@ def get_gemm2_kernels_list(
     elif (
         Adtype in bit8_list
         and Bdtype in bit8_list
-        and Adtype == Adtype
+        and Adtype == Adtype  # noqa: PLR0124
         and QuantType in QuantType_list
     ):
         tag = "a8w8blkscale"
-    elif Adtype in bit8_list and Bdtype in bit8_list and Adtype == Adtype:
+    elif (
+        Adtype in bit8_list
+        and Bdtype in bit8_list
+        and Adtype == Adtype  # noqa: PLR0124
+    ):
         if arch == "gfx950":
             tag = "a8w8_gfx950"
         else:
@@ -478,7 +495,7 @@ def get_gemm2_kernels_list(
     else:
         raise ValueError(f"Unsupported data type combination: {Adtype}, {Bdtype}")
     kernels_list = {k: copy.deepcopy(v) for k, v in gemm2_kernels_dict[tag].items()}
-    for id, kernel in kernels_list.items():
+    for kernel in kernels_list.values():
         kernel.MulRoutedWeight = MulRoutedWeight
         kernel.Nswizzle = Nswizzle
         kernel.QuantType = QuantType

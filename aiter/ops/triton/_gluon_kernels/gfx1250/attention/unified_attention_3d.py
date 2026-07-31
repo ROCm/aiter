@@ -1,16 +1,17 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
-from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from triton.language.core import _aggregate as aggregate
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-
 import math
+
+import torch
+import triton.experimental.gluon.language as gl
+import triton.language as tl
+from triton.experimental import gluon
+from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
 
@@ -58,7 +59,6 @@ class AttentionConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -1978,7 +1978,7 @@ def _unified_attention_gluon_kernel_3d(
     num_ctas: gl.constexpr = 1,  # int
     NUM_BLOCKS_GATHER_PER_TILE: gl.constexpr = 1,  # int NUM_BLOCKS_GATHER_PER_TILE > 1 for TDM gather mode
     ALL_DECODE: gl.constexpr = False,  # bool
-    SHUFFLED_KV_CACHE: gl.constexpr = False,  #
+    SHUFFLED_KV_CACHE: gl.constexpr = False,
     K_WIDTH: gl.constexpr = 0,  # int
     SCALE_K_WIDTH: gl.constexpr = 16,  # int
     USE_LOAD_BUFFER_OP: gl.constexpr = False,  # bool

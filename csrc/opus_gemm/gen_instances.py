@@ -9,24 +9,25 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
+
+# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
+# and ARCH_MAP_REGISTRY at import time.
+from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
+from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from codegen.common import (
     _A16W16_TAGS,
     _GFX942_A16W16_TAGS,
     _NOSPLIT,
     _SPLITK,
     get_arch_map,
+)
+from codegen.common import (
     kid_arch as _kid_arch_common,
 )
-
-# Import for side-effect: each arch module self-registers into EMIT_REGISTRY
-# and ARCH_MAP_REGISTRY at import time.
-from codegen import gen_instances_gfx950 as _gfx950  # noqa: F401
-from codegen import gen_instances_gfx942 as _gfx942  # noqa: F401
-from codegen import gen_instances_gfx1250 as _gfx1250  # noqa: F401
 from opus_gemm_common import (
     HEURISTIC_DEFAULT_KIDS,
     OpusGemmInstance,
-    heuristic_kids_for_arch,
     a8w8_kernels_list,
     a8w8_scale_kernels_list,
     a16w16_flatmm_kernels_list,
@@ -37,6 +38,7 @@ from opus_gemm_common import (
     gfx942_a8w8_kernels_list,
     gfx942_nosplit_kernels_list,
     gfx942_splitk_kernels_list,
+    heuristic_kids_for_arch,
     kernels_list,
 )
 
@@ -378,25 +380,25 @@ class opus_gemm_codegen:
         # with register_emit("gfx1250", ...) calls + one import in this file.
         from codegen.common import dispatch_emit
 
-        emit_kwargs = dict(
-            pipeline_header=pipeline_header,
-            traits_header=traits_header,
-            kernel_func=kernel_func,
-            da=da,
-            db=db,
-            traits_name=traits_name,
-            kargs_name=kargs_name,
-            kargs_template_vars=_kargs_template_vars,
-            instance_impl_preamble=instance_impl_preamble,
-            instance_impl_host_tu_split=instance_impl_host_tu_split,
-            record_one_instantiation=_record_one_instantiation,
-            make_host_decl=_make_host_decl,
-            make_device_decl=_make_device_decl,
-            A16W16_TUNE_HOST_EXTRA=A16W16_TUNE_HOST_EXTRA,
-            A8W8_SCALE_HOST_EXTRA=A8W8_SCALE_HOST_EXTRA,
-            A16W16_TUNE_TAGS=A16W16_TUNE_TAGS,
-            BIAS_HOST_VALIDATE=self.BIAS_HOST_VALIDATE,
-        )
+        emit_kwargs = {
+            "pipeline_header": pipeline_header,
+            "traits_header": traits_header,
+            "kernel_func": kernel_func,
+            "da": da,
+            "db": db,
+            "traits_name": traits_name,
+            "kargs_name": kargs_name,
+            "kargs_template_vars": _kargs_template_vars,
+            "instance_impl_preamble": instance_impl_preamble,
+            "instance_impl_host_tu_split": instance_impl_host_tu_split,
+            "record_one_instantiation": _record_one_instantiation,
+            "make_host_decl": _make_host_decl,
+            "make_device_decl": _make_device_decl,
+            "A16W16_TUNE_HOST_EXTRA": A16W16_TUNE_HOST_EXTRA,
+            "A8W8_SCALE_HOST_EXTRA": A8W8_SCALE_HOST_EXTRA,
+            "A16W16_TUNE_TAGS": A16W16_TUNE_TAGS,
+            "BIAS_HOST_VALIDATE": self.BIAS_HOST_VALIDATE,
+        }
         dispatch_emit(self, k, **emit_kwargs)
 
     # Shared host-side bias validation + kargs population. Consumed by gfx950
@@ -678,7 +680,7 @@ void
 """
         with open(os.path.join(self.working_path, "opus_gemm_manifest.h"), "w") as f:
             f.write(MANIFEST_HEAD)
-            for mnk, k in kernels_dict.items():
+            for k in kernels_dict.values():
                 if k.kernel_tag in A16W16_TUNE_TAGS:
                     f.write(MANIFEST_NOSCALE_4ARG.format(kernel_name=k.name))
                 elif k.kernel_tag in NOSCALE_TAGS:
@@ -881,7 +883,7 @@ void
         self._host_instantiations = []
         self._device_instantiations = []
 
-        for mnk, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_instance(k)
 
         # Emit one fused HOST TU + N device TUs (one per kid, dtype) + one dedicated splitk_reduce.device.cu.
@@ -1092,7 +1094,7 @@ if __name__ == "__main__":
     if os.path.exists(sidecar_path):
         try:
             with open(sidecar_path) as f:
-                sidecar_kids = set(int(x) for x in json.load(f))
+                sidecar_kids = {int(x) for x in json.load(f)}
         except (OSError, ValueError):
             sidecar_kids = set()
 
@@ -1118,7 +1120,7 @@ if __name__ == "__main__":
             from aiter.jit.utils.chip_info import get_gfx_runtime
 
             target_arches = {get_gfx_runtime().lower()}
-        except Exception:
+        except Exception:  # noqa: BLE001
             target_arches = None
 
     if target_arches is not None:
@@ -1144,8 +1146,9 @@ if __name__ == "__main__":
             "// Auto-generated. See gen_instances.py.\n"
             "#pragma once\n"
         )
-        for a in archs_for_header:
-            f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
+        f.writelines(
+            f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
+        )
 
     # gfx950 a8w8 (kid 1, 2) is only needed when the module is built with
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.

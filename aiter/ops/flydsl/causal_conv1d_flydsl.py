@@ -10,11 +10,12 @@ try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
     from flydsl.expr import arith
-    from flydsl.expr.typing import T, Int32
-    from flydsl.expr import buffer_ops
+    from flydsl.expr.typing import Int32, T
+
+    from aiter.ops.flydsl.kernels import buffer_ops
 
     _FLYDSL_AVAILABLE = True
-except Exception:  # pragma: no cover - flydsl optional
+except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
     _FLYDSL_AVAILABLE = False
 
 
@@ -336,42 +337,35 @@ def build_causal_conv1d_flydsl_module(
             emit_slow(blk_v, v_r, vs0, vs1, vstart)
 
         # conv_state writeback (chunk 0)
-        if fx.const_expr(SL > 0):
-            if is_chunk0:
-                zero_e = fx_elem_dtype(0.0)
-                slot = tok_group
-                should = (slot < (KW - 1)) & (gfeat < dim)
-                if should:
-                    in_coord = fx.Int32(
-                        buffer_ops.buffer_load(
-                            ci_r, seq_idx * sci, vec_width=1, dtype=i32
-                        )
-                    )
-                    pos_x = (seqlen - (KW - 1)) + slot
-                    x_in = pos_x >= 0
-                    safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
-                    val_x = fx_elem_dtype(
-                        buffer_ops.buffer_load(
-                            x_r, safe_x, vec_width=1, dtype=elem_dtype
-                        )
-                    )
-                    hi8 = fx.Int8(
-                        buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
-                    )
-                    hi_nz = hi8 != 0
-                    need_pr = (pos_x < 0) & hi_nz
-                    src = slot + seqlen
-                    safe_pr = need_pr.select(
-                        (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
-                    )
-                    val_pr = fx_elem_dtype(
-                        buffer_ops.buffer_load(
-                            cs_r, safe_pr, vec_width=1, dtype=elem_dtype
-                        )
-                    )
-                    wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
-                    cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
-                    buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
+        if fx.const_expr(SL > 0) and is_chunk0:
+            zero_e = fx_elem_dtype(0.0)
+            slot = tok_group
+            should = (slot < (KW - 1)) & (gfeat < dim)
+            if should:
+                in_coord = fx.Int32(
+                    buffer_ops.buffer_load(ci_r, seq_idx * sci, vec_width=1, dtype=i32)
+                )
+                pos_x = (seqlen - (KW - 1)) + slot
+                x_in = pos_x >= 0
+                safe_x = x_in.select(gfeat * sx0 + (seq_start + pos_x), 0)
+                val_x = fx_elem_dtype(
+                    buffer_ops.buffer_load(x_r, safe_x, vec_width=1, dtype=elem_dtype)
+                )
+                hi8 = fx.Int8(
+                    buffer_ops.buffer_load(hi_r, seq_idx, vec_width=1, dtype=T.i8)
+                )
+                hi_nz = hi8 != 0
+                need_pr = (pos_x < 0) & hi_nz
+                src = slot + seqlen
+                safe_pr = need_pr.select(
+                    (in_coord * scs0 + gfeat * scs1) + src * scs2, 0
+                )
+                val_pr = fx_elem_dtype(
+                    buffer_ops.buffer_load(cs_r, safe_pr, vec_width=1, dtype=elem_dtype)
+                )
+                wb_val = x_in.select(val_x, need_pr.select(val_pr, zero_e))
+                cs_wr = (in_coord * scs0 + gfeat * scs1) + slot * scs2
+                buffer_ops.buffer_store(wb_val, cs_r, cs_wr)
 
     @flyc.jit
     def launch(
@@ -406,7 +400,7 @@ def build_causal_conv1d_flydsl_module(
         vs1: Int32,
         num_programs: Int32,
         grid_y_dim: Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         gx = arith.index_cast(T.index, num_programs)
         gy = arith.index_cast(T.index, grid_y_dim)
@@ -447,7 +441,7 @@ def build_causal_conv1d_flydsl_module(
     return launch
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_compiled(width, has_bias, silu, tm, tn, block_threads, dtype_str):
     return build_causal_conv1d_flydsl_module(
         width, has_bias, silu, tm, tn, block_threads, dtype_str
@@ -577,7 +571,7 @@ def causal_conv1d_split_qkv_flydsl_fn(
     if compiled is None:
         try:
             launcher._fast_compiled = flyc.compile(launcher, *launch_args)
-        except Exception:
+        except Exception:  # noqa: BLE001
             launcher._fast_compiled = False  # fall back permanently
             launcher(*launch_args)
     elif compiled is not False:

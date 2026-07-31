@@ -3,19 +3,19 @@
 
 import torch
 import triton
-from typing import Optional
-from aiter.ops.triton.utils.types import get_dtype_max
-from aiter.ops.triton.utils.device_info import get_num_sms
+
 from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
-    _rms_norm_kernel,
-    _quant_rms_norm_kernel,
     _fused_add_rmsnorm_kernel,
     _quant_fused_add_rmsnorm_kernel,
-    _rmsnorm_bwd_triton,
+    _quant_rms_norm_kernel,
+    _rms_norm_kernel,
     _rmsnorm_bwd_dg_reduce_triton,
+    _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
 
@@ -47,7 +47,7 @@ def _rmsnorm_forward(x: torch.Tensor, weight: torch.Tensor, epsilon: float):
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs(x)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _rms_norm_kernel[grid](
         x,
         y,
@@ -82,7 +82,7 @@ def _rmsnorm_forward_with_add(
     USE_BLOCKED = use_blocked(x)
     NUM_PRGMS = num_programs(x)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _fused_add_rmsnorm_kernel[grid](
         x,
         out,
@@ -124,7 +124,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
         else None
     )
 
-    grid_bwd = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid_bwd = lambda meta: (NUM_PRGMS,)
     _rmsnorm_bwd_triton[grid_bwd](
         dz_,
         x_,
@@ -143,7 +143,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     )
 
     if need_reduction:
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]  # noqa: E731
+        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,
@@ -159,10 +159,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
 def _should_use_large_m_small_n(M: int, N: int) -> bool:
 
-    if M > 8192 and N <= 2048:
-        return True
-
-    return False
+    return bool(M > 8192 and N <= 2048)
 
 
 def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
@@ -333,7 +330,7 @@ def rmsnorm2d_fwd_with_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -366,7 +363,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     yscale: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
-    scale_ub: Optional[torch.Tensor] = None,
+    scale_ub: torch.Tensor | None = None,
     clamp_out: bool = False,
     dump_rms_norm: bool = False,
 ):
@@ -403,7 +400,7 @@ def rmsnorm2d_fwd_with_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_rms_norm_kernel[grid](
         input,
         out,
@@ -474,7 +471,7 @@ def rmsnorm2d_fwd_with_add_smoothquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,
@@ -538,7 +535,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     if USE_BLOCKED:
         aux = torch.empty(n_rows, n_cols, dtype=torch.float32, device=input.device)
 
-    grid = lambda meta: (NUM_PRGMS,)  # noqa: E731
+    grid = lambda meta: (NUM_PRGMS,)
     _quant_fused_add_rmsnorm_kernel[grid](
         input,
         out,

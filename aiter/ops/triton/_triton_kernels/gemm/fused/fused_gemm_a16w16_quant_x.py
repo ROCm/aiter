@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp8_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
@@ -9,8 +11,6 @@ from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
 )
-
-import triton
 
 _fused_gemm_a16w16_quant_x_repr = make_kernel_repr(
     "_fused_gemm_a16w16_quant_x_kernel",

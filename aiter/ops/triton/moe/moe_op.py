@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Dict, Optional, List
-from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
+
 from aiter.ops.triton._triton_kernels.moe.moe_op import (
-    _fused_moe_kernel_gptq_awq,
-    _fused_moe_persistent_kernel_gptq_awq,
     _fused_moe_kernel,
+    _fused_moe_kernel_gptq_awq,
     _fused_moe_persistent_kernel,
+    _fused_moe_persistent_kernel_gptq_awq,
 )
+from aiter.ops.triton.quant import dynamic_per_tensor_quant_fp8_i8
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -54,9 +56,9 @@ def fused_moe(
     A: torch.Tensor,
     B: torch.Tensor,
     C: torch.Tensor,
-    A_scale: Optional[torch.Tensor],
-    B_scale: Optional[torch.Tensor],
-    B_zp: Optional[torch.Tensor],
+    A_scale: torch.Tensor | None,
+    B_scale: torch.Tensor | None,
+    B_zp: torch.Tensor | None,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -68,8 +70,8 @@ def fused_moe(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
-    block_shape: Optional[List[int]] = None,
-    config: Optional[Dict[str, Any]] = None,
+    block_shape: list[int] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     """
     Fused Mixture-of-Experts (MoE) computation with top-k expert routing and optional quantization.
@@ -148,7 +150,7 @@ def fused_moe(
         assert B_zp is None or B_zp.ndim == 3
         if _USE_MOE_PERSISTENT_KERNEL:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
-            grid = lambda META: (  # noqa: E731
+            grid = lambda META: (
                 min(
                     NUM_SMS,
                     triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -194,7 +196,7 @@ def fused_moe(
                 **config,
             )
         else:
-            grid = lambda META: (  # noqa: E731
+            grid = lambda META: (
                 triton.cdiv(EM, META["BLOCK_SIZE_M"])
                 * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
             )
@@ -240,7 +242,7 @@ def fused_moe(
         if _USE_MOE_PERSISTENT_KERNEL:
             NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count * 2
 
-            grid = lambda META: (  # noqa: E731
+            grid = lambda META: (
                 min(
                     NUM_SMS,
                     triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
@@ -285,7 +287,7 @@ def fused_moe(
                 **config,
             )
         else:
-            grid = lambda META: (  # noqa: E731
+            grid = lambda META: (
                 triton.cdiv(EM, META["BLOCK_SIZE_M"])
                 * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
             )

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-import torch
-from ..jit.utils.chip_info import get_gfx_runtime
-from ..ops.enum import QuantType, ActivationType
-from .aiter_types import aiter_dtypes, aiter_tensor_t
 import argparse
+
+import torch
+
+from ..jit.utils.chip_info import get_gfx_runtime
+from ..ops.enum import ActivationType, QuantType
+from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
     "gfx942": {"fp8": torch.float8_e4m3fnuz},

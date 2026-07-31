@@ -3,8 +3,9 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _fused_gemm_a8w8_blockscale_mul_add_repr = make_kernel_repr(
@@ -101,7 +102,7 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
     tl.assume(stride_cbm > 0)
     tl.assume(stride_cbn > 0)
 
-    GRID_MN = tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
+    tl.cdiv(M, BLOCK_SIZE_M) * tl.cdiv(N, BLOCK_SIZE_N)
 
     # -----------------------------------------------------------
     # Map program ids `pid` to the block of C it should compute.
@@ -155,7 +156,6 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
         )
         offs_ks_step = BLOCK_SIZE_K // GROUP_K
 
-        acc_dtype = tl.float32 if c_ptr.type.element_ty != tl.int8 else tl.int32
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):

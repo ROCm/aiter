@@ -14,16 +14,17 @@ import os.path
 import triton
 import triton.language as tl
 
-# AITER
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
+# AITER
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 # Kernel config.
 # ------------------------------------------------------------------------------
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_config(
     gmm_type: str, M: int, K: int, N: int, G: int, accumulate: bool = False
 ) -> dict[str, int]:
@@ -42,7 +43,7 @@ def get_config(
             get_config._config_dict = json.load(config_file)
             assert all(
                 gmm_type in get_config._config_dict
-                for gmm_type in {"gmm", "ptgmm", "nptgmm"}
+                for gmm_type in ("gmm", "ptgmm", "nptgmm")
             ), "Not all GMM variants are present in the configuration file."
     # TODO: Fine tune GMM kernels and use (M, K, N, G) shape to query the best
     #       config in the dictionary.
@@ -175,7 +176,7 @@ def _process_gmm_tile(
 
     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if K_DIVISIBLE_BY_BLOCK_SIZE_K:
             lhs = tl.load(lhs_ptrs)
             rhs = tl.load(rhs_ptrs)
@@ -593,7 +594,7 @@ def tgmm_persistent_kernel(
             # Initialize bias accumulator
             bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-            for _ in range(0, loop_m):
+            for _ in range(loop_m):
                 lhs = tl.load(lhs_ptrs)
                 rhs = tl.load(rhs_ptrs)
 
@@ -764,7 +765,7 @@ def tgmm_non_persistent_kernel(
     # Initialize bias accumulator
     bias_acc = tl.zeros((BLOCK_SIZE_K,), dtype=tl.float32)
 
-    for _ in range(0, loop_m):
+    for _ in range(loop_m):
         lhs = tl.load(lhs_ptrs)
         rhs = tl.load(rhs_ptrs)
 

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 import triton
@@ -121,8 +120,8 @@ class _StateArgs:
 
 def _prepare_state_args(
     *,
-    initial_state: Optional[Tensor],
-    state_dtype: Optional[torch.dtype],
+    initial_state: Tensor | None,
+    state_dtype: torch.dtype | None,
     device: torch.device,
 ) -> _StateArgs:
     if initial_state is not None and initial_state.dtype not in (
@@ -155,7 +154,7 @@ def _prepare_state_args(
 
 
 def _normalize_g_tensor(
-    g: Optional[Tensor],
+    g: Tensor | None,
     *,
     batch_size: int,
     seq_len: int,
@@ -191,20 +190,20 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     k: Tensor,
     w: Tensor,
     u: Tensor,
-    g: Optional[Tensor] = None,
-    gk: Optional[Tensor] = None,
-    initial_state: Optional[Tensor] = None,
+    g: Tensor | None = None,
+    gk: Tensor | None = None,
+    initial_state: Tensor | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
     save_new_value: bool = True,
-    cu_seqlens: Optional[Tensor] = None,
-    selected_bv: Optional[int] = None,
-    state_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Tensor | None = None,
+    selected_bv: int | None = None,
+    state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     g_head_major: bool = False,
-    initial_state_indices: Optional[Tensor] = None,
-    inplace_final_state: Optional[bool] = None,
-) -> tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+    initial_state_indices: Tensor | None = None,
+    inplace_final_state: bool | None = None,
+) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """
     HIP hidden-state forward with h layout [V, K] (K=128, V=128, bf16), always
     returning ``(h, v_new, final_state)``.
@@ -231,7 +230,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     if any(t.dtype != torch.bfloat16 for t in (k, w, u)):
         raise TypeError("HIP kernel requires `k`, `w`, and `u` to be bfloat16.")
 
-    B, T, Hg, K = k.shape
+    B, T, _Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
     T_flat = w.shape[2]

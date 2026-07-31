@@ -1,5 +1,6 @@
 import pytest
 import torch
+
 from aiter.ops.triton.topk import topk as triton_topk
 
 DEVICE = "cuda"

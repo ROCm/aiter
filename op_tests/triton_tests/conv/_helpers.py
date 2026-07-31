@@ -36,17 +36,16 @@ import random
 import traceback
 from collections import namedtuple
 from dataclasses import dataclass
-from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 
+from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv._utils import (
-    _out_hw,
     _is_1x1_conv,
     _is_3x3_conv,
+    _out_hw,
 )
-from aiter.ops.triton.conv._launch import _select_3x3_method
 from aiter.ops.triton.conv.conv2d import (
     conv2d_nchw,
     conv2d_nchw_cblocked,
@@ -103,7 +102,7 @@ def apply_activation(y: torch.Tensor, activation: str):
 # correctness tests can run on CDNA hardware without being skipped.
 # AITER Triton CI relies on CDNA runners.
 SUPPORTED_ARCHS = {
-    "RDNA": {"gfx1200", "gfx1201"},
+    "RDNA": {"gfx1200", "gfx1201", "gfx1250"},
     "CDNA": {"gfx942", "gfx950"},
 }
 
@@ -180,16 +179,16 @@ class TestSuite:
         self.verbose = verbose
         self.print_shapes = print_shapes
         self.layout_mode = layout_mode
-        self.results: List[TestResult] = []
+        self.results: list[TestResult] = []
 
     def check_close(
         self,
         name: str,
         got: torch.Tensor,
         ref: torch.Tensor,
-        K_red: Optional[int] = None,
-        rtol: Optional[float] = None,
-        atol: Optional[float] = None,
+        K_red: int | None = None,
+        rtol: float | None = None,
+        atol: float | None = None,
     ) -> TestResult:
         got32 = got.float()
         ref32 = ref.float()
@@ -218,7 +217,7 @@ class TestSuite:
     def all_passed(self) -> bool:
         return all(r.passed for r in self.results)
 
-    def failed_results(self) -> List[TestResult]:
+    def failed_results(self) -> list[TestResult]:
         return [r for r in self.results if not r.passed]
 
 
@@ -241,7 +240,7 @@ def run_all_methods(
     suite: TestSuite,
     x: torch.Tensor,
     w: torch.Tensor,
-    b: Optional[torch.Tensor],
+    b: torch.Tensor | None,
     stride,
     padding,
     dilation,
@@ -418,6 +417,7 @@ def run_no_bias(suite: TestSuite, method: str = "default"):
         (1, 64, 8, 8, 128, 1, 1, (1, 1), (0, 0), (1, 1), "1x1 no bias"),
         (2, 32, 16, 16, 64, 3, 3, (1, 1), (1, 1), (1, 1), "3x3 no bias"),
         (1, 16, 8, 8, 32, 5, 5, (1, 1), (2, 2), (1, 1), "5x5 no bias"),
+        (4096, 3, 14, 14, 1024, 14, 14, (14, 14), (0, 0), (1, 1), "kimi_k3 patch"),
     ]
     for N, C, H, W, K_out, R, S, stride, padding, dilation, desc in shapes:
         x = torch.randn((N, C, H, W), device=suite.device, dtype=suite.dtype)
@@ -506,7 +506,7 @@ def run_random_fuzzing(
                 method=method,
                 activation=activation,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             tb = traceback.format_exc()
             suite.results.append(
                 TestResult(

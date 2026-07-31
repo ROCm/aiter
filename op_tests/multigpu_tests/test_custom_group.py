@@ -4,7 +4,6 @@
 import logging
 import os
 from multiprocessing import Pool, freeze_support, set_start_method
-from typing_extensions import Optional
 
 import pandas as pd
 import torch
@@ -47,7 +46,7 @@ def custom_group_worker(
     x_rs,
     custom_group_config,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{deviceID}")
     torch.cuda.set_device(device)
@@ -80,21 +79,24 @@ def custom_group_worker(
     if withGraph:
         # capture and time each op separately
         graph_ar = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_ar, stream=gc.stream):
-                out_ar = custom_all_reduce(x_ar)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_ar, stream=gc.stream
+        ):
+            out_ar = custom_all_reduce(x_ar)
         out_ar.fill_(0)
 
         graph_ag = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_ag, stream=gc.stream):
-                out_ag = custom_all_gather(x_ag)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_ag, stream=gc.stream
+        ):
+            out_ag = custom_all_gather(x_ag)
         out_ag.fill_(0)
 
         graph_rs = torch.cuda.CUDAGraph()
-        with custom_group.graph_capture() as gc:
-            with torch.cuda.graph(graph_rs, stream=gc.stream):
-                out_rs = custom_reduce_scatter(x_rs)
+        with custom_group.graph_capture() as gc, torch.cuda.graph(
+            graph_rs, stream=gc.stream
+        ):
+            out_rs = custom_reduce_scatter(x_rs)
         out_rs.fill_(0)
 
         @perftest()
@@ -168,7 +170,7 @@ def multi_group_worker(
     deviceID,
     inputs,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     device = torch.device(f"cuda:{deviceID}")
     torch.cuda.set_device(device)
@@ -204,21 +206,24 @@ def multi_group_worker(
 
         if withGraph:
             graph_ar = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_ar, stream=gc.stream):
-                    out_ar = custom_all_reduce(x_ar, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_ar, stream=gc.stream
+            ):
+                out_ar = custom_all_reduce(x_ar, group=gname)
             out_ar.fill_(0)
 
             graph_ag = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_ag, stream=gc.stream):
-                    out_ag = custom_all_gather(x_ag, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_ag, stream=gc.stream
+            ):
+                out_ag = custom_all_gather(x_ag, group=gname)
             out_ag.fill_(0)
 
             graph_rs = torch.cuda.CUDAGraph()
-            with group.graph_capture() as gc:
-                with torch.cuda.graph(graph_rs, stream=gc.stream):
-                    out_rs = custom_reduce_scatter(x_rs, group=gname)
+            with group.graph_capture() as gc, torch.cuda.graph(
+                graph_rs, stream=gc.stream
+            ):
+                out_rs = custom_reduce_scatter(x_rs, group=gname)
             out_rs.fill_(0)
 
             @perftest()
@@ -297,7 +302,7 @@ def test_custom_tp(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -379,7 +384,7 @@ def test_custom_dp(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -462,7 +467,7 @@ def test_custom_2d(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -568,7 +573,7 @@ def test_multi_group(
     shape,
     dtype,
     withGraph=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"

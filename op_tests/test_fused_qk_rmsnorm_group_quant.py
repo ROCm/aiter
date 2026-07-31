@@ -736,7 +736,7 @@ def test_fused_qk_rmsnorm_group_quant(
             hip_error_rate,
         )
     else:
-        hip_err_str = "N/A" if hip_error_rate is None else ("%.6f" % hip_error_rate)
+        hip_err_str = "N/A" if hip_error_rate is None else (f"{hip_error_rate:.6f}")
         aiter.logger.info(
             "[result] %s | time(us): hip=%.2f | "
             "bw(TB/s): hip=%.3f hip/mi308_peak=%.1f%% | "

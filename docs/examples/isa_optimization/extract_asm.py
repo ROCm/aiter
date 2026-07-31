@@ -20,9 +20,9 @@ Usage:
       -mcpu=gfx942 -o kernel_recompiled.co kernel.s
 """
 
+import argparse
 import re
 import sys
-import argparse
 
 
 def extract(isa_path: str, kernel_symbol: str, target: str) -> str:

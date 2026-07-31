@@ -267,14 +267,14 @@ def _attn_lean_tile(
     stride_kk,
     stride_vn,
     stride_vk,
-    qk_scale: tl.constexpr,  #
+    qk_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     tile_idx,
     local_iter,
     local_iter_end,
-):  #
+):
     Q_block_ptr = tl.make_block_ptr(
         base=Q_base,
         shape=(BLOCK_M, HEAD_DIM),

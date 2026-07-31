@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
+
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _batched_gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.batched.batched_gemm_bf16 import (
     _batched_gemm_bf16_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _batched_gemm_splitk_reduce_kernel,
-)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 _LOGGER = AiterTritonLogger()
 
@@ -23,20 +23,20 @@ _GLUON_SUPPORTED_ARCHS = ("gfx1250",)
 def _is_gluon_available():
     try:
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def batched_gemm_bf16(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    splitK: Optional[int] = None,
-    YQ: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    splitK: int | None = None,
+    YQ: torch.Tensor | None = None,
+    config: dict | None = None,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes batched 16 bit matrix multiplication Y[i] = X[i] @ W[i]^T with optional bias.
@@ -87,12 +87,12 @@ def batched_gemm_bf16(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
-            _KERNEL_MAP,
-        )
         from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
             create_shared_layouts,
             create_wmma_layouts,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
+            _KERNEL_MAP,
         )
 
         assert (
@@ -243,7 +243,7 @@ def batched_gemm_bf16(
         else:
             y_pp = None
 
-        grid = lambda META: (  # noqa: E731
+        grid = lambda META: (
             B,
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

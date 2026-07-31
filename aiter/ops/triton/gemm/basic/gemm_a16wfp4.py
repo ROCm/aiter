@@ -1,24 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
+    _gemm_splitk_reduce_kernel,
+)
 from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16wfp4 import (
     _gemm_a16wfp4_kernel,
     _gemm_a16wfp4_preshuffle_kernel,
     _get_config,
 )
-from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
-    _gemm_splitk_reduce_kernel,
-)
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     get_splitk,
 )
-from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -27,10 +27,10 @@ def gemm_a16wfp4_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    atomic_add: Optional[bool] = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    atomic_add: bool | None = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     if y is None:
         M, _ = x.shape
@@ -44,10 +44,10 @@ def gemm_a16wfp4_(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    atomic_add: Optional[bool] = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
+    atomic_add: bool | None = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with BF16 activations and FP4 weights.
@@ -114,7 +114,7 @@ def gemm_a16wfp4_(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -182,10 +182,10 @@ def gemm_a16wfp4(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    atomic_add: Optional[bool] = False,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    atomic_add: bool | None = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     config_hashable = serialize_dict(config) if config else None
     return gemm_a16wfp4_(x, w, w_scales, atomic_add, dtype, y, config_hashable)
@@ -195,10 +195,10 @@ def gemm_a16wfp4_preshuffle_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -226,11 +226,11 @@ def gemm_a16wfp4_preshuffle_(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    prequant: Optional[bool] = True,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    prequant: bool | None = True,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with BF16 activations and FP4 weights.
@@ -296,7 +296,7 @@ def gemm_a16wfp4_preshuffle_(
     if y is None and not return_y_pp:
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -366,11 +366,11 @@ def gemm_a16wfp4_preshuffle(
     x: torch.Tensor,
     w: torch.Tensor,
     w_scales: torch.Tensor,
-    prequant: Optional[bool] = True,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    prequant: bool | None = True,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     if config is None:
         config_hashable = None

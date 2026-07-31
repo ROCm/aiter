@@ -22,17 +22,16 @@ import os
 import re
 from functools import lru_cache
 
-import torch
-
-from aiter.jit.utils.chip_info import get_gfx
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, range_constexpr, rocdl
 from flydsl.expr.numeric import ArithValue
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import scf
-from flydsl._mlir import ir
+
+from aiter.jit.utils.chip_info import get_gfx
 
 from .tensor_shim import GTensor, _run_compiled, _to_raw
 
@@ -61,7 +60,7 @@ def _device_cu_count(device_index: int) -> int:
     """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
     try:
         return torch.cuda.get_device_properties(device_index).multi_processor_count
-    except Exception:
+    except Exception:  # noqa: BLE001
         return 304
 
 
@@ -450,7 +449,7 @@ def _build_kernel_mfma_r_w(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         n_blocks = arith.ceildivui(_to_raw(seq_len), _to_raw(fx.Int32(RPB)))
         gx = arith.index_cast(T.index, n_blocks)

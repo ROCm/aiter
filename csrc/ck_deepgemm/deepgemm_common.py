@@ -22,23 +22,19 @@ class kernelInstance:
             [
                 "deepgemm",
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [
-                            self.BLOCK_SIZE,
-                            self.MPerBLOCK,
-                            self.NPerBLOCK,
-                            self.KPerBLOCK,
-                        ],
-                    )
+                    str(x)
+                    for x in [
+                        self.BLOCK_SIZE,
+                        self.MPerBLOCK,
+                        self.NPerBLOCK,
+                        self.KPerBLOCK,
+                    ]
                 ),
                 ("x").join(
-                    map(
-                        lambda x: str(x),
-                        [self.WAVE_TILE_M, self.WAVE_TILE_N, self.WAVE_TILE_K],
-                    )
+                    str(x)
+                    for x in [self.WAVE_TILE_M, self.WAVE_TILE_N, self.WAVE_TILE_K]
                 ),
-                ("x").join(map(lambda x: str(x), [self.WAVE_MAP_M, self.WAVE_MAP_N])),
+                ("x").join(str(x) for x in [self.WAVE_MAP_M, self.WAVE_MAP_N]),
             ]
         )
 

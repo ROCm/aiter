@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
 import torch
 from torch import Tensor
-from typing import Optional
+
 from ..jit.core import compile_ops
-import functools
 
 
 @compile_ops(
@@ -18,9 +19,9 @@ def _gemm_a16w16_asm(
     B: Tensor,
     out: Tensor,
     semaphore: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
     bpreshuffle: bool = False,
 ) -> None: ...
 
@@ -61,9 +62,9 @@ def gemm_a16w16_asm(
     A: Tensor,
     B: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
-    splitK: Optional[int] = None,
-    kernelName: Optional[str] = None,
+    bias: Tensor | None = None,
+    splitK: int | None = None,
+    kernelName: str | None = None,
     bpreshuffle: bool = False,
 ):
     if splitK is None or splitK > 1:

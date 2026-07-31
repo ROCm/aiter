@@ -5,16 +5,15 @@
 
 from __future__ import annotations
 
-
-import os
 import csv
-import torch
-
-
+import os
 from pathlib import Path
+
+import torch
 from flydsl.runtime.device import get_rocm_arch
+
 from .kernels.gdr_decode import create_vk_gdr_decode_kernel
-from .kernels.tensor_shim import get_dtype_str, _run_compiled
+from .kernels.tensor_shim import _run_compiled, get_dtype_str
 
 __all__ = [
     "flydsl_gdr_decode",
@@ -40,7 +39,6 @@ def get_default_kwargs(
     d["NUM_WARPS"] = 4
     d["WARP_THREADS_K"] = 8
     global GDR_GLOBAL_CONFIG_MAP
-    global GDR_GPU_ARCH
     if GDR_GLOBAL_CONFIG_MAP is None:
         _dict = {}
         fname = os.path.join(Path(__file__).resolve().parent, "gdr_decode_tuned.csv")

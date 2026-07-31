@@ -116,7 +116,7 @@ def flydsl_flash_attn_func(
         )
     try:
         arch = torch.cuda.get_device_properties(q.device.index).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001
         arch = ""
     arch_base = arch.lower().split(":")[0] if arch else ""
     if not arch_base.startswith("gfx1201"):

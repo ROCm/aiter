@@ -3,8 +3,9 @@
 
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 _gemm_a8w8_blockscale_repr = make_kernel_repr(

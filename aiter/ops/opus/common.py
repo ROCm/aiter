@@ -42,7 +42,6 @@ from __future__ import annotations
 import functools
 import glob
 import os
-from typing import Optional
 
 import pandas as pd
 import torch
@@ -225,7 +224,7 @@ def lookup_tuned(
     outdtype: torch.dtype,
     scaleAB: bool = False,
     bpreshuffle: bool = False,
-) -> Optional[dict]:
+) -> dict | None:
     """Look up a tuned winner for this shape; returns dict or None.
 
     Dict contains 'solidx' (kernelId), 'splitK', 'kernelName'.

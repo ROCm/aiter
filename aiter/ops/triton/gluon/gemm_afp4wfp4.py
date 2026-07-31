@@ -1,4 +1,3 @@
-from typing import Optional
 import functools
 import json
 
@@ -7,14 +6,13 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 
 _LOGGER = AiterTritonLogger()
 
-global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
@@ -483,7 +481,7 @@ def _get_config(
         dev = arch_info.get_arch()
         if dev not in ["gfx950", "gfx1250"]:
             raise ValueError("Gluon implementation is not supported on this device.")
-        fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-AFP4WFP4.json"
+        fpath = f"{AITER_TRITON_CONFIGS_PATH}/{dev}/gluon/gemm/GEMM-AFP4WFP4.json"
         with open(fpath, "r") as file:
             config = json.load(file)
         _get_config._config_dict = config
@@ -496,10 +494,10 @@ def gemm_afp4wfp4(
     w: torch.Tensor,
     x_scales: torch.Tensor,
     w_scales: torch.Tensor,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    skip_reduce: Optional[bool] = False,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    skip_reduce: bool | None = False,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -565,7 +563,7 @@ def gemm_afp4wfp4(
     if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

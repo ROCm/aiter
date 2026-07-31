@@ -129,7 +129,8 @@ if [[ "$mla_in_shard" == "true" && "$MULTIGPU" != "TRUE" ]]; then
         "-c 49152 -b 1 -n 16,1 -kvd bf16" \
         "-c 98304 -b 1 -n 16,1 -kvd fp8" \
         "-c 10000 100000 -b 1 3 4 -n 12,1 16,1 -kvd bf16 -lse" \
-        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse"; do
+        "-c 1 21 63 64 65 256 -b 1 -n 16,1 -kvd bf16 -lse" \
+        "-c 16384 -b 4 -n 16,8 16,17 -kvd bf16"; do
         echo "=== extra: test_mla.py $args ===" | tee -a latest_test.log
         if ! timeout 10m python3 op_tests/test_mla.py $args 2>&1 | tee -a latest_test.log; then
             testFailed=true

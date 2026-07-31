@@ -1,9 +1,10 @@
-from itertools import product
-import os
-import sys
-import triton
 import argparse
+import os
 import subprocess
+import sys
+from itertools import product
+
+import triton
 from _utils import pre_pruning_rules
 
 
@@ -120,36 +121,36 @@ def parse_args():
 
 def main():
     args = parse_args()
-    M = getattr(args, "M")
-    N = getattr(args, "N")
-    K = getattr(args, "K")
-    G = getattr(args, "G")
-    ut_filename = getattr(args, "F")
-    block_size_m_range = getattr(args, "block_size_m_range")
-    block_size_n_range = getattr(args, "block_size_n_range")
-    block_size_k_range = getattr(args, "block_size_k_range")
-    num_ksplit_range = getattr(args, "num_ksplit_range")
-    group_size_m_range = getattr(args, "group_size_m_range")
-    num_warps_range = getattr(args, "num_warps_range")
-    num_stages_range = getattr(args, "num_stages_range")
-    waves_per_eu_range = getattr(args, "waves_per_eu_range")
-    matrix_instr_nonkdim_range = getattr(args, "matrix_instr_nonkdim_range")
-    cache_modifier_range = getattr(args, "cache_modifier_range")
+    M = args.M
+    N = args.N
+    K = args.K
+    G = args.G
+    ut_filename = args.F
+    block_size_m_range = args.block_size_m_range
+    block_size_n_range = args.block_size_n_range
+    block_size_k_range = args.block_size_k_range
+    num_ksplit_range = args.num_ksplit_range
+    group_size_m_range = args.group_size_m_range
+    num_warps_range = args.num_warps_range
+    num_stages_range = args.num_stages_range
+    waves_per_eu_range = args.waves_per_eu_range
+    matrix_instr_nonkdim_range = args.matrix_instr_nonkdim_range
+    cache_modifier_range = args.cache_modifier_range
 
-    force_overwrite = getattr(args, "overwrite")
-    verbose = getattr(args, "verbose")
-    batch_timeout = getattr(args, "timeout")
+    force_overwrite = args.overwrite
+    verbose = args.verbose
+    batch_timeout = args.timeout
 
     assert M == triton.next_power_of_2(M), "M has to be power of 2"
     assert os.path.isfile(ut_filename), f"{ut_filename} not found"
     assert all(
-        [v == triton.next_power_of_2(v) for v in block_size_m_range]
+        v == triton.next_power_of_2(v) for v in block_size_m_range
     ), "All possible BLOCK_SIZE_M must be power of 2"
     assert all(
-        [v == triton.next_power_of_2(v) for v in block_size_n_range]
+        v == triton.next_power_of_2(v) for v in block_size_n_range
     ), "All possible BLOCK_SIZE_N must be power of 2"
     assert all(
-        [v == triton.next_power_of_2(v) for v in block_size_k_range]
+        v == triton.next_power_of_2(v) for v in block_size_k_range
     ), "All possible BLOCK_SIZE_K must be power of 2"
 
     # default m, n, k, split-k range
@@ -231,11 +232,11 @@ def main():
     assert force_overwrite or not os.path.isfile(
         log_filename
     ), f"{log_filename} exists, please save your file somewhere else or use --overwrite to force overwrite log files"
-    s = " ".join([str(v) for v in parms.keys()])
+    s = " ".join([str(v) for v in parms])
     echo_to_file(f"Number of combinations = {len(parms_comb_list)}", log_filename, True)
     echo_to_file(f"{s}", log_filename)
     i_comb_start = 0
-    comb_max_batch = int(os.environ.get("SCREEN_MAX_BATCH", 100))
+    comb_max_batch = int(os.environ.get("SCREEN_MAX_BATCH", "100"))
     date_to_file(log_filename)
     env = os.environ.copy()
     env["HIP_VISIBLE_DEVICES"] = f"{G}"

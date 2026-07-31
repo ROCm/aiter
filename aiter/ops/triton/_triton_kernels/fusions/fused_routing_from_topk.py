@@ -9,6 +9,7 @@
 # histc, plus dtype casts) with three kernel launches.
 import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_routing_from_topk_hist_kernel_repr = make_kernel_repr(

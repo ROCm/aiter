@@ -78,12 +78,14 @@ _SENTINEL = object()  # distinct from None: "not in fallback table"
 
 def _get_tune_script(entry: dict, csrc_dir: str):
     """Derive the tune .py path from the non-pybind _tune.cu src entry."""
-    AITER_CSRC_DIR = csrc_dir  # noqa: N806,F841 — referenced by eval()
+    AITER_CSRC_DIR = csrc_dir  # noqa: F841 — referenced by eval()
     for src_expr in entry.get("srcs", []):
         if "_tune" in src_expr and "pybind" not in src_expr:
             try:
-                return eval(src_expr).replace(".cu", ".py")  # noqa: S307
-            except Exception:
+                return eval(src_expr).replace(".cu", ".py")
+            # Best-effort probe: any failure just means this src expression is
+            # not resolvable, so swallowing it silently is intentional.
+            except Exception:  # noqa: BLE001,S110
                 pass
     return None
 
@@ -185,7 +187,8 @@ def _make_untune_csv(tune_file: str, shape_keys: list) -> str:
         )
 
     shapes = merged[present].drop_duplicates().reset_index(drop=True)
-    tmp = tempfile.NamedTemporaryFile(
+    # delete=False on purpose: the path outlives the handle.
+    tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
         mode="w", suffix=".csv", prefix="aiter_pretune_", delete=False
     )
     shapes.to_csv(tmp.name, index=False)
@@ -293,7 +296,7 @@ def run_pretune(
             "--all",
         ]
         _log(f"[pretune] running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, env=env)
+        result = subprocess.run(cmd, env=env, check=False)
         if result.returncode != 0:
             _warn(
                 f"[pretune] tuner exited {result.returncode} for {module_name}. "
@@ -370,7 +373,7 @@ def run_pretune_modules(
             run_pretune(
                 mod, cfg, core, csrc_dir, repo_dir, build_one_module=build_one_module
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[pretune] {mod} failed: {exc}. Continuing with remaining modules."
             )
@@ -446,7 +449,7 @@ def _main() -> None:
 
     # Deferred import: core requires torch, not available during CI metadata phase
     sys.path.insert(0, os.path.join(repo_dir, "aiter"))
-    from jit import core  # noqa: PLC0415
+    from jit import core
 
     seen_keys: set = set()
     for mod in modules:
@@ -472,7 +475,7 @@ def _main() -> None:
         seen_keys.add(key)
         try:
             run_pretune(mod, cfg, core, csrc_dir, repo_dir, libtype=args.libtype)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             print(f"[pretune] {mod} failed: {exc}. Continuing.")
 
 

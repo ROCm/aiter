@@ -1,13 +1,15 @@
 import os
+from dataclasses import dataclass, field
+
 import torch
 import triton
-from dataclasses import dataclass, field
+
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
     _combined_routing_fused,
 )
-from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.utils._triton.arch_info import is_tdm_avail
 
 # HERD (Hot-Expert Routing for Decode): when AITER_TRITON_USE_HERD is set, the flat-topk
 # path uses fused min-unique routing (top-(k+1) -> drop least-batch-popular -> keep-k)
@@ -93,7 +95,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
     hist = hist[:n_expts_tot]
     assert hist.dtype == torch.int32
     # scratchpad
-    if n_gates <= 65536:
+    if n_gates <= 65536 - 1:  # save one token id for OOB checks
         combined_indx = torch.empty(n_gates * 2, dtype=torch.uint16, device=device)
     else:
         combined_indx = torch.empty(n_gates * 2, dtype=torch.int32, device=device)
@@ -127,10 +129,10 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         hist,
         n_expts_tot,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -199,10 +201,10 @@ def sort_tokens_fused(
         n_expts_tot,
         hist,
         token_offs_raw,
-        token_offs_pad,  #
+        token_offs_pad,
         blocks1a,
         block_pid_map,
-        block_pid_map.shape[0],  #
+        block_pid_map.shape[0],
         block_m_log2,
         BLOCK_A=BLOCK_A,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
@@ -232,7 +234,7 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = 128
+    BLOCK = triton.next_power_of_2(n_expts_tot)
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:

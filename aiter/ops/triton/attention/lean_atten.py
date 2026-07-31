@@ -17,18 +17,19 @@ TO be added features:
     -
 """
 
-import torch
-from typing import Optional
-from bisect import bisect_right
 import math
+from bisect import bisect_right
+
+import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.attention.lean_atten import (
-    la_persistent,
     _get_config,
+    la_persistent,
 )
-from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.device_info import get_num_xcds
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -48,8 +49,8 @@ def persistent_lean_attention(
     sm_scale: torch.float16,
     causal: bool = True,  # causal masking
     RAGGED_BATCH: bool = False,
-    config: Optional[dict] = None,
-    program_count: Optional[int] = None,
+    config: dict | None = None,
+    program_count: int | None = None,
 ):
     """
     Lean Attention using stream-K tiling for efficient CU utilization.
@@ -131,7 +132,7 @@ def _persistent_lean_attention(
     RAGGED_BATCH: bool,
     num_warps: int,
     waves_per_eu: int,
-    config: dict = {},
+    config: dict | None = None,
 ):
     """
     Internal implementation of Lean Attention with workload scheduling and buffer allocation.
@@ -160,6 +161,8 @@ def _persistent_lean_attention(
     Returns:
         Tuple[torch.Tensor, float]: Output tensor and kernel execution time (currently 0).
     """
+    if config is None:
+        config = {}
     DEBUG = False
 
     NUM_XCDS = get_num_xcds()
@@ -171,8 +174,7 @@ def _persistent_lean_attention(
     ), "Incompatible Q/K/V Hidden Dimensions"
     # Allow irregular head dims by padding compute width and masking I/O
     HEAD_DIM_PADDED = triton.next_power_of_2(HEAD_DIM_K)
-    if HEAD_DIM_PADDED < 16:
-        HEAD_DIM_PADDED = 16
+    HEAD_DIM_PADDED = max(HEAD_DIM_PADDED, 16)
 
     # MASKED_BLOCKS is used for prefill/causal for BLOCK_M > BLOCK_N
     # For gfx942, BLOCK_M=128, BLOCK_N=64 is better for performance
@@ -311,7 +313,7 @@ def _persistent_lean_attention(
     kernel_timing["attn_fwd"]["start_event"].record()
     """
 
-    la_kernel = la_persistent[grid](
+    la_persistent[grid](
         False,
         0,
         q,
@@ -437,7 +439,7 @@ def get_num_splits_and_buffer_sizes(
     tiles_per_head = 0
     if causal:
         # Prefill - Causal
-        for i in range(0, num_m_blocks):
+        for i in range(num_m_blocks):
             tiles_per_head += (((i + 1) * BLOCK_M) + BLOCK_N - 1) // BLOCK_N
         # Does not support ragged batch for causal.
         tiles_per_head = tiles_per_head * batch_size

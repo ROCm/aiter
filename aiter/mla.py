@@ -5,15 +5,15 @@
 
 import functools
 import os
-from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 import aiter
 from aiter import dtypes
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.jit.core import is_experimental_enabled
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 
@@ -21,7 +21,7 @@ from aiter.ops.attention import get_mla_decode_fwd_max_splits
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
-    O,  # noqa: E741
+    O,
     Final_lse,
     qo_indptr,
     kv_indptr,
@@ -92,7 +92,7 @@ def _fwd_kernel_stage2_asm(
             e_sum = 0.0
             e_max = -float("inf")
             acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
-            for split_kv_id in range(0, num_valid_kv_splits):
+            for split_kv_id in range(num_valid_kv_splits):
                 tv = tl.load(
                     Mid_O + offs_v + split_kv_id * stride_mid_os * Lv,
                     mask=mask_d,
@@ -122,7 +122,7 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_meta_param(
     num_kv_splits,
     bs,
@@ -184,7 +184,7 @@ def get_meta_param(
                 )
                 for i in range(1, 17)
             ]
-        num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
+        num_kv_splits = max(tmp, key=lambda x: x[0])[1]
 
     get_block_n_fp8 = {
         8: 64,
@@ -312,7 +312,7 @@ def mla_decode_fwd(
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
 
-    ori_total_s, ori_nhead, ori_v_head_dim = o.shape
+    ori_total_s, ori_nhead, _ori_v_head_dim = o.shape
     total_s, nhead, v_head_dim = o.shape
     bs = qo_indptr.shape[0] - 1
     total_kv = kv_indices.shape[0]
@@ -883,7 +883,7 @@ def mla_prefill_fwd(
     num_kv_splits=None,  # for experts only!!!
 ):
     device = q.device
-    num_page, page_size, nhead_kv, qk_head_dim = kv_buffer.shape
+    _num_page, _page_size, _nhead_kv, qk_head_dim = kv_buffer.shape
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if sm_scale is None:
         sm_scale = 1.0 / (qk_head_dim**0.5)
@@ -924,17 +924,17 @@ def mla_prefill_ps_fwd(
     qo_indptr: torch.Tensor,
     kv_indptr: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    work_indptr: Optional[torch.Tensor],
-    work_info_set: Optional[torch.Tensor],
+    work_indptr: torch.Tensor | None,
+    work_info_set: torch.Tensor | None,
     max_seqlen_q: int,
     is_causal: bool,
-    reduce_indptr: Optional[torch.Tensor] = None,
-    reduce_final_map: Optional[torch.Tensor] = None,
-    reduce_partial_map: Optional[torch.Tensor] = None,
-    softmax_scale: float = None,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
+    reduce_indptr: torch.Tensor | None = None,
+    reduce_final_map: torch.Tensor | None = None,
+    reduce_partial_map: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
@@ -1057,7 +1057,7 @@ def _mla_prefill_reduce_kernel(
             ) * stride_lse_tok + head_id * stride_lse_head
             lse = tl.load(partial_lse_ptr + lse_offset)
 
-            is_valid = lse == lse
+            is_valid = lse == lse  # noqa: PLR0124
             lse = tl.where(is_valid, lse, -float("inf"))
 
             lse_values = tl.where(tl.arange(0, MAX_PARTIALS) == p_idx, lse, lse_values)
@@ -1108,7 +1108,7 @@ def _mla_prefill_reduce_kernel(
                 )
 
                 # Handle NaN in output (NaN != NaN)
-                is_valid_out = partial_out == partial_out
+                is_valid_out = partial_out == partial_out  # noqa: PLR0124
                 partial_out = tl.where(is_valid_out, partial_out, 0.0)
 
                 acc += scale * partial_out
@@ -1133,7 +1133,9 @@ def mla_prefill_reduce_triton(
     reduce_partial_map: torch.Tensor,  # [num_partial_tiles], int32: [partial_qo_loc]
     output: torch.Tensor,  # [total_tokens, num_head_q, v_head_dim], output buffer
     tile_q: int = 256,  # Q tile size (for padding)
-    max_partials_static: int = None,  # Maximum number of partials, defaults to num_cu
+    max_partials_static: (
+        int | None
+    ) = None,  # Maximum number of partials, defaults to num_cu
 ) -> None:
     """Triton version of mla_prefill_reduce.
     All heads are uniformly split and reduced together.
@@ -1215,14 +1217,14 @@ def mla_prefill_reduce(
                 output,
                 tile_q,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Triton reduce failed ({e}), falling back to PyTorch")
 
     # torch implementation, just for reference
     num_reduce_groups = reduce_indptr.shape[0] - 1
     device = partial_output.device
     dtype = partial_output.dtype
-    _, num_heads, v_head_dim = partial_output.shape
+    _, num_heads, _v_head_dim = partial_output.shape
 
     for group_id in range(num_reduce_groups):
         start_idx = reduce_indptr[group_id].item()  # 0

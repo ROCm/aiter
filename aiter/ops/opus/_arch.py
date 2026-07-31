@@ -35,14 +35,14 @@ Detection order (shared by both helpers):
 
 import logging
 import os
-from typing import Iterable, Optional, Tuple
+from collections.abc import Iterable
 
 logger = logging.getLogger("aiter.ops.opus._arch")
 
 
 def _detect_arch(
     supported: Iterable[str],
-) -> Tuple[bool, Optional[str]]:
+) -> tuple[bool, str | None]:
     """Probe the active GPU arch against ``supported`` without raising.
 
     Parameters
@@ -82,7 +82,7 @@ def _detect_arch(
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         gfx = get_gfx_runtime().lower()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.debug(
             "opus: arch probe could not query rocminfo (%s). "
             "Treating as unknown; downstream host dispatcher will catch "
@@ -98,7 +98,7 @@ def _check_arch(
     supported: Iterable[str],
     *,
     feature: str,
-    hint: Optional[str] = None,
+    hint: str | None = None,
 ) -> None:
     """Raise ImportError if :func:`_detect_arch` reports an unsupported arch.
 

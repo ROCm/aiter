@@ -8,17 +8,11 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import (
-    arith,
-    buffer_ops,
-    const_expr,
-    gpu,
-    range_constexpr,
-    rocdl,
-    vector,
-)
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .tensor_shim import GTensor, get_dtype_in_kernel
 
@@ -387,7 +381,10 @@ def compile_hgemm_kernel(
             llvm.InlineAsmOp(None, [], asm, "", has_side_effects=True)
 
         def get_llvm_ptr(
-            ptr, offset, dtype_bytes, ptr_type=ir.Type.parse("!llvm.ptr<1>")
+            ptr,
+            offset,
+            dtype_bytes,
+            ptr_type=ir.Type.parse("!llvm.ptr<1>"),  # noqa: B008
         ):
             base_ptr = arith.index_cast(T.i64, fx.ptrtoint(ptr))
             byte_offset = arith.index_cast(
@@ -1093,7 +1090,6 @@ def compile_hgemm_kernel(
                         (m_global_idx, n_offset + n_local_idx), vec, LDG_VEC_SIZE
                     )
                     scf.YieldOp([])
-        return
 
     @flyc.jit
     def launch_hgemm_kernel(
@@ -1104,7 +1100,7 @@ def compile_hgemm_kernel(
         m: fx.Int32,
         semaphore: fx.Pointer,
         signal: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         bm = (m + BLOCK_M - 1) // BLOCK_M
         hgemm_kernel._func.__name__ = KERNEL_NAME

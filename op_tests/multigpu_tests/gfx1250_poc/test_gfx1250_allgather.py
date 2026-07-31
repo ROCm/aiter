@@ -147,7 +147,7 @@ if __name__ == "__main__":
             init_method = get_distributed_init_method(get_ip(), get_open_port())
             try:
                 latency_us, max_err = run_one(size, kt, init_method)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(
                     "size=%s kernel=%s FAILED: %s", _size_str(size), kernel_names[kt], e
                 )

@@ -37,7 +37,7 @@ import tempfile
 import unittest
 
 try:  # importing aiter requires torch; skip cleanly where it is unavailable.
-    import aiter.jit.core as core
+    from aiter.jit import core
 
     _IMPORT_ERR = None
 except Exception as e:  # noqa: BLE001

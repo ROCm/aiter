@@ -1,20 +1,22 @@
 import argparse
 import sys
-import triton
+
 import torch
+import triton
+
 from aiter.ops.triton.attention.hstu_attention import _AttentionFunction
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.attention.test_hstu_attn import (
-    switch_to_contiguous_if_needed,
-    generate_sparse_seq_len,
-    apply_SL,
-    sanity_check_attention,
-    get_flops,
-    get_bytes,
-)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    print_vgpr,
     get_caller_name_no_ext,
+    print_vgpr,
+)
+from op_tests.triton_tests.attention.test_hstu_attn import (
+    apply_SL,
+    generate_sparse_seq_len,
+    get_bytes,
+    get_flops,
+    sanity_check_attention,
+    switch_to_contiguous_if_needed,
 )
 
 
@@ -318,7 +320,7 @@ def main():
     args = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args)  # noqa: E731
+        fun = lambda: run_benchmark(args)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args)

@@ -16,21 +16,23 @@ Covers two operations, dispatched by ``--quant-dtype``:
         Compared paths: ref / split / HIP-fused (no Triton).
 """
 
+import argparse
+import itertools
+
+import pandas as pd
 import torch
+
 import aiter
-from aiter.test_common import checkAllclose, benchmark, run_perftest
-from aiter.fused_moe import moe_sorting, fused_topk
-from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter import dtypes, get_torch_quant
+from aiter.fused_moe import fused_topk, moe_sorting
 from aiter.jit.utils.chip_info import get_gfx
-from aiter import get_torch_quant, dtypes
 from aiter.ops.quant import (
     per_1x32_f8_scale_f8_quant,
     per_1x32_mx_quant_hip,
 )
+from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-import pandas as pd
-import itertools
-import argparse
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -117,12 +119,14 @@ def test_moe_mxfp4_sort(dtype, token_num, model_dim, E, topk, block_size, stage)
     score = torch.randn((token_num, E), dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids,
-        topk_weights,
-        E,
-        model_dim,
-        dtype,
+    sorted_ids, _sorted_weights, _sorted_expert_ids, num_valid_ids, _moe_buf = (
+        moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+        )
     )
     num_valid_ids = num_valid_ids[0]
     if stage == "stage1":
@@ -204,12 +208,14 @@ def test_moe_mx_quant_sort(
     score = torch.randn((token_num, E), dtype=dtype)
 
     topk_weights, topk_ids = fused_topk(input, score, topk, True)
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids,
-        topk_weights,
-        E,
-        model_dim,
-        dtype,
+    sorted_ids, _sorted_weights, _sorted_expert_ids, num_valid_ids, _moe_buf = (
+        moe_sorting(
+            topk_ids,
+            topk_weights,
+            E,
+            model_dim,
+            dtype,
+        )
     )
     num_valid_ids = num_valid_ids[0]
     topk_orig = topk  # keep before clobbering for stage1
@@ -231,7 +237,7 @@ def test_moe_mx_quant_sort(
     ref_scale = run_torch(scale.clone(), sorted_ids.clone(), num_valid_ids, token_num)
 
     # Split: per_1x32_mx_quant_hip + mxfp4_moe_sort_hip.
-    (split_out, split_scale), split_us = run_perftest(
+    (_split_out, split_scale), split_us = run_perftest(
         run_split_quant_sort,
         input,
         sorted_ids,
@@ -263,10 +269,10 @@ def test_moe_mx_quant_sort(
     # pointer (it does `tl.load(num_valid_ids_ptr)` internally), and
     # would otherwise see a Python int and fail at compile time with
     # "Unsupported ptr type triton.language.int32 in `tl.load`".
-    triton_out = triton_scale = None
+    triton_scale = None
     triton_us = None
     if not is_fp8:
-        (triton_out, triton_scale), triton_us = run_perftest(
+        (_triton_out, triton_scale), triton_us = run_perftest(
             fused_dynamic_mxfp4_quant_moe_sort,
             input,
             sorted_ids=sorted_ids,

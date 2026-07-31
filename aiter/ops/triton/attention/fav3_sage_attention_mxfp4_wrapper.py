@@ -2,18 +2,17 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from __future__ import annotations
-from typing import Optional, Tuple
+
 import torch
 import triton
+
+import aiter
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention import map_dims
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton._triton_kernels.attention.fav3_sage_attention_mxfp4 import (
     sage_fwd_mxfp4,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import sage_quant_mxfp4
-
-
-import aiter
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def get_sage_fwd_configs_mxfp4():
@@ -47,10 +46,10 @@ class _FAv3SageMXFP4WrapperFunc(torch.autograd.Function):
         layout: str = "bshd",
         q_smooth: bool = False,
         hadamard_rotation: bool = True,
-        config: Optional[dict] = None,
+        config: dict | None = None,
         R: torch.Tensor = None,
         BLOCK_R: int = 128,
-        block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
         return_lse: bool = False,
         smooth_k: bool = True,
     ):
@@ -183,10 +182,10 @@ def fav3_sage_mxfp4_wrapper(
     layout: str = "bshd",
     q_smooth: bool = False,
     hadamard_rotation: bool = False,
-    config: Optional[dict] = None,
+    config: dict | None = None,
     R: torch.Tensor = None,
     BLOCK_R: int = 128,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     return_lse: bool = False,
     smooth_k: bool = True,
 ):
@@ -234,10 +233,10 @@ def fav3_sage_mxfp4_func(
     bias: torch.Tensor = None,
     causal: bool = False,
     layout: str = "bshd",
-    config: Optional[dict] = None,
-    kv_block_indices: Optional[torch.Tensor] = None,
-    lut_start: Optional[torch.Tensor] = None,
-    lut_count: Optional[torch.Tensor] = None,
+    config: dict | None = None,
+    kv_block_indices: torch.Tensor | None = None,
+    lut_start: torch.Tensor | None = None,
+    lut_count: torch.Tensor | None = None,
     use_block_sparse: bool = False,
     return_lse: bool = False,
 ):

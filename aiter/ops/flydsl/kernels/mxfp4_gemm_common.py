@@ -5,8 +5,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith, buffer_ops
+from flydsl.expr import arith
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from . import dpp_utils
 

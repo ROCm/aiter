@@ -5,22 +5,27 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-
-from flydsl.expr.typing import T
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
+)
+from flydsl._mlir.dialects import (
     math as mlir_math,
+)
+from flydsl._mlir.dialects import scf
+from flydsl._mlir.dialects import (
     vector as mlir_vector,
 )
-from flydsl.expr import range_constexpr, const_expr, arith, vector, rocdl
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import (
-    get_dtype_in_kernel,
-    get_dtype_bytes,
     GTensor,
     _to_raw,
+    get_dtype_bytes,
+    get_dtype_in_kernel,
 )
 
 fm_fast = arith.FastMathFlags.fast
@@ -408,7 +413,6 @@ def create_vk_gdr_decode_kernel(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
             scf.YieldOp([])
-        return
 
     @flyc.jit
     def launch_gdr_decode_kernel(
@@ -423,7 +427,7 @@ def create_vk_gdr_decode_kernel(
         state: fx.Tensor,
         out: fx.Tensor,
         batch_size: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         gx = batch_size * num_v_heads * NUM_BLOCKS_PER_V_DIM
         gdr_decode_kernel._func.__name__ = KERNEL_NAME

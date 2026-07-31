@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-from typing import Any, Dict, Optional
-import os
-import json
 import functools
+import json
+import os
+import warnings
+from typing import Any
+
+import torch
+
 from ._triton import arch_info
 from .core import AITER_TRITON_CONFIGS_PATH
-import warnings
 
 M_THRESHOLD_SMALL = 256
 M_THRESHOLD_MEDIUM = 1024
@@ -16,11 +18,11 @@ M_THRESHOLD_MEDIUM = 1024
 
 def get_config_dtype_str(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
 ):
     if use_fp8_w8a8:
         return "FP8_W8A8"
@@ -40,7 +42,7 @@ def get_config_dtype_str(
 
 
 @functools.lru_cache
-def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
+def get_moe_configs(dtype: str | None) -> dict[int, Any] | None:
     """
     Return optimized configurations for the fused MoE kernel.
 
@@ -70,11 +72,11 @@ def get_moe_configs(dtype: Optional[str]) -> Optional[Dict[int, Any]]:
 
 def get_optimal_moe_config(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
     M: int = 1,
 ):
     dtype_str = get_config_dtype_str(
@@ -110,11 +112,11 @@ def get_optimal_moe_config(
 
 def get_optimal_moe_config_func(
     dtype: torch.dtype,
-    use_int8_w8a16: Optional[bool] = False,
-    use_int8_w8a8: Optional[bool] = False,
-    use_fp8_w8a8: Optional[bool] = False,
-    use_int4_w4a16: Optional[bool] = False,
-    use_mxfp4: Optional[bool] = False,
+    use_int8_w8a16: bool | None = False,
+    use_int8_w8a8: bool | None = False,
+    use_fp8_w8a8: bool | None = False,
+    use_int4_w4a16: bool | None = False,
+    use_mxfp4: bool | None = False,
 ):
     return functools.partial(
         get_optimal_moe_config,

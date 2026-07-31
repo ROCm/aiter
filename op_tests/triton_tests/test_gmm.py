@@ -6,34 +6,38 @@
 # ------------------------------------------------------------------------------
 
 # Python standard library
-from functools import partial
 import warnings
+from functools import partial
+
+# pytest
+import pytest
 
 # PyTorch
 import torch
 from torch import Tensor
 
-# pytest
-import pytest
+# AITER: Triton kernel wrappers
+from aiter.ops.triton.gmm import (
+    gmm as triton_gmm,
+)
+from aiter.ops.triton.gmm import (
+    nptgmm as triton_nptgmm,
+)
+from aiter.ops.triton.gmm import (
+    ptgmm as triton_ptgmm,
+)
 
 # AITER: GMM defaults and utility functions
 from aiter.ops.triton.utils.gmm_common import (
     DTYPE,
     check_input_device_dtype,
     gen_gmm_tensors,
-    get_gmm_shape,
-    get_gmm_output,
     gen_tgmm_tensors,
-    get_tgmm_shape,
-    get_tgmm_output,
+    get_gmm_output,
+    get_gmm_shape,
     get_tgmm_bias_grad,
-)
-
-# AITER: Triton kernel wrappers
-from aiter.ops.triton.gmm import (
-    gmm as triton_gmm,
-    ptgmm as triton_ptgmm,
-    nptgmm as triton_nptgmm,
+    get_tgmm_output,
+    get_tgmm_shape,
 )
 
 # Common code shared by GMM and TGMM unit tests.
@@ -71,8 +75,8 @@ OTHER_REAL_SHAPE: tuple[int, int, int, int] = (267424, 1280, 2560, 32)
 
 # Transpositions.
 
-TRANS_LSH_STR: set[str] = {f"tlhs{b}" for b in {"F", "T"}}
-TRANS_RHS_STR: set[str] = {f"trhs{b}" for b in {"F", "T"}}
+TRANS_LSH_STR: set[str] = {f"tlhs{b}" for b in ("F", "T")}
+TRANS_RHS_STR: set[str] = {f"trhs{b}" for b in ("F", "T")}
 
 
 def trans_from_str(trans_str: str, tensor_str: str) -> bool:

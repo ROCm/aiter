@@ -2,7 +2,6 @@
 # Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 import os
 from dataclasses import dataclass, field
-from typing import List
 
 # Legacy cache policy = traits default for split-barrier & persistent a16w16 (see
 # opus_gemm_traits_a16w16_gfx950.cuh).
@@ -40,7 +39,7 @@ class OpusGemmInstance:
     GROUP_N: int
     GROUP_K: int
     kernel_tag: str
-    output_dtypes: List[str] = field(default_factory=lambda: ["fp32_t"])
+    output_dtypes: list[str] = field(default_factory=lambda: ["fp32_t"])
     # Flatmm-only. Defaults to 2 (match existing behavior for non-flatmm kernels).
     # Only emitted in the generated instance name when kernel_tag == "a16w16_flatmm".
     WG_PER_CU: int = 2

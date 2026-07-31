@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import json
 
 # @manual=//triton:triton
@@ -20,10 +21,10 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-import functools
+
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 try:
     from triton.language.extra.libdevice import (
@@ -43,7 +44,7 @@ except ImportError:
 
 
 @triton.jit
-def _hstu_attn_fwd_one_block(  # noqa: C901
+def _hstu_attn_fwd_one_block(
     start_n,
     seq_len,
     offs_m,
@@ -114,7 +115,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
 
 
 @triton.jit
-def _hstu_attn_fwd_compute(  # noqa C901
+def _hstu_attn_fwd_compute(
     Q,
     K,
     V,
@@ -225,7 +226,7 @@ def _hstu_attn_fwd_compute(  # noqa C901
                     if HAS_CONTEXTUAL_SEQ_LEN:
                         low = low if low > contextual_seq_len else 0
                     else:
-                        low = low if low > 0 else 0
+                        low = max(0, low)
                 if HAS_MULTIPLE_TARGETS:
                     uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
                     if uih_end < start_m:
@@ -263,7 +264,8 @@ def _hstu_attn_fwd_compute(  # noqa C901
             V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             end_n += BLOCK_N
 
-        if HAS_MULTIPLE_TARGETS and CAUSAL:
+        # Not merged: the `# pyre-ignore[61]` between the two ifs applies to the inner one; merging would silently drop that suppression.
+        if HAS_MULTIPLE_TARGETS and CAUSAL:  # noqa: SIM102
             # pyre-ignore[61]
             if uih_end < start_m:
                 low_delta = start_m
@@ -333,7 +335,7 @@ _hstu_attn_fwd_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_hstu_attn_fwd_repr)
-def _hstu_attn_fwd(  # noqa C901
+def _hstu_attn_fwd(
     Q,
     K,
     V,
@@ -410,7 +412,7 @@ def _hstu_attn_fwd(  # noqa C901
 
 
 @triton.jit
-def _hstu_attn_bwd_one_block(  # noqa C901
+def _hstu_attn_bwd_one_block(
     start_m,
     offs_n,
     offs_m,
@@ -528,7 +530,7 @@ def _hstu_attn_bwd_one_block(  # noqa C901
 
 
 @triton.jit
-def _hstu_attn_bwd_one_col_block(  # noqa C901
+def _hstu_attn_bwd_one_col_block(
     start_n,
     seq_len,
     n_targets,
@@ -576,13 +578,12 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
             low = start_n
             if HAS_MAX_ATTN_LEN:
                 high = start_n + max_attn_len + BLOCK_N
-                high = high if high < seq_len else seq_len
+                high = min(seq_len, high)
             else:
                 high = seq_len
         if HAS_CONTEXTUAL_SEQ_LEN:
             contextual_block_end = tl.cdiv(contextual_seq_len, BLOCK_M) * BLOCK_M
-            if low < contextual_block_end:
-                low = contextual_block_end
+            low = max(low, contextual_block_end)
     else:
         low = 0
         high = start_n + BLOCK_N
@@ -723,7 +724,7 @@ _hstu_attn_bwd_repr = make_kernel_repr(
 
 
 @triton.jit(repr=_hstu_attn_bwd_repr)
-def _hstu_attn_bwd(  # noqa C901
+def _hstu_attn_bwd(
     Q,
     K,
     V,

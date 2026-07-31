@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
 import torch.nn.functional as F
+
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose, perftest
-import argparse
 
 
 @perftest(num_iters=5)
@@ -39,7 +41,7 @@ def test_gemm(dtype, b, m, n, k):
 
     a, avg_a = run_torch(x, weight, x_scale, w_scale, None, dtype)
     b, avg_b = run_gemm_ck(x, weight, x_scale, w_scale, None, dtype)
-    msg = f"[perf] dim: {str(dim):<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
+    msg = f"[perf] dim: {dim!s:<20} dtype: {dtype}, torch avg: {avg_a:<8.2f} us, ck avg: {avg_b:<8.2f} us, uplift: {avg_a/avg_b-1:<5.1%}"
     checkAllclose(
         a, b, msg="a,b: " + msg, rtol=1e-2, atol=0.01, catastrophic_check=True
     )

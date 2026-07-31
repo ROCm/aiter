@@ -2,12 +2,14 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
+
 from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4,
 )
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 
 # -----------------------------------------------------------------------------

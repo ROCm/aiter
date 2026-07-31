@@ -1,13 +1,15 @@
-import torch
-from torch import Tensor, nn
-import torch.nn.functional as F
-import math
-import aiter
-from aiter.test_common import run_perftest, checkAllclose, benchmark
-from aiter import dtypes
-import functools
-import pandas as pd
 import argparse
+import functools
+import math
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
 
 

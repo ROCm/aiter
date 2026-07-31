@@ -8,13 +8,17 @@ This module provides a reduce-scatter operation along the M dimension using
 GPU-initiated communication via the Iris library.
 """
 
-import torch
-from torch import Tensor
-import triton
-import triton.language as tl
 import logging
+from typing import TYPE_CHECKING
 
 import iris
+import triton
+import triton.language as tl
+from torch import Tensor
+
+if TYPE_CHECKING:
+    from .iris import IrisCommContext
+
 
 # If we got here, iris is available
 IRIS_AVAILABLE = True

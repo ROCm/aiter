@@ -1,6 +1,7 @@
-from collections import namedtuple
-import os
 import concurrent.futures
+import os
+from collections import namedtuple
+
 from csrc.cpp_itfs.mla.asm_mla_decode_fwd import compile
 from csrc.cpp_itfs.utils import AITER_CORE_DIR
 
@@ -43,7 +44,7 @@ def main():
         )
 
     with concurrent.futures.ProcessPoolExecutor(
-        os.environ.get("MAX_JOBS", 16)
+        os.environ.get("MAX_JOBS", "16")
     ) as executor:
         executor.map(process_config, configs)
 

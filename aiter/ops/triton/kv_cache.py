@@ -3,8 +3,9 @@
 
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
+
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.kv_cache import _cat_and_cache_mla_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -67,7 +68,7 @@ def cat_and_cache_mla(
     SCALE_K_WIDTH_ROPE = 4
     if kv_cache_dtype == torch.uint8:
         assert shuffled_kv_cache, "shuffle_kv_cache must be True for FP4 KV cache"
-        b_cache, h_cache, block_size, d_cache = kv_cache.shape
+        _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         SCALE_K_LORA = d_nope // 16
         SCALE_K_ROPE = d_rope // 16
         SCALE_K_WIDTH_NOPE = (
@@ -82,13 +83,13 @@ def cat_and_cache_mla(
         )
     else:
         if shuffled_kv_cache:
-            b_cache, h_cache, block_size, d_cache = kv_cache.shape
+            _b_cache, h_cache, block_size, d_cache = kv_cache.shape
         else:
-            b_cache, h_cache, d_cache = kv_cache.shape
+            _b_cache, h_cache, d_cache = kv_cache.shape
     (b_slot,) = slot_mapping.shape
 
     assert (
-        b == bk and b_slot == b_slot
+        b == bk and b_slot == b_slot  # noqa: PLR0124
     ), "K batch dimensions and slot_mapping should be identical (bk == bk == b_slot)"
     assert kh == kh2 == h_cache, "K head should be identical"
     if kv_cache.dtype == torch.uint8:

@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
 import pytest
-from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-    fused_gemm_afp4wfp4_split_cat,
-    fused_gemm_afp4wfp4_preshuffle_split_cat,
-)
-from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
-    mxfp4_to_f32,
-    e8m0_to_f32,
-)
+import torch
 
-from aiter.ops.triton.utils.types import str_to_torch_dtype
-
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+    fused_gemm_afp4wfp4_preshuffle_split_cat,
+    fused_gemm_afp4wfp4_split_cat,
+)
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.triton_tests.gemm.batched.test_batched_gemm_afp4wfp4 import (
+    e8m0_to_f32,
+    mxfp4_to_f32,
+)
 
 SCALE_GROUP_SIZE = 32
 

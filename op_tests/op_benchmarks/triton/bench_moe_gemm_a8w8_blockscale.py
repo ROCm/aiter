@@ -1,23 +1,25 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import chain
-from pathlib import Path
-import triton.profiler as proton
-import torch
 import argparse
 import csv
-from aiter.ops.triton.moe.moe_routing.routing import routing
+import inspect
+import tempfile
+from itertools import chain
+from pathlib import Path
+
+import torch
+import triton.profiler as proton
+
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+    _get_config,
+)
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w8_blockscale import (
     moe_gemm_a8w8_blockscale,
 )
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
-    _get_config,
-)
+from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-import tempfile
-import inspect
 
 # Default group_m, group_n, group_k
 group_shape = (128, 128, 128)
@@ -214,15 +216,9 @@ def bench_mlp_single_weight_init(
     M, K = xg.shape
     K, N = wg.shape
     config, _ = _get_config(M, N, K)
-    config["BLOCK_SIZE_M"] = (
-        128 if config["BLOCK_SIZE_M"] > 128 else config["BLOCK_SIZE_M"]
-    )
-    config["BLOCK_SIZE_N"] = (
-        128 if config["BLOCK_SIZE_N"] > 128 else config["BLOCK_SIZE_N"]
-    )
-    config["BLOCK_SIZE_K"] = (
-        128 if config["BLOCK_SIZE_K"] > 128 else config["BLOCK_SIZE_K"]
-    )
+    config["BLOCK_SIZE_M"] = min(config["BLOCK_SIZE_M"], 128)
+    config["BLOCK_SIZE_N"] = min(config["BLOCK_SIZE_N"], 128)
+    config["BLOCK_SIZE_K"] = min(config["BLOCK_SIZE_K"], 128)
 
     proton.start(str(fpath), hook="triton")
     for _ in range(reps):

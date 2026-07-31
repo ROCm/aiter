@@ -21,14 +21,14 @@ per iteration, avoiding read-modify-write races.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.compiler.kernel_function import CompilationContext
-
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import buffer_ops
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.typing import Int32, T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 BLOCK_THREADS = 256
 NLANE = 16
@@ -189,7 +189,7 @@ def build_swiglu_and_mul_module(inter_dim: int):
         x: fx.Tensor,
         out: fx.Tensor,
         num_rows: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         ctx = CompilationContext.get_current()
         with ir.InsertionPoint(ctx.gpu_module_body):

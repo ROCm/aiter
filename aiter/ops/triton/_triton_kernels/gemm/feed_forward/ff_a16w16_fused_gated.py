@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import triton
 import triton.language as tl
+
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
-
-import triton
 
 
 @triton.heuristics(
@@ -86,7 +86,7 @@ def _ff_a16w16_fused_gated(
         0, BLOCK_SIZE_N // 2
     )
     offs_w1n1 = (
-        (pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2))
+        pid_n.to(tl.int64) * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
     ) + (N // 2)
     w1n0_ptrs = w1_ptr + (
         offs_k[:, None] * stride_w1k + offs_w1n0[None, :] * stride_w1n
@@ -97,7 +97,7 @@ def _ff_a16w16_fused_gated(
     acc0 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
     acc1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N // 2), dtype=acc_dtype)
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
         if EVEN_K:
@@ -161,7 +161,7 @@ def _ff_a16w16_fused_gated(
     w2_ptrs += k_cyclic_offset * stride_w2k * BLOCK_SIZE_K
     y_ptrs += k_cyclic_offset * stride_yk * BLOCK_SIZE_K
 
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in range(tl.cdiv(K, BLOCK_SIZE_K)):
         if EVEN_K:
             w2 = tl.load(
                 w2_ptrs,

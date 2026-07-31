@@ -2,16 +2,17 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional
 
 import pandas as pd
 import torch
-from aiter import logger
-from aiter.jit.utils.torch_guard import torch_compile_guard
 from torch import Tensor
 
+from aiter import logger
+from aiter.jit.utils.torch_guard import torch_compile_guard
+
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
@@ -82,14 +83,14 @@ def gemm_a4w4_fake(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/block_size] MXFP4: block_size=32 e8m0 padded, NVFP4: block_size=16 e4m3 padded
     B_scale: Tensor,  # B_scale:[N, K/block_size] MXFP4: block_size=32 e8m0 padded, NVFP4: block_size=16 e4m3 padded
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bias: Tensor | None = None,  # bias:[1, N] f32
     dtype: torch.dtype = dtypes.bf16,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    global_B_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
+    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
 ) -> torch.Tensor:
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
@@ -103,14 +104,14 @@ def gemm_a4w4(
     B: Tensor,  # B:[N, K/2] f4x2
     A_scale: Tensor,  # A_scale:[M, K/block_size] MXFP4: block_size=32 e8m0 padded, NVFP4: block_size=16 e4m3 padded
     B_scale: Tensor,  # B_scale:[N, K/block_size] MXFP4: block_size=32 e8m0 padded, NVFP4: block_size=16 e4m3 padded
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    bias: Tensor | None = None,  # bias:[1, N] f32
     dtype: torch.dtype = dtypes.bf16,
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    apreshuffle: Optional[bool] = False,
-    global_A_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
-    global_B_scale: Optional[Tensor] = None,  # NVFP4 per-tensor
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    apreshuffle: bool | None = False,
+    global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
+    global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
 ) -> torch.Tensor:
     """
     A4W4 GEMM kernel for AMD GPUs.
@@ -222,8 +223,8 @@ def _gemm_a4w4_asm(
     A_scale: Tensor,  # A_scale:[M, K/32] e8m0 paded
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
+    kernelName: str | None = None,
+    bias: Tensor | None = None,  # bias:[1, N] f32
     alpha: float = 1.0,
     beta: float = 0.0,
     bpreshuffle: int = 1,
@@ -238,11 +239,11 @@ def gemm_a4w4_asm(
     B_scale: Tensor,  # B_scale:[N, K/32] e8m0 paded
     out: Tensor,  # Out:[M, N] bf16
     kernelName: str = "",
-    bias: Optional[Tensor] = None,  # bias:[1, N] f32
-    alpha: Optional[float] = 1.0,
-    beta: Optional[float] = 0.0,
-    bpreshuffle: Optional[bool] = True,
-    log2_k_split: Optional[int] = None,
+    bias: Tensor | None = None,  # bias:[1, N] f32
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+    log2_k_split: int | None = None,
 ) -> Tensor:
     _gemm_a4w4_asm(
         A,
@@ -271,7 +272,7 @@ def _mxfp4_gemm_asm(
     ScaleA: Tensor,  # ScaleA:[M, K/32] e8m0 (shuffled)
     ScaleB: Tensor,  # ScaleB:[N, K/32] e8m0 (shuffled)
     out: Tensor,  # Out:[M, N] bf16
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 
@@ -289,7 +290,7 @@ def _nvfp4_gemm_asm(
     GlobalScaleA: float,
     GlobalScaleB: float,
     out: Tensor,
-    kernelName: Optional[str] = None,
+    kernelName: str | None = None,
     a_preshuffle: int = 1,
 ) -> None: ...
 

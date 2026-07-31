@@ -1,31 +1,35 @@
-import sys
-import triton
 import math
+import sys
+from collections.abc import Callable
+
+import triton
+
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
 from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
+)
+from aiter.ops.triton.gluon.gemm_a8w8 import (
     gemm_a8w8_preshuffle as gluon_gemm_a8w8_preshuffle,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
-    generate_gemm_a8w8_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
     add_argparse_ff,
     get_ff_args,
+    get_parser,
 )
-
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
-    get_caller_name_no_ext,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
+    generate_gemm_a8w8_inputs,
 )
 
 
 def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: callable
+    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: Callable
 ):
     # NOTE: Assume bias and output has the same dtype
     c_dtype = str_to_torch_dtype["bf16"]
@@ -47,7 +51,7 @@ def bench_gemm_fn(
     mem_write = (M * N) * bias.element_size()
     mem = mem_read + mem_write
     ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),  # noqa: E731
+        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),
         warmup=25,
         rep=100,
     )
@@ -130,13 +134,15 @@ def run_benchmark(args, defaults):
             impl = gluon_gemm_a8w8
     else:
         if args.shuffle:
-            raise Exception("Argument --shuffle is only supported with --gluon flag.")
+            raise RuntimeError(
+                "Argument --shuffle is only supported with --gluon flag."
+            )
         impl = triton_gemm_a8w8
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args, impl)
@@ -148,7 +154,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args, impl)
@@ -174,7 +180,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)

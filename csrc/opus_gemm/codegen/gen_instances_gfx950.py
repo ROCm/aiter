@@ -566,7 +566,7 @@ def gen_persistent_instance(
     **_unused,
 ):
     """gfx950 a16w16_persistent launcher emit. See gen_instances.opus_gemm_codegen._gen_persistent_instance."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_oob_str = "true" if k.has_oob else "false"
@@ -703,7 +703,7 @@ def gen_scale_instance(
     **_unused,
 ):
     """gfx950 a8w8_scale launcher emit."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     traits_aliases = f"""
@@ -1128,7 +1128,7 @@ def gen_flatmm_instance(
     **_unused,
 ):
     """gfx950 a16w16_flatmm launcher emit."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_bias_str = "false"
@@ -1238,7 +1238,7 @@ def gen_flatmm_splitk_instance(
     **_unused,
 ):
     """gfx950 a16w16_flatmm_splitk launcher emit (uses ws_handle + reduce kernel call)."""
-    kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
+    _kargs_explicit_param, fwd_decl_kargs_tpl, fwd_decl_kargs_fnarg = (
         kargs_template_vars(k.kernel_tag, kargs_name)
     )
     has_oob_str = "true" if k.has_oob else "false"

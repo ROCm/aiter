@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import math
+
+import pandas as pd
+import pytest
 import torch
+
 import aiter
-from aiter import dtypes
+from aiter import dtypes, per_tensor_quant
 from aiter.test_common import run_perftest
-from aiter import per_tensor_quant
 from aiter.test_mha_common import (
     generate_qkv,
     generate_random_padding_mask,
 )
-import pytest
-import pandas as pd
-import argparse
-import math
 
 benchmark = {}
 

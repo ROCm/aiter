@@ -1,14 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+
 import torch
+
+# from ater.test_common import checkAllclose, perftest
+from torch.profiler import ProfilerActivity, profile
+
 import aiter
 from aiter import dtypes
 from aiter.test_common import checkAllclose
-import argparse
-
-# from ater.test_common import checkAllclose, perftest
-from torch.profiler import profile, ProfilerActivity
 
 # input shape: torch.Size([4096, 64, 160]) (20480, 1, 128)
 # other shape: torch.Size([4096, 64, 160]) (10240, 160, 1)

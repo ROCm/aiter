@@ -1,19 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
+
+import pandas as pd
 import torch
 from torch import Tensor
-from typing import Optional
-import functools
-import pandas as pd
+
+from aiter import logger
+
 from ..jit.core import (
-    compile_ops,
     AITER_CONFIGS,
     AITER_LOG_TUNED_CONFIG,
+    compile_ops,
 )
+from ..jit.utils.chip_info import get_cu_num
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..utility import dtypes
-from ..jit.utils.chip_info import get_cu_num, get_gfx_runtime as get_gfx
-from aiter import logger
 
 
 def gen_batched_gemm_a8w8_fake_tensors(
@@ -22,7 +25,7 @@ def gen_batched_gemm_a8w8_fake_tensors(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = 0,
 ) -> Tensor:
     return out
@@ -39,7 +42,7 @@ def batched_gemm_a8w8(
     x_scale: Tensor,
     w_scale: Tensor,
     out: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     splitK: int = 0,
 ) -> Tensor: ...
 
@@ -121,9 +124,9 @@ def batched_gemm_a8w8_CK(
     WQ: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype=dtypes.bf16,
-    splitK: Optional[int] = None,
+    splitK: int | None = None,
 ):
     assert dtype in [
         dtypes.bf16,

@@ -1,22 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
 
 import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    unified_attention,
     is_2d_gluon_available,
+    unified_attention,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_weight, shuffle_scale_batched
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_batched, shuffle_weight
+from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.quant.test_quant_mxfp4 import (
     torch_dynamic_mxfp4_quant,
 )
-from aiter.ops.triton.utils.types import e4m3_dtype
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.test_common import checkAllclose
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
@@ -293,13 +292,13 @@ def ref_paged_attn(
     block_tables: torch.Tensor,
     scale: float,
     out_dtype: torch.dtype,
-    sliding_window: Optional[int] = None,
-    soft_cap: Optional[float] = None,
-    sinks: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    output_scale: Optional[torch.Tensor] = None,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    sinks: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    output_scale: torch.Tensor | None = None,
     causal: int = 1,
 ) -> torch.Tensor:
     num_seqs = len(query_lens)
@@ -398,9 +397,9 @@ def test_triton_unified_attn_3d(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    sliding_window: Optional[int],
+    sliding_window: int | None,
     block_size: int,
-    soft_cap: Optional[float],
+    soft_cap: float | None,
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -557,7 +556,7 @@ def test_triton_unified_attn_3d(
     ],
 )
 @pytest.mark.parametrize("num_heads", [(8, 8), (8, 1)])
-@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("head_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("sliding_window", [None, 256])
 @pytest.mark.parametrize(
@@ -589,9 +588,9 @@ def test_triton_unified_attn(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    sliding_window: Optional[int],
+    sliding_window: int | None,
     block_size: int,
-    soft_cap: Optional[float],
+    soft_cap: float | None,
     num_blocks: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,

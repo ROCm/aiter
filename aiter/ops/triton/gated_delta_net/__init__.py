@@ -22,12 +22,12 @@ from .gated_delta_rule import (
 )
 
 __all__ = [
-    "chunk_gated_delta_rule",
-    "fused_rearrange_sigmoid_gated_delta_rule",
-    "fused_recurrent_gated_delta_rule",
-    "chunk_gated_delta_rule_opt",
-    "chunk_gated_delta_rule_opt_vk",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
     "causal_conv1d_update_split_qkv",
+    "chunk_gated_delta_rule",
+    "chunk_gated_delta_rule_opt",
+    "chunk_gated_delta_rule_opt_vk",
+    "fused_rearrange_sigmoid_gated_delta_rule",
+    "fused_recurrent_gated_delta_rule",
 ]

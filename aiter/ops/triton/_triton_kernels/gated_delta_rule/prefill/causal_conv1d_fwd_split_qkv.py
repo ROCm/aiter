@@ -86,9 +86,8 @@ def _causal_conv1d_fwd_split_qkv_kernel(
     else:
         conv_state_batch_coord = idx_seq
 
-    if USE_PAD_SLOT:
-        if conv_state_batch_coord == pad_slot_id:
-            return
+    if USE_PAD_SLOT and conv_state_batch_coord == pad_slot_id:
+        return
 
     conv_states_base = (
         conv_states_ptr
@@ -423,9 +422,8 @@ def _causal_conv1d_fwd_split_qkv_tile_kernel(
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
     ).to(tl.int64)
 
-    if USE_PAD_SLOT:
-        if conv_states_input_coord == pad_slot_id:
-            return
+    if USE_PAD_SLOT and conv_states_input_coord == pad_slot_id:
+        return
 
     conv_states_base = (
         conv_states_ptr

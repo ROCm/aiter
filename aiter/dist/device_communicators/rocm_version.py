@@ -89,7 +89,7 @@ def _from_torch():
         import torch
 
         hip = getattr(torch.version, "hip", None)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     v = _parse(hip)
     if v:
@@ -118,7 +118,7 @@ def _from_hip_runtime():
         if hip.hipRuntimeGetVersion(ctypes.byref(raw)) != 0:
             return None
         val = raw.value
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     v = (val // 10_000_000, (val // 100_000) % 100, val % 100_000)
     logger.info("ROCm version %s from hipRuntimeGetVersion=%d", v, val)

@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
+
 import aiter
-from aiter.ops.triton.utils.types import str_to_torch_dtype
 from aiter.ops.triton.normalization.norm import (
     layer_norm,
     layernorm2d_fwd_with_add,
-    layernorm2d_fwd_with_dynamicquant,
-    layernorm2d_fwd_with_smoothquant,
     layernorm2d_fwd_with_add_dynamicquant,
     layernorm2d_fwd_with_add_smoothquant,
+    layernorm2d_fwd_with_dynamicquant,
+    layernorm2d_fwd_with_smoothquant,
 )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
 def run_torch(

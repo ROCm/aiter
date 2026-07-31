@@ -45,7 +45,7 @@ def _bh_grid(num_queries: int, num_heads: int):
     return lambda META: (
         num_queries,
         triton.cdiv(num_heads, META["BLOCK_H"]),
-    )  # noqa: E731
+    )
 
 
 # ---------------------------------------------------------------------------

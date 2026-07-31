@@ -19,12 +19,13 @@ TO be added features:
 
 import functools
 import json
+
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 # Support tensor in [B, Seqlen, H, d] format. Taking tensors in [B*Seqlen, H, d] as inputs
 
@@ -763,7 +764,7 @@ def la_persistent_inner(
                 k * cap_high,
                 total_high_capacity + (k - ctas_high_avail) * cap_low,
             )
-            covered = tl.minimum(remaining, cap_by_k)
+            tl.minimum(remaining, cap_by_k)
 
             # final last_cta after loop is start_cta + number_of_iterations_performed
             last_cta = start_cta + ctas_to_use

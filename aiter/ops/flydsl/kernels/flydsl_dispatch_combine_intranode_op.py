@@ -8,15 +8,14 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-
-import mori.shmem as ms
-import torch
-from mori.shmem import mori_shmem_create_tensor
+from typing import Any
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.shmem as ms
+import torch
 from flydsl.runtime.device import get_rocm_arch
+from mori.shmem import mori_shmem_create_tensor
 
 from .communication_ops_utils import GeometryTuningTable
 from .flydsl_dispatch_combine_intranode_kernel import (
@@ -51,7 +50,7 @@ logger = logging.getLogger(__name__)
 _TUNING_CONFIGS_DIR = Path(__file__).resolve().parent / "mega_moe_tuning_config"
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _device_cu_count(device_index):
     """CU count (ROCm ``multiProcessorCount``) for the resident-block bound."""
     return torch.cuda.get_device_properties(device_index).multi_processor_count
@@ -129,7 +128,7 @@ def _detect_gpu_model(device_index=0):
     """GPU model substring (e.g. ``"mi355x"``) for tuning-file selection."""
     try:
         name = torch.cuda.get_device_properties(device_index).name.lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     m = re.search(r"\bmi\d+\w*", name)
     return m.group(0) if m else None
@@ -143,7 +142,7 @@ def resolve_tuning_config_path(
     if gpu_arch is None:
         try:
             gpu_arch = str(get_rocm_arch() or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             gpu_arch = None
     if gpu_model is None:
         gpu_model = _detect_gpu_model()
@@ -242,12 +241,12 @@ class FlyDSLDispatchCombineConfig:
     # User-pinned launch geometry, resolved ONCE per op (not per call):
     # pinned value (block_num+warp must be set together) > tuning table >
     # ``default_*`` fallback above. None => not pinned.
-    dispatch_block_num: Optional[int] = None
-    dispatch_warp_num_per_block: Optional[int] = None
-    combine_block_num: Optional[int] = None
-    combine_warp_num_per_block: Optional[int] = None
-    tuning_table: Optional[GeometryTuningTable] = None
-    tuning_config_path: Optional[str] = None
+    dispatch_block_num: int | None = None
+    dispatch_warp_num_per_block: int | None = None
+    combine_block_num: int | None = None
+    combine_warp_num_per_block: int | None = None
+    tuning_table: GeometryTuningTable | None = None
+    tuning_config_path: str | None = None
     scale_dim: int = 0
     scale_type_size: int = 0
     enable_std_moe: bool = False
@@ -366,13 +365,13 @@ class FlyDSLDispatchCombineIntraNodeOp:
         # Dispatch (encode) and combine (decode, Stage 3) must agree on this.
         self._effective_max_recv = config.effective_max_recv
 
-        self._disp_jit_cache: Dict[Tuple[torch.dtype, int, int], Any] = {}
-        self._disp_compiled_cache: Dict[Tuple[torch.dtype, int, int], Any] = {}
-        self._comb_jit_cache: Dict[
-            Tuple[torch.dtype, bool, bool, bool, int, int], Any
+        self._disp_jit_cache: dict[tuple[torch.dtype, int, int], Any] = {}
+        self._disp_compiled_cache: dict[tuple[torch.dtype, int, int], Any] = {}
+        self._comb_jit_cache: dict[
+            tuple[torch.dtype, bool, bool, bool, int, int], Any
         ] = {}
-        self._comb_compiled_cache: Dict[
-            Tuple[torch.dtype, bool, bool, bool, int, int], Any
+        self._comb_compiled_cache: dict[
+            tuple[torch.dtype, bool, bool, bool, int, int], Any
         ] = {}
 
         # Start at 1: a zero flag would satisfy the first wait and skip the sync.
@@ -413,8 +412,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
         self._fx_disp_grid_bar = fx.Int64(self.disp_grid_bar.data_ptr())
         self._fx_disp_out_wts = fx.Int64(self.shmem_disp_out_wts.data_ptr())
 
-        self._comb_no_s1_fn: Dict[Tuple[torch.dtype, bool, int, int], Any] = {}
-        self._comb_no_s1_compiled: Dict[Tuple[torch.dtype, bool, int, int], Any] = {}
+        self._comb_no_s1_fn: dict[tuple[torch.dtype, bool, int, int], Any] = {}
+        self._comb_no_s1_compiled: dict[tuple[torch.dtype, bool, int, int], Any] = {}
 
     def load_tuning_config(self, path=None):
         """Build and attach the geometry tuning table for this op's shape."""

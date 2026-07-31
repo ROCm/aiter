@@ -3,13 +3,15 @@
 
 
 import os
+
 import torch
 from torch.distributed import ProcessGroup
 
-from aiter import logger, get_hip_quant
+from aiter import get_hip_quant, logger
 from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
+
 from .base_device_communicator import DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
@@ -20,10 +22,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
     _ar_1stage_override = {"1": True, "0": False}.get(
         os.environ.get("AITER_AR_1STAGE", "")
     )
-    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", -1))
-    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", -1))
+    _ar_1stage_max_kb = int(os.environ.get("AITER_AR_1STAGE_MAX_KB", "-1"))
+    _ar_quant_max_bytes = int(os.environ.get("AITER_AR_QUANT_MAX_BYTES", "-1"))
     _ar_quant_no_prefill_max_bytes = int(
-        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", -1)
+        os.environ.get("AITER_AR_QUANT_NO_PREFILL_MAX_BYTES", "-1")
     )
 
     def __init__(
@@ -60,7 +62,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     group=self.cpu_group,
                     device=self.device,
                 )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to initialize PyNcclCommunicator for group "
                     f"{self.unique_name}. Exception: {e}"
@@ -527,7 +529,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     else:
                         out, res_out, scale_out = result
                     fused_ok = True
-            except Exception:
+            except Exception:  # noqa: BLE001,S110
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(

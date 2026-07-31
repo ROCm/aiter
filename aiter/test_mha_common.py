@@ -2,11 +2,14 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
-from .bert_padding import pad_input, unpad_input
-from einops import rearrange, repeat
+
 import torch
 import torch.nn.functional as F
+from einops import rearrange, repeat
+
 from aiter import dtypes
+
+from .bert_padding import pad_input, unpad_input
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -125,7 +128,7 @@ def attn_bias_from_alibi_slopes(
     causal=False,
     key_leftpad=None,
 ):
-    batch, nheads = slopes.shape
+    _batch, _nheads = slopes.shape
     device = slopes.device
     slopes = rearrange(slopes, "b h -> b h 1 1")
     if causal:
@@ -194,7 +197,7 @@ def generate_qkv(
         input_layout: "BSHD", "BHSD", "SBHD"
     """
     assert not (kvpacked and qkvpacked)
-    batch_size, seqlen_q, nheads, d = q.shape
+    batch_size, seqlen_q, _nheads, d = q.shape
     _, seqlen_k, nheads_k, _ = k.shape
     _, _, _, d_v = v.shape
     assert k.shape == (batch_size, seqlen_k, nheads_k, d)

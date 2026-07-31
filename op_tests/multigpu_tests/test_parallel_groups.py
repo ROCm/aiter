@@ -42,21 +42,21 @@ import torch.distributed as dist
 
 from aiter import dtypes
 from aiter.dist.communication_op import (
-    tensor_model_parallel_all_reduce,
-    expert_parallel_all_reduce,
     data_parallel_all_reduce,
+    expert_parallel_all_reduce,
+    tensor_model_parallel_all_reduce,
 )
 from aiter.dist.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
     ensure_model_parallel_initialized,
-    get_tp_group,
-    get_ep_group,
     get_dp_group,
-    get_pp_group,
+    get_ep_group,
     get_pcp_group,
+    get_pp_group,
     get_prefill_context_model_parallel_rank,
     get_prefill_context_model_parallel_world_size,
+    get_tp_group,
     init_distributed_environment,
     set_custom_all_reduce,
 )

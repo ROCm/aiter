@@ -3,9 +3,9 @@
 
 import torch
 from torch import Tensor
+
 from ..jit.core import compile_ops
 from ..utility.dtypes import get_dtype_fp8
-from typing import Optional
 
 
 @compile_ops(
@@ -133,9 +133,9 @@ def minimax_qk_norm_rope(
     rotary_dim: int,
     eps: float,
     is_neox_style: bool,
-    q_out: Optional[Tensor] = None,
-    k_out: Optional[Tensor] = None,
-    v_out: Optional[Tensor] = None,
+    q_out: Tensor | None = None,
+    k_out: Tensor | None = None,
+    v_out: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """MiniMax TP1 qkv split with full-vector q/k RMSNorm and RoPE.
 
@@ -175,11 +175,11 @@ _FUSED_QK_FALLBACK_M = 16384
 
 
 def _fused_qk_rmsnorm(
-    q_out: Optional[Tensor],
+    q_out: Tensor | None,
     q: Tensor,
     q_weight: Tensor,
     q_eps: float,
-    k_out: Optional[Tensor],
+    k_out: Tensor | None,
     k: Tensor,
     k_weight: Tensor,
     k_eps: float,
@@ -244,8 +244,8 @@ def fused_qk_norm_rope_cache_pts_quant_shuffle(
     slot_mapping: Tensor,
     per_tensor_k_scale: Tensor,
     per_tensor_v_scale: Tensor,
-    k_out: Optional[Tensor],
-    v_out: Optional[Tensor],
+    k_out: Tensor | None,
+    v_out: Tensor | None,
     return_kv: bool,
     use_shuffle_layout: bool,
     block_size: int,
@@ -306,7 +306,6 @@ def fused_qk_norm_rope_1way(
     (RoPE freqs are computed in fp32 there and the precision is consumed by the
     fp32 rope multiply). Passing bf16/fp16 cos_sin will raise inside the kernel.
     """
-    ...
 
 
 @compile_ops(
@@ -327,10 +326,10 @@ def _fused_qk_norm_rope_group_quant_kernel(
     eps: float,
     is_neox: bool,
     # q_weight: optional per-channel RMSNorm weight for Q [head_dim]. None = weightless (V4-Pro).
-    q_weight: Optional[Tensor] = None,
+    q_weight: Tensor | None = None,
     # q_scale: legacy separate Q scale (unused on the fp8 inline path; scale is written
     #   into q_nope_scale_buff at bytes [nope_dim : nope_dim+2*num_nope_groups), each tile-scale x2).
-    q_scale: Optional[Tensor] = None,
+    q_scale: Tensor | None = None,
     # quant_group_size: 1xG block-scale width for Q. Must be one of {32, 64, 128} and divide head_dim.
     # Ignored when q_nope_scale_buff is bf16.
     quant_group_size: int = 64,
@@ -338,16 +337,16 @@ def _fused_qk_norm_rope_group_quant_kernel(
     scale_dtype: str = "e8m0",
     # q_rope_buff: rotated Q-PE bf16 [num_tokens, num_heads, pe_dim]; required when Q is fp8
     #   (fp8 Q mirrors K: nope fp8 + inline dup e8m0 scale in q_nope_scale_buff, PE bf16 here). None for bf16 Q.
-    q_rope_buff: Optional[Tensor] = None,
+    q_rope_buff: Tensor | None = None,
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, pe_dim],
     # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
     # batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
-    swa_nope_scale_buff: Optional[Tensor] = None,
-    swa_rope_buff: Optional[Tensor] = None,
-    swa_block_tables: Optional[Tensor] = None,
+    swa_nope_scale_buff: Tensor | None = None,
+    swa_rope_buff: Tensor | None = None,
+    swa_block_tables: Tensor | None = None,
     swa_block_size: int = 0,
-    batch_id_per_token: Optional[Tensor] = None,
+    batch_id_per_token: Tensor | None = None,
 ) -> None: ...
 
 
@@ -363,32 +362,30 @@ def fused_qk_norm_rope_group_quant(
     # q_out_dtype controls whether Q is quantized: fp8 -> Q group-quant (q_scale produced);
     # bf16/fp16 -> Q stays unquantized. Default bf16. Ignored when an explicit `q_nope_scale_buff` is passed (dtype wins).
     q_out_dtype: torch.dtype = torch.bfloat16,
-    q_nope_scale_buff: Optional[
-        Tensor
-    ] = None,  # bf16: [.,H,512] full rotated Q; fp8: [.,H,512] Q nope+scale. dtype decides quant. Alloc if None.
-    q_rope_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_heads, rot_dim] bf16 rotated Q-PE; only for fp8 Q. Alloc if None.
-    k_nope_scale_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_kv_heads, 512] fp8 K nope+scale; allocated (zeroed) if None
-    k_rope_buff: Optional[
-        Tensor
-    ] = None,  # [num_tokens, num_kv_heads, rot_dim] bf16 rotated K-PE; allocated if None
-    q_weight: Optional[
-        Tensor
-    ] = None,  # optional per-channel Q RMSNorm weight [head_dim]
+    q_nope_scale_buff: (
+        Tensor | None
+    ) = None,  # bf16: [.,H,512] full rotated Q; fp8: [.,H,512] Q nope+scale. dtype decides quant. Alloc if None.
+    q_rope_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_heads, rot_dim] bf16 rotated Q-PE; only for fp8 Q. Alloc if None.
+    k_nope_scale_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_kv_heads, 512] fp8 K nope+scale; allocated (zeroed) if None
+    k_rope_buff: (
+        Tensor | None
+    ) = None,  # [num_tokens, num_kv_heads, rot_dim] bf16 rotated K-PE; allocated if None
+    q_weight: Tensor | None = None,  # optional per-channel Q RMSNorm weight [head_dim]
     quant_group_size: int = 64,
     scale_dtype: str = "e8m0",
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, rot_dim],
     # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
     # batch_id_per_token maps token->seq (-1 = skip).
-    swa_nope_scale_buff: Optional[Tensor] = None,
-    swa_rope_buff: Optional[Tensor] = None,
-    swa_block_tables: Optional[Tensor] = None,
-    swa_block_size: Optional[int] = None,
-    batch_id_per_token: Optional[Tensor] = None,
+    swa_nope_scale_buff: Tensor | None = None,
+    swa_rope_buff: Tensor | None = None,
+    swa_block_tables: Tensor | None = None,
+    swa_block_size: int | None = None,
+    batch_id_per_token: Tensor | None = None,
 ):
     """DeepSeek-V4 fused Q/K RMSNorm + RoPE + group-quant WITHOUT a paged KV cache.
 
@@ -549,8 +546,8 @@ def fused_qk_norm_rope_2way_fp8_perhead_quant(
     head_size: int,
     is_interleaved: bool,
     eps: float,
-    out_q01: Optional[Tensor] = None,
-    out_k01: Optional[Tensor] = None,
+    out_q01: Tensor | None = None,
+    out_k01: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Same as the pertensor variant, but with per-(batch, head) descales.
 
@@ -672,8 +669,8 @@ def fused_qk_norm_rope_1way_fp8_perhead_quant(
     head_size: int,
     is_interleaved: bool,
     eps: float,
-    out_q: Optional[Tensor] = None,
-    out_k: Optional[Tensor] = None,
+    out_q: Tensor | None = None,
+    out_k: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Z-Image single-stream fused RoPE+RMSNorm with per-(batch, head) FP8 Q/K."""
     want_bf16 = out_q is not None or out_k is not None
@@ -829,7 +826,7 @@ def fused_kv_norm_rope_group_quant(
         raise ValueError(
             f"kv must be 2D [T,D] or 3D [T,NK,D]; got rank {kv.dim()} shape={tuple(kv.shape)}"
         )
-    num_tokens, num_kv_heads, head_dim = kv_3d.shape
+    _num_tokens, _num_kv_heads, head_dim = kv_3d.shape
     rot_dim = cos_cache.shape[-1] * 2
     nope_dim = head_dim - rot_dim
     if nope_dim <= 0:

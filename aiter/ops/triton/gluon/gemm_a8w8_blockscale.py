@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import functools
 import json
 import os
+
 import torch
 import triton
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 from triton import language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.runtime.jit import constexpr_function
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
@@ -1001,7 +1002,7 @@ def _get_config(
         _get_config._config_dict["default"] = config
 
     key = f"{N}_{K}"
-    if key not in _get_config._config_dict.keys():
+    if key not in _get_config._config_dict:
         dev = arch_info.get_arch()
         fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-A8W8_BLOCKSCALE-N={N}-K={K}.json"
         if os.path.exists(fpath):
@@ -1013,7 +1014,7 @@ def _get_config(
 
     # Config keys should be named M_LEQ_<bound> or "any"
     bounds = []
-    for setting in _get_config._config_dict[key].keys():
+    for setting in _get_config._config_dict[key]:
         potential_block_m = setting.replace("M_LEQ_", "")
         if potential_block_m.isnumeric():
             bounds.append(int(potential_block_m))
@@ -1048,9 +1049,9 @@ def gemm_a8w8_blockscale(
     w: torch.Tensor,
     x_scale: torch.Tensor,
     w_scale: torch.Tensor,
-    dtype: Optional[float] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
+    dtype: float | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
 ):
     """
     Computes the 8 bit matmul Y = X x WT using the block-scale quantization approach.
@@ -1108,7 +1109,7 @@ def gemm_a8w8_blockscale(
     num_stages = max(num_stages, 2)
 
     # grid = (config["NUM_KSPLIT"], triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])

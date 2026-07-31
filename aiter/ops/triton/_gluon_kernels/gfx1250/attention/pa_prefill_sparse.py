@@ -73,6 +73,7 @@ def _pa_prefill_sparse(
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
+    HAS_INVALID: gl.constexpr,
     USE_EXP2: gl.constexpr,
     num_warps: gl.constexpr,
 ):
@@ -237,8 +238,11 @@ def _pa_prefill_sparse(
         gl.amd.gfx1250.tdm.async_load(p_slot_desc, [0, 1 * BLOCK_K], slot_bufs.index(1))
         gl.amd.gfx1250.tdm.async_wait(1)
         slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
-        cur_valid = slot_reg >= 0
-        safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+        if HAS_INVALID:
+            cur_valid = slot_reg >= 0
+            safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+        else:
+            safe_slot_cur = slot_reg
         gl.amd.gfx1250.tdm.async_gather(pkv_desc, safe_slot_cur, kv_bufs.index(0))
 
         buf_idx: gl.int32 = 0
@@ -259,8 +263,11 @@ def _pa_prefill_sparse(
                 .reshape([BLOCK_K])
                 .load(layout=slot_reg_layout)
             )
-            next_valid = slot_reg >= 0
-            safe_next_slot = gl.where(next_valid, slot_reg, 0)
+            if HAS_INVALID:
+                next_valid = slot_reg >= 0
+                safe_next_slot = gl.where(next_valid, slot_reg, 0)
+            else:
+                safe_next_slot = slot_reg
             gl.amd.gfx1250.tdm.async_gather(
                 pkv_desc, safe_next_slot, kv_bufs.index(async_idx)
             )
@@ -273,9 +280,11 @@ def _pa_prefill_sparse(
                 kv_t,
                 gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
             )
-            valid_col = gl.convert_layout(cur_valid, valid_col_mma)
-            score_bias = gl.where(valid_col, 0.0, float("-inf"))
-            scores = scores + score_bias[None, :]
+
+            if HAS_INVALID:
+                valid_col = gl.convert_layout(cur_valid, valid_col_mma)
+                score_bias = gl.where(valid_col, 0.0, float("-inf"))
+                scores = scores + score_bias[None, :]
 
             m_block = gl.max(scores, axis=1)
             m_new = gl.maximum(m_i, m_block)
@@ -294,14 +303,18 @@ def _pa_prefill_sparse(
 
             m_i = m_new
             l_i = l_new
-            cur_valid = next_valid
+            if HAS_INVALID:
+                cur_valid = next_valid
             buf_idx = async_idx
 
         # Epilogue: final prefix tile
         gl.amd.gfx1250.tdm.async_wait(0)
 
         final_in_range = ((p_iters - 1) * BLOCK_K + k_offs_slot) < p_len
-        final_valid = final_in_range & cur_valid
+        if HAS_INVALID:
+            final_valid = final_in_range & cur_valid
+        else:
+            final_valid = final_in_range
 
         kv_t = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
         scores = gl.amd.gfx1250.wmma(
@@ -360,8 +373,11 @@ def _pa_prefill_sparse(
         gl.amd.gfx1250.tdm.async_load(e_slot_desc, [0, 1 * BLOCK_K], slot_bufs.index(1))
         gl.amd.gfx1250.tdm.async_wait(1)
         slot_reg = slot_bufs.index(0).reshape([BLOCK_K]).load(layout=slot_reg_layout)
-        cur_valid = slot_reg >= 0
-        safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+        if HAS_INVALID:
+            cur_valid = slot_reg >= 0
+            safe_slot_cur = gl.where(cur_valid, slot_reg, 0)
+        else:
+            safe_slot_cur = slot_reg
         gl.amd.gfx1250.tdm.async_gather(ekv_desc, safe_slot_cur, kv_bufs.index(0))
 
         buf_idx: gl.int32 = 0
@@ -382,8 +398,11 @@ def _pa_prefill_sparse(
                 .reshape([BLOCK_K])
                 .load(layout=slot_reg_layout)
             )
-            next_valid = slot_reg >= 0
-            safe_next_slot = gl.where(next_valid, slot_reg, 0)
+            if HAS_INVALID:
+                next_valid = slot_reg >= 0
+                safe_next_slot = gl.where(next_valid, slot_reg, 0)
+            else:
+                safe_next_slot = slot_reg
             gl.amd.gfx1250.tdm.async_gather(
                 ekv_desc, safe_next_slot, kv_bufs.index(async_idx)
             )
@@ -396,9 +415,10 @@ def _pa_prefill_sparse(
                 kv_t,
                 gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=QK_WMMA_LAYOUT),
             )
-            valid_col = gl.convert_layout(cur_valid, valid_col_mma)
-            score_bias = gl.where(valid_col, 0.0, float("-inf"))
-            scores = scores + score_bias[None, :]
+            if HAS_INVALID:
+                valid_col = gl.convert_layout(cur_valid, valid_col_mma)
+                score_bias = gl.where(valid_col, 0.0, float("-inf"))
+                scores = scores + score_bias[None, :]
 
             m_block = gl.max(scores, axis=1)
             m_new = gl.maximum(m_i, m_block)
@@ -417,14 +437,18 @@ def _pa_prefill_sparse(
 
             m_i = m_new
             l_i = l_new
-            cur_valid = next_valid
+            if HAS_INVALID:
+                cur_valid = next_valid
             buf_idx = async_idx
 
         # Epilogue: final extend tile
         gl.amd.gfx1250.tdm.async_wait(0)
 
         final_in_range = ((e_iters - 1) * BLOCK_K + k_offs_slot) < e_len
-        final_valid = final_in_range & cur_valid
+        if HAS_INVALID:
+            final_valid = final_in_range & cur_valid
+        else:
+            final_valid = final_in_range
 
         kv_t = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
         scores = gl.amd.gfx1250.wmma(
