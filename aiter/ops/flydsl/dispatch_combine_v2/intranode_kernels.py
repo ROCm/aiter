@@ -112,13 +112,19 @@ def make_dispatch(
     enable_signal=True,
     replay=False,
     fp4=False,
+    push_group=False,
+    push_group_cap=0,
+    off_pg_running=0,
 ):
     # fp4 (e2m1) packs 2 values/byte -> token is hidden_dim/2 bytes; dispatch is a
     # pure byte mover (no fp4 decode).
     nbytes = hidden_dim // 2 if fp4 else hidden_dim * hidden_elem_size
     n_i32 = nbytes // 4
-    # sentinel: tok_map dropped-slot marker whose dest_pe (value // max_recv) == npes.
-    sentinel_val = npes * max_recv
+    # push-group: tokens land grouped as [num_local_experts, CAP]; the per-recv-row
+    # encoding base (tok_map / sentinel) grows from max_recv to num_local_experts*CAP.
+    row_stride = experts_per_rank * push_group_cap if push_group else max_recv
+    # sentinel: tok_map dropped-slot marker whose dest_pe (value // row_stride) == npes.
+    sentinel_val = npes * row_stride
     # Optional per-token scales forwarded verbatim to the dest peer's out_scales.
     scale_bytes = scale_dim * scale_type_size
     scale_num_i32 = (scale_bytes + 3) // 4
@@ -183,7 +189,29 @@ def make_dispatch(
                 cached = buffer_load(rsrc_tok_map, work_idx, vec_width=1, dtype=T.i32())
                 is_dup_or_overflow = cached >= sentinel_val
                 do_publish = cached < sentinel_val
-                dest_tok_id = cached - dest_pe * max_recv
+                dest_tok_id = cached - dest_pe * row_stride
+            elif const_expr(push_group):
+                # Fixed-slot landing: no per-PE dedup (a token routed to two experts
+                # on the same PE must appear in BOTH expert groups). Row =
+                # local_expert*CAP + atomic_add(pg_running[dest_pe][local_expert]).
+                local_expert = dest_expert - dest_pe * experts_per_rank
+                cur_lane0 = arith.constant(0)
+                if lane == 0:
+                    peer_run = fx.Int64(
+                        window.lsa_ptr(dest_pe, off_pg_running)
+                    ) + fx.Int64(local_expert) * fx.Int64(4)
+                    cur_lane0 = P.atomic_add_global(peer_run, fx.Int32(1))
+                cursor = readlane(T.i32(), cur_lane0, 0)
+                grouped_row = local_expert * push_group_cap + cursor
+                overflow = cursor >= push_group_cap
+                dest_tok_id = grouped_row
+                is_dup_or_overflow = overflow
+                do_publish = cursor < push_group_cap
+                tok_map_entry = arith.select(
+                    is_dup_or_overflow, sentinel_val, dest_pe * row_stride + grouped_row
+                )
+                if lane == 0:
+                    buffer_store(tok_map_entry, rsrc_tok_map, work_idx)
             else:
                 dest_tok_lane0 = arith.constant(0)
                 if lane == 0:
