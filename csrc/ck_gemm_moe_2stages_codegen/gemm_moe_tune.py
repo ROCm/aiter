@@ -652,7 +652,7 @@ class FmoeTuner(TunerCommon):
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
-            gate_mode=kparams.get("gate_mode", "interleave"),
+            gate_mode=kparams.get("gate_mode", "separated"),
             a_scale_one=a_scale_one,
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
