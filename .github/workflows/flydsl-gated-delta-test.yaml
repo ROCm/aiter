@@ -1,0 +1,142 @@
+name: FlyDSL Gated Delta Test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py'
+      - 'aiter/ops/flydsl/**'
+      - 'aiter/ops/triton/_triton_kernels/gated_delta_rule/**'
+      - 'aiter/ops/chunk_gated_delta_rule_fwd_h.py'
+      - '.github/workflows/flydsl-gated-delta-test.yaml'
+      - '.github/requirements/triton-test.txt'
+      - '.github/scripts/build_aiter_triton.sh'
+      - '.github/scripts/install_triton.sh'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py'
+      - 'aiter/ops/flydsl/**'
+      - 'aiter/ops/triton/_triton_kernels/gated_delta_rule/**'
+      - 'aiter/ops/chunk_gated_delta_rule_fwd_h.py'
+      - '.github/workflows/flydsl-gated-delta-test.yaml'
+      - '.github/requirements/triton-test.txt'
+      - '.github/scripts/build_aiter_triton.sh'
+      - '.github/scripts/install_triton.sh'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOCKER_IMAGE: "rocm/pytorch:latest"
+  TEST_FILE: "op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py"
+
+jobs:
+  check-signal:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Wait for Checks workflow
+        run: ./.github/scripts/check_signal.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+
+  flydsl_gated_delta:
+    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    name: FlyDSL Gated Delta - Correctness / ${{ matrix.label }} (1 GPU)
+    needs: [check-signal]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+          - runner: aiter-1gpu-runner
+            label: MI300X
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          submodules: 'recursive'
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: flydsl_gdn_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --network=host \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name flydsl_gdn_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup Aiter, Triton and FlyDSL
+        run: |
+          set -ex
+          docker exec -w /workspace flydsl_gdn_test ./.github/scripts/build_aiter_triton.sh
+
+      - name: Correctness tests (TestCorrectness)
+        timeout-minutes: 75
+        run: |
+          set -ex
+          docker exec -w /workspace flydsl_gdn_test mkdir -p test-reports
+          docker exec -w /workspace \
+            -e FLYDSL_RUNTIME_ENABLE_CACHE=0 \
+            flydsl_gdn_test \
+            pytest -v "${TEST_FILE}::TestCorrectness" \
+              --junitxml=test-reports/flydsl_gated_delta.xml
+
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flydsl-gated-delta-${{ matrix.label }}
+          path: test-reports/flydsl_gated_delta.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f flydsl_gdn_test || true
