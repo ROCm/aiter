@@ -68,6 +68,12 @@ _MXFP4_KEYS = ("a8w4_mxfp4", "a4w4_mxfp4")
 _FP8_KEYS = ("per_Token", "per_128x128")
 
 
+def _set_fused_combine_context(ctx):
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import set_fused_combine_context
+
+    set_fused_combine_context(ctx)
+
+
 def _import_mori_v2():
     """Import the vendored cco v2 op-layer (compiles FlyDSL on first use).
 
@@ -438,7 +444,8 @@ class DeviceMoEPipeline:
     torch.profiler. No fp32-reference logic here."""
 
     def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
-                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather"):
+                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather",
+                 fused_combine=False, fused_tile_bytes=512):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
@@ -448,6 +455,8 @@ class DeviceMoEPipeline:
         self.routings = routings
         self.ct = ct
         self.combine_mode = combine_mode
+        self.fused_combine = fused_combine
+        self.fused_tile_bytes = fused_tile_bytes
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -497,6 +506,11 @@ class DeviceMoEPipeline:
             num_experts_per_token=self.topk,
             data_type=self.transport_dtype,
             combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
+            fused_combine=self.fused_combine,
+            fused_combine_tile_bytes=self.fused_tile_bytes,
+            fused_combine_nt_per_task=int(
+                os.environ.get("AITER_EP_NT_PER_TASK", "4")
+            ),
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -529,13 +543,27 @@ class DeviceMoEPipeline:
                 ep_topk=ep_kwargs["ep_topk"],
                 ep_tis=ep_tis,
             )
+        fused_combine = self.op.cfg.use_fused_combine
+        if fused_combine:
+            # gemm2 becomes the P2P producer AND (once persistent) the reducer, so
+            # seed this layer's ready state and hand it the arena handles.
+            self.op.begin_fused_combine(ids, wts, self.ct)
+            _set_fused_combine_context(
+                self.op.fused_combine_params(self.ct)
+            )
         out = moe_forward(
             recv_x, self.w1_a, self.w2_a, self.w1_s, self.w2_s,
             recv_w, recv_idx.to(dtypes.i32), self.expert_mask, self.spec,
             num_local_tokens=total_recv_t,
             ep_kwargs=ep_kwargs,
         )
-        combine_out, _ = self.op.combine(out.to(self.transport_dtype), routing=handle)
+        if fused_combine:
+            _set_fused_combine_context(None)
+            combine_out = self.op.finish_fused_combine(self.ct)
+        else:
+            combine_out, _ = self.op.combine(
+                out.to(self.transport_dtype), routing=handle
+            )
         y = combine_out[: self.ct].to(dtypes.bf16)
         if self.sw1 is not None:
             y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
@@ -738,6 +766,8 @@ def main():
     pipe = DeviceMoEPipeline(
         dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct,
         combine_mode=args.combine,
+        fused_combine=bool(args.fused_combine),
+        fused_tile_bytes=args.fused_tile_bytes,
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -825,6 +855,10 @@ def _parse_args():
                         "can stall multi-rank graph-profile runs)")
     p.add_argument("--dispatch_commu_dtype", type=str, choices=["auto", "bf16", "fp8"],
                    default="auto", help="dispatch transport (communication) dtype")
+    p.add_argument("--fused_combine", type=int, default=0,
+                   help="tile-ready combine folded into gemm2 (scatter_fused only)")
+    p.add_argument("--fused_tile_bytes", type=int, default=512,
+                   help="recv-pool slot bytes; must equal gemm2 tile_n * 2")
     p.add_argument("--combine", type=str,
                    choices=["gather", "scatter", "scatter_fused"],
                    default=os.environ.get("COMBINE", "gather"),

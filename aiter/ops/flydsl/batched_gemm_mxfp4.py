@@ -58,7 +58,23 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_arena_handle=0,
     ep_tdm_gather=0,
     ep_world=0,
+    ep_rank=0,
     ep_rowmap=None,
+    ep_fused_combine=0,
+    ep_off_pool=0,
+    ep_off_ready=0,
+    ep_ready_stride=4,
+    ep_n_tiles=0,
+    ep_topk=0,
+    ep_max_tok=0,
+    ep_epoch=None,
+    ep_persist_workers=0,
+    ep_meta=None,
+    ep_task_state=None,
+    ep_combine_out=None,
+    ep_nt_per_task=0,
+    ep_num_tokens=0,
+    ep_hidden=0,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -95,6 +111,36 @@ def flydsl_grouped_gemm_a8w4_masked(
     # into peers' comb_inp instead of TDM-storing arg_c. ep_rowmap carries the
     # per-row (dst_packed, f32 weight) map; when off, pass a dummy tensor (unread).
     ep_rowmap_tensor = ep_rowmap if ep_rowmap is not None else out
+    ep_epoch_tensor = ep_epoch if ep_epoch is not None else out
+    if ep_fused_combine:
+        # Checked here, not in the kernel: inside the traced launcher N is a
+        # runtime value, so the tiling identity cannot be asserted there.
+        if not ep_p2p_write:
+            raise ValueError("ep_fused_combine requires ep_p2p_write")
+        want_tiles = (int(N) + int(tile_n) - 1) // int(tile_n)
+        if int(ep_n_tiles) != want_tiles:
+            raise ValueError(
+                f"ep_n_tiles={ep_n_tiles} does not match the gemm2 N tiling "
+                f"(N={N}, tile_n={tile_n} -> {want_tiles}); the recv pool slot must "
+                "be exactly one N tile"
+            )
+        if int(ep_topk) <= 0 or int(ep_max_tok) <= 0:
+            raise ValueError("ep_fused_combine needs ep_topk and ep_max_tok")
+        slot_b = int(tile_n) * 2
+        if slot_b & (slot_b - 1):
+            raise ValueError(
+                f"ep_fused_combine needs a pow2 recv slot (tile_n*2={slot_b}) so the "
+                "TDM gather can fold the peer into the row index"
+            )
+        if ep_epoch is None:
+            raise ValueError("ep_fused_combine needs the ready epoch tensor")
+        if int(ep_persist_workers) < 1:
+            raise ValueError("ep_fused_combine needs a positive persistent grid")
+        if ep_meta is None or ep_task_state is None or ep_combine_out is None:
+            raise ValueError(
+                "ep_fused_combine opportunistic reduction needs meta, task state, "
+                "and combine output tensors"
+            )
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -129,7 +175,24 @@ def flydsl_grouped_gemm_a8w4_masked(
         ep_arena_handle=int(ep_arena_handle),
         ep_tdm_gather=int(ep_tdm_gather),
         ep_world=int(ep_world),
+        ep_rank=int(ep_rank),
         arg_ep_rowmap=ep_rowmap_tensor,
+        ep_fused_combine=int(ep_fused_combine),
+        ep_off_pool=int(ep_off_pool),
+        ep_off_ready=int(ep_off_ready),
+        ep_ready_stride=int(ep_ready_stride),
+        ep_n_tiles=int(ep_n_tiles),
+        ep_topk=int(ep_topk),
+        ep_max_tok=int(ep_max_tok),
+        ep_persist_workers=int(ep_persist_workers),
+        ep_nt_per_task=int(ep_nt_per_task),
+        ep_num_tokens=int(ep_num_tokens),
+        ep_hidden=int(ep_hidden),
+        ep_meta_addr=(ep_meta.data_ptr() if ep_meta is not None else 0),
+        ep_combine_out_addr=(
+            ep_combine_out.data_ptr() if ep_combine_out is not None else 0
+        ),
+        arg_ep_epoch=ep_epoch_tensor,
     )
     return out
 

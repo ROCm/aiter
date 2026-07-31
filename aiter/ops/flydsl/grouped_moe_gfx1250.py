@@ -409,6 +409,43 @@ def _tdm_align_up(x: int, a: int) -> int:
     return ((int(x) + a - 1) // a) * a
 
 
+# fused_moe is a torch custom_op with a frozen schema, so the tile-ready combine
+# handles (arena offsets + the epoch tensor) ride a process-local context instead
+# of new op arguments. Set once per layer, right before the fused_moe call.
+_FUSED_COMBINE_CTX = None
+
+
+def _fused_persist_workers():
+    """Persistent gemm2 grid for the tile-ready scatter.
+
+    One resident block per CU: announcing arrivals costs a system release per
+    block per tile, so the block count -- not the tile count -- sets the publish
+    overhead."""
+    from aiter.jit.utils.chip_info import get_cu_num
+
+    cu = int(get_cu_num())
+    env = os.environ.get("AITER_EP_PERSIST_WORKERS")
+    if env:
+        requested = int(env)
+        if requested > cu:
+            raise ValueError(
+                f"complete fused combine requires every persistent worker resident; "
+                f"requested {requested} > {cu} CUs"
+            )
+        return requested
+    # One high-resource GEMM2 block per CU. Keeping the grid resident is a
+    # correctness requirement: workers block on arrivals produced by peers in the
+    # same kernel, so an unscheduled producer would deadlock the grid.
+    return max(1, cu)
+
+
+def set_fused_combine_context(ctx):
+    """Install (or clear with None) the tile-ready combine handles for the next
+    gemm2. ``ctx`` is the dict returned by EpDispatchCombineOp.fused_combine_params."""
+    global _FUSED_COMBINE_CTX
+    _FUSED_COMBINE_CTX = ctx
+
+
 def _grouped_a8w4_tdm_moe(
     hidden_states, w1, w2, topk_weight, topk_ids, *,
     E, model_dim, inter_dim, dtype, activation,
@@ -420,6 +457,10 @@ def _grouped_a8w4_tdm_moe(
     expert_mask=None, num_local_tokens=None,
     ep_scatter=False, ep_arena_handle=0, ep_comb_inp_off=0, ep_wire_nbytes=0,
     ep_rank=0, ep_max_tok=0, ep_topk=0, ep_tis=None,
+    ep_fused_combine=False, ep_off_pool=0, ep_off_ready=0, ep_ready_stride=4,
+    ep_n_tiles=0,
+    ep_epoch=None, ep_meta=None, ep_task_state=None, ep_combine_out=None,
+    ep_nt_per_task=0, ep_num_tokens=0,
 ):
     import functools
     import torch
@@ -530,8 +571,28 @@ def _grouped_a8w4_tdm_moe(
             # The felix TDM GEMM2 fused epilogue always scatters via TDM
             # gather-store (buffer_store path removed). comb_inp is pow2-padded to
             # match (see DispatchCombineConfig.tdm_gather_scatter).
-            ep_tdm_gather=1,
+            ep_tdm_gather=0 if ep_fused_combine else 1,
+            ep_rank=int(ep_rank),
             ep_rowmap=ep_rowmap,
+            # Tile-ready combine: gemm2 scatters just its own N tile per (token, k)
+            # with plain P2P vector stores and bumps the origin token's arrival
+            # counter, so the reduction can start before this rank's gemm2 has
+            # finished.
+            ep_fused_combine=1 if ep_fused_combine else 0,
+            ep_off_pool=int(ep_off_pool),
+            ep_off_ready=int(ep_off_ready),
+            ep_ready_stride=int(ep_ready_stride),
+            ep_n_tiles=int(ep_n_tiles),
+            ep_topk=int(ep_topk),
+            ep_max_tok=int(ep_max_tok),
+            ep_epoch=ep_epoch,
+            ep_persist_workers=_fused_persist_workers(),
+            ep_meta=ep_meta,
+            ep_task_state=ep_task_state,
+            ep_combine_out=ep_combine_out,
+            ep_nt_per_task=int(ep_nt_per_task),
+            ep_num_tokens=int(ep_num_tokens),
+            ep_hidden=int(model_dim),
         )
         if ep_scatter
         else {}
@@ -705,7 +766,32 @@ def _maybe_grouped_gfx1250_a8w4_moe(
     ep_max_tok: int = 0,
     ep_topk: int = 0,
     ep_tis: Optional[torch.Tensor] = None,
+    ep_fused_combine: bool = False,
+    ep_off_pool: int = 0,
+    ep_off_ready: int = 0,
+    ep_ready_stride: int = 4,
+    ep_n_tiles: int = 0,
+    ep_epoch: Optional[torch.Tensor] = None,
+    ep_meta: Optional[torch.Tensor] = None,
+    ep_task_state: Optional[torch.Tensor] = None,
+    ep_combine_out: Optional[torch.Tensor] = None,
+    ep_nt_per_task: int = 0,
+    ep_num_tokens: int = 0,
 ):
+    if ep_scatter and not ep_fused_combine and _FUSED_COMBINE_CTX is not None:
+        _c = _FUSED_COMBINE_CTX
+        ep_fused_combine = True
+        ep_off_pool = _c["ep_off_pool"]
+        ep_off_ready = _c["ep_off_ready"]
+        ep_ready_stride = _c["ep_ready_stride"]
+        ep_n_tiles = _c["ep_n_tiles"]
+        ep_epoch = _c["ep_epoch"]
+        ep_meta = _c["ep_combine_meta"]
+        ep_task_state = _c["ep_task_state"]
+        ep_combine_out = _c["ep_combine_out"]
+        ep_nt_per_task = _c["ep_nt_per_task"]
+        ep_num_tokens = _c["ep_num_tokens"]
+
     def _grouped_dbg(msg: str, stacklevel: int = 1):
         if os.environ.get("AITER_GROUPED_DEBUG", "0") not in (
             "",
@@ -1027,6 +1113,17 @@ def _maybe_grouped_gfx1250_a8w4_moe(
             ep_max_tok=ep_max_tok,
             ep_topk=ep_topk,
             ep_tis=ep_tis,
+            ep_fused_combine=ep_fused_combine,
+            ep_off_pool=ep_off_pool,
+            ep_off_ready=ep_off_ready,
+            ep_ready_stride=ep_ready_stride,
+            ep_n_tiles=ep_n_tiles,
+            ep_epoch=ep_epoch,
+            ep_meta=ep_meta,
+            ep_task_state=ep_task_state,
+            ep_combine_out=ep_combine_out,
+            ep_nt_per_task=ep_nt_per_task,
+            ep_num_tokens=ep_num_tokens,
             **_tdm_kw,
         )
 

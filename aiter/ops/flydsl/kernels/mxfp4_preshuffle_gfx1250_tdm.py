@@ -92,14 +92,62 @@ def launch_gemm_a8w4_tdm(
     ep_arena_handle: Constexpr[int] = 0,
     ep_tdm_gather: Constexpr[int] = 0,
     ep_world: Constexpr[int] = 0,
+    ep_rank: Constexpr[int] = 0,
     arg_ep_rowmap: fx.Tensor = None,
+    # Tile-ready fused combine: instead of one whole hidden row per (token, k),
+    # this block P2P-writes just ITS N-tile into the origin's recv pool slot
+    # ``pool[group][n_tile]`` with plain 16 B vector stores, then bumps that
+    # token's arrival counter ``ready[origin_token]`` by one. Each pool slot has
+    # exactly one producer, so the payload needs no atomics and no pre-zeroing;
+    # only the counter is atomic, and the route weight is left for the consumer
+    # (which owns the f32 weight already). A token is complete at
+    # ``epoch * topk * n_tiles``, so the consumer's probe is one uniform load.
+    ep_fused_combine: Constexpr[int] = 0,
+    ep_off_pool: Constexpr[int] = 0,
+    ep_off_ready: Constexpr[int] = 0,
+    ep_ready_stride: Constexpr[int] = 4,
+    ep_n_tiles: Constexpr[int] = 0,
+    ep_topk: Constexpr[int] = 0,
+    ep_max_tok: Constexpr[int] = 0,
+    ep_persist_workers: Constexpr[int] = 0,
+    ep_nt_per_task: Constexpr[int] = 0,
+    ep_num_tokens: Constexpr[int] = 0,
+    ep_hidden: Constexpr[int] = 0,
+    arg_ep_epoch: fx.Tensor = None,
+    ep_meta_addr: fx.Int64 = 0,
+    ep_combine_out_addr: fx.Int64 = 0,
 ):
+    _tdm_system_env = os.environ.get("AITER_EP_TDM_SYSTEM_COHERENT")
+    EP_TDM_SYSTEM_COHERENT = (
+        int(_tdm_system_env)
+        if _tdm_system_env is not None
+        else int(ep_num_tokens <= 128)
+    )
+    # Timing-only switches for decomposing the fused gemm2 cost. They drop the
+    # arrival announcements / the in-kernel reduction, so the combine output is
+    # garbage under either -- benchmark with --acc_verify 0 only.
+    EP_DBG_NO_PUBLISH = int(os.environ.get("AITER_EP_FUSED_NO_PUBLISH", "0"))
+    EP_DBG_NO_CONSUME = int(os.environ.get("AITER_EP_FUSED_NO_CONSUME", "0"))
+    # Consume ready tokens between GEMM tiles instead of only draining at the
+    # end. Off by default: the in-loop probe needs a system-scope acquire per
+    # tile, and that invalidates the very A/B lines the GEMM just staged --
+    # measured at +1475us on gemm2 (2505 vs 1031) for bs128/61-layer shapes,
+    # far more than the overlap it buys back. Correctness does not depend on it.
+    EP_FUSED_PROBE = int(os.environ.get("AITER_EP_FUSED_PROBE", "0"))
+    # flydsl_prims reads this at import time into a module global, which the jit
+    # cache key does not see; fold it in here so each setting gets its own entry
+    # instead of silently reusing another setting's binary.
+    EP_SPIN_SLEEP = int(os.environ.get("AITER_EP_SPIN_SLEEP", "1"))
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
         a_is_fp4, n_experts, stage1_act, has_bias, TDM_DESCRIPTOR_VERSION,
         stage1_quant_out, quant_wmma_rep,
         ep_p2p_write, ep_off_comb_inp, ep_wire_nbytes, ep_slot_stride,
-        ep_arena_handle, ep_tdm_gather, ep_world,
+        ep_arena_handle, ep_tdm_gather, ep_world, ep_rank,
+        ep_fused_combine, ep_off_pool, ep_off_ready, ep_ready_stride, ep_n_tiles,
+        ep_topk, ep_max_tok, ep_persist_workers, ep_nt_per_task, ep_num_tokens,
+        ep_hidden, EP_TDM_SYSTEM_COHERENT,
+        EP_DBG_NO_PUBLISH, EP_DBG_NO_CONSUME, EP_SPIN_SLEEP, EP_FUSED_PROBE,
     )
     _ = cache_tag
     if ep_p2p_write:
@@ -154,7 +202,9 @@ def launch_gemm_a8w4_tdm(
     if C_LDS_ROW_BYTES % 32 == 0:
         C_LDS_ROW_BYTES += 16
     C_LDS_PAD_ELEMS = (
-        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2 if ep_tdm_gather else 0
+        (C_LDS_ROW_BYTES - C_ROW_BYTES) // 2
+        if (ep_tdm_gather or ep_fused_combine)
+        else 0
     )
     C_STORE_B = (
         (tile_m * (tile_n + C_LDS_PAD_ELEMS) * 2 + 127) // 128
@@ -190,6 +240,9 @@ def launch_gemm_a8w4_tdm(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Tensor,
         arg_ep_rowmap: fx.Tensor,
+        arg_ep_epoch_k: fx.Tensor,
+        ep_meta_addr_k: fx.Int64,
+        ep_combine_out_addr_k: fx.Int64,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -209,6 +262,191 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
+
+        if const_expr(ep_fused_combine):
+            import mori.cco.device.flydsl as _cco
+            from aiter.ops.flydsl.dispatch_combine_v2 import flydsl_prims as _P
+
+            # Uniform scalar, loaded at kernel scope: buffer descriptors built
+            # inside the dynamic `expert < n_experts` region cannot reference a
+            # kernel argument tensor.
+            ep_epoch = buffer_ops.buffer_load(
+                buffer_ops.create_buffer_resource(arg_ep_epoch_k, max_size=True),
+                arith.constant(0, type=T.i32),
+                vec_width=1,
+                dtype=T.i32,
+            )
+            ep_pub_win = _cco.Window(fx.Int64(ep_arena_handle))
+            ep_rowmap_pub_rsrc = buffer_ops.create_buffer_resource(
+                arg_ep_rowmap, max_size=True
+            )
+            ep_meta_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                ep_meta_addr_k
+            )
+            ep_out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                ep_combine_out_addr_k
+            )
+            ep_pool_local = fx.Int64(
+                ep_pub_win.lsa_ptr(fx.Int32(ep_rank), ep_off_pool)
+            )
+            ep_ready_local = fx.Int64(
+                ep_pub_win.lsa_ptr(fx.Int32(ep_rank), ep_off_ready)
+            )
+
+            _ep_tasks_per_tok = (
+                ep_n_tiles + ep_nt_per_task - 1
+            ) // ep_nt_per_task
+            # A token collects one arrival per (route, N-tile) each layer, and
+            # routes nobody will send were credited by the init kernel. So the
+            # target is the same compile-time constant for every token, and the
+            # counters never need clearing between layers.
+            _ep_ready_target = ep_epoch * (ep_topk * ep_n_tiles)
+
+            def _ep_token_ready_addr(task_i32):
+                """Arrival-counter address of the token owning ``task_i32``.
+
+                Uniform across the wave, so both the probe and the drain spin on
+                a single address instead of gathering one flag per lane."""
+                return ep_ready_local + fx.Int64(
+                    task_i32 // _ep_tasks_per_tok
+                ) * fx.Int64(ep_ready_stride)
+
+            def _ep_reduce_task(task_i32):
+                """Weighted top-k sum of one (token, N-tile batch) task straight
+                out of the local recv pool into combine_out. The caller owns the
+                readiness wait and the acquire."""
+                _t = task_i32 // _ep_tasks_per_tok
+                _t0 = (task_i32 - _t * _ep_tasks_per_tok) * ep_nt_per_task
+                _groups = []
+                _weights = []
+                for _ck in range_constexpr(ep_topk):
+                    _groups.append(
+                        buffer_ops.buffer_load(
+                            ep_meta_rsrc,
+                            (_t * ep_topk + _ck) * 2,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    _weights.append(
+                        arith.bitcast(
+                            T.f32,
+                            buffer_ops.buffer_load(
+                                ep_meta_rsrc,
+                                (_t * ep_topk + _ck) * 2 + 1,
+                                vec_width=1,
+                                dtype=T.i32,
+                            ),
+                        )
+                    )
+
+                _v1i = T.vec(1, T.i32)
+                _v2bf = T.vec(2, T.bf16)
+                _v2f = T.vec(2, T.f32)
+                _tile_i32 = tile_n // 2
+                _hidden_i32 = ep_hidden // 2
+                for _sub in range_constexpr(ep_nt_per_task):
+                    _cj = _t0 + _sub
+                    if _cj < ep_n_tiles:
+                        _valid_i32 = arith.select(
+                            (_cj + 1) * _tile_i32 <= _hidden_i32,
+                            arith.constant(_tile_i32, type=T.i32),
+                            arith.constant(_hidden_i32, type=T.i32)
+                            - _cj * _tile_i32,
+                        )
+                        for _u_base in range_constexpr(0, _tile_i32, WAVE * 4):
+                            _u = lane * 4 + _u_base
+                            if _u < _valid_i32:
+                                _acc = [
+                                    arith.constant_vector(0.0, _v2f)
+                                    for _ in range_constexpr(4)
+                                ]
+                                for _ck in range_constexpr(ep_topk):
+                                    _src = ep_pool_local + fx.Int64(
+                                        (_groups[_ck] * ep_n_tiles + _cj)
+                                        * tile_n
+                                        * 2
+                                    )
+                                    _vv = _P.load_v4i32_nt(_src, _u)
+                                    _wv = vector.from_elements(
+                                        _v2f, [_weights[_ck], _weights[_ck]]
+                                    )
+                                    for _ce in range_constexpr(4):
+                                        _xi = vector.extract(
+                                            _vv, static_position=[_ce]
+                                        )
+                                        _xp = vector.bitcast(
+                                            _v2bf,
+                                            vector.from_elements(_v1i, [_xi]),
+                                        ).extf(_v2f)
+                                        _acc[_ce] = _acc[_ce] + _xp * _wv
+                                _packed = []
+                                for _ce in range_constexpr(4):
+                                    _packed.append(
+                                        vector.extract(
+                                            vector.bitcast(
+                                                _v1i,
+                                                _acc[_ce].truncf(_v2bf),
+                                            ),
+                                            static_position=[0],
+                                        )
+                                    )
+                                buffer_ops.buffer_store(
+                                    vector.from_elements(
+                                        T.vec(4, T.i32), _packed
+                                    ),
+                                    ep_out_rsrc,
+                                    _t * _hidden_i32 + _cj * _tile_i32 + _u,
+                                )
+
+            # Persistent grid. Announcing arrivals costs one system release
+            # (an L2 writeback) per block, which is the dominant cost of the
+            # tile-ready scatter, so the grid is collapsed to a fixed worker pool
+            # and each worker walks a strided slice of the (M, N) tile stream. The
+            # per-worker trip count is exact, so no worker runs an out-of-range
+            # tile and no tile is computed twice.
+            # The loop region is opened by hand rather than with a Python `for` so
+            # the tile body below keeps its original nesting.
+            _pw_idx = arith.index(ep_persist_workers)
+            _wid = arith.index_cast(T.index, bid_x)
+            _persist_total_m_tiles = (i32_m + (tile_m - 1)) // tile_m
+            _persist_total_n_tiles = (i32_n + (tile_n - 1)) // tile_n
+            _tasks = arith.index_cast(
+                T.index,
+                _persist_total_m_tiles * _persist_total_n_tiles,
+            )
+            _persist_rem = _tasks - _wid
+            _niter = arith.select(
+                arith.cmpi(
+                    arith.CmpIPredicate.sgt,
+                    _persist_rem,
+                    arith.index(0),
+                ),
+                (_persist_rem + _pw_idx - arith.index(1)) // _pw_idx,
+                arith.index(0),
+            )
+            # Combine tasks are assigned to waves statically (wave w of worker b
+            # owns b*num_waves + w, strided by workers*num_waves). The same wave
+            # runs a task whether it picks it up between GEMM tiles or in the
+            # drain, so the two consumers cannot double-write a token and no
+            # claim atomic is needed. The cursor rides the persistent loop as an
+            # iter_arg: whatever the interleaved consumer did not get to is
+            # exactly what the drain starts from.
+            _ep_task0 = _wid * arith.index(num_waves) + arith.index_cast(
+                T.index, wave
+            )
+            _ep_task_stride = _pw_idx * arith.index(num_waves)
+            _ep_task_end = arith.index(ep_num_tokens * _ep_tasks_per_tok)
+            _persist_for = scf.ForOp(
+                arith.index(0), _niter, arith.index(1), iter_args=[_ep_task0]
+            )
+            _persist_ip = ir.InsertionPoint(_persist_for.body)
+            _persist_ip.__enter__()
+            _ep_cursor = _AV(_persist_for.inner_iter_args[0])
+            bid_x = arith.index_cast(
+                T.i32,
+                _wid + _persist_for.induction_variable * _pw_idx,
+            )
 
         # DeepGEMM contiguous-M swizzle
         TILES_PER_GROUP = 16
@@ -263,7 +501,6 @@ def launch_gemm_a8w4_tdm(
         if const_expr(ep_p2p_write):
             _rowmap_lds_ptr = _smem.allocate(tile_m * 8)._ptr
             rowmap_lds_idx = ptr_to_idx(_rowmap_lds_ptr)
-
         def buf_ptr(s):
             return base_ptr + s * PITCH
 
@@ -657,7 +894,6 @@ def launch_gemm_a8w4_tdm(
                 import mori.cco.device.flydsl as _cco
 
                 ep_win = _cco.Window(fx.Int64(ep_arena_handle))
-
             # -- Activate + stage to LDS --
             if const_expr(stage1_quant_out and stage1_act):
                 # Fused silu/swiglu -> fp8 quant; stage fp8 payload to LDS, scatter scale to global.
@@ -729,13 +965,15 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(has_bias):
                     bias_ptr_type = fx.PointerType.get(elem_ty=out_elem, address_space=fx.AddressSpace.Global, alignment=2)
                     bias_map = fx.recast_iter(bias_ptr_type, arg_bias)
-                if const_expr(ep_p2p_write):
+                if const_expr(ep_p2p_write and not ep_fused_combine):
                     # Route weight per output row (ep_rowmap[grouped_row].col1, f32,
                     # byte 4 of the prologue-prefetched 8-byte [dst|weight] slot).
                     # The address depends on wm alone, but the C-tile store below
                     # also writes LDS and _raw_lds_ptr builds its pointer through
                     # inttoptr, so alias analysis cannot prove the two disjoint and
                     # would re-read this for every wn subtile.
+                    # The tile-ready combine keeps the raw tile instead and lets the
+                    # origin apply its own weight, so it needs none of this.
                     _wf_rows = [
                         _AV(
                             lds_load_b32_raw(
@@ -755,7 +993,7 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements([fused_silu_swiglu_elem(acc[2 * p], acc[2 * p + 1], swiglu=is_swiglu, limit_f32=f32_swiglu_limit, neg_limit_f32=neg_limit) for p in range_constexpr(4)], fx.Float32).to(oc)
                             lds_store_b64_raw(stC_idx, (row_rel * STORE_N + col_rel // 2) * 2, hv.bitcast(fx.Int32).ir_value())
                         else:
-                            if const_expr(ep_p2p_write):
+                            if const_expr(ep_p2p_write and not ep_fused_combine):
                                 # Weight the row BEFORE truncating to bf16; the
                                 # combine kernel does an unweighted sum.
                                 _wf = _wf_rows[wm]
@@ -769,7 +1007,92 @@ def launch_gemm_a8w4_tdm(
 
             # -- Shared LDS -> global --
             workgroup_barrier()
-            if const_expr(ep_tdm_gather):
+            if const_expr(ep_fused_combine):
+                # Tile-ready scatter: this block owns N-tile ``n_tile`` of every row
+                # in the M tile, and each (row, n_tile) lands in exactly one origin
+                # slot, so the payload needs no atomics and no pre-zeroing. Rows are
+                # handed out per wave; a wave stores all of its rows, takes ONE
+                # system release, then publishes those rows' epochs -- per-store
+                # fences would serialise the whole scatter.
+                _elem_b = 2
+                _tile_b = tile_n * _elem_b
+                _wp_log2 = int(math.log2(_tile_b))
+                _GRP = 8
+                _ngrp = (tile_m + _GRP - 1) // _GRP
+                # cco flat symmetric VA: peer_va = winBase + pe*perRankSize + off.
+                # A pool slot is exactly one N tile and pow2-sized, so perRankSize
+                # divides by it and (pe, slot) folds into ONE gather row index.
+                _pr = fx.Int64(ep_win.lsa_ptr(fx.Int32(1), 0)) - fx.Int64(
+                    ep_win.lsa_ptr(fx.Int32(0), 0)
+                )
+                _K = _AV(_pr.shrui(fx.Int64(_wp_log2)).ir_value()).trunci(T.i32)
+                _oob = _K * (ep_world if ep_world else 256)
+                _base0 = fx.Int64(ep_win.lsa_ptr(fx.Int32(0), ep_off_pool))
+                _n_tile = arith.index_cast(
+                    T.i32, arith.index_cast(T.index, blk_n) // arith.index(tile_n)
+                )
+
+                def _row_slot_at(r_i32, j_i32):
+                    """(produced, peer, pool slot) of row r's N-tile j."""
+                    _dst = _AV(
+                        lds_load_b32_raw(
+                            rowmap_lds_idx,
+                            arith.index_cast(T.index, r_i32 * arith.constant(8)),
+                        )
+                    )
+                    _ok = arith.andi(
+                        arith.cmpi(arith.CmpIPredicate.slt, r_i32, mn_oob),
+                        arith.cmpi(
+                            arith.CmpIPredicate.sge, _dst, arith.constant(0, type=T.i32)
+                        ),
+                    )
+                    _safe = arith.select(_ok, _dst, arith.constant(0, type=T.i32))
+                    _pe = _safe // ep_slot_stride
+                    _slot_rem = _safe % ep_slot_stride
+                    _lid = _slot_rem // ep_topk
+                    _k = _slot_rem % ep_topk
+                    _slot = (_k * ep_max_tok + _lid) * ep_n_tiles + j_i32
+                    return _ok, _pe, _slot
+
+                def _row_slot(r_i32):
+                    return _row_slot_at(r_i32, _n_tile)
+
+                for g in range_constexpr(_ngrp):
+                    base_row = g * _GRP
+                    if wave == g % num_waves:
+                        row_indices = []
+                        for i in range_constexpr(_GRP):
+                            r = base_row + i
+                            if const_expr(r < tile_m):
+                                _ok, _pe, _slot = _row_slot(
+                                    arith.constant(r, type=T.i32)
+                                )
+                                row_indices.append(
+                                    arith.select(_ok, _pe * _K + _slot, _oob)
+                                )
+                            else:
+                                row_indices.append(_oob)
+                        desc = make_tensor_gather_descriptor(
+                            global_addr_i64=_base0,
+                            lds_base_idx=stC_idx,
+                            row_indices=row_indices,
+                            row_width=LDS_STORE_N,
+                            tensor_dim0=tile_n,
+                            tensor_dim1=_oob,
+                            stride=tile_n,
+                            elem_bytes=_elem_b,
+                            index_size=32,
+                            lds_byte_offset=base_row * LDS_STORE_N * _elem_b,
+                        )
+                        tensor_store_gather(
+                            desc,
+                            cache_policy=(
+                                24 if EP_TDM_SYSTEM_COHERENT else 0
+                            ),
+                        )
+                tdm_ops.tensor_wait(0)
+                # Ready flags are published after a system release at worker end.
+            elif const_expr(ep_tdm_gather):
                 # EP gemm2-fused scatter via TDM gather-store. cco flat symmetric
                 # VA: peer_va = winBase + pe*perRankSize + off. The comb_inp slot is
                 # padded to a pow2 (ep_wire_nbytes) so perRankSize/wire divides
@@ -857,14 +1180,134 @@ def launch_gemm_a8w4_tdm(
                 fx.copy(atomC, lds_view(fx.recast_iter(oc_store, base_ptr), (tile_m, STORE_N), (STORE_N, 1)), gtC)
                 tdm_ops.tensor_wait(0)
 
+        if const_expr(ep_fused_combine):
+            # LDS is reused across tiles, so the next iteration must not start
+            # staging A/B while this tile's epilogue is still reading the C tile.
+            workgroup_barrier()
+
+            # Announce this tile's arrivals before taking the next one. Each row
+            # this tile scattered bumps its ORIGIN TOKEN's counter by one, so a
+            # token becomes consumable the moment its last contribution lands --
+            # while the rest of the GEMM is still running. Without publishing
+            # here the consumer below would have nothing to overlap with. The
+            # release is amortised over the whole tile rather than taken per row.
+            if const_expr(not EP_DBG_NO_PUBLISH):
+                if const_expr(not EP_TDM_SYSTEM_COHERENT):
+                    if wave == 0:
+                        _P.fence_system_release()
+                    workgroup_barrier()
+                for _row_base in range_constexpr(0, tile_m, block):
+                    _pub_row = arith.index_cast(T.i32, tid) + arith.constant(
+                        _row_base, type=T.i32
+                    )
+                    # Mirror the scatter's own row guard exactly: rows at or past
+                    # mn_oob were skipped by the gather-store, so counting them
+                    # here would let the consumer read a slot never written.
+                    if arith.andi(_pub_row < tile_m, _pub_row < mn_oob):
+                        _pub_dst = buffer_ops.buffer_load(
+                            ep_rowmap_pub_rsrc,
+                            (blk_m + _pub_row) * 2,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                        if _pub_dst >= arith.constant(0, type=T.i32):
+                            _pub_pe = _pub_dst // ep_slot_stride
+                            _pub_rem = _pub_dst % ep_slot_stride
+                            _pub_lid = _pub_rem // ep_topk
+                            _P.atomic_add_global(
+                                fx.Int64(
+                                    ep_pub_win.lsa_ptr(_pub_pe, ep_off_ready)
+                                )
+                                + fx.Int64(_pub_lid) * fx.Int64(ep_ready_stride),
+                                arith.constant(1, type=T.i32),
+                            )
+
+            if const_expr(EP_DBG_NO_CONSUME or not EP_FUSED_PROBE):
+                scf.YieldOp([_ep_cursor])
+            else:
+                # Interleaved consume: probe this wave's next task once per GEMM
+                # tile and reduce it only if the token is already complete. One
+                # uniform load against a constant target -- no flag gather, no
+                # ballot, and it never spins, so a consumer can never hold up a
+                # producer tile. Anything unready falls through to the drain.
+                _probe_have = arith.cmpi(
+                    arith.CmpIPredicate.slt, _ep_cursor, _ep_task_end
+                )
+                _probe_task = arith.index_cast(
+                    T.i32, arith.select(_probe_have, _ep_cursor, arith.index(0))
+                )
+                _probe_go = arith.andi(
+                    _probe_have,
+                    arith.cmpi(
+                        arith.CmpIPredicate.sge,
+                        _P.load_i32_acquire(_ep_token_ready_addr(_probe_task)),
+                        _ep_ready_target,
+                    ),
+                )
+                if _probe_go:
+                    _P.fence_system_acquire()
+                    _ep_reduce_task(_probe_task)
+                scf.YieldOp(
+                    [
+                        arith.select(
+                            _probe_go, _ep_cursor + _ep_task_stride, _ep_cursor
+                        )
+                    ]
+                )
+            _persist_ip.__exit__(None, None, None)
+
+            if const_expr(not EP_DBG_NO_CONSUME):
+                # Drain whatever the interleaved consumer did not get to. This
+                # one blocks, so it may only run once every local tile has been
+                # published -- which the loop above guarantees. The persistent
+                # grid is capped to resident blocks, so a wave waiting here
+                # cannot keep an unscheduled local producer off the GPU.
+                _claim_for = scf.ForOp(
+                    _AV(_persist_for.results[0]), _ep_task_end, _ep_task_stride
+                )
+                _claim_ip = ir.InsertionPoint(_claim_for.body)
+                _claim_ip.__enter__()
+                _task = arith.index_cast(T.i32, _claim_for.induction_variable)
+                _P.spin_until_ge_i32(
+                    _ep_token_ready_addr(_task), _ep_ready_target
+                )
+                _P.fence_system_acquire()
+                _ep_reduce_task(_task)
+                scf.YieldOp([])
+                _claim_ip.__exit__(None, None, None)
+
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
     # arg_ep_rowmap is only read under ep_p2p_write; keep a valid tensor for the
     # ABI when the caller left it unset (batched / non-EP paths).
     if arg_ep_rowmap is None:
         arg_ep_rowmap = arg_c
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, arg_ep_rowmap, i32_m, N, f32_swiglu_limit).launch(
-        grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
+    if arg_ep_epoch is None:
+        arg_ep_epoch = arg_c
+    kernel(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_m_tile_map,
+        arg_bias,
+        arg_quant_scale,
+        arg_ep_rowmap,
+        arg_ep_epoch,
+        ep_meta_addr,
+        ep_combine_out_addr,
+        i32_m,
+        N,
+        f32_swiglu_limit,
+    ).launch(
+        grid=(
+            (ep_persist_workers, 1, 1)
+            if ep_fused_combine
+            else (m_tiles * n_tiles, 1, 1)
+        ),
+        block=(block, 1, 1),
+        stream=stream,
     )
 
 

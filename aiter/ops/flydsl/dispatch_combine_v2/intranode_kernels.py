@@ -1549,6 +1549,393 @@ def make_combine_fused_reduce(
     return run
 
 
+# ── gemm2-fused tile-ready combine (scatter_fused + fused_combine) ────────
+
+
+def make_fused_combine_init(
+    *,
+    npes,
+    experts_per_rank,
+    experts_per_token,
+    max_tok_per_rank,
+    max_recv,
+    n_tiles,
+    ready_stride,
+    block_num,
+    warp_num_per_block,
+):
+    """Per-layer origin-side seeding for the tile-ready combine.
+
+    Bumps the monotonic ready epoch, clears the combine task claim states, and
+    resolves for every (token, k) whether some peer's gemm2 will actually produce
+    that contribution. A route is produced iff its token reached the expert's rank
+    (its dedup-group leader escaped the tok_map sentinel) and its bf16 route weight
+    is non-zero -- exactly the predicate the peer's ep_rowmap builder applies.
+
+    combine_meta[t*topk+k] = (recv group index, f32 route weight bits). Dropped
+    routes get the shared all-zero group, so the consumer stays branch-free and
+    still sums a hard zero.
+
+    A dropped route also never bumps the token's arrival counter, so this credits
+    it here with the ``n_tiles`` arrivals it will never receive. That keeps the
+    consumer's target at the compile-time constant ``epoch * topk * n_tiles`` for
+    every token, however many routes survived.
+    """
+    topk = experts_per_token
+    sentinel_val = npes * max_recv
+    zero_group = topk * max_tok_per_rank
+    threads = warp_num_per_block * WAVE
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def ep_fused_combine_init(
+        addr_tok_map: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_meta: Int64,
+        addr_state: Int64,
+        addr_epoch: Int64,
+        addr_ready: Int64,
+        cur_rank_num_token: Int32,
+        n_tasks: Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        gtid = bid * threads + tid
+        gnum = block_num * threads
+
+        rsrc_map = create_buffer_resource_from_addr(addr_tok_map)
+        rsrc_idx = create_buffer_resource_from_addr(addr_inp_idx)
+        rsrc_wts = create_buffer_resource_from_addr(addr_inp_wts)
+        rsrc_meta = create_buffer_resource_from_addr(addr_meta)
+        rsrc_state = create_buffer_resource_from_addr(addr_state)
+
+        if gtid == 0:
+            P.atomic_add_global(fx.Int64(addr_epoch), arith.constant(1))
+
+        for task in range(gtid, n_tasks, gnum):
+            buffer_store(arith.constant(0), rsrc_state, task)
+
+        work = cur_rank_num_token * topk
+        for route in range(gtid, work, gnum):
+            t = route // topk
+            k = route - t * topk
+            base = t * topk
+            expert_k = buffer_load(rsrc_idx, route, vec_width=1, dtype=T.i32())
+            pe_k = expert_k // experts_per_rank
+            # Walk k' downwards so the surviving override is the LOWEST slot that
+            # shares this dest PE, i.e. the dedup-group leader dispatch really sent.
+            leader_entry = buffer_load(rsrc_map, route, vec_width=1, dtype=T.i32())
+            for back in range_constexpr(topk):
+                j = topk - 1 - back
+                expert_j = buffer_load(
+                    rsrc_idx, base + j, vec_width=1, dtype=T.i32()
+                )
+                same_pe = (expert_j // experts_per_rank) == pe_k
+                is_lower = arith.constant(j) < k
+                entry_j = buffer_load(rsrc_map, base + j, vec_width=1, dtype=T.i32())
+                leader_entry = arith.select(
+                    arith.andi(same_pe, is_lower), entry_j, leader_entry
+                )
+
+            published = leader_entry != arith.constant(sentinel_val)
+            w_f32 = buffer_load(rsrc_wts, route, vec_width=1, dtype=T.f32())
+            w_wire = arith.extf(T.f32(), arith.truncf(T.bf16(), w_f32))
+            produced = arith.andi(
+                published, w_wire != arith.constant(0.0, type=T.f32())
+            )
+
+            group = arith.select(
+                produced, k * max_tok_per_rank + t, arith.constant(zero_group)
+            )
+            wbits = arith.select(
+                produced,
+                arith.bitcast(T.i32(), w_f32),
+                arith.constant(0),
+            )
+            buffer_store(group, rsrc_meta, route * 2)
+            buffer_store(wbits, rsrc_meta, route * 2 + 1)
+
+            # No peer will send this route, so credit its arrivals now. Peers may
+            # already be adding their own for this epoch; the counter only ever
+            # has to reach the total, so the two orders commute.
+            credit = arith.select(
+                produced, arith.constant(0), arith.constant(n_tiles)
+            )
+            if credit != arith.constant(0):
+                P.atomic_add_global(
+                    fx.Int64(addr_ready) + fx.Int64(t) * fx.Int64(ready_stride),
+                    credit,
+                )
+
+    @flyc.jit
+    def run(
+        addr_tok_map: Int64,
+        addr_inp_idx: Int64,
+        addr_inp_wts: Int64,
+        addr_meta: Int64,
+        addr_state: Int64,
+        addr_epoch: Int64,
+        addr_ready: Int64,
+        cur_rank_num_token: Int32,
+        n_tasks: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_fused_combine_init(
+            addr_tok_map,
+            addr_inp_idx,
+            addr_inp_wts,
+            addr_meta,
+            addr_state,
+            addr_epoch,
+            addr_ready,
+            cur_rank_num_token,
+            n_tasks,
+        ).launch(grid=(block_num, 1, 1), block=[threads, 1, 1], stream=stream)
+
+    return run
+
+
+def make_tile_ready_combine(
+    *,
+    experts_per_token,
+    hidden_dim,
+    hidden_elem_size,
+    max_tok_per_rank,
+    n_tiles,
+    tile_bytes,
+    nt_per_task,
+    tasks_per_token,
+    off_pool,
+    off_ready,
+    ready_stride,
+    block_num,
+    warp_num_per_block,
+):
+    """Ready-gated reduction over the per-N-tile recv pool.
+
+    One warp owns a (token, N-tile batch) task: it waits for the token's arrival
+    counter to reach this epoch's target, acquires, then does the weighted f32 sum
+    straight out of the pool. Dropped routes were resolved to the shared zero
+    group at seed time and credited on the counter, so the wait and the sum are
+    both branch-free in k.
+
+    This is the standalone form; the persistent gemm2 workgroups run the same
+    reduction opportunistically between tiles.
+    """
+    topk = experts_per_token
+    tile_i32 = tile_bytes // 4
+    hidden_i32 = hidden_dim * hidden_elem_size // 4
+    to_acc, from_acc, zero_acc = _accum_funcs(hidden_elem_size)
+    threads = warp_num_per_block * WAVE
+    # Arrivals a token collects per layer: every route lands each of its N tiles.
+    ready_target = topk * n_tiles
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def ep_tile_ready_combine(
+        arena: Int64,
+        addr_meta: Int64,
+        addr_out: Int64,
+        addr_epoch: Int64,
+        addr_state: Int64,
+        my_lsa_rank: Int32,
+        n_active_tasks: Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        lane = tid & LANE_MASK
+        warp = tid >> LOG2_WAVE
+        gwarp = bid * warp_num_per_block + warp
+        gwarps = block_num * warp_num_per_block
+
+        window = cco.Window(arena)
+        pool_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_pool))
+        ready_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_ready))
+        rsrc_meta = create_buffer_resource_from_addr(addr_meta)
+        rsrc_out = create_buffer_resource_from_addr(addr_out)
+        epoch = buffer_load(
+            create_buffer_resource_from_addr(addr_epoch),
+            arith.constant(0),
+            vec_width=1,
+            dtype=T.i32(),
+        )
+
+        def combine_task(task):
+            t = task // tasks_per_token
+            tile0 = (task - t * tasks_per_token) * nt_per_task
+            groups = []
+            weights = []
+            for k in range_constexpr(topk):
+                groups.append(
+                    buffer_load(
+                        rsrc_meta, (t * topk + k) * 2, vec_width=1, dtype=T.i32()
+                    )
+                )
+                weights.append(
+                    arith.bitcast(
+                        T.f32(),
+                        buffer_load(
+                            rsrc_meta,
+                            (t * topk + k) * 2 + 1,
+                            vec_width=1,
+                            dtype=T.i32(),
+                        ),
+                    )
+                )
+
+            # One uniform load for the whole task: the token's counter already
+            # carries every (route, N-tile) arrival, so readiness is a single
+            # compare against a constant target rather than a topk*nt-wide flag
+            # gather. Every lane spins on the same address, which the hardware
+            # coalesces into one request.
+            P.spin_until_ge_i32(
+                ready_base + fx.Int64(t) * fx.Int64(ready_stride),
+                epoch * ready_target,
+            )
+            P.fence_system_acquire()
+
+            for sub in range_constexpr(nt_per_task):
+                j = tile0 + sub
+                if j < n_tiles:
+                    slot_bases = [
+                        pool_base
+                        + fx.Int64(groups[k] * n_tiles + j) * fx.Int64(tile_bytes)
+                        for k in range_constexpr(topk)
+                    ]
+                    wvecs = [
+                        vector.from_elements(_V2F32(), [weights[k], weights[k]])
+                        for k in range_constexpr(topk)
+                    ]
+                    out_base = t * hidden_i32 + j * tile_i32
+                    # The last N tile of a non-multiple hidden is partial; keep the
+                    # vec4 fast path whole and mop the remainder up per dword.
+                    valid_i32 = arith.select(
+                        (j + 1) * tile_i32 <= hidden_i32,
+                        arith.constant(tile_i32),
+                        hidden_i32 - j * tile_i32,
+                    )
+                    v4_end = (valid_i32 // arith.constant(4)) * arith.constant(4)
+                    for u in range(lane * 4, v4_end, WAVE * 4):
+                        accs = [zero_acc() for _ in range_constexpr(4)]
+                        for k in range_constexpr(topk):
+                            vv = P.load_v4i32_nt(slot_bases[k], u)
+                            for e in range_constexpr(4):
+                                accs[e] = accs[e] + to_acc(
+                                    vector.extract(vv, static_position=[e])
+                                ) * wvecs[k]
+                        res = vector.from_elements(
+                            T.VectorType.get([4], T.i32()),
+                            [from_acc(accs[e]) for e in range_constexpr(4)],
+                        )
+                        buffer_store(res, rsrc_out, out_base + u)
+                    for u in range(v4_end + lane, valid_i32, WAVE):
+                        acc = zero_acc()
+                        for k in range_constexpr(topk):
+                            acc = acc + to_acc(
+                                P.load_i32_nt(slot_bases[k], u)
+                            ) * wvecs[k]
+                        buffer_store(from_acc(acc), rsrc_out, out_base + u)
+
+        for task in range(gwarp, n_active_tasks, gwarps):
+            # A gemm2 workgroup may already have reduced this task opportunistically;
+            # the CAS is what keeps the two consumers from double-writing a token.
+            claim_lane0 = arith.constant(1)
+            if lane == 0:
+                claim_lane0 = P.atomic_cas_acquire(
+                    fx.Int64(addr_state) + fx.Int64(task) * fx.Int64(4),
+                    arith.constant(0),
+                    arith.constant(1),
+                )
+            # The whole warp reduces the task together, so the claim has to be one
+            # atomic broadcast to every lane, not a per-lane race.
+            if readlane(T.i32(), claim_lane0, 0) == arith.constant(0):
+                combine_task(task)
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_meta: Int64,
+        addr_out: Int64,
+        addr_epoch: Int64,
+        addr_state: Int64,
+        my_lsa_rank: Int32,
+        n_active_tasks: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_tile_ready_combine(
+            arena,
+            addr_meta,
+            addr_out,
+            addr_epoch,
+            addr_state,
+            my_lsa_rank,
+            n_active_tasks,
+        ).launch(grid=(block_num, 1, 1), block=[threads, 1, 1], stream=stream)
+
+    return run
+
+
+def make_xdb_sync(*, rank, npes, off_xdb_mem, block_num=1, warp_num_per_block=4):
+    """Standalone cross-device barrier (combine Stage A without the reduction).
+
+    The fused combine already waits per token for the contributions it needs, so
+    all this has to do is stop a rank running a layer ahead and overwriting a
+    receive pool or ready flag a peer has not finished consuming."""
+    threads = warp_num_per_block * WAVE
+
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def ep_xdb_sync(
+        arena: Int64,
+        addr_bar: Int64,
+        addr_xdb_flag: Int64,
+        my_lsa_rank: Int32,
+    ):
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        grid_thread_id = bid * threads + tid
+
+        window = cco.Window(arena)
+        rsrc_bar = create_buffer_resource_from_addr(addr_bar)
+        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
+
+        fx.barrier()
+        if tid == 0:
+            P.atomic_add_global(fx.Int64(addr_bar), arith.constant(1))
+        if grid_thread_id < npes:
+            P.spin_until_eq_i32(fx.Int64(addr_bar), block_num)
+            P.fence_system_acquire()
+            buffer_store(arith.constant(0), rsrc_bar, 0)
+            xdb_remote = fx.Int64(
+                window.lsa_ptr(grid_thread_id, off_xdb_mem)
+            ) + fx.Int64(rank) * fx.Int64(8)
+            P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
+        if grid_thread_id == 0:
+            P.atomic_add_global(
+                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64())
+            )
+        if tid < npes:
+            xdb_peer_slot = fx.Int64(
+                window.lsa_ptr(my_lsa_rank, off_xdb_mem)
+            ) + fx.Int64(tid) * fx.Int64(8)
+            P.spin_until_eq_i64(xdb_peer_slot, xdb_cur_flag)
+            P.fence_system_acquire()
+        fx.barrier()
+        P.fence_system_acquire()
+
+    @flyc.jit
+    def run(
+        arena: Int64,
+        addr_bar: Int64,
+        addr_xdb_flag: Int64,
+        my_lsa_rank: Int32,
+        stream=fx.Stream(None),
+    ):
+        ep_xdb_sync(arena, addr_bar, addr_xdb_flag, my_lsa_rank).launch(
+            grid=(block_num, 1, 1), block=[threads, 1, 1], stream=stream
+        )
+
+    return run
+
+
 # ── StdMoE convert ────────────────────────────────────────────────────────
 
 

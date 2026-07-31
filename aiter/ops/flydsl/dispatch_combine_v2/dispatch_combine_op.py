@@ -37,6 +37,9 @@ from .intranode_kernels import (
     make_convert_dispatch_output,
     make_convert_combine_input,
     make_local_expert_count,
+    make_fused_combine_init,
+    make_tile_ready_combine,
+    make_xdb_sync,
 )
 
 _COMBINE_QUANT_TYPES = ("none", "fp8_direct_cast", "fp8_blockwise")
@@ -135,6 +138,17 @@ class EpDispatchCombineConfig:
     schedule: tuple = None
     enable_std_moe: bool = False
     max_total_recv_tokens: int = 0  # mori maxTotalRecvTokens; 0 = worst-case ws*M
+    # Tile-ready combine: gemm2 P2P-writes one N-tile per (token, k) into the
+    # origin's recv pool and bumps that token's arrival counter, and the
+    # reduction runs opportunistically inside gemm2's own persistent workgroups
+    # instead of in a separate barrier-gated kernel. Requires
+    # combine_mode="scatter_fused".
+    fused_combine: bool = False
+    # Payload bytes one gemm2 N-tile contributes, i.e. gemm2's tile_n * elem_size.
+    fused_combine_tile_bytes: int = 512
+    # Consecutive N-tiles a single claimed combine task covers: bigger tasks mean
+    # fewer readiness probes but coarser work stealing.
+    fused_combine_nt_per_task: int = 4
 
     def __post_init__(self):
         # all-or-none: setting only one silently defaults the other to data_type.
@@ -158,6 +172,24 @@ class EpDispatchCombineConfig:
             )
         if self.combine_quant_type != "none":
             self.combine_mode = "scatter"
+        if self.fused_combine:
+            if self.combine_mode != "scatter_fused":
+                raise ValueError(
+                    "fused_combine requires combine_mode='scatter_fused', got "
+                    f"{self.combine_mode!r}"
+                )
+            if self.combine_elem_size != 2:
+                raise ValueError("fused_combine is bf16/f16 combine only")
+            if self.fused_combine_tile_bytes % 16 != 0:
+                raise ValueError(
+                    "fused_combine_tile_bytes must be 16 B aligned (vec4 P2P store), "
+                    f"got {self.fused_combine_tile_bytes}"
+                )
+            if self.fused_combine_nt_per_task < 1:
+                raise ValueError(
+                    "fused_combine_nt_per_task must be >= 1, got "
+                    f"{self.fused_combine_nt_per_task}"
+                )
         # The dispatch grid barrier iterates peers as range(lane, npes, wave) and
         # resets inside the loop, correct only when npes <= wavefront.
         if self.world_size > 64:
@@ -280,6 +312,43 @@ class EpDispatchCombineConfig:
             "yes",
             "on",
         )
+
+    @property
+    def use_fused_combine(self):
+        """Tile-ready combine folded into gemm2's persistent workgroups."""
+        return self.is_fused and self.fused_combine
+
+    @property
+    def fused_ready_stride(self):
+        """Bytes between two tokens' arrival counters.
+
+        One counter per cache line. Packed 4 B apart, the whole rank's counters
+        fit in a handful of lines, so every remote increment invalidates the
+        line for the waves polling the ~15 neighbouring tokens -- with ~1k
+        pollers and ~20k cross-device increments per layer that false sharing
+        dominated the drain."""
+        return int(os.environ.get("AITER_EP_READY_STRIDE", "64"))
+
+    @property
+    def fused_n_tiles(self):
+        """Ready flags (and pool slots) per (token, k) contribution group."""
+        b = self.fused_combine_tile_bytes
+        return (self.hidden_dim * self.combine_elem_size + b - 1) // b
+
+    @property
+    def fused_groups(self):
+        """(token, k) contribution groups, plus one shared all-zero drop group."""
+        return self.num_experts_per_token * self.max_num_inp_token_per_rank + 1
+
+    @property
+    def fused_tasks_per_token(self):
+        return (
+            self.fused_n_tiles + self.fused_combine_nt_per_task - 1
+        ) // self.fused_combine_nt_per_task
+
+    @property
+    def fused_n_tasks(self):
+        return self.max_num_inp_token_per_rank * self.fused_tasks_per_token
 
     @property
     def comb_inp_slot_nbytes(self):
@@ -501,9 +570,24 @@ class EpDispatchCombineOp:
                 # (token,k) is written exactly once by the owner rank's gemm2 (the
                 # expert k of that token lives on one rank) -> no cross-rank collision.
                 # Weights are pre-multiplied in gemm2, so no comb_wts region.
-                regions.append(
-                    ("comb_inp", max_tok_per_rank * topk * cfg.comb_inp_slot_nbytes)
-                )
+                if cfg.use_fused_combine:
+                    # recv_pool[group][n_tile]: one gemm2 N-tile per slot, single
+                    # producer, so the payload needs no atomics. recv_ready is one
+                    # monotonic arrival counter per ORIGIN TOKEN (not one flag per
+                    # (token, k, N-tile)): every producer bumps it once per N-tile
+                    # it lands, so a consumer's readiness probe is a single load
+                    # against a compile-time constant instead of a topk*nt-wide
+                    # gather plus a ballot. Never cleared -- layer e is complete at
+                    # e * topk * n_tiles.
+                    grp_bytes = cfg.fused_n_tiles * cfg.fused_combine_tile_bytes
+                    regions.append(("recv_pool", cfg.fused_groups * grp_bytes))
+                    regions.append(
+                        ("recv_ready", max_tok_per_rank * cfg.fused_ready_stride)
+                    )
+                else:
+                    regions.append(
+                        ("comb_inp", max_tok_per_rank * topk * cfg.comb_inp_slot_nbytes)
+                    )
             else:
                 regions.append(
                     (
@@ -526,6 +610,20 @@ class EpDispatchCombineOp:
                     )
         self.arena = SymmArena(comm, regions)
         self.arena.zero()
+        if cfg.use_fused_combine:
+            n_routes = max_tok_per_rank * topk
+            # [group, f32 weight bits] per (token, k), rebuilt every layer.
+            self.combine_meta = torch.zeros(
+                n_routes * 2, dtype=torch.int32, device=device
+            )
+            self.combine_task_state = torch.zeros(
+                cfg.fused_n_tasks, dtype=torch.int32, device=device
+            )
+            # Monotonic across layers AND graph replays, so the arrival counters
+            # never need a second barrier to be cleared between layers: layer e's
+            # target is just e * topk * n_tiles.
+            self.combine_epoch = torch.zeros(1, dtype=torch.int32, device=device)
+            self._seed_fused_drop_group()
 
         self.token_dest_map = torch.full(
             (max_tok_per_rank * topk,), -1, dtype=torch.int32, device=device
@@ -636,7 +734,48 @@ class EpDispatchCombineOp:
             for (b, w) in dispatch_specs
         }
         self._dispatch_replay_variants = {}  # lazily compiled per (block, warp)
-        if cfg.is_fused:
+        if cfg.use_fused_combine:
+            # gemm2 owns both the P2P scatter and the reduction; the op only seeds
+            # per-layer ready state and closes the layer with a barrier.
+            self._fused_init = make_fused_combine_init(
+                npes=cfg.world_size,
+                experts_per_rank=cfg.num_experts_per_rank,
+                experts_per_token=topk,
+                max_tok_per_rank=max_tok_per_rank,
+                max_recv=recv_cap,
+                n_tiles=cfg.fused_n_tiles,
+                ready_stride=cfg.fused_ready_stride,
+                block_num=8,
+                warp_num_per_block=4,
+            )
+            self._fused_sync = make_xdb_sync(
+                rank=cfg.rank,
+                npes=cfg.world_size,
+                off_xdb_mem=arena.offset("cross_device_barrier"),
+            )
+            # Standalone reducer: the reference for the in-gemm2 opportunistic
+            # version and the fallback when gemm2 is not running the fused loop.
+            self._fused_reduce = make_tile_ready_combine(
+                experts_per_token=topk,
+                hidden_dim=hidden_dim,
+                hidden_elem_size=cfg.combine_elem_size,
+                max_tok_per_rank=max_tok_per_rank,
+                n_tiles=cfg.fused_n_tiles,
+                tile_bytes=cfg.fused_combine_tile_bytes,
+                nt_per_task=cfg.fused_combine_nt_per_task,
+                tasks_per_token=cfg.fused_tasks_per_token,
+                off_pool=arena.offset("recv_pool"),
+                off_ready=arena.offset("recv_ready"),
+                ready_stride=cfg.fused_ready_stride,
+                # 8192 waves: at BS2048/topk6/hidden7168 each ready task gets one
+                # wave instead of the old grid's 8 serial tasks/wave. The kernel
+                # is register-light and purely bandwidth bound, matching the tuned
+                # ep_combine_fused large-count geometry.
+                block_num=512,
+                warp_num_per_block=16,
+            )
+            self._combine_variants = {}
+        elif cfg.is_fused:
             # gemm2 already P2P-wrote weighted per-(token,k) results into comb_inp;
             # combine only barriers (wait for peers' writes) + sums the topk slots.
             self._combine_variants = {
@@ -1041,12 +1180,125 @@ class EpDispatchCombineOp:
         out = self.combine_out[: count * cols].view(cdt).view(count, cols)
         return out, self.combine_out_weights[: count * topk].view(count, topk)
 
+    # ---- tile-ready fused combine (fused_combine=True) ---- #
+    def _seed_fused_drop_group(self):
+        """Zero the shared drop group's payload, once.
+
+        Routes no peer will produce point their group here, so the consumer can
+        accumulate every top-k slot unconditionally and get a hard zero, no
+        branch needed. Nobody ever writes this group, so one zeroing lasts for
+        the life of the arena. Their missing arrivals are made up for on the
+        counter side: per-layer seeding lives in the init kernel, which knows
+        which routes were dropped."""
+        cfg = self.cfg
+        drop = cfg.fused_groups - 1
+        pool_bytes = cfg.fused_n_tiles * cfg.fused_combine_tile_bytes
+        pool = from_gpu_ptr(
+            self.arena.local_ptr("recv_pool"),
+            (cfg.fused_groups * pool_bytes,),
+            torch.int8,
+        )
+        pool[drop * pool_bytes :] = 0
+
+    def begin_fused_combine(self, topk_ids, topk_weights, num_tokens):
+        """Seed one layer of the tile-ready combine: bump the epoch, clear task
+        claims, resolve each (token, k) to a recv group + route weight, and credit
+        each token's arrival counter for the routes no peer will ever send.
+
+        Must run after dispatch (it reads this layer's tok_map) and before gemm2."""
+        assert self.cfg.use_fused_combine, "begin_fused_combine needs fused_combine=True"
+        stream = fx.Stream(torch.cuda.current_stream())
+        self._fused_init(
+            self.token_dest_map.data_ptr(),
+            topk_ids.reshape(-1).data_ptr(),
+            topk_weights.reshape(-1).data_ptr(),
+            self.combine_meta.data_ptr(),
+            self.combine_task_state.data_ptr(),
+            self.combine_epoch.data_ptr(),
+            self.arena.local_ptr("recv_ready"),
+            int(num_tokens),
+            int(num_tokens) * self.cfg.fused_tasks_per_token,
+            stream,
+        )
+
+    def fused_combine_params(self, num_tokens):
+        """Everything gemm2 needs to be both the P2P producer and the reducer."""
+        cfg = self.cfg
+        assert cfg.use_fused_combine, "fused_combine_params needs fused_combine=True"
+        return dict(
+            ep_arena_handle=self.arena.handle,
+            ep_rank=cfg.rank,
+            ep_world=cfg.world_size,
+            ep_topk=cfg.num_experts_per_token,
+            ep_max_tok=cfg.max_num_inp_token_per_rank,
+            ep_off_pool=self.arena.offset("recv_pool"),
+            ep_off_ready=self.arena.offset("recv_ready"),
+            ep_ready_stride=cfg.fused_ready_stride,
+            ep_tile_bytes=cfg.fused_combine_tile_bytes,
+            ep_n_tiles=cfg.fused_n_tiles,
+            ep_nt_per_task=cfg.fused_combine_nt_per_task,
+            ep_hidden=cfg.hidden_dim,
+            ep_combine_meta=self.combine_meta,
+            ep_task_state=self.combine_task_state,
+            ep_epoch=self.combine_epoch,
+            ep_combine_out=self.combine_out,
+            ep_num_tokens=int(num_tokens),
+        )
+
+    def reduce_fused_combine(self, num_tokens):
+        """Run the ready-gated reduction as a standalone kernel.
+
+        Used when gemm2 only plays producer; the persistent gemm2 does the same
+        work opportunistically and then this is skipped."""
+        assert self.cfg.use_fused_combine, "reduce_fused_combine needs fused_combine=True"
+        stream = torch.cuda.current_stream()
+        self._fused_reduce(
+            self.arena.handle,
+            self.combine_meta.data_ptr(),
+            self.combine_out.data_ptr(),
+            self.combine_epoch.data_ptr(),
+            self.combine_task_state.data_ptr(),
+            self.cfg.rank,
+            int(num_tokens) * self.cfg.fused_tasks_per_token,
+            fx.Stream(stream),
+        )
+
+    def finish_fused_combine(self, num_tokens):
+        """Close the layer: cross-device barrier, then the reduced tokens.
+
+        gemm2 already produced every output element, so this only keeps the next
+        layer from overwriting a pool a peer is still draining."""
+        cfg = self.cfg
+        assert cfg.use_fused_combine, "finish_fused_combine needs fused_combine=True"
+        if os.environ.get("AITER_EP_STANDALONE_REDUCE", "0") != "0":
+            # Producer-only gemm2: it published arrivals but skipped the drain
+            # (AITER_EP_FUSED_NO_CONSUME=1), so the reduction runs here instead,
+            # with a grid chosen for a bandwidth-bound reduce rather than
+            # inherited from the GEMM's tiling.
+            self.reduce_fused_combine(num_tokens)
+        stream = fx.Stream(torch.cuda.current_stream())
+        self._fused_sync(
+            self.arena.handle,
+            self.combine_barrier.data_ptr(),
+            self.cross_device_flag.data_ptr(),
+            cfg.rank,
+            stream,
+        )
+        cols = cfg.hidden_dim
+        count = int(num_tokens)
+        out = self.combine_out[: count * cols].view(cfg.combine_dtype)
+        return out.view(count, cols)
+
     # ---- gemm2-fused scatter (combine_mode="scatter_fused") ---- #
     def zero_fused_staging(self):
         """Zero the per-(token,k) comb_inp before the gemm2 P2P writes of a layer.
         Needed because gemm2 writes only the (token,k) slots whose expert survived
         dispatch/capacity; dropped slots must read 0 in the combine topk sum."""
         assert self.cfg.is_fused, "zero_fused_staging is scatter_fused-only"
+        if self.cfg.use_fused_combine:
+            # Tile-ready combine resolves dropped routes to the shared zero group
+            # instead, so there is nothing to pre-clear on the critical path.
+            return
         self.arena.zero("comb_inp")
 
     def ep_scatter_params(self):
@@ -1055,7 +1307,13 @@ class EpDispatchCombineOp:
         assert self.cfg.is_fused, "ep_scatter_params is scatter_fused-only"
         return dict(
             ep_arena_handle=self.arena.handle,
-            ep_comb_inp_off=self.arena.offset("comb_inp"),
+            # The tile-ready combine replaces comb_inp with the per-N-tile recv
+            # pool; gemm2 reads the pool offsets from fused_combine_params instead.
+            ep_comb_inp_off=(
+                0
+                if self.cfg.use_fused_combine
+                else self.arena.offset("comb_inp")
+            ),
             ep_tis_off=self.arena.offset("recv_to_src_token"),
             ep_wire_nbytes=self.cfg.comb_inp_slot_nbytes,
             ep_rank=self.cfg.rank,
@@ -1120,3 +1378,7 @@ class EpDispatchCombineOp:
         self.total_recv.zero_()
         self.combine_barrier.zero_()
         self.cross_device_flag.fill_(1)
+        if self.cfg.use_fused_combine:
+            self.combine_task_state.zero_()
+            self.combine_epoch.zero_()
+            self._seed_fused_drop_group()
