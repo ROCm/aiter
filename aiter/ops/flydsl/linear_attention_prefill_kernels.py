@@ -810,6 +810,17 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     V = u.shape[-1]
     T_flat = w.shape[2]
     BT = chunk_size
+
+    # 显式拒绝未校验的配置：该 kernel 的 wave 映射（wid*16，4 wave 覆盖 64 行）、
+    # gated_v 别名复用 h_state panel1（需 NUM_K_BLOCKS>=2）与 LDS 布局只在
+    # K=128、BT=64 上验证过（见 kernel 内断言）。其它值会触发 LDS 别名越界、越界
+    # store 或 LDS 超额，故在此提前给出清晰错误而非静默产生错误结果。
+    if BT != 64:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: 仅支持 chunk_size=64, got chunk_size={BT}."
+        )
+    if K != 128:
+        raise ValueError(f"FlyDSL K5 mfma16_hip: 仅支持 K=128, got K={K}.")
     assert K <= 256
 
     if cu_seqlens is None:

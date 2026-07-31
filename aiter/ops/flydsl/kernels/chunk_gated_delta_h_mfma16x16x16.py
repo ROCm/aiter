@@ -217,8 +217,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     unchanged, so this only affects HBM bandwidth / footprint of the SSM
     state. Mirrors the pattern used by ``kernels/gdr_decode.py``.
     """
-    assert K <= 256
-    assert K % 64 == 0
+    # 该 kernel 的 wave 映射（wid*16, 4 wave 覆盖 64 行）、协作载入分块与
+    # BT_STEPS 均硬编码 BT=64；gated_v 别名复用 h_state panel1（需
+    # NUM_K_BLOCKS>=2，K=64 时 panel1 根本不存在 → 越界 store），且 LDS 布局
+    # 只在 K=V=128 上校验过。其它 BT/K 会触发 LDS 别名越界、越界 store 或
+    # LDS 超额，故在此显式拒绝而非静默产生错误结果。
+    assert BT == 64, f"chunk_gated_delta_h_mfma16_hip 仅支持 BT=64, got BT={BT}"
+    assert K == 128, f"chunk_gated_delta_h_mfma16_hip 仅支持 K=128, got K={K}"
     assert BV % 16 == 0
     NUM_K_BLOCKS = K // 64
 
@@ -599,6 +604,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         if const_expr(STORE_FINAL_STATE):
             ht_base = state_nh * fx.Int32(V * K)
 
+        # g 头基址（head-major，stride-1 沿 T）。
+        #   varlen: g 为 [H, T_flat]，token = bos + rel_row（bos 是拼接序列里的
+        #     全局 token 偏移）→ base = i_h*T_flat + bos。
+        #   dense : g 为 [B, H, T_flat]，必须带上 batch 维 stride i_n*H；旧实现
+        #     用 i_h*T_flat + bos(=i_n*T_val) 漏掉了 i_n*H*T_flat，B>1 时读错行。
+        if const_expr(USE_G):
+            if const_expr(IS_VARLEN):
+                g_head_base = i_h * T_flat + bos
+            else:
+                g_head_base = (i_n * fx.Int32(H) + i_h) * T_flat
+
         # -- MFMA lane mapping for 16x16 tiles --
         lane_n = lane % fx.Int32(16)
         lane_m_base = lane // fx.Int32(16)
@@ -648,42 +664,65 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         nt_idx = fx.Index(NT)
 
         # -- PROLOGUE: load w/k for chunk 0 to LDS (HIP .cu:1125-1141) --
-        _prol_it = fx.Int32(0)
-        for kb in range_constexpr(NUM_K_BLOCKS):
-            wp_panel_base = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
-            for batch in range_constexpr(NUM_LOAD_BATCHES_64):
-                row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
-                abs_row = _prol_it * fx.Int32(BT) + row
-                safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
-                w_g_off = (
-                    w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
-                )
-                wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
-                swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
-                lds_wp.vec_store((fx.Index(swz),), wvec.shuffle(wvec, [0, 1, 2, 3]), 4)
-                lds_wp.vec_store(
-                    (fx.Index(swz ^ fx.Int32(4)),),
-                    wvec.shuffle(wvec, [4, 5, 6, 7]),
-                    4,
-                )
-        k_abs_t0_prol = _prol_it * fx.Int32(BT) + k_t0_pf
-        k_abs_t1_prol = _prol_it * fx.Int32(BT) + k_t1_pf
-        k_safe_t0_prol = (k_abs_t0_prol < T_local).select(k_abs_t0_prol, fx.Int32(0))
-        k_safe_t1_prol = (k_abs_t1_prol < T_local).select(k_abs_t1_prol, fx.Int32(0))
-        for kb in range_constexpr(NUM_K_BLOCKS):
-            kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
-            k_col_off = fx.Int32(kb * 64) + k_row_base_pf
-            k_g_off_t0 = k_base + k_safe_t0_prol * stride_k + k_col_off
-            k_g_off_t1 = k_base + k_safe_t1_prol * stride_k + k_col_off
-            kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
-            kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
-            for i in range_constexpr(LOAD_VEC_WIDTH):
-                row_i = k_row_base_pf + fx.Int32(i)
-                byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
-                elem_off = byte_off >> fx.Int32(1)
-                lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
-                lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
-        gpu.barrier()
+        # 空 varlen 序列（T_local==0 → NT==0）不需要预取；若不跳过，safe_row 会被
+        # 钳到 0，而末尾空序列的 bos==T_flat 会让 w/k 的全局地址越过输入 buffer 末尾
+        # 造成越界读。用 block-uniform 的 NT>0 守卫整体跳过 prologue（含其 barrier）。
+        # 空序列时主循环也跑 0 次，results 直接沿用 init_state(=h0)，epilogue 把
+        # h0 原样写回 ht，状态正确透传。
+        #
+        # 整段封进闭包 _load_chunk0_to_lds：GTensor(w_/k_) 与 STensor(lds_wp/lds_kp)
+        # 作为闭包自由变量被捕获，if body 内只出现"调用闭包 + barrier"，避免 FlyDSL
+        # AST rewriter 把这些非 MLIR-Value 的张量对象当作 scf.if 的透传 state
+        # （否则报 "GTensor is not an MLIR Value"）——与后文 has_next 用闭包同款。
+        def _load_chunk0_to_lds():
+            _prol_it = fx.Int32(0)
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                wp_panel_base = fx.Int32(kb * LDS_WP_PANEL_ELEMS)
+                for batch in range_constexpr(NUM_LOAD_BATCHES_64):
+                    row = fx.Int32(batch * ROWS_PER_BATCH_64) + load_row_in_batch
+                    abs_row = _prol_it * fx.Int32(BT) + row
+                    safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
+                    w_g_off = (
+                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                    )
+                    wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                    swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
+                    lds_wp.vec_store(
+                        (fx.Index(swz),), wvec.shuffle(wvec, [0, 1, 2, 3]), 4
+                    )
+                    lds_wp.vec_store(
+                        (fx.Index(swz ^ fx.Int32(4)),),
+                        wvec.shuffle(wvec, [4, 5, 6, 7]),
+                        4,
+                    )
+            k_abs_t0_prol = _prol_it * fx.Int32(BT) + k_t0_pf
+            k_abs_t1_prol = _prol_it * fx.Int32(BT) + k_t1_pf
+            k_safe_t0_prol = (k_abs_t0_prol < T_local).select(
+                k_abs_t0_prol, fx.Int32(0)
+            )
+            k_safe_t1_prol = (k_abs_t1_prol < T_local).select(
+                k_abs_t1_prol, fx.Int32(0)
+            )
+            for kb in range_constexpr(NUM_K_BLOCKS):
+                kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
+                k_col_off = fx.Int32(kb * 64) + k_row_base_pf
+                k_g_off_t0 = k_base + k_safe_t0_prol * stride_k + k_col_off
+                k_g_off_t1 = k_base + k_safe_t1_prol * stride_k + k_col_off
+                kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
+                kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
+                for i in range_constexpr(LOAD_VEC_WIDTH):
+                    row_i = k_row_base_pf + fx.Int32(i)
+                    byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
+                    elem_off = byte_off >> fx.Int32(1)
+                    lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
+                    lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
+
+        # NT 由整除得到、是底层 ArithValue（无 .ir_value）；包成 fx.Int32 再比较，
+        # 得到可经 scf.if 使用的 fx 布尔（与后文 has_next 同款）。
+        has_work = fx.Int32(NT) > fx.Int32(0)
+        if has_work.ir_value():
+            _load_chunk0_to_lds()
+            gpu.barrier()
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
             h_accs_in = list(state[:NUM_H_ACCS])
@@ -758,7 +797,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     u_prefetch.append(v_[fx.Index(u_off)])
 
             if const_expr(USE_G):
-                g_last = g_[fx.Index(i_h * T_flat + (bos + last_idx_raw))]
+                g_last = g_[fx.Index(g_head_base + last_idx_raw)]
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
                     abs_row = (
@@ -769,9 +808,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     )
                     in_bounds = abs_row < T_local
                     safe_row = in_bounds.select(abs_row, fx.Int32(0))
-                    g_row_pf.append(
-                        (g_[fx.Index(i_h * T_flat + (bos + safe_row))], in_bounds)
-                    )
+                    g_row_pf.append((g_[fx.Index(g_head_base + safe_row)], in_bounds))
 
             # -- GEMM1: b_v = w @ h_state, with w_next prefetch interleaved.
             # u/g/w_next loads are all in flight; 64 MFMA hide HBM latency.
@@ -896,6 +933,24 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     gate = _fast_exp(g_last - g_row_val)
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = vector.from_elements(T.f32x4, gate_elems)
+            else:
+                # 无 g 时也必须屏蔽最后一个 chunk 的 padding 行
+                # （abs_row >= T_local）。否则这些无效 token 的 v_new 会经 gated_v
+                # 进入 GEMM2（h += k^T @ v_new_gated）污染状态更新。USE_G 路径已借
+                # gate=0 屏蔽；这里用 0/1 掩码达到同样效果。
+                mask_elems = []
+                for elem_i in range_constexpr(4):
+                    abs_row = (
+                        i_t_i32 * fx.Int32(BT)
+                        + wid * fx.Int32(16)
+                        + lane_m_base * fx.Int32(4)
+                        + fx.Int32(elem_i)
+                    )
+                    in_bounds = abs_row < T_local
+                    mask_elems.append(
+                        in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
+                    )
+                gate_vec = vector.from_elements(T.f32x4, mask_elems)
 
             if const_expr(SAVE_NEW_VALUE):
 
@@ -928,10 +983,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + u_col
                             _emit_vn_store(vn_off, bf16_v)
 
-                if const_expr(USE_G):
-                    gated_val = vn_val * gate_vec
-                else:
-                    gated_val = vn_val
+                # gate_vec: USE_G 时是衰减门控（已折叠越界屏蔽），否则是纯 0/1
+                # padding 掩码。两条路径都乘 gate_vec，保证越界行贡献恒为 0。
+                gated_val = vn_val * gate_vec
                 gv_col = fx.Int32(idx * 16) + lane_n
                 gv_row_block = wid * fx.Int32(4) + lane_m_base
                 gv_cell = (gv_row_block * fx.Int32(BV) + gv_col) * fx.Int32(4)

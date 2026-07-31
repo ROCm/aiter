@@ -115,6 +115,14 @@ class PrefillArgs:
     # unique across the batched-token sweep. Empty for single-value groups, so
     # their ids are unchanged.
     bt_tag: str = ""
+    # dense(非 varlen) 路径的 batch 大小 B。>1 时 ``_make_inputs`` 会把 ``g`` 造成
+    # 3D ``[B, H, T_flat]`` 布局，覆盖 dense B>1 的 batch-head gate 偏移路径
+    # （kernel 端 ``g_head_base`` 需含 ``i_n*H*T_flat`` 的 batch stride）。varlen
+    # 路径忽略此字段（恒 B=1、N 段）。默认 1，保持既有 dense 用例不变。
+    dense_batch: int = 1
+    # 是否提供 ``g``。False 走 ``g=None`` (USE_G=False)，覆盖无 g 时对末 chunk
+    # padding 行的屏蔽（否则无效 token 的 v_new 会经 gated_v 污染状态更新）。
+    use_g: bool = True
 
     @property
     def Hg(self):
@@ -146,6 +154,8 @@ class PrefillArgs:
             tag += f"_T{T}_n{n}"
             if self.trace_tag:
                 tag += f"_{self.trace_tag}"
+            if not self.use_g:
+                tag += "_nog"
             return tag
         tag = self.model_name + "_" if self.model_name else ""
         tag += f"K{self.K}_V{self.V}_Hk{self.Hk}_Hv{self.Hv}"
@@ -154,6 +164,10 @@ class PrefillArgs:
             tag += f"_{self.bt_tag}"
         if not self.is_varlen:
             tag += "_novarlen"
+        if self.dense_batch != 1:
+            tag += f"_B{self.dense_batch}"
+        if not self.use_g:
+            tag += "_nog"
         if not self.output_final_state:
             tag += "_nofs"
         if self.ssm_state_dtype == torch.bfloat16:
@@ -240,6 +254,10 @@ class PrefillGroup:
     #     clusters (head near 6400 / 8192 / 9912 / 10000) found in the
     #     bench_gdr 20260604 trace.
     num_segments: int = 3
+    # dense(非 varlen) batch 大小；>1 时 g 转 3D [B,H,T_flat]（见 PrefillArgs）。
+    dense_batch: int = 1
+    # 是否提供 g；False 走 g=None(USE_G=False) 路径（见 PrefillArgs）。
+    use_g: bool = True
 
 
 def expand_groups(groups):
@@ -289,6 +307,8 @@ def expand_groups(groups):
                                 output_final_state=g.output_final_state,
                                 ssm_state_dtype=g.ssm_state_dtype,
                                 bt_tag=bt_tag,
+                                dense_batch=g.dense_batch,
+                                use_g=g.use_g,
                             )
                         )
                     else:
@@ -342,6 +362,8 @@ def expand_groups(groups):
                                     ssm_state_dtype=g.ssm_state_dtype,
                                     context_lens=context_lens,
                                     trace_tag=tag,
+                                    dense_batch=g.dense_batch,
+                                    use_g=g.use_g,
                                 )
                             )
     return out
@@ -377,6 +399,10 @@ _PREFILL_GROUPS = [
         full_prompt_lens=[1024, 2048, 4096, 8192],
         is_varlen=False,
         max_num_batched_tokens="full_prompt_len",
+        # dense B>1：g 转 3D [B,H,T]，验证 kernel 的 batch-head gate 偏移
+        # （g_head_base 含 i_n*H*T_flat）。dense 路径本就恒用 3D g，这里再把 B
+        # 提到 2 覆盖 i_n>0 的 batch stride 分支。
+        dense_batch=2,
     ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
     # else, so they collapse into a single group. Original rows left
@@ -400,11 +426,18 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
-        model_name="varlen-16k-aws",
+        # 无 g（USE_G=False）+ 短单段序列：T=100/200/300 均 %64!=0，末 chunk 含
+        # padding 行，验证无 g 时对越界行的屏蔽（否则无效 token 的 v_new 经 gated_v
+        # 污染状态更新）。刻意用短序列（<=5 chunk）：no-g 无门控衰减，长序列会让
+        # 状态累积增长把 bf16 累加误差放大到超 5e-2；no-g 计算逻辑本身已与 g=0 的
+        # with-g 路径逐位一致，此处只需在数值可控范围内验证 padding 屏蔽。
+        # （原 aws-16k with-g 覆盖由保留的 varlen-32k-aws 承担。）
+        model_name="nog-short",
         Hv=32,
         tps=[1],
-        full_prompt_lens=[1000, 5000, 10000],
-        max_num_batched_tokens=16384,
+        full_prompt_lens=[100, 200, 300],
+        max_num_batched_tokens="full_prompt_len",
+        use_g=False,
     ),
     PrefillGroup(
         model_name="varlen-32k-aws",
@@ -427,7 +460,9 @@ _PREFILL_GROUPS = [
         tps=[1],
         full_prompt_lens=[16384],
         max_num_batched_tokens=16384,
-        head_seqlens=[5, 10, 65, 704, 936, 1820, 4467, 5508],
+        # head=0 制造空首段（cu_seqlens=[0,0,10000,16384]），验证空 varlen 序列
+        # 跳过 W/K prologue、不越界读，且状态经 h0->ht 正确透传。
+        head_seqlens=[0, 10, 65, 704, 936, 1820, 4467, 5508],
         mid_seqlen=10000,
     ),
     PrefillGroup(
@@ -518,6 +553,8 @@ def _make_inputs(
     with_initial_state=True,
     is_varlen=True,
     ssm_state_dtype=torch.float32,
+    dense_batch=1,
+    use_g=True,
 ):
     if args is not None:
         tp = args.tp
@@ -528,6 +565,8 @@ def _make_inputs(
         dtype = args.dtype
         is_varlen = args.is_varlen
         ssm_state_dtype = args.ssm_state_dtype
+        dense_batch = args.dense_batch
+        use_g = args.use_g
 
     Hg = Hk_dim // tp
     H = Hv_dim // tp
@@ -539,7 +578,7 @@ def _make_inputs(
         B = 1
     else:
         T_total = sum(context_lens)
-        B = 1
+        B = dense_batch
         N = B
         cu_seqlens = None
         scheduled_q_lens = context_lens
@@ -547,10 +586,19 @@ def _make_inputs(
     k = torch.randn(B, T_total, Hg, K_dim, dtype=dtype, device=device) * 0.1
     w_orig = torch.randn(B, T_total, H, K_dim, dtype=dtype, device=device) * 0.1
     u_orig = torch.randn(B, T_total, H, V_dim, dtype=dtype, device=device) * 0.1
-    # g is head-major [H, T_total] (matches Triton VK / HIP / FlyDSL K5).
-    # cumsum is along the T dim.
-    g = torch.randn(H, T_total, dtype=torch.float32, device=device).abs() * -0.5
-    g = g.cumsum(dim=1)
+    # g gate 布局（head-major，cumsum 沿 T；匹配 Triton VK / HIP / FlyDSL K5）：
+    #   * use_g=False -> None（走 USE_G=False，验证末 chunk padding 行屏蔽）
+    #   * varlen      -> 2D [H, T_total]
+    #   * dense       -> 3D [B, H, T_total]（覆盖 dense B>1 的 batch-head gate
+    #                    偏移；B=1 时与 2D 数值等价）
+    if not use_g:
+        g = None
+    elif is_varlen:
+        g = torch.randn(H, T_total, dtype=torch.float32, device=device).abs() * -0.5
+        g = g.cumsum(dim=-1)
+    else:
+        g = torch.randn(B, H, T_total, dtype=torch.float32, device=device).abs() * -0.5
+        g = g.cumsum(dim=-1)
 
     w_c = w_orig.permute(0, 2, 1, 3).contiguous()
     u_c = u_orig.permute(0, 2, 1, 3).contiguous()
@@ -636,20 +684,32 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     b_v = u_chunk - w_chunk @ h_state.T
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
-                    last_idx = bos + t_end - 1
-                    g_last = g[i_h, last_idx].float()
-                    g_chunk = g[i_h, bos + t_start : bos + t_end].float()
+                    # g 序列：None(无 g) / 2D[H,T](varlen) / 3D[B,H,T](dense)。
+                    if g is None:
+                        g_seq = None
+                    elif g.dim() == 3:
+                        g_seq = g[b_idx, i_h]
+                    else:
+                        g_seq = g[i_h]
 
                     mask = torch.zeros(BT_dim, device=k.device)
                     mask[:actual_bt] = 1.0
-                    gate = torch.where(
-                        mask[:actual_bt].bool(),
-                        torch.exp(g_last - g_chunk),
-                        torch.zeros_like(g_chunk),
-                    )
+                    if g_seq is None:
+                        # 无 g：不做门控衰减；valid 行 gate=1，padding 行本就不在
+                        # chunk 切片内。对应 kernel USE_G=False 的纯 padding 屏蔽。
+                        gate = mask[:actual_bt]
+                    else:
+                        last_idx = bos + t_end - 1
+                        g_last = g_seq[last_idx].float()
+                        g_chunk = g_seq[bos + t_start : bos + t_end].float()
+                        gate = torch.where(
+                            mask[:actual_bt].bool(),
+                            torch.exp(g_last - g_chunk),
+                            torch.zeros_like(g_chunk),
+                        )
+                        h_state = h_state * torch.exp(g_last)
                     b_v_gated = b_v * gate.unsqueeze(-1)
 
-                    h_state = h_state * torch.exp(g_last)
                     k_chunk = k[b_idx, bos + t_start : bos + t_end, i_hg].float()
                     b_v_gated_cast = b_v_gated.to(k.dtype).float()
                     h_state = h_state + b_v_gated_cast.T @ k_chunk
