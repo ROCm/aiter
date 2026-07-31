@@ -83,10 +83,13 @@ def flydsl_grouped_gemm_a8w4_masked(
 
     if stream is None:
         stream = torch.cuda.current_stream()
-    if float(situ_beta) <= 0.0:
-        raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
-    if float(situ_linear_beta) <= 0.0:
-        raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
+    # Only meaningful for SiTUv2; the betas are ignored by every other epilogue,
+    # so do not let them reject a silu/swiglu launch.
+    if stage1_act == 3:
+        if float(situ_beta) <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+        if float(situ_linear_beta) <= 0.0:
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     nb = min(num_buffers, max(1, K // tile_k))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
