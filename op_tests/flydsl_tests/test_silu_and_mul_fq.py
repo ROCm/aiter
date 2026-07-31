@@ -3,6 +3,7 @@ import torch
 
 from aiter import dtypes
 from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort
@@ -63,13 +64,13 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
     _run_compiled(
         kernel,
         (
-            x,
-            out.view(-1).view(torch.uint8),
-            out_scale_sorted,
-            sorted_ids,
-            num_valid_ids,
-            sorted_ids,
-            torch.empty(0, dtype=torch.float32, device=device),
+            ptr_arg(x),
+            ptr_arg(out.view(-1).view(torch.uint8)),
+            ptr_arg(out_scale_sorted),
+            ptr_arg(sorted_ids),
+            ptr_arg(num_valid_ids),
+            ptr_arg(sorted_ids),
+            ptr_arg(torch.empty(0, dtype=torch.float32, device=device)),
             token_num,
             sorted_ids.numel(),
             7.0,
