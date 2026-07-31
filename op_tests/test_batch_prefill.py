@@ -4149,7 +4149,9 @@ def run_batch_prefill_asm(
     get_gpu_arch() != "gfx942", reason="asm qkptph/vph kernel is gfx942-only"
 )
 @pytest.mark.parametrize("use_p_scale", [False, True])
-@pytest.mark.parametrize("seqlen", [256, 512])
+@pytest.mark.parametrize(
+    "seqlen", [128, 256, 384, 512, 640, 768, 896, 1024, 2048]
+)
 def test_batch_prefill_asm_batched(seqlen, use_p_scale):
     # Batched / b=1 path (varlen kernel with a single [0, S] segment).
     run_batch_prefill_asm([seqlen], use_p_scale=use_p_scale, seed=11)
@@ -4224,7 +4226,25 @@ def test_batch_prefill_asm_combined_kv(seqlens, num_kv_layers, kv_layer_idx, use
     os.environ.get("AITER_ASM_PERF") != "1",
     reason="perf sweep; set AITER_ASM_PERF=1 to run",
 )
-@pytest.mark.parametrize("seqlen", [512, 1024, 2048, 4096, 8192, 16384, 27507, 32768])
+@pytest.mark.parametrize(
+    "seqlen",
+    [
+        128,
+        256,
+        384,
+        512,
+        640,
+        768,
+        896,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        27507,
+        32768,
+    ],
+)
 def test_batch_prefill_asm_perf(seqlen):
     run_batch_prefill_asm([seqlen], use_p_scale=True, seed=31, bench=True)
 
