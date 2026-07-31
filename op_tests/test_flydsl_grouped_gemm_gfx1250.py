@@ -77,6 +77,12 @@ AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
+_ACT_BY_NAME = {
+    "silu": ActivationType.Silu,
+    "swiglu": ActivationType.Swiglu,
+    "situv2": ActivationType.Situv2,
+}
+
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
 # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
@@ -670,17 +676,24 @@ def test_situv2_activation_matches_torch():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.skip(
-    reason="SiTUv2 has no grouped kernel since the fused stage1 epilogue was "
-    "removed; the TDM path runs it as silu. See TODO(situv2) in "
-    "grouped_moe_gfx1250."
-)
 def test_grouped_a4w4_situv2_matches_torch_ref():
     run_moe(
         "a4w4",
         activation=ActivationType.Situv2,
         model_dim=512,
         inter_dim=512,
+    )
+
+
+def test_grouped_a8w4_situv2_matches_torch_ref():
+    # a8w4 takes the fused stage1 quant epilogue (batched activation), which is
+    # a separate code path from a4w4's bf16 intermediate (element-wise).
+    run_moe(
+        "a8w4",
+        activation=ActivationType.Situv2,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W4,
     )
 
 
@@ -819,9 +832,7 @@ def run_csv_scenario(args) -> None:
 
     activation_override = None
     if args.act is not None:
-        activation_override = (
-            ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
-        )
+        activation_override = _ACT_BY_NAME[args.act]
 
     rows = []
     for idx, rec in enumerate(csv_rows):
@@ -981,14 +992,28 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=101)
     parser.add_argument(
         "--act",
-        choices=("silu", "swiglu"),
+        choices=("silu", "swiglu", "situv2"),
         default=None,
         help="stage1 activation: silu => silu(gate)*up; "
-        "swiglu => gpt-oss swiglu with clamp/alpha/residual. Default: swiglu "
+        "swiglu => gpt-oss swiglu with clamp/alpha/residual; "
+        "situv2 => Kimi-K3 SiTUv2 (see --situ-beta / --situ-linear-beta). "
+        "Default: swiglu "
         "for bench/verify/kernel; for --scenario csv, unset means use each "
         "row's act_type (pass --act to force one activation for all rows).",
     )
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
+    parser.add_argument(
+        "--situ-beta",
+        type=float,
+        default=4.0,
+        help="SiTUv2 gate beta (Kimi-K3 activation_situ_beta).",
+    )
+    parser.add_argument(
+        "--situ-linear-beta",
+        type=float,
+        default=25.0,
+        help="SiTUv2 up beta (Kimi-K3 activation_situ_linear_beta).",
+    )
     parser.add_argument(
         "--no-bias",
         action="store_true",
@@ -1046,7 +1071,7 @@ def main() -> None:
     # sets args.tokens to a single int so run_moe reads it unchanged.
     token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
     # None (unset) defaults to swiglu for the single-shape scenarios.
-    activation = ActivationType.Silu if args.act == "silu" else ActivationType.Swiglu
+    activation = _ACT_BY_NAME.get(args.act, ActivationType.Swiglu)
     rows = []
     for _tok in token_list:
         args.tokens = _tok
@@ -1066,6 +1091,8 @@ def main() -> None:
             tol=tol,
             activation=activation,
             swiglu_limit=args.swiglu_limit,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
             use_bias=not args.no_bias,
             check_aot_cache=not args.no_check_aot_cache,
             raise_on_fail=False,

@@ -398,6 +398,8 @@ def _grouped_a8w4_tdm_moe(
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     import functools
 
@@ -482,12 +484,22 @@ def _grouped_a8w4_tdm_moe(
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
-    stage1_act = 2 if activation == ActivationType.Swiglu else 1
+    # Stage1 epilogue code: 1 silu, 2 swiglu, 3 SiTUv2. The caller has already
+    # rejected anything else.
+    if activation == ActivationType.Swiglu:
+        stage1_act = 2
+    elif activation == ActivationType.Situv2:
+        stage1_act = 3
+    else:
+        stage1_act = 1
+    # SiTUv2 is bounded by construction and takes no clamp, so the limit only
+    # ever applies to swiglu.
     sl = (
         float(swiglu_limit)
         if swiglu_limit
         else (7.0 if activation == ActivationType.Swiglu else float("inf"))
     )
+    _situ_kw = {"situ_beta": situ_beta, "situ_linear_beta": situ_linear_beta}
     _b1 = (
         bias1.to(dtype).contiguous()
         if (bias1 is not None and bias1.numel() > 0)
@@ -560,6 +572,7 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            **_situ_kw,
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
@@ -584,6 +597,7 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            **_situ_kw,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
@@ -648,6 +662,7 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        **_situ_kw,
                     ),
                 )
             )
@@ -676,6 +691,7 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        **_situ_kw,
                     ),
                 )
             )
@@ -998,6 +1014,8 @@ def grouped_gemm_gfx1250_a8w4(
             data_format=data_format,
             expert_mask=expert_mask,
             num_local_tokens=num_local_tokens,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             **_tdm_kw,
         )
 
@@ -1005,10 +1023,6 @@ def grouped_gemm_gfx1250_a8w4(
     # GEMM (gemm_mxscale_gfx1250 / moe_grouped_gemm_mxscale_gfx1250) was
     # removed. Anything the TDM path cannot serve falls back to the caller's
     # generic MoE via None.
-    # TODO(situv2): ActivationType.Situv2 used to be handled by the deleted
-    # fused stage1 epilogue. The TDM stage1 act code only encodes silu/swiglu,
-    # so Situv2 currently runs as silu here -- add a real situv2 code (and
-    # plumb situ_beta / situ_linear_beta) when the TDM refactor settles.
     # TODO(aot): AOT has no coverage for the TDM batched GEMM
     # (batched_gemm_mxfp4); grouped kernels are JIT-compiled at first use
     # until that is added back.
