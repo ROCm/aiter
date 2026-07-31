@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: Wait for Checks workflow
         run: ./.github/scripts/check_signal.sh
@@ -68,7 +68,7 @@ jobs:
       # ---- Common steps (fork and non-fork) ----
       - name: Checkout code
         if: ${{ matrix.build_enabled }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -222,7 +222,7 @@ jobs:
 
       - name: Upload wheel as artifact
         if: ${{ matrix.build_enabled }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py${{ matrix.python_version }}
           path: dist/*.whl
@@ -239,14 +239,14 @@ jobs:
       contents: read
     steps:
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           pattern: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py*
           path: all-wheels
           merge-multiple: true
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a  # v4
         with:
           aws-region: us-east-1
           role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-nightlies
@@ -335,7 +335,7 @@ jobs:
       shard_count: 8
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -343,7 +343,7 @@ jobs:
         run: ./.github/scripts/split_tests.sh --shards 8 --test-type aiter
 
       - name: Upload test shard lists as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: aiter_shards
           path: aiter_shard_*.list
@@ -436,12 +436,12 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Download test shard lists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 15
         with:
           name: aiter_shards
@@ -469,7 +469,7 @@ jobs:
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
         id: download_aiter_wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -478,14 +478,14 @@ jobs:
 
       - name: Retry Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -660,7 +660,7 @@ jobs:
           python3 ./.github/scripts/collect_logs.py latest_test.log >> $GITHUB_STEP_SUMMARY
 
       - name: Upload test logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: standard-test-log-${{ matrix.runner }}-shard-${{ matrix.shard_idx }}
@@ -684,7 +684,7 @@ jobs:
     needs: [standard]
     steps:
       - name: Download all test logs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 15
         with:
           pattern: standard-test-log-*-shard-*
@@ -729,7 +729,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
@@ -746,7 +746,7 @@ jobs:
       - name: Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true'
         id: download_aiter_wheel
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -755,14 +755,14 @@ jobs:
 
       - name: Retry Download Aiter wheel artifact
         if: steps.restore_aiter_wheel.outputs.cache-hit != 'true' && steps.download_aiter_wheel.outcome == 'failure'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         with:
           name: ${{ env.AITER_WHEEL_ARTIFACT_NAME }}-py3.12
           path: aiter_wheels
 
       - name: Download Triton wheel artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 30
         continue-on-error: true
         with:
@@ -930,7 +930,7 @@ jobs:
           bash -c "./.github/scripts/aiter_test.sh"
 
       - name: Upload test logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         if: always()
         with:
           name: multigpu-test-${{ matrix.runner }}
@@ -966,7 +966,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download standard test logs (mi35x only)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         timeout-minutes: 15
         continue-on-error: true
         with:
@@ -1116,7 +1116,7 @@ jobs:
           steps.current.outputs.found == 'true' &&
           (github.event_name == 'push' && github.ref == 'refs/heads/main'
            || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: tuned-op-bench-${{ github.sha }}
           path: /tmp/publish/

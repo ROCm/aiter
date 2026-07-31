@@ -59,7 +59,7 @@ jobs:
       FLOOR_C64: ${{ matrix.floor_c64 }}
     steps:
       - name: Checkout AITER (with submodules)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           submodules: recursive
 
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: kimi-perf-${{ matrix.backend }}-output
           path: kimi_perf_${{ matrix.backend }}_output.txt
