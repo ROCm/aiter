@@ -2322,6 +2322,7 @@ namespace py = pybind11;
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                              \
+    AITER_SET_STREAM_PYBIND;                    \
     m.def("mhc_pre_gemm_sqrsum",                \
           &aiter::mhc_pre_gemm_sqrsum,          \
           "mhc_pre_gemm_sqrsum",                \
