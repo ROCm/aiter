@@ -703,6 +703,99 @@ def test_grouped_a4w4_swiglu_limit_clamps(activation):
 
 
 # ---------------------------------------------------------------------------
+# Contiguous-M prefix scan
+#
+# The scan sits in front of every grouped MoE launch: it turns the per-expert
+# row counts into the tile-aligned starts/psum the GEMM schedules on, and
+# rewrites the route rows in place. It is also the one piece whose width is set
+# by the expert count rather than the token count, so it gets its own coverage
+# above and below the block size -- a wrong row here does not produce a bad
+# number, it produces an out-of-bounds write in whichever kernel consumes the
+# row next.
+# ---------------------------------------------------------------------------
+def _psum_ref(masked_m: torch.Tensor, tile_m: int):
+    """starts / psum / contiguous_m from a tile-aligned cumulative sum."""
+    aligned = ((masked_m + tile_m - 1) // tile_m) * tile_m
+    inclusive = torch.cumsum(aligned.to(torch.int64), 0)
+    starts = inclusive - aligned
+    return (
+        starts.to(torch.int32),
+        (starts + masked_m).to(torch.int32),
+        max(int(inclusive[-1]), tile_m),
+    )
+
+
+def _random_route_counts(experts: int, topk: int, tokens: int, seed: int = 0):
+    """Per-expert counts from a real (unbalanced) random routing."""
+    torch.manual_seed(seed)
+    topk = min(topk, experts)
+    topk_ids = torch.stack([torch.randperm(experts)[:topk] for _ in range(tokens)]).to(
+        torch.int32
+    )
+    counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=experts)
+    return topk_ids, counts.to(torch.int32)
+
+
+# 512 is MAX_EXPERTS_PER_BLOCK: one thread per expert covers E up to that in a
+# single pass, and everything above it needs the chunked sweep. Kimi-K3 is 896.
+@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+def test_contiguous_psum_matches_cumsum(experts):
+    _require_gfx1250()
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum
+
+    tile_m = 64
+    _topk_ids, masked_m = _random_route_counts(experts, topk=16, tokens=128)
+    ref_starts, ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+    starts, psum, contiguous_m = contiguous_psum(masked_m, experts, tile_m)
+    torch.cuda.synchronize()
+
+    bad = int((starts != ref_starts).sum())
+    assert bad == 0, (
+        f"E={experts}: {bad} experts have a wrong start, first at "
+        f"{int((starts != ref_starts).nonzero()[0][0])}"
+    )
+    assert torch.equal(psum, ref_psum), f"E={experts}: psum mismatch"
+    assert (
+        int(contiguous_m[0]) == ref_total
+    ), f"E={experts}: contiguous_m {int(contiguous_m[0])} != {ref_total}"
+
+
+@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+def test_contiguous_psum_remap_rows_stay_in_bounds(experts):
+    """The remap is what the MoE actually calls; an unscanned expert lands here
+    as a row index pointing outside the contiguous buffer."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum_remap
+
+    tile_m, topk, tokens = 64, 16, 128
+    topk_ids, masked_m = _random_route_counts(experts, topk, tokens)
+    ref_starts, _ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+    # Masked layout: row = expert * max_m + slot, which is what
+    # flydsl_moe_topids_to_rows produces and the remap folds down.
+    flat = topk_ids.reshape(-1)
+    max_m = max(tile_m, ((flat.numel() + tile_m - 1) // tile_m) * tile_m)
+    slot = torch.zeros(experts, dtype=torch.int64)
+    rows = torch.empty(flat.numel(), dtype=torch.int32)
+    for i, e in enumerate(flat.tolist()):
+        rows[i] = e * max_m + int(slot[e])
+        slot[e] += 1
+
+    remapped = rows.clone()
+    contiguous_psum_remap(masked_m, remapped, experts, max_m, tile_m)
+    torch.cuda.synchronize()
+
+    expected = ref_starts[flat.long()].long() + (rows.long() - flat.long() * max_m)
+    assert torch.equal(remapped.long(), expected), f"E={experts}: row remap mismatch"
+    oob = int((remapped >= ref_total).sum())
+    assert oob == 0, (
+        f"E={experts}: {oob} remapped rows land outside the contiguous buffer "
+        f"(bound {ref_total}, max row {int(remapped.max())})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _mock_grouped_gemm() -> None:
