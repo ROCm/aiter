@@ -106,7 +106,10 @@ jobs:
             if ! ls /usr/lib/x86_64-linux-gnu/libgtest* >/dev/null 2>&1; then
               apt-get update -qq && apt-get install -y -qq libgtest-dev libfmt-dev libssl-dev
             fi
-            python3 -m pip install -q jinja2"
+            # The kernels are JIT-built on first call, and that path runs through
+            # aiter/jit/core.py -- so it needs aiter's own runtime requirements
+            # (psutil, ninja, pandas, ...), not just the template engine.
+            python3 -m pip install -q -r requirements.txt jinja2"
 
       - name: C++ interface tests
         timeout-minutes: 45
