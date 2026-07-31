@@ -257,6 +257,16 @@ def build_moe_contiguous_psum_remap_module():
             gpu.barrier()
             src, dst = dst, src
 
+        bid = ArithValue(fx.block_idx.x)
+        blk_sz = ArithValue(arith.constant(MAX_EXPERTS_PER_BLOCK, type=i32))
+        gtid = bid * blk_sz + tid
+        is_blk0 = arith.cmpi(CmpIPredicate.eq, _raw(bid), arith.constant(0, type=i32))
+        # Multi-block: every block recomputes the exclusive per-expert starts into
+        # LDS so the grid-strided remap reads starts from LDS (no cross-block
+        # barrier). Only block 0 writes the global starts/psum/contiguous_m. This
+        # parallelizes the O(num_valid_routes) remap across EP_REMAP_NBLK blocks
+        # (mirrors psum_remap_ep minus the ep_rowmap scatter).
+        starts_lds = dst
         _if_store = scf.IfOp(in_expert)
         with ir.InsertionPoint(_if_store.then_block):
             is_first = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
@@ -267,20 +277,24 @@ def build_moe_contiguous_psum_remap_module():
                 prev = src[fx.Index(tid - arith.constant(1, type=i32))]
                 scf.YieldOp([_raw(prev)])
             start = ArithValue(start_if.results[0])
-            m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(start, s_rsrc, tid)
-            buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
-            is_last = arith.cmpi(
-                CmpIPredicate.eq,
-                tid,
-                ArithValue(experts) - arith.constant(1, type=i32),
-            )
-            _if_last = scf.IfOp(is_last)
-            with ir.InsertionPoint(_if_last.then_block):
-                final_cur = src[fx.Index(tid)]
-                gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
-                cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
-                buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
+            starts_lds[fx.Index(tid)] = start
+            _if_g = scf.IfOp(is_blk0)
+            with ir.InsertionPoint(_if_g.then_block):
+                m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+                buffer_ops.buffer_store(start, s_rsrc, tid)
+                buffer_ops.buffer_store(start + ArithValue(m_tid), p_rsrc, tid)
+                is_last = arith.cmpi(
+                    CmpIPredicate.eq,
+                    tid,
+                    ArithValue(experts) - arith.constant(1, type=i32),
+                )
+                _if_last = scf.IfOp(is_last)
+                with ir.InsertionPoint(_if_last.then_block):
+                    final_cur = src[fx.Index(tid)]
+                    gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
+                    cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
+                    buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
+                    scf.YieldOp([])
                 scf.YieldOp([])
             scf.YieldOp([])
 
@@ -298,10 +312,10 @@ def build_moe_contiguous_psum_remap_module():
                 dtype=i32,
             )
         )
-        tid_idx = arith.index_cast(T.index, tid)
+        gtid_idx = arith.index_cast(T.index, _raw(gtid))
         nvr_idx = arith.index_cast(T.index, ArithValue(nvr))
-        stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        remap_loop = scf.ForOp(tid_idx, nvr_idx, stride_idx)
+        stride_idx = arith.index(EP_REMAP_NBLK * MAX_EXPERTS_PER_BLOCK)
+        remap_loop = scf.ForOp(gtid_idx, nvr_idx, stride_idx)
         with ir.InsertionPoint(remap_loop.body):
             route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
             row = ArithValue(
@@ -310,8 +324,8 @@ def build_moe_contiguous_psum_remap_module():
             m = ArithValue(route_max_m)
             expert = ArithValue(arith.divui(row, m))
             slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
+            start = ArithValue(starts_lds[fx.Index(expert)])
+            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
             scf.YieldOp([])
 
     @flyc.jit
@@ -344,7 +358,7 @@ def build_moe_contiguous_psum_remap_module():
             tile_m,
             num_valid_routes,
         ).launch(
-            grid=(arith.index(1), 1, 1),
+            grid=(arith.index(EP_REMAP_NBLK), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
