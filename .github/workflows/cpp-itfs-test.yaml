@@ -1,0 +1,128 @@
+name: C++ Interface Test
+
+# The csrc/cpp_itfs/ C++ entry points are consumed by non-PyTorch callers (C++
+# inference engines) and are NOT exercised by the Python test suite, which goes
+# through its own ctypes path. They had drifted out of sync with the kernel
+# templates they dispatch to. This workflow builds and runs the gtest suites in
+# csrc/cpp_itfs/ on a GPU runner so that drift is caught.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'csrc/cpp_itfs/**'
+      - 'csrc/include/**'
+      - '.github/workflows/cpp-itfs-test.yaml'
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths:
+      - 'csrc/cpp_itfs/**'
+      - 'csrc/include/**'
+      - '.github/workflows/cpp-itfs-test.yaml'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  DOCKER_IMAGE: "rocm/pytorch:latest"
+
+jobs:
+  cpp-itfs:
+    if: >-
+      (!github.event.pull_request || github.event.pull_request.draft == false) &&
+      github.event.action != 'labeled'
+    name: C++ Interface Tests (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-aiter-mi35x-1
+            label: MI35X
+          - runner: aiter-1gpu-runner
+            label: MI300X
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+
+      - name: Docker login
+        if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              echo "Docker login succeeded on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Docker login attempt ${attempt} failed"
+            if [ "${attempt}" != 3 ]; then
+              sleep 10
+            fi
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Run the container
+        run: |
+          set -ex
+          echo "Starting container: aiter_cpp_itfs_test"
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          --network=host \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name aiter_cpp_itfs_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Show environment
+        run: |
+          set -ex
+          docker exec -w /workspace aiter_cpp_itfs_test \
+            bash -lc "hipcc --version | head -3 && ls /opt/rocm/.info/version"
+
+      - name: Install build dependencies
+        run: |
+          set -ex
+          docker exec -w /workspace aiter_cpp_itfs_test bash -lc "
+            set -e
+            if ! ls /usr/lib/x86_64-linux-gnu/libgtest* >/dev/null 2>&1; then
+              apt-get update -qq && apt-get install -y -qq libgtest-dev libfmt-dev libssl-dev
+            fi
+            python3 -m pip install -q jinja2"
+
+      - name: C++ interface tests
+        timeout-minutes: 45
+        run: |
+          set -ex
+          # The kernels are JIT-compiled from source on first call, so the first
+          # run pays a one-off build cost (~20s per kernel config).
+          docker exec -w /workspace aiter_cpp_itfs_test bash -lc "
+            set -o pipefail
+            ./csrc/cpp_itfs/run_cpp_tests.sh 2>&1 | tee cpp_itfs_test.log"
+
+      - name: Upload test logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cpp-itfs-test-log-${{ matrix.runner }}
+          path: cpp_itfs_test.log
+          if-no-files-found: warn
+          retention-days: 7

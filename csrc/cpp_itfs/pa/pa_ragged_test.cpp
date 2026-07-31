@@ -111,31 +111,38 @@ TEST_F(PagedAttentionTest, BasicTest)
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
 
     // Prepare input data
-    std::vector<float> query_data(num_seqs * num_heads * head_size);
-    std::vector<float> key_cache_data(num_blocks * num_kv_heads * head_size * block_size);
-    std::vector<float> value_cache_data(num_blocks * num_kv_heads * head_size * block_size);
+    // Payloads are _Float16: that is the dtype declared in the call below.
+    std::vector<_Float16> query_data(num_seqs * num_heads * head_size);
+    std::vector<_Float16> key_cache_data(num_blocks * num_kv_heads * head_size * block_size);
+    std::vector<_Float16> value_cache_data(num_blocks * num_kv_heads * head_size * block_size);
     std::vector<int> kv_indptr_data       = {0, 2, 4};
     std::vector<int> kv_page_indices_data = {0, 1, 2, 3};
+    // One entry per sequence; both sequences fill their last page completely.
+    std::vector<int> kv_last_page_lens_data = {block_size, block_size};
     std::vector<float> k_scale_data       = {1.0f};
     std::vector<float> v_scale_data       = {1.0f};
 
     // Fill with random data
     for(auto& val : query_data)
-        val = dist(gen);
+        val = static_cast<_Float16>(dist(gen));
     for(auto& val : key_cache_data)
-        val = dist(gen);
+        val = static_cast<_Float16>(dist(gen));
     for(auto& val : value_cache_data)
-        val = dist(gen);
+        val = static_cast<_Float16>(dist(gen));
 
     // Allocate GPU memory
     query_ptr       = allocateAndInitGPU(query_data.size(), query_data);
     key_cache_ptr   = allocateAndInitGPU(key_cache_data.size(), key_cache_data);
     value_cache_ptr = allocateAndInitGPU(value_cache_data.size(), value_cache_data);
-    out_ptr         = allocateAndInitGPU(num_seqs * num_heads * head_size, std::vector<float>());
-    workspace_buffer_ptr =
-        allocateAndInitGPU(num_seqs * num_heads * max_num_partitions * 2, std::vector<float>());
+    out_ptr = allocateAndInitGPU(num_seqs * num_heads * head_size, std::vector<_Float16>());
+    // Per (seq, head, partition): a head_size-wide partial output plus the
+    // running max and sum. Sizing this at 2 floats per partition overflows.
+    workspace_buffer_ptr = allocateAndInitGPU(
+        num_seqs * num_heads * max_num_partitions * (head_size + 2), std::vector<float>());
     kv_indptr_ptr       = allocateAndInitGPU(kv_indptr_data.size(), kv_indptr_data);
     kv_page_indices_ptr = allocateAndInitGPU(kv_page_indices_data.size(), kv_page_indices_data);
+    kv_last_page_lens_ptr =
+        allocateAndInitGPU(kv_last_page_lens_data.size(), kv_last_page_lens_data);
     k_scale_ptr         = allocateAndInitGPU(k_scale_data.size(), k_scale_data);
     v_scale_ptr         = allocateAndInitGPU(v_scale_data.size(), v_scale_data);
 
