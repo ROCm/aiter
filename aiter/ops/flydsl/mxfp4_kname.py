@@ -24,7 +24,11 @@ def _select_mxfp4_a4w4_kernels(*, token: int, expert: int, topk: int) -> dict:
     expert = int(expert)
     average_rows = (routed_rows + expert - 1) // expert
 
-    if int(token) <= 128:
+    # BM16's fused inline quantization has excessive error for a single token.
+    # Use the prequantized BM32 path for this decode corner case.
+    if int(token) == 1:
+        block_m = 32
+    elif int(token) <= 128:
         block_m = 16
     elif average_rows <= 32:
         block_m = 32
@@ -33,11 +37,12 @@ def _select_mxfp4_a4w4_kernels(*, token: int, expert: int, topk: int) -> dict:
     else:
         block_m = 128
 
+    block_n = 256
     total_m_blocks = (routed_rows + block_m - 1) // block_m
     use_nt = block_m in (16, 32, 64) and total_m_blocks < expert
     xcd_swizzle = 2 if block_m == 64 and use_nt else 0
 
-    g1 = f"{_MXMOE_PREFIX[1]}{block_m}x256x256"
+    g1 = f"{_MXMOE_PREFIX[1]}{block_m}x{block_n}x256"
     if block_m == 16:
         g1 += "_f16in_nt"
     elif use_nt:
@@ -63,6 +68,8 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         mt = _MXMOE_TILE_RE.match(tok)
         if mt:
             nums["BM"] = int(mt.group(1))
+            nums["BN"] = int(mt.group(2))
+            nums["BK"] = int(mt.group(3))
             continue
         utok = tok.upper()
         if utok in flag_tokens:
@@ -81,6 +88,8 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
     nums, flags = parsed["nums"], parsed["flags"]
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
@@ -103,6 +112,8 @@ def _parse_mxfp4_g2_kname(kname: str) -> dict:
         )
     return {
         "BM": nums["BM"],
+        "BN": nums["BN"],
+        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "atomic": atomic,

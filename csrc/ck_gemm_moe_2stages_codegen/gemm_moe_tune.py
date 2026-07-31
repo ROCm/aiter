@@ -5078,11 +5078,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "config_env_name": "AITER_CONFIG_FMOE",
     }
     XCD_SWIZZLES: ClassVar[tuple[int, ...]] = (0, 2, 4)
+    STAGE1_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = ("gemm1_a4w4_port_",)
+    STAGE2_KERNEL_MARKERS: ClassVar[tuple[str, ...]] = ("mfma_moe2_",)
 
     @staticmethod
-    def _g1_kname(bm, use_nt, inline_quant, xcd_swizzle=0):
-        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
-        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
+    def _g1_kname(bm, bn, use_nt, inline_quant, xcd_swizzle=0):
+        # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x256[_f16in][_nt]; see mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x{bn}x256"
         if inline_quant:
             name += "_f16in"
         if use_nt:
@@ -5169,12 +5171,59 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         cands = []
         for bm in sorted({v[0] for v in G1}):
+            if int(row["token"]) == 1 and bm == 16:
+                continue
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
-                for xcd_swizzle in self.XCD_SWIZZLES:
-                    kn1 = self._g1_kname(bm, n1, iq1, xcd_swizzle)
-                    for kn2 in self._mixed_g2_knames(bm, xcd_swizzle):
-                        cands.append(self._candidate_row(row, bm, kn1, kn2))
+                for bn in (128, 256):
+                    for xcd_swizzle in self.XCD_SWIZZLES:
+                        kn1 = self._g1_kname(bm, bn, n1, iq1, xcd_swizzle)
+                        for kn2 in self._mixed_g2_knames(bm, xcd_swizzle):
+                            cands.append(self._candidate_row(row, bm, kn1, kn2))
         return cands
+
+    @classmethod
+    def _extract_stage_kernel_times(cls, kernel_times):
+        def stage_time(markers):
+            return sum(
+                float(us)
+                for name, us in kernel_times.items()
+                if any(marker in str(name) for marker in markers)
+            )
+
+        us1 = stage_time(cls.STAGE1_KERNEL_MARKERS)
+        us2 = stage_time(cls.STAGE2_KERNEL_MARKERS)
+        missing = []
+        if us1 <= 0:
+            missing.append("GEMM1")
+        if us2 <= 0:
+            missing.append("GEMM2")
+        if missing:
+            available = ", ".join(sorted(str(name) for name in kernel_times))
+            raise RuntimeError(
+                f"profiler did not report {'/'.join(missing)} target kernel time; "
+                f"available kernels: {available}"
+            )
+        return round(us1, 4), round(us2, 4)
+
+    def _calculate_candidate_performance(self, row, candidate, us):
+        perf_key = []
+        for key in self.keys:
+            if key == "dtype":
+                perf_key.append(dtypes.bf16)
+            elif key in ("q_dtype_a", "q_dtype_w"):
+                perf_key.append(dtypes.fp4x2)
+            else:
+                perf_key.append(row[key])
+        return self.calculate(
+            (
+                tuple(perf_key),
+                "",
+                candidate["kernelName1"],
+                candidate["block_m"],
+                us,
+                candidate["err1"],
+            )
+        )
 
     @staticmethod
     def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
@@ -5313,24 +5362,31 @@ class Mxfp4FlydslTuner(FmoeTuner):
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
-        _, us = run_perftest(
+        _, e2e_us, kernel_times = run_perftest(
             lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
+            return_kernel_times=True,
         )
-        us = round(float(us), 4)
+        e2e_us = round(float(e2e_us), 4)
+        us1, us2 = self._extract_stage_kernel_times(kernel_times)
+        us = round(us1 + us2, 4)
         candidate.update(
             {
-                "us1": us,
+                "us1": us1,
+                "us2": us2,
                 "us": us,
                 "err1": round(float(err), 6),
                 "err2": round(float(err), 6),
             }
         )
-        return us
+        candidate["tflops"], candidate["bw"] = self._calculate_candidate_performance(
+            row, candidate, us
+        )
+        return e2e_us
 
     def _tune_one_shape(self, row, args):
-        """Sweep all (g1, g2) candidates for one shape; return the best row dict.
+        """Sweep one shape and return its best row plus all successful profiles.
 
         --timeout (if > 0) bounds each candidate via SIGALRM. This runs on the
         main thread of whichever process owns the shape, so it works for both the
@@ -5375,19 +5431,25 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         ref = self._torch_ref(data, topk, dtype, activation)
 
-        best, failures = None, []
+        best, best_e2e_us, failures, profiles = None, None, [], []
         for candidate in self._candidate_rows(row):
             if timeout > 0:
                 signal.alarm(timeout)
             try:
-                us = self._run_candidate(row, candidate, args, data=data, ref=ref)
+                e2e_us = self._run_candidate(row, candidate, args, data=data, ref=ref)
+                profile_row = candidate.copy()
+                profile_row["e2e_us"] = e2e_us
+                profiles.append(profile_row)
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
-                    f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
+                    f"{candidate['kernelName1']} + {candidate['kernelName2']} "
+                    f"us1={candidate['us1']} us2={candidate['us2']} "
+                    f"kernel_us={candidate['us']} e2e_us={e2e_us}",
                     flush=True,
                 )
-                if best is None or us < float(best["us"]):
+                if best is None or e2e_us < best_e2e_us:
                     best = candidate
+                    best_e2e_us = e2e_us
             except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
@@ -5398,6 +5460,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     signal.alarm(0)
         if best is None:
             best = self._candidate_rows(row)[0]
+            best["us1"] = self.INVALID_TIME
+            best["us2"] = self.INVALID_TIME
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -5405,11 +5469,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 f"{tuple(row[k] for k in self.keys)}",
                 flush=True,
             )
-        return best
+        return best, profiles
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
+        self._profile_rows = []
+        if not rows:
+            return []
 
         mp_num = int(getattr(args, "mp", 1) or 1)
         try:
@@ -5419,31 +5486,49 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
 
         if mp_num <= 1:
-            return [self._tune_one_shape(row, args) for row in rows]
+            shape_results = [self._tune_one_shape(row, args) for row in rows]
+        else:
+            # One fresh process per shape (memory fully released between shapes),
+            # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
+            # the mp_num concurrent workers never collide on the same device.
+            import multiprocessing as _mp
 
-        # One fresh process per shape (memory fully released between shapes),
-        # spread across mp_num GPUs. A shared queue hands out distinct GPU ids so
-        # the mp_num concurrent workers never collide on the same device.
-        import multiprocessing as _mp
+            print(
+                f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs",
+                flush=True,
+            )
+            ctx = _mp.get_context("spawn")
+            mgr = ctx.Manager()
+            gpu_q = mgr.Queue()
+            for g in range(mp_num):
+                gpu_q.put(g)
+            payloads = [(self.keys, row, args, gpu_q) for row in rows]
+            with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
+                # chunksize=1 so each shape is its own task: with maxtasksperchild=1
+                # the worker is torn down after every shape (memory fully released,
+                # and one process never spans multiple GPUs via the shared queue).
+                shape_results = pool.map(
+                    _mxfp4_tune_shape_worker, payloads, chunksize=1
+                )
 
-        print(
-            f"[mxfp4-port] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True
-        )
-        ctx = _mp.get_context("spawn")
-        mgr = ctx.Manager()
-        gpu_q = mgr.Queue()
-        for g in range(mp_num):
-            gpu_q.put(g)
-        payloads = [(self.keys, row, args, gpu_q) for row in rows]
-        with ctx.Pool(processes=mp_num, maxtasksperchild=1) as pool:
-            # chunksize=1 so each shape is its own task: with maxtasksperchild=1
-            # the worker is torn down after every shape (memory fully released,
-            # and one process never spans multiple GPUs via the shared queue).
-            results = pool.map(_mxfp4_tune_shape_worker, payloads, chunksize=1)
-        return results
+        bests = []
+        for best, profiles in shape_results:
+            bests.append(best)
+            self._profile_rows.extend(profiles)
+        return bests
 
     def post_process(self, results, args, topk=-1, fast_mode=False):
-        del args, topk, fast_mode
+        del topk, fast_mode
+        profile_file = getattr(args, "profile_file", "")
+        profile_rows = getattr(self, "_profile_rows", [])
+        if profile_file and profile_rows:
+            profile_columns = self.columns + ["e2e_us"]
+            profile_df = pd.DataFrame(profile_rows, columns=profile_columns)
+            if os.path.exists(profile_file):
+                old_profile = self.get_tuned_gemm_list(profile_file, profile_columns)
+                profile_df = pd.concat([old_profile, profile_df], ignore_index=True)
+            profile_df.to_csv(profile_file, index=False)
+        self._profile_rows = []
         return pd.DataFrame(results, columns=self.columns)
 
     def result_to_csv(self, results, file, concat=False):
@@ -5501,10 +5586,12 @@ def _mxfp4_tune_shape_worker(payload):
         best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         best.keys = keys
         cand = best._candidate_rows(row)[0]
+        cand["us1"] = Mxfp4FlydslTuner.INVALID_TIME
+        cand["us2"] = Mxfp4FlydslTuner.INVALID_TIME
         cand["us"] = Mxfp4FlydslTuner.INVALID_TIME
         cand["kernelName1"] = (f"FAILED(GPU{gpu}): {exc}")[:240]
         print(f"[mxfp4-port] shape failed on GPU{gpu}: {exc}", flush=True)
-        return cand
+        return cand, []
     finally:
         gpu_q.put(gpu)
 

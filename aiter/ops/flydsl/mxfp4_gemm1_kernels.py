@@ -97,6 +97,10 @@ def _assert_supported(
             f"flydsl mxfp4 gemm1 requires 2*D_INTER (N_OUT) % {BN} == 0, "
             f"got D_INTER={D_INTER}"
         )
+    if BN not in (128, 256):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires BN in (128, 256), got {BN}"
+        )
     if (BM, use_nt, inline_quant) not in _SUPPORTED_BY_DTYPE[a_dtype]:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "

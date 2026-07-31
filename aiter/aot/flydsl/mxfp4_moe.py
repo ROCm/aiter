@@ -34,6 +34,8 @@ def _job_key(job: dict) -> tuple:
         return (
             1,
             job["BM"],
+            job["BN"],
+            job["BK"],
             job["use_nt"],
             job["inline_quant"],
             job["D_HIDDEN"],
@@ -114,10 +116,15 @@ def parse_csv(csv_path: str):
                 else None
             )
 
+            configured_kn1 = (row.get("kernelName1") or "").strip()
             kn1 = (
-                replacement["kernelName1"]
-                if replacement is not None
-                else (row.get("kernelName1") or "").strip()
+                configured_kn1
+                if _is_mxfp4_kname(configured_kn1)
+                else (
+                    replacement["kernelName1"]
+                    if replacement is not None
+                    else configured_kn1
+                )
             )
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
@@ -126,6 +133,8 @@ def parse_csv(csv_path: str):
                         "stage": 1,
                         "kernel_name": kn1,
                         "BM": p1["BM"],
+                        "BN": p1["BN"],
+                        "BK": p1["BK"],
                         "use_nt": p1["use_nt"],
                         "inline_quant": p1["inline_quant"],
                         "D_HIDDEN": model_dim,
@@ -192,6 +201,8 @@ def _compile_stage1(job):
         hidden_states=d,
         n_tokens=job["BM"],
         BM=job["BM"],
+        BN=job["BN"],
+        BK=job["BK"],
         use_nt=job["use_nt"],
         inline_quant=job["inline_quant"],
         NE=job["NE"],
