@@ -11,7 +11,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kimi_k3_kda_decode import (
+    flydsl_kimi_k3_kda_decode,
+    flydsl_kimi_k3_kda_decode_with_f_b,
+    is_flydsl_kimi_k3_kda_decode_supported,
+)
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 
@@ -27,12 +33,6 @@ def _gfx950_flydsl_available() -> bool:
 pytestmark = pytest.mark.skipif(
     not _gfx950_flydsl_available(),
     reason="gfx950 FlyDSL required",
-)
-
-from aiter.ops.flydsl.kimi_k3_kda_decode import (
-    flydsl_kimi_k3_kda_decode,
-    flydsl_kimi_k3_kda_decode_with_f_b,
-    is_flydsl_kimi_k3_kda_decode_supported,
 )
 
 _DEVICE = torch.device("cuda")
@@ -437,9 +437,19 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
 def test_f_b_api_rejects_invalid_projection_inputs() -> None:
     f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
 
+    with pytest.raises(ValueError, match="`f_a` must have rank 2"):
+        _run_with_f_b(f_a.unsqueeze(0), f_b_weight, inputs)
     with pytest.raises(ValueError, match="`f_a` must have dtype"):
         _run_with_f_b(f_a.float(), f_b_weight, inputs)
     with pytest.raises(ValueError, match="`f_b_weight` must have shape"):
         _run_with_f_b(f_a, f_b_weight[:, :, :-1], inputs)
     with pytest.raises(ValueError, match="`f_b_weight` must have inner strides"):
         _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
+
+
+def test_decode_api_rejects_invalid_input_rank() -> None:
+    inputs = _make_inputs(batch=1)
+    inputs.x = inputs.x.unsqueeze(0)
+
+    with pytest.raises(ValueError, match="`x` must have rank 2"):
+        _run(inputs)

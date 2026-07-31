@@ -272,10 +272,12 @@ def flydsl_kimi_k3_kda_decode(
     :func:`is_flydsl_kimi_k3_kda_decode_supported` before dispatching from a
     model implementation.
     """
+    if x.ndim != 2:
+        raise ValueError(f"`x` must have rank 2, got rank {x.ndim}.")
     if not x.is_cuda:
         raise ValueError("`x` must be a CUDA tensor.")
     device = x.device
-    batch = x.shape[0] if x.ndim == 2 else -1
+    batch = x.shape[0]
     out = _validate_kda_inputs(
         api_name="flydsl_kimi_k3_kda_decode",
         batch_source="x",
@@ -369,10 +371,12 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
     lower-bound decay gate. It does not materialize the projected raw-g tensor
     in global memory.
     """
+    if f_a.ndim != 2:
+        raise ValueError(f"`f_a` must have rank 2, got rank {f_a.ndim}.")
     if not f_a.is_cuda:
         raise ValueError("`f_a` must be a CUDA tensor.")
     device = f_a.device
-    batch = f_a.shape[0] if f_a.ndim == 2 else -1
+    batch = f_a.shape[0]
     _check_same_device((("f_b_weight", f_b_weight),), device)
     _check_tensor(
         "f_a",

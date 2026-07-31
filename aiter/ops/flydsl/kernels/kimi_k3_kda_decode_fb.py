@@ -12,8 +12,10 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu as mlir_gpu
 from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects import vector as mlir_vector
-from flydsl.expr import range_constexpr, vector
+from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import GTensor, _to_raw
 
