@@ -822,12 +822,12 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
                                 swizzle: bool = False,
                                 num_buffers: int = 2,
                                 prefetch_depth: int = 2):
-    """LDS double-buffered variant (gfx950 scaled atoms only).
+    """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
-    Parallel to ``_build_kernel_mfma_r_w`` but stages KV through a 2-slot LDS
-    double buffer filled by async global->LDS DMA (``raw_ptr_buffer_load_lds``),
-    with an explicit software pipeline (prefetch tile 0/1, then per-tile
-    ``s_waitcnt`` + prefetch(i+2) + compute).
+    Parallel to ``_build_kernel_mfma_r_w`` but stages KV through a multi-slot LDS
+    buffer filled by async global->LDS DMA (``raw_ptr_buffer_load_lds``),
+    with an explicit software pipeline (prefetch tile 0..PD-1, then per-tile
+    ``s_waitcnt`` + prefetch(i+PD) + compute).
 
     Work partition (the key difference vs the direct-load builder):
       * All ``WPB`` waves cooperatively load ONE ``BKV``-wide K-tile into LDS and
@@ -837,8 +837,8 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
       * A block owns ``ROWS_PER_BLOCK = RPW * WPB`` query rows (wave ``w`` owns
         rows ``[w*RPW, (w+1)*RPW)``). KV reuse factor becomes ``RPW * WPB``.
 
-    The epilogue (per-lane scalar ReLU/weight + ``shuffle_xor`` butterfly +
-    predicated store) is kept identical to the direct-load builder.
+    A-frags are loaded from global; B-frags are read from LDS.
+    The epilogue is kept identical to the direct-load builder.
     """
     H   = num_heads
     D   = head_size
@@ -878,7 +878,8 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
     _need_barrier_b = NUM_BUFFERS <= PREFETCH_DEPTH
     SLOT_BYTES  = BKV * D                 # fp8, 1 byte/elem
     SLOT_I32    = SLOT_BYTES // 4
-    DMA_BYTES   = 16                       # dwordx4 async load per lane
+    # gfx950 raw_ptr_buffer_load_lds supports size=16 (dwordx4).
+    DMA_BYTES = 16
     assert SLOT_BYTES % (MR_BLOCK_THREADS * DMA_BYTES) == 0, (
         f"SLOT_BYTES={SLOT_BYTES} must be divisible by "
         f"MR_BLOCK_THREADS*DMA_BYTES={MR_BLOCK_THREADS * DMA_BYTES}"
@@ -1149,7 +1150,12 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
             rocdl.s_waitcnt((PREFETCH_DEPTH - 1) * NUM_ASYNC_LOADS)
             gpu.barrier()
 
-            # Read all B-frags for this tile from LDS into registers.
+            # Read all B-frags for this tile from LDS into registers.  Hoisting
+            # every (ni,kk) read ahead of the compute nest lets the compiler
+            # batch the LDS loads and hide their lgkmcnt latency behind the MFMA
+            # work (an interleaved per-ni read was measured strictly worse -- it
+            # exposes the read latency and loses ILP, even though it would cut
+            # live B-frag VGPRs; the hoist is the better trade here).
             b_packs        = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
             cols           = [None] * N_TILES
             kv_scales_tile = [None] * N_TILES
@@ -1437,6 +1443,8 @@ if arch == "gfx950":
         "mfma32x32x64_bkv64_r2_w2_lds3":  _mfma32k64_lds_bkv(64,  2, 2, sw=True, nb=3, pd=2),
         "mfma32x32x64_bkv64_r2_w4_lds3":  _mfma32k64_lds_bkv(64,  2, 4, sw=True, nb=3, pd=2),
         "mfma32x32x64_bkv128_r2_w4_lds3": _mfma32k64_lds_bkv(128, 2, 4, sw=True, nb=3, pd=2),
+        "mfma32x32x64_bkv64_r1_w2_lds3":  _mfma32k64_lds_bkv(64,  1, 2, sw=True, nb=3, pd=2),
+        "mfma32x32x64_bkv128_r1_w2_lds3": _mfma32k64_lds_bkv(128, 1, 2, sw=True, nb=3, pd=2),
     })
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
