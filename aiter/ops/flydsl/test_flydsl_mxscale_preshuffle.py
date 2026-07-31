@@ -326,10 +326,10 @@ def test_a8w8_blockscale_inkernel(M, N, K, tile_m, tile_n, tile_k):
     sa_128 = sa_u.view(Ma, K // 128, 4).amax(dim=2).contiguous()
     sb_128 = sb_u[:N].view(N // 128, 128, K // 128, 4).amax(dim=(1, 3)).contiguous()
 
-    # Compact-shuffle on HOST (cpu) once, move the small result to device, then run
-    # with blockscale=True — the op takes the prepared scales as-is (no GPU repack).
-    sa_prep = _compact_blockscale_a(sa_128.cpu(), K).to(dev)
-    sb_prep = _compact_blockscale_b(sb_128.cpu(), N, K).to(dev)
+    # Compact-shuffle on device (plain reshape+permute), then run with
+    # blockscale=True — the op takes the prepared scales as-is (no GPU repack).
+    sa_prep = _compact_blockscale_a(sa_128, K)
+    sb_prep = _compact_blockscale_b(sb_128, N, K)
     out = torch.zeros(M, N, device=dev, dtype=torch.bfloat16)
     flydsl_mxscale_preshuffle_gemm(
         a_codes,
@@ -458,10 +458,10 @@ def _verify_tuned_shape(
     sa_128 = sau.view(Ma, K // 128, 4).amax(dim=2).contiguous()
     sb_128 = sbu[:N].view(N // 128, 128, K // 128, 4).amax(dim=(1, 3)).contiguous()
 
-    # compact-shuffle on HOST (cpu) once, move small result to device, pass
-    # scales_prepared=True so the op does no per-call GPU repack.
-    sa_prep = _compact_blockscale_a(sa_128.cpu(), K).to(dev)
-    sb_prep = _compact_blockscale_b(sb_128.cpu(), N, K).to(dev)
+    # compact-shuffle on device (plain reshape+permute), then pass blockscale=True
+    # so the op takes the prepared scales as-is (no per-call repack).
+    sa_prep = _compact_blockscale_a(sa_128, K)
+    sb_prep = _compact_blockscale_b(sb_128, N, K)
     out = _run(sa_prep, sb_prep, True)
     a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
         sa_128[:M].repeat_interleave(128, dim=1)

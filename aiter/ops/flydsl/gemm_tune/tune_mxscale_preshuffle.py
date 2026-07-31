@@ -82,8 +82,8 @@ def generate_data(
         sau, sbu = sa.view(torch.uint8), sb.view(torch.uint8)
         sa_128 = sau.view(ma, k // 128, 4).amax(dim=2).contiguous()
         sb_128 = sbu[:n].view(n // 128, 128, k // 128, 4).amax(dim=(1, 3)).contiguous()
-        a_scale = _compact_blockscale_a(sa_128.cpu(), k).to(device)
-        b_scale = _compact_blockscale_b(sb_128.cpu(), n, k).to(device)
+        a_scale = _compact_blockscale_a(sa_128, k)
+        b_scale = _compact_blockscale_b(sb_128, n, k)
         a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
             sa_128[:m].repeat_interleave(128, dim=1)
         )

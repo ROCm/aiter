@@ -63,11 +63,14 @@ def _compile_to_cache(
             # caller-prepared compact-shuffled scales (op no longer repacks); build
             # from coarse A 1x128 (rows,K//128) / B 128x128 (N//128,K//128).
             a_scale = _compact_blockscale_a(
-                torch.zeros((M + 31) // 32 * 32, K // 128, dtype=torch.uint8), K
-            ).to(dev)
+                torch.zeros(
+                    (M + 31) // 32 * 32, K // 128, dtype=torch.uint8, device=dev
+                ),
+                K,
+            )
             b_scale = _compact_blockscale_b(
-                torch.zeros(N // 128, K // 128, dtype=torch.uint8), N, K
-            ).to(dev)
+                torch.zeros(N // 128, K // 128, dtype=torch.uint8, device=dev), N, K
+            )
         else:
             a_scale = torch.zeros(
                 ((M + 31) // 32 * 32, K // 32), dtype=torch.uint8, device=dev

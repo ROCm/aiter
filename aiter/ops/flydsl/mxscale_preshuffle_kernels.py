@@ -26,9 +26,31 @@ from aiter.ops.flydsl.utils import is_flydsl_available
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
-def _compact_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
-    from aiter.ops.shuffle import shuffle_scale_a16w4
+def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
+    """Pad the 128-K block axis up to the shuffle's 256-K chunking (2 blocks per
+    chunk), filling with 0x7F (E8M0 1.0). K1 = (K+255)//256 mirrors shuffle_scale
+    rounding k_scale up to 8, so K%256!=0 (e.g. K=384) matches the kernel's chunks.
+    """
+    K1 = (K + 255) // 256
+    if s.shape[-1] < 2 * K1:
+        s = torch.nn.functional.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
+    return s, K1
 
+
+def _compact_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
+    """Coarse A blockscale (rows, K//128) -> the kernel's compact per-lane words.
+
+    Emits the layout directly as a reshape+permute: the byte a lane reads is
+    ``[n1][k1][nl][kp][np]`` with ``row = n1*32 + np*16 + nl`` and
+    ``kblk = k1*2 + kp`` (K_Lane dropped -- blockscale is constant inside a
+    128-K block, so the kernel broadcasts it via ``sc_lane_a = lane_mod_16``).
+
+    Equivalent to expanding the coarse scale to per-1x32, running the real
+    `shuffle_scale_a16w4` and keeping only K_Lane 0 (the other three slices are
+    byte-identical copies) -- but with no expansion and no full-shuffle
+    temporary, so it is cheap to call per-iteration on device (a per-call host
+    round-trip would stall the pipeline).
+    """
     s = a_scale.view(torch.uint8)
     rows = s.shape[0]
     if s.shape[-1] != K // 128:
@@ -36,30 +58,31 @@ def _compact_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
             f"blockscale a_scale must be (rows, K//128)=(*, {K // 128}); "
             f"got {tuple(a_scale.shape)}"
         )
-    per32 = s.repeat_interleave(4, dim=1)  # (rows, K//32), block-constant
-    full = shuffle_scale_a16w4(per32, 1, False).view(torch.uint8)
-    # K1 = 256-K chunk count, padded like shuffle_scale (k_scale rounded up to 8)
-    # so K not a multiple of 256 (e.g. K=384) matches the kernel's chunk sizing.
-    n1, K1 = rows // 32, (K + 255) // 256
-    fdw = full.reshape(n1, K1, 4, 16, 4)  # [n1, K1, K_Lane, N_Lane, word]
-    return fdw[:, :, 0, :, :].contiguous().reshape(-1)  # drop K_Lane
+    if rows % 32:
+        raise ValueError(
+            f"blockscale a_scale rows must be a multiple of 32, got {rows}"
+        )
+    s, K1 = _pad_kblocks(s, K)
+    # (rows, 2*K1) -> [n1, np, nl, k1, kp] -> [n1, k1, nl, kp, np]
+    return s.view(rows // 32, 2, 16, K1, 2).permute(0, 3, 2, 4, 1).contiguous().view(-1)
 
 
 def _compact_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
-    from aiter.ops.shuffle import shuffle_scale_a16w4
+    """Coarse B blockscale (N//128, K//128) -> one word per (128-N block, chunk).
 
+    B is constant over N as well, so N_Lane and 3/4 of the 32-N super-rows drop
+    out too (kernel: ``sc_lane_b = 0``, super-row ``nsb // 4``). The word keeps
+    ``[kp, np]`` with np duplicated, to stay dword-aligned. Same direct emit as
+    `_compact_blockscale_a`; see there for the shared reasoning.
+    """
     s = b_scale.view(torch.uint8)
     if s.shape != (N // 128, K // 128):
         raise ValueError(
             f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
             f"got {tuple(b_scale.shape)}"
         )
-    per32 = s.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)  # (N, K//32)
-    full = shuffle_scale_a16w4(per32, 1, False).view(torch.uint8)
-    # K1 padded to the shuffle's 256-K chunk count so K=384 (K%256!=0) works.
-    n1, K1 = N // 32, (K + 255) // 256
-    fdw = full.reshape(n1, K1, 4, 16, 4)
-    return fdw[0::4, :, 0, 0, :].contiguous().reshape(-1)  # 1 word / 128-N block
+    s, K1 = _pad_kblocks(s, K)
+    return s.view(N // 128, K1, 2, 1).expand(N // 128, K1, 2, 2).contiguous().view(-1)
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -89,11 +112,13 @@ def flydsl_mxscale_preshuffle_gemm(
     slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
 
     blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
-    the caller built (once, on host) via _compact_blockscale_a/_b from the coarse
-    E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]). The op does NOT
-    repack here — symmetric with MX mode where the caller pre-shuffles. The kernel
-    broadcasts them to the 1x32 scaled-MFMA via the scale load address. Prepare the
-    static B-scale at weight-prep time to keep it off the per-call path.
+    the caller built via _compact_blockscale_a/_b from the coarse E8M0 (A 1x128
+    [rows, K//128], B 128x128 [N//128, K//128]). The op does NOT repack here —
+    symmetric with MX mode where the caller pre-shuffles. The kernel broadcasts
+    them to the 1x32 scaled-MFMA via the scale load address. Prepare the static
+    B-scale at weight-prep time to keep it off the per-call path; the per-token
+    A-scale is a plain reshape+permute, so build it on device (a host round-trip
+    costs more than this GEMM).
     """
     if not is_flydsl_available():
         raise RuntimeError(
