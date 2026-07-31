@@ -426,9 +426,11 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     const D_SCALE*  qs_base = reinterpret_cast<const D_SCALE*>(kargs.ptr_q_scale) + (size_t)row_id * (T::K_CHUNKS * T::MFMA_M);
     const D_WEIGHT* w_base  = reinterpret_cast<const D_WEIGHT*>(kargs.ptr_weights) + (size_t)row_id * N_HEADS;
     const int*      bt_base = kargs.ptr_block_tables + (size_t)batch_id * max_blk;   // fold batch into base
-    D_OUT*          out_base = kargs.ptr_out + (size_t)row_id * kargs.stride_out_row + local_start;
-    const unsigned  out_win_bytes = (unsigned)(local_end > local_start ? local_end - local_start : 0)
-                                  * (unsigned)sizeof(D_OUT);
+    // Out base folds ONLY the row (16B-safe: never depends on local_start; fixes the leading-token
+    // drop for local_start % 4 != 0 -- see gcnasm/opus_logits/KNOWN_ISSUE_out_store_alignment.md).
+    // Store offsets are absolute token indices; masking is by forcing a < 0 (OOB) offset (see do_store).
+    D_OUT*          out_base  = kargs.ptr_out + (size_t)row_id * kargs.stride_out_row;
+    const unsigned  out_bytes = (unsigned)(local_end > 0 ? local_end : 0) * (unsigned)sizeof(D_OUT);
 
     auto g_q   = opus::make_gmem(q_base);
     auto g_qs  = opus::make_gmem(qs_base);
@@ -436,7 +438,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     auto g_kvs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(kargs.ptr_kv_scale));
     auto g_bt  = opus::make_gmem(bt_base);
     auto g_w   = opus::make_gmem(w_base);
-    auto g_out = opus::make_gmem(out_base, out_win_bytes);
+    auto g_out = opus::make_gmem(out_base, out_bytes);   // OOB size == local_end: drops out-of-window / non-writer (< 0) offsets
 
     // ---- Hoist Q (i32x8 per m-tile) ----
     auto u_q = make_layout_q<T>(lane_mod_16, lane_div_16);
@@ -463,12 +465,11 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     auto u_kv_nt = make_layout_kv_nt<T>(lane_mod_16, lane_div_16);   // per-nt split KV load
     auto u_kvs = make_layout_scale<T>(lane_div_16, lane_mod_16);
     auto u_bt  = make_layout_bt<T>(warp_id);
-    auto u_out = make_layout_out<T>(warp_id, lane_mod_16);
-    // Hoist the single-writer test out of the tile loop: pre-bias non-writer lanes
-    // (lane_div_16 != 0) by a large negative so every store offset stays < 0 (dropped OOB) for
-    // all tiles. -(chunk_start+tile_count)*block_k is below the CTA's smallest out_token base;
-    // with u_out's in-tile span (< block_k) and -local_start the sum is always <= -1.
-    u_out += (lane_div_16 != 0) ? -(chunk_start + tile_count) * block_k : 0;
+    const int tok_lane_base = warp_id * (NTPW * T::MFMA_N) + lane_mod_16;   // row r's abs out-token = c*block_k + nt*MFMA_N + this
+    // Single-writer lane via a large-negative ADDRESS bias (no compare): only lane_div_16 == 0 stores;
+    // the head reduction leaves all 4 groups with the same out[nt], so the other 3 get a < 0 offset
+    // (below the CTA's smallest out-token base) that the OOB size drops.
+    const int lane_bias = (lane_div_16 != 0) ? -(chunk_start + tile_count) * block_k : 0;
     constexpr int pages_per_tile = T::KV_TILE_SIZE / PAGE;   // warps per tile (== NUM_WARPS)
 
     // Per-tile paged lookups (block-table page id, then that page's packed KV scale word).
@@ -547,8 +548,19 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
             out[nt] = ts;
         });
     };
+    // FlyDSL-style masked store (branch-free): per nt, keep the absolute out-token offset if in-window
+    // (with the single-writer bias folded in), else force -1. Out-of-window / non-writer become a < 0
+    // offset that the buffer OOB size drops -- one v_cndmask + one UNCONDITIONAL store per nt, no store_if.
+    const unsigned win = (unsigned)(local_end > local_start ? local_end - local_start : 0);
     auto do_store = [&](opus::vector_t<float, NTPW>& out, int t) {
-        g_out.template store<1>(out, u_out + ((chunk_start + t) * block_k - local_start));
+        const int tile_off = (chunk_start + t) * block_k;
+        opus::static_for<NTPW>([&](auto ntc) {
+            constexpr int nt = ntc.value;
+            const int  abs_tok = tile_off + nt * T::MFMA_N + tok_lane_base;
+            const bool in_win  = (unsigned)(abs_tok - local_start) < win;
+            const int  off     = in_win ? (abs_tok + lane_bias) : -1;
+            g_out.template store<1>(out[nt], off);
+        });
     };
 
     // Empty assignment (0 tiles): nothing to load/compute/store (uniform across the block).

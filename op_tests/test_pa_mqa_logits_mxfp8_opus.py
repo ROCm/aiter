@@ -528,6 +528,29 @@ def main():
     # empty batch (qlen=0) mixed with non-empty batches
     rc |= run_varqlen_case(3, [2, 0, 3], [384, 256, 640], seed=28)
 
+    # ── prefill corner cases ──
+    print("  -- prefill corner cases --")
+    rc |= run_prefill_case(1, [[(0, 300)]], seed=30)                         # single row
+    rc |= run_prefill_case(1, [[(0, 256), (0, 512), (0, 257), (0, 255)]], seed=32)  # exact/±1 block_k
+    # Non-4-aligned local_start (guards the out-store alignment fix -- see
+    # gcnasm/opus_logits/KNOWN_ISSUE_out_store_alignment.md): windows whose start / end land mid-tile
+    # and span a block_k boundary must be written fully (no leading-token drop, no below-window leak).
+    rc |= run_prefill_case(2, [[(0, 1), (17, 33)], [(63, 65), (255, 257)]], seed=34)  # 1-token + unaligned small/spanning
+    # Exhaustive start sweep: every local_start in [0, 130) with a fixed 40-wide window. run_prefill_case
+    # already fails on any dropped in-window cell (cos_fp8 -> nan) or any leaked below-window cell (oob_neginf).
+    rc |= run_prefill_case(1, [[(s, s + 40) for s in range(0, 130)]], parallel_unit_num=1024, seed=52)
+    rc |= run_prefill_case(2, [[(0, 4096)], [(0, 4096)]], parallel_unit_num=1024, seed=36)  # heavy context-split
+    rc |= run_prefill_case(8, [[(0, 300)] for _ in range(8)], seed=38)       # many batches, 1 row each
+    rc |= run_prefill_case(2, [[(0, 0), (0, 200)], [(100, 100), (0, 128)]], seed=40)  # zero-length windows mixed
+    rc |= run_prefill_case(1, [[(0, 8192)]], seed=42)                        # single long row (32 tiles)
+
+    # ── varqlen corner cases ──
+    print("  -- varqlen corner cases --")
+    rc |= run_varqlen_case(2, [8, 3], [4, 500], seed=44)     # qlen > ctx -> some rows tail-clamped empty
+    rc |= run_varqlen_case(2, [8, 8], [1024, 2048], seed=46)  # next_n=8 uniform
+    rc |= run_varqlen_case(1, [1], [1000], seed=48)          # single batch, single decode token
+    rc |= run_varqlen_case(4, [16, 8, 24, 4], [4096, 2048, 4096, 1024], seed=50)  # larger / mixed
+
     print("  ALL PASS" if rc == 0 else "  SOME FAILED")
     return rc
 
