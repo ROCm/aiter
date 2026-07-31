@@ -15,10 +15,42 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
 namespace {
+struct U32ExtentBytesResult
+{
+    bool valid;
+    uint32_t bytes;
+};
+
+constexpr U32ExtentBytesResult compute_u32_extent_bytes(int64_t size0,
+                                                        int64_t stride0) noexcept
+{
+    if(size0 < 0 || stride0 < 0)
+        return {false, 0};
+
+    const uint64_t size = static_cast<uint64_t>(size0);
+    const uint64_t stride = static_cast<uint64_t>(stride0);
+    constexpr uint64_t max_extent = std::numeric_limits<uint32_t>::max();
+    if(stride != 0 && size > max_extent / stride)
+        return {false, 0};
+
+    return {true, static_cast<uint32_t>(size * stride)};
+}
+
+constexpr auto kMaxU32Extent =
+    compute_u32_extent_bytes(std::numeric_limits<uint32_t>::max(), 1);
+static_assert(kMaxU32Extent.valid &&
+                  kMaxU32Extent.bytes == std::numeric_limits<uint32_t>::max(),
+              "UINT32_MAX bytes must remain representable");
+static_assert(!compute_u32_extent_bytes(2, int64_t{1} << 31).valid,
+              "a 4 GiB extent must be rejected");
+static_assert(!compute_u32_extent_bytes(1, (int64_t{1} << 32) + 1).valid,
+              "an extent greater than 4 GiB must be rejected");
+
 OpusMoeStage2Bf16Kernel opus_moe_stage2_bf16_tune_dispatch(int id)
 {
     switch(opus_get_gfx_arch())
@@ -43,6 +75,21 @@ void check_contiguous_last_dim(const aiter_tensor_t& t, const char* name)
 {
     AITER_CHECK(t.dim() > 0, name, " must have at least one dimension");
     AITER_CHECK(t.stride(-1) == 1, name, " last dimension must be contiguous");
+}
+
+unsigned int checked_u32_extent_bytes(const aiter_tensor_t& t, const char* name)
+{
+    AITER_CHECK(t.size(0) >= 0 && t.stride(0) >= 0,
+                name,
+                " must have non-negative size(0) and stride(0)");
+    const auto extent = compute_u32_extent_bytes(t.size(0), t.stride(0));
+    AITER_CHECK(extent.valid,
+                name,
+                " byte extent exceeds the 32-bit make_gmem limit");
+    static_assert(std::numeric_limits<unsigned int>::max() ==
+                      std::numeric_limits<uint32_t>::max(),
+                  "make_gmem requires a 32-bit unsigned int extent");
+    return static_cast<unsigned int>(extent.bytes);
 }
 
 void check_tensor(const aiter_tensor_t& t,
@@ -718,16 +765,13 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.swiglu_limit = swiglu_limit;
 
     // Byte extent per global tensor (1-byte dtypes: size(0)*stride(0)) -> make_gmem bounds check.
-    kargs.hidden_size_bytes =
-        static_cast<unsigned int>(hidden_states.size(0) * hidden_states.stride(0));
-    kargs.w1_size_bytes = static_cast<unsigned int>(w1.size(0) * w1.stride(0));
+    kargs.hidden_size_bytes = checked_u32_extent_bytes(hidden_states, "hidden_states");
+    kargs.w1_size_bytes = checked_u32_extent_bytes(w1, "w1");
     kargs.hidden_scale_size_bytes =
-        static_cast<unsigned int>(hidden_scale.size(0) * hidden_scale.stride(0));
-    kargs.w1_scale_size_bytes =
-        static_cast<unsigned int>(w1_scale.size(0) * w1_scale.stride(0));
-    kargs.out_size_bytes = static_cast<unsigned int>(out.size(0) * out.stride(0));
-    kargs.out_scale_size_bytes =
-        static_cast<unsigned int>(out_scale.size(0) * out_scale.stride(0));
+        checked_u32_extent_bytes(hidden_scale, "hidden_scale");
+    kargs.w1_scale_size_bytes = checked_u32_extent_bytes(w1_scale, "w1_scale");
+    kargs.out_size_bytes = checked_u32_extent_bytes(out, "out");
+    kargs.out_scale_size_bytes = checked_u32_extent_bytes(out_scale, "out_scale");
 
     HipDeviceGuard guard(hidden_states.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();

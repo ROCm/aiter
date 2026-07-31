@@ -592,7 +592,7 @@ __device__ __forceinline__ void epilogue_store_group_to_smem(
             static_cast<int>(u_c_n(0, 0, ii, 0));
         float gate = static_cast<float>(gate_or_acc[ii]);
         float up_value = static_cast<float>(up[ii]);
-        if constexpr(Traits::ACTIVATION == Stage1Activation::Swiglu)
+        if(kargs.w1_bias != nullptr)
         {
             const int output_col =
                 tile.out_col_base +
