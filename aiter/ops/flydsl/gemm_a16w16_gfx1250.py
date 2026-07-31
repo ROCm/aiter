@@ -2,29 +2,64 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """gfx1250 FlyDSL backend for the A16W16 GEMM: torch-facing wrapper.
-
-The compiled kernel lives in ``kernels/gemm_a16w16_kernel_gfx1250.py``; this
-module owns layout detection, padding, output allocation and dtype mapping.
 """
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
 _compile_gemm_a16w16 = None
+_run_compiled = None
+_fx = None
 
 
 def _lazy_import():
-    """Defer the kernel import so ``import aiter`` does not pull in flydsl."""
-    global _compile_gemm_a16w16
+    global _compile_gemm_a16w16, _run_compiled, _fx
     if _compile_gemm_a16w16 is not None:
         return
     # Absolute (not relative) so this module also works when loaded by file path.
+    import flydsl.expr as fx
+
     from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
         compile_gemm_a16w16,
     )
+    from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled as run_compiled
 
     _compile_gemm_a16w16 = compile_gemm_a16w16
+    _run_compiled = run_compiled
+    _fx = fx
+
+
+_CFG_KEYS = (
+    "M",
+    "N",
+    "K",
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "m_warp",
+    "n_warp",
+    "in_dtype",
+    "out_dtype",
+    "num_buffers",
+    "waves_per_eu",
+    "activation",
+    "add_bias",
+    "physical_mk",
+    "physical_kn",
+    "kernarg_preload",
+    "split_k",
+    "sched_strategy",
+    "main_loop_unroll",
+    "variant",
+)
+
+
+@functools.lru_cache(maxsize=1024)
+def _cached_launcher(*cfg):
+    return _compile_gemm_a16w16(**dict(zip(_CFG_KEYS, cfg)))
 
 
 def gemm_a16w16(
@@ -41,7 +76,6 @@ def gemm_a16w16(
     n_warp: int = 4,
     num_buffers: int = 2,
     waves_per_eu: int | None = None,
-    l2_prefetch_distance: int = 2,
     kernarg_preload: bool = False,
     split_k: int = 1,
     sched_strategy: str | None = None,
@@ -103,32 +137,32 @@ def gemm_a16w16(
     if bias is None:
         bias = torch.empty(0, device=x.device, dtype=dtype)
 
-    launch_fn = _compile_gemm_a16w16(
-        M=M if not physical_mk else 0,
-        N=N,
-        K=K,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        m_warp=m_warp,
-        n_warp=n_warp,
-        in_dtype=in_dtype_str,
-        out_dtype=out_dtype_str,
-        num_buffers=num_buffers,
-        waves_per_eu=waves_per_eu,
-        l2_prefetch_distance=l2_prefetch_distance,
-        activation=activation,
-        add_bias=(bias.numel() > 0),
-        physical_mk=physical_mk,
-        physical_kn=physical_kn,
-        kernarg_preload=kernarg_preload,
-        split_k=split_k,
-        sched_strategy=sched_strategy,
-        main_loop_unroll=main_loop_unroll,
-        variant=variant,
+    launch_fn = _cached_launcher(
+        M if not physical_mk else 0,
+        N,
+        K,
+        tile_m,
+        tile_n,
+        tile_k,
+        m_warp,
+        n_warp,
+        in_dtype_str,
+        out_dtype_str,
+        num_buffers,
+        waves_per_eu,
+        activation,
+        bias.numel() > 0,
+        physical_mk,
+        physical_kn,
+        kernarg_preload,
+        split_k,
+        sched_strategy,
+        main_loop_unroll,
+        variant,
     )
 
-    launch_fn(y_buf, x, w, bias, M, N_stride, stream=torch.cuda.current_stream())
+    stream = torch.cuda.current_stream(device=x.device).cuda_stream
+    _run_compiled(launch_fn, y_buf, x, w, bias, M, N_stride, _fx.Stream(stream))
 
     result = y_buf[:, :N] if N_stride != N else y_buf
     if _splitk_f32_accum:

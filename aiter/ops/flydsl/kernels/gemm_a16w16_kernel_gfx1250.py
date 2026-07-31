@@ -1,58 +1,45 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as raw_rocdl
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    const_expr,
-    gpu,
-    idx2crd,
-    range_constexpr,
-    rocdl,
-    tdm_ops,
-)
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.compiler.protocol import dsl_size_of
+from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
-
-from aiter.ops.flydsl.kernels import buffer_ops
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
 
 
-def _align_up(n, a):
-    return ((n + a - 1) // a) * a
+def _byte_off_i32(elem_off, elem_bytes):
+    return (fx.Int32(elem_off) * elem_bytes).ir_value()
+
+
+def _f32(x):
+    return fx.Float32(fx.Float32(x).ir_value())
 
 
 def apply_activation_scalar(val, activation: str):
-    import math
-
-    from flydsl._mlir.dialects import math as _math
-
     if activation == "relu":
-        zero = arith.constant(0.0, type=T.f32)
+        zero = _f32(0.0)
         return (val > zero).select(val, zero)
-    one, half = arith.constant(1.0, type=T.f32), arith.constant(0.5, type=T.f32)
+    one, half = _f32(1.0), _f32(0.5)
     if activation in ("silu", "silu_exp2"):
-        return val / (one + _math.exp(arith.constant(0.0, type=T.f32) - val))
+        return val / (one + fx.exp(_f32(0.0) - val))
     if activation == "gelu":
-        scaled = val * arith.constant(1.0 / math.sqrt(2.0), type=T.f32)
-        return half * val * (one + _math.erf(scaled))
+        return half * val * (one + fx.erf(val * (1.0 / math.sqrt(2.0))))
     if activation == "gelu_tanh":
-        two = arith.constant(2.0, type=T.f32)
-        inner = arith.constant(math.sqrt(2.0 / math.pi), type=T.f32) * (
-            val + arith.constant(0.044715, type=T.f32) * val * val * val
-        )
-        # tanh(z) = 1 - 2/(1 + exp(2z))
-        tanh_val = one - two / (one + _math.exp(two * inner))
+        two = _f32(2.0)
+        inner = math.sqrt(2.0 / math.pi) * (val + 0.044715 * val * val * val)
+        tanh_val = one - two / (one + fx.exp(two * inner))
         return half * val * (one + tanh_val)
     return val
 
@@ -71,19 +58,16 @@ def compile_gemm_a16w16(
     out_dtype: str | None = None,
     num_buffers: int = 2,
     waves_per_eu: int | None = None,
-    l2_prefetch_distance: int = 2,
     activation: str | None = None,
     add_bias: bool = False,
     physical_mk: bool = True,  # True=M-major (row-major X), False=K-major (col-major X)
-    physical_kn: bool = False,  # False=N-major (row-major W), True=K-major (transposed W)
+    physical_kn: bool = False,  # False=N-major (row-major W), True=K-major (W^T)
     kernarg_preload: bool = False,
     split_k: int = 1,
     sched_strategy: str | None = None,
     main_loop_unroll: bool = False,
     variant: str = "bandwidth_bound",
 ):
-    _ = (M, N)
-
     def _req(cond, msg):
         if not cond:
             raise ValueError(msg)
@@ -91,7 +75,6 @@ def compile_gemm_a16w16(
     if out_dtype is None:
         out_dtype = "f16" if in_dtype == "fp16" else "bf16"
     is_f16 = in_dtype == "fp16"
-    effective_waves_per_eu = waves_per_eu
 
     _req(2 <= num_buffers <= 8, f"num_buffers must be in [2, 8], got {num_buffers}")
     _req(variant in ("bandwidth_bound", "compute_bound"), f"bad variant {variant!r}")
@@ -143,8 +126,7 @@ def compile_gemm_a16w16(
     k_wmma_steps = tile_k // WMMA_K
     _fx_elem = fx.Float16 if is_f16 else fx.BFloat16
     wmma_m_rep, wmma_n_rep = warp_tile_m // WMMA_M, warp_tile_n // WMMA_N
-    n_accs = wmma_m_rep * wmma_n_rep
-    N_ACCS = n_accs
+    N_ACCS = n_accs = wmma_m_rep * wmma_n_rep
     N_A_FRAGS, N_B_FRAGS = wmma_m_rep * k_wmma_steps, wmma_n_rep * k_wmma_steps
 
     if physical_mk:
@@ -165,14 +147,12 @@ def compile_gemm_a16w16(
         b_imm_bytes, lds_b_stride = tile_k * elem_bytes, tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
-    lds_a_data_bytes, lds_b_data_bytes = (
-        lds_a_elems * elem_bytes,
-        lds_b_elems * elem_bytes,
-    )
-    unified_a_off = 0
-    unified_b_off = _align_up(unified_a_off + num_buffers * lds_a_data_bytes, 16)
-    lds_arena_bytes = _align_up(unified_b_off + num_buffers * lds_b_data_bytes, 16)
-    check_smem_capacity(lds_arena_bytes, gpu_arch)
+    @fx.struct
+    class SharedStorage:
+        a: fx.Array[_fx_elem, num_buffers * lds_a_elems, 16]
+        b: fx.Array[_fx_elem, num_buffers * lds_b_elems, 16]
+
+    check_smem_capacity(dsl_size_of(SharedStorage), gpu_arch)
 
     _TDMS_PER_TILE = 2  # A + B
 
@@ -186,52 +166,46 @@ def compile_gemm_a16w16(
         i32_n: fx.Int32,
     ):
         rocdl.disable_xdl_arb_stall()
-        elem_ty = T.f16 if is_f16 else T.bf16
+        elem_ty = _fx_elem.ir_type
 
         tx, bx, by = gpu.thread_id("x"), gpu.block_id("x"), gpu.block_id("y")
-        blk_m, blk_n = bx * arith.index(tile_m), by * arith.index(tile_n)
+        blk_m, blk_n = fx.Uint64(bx) * tile_m, fx.Uint64(by) * tile_n
         if const_expr(split_k > 1):
-            bz = gpu.block_id("z")
-            split_k_base = bz * arith.index(split_k_chunk)
+            split_k_base = fx.Uint64(gpu.block_id("z")) * split_k_chunk
         else:
-            split_k_base = arith.index(0)
+            split_k_base = fx.Uint64(0)
 
         layout_thr = fx.make_layout(
             (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
         )
         thr_coord = idx2crd(tx, layout_thr)
         wave_m_idx, wave_n_idx, lane_kgrp, lane16 = (
-            fx.get(thr_coord, 0),
-            fx.get(thr_coord, 1),
-            fx.get(thr_coord, 2),
-            fx.get(thr_coord, 3),
+            fx.Uint64(fx.get(thr_coord, 0)),
+            fx.Uint64(fx.get(thr_coord, 1)),
+            fx.Uint64(fx.get(thr_coord, 2)),
+            fx.Uint64(fx.get(thr_coord, 3)),
         )
 
-        warp_m_base = wave_m_idx * arith.index(warp_tile_m)
-        warp_n_base = wave_n_idx * arith.index(warp_tile_n)
-        m_idx = arith.index_cast(T.index, i32_m.ir_value())
-        n_stride = arith.index_cast(T.index, i32_n.ir_value())
-        y_nrec = m_idx * n_stride * arith.index(elem_bytes_d)
+        warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
+        m_idx, n_stride = fx.Uint64(i32_m), fx.Uint64(i32_n)
         y_rsrc = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), y_nrec)
+            fx.rocdl.make_buffer_ptr(
+                fx.get_iter(arg_y), m_idx * n_stride * elem_bytes_d
+            )
         )
         if const_expr(add_bias):
             bias_rsrc = fx.rocdl.get_buffer_rsrc(
                 fx.rocdl.make_buffer_ptr(fx.get_iter(arg_bias))
             )
 
-        lds_base_ptr = fx.SharedAllocator(static=True).allocate(lds_arena_bytes)._ptr
-        big_a_mem = fx.recast_iter(_fx_elem, fx.add_offset(lds_base_ptr, unified_a_off))
-        big_b_mem = fx.recast_iter(_fx_elem, fx.add_offset(lds_base_ptr, unified_b_off))
-        big_a_base_idx = arith.index_cast(T.index, arith.unwrap(fx.ptrtoint(big_a_mem)))
-        big_b_base_idx = arith.index_cast(T.index, arith.unwrap(fx.ptrtoint(big_b_mem)))
-        slot_stride_a_elems_i32 = arith.constant(lds_a_elems, type=T.i32)
-        slot_stride_b_elems_i32 = arith.constant(lds_b_elems, type=T.i32)
+        lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
+        big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
+        big_a_base_idx = fx.Uint64(fx.ptrtoint(big_a_mem))
+        big_b_base_idx = fx.Uint64(fx.ptrtoint(big_b_mem))
         blk_m64, blk_n64 = fx.Int64(blk_m), fx.Int64(blk_n)
         split_k_base64 = fx.Int64(split_k_base)
 
         def _mk_side(tensor, base_off, shape, outer_stride, pad_interval, pad_amount):
-            """Global tile view + its TDM atom (identical shape for A and B)."""
             gt = fx.Tensor(
                 fx.make_view(
                     fx.add_offset(fx.get_iter(tensor), base_off),
@@ -241,23 +215,23 @@ def compile_gemm_a16w16(
             return gt, fx.rocdl.make_tdm_atom(
                 gt,
                 [None, None],
-                strides=[fx.Int64(outer_stride), None],
+                strides=[outer_stride, None],
                 num_warps=num_warps,
                 pad_interval=pad_interval,
                 pad_amount=pad_amount,
             )
 
         if const_expr(physical_mk):
-            a_base_off = blk_m64 * fx.Int64(K) + split_k_base64
+            a_base_off = blk_m64 * K + split_k_base64
         else:
-            a_base_off = split_k_base64 * fx.Int64(M) + blk_m64
+            a_base_off = split_k_base64 * M + blk_m64
         gA, atom_a = _mk_side(
             arg_x, a_base_off, a_tile_shape, a_outer_stride, a_pad_interval, LDS_PAD_A
         )
         if const_expr(physical_kn):
-            b_base_off = split_k_base64 * fx.Int64(N) + blk_n64
+            b_base_off = split_k_base64 * N + blk_n64
         else:
-            b_base_off = blk_n64 * fx.Int64(K) + split_k_base64
+            b_base_off = blk_n64 * K + split_k_base64
         gB, atom_b = _mk_side(
             arg_w, b_base_off, b_tile_shape, b_outer_stride, b_pad_interval, LDS_PAD_B
         )
@@ -265,37 +239,30 @@ def compile_gemm_a16w16(
         def _imm64(k_tile, mul):
             if const_expr(isinstance(k_tile, int)):
                 return fx.Int64(k_tile * mul)
-            as_index = arith.index_cast(
-                T.index, arith.muli(k_tile, arith.constant(mul, type=T.i32))
-            )
-            return fx.Int64(arith.index_cast(T.i64, as_index))
+            return fx.Int64(fx.Int32(k_tile) * mul)  # mul in i32, widen for TDM
 
-        def _slot_off(buf_idx, slot_elems, stride_i32):
+        def _slot_off(buf_idx, slot_elems):
             if const_expr(isinstance(buf_idx, int)):
-                return arith.index(buf_idx * slot_elems)
-            return arith.index_cast(T.index, arith.muli(buf_idx, stride_i32))
+                return fx.Uint64(buf_idx * slot_elems)
+            return fx.Uint64(fx.Int32(buf_idx) * slot_elems)  # mul in i32, widen
 
         def _lane_bases(warp_base, reps, lds_stride, transpose):
             if const_expr(not transpose):
-                row_off = (warp_base + lane16) * arith.index(lds_stride)
-                k_off = lane_kgrp * arith.index(8)
+                row_off = (warp_base + lane16) * lds_stride
+                k_off = lane_kgrp * 8
                 return [
-                    row_off + arith.index(rep * WMMA_M * lds_stride) + k_off
+                    row_off + rep * WMMA_M * lds_stride + k_off
                     for rep in range_constexpr(reps)
                 ]
-            k_off = (
-                lane_kgrp * arith.index(8) + lane16 % arith.index(8)
-            ) * arith.index(lds_stride)
-            grp_off = (lane16 / arith.index(8)) * arith.index(8)
+            k_off = (lane_kgrp * 8 + lane16 % 8) * lds_stride
+            grp_off = (lane16 // 8) * 8
             return [
-                k_off + warp_base + arith.index(rep * WMMA_M) + grp_off
+                k_off + warp_base + rep * WMMA_M + grp_off
                 for rep in range_constexpr(reps)
             ]
 
         # One spec per operand side; A and B differ only in these fields.
-        MEM, BASE, BASES, STRIDE, TR, ELEMS, SSTRIDE, REPS, ATOM, GT, SHAPE, IMM = (
-            range(12)
-        )
+        MEM, BASE, BASES, STRIDE, TR, ELEMS, REPS, ATOM, GT, SHAPE, IMM = range(11)
         A_SIDE = (
             big_a_mem,
             big_a_base_idx,
@@ -303,7 +270,6 @@ def compile_gemm_a16w16(
             lds_a_stride,
             not physical_mk,
             lds_a_elems,
-            slot_stride_a_elems_i32,
             wmma_m_rep,
             atom_a,
             gA,
@@ -317,7 +283,6 @@ def compile_gemm_a16w16(
             lds_b_stride,
             physical_kn,
             lds_b_elems,
-            slot_stride_b_elems_i32,
             wmma_n_rep,
             atom_b,
             gB,
@@ -326,7 +291,6 @@ def compile_gemm_a16w16(
         )
 
         def issue_tdm_loads(buf_idx, k_tile):
-            """A then B TDM for K-tile k_tile into LDS ring slot buf_idx."""
             for sd in (A_SIDE, B_SIDE):
                 fx.copy(
                     sd[ATOM],
@@ -335,7 +299,7 @@ def compile_gemm_a16w16(
                         fx.make_view(
                             fx.add_offset(
                                 sd[MEM],
-                                _slot_off(buf_idx, sd[ELEMS], sd[SSTRIDE]),
+                                _slot_off(buf_idx, sd[ELEMS]),
                             ),
                             fx.make_layout(sd[SHAPE], (sd[STRIDE], 1)),
                         )
@@ -351,36 +315,20 @@ def compile_gemm_a16w16(
                     off = (
                         sd[BASES][rep]
                         + slot_off
-                        + arith.index((ks * WMMA_K + k_half * 16) * sd[STRIDE])
+                        + (ks * WMMA_K + k_half * 16) * sd[STRIDE]
                     )
-                    addr = arith.index_cast(
-                        T.i32, sd[BASE] + off * arith.index(elem_bytes)
-                    )
-                    ptr = llvm_dialect.inttoptr(
-                        ir.Type.parse("!llvm.ptr<3>"), arith.unwrap(addr)
-                    )
-                    halves.append(raw_rocdl.ds_load_tr16_b128(vec8_ty, ptr))
+                    addr = fx.Int32(sd[BASE] + off * elem_bytes).ir_value()
+                    ptr = llvm_dialect.inttoptr(ir.Type.parse("!llvm.ptr<3>"), addr)
+                    halves.append(fx.Vector(rocdl.ds_load_tr16_b128(vec8_ty, ptr)))
                 else:
-                    off = (
-                        sd[BASES][rep]
-                        + slot_off
-                        + arith.index(ks * WMMA_K + k_half * 16)
-                    )
+                    off = sd[BASES][rep] + slot_off + (ks * WMMA_K + k_half * 16)
                     halves.append(
-                        arith.unwrap(
-                            fx.ptr_load(
-                                fx.add_offset(sd[MEM], off), result_type=vec8_ty
-                            )
-                        )
+                        fx.ptr_load(fx.add_offset(sd[MEM], off), result_type=vec8_ty)
                     )
-            return (
-                fx.Vector(halves[0])
-                .shuffle(fx.Vector(halves[1]), list(range(16)))
-                .ir_value()
-            )
+            return halves[0].shuffle(halves[1], list(range(16)))
 
         def load_frags(sd, buf_idx):
-            off = _slot_off(buf_idx, sd[ELEMS], sd[SSTRIDE])
+            off = _slot_off(buf_idx, sd[ELEMS])
             return [
                 _frag(sd, off, ks, rep)
                 for ks in range_constexpr(k_wmma_steps)
@@ -393,7 +341,7 @@ def compile_gemm_a16w16(
 
         def _rmem_vec(v, n, dtype):
             t = fx.make_rmem_tensor(n, dtype)
-            t.store(fx.Vector(arith.unwrap(v)))
+            t.store(v if isinstance(v, fx.Vector) else fx.Vector(v))
             return t
 
         def wmma_tile(accs_in, a_frags, b_frags, rotate_buf=None):
@@ -404,8 +352,8 @@ def compile_gemm_a16w16(
             next_a = [None] * N_A_FRAGS if rotate else None
             next_b = [None] * N_B_FRAGS if rotate else None
             if const_expr(rotate):
-                a_off = _slot_off(rotate_buf, lds_a_elems, slot_stride_a_elems_i32)
-                b_off = _slot_off(rotate_buf, lds_b_elems, slot_stride_b_elems_i32)
+                a_off = _slot_off(rotate_buf, lds_a_elems)
+                b_off = _slot_off(rotate_buf, lds_b_elems)
             for ks in range_constexpr(k_wmma_steps):
                 for wm in range_constexpr(wmma_m_rep):
                     a_f = a_ts[ks * wmma_m_rep + wm]
@@ -425,37 +373,32 @@ def compile_gemm_a16w16(
                     rocdl.sched_barrier(_SCHED_ALLOW_SALU)
                     for wn in range_constexpr(wmma_n_rep):
                         next_b[ks * wmma_n_rep + wn] = _frag(B_SIDE, b_off, ks, wn)
-            return [arith.unwrap(t.load()) for t in acc_ts], next_a, next_b
+            return [t.load() for t in acc_ts], next_a, next_b
 
         _half_out = out_dtype in ("f16", "bf16")
         _out_num = (
             fx.Float16 if out_dtype == "f16" else fx.BFloat16 if _half_out else None
         )
-        _bias_elem = elem_ty
 
         def epilogue_stores(final_accs):
+            zero_off = fx.Int32(0).ir_value()
             if const_expr(split_k > 1):
-                zero_i32 = fx.Int32(0)
+                zero_i32 = zero_off
             if const_expr(add_bias):
                 bias_vecs = []
                 for wn in range_constexpr(wmma_n_rep):
-                    col_i32 = arith.index_cast(
-                        T.i32,
-                        blk_n
-                        + warp_n_base
-                        + arith.index(wn * WMMA_N)
-                        + lane_kgrp * arith.index(8),
-                    )
+                    col_i32 = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
                     elems = []
                     for half in range_constexpr(2):
-                        bv = buffer_ops.buffer_load(
+                        bv = rocdl.raw_ptr_buffer_load(
+                            T.vec(4, elem_ty),
                             bias_rsrc,
-                            col_i32 + arith.constant(half * 4, type=T.i32),
-                            vec_width=4,
-                            dtype=_bias_elem,
+                            _byte_off_i32(col_i32 + half * 4, elem_bytes),
+                            zero_off,
+                            zero_off,
                         )
                         for i in range_constexpr(4):
-                            elems.append(fx.Vector(bv)[i].to(fx.Float32).ir_value())
+                            elems.append(fx.Vector(bv)[i].to(fx.Float32))
                     bias_vecs.append(
                         fx.Vector.from_elements(elems, fx.Float32).ir_value()
                     )
@@ -463,13 +406,8 @@ def compile_gemm_a16w16(
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     acc = final_accs[wm * wmma_n_rep + wn]
-                    row = blk_m + warp_m_base + arith.index(wm * WMMA_M) + lane16
-                    col_base = (
-                        blk_n
-                        + warp_n_base
-                        + arith.index(wn * WMMA_N)
-                        + lane_kgrp * arith.index(8)
-                    )
+                    row = blk_m + warp_m_base + wm * WMMA_M + lane16
+                    col_base = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
                     if const_expr(add_bias):
                         acc = acc + bias_vecs[wn]
                     if const_expr(activation is not None):
@@ -485,9 +423,7 @@ def compile_gemm_a16w16(
 
                     if const_expr(_half_out):
                         h_vec = fx.Vector(acc).to(_out_num)
-                        c_off_bytes = (row * n_stride + col_base) * arith.index(
-                            elem_bytes_d
-                        )
+                        c_off_bytes = (row * n_stride + col_base) * elem_bytes_d
                         if const_expr(split_k > 1):
                             for pair in range_constexpr(4):
                                 pair_vec = fx.Vector.from_elements(
@@ -500,29 +436,24 @@ def compile_gemm_a16w16(
                                 rocdl.raw_ptr_buffer_atomic_fadd(
                                     pair_vec,
                                     y_rsrc,
-                                    arith.index_cast(
-                                        T.i32, c_off_bytes + arith.index(pair * 4)
-                                    ),
+                                    fx.Int32(c_off_bytes + pair * 4).ir_value(),
                                     zero_i32,
                                     zero_i32,
                                 )
                         else:
-                            buffer_ops.buffer_store(
+                            rocdl.raw_ptr_buffer_store(
                                 h_vec.bitcast(fx.Int32).ir_value(),
                                 y_rsrc,
-                                c_off_bytes,
-                                offset_is_bytes=True,
+                                fx.Int32(c_off_bytes).ir_value(),
+                                zero_off,
+                                zero_off,
                             )
                     elif const_expr(split_k > 1):
                         for e in range_constexpr(8):
                             rocdl.raw_ptr_buffer_atomic_fadd(
                                 fx.Vector(acc)[e].ir_value(),
                                 y_rsrc,
-                                arith.index_cast(
-                                    T.i32,
-                                    (row * n_stride + col_base + arith.index(e))
-                                    * arith.index(4),
-                                ),
+                                _byte_off_i32(row * n_stride + col_base + e, 4),
                                 zero_i32,
                                 zero_i32,
                             )
@@ -535,8 +466,14 @@ def compile_gemm_a16w16(
                                 ],
                                 fx.Float32,
                             ).ir_value()
-                            col = col_base + arith.index(half * 4)
-                            buffer_ops.buffer_store(vec4, y_rsrc, row * n_stride + col)
+                            col = col_base + half * 4
+                            rocdl.raw_ptr_buffer_store(
+                                vec4,
+                                y_rsrc,
+                                _byte_off_i32(row * n_stride + col, 4),
+                                zero_off,
+                                zero_off,
+                            )
 
         def _pack_state(accs_, a_, b_):
             return list(accs_) + list(a_) + list(b_)
@@ -549,12 +486,12 @@ def compile_gemm_a16w16(
             return out
 
         def _run_tile(accs_, ca, cb, cidx, lidx):
-            issue_tdm_loads(arith.remui(lidx, nb_const_i32), lidx)
+            issue_tdm_loads(lidx % num_buffers, lidx)
             tdm_ops.tensor_wait(
                 0 if num_buffers == 2 else (num_buffers - 2) * _TDMS_PER_TILE
             )
             gpu.barrier()
-            next_buf_i32 = arith.remui(arith.addi(cidx, one_i32), nb_const_i32)
+            next_buf_i32 = (cidx + 1) % num_buffers
             if const_expr(variant == "compute_bound"):
                 return wmma_tile(accs_, ca, cb, rotate_buf=next_buf_i32)
             na = load_frags(A_SIDE, next_buf_i32)
@@ -562,8 +499,7 @@ def compile_gemm_a16w16(
             accs_, _, _ = wmma_tile(accs_, ca, cb)
             return accs_, na, nb
 
-        # Accumulators
-        acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
+        acc_zero = fx.Vector.filled(8, fx.Float32(0.0), fx.Float32)
         accs = [acc_zero] * n_accs
 
         # Prologue:
@@ -574,10 +510,7 @@ def compile_gemm_a16w16(
         cur_a, cur_b = load_frags(A_SIDE, 0), load_frags(B_SIDE, 0)
 
         main_loop_iters = num_k_tiles - (num_buffers - 1)
-        nb_const_i32 = arith.constant(num_buffers, type=T.i32)
-        one_i32 = arith.constant(1, type=T.i32)
-        load_idx_init = arith.constant(num_buffers - 1, type=T.i32)
-        compute_idx_init = arith.constant(0, type=T.i32)
+        load_idx_init, compute_idx_init = fx.Uint32(num_buffers - 1), fx.Uint32(0)
 
         TILES_PER_TRIP = 2 if variant == "bandwidth_bound" and main_loop_unroll else 1
         num_trips = main_loop_iters // TILES_PER_TRIP
@@ -590,16 +523,17 @@ def compile_gemm_a16w16(
             ]
             results = init_state
             for trip, state in range(0, num_trips, 1, init=init_state):
-                cidx, lidx = state[-1], state[-2]
+                cidx, lidx = fx.Uint32(state[-1]), fx.Uint32(state[-2])
                 p_accs, ca, cb = _unpack_state(state[:-2])
                 for _sub in range_constexpr(TILES_PER_TRIP):
                     p_accs, ca, cb = _run_tile(p_accs, ca, cb, cidx, lidx)
-                    cidx = arith.addi(cidx, one_i32)
-                    lidx = arith.addi(lidx, one_i32)
+                    cidx, lidx = cidx + 1, lidx + 1
                 results = yield _pack_state(p_accs, ca, cb) + [lidx, cidx]
 
             accs, cur_a, cur_b = _unpack_state(results[:-2])
-            load_idx_s, compute_idx_s = results[-2], results[-1]
+            # loop results come back untyped; re-wrap so % stays unsigned (remui)
+            load_idx_s = fx.Uint32(results[-2])
+            compute_idx_s = fx.Uint32(results[-1])
         else:
             accs = list(accs)
 
@@ -608,7 +542,7 @@ def compile_gemm_a16w16(
                 accs, cur_a, cur_b, compute_idx_s, load_idx_s
             )
 
-        # ── Drain (fully unrolled): consume carried frags, prefetch next bank per tile; final tile does no wait/barrier/ds_load ──
+        # Drain
         drain_count_d = (
             num_buffers - 1
             if main_loop_iters > 0
@@ -649,15 +583,13 @@ def compile_gemm_a16w16(
     ):
         ctx = CompilationContext.get_current()
 
-        idx_m = arith.index_cast(T.index, i32_m.ir_value())
-        idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
+        gy = (fx.Uint64(i32_n) + (tile_n - 1)) // tile_n
 
         launcher = kernel_gemm_a16w16(arg_y, arg_x, arg_w, arg_bias, i32_m, i32_n)
 
         flat_wg_attr = ir.StringAttr.get(f"{block_threads},{block_threads}")
-        wpe = int(effective_waves_per_eu or 0)
+        wpe = int(waves_per_eu or 0)
 
         for op in ctx.gpu_module_body.operations:
             if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
