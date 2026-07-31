@@ -3,10 +3,9 @@
 
 """FlyDSL 1x32 MXFP4/MXFP8 quantization with E8M0 scales."""
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpIPredicate
@@ -112,7 +111,7 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
         scale: fx.Tensor,
         m: fx.Int32,
         grid_blocks: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_blocks = arith.index_cast(T.index, grid_blocks)
         launcher = quant_kernel(x, y, scale, m)
@@ -239,7 +238,7 @@ def build_mxfp4_moe_scale_sort_module(cols: int):
         out_scale: fx.Tensor,
         token_num: fx.Int32,
         grid_tiles: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_tiles = arith.index_cast(T.index, grid_tiles)
         launcher = scale_sort_kernel(scale, sorted_ids, num_valid, out_scale, token_num)

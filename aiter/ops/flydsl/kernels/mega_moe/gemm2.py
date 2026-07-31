@@ -30,10 +30,14 @@ from ..mxfp4_gemm_common import (
 )
 
 
-def scale_view(arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None):
+def scale_view(
+    arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
+):
     """View one e8m0 scale word, optionally bounded to the real buffer extent."""
     base_dw = rocdl.readfirstlane(T.i32, _raw(base_dw))
-    i32_ptr_ty = fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4)
+    i32_ptr_ty = fx.PointerType.get(
+        T.i32, address_space=fx.AddressSpace.Global, alignment=4
+    )
     off_i64 = fx.Int64(base_dw)
     base_iter = fx.inttoptr(i32_ptr_ty, fx.Int64(arg_scale) + off_i64 * fx.Int64(4))
     shape = (4, 16, K_TILES_TOTAL, 1)
@@ -49,7 +53,9 @@ def scale_mma_atoms(a_dtype):
     elem_a = Float8E4M3FN if a_dtype == "fp8" else Float4E2M1FN
     return {
         (osa, osb): fx.make_mma_atom(
-            fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb)
+            fx.rocdl.cdna4.MFMA_Scale(
+                16, 16, 128, elem_a, Float4E2M1FN, opsel_a=osa, opsel_b=osb
+            )
         )
         for osa in range(4)
         for osb in range(4)
@@ -72,9 +78,15 @@ def mma_one_j(
 ):
     """Run one scaled-MFMA cluster over a 32-row A-scale group."""
     if const_expr(single_rg):
-        steps = tuple((2 * k + rg_off, k, i0, bq_frags_kt[J][k]) for k in range(k_halves))
+        steps = tuple(
+            (2 * k + rg_off, k, i0, bq_frags_kt[J][k]) for k in range(k_halves)
+        )
     else:
-        steps = tuple((2 * k + im, k, i0 + im, bq_frags_kt[J][k]) for k in range(k_halves) for im in range(2))
+        steps = tuple(
+            (2 * k + im, k, i0 + im, bq_frags_kt[J][k])
+            for k in range(k_halves)
+            for im in range(2)
+        )
     for osa, k, i, bJ in steps:
         osb = 2 * k + in_b
         fx.gemm(
@@ -131,13 +143,17 @@ def issue_a_load_lds_dt(
     for g in range_constexpr(n_row_groups):
         lds_row = gather_base_row + g * rows_per_call
         mask = (
-            lds_swizzle_mask_f8(lds_row + a_lane_row) if const_expr(is_f8) else lds_swizzle_mask(lds_row + a_lane_row)
+            lds_swizzle_mask_f8(lds_row + a_lane_row)
+            if const_expr(is_f8)
+            else lds_swizzle_mask(lds_row + a_lane_row)
         )
         tile_row = lds_row + a_lane_row
         voffset = (lane_col ^ mask) + tile_row * K_BYTES
         off = fx.Int32(slot * (BM * KH_TILE_A)) + lds_row * KH_TILE_A
         v_e = (voffset + kt * KH_TILE_A) // 4  # per-lane i32-elem index
-        fx.copy(atom, src[v_e, None], lds_dma_dst(base_i32, off, elem_ty=T.i32, align=16))
+        fx.copy(
+            atom, src[v_e, None], lds_dma_dst(base_i32, off, elem_ty=T.i32, align=16)
+        )
 
 
 @flyc.jit
@@ -196,7 +212,9 @@ def gemm2_compute_v2(
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
     N_OUT_rt = fx.Int32(i32_hidden)
-    kbs_per_expert_dw = (N_OUT_rt // fx.Int32(32)) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
+    kbs_per_expert_dw = (
+        N_OUT_rt // fx.Int32(32)
+    ) * kBS_stride_n0_dw  # (N_OUT//16//2)*stride
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
@@ -228,8 +246,13 @@ def gemm2_compute_v2(
     mma_atoms = scale_mma_atoms(a_dtype)
 
     # A activation: global->LDS DMA (issue_a_load_lds), then LDS->reg ds-read (issue_a_ds_read).
-    A_NDW = 8 if is_f8_a else 4  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
-    a_frags = [[fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)] for _ in range_constexpr(kMChunks)]
+    A_NDW = (
+        8 if is_f8_a else 4
+    )  # fp8 packs two 128-K halves -> i32<8:1>; fp4 -> i32<4:1>
+    a_frags = [
+        [fx.make_rmem_tensor(A_NDW, Int32) for _ in range_constexpr(kHalves)]
+        for _ in range_constexpr(kMChunks)
+    ]
 
     def issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
@@ -312,7 +335,11 @@ def gemm2_compute_v2(
 
     def load_a_scale_tile(kt):
         # One i32 A-scale register per 32-row chunk (kScaleSubBlocks).
-        chunk_kt = kt if const_expr(tilesPerScaleChunk == 1) else kt // fx.Int32(tilesPerScaleChunk)
+        chunk_kt = (
+            kt
+            if const_expr(tilesPerScaleChunk == 1)
+            else kt // fx.Int32(tilesPerScaleChunk)
+        )
         out = []
         for sub in range_constexpr(kScaleSubBlocks):
             saf = fx.make_fragment_like(sc_frag_tmpl)
@@ -363,7 +390,9 @@ def gemm2_compute_v2(
                 load_mask = None
                 if const_expr(has_pad):
                     col = n_block_idx * BN + wave * (BN // 4) + j * 16
-                    load_mask = (col < N_real) & (kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real)
+                    load_mask = (col < N_real) & (
+                        kt_rt * fx.Int32(kHalves) + fx.Int32(half) < halves_real
+                    )
                 bq_vec = buffer_ops.buffer_load(
                     bq_rsrc,
                     bq_off_dw,
@@ -373,7 +402,11 @@ def gemm2_compute_v2(
                     cache_modifier=2 if use_nt else 0,
                 )
                 bqf[j][half].store(Vec(bq_vec))
-        chunk_kt = kt_rt if const_expr(tilesPerScaleChunk == 1) else kt_rt // fx.Int32(tilesPerScaleChunk)
+        chunk_kt = (
+            kt_rt
+            if const_expr(tilesPerScaleChunk == 1)
+            else kt_rt // fx.Int32(tilesPerScaleChunk)
+        )
         for mw in range_constexpr(nPairs):
             fx.copy(
                 sc_copy_atom,
@@ -383,7 +416,10 @@ def gemm2_compute_v2(
 
     def stream_b_tile(kt_rt):
         # Fresh per-iter fragments (B streamed, not register-resident) then issue_b_load_into.
-        bqf = [[fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)] for _ in range_constexpr(numAccN)]
+        bqf = [
+            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)]
+            for _ in range_constexpr(numAccN)
+        ]
         bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(nPairs)]
         issue_b_load_into(bqf, bsf, kt_rt)
         return bqf, bsf
@@ -397,8 +433,13 @@ def gemm2_compute_v2(
 
     def mfma_cluster(bqf, bsf, sa, kt_rt):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
-        sa = [shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)]
-        sb_words = [shift_scale_word(_raw(Vec(bsf[mni].load())[0]), kt_rt) for mni in range_constexpr(nPairs)]
+        sa = [
+            shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
+        ]
+        sb_words = [
+            shift_scale_word(_raw(Vec(bsf[mni].load())[0]), kt_rt)
+            for mni in range_constexpr(nPairs)
+        ]
         for J in range_constexpr(numAccN):
             mni, in_b = J // 2, J % 2
             sb = sb_words[mni]
@@ -434,7 +475,10 @@ def gemm2_compute_v2(
 
     # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
-    c_frags = [[fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)] for _ in range_constexpr(kMChunks)]
+    c_frags = [
+        [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
+        for _ in range_constexpr(kMChunks)
+    ]
     for i in range_constexpr(kMChunks):
         for J in range_constexpr(numAccN):
             c_frags[i][J].store(zero4)
@@ -473,18 +517,26 @@ def gemm2_compute_v2(
     else:
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = [
-            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)] for _ in range_constexpr(numAccN)
+            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)]
+            for _ in range_constexpr(numAccN)
         ]
         cur_bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(nPairs)]
         nxt_bqf = [
-            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)] for _ in range_constexpr(numAccN)
+            [fx.make_fragment_like(frag_tmpl) for _ in range_constexpr(kHalves)]
+            for _ in range_constexpr(numAccN)
         ]
         nxt_bsf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(nPairs)]
         # g2_ascale_pf: carry the A-scale through scf.for state, same rotating-buffer model as B.
         cur_saf = nxt_saf = None
         if const_expr(g2_ascale_pf):
-            cur_saf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(kScaleSubBlocks)]
-            nxt_saf = [fx.make_fragment_like(sc_frag_tmpl) for _ in range_constexpr(kScaleSubBlocks)]
+            cur_saf = [
+                fx.make_fragment_like(sc_frag_tmpl)
+                for _ in range_constexpr(kScaleSubBlocks)
+            ]
+            nxt_saf = [
+                fx.make_fragment_like(sc_frag_tmpl)
+                for _ in range_constexpr(kScaleSubBlocks)
+            ]
 
         def load_b_carry():
             # Flat CURRENT (to-consume) B-weight, B-scale, then (opt) A-scale values.
@@ -583,7 +635,10 @@ def gemm2_compute_v2(
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
             # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
             if const_expr(g2_ascale_pf):
-                sa = [_raw(Vec(cur_saf[sub].load())[0]) for sub in range_constexpr(kScaleSubBlocks)]
+                sa = [
+                    _raw(Vec(cur_saf[sub].load())[0])
+                    for sub in range_constexpr(kScaleSubBlocks)
+                ]
             else:
                 sa = load_a_scale_tile(kt_rt)
             if const_expr(not g2_bhoist):
@@ -598,7 +653,9 @@ def gemm2_compute_v2(
         store_carry(results)
 
     # Load the C fragments (fp8/fp4 unified onto the same fx.gemm path) and hand them to the epilog.
-    accm_vecs = [[c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)]
+    accm_vecs = [
+        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
+    ]
     return accm_vecs, m_row, n_block_idx, N_OUT_rt
 
 
@@ -649,6 +706,8 @@ def _resolve_g2_knobs(g2_bhoist, g2_ascale_pf, g2_spart, g2_bf16_lds, use_reduce
     g2_group_num = g2_spart // 100 if g2_spart > 0 else 0
     g2_m01 = g2_spart % 100 if g2_spart > 0 else 0
     if g2_spart > 0 and (g2_group_num < 1 or g2_m01 < 1):
-        raise AssertionError(f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)")
+        raise AssertionError(
+            f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
+        )
     g2_bf16_lds = (True if g2_bf16_lds is None else bool(g2_bf16_lds)) and use_reduce
     return g2_bhoist, g2_ascale_pf, g2_spart, g2_group_num, g2_m01, g2_bf16_lds

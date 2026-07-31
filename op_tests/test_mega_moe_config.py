@@ -3,7 +3,10 @@
 
 import pytest
 
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import nearest_token_bucket, select_mega_moe_config
+from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
+    nearest_token_bucket,
+    select_mega_moe_config,
+)
 
 _STANDARD_PROFILES = {
     1: (32, 256, 4, 1, 64, 0, 1, 2, 32, 256, 0, 0, 0, "none"),
@@ -66,7 +69,15 @@ def test_standard_profiles_match_tuned_artifacts(tokens, expected):
 
 @pytest.mark.parametrize(
     "tokens,bucket",
-    [(2, 1), (3, 4), (6, 8), (16300, 16384), (16400, 16384), (24576, 32768), (65536, 32768)],
+    [
+        (2, 1),
+        (3, 4),
+        (6, 8),
+        (16300, 16384),
+        (16400, 16384),
+        (24576, 32768),
+        (65536, 32768),
+    ],
 )
 def test_nearest_token_bucket_prefers_larger_on_ties(tokens, bucket):
     assert nearest_token_bucket(tokens) == bucket
@@ -76,8 +87,16 @@ def test_mtpr_selects_fixed_or_compact_configs():
     fixed = select_mega_moe_config(128, 128)
     compact = select_mega_moe_config(128, 8192)
 
-    assert (fixed.stage1.tile_n, fixed.stage1.num_waves, fixed.stage1.num_dispatch_cu) == (128, 4, 224)
-    assert (compact.stage1.tile_n, compact.stage1.num_waves, compact.stage1.num_dispatch_cu) == (512, 8, 128)
+    assert (
+        fixed.stage1.tile_n,
+        fixed.stage1.num_waves,
+        fixed.stage1.num_dispatch_cu,
+    ) == (128, 4, 224)
+    assert (
+        compact.stage1.tile_n,
+        compact.stage1.num_waves,
+        compact.stage1.num_dispatch_cu,
+    ) == (512, 8, 128)
     for tokens in (8, 16, 32):
         assert select_mega_moe_config(tokens, 128).stage2.block_n == 128
         assert select_mega_moe_config(tokens, 8192).stage2.block_n == 256

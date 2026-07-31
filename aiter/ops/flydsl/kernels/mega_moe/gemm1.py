@@ -4,17 +4,15 @@
 
 import functools
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
 from ..tensor_shim import _run_compiled
-
 from .gemm_util import (
     _PACK,
     AS2RLoader,
@@ -34,8 +32,8 @@ class _LdsF32View:
         self.ptr = ptr
 
 
-@flyc.jit
 # fmt: off
+@flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
     mfma_amajor, async_a_copy, trb_rsrc):
@@ -337,7 +335,7 @@ def build_fused_gemm1(*, x_rsrc, x_base_addr, x_tensor, w_rsrc, sw_rsrc, sx_rsrc
 
 
 # fmt: off
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_gemm1(
     *, model_dim: int, inter_dim: int, expert_offset: int = 0, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, pipe_weights: bool = True,

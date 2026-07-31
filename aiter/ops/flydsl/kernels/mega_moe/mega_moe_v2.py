@@ -2,17 +2,21 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
+import flydsl.expr as fx
 import mori.shmem as ms
 import torch
 
-import flydsl.expr as fx
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
-
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
-from .mega_moe_config import FIXED_SLOT_MAX_MTPR, MegaMoEConfig, Stage1Config, select_mega_moe_config
+from .mega_moe_config import (
+    FIXED_SLOT_MAX_MTPR,
+    MegaMoEConfig,
+    Stage1Config,
+    select_mega_moe_config,
+)
 from .quant import per_1x32_mx_quant
 
 __all__ = ["MegaMoEV2"]

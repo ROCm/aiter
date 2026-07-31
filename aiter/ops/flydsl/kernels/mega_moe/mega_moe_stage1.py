@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# ruff: noqa: SIM102
 """Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
 
-import mori.ir.flydsl as mori_shmem
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -16,7 +16,6 @@ from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled
-
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
@@ -35,7 +34,9 @@ def ceildiv(a, b):
     return (a + b - 1) // b
 
 
-def _use_direct_fixed_slot(enabled, npes, experts_per_rank, max_tokens_per_rank, cap, tile_m):
+def _use_direct_fixed_slot(
+    enabled, npes, experts_per_rank, max_tokens_per_rank, cap, tile_m
+):
     if not enabled or tile_m <= 0 or max_tokens_per_rank <= 0:
         return False
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
@@ -43,17 +44,31 @@ def _use_direct_fixed_slot(enabled, npes, experts_per_rank, max_tokens_per_rank,
 
 
 def _validate_dispatch_capacity(
-    batch_size, npes, experts_per_rank, topk, tile_m, row_bytes, output_row_bytes, use_tile_resource
+    batch_size,
+    npes,
+    experts_per_rank,
+    topk,
+    tile_m,
+    row_bytes,
+    output_row_bytes,
+    use_tile_resource,
 ):
     max_rows = npes * batch_size * topk + experts_per_rank * tile_m
     if not use_tile_resource and max_rows * row_bytes >= _BUFFER_OFFSET_ABI_BYTES:
-        raise ValueError("MegaMoE v2 stage1 payload exceeds the 32-bit buffer-resource ABI")
-    if not use_tile_resource and max_rows * output_row_bytes >= _BUFFER_OFFSET_ABI_BYTES:
-        raise ValueError("MegaMoE v2 stage1 output exceeds the 32-bit buffer-resource ABI")
+        raise ValueError(
+            "MegaMoE v2 stage1 payload exceeds the 32-bit buffer-resource ABI"
+        )
+    if (
+        not use_tile_resource
+        and max_rows * output_row_bytes >= _BUFFER_OFFSET_ABI_BYTES
+    ):
+        raise ValueError(
+            "MegaMoE v2 stage1 output exceeds the 32-bit buffer-resource ABI"
+        )
 
 
 # fmt: off
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fixed_slot_dispatch: bool, sort_block_m: int = 32,

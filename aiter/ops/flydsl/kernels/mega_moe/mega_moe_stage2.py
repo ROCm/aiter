@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# ruff: noqa: I001
+# ruff: noqa: B023, I001
 """Fused GEMM2 and weighted cross-rank P2P scatter."""
 
 import flydsl.compiler as flyc
@@ -33,7 +33,9 @@ def _fp8_scale_for_leader(is_leader, local_max):
     e8m0 = fx.Int32(0)
     if is_leader:
         max_bits = local_max.bitcast(fx.Int32)
-        working_bits = (local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(fx.Int32)
+        working_bits = (local_max * fx.Int32(0x3B124925).bitcast(fx.Float32)).bitcast(
+            fx.Int32
+        )
         mantissa = working_bits & fx.Int32(0x7FFFFF)
         biased_exp = (working_bits >> fx.Int32(23)) & fx.Int32(0xFF)
         e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
@@ -264,8 +266,9 @@ def _stage2_lds_bytes(BM, BN, BK, a_dtype, aStages, g2_bf16_lds=False):
 
 # fmt: off
 def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, topk: int, rank: int, npes: int,
-    max_tok: int, recv_cap: int = None, comb_inp_nbytes: int = None, BM: int = 32, BN: int = 256, BK: int = 256,
-    use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8", SBM: int = None,
+    max_tok: int, recv_cap: int | None = None, comb_inp_nbytes: int | None = None, BM: int = 32, BN: int = 256,
+    BK: int = 256, use_nt: bool = True, HIDDEN_MAX: int = 8192, INTER_MAX: int = 8192, a_dtype: str = "fp8",
+    SBM: int | None = None,
     persist: bool = False, cu_num: int = 0, has_pad: bool = False, g2_bhoist=None, g2_ascale_pf=None,
     g2_spart=None, persist_strided: bool = False, g2_bf16_lds: bool = False, p2p_quant_type: str = "none",
     fixed_slot_dispatch: bool = False):
@@ -323,8 +326,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
         f"_bf16lds{int(g2_bf16_lds)}_{p2p_quant_type}"
     )
 
-    @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
     # fmt: off
+    @flyc.kernel(name=kernel_name, known_block_size=[256, 1, 1])
     def kernel_epilog_v2(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64,
         arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,
@@ -456,8 +459,8 @@ def compile_mega_moe_stage2(*, model_dim: int, inter_dim: int, experts: int, top
                 if fx.Int32(m_block) < total_m_blocks:
                     run_unit(unit_bx, m_block)
 
-    @flyc.jit
     # fmt: off
+    @flyc.jit
     def launch(arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
         arg_eids: fx.Int64, arg_cumsum: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64,
         arg_trb: fx.Int64, arg_p2p_comb_inp: fx.Int64, i32_max_m_blocks: fx.Int32,

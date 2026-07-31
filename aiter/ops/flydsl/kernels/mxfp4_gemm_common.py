@@ -152,6 +152,7 @@ def lds_acc_bytes_for(rows, BN):
 
 # MegaMoE gemm2 LDS/DMA helpers.
 
+
 def lds_swizzle_mask_f8(row):
     """lds_swizzle_mask<ROW_BYTES=256>(row) = (row & 15) << 4 (fp8 A tile)."""
     return (row & 15) << 4

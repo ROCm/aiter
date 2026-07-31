@@ -30,7 +30,9 @@ class TileScheduler:
         self._expert_offset = int(expert_offset)
 
     def expert_of(self, m_tile_i32):
-        g = _buffer_ops.buffer_load(self._expert_rsrc, m_tile_i32, vec_width=1, dtype=fx.Int32)
+        g = _buffer_ops.buffer_load(
+            self._expert_rsrc, m_tile_i32, vec_width=1, dtype=fx.Int32
+        )
         if const_expr(self._expert_offset != 0):
             return g - fx.Int32(self._expert_offset)
         return g
@@ -79,7 +81,9 @@ class ATileLoader:
     def for_tile(self, tile_row_base_i32):
         """Precompute LDS and tile-local global offsets for one M tile."""
         if self._x_base_addr is not None:
-            tile_base_addr = self._x_base_addr + fx.Int64(tile_row_base_i32) * fx.Int64(self._row_bytes)
+            tile_base_addr = self._x_base_addr + fx.Int64(tile_row_base_i32) * fx.Int64(
+                self._row_bytes
+            )
             self._tile_rsrc = _buffer_ops.create_buffer_resource_from_addr(
                 tile_base_addr,
                 num_records_bytes=self._sort_block_m * self._row_bytes,
@@ -121,7 +125,9 @@ class ATileLoader:
                 row_byte = (tile_row_base_i32 + row) * fx.Int32(self._row_bytes)
             if const_expr(self._swizzle):
                 col_i32 = chunk * fx.Int32(4)
-                swz = row * fx.Int32(row_stride_i32) + (col_i32 ^ ((row & fx.Int32(15)) << fx.Int32(2)))
+                swz = row * fx.Int32(row_stride_i32) + (
+                    col_i32 ^ ((row & fx.Int32(15)) << fx.Int32(2))
+                )
                 lds_byte = swz * fx.Int32(4)
             else:
                 lds_byte = lin * fx.Int32(16)
@@ -134,14 +140,22 @@ class ATileLoader:
         for lds_byte, chunk_base in self._chunks:
             g_i32 = (chunk_base + koff) // fx.Int32(4)
             x_rsrc = self._tile_rsrc if self._x_base_addr is not None else self._x_rsrc
-            regs.append((lds_byte, _buffer_ops.buffer_load(x_rsrc, g_i32, vec_width=4, dtype=fx.Int32)))
+            regs.append(
+                (
+                    lds_byte,
+                    _buffer_ops.buffer_load(x_rsrc, g_i32, vec_width=4, dtype=fx.Int32),
+                )
+            )
         return regs
 
     def store(self, lds_dst, regs, base_i32=0):
         """Scatter loaded chunks into LDS via ds_write (precomputed lds_byte incl. swizzle). base_i32 = ping/pong."""
         base_bytes = fx.Int32(base_i32) * fx.Int32(4)
         for lds_byte, v in regs:
-            ptr = fx.recast_iter(fx.Uint8, fx.add_offset(lds_dst.ptr, fx.make_int_tuple(base_bytes + lds_byte)))
+            ptr = fx.recast_iter(
+                fx.Uint8,
+                fx.add_offset(lds_dst.ptr, fx.make_int_tuple(base_bytes + lds_byte)),
+            )
             fx.ptr_store(Vec(v).bitcast(fx.Uint8), ptr)
 
     def prefetch_to_lds(self, k_step_byte_off, lds_dst, base_i32=0):
@@ -165,7 +179,9 @@ class ATileLoader:
                 logical_chunk = physical_chunk ^ (row & fx.Int32(15))
             else:
                 logical_chunk = physical_chunk
-            src_byte = row * fx.Int32(self._row_bytes) + koff + logical_chunk * fx.Int32(16)
+            src_byte = (
+                row * fx.Int32(self._row_bytes) + koff + logical_chunk * fx.Int32(16)
+            )
             src = fx.slice(
                 self._tile_dma,
                 (None, src_byte),
@@ -207,8 +223,12 @@ class AS2RLoader:
 
         col_lo = klane4 + fx.Int32(ksub * 32)
         lo = self._load_16b(lds_src, row_i32 + _c(col_lo)).bitcast(fx.Int64)
-        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + fx.Int32(16))).bitcast(fx.Int64)
-        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(fx.Int32)
+        hi = self._load_16b(lds_src, row_i32 + _c(col_lo + fx.Int32(16))).bitcast(
+            fx.Int64
+        )
+        return Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64).bitcast(
+            fx.Int32
+        )
 
 
 class BWeightLoader:
@@ -247,11 +267,17 @@ class BWeightLoader:
 
     def load_step(self, row_base_i32, kstep_i32):
         """list[num_acc_n] of [ksub0_i32x4, ksub1_i32x4] for this K-step."""
-        return [self.load_ni(row_base_i32, ni, kstep_i32) for ni in range_constexpr(self._num_acc_n)]
+        return [
+            self.load_ni(row_base_i32, ni, kstep_i32)
+            for ni in range_constexpr(self._num_acc_n)
+        ]
 
     def load_ni(self, row_base_i32, ni, kstep_i32):
         """One N-group's [ksub0, ksub1] fp4 packs (per-ni so the pipe can interleave one next-tile B load)."""
-        return [self._load_pack(row_base_i32, ni, kstep_i32, ks) for ks in range_constexpr(_PACK)]
+        return [
+            self._load_pack(row_base_i32, ni, kstep_i32, ks)
+            for ks in range_constexpr(_PACK)
+        ]
 
 
 class BScaleLoader:
@@ -272,7 +298,9 @@ class BScaleLoader:
         out = []
         for g in range_constexpr(self._n_groups):
             off = (base_group + fx.Int32(g)) * fx.Int32(self._row_stride) + kterm + lane
-            out.append(_buffer_ops.buffer_load(self._rsrc, off, vec_width=1, dtype=fx.Int32))
+            out.append(
+                _buffer_ops.buffer_load(self._rsrc, off, vec_width=1, dtype=fx.Int32)
+            )
         return out
 
 
@@ -322,7 +350,9 @@ class AScaleLoader:
     def load_step(self, lds_ascale, kstep_i32):
         """One packed i32 per pack-group, read from the LDS-staged A-scale (ds_read)."""
         lane_row = fx.Int32(self._lane % 16)
-        col0 = kstep_i32 * fx.Int32(8) + fx.Int32(self._lane // 16)  # e8m0 col = kstep*8 + ksub*4 + KLane
+        col0 = kstep_i32 * fx.Int32(8) + fx.Int32(
+            self._lane // 16
+        )  # e8m0 col = kstep*8 + ksub*4 + KLane
         out = []
         for g in range_constexpr(self._n_groups):
             r0 = fx.Int32(g * 32) + lane_row
@@ -330,14 +360,23 @@ class AScaleLoader:
             b = []
             for ksub in range_constexpr(_PACK):
                 for rr in (r0, r1):
-                    b.append(self._read_scale_lds(lds_ascale, rr, col0 + fx.Int32(ksub * 4)))
-            packed = b[0] | (b[1] << fx.Int32(8)) | (b[2] << fx.Int32(16)) | (b[3] << fx.Int32(24))
+                    b.append(
+                        self._read_scale_lds(lds_ascale, rr, col0 + fx.Int32(ksub * 4))
+                    )
+            packed = (
+                b[0]
+                | (b[1] << fx.Int32(8))
+                | (b[2] << fx.Int32(16))
+                | (b[3] << fx.Int32(24))
+            )
             out.append(packed)
         return out
 
     def _read_scale_lds(self, lds_ascale, row_i32, col_i32):
         off = row_i32 * fx.Int32(self._n_scale) + col_i32
-        ptr = fx.recast_iter(fx.Uint8, fx.add_offset(lds_ascale.ptr, fx.make_int_tuple(off)))
+        ptr = fx.recast_iter(
+            fx.Uint8, fx.add_offset(lds_ascale.ptr, fx.make_int_tuple(off))
+        )
         v = fx.make_view(ptr, fx.make_layout(1, 1)).load()
         return Vec(v)[0].to(fx.Int32)
 
@@ -350,7 +389,15 @@ class MfmaScaleGU:
         self._num_acc_n = num_acc_n
         self._atoms = {
             (osa, osb): fx.make_mma_atom(
-                fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN, fx.Float4E2M1FN, opsel_a=osa, opsel_b=osb)
+                fx.rocdl.cdna4.MFMA_Scale(
+                    16,
+                    16,
+                    128,
+                    fx.Float8E4M3FN,
+                    fx.Float4E2M1FN,
+                    opsel_a=osa,
+                    opsel_b=osb,
+                )
             )
             for osa in range(4)
             for osb in range(4)
@@ -369,7 +416,15 @@ class MfmaScaleGU:
         a_frag.store(Vec(a_op))
         b_frag.store(Vec(b_op))
         c_frag.store(Vec(acc))
-        fx.gemm(self._atoms[(opsel_a, opsel_b)], c_frag, a_frag, b_frag, c_frag, scale_a=sa_v, scale_b=sb_v)
+        fx.gemm(
+            self._atoms[(opsel_a, opsel_b)],
+            c_frag,
+            a_frag,
+            b_frag,
+            c_frag,
+            scale_a=sa_v,
+            scale_b=sb_v,
+        )
         return Vec(c_frag.load())
 
     def call(self, a_load, b, acc, sa, sb):

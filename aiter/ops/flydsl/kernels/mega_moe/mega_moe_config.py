@@ -4,9 +4,25 @@
 
 from bisect import bisect_left
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import cache
 
-TOKEN_BUCKETS = (1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
+TOKEN_BUCKETS = (
+    1,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+)
 P2P_FP8_MIN_TOKENS = 1024
 FIXED_SLOT_MAX_MTPR = 255
 
@@ -58,7 +74,9 @@ class MegaMoEConfig:
         sbm = self.stage1.sort_block_m
         bm = self.stage2.block_m
         if bm > sbm or sbm % bm:
-            raise ValueError(f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}")
+            raise ValueError(
+                f"Stage2 block_m={bm} must divide Stage1 sort_block_m={sbm}"
+            )
         if self.p2p_quant not in ("none", "fp8_blockwise_1x32"):
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
@@ -75,7 +93,15 @@ _FIXED_GEOMETRY = {
     128: (3, 224, False, 2, 3),
 }
 
-_COMPACT_SMALL_DISPATCH_CU = {1: 224, 4: 128, 8: 192, 16: 64, 32: 128, 64: 192, 128: 128}
+_COMPACT_SMALL_DISPATCH_CU = {
+    1: 224,
+    4: 128,
+    8: 192,
+    16: 64,
+    32: 128,
+    64: 192,
+    128: 128,
+}
 
 
 def nearest_token_bucket(tokens: int) -> int:
@@ -92,7 +118,9 @@ def nearest_token_bucket(tokens: int) -> int:
 
 def _select_stage1(bucket: int, fixed_slot: bool, mtpr: int) -> Stage1Config:
     if fixed_slot:
-        grid_mult, dispatch_cu, tile_resource, waves_per_eu, b_nt = _FIXED_GEOMETRY[bucket]
+        grid_mult, dispatch_cu, tile_resource, waves_per_eu, b_nt = _FIXED_GEOMETRY[
+            bucket
+        ]
         config = Stage1Config(
             sort_block_m=32,
             tile_n=256 if bucket <= 8 else 128,
@@ -176,7 +204,11 @@ def _select_stage1(bucket: int, fixed_slot: bool, mtpr: int) -> Stage1Config:
 
 def _select_stage2(bucket: int, fixed_slot: bool) -> Stage2Config:
     block_m = 64 if bucket >= 4096 else 32
-    block_n = 256 if bucket in (1, 4, 64) or bucket >= 1024 or (not fixed_slot and bucket < 128) else 128
+    block_n = (
+        256
+        if bucket in (1, 4, 64) or bucket >= 1024 or (not fixed_slot and bucket < 128)
+        else 128
+    )
     persist = bucket >= 128
     persist_cu = 0
     if persist:
@@ -191,7 +223,7 @@ def _select_stage2(bucket: int, fixed_slot: bool) -> Stage2Config:
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _select_bucket_config(bucket: int, mtpr: int, p2p_quant: str) -> MegaMoEConfig:
     fixed_slot = mtpr <= FIXED_SLOT_MAX_MTPR
     stage1 = _select_stage1(bucket, fixed_slot, mtpr)

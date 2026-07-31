@@ -40,7 +40,9 @@ __all__ = [
 
 def _to_ptr_global(v):
     """Cast an i64 address to ``!llvm.ptr<1>`` (global address space)."""
-    return _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), arith.unwrap(v)).result
+    return _llvm_d.IntToPtrOp(
+        _llvm_d.PointerType.get(address_space=1), arith.unwrap(v)
+    ).result
 
 
 def store_i32_system(addr_i64, offset, val):
@@ -52,16 +54,30 @@ def store_i32_system(addr_i64, offset, val):
     _i32 = ir.IntegerType.get_signless(32)
     _nuw = ir.Attribute.parse("#llvm.overflow<none>")
     off64 = _llvm_d.ZExtOp(_i64, off).res if off.type == _i32 else off
-    byte_off = _llvm_d.MulOp(off64, _llvm_d.ConstantOp(_i64, ir.IntegerAttr.get(_i64, 4)).result, _nuw).result
+    byte_off = _llvm_d.MulOp(
+        off64, _llvm_d.ConstantOp(_i64, ir.IntegerAttr.get(_i64, 4)).result, _nuw
+    ).result
     addr = _llvm_d.AddOp(base, byte_off, _nuw).result
     gptr = _llvm_d.IntToPtrOp(_llvm_d.PointerType.get(address_space=1), addr).result
-    _llvm_d.StoreOp(val_, gptr, alignment=4, ordering=_llvm_d.AtomicOrdering.release, syncscope="one-as")
+    _llvm_d.StoreOp(
+        val_,
+        gptr,
+        alignment=4,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope="one-as",
+    )
 
 
 def store_i64_global_system(addr_i64, val):
     """System-scope release i64 store to ``addr_i64``."""
     gptr = _to_ptr_global(addr_i64)
-    _llvm_d.StoreOp(arith.unwrap(val), gptr, alignment=8, ordering=_llvm_d.AtomicOrdering.release, syncscope="one-as")
+    _llvm_d.StoreOp(
+        arith.unwrap(val),
+        gptr,
+        alignment=8,
+        ordering=_llvm_d.AtomicOrdering.release,
+        syncscope="one-as",
+    )
 
 
 def fence_acquire(syncscope):
@@ -143,7 +159,15 @@ class GeometryTuningTable:
 
     @classmethod
     def from_tuning_file(
-        cls, path, *, dtype, hidden_dim, zero_copy, topk=None, local_expert_num=None, combine_dtype="bf16"
+        cls,
+        path,
+        *,
+        dtype,
+        hidden_dim,
+        zero_copy,
+        topk=None,
+        local_expert_num=None,
+        combine_dtype="bf16",
     ):
         """Build a per-op table from a multi-shape tuning JSON, filtered to this
         op's shape; empty table => cfg defaults."""
@@ -151,7 +175,10 @@ class GeometryTuningTable:
             raw = json.load(f)
 
         def _match(r, want_dtype, need_zc):
-            if r.get("dtype") != want_dtype or int(r.get("hidden_dim", -1)) != hidden_dim:
+            if (
+                r.get("dtype") != want_dtype
+                or int(r.get("hidden_dim", -1)) != hidden_dim
+            ):
                 return False
             if topk is not None and "topk" in r and int(r["topk"]) != topk:
                 return False
@@ -165,7 +192,10 @@ class GeometryTuningTable:
 
         def _build(rules, want_dtype, need_zc):
             return {
-                int(r["num_tokens"]): (int(r["block_num"]), int(r["warp_num_per_block"]))
+                int(r["num_tokens"]): (
+                    int(r["block_num"]),
+                    int(r["warp_num_per_block"]),
+                )
                 for r in rules
                 if _match(r, want_dtype, need_zc)
             }

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Independent v4_pro MegaMoEV2 accuracy and performance test."""
@@ -10,19 +9,19 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
-import aiter
 import mori.shmem as ms
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+
+import aiter
 from aiter import dtypes
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
-
 NETWORKS = {
-    "v4_pro": dict(model_dim=7168, inter_dim=3072, experts=384, topk=6),
+    "v4_pro": {"model_dim": 7168, "inter_dim": 3072, "experts": 384, "topk": 6},
 }
 
 
@@ -66,10 +65,18 @@ def _next_power_of_two(value):
 
 def _make_inputs(tokens, model_dim, experts, topk, rank, seed, device):
     generator = torch.Generator(device=device).manual_seed(seed + rank)
-    x = torch.randn((tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator)
-    scores = torch.randn((tokens, experts), dtype=torch.float32, device=device, generator=generator)
+    x = torch.randn(
+        (tokens, model_dim), dtype=torch.bfloat16, device=device, generator=generator
+    )
+    scores = torch.randn(
+        (tokens, experts), dtype=torch.float32, device=device, generator=generator
+    )
     values, ids = torch.topk(scores, topk, dim=-1)
-    return x.contiguous(), values.softmax(dim=-1).contiguous(), ids.to(torch.int32).contiguous()
+    return (
+        x.contiguous(),
+        values.softmax(dim=-1).contiguous(),
+        ids.to(torch.int32).contiguous(),
+    )
 
 
 def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
@@ -104,7 +111,16 @@ def _quantize_weights(model_dim, inter_dim, local_experts, rank, seed, device):
     w2_kernel = shuffle_weight_a16w4(w2_q, 16, False).contiguous()
     w2_scale_kernel = shuffle_scale_a16w4(w2_scale, local_experts, False).contiguous()
     torch.cuda.empty_cache()
-    return w1_kernel, w1_scale_kernel, w2_kernel, w2_scale_kernel, w1_q, w1_scale_ref, w2_q, w2_scale_ref
+    return (
+        w1_kernel,
+        w1_scale_kernel,
+        w2_kernel,
+        w2_scale_kernel,
+        w1_q,
+        w1_scale_ref,
+        w2_q,
+        w2_scale_ref,
+    )
 
 
 def _dequant_expert(weight, scale, rows, cols):
@@ -120,9 +136,17 @@ def _all_gather(tensor):
 
 
 @torch.no_grad()
-def _reference(x, route_weights, ids, ref_weights, rank, world, model_dim, inter_dim, experts):
-    x_all, weights_all, ids_all = _all_gather(x), _all_gather(route_weights), _all_gather(ids)
-    partial = torch.zeros((x_all.shape[0], model_dim), dtype=torch.float32, device=x.device)
+def _reference(
+    x, route_weights, ids, ref_weights, rank, world, model_dim, inter_dim, experts
+):
+    x_all, weights_all, ids_all = (
+        _all_gather(x),
+        _all_gather(route_weights),
+        _all_gather(ids),
+    )
+    partial = torch.zeros(
+        (x_all.shape[0], model_dim), dtype=torch.float32, device=x.device
+    )
     w1_q, w1_scale, w2_q, w2_scale = ref_weights
     local_experts = experts // world
     expert_start = rank * local_experts
@@ -133,7 +157,9 @@ def _reference(x, route_weights, ids, ref_weights, rank, world, model_dim, inter
         positions = torch.nonzero(ids_all == expert, as_tuple=False)
         rows, slots = positions[:, 0], positions[:, 1]
         local_id = expert - expert_start
-        w1 = _dequant_expert(w1_q[local_id], w1_scale[local_id], 2 * inter_dim, model_dim)
+        w1 = _dequant_expert(
+            w1_q[local_id], w1_scale[local_id], 2 * inter_dim, model_dim
+        )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
         hidden = F.silu(inp @ w1[:inter_dim].T) * (inp @ w1[inter_dim:].T)
@@ -156,7 +182,9 @@ def _time_graph(fn, device, iters):
     for _ in range(10):
         graph.replay()
     torch.cuda.synchronize()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True
+    )
     start.record()
     for _ in range(iters):
         graph.replay()
@@ -185,7 +213,10 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.inter_dim,
             moe.experts,
         )
-        rel_l2 = float(torch.linalg.vector_norm(output.float() - reference) / torch.linalg.vector_norm(reference))
+        rel_l2 = float(
+            torch.linalg.vector_norm(output.float() - reference)
+            / torch.linalg.vector_norm(reference)
+        )
         rel_l2 = _reduce_float(rel_l2, device, dist.ReduceOp.MAX)
         if rel_l2 >= args.rtol:
             raise AssertionError(f"bs={tokens} relL2={rel_l2:.6f} exceeds {args.rtol}")
@@ -240,8 +271,12 @@ def main():
     try:
         network = NETWORKS[args.network]
         if network["experts"] % world:
-            raise ValueError(f"experts={network['experts']} must be divisible by world={world}")
-        if args.max_tok_per_rank is not None and args.max_tok_per_rank < max(batch_sizes):
+            raise ValueError(
+                f"experts={network['experts']} must be divisible by world={world}"
+            )
+        if args.max_tok_per_rank is not None and args.max_tok_per_rank < max(
+            batch_sizes
+        ):
             raise ValueError("--max-tok-per-rank must cover the largest batch size")
         local_experts = network["experts"] // world
         packed = _quantize_weights(
@@ -265,7 +300,9 @@ def main():
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         for batch_size in batch_sizes:
-            max_tok_per_rank = args.max_tok_per_rank or max(16, _next_power_of_two(batch_size))
+            max_tok_per_rank = args.max_tok_per_rank or max(
+                16, _next_power_of_two(batch_size)
+            )
             moe = MegaMoEV2(
                 rank=rank,
                 world_size=world,

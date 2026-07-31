@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
+# ruff: noqa: B023, SIM102
 """Compact dispatch path for MegaMoE v2 stage1."""
 
 from enum import IntEnum
 
-import mori.ir.flydsl as mori_shmem
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
