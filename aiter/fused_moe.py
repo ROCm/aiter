@@ -1170,6 +1170,7 @@ def _opus_a8w4_stage1_wrapper(
     a1_scale=None,
     sorted_weights=None,
     bias1=None,
+    swiglu_limit: float | None = None,
     inter_dim_pad: int = 0,
     **_kwargs,
 ):
@@ -1193,6 +1194,7 @@ def _opus_a8w4_stage1_wrapper(
         out=out,
         block_m=int(block_m),
         kernelName=str(kernelName),
+        swiglu_limit=swiglu_limit,
     )
 
 
@@ -2708,8 +2710,9 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if metadata.stage1.func is _flydsl_stage1_wrapper:
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if stage1_func is _flydsl_stage1_wrapper:
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
         # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).

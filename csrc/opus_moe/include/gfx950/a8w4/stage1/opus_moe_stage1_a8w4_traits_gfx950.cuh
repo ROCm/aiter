@@ -39,6 +39,7 @@ struct OpusMoeStage1A8W4Kargs
     int inter_dim;
     int hidden_scale_cols;
     int k_steps;
+    float swiglu_limit;
 
     // Byte extents per global tensor -> make_gmem, so the HW OOB bounds check stays active.
     unsigned int hidden_size_bytes;

@@ -570,7 +570,8 @@ void opus_moe_stage1_a8w4_fwd(
     aiter_tensor_t& out_scale,
     int block_m,
     const std::string& kernelName,
-    int inter_dim_pad)
+    int inter_dim_pad,
+    float swiglu_limit)
 {
     check_tensor(hidden_states,
                  "hidden_states",
@@ -617,6 +618,7 @@ void opus_moe_stage1_a8w4_fwd(
     const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
     const int effective_inter_dim = inter_dim - inter_dim_pad;
     const int kernel_id = opus_moe::stage1_a8w4_kid_from_name(kernelName.c_str());
+    AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",
                 kernelName);
@@ -713,6 +715,7 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.inter_dim = inter_dim;
     kargs.hidden_scale_cols = hidden_scale_cols;
     kargs.k_steps = k_steps;
+    kargs.swiglu_limit = swiglu_limit;
 
     // Byte extent per global tensor (1-byte dtypes: size(0)*stride(0)) -> make_gmem bounds check.
     kargs.hidden_size_bytes =

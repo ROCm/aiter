@@ -540,7 +540,8 @@ __device__ __forceinline__ void reduce_single_group_kwave(
 }
 
 template<Stage1Activation Act>
-__device__ __forceinline__ float activation_mul_stage1(float gate_raw, float up_raw)
+__device__ __forceinline__ float
+activation_mul_stage1(float gate_raw, float up_raw, float swiglu_limit)
 {
     if constexpr(Act == Stage1Activation::Swiglu)
     {
@@ -555,12 +556,10 @@ __device__ __forceinline__ float activation_mul_stage1(float gate_raw, float up_
     }
     else
     {
-        // silu with swiglu_limit=10 clamp (flydsl silu_and_mul_fq): gate=min(g,lim), linear=clamp(u,-lim,lim).
-        constexpr float kLimit = 10.0f;
         constexpr float kNegLog2E = -1.4426950408889634f;
-        const float gate = gate_raw < kLimit ? gate_raw : kLimit;
-        const float up_hi = up_raw < kLimit ? up_raw : kLimit;
-        const float linear = up_hi > -kLimit ? up_hi : -kLimit;
+        const float gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
+        const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
+        const float linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
         const float emu = __builtin_amdgcn_exp2f(gate * kNegLog2E);
         const float sig = __builtin_amdgcn_rcpf(1.0f + emu);
         return gate * sig * linear;
@@ -603,7 +602,7 @@ __device__ __forceinline__ void epilogue_store_group_to_smem(
                 kargs, expert_id, kargs.inter_dim + output_col);
         }
         const float value = activation_mul_stage1<Traits::ACTIVATION>(
-            gate, up_value);
+            gate, up_value, kargs.swiglu_limit);
         const int offset = epilogue_smem_offset<Traits>(
             smem_row, group, local_col);
         smem_values[offset] = value;

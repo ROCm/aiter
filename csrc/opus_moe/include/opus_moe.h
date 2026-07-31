@@ -39,4 +39,5 @@ void opus_moe_stage1_a8w4_fwd(
     aiter_tensor_t& out_scale,
     int block_m,
     const std::string& kernelName,
-    int inter_dim_pad);
+    int inter_dim_pad,
+    float swiglu_limit);

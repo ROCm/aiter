@@ -50,6 +50,7 @@ def _opus_moe_stage1_a8w4_fwd_raw(
     block_m: int,
     kernelName: str,
     inter_dim_pad: int,
+    swiglu_limit: float,
 ) -> Tensor: ...
 
 
@@ -90,6 +91,7 @@ def opus_moe_stage1_a8w4_fwd(
     bias: Tensor | None = None,
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
+    swiglu_limit: float | None = None,
 ) -> tuple[Tensor, Tensor]:
     block_m = int(block_m)
     kernelName = str(kernelName)
@@ -122,6 +124,7 @@ def opus_moe_stage1_a8w4_fwd(
         int(block_m),
         kernelName,
         int(inter_dim_pad),
+        float(swiglu_limit) if swiglu_limit else float("inf"),
     )
     return out, out_scale
 
