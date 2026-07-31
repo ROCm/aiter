@@ -17,6 +17,15 @@ _WAVES_PER_EU = 2
 _WEIGHT_CACHE_MODIFIER = 0
 
 
+def _is_gfx950_flydsl_available() -> bool:
+    if not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
+
+
 def supports_kimi_k3_mla_gate(
     hidden: torch.Tensor,
     gate_weight: torch.Tensor,
@@ -33,8 +42,7 @@ def supports_kimi_k3_mla_gate(
         and tuple(hidden.shape) == (1, _HIDDEN)
         and tuple(gate_weight.shape) == (_OUTPUT, _HIDDEN)
         and tuple(attention_output.shape) == (1, _OUTPUT)
-        and is_flydsl_available()
-        and get_gfx_runtime() == "gfx950"
+        and _is_gfx950_flydsl_available()
     )
 
 

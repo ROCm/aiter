@@ -9,9 +9,19 @@ from aiter.ops.flydsl.kimi_k3_mla_gate import (
     kimi_k3_mla_gate,
     supports_kimi_k3_mla_gate,
 )
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+
+def _gfx950_flydsl_available() -> bool:
+    if not torch.cuda.is_available() or not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    not _gfx950_flydsl_available(),
     reason="Kimi-K3 MLA gate specialization requires gfx950",
 )
 
@@ -32,13 +42,21 @@ def _relative_rmse(actual: torch.Tensor, expected: torch.Tensor) -> float:
     ).item()
 
 
+def _reference(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    attention: torch.Tensor,
+) -> torch.Tensor:
+    projected = (hidden.float() @ weight.float().T).to(torch.bfloat16)
+    gate = torch.sigmoid(projected.float()).to(torch.bfloat16)
+    return (gate.float() * attention.float()).to(torch.bfloat16)
+
+
 def test_kimi_k3_mla_gate_primary_dispatch_and_accuracy():
     hidden, weight, attention = _inputs(1)
     assert supports_kimi_k3_mla_gate(hidden, weight, attention)
     output = kimi_k3_mla_gate(hidden, weight, attention)
-    reference = (
-        torch.sigmoid(hidden.float() @ weight.float().T) * attention.float()
-    ).to(torch.bfloat16)
+    reference = _reference(hidden, weight, attention)
     assert output.dtype == torch.bfloat16
     assert output.is_contiguous()
     assert _relative_rmse(output, reference) <= 0.01
@@ -65,9 +83,7 @@ def test_kimi_k3_mla_gate_reuses_valid_output():
 def test_kimi_k3_mla_gate_supports_attention_output_alias():
     hidden, weight, attention = _inputs(1)
     attention_input = attention.clone()
-    reference = (
-        torch.sigmoid(hidden.float() @ weight.float().T) * attention_input.float()
-    ).to(torch.bfloat16)
+    reference = _reference(hidden, weight, attention_input)
 
     actual = kimi_k3_mla_gate(hidden, weight, attention, out=attention)
     torch.cuda.synchronize()
@@ -79,6 +95,8 @@ def test_kimi_k3_mla_gate_supports_attention_output_alias():
 def test_kimi_k3_mla_gate_graph_replay_uses_changed_inputs():
     hidden, weight, attention = _inputs(1)
     output = torch.empty_like(attention)
+    kimi_k3_mla_gate(hidden, weight, attention, out=output)
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         kimi_k3_mla_gate(hidden, weight, attention, out=output)
@@ -93,9 +111,7 @@ def test_kimi_k3_mla_gate_graph_replay_uses_changed_inputs():
     second = output.clone()
 
     assert not torch.equal(first, second)
-    reference = (
-        torch.sigmoid(hidden.float() @ weight.float().T) * attention.float()
-    ).to(torch.bfloat16)
+    reference = _reference(hidden, weight, attention)
     assert _relative_rmse(second, reference) <= 0.01
 
 
