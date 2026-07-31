@@ -10,10 +10,10 @@
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
 #   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
-#                        nhead <= 96, batch_size=1, NUM_KV_SPLITS=256.
-#                        (batch, split, head_block*qlen) grid. Always splits +
-#                        always reduces. A partial last head block
-#                        (nhead % BLOCK_H != 0) masks OOB heads on Q load / O store.
+#                        nhead <= 96, batch_size >= 1,
+#                        (batch, split, head_block*qlen) grid. Full decode
+#                        (stage-1 + stage-2 reduce into the final O). A partial
+#                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
 #   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
 #                        nhead <= 96, batch_size >= 1,
 #                        (batch, split, head_block*qlen) grid. Full decode
@@ -948,9 +948,6 @@ def mla_gluon(
         # that every split is non-empty (floor split size = min_kv_seq_len //
         # NUM_KV_SPLITS >= 1). Each clamp below keeps NUM_KV_SPLITS <= min_kv_seq_len,
         if REGIME == "bh16bn128":
-            assert (
-                batch_size == 1
-            ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
             NUM_KV_SPLITS = max(
                 1, min(256 // (batch_size * qlen * NUM_M_BLOCKS), min_kv_seq_len)
             )
