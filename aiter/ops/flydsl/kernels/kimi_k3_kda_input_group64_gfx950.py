@@ -337,7 +337,7 @@ def build_kimi_k3_kda_input_group64_module(
         weight: fx.Pointer,
         weight_scale: fx.Pointer,
         output: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream,
     ):
         context = CompilationContext.get_current()
         if const_expr(waves_per_eu > 0):
