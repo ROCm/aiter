@@ -510,8 +510,7 @@ jobs:
               pip install --no-build-isolation .
 
           RUN echo "=== Installed versions ===" && \
-              pip show flash-attn && \
-              pip show amd-aiter
+              pip show flash-attn
 
           WORKDIR /flash-attention
           EOF
