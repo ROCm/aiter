@@ -230,9 +230,7 @@ def test_fmoe(
     # a16w4 by the caller but dispatched as a8w4 on gfx950.
     reference_aq_dtype = AQDType
     if actType == aiter.ActivationType.Situv2:
-        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
-            token, gateMode, qType, WQDType
-        )
+        runtime_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(qType, WQDType)
         if runtime_aq_dtype is not None:
             reference_aq_dtype = runtime_aq_dtype
 
@@ -889,10 +887,7 @@ def _iter_csv_cases():
         # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
         if kwargs["actType"] == aiter.ActivationType.Situv2:
             expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
-                kwargs["token"],
-                kwargs["gateMode"],
-                kwargs["qType"],
-                kwargs["WQDType"],
+                kwargs["qType"], kwargs["WQDType"]
             )
             runtime_mode = "SiTUv2 MXFP4"
         else:
@@ -965,7 +960,7 @@ def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
     return None
 
 
-def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
+def _runtime_situv2_mxfp4_q_dtype_a(q_type, wq_dtype):
     """Mirror fused_moe's SiTUv2 MXFP4 activation-dtype routing."""
     if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
         return None
@@ -977,10 +972,10 @@ def _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype):
             else dtypes.fp4x2
         )
 
-    if GateMode(gate_mode) == GateMode.INTERLEAVE:
-        bound = int(os.environ.get("AITER_BF16_FP8_MOE_BOUND", "256"))
-        return dtypes.bf16 if get_gfx() != "gfx950" or token < bound else dtypes.fp8
-
+    # fused_moe tests SiTUv2 ahead of the Swiglu/INTERLEAVE branch, so gate mode
+    # and token count do not enter into it -- mirror that order here, otherwise
+    # a4w4/a8w4 rows are skipped as "mode mismatch" under gate_mode=INTERLEAVE
+    # and the opt-in paths go untested.
     if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
         return dtypes.fp8
     if os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
