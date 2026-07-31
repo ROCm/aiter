@@ -49,10 +49,11 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from aiter.utility import dtypes as aiter_dtypes
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
+
+from aiter.utility import dtypes as aiter_dtypes
 
 from .tensor_shim import _run_compiled
 
@@ -109,21 +110,30 @@ def _v_per_block(head_size, block_size, x, num_kv_heads):
     return num_kv_heads * _v_head_stride(head_size, block_size, x)
 
 
+# Other helpers
+
+def rms_reduce_add(x, lane):
+    v = x
+    for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
+        off = RMS_GROUP // (2 << sh_exp)
+        peer = v.shuffle_xor(off, RMS_GROUP)
+        v = v.addf(peer, fastmath=arith.FastMathFlags.fast)
+    other_half = v.shuffle_xor(RMS_GROUP, WAVE)
+    return (lane < RMS_GROUP).select(v, other_half)
+
 # ============================================================================
 # Q kernel builder
 # ============================================================================
 def _build_q_kernel(
     *,
     num_heads_q: int,
-    num_heads_k: int,
-    num_heads_v: int,
     head_size: int,
     mrope_section: list[int],
     eps: float,
     is_interleaved: bool,
     gemma_norm: bool,
 ):
-    H_Q, H_K, H_V, D = num_heads_q, num_heads_k, num_heads_v, head_size
+    H_Q, D = num_heads_q, head_size
     HALF = D // 2
     PROD_VEC_SIZE = D // RMS_GROUP
     VEC_PAIRS = max(1, HALF // WAVE)
@@ -137,25 +147,9 @@ def _build_q_kernel(
         cos_sin: fx.Tensor,  # [max_pos, D] bf16 (cos=[:, :D/2], sin=[:, D/2:])
         q_norm_w: fx.Tensor,  # [D] bf16
         q_out: fx.Tensor,  # [T, H_Q, D] bf16
-        num_tokens: fx.Int32,
         token_offset: fx.Int32,
     ):
-        # NOTE: helpers are nested inside the @flyc.kernel body, not sibling
-        # functions in _build_q_kernel -- FlyDSL's AST rewriter (dynamic
-        # if/elif/else -> structured dispatch, `and`/`or` ->
-        # __dsl_and__/__dsl_or__) only rewrites the decorated function's own
-        # source text; nested `def`s are included, plain sibling functions
-        # merely *called* from it are not. See flydsl-best-practices.md S1.
         fm_fast = arith.FastMathFlags.fast
-
-        def rms_reduce_add(x, lane):
-            v = x
-            for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
-                off = RMS_GROUP // (2 << sh_exp)
-                peer = v.shuffle_xor(off, RMS_GROUP)
-                v = v.addf(peer, fastmath=fm_fast)
-            other_half = v.shuffle_xor(RMS_GROUP, WAVE)
-            return (lane < RMS_GROUP).select(v, other_half)
 
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
             """Interleaved 3D-mrope cos/sin gather for column ``col`` in
@@ -290,7 +284,6 @@ def _build_q_kernel(
             cos_sin,
             q_norm_w,
             q_out,
-            num_tokens,
             token_offset,
         )
         k.launch(
@@ -391,14 +384,6 @@ def _build_kv_kernel(
             stride=(block_size * D, D * x, x, 1),
         )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
-
-        def rms_reduce_add(v, lane):
-            for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
-                off = RMS_GROUP // (2 << sh_exp)
-                peer = v.shuffle_xor(off, RMS_GROUP)
-                v = v.addf(peer, fastmath=fm_fast)
-            other_half = v.shuffle_xor(RMS_GROUP, WAVE)
-            return (lane < RMS_GROUP).select(v, other_half)
 
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
             if const_expr(is_interleaved):
@@ -532,8 +517,8 @@ def _build_kv_kernel(
                             if const_expr(cache_is_fp8):
                                 # Production assigns RoPE output to vec_t<bf16>
                                 # before converting that vector to FP8.
-                                o0 = o0.to(fx.BFloat16).to(fx.Float32)
-                                o1 = o1.to(fx.BFloat16).to(fx.Float32)
+                                o0 = o0.to(fx.BFloat16)
+                                o1 = o1.to(fx.BFloat16)
                                 kb0, kb1 = quant_pair_fp8(o0, o1, k_scale_value)
                             else:
                                 kb0 = o0.to(fx.BFloat16)
@@ -749,8 +734,6 @@ def _build_kv_kernel(
 def _compile_q(
     *,
     num_heads_q,
-    num_heads_k,
-    num_heads_v,
     head_size,
     mrope_section,
     eps,
@@ -759,8 +742,6 @@ def _compile_q(
 ):
     return _build_q_kernel(
         num_heads_q=num_heads_q,
-        num_heads_k=num_heads_k,
-        num_heads_v=num_heads_v,
         head_size=head_size,
         mrope_section=list(mrope_section),
         eps=eps,
@@ -1067,8 +1048,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
 
     q_launch = _compile_q(
         num_heads_q=H_Q,
-        num_heads_k=H_K,
-        num_heads_v=H_V,
         head_size=D,
         mrope_section=tuple(mrope_section_),
         eps=eps,
