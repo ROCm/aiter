@@ -140,9 +140,7 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
     f32v = vector.from_elements(vec_t, raw)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
-    my_off = ArithValue(row_off_elems) + ArithValue(idx) * arith.constant(
-        vec, type=T.i32
-    )
+    my_off = fx.Int32(row_off_elems) + fx.Int32(idx) * vec
     g_out.store(my_off, bf16v, vec_size=vec)
 
 
@@ -163,7 +161,6 @@ def _store_fp8_packed(
     """
     f32 = T.f32
     i32 = T.i32
-    c8 = arith.constant(8, type=i32)
 
     if skip_fnuz_clamp:
         safe = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
@@ -189,7 +186,7 @@ def _store_fp8_packed(
     p1 = rocdl.cvt_pk_fp8_f32(i32, safe[4], safe[5], p1, 0)
     p1 = rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
 
-    off_bytes = row_base_bytes + ArithValue(idx) * c8
+    off_bytes = fx.Int32(row_base_bytes) + fx.Int32(idx) * 8
     vec2_i32 = T.vec(2, i32)
     store_vec = vector.from_elements(vec2_i32, [p0, p1])
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
@@ -234,9 +231,9 @@ def _build_kernel(
     ROPE_THREAD_LO = NOPE // VEC
     PAIRS_PER_THREAD = VEC // 2
 
-    assert (
-        D % BLOCK_THREADS == 0
-    ), f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    assert D % BLOCK_THREADS == 0, (
+        f"D={D} must be divisible by BLOCK_THREADS={BLOCK_THREADS}"
+    )
     assert NOPE % VEC == 0, f"NOPE={NOPE} must be divisible by VEC={VEC}"
     assert RD % 2 == 0, "rope_head_dim must be even (GPT-J pair layout)"
     assert RD % VEC == 0, f"RD={RD} must be divisible by VEC={VEC}"
@@ -256,20 +253,20 @@ def _build_kernel(
     # --- quant-group layout ------------------------------------------------
     # group_size must divide D evenly AND be a multiple of VEC (so a single
     # thread's VEC-wide slice never crosses a group boundary).
-    assert (
-        group_size > 0 and D % group_size == 0
-    ), f"group_size {group_size} must divide head_dim {D}"
-    assert (
-        group_size % VEC == 0
-    ), f"group_size {group_size} must be a multiple of VEC {VEC}"
+    assert group_size > 0 and D % group_size == 0, (
+        f"group_size {group_size} must divide head_dim {D}"
+    )
+    assert group_size % VEC == 0, (
+        f"group_size {group_size} must be a multiple of VEC {VEC}"
+    )
     TPG = group_size // VEC  # threads per group
     NG = D // group_size  # number of groups per row
-    assert (
-        TPG > 0 and (TPG & (TPG - 1)) == 0
-    ), f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
-    assert (
-        scale_dtype in SCALE_DTYPE_OPTIONS
-    ), f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    assert TPG > 0 and (TPG & (TPG - 1)) == 0, (
+        f"TPG {TPG} must be a power of 2 (for butterfly reduce)"
+    )
+    assert scale_dtype in SCALE_DTYPE_OPTIONS, (
+        f"scale_dtype {scale_dtype!r} must be one of {SCALE_DTYPE_OPTIONS}"
+    )
 
     log2_block = int(math.log2(BLOCK_THREADS))
     log2_tpg = int(math.log2(TPG))
@@ -477,7 +474,7 @@ def _build_kernel(
                 group_idx = tid >> fx.Int32(log2_tpg)
                 lane_in_group = tid & fx.Int32(TPG - 1)
                 if lane_in_group == 0:
-                    my_scale_off = scale_base_off + ArithValue(group_idx)
+                    my_scale_off = scale_base_off + group_idx
                     if const_expr(is_e8m0):
                         e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased).result
                         buffer_ops.buffer_store(e8m0_i8, scale_rsrc, my_scale_off)
@@ -537,13 +534,7 @@ def _build_kernel(
             else:
                 _store_bf16_vec_g(final_list, bf16_out_g, bf16_out_row_off, tid, VEC)
                 if const_expr(kv_write) and do_swa:
-                    _store_bf16_vec_g(
-                        final_list,
-                        swa_out_g,
-                        arith.constant(0, type=i32),
-                        tid,
-                        VEC,
-                    )
+                    _store_bf16_vec_g(final_list, swa_out_g, 0, tid, VEC)
 
         # ============ runtime dispatch on bid_x < H ============
         # Per-token byte offsets fold ``bid_t`` into the buffer descriptor
@@ -573,9 +564,7 @@ def _build_kernel(
                 shape=(H, D),
                 static_bytes_offset_i64=q_tok_off_bytes,
             )
-            q_my_off = ArithValue(head_idx) * arith.constant(D, type=i32) + ArithValue(
-                tid
-            ) * arith.constant(VEC, type=i32)
+            q_my_off = head_idx * D + tid * VEC
             raw_x_vec = q_in_tok.load(q_my_off, vec_size=VEC)
             # Round-trip through rmem so the rest of emit_body (.to/.reduce)
             # sees a Fly-wrapped vec instead of a raw MLIR vec.
@@ -595,7 +584,7 @@ def _build_kernel(
             else:
                 qw_f32 = None
 
-            row_off_q_elems = ArithValue(head_idx) * arith.constant(D, type=i32)
+            row_off_q_elems = head_idx * D
             if const_expr(quant):
                 # Per-token shifted base for q_out (fp8 = 1 byte/elem).
                 q_tok_off_fp8 = arith.MulIOp(
@@ -609,13 +598,11 @@ def _build_kernel(
                 )
                 qo_rsrc = qo_g_tmp.rsrc
                 # row_base_bytes is now token-relative (head_idx * D bytes for fp8).
-                row_base_bytes = ArithValue(head_idx) * arith.constant(D, type=i32)
+                row_base_bytes = head_idx * D
                 qs_rsrc = _ptr_buffer_resource(q_scale)
                 # q_scale layout (T, H, NG) flat: bid_t * H*NG + head_idx * NG.
                 # Per-lane adds group_idx inside emit_body.
-                scale_base_off_q = ArithValue(bid_t) * arith.constant(
-                    H * NG, type=i32
-                ) + ArithValue(head_idx) * arith.constant(NG, type=i32)
+                scale_base_off_q = bid_t * (H * NG) + head_idx * NG
                 emit_body(
                     weighted=q_weighted,
                     x_f32_vec=x_f32,
@@ -654,10 +641,8 @@ def _build_kernel(
             # round-trip through an rmem tensor to get a Fly-wrapped vec that
             # the rest of emit_body (.to/.reduce/[i]) expects.
             kv_rsrc = _ptr_buffer_resource(kv_in)
-            kv_off_elems = ArithValue(bid_t) * ArithValue(
-                kv_in_row_stride
-            ) + ArithValue(tid) * arith.constant(VEC, type=i32)
-            kv_off_dw = kv_off_elems >> arith.constant(1, type=i32)
+            kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
+            kv_off_dw = kv_off_elems >> 1
             vec_bf16xV = T.vec(VEC, T.bf16)
             x_raw = buffer_ops.buffer_load(
                 kv_rsrc, kv_off_dw, vec_width=VEC // 2, dtype=i32
@@ -689,7 +674,7 @@ def _build_kernel(
                 kvs_rsrc = _ptr_buffer_resource(kv_scale)
                 # kv_scale layout (T, NG) flat: bid_t * NG. Per-lane adds
                 # group_idx inside emit_body.
-                scale_base_off_kv = ArithValue(bid_t) * arith.constant(NG, type=i32)
+                scale_base_off_kv = bid_t * NG
                 emit_body(
                     weighted=True,
                     x_f32_vec=x_f32,
