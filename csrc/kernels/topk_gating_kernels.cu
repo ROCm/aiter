@@ -1330,7 +1330,7 @@ void topk_softplus(aiter_tensor_t& topk_weights,
                 if(num_tokens >= 1024)
                 {
                     if(topk <= 8)
-                        best_tpw = (num_experts <= 64) ? (topk <= 4 ? 16 : 8) : (num_experts <= 128) ? 8 : 4;
+                        best_tpw = (num_experts <= 64) ? (topk <= 4 ? 16 : 8) : (num_experts <= 128) ? 8 : (num_experts <= 256) ? 4 : 2;
                     else if(topk <= 16)
                         best_tpw = 4;
                 }
@@ -1358,11 +1358,20 @@ void topk_softplus(aiter_tensor_t& topk_weights,
                         _DISPATCH_PREFILL_N_KERNEL(256, 4)
                     }
                 }
+                if(best_tpw >= 2 && topk <= 8 && num_tokens <= 2048)
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(640, 2)
+                }
                 // TPW=1 fallback for known expert counts
                 _DISPATCH_PREFILL_N_KERNEL(64,  1)
                 _DISPATCH_PREFILL_N_KERNEL(128, 1)
                 _DISPATCH_PREFILL_N_KERNEL(256, 1)
                 _DISPATCH_PREFILL_N_KERNEL(384, 1)
+                // E=640: prefill_n wins at T<=2048; above that smem is faster.
+                if(num_tokens <= 2048)
+                {
+                    _DISPATCH_PREFILL_N_KERNEL(640, 1)
+                }
             }
 #undef _DISPATCH_PREFILL_N_KERNEL
         }
