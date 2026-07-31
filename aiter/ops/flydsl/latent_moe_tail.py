@@ -21,6 +21,15 @@ _B1_WAVES_PER_EU = 4
 _B1_WEIGHT_CACHE_MODIFIER = 2
 
 
+def _is_gfx950_flydsl_available() -> bool:
+    if not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
+
+
 def supports_latent_moe_tail(
     routed: torch.Tensor,
     shared: torch.Tensor,
@@ -42,8 +51,7 @@ def supports_latent_moe_tail(
         and tuple(up_weight.shape) == (_HIDDEN_DIM, _LATENT_DIM)
         and math.isfinite(epsilon)
         and epsilon > 0.0
-        and is_flydsl_available()
-        and get_gfx_runtime() == "gfx950"
+        and _is_gfx950_flydsl_available()
     )
 
 

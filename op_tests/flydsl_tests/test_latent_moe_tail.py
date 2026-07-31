@@ -9,9 +9,19 @@ from aiter.ops.flydsl.latent_moe_tail import (
     latent_moe_tail,
     supports_latent_moe_tail,
 )
+from aiter.ops.flydsl.utils import is_flydsl_available
+
+
+def _gfx950_flydsl_available() -> bool:
+    if not torch.cuda.is_available() or not is_flydsl_available():
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError):
+        return False
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_gfx_runtime() != "gfx950",
+    not _gfx950_flydsl_available(),
     reason="Kimi-K3 latent-MoE local-tail specialization requires gfx950",
 )
 
@@ -107,6 +117,15 @@ def test_latent_moe_tail_rejects_noncontiguous_input():
 def test_latent_moe_tail_graph_capture_and_output_reuse():
     routed, shared, rms_weight, up_weight = _inputs()
     out = torch.empty_like(shared)
+    latent_moe_tail(
+        routed,
+        shared,
+        rms_weight,
+        up_weight,
+        EPSILON,
+        out=out,
+    )
+    torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
 
     with torch.cuda.graph(graph):
