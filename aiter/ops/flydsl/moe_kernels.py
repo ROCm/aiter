@@ -426,7 +426,7 @@ def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> dict[str, dict]:
     tile_ns = [64, 128]
     k_batches = [1, 2, 3, 4, 6, 7, 14]
 
-    for gate_mode in ("separated", "interleave"):
+    for gate_mode in ("interleave",):
         for tm in tile_ms:
             for tn in tile_ns:
                 for tk in tile_ks:
@@ -436,8 +436,7 @@ def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> dict[str, dict]:
                         )
                         if kb != 1:
                             name += f"_kb{kb}"
-                        if gate_mode == "interleave":
-                            name += "_gui"
+                        name += "_gui"
                         kernels[name] = {
                             "stage": 1,
                             "a_dtype": a_dtype,
@@ -532,7 +531,7 @@ def compile_flydsl_moe_stage1(
     k_batch: int = 1,
     waves_per_eu: int = 3,
     b_nt: int = 2,
-    gate_mode: str = "separated",
+    gate_mode: str = "interleave",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
@@ -632,7 +631,7 @@ def compile_flydsl_moe_stage1(
         )
     elif a_dtype == "bf16" and b_dtype == "fp4bf16":
         # fp4_bf16: MXFP4 weights (FP4 E2M1 + E8M0 block scales), bf16 activations.
-        # Supports SEPARATED and INTERLEAVE gate modes.
+        # INTERLEAVE gate mode (gate/up interleaved along N axis).
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
         _use_cshuffle = None
@@ -1414,7 +1413,7 @@ def flydsl_moe_stage1(
     k_batch_intra_block: int | None = None,
     waves_per_eu: int = 3,
     b_nt: int = 0,
-    gate_mode: str = "separated",
+    gate_mode: str = "interleave",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
     bias: torch.Tensor | None = None,

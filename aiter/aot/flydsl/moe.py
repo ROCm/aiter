@@ -202,7 +202,7 @@ def _precompile_to_cache(
     waves_per_eu: int | None = None,
     k_batch: int = 1,
     b_nt: int = 2,
-    gate_mode: str = "separated",
+    gate_mode: str = "interleave",
     mode: str = "atomic",
     persist=None,
     sort_block_m: int = 0,

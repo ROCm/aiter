@@ -110,7 +110,7 @@ def compile_moe_gemm1(
     use_cshuffle_epilog: bool | None = None,
     scale_is_bf16: bool = False,
     k_batch: int = 1,
-    gate_mode: str = "separated",
+    gate_mode: str = "interleave",
     swiglu_limit: float = 0.0,
     act: str = "silu",
     waves_per_eu: int = 0,
@@ -325,16 +325,7 @@ def compile_moe_gemm1(
             "stage1 cshuffle epilog currently supports only f16/bf16 output"
         )
 
-    # INTERLEAVE gate mode: gate and up weights are packed at alternating N positions.
-    # Only supported for fp4_bf16 (MXFP4) where the physical weight layout interleaves
-    # gate/up columns so a single B-tile covers both. For other dtypes, gate and up are
-    # loaded from separate row ranges (SEPARATED).
-    gate_up_interleave = is_fp4_bf16 and gate_mode == "interleave"
-    _use_klane_inner = is_fp4_bf16 and gate_up_interleave
-    if gate_up_interleave and not is_fp4_bf16:
-        raise ValueError(
-            "gate_mode='interleave' is only supported for in_dtype='fp4_bf16'"
-        )
+    _use_klane_inner = is_fp4_bf16
 
     _use_swiglu = act == "swiglu"
 
@@ -344,7 +335,7 @@ def compile_moe_gemm1(
     _gs_tag = f"_g{group_size}" if use_groupwise_scale else ""
     scale_tag = "_sbf16" if _scale_is_bf16 else ""
     _split_k_tag = f"_splitk{k_batch}" if _is_splitk else ""
-    _gui_tag = "_gui" if gate_up_interleave else ""
+    _gui_tag = "_gui" if is_fp4_bf16 else ""
     _act_tag = "_swiglu" if _use_swiglu else ""
     (
         f"mfma_moe1_{in_dtype}_{out_dtype}_{epilog_tag}"
@@ -366,8 +357,8 @@ def compile_moe_gemm1(
     _splitk_use_bf16 = _is_splitk and is_bf16
     _cshuffle_elem_bytes = 2 if (not _is_splitk or _splitk_use_bf16) else 4
     _cshuffle_frag_elem_is_bf16 = is_bf16
-    _cshuffle_tile_n = tile_n // 2 if gate_up_interleave else tile_n
-    _cshuffle_e_vec = 2 if gate_up_interleave else 4
+    _cshuffle_tile_n = tile_n // 2 if is_fp4_bf16 else tile_n
+    _cshuffle_e_vec = 2 if is_fp4_bf16 else 4
     _cshuffle_nlane = min(32, _cshuffle_tile_n // _cshuffle_e_vec)
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(elem_bytes)
     lds_out_bytes = (
@@ -384,7 +375,7 @@ def compile_moe_gemm1(
 
     # Pre-compute swiglu effective limit (7.0 when swiglu_limit==0, per aiter convention).
     _swiglu_eff_limit = float(swiglu_limit) if swiglu_limit != 0.0 else 7.0
-    _zero_n_tiles = (inter_dim * (2 if gate_up_interleave else 1)) // tile_n
+    _zero_n_tiles = (inter_dim * (2 if is_fp4_bf16 else 1)) // tile_n
 
     if True:
 
@@ -903,8 +894,6 @@ def compile_moe_gemm1(
                 # Precompute n_blk/n_intra for gate and up rows (GEMM-style: idx2crd/get)
                 n_intra_gate = []
                 n_blk_gate = []
-                n_intra_up = []
-                n_blk_up = []
                 col_g_list = []
                 inter_idx = fx.Index(inter_dim)
                 c_n_total // fx.Index(16)
@@ -920,28 +909,10 @@ def compile_moe_gemm1(
                     n_blk_gate.append(fx.get(coord_gate, 0))
                     n_intra_gate.append(fx.get(coord_gate, 1))
 
-                    if const_expr(gate_up_interleave):
-                        # INTERLEAVE: shuffle_weight_a16w4(gate_up=True) interleaves gate/up
-                        # blocks: physical block 2k = gate row k, block 2k+1 = up row k.
-                        # With col_g = by_n + n_tile_base + ni*16, n_blk_gate[ni] = ni + base:
-                        # even ni → gate block, odd ni → up block.
-                        # n_blk_up and n_blk_gate both use n_blk_gate addressing
-                        # (the "up" is just the next ni's gate block).
-                        # We don't need a separate n_blk_up list — handled in compute_tile.
-                        pass
-                    else:
-                        # SEPARATED: up weights are at row_gate + inter_dim
-                        row_up = row_gate + inter_idx
-                        coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
-                        n_blk_up.append(fx.get(coord_up, 0))
-                        n_intra_up.append(fx.get(coord_up, 1))
-
                 # MXFP4: precompute per-ni scale addressing (N-block index for E8M0 scale)
                 if const_expr(is_fp4_bf16):
                     _mxfp4_scale_mni_gate = []
                     _mxfp4_scale_n_pack_gate = []
-                    _mxfp4_scale_mni_up = []
-                    _mxfp4_scale_n_pack_up = []
                     for ni in range_constexpr(num_acc_n):
                         n_col = (
                             expert_off_idx + by_n + n_tile_base + arith.index(ni * 16)
@@ -950,12 +921,6 @@ def compile_moe_gemm1(
                         _mxfp4_scale_n_pack_gate.append(
                             (n_col // fx.Index(16)) % fx.Index(2)
                         )
-                        if const_expr(not gate_up_interleave):
-                            n_up = n_col + inter_idx
-                            _mxfp4_scale_mni_up.append(n_up // fx.Index(32))
-                            _mxfp4_scale_n_pack_up.append(
-                                (n_up // fx.Index(16)) % fx.Index(2)
-                            )
 
                 m_repeat = tile_m // 16
                 k_unroll = (
@@ -976,10 +941,7 @@ def compile_moe_gemm1(
                     _b_vmem_per_tile = k_unroll * num_acc_n * 2
                 else:
                     _b_vmem_per_tile = k_unroll * num_acc_n
-                # SEPARATED mode issues two load_b_tile calls per K step.
-                _b_vmem_total = (
-                    _b_vmem_per_tile if gate_up_interleave else _b_vmem_per_tile * 2
-                )
+                _b_vmem_total = _b_vmem_per_tile
 
                 # --- B Load Logic (K64) - shared layout with preshuffle GEMM ---
                 def load_b_pack(base_k, ki_step, ni, blk_list, intra_list):
@@ -1040,17 +1002,8 @@ def compile_moe_gemm1(
                             raw_data.append(raw_ku)
                         return raw_data
                     elif const_expr(is_fp4_bf16 and _use_klane_inner):
-                        _is_gate_side = id(blk_list) == id(n_blk_gate)
-                        _mni_list = (
-                            _mxfp4_scale_mni_gate
-                            if _is_gate_side
-                            else _mxfp4_scale_mni_up
-                        )
-                        _npk_list = (
-                            _mxfp4_scale_n_pack_gate
-                            if _is_gate_side
-                            else _mxfp4_scale_n_pack_up
-                        )
+                        _mni_list = _mxfp4_scale_mni_gate
+                        _npk_list = _mxfp4_scale_n_pack_gate
                         raw_data = []
                         _sc_vec4_cache = {}
                         c128_ki = fx.Index(128)
@@ -1111,17 +1064,8 @@ def compile_moe_gemm1(
                         # MXFP4: two-pass load to hide scale load latency.
                         # Pass 1: issue all buffer_load_dword scale loads up front so they
                         # are in-flight while the larger weight loads execute in Pass 2.
-                        _is_gate_side = id(blk_list) == id(n_blk_gate)
-                        _mni_list = (
-                            _mxfp4_scale_mni_gate
-                            if _is_gate_side
-                            else _mxfp4_scale_mni_up
-                        )
-                        _npk_list = (
-                            _mxfp4_scale_n_pack_gate
-                            if _is_gate_side
-                            else _mxfp4_scale_n_pack_up
-                        )
+                        _mni_list = _mxfp4_scale_mni_gate
+                        _npk_list = _mxfp4_scale_n_pack_gate
                         _sc_cache = {}
                         _scale_packed = {}
                         for ku in range_constexpr(k_unroll):
@@ -1448,34 +1392,19 @@ def compile_moe_gemm1(
                                         curr_row_a_lds, col_base, lds_base
                                     )
 
-                                b_up_raw = b_up_tile_in[ku]
                                 for ni in range_constexpr(num_acc_n):
                                     acc_idx = mi * num_acc_n + ni
                                     raw_g, sc_g = b_gate_raw[ni]
                                     bg0, bg1 = unpack_b_mxfp4_bf16(
                                         raw_g, arith, vector, scale_f32=sc_g
                                     )
-                                    if const_expr(gate_up_interleave):
-                                        # Even ni = gate block, odd ni = up block
-                                        # (physical layout: gate0, up0, gate1, up1, ...)
-                                        if ni % 2 == 0:
-                                            gate_list[acc_idx] = mfma_k64(
-                                                gate_list[acc_idx], a0, a1, bg0, bg1
-                                            )
-                                        else:
-                                            up_list[acc_idx] = mfma_k64(
-                                                up_list[acc_idx], a0, a1, bg0, bg1
-                                            )
-                                    else:
-                                        raw_u, sc_u = b_up_raw[ni]
+                                    if ni % 2 == 0:
                                         gate_list[acc_idx] = mfma_k64(
                                             gate_list[acc_idx], a0, a1, bg0, bg1
                                         )
-                                        bu0, bu1 = unpack_b_mxfp4_bf16(
-                                            raw_u, arith, vector, scale_f32=sc_u
-                                        )
+                                    else:
                                         up_list[acc_idx] = mfma_k64(
-                                            up_list[acc_idx], a0, a1, bu0, bu1
+                                            up_list[acc_idx], a0, a1, bg0, bg1
                                         )
                     elif const_expr(is_int4_bf16 or is_int4_bf16_groupwise):
                         # W4A16: deferred dequant — unpack int4->bf16 right before MFMA
@@ -1671,12 +1600,7 @@ def compile_moe_gemm1(
                 # already arrived — the s_waitcnt stall covers only A's latency.
                 k0 = k_base_idx
                 b_gate_cur = load_b_tile(k0, n_blk_gate, n_intra_gate)
-                # INTERLEAVE: gate and up alternate in n_blk_gate; no separate up tile needed.
-                b_up_cur = (
-                    b_gate_cur
-                    if gate_up_interleave
-                    else load_b_tile(k0, n_blk_up, n_intra_up)
-                )
+                b_up_cur = b_gate_cur
                 rocdl.sched_barrier(0)
                 x_regs0 = load_x_tile(k0)  # A in-flight after B
                 rocdl.sched_barrier(0)
@@ -1796,11 +1720,7 @@ def compile_moe_gemm1(
                     x_regs_ping = load_x_tile(next_k1)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bg_ping = load_b_tile(next_k1, n_blk_gate, n_intra_gate)
-                    _bu_ping = (
-                        _bg_ping
-                        if gate_up_interleave
-                        else load_b_tile(next_k1, n_blk_up, n_intra_up)
-                    )
+                    _bu_ping = _bg_ping
                     rocdl.sched_barrier(0)
 
                     _ag, _au, _ = compute_tile(
@@ -1819,11 +1739,7 @@ def compile_moe_gemm1(
                     x_regs_pong = load_x_tile(next_k2)  # A in-flight
                     rocdl.sched_barrier(0)
                     _bg_next = load_b_tile(next_k2, n_blk_gate, n_intra_gate)
-                    _bu_next = (
-                        _bg_next
-                        if gate_up_interleave
-                        else load_b_tile(next_k2, n_blk_up, n_intra_up)
-                    )
+                    _bu_next = _bg_next
                     rocdl.sched_barrier(0)
 
                     _ag, _au, _ = compute_tile(
@@ -1862,11 +1778,7 @@ def compile_moe_gemm1(
                 x_regs_ping = load_x_tile(k_tail1)  # A in-flight
                 rocdl.sched_barrier(0)
                 b_gate_ping = load_b_tile(k_tail1, n_blk_gate, n_intra_gate)
-                b_up_ping = (
-                    b_gate_ping
-                    if gate_up_interleave
-                    else load_b_tile(k_tail1, n_blk_up, n_intra_up)
-                )
+                b_up_ping = b_gate_ping
                 rocdl.sched_barrier(0)
 
                 acc_gate, acc_up, _ = compute_tile(
@@ -2170,7 +2082,7 @@ def compile_moe_gemm1(
                     # Pass 2: up
                     _split_k_acc[0] = acc_up
                     _split_k_sw_vals[0] = sw_up_vals
-                    _split_k_n_offset[0] = 0 if gate_up_interleave else inter_dim
+                    _split_k_n_offset[0] = 0
                     c_shuffle_epilog(
                         arith=arith,
                         vector=vector,
@@ -2258,67 +2170,31 @@ def compile_moe_gemm1(
                             )
 
                         _sep_out_ty = out_mlir()
-                        if const_expr(gate_up_interleave):
-                            _gui_pairs = num_acc_n // 2
-                            for p in range_constexpr(_gui_pairs):
-                                g_idx = mi * num_acc_n + p * 2
-                                u_idx = mi * num_acc_n + p * 2 + 1
-                                col_local = col_base_local + p * 16
-                                vg = vector.extract(
-                                    acc_gate[g_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-                                vu = vector.extract(
-                                    acc_up[u_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-                                if const_expr(_use_swiglu):
-                                    y = swiglu_apply(vg * sx, vu * sx)
-                                else:
-                                    y = silu(vg * sx) * (vu * sx)
-                                if const_expr(doweight_stage1):
-                                    y = y * tw
-                                y16 = arith.trunc_f(_sep_out_ty, y)
-                                lds_idx = row_base_lds + col_local
-                                v1 = vector.from_elements(T.vec(1, _sep_out_ty), [y16])
-                                vector.store(v1, lds_out, [lds_idx], alignment=2)
-                        else:
-                            for ni in range_constexpr(num_acc_n):
-                                col_local = col_base_local + (ni * 16)
-                                sw_gate = sw_gate_vals[ni]
-                                sw_up = sw_up_vals[ni]
-
-                                acc_idx = mi * num_acc_n + ni
-                                vg = vector.extract(
-                                    acc_gate[acc_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-                                vu = vector.extract(
-                                    acc_up[acc_idx],
-                                    static_position=[ii],
-                                    dynamic_position=[],
-                                )
-
-                                if const_expr(is_int8):
-                                    vg = arith.sitofp(T.f32, vg)
-                                    vu = arith.sitofp(T.f32, vu)
-                                vg = vg * sx * sw_gate
-                                vu = vu * sx * sw_up
-
-                                if const_expr(_use_swiglu):
-                                    y = swiglu_apply(vg, vu)
-                                else:
-                                    y = silu(vg) * vu
-                                if const_expr(doweight_stage1):
-                                    y = y * tw
-                                y16 = arith.trunc_f(_sep_out_ty, y)
-
-                                lds_idx = row_base_lds + col_local
-                                v1 = vector.from_elements(T.vec(1, _sep_out_ty), [y16])
-                                vector.store(v1, lds_out, [lds_idx], alignment=2)
+                        _gui_pairs = num_acc_n // 2
+                        for p in range_constexpr(_gui_pairs):
+                            g_idx = mi * num_acc_n + p * 2
+                            u_idx = mi * num_acc_n + p * 2 + 1
+                            col_local = col_base_local + p * 16
+                            vg = vector.extract(
+                                acc_gate[g_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            vu = vector.extract(
+                                acc_up[u_idx],
+                                static_position=[ii],
+                                dynamic_position=[],
+                            )
+                            if const_expr(_use_swiglu):
+                                y = swiglu_apply(vg * sx, vu * sx)
+                            else:
+                                y = silu(vg * sx) * (vu * sx)
+                            if const_expr(doweight_stage1):
+                                y = y * tw
+                            y16 = arith.trunc_f(_sep_out_ty, y)
+                            lds_idx = row_base_lds + col_local
+                            v1 = vector.from_elements(T.vec(1, _sep_out_ty), [y16])
+                            vector.store(v1, lds_out, [lds_idx], alignment=2)
 
                     def precompute_row(*, row_local, row):
                         fused2 = buffer_ops.buffer_load(
@@ -2344,11 +2220,9 @@ def compile_moe_gemm1(
                             # Vectorized fp16 store (EVec=4).
                             buffer_ops.buffer_store(frag, out_rsrc, idx_out)
 
-                    _cs_by_n = by_n // arith.index(2) if gate_up_interleave else by_n
+                    _cs_by_n = by_n // arith.index(2) if is_fp4_bf16 else by_n
                     _cs_n_tile_base = (
-                        n_tile_base // arith.index(2)
-                        if gate_up_interleave
-                        else n_tile_base
+                        n_tile_base // arith.index(2) if is_fp4_bf16 else n_tile_base
                     )
                     mfma_epilog(
                         use_cshuffle=True,
@@ -2431,7 +2305,7 @@ def compile_moe_gemm1(
 
                     _if_valid = scf.IfOp(t_valid)
                     with _if_then(_if_valid):
-                        if const_expr(gate_up_interleave):
+                        if const_expr(is_fp4_bf16):
                             # INTERLEAVE: acc_gate[2p]=gate, acc_up[2p+1]=up for pair p.
                             # Output col = (by_n + n_tile_base)//2 + p*16 + lane_mod_16.
                             _gui_pairs = num_acc_n // 2
@@ -2534,7 +2408,7 @@ def compile_moe_gemm1(
         # INTERLEAVE: grid must span inter_dim*2 physical N columns (gate+up interleaved),
         # while i32_inter_in carries inter_dim (the output stride). Use static Python
         # arithmetic to compute gx so the constant folds at trace time.
-        _n_tiles = (inter_dim * (2 if gate_up_interleave else 1)) // tile_n
+        _n_tiles = (inter_dim * (2 if is_fp4_bf16 else 1)) // tile_n
         gx = fx.Index(_n_tiles)
         gy = size_expert_ids_in
 

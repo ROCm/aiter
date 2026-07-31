@@ -659,7 +659,7 @@ class FmoeTuner(TunerCommon):
             k_batch=kparams.get("k_batch", 1),
             waves_per_eu=kparams.get("waves_per_eu", 3),
             b_nt=kparams.get("b_nt", 2),
-            gate_mode=kparams.get("gate_mode", "separated"),
+            gate_mode=kparams.get("gate_mode", "interleave"),
             a_scale_one=a_scale_one,
             xcd_swizzle=kparams.get("xcd_swizzle", 0),
             bias=bias,
@@ -3766,15 +3766,7 @@ class FmoeTuner(TunerCommon):
 
                 w1_qt_fmoe.is_shuffled = True
                 w2_qt_fmoe.is_shuffled = True
-                _fmoe_gate_mode = (
-                    GateMode.INTERLEAVE.value
-                    if (
-                        q_type == QuantType.per_1x32
-                        and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
-                        and q_dtype_w == dtypes.fp4x2
-                    )
-                    else GateMode.SEPARATED.value
-                )
+                _fmoe_gate_mode = GateMode.INTERLEAVE.value
 
                 score = torch.randn((token, expert), dtype=dtype, device="cuda")
                 topk_weights, topk_ids = fused_topk(hidden, score, topk, True)
