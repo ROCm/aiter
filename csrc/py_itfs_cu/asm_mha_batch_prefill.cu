@@ -130,20 +130,22 @@ struct __attribute__((packed)) qkptph_kernargs
 static_assert(sizeof(qkptph_kernargs) == 768, "qkptph kernarg ABI must be 768 bytes");
 
 // Find the registered varlen config (mask=2 causal, mode=1), gfx942 fp8 hd128,
-// for the requested physical page size. Two kernels are shipped and selected by
-// page_block_size: page=16 (the 32/64-bit ps=16 build) and page=64 (the 64-token
-// retile build); each has its own .co and kernel symbol. Only the varlen
+// for the requested physical page size and maximum Q sequence length. Page-64
+// configs carry non-overlapping qseq ranges so tuned kernels can coexist with
+// the original unbounded fallback. Only the varlen
 // (packed-Q / cu_seqlens) kernel is shipped: it is correct for all batch sizes
 // (b=1 degenerates to a single segment) and within ~1% of a dedicated batch
 // kernel at b=1, so the batch (mode=0) variant was dropped.
-const fmha_v3_fwdConfig* find_qkptph_cfg(int page_block_size)
+const fmha_v3_fwdConfig* find_qkptph_cfg(int page_block_size, int max_seqlen_q)
 {
     const std::string arch_id = get_gpu_arch();
     for(const auto& el : cfg_fmha_fwd_fp8_ps)
     {
         const auto& c = el.second;
         if(c.arch == arch_id && c.dtype == "fp8" && c.hdim_q == 128 && c.hdim_v == 128 &&
-           c.mask == 2 && c.mode == 1 && c.page == page_block_size)
+           c.mask == 2 && c.mode == 1 && c.page == page_block_size &&
+           (c.qseq_min == 0 || max_seqlen_q >= c.qseq_min) &&
+           (c.qseq_max == 0 || max_seqlen_q <= c.qseq_max))
         {
             return &c;
         }
@@ -193,7 +195,7 @@ mha_batch_prefill_asm(const at::Tensor& q,                   // [total_q, hq, d]
     TORCH_CHECK(out.scalar_type() == at::ScalarType::BFloat16,
                 "mha_batch_prefill_asm: out must be bf16");
 
-    const fmha_v3_fwdConfig* cfg = find_qkptph_cfg(page_block_size);
+    const fmha_v3_fwdConfig* cfg = find_qkptph_cfg(page_block_size, max_seqlen_q);
     TORCH_CHECK(cfg != nullptr,
                 "mha_batch_prefill_asm: no registered varlen (mode=1) asm config for "
                 "page_block_size=", page_block_size, " (expected 16 or 64)");
@@ -271,8 +273,8 @@ mha_batch_prefill_asm(const at::Tensor& q,                   // [total_q, hq, d]
         a.s_p_scale_Hs = p_scale.value().stride(0) * sc_es;
     }
 
-    // Persistent snake scheduler: G cost-balanced bins/head so the bin grid fills
-    // one CU wave (G*nheads ~= #CU). Grid = (G, nheads, batch).
+    // Persistent snake scheduler: configs select how many resident workgroups/CU
+    // to target. Grid = (G, nheads, batch).
     int num_cu = 80;
     {
         hipDeviceProp_t props;
@@ -282,7 +284,7 @@ mha_batch_prefill_asm(const at::Tensor& q,                   // [total_q, hq, d]
     }
     const int sub_q  = cfg->ts_qo;
     const int ntiles = (max_seqlen_q + sub_q - 1) / sub_q;
-    int g            = num_cu / num_heads;
+    int g            = cfg->wg_per_cu * num_cu / num_heads;
     if(g < 1) g = 1;
     if(g > ntiles) g = ntiles;
     a.s_sched_groups = static_cast<uint32_t>(g);
@@ -299,7 +301,7 @@ mha_batch_prefill_asm(const at::Tensor& q,                   // [total_q, hq, d]
     AiterAsmKernel* impl_ptr =
         &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, cfg->co_name.c_str()); });
 
-    const int bdx = 512;
+    const int bdx = cfg->bdx;
     void* args_ptr      = &a;
     size_t* arg_size_ptr = &arg_size;
     impl_ptr->launch_kernel({args_ptr, arg_size_ptr, g, num_heads, batch, bdx, 1, 1, stream});
