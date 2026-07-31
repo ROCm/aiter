@@ -350,16 +350,17 @@ class KManager:
         stride_k_head,
         kv_head,
         kv_row0,  # fx.Int32: global token of this block's kv-row 0
-        kv_valid,  # fx.Int32: valid kv rows in this block (for OOB clamp)
+        kv_valid,  # fx.Int32: valid kv rows in this block (only read if check_oob)
         row_idx,  # kv offset within block, mult of 8, < n_block
         col_idx,  # hdim offset, mult of 32, < qk_hdim
         lane_idx,
+        check_oob=True,  # compile-time: clamp rows >= kv_valid in-bounds
     ):
         """One warp streams an 8(kv) x 32(hdim) tile into ``ptr_lds`` — one b128
         (8 bf16) per lane: lane -> (wr_row = lane//4, chunk = lane%4). ``row_idx``/
         ``col_idx`` may be Python ints or fx values (all addressing below is plain
-        integer arithmetic). Rows >= kv_valid are clamped in-bounds (masked in
-        softmax later); causal masking is the caller's job via ``kv_valid``."""
+        integer arithmetic). When ``check_oob`` is False the caller guarantees the
+        whole block is in-bounds and the clamp is skipped."""
         _assert_multiple("row_idx", row_idx, K_WR_TILE_KV)
         _assert_multiple("col_idx", col_idx, K_WR_TILE_HD)
         wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
@@ -369,8 +370,9 @@ class KManager:
         tile_col = col_idx // WMMA_K
 
         kv_row = fx.Int32(row_idx) + wr_row
-        safe = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
-        token = kv_row0 + safe
+        if check_oob:
+            kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
+        token = kv_row0 + kv_row
         g_off = (
             token * stride_k_seq
             + kv_head * stride_k_head
@@ -395,13 +397,15 @@ class KManager:
         kv_valid,
         warp_idx,
         lane_idx,
+        check_oob=True,
     ):
         """Load the whole ``N_BLOCK x qk_hdim`` K block into ``ptr_lds``.
 
         The 8x32 write-tile grid (``n_wr_tile_rows x n_wr_tile_cols``) is spread
         round-robin across the 8 warps: warp ``w`` streams tiles ``w, w+8, ...``.
         ``row_idx``/``col_idx`` are derived from the runtime warp id, so the tile
-        method runs with runtime indices here (plain integer arithmetic)."""
+        method runs with runtime indices here (plain integer arithmetic).
+        ``check_oob`` is forwarded to each tile (skip the clamp for full blocks)."""
         n_tiles = self.n_wr_tile_rows * self.n_wr_tile_cols
         if n_tiles % NUM_WAVES != 0:
             raise NotImplementedError(
@@ -424,16 +428,17 @@ class KManager:
                 row_idx=row_idx,
                 col_idx=col_idx,
                 lane_idx=lane_idx,
+                check_oob=check_oob,
             )
 
     # ------------------------------------------------------------------
-    def load_lds_to_vgpr_tile(self, *, ptr_lds, row_idx, col_idx, lane_idx):
-        """Read one 16x16 tile (row_idx=kv, col_idx=hdim; both mult of 16) -> v8
-        bf16 per lane.
+    def load_lds_to_vgpr_tile_as_k(self, *, ptr_lds, row_idx, col_idx, lane_idx):
+        """Read one 16x16 tile as a WMMA fragment via natural ``ds_load_b128``
+        (row_idx=kv, col_idx=hdim; both mult of 16) -> v8 bf16 per lane.
 
         lane -> (row_in_tile = lane%16, col_half = lane//16); returns this lane's 8
         hdim cols [col_idx + col_half*8 .. +8) of kv-row (row_idx + lane%16). Two
-        adjacent calls (col_idx, col_idx+16) shuffle into a 16x32 WMMA B operand."""
+        adjacent calls (col_idx, col_idx+16) shuffle into a 16x32 WMMA fragment."""
         _assert_multiple("row_idx", row_idx, WMMA_M)
         _assert_multiple("col_idx", col_idx, WMMA_M)
         row_in_tile = lane_idx % WMMA_M
