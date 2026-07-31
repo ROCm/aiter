@@ -691,6 +691,7 @@ def _get_or_compile_mfma16_hip(
     use_state_indices=False,
     sched_gfx942=False,
     g_head_major=False,
+    bf16_convert_trunc=True,
 ):
     """Compile (and cache) the mfma16 / HIP-aligned K5 kernel: 16x16x16 bf16
     MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
@@ -737,6 +738,7 @@ def _get_or_compile_mfma16_hip(
         USE_STATE_INDICES=use_state_indices,
         SCHED_GFX942=sched_gfx942,
         G_HEAD_MAJOR=g_head_major,
+        BF16_CONVERT_TRUNC=bf16_convert_trunc,
     )
 
 
@@ -758,6 +760,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
     g_head_major: bool = False,
+    bf16_convert_trunc: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
@@ -890,6 +893,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         use_state_indices=use_state_indices,
         sched_gfx942=_IS_GFX942,
         g_head_major=g_head_major,
+        bf16_convert_trunc=bf16_convert_trunc,
     )
 
     # Null-arg placeholder for the @flyc.jit slots ignored on this path. Sized

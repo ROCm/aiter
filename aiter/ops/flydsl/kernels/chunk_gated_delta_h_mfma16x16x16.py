@@ -156,27 +156,29 @@ def _f32x4_to_bf16x4_trunc(vec_f32x4):
     return vector.bitcast(T.vec(4, T.bf16), hi16)
 
 
-# fp32->bf16 output-conversion mode. When True (default), use bit-truncation to
+# Default fp32->bf16 output-conversion mode. When True, use bit-truncation to
 # match HIP's ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``) so flydsl-hip
 # outputs are bit-identical to the HIP/C++ K5 kernel. When False, use RNE
-# (~0.5 ulp closer to the FP32 reference, but NOT bit-matching HIP).
-_BF16_CONVERT_TRUNC = True
+# (~0.5 ulp closer to the FP32 reference, but NOT bit-matching HIP). This is
+# only the default; the actual mode is a compile option (``BF16_CONVERT_TRUNC``)
+# threaded through ``compile_chunk_gated_delta_h_mfma16_hip``.
+_BF16_CONVERT_TRUNC_DEFAULT = True
 
 
-def _f32x4_to_bf16x4_rne(vec_f32x4):
-    """Arch-aware fp32x4 -> bf16x4 output conversion.
+def _make_bf16_converter(trunc: bool):
+    """Return the arch-aware fp32x4 -> bf16x4 output converter for this compile.
 
-    With ``_BF16_CONVERT_TRUNC`` (default) this truncates to match HIP exactly.
-    Otherwise it uses the native ``v_cvt_pk_bf16_f32`` RNE convert on gfx950
-    (CDNA4) and a portable integer software RNE everywhere else (gfx942 / CDNA3
-    has no ``v_cvt_pk_bf16_f32``). Called at trace time, so dispatching on
+    With ``trunc=True`` this truncates to match HIP exactly. Otherwise it uses
+    the native ``v_cvt_pk_bf16_f32`` RNE convert on gfx950 (CDNA4) and a
+    portable integer software RNE everywhere else (gfx942 / CDNA3 has no
+    ``v_cvt_pk_bf16_f32``). Called at trace time, so dispatching on
     ``get_rocm_arch()`` here selects the right lowering per compile.
     """
-    if _BF16_CONVERT_TRUNC:
-        return _f32x4_to_bf16x4_trunc(vec_f32x4)
+    if trunc:
+        return _f32x4_to_bf16x4_trunc
     if "gfx950" in get_rocm_arch():
-        return _f32x4_to_bf16x4_rne_gfx950(vec_f32x4)
-    return _f32x4_to_bf16x4_rne_portable(vec_f32x4)
+        return _f32x4_to_bf16x4_rne_gfx950
+    return _f32x4_to_bf16x4_rne_portable
 
 
 # -- Compile the kernel ---------------------------------------------------
@@ -202,6 +204,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     USE_STATE_INDICES: bool = False,
     SCHED_GFX942: bool = False,
     G_HEAD_MAJOR: bool = False,
+    BF16_CONVERT_TRUNC: bool = _BF16_CONVERT_TRUNC_DEFAULT,
 ):
     """Compile the GDN K5 kernel.
 
@@ -240,6 +243,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # wrapper module), which requires flydsl >=0.2.0.
 
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
+    # fp32->bf16 output converter selected by the compile option (arch-aware).
+    _f32x4_to_bf16x4 = _make_bf16_converter(BF16_CONVERT_TRUNC)
 
     WARP_SIZE = 64
     NUM_WARPS = 4
@@ -300,7 +305,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    # fp32->bf16 output truncates (_BF16_CONVERT_TRUNC) to match hip float_to_bf16
+    # fp32->bf16 output conversion is a compile option (BF16_CONVERT_TRUNC):
+    # truncate to match hip float_to_bf16, or RNE.
     # rev123: g offset generalized to head-major/token-major via G_HEAD_MAJOR
     _K5_KERNEL_REVISION = 123
 
@@ -770,7 +776,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     ) * fx.Int32(4)
                     lds_hp.vec_store(
                         (fx.Index(hp_cell),),
-                        _f32x4_to_bf16x4_rne(acc_val),
+                        _f32x4_to_bf16x4(acc_val),
                         4,
                     )
 
@@ -784,7 +790,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     ) * fx.Int32(4)
                     lds_ht.vec_store(
                         (fx.Index(ht_idx),),
-                        _f32x4_to_bf16x4_rne(acc_val),
+                        _f32x4_to_bf16x4(acc_val),
                         4,
                     )
 
@@ -998,7 +1004,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 vn_val = u_f32 - bv_val
 
                 if const_expr(SAVE_NEW_VALUE):
-                    vn_bf16 = fx.Vector(_f32x4_to_bf16x4_rne(vn_val), (4,), fx.BFloat16)
+                    vn_bf16 = fx.Vector(_f32x4_to_bf16x4(vn_val), (4,), fx.BFloat16)
                     bt_tile_base = wid * fx.Int32(16)
                     for elem_i in range_constexpr(4):
                         vn_bt_row = (
@@ -1021,7 +1027,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 gv_cell = (gv_row_block * fx.Int32(BV) + gv_col) * fx.Int32(4)
                 lds_gv.vec_store(
                     (fx.Index(gv_cell),),
-                    _f32x4_to_bf16x4_rne(gated_val),
+                    _f32x4_to_bf16x4(gated_val),
                     4,
                 )
 
@@ -1218,7 +1224,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     )
                     ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
                     if const_expr(STATE_DTYPE_BF16):
-                        out_vec = _f32x4_to_bf16x4_rne(acc_val)
+                        out_vec = _f32x4_to_bf16x4(acc_val)
                     else:
                         out_vec = acc_val
                     ht_.vec_store((fx.Index(ht_off_base),), out_vec, 4)
