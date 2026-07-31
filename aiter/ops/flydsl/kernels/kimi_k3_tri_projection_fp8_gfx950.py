@@ -17,7 +17,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as arith_dialect
-from flydsl._mlir.dialects import scf
+from flydsl._mlir.dialects import llvm, scf
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -59,6 +59,7 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
     waves_per_eu: int = 0,
     weight_cache_modifier: int = 0,
     hidden_to_lds: bool = True,
+    use_fp8_fdot2: bool = True,
 ):
     """Build the fixed mixed-precision tri-projection launcher."""
 
@@ -89,6 +90,7 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
         f"_rpw{rows_per_wave}_cu{cu_count}_wpb{waves_per_block}"
         f"_wpe{waves_per_eu}_wcm{weight_cache_modifier}"
         f"_hlds{int(hidden_to_lds)}"
+        f"_fdot2{int(use_fp8_fdot2)}"
     )
 
     @flyc.kernel(
@@ -125,6 +127,7 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
         hidden_lds = fx.SharedAllocator().allocate(SharedStorage).peek().hidden.ptr
 
         vec2_f32 = T.vec(2, f32)
+        vec2_bf16 = T.vec(2, T.bf16)
         vec8_bf16 = T.vec(_ELEMENTS_PER_LOAD, T.bf16)
         vec8_f32 = T.vec(_ELEMENTS_PER_LOAD, f32)
         zero_i32 = arith.constant(0, type=i32)
@@ -173,6 +176,53 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
                     fastmath=fm_fast,
                 ).result
             return reduced
+
+        def dot_bf16x8(left, right, accumulator):
+            dot = _raw(accumulator)
+            for pair_index in range_constexpr(_ELEMENTS_PER_LOAD // 2):
+                left_pair = vector.from_elements(
+                    vec2_bf16,
+                    [
+                        vector.extract(
+                            left,
+                            static_position=[pair_index * 2],
+                            dynamic_position=[],
+                        ),
+                        vector.extract(
+                            left,
+                            static_position=[pair_index * 2 + 1],
+                            dynamic_position=[],
+                        ),
+                    ],
+                )
+                right_pair = vector.from_elements(
+                    vec2_bf16,
+                    [
+                        vector.extract(
+                            right,
+                            static_position=[pair_index * 2],
+                            dynamic_position=[],
+                        ),
+                        vector.extract(
+                            right,
+                            static_position=[pair_index * 2 + 1],
+                            dynamic_position=[],
+                        ),
+                    ],
+                )
+                dot = llvm.call_intrinsic(
+                    f32,
+                    "llvm.amdgcn.fdot2.f32.bf16",
+                    [
+                        left_pair,
+                        right_pair,
+                        dot,
+                        arith.constant(False, type=ir.IntegerType.get_signless(1)),
+                    ],
+                    [],
+                    [],
+                )
+            return ArithValue(dot)
 
         if const_expr(hidden_to_lds):
             for load_iteration in range_constexpr(hidden_load_iterations):
@@ -260,7 +310,6 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
                                 )
                             else:
                                 hidden_bf16 = load_bf16x8(hidden_rsrc, k_element)
-                            hidden_f32 = ArithValue(hidden_bf16).extf(vec8_f32)
                             weight_if = scf.IfOp(
                                 is_routed,
                                 results_=[vec8_f32],
@@ -286,9 +335,21 @@ def build_kimi_k3_b1_tri_projection_fp8_module(
                                     weight_element,
                                 )
                                 scf.YieldOp([_raw(weight_f32)])
-                            local_dot = local_dot + (
-                                hidden_f32 * ArithValue(weight_if.results[0])
-                            ).reduce(ReductionOp.ADD, fastmath=fm_fast)
+                            if const_expr(use_fp8_fdot2):
+                                weight_bf16 = arith.trunc_f(
+                                    vec8_bf16,
+                                    weight_if.results[0],
+                                )
+                                local_dot = dot_bf16x8(
+                                    hidden_bf16,
+                                    weight_bf16,
+                                    local_dot,
+                                )
+                            else:
+                                hidden_f32 = ArithValue(hidden_bf16).extf(vec8_f32)
+                                local_dot = local_dot + (
+                                    hidden_f32 * ArithValue(weight_if.results[0])
+                                ).reduce(ReductionOp.ADD, fastmath=fm_fast)
 
                         reduced = ArithValue(wave_reduce_add(local_dot)) * ArithValue(
                             scale_if.results[0]
