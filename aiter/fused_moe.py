@@ -642,13 +642,16 @@ def fused_moe_(
     if is_flydsl_available():
         try:
             from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                _maybe_grouped_gfx1250_a8w4_moe,
+                grouped_gemm_gfx1250_a8w4,
             )
         except ImportError:
-            _maybe_grouped_gfx1250_a8w4_moe = None
+            grouped_gemm_gfx1250_a8w4 = None
 
-        if _maybe_grouped_gfx1250_a8w4_moe is not None:
-            grouped_a8w4_out = _maybe_grouped_gfx1250_a8w4_moe(
+        # grouped_gemm_gfx1250_a8w4 reads GUGU (gate/up row-interleaved) w1 only,
+        # so it is reachable exclusively from GateMode.INTERLEAVE. SEPARATED
+        # weights fall through to the generic MoE below.
+        if grouped_gemm_gfx1250_a8w4 is not None and gate_mode == GateMode.INTERLEAVE:
+            grouped_a8w4_out = grouped_gemm_gfx1250_a8w4(
                 hidden_states,
                 w1,
                 w2,
@@ -671,8 +674,8 @@ def fused_moe_(
                 intermediate_pad=intermediate_pad,
                 bias1=bias1,
                 bias2=bias2,
-                gate_mode=gate_mode,
                 swiglu_limit=swiglu_limit,
+                num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
@@ -715,10 +718,9 @@ def fused_moe_(
         and stage1_func in (_flydsl_stage1_wrapper, cktile_moe_stage1)
         and expert_mask is not None
     )
-    assert not metadata.flat or get_gfx() in (
-        "gfx942",
-        "gfx950",
-    ), f"FLAT fmoe asm kernels require gfx942/gfx950; got {get_gfx()}. "
+    assert (
+        not metadata.flat or get_gfx() == "gfx950"
+    ), f"FLAT fmoe asm kernels are gfx950-only; refusing to launch on {get_gfx()}. "
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1155,6 +1157,49 @@ def _normalize_bias_for_kernel(
     return bias
 
 
+def _opus_a8w4_stage1_wrapper(
+    hidden_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    block_m: int = 0,
+    w1_scale=None,
+    a1_scale=None,
+    sorted_weights=None,
+    bias1=None,
+    swiglu_limit: float | None = None,
+    inter_dim_pad: int = 0,
+    **_kwargs,
+):
+    if sorted_weights is not None:
+        raise NotImplementedError(
+            "Opus A8W4 stage1 does not support routed-weight multiplication"
+        )
+    from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
+
+    return opus_moe_stage1_a8w4_fwd(
+        hidden_states,
+        w1,
+        a1_scale,
+        w1_scale,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        topk=int(topk),
+        inter_dim_pad=int(inter_dim_pad),
+        bias=_normalize_bias_for_kernel(bias1),
+        out=out,
+        block_m=int(block_m),
+        kernelName=str(kernelName),
+        swiglu_limit=swiglu_limit,
+    )
+
+
 # TODO: remove this function once kernel handles padding in the runtime
 def _get_padding_for_flydsl(
     inter_dim_pad,
@@ -1446,12 +1491,8 @@ def _mxfp4_a4w4_stage2(
     if atomic:
         out_buf = out_dst
     else:
-        # 7168: DeepSeek-V3-class; 6144: GLM-5.2 (256 routed + 1 shared -> NE 257).
         _mx_shape_ok = (
-            BM == 128
-            and D_HIDDEN in (7168, 6144)
-            and D_INTER == 512
-            and NE in (257, 385)
+            BM == 128 and D_HIDDEN == 7168 and D_INTER == 512 and NE in (257, 385)
         )
 
         # Lossy before-sum 4-bit quant (ok for gsm8k, degrades other evals): opt-in.
@@ -1811,7 +1852,7 @@ def get_2stage_cfgs(
         inter_dim,
         expert,
         topk,
-        str(activation),
+        activation,
         str(dtype),
         str(q_dtype_a),
         str(q_dtype_w),
@@ -2047,14 +2088,22 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
+    is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith("opus_moe1_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
-    if (is_flydsl1 or is_flydsl2) and is_flydsl_available():
+    if is_opus1 or ((is_flydsl1 or is_flydsl2) and is_flydsl_available()):
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
         _s1_fp4q = is_flydsl1 and "_fp4" in kernelName1.split("_t")[-1]
-        if is_flydsl1:
+        if is_opus1:
+            stage1_func = functools.partial(
+                _opus_a8w4_stage1_wrapper,
+                kernelName=kernelName1,
+                block_m=block_m,
+                inter_dim_pad=intermediate_pad,
+            )
+        elif is_flydsl1:
             stage1_func = functools.partial(
                 _flydsl_stage1_wrapper,
                 kernelName=kernelName1,
@@ -2103,7 +2152,7 @@ def get_2stage_cfgs(
                 quant_type=q_type,
                 use_non_temporal_load=use_non_temporal_load,
             )
-        _s1_fp8q = is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1]
+        _s1_fp8q = is_opus1 or (is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1])
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
         return MOEMetadata(
             stage1_func,
@@ -2111,9 +2160,9 @@ def get_2stage_cfgs(
             block_m,
             int(ksplit),
             run_1stage,
-            has_bias=enable_bias and is_flydsl1,
+            has_bias=enable_bias and (is_opus1 or is_flydsl1),
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias and is_flydsl2,
+            stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
             **route_bucket_metadata,
         )
     if (
@@ -2659,8 +2708,9 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if metadata.stage1.func is _flydsl_stage1_wrapper:
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if stage1_func is _flydsl_stage1_wrapper:
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
         # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
@@ -3045,12 +3095,11 @@ def torch_moe_stage1(
         )
         w1 = w1.view(w1_shape)
 
-        if a1_scale is not None and a1_scale.numel() > 0:
-            a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
-            a1_scale = a1_scale.repeat(
-                1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
-            ).view(hidden_states.shape[0], -1)
-            hidden_states = hidden_states * a1_scale
+        a1_scale = a1_scale.view(hidden_states.shape[0], -1, 1)
+        a1_scale = a1_scale.repeat(
+            1, 1, hidden_states.shape[-1] // a1_scale.shape[1]
+        ).view(hidden_states.shape[0], -1)
+        hidden_states = hidden_states * a1_scale
     elif quant_type == QuantType.No:
         pass
     elif (
@@ -3251,14 +3300,7 @@ def ck_moe_stage1(
     dtype=None,
 ):
     token_num = hidden_states.shape[0]
-    # Only enable split-k when each K partition owns >= 2 k-tiles
-    # (KBatch = K / (splitk * KPerBlock), KPerBlock == 256). When KBatch == 1 the
-    # CK kernel uses atomic-add but skips the output memset, accumulating onto
-    # uninitialized memory -> gibberish. This guards splitk from CSV / AITER_KSPLIT
-    # that bypass get_ksplit's KBatch >= 2 check.
-    KPerBlock = 256
-    k_batch = (hidden_states.shape[1] // splitk) // KPerBlock if splitk > 1 else 1
-    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1 and k_batch >= 2
+    is_splitk = quant_type == QuantType.per_1x128 and splitk > 1
     if is_splitk:
         # CK kernel zeros this buffer via hipMemsetAsync when KBatch > 1
         sorted_size = min(token_num * topk * block_m, sorted_token_ids.shape[0])
@@ -3508,6 +3550,7 @@ def fused_topk(
             (256, 6),
             (256, 8),
             (384, 8),
+            (640, 8),
         ]
         and gating_output.dtype in [dtypes.bf16, dtypes.fp32]
         and gating_output.is_contiguous()
