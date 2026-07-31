@@ -82,6 +82,21 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/multigpu_tests/test_mega_moe_v2.py)
+            {
+                echo "Running MegaMoEV2 v4_pro fixed-slot and compact coverage on 8 GPUs"
+            } | tee -a latest_test.log
+            test_cmd=(
+                env MORI_SHMEM_HEAP_SIZE=40G
+                timeout 60m
+                torchrun --standalone --nproc_per_node=8 "$file"
+                --network v4_pro
+                --bs-list 128,512
+                --iters 10
+                --accuracy-max-bs 512
+                --rtol 0.10
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"

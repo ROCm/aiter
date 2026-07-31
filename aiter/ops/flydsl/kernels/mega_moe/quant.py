@@ -3,13 +3,13 @@
 
 """FlyDSL 1x32 MXFP4/MXFP8 quantization with E8M0 scales."""
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
+
 from aiter.ops.flydsl.kernels import buffer_ops
 
 BLOCK = 64
