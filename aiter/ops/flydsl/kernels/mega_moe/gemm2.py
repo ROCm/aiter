@@ -5,7 +5,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import _to_raw as _raw
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float4E2M1FN,
     Float8E4M3FN,
@@ -14,6 +14,9 @@ from flydsl.expr.typing import (
     T,
 )
 from flydsl.expr.typing import Vector as Vec
+
+from aiter.ops.flydsl.kernels import buffer_ops
+
 from ..mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from ..mxfp4_gemm_common import (
     flat_buffer_view,

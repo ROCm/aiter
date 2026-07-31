@@ -8,8 +8,10 @@ import mori.ir.flydsl as mori_shmem
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from .. import communication_ops_utils as comm_ops
 

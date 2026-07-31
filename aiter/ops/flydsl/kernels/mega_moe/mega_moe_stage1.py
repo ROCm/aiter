@@ -8,10 +8,11 @@ import mori.ir.flydsl as mori_shmem
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled

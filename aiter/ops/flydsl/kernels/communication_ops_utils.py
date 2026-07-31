@@ -26,7 +26,6 @@ __all__ = [
     "atomic_add_agent",
     "atomic_add_global_at",
     "atomic_add_system",
-    "atomic_xchg_global_at",
     "fence_acquire",
     "fence_agent_acquire",
     "fence_agent_release",
@@ -123,19 +122,6 @@ def atomic_add_agent(addr_i64, val):
 def atomic_add_system(addr_i64, val):
     """System-scope monotonic global fetch-and-add."""
     return atomic_add_global_at(addr_i64, val)
-
-
-def atomic_xchg_global_at(addr_i64, val, syncscope="agent"):
-    """Monotonic global exchange with configurable agent/system visibility."""
-    ptr = _to_ptr_global(addr_i64)
-    kwargs = {} if syncscope is None else {"syncscope": syncscope}
-    return _llvm_d.AtomicRMWOp(
-        _llvm_d.AtomicBinOp.xchg,
-        ptr,
-        arith.unwrap(val),
-        _llvm_d.AtomicOrdering.monotonic,
-        **kwargs,
-    ).res
 
 
 @dataclass

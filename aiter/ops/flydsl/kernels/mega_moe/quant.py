@@ -7,10 +7,12 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, ReductionOp, T, Vector
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 BLOCK = 64
 GROUP = 32

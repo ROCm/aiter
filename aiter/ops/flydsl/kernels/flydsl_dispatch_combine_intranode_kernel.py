@@ -23,11 +23,6 @@ from flydsl.expr.rocdl import (
 )
 from flydsl.expr.typing import Stream
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.buffer_ops import (
-    buffer_load,
-    buffer_store,
-    create_buffer_resource_from_addr,
-)
 
 from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
