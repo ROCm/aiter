@@ -449,11 +449,16 @@ jobs:
   # CK Backend
   # =============================================================================
   flash_attention_ck:
-    if: false  # Disabled until CK tests are ready
-    # if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
+    if: ${{ needs.prechecks.outputs.run_ck == 'true' }}
     name: Flash Attention - CK (1 GPU)
     needs: [check-signal, prechecks]
     runs-on: linux-aiter-mi35x-1
+    env:
+      # TEMPORARY, for validating this branch: point at Dao-AILab/flash-attention#2742 (the CK
+      # varlen_fwd binding fix) instead of upstream main, which is currently broken. Drop this
+      # block before merging so the job tracks upstream main again.
+      FA_REPOSITORY_URL: https://github.com/hyoon1/flash-attention.git
+      FA_BRANCH: fix/rocm-ck-varlen-fwd-binding
 
     steps:
       - name: Checkout aiter repo
@@ -534,14 +539,37 @@ jobs:
             --name fa_ck_test \
             fa_ck_test:ci
 
-      - name: Run correctness tests
-        timeout-minutes: 360
+      - name: Run CK binding smoke tests
+        timeout-minutes: 60
         run: |
-          echo "CK tests not yet implemented - to be enabled by ChunYu Lai"
-          # docker exec fa_ck_test bash -c "
-          #   cd /flash-attention
-          #   pytest -v --reruns 2 --timeout=120 tests/test_flash_attn_ck.py
-          # "
+          set -o pipefail
+          docker exec -i fa_ck_test bash -s <<'SMOKE'
+          set -euo pipefail
+          cd /flash-attention
+          FILE=tests/test_flash_attn_ck.py
+          # ONE small shape (seqlen 113/203, d=32, no dropout). The point is to CALL each binding,
+          # not to cover kernel logic: the bug class this catches is the binding itself, and
+          # Dao-AILab/flash-attention#2742 was a 21-vs-22 argument arity mismatch that COMPILED
+          # and linked fine (pybind derives the signature from the function pointer) and only
+          # raised at call time. A build-only job goes green on it; any test that reaches the
+          # binding fails immediately.
+          FILTER='113-203 and 32 and 0.0'
+
+          echo "=== matching cases ==="
+          python -m pytest "$FILE" -k "$FILTER" --collect-only -q | tail -3
+
+          # Take the first few matching cases rather than the whole selection: this is a smoke
+          # test, and the ids are read off collection instead of hardcoded so a change to the
+          # upstream parametrization cannot silently select nothing.
+          IDS=$(python -m pytest "$FILE" -k "$FILTER" --collect-only -q | grep '::' | head -8)
+          if [ -z "$IDS" ]; then
+            echo "ERROR: the filter matched no cases; the upstream parametrization changed" >&2
+            exit 1
+          fi
+          echo "=== running ==="
+          printf '%s\n' "$IDS"
+          python -m pytest -v -x --timeout=300 $IDS
+          SMOKE
 
       - name: Run benchmarks
         timeout-minutes: 30
