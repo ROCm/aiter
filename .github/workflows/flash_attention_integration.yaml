@@ -552,11 +552,13 @@ jobs:
           # One small shape: the point is to CALL each binding, not to cover kernel logic.
           FILTER='113-203 and 32 and 0.0'
 
+          # Collect once and reuse it; walking 412k parametrizations takes ~30s.
+          python -m pytest "$FILE" -k "$FILTER" --collect-only -q > /tmp/collected.txt
           echo "=== matching cases ==="
-          python -m pytest "$FILE" -k "$FILTER" --collect-only -q | tail -3
+          tail -3 /tmp/collected.txt
 
-          # A few cases, ids read off collection rather than hardcoded.
-          IDS=$(python -m pytest "$FILE" -k "$FILTER" --collect-only -q | grep '::' | head -8)
+          # awk, never `| head -8`: head closes the pipe and pipefail turns the SIGPIPE into exit 141.
+          IDS=$(awk '/::/ && ++n<=8' /tmp/collected.txt)
           # Required: an empty $IDS below would run the WHOLE suite, not nothing.
           if [ -z "$IDS" ]; then
             echo "ERROR: the filter matched no cases; the upstream parametrization changed" >&2
