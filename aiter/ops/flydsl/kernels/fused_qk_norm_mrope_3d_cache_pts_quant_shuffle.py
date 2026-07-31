@@ -267,7 +267,7 @@ def _build_q_kernel(
         token_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
-        stream: fx.Stream,
+        stream: fx.Stream = fx.Stream(None), # noqa: B008
     ):
         positions = fx.Tensor(
             fx.make_view(
@@ -693,7 +693,7 @@ def _build_kv_kernel(
         page_block_offset: fx.Int32,
         positions_stride_0: fx.Int32,
         positions_stride_1: fx.Int32,
-        stream: fx.Stream,
+        stream: fx.Stream = fx.Stream(None), # noqa: B008
     ):
         positions = fx.Tensor(
             fx.make_view(
@@ -781,11 +781,11 @@ def _compile_kv(
 
 
 def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
-    qkv: torch.Tensor,
-    qw: torch.Tensor,
-    kw: torch.Tensor,
-    cos_sin: torch.Tensor,
-    positions: torch.Tensor,
+    qkv: fx.Tensor,
+    qw: fx.Tensor,
+    kw: fx.Tensor,
+    cos_sin: fx.Tensor,
+    positions: fx.Tensor,
     num_tokens: int,
     num_heads_q: int,
     num_heads_k: int,
@@ -795,21 +795,21 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     mrope_section_: list[int],
     is_interleaved: bool,
     eps: float,
-    q_out: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    slot_mapping: torch.Tensor,
-    per_tensor_k_scale: torch.Tensor,
-    per_tensor_v_scale: torch.Tensor,
-    k_out: torch.Tensor | None,
-    v_out: torch.Tensor | None,
+    q_out: fx.Tensor,
+    k_cache: fx.Tensor,
+    v_cache: fx.Tensor,
+    slot_mapping: fx.Tensor,
+    per_tensor_k_scale: fx.Tensor,
+    per_tensor_v_scale: fx.Tensor,
+    k_out: fx.Tensor | None,
+    v_out: fx.Tensor | None,
     return_kv: bool,
     use_shuffle_layout: bool,
     block_size: int,
     x: int,
     rotary_dim: int = 0,
     gemma_norm: bool = False,
-    stream: torch.cuda.Stream | None = None,
+    stream: fx.Stream = fx.Stream(None) # noqa: B008
 ) -> None:
     """FlyDSL drop-in for ``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle``.
 
@@ -871,7 +871,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             partial rotary -- rotating only a leading sub-range of the head
             -- is not implemented).
         gemma_norm: use Gemma's ``(1+weight)`` RMSNorm gamma convention.
-        stream: torch CUDA stream to launch on; defaults to the current
+        stream: fx.Stream to launch on; defaults to the current
             stream.
     """
     from aiter.jit.utils.chip_info import get_gfx as _get_gfx
@@ -904,11 +904,11 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     if k_cache.dtype != v_cache.dtype:
         raise TypeError("k_cache/v_cache must have the same dtype")
     cache_is_fp8 = k_cache.dtype == aiter_dtypes.fp8
-    cache_is_bf16 = k_cache.dtype == torch.bfloat16
+    cache_is_bf16 = k_cache.dtype == aiter_dtypes.bf16
     if not cache_is_fp8 and not cache_is_bf16:
         raise TypeError(
             "k_cache/v_cache must use the architecture-native AITER FP8 dtype "
-            f"({aiter_dtypes.fp8}) or torch.bfloat16, got {k_cache.dtype}"
+            f"({aiter_dtypes.fp8}) or {aiter_dtypes.bf16}, got {k_cache.dtype}"
         )
     expected_x = _RUN_BYTES // k_cache.element_size()
     if x != expected_x:
@@ -948,9 +948,9 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"{lds_bytes} B of LDS staging (K + V tiles), "
             f"exceeding the {_MAX_LDS_BYTES} B budget assumed here."
         )
-    if qkv.dtype != torch.bfloat16:
+    if qkv.dtype != aiter_dtypes.bf16:
         raise TypeError(f"qkv must be bf16, got {qkv.dtype}")
-    if qw.dtype != torch.bfloat16 or kw.dtype != torch.bfloat16:
+    if qw.dtype != aiter_dtypes.bf16 or kw.dtype != aiter_dtypes.bf16:
         raise TypeError("qw/kw must be bf16")
     if positions.dtype != torch.int64:
         raise TypeError(f"positions must be int64, got {positions.dtype}")
@@ -999,11 +999,11 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise ValueError(f"qw/kw must both have shape ({D},)")
     if not qw.is_contiguous() or not kw.is_contiguous():
         raise ValueError("qw/kw must be contiguous")
-    if cos_sin.dtype != torch.bfloat16 or cos_sin.dim() != 2 or cos_sin.shape[1] != D:
+    if cos_sin.dtype != aiter_dtypes.bf16 or cos_sin.dim() != 2 or cos_sin.shape[1] != D:
         raise TypeError(f"cos_sin must be 2-D bf16 with trailing dimension {D}")
     if not cos_sin.is_contiguous():
         raise ValueError("cos_sin must be contiguous")
-    if q_out.dtype != torch.bfloat16 or q_out.numel() != num_tokens * H_Q * D:
+    if q_out.dtype != aiter_dtypes.bf16 or q_out.numel() != num_tokens * H_Q * D:
         raise ValueError(f"q_out must be bf16 with {num_tokens * H_Q * D} elements")
     if not q_out.is_contiguous():
         raise ValueError("q_out must be contiguous")
@@ -1042,10 +1042,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
     if num_tokens == 0:
         return
 
-    if stream is None:
-        stream = torch.cuda.current_stream()
-    fx_stream = fx.Stream(stream)
-
     q_launch = _compile_q(
         num_heads_q=H_Q,
         head_size=D,
@@ -1079,7 +1075,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             token_offset,
             positions_stride_0,
             positions_stride_1,
-            fx_stream,
+            stream,
         )
 
     kv_launch = _compile_kv(
@@ -1131,5 +1127,5 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             page_block_offset,
             positions_stride_0,
             positions_stride_1,
-            fx_stream,
+            stream,
         )
