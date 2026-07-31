@@ -1634,7 +1634,8 @@ def _bench_reduce_candidates(
     for name, fn in candidates.items():
         x.fout.zero_()
         x.flse.zero_()
-        _, us = run_perftest(fn, num_warmup=25, num_iters=100)
+        # ROCTracer can crash after repeated HIP graph captures in CI.
+        _, us = run_perftest(fn, num_warmup=25, num_iters=100, use_cuda_event=True)
         err = checkAllclose(
             ref_out.to(dtypes.fp32),
             x.fout.clone().to(dtypes.fp32),
