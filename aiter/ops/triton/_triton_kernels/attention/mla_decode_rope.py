@@ -25,13 +25,15 @@ It supports page size = 1.
 
 import functools
 import json
+
 import triton
 import triton.language as tl
+
 from aiter.ops.triton._triton_kernels.activation import _tanh
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 _fwd_grouped_kernel_stage1_rope_repr = make_kernel_repr(
     "_fwd_grouped_kernel_stage1_rope",
@@ -299,14 +301,11 @@ def _fwd_grouped_kernel_stage1_rope(
             + offs_c[None, :]
         )
 
-        if USE_ROPE:
-            if LAST_SPLIT:
-                k_pe_last_token_ptrs = (
-                    k_pe_t_out
-                    + cur_batch * stride_kpe_tokens_out_b
-                    + tl.arange(0, BLOCK_R)
-                )
-                tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
+        if USE_ROPE and LAST_SPLIT:
+            k_pe_last_token_ptrs = (
+                k_pe_t_out + cur_batch * stride_kpe_tokens_out_b + tl.arange(0, BLOCK_R)
+            )
+            tl.store(k_pe_last_token_ptrs, k_pe_last_token, mask=mask_qk_r)
 
         tl.store(
             Att_Out + offs_mid_o,
@@ -376,7 +375,7 @@ def _fwd_kernel_stage2(
     offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
     offs_logic = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + Lv
 
-    for split_kv_id in range(0, NUM_KV_SPLITS):
+    for split_kv_id in range(NUM_KV_SPLITS):
         kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)

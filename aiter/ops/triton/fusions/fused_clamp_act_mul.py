@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 import triton
@@ -18,11 +18,11 @@ _LOGGER = AiterTritonLogger()
 
 def fused_clamp_act_mul(
     inp: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    scale: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    scale: torch.Tensor | None = None,
     swiglu_limit: float = 0,
     activation: Literal["silu", "gelu", "gelu_tanh"] = "silu",
-    weights: Optional[torch.Tensor] = None,
+    weights: torch.Tensor | None = None,
     dtype_quant: torch.dtype | None = None,
     transpose_scale: bool = False,
     quant_block_size: int = 128,

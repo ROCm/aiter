@@ -1,60 +1,67 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-import pandas as pd
 import os
 import sys
 import tempfile
-from aiter import QuantType
-from aiter.jit.core import (
-    get_asm_dir,
-    AITER_CSRC_DIR,
-    AITER_CONFIG_FMOE,
-    AITER_CONFIG_GROUPED_FMOE,
-    AITER_ROOT_DIR,
+from typing import Any, ClassVar
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+
+import aiter
+from aiter import (
+    ActivationType,
+    QuantType,
+    ck_moe_stage1_fwd,
+    ck_moe_stage2_fwd,
+    dtype2str_dict,
+    dtypes,
 )
 from aiter.fused_moe import (
+    _mxfp4_a4w4_stage1_fw,
+    _mxfp4_a4w4_stage2_fw,
+    asm_stage1,
+    cktile_moe_stage1,
+    cktile_moe_stage2,
     fused_moe,
     fused_topk,
     moe_sorting,
-    asm_stage1,
+    torch_moe,
     torch_moe_stage1,
     torch_moe_stage2,
-    torch_moe,
-    cktile_moe_stage1,
-    cktile_moe_stage2,
-    _mxfp4_a4w4_stage1_fw,
-    _mxfp4_a4w4_stage2_fw,
 )
+from aiter.int4_utils import (
+    convert_int8_to_uint32_int4,
+    rearrange_4bit_elements,
+)
+from aiter.jit.core import (
+    AITER_CONFIG_FMOE,
+    AITER_CONFIG_GROUPED_FMOE,
+    AITER_CSRC_DIR,
+    AITER_ROOT_DIR,
+    get_asm_dir,
+)
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
 )
-from aiter import ck_moe_stage1_fwd, ck_moe_stage2_fwd, dtype2str_dict
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.ops.shuffle import (
-    shuffle_weight,
+    pack_int8_to_packed_int4,
     shuffle_scale,
     shuffle_scale_a16w4,
-    shuffle_weight_a16w4,
-    pack_int8_to_packed_int4,
     shuffle_scale_for_int4,
+    shuffle_weight,
+    shuffle_weight_a16w4,
 )
-from aiter.utility.mp_tuner import mp_tuner
-from aiter.int4_utils import (
-    rearrange_4bit_elements,
-    convert_int8_to_uint32_int4,
-)
-from aiter.ops.quant import per_1x32_i4_quant, per_1x32_f8_scale_f8_quant
-from aiter import dtypes
-from aiter import ActivationType as ActivationType
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
-import torch.nn.functional as F
-from einops import rearrange
-from aiter.utility.base_tuner import TunerCommon
 from aiter.utility import fp4_utils
+from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.fp4_utils import moe_mxfp4_sort
+from aiter.utility.mp_tuner import mp_tuner
 
 try:
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -67,12 +74,12 @@ except ImportError:
 if is_flydsl_available():
     try:
         from aiter.ops.flydsl.moe_kernels import (
-            get_flydsl_stage1_kernels,
-            get_flydsl_stage2_kernels,
-            get_flydsl_stage1_kernels_int4_bf16,
-            get_flydsl_stage2_kernels_int4_bf16,
             flydsl_moe_stage1,
             flydsl_moe_stage2,
+            get_flydsl_stage1_kernels,
+            get_flydsl_stage1_kernels_int4_bf16,
+            get_flydsl_stage2_kernels,
+            get_flydsl_stage2_kernels_int4_bf16,
         )
     except ImportError:
 
@@ -256,7 +263,7 @@ def tensor_compare_diagnostics(
                 )
             parts.append("top=[" + "; ".join(example_text) + "]")
         return ", ".join(parts)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return f"diagnostic_error={type(exc).__name__}:{exc}"
 
 
@@ -289,7 +296,7 @@ _GEN_DATA_1STAGE_KEYS = [
 
 
 class FmoeTuner(TunerCommon):
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
         "tune_file": f"{AITER_CONFIG_FMOE}",
@@ -435,28 +442,25 @@ class FmoeTuner(TunerCommon):
                 device=a1_qt.device,
             )
             tmp_out = out
-        try:
-            ck_moe_stage1_fwd(
-                a1_qt,
-                w1_qt_shffle_ck,
-                w2_qt_shffle_ck,
-                sorted_ids,
-                sorted_expert_ids,
-                num_valid_ids,
-                tmp_out,
-                topk,
-                kernelName,
-                w1_scale,
-                a1_scale,
-                blockM,
-                sorted_weights,
-                q_type,
-                act_type,
-                splitk if is_splitk else 0,
-                dst_type=dtype if is_splitk else None,
-            )
-        except Exception:
-            raise
+        ck_moe_stage1_fwd(
+            a1_qt,
+            w1_qt_shffle_ck,
+            w2_qt_shffle_ck,
+            sorted_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            tmp_out,
+            topk,
+            kernelName,
+            w1_scale,
+            a1_scale,
+            blockM,
+            sorted_weights,
+            q_type,
+            act_type,
+            splitk if is_splitk else 0,
+            dst_type=dtype if is_splitk else None,
+        )
         if is_splitk:
             out = torch.empty(
                 (token_num, topk, inter_dim),
@@ -472,7 +476,7 @@ class FmoeTuner(TunerCommon):
                 aiter.gelu_and_mul(out, valid_out.view(dtypes.fp32))
         if q_type == QuantType.per_1x128:
             quant_func = aiter.get_hip_quant(q_type)
-            a2, a2_scale = quant_func(
+            a2, _a2_scale = quant_func(
                 out,
                 quant_dtype=a1_qt.dtype,
             )
@@ -623,7 +627,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -1284,6 +1292,15 @@ class FmoeTuner(TunerCommon):
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, True)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
+        elif q_dtype_w == dtypes.fp4x2 and q_dtype_a in (dtypes.bf16, dtypes.fp16):
+            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): same wfp4 weight layout
+            # as a8w4 but separated gate (gate_up=False) and w2 scale via plain
+            # e8m0_shuffle (no act-scale interleave). Mirrors the reference
+            # op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py data prep.
+            w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, False)
+            w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, False)
+            w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
+            w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         else:
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
@@ -1429,6 +1446,16 @@ class FmoeTuner(TunerCommon):
                     token_num=token,
                     block_size=blockM,
                 )
+            elif (
+                q_type == QuantType.per_1x32
+                and q_dtype_a in (dtypes.bf16, dtypes.fp16)
+                and q_dtype_w == dtypes.fp4x2
+            ):
+                # a16w4 mxfp4: the abf16 stage2 consumes the bf16 intermediate
+                # directly -- no inter-stage activation quant (a2_scale=None).
+                a2_qt = ref1
+                a2_scale = None
+                a2_scale_mxfp4_sort = None
             elif q_type == QuantType.per_1x32 and q_dtype_a == dtypes.fp8:
                 # FlyDSL stage2 receives fp8 input
                 a2_qt = ref1.to(dtypes.fp8)
@@ -1631,7 +1658,7 @@ class FmoeTuner(TunerCommon):
         if fuse_fp4:
             from aiter.ops.quant import per_1x32_f4_quant
 
-            a2, a2_scale = per_1x32_f4_quant(ref1, quant_dtype=dtypes.fp4x2)
+            a2, _a2_scale = per_1x32_f4_quant(ref1, quant_dtype=dtypes.fp4x2)
             return a2.view(token_num, topk, -1)
         elif fuse_fp8:
             inter_dim = ref1.shape[-1]
@@ -1642,7 +1669,7 @@ class FmoeTuner(TunerCommon):
             return a2
 
         if quant_type == QuantType.per_1x128:
-            ref1, ref_scale = aiter.pertoken_quant(
+            ref1, _ref_scale = aiter.pertoken_quant(
                 ref1.view(ref1.shape[0], -1, 128), quant_dtype=a1_qt.dtype
             )
             ref1 = ref1.view(ref1.shape[0], topk, -1)
@@ -2054,22 +2081,22 @@ class FmoeTuner(TunerCommon):
         return (out * topk_weight.view(B, -1, 1)).sum(dim=1).to(dtype)
 
     def calculate(self, results, bpes=(1, 1, 2)):
-        key, stage, kernelName, block_m, us, err = results
+        key, stage, _kernelName, _block_m, us, _err = results
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
             expert,
             topk,
-            act_type,
+            _act_type,
             dtype,
             q_dtype_a,
             q_dtype_w,
-            q_type,
+            _q_type,
             use_g1u1,
-            doweight_stage1,
+            _doweight_stage1,
         ) = key
         if us == self.INVALID_TIME or us == self.INF_TIME:
             return 0, 0
@@ -2167,8 +2194,8 @@ class FmoeTuner(TunerCommon):
         task_1stage = []
         info = key
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -2219,7 +2246,7 @@ class FmoeTuner(TunerCommon):
         )
         if fmoe_func is None:
             return task_1stage
-        for tile_m, tile_n, smf in asm_kernels_1stage.keys():
+        for tile_m, tile_n, smf in asm_kernels_1stage:
             if inter_dim % tile_n != 0 or smf != 0:
                 continue
 
@@ -2324,7 +2351,7 @@ class FmoeTuner(TunerCommon):
             if os.path.exists(xbf16_csv):
                 _df = pd.read_csv(xbf16_csv)
                 xbf16_flat = _manifest_flat_by_kernel(_df)
-            for tile_m, tile_n, smf in xbf16_kernels.keys():
+            for tile_m, tile_n, smf in xbf16_kernels:
                 if inter_dim % tile_n != 0 or smf != 0:
                     continue
                 for el in xbf16_kernels.get((tile_m, tile_n, 0), []):
@@ -2394,8 +2421,8 @@ class FmoeTuner(TunerCommon):
         info = key
         tasks = []
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -2506,8 +2533,8 @@ class FmoeTuner(TunerCommon):
         info = key
         tasks_ck = []
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -2563,7 +2590,6 @@ class FmoeTuner(TunerCommon):
             and q_dtype_a == dtypes.fp8
             and q_dtype_w == dtypes.fp8
         )
-        ck_stage1_splitk_kernels = {}
         splitk_list = []
         if is_fp8_blockscale:
             tilek = 128
@@ -2571,7 +2597,7 @@ class FmoeTuner(TunerCommon):
                 if (model_dim % _sk == 0) and ((model_dim // _sk) % tilek == 0):
                     splitk_list.append(_sk)
             if splitk_list:
-                _, ck_stage1_splitk_kernels = get_gemm1_kernels_list(
+                _, _ck_stage1_splitk_kernels = get_gemm1_kernels_list(
                     dtype2str_dict[q_dtype_a],
                     dtype2str_dict[q_dtype_w],
                     dtype2str_dict[dtype],
@@ -2741,8 +2767,8 @@ class FmoeTuner(TunerCommon):
         """A8W4 (fp8 activation + fp4 weight + per_1x32) uses cktile path."""
         tasks_ck = []
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -2901,8 +2927,8 @@ class FmoeTuner(TunerCommon):
         if not is_flydsl_available():
             return tasks_flydsl
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -2927,7 +2953,11 @@ class FmoeTuner(TunerCommon):
             dtypes.fp8: "fp8",
             dtypes.fp4x2: "fp4",
             dtypes.fp16: "fp16",
-            dtypes.bf16: "fp16",
+            # a16w4: bf16 activation -> "bf16" so we enumerate the abf16_wfp4
+            # kernels the runtime actually selects (see fused_moe heuristic
+            # fallback kn1/kn2 = flydsl_moe{1,2}_abf16_wfp4_*). Mapping bf16 to
+            # "fp16" here would tune afp16_* kernels that never match at runtime.
+            dtypes.bf16: "bf16",
         }
         a_dtype_str = _a_dtype_map.get(q_dtype_a, "fp8")
         b_dtype_str = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
@@ -2968,6 +2998,13 @@ class FmoeTuner(TunerCommon):
                             (kname, nonfused_params, False, False),
                             (kname + "_fp8", fp8_params, False, True),
                         ]
+                elif a_dtype_str in ("bf16", "fp16"):
+                    # a16w4 (bf16/fp16 activation): stage1 emits a bf16
+                    # intermediate consumed directly by the abf16 stage2 (no
+                    # inter-stage fp4 quant). Only the bf16-output variant is
+                    # valid; a fp4-output stage1 would be mispaired with the
+                    # bf16-input stage2.
+                    s1_variants = [(kname, kparams, False, False)]
                 else:
                     fp4_params = {**kparams, "out_dtype": "fp4"}
                     if is_splitk:
@@ -3181,7 +3218,7 @@ class FmoeTuner(TunerCommon):
         tasks_opus = []
         (
             gfx,
-            cu_num,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -3306,8 +3343,8 @@ class FmoeTuner(TunerCommon):
         if not is_flydsl_available():
             return tasks_flydsl
         (
-            gfx,
-            cu_num,
+            _gfx,
+            _cu_num,
             token,
             model_dim,
             inter_dim,
@@ -3538,7 +3575,7 @@ class FmoeTuner(TunerCommon):
 
     def run_config(self, args):
         from aiter.fused_moe import fused_moe, fused_topk
-        from aiter.test_common import run_perftest, checkAllclose
+        from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
         results = []
@@ -3884,7 +3921,7 @@ class FmoeTuner(TunerCommon):
                             "status": f"error:{e}",
                         }
                     )
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 results.append(
                     {
                         "shape": shape_str,
@@ -3961,9 +3998,9 @@ class FmoeTuner(TunerCommon):
             #   TUNE_ONLY=flydsl  -> only gen_flydsl_2stages_task
             #   TUNE_ONLY=opus    -> only gen_opus_2stages_task
             # empty = all (subject to OPUS_ONLY / OPUS_SKIP_CKTILE below).
-            _tune_only = set(s for s in os.environ.get("TUNE_ONLY", "").split(",") if s)
+            _tune_only = {s for s in os.environ.get("TUNE_ONLY", "").split(",") if s}
 
-            def _want(name):
+            def _want(name, _opus_only=_opus_only, _tune_only=_tune_only):
                 if _tune_only:
                     return name in _tune_only
                 if _opus_only:
@@ -4332,10 +4369,10 @@ class FmoeTuner(TunerCommon):
                 # (simple .to(dtypes.fp8)) and add it to kernels whose stage1 name does
                 # not end with _fp8 (those fuse the cast in stage1).
                 if q_dtype_a == dtypes.fp4x2:
-                    from aiter.test_common import run_perftest
                     from aiter.ops.triton.quant.fused_mxfp4_quant import (
                         fused_dynamic_mxfp4_quant_moe_sort,
                     )
+                    from aiter.test_common import run_perftest
 
                     us_qs_cache = {}
                     for bm in profileDF["block_m"].unique():
@@ -4405,8 +4442,8 @@ class FmoeTuner(TunerCommon):
 
             has_xbf16 = "xbf16" in profileDF.columns and profileDF["xbf16"].any()
             if q_type == QuantType.per_1x128 and has_xbf16:
-                from aiter.test_common import run_perftest
                 from aiter.ops.quant import per_group_quant_hip
+                from aiter.test_common import run_perftest
 
                 dummy_act = torch.randn(token, model_dim, dtype=dtype, device="cuda")
                 _, us_quant = run_perftest(
@@ -4426,8 +4463,8 @@ class FmoeTuner(TunerCommon):
             # moe_sorting fairness: flat=1 kernels sort internally; add host sort cost to others.
             has_flat = "flat" in profileDF.columns and (profileDF["flat"] == 1).any()
             if has_flat:
-                from aiter.test_common import run_perftest
                 from aiter.fused_moe import moe_sorting
+                from aiter.test_common import run_perftest
 
                 _topk_ids = torch.randint(
                     0, expert, (token, topk), dtype=torch.int32, device="cuda"
@@ -4447,7 +4484,7 @@ class FmoeTuner(TunerCommon):
                             bm_int,
                         )
                         us_sort_cache[bm] = round(us_sort, 4)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         print(
                             f"  moe_sorting benchmark failed for block_m={bm_int}: {e}"
                         )
@@ -4552,7 +4589,22 @@ class FmoeTuner(TunerCommon):
                     # allocate a second moe_buf via torch.zeros, adding an
                     # aten::fill_ kernel that isn't on the production stream).
 
-                    def _flat_seq():
+                    def _flat_seq(
+                        _a1_scale_t=_a1_scale_t,
+                        _act_int=_act_int,
+                        _flat_kname=_flat_kname,
+                        _input=_input,
+                        _topk_ids=_topk_ids,
+                        _topk_w=_topk_w,
+                        _w1_qt_s=_w1_qt_s,
+                        _w1_scale=_w1_scale,
+                        _w2_qt_s=_w2_qt_s,
+                        _w2_scale=_w2_scale,
+                        dtype=dtype,
+                        expert=expert,
+                        model_dim=model_dim,
+                        topk=topk,
+                    ):
                         sids, sws, seids, nv, mbuf = moe_sorting(
                             _topk_ids,
                             _topk_w,
@@ -4580,7 +4632,23 @@ class FmoeTuner(TunerCommon):
                         )
                         return mbuf
 
-                    def _nf_seq():
+                    def _nf_seq(
+                        _a1_scale_t=_a1_scale_t,
+                        _act_int=_act_int,
+                        _nf_a1=_nf_a1,
+                        _nf_kname=_nf_kname,
+                        _topk_ids=_topk_ids,
+                        _topk_w=_topk_w,
+                        _w1_qt_s=_w1_qt_s,
+                        _w1_scale=_w1_scale,
+                        _w2_qt_s=_w2_qt_s,
+                        _w2_scale=_w2_scale,
+                        dtype=dtype,
+                        expert=expert,
+                        model_dim=model_dim,
+                        nf_block_m=nf_block_m,
+                        topk=topk,
+                    ):
                         sids, sws, seids, nv, mbuf = moe_sorting(
                             _topk_ids,
                             _topk_w,
@@ -4634,7 +4702,7 @@ class FmoeTuner(TunerCommon):
                             "  -> FLAT confirmed (or within noise); "
                             "keeping additive-fairness ranking"
                         )
-                except Exception as _e2e_err:
+                except Exception as _e2e_err:  # noqa: BLE001
                     print(
                         f"  e2e head-to-head skipped/failed ({_e2e_err}); "
                         "falling back to additive fairness"
@@ -4736,7 +4804,7 @@ class GroupedFmoeTuner(FmoeTuner):
     TILE_K = 256
     TILE_M_CANDIDATES = (16, 32, 64, 128)
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
         "tune_file": f"{AITER_CONFIG_GROUPED_FMOE}",
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_grouped_fmoe.csv",
@@ -4769,7 +4837,6 @@ class GroupedFmoeTuner(FmoeTuner):
             "num_buffers": 2,
             "grouped_persistent_m": 1,
             "persistent_workers": "",
-            "stage1_weight_layout": layout,
             "kernelName1": f"grouped_gemm1_{data_format}_{layout}",
             "kernelName2": f"grouped_gemm2_{data_format}",
             "us": 0,
@@ -4858,7 +4925,8 @@ class GroupedFmoeTuner(FmoeTuner):
         return hidden, w1_arg, w2_arg, topk_weight, topk_ids, w1_scale, w2_scale
 
     def _write_candidate_config(self, candidate):
-        tmp = tempfile.NamedTemporaryFile(
+        # delete=False on purpose: the path outlives the handle.
+        tmp = tempfile.NamedTemporaryFile(  # noqa: SIM115
             mode="w",
             suffix=".csv",
             prefix="aiter_grouped_candidate_",
@@ -4961,7 +5029,7 @@ class GroupedFmoeTuner(FmoeTuner):
                     )
                     if best is None or us < float(best["us"]):
                         best = candidate
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     failures.append(f"tile_m={candidate['tile_m']}: {exc}")
                     print(f"[grouped] candidate failed: {failures[-1]}", flush=True)
             if best is None:
@@ -5005,7 +5073,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     unit.
     """
 
-    ARG_DEFAULTS = {
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_untuned_fmoe.csv",
         "tune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_tuned_fmoe.csv",
@@ -5254,7 +5322,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
                 if best is None or us < float(best["us"]):
                     best = candidate
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
                 )
@@ -5280,7 +5348,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = int(getattr(args, "mp", 1) or 1)
         try:
             ngpu = torch.cuda.device_count()
-        except Exception:
+        except Exception:  # noqa: BLE001
             ngpu = 1
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
 
@@ -5349,7 +5417,7 @@ def _mxfp4_tune_shape_worker(payload):
             flush=True,
         )
         return tuner._tune_one_shape(row, args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Catastrophic (non per-candidate) failure: record as a failed shape so
         # the pool keeps going instead of aborting the whole run.
         best = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
@@ -5408,7 +5476,6 @@ if __name__ == "__main__":
         "num_buffers",
         "grouped_persistent_m",
         "persistent_workers",
-        "stage1_weight_layout",
         "kernelName1",
         "kernelName2",
         "us",
