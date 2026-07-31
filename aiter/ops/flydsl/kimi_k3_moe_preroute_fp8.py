@@ -256,7 +256,7 @@ def _shared_down_launcher(
         rows_per_wave=1,
         cu_count=248,
         waves_per_eu=0,
-        weight_cache_modifier=0,
+        weight_cache_modifier=2,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
     )
