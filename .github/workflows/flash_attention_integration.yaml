@@ -454,11 +454,11 @@ jobs:
     needs: [check-signal, prechecks]
     runs-on: linux-aiter-mi35x-1
     env:
-      # TEMPORARY, for validating this branch: point at Dao-AILab/flash-attention#2742 (the CK
-      # varlen_fwd binding fix) instead of upstream main, which is currently broken. Drop this
-      # block before merging so the job tracks upstream main again.
+      # TEMPORARY: validate against Dao-AILab/flash-attention#2742; drop before merging.
       FA_REPOSITORY_URL: https://github.com/hyoon1/flash-attention.git
       FA_BRANCH: fix/rocm-ck-varlen-fwd-binding
+      # docker build has no GPU, so the CK build must be told what to cross-compile for.
+      GPU_ARCHS: gfx950
 
     steps:
       - name: Checkout aiter repo
@@ -504,6 +504,7 @@ jobs:
               rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
               cd /flash-attention && \
+              GPU_ARCHS=${{ env.GPU_ARCHS }} \
               pip install --no-build-isolation .
 
           RUN echo "=== Installed versions ===" && \
@@ -547,21 +548,15 @@ jobs:
           set -euo pipefail
           cd /flash-attention
           FILE=tests/test_flash_attn_ck.py
-          # ONE small shape (seqlen 113/203, d=32, no dropout). The point is to CALL each binding,
-          # not to cover kernel logic: the bug class this catches is the binding itself, and
-          # Dao-AILab/flash-attention#2742 was a 21-vs-22 argument arity mismatch that COMPILED
-          # and linked fine (pybind derives the signature from the function pointer) and only
-          # raised at call time. A build-only job goes green on it; any test that reaches the
-          # binding fails immediately.
+          # One small shape: the point is to CALL each binding, not to cover kernel logic.
           FILTER='113-203 and 32 and 0.0'
 
           echo "=== matching cases ==="
           python -m pytest "$FILE" -k "$FILTER" --collect-only -q | tail -3
 
-          # Take the first few matching cases rather than the whole selection: this is a smoke
-          # test, and the ids are read off collection instead of hardcoded so a change to the
-          # upstream parametrization cannot silently select nothing.
+          # A few cases, ids read off collection rather than hardcoded.
           IDS=$(python -m pytest "$FILE" -k "$FILTER" --collect-only -q | grep '::' | head -8)
+          # Required: an empty $IDS below would run the WHOLE suite, not nothing.
           if [ -z "$IDS" ]; then
             echo "ERROR: the filter matched no cases; the upstream parametrization changed" >&2
             exit 1
