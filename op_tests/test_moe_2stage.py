@@ -982,8 +982,6 @@ def _runtime_swiglu_mxfp4_q_dtype_a(
     token, act_type, gate_mode, q_type, aq_dtype, wq_dtype
 ):
     """Return the q_dtype_a that fused_moe will select for Swiglu MXFP4."""
-    if act_type == aiter.ActivationType.Situv2:
-        return _runtime_situv2_mxfp4_q_dtype_a(token, gate_mode, q_type, wq_dtype)
     if act_type != aiter.ActivationType.Swiglu:
         return None
     if q_type != aiter.QuantType.per_1x32 or wq_dtype != dtypes.fp4x2:
