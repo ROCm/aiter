@@ -32,8 +32,6 @@ _STORED_OUTPUT_FEATURES = 6284
 _GROUP_SIZE = 64
 _GROUPS_PER_ROW = _INPUT_FEATURES // _GROUP_SIZE
 _WAVE_SIZE = 64
-# Two 128-bit BF16 loads and one 128-bit packed-FP8 load per lane reduce the
-# fixed K loop from 14 iterations to 7 while retaining FP32 scaled accumulation.
 _ELEMENTS_PER_LOAD = 16
 _K_PER_WAVE_ITERATION = _WAVE_SIZE * _ELEMENTS_PER_LOAD
 
@@ -44,8 +42,8 @@ def _raw(value):
 
 def build_kimi_k3_kda_input_group64_module(
     *,
-    rows_per_wave: int = 1,
-    cu_count: int = 240,
+    rows_per_wave: int = 2,
+    cu_count: int = 256,
     waves_per_eu: int = 0,
     weight_cache_modifier: int = 2,
     hidden_to_lds: bool = True,

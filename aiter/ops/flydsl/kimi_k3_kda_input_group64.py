@@ -20,6 +20,9 @@ _STORED_OUTPUT = 6284
 _GROUP = 64
 _GROUPS_PER_ROW = _HIDDEN // _GROUP
 _FP8_MAX = 448.0
+_ROWS_PER_WAVE = 2
+_CU_COUNT = 256
+_WEIGHT_CACHE_MODIFIER = 2
 
 
 def _is_gfx950(device: torch.device) -> bool:
@@ -84,17 +87,13 @@ def quantize_kimi_k3_kda_input_group64(
     return packed, scale.contiguous()
 
 
-@functools.lru_cache(maxsize=8)
-def _launcher(
-    rows_per_wave: int,
-    cu_count: int,
-    weight_cache_modifier: int,
-):
+@functools.lru_cache(maxsize=1)
+def _launcher():
     return build_kimi_k3_kda_input_group64_module(
-        rows_per_wave=rows_per_wave,
-        cu_count=cu_count,
+        rows_per_wave=_ROWS_PER_WAVE,
+        cu_count=_CU_COUNT,
         waves_per_eu=0,
-        weight_cache_modifier=weight_cache_modifier,
+        weight_cache_modifier=_WEIGHT_CACHE_MODIFIER,
         hidden_to_lds=True,
     )
 
@@ -104,10 +103,6 @@ def kimi_k3_kda_input_group64(
     weight: torch.Tensor,
     scale: torch.Tensor,
     output: torch.Tensor | None = None,
-    *,
-    rows_per_wave: int = 2,
-    cu_count: int = 256,
-    weight_cache_modifier: int = 2,
 ) -> torch.Tensor:
     """Launch only after the caller has passed the typed support predicate."""
 
@@ -122,7 +117,7 @@ def kimi_k3_kda_input_group64(
         or not output.is_contiguous()
     ):
         raise ValueError("output must be contiguous BF16 [1,6288] on the same device")
-    launcher = _launcher(rows_per_wave, cu_count, weight_cache_modifier)
+    launcher = _launcher()
     launcher(
         ptr_arg(hidden),
         ptr_arg(weight),

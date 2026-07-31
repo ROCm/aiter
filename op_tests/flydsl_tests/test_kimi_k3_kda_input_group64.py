@@ -37,6 +37,14 @@ def test_wrapper_uses_validated_gfx950_schedule_by_default(monkeypatch) -> None:
     schedules = []
     launches = []
 
+    def fake_builder(**kwargs):
+        schedules.append(kwargs)
+
+        def launch(*args, **kwargs):
+            launches.append((args, kwargs))
+
+        return launch
+
     monkeypatch.setattr(
         group64_module,
         "supports_kimi_k3_kda_input_group64",
@@ -44,17 +52,25 @@ def test_wrapper_uses_validated_gfx950_schedule_by_default(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         group64_module,
-        "_launcher",
-        lambda *args: (
-            schedules.append(args) or (lambda *args, **kwargs: launches.append(args))
-        ),
+        "build_kimi_k3_kda_input_group64_module",
+        fake_builder,
     )
     monkeypatch.setattr(group64_module, "ptr_arg", lambda tensor: tensor)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+    group64_module._launcher.cache_clear()
 
     assert kimi_k3_kda_input_group64(hidden, weight, scale, output) is output
-    assert schedules == [(2, 256, 2)]
+    assert schedules == [
+        {
+            "rows_per_wave": 2,
+            "cu_count": 256,
+            "waves_per_eu": 0,
+            "weight_cache_modifier": 2,
+            "hidden_to_lds": True,
+        }
+    ]
     assert len(launches) == 1
+    group64_module._launcher.cache_clear()
 
 
 @pytest.mark.parametrize("rows_per_wave", [0, 5])
@@ -119,12 +135,18 @@ def test_group64_projection_matches_dequantized_reference_on_gfx950() -> None:
         .reshape(stored_rows, groups_per_row, group_size)
         * scale[..., None]
     )
-    expected = (dequantized * hidden_groups).sum(dim=(1, 2))
-
-    torch.testing.assert_close(
-        actual[0, :stored_rows].float(),
-        expected,
-        rtol=2e-2,
-        atol=1.25e-1,
+    expected = (dequantized * hidden_groups).sum(dim=(1, 2)).to(torch.bfloat16)
+    actual_fp32 = actual[0, :stored_rows].float()
+    expected_fp32 = expected.float()
+    delta = actual_fp32 - expected_fp32
+    relative_rmse = delta.square().mean().sqrt() / expected_fp32.square().mean().sqrt()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual_fp32,
+        expected_fp32,
+        dim=0,
     )
+
+    assert torch.isfinite(actual).all()
+    assert relative_rmse <= 5e-4
+    assert cosine >= 0.99999
     assert torch.count_nonzero(actual[0, stored_rows:]).item() == 0
