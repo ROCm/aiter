@@ -194,10 +194,10 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     state = {}
 
     def stage1():
-        state["sbm"] = moe._run_fused_stage1(x_q, weights, scale, ids)
+        moe._run_fused_stage1(x_q, weights, scale, ids)
 
     def stage2():
-        state["output"] = moe._run_stage2(tokens, None, True, state["sbm"])
+        state["output"] = moe._run_stage2(tokens, None, True, moe._active_config)
 
     def end_to_end():
         state["output"] = moe(x, weights, ids)
@@ -208,12 +208,13 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
     stage2_ms = _time_graph(stage2, device, args.iters)
     e2e_ms = _time_graph(end_to_end, device, args.iters)
     sbm = int(moe._s1_active_tile_m)
-    gemm2_bm = int(moe._g2_tuner.last_config.kwargs["BM"])
+    gemm2_bm = int(moe._g2_active_block_m)
+    p2p_quant = moe._active_config.p2p_quant
     if rank == 0:
         print(
             f"[MEGA-V2] bs={tokens} relL2={rel_l2:.6f} "
             f"path={'fixed' if moe._s1_fixed_slot else 'compact'} "
-            f"p2p_quant={moe._stage2_p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
+            f"p2p_quant={p2p_quant} SBM={sbm} G2_BM={gemm2_bm} "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
             f"stage2={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
             f"e2e={e2e_ms[0]:.4f}/{e2e_ms[1]:.4f}ms mean/max",
@@ -230,11 +231,6 @@ def main():
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
     parser.add_argument("--rtol", type=float, default=0.10)
     parser.add_argument("--max-tok-per-rank", type=int)
-    parser.add_argument(
-        "--stage2-p2p-quant",
-        choices=("auto", "none", "fp8_blockwise_1x32"),
-        default="auto",
-    )
     args = parser.parse_args()
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
@@ -245,8 +241,7 @@ def main():
         network = NETWORKS[args.network]
         if network["experts"] % world:
             raise ValueError(f"experts={network['experts']} must be divisible by world={world}")
-        max_tok_per_rank = args.max_tok_per_rank or _next_power_of_two(max(batch_sizes))
-        if max_tok_per_rank < max(batch_sizes):
+        if args.max_tok_per_rank is not None and args.max_tok_per_rank < max(batch_sizes):
             raise ValueError("--max-tok-per-rank must cover the largest batch size")
         local_experts = network["experts"] // world
         packed = _quantize_weights(
@@ -268,22 +263,20 @@ def main():
             args.seed,
             device,
         )
-        moe = MegaMoEV2(
-            rank=rank,
-            world_size=world,
-            quant="a8w4",
-            w1=w1,
-            w1_scale=w1_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-            max_tok_per_rank=max_tok_per_rank,
-            tune_tokens=max_bs,
-            gate_mode="interleave",
-            stage2_p2p_quant=args.stage2_p2p_quant,
-            **network,
-        )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         for batch_size in batch_sizes:
+            max_tok_per_rank = args.max_tok_per_rank or max(16, _next_power_of_two(batch_size))
+            moe = MegaMoEV2(
+                rank=rank,
+                world_size=world,
+                quant="a8w4",
+                w1=w1,
+                w1_scale=w1_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                max_tok_per_rank=max_tok_per_rank,
+                **network,
+            )
             _run_size(
                 moe,
                 x[:batch_size].contiguous(),

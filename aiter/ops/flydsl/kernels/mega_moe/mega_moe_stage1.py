@@ -13,8 +13,6 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
-from ...utils import autotune_compat as autotune
-from ...utils import do_bench_collective
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled
 
@@ -27,13 +25,7 @@ from .dispatch import (
     emit_dispatch_plan,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
-from .stage1_configs import (
-    get_stage1_autotune_configs,
-    prune_stage1_autotune_configs,
-    stage1_config_is_valid,
-)
 
-_AUTOTUNE_SCHEMA = 19
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
 
@@ -69,6 +61,8 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, active_expert_producer: bool = False,
     cooperative_payload_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
+    work_shards: int | None = None, external_grouping: bool | None = None,
+    external_counting: bool | None = None,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
@@ -102,7 +96,10 @@ def compile_mega_moe_stage1(
     assert A_K_STEP_BYTES == 256, "MegaMoE v2 GEMM1 requires tile_k=256"
     K_ITERS = model_dim // tile_k
     TOTAL_THREADS = NUM_WAVES * 64
-    WORK_SHARDS = 4 if int(fuse_mtpr) >= 8192 else 8
+    WORK_SHARDS = 4 if work_shards is None and int(fuse_mtpr) >= 8192 else 8
+    if work_shards is not None:
+        WORK_SHARDS = int(work_shards)
+    assert WORK_SHARDS in (1, 2, 4, 8)
 
     a_lds_size = sort_block_m * A_K_STEP_BYTES
     a_lds_i32 = a_lds_size // 4
@@ -113,9 +110,11 @@ def compile_mega_moe_stage1(
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
-    # Only large EP8/local48 plans amortize cross-CTA grouping.
-    external_grouping = fz_mtpr >= 2048 and fz_npes == 8 and fz_epr == 48 and not active_expert_producer
-    external_counting = external_grouping and fz_mtpr >= 8192
+    if external_grouping is None:
+        external_grouping = fz_mtpr >= 2048 and fz_npes == 8 and fz_epr == 48 and not active_expert_producer
+    if external_counting is None:
+        external_counting = external_grouping and fz_mtpr >= 8192
+    assert not external_counting or external_grouping
     fz_tile_m = int(sort_block_m)
     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
     direct_fixed_slot = _use_direct_fixed_slot(
@@ -387,16 +386,14 @@ def compile_mega_moe_stage1(
     return launch
 
 
-def _run_stage1_config(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
+def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
     tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
     addr_parity, addr_expected, stream, *, model_dim, inter_dim, rank, experts_per_rank, fuse_npes,
-    fuse_topk, fuse_cap, fuse_mtpr, fuse_scale_dim, fixed_slot_dispatch, metadata_block_m, num_cu,
-    tune_tokens, dispatch_constraint, grid_constraint, tile_m_constraint, autotune_schema,
-    sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True, mfma_amajor=False,
-    swizzle_a=True, async_a_copy=False, active_expert_producer=False,
-    cooperative_payload_copy=False, num_dispatch_cu=32, use_tile_resource=True,
-    waves_per_eu_hint=2, b_nt=-1):
-    del metadata_block_m, tune_tokens, dispatch_constraint, grid_constraint, tile_m_constraint, autotune_schema
+    fuse_topk, fuse_cap, fuse_mtpr, fuse_scale_dim, fixed_slot_dispatch, num_cu,
+    sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
+    mfma_amajor=False, swizzle_a=True, async_a_copy=False, active_expert_producer=False,
+    cooperative_payload_copy=False, num_dispatch_cu=32, use_tile_resource=True, waves_per_eu_hint=2,
+    b_nt=-1, work_shards=None, external_grouping=None, external_counting=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -406,44 +403,12 @@ def _run_stage1_config(out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids
         async_a_copy=async_a_copy, active_expert_producer=active_expert_producer,
         cooperative_payload_copy=cooperative_payload_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
-        b_nt=b_nt,
+        b_nt=b_nt, work_shards=work_shards, external_grouping=external_grouping,
+        external_counting=external_counting,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,
         tokens, addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc,
         addr_parity, addr_expected, stream,
     )
-# fmt: on
-
-
-# fmt: off
-@functools.lru_cache(maxsize=None)
-def make_stage1_autotuner(dispatch_cu=None, grid_mult=None, tile_m_values=(32,)):
-    configs = get_stage1_autotune_configs(
-        dispatch_cu=dispatch_cu, grid_mult=grid_mult, tile_m_values=tile_m_values
-    )
-    def default(*args, **kwargs):
-        sig_args = dict(zip(tuner.arg_names, args))
-        sig_args.update(kwargs)
-        return prune_stage1_autotune_configs(configs, sig_args)[0]
-
-    key = [
-        "model_dim", "inter_dim", "experts_per_rank", "fuse_npes", "fuse_topk", "fuse_cap", "fuse_mtpr",
-        "fuse_scale_dim", "fixed_slot_dispatch", "metadata_block_m", "num_cu", "tune_tokens",
-        "dispatch_constraint", "grid_constraint", "tile_m_constraint", "autotune_schema",
-    ]
-    artifact_key = [
-        "model_dim", "inter_dim", "experts_per_rank", "fuse_npes", "fuse_topk", "fuse_scale_dim",
-        "fixed_slot_dispatch", "metadata_block_m", "num_cu", "tune_tokens", "dispatch_constraint",
-        "grid_constraint", "tile_m_constraint", "autotune_schema",
-    ]
-    tuner = autotune(
-        configs=configs, key=key, warmup=2, rep=7,
-        prune_configs_by=prune_stage1_autotune_configs, do_bench=do_bench_collective,
-        default=default, artifact_name="mega-moe-v2-stage1", artifact_bundle=True,
-        artifact_key=artifact_key, artifact_nearest_key="tune_tokens",
-        artifact_validator=stage1_config_is_valid,
-    )(_run_stage1_config)
-    tuner.schema = _AUTOTUNE_SCHEMA
-    return tuner
 # fmt: on

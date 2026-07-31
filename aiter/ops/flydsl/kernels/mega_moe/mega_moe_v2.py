@@ -2,67 +2,20 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import functools
-import os
-from pathlib import Path
-
 import mori.shmem as ms
 import torch
 
 import flydsl.expr as fx
-from flydsl.autotune import Config
-
-from ...utils import autotune_compat as autotune
-from ...utils import do_bench_collective
 from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
 
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
+from .mega_moe_config import FIXED_SLOT_MAX_MTPR, MegaMoEConfig, Stage1Config, select_mega_moe_config
 from .quant import per_1x32_mx_quant
 
 __all__ = ["MegaMoEV2"]
-_JOINT_AUTOTUNE_SCHEMA = 7
-_STAGE2_P2P_QUANT_TYPES = ("auto", "none", "fp8_blockwise_1x32")
-_AUTO_FP8_MIN_TOKENS = 1024
-_COMPACT_DISPATCH_MIN_MTPR = 256
-_AUTOTUNE_CONFIG_DIR = Path(__file__).with_name("autotune_configs")
-if _AUTOTUNE_CONFIG_DIR.is_dir():
-    os.environ.setdefault("FLYDSL_AUTOTUNE_CONFIG_DIR", str(_AUTOTUNE_CONFIG_DIR))
-
-
-def _resolve_stage2_p2p_quant(mode, run_tokens):
-    if mode == "auto":
-        return "fp8_blockwise_1x32" if run_tokens > _AUTO_FP8_MIN_TOKENS else "none"
-    return mode
-
-
-# fmt: off
-def _run_joint_sbm_config(owner, x, scales, wts, topk_ids, stream, slice_output, *, SBM, tune_tokens,
-    model_dim, inter_dim, experts, topk, rank, npes, max_tok, sbm_candidates, autotune_schema):
-    del model_dim, inter_dim, experts, topk, rank, npes, max_tok, sbm_candidates, autotune_schema
-    sorted_block_m = owner._run_fused_stage1(x, wts, scales, topk_ids, stream=stream, tile_m=SBM)
-    owner._joint_output = owner._run_stage2(int(tune_tokens), stream, slice_output, sorted_block_m)
-
-
-@functools.lru_cache(maxsize=None)
-def _make_joint_sbm_autotuner(tile_m_values):
-    configs = [Config(SBM=int(tile_m)) for tile_m in tile_m_values]
-    key = [
-        "tune_tokens", "model_dim", "inter_dim", "experts", "topk", "npes", "max_tok",
-        "sbm_candidates", "autotune_schema",
-    ]
-    artifact_key = [
-        "tune_tokens", "model_dim", "inter_dim", "experts", "topk", "npes",
-        "sbm_candidates", "autotune_schema",
-    ]
-    return autotune(
-        configs=configs, key=key, warmup=2, rep=7, do_bench=do_bench_collective,
-        default=configs[0], artifact_name="mega-moe-v2-joint-sbm", artifact_bundle=True,
-        artifact_key=artifact_key, artifact_nearest_key="tune_tokens",
-    )(_run_joint_sbm_config)
-# fmt: on
 
 
 class MegaMoEV2:
@@ -71,29 +24,14 @@ class MegaMoEV2:
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, tune_tokens: int | None = None, mega_scheme: str = "fixedslot",
-        gemm2_tile_m: int = -1, gemm2_tile_n: int = -1, gemm2_tile_k: int = -1,
-        enable_fused_stage1: bool = True, enable_fused_stage2: bool = True, gate_mode=None,
-        stage1_dispatch_cu: int | None = None, stage1_grid_mult: int | None = None,
-        stage1_tile_m_values: tuple[int, ...] | None = None, stage2_p2p_quant: str = "auto"):
+        max_tok_per_rank: int, mega_scheme: str = "fixedslot"):
     # fmt: on
-        if not enable_fused_stage1 or not enable_fused_stage2:
-            raise ValueError("MegaMoEV2 requires enable_fused_stage1=True and enable_fused_stage2=True")
         if quant != "a8w4":
             raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
-        if stage2_p2p_quant not in _STAGE2_P2P_QUANT_TYPES:
-            raise ValueError(
-                "stage2_p2p_quant must be 'auto', 'none', or 'fp8_blockwise_1x32', "
-                f"got {stage2_p2p_quant!r}"
-            )
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
-        mode = getattr(gate_mode, "value", gate_mode)
-        if mode not in (None, "interleave"):
-            raise ValueError("MegaMoEV2 requires interleaved gate/up weights")
-        del gemm2_tile_m, gemm2_tile_n, gemm2_tile_k
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.model_dim = int(model_dim)
@@ -101,25 +39,11 @@ class MegaMoEV2:
         self.experts = int(experts)
         self.epr = int(experts // world_size)
         self.topk = int(topk)
-        self.quant = quant
         self.mtpr = int(max_tok_per_rank)
         self.dev = torch.device("cuda", rank)
         self.max_recv = self.world_size * self.mtpr
-        self.enable_fused_stage1 = True
-        self.enable_fused_stage2 = True
-        self.gate_mode = "interleave"
-        self.mega_scheme = mega_scheme
-        self._stage2_p2p_quant = stage2_p2p_quant
-        self._v2_dispatch_cu = None if stage1_dispatch_cu is None else int(stage1_dispatch_cu)
-        self._v2_grid_mult = None if stage1_grid_mult is None else int(stage1_grid_mult)
-        if stage1_tile_m_values is None:
-            token_capacity = int(max_tok_per_rank if tune_tokens is None else tune_tokens)
-            stage1_tile_m_values = (32,) if token_capacity < 256 else (32, 64, 128)
-        self._v2_tile_m_values = tuple(sorted({int(tile_m) for tile_m in stage1_tile_m_values}))
-        if not self._v2_tile_m_values or any(tile_m not in (32, 64, 128) for tile_m in self._v2_tile_m_values):
-            raise ValueError("stage1_tile_m_values must contain only 32, 64, and/or 128")
-        capacity_tile_m = max(self._v2_tile_m_values)
-        compact = self.mtpr >= _COMPACT_DISPATCH_MIN_MTPR or self.epr > 64
+        compact = self.mtpr > FIXED_SLOT_MAX_MTPR
+        capacity_tile_m = 128 if compact else 32
         self._s1_fixed_slot = not compact
         self._s1_scale_dim = self.model_dim // 32
         # fmt: off
@@ -137,12 +61,11 @@ class MegaMoEV2:
         self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        self._joint_sbm_tuner = _make_joint_sbm_autotuner(self._v2_tile_m_values)
 
     def _build_fused_stage1(self, w1, w1_scale):
-        from .mega_moe_stage1 import make_stage1_autotuner
+        from .mega_moe_stage1 import run_mega_moe_stage1
 
-        self.sort_block_m = min(self._v2_tile_m_values)
+        self.sort_block_m = 32
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -160,11 +83,7 @@ class MegaMoEV2:
         self._s1_epoch_expected = torch.zeros(2, dtype=torch.int32, device=self.dev)
         self._s1_num_cu = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         self._allocate_dispatch_workspace(op)
-        self._s1_mega = make_stage1_autotuner(self._v2_dispatch_cu, self._v2_grid_mult, self._v2_tile_m_values)
-        self._s1_mega_by_tile = {
-            tile_m: make_stage1_autotuner(self._v2_dispatch_cu, self._v2_grid_mult, (tile_m,))
-            for tile_m in self._v2_tile_m_values
-        }
+        self._s1_mega = run_mega_moe_stage1
 
         v = op._ll_views()
         self._s1_rx = v["rx_em"]
@@ -246,7 +165,12 @@ class MegaMoEV2:
         table[DispatchSlot.P2P_RUNNING] = op.p2p_running.data_ptr()
         self._s1_disp = torch.tensor(table, dtype=torch.int64, device=self.dev)
 
-    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, tile_m=None):
+    def _select_config(self, tokens: int) -> MegaMoEConfig:
+        config = select_mega_moe_config(tokens, self.mtpr)
+        self._active_config = config
+        return config
+
+    def _run_fused_stage1(self, x, wts, scales, topk_ids, stream=None, config: Stage1Config | None = None):
         if stream is None:
             stream = fx.Stream(torch.cuda.current_stream())
         cur_tok = int(x.shape[0])
@@ -266,47 +190,43 @@ class MegaMoEV2:
             raise ValueError(f"topk_ids must have shape ({cur_tok}, {self.topk})")
         if not scales.is_contiguous():
             raise ValueError("scales must be contiguous")
+        if config is None:
+            config = self._select_config(cur_tok).stage1
         op = self._s1_op
-        joint_config = self._joint_sbm_tuner.last_config
-        if tile_m is None and joint_config is not None:
-            tile_m = int(joint_config.kwargs["SBM"])
-        tuner = self._s1_mega if tile_m is None else self._s1_mega_by_tile[int(tile_m)]
-        tile_m_values = self._v2_tile_m_values if tile_m is None else (int(tile_m),)
-        metadata_block_m = self.sort_block_m if tile_m is None else int(tile_m)
         # fmt: off
-        tuner(self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
+        self._s1_mega(
+            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
             op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(cur_tok), fx.Int64(x.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()),
             fx.Int64(self._s1_epoch_parity.data_ptr()), fx.Int64(self._s1_epoch_expected.data_ptr()),
-            stream, model_dim=self.model_dim, inter_dim=self.inter_dim,
-            rank=self.rank, experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
+            stream, model_dim=self.model_dim, inter_dim=self.inter_dim, rank=self.rank,
+            experts_per_rank=self.epr, fuse_npes=self.world_size, fuse_topk=self.topk,
             fuse_cap=self._s1_cap, fuse_mtpr=self.mtpr, fuse_scale_dim=self._s1_scale_dim,
-            fixed_slot_dispatch=self._s1_fixed_slot, metadata_block_m=metadata_block_m,
-            num_cu=self._s1_num_cu,
-            tune_tokens=cur_tok, dispatch_constraint=-1 if self._v2_dispatch_cu is None else self._v2_dispatch_cu,
-            grid_constraint=-1 if self._v2_grid_mult is None else self._v2_grid_mult,
-            tile_m_constraint=",".join(str(v) for v in tile_m_values), autotune_schema=tuner.schema)
+            fixed_slot_dispatch=self._s1_fixed_slot, num_cu=self._s1_num_cu,
+            sort_block_m=config.sort_block_m, tile_n=config.tile_n, tile_k=config.tile_k,
+            num_waves=config.num_waves, grid_mult=config.grid_mult, pipe_weights=config.pipe_weights,
+            mfma_amajor=config.mfma_amajor, swizzle_a=config.swizzle_a,
+            async_a_copy=config.async_a_copy, active_expert_producer=config.active_expert_producer,
+            cooperative_payload_copy=config.cooperative_payload_copy,
+            num_dispatch_cu=config.num_dispatch_cu, use_tile_resource=config.use_tile_resource,
+            waves_per_eu_hint=config.waves_per_eu_hint, b_nt=config.b_nt,
+            work_shards=config.work_shards, external_grouping=config.external_grouping,
+            external_counting=config.external_counting)
         # fmt: on
-        self._s1_active_tile_m = int(tuner.last_config.kwargs["sort_block_m"])
+        self._s1_active_tile_m = config.sort_block_m
         return self._s1_active_tile_m
 
     def quantize(self, x_bf16):
         return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
 
     def _run_joint(self, x, scales, wts, topk_ids, run_tokens, stream, slice_output):
-        # fmt: off
-        self._joint_sbm_tuner(
-            self, x, scales, wts, topk_ids, stream, slice_output, tune_tokens=int(run_tokens),
-            model_dim=self.model_dim, inter_dim=self.inter_dim, experts=self.experts, topk=self.topk,
-            rank=self.rank, npes=self.world_size, max_tok=self.mtpr,
-            sbm_candidates=",".join(str(v) for v in self._v2_tile_m_values),
-            autotune_schema=_JOINT_AUTOTUNE_SCHEMA)
-        # fmt: on
-        return self._joint_output
+        config = self._select_config(run_tokens)
+        self._run_fused_stage1(x, wts, scales, topk_ids, stream=stream, config=config.stage1)
+        return self._run_stage2(run_tokens, stream, slice_output, config)
 
-    def _run_stage2(self, run_tokens, stream, slice_output, sorted_block_m):
-        ret = self._run_fused_stage2(run_tokens, sorted_block_m, stream)
+    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
+        ret = self._run_fused_stage2(run_tokens, config, stream)
         out_tok = ret[0] if isinstance(ret, (tuple, list)) else ret
         if out_tok is None:
             cfg = self.comb_cfg
@@ -340,7 +260,7 @@ class MegaMoEV2:
     __call__ = forward
 
     def _build_fused_stage2(self):
-        from .mega_moe_stage2 import make_gemm2_autotuner
+        from .mega_moe_stage2 import run_mega_moe_stage2
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
         comb_cfg = self.comb_cfg
@@ -349,21 +269,14 @@ class MegaMoEV2:
         cu_num = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
         self._g2v2_inter = int(self.inter_dim)
         self._g2v2_hidden = int(comb_cfg.hidden_dim)
-        quant_modes = (
-            ("none", "fp8_blockwise_1x32")
-            if self._stage2_p2p_quant == "auto"
-            else (self._stage2_p2p_quant,)
-        )
-        self._g2_tuners = {}
+        self._g2_run = run_mega_moe_stage2
         self._g2_invariants_by_quant = {}
-        for p2p_quant in quant_modes:
-            tuner = make_gemm2_autotuner(a_dtype="fp8", p2p_quant_type=p2p_quant)
+        for p2p_quant in ("none", "fp8_blockwise_1x32"):
             p2p_row_nbytes = (
                 int(comb_cfg.hidden_dim) + int(comb_cfg.hidden_dim) // 32
                 if p2p_quant == "fp8_blockwise_1x32"
                 else int(comb_cfg.hidden_dim) * 2
             )
-            self._g2_tuners[p2p_quant] = tuner
             self._g2_invariants_by_quant[p2p_quant] = {
                 "model_dim": int(comb_cfg.hidden_dim), "inter_dim": int(self.inter_dim),
                 "experts": int(comb_cfg.num_experts_per_rank), "topk": int(k), "rank": int(comb_cfg.rank),
@@ -371,35 +284,36 @@ class MegaMoEV2:
                 "recv_cap": int(self.max_recv),
                 "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * p2p_row_nbytes,
                 "HIDDEN_MAX": int(comb_cfg.hidden_dim), "INTER_MAX": int(self.inter_dim), "cu_num": int(cu_num),
-                "autotune_schema": tuner.schema, "p2p_quant_type": p2p_quant,
-                "fixed_slot_dispatch": bool(self._s1_fixed_slot),
+                "p2p_quant_type": p2p_quant, "fixed_slot_dispatch": bool(self._s1_fixed_slot),
             }
-        initial_quant = _resolve_stage2_p2p_quant(self._stage2_p2p_quant, 0)
-        self._g2_tuner = self._g2_tuners[initial_quant]
-        self._g2_invariants = self._g2_invariants_by_quant[initial_quant]
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
         )
 
-    def _run_fused_stage2(self, run_tokens, sorted_block_m, stream=None):
+    def _run_fused_stage2(self, run_tokens, config: MegaMoEConfig, stream=None):
         comb_op = self.comb_op
         op = self._s1_op
         if stream is None:
             stream = torch.cuda.current_stream()
         s_fx = fx.Stream(stream.cuda_stream)
-        p2p_quant = _resolve_stage2_p2p_quant(self._stage2_p2p_quant, run_tokens)
-        self._g2_tuner = self._g2_tuners[p2p_quant]
-        self._g2_invariants = self._g2_invariants_by_quant[p2p_quant]
+        stage2 = config.stage2
+        p2p_quant = config.p2p_quant
+        invariants = self._g2_invariants_by_quant[p2p_quant]
         # fmt: off
-        self._g2_tuner(
+        self._g2_run(
             fx.Int64(self._s1_out.view(-1).data_ptr()), fx.Int64(self._s1_osd.data_ptr()),
             fx.Int64(self.w2.data_ptr()), fx.Int64(self.w2_scale.data_ptr()),
             fx.Int64(op.sorted_expert_ids.data_ptr()), fx.Int64(op.num_valid.data_ptr()),
             fx.Int64(op.srcmap_em.data_ptr()), fx.Int64(op.wts_em.data_ptr()),
             fx.Int64(op.tile_row_base.data_ptr()), comb_op._fx_p2p_comb_inp, self._s1_nvm,
-            self._g2v2_inter, self._g2v2_hidden, s_fx,
-            tune_tokens=int(run_tokens), SBM=int(sorted_block_m), **self._g2_invariants)
+            self._g2v2_inter, self._g2v2_hidden, s_fx, BM=stage2.block_m,
+            SBM=config.stage1.sort_block_m, BN=stage2.block_n, BK=stage2.block_k,
+            use_nt=stage2.use_nt, g2_bhoist=stage2.b_hoist,
+            g2_ascale_pf=stage2.ascale_prefetch, g2_spart=stage2.spatial_partition,
+            persist=stage2.persist, persist_cu=stage2.persist_cu,
+            persist_strided=stage2.persist_strided, g2_bf16_lds=stage2.bf16_lds, **invariants)
         # fmt: on
+        self._g2_active_block_m = stage2.block_m
         return comb_op.combine_no_stage1(
             self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,
             stage2_p2p_quant=p2p_quant,
