@@ -133,9 +133,9 @@ struct opus_mqa_logits_traits {
     // Data-type aliases the kernel refers to.
     using D_DATA   = mqa_logits_fp8_t;    // Q / KV data (E4M3), MFMA A/B operand element
     using D_WEIGHT = mqa_logits_bf16_t;   // per-head weights
-    using D_ACC    = float;               // MFMA accumulator (C)
-    using D_OUT    = float;               // output logits
-    using D_SCALE  = int;                 // E8M0 blockscale, packed as an int32 dword per lane
+    using D_ACC    = float;    // MFMA accumulator (C)
+    using D_OUT    = float;    // output logits
+    using D_SCALE  = int;      // E8M0 blockscale, packed as an int32 dword per lane
 
     // MFMA: scaled f8f6f4, 16x16x128 (M x N x K). K covers 128 head_dim in one shot.
     static constexpr int MFMA_M = 16;
@@ -145,16 +145,17 @@ struct opus_mqa_logits_traits {
     static constexpr int SCALE_BLOCK = 32;                 // E8M0 blockscale granularity
     static constexpr int K_CHUNKS    = MFMA_K / SCALE_BLOCK; // 4 (32-elem chunks per 128-K)
 
-    static constexpr int m_tiles = N_HEADS / MFMA_M;       // 4  (head tiles along M)
-    static constexpr int k_tiles = HEAD_DIM / MFMA_K;      // 1  (outer K loop)
+    static constexpr int M_TILES = N_HEADS / MFMA_M;       // 4  (head tiles along M)
+    static constexpr int K_TILES = HEAD_DIM / MFMA_K;      // 1  (outer K loop)
 
-    static constexpr int N_TILES          = KV_TILE_SIZE / MFMA_N;    // 16
-    static constexpr int N_TILES_PER_WARP = N_TILES / NUM_WARPS;      // 4
+    static constexpr int N_TOTAL_TILES          = KV_TILE_SIZE / MFMA_N;    // 16
+    static constexpr int N_TILES = N_TOTAL_TILES / NUM_WARPS;      // 4
     static constexpr int TILES_PER_BLOCK  = PAGE_SIZE / MFMA_N;       // 4 (MFMA_N tiles per page)
     // #physical blocks a warp's NTPW tiles span (1 => all NTPW share one page).
-    static constexpr int N_PHYS = (N_TILES_PER_WARP + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK; // 1
+    static constexpr int N_PHYS = (N_TILES + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK; // 1
 
-    static constexpr int ELEM_BYTES = 1;   // fp8 = 1 byte/elem
+    static constexpr int ELEM_BYTES = sizeof(D_DATA);   // fp8 = 1 byte/elem
+    static constexpr int DWORDx4_BYTES = 16;
 
     // MI350 fp8 16x16x128 register layout: lane g=lane/16 holds
     //   vgpr0-3 = K[g*16 : +16]  and  vgpr4-7 = K[64 + g*16 : +16]  (two 16-K groups).
@@ -168,8 +169,8 @@ struct opus_mqa_logits_traits {
     static constexpr int LANE_M_GROUPS = WARP_SIZE / MFMA_M;              // 4: 16-lane groups per wave (lane_div_16 range)
     static constexpr int VGRP_PER_LANE = A_BYTES_PER_LANE / KV_GRP_BYTES;  // 2: 16-elem K groups per A/B fragment
 
-    // q_scale preshuffle: [T, K_TILES, 4, 16, QS_PAD]; QS_PAD = round_up(m_tiles,4).
-    static constexpr int QS_DW  = (m_tiles + 3) / 4;   // 1
+    // q_scale preshuffle: [T, K_TILES, 4, 16, QS_PAD]; QS_PAD = round_up(M_TILES,4).
+    static constexpr int QS_DW  = (M_TILES + 3) / 4;   // 1
     static constexpr int QS_PAD = QS_DW * 4;           // 4
 
     // ---- byte strides for paged KV cache [num_blocks, K_TILES, 8(c), PAGE, 16] ----
@@ -179,19 +180,47 @@ struct opus_mqa_logits_traits {
     static constexpr int VGRP_CHUNK_HI  = 4;                            // vgpr4-7 chunk = g + 4
     static constexpr int stride_kv_chunk = PAGE_SIZE * KV_GRP_BYTES;    // one 16-K chunk across page
     static constexpr int stride_kv_ktile = K16_PER_TILE * stride_kv_chunk;
-    static constexpr int stride_kv_block = k_tiles * stride_kv_ktile;
+    static constexpr int stride_kv_block = K_TILES * stride_kv_ktile;
     // ---- byte strides for kv_scale [num_blocks, K_TILES, 4, PAGE] (e8m0, 1 byte) ----
     static constexpr int stride_kvs_ktile = K_CHUNKS * PAGE_SIZE;
-    static constexpr int stride_kvs_block = k_tiles  * stride_kvs_ktile;
+    static constexpr int stride_kvs_block = K_TILES  * stride_kvs_ktile;
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // async-Q via LDS (mirrors gqa_d128 trait names; fp8 => ELEM_BYTES == 1).
+    // Feeds make_layout_gq (global->LDS) / make_layout_sq (LDS store) / make_layout_rq
+    // (LDS->reg) in the kernel template.
+    // ─────────────────────────────────────────────────────────────────────────────
+    // Vector length (elements) for the async global load / LDS store of Q. 16 fp8 = 16 B = dwordx4.
+    static constexpr int VEC_Q  = DWORDx4_BYTES / ELEM_BYTES;
+    static constexpr int VEC_KV = 16;   // (make_layout_sq reuses this as the LDS-store VEC)
+
+    // 128-byte async-copy granule in elements. For fp8 the 128-elem head dim == one 128B
+    // granule, so smem_d_rpt == 1 (bf16 mha would get 2).
+    static constexpr int D_128B_SIZE      = 128 / ELEM_BYTES;                 // 128
+    static constexpr int smem_linear_wave = WARP_SIZE * DWORDx4_BYTES / ELEM_BYTES;      // 1024 (elems/wave/pass)
+    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;   // 8
+    static constexpr int smem_d_rpt       = HEAD_DIM / D_128B_SIZE;           // 1
+
+    // Q staged whole (all N_HEADS rows) through LDS -> the "n" tile size is N_HEADS.
+    static constexpr int smem_n_q_rpt = N_HEADS / smem_n_per_wave; // 8
+
+    static constexpr int smem_padding_16B = 16 / ELEM_BYTES;   // 16
+    static constexpr int smem_padding_32B = 32 / ELEM_BYTES;   // 32
+    static constexpr int smem_padding_64B = 64 / ELEM_BYTES;   // 64
+
+    // LDS tile for Q (padded, elements) + byte size for the __shared__ allocation.
+    static constexpr int smem_q_padding    = smem_padding_32B;
+    static constexpr int smem_q_tile_elems = smem_n_q_rpt * smem_d_rpt * (smem_linear_wave + smem_q_padding);
+    static constexpr size_t smem_size_bytes() { return (size_t)smem_q_tile_elems * ELEM_BYTES; }
 
     static_assert(HEAD_DIM % MFMA_K == 0, "HEAD_DIM must be a multiple of MFMA_K (128)");
     static_assert(N_HEADS % MFMA_M == 0, "N_HEADS must be a multiple of MFMA_M (16)");
-    static_assert(m_tiles <= 8, "m_tiles > 8 unsupported (use N_HEADS <= 128)");
+    static_assert(M_TILES <= 8, "M_TILES > 8 unsupported (use N_HEADS <= 128)");
     static_assert(KV_TILE_SIZE % MFMA_N == 0, "KV_TILE must be a multiple of MFMA_N");
-    static_assert(N_TILES % NUM_WARPS == 0, "N_TILES must be a multiple of NUM_WARPS");
+    static_assert(N_TOTAL_TILES % NUM_WARPS == 0, "N_TOTAL_TILES must be a multiple of NUM_WARPS");
     static_assert(PAGE_SIZE % MFMA_N == 0, "PAGE must be a multiple of MFMA_N");
     static_assert(KV_TILE_SIZE % PAGE_SIZE == 0, "KV_TILE must be a multiple of PAGE");
-    static_assert(N_TILES_PER_WARP == 4, "kernel currently assumes N_TILES_PER_WARP == 4");
+    static_assert(N_TILES == 4, "kernel currently assumes N_TILES == 4");
     static_assert(N_PHYS == 1, "kernel currently assumes N_PHYS == 1 (NTPW tiles share one page)");
 };
 
@@ -218,6 +247,8 @@ template<class T> __global__ void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kar
 
 namespace opus_logits {
 
+using opus::operator""_I;
+
 // ── sched_group_barrier co-exec control (mha idiom) ──────────────────────────────────────────
 // LLVM SchedGroup masks: pin which instruction classes land in each ordered group so the
 // scaled-MFMA shadow gets filled with exactly the ops that CAN co-execute with it.
@@ -234,11 +265,21 @@ __device__ inline void sched_mfma_pairs() {
     if constexpr (Pairs > 1) sched_mfma_pairs<Pairs - 1, OTHER_MASK, CNT, Group>();
 }
 
-// Butterfly add across the XOR-partner lane (head reduction step).
-__device__ inline float bperm_xor_add(float v, int lane, int sh) {
-    int peer_byte = (lane ^ sh) << 2;   // ds_bpermute addresses in bytes (lane*4)
-    int peer = __builtin_amdgcn_ds_bpermute(peer_byte, __builtin_bit_cast(int, v));
-    return v + __builtin_bit_cast(float, peer);
+// Head reduction across the 4 lane-groups (lane_div_16 = 0..3): butterfly-add over lane^32
+// then lane^16 via v_permlane{32,16}_swap_b32 (ALU cross-lane, no LDS / no lgkmcnt) instead
+// of 2x ds_bpermute. hk_mla idiom: seed both regs from val with an OPAQUE v_mov (blocks the
+// optimizer coalescing a onto b, and gives the scheduler slack for the swap's HW wait state),
+// then a=self / b=partner after the swap -> a+b = the butterfly add. (The permlane16 *builtin*
+// is unused across the codebase / mis-lowers; the asm form is the proven-correct path.)
+__device__ inline float permlane_head_reduce(float v) {
+    int a = __builtin_bit_cast(int, v), b = a;
+    asm("v_mov_b32_e32 %0, %1\n\t" : "=v"(a) : "v"(b));
+    asm("v_permlane32_swap_b32 %0, %1\n\t" : "+v"(a), "+v"(b));
+    v = __builtin_bit_cast(float, a) + __builtin_bit_cast(float, b);   // += lane^32
+    a = __builtin_bit_cast(int, v); b = a;
+    asm("v_mov_b32_e32 %0, %1\n\t" : "=v"(a) : "v"(b));
+    asm("v_permlane16_swap_b32 %0, %1\n\t" : "+v"(a), "+v"(b));
+    return __builtin_bit_cast(float, a) + __builtin_bit_cast(float, b); // += lane^16
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +293,7 @@ __device__ inline float bperm_xor_add(float v, int lane, int sh) {
 template<class T>
 __device__ inline auto make_layout_q(int lane_mod_16, int lane_div_16) {
     constexpr auto shape = opus::make_tuple(
-        opus::number<T::m_tiles>{},        // m-tile              (y, outer)
+        opus::number<T::M_TILES>{},        // m-tile              (y, outer)
         opus::number<T::VGRP_PER_LANE>{},  // 16-K group (hi/lo)  (y)
         opus::number<T::MFMA_M>{},         // head row in tile    (p: lane_mod_16)
         opus::number<T::K_CHUNKS>{},       // K group g           (p: lane_div_16)
@@ -270,6 +311,86 @@ __device__ inline auto make_layout_q(int lane_mod_16, int lane_div_16) {
             opus::number<T::HEAD_DIM>{},             // head row
             opus::number<1>{})),                     // (g, VEC) base=1 -> g=KV_GRP_ELEMS(16), VEC=1
         opus::unfold_p_coord(dim, opus::make_tuple(lane_mod_16, lane_div_16)));
+}
+
+
+
+// ─── Q global→shared load layout (async-Q via LDS), parameterized on N tile size ───
+// Identical machinery to make_layout_gk_gv but for an arbitrary N tile (Q uses the whole
+// NUM_WARPS*Q_TILE block). Q shares K's head dim (128) so uses T::smem_d_rpt.
+template<typename T>
+__device__ inline auto make_layout_gq(int warp_id, int lane_id, int stride_q_n) {
+    constexpr int threads_d = T::D_128B_SIZE / T::VEC_Q;  // 8
+    constexpr int threads_n_per_block = T::BLOCK_SIZE / threads_d;
+    constexpr int threads_n_per_wave = opus::get_warp_size() / threads_d; // 8
+
+    constexpr auto gq_block_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt>{},
+        opus::number<T::N_HEADS / threads_n_per_block>{},
+        opus::number<threads_n_per_wave>{},
+        opus::number<T::NUM_WARPS>{},
+        opus::number<threads_d>{},
+        opus::number<T::VEC_Q>{});
+
+    constexpr auto gq_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
+
+    return opus::make_layout(
+        gq_block_shape,
+        opus::unfold_x_stride(gq_block_dim, gq_block_shape, opus::tuple{opus::number<T::D_128B_SIZE>{}, stride_q_n, 1_I}),
+        opus::unfold_p_coord(gq_block_dim, opus::tuple{lane_id / threads_d, warp_id, lane_id % threads_d}));
+}
+
+// ─── Q shared store layout (async-Q), parameterized on d-chunk count + padding ───
+template<typename T>
+__device__ inline auto make_layout_sq(int warp_id) {
+    constexpr int n_q_rpt = T::smem_n_q_rpt / T::NUM_WARPS;
+    constexpr auto s_block_shape = opus::make_tuple(
+        opus::number<T::smem_d_rpt>{},
+        opus::number<T::NUM_WARPS>{},
+        opus::number<n_q_rpt>{},
+        opus::number<T::VEC_KV>{});
+
+    constexpr auto s_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}));
+
+    return opus::make_layout(
+        s_block_shape,
+        opus::unfold_x_stride(s_block_dim, s_block_shape, opus::tuple{opus::number<T::smem_linear_wave * n_q_rpt + T::smem_q_padding>{}, opus::number<T::smem_linear_wave>{}, 1_I}),
+        opus::unfold_p_coord(s_block_dim, opus::tuple{warp_id}));
+}
+
+// ─── Q shared→register read layout (async-Q, feeds gemm0 a-operand) ───
+template<typename T>
+__device__ inline auto make_layout_rq(int warp_id, int lane_id) {
+    constexpr int n_q_rpt = T::smem_n_q_rpt / T::NUM_WARPS;
+
+    constexpr auto rq_block_shape = opus::make_tuple(
+        opus::number<T::NUM_WARPS>{},
+        opus::number<T::M_TILES>{},
+        opus::number<T::MFMA_M / T::NUM_WARPS>{},
+        opus::number<T::smem_d_rpt>{},
+        opus::number<T::K_TILES / T::smem_d_rpt>{},
+        opus::number<T::VGRP_PER_LANE>{},    // vgpr group
+        opus::number<opus::get_warp_size() / T::MFMA_M>{},
+        opus::number<T::VEC_Q>{});
+
+    constexpr auto rq_block_dim = opus::make_tuple(
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::y_dim{}, opus::p_dim{}, opus::y_dim{}));
+
+    auto lane_id_n = lane_id % T::MFMA_M;
+
+    return opus::make_layout(
+        rq_block_shape,
+        opus::unfold_x_stride(rq_block_dim, rq_block_shape, opus::tuple{opus::number<T::smem_linear_wave * n_q_rpt + T::smem_q_padding>{}, opus::number<T::D_128B_SIZE>{}, opus::number<T::NUM_WARPS * (T::smem_linear_wave * n_q_rpt + T::smem_q_padding)>{}, 1_I}),
+        opus::unfold_p_coord(rq_block_dim, opus::tuple{lane_id_n % T::NUM_WARPS, lane_id_n / T::NUM_WARPS, lane_id / T::MFMA_M}));
 }
 
 // Per-nt KV (B operand), paged [num_blocks,K_TILES,8(c),page,16] fp8: ONE token-tile's i32x8
@@ -341,7 +462,7 @@ __device__ inline auto make_layout_bt(int warp_id) {
 template<class T>
 __device__ inline auto make_layout_w(int lane_div_16) {
     constexpr auto shape = opus::make_tuple(
-        opus::number<T::m_tiles>{},        // m-tile          (y, outer)
+        opus::number<T::M_TILES>{},        // m-tile          (y, outer)
         opus::number<T::LANE_M_GROUPS>{},  // lane_div_16 grp (p)
         opus::number<T::C_FRAG>{});        // VEC = C_FRAG bf16 (y, contiguous, one per head)
     constexpr auto dim = opus::make_tuple(
@@ -360,7 +481,7 @@ __device__ inline auto make_layout_w(int lane_div_16) {
 template<class T>
 __device__ inline auto make_layout_out(int warp_id, int lane_mod_16) {
     constexpr auto shape = opus::make_tuple(
-        opus::number<T::N_TILES_PER_WARP>{}, // token-tile nt              (y)
+        opus::number<T::N_TILES>{}, // token-tile nt              (y)
         opus::number<T::NUM_WARPS>{},        // warp = NTPW*MFMA_N tokens   (p: warp_id)
         opus::number<T::MFMA_N>{});          // token in tile              (p: lane_mod_16)
     constexpr auto dim = opus::make_tuple(
@@ -371,7 +492,7 @@ __device__ inline auto make_layout_out(int warp_id, int lane_mod_16) {
         shape,
         opus::unfold_x_stride(dim, shape, opus::make_tuple(
             opus::number<T::MFMA_N>{},                        // nt stride
-            opus::number<T::N_TILES_PER_WARP * T::MFMA_N>{},  // warp stride (== PAGE tokens)
+            opus::number<T::N_TILES * T::MFMA_N>{},  // warp stride (== PAGE tokens)
             opus::number<1>{})),                              // lane_mod_16 stride
         opus::unfold_p_coord(dim, opus::make_tuple(warp_id, lane_mod_16)));
 }
@@ -386,8 +507,8 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     using D_OUT    = typename T::D_OUT;
 
     constexpr int WARP     = T::WARP_SIZE;          // 64
-    constexpr int NTPW     = T::N_TILES_PER_WARP;   // 4
-    constexpr int MT       = T::m_tiles;            // 4
+    constexpr int NTPW     = T::N_TILES;   // 4
+    constexpr int MT       = T::M_TILES;            // 4
     constexpr int PAGE     = T::PAGE_SIZE;          // 64
     constexpr int HEAD_DIM = T::HEAD_DIM;           // 128
     constexpr int N_HEADS  = T::N_HEADS;            // 64
@@ -415,7 +536,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
 
     // ---- GEMM object (scaled fp8 16x16x128); use its single-tile MMA + accumulator type ----
     auto mma = opus::make_tiled_mma<D_DATA, D_DATA, D_ACC>(
-        opus::seq<MT, NTPW, T::k_tiles>{},                        // expand (E_M,E_N,E_K)
+        opus::seq<MT, NTPW, T::K_TILES>{},                        // expand (E_M,E_N,E_K)
         opus::seq<1, T::NUM_WARPS, 1>{},                          // waves  (T_M,T_N,T_K)
         opus::seq<T::MFMA_M, T::MFMA_N, T::MFMA_K>{});            // wave   (W_M,W_N,W_K)
     using Mma = typename decltype(mma)::MMA;
@@ -426,9 +547,6 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     const D_SCALE*  qs_base = reinterpret_cast<const D_SCALE*>(kargs.ptr_q_scale) + (size_t)row_id * (T::K_CHUNKS * T::MFMA_M);
     const D_WEIGHT* w_base  = reinterpret_cast<const D_WEIGHT*>(kargs.ptr_weights) + (size_t)row_id * N_HEADS;
     const int*      bt_base = kargs.ptr_block_tables + (size_t)batch_id * max_blk;   // fold batch into base
-    // Out base folds ONLY the row (16B-safe: never depends on local_start; fixes the leading-token
-    // drop for local_start % 4 != 0 -- see gcnasm/opus_logits/KNOWN_ISSUE_out_store_alignment.md).
-    // Store offsets are absolute token indices; masking is by forcing a < 0 (OOB) offset (see do_store).
     D_OUT*          out_base  = kargs.ptr_out + (size_t)row_id * kargs.stride_out_row;
     const unsigned  out_bytes = (unsigned)(local_end > 0 ? local_end : 0) * (unsigned)sizeof(D_OUT);
 
@@ -438,37 +556,38 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     auto g_kvs = opus::make_gmem(reinterpret_cast<const D_SCALE*>(kargs.ptr_kv_scale));
     auto g_bt  = opus::make_gmem(bt_base);
     auto g_w   = opus::make_gmem(w_base);
-    auto g_out = opus::make_gmem(out_base, out_bytes);   // OOB size == local_end: drops out-of-window / non-writer (< 0) offsets
+    auto g_out = opus::make_gmem(out_base, out_bytes);   // OOB size == local_end: masks upper bound + neg-biased lanes
 
-    // ---- Hoist Q (i32x8 per m-tile) ----
-    auto u_q = make_layout_q<T>(lane_mod_16, lane_div_16);
-    auto v_q = opus::load<T::KV_GRP_ELEMS>(g_q, u_q);
+    // ---- Q/scale/weight partition layouts + register storage (ALL loads deferred to the
+    // prologue; declared here so the compute lambdas can [&]-capture them). ----
+    // Q staged through LDS (async global->LDS->reg), mirrors mha d128. Q is identical across
+    // warps (M/heads not split by wave: T_M==1) so make_layout_rq is warp-independent; all
+    // 4 warps cooperatively store one Q copy.
+    __shared__ char smem_buf[T::smem_size_bytes()];
+    auto s_q  = opus::make_smem(reinterpret_cast<D_DATA*>(smem_buf));
+    auto u_gq = make_layout_gq<T>(warp_id, lane_id, HEAD_DIM);   // global head stride == HEAD_DIM
+    auto u_sq = make_layout_sq<T>(warp_id);
+    // Issue Q's global->LDS DMA HERE (right after kargs are loaded, before the rest of the
+    // address-setup SALU) so the DMA flies concurrently with those scalar computations. The
+    // sched_barrier pins it above the following SALU (else the scheduler sinks it to the wait).
+    opus::async_load<T::VEC_Q>(g_q, s_q.ptr, u_gq, u_sq, 0);     // Q global -> LDS (DMA)
+    __builtin_amdgcn_sched_barrier(0);
+    auto u_rq = make_layout_rq<T>(warp_id, lane_id);
+    decltype(opus::load<T::VEC_Q>(s_q, u_rq)) v_q;                // Q a-operand regs (filled in prologue)
     auto* q_a = reinterpret_cast<typename Mma::vtype_a*>(&v_q);   // vector_t<D_DATA, 32> per m-tile
 
-    // ---- Hoist Q scale (one dword; byte mi = e8m0 for head-tile mi) ----
-    auto u_qs = make_layout_scale<T>(lane_div_16, lane_mod_16);
-    const int q_scale = opus::load<1>(g_qs, u_qs)[0];
+    auto u_qs = make_layout_scale<T>(lane_div_16, lane_mod_16);   // q scale (one e8m0 dword/lane)
+    int q_scale;
 
-    // ---- Hoist weights (C_FRAG f32 per m-tile, one per head row) with weight_scale folded in ----
-    auto u_w = make_layout_w<T>(lane_div_16);
-    auto v_w = opus::load<T::C_FRAG>(g_w, u_w);
-    auto* w4 = reinterpret_cast<opus::vector_t<D_WEIGHT, T::C_FRAG>*>(&v_w);
-    opus::vector_t<float, T::C_FRAG> w_pl[MT];
-    opus::static_for<MT>([&](auto mic) {
-        constexpr int mi = mic.value;
-        opus::static_for<T::C_FRAG>([&](auto ec) {
-            constexpr int e = ec.value;
-            w_pl[mi][e] = (float)w4[mi][e] * kargs.weight_scale;
-        });
-    });
+    auto u_w = make_layout_w<T>(lane_div_16);                     // weights (C_FRAG bf16/m-tile)
+    opus::vector_t<float, T::C_FRAG> w_pl[MT];                    // weight_scale folded in (prologue)
 
     auto u_kv_nt = make_layout_kv_nt<T>(lane_mod_16, lane_div_16);   // per-nt split KV load
     auto u_kvs = make_layout_scale<T>(lane_div_16, lane_mod_16);
     auto u_bt  = make_layout_bt<T>(warp_id);
-    const int tok_lane_base = warp_id * (NTPW * T::MFMA_N) + lane_mod_16;   // row r's abs out-token = c*block_k + nt*MFMA_N + this
-    // Single-writer lane via a large-negative ADDRESS bias (no compare): only lane_div_16 == 0 stores;
-    // the head reduction leaves all 4 groups with the same out[nt], so the other 3 get a < 0 offset
-    // (below the CTA's smallest out-token base) that the OOB size drops.
+    const int tok_lane_base = warp_id * (NTPW * T::MFMA_N) + lane_mod_16;
+    // -(chunk_start+tile_count)*block_k is below the CTA's smallest absolute out-token base, so with
+    // the in-tile span (< block_k) the biased offset is always <= -1.
     const int lane_bias = (lane_div_16 != 0) ? -(chunk_start + tile_count) * block_k : 0;
     constexpr int pages_per_tile = T::KV_TILE_SIZE / PAGE;   // warps per tile (== NUM_WARPS)
 
@@ -542,23 +661,18 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
         opus::static_for<NTPW>([&](auto ntc) {
             constexpr int nt = ntc.value;
             float ts = acc[nt][0] + acc[nt][1];
-            // head reduce across the LANE_M_GROUPS 16-lane groups: xor MFMA_M then 2*MFMA_M.
-            ts = bperm_xor_add(ts, lane_id, T::MFMA_M);
-            ts = bperm_xor_add(ts, lane_id, 2 * T::MFMA_M);
-            out[nt] = ts;
+            // head reduce across the LANE_M_GROUPS 16-lane groups (lane^16 then lane^32).
+            out[nt] = permlane_head_reduce(ts);
         });
     };
-    // FlyDSL-style masked store (branch-free): per nt, keep the absolute out-token offset if in-window
-    // (with the single-writer bias folded in), else force -1. Out-of-window / non-writer become a < 0
-    // offset that the buffer OOB size drops -- one v_cndmask + one UNCONDITIONAL store per nt, no store_if.
     const unsigned win = (unsigned)(local_end > local_start ? local_end - local_start : 0);
     auto do_store = [&](opus::vector_t<float, NTPW>& out, int t) {
-        const int tile_off = (chunk_start + t) * block_k;
+        const int tile_off = (chunk_start + t) * block_k;                  // absolute token base of the tile
         opus::static_for<NTPW>([&](auto ntc) {
             constexpr int nt = ntc.value;
             const int  abs_tok = tile_off + nt * T::MFMA_N + tok_lane_base;
-            const bool in_win  = (unsigned)(abs_tok - local_start) < win;
-            const int  off     = in_win ? (abs_tok + lane_bias) : -1;
+            const bool in_win  = (unsigned)(abs_tok - local_start) < win;  // both edges in one unsigned check
+            const int  off     = in_win ? (abs_tok + lane_bias) : -1;      // out-of-window / non-writer -> < 0 (OOB)
             g_out.template store<1>(out[nt], off);
         });
     };
@@ -606,8 +720,25 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     int     pgA, pgB;
     opus::vector_t<float, NTPW> outA, outB;   // double-buffered output (phase i even->outA, odd->outB)
 
-    // ---- prologue: chunk-0 -> kvA (+nt=0 -> acc0A), chunk-1 -> kvB; page ids for first reloads (2,3). ----
+    // ---- prologue: Q->LDS DMA already issued above (overlaps the address SALU). Wait for it,
+    // barrier, then load q_scale + weights; chunk-0 -> kvA (+nt=0 -> acc0A), chunk-1 -> kvB. ----
+    opus::s_waitcnt_vmcnt(opus::number<0>{});                    // wait q
+    __builtin_amdgcn_s_barrier();                                // all warps' LDS Q stores visible
+    q_scale = opus::load<1>(g_qs, u_qs)[0];                      // q scale (global -> reg)
+    {                                                            // weights: load + fold weight_scale
+        auto v_w = opus::load<T::C_FRAG>(g_w, u_w);
+        auto* w4 = reinterpret_cast<opus::vector_t<D_WEIGHT, T::C_FRAG>*>(&v_w);
+        opus::static_for<MT>([&](auto mic) {
+            constexpr int mi = mic.value;
+            opus::static_for<T::C_FRAG>([&](auto ec) {
+                constexpr int e = ec.value;
+                w_pl[mi][e] = (float)w4[mi][e] * kargs.weight_scale;
+            });
+        });
+    }
+
     issue_ks(kvA, kvsA, load_page_id(clamp_tile(0)));
+    v_q = opus::load<T::VEC_Q>(s_q, u_rq);
     gemm_nt(acc0A, kvA[0], kvsA, opus::number<0>{});
     issue_ks(kvB, kvsB, load_page_id(clamp_tile(1)));
     pgA = load_page_id(clamp_tile(2));
@@ -645,5 +776,4 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
 
 } // namespace opus_logits
 #endif
-
 #endif  // PA_MQA_LOGITS_MXFP8_IMPL
