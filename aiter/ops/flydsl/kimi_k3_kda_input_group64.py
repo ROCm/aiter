@@ -105,8 +105,8 @@ def kimi_k3_kda_input_group64(
     scale: torch.Tensor,
     output: torch.Tensor | None = None,
     *,
-    rows_per_wave: int = 1,
-    cu_count: int = 240,
+    rows_per_wave: int = 2,
+    cu_count: int = 256,
     weight_cache_modifier: int = 2,
 ) -> torch.Tensor:
     """Launch only after the caller has passed the typed support predicate."""

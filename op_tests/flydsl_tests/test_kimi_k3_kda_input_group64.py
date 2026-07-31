@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
+
 import pytest
 import torch
 
@@ -14,6 +16,8 @@ from aiter.ops.flydsl.kimi_k3_kda_input_group64 import (
     supports_kimi_k3_kda_input_group64,
 )
 
+group64_module = importlib.import_module("aiter.ops.flydsl.kimi_k3_kda_input_group64")
+
 
 def test_support_predicate_fails_closed_off_gpu() -> None:
     tensor = torch.empty(1)
@@ -23,6 +27,34 @@ def test_support_predicate_fails_closed_off_gpu() -> None:
 def test_quantizer_rejects_non_cuda_input() -> None:
     with pytest.raises(ValueError, match="contiguous CUDA BF16"):
         quantize_kimi_k3_kda_input_group64(torch.empty(1, dtype=torch.bfloat16))
+
+
+def test_wrapper_uses_validated_gfx950_schedule_by_default(monkeypatch) -> None:
+    hidden = torch.empty((1, 7168), dtype=torch.bfloat16)
+    weight = torch.empty((6284, 7168), dtype=torch.float8_e4m3fn)
+    scale = torch.empty((6284, 112), dtype=torch.float32)
+    output = torch.empty((1, 6288), dtype=torch.bfloat16)
+    schedules = []
+    launches = []
+
+    monkeypatch.setattr(
+        group64_module,
+        "supports_kimi_k3_kda_input_group64",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        group64_module,
+        "_launcher",
+        lambda *args: (
+            schedules.append(args) or (lambda *args, **kwargs: launches.append(args))
+        ),
+    )
+    monkeypatch.setattr(group64_module, "ptr_arg", lambda tensor: tensor)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
+
+    assert kimi_k3_kda_input_group64(hidden, weight, scale, output) is output
+    assert schedules == [(2, 256, 2)]
+    assert len(launches) == 1
 
 
 @pytest.mark.parametrize("rows_per_wave", [0, 5])
