@@ -777,7 +777,8 @@ def _moe_gemm_a4w4_prefill(
             ) % M
         else:
             offs_x_m_scales = gl.convert_layout(
-                offs_x_m, gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES)
+                gl.where(mask_idx, offs_x_m, 0),
+                gl.SliceLayout(1, BLOCKED_LAYOUT_X_SCALES),
             )
         offs_x_k_scales = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, BLOCKED_LAYOUT_X_SCALES)
@@ -1104,18 +1105,35 @@ def _moe_gemm_a4w4_prefill(
         cur_x_scales = next_x_scales
         cur_w_scales = next_w_scales
 
-    # load bias
     offs_m = BLOCK_M * block_id + gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
     )
-    offs_y_n = BLOCK_N * pid_n + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
     mask_m = offs_m < M
-    mask_n = offs_y_n < N
+
+    # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
-        bias = gl.amd.gfx1250.buffer_load(B, offs_y_n, mask=mask_n)
+        SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        bias_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=B,
+            shape=(1, N),
+            strides=(stride_b_e, 1),
+            block_shape=(1, BLOCK_N),
+            layout=SHARED_LAYOUT_BIAS,
+        )
+        bias_buffer = gl.allocate_shared_memory(
+            bias_desc.dtype, shape=[1, BLOCK_N], layout=bias_desc.layout
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            bias_desc,
+            [0, pid_n * BLOCK_N],
+            bias_buffer,
+        )
+        TDM_BIAS_WAIT: gl.constexpr = 1
+    else:
+        TDM_BIAS_WAIT: gl.constexpr = 0
 
     # epilogue: drain remaining tiles
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
@@ -1128,7 +1146,9 @@ def _moe_gemm_a4w4_prefill(
             gl.amd.gfx1250.cluster.wait()
 
         # wait for next tile to be filled
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS)
+        gl.amd.gfx1250.tdm.async_wait(
+            (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
+        )
         if not X_SCALES_TDM:
             gl.amd.gfx1250.async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
@@ -1184,6 +1204,10 @@ def _moe_gemm_a4w4_prefill(
 
     # bias
     if B is not None:
+        gl.amd.gfx1250.tdm.async_wait(0)
+        bias = bias_buffer.reshape((BLOCK_N,)).load(
+            layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
         acc = acc + bias[None, :]
 
     # apply activation function
@@ -1649,22 +1673,42 @@ def _moe_gemm_a4w4_decode(
         if num_ctas > 1:
             gl.amd.gfx1250.cluster.wait()
 
-    # load bias while the pipeline drains
     offs_m = BLOCK_M * block_id + gl.arange(
         0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
     )
-    offs_y_n = BLOCK_N * pid_n + gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )
     mask_m = offs_m < M
-    mask_n = offs_y_n < N
+
+    # load bias into LDS while the pipeline drains
     if B is not None:
         B += expt_id * stride_b_e
-        bias = gl.amd.gfx1250.buffer_load(B, offs_y_n, mask=mask_n)
+        # one row, so there is no cga_layout to split (num_ctas == 1)
+        SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
+        )
+        bias_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=B,
+            shape=(1, N),
+            strides=(stride_b_e, 1),
+            block_shape=(1, BLOCK_N),
+            layout=SHARED_LAYOUT_BIAS,
+        )
+        bias_buffer = gl.allocate_shared_memory(
+            bias_desc.dtype, shape=[1, BLOCK_N], layout=bias_desc.layout
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            bias_desc,
+            [0, pid_n * BLOCK_N],
+            bias_buffer,
+        )
+        TDM_BIAS_WAIT: gl.constexpr = 1
+    else:
+        TDM_BIAS_WAIT: gl.constexpr = 0
 
     # epilogue: drain remaining tiles (no new TDM loads)
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1 - k_ep) * NUM_TDM_OPS - 1)
+        gl.amd.gfx1250.tdm.async_wait(
+            (NUM_BUFFERS - 1 - k_ep) * NUM_TDM_OPS - 1 + TDM_BIAS_WAIT
+        )
         if PRESHUFFLE_WEIGHTS:
             cur_w = (
                 (
@@ -1684,7 +1728,9 @@ def _moe_gemm_a4w4_decode(
                 .load(layout=DOT_LAYOUT_W)
             )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS)
+        gl.amd.gfx1250.tdm.async_wait(
+            (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
+        )
         cur_x = x_buffer.index(wmma_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         cur_x_scales = x_scales_buffer.index(wmma_idx % NUM_BUFFERS).load(
             layout=DOT_LAYOUT_X_SCALES
@@ -1715,6 +1761,10 @@ def _moe_gemm_a4w4_decode(
 
     # bias
     if B is not None:
+        gl.amd.gfx1250.tdm.async_wait(0)
+        bias = bias_buffer.reshape((BLOCK_N,)).load(
+            layout=gl.SliceLayout(0, WMMA_LAYOUT)
+        )
         acc = acc + bias[None, :]
 
     # apply activation function
