@@ -22,7 +22,6 @@ from aiter.ops.shuffle import (
     shuffle_weight,
 )
 
-
 _SKIP_GFX942_FLYDSL = pytest.mark.skipif(
     get_gfx() != "gfx942" or not is_flydsl_available(),
     reason="gfx942 FlyDSL required",

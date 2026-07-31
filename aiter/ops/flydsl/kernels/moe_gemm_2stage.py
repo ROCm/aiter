@@ -96,13 +96,7 @@ def _stage1_activation_module_tag(
         return "_silu"
 
     def float_tag(value: float) -> str:
-        return (
-            float(value)
-            .hex()
-            .replace("-", "m")
-            .replace("+", "p")
-            .replace(".", "d")
-        )
+        return float(value).hex().replace("-", "m").replace("+", "p").replace(".", "d")
 
     return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
 
@@ -169,9 +163,7 @@ def compile_moe_gemm1(
         if situ_beta <= 0.0:
             raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
         if situ_linear_beta <= 0.0:
-            raise ValueError(
-                f"situ_linear_beta must be > 0, got {situ_linear_beta!r}"
-            )
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
@@ -220,8 +212,7 @@ def compile_moe_gemm1(
     if _is_splitk:
         if act != "silu":
             raise NotImplementedError(
-                "split-K stage1 activation supports only 'silu', got "
-                f"{act!r}"
+                "split-K stage1 activation supports only 'silu', got " f"{act!r}"
             )
         _k_per_batch = model_dim // k_batch
         assert (

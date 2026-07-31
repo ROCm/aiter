@@ -7,7 +7,6 @@ import ast
 import re
 from pathlib import Path
 
-
 _SOURCE = (
     Path(__file__).resolve().parents[2]
     / "aiter"
@@ -27,7 +26,11 @@ def _activation_module_tag():
         and node.name == "_stage1_activation_module_tag"
     )
     namespace = {}
-    exec(
+    # S102 is suppressed deliberately. This test evaluates one function out of
+    # the source file without importing aiter, so the suite stays runnable on a
+    # host with no GPU and no FlyDSL. The compiled input is a single function
+    # node parsed from a file in this repository, never external input.
+    exec(  # noqa: S102
         compile(ast.Module(body=[function], type_ignores=[]), str(_SOURCE), "exec"),
         namespace,
     )
