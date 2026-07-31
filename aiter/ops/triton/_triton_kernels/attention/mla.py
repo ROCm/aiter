@@ -101,6 +101,7 @@ def _mla_prefill_fwd_kernel(
     num_warps: tl.constexpr,  # int
     num_stages: tl.constexpr,  # int
     NUM_HEAD_BLOCKS: tl.constexpr = 1,  # int
+    IS_CAUSAL: tl.constexpr = True,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -195,16 +196,20 @@ def _mla_prefill_fwd_kernel(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if IS_CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # non-causal: every query attends the whole sequence, so no tiles
+        # can be pruned by a causal prefix.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -245,7 +250,11 @@ def _mla_prefill_fwd_kernel(
             kv_buffer_ptr + k_rope_offset,
         )
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            # non-causal: every query attends the full sequence prefix.
+            seq_mask = seq_offset[None, :] < seq_len
 
         S_lora = tl.dot(Q_lora, KV_lora.trans(1, 0).to(Q_lora.dtype))
         S_rope = tl.dot(Q_rope, K_rope.to(Q_lora.dtype))
@@ -371,6 +380,7 @@ def _mla_decode_fwd_kernel(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     IS_Q_FP8: tl.constexpr = False,  # bool
     IS_KV_FP8: tl.constexpr = False,  # bool
+    IS_CAUSAL: tl.constexpr = True,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -474,16 +484,20 @@ def _mla_decode_fwd_kernel(
 
     # compute the length of the longest sequence prefix spanned by any
     # query token in the current q_block (token_q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + token_q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if IS_CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + token_q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        # adjust for potential padding in the last q_block by considering the
+        # actual sequence length
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        # non-causal: every query attends the whole sequence, so no tiles
+        # can be pruned by a causal prefix.
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -581,7 +595,11 @@ def _mla_decode_fwd_kernel(
                 .permute((1, 0))
             )
 
-        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+        else:
+            # non-causal: every query attends the full sequence prefix.
+            seq_mask = seq_offset[None, :] < seq_len
 
         if SHUFFLED_KV_CACHE:
             S_lora = tl.dot(Q_lora, KV_lora)

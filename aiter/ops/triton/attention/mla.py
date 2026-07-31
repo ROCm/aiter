@@ -140,7 +140,6 @@ def mla_prefill_fwd(
     out_scale=None,
     shuffled_kv_cache: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
     assert (
         not shuffled_kv_cache
     ), "Shuffled kv cache is not supported in mla_prefill_fwd"
@@ -190,6 +189,7 @@ def mla_prefill_fwd(
     )
 
     if IS_DEVICE_ARCH_GFX12:
+        assert causal, "Non-causal MLA prefill is not supported on gfx1250 (gluon)"
         gluon_mla_prefill_fwd_kernel_non_pipelined[(num_kv_heads, total_num_q_blocks)](
             output_ptr=out,
             query_ptr=q,
@@ -253,6 +253,7 @@ def mla_prefill_fwd(
             BLOCK_Q=BLOCK_Q,
             BLOCK_M=BLOCK_M,
             NUM_HEAD_BLOCKS=NUM_HEAD_BLOCKS,
+            IS_CAUSAL=causal,
             **attn_config,
         )
     return out
@@ -277,7 +278,6 @@ def mla_decode_fwd(
     shuffled_kv_cache: bool = False,
     skip_reduce: bool = False,
 ):
-    assert causal, "Only causal attention is supported"
     q_dtype = q.dtype
     kv_buffer_dtype = kv_buffer.dtype
     total_num_tokens, num_query_heads, qk_head_dim = q.shape
@@ -398,6 +398,7 @@ def mla_decode_fwd(
         segm_expsum = out  # dummy ptr
 
     if IS_DEVICE_ARCH_GFX12:
+        assert causal, "Non-causal MLA decode is not supported on gfx1250 (gluon)"
         if shuffled_kv_cache:
             impl = gluon_mla_decode_fwd_kernel
         else:
@@ -483,6 +484,7 @@ def mla_decode_fwd(
             SHUFFLED_KV_CACHE=shuffled_kv_cache,
             IS_Q_FP8=(q_dtype == e4m3_dtype),
             IS_KV_FP8=(kv_buffer_dtype == e4m3_dtype),
+            IS_CAUSAL=causal,
             **attn_config,
         )
 
