@@ -885,25 +885,35 @@ def _iter_csv_cases():
             )
             continue
         # The reference path below uses the CSV q_dtype_a directly, while
-        # fused_moe selects q_dtype_a from the current Swiglu MXFP4 runtime mode.
-        # Skip CSV rows that are tuned for a different mode to avoid comparing
-        # e.g. an fp4x2 reference against a bf16/fp8 runtime dispatch.
-        expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
-            kwargs["token"],
-            kwargs["actType"],
-            kwargs["gateMode"],
-            kwargs["qType"],
-            kwargs["AQDType"],
-            kwargs["WQDType"],
-        )
+        # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV
+        # rows tuned for a different mode (e.g. a4w4/a8w4 without the opt-in env).
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            expected_aq_dtype = _runtime_situv2_mxfp4_q_dtype_a(
+                kwargs["token"],
+                kwargs["gateMode"],
+                kwargs["qType"],
+                kwargs["WQDType"],
+            )
+            runtime_mode = "SiTUv2 MXFP4"
+        else:
+            expected_aq_dtype = _runtime_swiglu_mxfp4_q_dtype_a(
+                kwargs["token"],
+                kwargs["actType"],
+                kwargs["gateMode"],
+                kwargs["qType"],
+                kwargs["AQDType"],
+                kwargs["WQDType"],
+            )
+            runtime_mode = "Swiglu MXFP4"
         if expected_aq_dtype is not None and kwargs["AQDType"] != expected_aq_dtype:
             aiter.logger.info(
                 "skip row token=%s dim=(%s,%s): q_dtype_a=%s does not match "
-                "current Swiglu MXFP4 runtime mode (expected %s)",
+                "current %s runtime mode (expected %s)",
                 row.get("token"),
                 row.get("model_dim"),
                 row.get("inter_dim"),
                 kwargs["AQDType"],
+                runtime_mode,
                 expected_aq_dtype,
             )
             continue
