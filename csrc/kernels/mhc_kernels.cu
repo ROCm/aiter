@@ -12,8 +12,6 @@
 #include "aiter_dispatch.h"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
-#include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 
 namespace aiter {
