@@ -4,24 +4,11 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import math as math_dialect
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import (
-    arith,
-    const_expr,
-    gpu,
-    idx2crd,
-    range_constexpr,
-    rocdl,
-    tdm_ops,
-)
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import check_smem_capacity
-
-from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import store_acc_vec8_to_buffer
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
@@ -35,9 +22,45 @@ def _align_up(n, a):
 
 
 def lds_load_b128(lds_i8_ptr, byte_off):
-    return arith.unwrap(
-        fx.ptr_load(fx.add_offset(lds_i8_ptr, byte_off), result_type=T.vec(4, T.i32))
+    return fx.ptr_load(fx.add_offset(lds_i8_ptr, byte_off), result_type=T.vec(4, T.i32))
+
+
+def _vec(v):
+    return v if isinstance(v, fx.Vector) else fx.Vector(v)
+
+
+def _byte_off_i32(elem_off, elem_bytes):
+    """Element offset -> i32 byte offset; rocdl raw-buffer ops take bytes."""
+    return (fx.Int32(elem_off) * elem_bytes).ir_value()
+
+
+def buffer_load_f32(rsrc, elem_off):
+    """Scalar f32 buffer load at an element offset (hardware OOB-checked)."""
+    zero = fx.Int32(0).ir_value()
+    return rocdl.raw_ptr_buffer_load(
+        T.f32, rsrc, _byte_off_i32(elem_off, 4), zero, zero
     )
+
+
+def store_acc_vec8_to_buffer(acc_vec8, c_rsrc, addr, out_dt=None, byte_addr=False):
+    """Write one 8-element f32 accumulator to global memory.
+
+    Half output (out_dt set): convert -> bitcast(vec<4xi32>) -> one store.
+    f32 output: two vec<4xf32> stores, `addr` a pair of element offsets.
+    """
+    zero = fx.Int32(0).ir_value()
+    acc = _vec(acc_vec8)
+
+    def _store(data, a):
+        off = fx.Int32(a).ir_value() if byte_addr else _byte_off_i32(a, 4)
+        rocdl.raw_ptr_buffer_store(data, c_rsrc, off, zero, zero)
+
+    if out_dt is not None:
+        _store(acc.to(out_dt).bitcast(fx.Int32).ir_value(), addr)
+    else:
+        for half in range(2):
+            vals = [acc[half * 4 + vi] for vi in range(4)]
+            _store(fx.Vector.from_elements(vals, fx.Float32).ir_value(), addr[half])
 
 
 def compile_gemm_a8w8_blockscale(
@@ -176,39 +199,37 @@ def compile_gemm_a8w8_blockscale(
         i32_n: fx.Int32,
     ):
         tx, bx, by = gpu.thread_id("x"), gpu.block_id("x"), gpu.block_id("y")
-        blk_m, blk_n = bx * arith.index(tile_m), by * arith.index(tile_n)
+        blk_m, blk_n = fx.Uint64(bx) * tile_m, fx.Uint64(by) * tile_n
         if const_expr(split_k > 1):
-            bz = gpu.block_id("z")
-            split_k_base = bz * arith.index(split_k_chunk)
-            split_kb_base = bz * arith.index(scale_k_per_split)
+            bz = fx.Uint64(gpu.block_id("z"))
+            split_k_base, split_kb_base = bz * split_k_chunk, bz * scale_k_per_split
         else:
-            split_k_base, split_kb_base = arith.index(0), arith.index(0)
+            split_k_base, split_kb_base = fx.Uint64(0), fx.Uint64(0)
 
         layout_thr = fx.make_layout(
             (m_warp, n_warp, 2, 16), (n_warp * WAVE_SIZE, WAVE_SIZE, 16, 1)
         )
         thr_coord = idx2crd(tx, layout_thr)
-        wave_m_idx, wave_n_idx = fx.get(thr_coord, 0), fx.get(thr_coord, 1)
-        lane_kgrp, lane16 = fx.get(thr_coord, 2), fx.get(thr_coord, 3)
-        warp_m_base = wave_m_idx * arith.index(warp_tile_m)
-        warp_n_base = wave_n_idx * arith.index(warp_tile_n)
-        m_idx = arith.index_cast(T.index, i32_m.ir_value())
-        n_idx = arith.index_cast(T.index, i32_n.ir_value())
+        wave_m_idx = fx.Uint64(fx.get(thr_coord, 0))
+        wave_n_idx = fx.Uint64(fx.get(thr_coord, 1))
+        lane_kgrp, lane16 = (
+            fx.Uint64(fx.get(thr_coord, 2)),
+            fx.Uint64(fx.get(thr_coord, 3)),
+        )
+        warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
+        m_idx, n_idx = fx.Uint64(i32_m), fx.Uint64(i32_n)
 
-        y_total_bytes = m_idx * n_idx * arith.index(elem_bytes_d)
         y_buf = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), y_total_bytes)
+            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), m_idx * n_idx * elem_bytes_d)
         )
-
-        num_n_scale_blocks = (n_idx + arith.index(scale_block_n - 1)) / arith.index(
-            scale_block_n
-        )
-        w_scale_total_bytes = num_n_scale_blocks * arith.index(scale_k) * arith.index(4)
+        n_scale_blocks = (n_idx + (scale_block_n - 1)) // scale_block_n
         w_scale_buf = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_w_scale), w_scale_total_bytes)
+            fx.rocdl.make_buffer_ptr(
+                fx.get_iter(arg_w_scale), n_scale_blocks * scale_k * 4
+            )
         )
 
-        scale_zero = arith.constant(0.0, type=T.f32)
+        scale_zero = fx.Float32(0.0)
 
         lds_base_ptr = fx.SharedAllocator(static=True).allocate(lds_arena_bytes)._ptr
 
@@ -218,17 +239,12 @@ def compile_gemm_a8w8_blockscale(
         def _slot_byte_off(buf_idx, region_off, slot_bytes):
             if const_expr(isinstance(buf_idx, int)):
                 return region_off + buf_idx * slot_bytes
-            return arith.index_cast(T.index, buf_idx) * arith.index(
-                slot_bytes
-            ) + arith.index(region_off)
+            return fx.Uint64(buf_idx) * slot_bytes + region_off
 
         def _imm64(k_tile, mul):
             if const_expr(isinstance(k_tile, int)):
                 return fx.Int64(k_tile * mul)
-            as_index = arith.index_cast(
-                T.index, arith.muli(k_tile, arith.constant(mul, type=T.i32))
-            )
-            return fx.Int64(arith.index_cast(T.i64, as_index))
+            return fx.Int64(fx.Int32(k_tile) * mul)  # mul in i32, widen for TDM
 
         def _byte_view(tensor, byte_off, shape, stride):
             return fx.Tensor(
@@ -259,90 +275,69 @@ def compile_gemm_a8w8_blockscale(
         def ds_read_x_scales(buf_idx):
             slot_elems = lds_x_scale_data_bytes // 4
             if const_expr(isinstance(buf_idx, int)):
-                slot_off = arith.index(buf_idx * slot_elems)
+                slot_off = fx.Uint64(buf_idx * slot_elems)
             else:
-                slot_off = arith.index_cast(
-                    T.index,
-                    arith.muli(buf_idx, arith.constant(slot_elems, type=T.i32)),
-                )
+                slot_off = fx.Uint64(buf_idx) * slot_elems
             out = []
             for sc in range_constexpr(scales_per_tile):
                 for wm in range_constexpr(wmma_m_rep):
-                    row = warp_m_base + arith.index(wm * WMMA_M) + lane16
-                    off = (
-                        slot_off + row * arith.index(scales_per_tile) + arith.index(sc)
-                    )
-                    out.append(
-                        arith.unwrap(fx.ptr_load(fx.add_offset(big_x_scale_mem, off)))
-                    )
+                    row = warp_m_base + wm * WMMA_M + lane16
+                    off = slot_off + row * scales_per_tile + sc
+                    out.append(fx.ptr_load(fx.add_offset(big_x_scale_mem, off)))
             return out
 
         def _issue_w_chunk(chunk):
             if const_expr(isinstance(chunk, int)):
-                offset = arith.index(chunk * 32)
+                offset = fx.Uint64(chunk * 32)
             else:
-                clamped_i32 = arith.minui(
-                    chunk, arith.constant(NUM_W_CHUNKS - 1, type=T.i32)
-                )
-                offset = arith.index_cast(
-                    T.index, arith.muli(clamped_i32, arith.constant(32, type=T.i32))
-                )
-            idx = wave_n_block * arith.index(scale_k) + lane_id_full + offset
+                c, hi = fx.Uint32(chunk), fx.Uint32(NUM_W_CHUNKS - 1)
+                offset = fx.Uint64((c < hi).select(c, hi) * 32)
+            idx = wave_n_block * scale_k + lane_id_full + offset
             if const_expr(split_k > 1):
                 idx = idx + split_kb_base
-            return buffer_ops.buffer_load(w_scale_buf, idx, vec_width=1, dtype=T.f32)
+            return buffer_load_f32(w_scale_buf, idx)
 
-        def _w_readlane(kb_i32):
+        def _w_readlane(kb):
             if const_expr(NUM_W_CHUNKS == 1):
-                return rocdl.readlane(T.f32, bulk_w_cur, kb_i32)
-            kb_chunk_i32 = arith.shrui(kb_i32, arith.constant(5, type=T.i32))
-            lane_in_chunk_i32 = arith.andi(kb_i32, arith.constant(31, type=T.i32))
-            is_cur = arith.cmpi(arith.CmpIPredicate.eq, kb_chunk_i32, cur_chunk_idx_i32)
-            chosen = arith.select(is_cur, bulk_w_cur, bulk_w_prefetch)
-            return rocdl.readlane(T.f32, chosen, lane_in_chunk_i32)
+                return rocdl.readlane(T.f32, bulk_w_cur, kb.ir_value())
+            is_cur = (kb >> 5) == fx.Uint32(cur_chunk_idx)
+            chosen = is_cur.select(fx.Float32(bulk_w_cur), fx.Float32(bulk_w_prefetch))
+            return rocdl.readlane(T.f32, chosen.ir_value(), (kb & 31).ir_value())
 
-        def _advance_w_chunks(next_compute_idx, one_i32):
-            next_kb_i32 = arith.muli(
-                next_compute_idx, arith.constant(scales_per_tile, type=T.i32)
+        def _advance_w_chunks(next_compute_idx):
+            next_chunk = (fx.Uint32(next_compute_idx) * scales_per_tile) >> 5
+            need_advance = next_chunk != fx.Uint32(cur_chunk_idx)
+            new_cur = need_advance.select(
+                fx.Float32(bulk_w_prefetch), fx.Float32(bulk_w_cur)
             )
-            next_chunk_i32 = arith.shrui(next_kb_i32, arith.constant(5, type=T.i32))
-            need_advance = arith.cmpi(
-                arith.CmpIPredicate.ne, next_chunk_i32, cur_chunk_idx_i32
-            )
-            new_cur = arith.select(need_advance, bulk_w_prefetch, bulk_w_cur)
-            new_prefetch = _issue_w_chunk(arith.addi(next_chunk_i32, one_i32))
-            return new_cur, new_prefetch, next_chunk_i32
+            return new_cur, _issue_w_chunk(next_chunk + 1), next_chunk
 
         def _a_lane_base(wm):
             return (
-                (warp_m_base + lane16) * arith.index(lds_a_stride_bytes)
-                + arith.index(wm * WMMA_M * lds_a_stride_bytes)
+                (warp_m_base + lane16) * lds_a_stride_bytes
+                + wm * WMMA_M * lds_a_stride_bytes
                 + k_half_byte_offset
             )
 
         def _b_lane_base(wn):
-            stripe_offset = (
-                (warp_n_base + arith.index(wn * WMMA_N))
-                / arith.index(WMMA_N)
-                * arith.index(lds_b_stride_bytes)
-            )
-            return stripe_offset + b_k_half_byte_offset + lane16 * arith.index(16)
+            stripe = (warp_n_base + wn * WMMA_N) // WMMA_N * lds_b_stride_bytes
+            return stripe + b_k_half_byte_offset + lane16 * 16
 
         def _load_frag(
             lds_memref, lane_base, ks, cycle_stride_bytes=16, ks_stride_bytes=WMMA_K
         ):
-            off = lane_base + arith.index(ks * ks_stride_bytes)
+            off = lane_base + ks * ks_stride_bytes
             v = [
-                lds_load_b128(lds_memref, off + arith.index(cycle_stride_bytes * j))
+                lds_load_b128(lds_memref, off + cycle_stride_bytes * j)
                 for j in range_constexpr(4)
             ]
-            v01 = fx.Vector(v[0]).shuffle(fx.Vector(v[1]), list(range(8)))
-            v23 = fx.Vector(v[2]).shuffle(fx.Vector(v[3]), list(range(8)))
-            return v01.shuffle(v23, list(range(16))).ir_value()
+            v01 = v[0].shuffle(v[1], list(range(8)))
+            v23 = v[2].shuffle(v[3], list(range(8)))
+            return v01.shuffle(v23, list(range(16)))
 
         def _rmem_vec(v, n, dtype):
             t = fx.make_rmem_tensor(n, dtype)
-            t.store(fx.Vector(arith.unwrap(v)))
+            t.store(_vec(v))
             return t
 
         def _rmem_frag_lists(a_frags, b_frags):
@@ -358,16 +353,17 @@ def compile_gemm_a8w8_blockscale(
                 a_t = a_frags[ks * wmma_m_rep + wm]
                 b_t = b_frags[ks * wmma_n_rep + wn]
                 fx.gemm(wmma_atom, temp_t, b_t, a_t, temp_t)
-            return arith.unwrap(temp_t.load())
+            return temp_t.load()
 
         def apply_scale(temp, scale, acc):
-            scale_vec = fx.Vector.filled(8, fx.Float32(scale), fx.Float32).ir_value()
-            return math_dialect.fma(temp, scale_vec, acc)
+            return fx.fma(
+                temp, fx.Vector.filled(8, fx.Float32(scale), fx.Float32), _vec(acc)
+            )
 
         def _pack_state(accs_, a_, b_, x_, w_, pw_, load_idx, compute_idx):
             state = list(accs_) + list(a_) + list(b_) + list(x_) + list(w_) + list(pw_)
             if const_expr(USES_W_CHUNK_PREFETCH):
-                state = state + [bulk_w_cur, bulk_w_prefetch, cur_chunk_idx_i32]
+                state = state + [bulk_w_cur, bulk_w_prefetch, cur_chunk_idx]
             return state + [load_idx, compute_idx]
 
         def _unpack_state(state):
@@ -378,35 +374,25 @@ def compile_gemm_a8w8_blockscale(
             return regs, list(state[i : i + N_W_TAIL]), state[-2], state[-1]
 
         def issue_w_raw_scales(k_base):
-            kb_base = k_base / arith.index(scale_block_k)
+            kb_base = k_base // scale_block_k
             w_raw = []
             for sc in range_constexpr(scales_per_tile):
-                kb_i32 = arith.index_cast(T.i32, kb_base + arith.index(sc))
-                w_val = _w_readlane(kb_i32)
+                w_val = _w_readlane(fx.Uint32(kb_base + sc))
                 for wn in range_constexpr(wmma_n_rep):
                     w_raw.append(w_val)
             return w_raw
 
-        def issue_w_raw_scales_masked(future_tile_rt):
-            future_tile_i32 = arith.index_cast(T.i32, future_tile_rt)
-            valid_future = arith.cmpi(
-                arith.CmpIPredicate.ult,
-                future_tile_i32,
-                arith.constant(num_k_tiles, type=T.i32),
-            )
-            safe_tile_i32 = arith.select(
-                valid_future, future_tile_i32, arith.constant(0, type=T.i32)
-            )
-            safe_tile_idx = arith.index_cast(T.index, safe_tile_i32)
-            safe_k_base = safe_tile_idx * arith.index(tile_k)
-            raw_w = issue_w_raw_scales(safe_k_base)
-            masked_w = [arith.select(valid_future, v, scale_zero) for v in raw_w]
-            return masked_w
+        def issue_w_raw_scales_masked(future_tile):
+            ft = fx.Uint32(future_tile)
+            valid = ft < num_k_tiles
+            safe_tile = valid.select(ft, fx.Uint32(0))
+            raw_w = issue_w_raw_scales(fx.Uint64(safe_tile) * tile_k)
+            return [valid.select(fx.Float32(v), scale_zero) for v in raw_w]
 
-        def _slot_off(buffer_idx, data_bytes, stride_i32):
+        def _slot_off(buffer_idx, data_bytes):
             if const_expr(isinstance(buffer_idx, int)):
-                return arith.index(buffer_idx * data_bytes)
-            return arith.index_cast(T.index, arith.muli(buffer_idx, stride_i32))
+                return fx.Uint64(buffer_idx * data_bytes)
+            return fx.Uint64(fx.Int32(buffer_idx) * data_bytes)  # mul in i32, widen
 
         def _a_step_frags(slot_off_a, ks):
             return [
@@ -427,7 +413,7 @@ def compile_gemm_a8w8_blockscale(
             ]
 
         def load_a_frags(buffer_idx):
-            slot_off_a = _slot_off(buffer_idx, lds_a_data_bytes, slot_stride_a_i32)
+            slot_off_a = _slot_off(buffer_idx, lds_a_data_bytes)
             return [
                 f
                 for ks in range_constexpr(k_wmma_steps)
@@ -435,7 +421,7 @@ def compile_gemm_a8w8_blockscale(
             ]
 
         def load_b_frags(buffer_idx):
-            slot_off_b = _slot_off(buffer_idx, lds_b_data_bytes, slot_stride_b_i32)
+            slot_off_b = _slot_off(buffer_idx, lds_b_data_bytes)
             return [
                 f
                 for ks in range_constexpr(k_wmma_steps)
@@ -447,8 +433,8 @@ def compile_gemm_a8w8_blockscale(
             for sc in range_constexpr(scales_per_tile):
                 row = [None] * n_accs
                 for wm, wn, idx in acc_coords:
-                    row[idx] = arith.mulf(
-                        x_raw[sc * wmma_m_rep + wm], w_raw[sc * wmma_n_rep + wn]
+                    row[idx] = fx.Float32(x_raw[sc * wmma_m_rep + wm]) * fx.Float32(
+                        w_raw[sc * wmma_n_rep + wn]
                     )
                 scales.append(row)
             return scales
@@ -459,8 +445,8 @@ def compile_gemm_a8w8_blockscale(
             if const_expr(buf is None):
                 a_ts, b_ts = _rmem_frag_lists(a_frags, b_frags)
             else:
-                slot_a = _slot_off(buf, lds_a_data_bytes, slot_stride_a_i32)
-                slot_b = _slot_off(buf, lds_b_data_bytes, slot_stride_b_i32)
+                slot_a = _slot_off(buf, lds_a_data_bytes)
+                slot_b = _slot_off(buf, lds_b_data_bytes)
             for sc in range_constexpr(scales_per_tile):
                 sc_base = sc
                 if const_expr(buf is not None):
@@ -474,8 +460,8 @@ def compile_gemm_a8w8_blockscale(
                 for wm, wn, idx in acc_coords:
                     temp = issue_wmma_step(sc_base, wm, wn, a_ts, b_ts)
                     if const_expr(scales is None):
-                        scale = arith.mulf(
-                            x_raw[sc * wmma_m_rep + wm], w_raw[sc * wmma_n_rep + wn]
+                        scale = fx.Float32(x_raw[sc * wmma_m_rep + wm]) * fx.Float32(
+                            w_raw[sc * wmma_n_rep + wn]
                         )
                     else:
                         scale = scales[sc][idx]
@@ -486,8 +472,6 @@ def compile_gemm_a8w8_blockscale(
             _lds_region_ptr(unified_a_off),
             _lds_region_ptr(unified_b_off),
         )
-        slot_stride_a_i32 = arith.constant(lds_a_data_bytes, type=T.i32)
-        slot_stride_b_i32 = arith.constant(lds_b_data_bytes, type=T.i32)
         blk_m64, blk_n64 = fx.Int64(blk_m), fx.Int64(blk_n)
         split_k_base64 = fx.Int64(split_k_base)
         x_base_bytes = blk_m64 * fx.Int64(K) + split_k_base64
@@ -544,13 +528,12 @@ def compile_gemm_a8w8_blockscale(
             (atom_xs, gXS, unified_x_scale_off, (tile_m, xs_row_bytes), xs_row_bytes),
         )
 
-        wave_n_block = (blk_n + warp_n_base) / arith.index(scale_block_n)
-        lane_id_full = lane_kgrp * arith.index(16) + lane16
+        wave_n_block = (blk_n + warp_n_base) // scale_block_n
+        lane_id_full = lane_kgrp * 16 + lane16
         bulk_w_cur = bulk_w_prefetch = None
-        cur_chunk_idx_i32 = arith.constant(0, type=T.i32)
-        k_half_byte_offset = lane_kgrp * arith.index(64)
-        b_k_half_byte_offset = lane_kgrp * arith.index(1024)
-        acc_zero = arith.constant_vector(0.0, T.vec(8, T.f32))
+        cur_chunk_idx = fx.Uint32(0)
+        k_half_byte_offset, b_k_half_byte_offset = lane_kgrp * 64, lane_kgrp * 1024
+        acc_zero = fx.Vector.filled(8, fx.Float32(0.0), fx.Float32)
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMA(WMMA_M, WMMA_N, WMMA_K, fx.Float8E4M3FN, fx.Float32)
@@ -590,16 +573,15 @@ def compile_gemm_a8w8_blockscale(
         cur_x_raw = [] if READ_CUR else ds_read_x_scales(0)
         cur_a = [] if FRAGS_IN_COMPUTE else load_a_frags(0)
 
-        cur_w_raw = issue_w_raw_scales(arith.index(0))
+        cur_w_raw = issue_w_raw_scales(fx.Uint64(0))
         if const_expr(num_k_tiles > 1):
-            prefetch_w_raw = issue_w_raw_scales(arith.index(tile_k))
+            prefetch_w_raw = issue_w_raw_scales(fx.Uint64(tile_k))
         else:
             prefetch_w_raw = zero_w_raw
 
         # Accumulator init
         accs = [acc_zero] * n_accs
-        load_idx_init = arith.constant(PROLOGUE_FILL, type=T.i32)
-        compute_idx_init = arith.constant(0, type=T.i32)
+        load_idx_init, compute_idx_init = fx.Uint32(PROLOGUE_FILL), fx.Uint32(0)
 
         if const_expr(MAIN_LOOP_ITERS > 0):
             init_state = _pack_state(
@@ -613,12 +595,6 @@ def compile_gemm_a8w8_blockscale(
                 compute_idx_init,
             )
 
-            nb_const_i32 = arith.constant(num_buffers, type=T.i32)
-            one_i32, two_i32 = (
-                arith.constant(1, type=T.i32),
-                arith.constant(2, type=T.i32),
-            )
-
             for tile_step, state in range(0, MAIN_LOOP_ITERS, 1, init=init_state):
                 (
                     (cur_accs, cur_a, cur_b, cur_x_raw, cur_w_raw, prefetch_w_raw),
@@ -627,16 +603,16 @@ def compile_gemm_a8w8_blockscale(
                     cur_compute_idx,
                 ) = _unpack_state(state)
                 if const_expr(USES_W_CHUNK_PREFETCH):
-                    bulk_w_cur, bulk_w_prefetch, cur_chunk_idx_i32 = _w_tail
+                    bulk_w_cur, bulk_w_prefetch, cur_chunk_idx = _w_tail
 
                 # SSA buf indices for this iteration.
-                load_buf_i32 = arith.remui(cur_load_idx, nb_const_i32)
-                next_compute_idx = arith.addi(cur_compute_idx, one_i32)
-                next_buf_i32 = arith.remui(next_compute_idx, nb_const_i32)
+                cur_load_idx = fx.Uint32(cur_load_idx)
+                cur_compute_idx = fx.Uint32(cur_compute_idx)
+                load_buf_i32 = cur_load_idx % num_buffers
+                next_compute_idx = cur_compute_idx + 1
+                next_buf_i32 = next_compute_idx % num_buffers
                 cur_buf_i32 = (
-                    arith.remui(cur_compute_idx, nb_const_i32)
-                    if FRAGS_IN_COMPUTE
-                    else None
+                    cur_compute_idx % num_buffers if FRAGS_IN_COMPUTE else None
                 )
 
                 # Main loop
@@ -673,16 +649,12 @@ def compile_gemm_a8w8_blockscale(
                 cur_b = next_b
                 cur_x_raw = next_x_raw
                 cur_w_raw = prefetch_w_raw
-                future_tile_i32 = arith.addi(cur_compute_idx, two_i32)
-                future_tile_idx = arith.index_cast(T.index, future_tile_i32)
-                prefetch_w_raw = issue_w_raw_scales_masked(future_tile_idx)
+                prefetch_w_raw = issue_w_raw_scales_masked(cur_compute_idx + 2)
 
                 if const_expr(USES_W_CHUNK_PREFETCH):
-                    (
-                        bulk_w_cur,
-                        bulk_w_prefetch,
-                        cur_chunk_idx_i32,
-                    ) = _advance_w_chunks(next_compute_idx, one_i32)
+                    bulk_w_cur, bulk_w_prefetch, cur_chunk_idx = _advance_w_chunks(
+                        next_compute_idx
+                    )
 
                 results = yield _pack_state(
                     cur_accs,
@@ -691,35 +663,28 @@ def compile_gemm_a8w8_blockscale(
                     cur_x_raw,
                     cur_w_raw,
                     prefetch_w_raw,
-                    arith.addi(cur_load_idx, one_i32),
+                    cur_load_idx + 1,
                     next_compute_idx,
                 )
 
             final_compute_idx = results[-1]
             if const_expr(USES_W_CHUNK_PREFETCH):
-                bulk_w_cur, bulk_w_prefetch, cur_chunk_idx_i32 = results[-5:-2]
+                bulk_w_cur, bulk_w_prefetch, cur_chunk_idx = results[-5:-2]
             accs = list(results[:N_ACCS])
         else:
             accs = list(accs)
-            final_compute_idx = arith.constant(0, type=T.i32)
+            final_compute_idx = fx.Uint32(0)
 
         # EPILOGUE - scf.for drain, small carry (accs + tile idx, frags reloaded fresh); descending tensorcnt via range_constexpr if-ladder; DRAIN_COUNT tiles, no new TDMs.
-        nb_const_i32_d = arith.constant(num_buffers, type=T.i32)
-        one_i32_d = arith.constant(1, type=T.i32)
         drain_init = list(accs) + [final_compute_idx]
         for _drain_i, dstate in range(0, DRAIN_COUNT, 1, init=drain_init):
             accs_d = list(dstate[:N_ACCS])
-            cur_dci_d = dstate[-1]
-            drain_buf_i32 = arith.remui(cur_dci_d, nb_const_i32_d)
+            cur_dci_d = fx.Uint32(dstate[-1])
+            drain_buf_i32 = cur_dci_d % num_buffers
 
             # cur tile == num_k_tiles-1-_k  ->  _k later tiles still in flight.
             for _k in range_constexpr(DRAIN_COUNT):
-                _is_k = arith.cmpi(
-                    arith.CmpIPredicate.eq,
-                    cur_dci_d,
-                    arith.constant(num_k_tiles - 1 - _k, type=T.i32),
-                )
-                if _is_k:
+                if cur_dci_d == num_k_tiles - 1 - _k:
                     tdm_ops.tensor_wait(_k * _TDMS_PER_TILE)
             gpu.barrier()
 
@@ -727,7 +692,7 @@ def compile_gemm_a8w8_blockscale(
             cur_b_d = [] if FRAGS_IN_COMPUTE else load_b_frags(drain_buf_i32)
             cur_x_d = ds_read_x_scales(drain_buf_i32)
             cur_a_d = [] if FRAGS_IN_COMPUTE else load_a_frags(drain_buf_i32)
-            cur_w_d = issue_w_raw_scales_masked(arith.index_cast(T.index, cur_dci_d))
+            cur_w_d = issue_w_raw_scales_masked(cur_dci_d)
             accs_d = compute_wmma(
                 accs_d,
                 cur_a_d,
@@ -736,57 +701,47 @@ def compile_gemm_a8w8_blockscale(
                 cur_w_d,
                 buf=drain_buf_i32 if FRAGS_IN_COMPUTE else None,
             )
-            dresults = yield list(accs_d) + [arith.addi(cur_dci_d, one_i32_d)]
+            dresults = yield list(accs_d) + [cur_dci_d + 1]
         accs = list(dresults[:N_ACCS])
 
         # Step 4: convert f32 accs to out_dtype, buffer_store to Y.
         if const_expr(num_buffers > 2):
             rocdl.sched_barrier(0)
 
-        out_elem = (
-            T.bf16 if out_dtype == "bf16" else T.f16 if out_dtype == "fp16" else None
+        out_dt = (
+            fx.BFloat16
+            if out_dtype == "bf16"
+            else fx.Float16 if out_dtype == "fp16" else None
         )
-        is_half_out = out_dtype in ("bf16", "fp16")
 
         if const_expr(split_k > 1):
-            zero_i32_s = arith.constant(0, type=T.i32)
+            zero_i32_s = fx.Int32(0).ir_value()
         for wm, wn, idx in acc_coords:
-            row = blk_m + warp_m_base + arith.index(wm * WMMA_M) + lane16
-            col_base = (
-                blk_n
-                + warp_n_base
-                + arith.index(wn * WMMA_N)
-                + lane_kgrp * arith.index(8)
-            )
+            row = blk_m + warp_m_base + wm * WMMA_M + lane16
+            col_base = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
+            elem_off = row * n_idx + col_base
 
             if const_expr(split_k > 1):
                 for e in range_constexpr(8):
-                    byte_off = arith.index_cast(
-                        T.i32,
-                        (row * n_idx + col_base + arith.index(e)) * arith.index(4),
-                    )
                     rocdl.raw_ptr_buffer_atomic_fadd(
-                        fx.Vector(accs[idx])[e].ir_value(),
+                        _vec(accs[idx])[e].ir_value(),
                         y_buf,
-                        byte_off,
+                        _byte_off_i32(elem_off + e, 4),
                         zero_i32_s,
                         zero_i32_s,
                     )
-            elif is_half_out:
-                c_off_bytes = (row * n_idx + col_base) * arith.index(elem_bytes_d)
+            elif const_expr(out_dt is not None):
                 store_acc_vec8_to_buffer(
                     accs[idx],
                     y_buf,
-                    c_off_bytes,
-                    out_elem=out_elem,
-                    offset_is_bytes=True,
+                    elem_off * elem_bytes_d,
+                    out_dt=out_dt,
+                    byte_addr=True,
                 )
             else:
-                offsets = []
-                for half in range_constexpr(2):
-                    col = col_base + arith.index(half * 4)
-                    offsets.append(row * n_idx + col)
-                store_acc_vec8_to_buffer(accs[idx], y_buf, offsets)
+                store_acc_vec8_to_buffer(
+                    accs[idx], y_buf, [elem_off + half * 4 for half in range(2)]
+                )
 
     @flyc.jit
     def launch_gemm_a8w8_blockscale(
@@ -799,10 +754,8 @@ def compile_gemm_a8w8_blockscale(
         i32_n: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_m = arith.index_cast(T.index, i32_m.ir_value())
-        idx_n = arith.index_cast(T.index, i32_n.ir_value())
-        gx = _raw((idx_m + arith.index(tile_m - 1)) / arith.index(tile_m))
-        gy = _raw((idx_n + arith.index(tile_n - 1)) / arith.index(tile_n))
+        gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
+        gy = (fx.Uint64(i32_n) + (tile_n - 1)) // tile_n
 
         wpe = int(waves_per_eu) if waves_per_eu is not None else 0
         launcher = kernel_gemm_a8w8_blockscale(
