@@ -40,25 +40,28 @@ namespace mla_decode_fwd_16mx8_32nx1_fp8fp8 {
 namespace sched_masks {
 constexpr int MFMA    = 0x08;
 constexpr int VALU    = 0x02;
-constexpr int SALU    = 0x04;
 constexpr int DS_READ = 0x100;
 constexpr int EXP     = 0x400;
 } // namespace sched_masks
 
-// Manually interleave the QK compute region (same helper as dsa_v32) so the long
-// latency fp8 128-K MFMAs hide the K / rope DS_READs and the softmax VALU / EXP.
-// sched_group_barrier only reorders within data-dependency constraints, so it is
-// correctness-safe. The 10 groups match this kernel's 10 GEMM0 MFMAs
-// (GEMM0_E_N * GEMM0_NOPE_E_K = 8 nope + GEMM0_ROPE_E_K = 2 rope).
-template <int G>
-__device__ inline void sched_compute_qk_dsa()
+// Interleave the GEMM0 region (dsa_v32's sched_compute_qk_dsa applied to this kernel's
+// 12 QK MFMAs) so the long-latency fp8 128-K MFMAs hide the K / rope DS_READs and the
+// softmax-tail EXP/VALU. Expressed as a scheduler *preference* rather than the hand-placed
+// chunks stage3 uses for PV: GEMM0 reads K through load<>, i.e. real ds_read that the
+// compiler tracks and will re-waitcnt after reordering, whereas hard fences here lengthen
+// live ranges enough to spill at 256 VGPR. EXP precedes VALU in each group because the
+// row sum consumes the exps. Pairing each DS_READ with its MFMA matters: dropping the
+// DS_READ group lets the solver hoist the loads and costs both a spill and ~1.5% perf.
+// Rpt should cover the region's MFMA count; groups that cannot be filled are dropped.
+template <int Rpt, int G>
+__device__ inline void sched_compute_qk()
 {
     using namespace sched_masks;
-    opus::static_for<10>([&](auto) {
+    opus::static_for<Rpt>([&](auto) {
         __builtin_amdgcn_sched_group_barrier(MFMA, 1, G);
-        __builtin_amdgcn_sched_group_barrier(DS_READ, 2, G);
-        __builtin_amdgcn_sched_group_barrier(VALU, 2, G);
+        __builtin_amdgcn_sched_group_barrier(DS_READ, 1, G);
         __builtin_amdgcn_sched_group_barrier(EXP, 1, G);
+        __builtin_amdgcn_sched_group_barrier(VALU, 2, G);
     });
 }
 
@@ -434,11 +437,18 @@ __device__ inline typename T::D_ACC attn_row_max(const V& v_s)
     return max(std::bit_cast<float>(res16.x), std::bit_cast<float>(res16.y));
 }
 
+// Fused `v_s * scale - row_max`. The caller takes the row max of the *raw* scores and
+// scales that single scalar instead (scale > 0, so the max commutes with it): the raw
+// scores then feed one v_fma each. Pre-scaling the tile before the reduction instead
+// costs a second pass of muls, because the subtract fuses the scale back in anyway,
+// and it puts those muls on the critical path ahead of the reduction.
 template <typename T, typename V>
-__device__ inline void attn_sub_row(V& v_s, typename T::D_ACC row_max)
+__device__ inline void
+attn_scale_sub_row(V& v_s, typename T::D_ACC scale, typename T::D_ACC row_max)
 {
     constexpr opus::index_t s_len = opus::vector_traits<V>::size();
-    opus::static_for<s_len>([&](auto i) { v_s[i.value] -= row_max; });
+    opus::static_for<s_len>(
+        [&](auto i) { v_s[i.value] = __builtin_fmaf(v_s[i.value], scale, -row_max); });
 }
 
 template <typename T, opus::index_t Offset, opus::index_t Count, typename V>
@@ -666,6 +676,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
 
     constexpr index_t s_len      = vector_traits<typename decltype(mma0_rope)::vtype_c>::size();
     constexpr index_t s_half_len = s_len / 2;
+    // GEMM0 MFMA count: each e_k step (nope and rope alike) issues GEMM0_E_N of them.
+    constexpr int QK_MFMA_CNT = T::GEMM0_E_N * (T::GEMM0_NOPE_E_K + T::GEMM0_ROPE_E_K);
 
     constexpr D_ACC RESCALE_THRESHOLD = 8.0f;
     D_ACC rescale_m                   = 1.0f;
@@ -687,6 +699,10 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             g_k_rope, s_k_rope.ptr, u_gk_rope + kv_page_offset(kv_page_rope), u_sk_rope + slot_off);
     };
 
+    // GEMM0. Deliberately left for the compiler to schedule: v_o alone is 128 VGPR, so at
+    // 256 there is no headroom here, and hand-fencing the softmax tail into these e_k steps
+    // (the way stage3 does for the PV loop) lengthens live ranges enough to spill. The
+    // scheduler already mixes the tail into the later QK MFMAs on its own.
     auto compute_qk_nope = [&](auto& s, auto& q, auto& k, auto noff) {
         clear(s);
         static_for<T::GEMM0_NOPE_E_K>([&](auto ek) {
@@ -716,20 +732,39 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_lgkmcnt(0_I);
         s = mma0_rope(q[1], k[1], s);
     };
-    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto noff) {
-        static_for<T::NUM_D_SLICES - 2>([&](auto i) {
+    // One PV pass over all d-slices; slice i is one mma1 (2 MFMA) plus the tr_load feeding
+    // the slice two ahead. `co(i)` is emitted immediately after slice i, so its VALU issues
+    // while that MFMA pair is still occupying the MAI pipe.
+    //
+    // The placement is by hand rather than left to sched_group_barrier because neither half
+    // of that works here. The scheduler keeps program order on its own: consecutive mma1
+    // accumulate into different registers, so it sees no stall worth filling. And it must
+    // not be given the freedom anyway -- tr_load lowers to inline asm (ds_read_b64_tr_b8),
+    // so the compiler does not see a DS read at all: sched_group_barrier's DS_READ class
+    // never matches it, SIInsertWaitcnts never emits a wait for it, and the s_waitcnt below
+    // is the only thing publishing its result. Let it drift by one slot and the MFMA reads
+    // stale LDS. Hence hard fences around each chunk; they cost nothing, since co-execution
+    // is a property of issue order, not of the scheduler's regions.
+    auto compute_pv = [&](const auto& p, auto& v, auto& o, auto noff, auto&& co) {
+        static_for<T::NUM_D_SLICES>([&](auto i) {
             constexpr int idx  = i.value;
             constexpr int slot = idx & 1;
             o[idx]             = mma1(p, v[slot], o[idx]);
-            v[slot] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + noff + sv_slice(number<idx + 2>{}));
-            s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+            if constexpr(idx + 2 < T::NUM_D_SLICES)
+            {
+                v[slot] = tr_load<T::VEC_TR_V>(s_k_nope, u_rv + noff + sv_slice(number<idx + 2>{}));
+                s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
+            }
+            else if constexpr(idx + 1 < T::NUM_D_SLICES)
+            {
+                s_waitcnt_lgkmcnt(0_I);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+            co(i);
             __builtin_amdgcn_sched_barrier(0);
         });
-        o[T::NUM_D_SLICES - 2] = mma1(p, v[(T::NUM_D_SLICES - 2) & 1], o[T::NUM_D_SLICES - 2]);
-        s_waitcnt_lgkmcnt(0_I);
-        __builtin_amdgcn_sched_barrier(0);
-        o[T::NUM_D_SLICES - 1] = mma1(p, v[(T::NUM_D_SLICES - 1) & 1], o[T::NUM_D_SLICES - 1]);
     };
+    auto no_co = [](auto) {};
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
 
@@ -806,9 +841,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     compute_qk_nope(v_s[0], v_q_nope_slices, v_k_nope, 0_I);
     compute_qk_rope(v_s[0], v_q_rope_slices, v_k_rope, 0_I);
     mask_oob_scores(v_s[0], tile_begin);
-    static_for<s_len>([&](auto i) { v_s[0][i.value] *= temperature_scale; });
-    m_row = max(m_row, attn_row_max<T>(v_s[0]));
-    attn_sub_row<T>(v_s[0], m_row);
+    m_row = max(m_row, temperature_scale * attn_row_max<T>(v_s[0]));
+    attn_scale_sub_row<T>(v_s[0], temperature_scale, m_row);
     attn_exp2_slice<T, 0, s_half_len>(v_s[0]);
     asm volatile("" : "+v"(v_s[0])::);
     // s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
@@ -831,13 +865,14 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_lgkmcnt(number<T::k_nope_ds_read_insts>{});
         stage_end();
 
-        // stage1 [compute]: gemm0 su0(t) [12 MFMA]; softmax-tail(t-1) exp slice [8 EXP].
+        // stage1 [compute]: gemm0 QK(t) [12 MFMA]; softmax-tail(t-1) [4 EXP + ~18 VALU].
         __builtin_amdgcn_s_setprio(1);
         compute_qk_nope(vs_cur, v_q_nope_slices, v_k_nope, cur_slot * kv_slot_off);
         compute_qk_rope(vs_cur, v_q_rope_slices, v_k_rope, cur_slot * kv_slot_off);
         attn_exp2_slice<T, s_half_len, s_half_len>(vs_prev);
         l_row += attn_row_sum<T>(vs_prev);
         v_p = cast<D_K>(vs_prev);
+        sched_compute_qk<QK_MFMA_CNT, 1>();
         stage_end();
 
         // stage2 [mem]: read V(t-1); prefetch tile t+2 into the slot tile t-2 vacated
@@ -850,16 +885,64 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
         s_waitcnt_lgkmcnt(number<T::v_ds_read_insts>{});
         stage_end();
 
-        // stage3 [compute]: gemm1 su0(t - 1) [12 MFMA]; softmax-head(t) exp slice [8 EXP].
+        // stage3 [compute]: gemm1 PV(t-1) [32 MFMA] with the softmax head of tile t chopped
+        // into per-d-slice chunks that ride in the MFMA shadows. The head reads only
+        // vs_cur, which stage1 finished, so nothing in it depends on the PV chain, and the
+        // ~25 VALU + 4 exp it used to run as a serial block after the last MFMA now cost
+        // nothing. Chunk k runs after PV slice k:
+        //   0,1  local row max          2,3  cross-lane max (permlane32 / permlane16)
+        //   4    rescale decision       5-8  fused scale-subtract   6-9  exp2
+        // Two MFMA (~32 cycles) separate consecutive chunks, which more than covers the
+        // 4-cycle dependent-VALU latency of the reduction chain.
+        D_ACC rmx;
+        auto head_chunk = [&](auto slice) {
+            constexpr int k = decltype(slice)::value;
+            if constexpr(k == 0)
+            {
+                rmx = vs_cur[0];
+                static_for<s_half_len - 1>([&](auto i) { rmx = max(rmx, vs_cur[i.value + 1]); });
+            }
+            else if constexpr(k == 1)
+            {
+                static_for<s_len - s_half_len>(
+                    [&](auto i) { rmx = max(rmx, vs_cur[s_half_len + i.value]); });
+            }
+            else if constexpr(k == 2)
+            {
+                vector_t<u32_t, 2> r = __builtin_amdgcn_permlane32_swap(
+                    std::bit_cast<u32_t>(rmx), std::bit_cast<u32_t>(rmx), false, true);
+                rmx = max(std::bit_cast<float>(r.x), std::bit_cast<float>(r.y));
+            }
+            else if constexpr(k == 3)
+            {
+                vector_t<u32_t, 2> r = __builtin_amdgcn_permlane16_swap(
+                    std::bit_cast<u32_t>(rmx), std::bit_cast<u32_t>(rmx), false, true);
+                row_max =
+                    temperature_scale * max(std::bit_cast<float>(r.x), std::bit_cast<float>(r.y));
+            }
+            else if constexpr(k == 4)
+            {
+                below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
+                all_below =
+                    (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
+                row_max = all_below ? m_row : max(m_row, row_max);
+            }
+            // fma-subtract and exp2 overlap: exp of element e only needs its own subtract,
+            // which landed one chunk earlier.
+            if constexpr(k >= 5 && k < 5 + s_len / 2) // two elements per chunk
+            {
+                constexpr int b = (k - 5) * 2;
+                vs_cur[b]       = __builtin_fmaf(vs_cur[b], temperature_scale, -row_max);
+                vs_cur[b + 1]   = __builtin_fmaf(vs_cur[b + 1], temperature_scale, -row_max);
+            }
+            if constexpr(k >= 6 && k < 6 + s_half_len)
+            {
+                constexpr int e = k - 6;
+                vs_cur[e]       = __builtin_amdgcn_exp2f(vs_cur[e]);
+            }
+        };
         __builtin_amdgcn_s_setprio(1);
-        compute_pv(v_p, v_v, v_o_slices, prev_slot * kv_slot_off);
-        static_for<s_len>([&](auto i) { vs_cur[i.value] *= temperature_scale; });
-        row_max      = attn_row_max<T>(vs_cur);
-        below_thresh = ((row_max - m_row) <= RESCALE_THRESHOLD);
-        all_below    = (__builtin_amdgcn_ballot_w64(below_thresh) == __builtin_amdgcn_read_exec());
-        row_max      = all_below ? m_row : max(m_row, row_max);
-        attn_sub_row<T>(vs_cur, row_max);
-        attn_exp2_slice<T, 0, s_half_len>(vs_cur);
+        compute_pv(v_p, v_v, v_o_slices, prev_slot * kv_slot_off, head_chunk);
         asm volatile("" : "+v"(vs_cur)::);
         __builtin_amdgcn_sched_barrier(0);
         if(!all_below)
@@ -928,7 +1011,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     stage_end();
 
     // stage2 [compute]: gemm1 su0
-    compute_pv(v_p, v_v, v_o_slices, last_slot * kv_slot_off);
+    compute_pv(v_p, v_v, v_o_slices, last_slot * kv_slot_off, no_co);
     __builtin_amdgcn_sched_barrier(0);
 
     // Stagger: the group that skipped the prologue barrier does its extra one here.
