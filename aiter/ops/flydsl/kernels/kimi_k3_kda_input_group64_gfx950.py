@@ -5,7 +5,7 @@
 
 The schedule is inherited from the measured row-E4M3 projection.  The only
 numerical change is a FP32 scale per output row and 64 input columns.  FP8
-values are converted to BF16 for ``fdot2``; each eight-element partial is
+values are converted to BF16 for ``fdot2``; each sixteen-element partial is
 scaled in FP32 and accumulated in FP32.  The final store is BF16.
 """
 
@@ -32,7 +32,9 @@ _STORED_OUTPUT_FEATURES = 6284
 _GROUP_SIZE = 64
 _GROUPS_PER_ROW = _INPUT_FEATURES // _GROUP_SIZE
 _WAVE_SIZE = 64
-_ELEMENTS_PER_LOAD = 8
+# Two 128-bit BF16 loads and one 128-bit packed-FP8 load per lane reduce the
+# fixed K loop from 14 iterations to 7 while retaining FP32 scaled accumulation.
+_ELEMENTS_PER_LOAD = 16
 _K_PER_WAVE_ITERATION = _WAVE_SIZE * _ELEMENTS_PER_LOAD
 
 
@@ -100,37 +102,69 @@ def build_kimi_k3_kda_input_group64_module(
         hidden_lds = fx.SharedAllocator().allocate(SharedStorage).peek().hidden.ptr
         vec2_f32 = T.vec(2, f32)
         vec2_bf16 = T.vec(2, T.bf16)
-        vec8_bf16 = T.vec(_ELEMENTS_PER_LOAD, T.bf16)
+        vec16_bf16 = T.vec(_ELEMENTS_PER_LOAD, T.bf16)
         zero_f32 = arith.constant(0.0, type=f32)
 
-        def load_bf16x8(resource, element_index):
-            dwords = buffer_ops.buffer_load(
-                resource,
-                element_index // arith.constant(2, type=i32),
-                vec_width=4,
-                dtype=i32,
+        def load_bf16x16(resource, element_index):
+            dwords_lo = ArithValue(
+                buffer_ops.buffer_load(
+                    resource,
+                    element_index // arith.constant(2, type=i32),
+                    vec_width=4,
+                    dtype=i32,
+                )
             )
-            return vector.bitcast(vec8_bf16, dwords)
+            dwords_hi = ArithValue(
+                buffer_ops.buffer_load(
+                    resource,
+                    (element_index + arith.constant(_ELEMENTS_PER_LOAD // 2, type=i32))
+                    // arith.constant(2, type=i32),
+                    vec_width=4,
+                    dtype=i32,
+                )
+            )
+            dwords = vector.shuffle(dwords_lo, dwords_hi, list(range(8)))
+            return vector.bitcast(vec16_bf16, dwords)
 
-        def load_fp8x8_as_f32(resource, element_index):
+        def load_fp8x16_as_f32(resource, element_index):
             packed = ArithValue(
                 buffer_ops.buffer_load(
                     resource,
                     element_index // arith.constant(4, type=i32),
-                    vec_width=2,
+                    vec_width=4,
                     dtype=i32,
                     cache_modifier=weight_cache_modifier,
                 )
             )
-            packed0 = vector.extract(packed, static_position=[0], dynamic_position=[])
-            packed1 = vector.extract(packed, static_position=[1], dynamic_position=[])
-            weight0_lo = cvt_pk_f32_fp8(res=vec2_f32, src=packed0, word_sel=False)
-            weight0_hi = cvt_pk_f32_fp8(res=vec2_f32, src=packed0, word_sel=True)
-            weight1_lo = cvt_pk_f32_fp8(res=vec2_f32, src=packed1, word_sel=False)
-            weight1_hi = cvt_pk_f32_fp8(res=vec2_f32, src=packed1, word_sel=True)
-            weight_lo = weight0_lo.shuffle(weight0_hi, [0, 1, 2, 3])
-            weight_hi = weight1_lo.shuffle(weight1_hi, [0, 1, 2, 3])
-            return weight_lo.shuffle(weight_hi, [0, 1, 2, 3, 4, 5, 6, 7])
+            converted = []
+            for packed_index in range_constexpr(4):
+                packed_dword = vector.extract(
+                    packed,
+                    static_position=[packed_index],
+                    dynamic_position=[],
+                )
+                weight_lo = cvt_pk_f32_fp8(
+                    res=vec2_f32,
+                    src=packed_dword,
+                    word_sel=False,
+                )
+                weight_hi = cvt_pk_f32_fp8(
+                    res=vec2_f32,
+                    src=packed_dword,
+                    word_sel=True,
+                )
+                converted.append(vector.shuffle(weight_lo, weight_hi, [0, 1, 2, 3]))
+            weight_lo = vector.shuffle(
+                converted[0],
+                converted[1],
+                list(range(8)),
+            )
+            weight_hi = vector.shuffle(
+                converted[2],
+                converted[3],
+                list(range(8)),
+            )
+            return vector.shuffle(weight_lo, weight_hi, list(range(16)))
 
         def wave_reduce_add(value):
             reduced = _raw(value)
@@ -157,7 +191,7 @@ def build_kimi_k3_kda_input_group64_module(
                 load_if = scf.IfOp(can_load)
                 with ir.InsertionPoint(load_if.then_block):
                     fx.ptr_store(
-                        load_bf16x8(hidden_rsrc, element_index),
+                        load_bf16x16(hidden_rsrc, element_index),
                         hidden_lds + element_index,
                     )
                     scf.YieldOp([])
@@ -199,16 +233,16 @@ def build_kimi_k3_kda_input_group64_module(
                             if const_expr(hidden_to_lds):
                                 hidden_bf16 = fx.ptr_load(
                                     hidden_lds + k_element,
-                                    result_type=vec8_bf16,
+                                    result_type=vec16_bf16,
                                 )
                             else:
-                                hidden_bf16 = load_bf16x8(hidden_rsrc, k_element)
+                                hidden_bf16 = load_bf16x16(hidden_rsrc, k_element)
                             weight_element = (
                                 row * arith.constant(_INPUT_FEATURES, type=i32)
                                 + k_element
                             )
-                            weight_f32 = load_fp8x8_as_f32(weight_rsrc, weight_element)
-                            weight_bf16 = arith.trunc_f(vec8_bf16, _raw(weight_f32))
+                            weight_f32 = load_fp8x16_as_f32(weight_rsrc, weight_element)
+                            weight_bf16 = arith.trunc_f(vec16_bf16, _raw(weight_f32))
                             chunk_dot = ArithValue(zero_f32)
                             for pair_index in range_constexpr(_ELEMENTS_PER_LOAD // 2):
                                 hidden_pair = vector.from_elements(
