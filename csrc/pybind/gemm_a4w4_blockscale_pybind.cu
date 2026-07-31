@@ -7,7 +7,7 @@
 // extracts the current HIP stream from ATen, and delegates to aiter::.
 #include "rocm_ops.hpp"
 #include "gemm_a4w4_blockscale.h"
-#include "pybind_aiter_compat.h"
+#include "py_itfs_common.h"
 
 #include <ATen/hip/HIPContext.h>
 

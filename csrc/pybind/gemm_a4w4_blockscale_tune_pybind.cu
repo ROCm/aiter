@@ -5,7 +5,7 @@
 // See gemm_a4w4_blockscale_pybind.cu for the rationale.
 #include "rocm_ops.hpp"
 #include "gemm_a4w4_blockscale.h"
-#include "pybind_aiter_compat.h"
+#include "py_itfs_common.h"
 
 #include <ATen/hip/HIPContext.h>
 
