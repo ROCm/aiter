@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 FlyDSL backend for the A16W16 GEMM: torch-facing wrapper.
-"""
+"""gfx1250 FlyDSL backend for the A16W16 GEMM: torch-facing wrapper."""
 
 from __future__ import annotations
 
