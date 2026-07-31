@@ -115,13 +115,16 @@ class PrefillArgs:
     # unique across the batched-token sweep. Empty for single-value groups, so
     # their ids are unchanged.
     bt_tag: str = ""
-    # dense(非 varlen) 路径的 batch 大小 B。>1 时 ``_make_inputs`` 会把 ``g`` 造成
-    # 3D ``[B, H, T_flat]`` 布局，覆盖 dense B>1 的 batch-head gate 偏移路径
-    # （kernel 端 ``g_head_base`` 需含 ``i_n*H*T_flat`` 的 batch stride）。varlen
-    # 路径忽略此字段（恒 B=1、N 段）。默认 1，保持既有 dense 用例不变。
+    # Batch size B for the dense (non-varlen) path. When >1, ``_make_inputs``
+    # builds ``g`` as a 3D ``[B, H, T_flat]`` layout, exercising the dense B>1
+    # batch-head gate-offset path (the kernel's ``g_head_base`` must include the
+    # ``i_n*H*T_flat`` batch stride). The varlen path ignores this field (always
+    # B=1, N segments). Defaults to 1 so existing dense cases are unchanged.
     dense_batch: int = 1
-    # 是否提供 ``g``。False 走 ``g=None`` (USE_G=False)，覆盖无 g 时对末 chunk
-    # padding 行的屏蔽（否则无效 token 的 v_new 会经 gated_v 污染状态更新）。
+    # Whether to provide ``g``. False takes the ``g=None`` (USE_G=False) path,
+    # covering the masking of the last chunk's padding rows when there is no g
+    # (otherwise invalid tokens' v_new would flow through gated_v and corrupt
+    # the state update).
     use_g: bool = True
 
     @property
@@ -254,9 +257,9 @@ class PrefillGroup:
     #     clusters (head near 6400 / 8192 / 9912 / 10000) found in the
     #     bench_gdr 20260604 trace.
     num_segments: int = 3
-    # dense(非 varlen) batch 大小；>1 时 g 转 3D [B,H,T_flat]（见 PrefillArgs）。
+    # dense (non-varlen) batch size; when >1, g becomes 3D [B,H,T_flat] (see PrefillArgs).
     dense_batch: int = 1
-    # 是否提供 g；False 走 g=None(USE_G=False) 路径（见 PrefillArgs）。
+    # whether to provide g; False takes the g=None (USE_G=False) path (see PrefillArgs).
     use_g: bool = True
 
 
@@ -399,9 +402,10 @@ _PREFILL_GROUPS = [
         full_prompt_lens=[1024, 2048, 4096, 8192],
         is_varlen=False,
         max_num_batched_tokens="full_prompt_len",
-        # dense B>1：g 转 3D [B,H,T]，验证 kernel 的 batch-head gate 偏移
-        # （g_head_base 含 i_n*H*T_flat）。dense 路径本就恒用 3D g，这里再把 B
-        # 提到 2 覆盖 i_n>0 的 batch stride 分支。
+        # dense B>1: g becomes 3D [B,H,T], validating the kernel's batch-head
+        # gate offset (g_head_base includes i_n*H*T_flat). The dense path always
+        # uses 3D g anyway; bumping B to 2 here covers the i_n>0 batch-stride
+        # branch.
         dense_batch=2,
     ),
     # varlen + final_state (default path), TP=4 / TP=8 share everything
@@ -426,12 +430,16 @@ _PREFILL_GROUPS = [
         # max_num_batched_tokens=[65536],
     ),
     PrefillGroup(
-        # 无 g（USE_G=False）+ 短单段序列：T=100/200/300 均 %64!=0，末 chunk 含
-        # padding 行，验证无 g 时对越界行的屏蔽（否则无效 token 的 v_new 经 gated_v
-        # 污染状态更新）。刻意用短序列（<=5 chunk）：no-g 无门控衰减，长序列会让
-        # 状态累积增长把 bf16 累加误差放大到超 5e-2；no-g 计算逻辑本身已与 g=0 的
-        # with-g 路径逐位一致，此处只需在数值可控范围内验证 padding 屏蔽。
-        # （原 aws-16k with-g 覆盖由保留的 varlen-32k-aws 承担。）
+        # No g (USE_G=False) + short single-segment sequences: T=100/200/300 are
+        # all %64!=0, so the last chunk has padding rows -- validates the masking
+        # of OOB rows when there is no g (otherwise invalid tokens' v_new flows
+        # through gated_v and corrupts the state update). Short sequences
+        # (<=5 chunks) are used on purpose: no-g has no gate decay, so a long
+        # sequence lets the state grow and amplify bf16 accumulation error past
+        # 5e-2; the no-g compute path itself is already bit-identical to the
+        # with-g path at g=0, so here we only need to validate padding masking
+        # within a numerically controlled range. (The original aws-16k with-g
+        # coverage is carried by the retained varlen-32k-aws group.)
         model_name="nog-short",
         Hv=32,
         tps=[1],
@@ -460,8 +468,9 @@ _PREFILL_GROUPS = [
         tps=[1],
         full_prompt_lens=[16384],
         max_num_batched_tokens=16384,
-        # head=0 制造空首段（cu_seqlens=[0,0,10000,16384]），验证空 varlen 序列
-        # 跳过 W/K prologue、不越界读，且状态经 h0->ht 正确透传。
+        # head=0 creates an empty first segment (cu_seqlens=[0,0,10000,16384]),
+        # validating that empty varlen sequences skip the W/K prologue, do not
+        # read out of bounds, and pass state through h0->ht correctly.
         head_seqlens=[0, 10, 65, 704, 936, 1820, 4467, 5508],
         mid_seqlen=10000,
     ),
@@ -586,11 +595,11 @@ def _make_inputs(
     k = torch.randn(B, T_total, Hg, K_dim, dtype=dtype, device=device) * 0.1
     w_orig = torch.randn(B, T_total, H, K_dim, dtype=dtype, device=device) * 0.1
     u_orig = torch.randn(B, T_total, H, V_dim, dtype=dtype, device=device) * 0.1
-    # g gate 布局（head-major，cumsum 沿 T；匹配 Triton VK / HIP / FlyDSL K5）：
-    #   * use_g=False -> None（走 USE_G=False，验证末 chunk padding 行屏蔽）
+    # g gate layout (head-major, cumsum along T; matches Triton VK / HIP / FlyDSL K5):
+    #   * use_g=False -> None (USE_G=False path, validates last-chunk padding masking)
     #   * varlen      -> 2D [H, T_total]
-    #   * dense       -> 3D [B, H, T_total]（覆盖 dense B>1 的 batch-head gate
-    #                    偏移；B=1 时与 2D 数值等价）
+    #   * dense       -> 3D [B, H, T_total] (covers the dense B>1 batch-head
+    #                    gate offset; numerically equal to 2D when B=1)
     if not use_g:
         g = None
     elif is_varlen:
@@ -684,7 +693,7 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     b_v = u_chunk - w_chunk @ h_state.T
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
-                    # g 序列：None(无 g) / 2D[H,T](varlen) / 3D[B,H,T](dense)。
+                    # g sequence: None(no g) / 2D[H,T](varlen) / 3D[B,H,T](dense).
                     if g is None:
                         g_seq = None
                     elif g.dim() == 3:
@@ -695,8 +704,9 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     mask = torch.zeros(BT_dim, device=k.device)
                     mask[:actual_bt] = 1.0
                     if g_seq is None:
-                        # 无 g：不做门控衰减；valid 行 gate=1，padding 行本就不在
-                        # chunk 切片内。对应 kernel USE_G=False 的纯 padding 屏蔽。
+                        # No g: no gate decay; valid rows have gate=1 and padding
+                        # rows are not in the chunk slice at all. Matches the
+                        # kernel's pure padding masking under USE_G=False.
                         gate = mask[:actual_bt]
                     else:
                         last_idx = bos + t_end - 1

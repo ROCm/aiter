@@ -217,13 +217,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     unchanged, so this only affects HBM bandwidth / footprint of the SSM
     state. Mirrors the pattern used by ``kernels/gdr_decode.py``.
     """
-    # 该 kernel 的 wave 映射（wid*16, 4 wave 覆盖 64 行）、协作载入分块与
-    # BT_STEPS 均硬编码 BT=64；gated_v 别名复用 h_state panel1（需
-    # NUM_K_BLOCKS>=2，K=64 时 panel1 根本不存在 → 越界 store），且 LDS 布局
-    # 只在 K=V=128 上校验过。其它 BT/K 会触发 LDS 别名越界、越界 store 或
-    # LDS 超额，故在此显式拒绝而非静默产生错误结果。
-    assert BT == 64, f"chunk_gated_delta_h_mfma16_hip 仅支持 BT=64, got BT={BT}"
-    assert K == 128, f"chunk_gated_delta_h_mfma16_hip 仅支持 K=128, got K={K}"
+    # This kernel's wave mapping (wid*16, 4 waves cover 64 rows), the
+    # cooperative-load batching, and BT_STEPS all hardcode BT=64; gated_v
+    # alias-reuses h_state panel1 (needs NUM_K_BLOCKS>=2; for K=64 panel1 does
+    # not exist at all -> out-of-bounds store), and the LDS layout is only
+    # validated for K=V=128. Other BT/K would trigger LDS aliasing OOB,
+    # out-of-bounds stores, or excessive LDS usage, so reject them explicitly
+    # here instead of silently producing wrong results.
+    assert BT == 64, f"chunk_gated_delta_h_mfma16_hip only supports BT=64, got BT={BT}"
+    assert K == 128, f"chunk_gated_delta_h_mfma16_hip only supports K=128, got K={K}"
     assert BV % 16 == 0
     NUM_K_BLOCKS = K // 64
 
@@ -297,9 +299,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
     # on revision change (port of FlyDSL commit d4643e0e).
-    _K5_KERNEL_REVISION = (
-        122  # fp32->bf16 输出改用截断(_BF16_CONVERT_TRUNC)对齐 hip float_to_bf16
-    )
+    # fp32->bf16 output truncates (_BF16_CONVERT_TRUNC) to match hip float_to_bf16
+    _K5_KERNEL_REVISION = 122
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -604,11 +605,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         if const_expr(STORE_FINAL_STATE):
             ht_base = state_nh * fx.Int32(V * K)
 
-        # g 头基址（head-major，stride-1 沿 T）。
-        #   varlen: g 为 [H, T_flat]，token = bos + rel_row（bos 是拼接序列里的
-        #     全局 token 偏移）→ base = i_h*T_flat + bos。
-        #   dense : g 为 [B, H, T_flat]，必须带上 batch 维 stride i_n*H；旧实现
-        #     用 i_h*T_flat + bos(=i_n*T_val) 漏掉了 i_n*H*T_flat，B>1 时读错行。
+        # g head base offset (head-major, stride-1 along T).
+        #   varlen: g is [H, T_flat], token = bos + rel_row (bos is the global
+        #     token offset within the concatenated sequence) -> base =
+        #     i_h*T_flat + bos.
+        #   dense : g is [B, H, T_flat], so the batch-dim stride i_n*H must be
+        #     included; the old code used i_h*T_flat + bos(=i_n*T_val), which
+        #     dropped i_n*H*T_flat and read the wrong rows when B>1.
         if const_expr(USE_G):
             if const_expr(IS_VARLEN):
                 g_head_base = i_h * T_flat + bos
@@ -664,16 +667,22 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         nt_idx = fx.Index(NT)
 
         # -- PROLOGUE: load w/k for chunk 0 to LDS (HIP .cu:1125-1141) --
-        # 空 varlen 序列（T_local==0 → NT==0）不需要预取；若不跳过，safe_row 会被
-        # 钳到 0，而末尾空序列的 bos==T_flat 会让 w/k 的全局地址越过输入 buffer 末尾
-        # 造成越界读。用 block-uniform 的 NT>0 守卫整体跳过 prologue（含其 barrier）。
-        # 空序列时主循环也跑 0 次，results 直接沿用 init_state(=h0)，epilogue 把
-        # h0 原样写回 ht，状态正确透传。
+        # Empty varlen sequences (T_local==0 -> NT==0) need no prefetch; if not
+        # skipped, safe_row is clamped to 0 while a trailing empty sequence has
+        # bos==T_flat, so the w/k global address runs past the end of the input
+        # buffer -> out-of-bounds read. Use a block-uniform NT>0 guard to skip
+        # the whole prologue (including its barrier). For an empty sequence the
+        # main loop also runs 0 times, results simply carry init_state(=h0)
+        # through, and the epilogue writes h0 back to ht -- state passes through
+        # correctly.
         #
-        # 整段封进闭包 _load_chunk0_to_lds：GTensor(w_/k_) 与 STensor(lds_wp/lds_kp)
-        # 作为闭包自由变量被捕获，if body 内只出现"调用闭包 + barrier"，避免 FlyDSL
-        # AST rewriter 把这些非 MLIR-Value 的张量对象当作 scf.if 的透传 state
-        # （否则报 "GTensor is not an MLIR Value"）——与后文 has_next 用闭包同款。
+        # The whole body is wrapped in the closure _load_chunk0_to_lds: the
+        # GTensor (w_/k_) and STensor (lds_wp/lds_kp) are captured as free
+        # variables so the if body only contains "call closure + barrier". This
+        # keeps the FlyDSL AST rewriter from treating these non-MLIR-Value
+        # tensor objects as scf.if carried state (otherwise it errors with
+        # "GTensor is not an MLIR Value") -- same trick as the has_next block
+        # below.
         def _load_chunk0_to_lds():
             _prol_it = fx.Int32(0)
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -717,8 +726,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
                     lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
 
-        # NT 由整除得到、是底层 ArithValue（无 .ir_value）；包成 fx.Int32 再比较，
-        # 得到可经 scf.if 使用的 fx 布尔（与后文 has_next 同款）。
+        # NT comes from integer division and is a raw ArithValue (no
+        # .ir_value); wrap it in fx.Int32 before comparing to get an fx boolean
+        # usable by scf.if (same as the has_next block below).
         has_work = fx.Int32(NT) > fx.Int32(0)
         if has_work.ir_value():
             _load_chunk0_to_lds()
@@ -850,10 +860,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_hi, b_frag_hi, bv_accs[nr]
                         )
-                    # gfx942 调度：在每个 ks 边界插 sched_barrier(mask_mfma)，阻止 LLVM
-                    # 把各 ks 的 b_frag ds_read 跨迭代 hoist 聚成一大簇（LDS 端口背压
-                    # 主因），但放行 MFMA 跨 ks 重叠以保留流水隐藏延迟。sched_barrier
-                    # 只约束指令排布、不改地址/数值，正确性安全。
+                    # gfx942 scheduling: insert sched_barrier(mask_mfma) at each
+                    # ks boundary to stop LLVM from hoisting the per-ks b_frag
+                    # ds_read across iterations into one big cluster (the main
+                    # cause of LDS port back-pressure), while still allowing MFMA
+                    # to overlap across ks to keep pipeline latency hidden.
+                    # sched_barrier only constrains instruction ordering, not
+                    # addresses/values, so it is correctness-safe.
                     if const_expr(SCHED_GFX942):
                         rocdl.sched_barrier(rocdl.mask_mfma)
 
@@ -916,7 +929,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_hi, b_frag_hi, bv_accs[nr]
                         )
-                    # gfx942 调度：同上，切断 remaining K-block 跨 ks 的 ds_read 聚簇，放行 MFMA。
+                    # gfx942 scheduling: same as above, break up the remaining
+                    # K-block's cross-ks ds_read clustering while allowing MFMA.
                     if const_expr(SCHED_GFX942):
                         rocdl.sched_barrier(rocdl.mask_mfma)
 
@@ -934,10 +948,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
                 gate_vec = vector.from_elements(T.f32x4, gate_elems)
             else:
-                # 无 g 时也必须屏蔽最后一个 chunk 的 padding 行
-                # （abs_row >= T_local）。否则这些无效 token 的 v_new 会经 gated_v
-                # 进入 GEMM2（h += k^T @ v_new_gated）污染状态更新。USE_G 路径已借
-                # gate=0 屏蔽；这里用 0/1 掩码达到同样效果。
+                # Even without g we must mask the last chunk's padding rows
+                # (abs_row >= T_local). Otherwise these invalid tokens' v_new
+                # would flow through gated_v into GEMM2 (h += k^T @ v_new_gated)
+                # and corrupt the state update. The USE_G path already masks via
+                # gate=0; here a 0/1 mask achieves the same effect.
                 mask_elems = []
                 for elem_i in range_constexpr(4):
                     abs_row = (
@@ -983,8 +998,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             vn_off = vn_base + vn_bt_row * fx.Int32(V) + u_col
                             _emit_vn_store(vn_off, bf16_v)
 
-                # gate_vec: USE_G 时是衰减门控（已折叠越界屏蔽），否则是纯 0/1
-                # padding 掩码。两条路径都乘 gate_vec，保证越界行贡献恒为 0。
+                # gate_vec: with USE_G it is the decay gate (with the OOB mask
+                # already folded in); otherwise it is a pure 0/1 padding mask.
+                # Both paths multiply by gate_vec so OOB rows always contribute 0.
                 gated_val = vn_val * gate_vec
                 gv_col = fx.Int32(idx * 16) + lane_n
                 gv_row_block = wid * fx.Int32(4) + lane_m_base
