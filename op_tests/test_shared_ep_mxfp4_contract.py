@@ -11,7 +11,6 @@ from aiter.ops.triton.moe.shared_ep_mxfp4 import (
     validate_shared_ep_mxfp4_contract,
 )
 
-
 TOP_K = 2
 BLOCK_M = 64
 K = 128
@@ -149,21 +148,112 @@ def test_shared_ep_w13_w2_contract_and_config_hook() -> None:
     assert w2_profile.route_capacity == 6
 
 
+def test_dsv4_pro_production_shapes_validate_without_materialization() -> None:
+    device = torch.device("meta")
+    owners = 8
+    tokens_per_owner = 32
+    top_k = 6
+    hidden_size = 7168
+    intermediate_size = 3072
+    num_local_experts = 48
+    block_m = 128
+    owner_rows = owners * tokens_per_owner
+    route_capacity = owner_rows * top_k
+    sorted_capacity = route_capacity + num_local_experts * (block_m - 1)
+    route_blocks = (sorted_capacity + block_m - 1) // block_m
+
+    routes = torch.empty(sorted_capacity, dtype=torch.int32, device=device)
+    experts = torch.empty(route_blocks, dtype=torch.int32, device=device)
+    num_padded = torch.empty(1, dtype=torch.int32, device=device)
+
+    w13_profile = validate_shared_ep_mxfp4_contract(
+        torch.empty(
+            (owners, tokens_per_owner, hidden_size), dtype=torch.bfloat16, device=device
+        ),
+        torch.empty(
+            (num_local_experts, 2 * intermediate_size, hidden_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        torch.empty(
+            (num_local_experts, 2 * intermediate_size, hidden_size // 32),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        routes,
+        experts,
+        num_padded,
+        stage="w13",
+        top_k=top_k,
+        route_block_size=block_m,
+        out=torch.empty(
+            (route_capacity, intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        check_route_values=False,
+    )
+    assert w13_profile.num_owner_rows == owner_rows
+    assert w13_profile.route_capacity == route_capacity
+    assert w13_profile.num_padded_routes == sorted_capacity
+    assert w13_profile.input_dim == hidden_size
+    assert w13_profile.output_dim == intermediate_size
+
+    w2_profile = validate_shared_ep_mxfp4_contract(
+        torch.empty(
+            (route_capacity, intermediate_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        torch.empty(
+            (num_local_experts, hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        torch.empty(
+            (num_local_experts, hidden_size, intermediate_size // 32),
+            dtype=torch.uint8,
+            device=device,
+        ),
+        routes,
+        experts,
+        num_padded,
+        stage="w2",
+        top_k=top_k,
+        route_block_size=block_m,
+        route_weights=torch.empty(
+            (owners, tokens_per_owner, top_k),
+            dtype=torch.float32,
+            device=device,
+        ),
+        out=torch.empty(
+            (route_capacity, hidden_size),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        check_route_values=False,
+    )
+    assert w2_profile.num_owner_rows == owner_rows
+    assert w2_profile.route_capacity == route_capacity
+    assert w2_profile.input_dim == intermediate_size
+    assert w2_profile.output_dim == hidden_size
+
+
 def test_shared_ep_contract_fails_closed() -> None:
     routes, experts, num_padded = _route_metadata()
     weight, scales = _weight_and_scales(256)
     activations = torch.ones((3, K), dtype=torch.bfloat16)
-    common = dict(
-        activations=activations,
-        weight=weight,
-        weight_scales=scales,
-        sorted_route_ids=routes,
-        expert_ids=experts,
-        num_tokens_post_padded=num_padded,
-        stage="w13",
-        top_k=TOP_K,
-        route_block_size=BLOCK_M,
-    )
+    common = {
+        "activations": activations,
+        "weight": weight,
+        "weight_scales": scales,
+        "sorted_route_ids": routes,
+        "expert_ids": experts,
+        "num_tokens_post_padded": num_padded,
+        "stage": "w13",
+        "top_k": TOP_K,
+        "route_block_size": BLOCK_M,
+    }
 
     with pytest.raises(ValueError, match="canonical unswizzled"):
         validate_shared_ep_mxfp4_contract(

@@ -17,14 +17,14 @@ swizzled layouts intentionally fail closed.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Callable, ContextManager, Literal, Mapping, Optional, Union
+from typing import Any, Literal
 
 import torch
-
 
 SharedEPMXFP4Stage = Literal["w13", "w2"]
 
@@ -48,7 +48,7 @@ class SharedEPMXFP4Profile:
     stage: SharedEPMXFP4Stage
     num_owner_rows: int
     route_capacity: int
-    num_active_routes: Optional[int]
+    num_active_routes: int | None
     num_padded_routes: int
     route_block_size: int
     num_experts: int
@@ -57,9 +57,9 @@ class SharedEPMXFP4Profile:
     top_k: int
 
 
-SharedEPMXFP4ConfigHook = Callable[[SharedEPMXFP4Profile], Optional[Mapping[str, Any]]]
+SharedEPMXFP4ConfigHook = Callable[[SharedEPMXFP4Profile], Mapping[str, Any] | None]
 SharedEPMXFP4ProfileHook = Callable[
-    [SharedEPMXFP4Profile, Mapping[str, Any]], Optional[ContextManager[Any]]
+    [SharedEPMXFP4Profile, Mapping[str, Any]], AbstractContextManager[Any] | None
 ]
 
 _FP4_PACKED_DTYPE = getattr(torch, "float4_e2m1fn_x2", None)
@@ -84,7 +84,7 @@ def _normalize_stage(stage: str) -> SharedEPMXFP4Stage:
 
 
 def _normalize_layout(
-    layout: Union[str, SharedEPMXFP4WeightLayout],
+    layout: str | SharedEPMXFP4WeightLayout,
 ) -> SharedEPMXFP4WeightLayout:
     try:
         normalized = SharedEPMXFP4WeightLayout(layout)
@@ -99,7 +99,7 @@ def _normalize_layout(
 
 
 def _normalize_scale_layout(
-    layout: Union[str, SharedEPMXFP4ScaleLayout],
+    layout: str | SharedEPMXFP4ScaleLayout,
 ) -> SharedEPMXFP4ScaleLayout:
     try:
         normalized = SharedEPMXFP4ScaleLayout(layout)
@@ -230,14 +230,12 @@ def validate_shared_ep_mxfp4_contract(
     stage: SharedEPMXFP4Stage,
     top_k: int,
     route_block_size: int,
-    route_weights: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    weight_layout: Union[
-        str, SharedEPMXFP4WeightLayout
-    ] = SharedEPMXFP4WeightLayout.CANONICAL,
-    scale_layout: Union[
-        str, SharedEPMXFP4ScaleLayout
-    ] = SharedEPMXFP4ScaleLayout.CANONICAL,
+    route_weights: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    weight_layout: (
+        str | SharedEPMXFP4WeightLayout
+    ) = SharedEPMXFP4WeightLayout.CANONICAL,
+    scale_layout: str | SharedEPMXFP4ScaleLayout = SharedEPMXFP4ScaleLayout.CANONICAL,
     check_route_values: bool = True,
     require_cuda: bool = False,
 ) -> SharedEPMXFP4Profile:
@@ -419,7 +417,7 @@ def validate_shared_ep_mxfp4_contract(
         if check_route_values
         else sorted_route_ids.numel()
     )
-    num_active_routes: Optional[int] = None
+    num_active_routes: int | None = None
     if check_route_values:
         if num_padded_routes < 0 or num_padded_routes > sorted_route_ids.numel():
             raise ValueError(
@@ -483,8 +481,8 @@ def validate_shared_ep_mxfp4_contract(
 def get_shared_ep_mxfp4_config(
     profile: SharedEPMXFP4Profile,
     *,
-    config: Optional[Mapping[str, Any]] = None,
-    config_hook: Optional[SharedEPMXFP4ConfigHook] = None,
+    config: Mapping[str, Any] | None = None,
+    config_hook: SharedEPMXFP4ConfigHook | None = None,
 ) -> dict[str, Any]:
     """Resolve and validate a gfx950 kernel config for a SharedEP profile.
 
@@ -499,7 +497,7 @@ def get_shared_ep_mxfp4_config(
     if config is not None and config_hook is not None:
         raise ValueError("pass either config or config_hook, not both")
 
-    selected: Optional[Mapping[str, Any]] = config
+    selected: Mapping[str, Any] | None = config
     if config_hook is not None:
         selected = config_hook(profile)
     if selected is None:
@@ -558,10 +556,10 @@ def _require_gfx950() -> None:
 
 
 def _profile_context(
-    profile_hook: Optional[SharedEPMXFP4ProfileHook],
+    profile_hook: SharedEPMXFP4ProfileHook | None,
     profile: SharedEPMXFP4Profile,
     config: Mapping[str, Any],
-) -> ContextManager[Any]:
+) -> AbstractContextManager[Any]:
     if profile_hook is None:
         return nullcontext()
     context = profile_hook(profile, MappingProxyType(dict(config)))
@@ -579,11 +577,11 @@ def _launch_shared_ep_mxfp4(
     sorted_route_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
-    route_weights: Optional[torch.Tensor],
+    route_weights: torch.Tensor | None,
     out: torch.Tensor,
     profile: SharedEPMXFP4Profile,
     config: Mapping[str, Any],
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
 ) -> None:
     from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
@@ -667,18 +665,16 @@ def shared_ep_mxfp4_w13(
     *,
     top_k: int,
     route_block_size: int,
-    out: Optional[torch.Tensor] = None,
-    weight_layout: Union[
-        str, SharedEPMXFP4WeightLayout
-    ] = SharedEPMXFP4WeightLayout.CANONICAL,
-    scale_layout: Union[
-        str, SharedEPMXFP4ScaleLayout
-    ] = SharedEPMXFP4ScaleLayout.CANONICAL,
-    config: Optional[Mapping[str, Any]] = None,
-    config_hook: Optional[SharedEPMXFP4ConfigHook] = None,
-    profile_hook: Optional[SharedEPMXFP4ProfileHook] = None,
+    out: torch.Tensor | None = None,
+    weight_layout: (
+        str | SharedEPMXFP4WeightLayout
+    ) = SharedEPMXFP4WeightLayout.CANONICAL,
+    scale_layout: str | SharedEPMXFP4ScaleLayout = SharedEPMXFP4ScaleLayout.CANONICAL,
+    config: Mapping[str, Any] | None = None,
+    config_hook: SharedEPMXFP4ConfigHook | None = None,
+    profile_hook: SharedEPMXFP4ProfileHook | None = None,
     check_route_values: bool = True,
-    swiglu_limit: Optional[float] = None,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Run SharedEP W13 and return route-indexed BF16 intermediates.
 
@@ -758,16 +754,14 @@ def shared_ep_mxfp4_w2(
     *,
     top_k: int,
     route_block_size: int,
-    out: Optional[torch.Tensor] = None,
-    weight_layout: Union[
-        str, SharedEPMXFP4WeightLayout
-    ] = SharedEPMXFP4WeightLayout.CANONICAL,
-    scale_layout: Union[
-        str, SharedEPMXFP4ScaleLayout
-    ] = SharedEPMXFP4ScaleLayout.CANONICAL,
-    config: Optional[Mapping[str, Any]] = None,
-    config_hook: Optional[SharedEPMXFP4ConfigHook] = None,
-    profile_hook: Optional[SharedEPMXFP4ProfileHook] = None,
+    out: torch.Tensor | None = None,
+    weight_layout: (
+        str | SharedEPMXFP4WeightLayout
+    ) = SharedEPMXFP4WeightLayout.CANONICAL,
+    scale_layout: str | SharedEPMXFP4ScaleLayout = SharedEPMXFP4ScaleLayout.CANONICAL,
+    config: Mapping[str, Any] | None = None,
+    config_hook: SharedEPMXFP4ConfigHook | None = None,
+    profile_hook: SharedEPMXFP4ProfileHook | None = None,
     check_route_values: bool = True,
 ) -> torch.Tensor:
     """Run SharedEP W2 directly into canonical global owner route slots.
@@ -840,7 +834,7 @@ __all__ = [
     "SharedEPMXFP4WeightLayout",
     "get_shared_ep_mxfp4_config",
     "shared_ep_mxfp4_route_rows",
-    "shared_ep_mxfp4_w13",
     "shared_ep_mxfp4_w2",
+    "shared_ep_mxfp4_w13",
     "validate_shared_ep_mxfp4_contract",
 ]

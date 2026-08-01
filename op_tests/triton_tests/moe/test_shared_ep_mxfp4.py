@@ -7,11 +7,10 @@ import torch
 from aiter.ops.triton.moe.shared_ep_mxfp4 import (
     get_shared_ep_mxfp4_config,
     shared_ep_mxfp4_route_rows,
-    shared_ep_mxfp4_w13,
     shared_ep_mxfp4_w2,
+    shared_ep_mxfp4_w13,
     validate_shared_ep_mxfp4_contract,
 )
-
 
 _TOP_K = 2
 _BLOCK_M = 64
@@ -111,7 +110,7 @@ def _require_gfx950() -> None:
         from aiter.ops.triton.utils._triton import arch_info
 
         arch = str(arch_info.get_arch()).split(":", 1)[0]
-    except Exception as exc:  # pragma: no cover - depends on host runtime
+    except (AttributeError, ImportError, RuntimeError) as exc:  # pragma: no cover
         pytest.skip(f"unable to query ROCm architecture: {exc}")
     if arch != "gfx950":
         pytest.skip(f"SharedEP MXFP4 GPU test requires gfx950, got {arch}")
@@ -351,3 +350,217 @@ def test_gfx950_shared_ep_w13_w2_reference() -> None:
         projected = torch.mv(dense_w2[expert_id], intermediate[route_id].float())
         w2_ref[route_id] = (projected * flat_route_weights[route_id]).to(torch.bfloat16)
     torch.testing.assert_close(w2_out, w2_ref, rtol=5e-2, atol=2e-1)
+
+
+def test_gfx950_dsv4_pro_shape_graph_replay_and_invalid_route_guard() -> None:
+    _require_gfx950()
+    device = torch.device("cuda")
+    hidden_size = 7168
+    intermediate_size = 3072
+    top_k = 6
+    owner_rows = 32
+    route_capacity = owner_rows * top_k
+    block_m = 128
+    padded_routes = 2 * block_m
+    config = {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+
+    routes = torch.full(
+        (padded_routes,),
+        route_capacity,
+        dtype=torch.int32,
+        device=device,
+    )
+    routes[:route_capacity] = torch.arange(
+        route_capacity,
+        dtype=torch.int32,
+        device=device,
+    )
+    experts = torch.zeros(
+        (padded_routes // block_m,),
+        dtype=torch.int32,
+        device=device,
+    )
+    num_padded = torch.tensor([padded_routes], dtype=torch.int32, device=device)
+    activations = torch.full(
+        (owner_rows, hidden_size),
+        1.0 / 4096,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w13_weight = torch.full(
+        (1, 2 * intermediate_size, hidden_size // 2),
+        0x22,
+        dtype=torch.uint8,
+        device=device,
+    )
+    w13_scales = torch.full(
+        (1, 2 * intermediate_size, hidden_size // 32),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_weight = torch.full(
+        (1, hidden_size, intermediate_size // 2),
+        0x22,
+        dtype=torch.uint8,
+        device=device,
+    )
+    w2_scales = torch.full(
+        (1, hidden_size, intermediate_size // 32),
+        127,
+        dtype=torch.uint8,
+        device=device,
+    )
+    route_weights = (
+        torch.arange(1, top_k + 1, dtype=torch.float32, device=device)
+        .div_(top_k)
+        .expand(owner_rows, -1)
+        .contiguous()
+    )
+
+    eager_w13 = torch.empty(
+        (route_capacity, intermediate_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    assert (
+        shared_ep_mxfp4_w13(
+            activations,
+            w13_weight,
+            w13_scales,
+            routes,
+            experts,
+            num_padded,
+            top_k=top_k,
+            route_block_size=block_m,
+            out=eager_w13,
+            config=config,
+            swiglu_limit=0.05,
+        ).data_ptr()
+        == eager_w13.data_ptr()
+    )
+    projected = torch.tensor(
+        hidden_size / 4096,
+        dtype=torch.bfloat16,
+        device=device,
+    ).float()
+    expected_w13 = (
+        torch.nn.functional.silu(projected.clamp(max=0.05))
+        * projected.clamp(min=-0.05, max=0.05)
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(
+        eager_w13,
+        torch.ones_like(eager_w13) * expected_w13,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+
+    eager_w2 = torch.empty(
+        (route_capacity, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    assert (
+        shared_ep_mxfp4_w2(
+            eager_w13,
+            w2_weight,
+            w2_scales,
+            route_weights,
+            routes,
+            experts,
+            num_padded,
+            top_k=top_k,
+            route_block_size=block_m,
+            out=eager_w2,
+            config=config,
+        ).data_ptr()
+        == eager_w2.data_ptr()
+    )
+    expected_w2_rows = (
+        eager_w13[:, 0].float() * intermediate_size * route_weights.view(-1)
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(
+        eager_w2,
+        expected_w2_rows[:, None].expand_as(eager_w2),
+        # W13 and W2 each quantize BF16 activations to E2M1. The production
+        # multi-tile path compounds the representable E2M1 rounding error.
+        rtol=1.6e-1,
+        atol=6e-1,
+    )
+
+    graph_w13 = torch.empty_like(eager_w13)
+    graph_w2 = torch.empty_like(eager_w2)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        shared_ep_mxfp4_w13(
+            activations,
+            w13_weight,
+            w13_scales,
+            routes,
+            experts,
+            num_padded,
+            top_k=top_k,
+            route_block_size=block_m,
+            out=graph_w13,
+            config=config,
+            swiglu_limit=0.05,
+            check_route_values=False,
+        )
+        shared_ep_mxfp4_w2(
+            graph_w13,
+            w2_weight,
+            w2_scales,
+            route_weights,
+            routes,
+            experts,
+            num_padded,
+            top_k=top_k,
+            route_block_size=block_m,
+            out=graph_w2,
+            config=config,
+            check_route_values=False,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_w13, eager_w13, rtol=0, atol=0)
+    torch.testing.assert_close(graph_w2, eager_w2, rtol=0, atol=0)
+
+    graph_w13.fill_(7)
+    graph_w2.fill_(7)
+    num_padded.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(graph_w13 == 7)
+    assert torch.all(graph_w2 == 7)
+
+    routes[0] = -1
+    num_padded.fill_(padded_routes)
+    guarded_w13 = torch.full_like(eager_w13, 7)
+    shared_ep_mxfp4_w13(
+        activations,
+        w13_weight,
+        w13_scales,
+        routes,
+        experts,
+        num_padded,
+        top_k=top_k,
+        route_block_size=block_m,
+        out=guarded_w13,
+        config=config,
+        swiglu_limit=0.05,
+        check_route_values=False,
+    )
+    torch.cuda.synchronize()
+    assert torch.all(guarded_w13[0] == 7)
+    torch.testing.assert_close(guarded_w13[1:], eager_w13[1:], rtol=0, atol=0)
