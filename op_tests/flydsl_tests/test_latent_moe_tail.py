@@ -20,6 +20,7 @@ def _gfx950_flydsl_available() -> bool:
     except (AssertionError, KeyError, RuntimeError):
         return False
 
+
 pytestmark = pytest.mark.skipif(
     not _gfx950_flydsl_available(),
     reason="Kimi-K3 latent-MoE local-tail specialization requires gfx950",
