@@ -313,7 +313,7 @@ def build_kimi_k3_b1_shared_down_fp8_module(
         weight: fx.Pointer,
         weight_scale: fx.Pointer,
         output: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         ctx = CompilationContext.get_current()
         if const_expr(waves_per_eu > 0):
