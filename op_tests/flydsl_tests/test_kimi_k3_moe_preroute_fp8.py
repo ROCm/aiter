@@ -175,8 +175,9 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
 
     assert _relative_rmse(routed, routed_ref) < 0.035
     assert _relative_rmse(gate_up, gate_up_ref) < 0.035
-    torch.testing.assert_close(tri_routed, routed, atol=0, rtol=0)
-    torch.testing.assert_close(tri_gate_up, gate_up, atol=0, rtol=0)
+    # fdot2 may round in a different reduction order than the dual kernel.
+    assert _relative_rmse(tri_routed, routed_ref) < 0.035
+    assert _relative_rmse(tri_gate_up, gate_up_ref) < 0.035
     router_ref = F.linear(hidden, router_bf16).float()
     assert _relative_rmse(router_logits, router_ref) < 0.01
     torch.testing.assert_close(
