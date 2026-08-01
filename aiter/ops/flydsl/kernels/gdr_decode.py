@@ -5,14 +5,12 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
 )
 from flydsl._mlir.dialects import (
     math as mlir_math,
 )
-from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects import (
     vector as mlir_vector,
 )
@@ -184,9 +182,10 @@ def create_vk_gdr_decode_kernel(
         def fast_log1p(x):
             return mlir_math.log1p(x, fastmath=fm_fast)
 
-        cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
-        cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
-        with ir.InsertionPoint(cond_valid_if.then_block):
+        # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
+        # closure so the runtime `if` sees an opaque call (no GTensor "state"
+        # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
+        def _do_decode():
             if const_expr("f32" in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
             else:
@@ -216,8 +215,7 @@ def create_vk_gdr_decode_kernel(
 
                 # softplus with the large-x identity: for beta_x > threshold,
                 # softplus(x) == x. select computes both arms (the overflow arm
-                # is discarded) -> bit-identical to the old scf.if. Works inside
-                # the raw scf valid-guard region since select is a plain op.
+                # is discarded) -> bit-identical to the old branch.
                 softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
                 softplus_x = (
                     fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
@@ -385,13 +383,14 @@ def create_vk_gdr_decode_kernel(
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
 
                     sum_hq = sum_hq.truncf(dtype_)
-                    write_cond = arith.cmpi(
-                        arith.CmpIPredicate.eq, fx.Int64(warp_k_vec_start), fx.Int64(0)
-                    )
-                    write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
-                    with ir.InsertionPoint(write_cond_if.then_block):
-                        out_tensor[b_i, sq_i, hv_i, global_v_i] = sum_hq
-                        scf.YieldOp([])
+
+                    # Only k-vec lane 0 writes the q output; closure keeps the
+                    # GTensor store opaque to the runtime-if state analysis.
+                    def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
+                        out_tensor[b_i, _sq, hv_i, _gv] = _sum_hq
+
+                    if warp_k_vec_start == 0:
+                        _write_q()
 
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
@@ -404,7 +403,9 @@ def create_vk_gdr_decode_kernel(
                     state_tensor.vec_store(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
-            scf.YieldOp([])
+
+        if pool_idx >= fx.Int32(0):
+            _do_decode()
 
     @flyc.jit
     def launch_gdr_decode_kernel(
