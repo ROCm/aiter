@@ -171,6 +171,7 @@ def compile_mixed_moe_gemm1(
     b_nt: int = 0,
     gate_mode: GateMode = GateMode.SEPARATED,
     a_scale_one: bool = False,
+    a_scale_compact: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
 ):
@@ -244,6 +245,18 @@ def compile_mixed_moe_gemm1(
     gate_only = gate_mode is GateMode.GATE_ONLY
 
     is_splitk = k_batch > 1
+    if a_scale_compact:
+        if not is_f4_a:
+            raise ValueError("compact A scales are only supported for FP4 activations")
+        if a_scale_one:
+            raise ValueError("compact A scales are incompatible with a_scale_one")
+        if is_splitk:
+            raise ValueError("compact A scales are not supported with split-K")
+        if tile_m != 32 or tile_k != 256 or sort_block_m != 32:
+            raise ValueError(
+                "compact A-scale gathering currently requires "
+                "tile_m=32, tile_k=256, and sort_block_m=32"
+            )
     if mock_gate_only and not is_splitk:
         raise ValueError("mock_gate_only requires k_batch > 1 (split-K)")
     if is_splitk:
@@ -295,6 +308,7 @@ def compile_mixed_moe_gemm1(
     go_tag = "_go" if mock_gate_only else ""
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
+    asc_tag = "_asc4" if a_scale_compact else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
     # distinct symbol so they can't alias the silu kernel on disk. beta is
@@ -311,7 +325,7 @@ def compile_mixed_moe_gemm1(
         act_tag += f"_sb{_beta_tag(situ_beta)}_slb{_beta_tag(situ_linear_beta)}"
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}_v32"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{asc_tag}{xcd_tag}{act_tag}_v32"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -651,7 +665,8 @@ def compile_mixed_moe_gemm1(
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                sx_nbytes_idx = sorted_m * kblk
+                sx_rows = tokens_in if a_scale_compact else sorted_m
+                sx_nbytes_idx = sx_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
@@ -1077,17 +1092,97 @@ def compile_mixed_moe_gemm1(
                     as1_const = arith.constant(0x7F7F7F7F, type=T.i32)
                     as1_vec = vector.from_elements(T.vec(1, T.i32), [as1_const])
 
-                def prefetch_ab_scale_tile(base_k, ku_packed_limit=k_unroll_packed):
-                    a_scale_tile = []
-                    gate_b_scale = []
-                    up_b_scale = (
-                        [] if (not mock_gate_only and not gate_up_interleave) else None
+                def load_compact_a_scale_dword(base_k, ku):
+                    row0_vec = vector.load_op(T.vec(1, T.i32), lds_tid, [lane_mod_16])
+                    row1_vec = vector.load_op(
+                        T.vec(1, T.i32),
+                        lds_tid,
+                        [lane_mod_16 + arith.constant(16, index=True)],
                     )
+                    fused0 = vector.extract(
+                        row0_vec, static_position=[0], dynamic_position=[]
+                    )
+                    fused1 = vector.extract(
+                        row1_vec, static_position=[0], dynamic_position=[]
+                    )
+                    token0_raw = arith.andi(fused0, mask24)
+                    token1_raw = arith.andi(fused1, mask24)
+                    token0_valid = arith.cmpi(CmpIPredicate.ult, token0_raw, tokens_i32)
+                    token1_valid = arith.cmpi(CmpIPredicate.ult, token1_raw, tokens_i32)
+                    token0 = arith.select(
+                        token0_valid, token0_raw, arith.constant(0, type=T.i32)
+                    )
+                    token1 = arith.select(
+                        token1_valid, token1_raw, arith.constant(0, type=T.i32)
+                    )
+                    scale_dwords_per_token = arith.constant(
+                        (model_dim // 32) // 4, type=T.i32
+                    )
+                    scale_ku = arith.index_cast(
+                        T.i32, base_k + arith.constant(ku, index=True)
+                    )
+                    dword_in_row = scale_ku * arith.constant(2, type=T.i32)
+                    dword0 = token0 * scale_dwords_per_token + dword_in_row
+                    dword1 = token1 * scale_dwords_per_token + dword_in_row
+                    pair0 = buffer_ops.buffer_load(
+                        sx_rsrc,
+                        arith.index_cast(ir.IndexType.get(), dword0),
+                        vec_width=2,
+                        dtype=T.i32,
+                        cache_modifier=0,
+                    )
+                    pair1 = buffer_ops.buffer_load(
+                        sx_rsrc,
+                        arith.index_cast(ir.IndexType.get(), dword1),
+                        vec_width=2,
+                        dtype=T.i32,
+                        cache_modifier=0,
+                    )
+                    row0_lo = vector.extract(
+                        pair0, static_position=[0], dynamic_position=[]
+                    )
+                    row0_hi = vector.extract(
+                        pair0, static_position=[1], dynamic_position=[]
+                    )
+                    row1_lo = vector.extract(
+                        pair1, static_position=[0], dynamic_position=[]
+                    )
+                    row1_hi = vector.extract(
+                        pair1, static_position=[1], dynamic_position=[]
+                    )
+                    shift = arith.index_cast(T.i32, lane_div_16) * arith.constant(
+                        8, type=T.i32
+                    )
+                    b0 = arith.andi(arith.shrui(row0_lo, shift), scale_mask_lo)
+                    b1 = arith.andi(arith.shrui(row1_lo, shift), scale_mask_lo)
+                    b2 = arith.andi(arith.shrui(row0_hi, shift), scale_mask_lo)
+                    b3 = arith.andi(arith.shrui(row1_hi, shift), scale_mask_lo)
+                    packed = arith.ori(
+                        arith.ori(
+                            b0,
+                            arith.shli(b1, arith.constant(8, type=T.i32)),
+                        ),
+                        arith.ori(
+                            arith.shli(b2, arith.constant(16, type=T.i32)),
+                            arith.shli(b3, arith.constant(24, type=T.i32)),
+                        ),
+                    )
+                    return vector.from_elements(T.vec(1, T.i32), [packed])
+
+                def prefetch_a_scale_tile(
+                    base_k,
+                    ku_packed_limit=k_unroll_packed,
+                ):
+                    a_scale_tile = []
                     for ku in range_constexpr(ku_packed_limit):
                         k_off = (ku + base_k) * layout_b_scale.stride_k0
                         for mi in range_constexpr(m_repeat_packed):
                             if const_expr(a_scale_one):
                                 a_scale_tile.append(as1_vec)
+                            elif const_expr(a_scale_compact):
+                                a_scale_tile.append(
+                                    load_compact_a_scale_dword(base_k, ku)
+                                )
                             else:
                                 s = buffer_ops.buffer_load(
                                     sx_rsrc,
@@ -1100,6 +1195,15 @@ def compile_mixed_moe_gemm1(
                                 a_scale_tile.append(
                                     vector.from_elements(T.vec(1, T.i32), [s])
                                 )
+                    return a_scale_tile
+
+                def prefetch_b_scale_tile(base_k, ku_packed_limit=k_unroll_packed):
+                    gate_b_scale = []
+                    up_b_scale = (
+                        [] if (not mock_gate_only and not gate_up_interleave) else None
+                    )
+                    for ku in range_constexpr(ku_packed_limit):
+                        k_off = (ku + base_k) * layout_b_scale.stride_k0
                         for ni in range_constexpr(num_acc_n_packed):
                             gs = buffer_ops.buffer_load(
                                 sw_rsrc,
@@ -1126,6 +1230,19 @@ def compile_mixed_moe_gemm1(
                                 up_b_scale.append(
                                     vector.from_elements(T.vec(1, T.i32), [us])
                                 )
+                    return gate_b_scale, up_b_scale
+
+                def prefetch_ab_scale_tile(
+                    base_k,
+                    ku_packed_limit=k_unroll_packed,
+                ):
+                    a_scale_tile = prefetch_a_scale_tile(
+                        base_k,
+                        ku_packed_limit=ku_packed_limit,
+                    )
+                    gate_b_scale, up_b_scale = prefetch_b_scale_tile(
+                        base_k, ku_packed_limit=ku_packed_limit
+                    )
                     return [a_scale_tile, gate_b_scale, up_b_scale]
 
                 lds_base_zero = arith.index(0)
@@ -1598,7 +1715,6 @@ def compile_mixed_moe_gemm1(
                         prefetch_x_to_lds(abs_k_dma, lds_write)
                     if const_expr(not use_async_copy):
                         x_regs = load_x_tile(abs_k_dma)
-
                     prev_asvs = []
                     for i_as in range_constexpr(len(prev_a_scale)):
                         prev_asvs.append(
@@ -1646,6 +1762,17 @@ def compile_mixed_moe_gemm1(
                                 for mi_p in range_constexpr(m_repeat_packed):
                                     if const_expr(a_scale_one):
                                         new_as_list.append(as1_const)
+                                    elif const_expr(a_scale_compact):
+                                        direct_vec = load_compact_a_scale_dword(
+                                            sk, ku_s
+                                        )
+                                        new_as_list.append(
+                                            vector.extract(
+                                                direct_vec,
+                                                static_position=[0],
+                                                dynamic_position=[],
+                                            )
+                                        )
                                     else:
                                         raw_as = buffer_ops.buffer_load(
                                             sx_rsrc,
@@ -1817,9 +1944,13 @@ def compile_mixed_moe_gemm1(
                     store_x_tile_to_lds(x_regs0, lds_x_pong)
                 rocdl.sched_barrier(0)
                 k0_scale = k_base_idx // arith.constant(pack_K * 128, index=True)
-                a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
-                    k0_scale
-                )
+                if const_expr(a_scale_compact):
+                    gate_bs_pong, up_bs_pong = prefetch_b_scale_tile(k0_scale)
+                    a_scale_pong = None
+                else:
+                    a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(
+                        k0_scale
+                    )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
                 tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, c_tile_m_idx)
                 if_tid = scf.IfOp(tid_in_range)
@@ -1852,6 +1983,8 @@ def compile_mixed_moe_gemm1(
                 gpu.barrier()
                 rocdl.sched_barrier(0)
                 a_tile_pong = prefetch_full_a_from_lds(lds_x_pong)
+                if const_expr(a_scale_compact):
+                    a_scale_pong = prefetch_a_scale_tile(k0_scale)
 
                 rocdl.sched_barrier(0)
                 rocdl.s_waitcnt(6)
@@ -1949,17 +2082,38 @@ def compile_mixed_moe_gemm1(
                             k_tail1 // arith.constant(b_byte_div, index=True),
                             ku_limit=tail_ku,
                         )
-                        a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(
-                            k_tail1 // arith.constant(pack_K * 128, index=True),
-                            ku_packed_limit=tail_ku_packed,
-                        )
+                        if const_expr(a_scale_compact):
+                            gate_bs_ping, up_bs_ping = prefetch_b_scale_tile(
+                                k_tail1 // arith.constant(pack_K * 128, index=True),
+                                ku_packed_limit=tail_ku_packed,
+                            )
+                            a_scale_ping = None
+                        else:
+                            (
+                                a_scale_ping,
+                                gate_bs_ping,
+                                up_bs_ping,
+                            ) = prefetch_ab_scale_tile(
+                                k_tail1 // arith.constant(pack_K * 128, index=True),
+                                ku_packed_limit=tail_ku_packed,
+                            )
                     else:
                         gate_w_ping, up_w_ping = load_b_tile(
                             k_tail1 // arith.constant(b_byte_div, index=True)
                         )
-                        a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(
-                            k_tail1 // arith.constant(pack_K * 128, index=True)
-                        )
+                        if const_expr(a_scale_compact):
+                            gate_bs_ping, up_bs_ping = prefetch_b_scale_tile(
+                                k_tail1 // arith.constant(pack_K * 128, index=True)
+                            )
+                            a_scale_ping = None
+                        else:
+                            (
+                                a_scale_ping,
+                                gate_bs_ping,
+                                up_bs_ping,
+                            ) = prefetch_ab_scale_tile(
+                                k_tail1 // arith.constant(pack_K * 128, index=True)
+                            )
                     acc_gate, acc_up, _ = compute_tile(
                         acc_gate,
                         acc_up,
@@ -1980,6 +2134,13 @@ def compile_mixed_moe_gemm1(
                         )
                     else:
                         a_tile_ping = prefetch_full_a_from_lds(lds_x_ping)
+                    if const_expr(a_scale_compact):
+                        a_scale_ping = prefetch_a_scale_tile(
+                            k_tail1 // arith.constant(pack_K * 128, index=True),
+                            ku_packed_limit=(
+                                tail_ku_packed if pad_ku_skip > 0 else k_unroll_packed
+                            ),
+                        )
                     acc_gate, acc_up, epilogue_pf = compute_tile(
                         acc_gate,
                         acc_up,
@@ -2994,6 +3155,7 @@ def compile_mixed_moe_gemm1(
         k_batch,
         gate_mode,
         a_scale_one,
+        a_scale_compact,
         xcd_swizzle,
     )
 

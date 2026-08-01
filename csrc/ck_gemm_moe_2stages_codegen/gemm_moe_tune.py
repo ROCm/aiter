@@ -156,6 +156,75 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
     return cos_diff
 
 
+# Suffixes marking FlyDSL stage-1 kernels that fuse the intermediate
+# quantization consumed by stage 2. Kernels without one of these suffixes need a
+# separate quant+sort launch and are charged for it by
+# ``add_intermediate_quant_cost``.
+FUSED_INTERMEDIATE_SUFFIXES = ("_fp4", "_fp8")
+
+
+def dedupe_objective_candidates(profile_df: pd.DataFrame) -> pd.DataFrame:
+    """Keep the raw-fastest candidate per distinct runtime objective path.
+
+    Fused (``_fp4``/``_fp8``) and non-fused kernels must survive raw-kernel
+    deduplication independently: the fairness penalty applied by
+    ``add_intermediate_quant_cost`` only charges non-fused kernels, so deduping
+    on raw ``us`` alone would discard the fused candidate before the penalty
+    ever runs.
+    """
+    if profile_df.empty:
+        return profile_df
+
+    work = profile_df.copy()
+    work["_is_fused"] = (
+        work["kernelName"].astype(str).str.endswith(FUSED_INTERMEDIATE_SUFFIXES)
+    )
+    return (
+        work.sort_values("us")
+        .drop_duplicates(["stage", "block_m", "flat", "_is_fused"], keep="first")
+        .drop(columns=["_is_fused"])
+    )
+
+
+def add_intermediate_quant_cost(
+    profile_df: pd.DataFrame, suffix: str, us_by_block_m: dict
+) -> pd.DataFrame:
+    """Charge non-fused stage-1 candidates for their quant+sort launch.
+
+    ``suffix`` is the fused marker for the active activation dtype (``_fp4`` or
+    ``_fp8``); rows whose stage-1 kernel ends with it already fuse the work and
+    are left untouched. Every other row has the measured per-``block_m`` cost in
+    ``us_by_block_m`` added to its ``us1``.
+    """
+    if profile_df.empty or not us_by_block_m:
+        return profile_df
+
+    work = profile_df.copy()
+    quant_us = work["block_m"].map(us_by_block_m).fillna(0)
+    is_fused = work["kernelName1"].astype(str).str.endswith(suffix)
+    work.loc[~is_fused, "us1"] = work.loc[~is_fused, "us1"] + quant_us[~is_fused]
+    return work
+
+
+def select_fastest_stage_combination(profile_df: pd.DataFrame) -> pd.Series:
+    """Return the row with the shortest adjusted Stage1 + Stage2 latency.
+
+    ``us1`` already includes any launch costs needed to compare fused and
+    non-fused Stage1 kernels fairly. One-stage kernels use ``us2=0``, so they
+    participate in the same end-to-end objective. Select before display
+    rounding so near-equal candidates cannot tie at four decimal places.
+    """
+    if profile_df.empty:
+        raise ValueError("cannot select a stage combination from an empty frame")
+    missing = {"us1", "us2"} - set(profile_df.columns)
+    if missing:
+        raise ValueError(
+            f"stage combination candidates are missing columns: {sorted(missing)}"
+        )
+    combined_us = profile_df["us1"] + profile_df["us2"]
+    return profile_df.loc[combined_us.idxmin()].copy()
+
+
 def tensor_compare_diagnostics(
     ref, res, rtol=1e-2, atol=1e-2, max_items=3, sample_elements=4096
 ):
@@ -4342,16 +4411,7 @@ class FmoeTuner(TunerCommon):
             # Dedup fused (_fp4/_fp8) and non-fused stage1 separately: the fairness
             # penalty below is applied only to non-fused, so dedup must not drop the
             # fused kernel by raw us before that penalty runs.
-            profileDF["_is_fused"] = (
-                profileDF["kernelName"].astype(str).str.endswith(("_fp4", "_fp8"))
-            )
-            profileDF = (
-                profileDF.sort_values("us")
-                .drop_duplicates(
-                    ["stage", "block_m", "flat", "_is_fused"], keep="first"
-                )
-                .drop(columns=["_is_fused"])
-            )
+            profileDF = dedupe_objective_candidates(profileDF)
             stage1_profileDF = profileDF[profileDF["stage"] == "stage1"].drop(
                 columns=["stage", "flat"]
             )
@@ -4521,14 +4581,10 @@ class FmoeTuner(TunerCommon):
                         print(
                             f"  quant_sort benchmark: blockM={bm_int}, us={us_qs_cache[bm]}"
                         )
-                    profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
                     # _fp4 kernels already fuse the fp4-quant+sort; skip cost addition
-                    is_fp4 = profileDF["kernelName1"].astype(str).str.endswith("_fp4")
-                    profileDF.loc[~is_fp4, "us1"] = (
-                        profileDF.loc[~is_fp4, "us1"]
-                        + profileDF.loc[~is_fp4, "us_quant_sort"]
+                    profileDF = add_intermediate_quant_cost(
+                        profileDF, "_fp4", us_qs_cache
                     )
-                    profileDF.drop(columns=["us_quant_sort"], inplace=True)
                 elif q_dtype_a == dtypes.fp8:
                     from aiter.test_common import run_perftest
 
@@ -4550,13 +4606,9 @@ class FmoeTuner(TunerCommon):
                     us_qs_cache = {}
                     for bm in profileDF["block_m"].unique():
                         us_qs_cache[bm] = us_fp8_cast
-                    profileDF["us_quant_sort"] = profileDF["block_m"].map(us_qs_cache)
-                    is_fp8 = profileDF["kernelName1"].astype(str).str.endswith("_fp8")
-                    profileDF.loc[~is_fp8, "us1"] = (
-                        profileDF.loc[~is_fp8, "us1"]
-                        + profileDF.loc[~is_fp8, "us_quant_sort"]
+                    profileDF = add_intermediate_quant_cost(
+                        profileDF, "_fp8", us_qs_cache
                     )
-                    profileDF.drop(columns=["us_quant_sort"], inplace=True)
 
             has_xbf16 = "xbf16" in profileDF.columns and profileDF["xbf16"].any()
             if q_type == QuantType.per_1x128 and has_xbf16:
@@ -4853,7 +4905,7 @@ class FmoeTuner(TunerCommon):
                     old_df = pd.DataFrame(columns=self.columns)
                 tmpprofileDF = pd.concat([old_df, profileDF], ignore_index=True)
                 tmpprofileDF.to_csv(args.profile_file, index=False)
-            best_one = profileDF.loc[profileDF["us"].idxmin()].copy()
+            best_one = select_fastest_stage_combination(profileDF)
             print(
                 f"Tuning result for {key} is {best_one['block_m'], best_one['kernelName1'], best_one['kernelName2'], best_one['err1'], best_one['err2'], best_one['run_1stage']} {best_one['us']} us, {best_one['tflops']} TFLOPS, {best_one['bw']} GB/s"
             )

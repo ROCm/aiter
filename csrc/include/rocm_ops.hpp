@@ -1435,7 +1435,20 @@ namespace py = pybind11;
           py::arg("dispatch_policy")   = 0,            \
           py::arg("local_topk_ids")    = std::nullopt, \
           py::arg("m_indices")         = std::nullopt, \
-          py::arg("reverse_sorted")    = std::nullopt);
+          py::arg("reverse_sorted")    = std::nullopt); \
+    m.def("mxfp4_moe_sort_quant_fwd",                  \
+          &mxfp4_moe_sort_quant_fwd,                   \
+          py::arg("hidden_states"),                    \
+          py::arg("topk_ids"),                         \
+          py::arg("topk_weights"),                     \
+          py::arg("sorted_token_ids"),                 \
+          py::arg("sorted_weights"),                   \
+          py::arg("sorted_expert_ids"),                \
+          py::arg("num_valid_ids"),                    \
+          py::arg("moe_buf"),                          \
+          py::arg("activation_quant"),                 \
+          py::arg("activation_scale_token"),           \
+          py::arg("num_experts"));
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_opus_fwd",                \
