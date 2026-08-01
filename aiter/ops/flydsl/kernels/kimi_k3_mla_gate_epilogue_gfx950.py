@@ -15,7 +15,6 @@ from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
-
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
