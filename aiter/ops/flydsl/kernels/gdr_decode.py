@@ -9,9 +9,6 @@ from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
 )
 from flydsl._mlir.dialects import (
-    math as mlir_math,
-)
-from flydsl._mlir.dialects import (
     vector as mlir_vector,
 )
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
@@ -177,10 +174,10 @@ def create_vk_gdr_decode_kernel(
                 log2e = 1.4426950408889634
                 out = rocdl.exp2(T.f32, x * log2e)
                 return out
-            return mlir_math.exp(x, fastmath=fm_fast)
+            return fx.math.exp(x, fastmath=fm_fast)
 
         def fast_log1p(x):
-            return mlir_math.log1p(x, fastmath=fm_fast)
+            return fx.math.log1p(x, fastmath=fm_fast)
 
         # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
         # closure so the runtime `if` sees an opaque call (no GTensor "state"
@@ -294,10 +291,14 @@ def create_vk_gdr_decode_kernel(
                         width_i32,
                         mode="idx",
                     ).shuffleResult
-                    inv_norm_q = mlir_math.rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = mlir_math.rsqrt(local_sum_k + 1e-6)
-                    inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, inv_norm_q).vector
-                    inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, inv_norm_k).vector
+                    inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q_vec = vector.BroadcastOp(
+                        acc_vec_t, _to_raw(inv_norm_q)
+                    ).vector
+                    inv_norm_k_vec = vector.BroadcastOp(
+                        acc_vec_t, _to_raw(inv_norm_k)
+                    ).vector
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * inv_norm_q_vec * scale_vec
                         sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec

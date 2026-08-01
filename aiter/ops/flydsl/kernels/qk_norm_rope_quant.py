@@ -794,7 +794,7 @@ def _build_kernel(
         num_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_tokens = arith.index_cast(T.index, _to_raw(num_tokens))
+        idx_tokens = fx.Int64(num_tokens)
         k = kernel(
             q_in,
             kv_in,

@@ -1364,7 +1364,7 @@ def _build_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
+        idx_p = fx.Int64(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -2376,7 +2376,7 @@ def _build_kernel_ksplit(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
+        idx_p = fx.Int64(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,

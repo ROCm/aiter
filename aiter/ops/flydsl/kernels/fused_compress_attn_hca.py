@@ -569,8 +569,8 @@ def _build_compress_forward_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
-        idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
+        idx_p = fx.Int64(plan_capacity)
+        idx_s = fx.Int64(NUM_SPLIT)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -989,7 +989,7 @@ def _build_norm_rope_scatter_kernel(
             arith.addi(cap_raw, arith.constant(KW - 1, type=T.i32)),
             arith.constant(KW, type=T.i32),
         )
-        idx_p = arith.index_cast(T.index, nblocks)
+        idx_p = fx.Int64(nblocks)
         k = kernel(
             kv_compressed,
             kv_compressed_row_stride,
