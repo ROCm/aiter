@@ -342,7 +342,27 @@ class GTensor(TensorBase):
         )
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
-        bytes_offset_i64 = arith.index_cast(T.i64, bytes_offset_i64)
+        # Accept index / i32 / i64 byte offsets. index -> index_cast; a value
+        # already i64 (e.g. fx.Int64 math) is kept as-is (index_cast i64<->i64
+        # is invalid); narrower ints are sign-extended.
+        bo = (
+            bytes_offset_i64.ir_value()
+            if hasattr(bytes_offset_i64, "ir_value")
+            else (
+                extract_to_ir_values(bytes_offset_i64)[0]
+                if not isinstance(bytes_offset_i64, ir.Value)
+                else bytes_offset_i64
+            )
+        )
+        if isinstance(bo.type, ir.IntegerType):
+            if bo.type.width == 64:
+                bytes_offset_i64 = bo
+            elif bo.type.width < 64:
+                bytes_offset_i64 = arith.extsi(T.i64, bo)
+            else:
+                bytes_offset_i64 = arith.trunci(T.i64, bo)
+        else:
+            bytes_offset_i64 = arith.index_cast(T.i64, bo)
         _ptr_type = ir.Type.parse(ptr_type)
         raw = extract_to_ir_values(ptr)[0]
         if str(raw.type).startswith("!fly.ptr"):
