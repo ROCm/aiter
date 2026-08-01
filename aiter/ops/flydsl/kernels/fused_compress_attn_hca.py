@@ -41,14 +41,12 @@ to use the legacy single-kernel ``flydsl_fused_compress_attn``.
 """
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -63,17 +61,6 @@ BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
-
-
-@contextmanager
-def _if_then(if_op):
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -119,21 +106,21 @@ def _build_compress_forward_kernel(
     sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to >= 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
-    assert (
-        head_dim % slice_size == 0
-    ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
-    assert (
-        slice_size % 64 == 0
-    ), f"slice_size={slice_size} must be a multiple of 64 (wave width)"
+    assert head_dim % slice_size == 0, (
+        f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
+    )
+    assert slice_size % 64 == 0, (
+        f"slice_size={slice_size} must be a multiple of 64 (wave width)"
+    )
     assert slice_size // 64 in (
         1,
         2,
         4,
         8,
     ), f"VEC={slice_size // 64} must be 1, 2, 4, or 8"
-    assert (
-        ratio % k_split_num_waves == 0
-    ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    assert ratio % k_split_num_waves == 0, (
+        f"K={ratio} must divide evenly across {k_split_num_waves} waves"
+    )
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
     D = head_dim
     K = ratio
@@ -218,9 +205,9 @@ def _build_compress_forward_kernel(
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
-        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0, as a closure
+        # under a runtime `if` (rewriter sees an opaque call -> scf.if).
+        def _body():
             # Per-thread head_dim base: each thread owns VEC contiguous
             # elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
@@ -499,9 +486,7 @@ def _build_compress_forward_kernel(
             # (VEC elements per thread). For each owned element, the thread
             # reads NW values from LDS (one per K-split wave) and computes
             # the global online-softmax.
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
                     lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
@@ -557,6 +542,12 @@ def _build_compress_forward_kernel(
                         out_rsrc,
                         ArithValue(out_off) + arith.constant(half, type=i32),
                     )
+
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_hca_compress_forward(
@@ -653,9 +644,9 @@ def _build_norm_rope_scatter_kernel(
     # FP8 1xG e8m0 group-quant geometry (nope region only). GROUP_SIZE must divide
     # NOPE and be a multiple of VEC (a lane's VEC slice never crosses a group).
     GROUP_SIZE_Q = quant_group_size
-    assert (not quant) or (
-        NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
-    ), f"quant: NOPE={NOPE} must be divisible by group={GROUP_SIZE_Q}, group%VEC==0"
+    assert (not quant) or (NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0), (
+        f"quant: NOPE={NOPE} must be divisible by group={GROUP_SIZE_Q}, group%VEC==0"
+    )
     RTS = GROUP_SIZE_Q // VEC if quant else 1  # threads per group (=8 for G=64,VEC=8)
     log2_rts = int(math.log2(RTS)) if quant else 0
 
@@ -720,11 +711,12 @@ def _build_norm_rope_scatter_kernel(
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
         # bounds-checked to 0 by the buffer resource, so guard explicitly here).
-        pos_ok = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        row_ok = arith.cmpi(CmpIPredicate.slt, _to_raw(pid), _to_raw(plan_capacity))
-        is_active = arith.andi(pos_ok, row_ok)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        is_active = (fx.Int32(position) >= 0) & (
+            fx.Int32(pid) < fx.Int32(plan_capacity)
+        )
+
+        # Whole body as a closure under the runtime guard (opaque call -> scf.if).
+        def _body():
             tid_x_vec = ArithValue(lane) * arith.constant(VEC, type=i32)
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
@@ -970,6 +962,9 @@ def _build_norm_rope_scatter_kernel(
                     buffer_ops.buffer_store(scalar_i32, out_rsrc, cache_off_dw)
                 else:
                     buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
+
+        if is_active:
+            _body()
 
     @flyc.jit
     def launch_hca_norm_rope_scatter(
