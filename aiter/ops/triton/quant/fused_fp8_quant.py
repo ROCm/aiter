@@ -341,10 +341,14 @@ def fused_rms_fp8_group_quant(
         ACTIVATION="silu",
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the transposed scale buffer as
+    # (M, num_bs_cols): same logical values, but column-major memory layout.
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        # out1_bs was allocated [num_bs_cols, M] and written column-major by the
+        # kernel (swapped strides); present it as (M, num_bs_cols) with a true
+        # transposed (column-major) view. .view() here would reinterpret the
+        # buffer row-major and silently drop the transpose.
+        out1_bs = out1_bs.transpose(0, 1)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1
 
@@ -946,10 +950,14 @@ def fused_reduce_rms_fp8_group_quant(
         NUM_SPLITK_POW2=triton.next_power_of_2(SPK),
         num_warps=num_warps,
     )
-    # When transpose_scale=True, view the transposed buffer back to original shape
-    # This keeps shape (M, num_bs_cols) but with column-major memory layout
+    # When transpose_scale=True, re-present the transposed scale buffer as
+    # (M, num_bs_cols): same logical values, but column-major memory layout.
     if transpose_scale:
-        out1_bs = out1_bs.view(M, num_bs_cols)
+        # out1_bs was allocated [num_bs_cols, M] and written column-major by the
+        # kernel (swapped strides); present it as (M, num_bs_cols) with a true
+        # transposed (column-major) view. .view() here would reinterpret the
+        # buffer row-major and silently drop the transpose.
+        out1_bs = out1_bs.transpose(0, 1)
 
     return (out1_fp8, out1_bs), out1, out2, out_res1, out3
 

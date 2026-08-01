@@ -256,7 +256,15 @@ def test_rmsnorm_quant_fuse(m, n):
 @pytest.mark.parametrize("N1, N2", [(128, 128), (128, 7168), (7168, 7168)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dtype):
-    """Test that transpose_scale parameter returns scale with transposed memory layout."""
+    """transpose_scale=True must return the *same logical* (M, num_bs_cols) scale
+    as the default path, only in column-major storage (strides (1, M)).
+
+    Regression: the wrapper previously did ``out1_bs.view(M, num_bs_cols)`` on the
+    ``[num_bs_cols, M]`` kernel buffer, which reinterprets it row-major and thus
+    silently scrambles the values (transpose_scale became a no-op). This case
+    fails on that ``.view`` for any num_bs_cols >= 2 (e.g. N1=7168) and passes on
+    the ``.transpose(0, 1)`` fix.
+    """
     torch.manual_seed(0)
     group_size = 128
     dtype_quant = aiter.dtypes.fp8
@@ -309,19 +317,27 @@ def test_fused_rms_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int, dty
         num_bs_cols,
     ), f"Expected shape (M, num_bs_cols), got {y1_s_transposed.shape}"
 
-    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
-    y1_s_expected = y1_s_orig.transpose(0, 1).contiguous().view(*y1_s_orig.shape)
+    # Default path is row-major contiguous.
+    assert y1_s_orig.stride() == (num_bs_cols, 1)
+    assert y1_s_orig.is_contiguous()
 
-    # Verify that both have the same shape and strides (row-major)
-    assert (
-        y1_s_orig.stride() == y1_s_transposed.stride()
-    ), "Both should have row-major strides"
-    assert (
-        y1_s_orig.is_contiguous() and y1_s_transposed.is_contiguous()
-    ), "Both should be contiguous"
+    # Logical values are identical -- the flag only changes physical layout, not
+    # the per-token-group scales. This is what the old .view() broke.
+    torch.testing.assert_close(y1_s_transposed, y1_s_orig, atol=0, rtol=0)
 
-    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
-    torch.testing.assert_close(y1_s_transposed, y1_s_expected, atol=1e-6, rtol=1e-6)
+    # transpose_scale=True path is column-major: strides (1, M), and its transpose
+    # is contiguous -- exactly the layout the CK bpreshuffle GEMM reads directly.
+    # (num_bs_cols == 1 is degenerate: row- and column-major coincide.)
+    if num_bs_cols > 1 and M > 1:
+        assert y1_s_transposed.stride() == (1, M)
+        assert y1_s_transposed.T.is_contiguous()
+        # Bit-exact with the materialize (.t().contiguous().t()) copy path.
+        torch.testing.assert_close(
+            y1_s_transposed,
+            y1_s_orig.t().contiguous().t(),
+            atol=0,
+            rtol=0,
+        )
 
     # Verify that other outputs are identical
     # For fp8 tensors, use exact bitwise comparison
@@ -677,19 +693,27 @@ def test_fused_reduce_rms_fp8_group_quant_transpose_scale(
         num_bs_cols,
     ), f"Expected shape (M, num_bs_cols), got {y1_s_transposed.shape}"
 
-    # Verify that transpose_scale=True version is equivalent to .transpose().contiguous().view()
-    y1_s_expected = y1_s_orig.transpose(0, 1).contiguous().view(*y1_s_orig.shape)
+    # Default path is row-major contiguous.
+    assert y1_s_orig.stride() == (num_bs_cols, 1)
+    assert y1_s_orig.is_contiguous()
 
-    # Verify that both have the same shape and strides (row-major)
-    assert (
-        y1_s_orig.stride() == y1_s_transposed.stride()
-    ), "Both should have row-major strides"
-    assert (
-        y1_s_orig.is_contiguous() and y1_s_transposed.is_contiguous()
-    ), "Both should be contiguous"
+    # Logical values are identical -- the flag only changes physical layout, not
+    # the per-token-group scales. This is what the old .view() broke.
+    torch.testing.assert_close(y1_s_transposed, y1_s_orig, atol=0, rtol=0)
 
-    # Verify numerical correctness - values should match the transpose().contiguous().view() pattern
-    torch.testing.assert_close(y1_s_transposed, y1_s_expected, atol=1e-6, rtol=1e-6)
+    # transpose_scale=True path is column-major: strides (1, M), and its transpose
+    # is contiguous -- exactly the layout the CK bpreshuffle GEMM reads directly.
+    # (num_bs_cols == 1 is degenerate: row- and column-major coincide.)
+    if num_bs_cols > 1 and M > 1:
+        assert y1_s_transposed.stride() == (1, M)
+        assert y1_s_transposed.T.is_contiguous()
+        # Bit-exact with the materialize (.t().contiguous().t()) copy path.
+        torch.testing.assert_close(
+            y1_s_transposed,
+            y1_s_orig.t().contiguous().t(),
+            atol=0,
+            rtol=0,
+        )
 
     # Verify that other outputs are identical
     # For fp8 tensors, use exact bitwise comparison
