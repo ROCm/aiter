@@ -791,6 +791,52 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
+    # a16w4 (bf16 A x MXFP4 W) SiTUv2 SEPARATED: route to the numerically-correct
+    # ported FlyDSL kernel (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). aiter's
+    # previous compile_mixed_moe_gemm{1,2}_a16w4 fails its own strict accuracy
+    # gate on this path; the port passes at logits_diff ~1.5e-5. CDNA (gfx942 /
+    # gfx950) only -- gfx1250 is handled by the q_dtype_a override above and never
+    # reaches here as bf16-a16w4.
+    if (
+        is_flydsl_available()
+        and quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and q_dtype_a == dtypes.bf16
+        and activation == ActivationType.Situv2
+        and gate_mode == GateMode.SEPARATED
+        and isShuffled
+        and isG1U1
+        and not doweight_stage1
+        and expert_mask is None
+        and bias1 is None
+        and bias2 is None
+        # the ported kernel bakes SiTUv2 beta/linear_beta at 1.0 (no per-call
+        # scale); non-default betas keep aiter's existing a16w4 kernel.
+        and beta in (None, 1.0)
+        and linear_beta in (None, 1.0)
+        and get_gfx() in ("gfx942", "gfx950")
+    ):
+        from aiter.ops.flydsl.moe_2stage_a16w4_dispatch import fused_moe_a16w4_flydsl
+
+        _bm = block_size_M if block_size_M not in (None, -1) else None
+        out = fused_moe_a16w4_flydsl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=E,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            topk=topk,
+            dtype=dtype,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            block_size_M=_bm,
+            kernel_bench_callable=kernel_bench_callable,
+        )
+        return out.to(dtype)
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
