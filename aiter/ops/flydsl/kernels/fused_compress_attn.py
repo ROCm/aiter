@@ -373,14 +373,12 @@ def _build_kernel(
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
         # ---- Step 2: sentinel-skip ----
-        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's
-        # `if cond: return` does NOT actually early-exit (tail kernel body
-        # still runs with stale values, OOB faults). The IfOp does.
-        is_active = arith.cmpi(
-            CmpIPredicate.sge, _to_raw(position), arith.constant(0, type=i32)
-        )
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0. A bare
+        # `if cond: return` does NOT early-exit under the tracer (tail still
+        # runs with stale values -> OOB), so the body is a closure invoked
+        # under a runtime `if`: the rewriter sees an opaque call (no state to
+        # thread) and lowers it to scf.if, guarding every store inside.
+        def _body():
             # ---- Step 3: per-seq state slot ----
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
@@ -1371,6 +1369,9 @@ def _build_kernel(
                             _to_raw(cs_off),
                         )  # e8m0 uint8
             # else: warmup — no scatter, just consume compute.
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_fused_compress_attn(
