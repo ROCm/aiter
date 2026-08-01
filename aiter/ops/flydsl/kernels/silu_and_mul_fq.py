@@ -130,8 +130,8 @@ def build_silu_and_mul_fq_module(
         token_num: Int32,
         swiglu_limit_f: fx.Float32,
     ):
-        bid = fx.Int32(fx.block_idx.x)
-        tid = fx.Int32(fx.thread_idx.x)
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
 
         f32 = T.f32
 

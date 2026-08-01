@@ -68,8 +68,8 @@ def build_swiglu_and_mul_module(inter_dim: int):
         out: fx.Tensor,  # (rows, inter_dim)   bf16
         num_rows: Int32,
     ):
-        bid = fx.Int32(fx.block_idx.x)
-        tid = fx.Int32(fx.thread_idx.x)
+        bid = fx.block_idx.x
+        tid = fx.thread_idx.x
 
         f32 = T.f32
 

@@ -1156,7 +1156,7 @@ def _build_kernel(
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
-                        if (fx.Int32(tid) & 1) == 0:
+                        if (tid & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword,
                                 out_rsrc,
@@ -1180,7 +1180,7 @@ def _build_kernel(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    if fx.Int32(tid) == 0:
+                    if tid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -1292,7 +1292,7 @@ def _build_kernel(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(tid_x_vec, c32_i32)
-                    if fx.Int32(tid) % NTG == 0:
+                    if tid % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -2182,7 +2182,7 @@ def _build_kernel_ksplit(
                     byte_off = block_byte_base + in_block_off
 
                     if const_expr(VEC == 2):
-                        if (fx.Int32(lid) & 1) == 0:
+                        if (lid & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword, out_rsrc, byte_off, offset_is_bytes=True
                             )
@@ -2199,7 +2199,7 @@ def _build_kernel_ksplit(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    if fx.Int32(lid) == 0:
+                    if lid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -2304,7 +2304,7 @@ def _build_kernel_ksplit(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(lid_x_vec_i, c32_i32)
-                    if fx.Int32(lid) % NTG == 0:
+                    if lid % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )

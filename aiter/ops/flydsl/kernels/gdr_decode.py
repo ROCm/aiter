@@ -404,7 +404,7 @@ def create_vk_gdr_decode_kernel(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
 
-        if pool_idx >= fx.Int32(0):
+        if pool_idx >= 0:
             _do_decode()
 
     @flyc.jit

@@ -711,9 +711,7 @@ def _build_norm_rope_scatter_kernel(
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
         # bounds-checked to 0 by the buffer resource, so guard explicitly here).
-        is_active = (fx.Int32(position) >= 0) & (
-            fx.Int32(pid) < fx.Int32(plan_capacity)
-        )
+        is_active = (fx.Int32(position) >= 0) & (pid < plan_capacity)
 
         # Whole body as a closure under the runtime guard (opaque call -> scf.if).
         def _body():
