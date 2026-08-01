@@ -65,7 +65,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 
 # JIT-free MX-format mode/dtype int mirrors. ``aiter.utility.mx_types``'s
 # pybind11 ``MxScaleRoundMode`` / ``MxDtype`` lazy-load on first attribute
@@ -136,9 +136,8 @@ def _store_bf16_vec_g(vals_list, g_out, row_off_elems, idx, vec):
     """Convert VEC fp32 values to a bf16 vector and store via a GTensor whose
     base is already shifted per-token. ``row_off_elems`` is this head's row
     offset within the token (i32 elements); ``idx`` is the lane id."""
-    vec_t = T.vec(vec, T.f32)
     raw = [v.ir_value() if hasattr(v, "ir_value") else v for v in vals_list]
-    f32v = vector.from_elements(vec_t, raw)
+    f32v = fx.Vector.from_elements(raw, dtype=fx.Float32)
     bf16v = f32v.truncf(T.vec(vec, T.bf16))
     my_off = fx.Int32(row_off_elems) + fx.Int32(idx) * vec
     g_out.store(my_off, bf16v, vec_size=vec)
@@ -187,8 +186,7 @@ def _store_fp8_packed(
     p1 = rocdl.cvt_pk_fp8_f32(i32, safe[6], safe[7], p1, 1)
 
     off_bytes = fx.Int32(row_base_bytes) + fx.Int32(idx) * 8
-    vec2_i32 = T.vec(2, i32)
-    store_vec = vector.from_elements(vec2_i32, [p0, p1])
+    store_vec = fx.Vector.from_elements([p0, p1], dtype=fx.Int32)
     buffer_ops.buffer_store(store_vec, out_rsrc, off_bytes, offset_is_bytes=True)
 
 
@@ -470,7 +468,8 @@ def _build_kernel(
                 # Per-lane scale_off = scale_base_off + (tid / TPG).
                 # NOTE: tried buffer_ops.buffer_store(mask=...) for
                 # predication but the mask path sets offset to 0x7FFFFFFF on
-                # masked-off lanes -> OOB GPU fault on gfx950. Stay with scf.if.
+                # masked-off lanes -> OOB GPU fault on gfx950. Stay with the
+                # predicated (lane-leader) branch instead.
                 group_idx = tid >> fx.Int32(log2_tpg)
                 lane_in_group = tid & fx.Int32(TPG - 1)
                 if lane_in_group == 0:
@@ -498,7 +497,7 @@ def _build_kernel(
             # ---- Store scaled to rmem for cross-branch value passing ----
             out_rmem = fx.make_rmem_tensor(full_lay, fx.Float32)
             scaled_raw = [_to_raw(s) for s in scaled]
-            scaled_vec = vector.from_elements(T.vec(VEC, f32), scaled_raw)
+            scaled_vec = fx.Vector.from_elements(scaled_raw, dtype=fx.Float32)
             fx.memref_store_vec(scaled_vec, out_rmem)
 
             # ---- ROPE branch: load from rmem, rotate, store back ----
@@ -519,7 +518,7 @@ def _build_kernel(
                     s = sin_f32[k]
                     rope_elems.append(_to_raw(e * c - o * s))
                     rope_elems.append(_to_raw(e * s + o * c))
-                rotated_vec = vector.from_elements(T.vec(VEC, f32), rope_elems)
+                rotated_vec = fx.Vector.from_elements(rope_elems, dtype=fx.Float32)
                 fx.memref_store_vec(rotated_vec, out_rmem)
 
             # ---- Unified store: all threads read from rmem and write ----
@@ -643,11 +642,10 @@ def _build_kernel(
             kv_rsrc = _ptr_buffer_resource(kv_in)
             kv_off_elems = bid_t * kv_in_row_stride + tid * VEC
             kv_off_dw = kv_off_elems >> 1
-            vec_bf16xV = T.vec(VEC, T.bf16)
             x_raw = buffer_ops.buffer_load(
                 kv_rsrc, kv_off_dw, vec_width=VEC // 2, dtype=i32
             )
-            x_vec_bf16_raw = vector.bitcast(vec_bf16xV, x_raw)
+            x_vec_bf16_raw = fx.Vector(x_raw).bitcast(fx.BFloat16)
             kv_rmem = fx.make_rmem_tensor(full_lay, elem_dtype)
             fx.memref_store_vec(x_vec_bf16_raw, kv_rmem)
             x_vec = fx.memref_load_vec(kv_rmem)

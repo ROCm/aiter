@@ -29,7 +29,7 @@ from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
-from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from aiter.utility.mx_types import (
     MX_DEFAULT_ROUND_MODE as _DEFAULT_MODE,
@@ -216,21 +216,18 @@ def build_silu_and_mul_fq_module(
                     vec_f32_ty = T.vec(VEC, f32)
 
                     if const_expr(vec_dw == 1):
-                        vec1_i32_ty = T.vec(1, T.i32)
                         gate_raw = buffer_ops.buffer_load(
                             in_rsrc, gate_dw, vec_width=1, dtype=T.i32
                         )
                         up_raw = buffer_ops.buffer_load(
                             in_rsrc, up_dw, vec_width=1, dtype=T.i32
                         )
-                        gate_bf16 = vector.bitcast(
-                            vec_bf16_ty,
-                            vector.from_elements(vec1_i32_ty, [gate_raw]),
-                        )
-                        up_bf16 = vector.bitcast(
-                            vec_bf16_ty,
-                            vector.from_elements(vec1_i32_ty, [up_raw]),
-                        )
+                        gate_bf16 = fx.Vector.from_elements(
+                            [gate_raw], dtype=fx.Int32
+                        ).bitcast(fx.BFloat16)
+                        up_bf16 = fx.Vector.from_elements(
+                            [up_raw], dtype=fx.Int32
+                        ).bitcast(fx.BFloat16)
                     else:
                         gate_raw = buffer_ops.buffer_load(
                             in_rsrc, gate_dw, vec_width=vec_dw, dtype=T.i32
@@ -238,8 +235,8 @@ def build_silu_and_mul_fq_module(
                         up_raw = buffer_ops.buffer_load(
                             in_rsrc, up_dw, vec_width=vec_dw, dtype=T.i32
                         )
-                        gate_bf16 = vector.bitcast(vec_bf16_ty, gate_raw)
-                        up_bf16 = vector.bitcast(vec_bf16_ty, up_raw)
+                        gate_bf16 = fx.Vector(gate_raw).bitcast(fx.BFloat16)
+                        up_bf16 = fx.Vector(up_raw).bitcast(fx.BFloat16)
                     gate_f32 = gate_bf16.extf(vec_f32_ty)
                     up_f32 = up_bf16.extf(vec_f32_ty)
 
@@ -302,12 +299,8 @@ def build_silu_and_mul_fq_module(
 
                     act_vals = []
                     for vi in range_constexpr(VEC):
-                        g = vector.extract(
-                            gate_f32, static_position=[vi], dynamic_position=[]
-                        )
-                        u = vector.extract(
-                            up_f32, static_position=[vi], dynamic_position=[]
-                        )
+                        g = gate_f32[vi].ir_value()
+                        u = up_f32[vi].ir_value()
 
                         if enable_bias:
                             bias_col = col0 + vi
@@ -490,17 +483,14 @@ def build_silu_and_mul_fq_module(
                         out_row_byte_base = in_row * (inter_dim * elem_bytes_bf16)
                         out_byte_off = out_row_byte_base + col0 * elem_bytes_bf16
                         out_dw_off = out_byte_off >> 2
-                        act_f32_vec = vector.from_elements(vec_f32_ty, act_vals)
-                        act_bf16_vec = act_f32_vec.truncf(vec_bf16_ty)
-                        act_i32 = vector.bitcast(
-                            T.vec(VEC * elem_bytes_bf16 // 4, T.i32), act_bf16_vec
+                        act_f32_vec = fx.Vector.from_elements(
+                            act_vals, dtype=fx.Float32
                         )
+                        act_bf16_vec = act_f32_vec.truncf(vec_bf16_ty)
+                        act_i32 = fx.Vector(act_bf16_vec).bitcast(fx.Int32)
                         vec_dw_out = VEC * elem_bytes_bf16 // 4
                         if const_expr(vec_dw_out == 1):
-                            store_scalar = vector.extract(
-                                act_i32, static_position=[0], dynamic_position=[]
-                            )
-                            buffer_ops.buffer_store(store_scalar, out_rsrc, out_dw_off)
+                            buffer_ops.buffer_store(act_i32[0], out_rsrc, out_dw_off)
                         else:
                             buffer_ops.buffer_store(act_i32, out_rsrc, out_dw_off)
 
