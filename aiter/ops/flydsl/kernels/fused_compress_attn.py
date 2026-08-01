@@ -25,9 +25,9 @@ Two kernel families share this file:
 
 Grid: ``(plan_capacity, 1, 1)`` -- one program per packed plan row
 ``[ragged_id, batch_id, position, window_len]``. Position == -1 rows
-sentinel-skip; sentinel-skip is implemented as an scf.IfOp that wraps the
-entire body (flydsl ``if cond: return`` does NOT actually early-exit inside
-a @flyc.kernel -- same trap as ``qk_norm_rope_quant``'s grid-Y chunk loop).
+sentinel-skip; the whole body is a closure invoked under a runtime ``if``
+(flydsl ``if cond: return`` does NOT actually early-exit inside a
+@flyc.kernel, but ``if cond: _body()`` lowers to scf.if and guards it).
 
 Per-thread layout (single wave64, BLOCK_THREADS=64):
   - VEC = D / 64 (V4-Pro Main: D=512 -> VEC=8; Indexer: D=128 -> VEC=2)
@@ -70,14 +70,12 @@ previous-fwd. Caller MUST invoke BEFORE ``update_compressor_states``.
 # triggering a JIT recompile per dynamic-arg value).
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl._mlir.dialects import llvm, rocdl
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -137,18 +135,6 @@ _FP4_K_TILE = 128
 # ============================================================================
 # scf helpers (copied verbatim from moe_gemm_2stage.py -- too small to share)
 # ============================================================================
-
-
-@contextmanager
-def _if_then(if_op):
-    """SCF IfOp then-region context manager. Auto-yields empty if missing."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -227,9 +213,9 @@ def _build_kernel(
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
     if nm_asm:
         assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
-        assert (
-            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
-        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
+        assert NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0, (
+            f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
+        )
 
     assert D % BLOCK_THREADS == 0, f"D={D} must divide BLOCK_THREADS={BLOCK_THREADS}"
     assert VEC in (2, 4, 8), f"VEC={VEC} (D/{BLOCK_THREADS}) outside supported set"
@@ -250,9 +236,9 @@ def _build_kernel(
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
         assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
         assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
-        assert (
-            _FP4_GROUP_SIZE % VEC == 0
-        ), f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
+        assert _FP4_GROUP_SIZE % VEC == 0, (
+            f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
+        )
         if preshuffle:
             assert k_per_block % _PRESHUFFLE_TILE == 0
 
@@ -746,47 +732,39 @@ def _build_kernel(
                     )
                     loop_final = yield new_state
 
-                # Tail iter at k=K-1. Gated by `window_len < K`: when wl==K
-                # Phase 2 is empty and the IfOp returns phase1_state.
-                is_phase2_nonempty = arith.cmpi(
-                    CmpIPredicate.slt,
-                    _to_raw(window_len),
-                    arith.constant(K, type=i32),
+                # Tail iter at k=K-1. When window_len == K phase 2 is empty and
+                # the accumulator passes through phase1_state. Both arms are pure
+                # arithmetic (no loads), so compute the update unconditionally and
+                # per-lane select -- bit-identical to the old value-yielding IfOp.
+                is_phase2_nonempty = fx.Int32(window_len) < K
+                m_lane_t = list(loop_final[0:VEC])
+                kv_lane_t = list(loop_final[VEC : 2 * VEC])
+                w_lane_t = list(loop_final[2 * VEC : 3 * VEC])
+                pre_kv_t = list(loop_final[3 * VEC : 4 * VEC])
+                pre_sc_t = list(loop_final[4 * VEC : 5 * VEC])
+                pre_ape_t = list(loop_final[5 * VEC : 6 * VEC])
+                score_k_lane_t = [
+                    arith.AddFOp(pre_sc_t[i], pre_ape_t[i], fastmath=fm_fast).result
+                    for i in range(VEC)
+                ]
+                _, new_kv_t, new_w_t = _online_softmax_update(
+                    m_lane_t,
+                    kv_lane_t,
+                    w_lane_t,
+                    score_k_lane_t,
+                    pre_kv_t,
+                    score_can_be_neg_inf=False,
                 )
-                tail_result_types = [f32] * (3 * VEC)
-                _if_tail = scf.IfOp(
-                    is_phase2_nonempty, tail_result_types, has_else=True
-                )
-                with ir.InsertionPoint(_if_tail.then_block):
-                    m_lane_t = list(loop_final[0:VEC])
-                    kv_lane_t = list(loop_final[VEC : 2 * VEC])
-                    w_lane_t = list(loop_final[2 * VEC : 3 * VEC])
-                    pre_kv_t = list(loop_final[3 * VEC : 4 * VEC])
-                    pre_sc_t = list(loop_final[4 * VEC : 5 * VEC])
-                    pre_ape_t = list(loop_final[5 * VEC : 6 * VEC])
-                    score_k_lane_t = [
-                        arith.AddFOp(pre_sc_t[i], pre_ape_t[i], fastmath=fm_fast).result
-                        for i in range(VEC)
-                    ]
-                    new_m_t, new_kv_t, new_w_t = _online_softmax_update(
-                        m_lane_t,
-                        kv_lane_t,
-                        w_lane_t,
-                        score_k_lane_t,
-                        pre_kv_t,
-                        score_can_be_neg_inf=False,
-                    )
-                    scf.YieldOp(list(new_m_t) + list(new_kv_t) + list(new_w_t))
-                with ir.InsertionPoint(_if_tail.else_block):
-                    # Phase 2 empty (window_len == K): pass through phase1
-                    # accumulator unchanged.
-                    m_p1 = list(phase1_state[0:VEC])
-                    kv_p1 = list(phase1_state[VEC : 2 * VEC])
-                    w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
-                    scf.YieldOp(list(m_p1) + list(kv_p1) + list(w_p1))
-
-                kv_final = list(_if_tail.results[VEC : 2 * VEC])
-                w_final = list(_if_tail.results[2 * VEC : 3 * VEC])
+                kv_p1 = list(phase1_state[VEC : 2 * VEC])
+                w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
+                kv_final = [
+                    is_phase2_nonempty.select(new_kv_t[i], kv_p1[i]).ir_value()
+                    for i in range(VEC)
+                ]
+                w_final = [
+                    is_phase2_nonempty.select(new_w_t[i], w_p1[i]).ir_value()
+                    for i in range(VEC)
+                ]
 
             # ---- Step 8: compressed = kv_acc / w_acc (per-lane) ----
             comp_lane = []
@@ -1178,13 +1156,7 @@ def _build_kernel(
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(tid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        if (fx.Int32(tid) & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword,
                                 out_rsrc,
@@ -1208,19 +1180,13 @@ def _build_kernel(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    is_lane0 = arith.cmpi(
-                        CmpIPredicate.eq,
-                        _to_raw(tid),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_l0 = scf.IfOp(is_lane0)
-                    with _if_then(_if_l0):
+                    if fx.Int32(tid) == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
+                        cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
+                        ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
                     # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
@@ -1326,13 +1292,7 @@ def _build_kernel(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(tid_x_vec, c32_i32)
-                    is_grp_rep = arith.cmpi(
-                        CmpIPredicate.eq,
-                        arith.remui(_to_raw(tid), arith.constant(NTG, type=i32)),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_grp = scf.IfOp(is_grp_rep)
-                    with _if_then(_if_grp):
+                    if fx.Int32(tid) % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -1537,9 +1497,9 @@ def _build_kernel_ksplit(
         assert quant, "internal: quant_fp4 requires quant=True"
         assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
         assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
-        assert (
-            _FP4_GROUP_SIZE % VEC == 0
-        ), f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
+        assert _FP4_GROUP_SIZE % VEC == 0, (
+            f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
+        )
         if preshuffle:
             assert k_per_block % _PRESHUFFLE_TILE == 0
     elif quant and preshuffle:
@@ -1547,9 +1507,9 @@ def _build_kernel_ksplit(
         assert k_per_block % _PRESHUFFLE_TILE == 0
     if nm_asm:
         assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
-        assert (
-            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
-        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
+        assert NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0, (
+            f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
+        )
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D
@@ -1655,9 +1615,9 @@ def _build_kernel_ksplit(
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
-        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: whole body runs only for position >= 0, as a closure
+        # under a runtime `if` (see the CSA kernel above for the rationale).
+        def _body():
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
             )
@@ -1874,9 +1834,7 @@ def _build_kernel_ksplit(
             gpu.barrier()
 
             # ---- wave 0: cross-wave reduce + norm + rope + scatter ----
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_lane = []
                 for i in range_constexpr(VEC):
                     lane_off = lid_x_vec + arith.constant(i, type=i32)
@@ -2224,13 +2182,7 @@ def _build_kernel_ksplit(
                     byte_off = block_byte_base + in_block_off
 
                     if const_expr(VEC == 2):
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(lid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        if (fx.Int32(lid) & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword, out_rsrc, byte_off, offset_is_bytes=True
                             )
@@ -2247,19 +2199,13 @@ def _build_kernel_ksplit(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    is_lane0 = arith.cmpi(
-                        CmpIPredicate.eq,
-                        _to_raw(lid),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_l0 = scf.IfOp(is_lane0)
-                    with _if_then(_if_l0):
+                    if fx.Int32(lid) == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
+                        cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
+                        ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
                     # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
@@ -2358,13 +2304,7 @@ def _build_kernel_ksplit(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(lid_x_vec_i, c32_i32)
-                    is_grp_rep = arith.cmpi(
-                        CmpIPredicate.eq,
-                        arith.remui(_to_raw(lid), arith.constant(NTG, type=i32)),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_grp = scf.IfOp(is_grp_rep)
-                    with _if_then(_if_grp):
+                    if fx.Int32(lid) % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -2398,6 +2338,12 @@ def _build_kernel_ksplit(
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8
+
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_fused_compress_attn_ksplit(
