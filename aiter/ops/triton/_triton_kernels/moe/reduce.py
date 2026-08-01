@@ -14,6 +14,12 @@ def _reduce_grouped(
     stride_om: tl.uint64,
     stride_on,  # output tensor
     InIndx,
+    # Optional per-gate validity, same [num_groups, K] shape as InIndx. Needed
+    # when only some of a group's K slots were produced by the matmul -- e.g.
+    # expert-parallel routing, where a token's non-local experts are computed on
+    # another rank, so those slots of X are never written. Without this the
+    # reduce sums uninitialized memory.
+    InIndxValid,
     B,
     M,
     N,
@@ -24,6 +30,7 @@ def _reduce_grouped(
     limit,
     ACTIVATION_REDUCTION_N: tl.constexpr,
     K: tl.constexpr,
+    HAS_INDX_VALID: tl.constexpr,
     BLOCK_N: tl.constexpr,
     EVEN_N: tl.constexpr,
     SWIGLU_ADD_RESIDUAL: tl.constexpr,
@@ -48,6 +55,16 @@ def _reduce_grouped(
         indxs = ()
         for i in tl.static_range(0, K):
             indxs = indxs + (tl.load(InIndx + start + i),)
+    if HAS_INDX_VALID:
+        # Clamp masked slots to row 0 so the load stays in bounds; their value is
+        # discarded below. Cheaper than a branch and keeps the loop uniform.
+        valids = ()
+        for i in tl.static_range(0, K):
+            valids = valids + (tl.load(InIndxValid + start + i) != 0,)
+        safe_indxs = ()
+        for i in tl.static_range(0, K):
+            safe_indxs = safe_indxs + (tl.where(valids[i], indxs[i], 0),)
+        indxs = safe_indxs
     XPtrs = X + (pid_n * BLOCK_N + tl.arange(0, BLOCK_N)) * stride_xn
     OutPtrs = Out + (pid_n * BLOCK_N_OUT + tl.arange(0, BLOCK_N_OUT)) * stride_on
 
@@ -73,6 +90,11 @@ def _reduce_grouped(
                     vals = tl.load(x_row_ptr, mask=x_n_mask, other=0.0)
             vals = vals.to(tl.float32)
             curr += vals
+
+        if HAS_INDX_VALID:
+            # Drop the clamped row's value. Done before the activation so a
+            # masked slot contributes exactly 0, not swiglu(0).
+            curr = tl.where(valids[i], curr, 0.0)
 
         # apply nonlinearity to split-k output
         if APPLY_SWIGLU:
