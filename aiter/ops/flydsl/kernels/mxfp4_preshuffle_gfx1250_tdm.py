@@ -96,6 +96,7 @@ def launch_gemm_a8w4_tdm(
     push_group: Constexpr[int] = 0,
     arg_tile_row_base: fx.Pointer = None,
     arg_expert_ids: fx.Pointer = None,
+    arg_tile_valid: fx.Pointer = None,
 ):
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
@@ -196,6 +197,7 @@ def launch_gemm_a8w4_tdm(
         arg_ep_rowmap: fx.Tensor,
         arg_tile_row_base: fx.Pointer,
         arg_expert_ids: fx.Pointer,
+        arg_tile_valid: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -267,7 +269,11 @@ def launch_gemm_a8w4_tdm(
         # tile (padding rows read stale within-CAP data, discarded downstream);
         # else bound to the owning expert's valid-row end.
         if const_expr(push_group):
-            mn_oob = fx.Int32(tile_m)
+            # valid rows in this fixed-slot tile (from finalize): padding rows
+            # (>= mn_oob) load 0, so they never compute Inf/NaN from stale recv data
+            # and the scatter drops them (r < mn_oob guard) -- matches the pull path.
+            tvw = fx.recast_iter(i32_ptr, arg_tile_valid)
+            mn_oob = tvw[m_tile]
         else:
             mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
@@ -889,7 +895,9 @@ def launch_gemm_a8w4_tdm(
         arg_tile_row_base = arg_a
     if arg_expert_ids is None:
         arg_expert_ids = arg_a
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, arg_ep_rowmap, arg_tile_row_base, arg_expert_ids, i32_m, N, f32_swiglu_limit).launch(
+    if arg_tile_valid is None:
+        arg_tile_valid = arg_a
+    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, arg_ep_rowmap, arg_tile_row_base, arg_expert_ids, arg_tile_valid, i32_m, N, f32_swiglu_limit).launch(
         grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 

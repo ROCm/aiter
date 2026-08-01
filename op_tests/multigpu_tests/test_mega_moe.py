@@ -512,6 +512,39 @@ class DeviceMoEPipeline:
             xn, wts, None, ids, return_routing=True
         )
         ep_kwargs = None
+        if self.op.cfg.is_fused and self.op.cfg.push_group:
+            # push-group fixed-slot path: dispatch already landed tokens grouped by
+            # local expert AND emitted pg_rowmap (map[final_slot]={origin,weight}).
+            # Skip topids_to_rows/psum_remap/gather entirely; the gemm2 TDM epilogue
+            # scatters straight into peers' comb_inp via pg_rowmap.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                grouped_a8w4_tdm_moe_push_scatter,
+            )
+
+            self.op.zero_fused_staging()
+            ep = self.op.ep_scatter_params()
+            pg = self.op.push_group_moe_inputs()
+            grouped_a8w4_tdm_moe_push_scatter(
+                pg["disp_out"].view(dtypes.bf16), pg["pg_running"], pg["pg_rowmap"],
+                self.w1_a, self.w2_a, self.w1_s, self.w2_s,
+                E_local=self.EPR, model_dim=self.hdim, inter_dim=self.idim,
+                cap=pg["cap"], activation=ActivationType.Silu,
+                # GEMM1 K=hidden -> tile_k=256 (matches pull); GEMM2 K=inter_dim ->
+                # tile_k2=128, aligning to pull's tuned GEMM2 tile (don't inherit 256).
+                tile_m=64, tile_n=256, tile_k=256, num_buffers=2,
+                tile_k2=128,
+                ep_arena_handle=ep["ep_arena_handle"],
+                ep_comb_inp_off=ep["ep_comb_inp_off"],
+                ep_wire_nbytes=ep["ep_wire_nbytes"],
+                ep_slot_stride=pg["slot_stride"],
+                ep_world=self.dist_ctx.world,
+            )
+            # combine (scatter_fused) ignores its input arg -- it reads comb_inp.
+            combine_out, _ = self.op.combine(xn, routing=handle)
+            y = combine_out[: self.ct].to(dtypes.bf16)
+            if self.sw1 is not None:
+                y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
+            return x + y
         if self.op.cfg.is_fused:
             # gemm2-fused scatter: zero the per-(token,k) comb_inp before gemm2's
             # P2P writes (dropped/unwritten slots must read 0 in the combine sum),

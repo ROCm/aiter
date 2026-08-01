@@ -22,6 +22,7 @@
 """Host op-layer for the cco-LSA intranode dispatch/combine kernels. One SymmArena
 window holds the symmetric staging; per-rank metadata are plain device tensors."""
 from dataclasses import dataclass
+import math
 import os
 
 import torch
@@ -108,10 +109,21 @@ _PUSH_GROUP_TILE_M = 64
 
 def _push_group_regions(cfg, tile_m=_PUSH_GROUP_TILE_M):
     """Extra symmetric regions for fixed-slot push-group dispatch (empty when off).
-    `pg_running[local_expert]` is the per-expert landing cursor (atomic_add target)."""
+
+    * ``pg_running[local_expert]`` -- per-expert landing cursor (atomic_add target).
+    * ``pg_rowmap[grouped_row]``   -- (rrows+1, 2) i32 map dispatch emits for the
+      downstream gemm2 scatter epilogue: col0 = ``origin_pe*slot_stride +
+      origin_lid*topk + k`` (the peer comb_inp slot), col1 = f32 route weight bits.
+      Indexed by the SAME fixed-slot row (``local_expert*CAP + cursor``) the gemm2
+      TDM kernel derives from ``tile_row_base``, so ep_rowmap==pg_rowmap needs no
+      remap. Empty/padding slots carry col0 = -1 (dropped in the scatter)."""
     if not cfg.push_group:
         return []
-    return [("pg_running", cfg.num_experts_per_rank * 4)]
+    rrows = cfg.num_experts_per_rank * cfg.push_group_cap
+    return [
+        ("pg_running", cfg.num_experts_per_rank * 4),
+        ("pg_rowmap", (rrows + 1) * 2 * 4),
+    ]
 
 
 @dataclass
@@ -424,15 +436,35 @@ class EpDispatchCombineConfig:
     @property
     def push_group_cap(self) -> int:
         """Per-local-expert fixed-slot row capacity, aligned up to the GEMM1 tile_m.
-        Default upper bound = world_size*max_num_inp_token_per_rank (all tokens hit
-        one expert); override via AITER_EP_PUSH_GROUP_CAP."""
+
+        The fixed-slot GEMM launches ``E*CAP/tile_m`` M-tiles and pays for EVERY
+        padding tile (sentinel tiles are NOT free -- each still costs a tile launch
+        + the full N/K loop), so GEMM1/2 cost scales ~linearly with ``E*CAP``. CAP
+        must therefore track the real peak per-expert load, not the worst case.
+
+        Default = ``ceil(SAFETY * avg)`` aligned up to tile_m, where ``avg`` is the
+        expected uniform-routing landings per LOCAL expert
+        ``max_tok_per_rank * topk / experts_per_rank`` (world cancels), floored at
+        tile_m. Tune the multiple with ``AITER_EP_PUSH_GROUP_SAFETY`` (default 2),
+        or pin CAP directly with ``AITER_EP_PUSH_GROUP_CAP`` (worst-case-safe value
+        = ``world_size*max_tok_per_rank``, i.e. all tokens hit one expert).
+
+        TRADE-OFF: this favors speed over worst-case safety. Adversarial/skewed
+        routing whose peak per-expert load exceeds CAP silently DROPS the overflow
+        tokens (clamped in finalize). Raise SAFETY / pin CAP for skewed workloads.
+        """
         tile_m = _PUSH_GROUP_TILE_M
-        base = int(
-            os.environ.get(
-                "AITER_EP_PUSH_GROUP_CAP",
-                str(self.world_size * self.max_num_inp_token_per_rank),
+        env_cap = os.environ.get("AITER_EP_PUSH_GROUP_CAP")
+        if env_cap is not None:
+            base = int(env_cap)
+        else:
+            safety = float(os.environ.get("AITER_EP_PUSH_GROUP_SAFETY", "2.0"))
+            avg = (
+                self.max_num_inp_token_per_rank
+                * self.num_experts_per_token
+                / max(1, self.num_experts_per_rank)
             )
-        )
+            base = max(tile_m, int(math.ceil(avg * safety)))
         return ((base + tile_m - 1) // tile_m) * tile_m
 
 
@@ -519,6 +551,7 @@ class EpDispatchCombineOp:
         # push-group fixed-slot: recv-side regions grow from recv-order (recv_cap
         # rows) to grouped [num_local_experts, CAP] rows so tokens land grouped.
         self._push_group = cfg.push_group
+        self._pg_initialized = False
         self._push_group_cap = cfg.push_group_cap if cfg.push_group else 0
         rrows = (
             cfg.num_experts_per_rank * self._push_group_cap
@@ -680,6 +713,7 @@ class EpDispatchCombineOp:
             push_group=cfg.push_group,
             push_group_cap=self._push_group_cap,
             off_pg_running=arena.offset("pg_running") if cfg.push_group else 0,
+            off_pg_rowmap=arena.offset("pg_rowmap") if cfg.push_group else 0,
         )
         # (block, warp) -> compiled dispatch / combine kernel.
         self._dispatch_variants = {
@@ -964,10 +998,13 @@ class EpDispatchCombineOp:
             )
         num_input_tokens = input.shape[0]
         disp_spec, _ = self._pick(num_input_tokens)
-        if routing is None:
-            # per-expert landing cursors must start at 0 each dispatch (kernel does
-            # not self-reset them, unlike the per-PE tok_off counter).
+        if routing is None and self._push_group and not self._pg_initialized:
+            # One-time only: seed pg_running=0 before the very first push-group
+            # landing. Subsequent layers are zeroed race-free inside finalize
+            # (read-then-zero). Doing it per-dispatch would race with peers' P2P
+            # atomic_add into this counter.
             self.reset_push_group()
+            self._pg_initialized = True
         # total_recv is self-reset inside the dispatch kernel (warp 0, Phase 2).
         scale_ptr = (
             scales.data_ptr() if (scales is not None and self._enable_scales) else 0
@@ -1181,19 +1218,19 @@ class EpDispatchCombineOp:
         self.cross_device_flag.fill_(1)
 
     def reset_push_group(self):
-        """Zero the per-expert landing cursors and pre-fill the recv->src map with
-        the drop sentinel before a push-group dispatch: any fixed-slot row a token
-        never lands in then reads sentinel, so combine skips the tail padding
-        (finalize only produces tile metadata, not padding)."""
+        """One-time init of the per-expert landing cursors (pg_running == 0) before
+        the FIRST push-group dispatch. NOT called per-layer: the finalize kernel
+        read-then-zeros pg_running each layer (race-free, between dispatch's end
+        barrier and the next layer's landing). A per-layer memset here would race
+        with peers' P2P atomic_add into the same counter -> lost increments ->
+        dropped rows -> intermittent wrong results.
+
+        pg_rowmap / recv_to_src_token need NO reset: with the finalize tile_valid
+        bound, the gemm2 scatter only reads a tile's valid rows (< mn_oob), which
+        dispatch overwrites every layer; padding rows are never read."""
         if not self._push_group:
             return
         self.arena.zero("pg_running")
-        sentinel = self.cfg.world_size * self.cfg.max_num_inp_token_per_rank
-        from_gpu_ptr(
-            self.arena.local_ptr("recv_to_src_token"),
-            (self._pg_recv_rows,),
-            torch.int32,
-        ).fill_(sentinel)
 
     def push_group_ptrs(self):
         """Fixed-slot layout descriptor for the GEMM1 contiguous A-load: local
@@ -1207,7 +1244,39 @@ class EpDispatchCombineOp:
             "recv_rows": self._pg_recv_rows,
             "disp_out_ptr": self.arena.local_ptr("disp_out"),
             "pg_running_ptr": self.arena.local_ptr("pg_running"),
+            "pg_rowmap_ptr": self.arena.local_ptr("pg_rowmap"),
             "recv_to_src_token_ptr": self.arena.local_ptr("recv_to_src_token"),
             "out_idx_ptr": self.arena.local_ptr("out_idx"),
             "out_wts_ptr": self.arena.local_ptr("out_wts"),
         }
+
+    def push_group_moe_inputs(self):
+        """Torch views of the fixed-slot recv grid + the dispatch-emitted combine
+        map, for the push-group MoE (grouped_a8w4_tdm_moe_push_scatter). ``disp_out``
+        is [num_local_experts*CAP, hidden] grouped bf16, ``pg_running`` the per-expert
+        landed counts, ``pg_rowmap`` the (rrows+1,2) {dst_packed, weight} map."""
+        if not self._push_group:
+            return None
+        rrows = self._pg_recv_rows
+        cols = self.cfg.hidden_dim // 2 if self.cfg.is_fp4 else self.cfg.hidden_dim
+        return dict(
+            disp_out=from_gpu_ptr(
+                self.arena.local_ptr("disp_out"),
+                (rrows, cols),
+                self.cfg.dispatch_dtype,
+            ),
+            pg_running=from_gpu_ptr(
+                self.arena.local_ptr("pg_running"),
+                (self.cfg.num_experts_per_rank,),
+                torch.int32,
+            ),
+            pg_rowmap=from_gpu_ptr(
+                self.arena.local_ptr("pg_rowmap"),
+                (rrows + 1, 2),
+                torch.int32,
+            ),
+            cap=self._push_group_cap,
+            num_local_experts=self.cfg.num_experts_per_rank,
+            slot_stride=self.cfg.max_num_inp_token_per_rank
+            * self.cfg.num_experts_per_token,
+        )

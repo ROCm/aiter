@@ -115,6 +115,7 @@ def make_dispatch(
     push_group=False,
     push_group_cap=0,
     off_pg_running=0,
+    off_pg_rowmap=0,
 ):
     # fp4 (e2m1) packs 2 values/byte -> token is hidden_dim/2 bytes; dispatch is a
     # pure byte mover (no fp4 decode).
@@ -241,6 +242,32 @@ def make_dispatch(
                         create_buffer_resource_from_addr(peer_tis),
                         dest_tok_id,
                     )
+                    if const_expr(push_group):
+                        # Emit the downstream combine map[final_slot] = {origin, weight}
+                        # straight into the dest peer's pg_rowmap at the fixed-slot row
+                        # this token just landed in (dest_tok_id == grouped_row). The
+                        # gemm2 TDM scatter epilogue reads pg_rowmap[grouped_row] and
+                        # writes the weighted result into comb_inp[origin_pe][
+                        # origin_lid*topk + k] -- no gather/remap needed.
+                        pg_slot_stride = max_tok_per_rank * experts_per_token
+                        dst_packed = (
+                            rank * pg_slot_stride + src_tok * experts_per_token + k_slot
+                        )
+                        pg_w = buffer_load(
+                            rsrc_inp_wts,
+                            src_tok * experts_per_token + k_slot,
+                            vec_width=1,
+                            dtype=T.f32(),
+                        )
+                        peer_rowmap = create_buffer_resource_from_addr(
+                            fx.Int64(window.lsa_ptr(dest_pe, off_pg_rowmap))
+                        )
+                        buffer_store(dst_packed, peer_rowmap, dest_tok_id * 2)
+                        buffer_store(
+                            arith.bitcast(T.i32(), pg_w),
+                            peer_rowmap,
+                            dest_tok_id * 2 + 1,
+                        )
                     dest_ctr_addr = fx.Int64(addr_dest_pe_ctr) + fx.Int64(
                         dest_pe
                     ) * fx.Int64(4)

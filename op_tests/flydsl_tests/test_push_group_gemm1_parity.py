@@ -124,12 +124,14 @@ def test_push_group_gemm1_byte_exact():
     max_tiles = cm_pg // tile_m
     trb = torch.full((max_tiles,), -1, dtype=torch.int32, device=dev)
     eids = torch.full((max_tiles,), E, dtype=torch.int32, device=dev)  # E == skip sentinel
+    tvd = torch.zeros((max_tiles,), dtype=torch.int32, device=dev)
     num_valid = torch.zeros(1, dtype=torch.int32, device=dev)
     launch_push_group_finalize(
         pg_running_ptr=counts_t.data_ptr(),
         tile_row_base_ptr=trb.data_ptr(),
         expert_ids_ptr=eids.data_ptr(),
         num_valid_ptr=num_valid.data_ptr(),
+        tile_valid_ptr=tvd.data_ptr(),
         num_local_experts=E, cap=CAP, tile_m=tile_m, rank=0, experts_per_rank=E,
     )
     torch.cuda.synchronize()
@@ -141,7 +143,7 @@ def test_push_group_gemm1_byte_exact():
         n_experts=E, contiguous_m=cm_pg, N=two_inter, K=K,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
         out_is_f16=0, a_is_fp4=0, stage1_act=1, bias=None, num_buffers=2,
-        push_group=1, tile_row_base=trb, expert_ids=eids,
+        push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
     )
     torch.cuda.synchronize()
 

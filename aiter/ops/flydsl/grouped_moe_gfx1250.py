@@ -670,6 +670,146 @@ def _grouped_a8w4_tdm_moe(
     return moe_out
 
 
+def grouped_a8w4_tdm_moe_push_scatter(
+    disp_out, pg_running, pg_rowmap, w1, w2, w1_scale, w2_scale, *,
+    E_local, model_dim, inter_dim, cap, activation, swiglu_limit=None,
+    tile_m=64, tile_n=256, tile_k=256, num_buffers=3,
+    tile_m2=None, tile_n2=None, tile_k2=None, num_buffers2=None,
+    dtype=None, bias1=None, bias2=None,
+    ep_arena_handle, ep_comb_inp_off, ep_wire_nbytes, ep_slot_stride, ep_world,
+):
+    """Push-group fixed-slot MoE (gemm2-fused scatter). Consumes the grouped recv
+    grid dispatch already produced -- no topids_to_rows / contiguous_psum_remap /
+    gather. ``pg_running[le]`` are the per-local-expert landing counts, ``pg_rowmap``
+    is the dispatch-emitted map[final_slot]={origin_pe,origin_lid,k}+weight the gemm2
+    TDM epilogue P2P-scatters by. Results land straight in peers' comb_inp; combine
+    then sums the topk slots. Returns nothing (scatter is the side effect).
+
+      disp_out    bf16 [E_local*cap, model_dim]  fixed-slot recv grid (arena disp_out)
+      pg_running  i32  [E_local]                 per-expert landed count
+      pg_rowmap   i32  [(E_local*cap+1), 2]       {dst_packed, weight_f32_bits}
+    """
+    import torch
+
+    from aiter.ops.flydsl.batched_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
+    from aiter.ops.flydsl.kernels.push_group_finalize_gfx1250 import (
+        launch_push_group_finalize,
+    )
+
+    device = disp_out.device
+    if dtype is None:
+        dtype = disp_out.dtype
+    if tile_m2 is None:
+        tile_m2 = tile_m
+    if tile_n2 is None:
+        tile_n2 = tile_n
+    if tile_k2 is None:
+        tile_k2 = tile_k
+    if num_buffers2 is None:
+        num_buffers2 = num_buffers
+    E = int(E_local)
+    cap = int(cap)
+    cm = E * cap  # fixed-slot contiguous rows (multiple of tile_m by construction)
+    two_inter = 2 * inter_dim
+    wmma_rep = tile_m // 16
+    wmma_rep2 = tile_m2 // 16
+
+    # 1) counts -> tile schedule (local expert ids: rank=0/experts_per_rank=E so the
+    #    gemm's `expert` indexes the LOCAL weight slab, padding tiles carry E==skip).
+    max_tiles = cm // tile_m
+    trb = torch.full((max_tiles,), -1, dtype=torch.int32, device=device)
+    eids = torch.full((max_tiles,), E, dtype=torch.int32, device=device)
+    # tile_valid defaults to 0: a padding tile (never written by finalize) then
+    # loads 0 rows of A -> computes nothing garbage.
+    tvd = torch.zeros((max_tiles,), dtype=torch.int32, device=device)
+    num_valid = torch.zeros(1, dtype=torch.int32, device=device)
+    # Snapshot the counts for the preshuffle mask BEFORE finalize, which read-then-
+    # zeros pg_running (its per-layer reset). Clamp to cap: a token that overflowed
+    # its expert's CAP never landed, so preshuffle must not read past cap.
+    masked = torch.clamp(pg_running.to(torch.int32), max=cap).contiguous()
+    launch_push_group_finalize(
+        pg_running_ptr=pg_running.data_ptr(),
+        tile_row_base_ptr=trb.data_ptr(),
+        expert_ids_ptr=eids.data_ptr(),
+        num_valid_ptr=num_valid.data_ptr(),
+        tile_valid_ptr=tvd.data_ptr(),
+        num_local_experts=E, cap=cap, tile_m=tile_m, rank=0, experts_per_rank=E,
+    )
+
+    # 2) preshuffle the grouped bf16 grid in place (identity map, masked per expert)
+    #    -> fixed-slot fp8 payload + preshuffled e8m0 scale, exactly the layout the
+    #    push-group gemm reads via tile_row_base.
+    a1_payload, a1_scale = flydsl_moe_fused_quant_preshuffle(
+        disp_out.reshape(E, cap, model_dim), E, cap,
+        wmma_rep=wmma_rep, quant_mode="fp8", masked_m=masked, topids_to_rows=None,
+    )
+
+    out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
+    stage1_act = 2 if activation == ActivationType.Swiglu else 1
+    sl = (
+        float(swiglu_limit) if swiglu_limit
+        else (7.0 if activation == ActivationType.Swiglu else float("inf"))
+    )
+    _b1 = bias1.to(dtype).contiguous() if (bias1 is not None and bias1.numel() > 0) else None
+    _b2 = bias2.to(dtype).contiguous() if (bias2 is not None and bias2.numel() > 0) else None
+    _fuse_quant = _b1 is None
+    w1_u8 = _grouped_weight_uint8(w1)
+    w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
+    w2_u8 = _grouped_weight_uint8(w2)
+    w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
+    psum_dummy = torch.zeros(E, dtype=torch.int32, device=device)
+
+    # 3) GEMM1 (+ fused silu/swiglu + fp8 quant epilogue), fixed-slot rows.
+    if _fuse_quant:
+        a2_payload = torch.empty((1, cm, inter_dim), dtype=torch.uint8, device=device)
+        a2_scale = torch.empty(
+            (1, cm // wmma_rep2, (inter_dim // 32) * wmma_rep2),
+            dtype=torch.uint8, device=device,
+        )
+        flydsl_grouped_gemm_a8w4_masked(
+            a2_payload.view(torch.uint8), a1_payload, w1_u8, a1_scale, w1s_i32,
+            psum_dummy, n_experts=E, contiguous_m=cm, N=two_inter, K=model_dim,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=stage1_act, bias=_b1,
+            swiglu_limit=sl, num_buffers=num_buffers,
+            stage1_quant_out=1, quant_scale=a2_scale, quant_wmma_rep=wmma_rep2,
+            push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+        )
+    else:
+        y = torch.empty((1, cm, inter_dim), dtype=dtype, device=device)
+        flydsl_grouped_gemm_a8w4_masked(
+            y, a1_payload, w1_u8, a1_scale, w1s_i32, psum_dummy,
+            n_experts=E, contiguous_m=cm, N=two_inter, K=model_dim,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=stage1_act, bias=_b1,
+            swiglu_limit=sl, num_buffers=num_buffers,
+            push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+        )
+        a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
+            y, 1, cm, wmma_rep=wmma_rep2, quant_mode="fp8",
+            masked_m=None, topids_to_rows=None,
+        )
+
+    # 4) GEMM2 whose TDM epilogue weights each fixed-slot row by pg_rowmap[row].w and
+    #    P2P-scatters it into peers' comb_inp[origin]. grouped_out is a scratch C
+    #    target (the real output is the scatter side effect).
+    grouped_out = torch.empty((1, cm, model_dim), dtype=dtype, device=device)
+    flydsl_grouped_gemm_a8w4_masked(
+        grouped_out, a2_payload, w2_u8, a2_scale, w2s_i32, psum_dummy,
+        n_experts=E, contiguous_m=cm, N=model_dim, K=inter_dim,
+        tile_m=tile_m2, tile_n=tile_n2, tile_k=tile_k2,
+        out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=0, bias=_b2,
+        num_buffers=num_buffers2,
+        push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+        ep_p2p_write=1, ep_off_comb_inp=int(ep_comb_inp_off),
+        ep_wire_nbytes=int(ep_wire_nbytes), ep_slot_stride=int(ep_slot_stride),
+        ep_arena_handle=int(ep_arena_handle), ep_tdm_gather=1,
+        ep_world=int(ep_world), ep_rowmap=pg_rowmap,
+    )
+    os.environ["AITER_LAST_FUSED_MOE_IMPL"] = "grouped_a8w4_tdm_push"
+
+
 def _maybe_grouped_gfx1250_a8w4_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,

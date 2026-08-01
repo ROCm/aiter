@@ -11,6 +11,7 @@
 - **T-A（打底，收益为正、可测）**：dispatch 前把层输入量化成 fp8+e8m0（每源 token 一次）→ dispatch 用 `data_type=fp8`+`scale_dim=hidden//32` **只发 fp8+e8m0（传输减半）** → GEMM1 a1 prep 消费 fp8 `recv_x`+`out_scales`，**复用已落地的 fp8-gather**（`build_moe_fp8_gather_preshuffle_route_ksplit_module` / `flydsl_moe_fused_quant_preshuffle(in_fp8_payload=,in_fp8_scale=)`）。
 - **T-B（真·dispatch+GEMM1 融合，用户目标的收益点）**：把 a1 的 gather+preshuffle **折进 GEMM1 的 A-load prologue**，消除独立 a1 kernel launch + grouped a1 的一整趟 HBM 往返（写 `contiguous_m×hidden` fp8 再读回）。改动集中在 `batched_gemm_mxfp4` 的 TDM a8w4 A-loader。
 - **T-C**：端到端 `MEGA-CHECK PASS` + profile A/B（dispatch 字节减半、a1 kernel 消失）。
+- **T-D（融合目标的可行落地，实测净赢）**：**push-group 固定槽落位**——dispatch 直接按 local expert 分组落到 `[E,CAP]` 网格，GEMM **无 gather / 保留 wave-spec**，combine 靠 `pg_rowmap` scatter。经 finalize 并行化 + GEMM2 tile_k2=128 + 自动 CAP 三优化后，DeepSeek/均衡两配置**开箱稳定净赢 pull ~3.5–4%**（详见下方 Task T-D）。
 - **终极**：Phase 3 整层巨核（spec §7），dispatch warps 直喂 GEMM1 ring。
 
 **复用产物（已落地并验证）**：`_emit_fp8_gather_preshuffle` + fp8-gather route-ksplit builder + `flydsl_moe_fused_quant_preshuffle` 的 fp8-in 分支（原 Task 3）。**弃用**：`emit_per_token_mx_quant` 在 `make_dispatch` 内的调用 + `disp_out_q`/`disp_out_qscale` region（`AITER_EP_FUSE_DISPATCH_GEMM1`，默认关，保留作负结果实证）。
@@ -66,6 +67,32 @@
 - [x] **T-B.4 真 rowmap + 单 GPU parity**：确认 `contiguous_psum_remap` 把 `topids_to_rows` **原地**重映射到 contiguous 空间；a1 物化用 `E=1,max_m=contiguous_m,source_topk=topk` ⇒ `source_row = route//topk`。共享 helper `_build_a_gather_rowmap(topids_to_rows, contiguous_m, topk, num_recv_rows, num_valid_routes)`：`a_rowmap[contiguous_row] = route//topk`（图安全静态形状，invalid/dead-tail 走 dump 槽 + OOB 索引）。`_grouped_a8w4_tdm_moe` 的 `_use_disp_q` 分支：`_gemm1_a = _dq_p.reshape(-1,model_dim)`（**未分组 recv**）+ 真 rowmap 调 gemm，**不再消费 a1_payload**。**parity 单测** `test_real_rowmap_matches_materialized_a1`：用 `flydsl_moe_topids_to_rows`+`contiguous_psum_remap` 建同款 contiguous t2r，断言 `materialized_a1[g] == src[a_rowmap[g]]`（每个 valid grouped 行逐字节）。**PASS**。⇒ 机制正确(T-B.3) ∧ rowmap 正确(T-B.4) ⇒ 真 gather 与消费物化 a1 逐字节等价。
 - [x] **T-B.5 EP mega e2e + 收益证明 → 负结果，A-load gather 废弃**（2026-07-29，4×gfx1250，e384/k6/hd7168/id3072/scatter_fused/layers=2）：`AITER_EP_FP8_TRANSPORT=1 AITER_EP_A_GATHER=1` 端到端**数值正确**（`MEGA-CHECK PASS`，logits_diff=0.002158，与纯 fp8 transport 逐位一致），但**性能严重负优化**：gemm1 `...K7168` per_call **177.6→639.0us（+3.6×）**、整层 wall **538.0→1098.5us（+2.0×）**、device/layer 547.5→1053.7us。**根因**（= T-B.1 feasibility verdict 落地）：(1) `mxfp4_preshuffle_gfx1250_tdm.py:288` `WAVE_SPEC = ... and not ep_a_gather` ⇒ 一开 gather 就关掉 4-stream wave-spec 流水线；(2) A-load 从单块连续 TDM 退化为逐组 `tensor_load_gather`，coalescing 崩塌。即使拆成 scale-only 省掉 a1_payload 写（~53us/layer + 一趟 fp8 HBM 写），也远补不回 gemm1 的 +461us/call。**结论**：T-B（把 gather 折进 GEMM1 A-load）在当前"单块 TDM + wave-specialized"架构下走不通，**废弃**（`AITER_EP_A_GATHER` 开关保留、默认关，作负结果实证；机制/rowmap 单测 T-B.3/B.4 仍绿，留作 Phase 2/3 dispatch warp→gemm ring 组件参考）。详见 spec §8.8。**后续 ROI 排序**：① 修 combine 非对称 dtype 限制（恢复 fp8-transport 下 `scatter_fused` 融合 combine，+66us/call 实打实回退）② T-B fallback（dispatch grid 内第二遍拷 grouped a1）③ Phase 3 整层巨核（gather 移到 ring 生产侧）。
 - [ ] **T-B fallback（若 gather-load 引入 coalescing 回退）**：退化为"在 dispatch 现有 grid 内做第二遍把到达序 fp8 拷成 grouped 连续 a1"（省 kernel launch，不省 HBM 往返），或直接推进 Phase 3 整层巨核（spec §7）。二选一并记录实测依据。
+
+### Task T-D：push-group 固定槽落位（dispatch 直接分组，GEMM 无 gather）—— T-B 的可行替代，实测净赢
+
+**动机**：T-B 把 gather 折进 GEMM1 A-load 会关掉 wave-spec + 破坏 coalescing（T-B.5 废弃）。**push-group 反其道而行**：不在消费侧 gather，而是让 **dispatch 直接把 token 按 local expert 分组落到固定槽网格** `disp_out[E_local, CAP, hidden]`（行 = `local_expert*CAP + atomic_add(pg_running[le])`），于是 GEMM1/2 **按固定槽连续读**、wave-spec 完整保留、**完全无 gather / 无 `topids_to_rows` / 无 `contiguous_psum_remap`**。combine 侧靠 dispatch 同时产出的 `pg_rowmap[final_slot]={origin_pe,origin_tok,k}+weight`，由 GEMM2 TDM epilogue **P2P scatter 直写 peer 的 comb_inp**。开关 `AITER_EP_PUSH_GROUP`（默认关）。
+
+**已落地组件（引用）**：
+- dispatch 固定槽落地 + `pg_rowmap`/`pg_running`：`intranode_kernels.py`（push landing，lane0 `atomic_add` 定 cursor + 写 rowmap）、`dispatch_combine_op.py::_push_group_regions/push_group_moe_inputs`。
+- `push_group_finalize_gfx1250.py`：counts → GEMM tile 元数据(`tile_row_base/expert_ids/tile_valid`) + read-then-zero `pg_running`（跨卡竞态由 dispatch end barrier + combine barrier 保护）。
+- `grouped_moe_gfx1250.py::grouped_a8w4_tdm_moe_push_scatter`：finalize→preshuffle(masked)→GEMM1(+fused quant)→GEMM2 scatter(`ep_p2p_write=1, ep_rowmap=pg_rowmap`)。
+- `test_mega_moe.py::_layer_step` push 分支；单测 `test_push_group_finalize.py` / `test_push_group_gemm1_parity.py`。
+
+- [x] **T-D.1 端到端接通 + 正确性（push off vs on）**：dispatch 产 `map[final_slot]` → GEMM2 scatter 直写 comb_inp。2/4-rank `MEGA-CHECK PASS`，push 与 pull `logits_diff` 逐位同量级（DeepSeek 0.002172 vs 0.002175，均衡 0.007945）。踩坑修复见 spec/transcript：padding 行 NaN 泄漏（分离 dst=-1 与 weight=0.0）、padding 读 stale disp_out（新增 `tile_valid` 作 `mn_oob`，padding 行 load 0）、跨卡 `pg_running` reset 竞态（zero 移进 finalize）、finalize-zero 破坏 preshuffle mask（finalize 前先 snapshot `masked`）。
+- [x] **T-D.2 首版 A/B → 收益≈0（甚至微负）**（4×gfx1250，E384/k6/hd7168/id3072/scatter_fused/layers=2，CAP=128）：per_layer **push 541.0 vs pull 527.7（+2.5% 慢）**；均衡 E32/k4 bs256：push 234.8 vs pull 233.4（+0.6%）。**逐 kernel 拆解**：融合本身有效——**GEMM1 K7168 1214.6→959.7us（−21%）** + 省掉 pull 的 `psum_remap`/`route_g2l`/`g2l_lut`(~58us)；但被三块吃掉：**finalize 148us（单线程纯延迟）** + **preshuffle padding +68us** + **GEMM2 tile_k 写死 256(vs pull 调优 128) + padding +58us**。
+- [x] **T-D.3 三个优化（净转正，开箱即赢）**：
+  1. **finalize 并行化**（`push_group_finalize_gfx1250.py`）：单 block 单线程 → **一线程/专家**（单 block，`E_local ≤ 1024`）。关键：GEMM 按固定网格 `E*CAP/tile_m` 发射、靠 `expert_ids==E` sentinel 跳 padding，**不读 `num_valid`、无需压缩** ⇒ 直接写**非压缩固定布局**（`meta = le*tiles_per_expert + t`），每专家计数器由唯一线程 read-then-zero（零竞态、无需 prefix-scan）。**24.7 → 2.5 us/call**。单测 `test_push_group_finalize.py` 同步改为校验固定布局。
+  2. **GEMM2 tile_k2=128**（`test_mega_moe.py` push 调用）：GEMM1 K=hidden 仍 256，GEMM2 K=inter_dim 传 `tile_k2=128` 对齐 pull 调优，不再继承写死的 256。**GEMM2 126 → 113 us/call**。
+  3. **自动 CAP**（`dispatch_combine_op.py::push_group_cap`）：替换 worst-case 默认（`world*max_tokens`）为 `align_up(max(tile_m, ceil(SAFETY*avg)), tile_m)`，`avg = max_tok_per_rank*topk/experts_per_rank`（world 抵消），`SAFETY` 默认 2（env `AITER_EP_PUSH_GROUP_SAFETY`），`AITER_EP_PUSH_GROUP_CAP` 仍可硬 pin。DeepSeek `8×2→floor 64`、均衡 `64×2→128`，即实测最优值。
+- [x] **T-D.4 CAP 是决定性旋钮（padding tile 非免费）**：graph 捕获下 GEMM 网格静态 = `E*CAP/tile_m`，sentinel 跳过的 padding tile **仍付 tile launch + 整趟 N/K 循环**。实测 DeepSeek push：**CAP 64→128 时 GEMM1 160→268、GEMM2 113→161 us/call，per_layer 510→660us（+30%，反超 pull）**。故必须 CAP 贴实际峰值；老的 worst-case 默认会让 push 开箱即巨亏——这是自动 CAP 的根因。**取舍**：极端不均衡若峰值超 CAP 会 finalize clamp **静默丢 token**，需调大 SAFETY 或 pin CAP。
+- [x] **T-D.5 开箱 A/B（无任何 CAP env，同 session，均 `MEGA-CHECK PASS`）**：
+
+  | 配置 | pull | push(优化后,自动CAP) | 自动CAP | Δ | push(优化前) |
+  |---|---|---|---|---|---|
+  | DeepSeek E384/k6/hd7168/id3072 (world4) | 529.8 us | **508.8 us** | 64 | **−4.0%** | 541.0 (+2.5%) |
+  | 均衡 E32/k4/hd4096/id2048 bs256 (world2) | 249.9 us | **241.4 us** | 128 | **−3.4%** | 234.8 (+0.6%) |
+
+  finalize 稳定 2.2–2.6us/call；GEMM1 的 −255us 现真正流到 per_layer。**结论**：push-group 是 T-B 融合目标的**可行落地**（GEMM 无 gather、wave-spec 保留），在两配置稳定净赢 pull ~3.5–4%，且无需手工调参。
 
 ### Task T-C：端到端正确性 + 性能验收
 
@@ -494,7 +521,7 @@ git commit -m "docs(ep): record phase-1a dispatch fp8 fusion perf"
 **Spec coverage**（对照 spec §8 修订）:
 - §8.1 事实订正（`num_experts_per_rank` / quant_mode 固定 fp8 / TDM contiguous 默认）→ Global Constraints + Task 1 ✓
 - §8.3 R1（contiguous、保留 topids/psum/ep_rowmap）→ Task 1–4（1a）✓
-- §8.2 前缀和/顺序张力 → 1a 用到达序 per-token 规避；grouped 落位归入 1b ✓
+- §8.2 前缀和/顺序张力 → 1a 用到达序 per-token 规避；grouped 落位归入 1b ✓；**T-D push-group 则把 grouped 落位提前进 dispatch（固定槽 + `pg_rowmap`），实测为融合目标的可行净赢路径** ✓
 - 1b（消除 launch）→ 里程碑，待 1a 后补 plan ✓
 - spec §4/§7（Phase 2/3）→ 里程碑，各补独立 plan ✓
 

@@ -62,6 +62,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     push_group=0,
     tile_row_base=None,
     expert_ids=None,
+    tile_valid=None,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -136,6 +137,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         push_group=int(push_group),
         arg_tile_row_base=ptr_arg(tile_row_base if tile_row_base is not None else a),
         arg_expert_ids=ptr_arg(expert_ids if expert_ids is not None else a),
+        arg_tile_valid=ptr_arg(tile_valid if tile_valid is not None else a),
     )
     return out
 
