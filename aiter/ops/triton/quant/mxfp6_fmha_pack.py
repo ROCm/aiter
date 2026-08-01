@@ -37,6 +37,16 @@ except ImportError:  # numpy-only host packing still works without triton/torch
     _HAVE_TRITON = False
 
 
+_K_TILE_TOKENS = 128
+_K_PACKED_ROW_BYTES = 96
+_K_COMPACT_DATA_BYTES = _K_TILE_TOKENS * _K_PACKED_ROW_BYTES
+_K_RESERVED_BYTES = 4096
+_K_SCALE_TAIL_BYTES = 1024
+_K_SCALE_TAIL_OFFSET = _K_COMPACT_DATA_BYTES + _K_RESERVED_BYTES
+_K_TILE_BYTES = _K_SCALE_TAIL_OFFSET + _K_SCALE_TAIL_BYTES
+_K_SEQ_STRIDE_BYTES = _K_TILE_BYTES // _K_TILE_TOKENS
+
+
 # ---------------------------------------------------------------------------
 # E2M3 grid + scalar encode
 # ---------------------------------------------------------------------------
@@ -151,14 +161,21 @@ def quantize_fp6_lastdim(x: np.ndarray):
 # becomes this one-time host op. (Stalled-on-Address 18.5%->0.7%, L1-L2 txns
 # 332M->241M, +1.3% end-to-end vs the token-strided load.)
 #
-# Permutation derived from the kernel's default chunk-major load addressing:
-#   tile (16384 B) LDS/HBM position P = w*1024 + i*4096 + v0*16 + byte  <-  the
+# Permutation derived from the kernel's default chunk-major load addressing. C0 retains its
+# original 16B/lane layout; C1 keeps only its 8 useful bytes/lane, compacting 16KB to 12KB:
+#   original position P = w*1024 + i*4096 + v0*16 + byte  <-  the
 #   token-major byte v_K_base(v0)+C_i(w,i)+byte, with
 #   v_K_base = (v0&31)*96 + ((v0>>5)&1)*24  and  C_i: blk=w+(i&1)*4; half=blk&1;
 #   n=blk>>1; chunk=i>>1; C_i = n*32*96 + half*48 + chunk*16.
 def _k_lds_order_gather_index():
-    """Per-tile [16384] token-major byte index for each contiguous LDS-order position P."""
-    P = np.arange(16384)
+    """Per-tile [12288] token-major byte index for the compact LDS-order image."""
+    c0 = np.arange(8192)
+    block = np.arange(8)[:, None, None, None]
+    parity = np.arange(2)[None, :, None, None]
+    lane = np.arange(32)[None, None, :, None]
+    byte = np.arange(8)[None, None, None, :]
+    c1 = 8192 + block * 1024 + parity * 512 + lane * 16 + byte
+    P = np.concatenate((c0, c1.reshape(-1)))
     byte = P & 15
     r = P >> 4
     v0 = r & 63
@@ -180,9 +197,9 @@ def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
 
     Input : k_thd f32 [b, sk, h, 128].
     Output:
-      data  uint8 [b, h, n_tiles*16384]  (each tile = the 16384B chunk-major LDS image; the kernel's
+    data  uint8 [b, h, n_tiles*12288]  (each tile = the compact 12288B chunk-major LDS image; the kernel's
             contiguous coalesced load lands it byte-identically to the token-strided chunk-major load).
-            tile = 16384B over 128 tokens -> the kernel must see this view with seq stride 128.
+            tile = 12288B over 128 tokens.
       scale uint8 [b, sk, h, 4]
     """
     k = np.asarray(k_thd)
@@ -192,13 +209,16 @@ def quantize_fp6_k_lds_order(k_thd: np.ndarray, tile: int = 128):
     packed, scale = quantize_fp6_lastdim(k.astype(np.float64))  # [b,sk,h,96], [b,sk,h,4]
     # token-major flat per (b,h): [b, h, sk*96]
     km = np.ascontiguousarray(np.transpose(packed, (0, 2, 1, 3))).reshape(b, h, sk * 96)
-    idx = _k_lds_order_gather_index()  # [16384]
+    idx = _k_lds_order_gather_index()  # [12288]
     total = sk * 96
-    out = np.zeros((b, h, nt * 16384), np.uint8)
+    out = np.zeros((b, h, nt * _K_COMPACT_DATA_BYTES), np.uint8)
     for t in range(nt):
-        g = t * 12288 + idx
+        g = t * _K_COMPACT_DATA_BYTES + idx
         valid = g < total
-        out[:, :, t * 16384:(t + 1) * 16384] = np.where(valid, km[:, :, np.where(valid, g, 0)], 0)
+        start = t * _K_COMPACT_DATA_BYTES
+        out[:, :, start:start + _K_COMPACT_DATA_BYTES] = np.where(
+            valid, km[:, :, np.where(valid, g, 0)], 0
+        )
     return np.ascontiguousarray(out).astype(np.uint8), scale.astype(np.uint8)
 
 
@@ -571,10 +591,11 @@ if _HAVE_TRITON:
         buf_ptr,  # uint8 LDS-order output buffer [b, h, k_hs] flattened
         srcw_ptr,  # int32 [k_hs] within-(b,h) source byte offset = (gc//96)*(h*96)+(gc%96)
         valid_ptr,  # int8 [k_hs] 1=keep, 0=zero (fp6 dup/overflow + partial-seq tail)
-        DATA_HS,  # nt*16384 data bytes per (b,h)
+        DATA_HS,  # nt*12288 data bytes per (b,h)
         TILE_BYTES,
         SKH96,  # sk*h*96 = packed bytes per batch
         H,  # heads
+        DATA_TILE_BYTES: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         # One fused pass replacing the torch permute+contiguous / advanced-index gather /
@@ -591,9 +612,9 @@ if _HAVE_TRITON:
         src_addr = bIdx * SKH96 + hIdx * 96 + srcw
         byte = tl.load(packed_ptr + src_addr).to(tl.int32)
         byte = tl.where(valid != 0, byte, 0).to(tl.uint8)
-        tile = p // 16384
-        in_tile = p - tile * 16384
-        dst_addr = bh * (DATA_HS // 16384) * TILE_BYTES + tile * TILE_BYTES + in_tile
+        tile = p // DATA_TILE_BYTES
+        in_tile = p - tile * DATA_TILE_BYTES
+        dst_addr = bh * (DATA_HS // DATA_TILE_BYTES) * TILE_BYTES + tile * TILE_BYTES + in_tile
         tl.store(buf_ptr + dst_addr, byte)
 
     @triton.jit
@@ -603,6 +624,8 @@ if _HAVE_TRITON:
         SK,
         H,
         NT,
+        TILE_BYTES: tl.constexpr,
+        SCALE_TAIL_OFFSET: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -619,7 +642,7 @@ if _HAVE_TRITON:
         src_shift = byte_in_dword + region_b.to(tl.int32)
         src_token = t * 128 + ((lane & 3) << 5) + (lane >> 2) + inst * 16 + (src_shift >> 2)
         src_byte = src_shift & 3
-        dst = bh * (NT * 17408) + t * 17408 + 16384 + offs
+        dst = bh * (NT * TILE_BYTES) + t * TILE_BYTES + SCALE_TAIL_OFFSET + offs
         src = ((bidx * SK + src_token) * H + hidx) * 4 + src_byte
         valid = src_token < SK
         val = tl.load(scale_ptr + src, mask=valid, other=0).to(tl.uint8)
@@ -695,7 +718,7 @@ _K_LDS_GIDX_CACHE: dict = {}
 
 
 def _k_lds_gather_index(nt: int, total: int, device):
-    """Cached [(nt*16384)] LDS-order gather index + valid mask. valid = (g < total)
+    """Cached [(nt*12288)] compact LDS-order gather index + valid mask. valid = (g < total)
     zeroes BOTH the fp6 dup/overflow LDS tail AND a partial seq tail. Keyed by
     (nt, total, device): with a partial tail the same nt pairs with different total."""
     key = (nt, total, device)
@@ -705,7 +728,7 @@ def _k_lds_gather_index(nt: int, total: int, device):
             _k_lds_order_gather_index(), dtype=torch.long, device=device
         )
         full = (
-            torch.arange(nt, device=device, dtype=torch.long) * 12288
+            torch.arange(nt, device=device, dtype=torch.long) * _K_COMPACT_DATA_BYTES
         ).unsqueeze(1) + idx16k.unsqueeze(0)
         full = full.reshape(-1)
         valid = full < total
@@ -735,8 +758,8 @@ def _k_lds_src_within(nt: int, total: int, h: int, device):
 
 def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
     """GPU pack of K into the kernel-ready LDS-order fp6 view WITH the E8M0 K-scale packed in the
-    per-tile tail. Each 128-token tile is 17408B = 16384B chunk-major fp6 K data + a 1024B
-    lane-major K-scale image (Region A unshifted + Region B pre-shifted); the kernel loads the
+    per-tile tail. Each 128-token tile retains its 17408B global ABI: 12288B compact chunk-major
+    fp6 K data + a 4096B unused hole + a 1024B lane-major K-scale image. The kernel loads the
     scale straight from the K buffer tail (coalesced buffer_load lds:1), so there is no separate
     K-scale global-load stream. Runs the pack + gather + tail-fill entirely on-device. Supports
     S % tile != 0 (the gather's valid mask zeroes the partial tail tile, which the kernel masks in
@@ -762,16 +785,17 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     # permute+contiguous / advanced-index gather / masked_fill / buffer-copy (~4 full-size
     # passes -> 1 gathered read + 1 write; ~1.35x faster on the K reorder at long seq).
     srcw, valid8 = _k_lds_src_within(nt, total, h, k_thd.device)
-    # Each 128-token tile is 17408B: 16384B fp6 K data + a 1024B lane-major E8M0 K-scale TAIL image.
+    # Each 128-token tile remains 17408B: 12288B compact fp6 K data, a 4096B unused hole, then the
+    # 1024B lane-major E8M0 K-scale tail.
     # The kernel loads that scale image with a coalesced buffer_load lds:1 straight from the K
     # buffer (no separate scale pointer / global_load) -- this removes the stalling K-scale global
     # loads. seq stride = 136 (17408/128) -> the kernel's _s_k_Seqs=136 -> tile base = token*136.
-    k_tile_bytes = 17408
+    k_tile_bytes = _K_TILE_BYTES
     k_hs = nt * k_tile_bytes
     k_bs = h * k_hs
     buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k_thd.device)
     BLOCK = 1024
-    data_hs = nt * 16384
+    data_hs = nt * _K_COMPACT_DATA_BYTES
     assert data_hs % BLOCK == 0, (data_hs, BLOCK)
     grid = (b * h * (data_hs // BLOCK),)
     _gather_k_lds_kernel[grid](
@@ -783,6 +807,7 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
         k_tile_bytes,
         sk * h * 96,
         h,
+        DATA_TILE_BYTES=_K_COMPACT_DATA_BYTES,
         BLOCK=BLOCK,
         num_warps=4,
     )
@@ -795,10 +820,15 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
         sk,
         h,
         nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
         BLOCK=1024,
         num_warps=4,
     )
-    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 136, k_hs, 1))
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
     # `scale` is still returned to satisfy the k_descale ABI arg, but the kernel reads scales from
     # the K tail, not this tensor. Re-home into a +64 slack buffer (harmless; keeps callers happy).
     sflat = scale.reshape(-1)
@@ -919,7 +949,7 @@ def quantize_fp6_k_lds_order_torch(
     k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False
 ):
     """Graph-friendly (pure-torch) port of quantize_fp6_k_lds_order_triton (identical 17408B/tile
-    layout: 16384B chunk-major fp6 K data + 1024B lane-major E8M0 K-scale tail). Traceable by
+    ABI: 12288B compact fp6 K data + 4096B unused + 1024B lane-major E8M0 K-scale tail). Traceable by
     Inductor (torch pack + index-gathers + cat) so the K pack can overlap the Ulysses all-to-all.
     Byte-identical to the Triton packer (reuses the exact LDS gather / scale-tail index tables).
 
@@ -936,10 +966,10 @@ def quantize_fp6_k_lds_order_torch(
 
     # DATA region: token-major per head, then the LDS-order gather (shared across heads), invalid->0.
     km = packed.permute(0, 2, 1, 3).reshape(b, h, sk * 96).contiguous()
-    gc, dvalid = _k_lds_gather_index(nt, total, k_thd.device)  # ([nt*16384] long, bool)
-    data = km[:, :, gc]  # [b, h, nt*16384]
+    gc, dvalid = _k_lds_gather_index(nt, total, k_thd.device)  # compact data indices
+    data = km[:, :, gc]
     data = torch.where(dvalid[None, None, :], data, torch.zeros_like(data)).reshape(
-        b, h, nt, 16384
+        b, h, nt, _K_COMPACT_DATA_BYTES
     )
 
     # SCALE-TAIL region (1024B/tile): gather the E8M0 scale into the lane-major tail image, invalid->0.
@@ -948,9 +978,10 @@ def quantize_fp6_k_lds_order_torch(
     stail = sf[:, sidx.reshape(-1)].reshape(b, h, nt, 1024)
     stail = torch.where(svalid[None, None], stail, torch.zeros_like(stail))
 
-    # Assemble per-tile 17408B buffer [b,h,nt,17408] = 16384 data + 1024 scale; flatten + slack.
-    buf_full = torch.cat([data, stail], dim=-1)  # [b, h, nt, 17408]
-    k_tile_bytes = 17408
+    # Preserve the 17408B global tile ABI: compact data + unused staging hole + scale tail.
+    padding = data.new_zeros(b, h, nt, _K_RESERVED_BYTES)
+    buf_full = torch.cat([data, padding, stail], dim=-1)  # [b, h, nt, 17408]
+    k_tile_bytes = _K_TILE_BYTES
     k_hs = nt * k_tile_bytes
     k_bs = h * k_hs
     buf = torch.cat([buf_full.reshape(-1), buf_full.new_zeros(256)])
@@ -958,7 +989,10 @@ def quantize_fp6_k_lds_order_torch(
     sbuf = torch.cat([sflat, sflat.new_zeros(64)])
     if return_raw:
         return buf, sbuf
-    k_view = buf.as_strided((b, sk, h, 96), (k_bs, 136, k_hs, 1))
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
     scale_out = sbuf[: sflat.numel()].view(b, sk, h, 4)
     return k_view, scale_out
 
