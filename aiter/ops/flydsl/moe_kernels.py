@@ -366,78 +366,6 @@ def _register_production_variants_stage2(
         kernels[_base + psuffix] = {**kernels[_base], **povr}
 
 
-def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
-    """Return {kernelName: params} for all supported int4_bf16 stage1 configs."""
-    kernels = {}
-    a_dtype = "bf16"
-    b_dtype = "int4"
-    tile_ks = [128, 256]
-    tile_ms = [16, 32, 64, 128]
-    tile_ns = [64, 128]
-    k_batches = [1, 2, 4, 7, 14]
-
-    for tm in tile_ms:
-        for tn in tile_ns:
-            for tk in tile_ks:
-                for kb in k_batches:
-                    name = flydsl_kernel_name(
-                        1, a_dtype, b_dtype, out_dtype, tm, tn, tk
-                    )
-                    if kb != 1:
-                        name += f"_kb{kb}"
-                    kernels[name] = {
-                        "stage": 1,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "MPerBlock": tm,
-                        "in_dtype": "int4_bf16",
-                        "k_batch": kb,
-                    }
-    return kernels
-
-
-def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
-    """Return {kernelName: params} for all supported int4_bf16 stage2 configs."""
-    kernels = {}
-    a_dtype = "bf16"
-    b_dtype = "int4"
-    tile_ks = [128, 256]
-    tile_ms = [16, 32, 64, 128]
-    tile_ns = [128]
-    # modes = ["atomic", "reduce"]
-    modes = ["atomic"]
-
-    for tm in tile_ms:
-        for tn in tile_ns:
-            for tk in tile_ks:
-                for mode in modes:
-                    base_name = flydsl_kernel_name(
-                        2, a_dtype, b_dtype, out_dtype, tm, tn, tk, mode
-                    )
-                    base_params = {
-                        "stage": 2,
-                        "a_dtype": a_dtype,
-                        "b_dtype": b_dtype,
-                        "out_dtype": out_dtype,
-                        "tile_m": tm,
-                        "tile_n": tn,
-                        "tile_k": tk,
-                        "mode": mode,
-                        "MPerBlock": tm,
-                        "in_dtype": "int4_bf16",
-                    }
-                    kernels[base_name] = base_params
-                    kernels[base_name + "_persist"] = {
-                        **base_params,
-                        "persist": True,
-                    }
-    return kernels
-
-
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -449,10 +377,8 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels("fp8", "fp8", out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels("fp8", "fp8", out))
-    # int4_bf16 (a16wi4) configs
-    for out in ("bf16", "f16"):
-        _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
-        _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    # a16wi4 (int4_bf16) is served by the shared FlyDSL a16w-mix kernel via the
+    # a16wi4 dispatch, not the _flydsl_stage1/2_wrapper name path -- no configs here.
 
 
 _register_all_configs()
@@ -552,27 +478,13 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        from .kernels.moe_gemm_2stage import compile_moe_gemm1
-
-        # split-K needs cshuffle (None -> auto-enable); non-split-K uses direct epilog
-        _use_cshuffle = None if k_batch > 1 else False
-
-        return compile_moe_gemm1(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage1=doweight_stage1,
-            in_dtype="int4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            use_cshuffle_epilog=_use_cshuffle,
-            scale_is_bf16=True,
-            k_batch=k_batch,
+        # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel
+        # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix) via
+        # aiter/ops/flydsl/moe_2stage_a16wi4_dispatch.py, dispatched directly from
+        # fused_moe_; it no longer routes through this stage1 compile path.
+        raise NotImplementedError(
+            "a16wi4 (bf16 A x int4 W) stage1 is served by the shared FlyDSL kernel "
+            "via fused_moe_'s a16wi4 dispatch, not compile_flydsl_moe_stage1."
         )
     else:
         raise ValueError(
@@ -662,23 +574,11 @@ def compile_flydsl_moe_stage2(
             enable_bias=enable_bias,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4: bf16 activations, int4 weights with groupwise scale
-        from .kernels.moe_gemm_2stage import compile_moe_gemm2
-
-        return compile_moe_gemm2(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            in_dtype="int4_bf16",
-            group_size=32,
-            out_dtype=out_dtype,
-            accumulate=accumulate,
-            scale_is_bf16=True,
+        # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel;
+        # see the note in compile_flydsl_moe_stage1. It no longer routes here.
+        raise NotImplementedError(
+            "a16wi4 (bf16 A x int4 W) stage2 is served by the shared FlyDSL kernel "
+            "via fused_moe_'s a16wi4 dispatch, not compile_flydsl_moe_stage2."
         )
     else:
         raise ValueError(

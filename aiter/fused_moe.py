@@ -791,6 +791,63 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
+    # a16wi4 (bf16 A x int4 W): served by the shared FlyDSL a16w-mix kernel
+    # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix, w_dtype="int4") via
+    # aiter/ops/flydsl/moe_2stage_a16wi4_dispatch.py, unifying the a16w4 (mxfp4) and
+    # a16wi4 (int4) families onto one kernel. On-par with aiter's own int4 kernel.
+    # CDNA (gfx942/gfx950); the kernel consumes the raw per_1x32_i4_quant outputs.
+    if (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.i4x2
+        and q_dtype_a == dtypes.bf16
+    ):
+        if get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available():
+            raise NotImplementedError(
+                "a16wi4 (bf16 A x int4 W) requires the FlyDSL kernel on CDNA "
+                f"gfx942/gfx950; got gfx={get_gfx()!r}, "
+                f"flydsl_available={is_flydsl_available()}."
+            )
+        # Features the shared kernel does not implement; fail explicitly.
+        if bias1 is not None or bias2 is not None:
+            raise NotImplementedError(
+                "a16wi4 with per-expert bias is not supported by the FlyDSL kernel."
+            )
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "a16wi4 with expert-parallel masking is not supported by the "
+                "FlyDSL kernel."
+            )
+        if doweight_stage1:
+            raise NotImplementedError(
+                "a16wi4 with doweight_stage1=True is not supported by the FlyDSL "
+                "kernel."
+            )
+
+        from aiter.ops.flydsl.moe_2stage_a16wi4_dispatch import fused_moe_a16wi4_flydsl
+
+        _act = "silu"
+        if activation == ActivationType.Swiglu:
+            _act = "swiglu"
+        elif activation == ActivationType.Situv2:
+            _act = "situv2"
+        out = fused_moe_a16wi4_flydsl(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            E=E,
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            topk=topk,
+            dtype=dtype,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            activation=_act,
+            kernel_bench_callable=kernel_bench_callable,
+        )
+        return out.to(dtype)
+
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
         model_dim,
@@ -2314,48 +2371,10 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    if (
-        q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.i4x2
-        and is_flydsl_available()
-    ):
-        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
-        _out_str = "bf16"
-        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
-
-        kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
-        if _ksplit > 1:
-            kn1 += f"_kb{_ksplit}"
-        kn2 = flydsl_kernel_name(
-            2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
-        )
-        return MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            _ksplit,
-            False,
-        )
+    # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel via
+    # fused_moe_'s a16wi4 dispatch (aiter/ops/flydsl/moe_2stage_a16wi4_dispatch.py),
+    # which intercepts before this metadata builder. The old heuristic
+    # _flydsl_stage1/2_wrapper int4 dispatch was removed here.
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
     use_mxfp4_flydsl = (
