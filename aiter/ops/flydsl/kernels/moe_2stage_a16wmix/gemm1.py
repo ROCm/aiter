@@ -275,6 +275,7 @@ def _gemm1_body_a16w4(
     act="silu",
     b_cache_mod=2,
     w_dtype="mxfp4",
+    w_layout="standard",
     k_wave=1,
     use_k16=False,
 ):
@@ -660,23 +661,42 @@ def _gemm1_body_a16w4(
     col_g_list = []
     n_blk_gate, n_intra_gate, n_blk_up, n_intra_up = [], [], [], []
     scale_mni_gate, scale_np_gate, scale_mni_up, scale_np_up = [], [], [], []
+    _guint = w_layout == "guinterleave"
     for ni in range_constexpr(num_acc_n):
         col_g = by_n + n_tile_base + fx.Int32(ni * 16) + lane_mod_16
         col_g_list.append(col_g)
-        # bf16 W folds expert_off into the resource base (see w_tiles); mxfp4/int4 index it.
-        _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
-        row_gate = _row_expert_off + col_g
-        row_up = row_gate + inter_i32
-        n_blk_gate.append(row_gate // fx.Int32(16))
-        n_intra_gate.append(row_gate % fx.Int32(16))
-        n_blk_up.append(row_up // fx.Int32(16))
-        n_intra_up.append(row_up % fx.Int32(16))
-        ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)
-        scale_mni_gate.append(ng // fx.Int32(32))
-        scale_np_gate.append((ng // fx.Int32(16)) % fx.Int32(2))
-        nu = ng + inter_i32
-        scale_mni_up.append(nu // fx.Int32(32))
-        scale_np_up.append((nu // fx.Int32(16)) % fx.Int32(2))
+        if const_expr(_guint):
+            # GUGU (aiter guinterleave, shuffle_weight/shuffle_scale is_guinterleave=True):
+            # gate/up rows are interleaved. The weight 16-row block index within an expert
+            # is n0*2 (gate) / n0*2+1 (up); the scale packs gate/up into the N_Pack byte of
+            # a SHARED dword (np = 0 gate / 1 up). K indexing is unchanged vs standard
+            # (verified byte-identical; only the N term differs). mxfp4 only.
+            n0_local = (by_n + n_tile_base + fx.Int32(ni * 16)) // fx.Int32(16)
+            blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
+            n_blk_gate.append(blk_gate)
+            n_intra_gate.append(lane_mod_16)
+            n_blk_up.append(blk_gate + fx.Int32(1))
+            n_intra_up.append(lane_mod_16)
+            scale_mni = e * fx.Int32(N_OUT // 32) + n0_local
+            scale_mni_gate.append(scale_mni)
+            scale_np_gate.append(fx.Int32(0))
+            scale_mni_up.append(scale_mni)
+            scale_np_up.append(fx.Int32(1))
+        else:
+            # bf16 W folds expert_off into the resource base (see w_tiles); mxfp4/int4 index it.
+            _row_expert_off = fx.Int32(0) if const_expr(_is_bf16) else expert_off
+            row_gate = _row_expert_off + col_g
+            row_up = row_gate + inter_i32
+            n_blk_gate.append(row_gate // fx.Int32(16))
+            n_intra_gate.append(row_gate % fx.Int32(16))
+            n_blk_up.append(row_up // fx.Int32(16))
+            n_intra_up.append(row_up % fx.Int32(16))
+            ng = expert_off + by_n + n_tile_base + fx.Int32(ni * 16)
+            scale_mni_gate.append(ng // fx.Int32(32))
+            scale_np_gate.append((ng // fx.Int32(16)) % fx.Int32(2))
+            nu = ng + inter_i32
+            scale_mni_up.append(nu // fx.Int32(32))
+            scale_np_up.append((nu // fx.Int32(16)) % fx.Int32(2))
 
     # ---- accumulators ---------------------------------------------------------
     acc_layout = fx.make_layout(4, 1)
@@ -928,6 +948,7 @@ def compile_gemm1_a16w4_port(
     xcd_swizzle=0,
     waves_per_eu=None,
     w_dtype="mxfp4",
+    w_layout="standard",
     k_wave=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
@@ -938,6 +959,12 @@ def compile_gemm1_a16w4_port(
     (a16w16): RAW bf16 W preshuffled N-major (shuffle_weight (16,16)); each dwordx4 IS
     one MFMA K32 fragment. All feed MFMA(16,16,32,bf16) K=32 + SiLU epilogue.
 
+    ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle.
+    ``"guinterleave"`` (mxfp4 only) consumes aiter's native GUGU stage1 W1+scale layout
+    (``shuffle_weight_a16w4``/``shuffle_scale_a16w4``, ``is_guinterleave=True``) directly,
+    no host relayout. Stage2 (gemm2) needs no mode: its gate_up=False native layout is
+    byte-identical to standard when E*model_dim % 256 == 0.
+
     ``k_wave`` (aiter slice-K, default 1): repartition 4 waves into (4/k_wave) N-waves x
     k_wave K-waves; partials LDS-reduced. k_wave in {1,2,4}; requires 4 % k_wave == 0 and
     D_HIDDEN % (k_wave*TILE_K) == 0.
@@ -947,6 +974,13 @@ def compile_gemm1_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
+    assert w_layout in (
+        "standard",
+        "guinterleave",
+    ), f"w_layout must be 'standard' or 'guinterleave', got {w_layout!r}"
+    assert not (
+        w_layout == "guinterleave" and w_dtype != "mxfp4"
+    ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
     _K = D_HIDDEN
@@ -992,8 +1026,9 @@ def compile_gemm1_a16w4_port(
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
+    _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
 
     @fx.struct
     class SharedStorage:
@@ -1072,6 +1107,7 @@ def compile_gemm1_a16w4_port(
                 act=act,
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
+                w_layout=w_layout,
                 k_wave=k_wave,
                 use_k16=_use_k16,
             )

@@ -487,14 +487,28 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x mxfp4 W) is served by the ported FlyDSL kernel
-    # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix) via
-    # aiter/ops/flydsl/moe_2stage_a16w4_dispatch.py, dispatched directly from
-    # fused_moe_; it no longer routes through this stage1 compile path.
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2: the numerically-correct ported FlyDSL kernel
+    # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). It consumes aiter's NATIVE
+    # guinterleave W1+scale layout directly (w_layout="guinterleave"), replacing the
+    # former (broken) compile_mixed_moe_gemm1_a16w4. Launched via run_flydsl_a16w4_moe.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        raise NotImplementedError(
-            "a16w4 (bf16 A x mxfp4 W) stage1 is served by the ported FlyDSL kernel "
-            "via fused_moe_'s a16w4 dispatch, not compile_flydsl_moe_stage1."
+        from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+
+        return compile_gemm1_a16w4_port(
+            BM=tile_m,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            NE=experts,
+            TOPK=topk,
+            TILE_N=tile_n,
+            TILE_K=tile_k,
+            act=act,
+            b_cache_mod=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=waves_per_eu,
+            w_dtype="mxfp4",
+            w_layout="guinterleave",
+            k_wave=k_wave,
         )
     if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -581,12 +595,24 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x mxfp4 W) is served by the ported FlyDSL kernel; see the
-    # note in compile_flydsl_moe_stage1. It no longer routes through this path.
+    # a16w4 (bf16 A x mxfp4 W) down-proj: the ported FlyDSL kernel. Its native
+    # gate_up=False W2+scale layout is byte-identical to the standard
+    # shuffle_weight/e8m0_shuffle layout (E*model_dim % 256 == 0), so no layout mode
+    # is needed. Launched via run_flydsl_a16w4_moe.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        raise NotImplementedError(
-            "a16w4 (bf16 A x mxfp4 W) stage2 is served by the ported FlyDSL kernel "
-            "via fused_moe_'s a16w4 dispatch, not compile_flydsl_moe_stage2."
+        from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
+
+        return compile_gemm2_a16w4_port(
+            BM=tile_m,
+            NE=experts,
+            N_OUT=model_dim,
+            D_INTER=inter_dim,
+            TILE_N=tile_n,
+            TILE_K=tile_k,
+            xcd_swizzle=xcd_swizzle,
+            b_cache_mod=b_nt,
+            waves_per_eu=waves_per_eu,
+            w_dtype="mxfp4",
         )
     if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
@@ -643,6 +669,140 @@ def compile_flydsl_moe_stage2(
         raise ValueError(
             f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
         )
+
+
+def run_flydsl_a16w4_moe(
+    hidden_states,
+    w1,  # [E, 2*inter_dim, model_dim//2] fp4x2, NATIVE guinterleave (gate_up) shuffled
+    w2,  # [E, model_dim, inter_dim//2] fp4x2, NATIVE guinterleave (gate_up=False) shuffled
+    topk_weight,
+    topk_ids,
+    *,
+    E,
+    model_dim,
+    inter_dim,
+    topk,
+    dtype,
+    w1_scale,  # [E*2*inter_dim, model_dim//32] e8m0, NATIVE guinterleave (gate_up)
+    w2_scale,  # [E*model_dim, inter_dim//32] e8m0, NATIVE guinterleave (gate_up=False)
+    block_size_M,
+    kernel_bench_callable=None,
+):
+    """Run the ported FlyDSL a16w4 (bf16 A x MXFP4 W) SiTUv2 2-stage MoE.
+
+    Numerically correct where aiter's former ``compile_mixed_moe_gemm{1,2}_a16w4`` was
+    not. Consumes aiter's NATIVE guinterleave weight+scale layout directly (no host
+    relayout): stage1 via ``w_layout="guinterleave"``; stage2's gate_up=False layout is
+    byte-identical to the standard layout the gemm2 kernel already reads
+    (E*model_dim % 256 == 0). Both stages build through
+    ``compile_flydsl_moe_stage{1,2}``. gemm2 tiles come from aiter's tuned CSV via
+    ``resolve_a16w4_gemm2_config``; gemm1 keeps the kernel's tuned default (the CSV gemm1
+    tiles regress mid/high-M). Returns ``[tokens, model_dim]``.
+    """
+    from aiter.fused_moe import moe_sorting
+    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+        flydsl_a16w4_gemm1,
+        flydsl_a16w4_gemm2,
+        resolve_a16w4_gemm2_config,
+    )
+
+    dev = hidden_states.device
+    tokens = hidden_states.shape[0]
+    BM = int(block_size_M) if block_size_M else 32
+    assert (E * model_dim) % 256 == 0, (
+        "a16w4 stage2 native scale layout requires E*model_dim % 256 == 0, got "
+        f"E={E}, model_dim={model_dim}"
+    )
+    w1_shuf = w1.view(torch.uint8).contiguous()
+    w2_shuf = w2.view(torch.uint8).contiguous()
+    w1_scale_1d = w1_scale.view(torch.uint8).contiguous().view(-1)
+    w2_scale_1d = w2_scale.view(torch.uint8).contiguous().view(-1)
+
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weight, E, model_dim, dtype, BM
+    )
+    sorted_size = int(sorted_expert_ids.shape[0]) * BM
+    cumsum = num_valid_ids.to(torch.int32).contiguous()
+    m_indices = sorted_ids.to(torch.int32).contiguous()
+    x_bf16 = hidden_states.to(torch.bfloat16).contiguous()
+    inter_sorted = torch.zeros(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
+
+    def g1():
+        # gemm1 keeps the kernel's tuned default (tile_n=None); CSV tiles regress here.
+        flydsl_a16w4_gemm1(
+            a_bf16=x_bf16,
+            w1_u8=w1_shuf,
+            w1_scale_u8=w1_scale_1d,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum,
+            m_indices=m_indices,
+            inter_sorted_bf16=inter_sorted,
+            n_tokens=tokens,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=BM,
+            tile_n=None,
+            act="situv2",
+            w_layout="guinterleave",
+        )
+
+    out_buf = torch.zeros(tokens * model_dim, dtype=torch.bfloat16, device=dev)
+
+    # gemm2 uses aiter's tuned CSV tiles (on-par-to-faster); None -> kernel default.
+    g2c = (
+        resolve_a16w4_gemm2_config(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=E,
+            topk=topk,
+            tokens=tokens,
+        )
+        or {}
+    )
+    g2_tile_n = g2c.get("tile_n", 256)
+    if model_dim % g2_tile_n != 0:
+        g2_tile_n = 256 if model_dim % 256 == 0 else 128
+    g2_tile_k = g2c.get("tile_k", 256)
+    if inter_dim % g2_tile_k != 0:
+        g2_tile_k = 128 if inter_dim % 128 == 0 else 64
+
+    def g2():
+        out_buf.zero_()  # atomic scatter accumulates; zero before each launch
+        flydsl_a16w4_gemm2(
+            inter_sorted_bf16=inter_sorted,
+            w2_u8=w2_shuf,
+            w2_scale_u8=w2_scale_1d,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum,
+            sorted_token_ids=sorted_ids,
+            sorted_weights=sorted_weights,
+            flat_out=out_buf,
+            M_logical=tokens,
+            max_sorted=sorted_size,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=BM,
+            tile_n=g2_tile_n,
+            tile_k=g2_tile_k,
+            b_nt=g2c.get("b_nt"),
+            waves_per_eu=g2c.get("waves_per_eu"),
+            xcd_swizzle=g2c.get("xcd_swizzle", 1),
+        )
+
+    g1()
+    torch.cuda.synchronize()
+    g2()
+    torch.cuda.synchronize()
+    out = out_buf.view(tokens, model_dim)
+
+    if kernel_bench_callable is not None:
+        kernel_bench_callable.append(("stage1", g1))
+        kernel_bench_callable.append(("stage2", g2))
+    return out
 
 
 # Private helpers

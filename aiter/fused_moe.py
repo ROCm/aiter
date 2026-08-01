@@ -838,10 +838,10 @@ def _fused_moe_impl(
                 "doweight_stage1=False."
             )
 
-        from aiter.ops.flydsl.moe_2stage_a16w4_dispatch import fused_moe_a16w4_flydsl
+        from aiter.ops.flydsl.moe_kernels import run_flydsl_a16w4_moe
 
         _bm = block_size_M if block_size_M not in (None, -1) else None
-        out = fused_moe_a16w4_flydsl(
+        out = run_flydsl_a16w4_moe(
             hidden_states,
             w1,
             w2,
