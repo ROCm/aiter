@@ -46,7 +46,6 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -188,9 +187,7 @@ def _build_compress_forward_kernel(
         c_state_size = arith.constant(state_size, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         # Per-thread wave / lane (block-local).
         wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
@@ -510,11 +507,7 @@ def _build_compress_forward_kernel(
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
                     comp_list.append(_to_raw(kv_sum * rcp_w))
 
                 # -- Vectorized write of VEC f32 comp values --

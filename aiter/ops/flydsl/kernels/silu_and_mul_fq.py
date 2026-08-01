@@ -23,7 +23,6 @@ Compile options:
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr.typing import Int32, T
@@ -101,9 +100,6 @@ def build_silu_and_mul_fq_module(
         d *= 2
 
     elem_bytes_bf16 = 2
-
-    if _need_fp8:
-        from flydsl._mlir.dialects import rocdl
 
     # All four MXFP4/MXFP8 scale modes share NV ROUND_UP today (industry default,
     # 0% max-value clipping). FP8 dtype follows the HW FP8 variant: gfx942 ships
@@ -260,12 +256,8 @@ def build_silu_and_mul_fq_module(
                         return -((-x).maximumf(_neg_limit))
 
                     def _sigmoid_s(x, neg_log2e=neg_log2e):
-                        emu = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.exp2.f32", [x * neg_log2e], [], []
-                        )
-                        return llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [c1_f32 + emu], [], []
-                        )
+                        emu = fx.rocdl.exp2(f32, x * neg_log2e)
+                        return fx.rocdl.rcp(f32, c1_f32 + emu)
 
                     def _tanh_s(x):
                         # tanh(x) = 2*sigmoid(2x) - 1
@@ -318,13 +310,9 @@ def build_silu_and_mul_fq_module(
                         else:
                             t = gate * neg_log2e
 
-                        emu = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.exp2.f32", [t], [], []
-                        )
+                        emu = fx.rocdl.exp2(f32, t)
                         den = c1_f32 + emu
-                        sig = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                        )
+                        sig = fx.rocdl.rcp(f32, den)
                         if const_expr(act == "swiglu"):
                             act_v = gate * sig * (linear + c1_f32)
                         else:
@@ -334,9 +322,7 @@ def build_silu_and_mul_fq_module(
                     if const_expr(_need_quant):
                         local_max = c0_f32
                         for vi in range_constexpr(VEC):
-                            abs_v = llvm.call_intrinsic(
-                                f32, "llvm.fabs.f32", [act_vals[vi]], [], []
-                            )
+                            abs_v = fx.math.absf(act_vals[vi])
                             local_max = arith.maximumf(local_max, abs_v)
 
                         for sh_dist in SHUFFLE_DISTS:
@@ -404,7 +390,7 @@ def build_silu_and_mul_fq_module(
                             if const_expr(VEC <= 4):
                                 packed_i32 = arith.constant(0, type=T.i32)
                                 for _w in range_constexpr(VEC // 2):
-                                    packed_i32 = rocdl.cvt_pk_fp8_f32(
+                                    packed_i32 = fx.rocdl.cvt_pk_fp8_f32(
                                         T.i32,
                                         scaled_vals[2 * _w],
                                         scaled_vals[2 * _w + 1],
@@ -429,14 +415,14 @@ def build_silu_and_mul_fq_module(
                                 for _wg in range_constexpr(VEC // 4):
                                     _b = _wg * 4
                                     packed_w = arith.constant(0, type=T.i32)
-                                    packed_w = rocdl.cvt_pk_fp8_f32(
+                                    packed_w = fx.rocdl.cvt_pk_fp8_f32(
                                         T.i32,
                                         scaled_vals[_b],
                                         scaled_vals[_b + 1],
                                         packed_w,
                                         0,
                                     )
-                                    packed_w = rocdl.cvt_pk_fp8_f32(
+                                    packed_w = fx.rocdl.cvt_pk_fp8_f32(
                                         T.i32,
                                         scaled_vals[_b + 2],
                                         scaled_vals[_b + 3],

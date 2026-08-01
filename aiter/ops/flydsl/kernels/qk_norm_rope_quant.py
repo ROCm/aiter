@@ -59,7 +59,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import rocdl
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
@@ -453,9 +453,7 @@ def _build_kernel(
                     # factor   = FP8_MAX / (amax * SQRT2)        (applied to x_in)
                     # The rstd factor cancels algebraically: store(out) =
                     # x_in * factor -> dequant: x_norm = scale * out = x_in * rstd.
-                    rcp_am = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [am_safe], [], []
-                    )
+                    rcp_am = fx.rocdl.rcp(f32, am_safe)
                     _fc = _fp8_const()
                     factor = arith.constant(_fc["max_over_sqrt2"], type=f32) * rcp_am
                     scale_val = (

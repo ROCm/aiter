@@ -75,7 +75,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import rocdl
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -323,9 +323,7 @@ def _build_kernel(
 
         def fexp_f32(x):
             """exp(x) via exp2(x * log2e). Single v_exp_f32 on AMD."""
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         def wave_reduce_add(x):
             """Butterfly sum across wave64."""
@@ -769,9 +767,7 @@ def _build_kernel(
             # ---- Step 8: compressed = kv_acc / w_acc (per-lane) ----
             comp_lane = []
             for i in range_constexpr(VEC):
-                rcp_w = llvm.call_intrinsic(
-                    f32, "llvm.amdgcn.rcp.f32", [w_final[i]], [], []
-                )
+                rcp_w = fx.rocdl.rcp(f32, w_final[i])
                 comp_lane.append(
                     arith.MulFOp(kv_final[i], rcp_w, fastmath=fm_fast).result
                 )
@@ -1044,9 +1040,7 @@ def _build_kernel(
                         scale_v = scale_raw
 
                     # (c) inv_scale via rcp.f32
-                    inv_scale = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [scale_v], [], []
-                    )
+                    inv_scale = fx.rocdl.rcp(f32, scale_v)
 
                     # (d) per-lane fp8 cast: clamp + NaN guard
                     #     NaN guard: cvt_pk_fp8_f32 on fnuz returns 0x80 (NaN)
@@ -1599,9 +1593,7 @@ def _build_kernel_ksplit(
         c_D = arith.constant(D, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
         lid = arith.remui(_to_raw(tid), c_64)  # ? [0, 64)
@@ -1854,11 +1846,7 @@ def _build_kernel_ksplit(
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_arr[w] - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
                     comp_lane.append(_to_raw(kv_sum * rcp_w))
 
                 # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
@@ -2096,9 +2084,7 @@ def _build_kernel_ksplit(
                         scale_v = scale_raw
 
                     # (c) inv_scale via rcp.f32
-                    inv_scale = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [scale_v], [], []
-                    )
+                    inv_scale = fx.rocdl.rcp(f32, scale_v)
 
                     # (d) per-lane fp8 cast: clamp + fnuz NaN guard
                     c_neg_uf = arith.constant(-(2.0**-8), type=f32)

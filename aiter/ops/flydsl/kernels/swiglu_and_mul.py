@@ -22,7 +22,6 @@ per iteration, avoiding read-modify-write races.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, range_constexpr
 from flydsl.expr.typing import Int32, T
@@ -42,9 +41,9 @@ def _swiglu_scalar(g, u, limit_f32, neg_limit_f32, neg_alpha_log2e, c1_f32):
     u_clamped = arith.maximumf(arith.minimumf(u, limit_f32), neg_limit_f32)
 
     t = g_clamped * neg_alpha_log2e
-    emu = llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [t], [], [])
+    emu = fx.rocdl.exp2(f32, t)
     den = c1_f32 + emu
-    sig = llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [den], [], [])
+    sig = fx.rocdl.rcp(f32, den)
     return g_clamped * sig * (u_clamped + c1_f32)
 
 
