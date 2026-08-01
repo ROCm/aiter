@@ -169,8 +169,8 @@ def create_vk_gdr_decode_kernel(
             dtype=state_dtype_,
             shape=(num_v_heads, head_v_dim, head_k_dim),
             stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Index(pool_idx)
-            * fx.Index(state_strides[0])
+            static_bytes_offset_i64=fx.Int64(pool_idx)
+            * fx.Int64(state_strides[0])
             * get_dtype_bytes(state_dtype),
         )
 
@@ -187,7 +187,6 @@ def create_vk_gdr_decode_kernel(
         cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
-
             if const_expr("f32" in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
             else:
@@ -210,25 +209,19 @@ def create_vk_gdr_decode_kernel(
                         ].extf(acc_vec_t)
 
             for sq_i in range_constexpr(seq_length):
-
                 r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
-                cond_sp = arith.cmpf(
-                    arith.CmpFPredicate.OLE, beta_x, fx.Float32(softplus_threshold_)
-                )
-                cond_sp_if = scf.IfOp(cond_sp, results_=[T.f32], has_else=True)
-                with ir.InsertionPoint(cond_sp_if.then_block):
-                    softplus_x_ = (f32_1 / softplus_beta_) * fast_log1p(
-                        fast_exp(beta_x)
-                    )
-                    scf.YieldOp([softplus_x_])
-                with ir.InsertionPoint(cond_sp_if.else_block):
-                    softplus_x_ = x
-                    scf.YieldOp([softplus_x_])
-                softplus_x = cond_sp_if.results[0]
+                # softplus with the large-x identity: for beta_x > threshold,
+                # softplus(x) == x. select computes both arms (the overflow arm
+                # is discarded) -> bit-identical to the old scf.if. Works inside
+                # the raw scf valid-guard region since select is a plain op.
+                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
+                softplus_x = (
+                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                ).select(softplus_big, x)
 
                 r_g_value = -fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
@@ -333,7 +326,6 @@ def create_vk_gdr_decode_kernel(
                     )
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
-
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
@@ -394,7 +386,7 @@ def create_vk_gdr_decode_kernel(
 
                     sum_hq = sum_hq.truncf(dtype_)
                     write_cond = arith.cmpi(
-                        arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0)
+                        arith.CmpIPredicate.eq, fx.Int64(warp_k_vec_start), fx.Int64(0)
                     )
                     write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
                     with ir.InsertionPoint(write_cond_if.then_block):
