@@ -27,6 +27,7 @@ def reduce_grouped(
     out_dtype=None,
     swiglu_add_residual: bool = True,
     residual: torch.Tensor | None = None,
+    indx_valid: torch.Tensor | None = None,
 ):
     """
     Grouped row reduction used during moe scatter and also compatible with split-k reduce.
@@ -67,6 +68,8 @@ def reduce_grouped(
     # Gluon path on gfx1250 for the plain grouped combine; swiglu-fused (MoE1 split-k) reductions, reduction_n != 1, and non-contiguous inputs stay on the Triton _reduce_grouped.
     use_gluon = (
         is_tdm_avail()
+        # the gluon reduce has no per-gate validity support
+        and indx_valid is None
         and indx is not None
         and not apply_swiglu
         and reduction_n == 1
@@ -129,6 +132,7 @@ def reduce_grouped(
         out.stride(0),
         out.stride(1),
         indx,
+        indx_valid,
         x.shape[0],
         x.shape[1],
         x.shape[2],
@@ -140,6 +144,7 @@ def reduce_grouped(
         BLOCK_N=BLOCK_N,
         EVEN_N=(x.shape[-1] % BLOCK_N == 0),
         K=K,
+        HAS_INDX_VALID=indx_valid is not None,
         SWIGLU_ADD_RESIDUAL=swiglu_add_residual,
         USE_TDM=is_tdm_avail(),
         Residual=residual,
