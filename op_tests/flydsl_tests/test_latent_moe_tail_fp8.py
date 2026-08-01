@@ -92,6 +92,20 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
     ).bfloat16()
 
     out = torch.empty_like(shared)
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        latent_moe_tail_fp8(
+            routed,
+            shared,
+            rms_weight,
+            packed,
+            scale,
+            EPSILON,
+            out=out,
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = latent_moe_tail_fp8(

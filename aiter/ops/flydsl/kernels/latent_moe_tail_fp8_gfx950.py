@@ -312,6 +312,7 @@ def build_b1_latent_moe_tail_fp8_persistent_module(
                     )
                     write_if = scf.IfOp(is_lane_zero)
                     with ir.InsertionPoint(write_if.then_block):
+                        # Match the BF16 Linear output boundary before the add.
                         projected_bf16 = arith.trunc_f(T.bf16, _raw(reduced))
                         projected_f32 = ArithValue(arith.extf(f32, projected_bf16))
                         shared_bf16 = buffer_ops.buffer_load(
