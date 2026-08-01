@@ -704,6 +704,22 @@ def fused_moe_(
         has_stage2_bias=bias2 is not None,
     )
 
+    if metadata.stage0 is not None:
+        return metadata.stage0(
+            hidden_states,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids,
+            activation,
+            quant_type,
+            w1_scale,
+            w2_scale,
+            expert_mask,
+            num_local_tokens,
+            moe_sorting_dispatch_policy,
+        )
+
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
     if block_size_M is not None:
@@ -1141,6 +1157,7 @@ class MOEMetadata:
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
+    stage0: Callable = None
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -2036,6 +2053,28 @@ def get_2stage_cfgs(
     logger.info(
         f"[fused_moe] using {'1stage' if run_1stage else '2stage'}{' xbf16' if run_1stage_xbf16 else ''} {'default' if cfg is None else tag} for {keys} "
     )
+
+    if kernelName1 and kernelName1.startswith("fused_moe_gfx942"):
+        kernel_name1_parts = kernelName1.split("__", 1)
+        if len(kernel_name1_parts) == 2:
+            if not is_flydsl_available():
+                logger.warning(
+                    "[fused_moe] tuned config requests FlyDSL gfx942 kernels but "
+                    "flydsl is not available; falling back to default dispatch."
+                )
+            else:
+                from aiter.fused_moe_gfx942 import fused_moe_gfx942
+
+                return MOEMetadata(
+                    None,
+                    None,
+                    block_m,
+                    ksplit,
+                    run_1stage,
+                    stage0=functools.partial(
+                        fused_moe_gfx942, config_string=kernel_name1_parts[1]
+                    ),
+                )
 
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
