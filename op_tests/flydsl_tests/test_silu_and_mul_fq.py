@@ -2,8 +2,8 @@ import pytest
 import torch
 
 from aiter import dtypes
-from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant
 from aiter.utility.fp4_utils import moe_mxfp4_sort

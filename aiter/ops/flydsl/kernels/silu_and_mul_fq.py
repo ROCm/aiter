@@ -483,30 +483,29 @@ def build_silu_and_mul_fq_module(
                 else:
                     # Padding row: zero the E8M0 scale so the sorted scale buffer
                     # has no stale entries for invalid (padded) token slots.
-                    if const_expr(_need_quant):
-                        if (col0 & 31) == 0:
-                            row_s_p = bid
-                            col_s_p = col0 >> 5
-                            d0_p = row_s_p >> 5
-                            d1_p = (row_s_p >> 4) & 1
-                            d2_p = row_s_p & 15
-                            d3_p = col_s_p >> 3
-                            d4_p = (col_s_p >> 2) & 1
-                            d5_p = col_s_p & 3
-                            s_byte_off_p = (
-                                d0_p * n32_sort
-                                + d3_p * 256
-                                + d5_p * 64
-                                + d2_p * 4
-                                + d4_p * 2
-                                + d1_p
-                            )
-                            buffer_ops.buffer_store(
-                                arith.constant(0, type=T.i8),
-                                scale_rsrc,
-                                s_byte_off_p,
-                                offset_is_bytes=True,
-                            )
+                    if const_expr(_need_quant) and (col0 & 31) == 0:
+                        row_s_p = bid
+                        col_s_p = col0 >> 5
+                        d0_p = row_s_p >> 5
+                        d1_p = (row_s_p >> 4) & 1
+                        d2_p = row_s_p & 15
+                        d3_p = col_s_p >> 3
+                        d4_p = (col_s_p >> 2) & 1
+                        d5_p = col_s_p & 3
+                        s_byte_off_p = (
+                            d0_p * n32_sort
+                            + d3_p * 256
+                            + d5_p * 64
+                            + d2_p * 4
+                            + d4_p * 2
+                            + d1_p
+                        )
+                        buffer_ops.buffer_store(
+                            arith.constant(0, type=T.i8),
+                            scale_rsrc,
+                            s_byte_off_p,
+                            offset_is_bytes=True,
+                        )
 
     @flyc.jit
     def launch_silu_and_mul_fq(
