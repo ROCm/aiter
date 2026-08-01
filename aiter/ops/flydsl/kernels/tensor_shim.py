@@ -6,12 +6,13 @@ from abc import ABC, abstractmethod
 from itertools import product
 
 import flydsl.compiler as flyc
+import flydsl.expr as fx
 import numpy as np
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.compiler.protocol import extract_to_ir_values
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
@@ -27,17 +28,21 @@ AITER_FLYDSL_KERNARG_PRELOAD_COUNT = int(
     os.environ.get("AITER_FLYDSL_KERNARG_PRELOAD_COUNT", "32")
 )
 
+# Toggle for the amdgpu-expert-scheduling-mode compile hint on the MoE GEMM
+# kernels. Disabled by default; set AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1
+# to enable it.
+AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE = bool(
+    int(os.environ.get("AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE", "0"))
+)
+
 
 def ptr_rsrc(ptr):
     """Convert an fx.Pointer kernel arg to a buffer resource for buffer_load/store."""
-    addr_i64 = arith.index_cast(T.i64, ptrtoint(ptr))
-    return buffer_ops.create_buffer_resource_from_addr(addr_i64)
+    return buffer_ops.create_buffer_resource_from_addr(fx.Int64(ptrtoint(ptr)))
 
 
 def ptr_arg(t: torch.Tensor):
     """Wrap a torch.Tensor as an fx.Pointer (PointerJitArg) for kernel launch."""
-    import flydsl.expr as fx
-
     type_name = type(t).__name__
     module_name = type(t).__module__
     if type_name == "FakeTensor" or "fake_tensor" in module_name:
@@ -322,7 +327,7 @@ class GTensor(TensorBase):
         raw = extract_to_ir_values(memref)[0]
         if static_bytes_offset_i64 is None:
             if str(raw.type).startswith("!fly.ptr"):
-                base_i64 = arith.index_cast(T.i64, ptrtoint(memref))
+                base_i64 = fx.Int64(ptrtoint(memref))
                 self.rsrc = buffer_ops.create_buffer_resource_from_addr(base_i64)
             else:
                 self.rsrc = buffer_ops.create_buffer_resource(memref, max_size=True)
@@ -342,31 +347,12 @@ class GTensor(TensorBase):
         )
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
-        # Accept index / i32 / i64 byte offsets. index -> index_cast; a value
-        # already i64 (e.g. fx.Int64 math) is kept as-is (index_cast i64<->i64
-        # is invalid); narrower ints are sign-extended.
-        bo = (
-            bytes_offset_i64.ir_value()
-            if hasattr(bytes_offset_i64, "ir_value")
-            else (
-                extract_to_ir_values(bytes_offset_i64)[0]
-                if not isinstance(bytes_offset_i64, ir.Value)
-                else bytes_offset_i64
-            )
-        )
-        if isinstance(bo.type, ir.IntegerType):
-            if bo.type.width == 64:
-                bytes_offset_i64 = bo
-            elif bo.type.width < 64:
-                bytes_offset_i64 = arith.extsi(T.i64, bo)
-            else:
-                bytes_offset_i64 = arith.trunci(T.i64, bo)
-        else:
-            bytes_offset_i64 = arith.index_cast(T.i64, bo)
+        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
+        bytes_offset_i64 = _to_raw(fx.Int64(bytes_offset_i64))
         _ptr_type = ir.Type.parse(ptr_type)
         raw = extract_to_ir_values(ptr)[0]
         if str(raw.type).startswith("!fly.ptr"):
-            base_ptr = arith.index_cast(T.i64, ptrtoint(ptr))
+            base_ptr = _to_raw(fx.Int64(ptrtoint(ptr)))
         else:
             base_ptr = fly.extract_aligned_pointer_as_index(_ptr_type, raw)
             base_ptr = llvm.PtrToIntOp(T.i64, base_ptr).result
