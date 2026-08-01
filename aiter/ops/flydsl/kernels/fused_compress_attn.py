@@ -213,9 +213,9 @@ def _build_kernel(
     log2_rts = int(math.log2(RTS)) if nm_asm else 0
     if nm_asm:
         assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
-        assert NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0, (
-            f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
-        )
+        assert (
+            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
 
     assert D % BLOCK_THREADS == 0, f"D={D} must divide BLOCK_THREADS={BLOCK_THREADS}"
     assert VEC in (2, 4, 8), f"VEC={VEC} (D/{BLOCK_THREADS}) outside supported set"
@@ -236,9 +236,9 @@ def _build_kernel(
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
         assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
         assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
-        assert _FP4_GROUP_SIZE % VEC == 0, (
-            f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
-        )
+        assert (
+            _FP4_GROUP_SIZE % VEC == 0
+        ), f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
         if preshuffle:
             assert k_per_block % _PRESHUFFLE_TILE == 0
 
@@ -1491,9 +1491,9 @@ def _build_kernel_ksplit(
         assert quant, "internal: quant_fp4 requires quant=True"
         assert D % _FP4_K_TILE == 0, f"FP4 requires D%128==0, got D={D}"
         assert D % _FP4_GROUP_SIZE == 0, f"FP4 requires D%32==0, got D={D}"
-        assert _FP4_GROUP_SIZE % VEC == 0, (
-            f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
-        )
+        assert (
+            _FP4_GROUP_SIZE % VEC == 0
+        ), f"FP4 group {_FP4_GROUP_SIZE} must be a multiple of VEC={VEC}"
         if preshuffle:
             assert k_per_block % _PRESHUFFLE_TILE == 0
     elif quant and preshuffle:
@@ -1501,9 +1501,9 @@ def _build_kernel_ksplit(
         assert k_per_block % _PRESHUFFLE_TILE == 0
     if nm_asm:
         assert quant and not preshuffle, "nm_asm: requires quant=True, preshuffle=False"
-        assert NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0, (
-            f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
-        )
+        assert (
+            NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+        ), f"nm_asm: NOPE={NOPE} % G={GROUP_SIZE_Q} and G % VEC={VEC} must be 0"
 
     # LDS: 3 fp32 arrays, each NW * D entries.
     LDS_ELEMS = NW * D

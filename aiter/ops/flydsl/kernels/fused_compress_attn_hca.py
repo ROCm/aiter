@@ -105,21 +105,21 @@ def _build_compress_forward_kernel(
     sub-loop reading kv_in + score_in. Phase 2 in_row is clamped to >= 0
     so wasted reads in pure-Phase-1 iters stay in-bounds.
     """
-    assert head_dim % slice_size == 0, (
-        f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
-    )
-    assert slice_size % 64 == 0, (
-        f"slice_size={slice_size} must be a multiple of 64 (wave width)"
-    )
+    assert (
+        head_dim % slice_size == 0
+    ), f"head_dim={head_dim} must be divisible by slice_size={slice_size}"
+    assert (
+        slice_size % 64 == 0
+    ), f"slice_size={slice_size} must be a multiple of 64 (wave width)"
     assert slice_size // 64 in (
         1,
         2,
         4,
         8,
     ), f"VEC={slice_size // 64} must be 1, 2, 4, or 8"
-    assert ratio % k_split_num_waves == 0, (
-        f"K={ratio} must divide evenly across {k_split_num_waves} waves"
-    )
+    assert (
+        ratio % k_split_num_waves == 0
+    ), f"K={ratio} must divide evenly across {k_split_num_waves} waves"
     assert state_size >= ratio, f"state_size={state_size} must be >= K={ratio}"
     D = head_dim
     K = ratio
@@ -637,9 +637,9 @@ def _build_norm_rope_scatter_kernel(
     # FP8 1xG e8m0 group-quant geometry (nope region only). GROUP_SIZE must divide
     # NOPE and be a multiple of VEC (a lane's VEC slice never crosses a group).
     GROUP_SIZE_Q = quant_group_size
-    assert (not quant) or (NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0), (
-        f"quant: NOPE={NOPE} must be divisible by group={GROUP_SIZE_Q}, group%VEC==0"
-    )
+    assert (not quant) or (
+        NOPE % GROUP_SIZE_Q == 0 and GROUP_SIZE_Q % VEC == 0
+    ), f"quant: NOPE={NOPE} must be divisible by group={GROUP_SIZE_Q}, group%VEC==0"
     RTS = GROUP_SIZE_Q // VEC if quant else 1  # threads per group (=8 for G=64,VEC=8)
     log2_rts = int(math.log2(RTS)) if quant else 0
 

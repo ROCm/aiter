@@ -38,9 +38,9 @@ def build_causal_conv1d_flydsl_module(
     """Build the FlyDSL causal conv1d kernel for the given config."""
     assert _FLYDSL_AVAILABLE, "flydsl is not installed"
     assert width in (2, 3, 4)
-    assert tm == 64 and tn == 64 and block_threads == 256, (
-        "fixed TM=TN=64, 256-thread tile"
-    )
+    assert (
+        tm == 64 and tn == 64 and block_threads == 256
+    ), "fixed TM=TN=64, 256-thread tile"
 
     W = width
     KW = W
