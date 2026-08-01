@@ -87,6 +87,14 @@ idx  = tx
 - Wrap a runtime value once, at first typed use.
 - A real cast (`fx.Int64(i32)` widen, `fx.Int32(index)` narrow) is not redundant —
   it replaces `arith.index_cast`.
+- **Already-fx sources — don't re-wrap:** `fx.thread_idx.x` / `fx.block_idx.x`,
+  a param typed `fx.Int32`/`Int32`, and any `fx` arithmetic result already carry
+  a type and overload operators. `fx.Int32(tid)`, `bid = fx.Int32(fx.block_idx.x)`,
+  `fx.Int32(pid) < fx.Int32(plan_capacity)` → use `tid`, `bid = fx.block_idx.x`,
+  `pid < plan_capacity`.
+- **But `vector.extract(...)` / `buffer_load(...)` results ARE raw** — those *do*
+  need `fx.Int32(...)` to become a tracer-usable value (e.g. so `if x >= 0:`
+  lowers to `scf.if`). Wrap those; don't wrap the thread/block ids.
 
 ---
 
@@ -116,6 +124,17 @@ fx.copy_atom_call(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA
 - A scalar-base + per-thread-offset load with no layout form may stay on
   `buffer_ops` — note it. `buffer_load/store` `offset` is in **elements** (×
   `sizeof(dtype)` internally) — a classic bug.
+- A packing kernel (fp4/fp8 pack, tiled e8m0 scale writes) with hand-computed
+  byte offsets legitimately stays on `buffer_ops` — migrate its *index/condition*
+  math to `fx.Int32` and its `scf.IfOp`→Python `if`, but keep the manual
+  addressing. In aiter, `buffer_ops`/`vector`/`tensor_shim` are **vendored** at
+  `aiter.ops.flydsl.kernels.*` (flydsl moved them out of `flydsl.expr`).
+- **`fx.Int64` offsets now work through the shim.** `buffer_ops.buffer_load/store`
+  and `tensor_shim.GTensor` accept `index` / `i32` / `fx.Int64` offsets (the
+  vendored `buffer_ops._to_i32_offset` and `GTensor.get_llvm_ptr` normalize width
+  via `fx.Int64` coercion). So a GTensor-heavy kernel *can* migrate
+  `fx.Index(...)` → `fx.Int64(...)` for `static_bytes_offset` / `vec_load` /
+  `vec_store` — the old "GTensor needs `index`-typed" constraint is gone.
 
 ---
 
@@ -155,11 +174,49 @@ Runtime bounds must be typed (`fx.Int64`) or the rewriter unrolls and drops
 
 ### `llvm` / `memref` / `math`
 - `llvm.*` ptr math / load/store / const → layout views (`fx.make_view`,
-  `fx.get_iter`), `fx.Array` + `SharedAllocator`, `fx` constants. Real intrinsics
-  go in `expr/rocdl/inline_asm.py` or `rocdl` wrappers.
+  `fx.get_iter`), `fx.Array` + `SharedAllocator`, `fx` constants.
 - `memref.*` → layout tensors/views + copy atoms.
 - `math.*` → `fx` math helpers (`expr/math.py`); keep `math_dialect.fma` etc. only
   where no wrapper exists.
+
+### `llvm.call_intrinsic` amdgcn intrinsics → `fx.rocdl` / `fx.math`
+
+The verbose `llvm.call_intrinsic(f32, "llvm.amdgcn.*", [x], [], [])` form has
+direct fx equivalents that lower to the **same instruction** (byte-identical):
+
+| Raw | Preferred |
+|---|---|
+| `llvm.call_intrinsic(f32, "llvm.amdgcn.exp2.f32", [x], [], [])` | `fx.rocdl.exp2(f32, x)` |
+| `llvm.call_intrinsic(f32, "llvm.amdgcn.rcp.f32", [x], [], [])` | `fx.rocdl.rcp(f32, x)` |
+| `llvm.call_intrinsic(f32, "llvm.fabs.f32", [x], [], [])` | `fx.math.absf(x)` |
+| raw `rocdl.cvt_pk_fp8_f32(...)` | `fx.rocdl.cvt_pk_fp8_f32(...)` |
+
+`fx.rocdl` (via `import flydsl.expr as fx`) also carries `readlane`,
+`ds_bpermute`, `make_buffer_tensor`, the `BufferCopy*` atoms, etc. — prefer it
+over `from flydsl._mlir.dialects import rocdl`. `fx.rocdl.exp2/rcp` return a raw
+`OpResult`, so they drop straight into existing raw f32 arithmetic (no wrapping).
+
+### Raw MLIR dialects (`mlir_math` / `mlir_vector` / `mlir_gpu`) → `fx`
+
+Kernels that alias `from flydsl._mlir.dialects import math as mlir_math` (etc.)
+can move to the fx surface:
+
+| Raw | Preferred |
+|---|---|
+| `mlir_math.exp/log1p/rsqrt(x, fastmath=..)` | `fx.math.exp/log1p/rsqrt(x, fastmath=..)` |
+| `mlir_vector.ReductionOp(T.f32, vector.CombiningKind.ADD, v).dest` | `fx.Vector(v).reduce(fx.ReductionOp.ADD)` |
+| `mlir_gpu.ShuffleOp(v, off, width, mode="xor").shuffleResult` | `v.shuffle_xor(off, width)` (typed numeric method) |
+
+**Keepers (no byte-exact fx surface — leave raw, note them):**
+- `mlir_gpu.ShuffleOp(mode="idx")` reading a **per-lane** source lane
+  (group-leader broadcast): `readlane` needs a *uniform* lane and `ds_bpermute`
+  needs a manual i32-bitcast dance — neither is a drop-in.
+- `vector.FMAOp` — `fx.Vector` has no vector FMA; `a*b+c` is 2-rounding, not
+  byte-exact vs a fused MAC.
+- Boundary rule: when a reduced/`.select`ed value becomes an fx scalar and then
+  feeds a raw op (`ShuffleOp`, `BroadcastOp`, `llvm.call_intrinsic`), unwrap once
+  with `.ir_value()` / `_to_raw(...)`; when it feeds a raw scalar→bf16 store, use
+  `x.to(fx.BFloat16)` (fx scalars have no `.truncf`, that's a Vector method).
 
 ---
 
@@ -225,6 +282,44 @@ dispatch()
 - `const_expr(flag)` for compile-time branches; never wrap runtime SSA
   (`gpu.thread_id`, `lane`) in `const_expr`.
 - Keep manual `scf.IfOp` only where the rewriter can't express it; localize it.
+
+### 5a. Killing a raw `scf.IfOp(cond)` whole-body guard — the closure idiom
+
+A raw `scf.IfOp(is_active)` wrapping a big body (sentinel-skip / bounds guard)
+does **not** convert to an inline `if is_active: <body>` when the body does
+`gtensor[...] = x` or defines loop-carried state — the rewriter tries to yield
+those as scf results and fails: *"state variable 'out' is GTensor, not an MLIR
+Value"*. The fix is the branch-helper form: put the body in a **local closure**
+and call it under the runtime `if`. The rewriter then sees an opaque call (no
+state to thread) and lowers the `if` to `scf.if` itself:
+
+```python
+# Before: raw region wrapping the whole kernel body
+_if_active = scf.IfOp(is_active)
+with _if_then(_if_active):
+    ... GTensor stores, nested guards, emitter calls ...
+# After
+def _body():
+    ... same body, unchanged indent ...
+if fx.Int32(position) >= 0:      # runtime fx compare -> scf.if
+    _body()
+```
+
+- **Nested store guards** (`buffer_store(...)`, no assignment target) inside a
+  now-traced body work as a plain inline `if lane == 0: buffer_store(...)` — no
+  closure needed (nothing to yield). Only GTensor `[...] =` / value-defining
+  branches need the closure.
+- **Value-returning** `scf.IfOp(cond, results_=[...])` where both arms are pure
+  arithmetic → per-element `cond.select(then_v, else_v)` (compute both, the
+  discarded arm is fine — byte-identical). `.ir_value()` the result if it then
+  feeds a raw `llvm.call_intrinsic`.
+- **Hard limit — external helpers can't use Python `if`.** The `@flyc.kernel`
+  AST rewriter only rewrites `if` statements *lexically inside the kernel body
+  (and `def` closures defined in it)*. A shared **module-level emitter** invoked
+  from the kernel runs as plain Python: its `if fx_bool:` hits
+  *"cannot evaluate dynamic 'Boolean' as Python bool during tracing."* Keep
+  `scf.IfOp` inside such emitters (callers may now be closures — raw scf composes
+  fine inside a traced region).
 
 ---
 
@@ -339,19 +434,35 @@ def _run_compiled(exe, *args):             # in-tree
    grep -nE "SmemPtr|SmemAllocator|\.finalize\(\)" <file>
    grep -nE "fx\.(Int32|Int64|Float32)\(fx\.(Int32|Int64|Float32)\(" <file>
    grep -nE "rocdl\.mfma_|\bmfma_(f32|i32)_|copy_atom_call|mma_atom_call" <file>
+   grep -nE "llvm\.call_intrinsic|mlir_(math|vector|gpu)\." <file>
    ```
-2. **Triage:** do mechanical swaps (operators, casts, `vector.extract/bitcast`)
-   first; structural ones (control flow, `buffer_ops` offsets, MMA loops) next.
+2. **Triage:** do mechanical swaps (operators, casts, `vector.extract/bitcast`,
+   `llvm.call_intrinsic`→`fx.rocdl`) first; structural ones (control flow,
+   `buffer_ops` offsets, MMA loops) next.
 3. **Migrate in small commits**, one family at a time, matching local style.
-4. **Verify:**
+4. **Verify — prefer byte-exact old-vs-new over the tolerance test.** Build the
+   pre-cleanup kernel alongside the new one and assert `torch.equal` on a COLD
+   recompile:
    ```bash
-   bash scripts/check_python_style.sh --fix
-   FLYDSL_RUNTIME_ENABLE_CACHE=0 python3 -m pytest tests/kernels/test_<kernel>.py -v
+   git show HEAD:<file> | sed 's/build_X/build_X_OLD/' > kernels/_x_old_mod.py
+   FLYDSL_RUNTIME_ENABLE_CACHE=0; rm -rf ~/.flydsl/cache
+   # harness: run OLD and NEW on the SAME input (generate it once — per-call
+   # torch.randn desyncs the RNG and false-fails), torch.equal across all config
+   # combos (dtype/quant/layout/shape) + the padding / bounds branch.
    ```
-   Diff numerics for offset-sensitive buffer changes.
-5. **Check `git diff --stat`** shows a net line reduction; growth is a red flag.
-6. **Report** anything left legacy on purpose (pervasive `_scf.IfOp`, a
-   scalar-base load with no layout form).
+   For kernels whose test bypasses the op wrapper, wrap args in `ptr_arg(...)`
+   like production (see `tensor_shim.ptr_arg`). Then run the op test:
+   `python op_tests/flydsl_tests/test_<kernel>.py` (or `-m pytest`).
+5. **CI lint (aiter):** the style job pins **`ruff==0.16.0`** and runs
+   `ruff check .`; its default set is wider than older ruff (e.g. **SIM102** wants
+   nested `if a: if b:` combined into `if a and b:` — safe: `const_expr(flag)`
+   short-circuits at trace time; **I001** import order). Reproduce with
+   `pip install ruff==0.16.0 && ruff check <files> && ruff format --check <files>`,
+   not your ambient ruff.
+6. **Check `git diff --stat`** shows a net line reduction; growth is a red flag.
+7. **Report** anything left legacy on purpose (external emitter `scf.IfOp`,
+   per-lane `mode="idx"` shuffle, `vector.FMAOp`, packing `buffer_ops`, index-typed
+   `MulIOp` byte offsets).
 
 ---
 
@@ -365,6 +476,11 @@ def _run_compiled(exe, *args):             # in-tree
 | `arith.mulf/addf/trunc_f/select` | `*`, `+`, `.to(ty)`, `.select(...)` |
 | `vector.extract/bitcast/splat` | `fx.Vector(v)[i]` / `.bitcast(ty)` / `.filled(...)` |
 | `scf.ForOp` / `scf.IfOp` | `range_constexpr` / `range(..., init=)` / Python `if` / `const_expr` |
+| `scf.IfOp(cond)` whole-body guard (GTensor stores) | `def _body(): ...; if cond: _body()` (closure → scf.if) |
+| value-returning `scf.IfOp` (pure arms) | `cond.select(then_v, else_v)` (+ `.ir_value()` at raw boundary) |
+| `llvm.call_intrinsic("llvm.amdgcn.exp2/rcp.f32")` | `fx.rocdl.exp2/rcp(f32, x)` |
+| `llvm.call_intrinsic("llvm.fabs.f32")` | `fx.math.absf(x)` |
+| `mlir_math.*` / `mlir_vector.ReductionOp` / `mlir_gpu.ShuffleOp(xor)` | `fx.math.*` / `fx.Vector(v).reduce(ADD)` / `v.shuffle_xor(off,w)` |
 | `buffer_ops.*` + offsets | `fx.rocdl.make_buffer_tensor` + layout + `fx.copy_atom_call` |
 | raw `llvm`/`memref` access | `fx.make_view` / `fx.get_iter` / `SharedAllocator` |
 | `SmemAllocator`/`SmemPtr` + `finalize()` | `@fx.struct` + `fx.SharedAllocator().allocate(...).peek().view(...)` |
