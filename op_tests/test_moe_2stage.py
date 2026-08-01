@@ -269,9 +269,17 @@ def test_fmoe(
     # bias dtype convert
     if (
         qType == aiter.QuantType.per_1x32
+        and AQDType == dtypes.bf16
+        and WQDType == dtypes.fp4x2
+        and actType == aiter.ActivationType.Situv2
+    ):  # a16w4 SiTUv2: served by the ported FlyDSL kernel (no per-expert bias)
+        exp_bias1 = exp_bias2 = None
+        exp_bias1_aiter = exp_bias2_aiter = None
+    elif (
+        qType == aiter.QuantType.per_1x32
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    ):  # a8w4 (fp8 A) mxfp4
         exp_bias1_aiter = None if exp_bias1 is None else exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = None if exp_bias2 is None else exp_bias2.to(dtypes.fp32)
     elif (
@@ -938,10 +946,15 @@ def _situv2_beta_kwargs(act_type):
 
 
 def _effective_gate_mode(aq_dtype, wq_dtype):
-    # a16w4/a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2 is served by the ported FlyDSL kernel via
+    # fused_moe_'s SEPARATED dispatch; keep it in SEPARATED (bf16 activation) so
+    # the abf16_wfp4 rows exercise that kernel instead of downgrading to a8w4/fp8.
+    if aq_dtype == dtypes.bf16 and wq_dtype == dtypes.fp4x2:
+        return GateMode.SEPARATED.value
+    # a8w4 mxfp4 weights run the gate/up-interleaved (guinterleave) layout,
     # matching serving's ATOM_MOE_GU_ITLV=1. gate_mode is a runtime weight-layout
     # property (not a tuned-config key); request INTERLEAVE here for them.
-    if aq_dtype in [dtypes.fp8, dtypes.bf16] and wq_dtype == dtypes.fp4x2:
+    if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp4x2:
         return GateMode.INTERLEAVE.value
     # mxfp8 (a8w8) uses the gate-up interleave stage1 path as well.
     if aq_dtype == dtypes.fp8 and wq_dtype == dtypes.fp8:
