@@ -487,40 +487,16 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
+    # a16w4 (bf16 A x mxfp4 W) is served by the ported FlyDSL kernel
+    # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix) via
+    # aiter/ops/flydsl/moe_2stage_a16w4_dispatch.py, dispatched directly from
+    # fused_moe_; it no longer routes through this stage1 compile path.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        from .kernels.mixed_moe_gemm_2stage import (
-            GateMode,
-            compile_mixed_moe_gemm1_a16w4,
+        raise NotImplementedError(
+            "a16w4 (bf16 A x mxfp4 W) stage1 is served by the ported FlyDSL kernel "
+            "via fused_moe_'s a16w4 dispatch, not compile_flydsl_moe_stage1."
         )
-
-        return compile_mixed_moe_gemm1_a16w4(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage1=doweight_stage1,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            out_dtype=out_dtype,
-            act=act,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            persist_m=persist_m,
-            use_async_copy=use_async_copy,
-            k_batch=k_batch,
-            waves_per_eu=waves_per_eu,
-            b_nt=b_nt,
-            gate_mode=GateMode(gate_mode),
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
-            enable_bias=enable_bias,
-            a_scale_one=a_scale_one,
-            xcd_swizzle=xcd_swizzle,
-        )
-    elif b_dtype in ("fp4", "mxfp4", "fp8"):
+    if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
 
         return compile_mixed_moe_gemm1(
@@ -605,31 +581,14 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
+    # a16w4 (bf16 A x mxfp4 W) is served by the ported FlyDSL kernel; see the
+    # note in compile_flydsl_moe_stage1. It no longer routes through this path.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2_a16w4
-
-        return compile_mixed_moe_gemm2_a16w4(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts,
-            topk=topk,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            tile_k=tile_k,
-            doweight_stage2=doweight_stage2,
-            a_dtype=a_dtype,
-            b_dtype=b_dtype,
-            out_dtype=out_dtype,
-            accumulate=accumulate,
-            sort_block_m=sort_block_m,
-            waves_per_eu=0 if waves_per_eu is None else waves_per_eu,
-            b_nt=b_nt,
-            xcd_swizzle=xcd_swizzle,
-            model_dim_pad=model_dim_pad,
-            inter_dim_pad=inter_dim_pad,
-            enable_bias=enable_bias,
+        raise NotImplementedError(
+            "a16w4 (bf16 A x mxfp4 W) stage2 is served by the ported FlyDSL kernel "
+            "via fused_moe_'s a16w4 dispatch, not compile_flydsl_moe_stage2."
         )
-    elif b_dtype in ("fp4", "mxfp4", "fp8"):
+    if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(

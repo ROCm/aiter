@@ -791,31 +791,53 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    # a16w4 (bf16 A x MXFP4 W) SiTUv2 SEPARATED: route to the numerically-correct
-    # ported FlyDSL kernel (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). aiter's
-    # previous compile_mixed_moe_gemm{1,2}_a16w4 fails its own strict accuracy
-    # gate on this path; the port passes at logits_diff ~1.5e-5. CDNA (gfx942 /
-    # gfx950) only -- gfx1250 is handled by the q_dtype_a override above and never
-    # reaches here as bf16-a16w4.
-    if (
-        is_flydsl_available()
-        and quant_type == QuantType.per_1x32
+    # a16w4 (bf16 A x MXFP4 W) SiTUv2: served by the numerically-correct ported
+    # FlyDSL kernel (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). This fully
+    # replaces aiter's former compile_mixed_moe_gemm{1,2}_a16w4, which failed
+    # aiter's own strict accuracy gate on this path (logits_diff ~1.0); the port
+    # passes at ~1.5e-5. CDNA (gfx942 / gfx950) only -- gfx1250 is handled by the
+    # q_dtype_a override above and never reaches here as bf16-a16w4. Gate mode is
+    # irrelevant to this kernel (bf16 activation, guinterleave weights either
+    # way); only the SEPARATED/INTERLEAVE-bf16 activation-dtype routing above
+    # decides whether q_dtype_a stays bf16 (a16w4) or downgrades to fp8 (a8w4).
+    _is_a16w4 = (
+        quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Situv2
-        and gate_mode == GateMode.SEPARATED
-        and isShuffled
-        and isG1U1
-        and not doweight_stage1
-        and expert_mask is None
-        and bias1 is None
-        and bias2 is None
-        # the ported kernel bakes SiTUv2 beta/linear_beta at 1.0 (no per-call
-        # scale); non-default betas keep aiter's existing a16w4 kernel.
-        and beta in (None, 1.0)
-        and linear_beta in (None, 1.0)
-        and get_gfx() in ("gfx942", "gfx950")
-    ):
+    )
+    if _is_a16w4:
+        if get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available():
+            raise NotImplementedError(
+                "a16w4 (bf16 A x MXFP4 W) SiTUv2 requires the FlyDSL kernel on "
+                f"CDNA gfx942/gfx950; got gfx={get_gfx()!r}, "
+                f"flydsl_available={is_flydsl_available()}."
+            )
+        # The ported kernel bakes SiTUv2 beta/linear_beta at 1.0 and does not yet
+        # support per-expert bias or expert-parallel masking. The old (broken)
+        # kernel used to cover these; fail explicitly rather than route to a
+        # kernel known to be numerically wrong.
+        if beta not in (None, 1.0) or linear_beta not in (None, 1.0):
+            raise NotImplementedError(
+                "a16w4 SiTUv2 with non-default beta/linear_beta is not supported "
+                "by the ported FlyDSL kernel (beta/linear_beta are baked at 1.0)."
+            )
+        if bias1 is not None or bias2 is not None:
+            raise NotImplementedError(
+                "a16w4 SiTUv2 with per-expert bias is not supported by the ported "
+                "FlyDSL kernel."
+            )
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "a16w4 SiTUv2 with expert-parallel masking is not supported by the "
+                "ported FlyDSL kernel."
+            )
+        if not (isShuffled and isG1U1 and not doweight_stage1):
+            raise NotImplementedError(
+                "a16w4 SiTUv2 requires preshuffled g1u1 weights and "
+                "doweight_stage1=False."
+            )
+
         from aiter.ops.flydsl.moe_2stage_a16w4_dispatch import fused_moe_a16w4_flydsl
 
         _bm = block_size_M if block_size_M not in (None, -1) else None
@@ -2404,6 +2426,9 @@ def get_2stage_cfgs(
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
+    # NB: a16w4 (bf16 A x mxfp4 W) SiTUv2 is intercepted earlier in fused_moe_
+    # and served by the ported FlyDSL kernel, so it never reaches this metadata
+    # path; only quantized-activation (fp4/fp8) mxfp4/mxfp8 route here.
     use_mxfp4_flydsl = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
@@ -2412,18 +2437,8 @@ def get_2stage_cfgs(
             or _flydsl_force
         )
         and (
-            (
-                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
-            )
-            or (
-                # a16w4 bf16/fp16 x mxfp4: routed to the mixed_moe a16w4 kernel
-                # ONLY for SiTUv2. Situv2 uniquely identifies this path, so
-                # GPT-OSS / legacy bf16-Swiglu keep their CK-Tile routing.
-                q_dtype_a in (dtypes.bf16, dtypes.fp16)
-                and q_dtype_w == dtypes.fp4x2
-                and activation == ActivationType.Situv2
-            )
+            q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+            and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
         )
         and is_shuffled
         and use_g1u1
@@ -2439,17 +2454,12 @@ def get_2stage_cfgs(
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype routing:
-        #   "fp4"         => a4w4 fp4/fp4
-        #   "fp8"         => a8w4 fp8/fp4 (or a8w8 with w=fp8)
-        #   "bf16"/"fp16" => a16w4 bf16/fp16 x mxfp4 (SiTUv2 only; no act scale)
+        #   "fp4" => a4w4 fp4/fp4
+        #   "fp8" => a8w4 fp8/fp4 (or a8w8 with w=fp8)
         if q_dtype_a == dtypes.fp4x2:
             _a_type = "fp4"
-        elif q_dtype_a == dtypes.fp8:
-            _a_type = "fp8"
-        elif q_dtype_a == dtypes.bf16:
-            _a_type = "bf16"
         else:
-            _a_type = "fp16"
+            _a_type = "fp8"
         # w-dtype "fp4" => mxfp4 weight; "fp8" => mxfp8 weight (a8w8).
         _w_type = "fp8" if q_dtype_w == dtypes.fp8 else "fp4"
         _s2_tk = pick_flydsl_stage2_tile_k(inter_dim)
