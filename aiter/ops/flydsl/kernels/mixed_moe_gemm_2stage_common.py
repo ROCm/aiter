@@ -3413,7 +3413,6 @@ def compile_mixed_moe_gemm2_common(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
-    del b_nt
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
         raise ValueError(
@@ -4187,6 +4186,7 @@ def compile_mixed_moe_gemm2_common(
                             vec_elems=vec_elems,
                             elem_bytes=b_elem_bytes,
                             offset_in_bytes=(b_elem_bytes == 1),
+                            cache_modifier=b_nt,
                         )
                         b_i64x2 = vector.bitcast(vec2_i64, b16)
                         return (
