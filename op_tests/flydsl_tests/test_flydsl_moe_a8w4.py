@@ -238,6 +238,73 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
 
 
+def _stage2_nt_load_count(dump_root):
+    """Count stage2 weight loads that carry the non-temporal modifier."""
+    isa = [
+        p
+        for p in dump_root.rglob("21_final_isa.s")
+        if p.parent.name.startswith("mfma_moe2_")
+    ]
+    assert len(isa) == 1, f"expected one stage2 ISA dump under {dump_root}, got {isa}"
+    return sum(
+        1
+        for line in isa[0].read_text().splitlines()
+        if line.strip().startswith("buffer_load") and line.split()[-1] == "nt"
+    )
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_a8w4_b_nt_reaches_w2_load(tmp_path, monkeypatch):
+    """b_nt must reach the emitted w2 load rather than be accepted and dropped.
+
+    The `_bnt{N}` suffix the stage2 registry generates is only meaningful if the
+    parameter survives into the load, and nt is a cache hint that changes no
+    arithmetic, so numerics cannot witness it. Assert on the ISA instead.
+    """
+    from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, model_dim, inter_dim, E, topk, block_m = 16, 512, 256, 8, 2, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=103
+    )
+
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    counts = {}
+    for b_nt in (0, 2):
+        monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path / f"bnt{b_nt}"))
+        # Force a fresh build so the dump reflects this b_nt and not a cache hit.
+        compile_mixed_moe_gemm2.cache_clear()
+        out = flydsl_moe_stage2(
+            inter_states=data["a2_q"],
+            w2=data["w2_shuf"],
+            sorted_token_ids=data["sorted_ids"],
+            sorted_expert_ids=data["sorted_expert_ids"],
+            num_valid_ids=data["num_valid_ids"],
+            topk=topk,
+            tile_m=32,
+            tile_n=256,
+            tile_k=256,
+            a_dtype="fp8",
+            b_dtype="fp4",
+            out_dtype="bf16",
+            mode="atomic",
+            w2_scale=data["w2_scale_shuf"],
+            a2_scale=data["a2_scale_sort"],
+            sorted_weights=data["sorted_weights"],
+            inter_dim_pad=data["inter_pad"],
+            model_dim_pad=0,
+            b_nt=b_nt,
+        )
+        torch.cuda.synchronize()
+        _check_close(data["ref_stage2"], out, f"stage2_a8w4_b_nt{b_nt}")
+        counts[b_nt] = _stage2_nt_load_count(tmp_path / f"bnt{b_nt}")
+    compile_mixed_moe_gemm2.cache_clear()
+
+    assert counts[0] == 0, f"b_nt=0 emitted {counts[0]} non-temporal loads"
+    assert counts[2] > 0, "b_nt=2 was accepted but no emitted load carries nt"
+
+
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):
