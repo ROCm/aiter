@@ -4,12 +4,12 @@
 
 import functools
 
-import mori.ir.flydsl as mori_shmem
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+import mori.ir.flydsl as mori_shmem
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import T, Vector as Vec
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from .. import communication_ops_utils as comm_ops
@@ -67,7 +67,7 @@ def _validate_dispatch_capacity(
 
 
 # fmt: off
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fixed_slot_dispatch: bool, sort_block_m: int = 32,
@@ -264,7 +264,7 @@ def compile_mega_moe_stage1(
         payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
         payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
 
-        if compact_owner:
+        if compact_owner:  # noqa: SIM102 - keep the device and compile-time branches separate.
             if const_expr(not direct_fixed_slot):
                 emit_dispatch_plan(
                     num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr,
@@ -387,7 +387,7 @@ def compile_mega_moe_stage1(
             work = Vec(work_scratch_view.load())[0]
             if tid == fx.Int32(0):
                 has_work = (work < total_work).select(fx.Int32(1), fx.Int32(0))
-                if has_work != fx.Int32(0):
+                if has_work != fx.Int32(0):  # noqa: SIM102 - keep the device and compile-time branches separate.
                     if const_expr(not direct_fixed_slot):
                         _wait_tile_payload(work)
                 fx.ptr_store(Vec.from_elements([has_work], fx.Int32), work_scratch)
