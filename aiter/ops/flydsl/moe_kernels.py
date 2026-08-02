@@ -492,7 +492,12 @@ def compile_flydsl_moe_stage1(
     # guinterleave W1+scale layout directly (w_layout="guinterleave"), replacing the
     # former (broken) compile_mixed_moe_gemm1_a16w4. Launched via run_flydsl_a16w4_moe.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        from .kernels.moe_2stage_a16wmix.gemm1 import compile_gemm1_a16w4_port
+        from flydsl.runtime.device import get_rocm_arch
+
+        from .kernels.moe_2stage_a16wmix.gemm1 import (
+            a16wmix_use_k16,
+            compile_gemm1_a16w4_port,
+        )
 
         return compile_gemm1_a16w4_port(
             BM=tile_m,
@@ -509,6 +514,7 @@ def compile_flydsl_moe_stage1(
             w_dtype="mxfp4",
             w_layout="guinterleave",
             k_wave=k_wave,
+            use_k16=a16wmix_use_k16(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -600,6 +606,9 @@ def compile_flydsl_moe_stage2(
     # shuffle_weight/e8m0_shuffle layout (E*model_dim % 256 == 0), so no layout mode
     # is needed. Launched via run_flydsl_a16w4_moe.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+        from flydsl.runtime.device import get_rocm_arch
+
+        from .kernels.moe_2stage_a16wmix.gemm1 import a16wmix_use_k16
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
 
         return compile_gemm2_a16w4_port(
@@ -613,6 +622,7 @@ def compile_flydsl_moe_stage2(
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype="mxfp4",
+            use_k16=a16wmix_use_k16(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "mxfp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2

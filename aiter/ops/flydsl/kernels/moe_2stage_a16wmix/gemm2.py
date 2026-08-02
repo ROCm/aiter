@@ -8,7 +8,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 
@@ -28,7 +27,6 @@ from .gemm1 import (
     _raw,
     _udiv,
     _umod,
-    a16wmix_use_k16,
     kmchunks_for,
     lds_acc_bytes_for,
 )
@@ -596,6 +594,7 @@ def compile_gemm2_a16w4_port(
     waves_per_eu=None,
     w_dtype="mxfp4",
     persist=False,
+    use_k16,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -611,8 +610,8 @@ def compile_gemm2_a16w4_port(
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
-    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
-    _use_k16 = a16wmix_use_k16(get_rocm_arch())
+    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in.
+    _use_k16 = use_k16
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert (

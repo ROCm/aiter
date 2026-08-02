@@ -8,7 +8,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
@@ -884,6 +883,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="mxfp4",
     w_layout="standard",
     k_wave=1,
+    use_k16,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -952,9 +952,9 @@ def compile_gemm1_a16w4_port(
         "silu",
         "situv2",
     ), f"a16w4 gemm1 act must be 'silu' or 'situv2', got {act!r}"
-    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); not in name_suffix (ARCH is already in
-    # the JIT cache key).
-    _use_k16 = a16wmix_use_k16(get_rocm_arch())
+    # Arch-gate K=16 (gfx942) vs K=32 (gfx950); resolved by the caller and passed in
+    # (not in name_suffix -- ARCH is already in the JIT cache key).
+    _use_k16 = use_k16
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
