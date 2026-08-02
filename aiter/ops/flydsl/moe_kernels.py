@@ -718,14 +718,20 @@ def run_flydsl_a16w4_moe(
     w1_scale_1d = w1_scale.view(torch.uint8).contiguous().view(-1)
     w2_scale_1d = w2_scale.view(torch.uint8).contiguous().view(-1)
 
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+    # moe_sorting returns moe_buf [tokens, model_dim], already zero-inited on-device
+    # by the sort (accumulate=True); reuse it as the gemm2 atomic-scatter target
+    # instead of a separate zeroed output (matches the a8w4/mxfp4 sibling path).
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids, topk_weight, E, model_dim, dtype, BM
     )
     sorted_size = int(sorted_expert_ids.shape[0]) * BM
     cumsum = num_valid_ids.to(torch.int32).contiguous()
     m_indices = sorted_ids.to(torch.int32).contiguous()
     x_bf16 = hidden_states.to(torch.bfloat16).contiguous()
-    inter_sorted = torch.zeros(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
+    # gemm1 writes only valid sorted rows (masked store, num_records=cumsum) and gemm2
+    # gates every scatter on token_id < M, so intermediate padding never reaches the
+    # output -- no pre-zeroing needed.
+    inter_sorted = torch.empty(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
 
     def g1():
         # gemm1 keeps the kernel's tuned default (tile_n=None); CSV tiles regress here.
@@ -748,7 +754,7 @@ def run_flydsl_a16w4_moe(
             w_layout="guinterleave",
         )
 
-    out_buf = torch.zeros(tokens * model_dim, dtype=torch.bfloat16, device=dev)
+    out_buf = moe_buf.view(-1)  # sort-zeroed atomic-scatter target
 
     # gemm2 uses aiter's tuned CSV tiles (on-par-to-faster); None -> kernel default.
     g2c = (
@@ -769,7 +775,6 @@ def run_flydsl_a16w4_moe(
         g2_tile_k = 128 if inter_dim % 128 == 0 else 64
 
     def g2():
-        out_buf.zero_()  # atomic scatter accumulates; zero before each launch
         flydsl_a16w4_gemm2(
             inter_sorted_bf16=inter_sorted,
             w2_u8=w2_shuf,
@@ -793,10 +798,9 @@ def run_flydsl_a16w4_moe(
             xcd_swizzle=g2c.get("xcd_swizzle", 1),
         )
 
+    # Same stream: g2 reads inter_sorted after g1 writes it; no host sync needed.
     g1()
-    torch.cuda.synchronize()
     g2()
-    torch.cuda.synchronize()
     out = out_buf.view(tokens, model_dim)
 
     if kernel_bench_callable is not None:
