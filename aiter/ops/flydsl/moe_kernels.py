@@ -939,7 +939,7 @@ def _run_moe_reduction(
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         return
 
-    from .kernels.moe_gemm_2stage import compile_moe_reduction
+    from .kernels.moe_reduce import compile_moe_reduction
 
     reduce_exe = compile_moe_reduction(
         topk=topk,
