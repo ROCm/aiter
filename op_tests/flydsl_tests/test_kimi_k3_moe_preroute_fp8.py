@@ -180,9 +180,13 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
     assert _relative_rmse(tri_gate_up, gate_up_ref) < 0.035
     router_ref = F.linear(hidden, router_bf16).float()
     assert _relative_rmse(router_logits, router_ref) < 0.01
+    router_topk = router_logits.topk(17, dim=-1)
+    reference_topk = router_ref.topk(17, dim=-1)
+    assert reference_topk.values[0, 15] > reference_topk.values[0, 16]
+    # torch.topk does not define the order of equal values within the result.
     torch.testing.assert_close(
-        router_logits.topk(16, dim=-1).indices,
-        router_ref.topk(16, dim=-1).indices,
+        router_topk.indices[:, :16].sort(dim=-1).values,
+        reference_topk.indices[:, :16].sort(dim=-1).values,
         atol=0,
         rtol=0,
     )
