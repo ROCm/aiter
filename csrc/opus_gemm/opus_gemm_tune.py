@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, ClassVar
 
 import pandas as pd
 import torch
@@ -551,10 +552,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if N % 16 != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
 
     if k_inst.kernel_tag in ("a16w16_wave_k_coop", "a16w16_wave_k_coop_accum"):
         waves_per_wg = k_inst.BLOCK_SIZE // 64
@@ -572,9 +573,10 @@ def kid_rejects_shape(k_inst, M, N, K):
     if k_inst.kernel_tag == "a16w16_flatmm_splitk":
         if loops < _flatmm_splitk_pfk(k_inst):
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
+        if not k_inst.has_oob and (
+            M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0
+        ):
+            return True
         # Workspace + reduce buffer-resource size limit.
         padded_M = _ceil_div(M, k_inst.B_M) * k_inst.B_M
         padded_N = _ceil_div(N, k_inst.B_N) * k_inst.B_N
@@ -652,12 +654,6 @@ def kid_rejects_shape(k_inst, M, N, K):
         # cwn>1) GPU-hang at runtime and no barrier-sync variant fixes it. Reject
         # here too so an explicit-id / heuristic path can never launch a hanging kid.
         # Override with OPUS_ALLOW_2D=1 for isolated root-cause probing only.
-        if (
-            k_inst.cluster_wg_m > 1
-            and k_inst.cluster_wg_n > 1
-            and os.environ.get("OPUS_ALLOW_2D") != "1"
-        ):
-            return True
         # NOTE: large output tiles (B_M*B_N >= 16384, e.g. 128x128 / 64x256) used
         # to fault at runtime, but the root cause was a clang<=22 (HIP<=7.2)
         # codegen bug in the bounded-buffer C-store address lowering (it sank the
@@ -665,7 +661,11 @@ def kid_rejects_shape(k_inst, M, N, K):
         # bits). That is now worked around in opus.hpp::gmem::_store (inline-asm
         # voffset barrier, auto-gated to __clang_major__<=22), so large clusterlaunch
         # tiles are safe to tune again. No tile-area cap here.
-        return False
+        return (
+            k_inst.cluster_wg_m > 1
+            and k_inst.cluster_wg_n > 1
+            and os.environ.get("OPUS_ALLOW_2D") != "1"
+        )
 
     # kbuf2v_sk and quad_mfma32 splitK families require loops_per_split
     # (both full and last) even AND >=2.
@@ -705,10 +705,10 @@ def kid_rejects_shape(k_inst, M, N, K):
             return True
         if num_tiles_m % split_m != 0:
             return True
-        if not k_inst.has_oob:
-            if M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0:
-                return True
-        return False
+        return bool(
+            not k_inst.has_oob
+            and (M % k_inst.B_M != 0 or N % k_inst.B_N != 0 or K % k_inst.B_K != 0)
+        )
 
     if k_inst.kernel_tag == "a16w16_mono_tile":
         # mono_tile is divisible-only (has_oob=False is intrinsic; the
@@ -1445,7 +1445,7 @@ def _install_opus_perftest_once():
 
 
 class OpusGemmA16W16Tuner(GemmCommonTuner):
-    ARG_DEFAULTS = {  # noqa: RUF012
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **GemmCommonTuner.ARG_DEFAULTS,
         "tune_file": OPUS_DEBUG_TUNED_CSV,
         "untune_file": "aiter/configs/model_configs/gptoss_bf16_untuned_gemm.csv",
@@ -1456,7 +1456,7 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
     }
 
     # 17-column schema matching aiter/configs/model_configs/gptoss_bf16_tuned_gemm.csv exactly.
-    OUT_COLUMNS = [  # noqa: RUF012
+    OUT_COLUMNS: ClassVar[list[Any]] = [
         "cu_num",
         "M",
         "N",
@@ -1965,13 +1965,12 @@ class OpusGemmA16W16Tuner(GemmCommonTuner):
                 # shape-driven candidate set would have excluded them.
                 shape_cands = shape_cands | forced_kids
             opus_candidate_kids |= shape_cands
-        if opus_candidate_kids:
-            if _ensure_kids_compiled(opus_candidate_kids):
-                logger.info(
-                    f"opus_gemm_tune: expanded subset-compile sidecar to cover "
-                    f"{len(opus_candidate_kids)} candidate kids; "
-                    f"module_deepgemm_opus will rebuild on next call."
-                )
+        if opus_candidate_kids and _ensure_kids_compiled(opus_candidate_kids):
+            logger.info(
+                f"opus_gemm_tune: expanded subset-compile sidecar to cover "
+                f"{len(opus_candidate_kids)} candidate kids; "
+                f"module_deepgemm_opus will rebuild on next call."
+            )
 
         # mp_tuner.worker calls `run_perftest(func, *args, **kwargs)` with the func/kwargs we provide here.
         bench_func = run_opus_gemm_bench

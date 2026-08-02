@@ -394,25 +394,25 @@ class opus_gemm_codegen:
         # with register_emit("gfx1250", ...) calls + one import in this file.
         from codegen.common import dispatch_emit
 
-        emit_kwargs = dict(
-            pipeline_header=pipeline_header,
-            traits_header=traits_header,
-            kernel_func=kernel_func,
-            da=da,
-            db=db,
-            traits_name=traits_name,
-            kargs_name=kargs_name,
-            kargs_template_vars=_kargs_template_vars,
-            instance_impl_preamble=instance_impl_preamble,
-            instance_impl_host_tu_split=instance_impl_host_tu_split,
-            record_one_instantiation=_record_one_instantiation,
-            make_host_decl=_make_host_decl,
-            make_device_decl=_make_device_decl,
-            A16W16_TUNE_HOST_EXTRA=A16W16_TUNE_HOST_EXTRA,
-            A8W8_SCALE_HOST_EXTRA=A8W8_SCALE_HOST_EXTRA,
-            A16W16_TUNE_TAGS=A16W16_TUNE_TAGS,
-            BIAS_HOST_VALIDATE=self.BIAS_HOST_VALIDATE,
-        )
+        emit_kwargs = {
+            "pipeline_header": pipeline_header,
+            "traits_header": traits_header,
+            "kernel_func": kernel_func,
+            "da": da,
+            "db": db,
+            "traits_name": traits_name,
+            "kargs_name": kargs_name,
+            "kargs_template_vars": _kargs_template_vars,
+            "instance_impl_preamble": instance_impl_preamble,
+            "instance_impl_host_tu_split": instance_impl_host_tu_split,
+            "record_one_instantiation": _record_one_instantiation,
+            "make_host_decl": _make_host_decl,
+            "make_device_decl": _make_device_decl,
+            "A16W16_TUNE_HOST_EXTRA": A16W16_TUNE_HOST_EXTRA,
+            "A8W8_SCALE_HOST_EXTRA": A8W8_SCALE_HOST_EXTRA,
+            "A16W16_TUNE_TAGS": A16W16_TUNE_TAGS,
+            "BIAS_HOST_VALIDATE": self.BIAS_HOST_VALIDATE,
+        }
         dispatch_emit(self, k, **emit_kwargs)
 
     # Shared host-side bias validation + kargs population. Consumed by gfx950
@@ -1158,7 +1158,7 @@ if __name__ == "__main__":
     if os.path.exists(sidecar_path):
         try:
             with open(sidecar_path) as f:
-                sidecar_kids = set(int(x) for x in json.load(f))
+                sidecar_kids = {int(x) for x in json.load(f)}
         except (OSError, ValueError):
             sidecar_kids = set()
 
@@ -1210,8 +1210,9 @@ if __name__ == "__main__":
             "// Auto-generated. See gen_instances.py.\n"
             "#pragma once\n"
         )
-        for a in archs_for_header:
-            f.write(f"#define OPUS_BUILD_HAS_{a.upper()} 1\n")
+        f.writelines(
+            f"#define OPUS_BUILD_HAS_{a.upper()} 1\n" for a in archs_for_header
+        )
 
     # gfx950 a8w8 (kid 1, 2) is only needed when the module is built with
     # gfx950 support. gfx942 has its own blockscale bpreshuffle A8W8 tune path.
