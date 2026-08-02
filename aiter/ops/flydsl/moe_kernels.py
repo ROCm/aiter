@@ -1367,20 +1367,15 @@ def _flydsl_moe_stage1_impl(
     dev = a.device
     _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
     if _is_a16w4:
-        # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the ported FlyDSL
-        # gemm1 launcher (moe_2stage_a16wmix). Its ABI differs from the
-        # standard _s1_args_fp4 path: it consumes aiter's NATIVE guinterleave
-        # W1+scale layout directly (w_layout="guinterleave"), writes a bf16
-        # intermediate [sorted_size, inter_dim] by sorted position, and keeps
-        # gemm1 on the kernel's tuned tile heuristic (tile_n=None; CSV gemm1
-        # tiles regress). We ignore any caller-provided `out` and return our
-        # own sorted intermediate, which fused_moe_2stages threads to stage2
-        # unchanged (a2_scale=None, no reshape).
+        # a16w4 (bf16 A x MXFP4 W) SiTUv2: call the ported gemm1 launcher, which
+        # writes a bf16 sorted intermediate [sorted_size, inter_dim] (heuristic
+        # tiles, tile_n=None). fused_moe_2stages threads it to stage2 unchanged.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
         _act = "situv2" if act in ("situv2", "situ") else act
         sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
-        inter_sorted = torch.empty(
+        _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
+        inter_sorted = _alloc(
             sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
         )
         flydsl_a16w4_gemm1(
@@ -1829,13 +1824,10 @@ def _flydsl_moe_stage2_impl(
     """Run stage2 with injectable compiler and launch-argument builders."""
 
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        # a16w4 (bf16 A x MXFP4 W) down-proj via the ported FlyDSL gemm2
-        # launcher (moe_2stage_a16wmix). Consumes the bf16 [sorted_size,
-        # inter_dim] intermediate from stage1 (inter_states) and scatters the
-        # routing-weighted bf16 result into the caller's `out` (the
-        # moe_sorting-zeroed moe_buf) via atomic scatter -- no alloc/zeroing
-        # here. gemm2 tiles come from the tuned CSV (resolve_a16w4_gemm2_config);
-        # the port ABI differs from _s2_args_fp4.
+        # a16w4 (bf16 A x MXFP4 W) down-proj: call the ported gemm2 launcher, which
+        # consumes stage1's bf16 [sorted_size, inter_dim] intermediate and atomic-
+        # scatters the routing-weighted result into the caller's moe_sorting-zeroed
+        # `out` (no alloc/zeroing here). gemm2 tiles from the tuned CSV.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
             flydsl_a16w4_gemm2,
             resolve_a16w4_gemm2_config,

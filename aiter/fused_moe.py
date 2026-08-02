@@ -802,13 +802,11 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the STANDARD 2-stage FlyDSL
-    # path (get_2stage_cfgs -> fused_moe_2stages), which dispatches the ported
-    # gemm1/gemm2 launchers (moe_2stage_a16wmix) via the a_dtype=="bf16" branch
-    # in the stage impls. The q_dtype_a routing above already picks bf16 (a16w4)
-    # vs fp8 (a8w4); reaching this point with those dtypes implies a16w4. Guard
-    # here for the feature combinations the port genuinely cannot serve, so they
-    # fail loudly instead of silently mis-running.
+    # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the standard 2-stage path
+    # (get_2stage_cfgs -> fused_moe_2stages, a_dtype=="bf16" branch of the stage
+    # impls). Guard the feature combos the port can't serve so they fail loudly
+    # instead of silently mis-running (it bakes beta/linear_beta at 1.0 and has no
+    # per-expert bias / expert-parallel masking).
     _is_a16w4 = (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
@@ -816,34 +814,27 @@ def _fused_moe_impl(
         and activation == ActivationType.Situv2
     )
     if _is_a16w4:
-        if get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available():
-            raise NotImplementedError(
-                "a16w4 (bf16 A x MXFP4 W) SiTUv2 requires the FlyDSL kernel on "
-                f"CDNA gfx942/gfx950; got gfx={get_gfx()!r}, "
-                f"flydsl_available={is_flydsl_available()}."
-            )
-        # The port bakes beta/linear_beta at 1.0 and has no per-expert bias or
-        # expert-parallel masking.
-        if beta not in (None, 1.0) or linear_beta not in (None, 1.0):
-            raise NotImplementedError(
-                "a16w4 SiTUv2 with non-default beta/linear_beta is not supported "
-                "by the ported FlyDSL kernel (beta/linear_beta are baked at 1.0)."
-            )
-        if bias1 is not None or bias2 is not None:
-            raise NotImplementedError(
-                "a16w4 SiTUv2 with per-expert bias is not supported by the ported "
-                "FlyDSL kernel."
-            )
-        if expert_mask is not None:
-            raise NotImplementedError(
-                "a16w4 SiTUv2 with expert-parallel masking is not supported by the "
-                "ported FlyDSL kernel."
-            )
-        if not (isShuffled and isG1U1 and not doweight_stage1):
-            raise NotImplementedError(
-                "a16w4 SiTUv2 requires preshuffled g1u1 weights and "
-                "doweight_stage1=False."
-            )
+        for _bad, _why in (
+            (
+                get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
+                f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
+                f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})",
+            ),
+            (
+                beta not in (None, 1.0) or linear_beta not in (None, 1.0),
+                "non-default beta/linear_beta (baked at 1.0)",
+            ),
+            (bias1 is not None or bias2 is not None, "per-expert bias"),
+            (expert_mask is not None, "expert-parallel masking"),
+            (
+                not (isShuffled and isG1U1 and not doweight_stage1),
+                "non-preshuffled / non-g1u1 weights or doweight_stage1=True",
+            ),
+        ):
+            if _bad:
+                raise NotImplementedError(
+                    f"a16w4 (bf16 A x MXFP4 W) SiTUv2 is not supported: {_why}."
+                )
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
