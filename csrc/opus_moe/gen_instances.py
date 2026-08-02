@@ -459,6 +459,8 @@ def _stage1_cpp_shape(inst) -> str:
         inst.quant_group_blocks,
         inst.block_threads,
         inst.weight_load_stream,
+        inst.weight_load_reverse,
+        inst.sparse_epilogue,
         inst.k_loop_swizzle_colors,
         inst.route_affinity_window,
         inst.route_affinity_phase_period,

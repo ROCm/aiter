@@ -862,13 +862,10 @@ def _iter_csv_cases():
                 e,
             )
             continue
-        if (
-            kernel_name1.startswith("opus_moe1_")
-            and kwargs["actType"] == aiter.ActivationType.Situv2
-        ):
-            kwargs["beta"] = 2.0 if args.beta is None else float(args.beta)
+        if kwargs["actType"] == aiter.ActivationType.Situv2:
+            kwargs["beta"] = 4.0 if args.beta is None else float(args.beta)
             kwargs["linear_beta"] = (
-                1.5 if args.linear_beta is None else float(args.linear_beta)
+                25.0 if args.linear_beta is None else float(args.linear_beta)
             )
         # The reference path below uses the CSV q_dtype_a directly, while
         # fused_moe selects q_dtype_a from the current runtime mode. Skip CSV

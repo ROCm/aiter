@@ -1710,6 +1710,8 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        situ_beta=_TUNER_SITU_BETA,
+        situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1733,8 +1735,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:

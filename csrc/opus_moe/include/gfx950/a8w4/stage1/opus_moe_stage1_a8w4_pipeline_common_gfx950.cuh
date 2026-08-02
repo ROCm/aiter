@@ -358,7 +358,8 @@ __device__ __forceinline__ void load_b_kpair_stage1(
 {
     opus::static_for<Traits::B_ITEMS_PER_WAVE>([&](auto issue_id) {
         constexpr int flat_item =
-            Traits::WEIGHT_LOAD_STREAM ? issue_id.value :
+            Traits::WEIGHT_LOAD_STREAM && !Traits::WEIGHT_LOAD_REVERSE ?
+                issue_id.value :
                 Traits::B_ITEMS_PER_WAVE - 1 - issue_id.value;
         constexpr int local_group =
             flat_item / Traits::B_ITEMS_PER_GROUP;
@@ -495,19 +496,22 @@ __device__ __forceinline__ void reduce_single_group_kwave(
         const int wave_k = wave_id / Traits::KWAVE_BASE_WAVES;
         auto* smem_c = reinterpret_cast<CReg*>(smem_reduce);
 
-        opus::static_for<kAccItems>([&](auto item_id) {
-            constexpr int item = item_id.value;
-            constexpr int mi = item / Traits::ACC_SCALE_GROUPS_PER_TILE;
-            constexpr int acc_group =
-                item - mi * Traits::ACC_SCALE_GROUPS_PER_TILE;
-            const int store_idx =
-                (((wave_k * Traits::KWAVE_BASE_WAVES + base_wave) *
-                      kAccItems +
-                  item) *
-                     Traits::WAVE_SIZE +
-                 lane_id);
-            smem_c[store_idx] = rc[mi][acc_group];
-        });
+        if(wave_k != 0)
+        {
+            opus::static_for<kAccItems>([&](auto item_id) {
+                constexpr int item = item_id.value;
+                constexpr int mi = item / Traits::ACC_SCALE_GROUPS_PER_TILE;
+                constexpr int acc_group =
+                    item - mi * Traits::ACC_SCALE_GROUPS_PER_TILE;
+                const int store_idx =
+                    (((wave_k * Traits::KWAVE_BASE_WAVES + base_wave) *
+                          kAccItems +
+                      item) *
+                         Traits::WAVE_SIZE +
+                     lane_id);
+                smem_c[store_idx] = rc[mi][acc_group];
+            });
+        }
         opus::sync_threads();
 
         if(wave_k == 0)
@@ -517,11 +521,7 @@ __device__ __forceinline__ void reduce_single_group_kwave(
                 constexpr int mi = item / Traits::ACC_SCALE_GROUPS_PER_TILE;
                 constexpr int acc_group =
                     item - mi * Traits::ACC_SCALE_GROUPS_PER_TILE;
-                const int base_idx =
-                    ((base_wave * kAccItems + item) *
-                         Traits::WAVE_SIZE +
-                     lane_id);
-                CReg sum = smem_c[base_idx];
+                CReg sum = rc[mi][acc_group];
                 opus::static_for<Traits::K_WAVE - 1>([&](auto kw_id) {
                     constexpr int kw = kw_id.value + 1;
                     const int load_idx =
@@ -535,7 +535,8 @@ __device__ __forceinline__ void reduce_single_group_kwave(
                 rc[mi][acc_group] = sum;
             });
         }
-        opus::sync_threads();
+        if constexpr(!Traits::DEDICATED_EPILOGUE_SCRATCH)
+            opus::sync_threads();
     }
 }
 
@@ -556,6 +557,7 @@ __device__ __forceinline__ float tanh_stage1(float value)
     return value > 0.0f ? tanh_abs : -tanh_abs;
 }
 
+template<typename Traits>
 __device__ __forceinline__ float activation_mul_stage1(
     float gate_raw,
     float up_raw,
@@ -564,9 +566,25 @@ __device__ __forceinline__ float activation_mul_stage1(
     float situ_beta,
     float situ_linear_beta)
 {
-    const float gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
-    const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
-    const float linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
+    float gate = gate_raw;
+    float linear = up_raw;
+    if constexpr(Traits::SPARSE_EPILOGUE)
+    {
+        // SiTUv2 does not use the SwiGLU clamp. Decode normally passes an
+        // infinite limit, so skip its three redundant compare/select pairs.
+        if(activation != ActivationType::Situv2)
+        {
+            gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
+            const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
+            linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
+        }
+    }
+    else
+    {
+        gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
+        const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
+        linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
+    }
 
     if(activation == ActivationType::Swiglu)
     {
@@ -592,19 +610,31 @@ __device__ __forceinline__ float load_w1_bias_stage1(
         col];
 }
 
-template<typename Traits, typename Acc, typename CLayoutM, typename CLayoutN>
+template<typename Traits, int Mi, typename Acc, typename CLayoutM, typename CLayoutN>
 __device__ __forceinline__ void epilogue_store_group_to_smem(
     const OpusMoeStage1A8W4Kargs& kargs,
     float* __restrict__ smem_values,
     const Acc& gate_or_acc, const Acc& up,
     const CLayoutM& u_c_m,
     const CLayoutN& u_c_n,
-    const Tile& tile, int expert_id, int group, int row_pass_base)
+    const Tile& tile, int expert_id, int group,
+    int layout_row_offset, int row_pass_base,
+    const int* __restrict__ smem_route,
+    const bool* __restrict__ fragment_full)
 {
     opus::static_for<4>([&](auto ii_id) {
         constexpr int ii = ii_id.value;
         const int smem_row =
-            static_cast<int>(u_c_m(0, 0, ii, 0)) - row_pass_base;
+            static_cast<int>(u_c_m(0, 0, ii, 0)) - layout_row_offset;
+        if constexpr(Traits::SPARSE_EPILOGUE)
+        {
+            // MFMA still computes padded rows, but their activation values are
+            // never consumed by the quantizer. Full fragments retain the
+            // original straight-line path; sparse fragments skip them here.
+            if(!fragment_full[Mi] &&
+               smem_route[row_pass_base + smem_row] < 0)
+                return;
+        }
         const int local_col =
             tile.out_half * Traits::MMA_N +
             static_cast<int>(u_c_n(0, 0, ii, 0));
@@ -619,7 +649,7 @@ __device__ __forceinline__ void epilogue_store_group_to_smem(
             up_value += load_w1_bias_stage1(
                 kargs, expert_id, kargs.inter_dim + output_col);
         }
-        const float value = activation_mul_stage1(
+        const float value = activation_mul_stage1<Traits>(
             gate,
             up_value,
             kargs.activation,
@@ -646,7 +676,9 @@ __device__ __forceinline__ void epilogue_store_row_pass(
     const CLayoutN& u_c_n,
     const Tile& tile,
     int expert_id,
-    const bool (&fragment_active)[Traits::M_MFMA_PER_WAVE])
+    const int* __restrict__ smem_route,
+    const bool (&fragment_active)[Traits::M_MFMA_PER_WAVE],
+    const bool* __restrict__ fragment_full)
 {
     if constexpr(!Traits::GATE_UP_GROUP_SPLIT && Traits::K_WAVE > 1)
         if(tile.wave_id >= Traits::KWAVE_BASE_WAVES)
@@ -670,10 +702,12 @@ __device__ __forceinline__ void epilogue_store_row_pass(
             constexpr int local_group = local_group_id.value;
             const int group = Traits::GATE_UP_GROUP_SPLIT ?
                 tile.group_base + local_group : 0;
-            epilogue_store_group_to_smem<Traits, CAcc>(
+            epilogue_store_group_to_smem<Traits, mi, CAcc>(
                 kargs, smem_values, rc[mi][local_group],
                 rc[mi][local_group + kUpOffset], u_c_m, u_c_n,
-                tile, expert_id, group, kRowPassBase - mi * Traits::MMA_M);
+                tile, expert_id, group,
+                kRowPassBase - mi * Traits::MMA_M, kRowPassBase,
+                smem_route, fragment_full);
         });
     });
 }
@@ -799,7 +833,8 @@ inline __device__ void quant_epilogue(
              [Traits::ACC_SCALE_GROUPS_PER_TILE],
     const int* __restrict__ smem_route,
     float* __restrict__ smem_gate_up,
-    const bool (&fragment_active)[Traits::M_MFMA_PER_WAVE])
+    const bool (&fragment_active)[Traits::M_MFMA_PER_WAVE],
+    const bool* __restrict__ fragment_full)
 {
     opus::static_for<Traits::EPILOGUE_ROW_SPLIT>([&](auto row_pass_id) {
         constexpr int row_pass = row_pass_id.value;
@@ -807,7 +842,7 @@ inline __device__ void quant_epilogue(
             row_pass * Traits::EPILOGUE_ROWS_PER_PASS;
         epilogue_store_row_pass<Traits, row_pass, CAcc>(
             kargs, smem_gate_up, rc, u_c_m, u_c_n, tile, expert_id,
-            fragment_active);
+            smem_route, fragment_active, fragment_full);
         opus::sync_threads();
         epilogue_quantize_row_pass<Traits>(
             kargs, g_out, g_out_scale, tile, row_pass_base,

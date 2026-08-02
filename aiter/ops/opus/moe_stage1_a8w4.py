@@ -97,8 +97,8 @@ def opus_moe_stage1_a8w4_fwd(
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
     swiglu_limit: float | None = None,
-    situ_beta: float = 2.0,
-    situ_linear_beta: float = 1.5,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ) -> tuple[Tensor, Tensor]:
     block_m = int(block_m)
     kernelName = str(kernelName)

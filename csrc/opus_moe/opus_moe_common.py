@@ -67,6 +67,8 @@ class OpusA8W4Stage1Instance:
     quant_group_blocks: int = 1
     block_threads: int = 256
     weight_load_stream: bool = False
+    weight_load_reverse: bool = False
+    sparse_epilogue: bool = False
     k_loop_swizzle_colors: int = 0
     route_affinity_window: int = 0
     route_affinity_phase_period: int = 1
@@ -174,6 +176,8 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=256,
         gate_up_group_split=True,
         quant_group_blocks=2,
+        weight_load_stream=True,
+        weight_load_reverse=True,
     ),
     OpusA8W4Stage1Instance(
         kid=1013,
@@ -272,6 +276,18 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         quant_group_blocks=3,
         route_affinity_window=64,
         b_k1_lead=True,
+    ),
+    # Decode-oriented paired variant.  block_m=16 avoids forcing Stage2 to use
+    # a wider sorting tile when only a handful of routes are active.
+    OpusA8W4Stage1Instance(
+        kid=1022,
+        name="opus_moe1_afp8_wfp4_bf16_t16x384_pair_kw7_m1_stream",
+        block_m=16,
+        block_n=384,
+        k_wave=7,
+        min_blocks_per_cu_override=1,
+        weight_load_stream=True,
+        sparse_epilogue=True,
     ),
 )
 

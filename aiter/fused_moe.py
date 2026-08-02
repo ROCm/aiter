@@ -1290,8 +1290,8 @@ def _opus_a8w4_stage1_wrapper(
     sorted_weights=None,
     bias1=None,
     swiglu_limit: float | None = None,
-    situ_beta: float = 2.0,
-    situ_linear_beta: float = 1.5,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     inter_dim_pad: int = 0,
     **_kwargs,
 ):
@@ -2874,9 +2874,9 @@ def fused_moe_2stages(
             1.0 if linear_beta is None else float(linear_beta)
         )
     elif stage1_func is _opus_a8w4_stage1_wrapper:
-        extra_stage1_args["situ_beta"] = 2.0 if beta is None else float(beta)
+        extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
-            1.5 if linear_beta is None else float(linear_beta)
+            25.0 if linear_beta is None else float(linear_beta)
         )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
@@ -3186,8 +3186,8 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float | None = 7.0):
 def situv2(
     gate: torch.Tensor,
     up: torch.Tensor,
-    beta: float = 2.0,
-    linear_beta: float = 1.5,
+    beta: float = 4.0,
+    linear_beta: float = 25.0,
 ) -> torch.Tensor:
     situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
     up_scaled = linear_beta * torch.tanh(up / linear_beta)
@@ -3209,8 +3209,8 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
     swiglu_limit=None,
-    situ_beta: float = 2.0,
-    situ_linear_beta: float = 1.5,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type

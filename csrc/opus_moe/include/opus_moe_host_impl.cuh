@@ -93,6 +93,30 @@ unsigned int checked_u32_extent_bytes(const aiter_tensor_t& t, const char* name)
     return static_cast<unsigned int>(extent.bytes);
 }
 
+int active_sorted_block_upper_bound(const aiter_tensor_t& sorted_expert_ids,
+                                    int token_num,
+                                    int topk)
+{
+    AITER_CHECK(token_num >= 0 && topk > 0,
+                "invalid route shape: token_num=",
+                token_num,
+                " topk=",
+                topk);
+    // Opus sorting compacts non-empty expert blocks at the front of
+    // sorted_expert_ids. Every non-empty block owns at least one route, so the
+    // number of blocks that downstream kernels can consume is bounded by the
+    // number of input routes. Avoid launching the allocation tail reserved for
+    // worst-case expert padding, which is especially large for decode shapes.
+    const int64_t route_count = static_cast<int64_t>(token_num) * topk;
+    const int64_t metadata_capacity = sorted_expert_ids.size(0);
+    const int64_t launch_blocks =
+        route_count < metadata_capacity ? route_count : metadata_capacity;
+    AITER_CHECK(launch_blocks <= std::numeric_limits<int>::max(),
+                "sorted route block count exceeds int range: ",
+                launch_blocks);
+    return static_cast<int>(launch_blocks);
+}
+
 void check_tensor(const aiter_tensor_t& t,
                   const char* name,
                   int expected_dim,
@@ -355,7 +379,8 @@ void opus_moe_stage2_route_reduce_fwd(aiter_tensor_t& inter_states,
     HipDeviceGuard guard(inter_states.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
+    const int sorted_blocks =
+        active_sorted_block_upper_bound(sorted_expert_ids, token_num, actual_topk);
     auto launcher = opus_moe_stage2_bf16_tune_dispatch(selected_kernel_id);
     launcher(decode_kargs, sorted_blocks, stream);
     HIP_CALL_LAUNCH(hipGetLastError());
@@ -416,7 +441,8 @@ void opus_moe_stage2_a8w4_decode_fwd(
     const int num_experts = static_cast<int>(w2.size(0));
     const int model_dim = static_cast<int>(w2.size(1));
     const int packed_inter_dim = static_cast<int>(w2.size(2));
-    const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
+    const int sorted_blocks =
+        active_sorted_block_upper_bound(sorted_expert_ids, token_num, actual_topk);
     const int packed_k_tile_width =
         opus_moe::kStage2A8W4DecodeBKLogical /
         opus_moe::kStage2A8W4DecodeFp4ValuesPerByte;
@@ -666,7 +692,8 @@ void opus_moe_stage1_a8w4_fwd(
     const int packed_model_dim = static_cast<int>(w1.size(2));
     const int topk = static_cast<int>(out.size(1));
     const int inter_dim = static_cast<int>(out.size(2));
-    const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
+    const int sorted_blocks =
+        active_sorted_block_upper_bound(sorted_expert_ids, token_num, topk);
     const int effective_inter_dim = inter_dim - inter_dim_pad;
     const int kernel_id = opus_moe::stage1_a8w4_kid_from_name(kernelName.c_str());
     const ActivationType activation_type = static_cast<ActivationType>(activation);
@@ -676,11 +703,19 @@ void opus_moe_stage1_a8w4_fwd(
                 "Opus A8W4 stage1 activation must be Silu (0), Swiglu (2), or "
                 "Situv2 (3), got ",
                 activation);
-    AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     if(activation_type == ActivationType::Situv2)
     {
+        // Situv2 must not be SwiGLU-clamped; the non-sparse stage1 kernel clamps
+        // every activation, so pass +inf (no-op) if a stray non-positive limit
+        // reaches this path from warmup (Python passes +inf).
+        if(!(swiglu_limit > 0.0f))
+            swiglu_limit = std::numeric_limits<float>::infinity();
         AITER_CHECK(situ_beta > 0.0f, "situ_beta must be positive");
         AITER_CHECK(situ_linear_beta > 0.0f, "situ_linear_beta must be positive");
+    }
+    else
+    {
+        AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     }
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",

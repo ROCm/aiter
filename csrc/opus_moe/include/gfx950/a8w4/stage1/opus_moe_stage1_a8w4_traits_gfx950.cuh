@@ -79,6 +79,8 @@ struct OpusMoeStage1A8W4Shape
     static constexpr int K_WAVE = Policy::K_WAVE;
     static constexpr bool GATE_UP_GROUP_SPLIT = Policy::GATE_UP_GROUP_SPLIT;
     static constexpr bool WEIGHT_LOAD_STREAM = Policy::WEIGHT_LOAD_STREAM;
+    static constexpr bool WEIGHT_LOAD_REVERSE = Policy::WEIGHT_LOAD_REVERSE;
+    static constexpr bool SPARSE_EPILOGUE = Policy::SPARSE_EPILOGUE;
     static constexpr int K_LOOP_SWIZZLE_COLORS = Policy::K_LOOP_SWIZZLE_COLORS;
     static constexpr int ROUTE_AFFINITY_WINDOW = Policy::ROUTE_AFFINITY_WINDOW;
     static constexpr int ROUTE_AFFINITY_PHASE_PERIOD =
@@ -131,7 +133,7 @@ struct OpusMoeStage1A8W4Shape
             2 * SCALE_K_PACK * A_REG_LDS_STAGE_BYTES :
             KWAVE_REDUCE_BYTES;
     static constexpr bool DEDICATED_EPILOGUE_SCRATCH =
-        GATE_UP_GROUP_SPLIT &&
+        (GATE_UP_GROUP_SPLIT || K_WAVE > 1) &&
         MAINLOOP_SCRATCH_BYTES + EPILOGUE_SMEM_BYTES <=
             kDedicatedEpilogueScratchLdsLimit;
     static constexpr int EPILOGUE_SCRATCH_OFFSET =
@@ -162,6 +164,8 @@ struct OpusMoeStage1A8W4Shape
     static_assert(SHARED_SCRATCH_BYTES <= kGfx950LdsBytes);
     static_assert(GATE_UP_GROUP_SPLIT || M_MFMA_PER_WAVE <= 2);
     static_assert(ROUTE_AFFINITY_PHASE_PERIOD >= 1);
+    static_assert(!WEIGHT_LOAD_REVERSE || WEIGHT_LOAD_STREAM);
+    static_assert(!SPARSE_EPILOGUE || B_M <= WAVE_SIZE);
 };
 
 template<bool GateUpGroupSplit = false,
@@ -170,6 +174,8 @@ template<bool GateUpGroupSplit = false,
          int QuantGroupBlocks = 1,
          int BlockThreads = kDefaultCtaThreads,
          bool WeightLoadStream = false,
+         bool WeightLoadReverse = false,
+         bool SparseEpilogue = false,
          int KLoopSwizzleColors = 0,
          int RouteAffinityWindow = 0,
          int RouteAffinityPhasePeriod = 1,
@@ -183,6 +189,8 @@ struct OpusMoeStage1A8W4Policy
     static constexpr int QUANT_GROUP_BLOCKS = QuantGroupBlocks;
     static constexpr int BLOCK_THREADS = BlockThreads;
     static constexpr bool WEIGHT_LOAD_STREAM = WeightLoadStream;
+    static constexpr bool WEIGHT_LOAD_REVERSE = WeightLoadReverse;
+    static constexpr bool SPARSE_EPILOGUE = SparseEpilogue;
     static constexpr int K_LOOP_SWIZZLE_COLORS = KLoopSwizzleColors;
     static constexpr int ROUTE_AFFINITY_WINDOW = RouteAffinityWindow;
     static constexpr int ROUTE_AFFINITY_PHASE_PERIOD =
