@@ -53,7 +53,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.device_info import get_num_xcds
+from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 
 # fmt: off
 @gluon.jit
@@ -954,16 +954,22 @@ def mla_gluon(
                 1, min(256 // (batch_size * qlen * NUM_M_BLOCKS), min_kv_seq_len)
             )
         else:  # bh16bn64
-            # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
-            # but never split a sequence into more blocks than it has: bound by the
-            # shortest seq's block count so every split holds >= 1 block (no wasted
-            # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
-            # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
+            # Split to fill one wave (total WGs = batch * NUM_KV_SPLITS *
+            # NUM_M_BLOCKS * qlen, ~one per CU), while keeping at least one BLOCK_N
+            # block of KV per split. Per-request context is the page table's
+            # allocated width, host-known and shape-stable, so the constexpr is
+            # identical at HIP-graph capture time and on every replay.
+            if use_2d_view:
+                pt_tokens_per_req = int(page_table.shape[-1])
+            else:
+                pt_tokens_per_req = max(
+                    1, int(page_table.numel()) // max(1, batch_size)
+                )
             NUM_KV_SPLITS = max(
                 1,
                 min(
-                    256 // (batch_size * qlen * NUM_M_BLOCKS),
-                    triton.cdiv(min_kv_seq_len, BLOCK_N),
+                    get_num_sms() // max(1, batch_size * qlen * NUM_M_BLOCKS),
+                    triton.cdiv(pt_tokens_per_req, BLOCK_N),
                 ),
             )
         assert (
