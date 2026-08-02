@@ -249,10 +249,10 @@ def pa_mqa_logits_mxfp8_decode(
 
 
 __all__ = [
-    "pa_mqa_logits_mxfp8_fwd_prefill",
-    "pa_mqa_logits_mxfp8_fwd_decode",
-    "pa_mqa_logits_mxfp8_prefill",
-    "pa_mqa_logits_mxfp8_decode",
-    "pa_mqa_logits_mxfp8_prefill_windows",
     "compute_prefill_windows",
+    "pa_mqa_logits_mxfp8_decode",
+    "pa_mqa_logits_mxfp8_fwd_decode",
+    "pa_mqa_logits_mxfp8_fwd_prefill",
+    "pa_mqa_logits_mxfp8_prefill",
+    "pa_mqa_logits_mxfp8_prefill_windows",
 ]

@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -505,7 +504,7 @@ def test_prefill(bs):
     ctxs = list(qlens)
     total_q = sum(qlens)
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, _t_max, max_seq_len = (
         build_paged_kv(bs, max(ctxs), KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed)
     )
     cu = torch.tensor(
@@ -581,7 +580,6 @@ def test_prefill(bs):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
 
-    del out, kv_bf16, kv_dq, kv_cache, kv_scale, q_bf16, q_fp8, q_dq
     torch.cuda.empty_cache()
     return ret
 
@@ -694,7 +692,6 @@ def test_decode(batch, max_ctx, next_n):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
 
-    del out, kv_bf16, kv_dq, kv_cache, kv_scale, q_bf16, q_fp8, q_dq
     torch.cuda.empty_cache()
     return ret
 
@@ -709,7 +706,7 @@ def _check_prefill_case(bs, windows_per_batch, seed):
     max_end = max(
         (w if isinstance(w, int) else w[1]) for ws in windows_per_batch for w in ws
     )
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+    _kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, _t_max, max_seq_len = (
         build_paged_kv(bs, max_end, KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed)
     )
     rb, ls, le = [], [], []
@@ -720,7 +717,7 @@ def _check_prefill_case(bs, windows_per_batch, seed):
             ls.append(s)
             le.append(e)
     total = len(rb)
-    q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total)
+    _q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total)
 
     ref = ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, WEIGHT_SCALE)
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_prefill
@@ -762,7 +759,7 @@ def _check_prefill_case(bs, windows_per_batch, seed):
 def _check_varqlen_case(bs, qlens, context_lens, seed):
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_decode
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+    _kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, _t_max, max_seq_len = (
         build_paged_kv(bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed)
     )
     cu = [0]
@@ -779,7 +776,7 @@ def _check_varqlen_case(bs, qlens, context_lens, seed):
             rb.append(b)
             ls.append(0)
             le.append(max(int(context_lens[b]) - (ql - 1 - n), 0))
-    q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total_q)
+    _q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total_q)
     ref = ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, WEIGHT_SCALE)
 
     out = pa_mqa_logits_mxfp8_decode(
@@ -820,7 +817,7 @@ def _check_fixed_mtp_case(bs, next_n, context_lens, seed):
     built in-kernel). Windows are tail-causal: row (b, n) -> [0, ctx_b-(next_n-1-n))."""
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_decode
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+    _kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, _t_max, max_seq_len = (
         build_paged_kv(bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed)
     )
     total_q = bs * next_n
@@ -832,7 +829,7 @@ def _check_fixed_mtp_case(bs, next_n, context_lens, seed):
             rb.append(b)
             ls.append(0)
             le.append(max(int(context_lens[b]) - (next_n - 1 - n), 0))
-    q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total_q)
+    _q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total_q)
     ref = ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, WEIGHT_SCALE)
 
     out = pa_mqa_logits_mxfp8_decode(  # cu_seq_q omitted -> fixed-MTP (uniform) path
@@ -882,7 +879,7 @@ def run_corner_correctness():
     # non-4-aligned local_start (guards the out-store alignment fix): 1-token + spanning.
     rc |= _check_prefill_case(2, [[(0, 1), (17, 33)], [(63, 65), (255, 257)]], 34)
     # exhaustive start sweep: every local_start in [0, 130) with a fixed 40-wide window.
-    rc |= _check_prefill_case(1, [[(s, s + 40) for s in range(0, 130)]], 52)
+    rc |= _check_prefill_case(1, [[(s, s + 40) for s in range(130)]], 52)
     rc |= _check_prefill_case(
         2, [[(0, 0), (0, 200)], [(100, 100), (0, 128)]], 40
     )  # zero-len mix
