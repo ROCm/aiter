@@ -91,7 +91,10 @@ from aiter.utility.mx_types import (
 
 # Shared FP8 group_fp8 (V4 nm-asm) scatter emitter (single source of truth across
 # the CSA single-kernel + HCA 2-kernel paths). See fused_compress_attn_common.
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    emit_group_fp8_nm_asm_scatter,
+    state_slot_byte_offset,
+)
 from .quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
 from .tensor_shim import _run_compiled, _to_raw
 
@@ -512,9 +515,22 @@ def _build_kernel(
             # Buffer resources reused across K iters.
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # State descriptors are rebased onto THIS program's slot. A buffer
+            # offset is a 32-bit byte offset, so one descriptor can only reach
+            # 4 GiB from its base; a state tensor whose slot stride is a
+            # per-request arena entry (rather than the field's own size) spans
+            # far more than that across all slots. Folding the slot term into
+            # the base — 64-bit pointer arithmetic, done once per program —
+            # leaves the offset covering a single entry.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -561,15 +577,14 @@ def _build_kernel(
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
 
+                # Slot term already folded into the descriptor base.
                 base_kv_off = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
                 base_sc_off = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + tid_x_vec
                 )
@@ -1622,9 +1637,16 @@ def _build_kernel_ksplit(
 
             kv_in_rsrc = buffer_ops.create_buffer_resource(kv_in, max_size=True)
             score_in_rsrc = buffer_ops.create_buffer_resource(score_in, max_size=True)
-            kv_state_rsrc = buffer_ops.create_buffer_resource(kv_state, max_size=True)
+            # Rebased onto this program's slot — see `state_slot_byte_offset`.
+            kv_state_rsrc = buffer_ops.create_buffer_resource(
+                kv_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, kv_state_slot_stride),
+            )
             score_state_rsrc = buffer_ops.create_buffer_resource(
-                score_state, max_size=True
+                score_state,
+                max_size=True,
+                base_byte_offset=state_slot_byte_offset(slot, score_state_slot_stride),
             )
             ape_rsrc = buffer_ops.create_buffer_resource(ape, max_size=True)
 
@@ -1725,15 +1747,14 @@ def _build_kernel_ksplit(
                 s_safe = arith.select(is_pad, c_zero_i32, s)
                 ring = arith.remui(s_safe, c_state_size)
                 col_off = _col_off_for_k(k_i32)
+                # Slot term already folded into the descriptor base.
                 base_kv = (
-                    ArithValue(slot) * ArithValue(kv_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(kv_state_pos_stride)
+                    ArithValue(ring) * ArithValue(kv_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
                 base_sc = (
-                    ArithValue(slot) * ArithValue(score_state_slot_stride)
-                    + ArithValue(ring) * ArithValue(score_state_pos_stride)
+                    ArithValue(ring) * ArithValue(score_state_pos_stride)
                     + ArithValue(col_off)
                     + lid_x_vec
                 )
@@ -2696,8 +2717,13 @@ def flydsl_fused_compress_attn(
         raise ValueError("score_state shape != kv_state")
     if kv_state.dtype != torch.float32 or score_state.dtype != torch.float32:
         raise TypeError("kv_state/score_state must be fp32")
-    if not (kv_state.is_contiguous() and score_state.is_contiguous()):
-        raise ValueError("kv_state/score_state must be contiguous")
+    # Slot and ring strides are passed to the kernel and the descriptor is
+    # rebased per slot, so the states may be strided views — a per-request
+    # arena hands out a view whose slot stride is a whole entry. Only the
+    # innermost dim must be unit stride: the kernel addresses it as
+    # `col_off + lane`.
+    if kv_state.stride(-1) != 1 or score_state.stride(-1) != 1:
+        raise ValueError("kv_state/score_state inner stride must be 1")
     if ape.shape != (ratio, dim_full) or ape.dtype != torch.float32:
         raise ValueError(
             f"ape shape {tuple(ape.shape)} dtype {ape.dtype} != ({ratio}, {dim_full}) f32"
