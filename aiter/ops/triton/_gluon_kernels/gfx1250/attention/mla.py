@@ -10,8 +10,8 @@ from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils.types import e4m3_dtype
 from aiter.ops.triton.utils.common_utils import strip_annotate
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
