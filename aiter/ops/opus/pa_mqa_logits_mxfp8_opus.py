@@ -60,6 +60,49 @@ def pa_mqa_logits_mxfp8_fwd(
 
 
 @compile_ops("module_pa_mqa_logits_mxfp8_opus", develop=True)
+def pa_mqa_logits_mxfp8_fwd_direct(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    local_starts: torch.Tensor,
+    local_ends: torch.Tensor,
+    out: torch.Tensor,
+    num_rows: int,
+    split_kv: int,
+    weight_scale: float,
+    block_k: int,
+    kv_block_size: int,
+    max_seq_len: int,
+) -> None: ...
+
+
+@compile_ops("module_pa_mqa_logits_mxfp8_opus", develop=True)
+def pa_mqa_logits_mxfp8_fwd_decode(
+    q: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    context_lens: torch.Tensor,
+    out: torch.Tensor,
+    batch: int,
+    next_n_max: int,
+    split_kv: int,
+    axis: int,
+    weight_scale: float,
+    block_k: int,
+    kv_block_size: int,
+    max_seq_len: int,
+) -> None: ...
+
+
+@compile_ops("module_pa_mqa_logits_mxfp8_opus", develop=True)
 def pa_mqa_logits_mxfp8_prefill_schedule(
     row_to_batch: torch.Tensor,
     local_starts: torch.Tensor,
@@ -167,14 +210,19 @@ def pa_mqa_logits_mxfp8_prefill(
     max_seq_len: int,
     *,
     weight_scale: float = 1.0,
-    block_k: int = 256,
+    block_k: int = 64,
     kv_block_size: int = 64,
     parallel_unit_num: int = 512,
     out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
     n_ctas: int | None = None,
 ) -> torch.Tensor:
-    """Ragged-prefill MXFP8 paged MQA logits (gfx950)."""
+    """Ragged-prefill MXFP8 paged MQA logits (gfx950).
+
+    Defaults to the 1-wave variant (``block_k=64``, one warp/CTA, finer kv split), which mirrors
+    the triton single-warp prefill kernel. Pass ``block_k=256`` to use the 4-wave variant instead.
+    The launcher selects the compiled kernel by ``block_k`` (64 -> 1-wave, 256 -> 4-wave).
+    """
     gfx = get_gfx_runtime()
     if gfx != "gfx950":
         raise RuntimeError(f"pa_mqa_logits_mxfp8 requires gfx950, got {gfx}")
@@ -245,13 +293,15 @@ def pa_mqa_logits_mxfp8_varqlen(
 ) -> torch.Tensor:
     """Variable-qlen (per-batch MTP) MXFP8 paged MQA logits (gfx950).
 
-    Implemented as varqlen-over-prefill: builds explicit ragged windows from
-    ``cu_seq_q`` + ``context_lens`` (MTP tail-causal), then reuses the prefill
-    kernel + schedule. Each batch's query length (``cu_seq_q[b+1]-cu_seq_q[b]``)
-    may differ, so the per-batch MTP width is fully variable — there is no fixed
-    ``next_n`` (the 6-field prefill schedule maps rows via prefix-sum searchsorted,
-    with no next_n modulo constraint). ``parallel_unit_num`` is auto-derived from
-    static shapes (cudagraph-safe) when not given.
+    Defaults to the 4-wave variant (``block_k=256``) for decode. Implemented as
+    varqlen-over-prefill: builds explicit ragged windows from ``cu_seq_q`` +
+    ``context_lens`` (MTP tail-causal), then reuses the same kernel + schedule.
+    Each batch's query length (``cu_seq_q[b+1]-cu_seq_q[b]``) may differ, so the
+    per-batch MTP width is fully variable — there is no fixed ``next_n`` (the
+    6-field prefill schedule maps rows via prefix-sum searchsorted, with no next_n
+    modulo constraint). ``parallel_unit_num`` is auto-derived from static shapes
+    (cudagraph-safe) when not given. The launcher selects the kernel by ``block_k``
+    (256 -> 4-wave, 64 -> 1-wave).
     """
     total_q = int(q_fp8.shape[0])
     if windows is None:
@@ -289,11 +339,169 @@ def pa_mqa_logits_mxfp8_varqlen(
     )
 
 
+# ---------------------------------------------------------------------------
+# Schedule-free (direct) wrappers: no cta_info table / no compute_prefill_schedule.
+# The per-CTA assignment is derived in-kernel from blockIdx + per-row windows +
+# split_kv (triton/deepgemm style). grid = num_rows * split_kv.
+# ---------------------------------------------------------------------------
+def pa_mqa_logits_mxfp8_prefill_direct(
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    row_to_batch: torch.Tensor,
+    local_starts: torch.Tensor,
+    local_ends: torch.Tensor,
+    max_seq_len: int,
+    *,
+    weight_scale: float = 1.0,
+    block_k: int = 64,
+    kv_block_size: int = 64,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Ragged-prefill MQA logits without a schedule: one CTA per query row.
+
+    grid = total_tokens (split_kv=1). Each CTA derives its window from the
+    per-row arrays (row_to_batch / local_starts / local_ends) and covers its
+    whole window (no context split). No ``compute_prefill_schedule`` / cta_info.
+    ``out`` (if reused across calls) must be pre-filled with -inf: the kernel
+    only writes in-window cells.
+    """
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(f"pa_mqa_logits_mxfp8 requires gfx950, got {gfx}")
+
+    total_tokens = int(q_fp8.shape[0])
+    if out is None:
+        out = torch.full(
+            (total_tokens, max_seq_len), float("-inf"), dtype=torch.float32, device=q_fp8.device
+        )
+    pa_mqa_logits_mxfp8_fwd_direct(
+        q_fp8,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_to_batch.to(torch.int32),
+        local_starts.to(torch.int32),
+        local_ends.to(torch.int32),
+        out,
+        total_tokens,
+        1,
+        float(weight_scale),
+        int(block_k),
+        int(kv_block_size),
+        int(max_seq_len),
+    )
+    return out
+
+
+def pa_mqa_logits_mxfp8_decode(
+    q_fp8: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    next_n: int | None = None,
+    cu_seq_q: torch.Tensor | None = None,
+    next_n_max: int | None = None,
+    weight_scale: float = 1.0,
+    block_k: int = 64,
+    kv_block_size: int = 64,
+    cta_target: int | None = None,
+    split_kv: int | None = None,
+    axis: int = 3,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode MQA logits (MTP), schedule-free + cudagraph-safe. One path for both
+    fixed-MTP (``next_n``) and varqlen (``cu_seq_q``) decode.
+
+    ``q_fp8`` / ``weights`` / ``out`` are PACKED ([total_q, ...], total_q = sum of
+    per-batch qlen; fixed MTP => batch*next_n). The kernel uses a 3D grid
+    (split_kv, next_n_max, batch): batch/MTP-position/context-split come straight
+    from blockIdx and the MTP tail-causal window is derived inline from the
+    per-batch ``cu_seq_q`` + ``context_lens`` -- NO per-row window arrays and NO
+    window-build kernel (decode schedule collapses to ~0).
+
+    Context is split across ``split_kv`` only when the query rows alone can't fill
+    the GPU (``total_q < cta_target``). All grid dims are static shapes
+    (cudagraph-safe); ``context_lens`` values are only read in-kernel. Default
+    ``cta_target`` is 1024 for the 1-wave variant (block_k=64) / 256 for 4-wave.
+    For varqlen under CUDAGraph pass a static ``next_n_max`` (else it is derived
+    from ``cu_seq_q`` with a host sync).
+    """
+    gfx = get_gfx_runtime()
+    if gfx != "gfx950":
+        raise RuntimeError(f"pa_mqa_logits_mxfp8 requires gfx950, got {gfx}")
+
+    total_q = int(q_fp8.shape[0])
+    batch = int(context_lens.shape[0])
+    if cu_seq_q is None:
+        if next_n is None:
+            raise ValueError(
+                "pa_mqa_logits_mxfp8_decode: pass next_n (fixed MTP) or cu_seq_q (varqlen)."
+            )
+        cu_seq_q = torch.arange(
+            0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=q_fp8.device
+        )
+        if next_n_max is None:
+            next_n_max = int(next_n)
+    else:
+        cu_seq_q = cu_seq_q.to(torch.int32)
+        if next_n_max is None:  # host sync; pass next_n_max explicitly for cudagraph capture
+            next_n_max = int((cu_seq_q[1:] - cu_seq_q[:-1]).max().item())
+
+    if split_kv is None:
+        if cta_target is None:
+            cta_target = 1024 if int(block_k) <= 64 else 256
+        max_chunks = max(1, (int(max_seq_len) + int(block_k) - 1) // int(block_k))
+        if total_q >= cta_target:
+            split_kv = 1
+        else:
+            split_kv = min(max_chunks, (cta_target + total_q - 1) // total_q)
+
+    if out is None:
+        out = torch.full(
+            (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=q_fp8.device
+        )
+    pa_mqa_logits_mxfp8_fwd_decode(
+        q_fp8,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        cu_seq_q,
+        context_lens.to(torch.int32),
+        out,
+        int(batch),
+        int(next_n_max),
+        int(split_kv),
+        int(axis),
+        float(weight_scale),
+        int(block_k),
+        int(kv_block_size),
+        int(max_seq_len),
+    )
+    return out
+
+
 __all__ = [
     "pa_mqa_logits_mxfp8_fwd",
+    "pa_mqa_logits_mxfp8_fwd_direct",
+    "pa_mqa_logits_mxfp8_fwd_decode",
     "pa_mqa_logits_mxfp8_prefill",
+    "pa_mqa_logits_mxfp8_prefill_direct",
     "pa_mqa_logits_mxfp8_prefill_schedule",
     "pa_mqa_logits_mxfp8_varqlen",
+    "pa_mqa_logits_mxfp8_decode",
     "pa_mqa_logits_mxfp8_varqlen_windows",
     "compute_prefill_schedule",
     "compute_varqlen_windows",

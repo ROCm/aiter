@@ -55,6 +55,56 @@ void pa_mqa_logits_mxfp8_fwd(aiter_tensor_t& q,
                           int kv_block_size,
                           int max_seq_len);
 
+// Schedule-free launch (no cta_info table): the per-CTA assignment is derived
+// in-kernel from blockIdx + per-row windows (row_to_batch / local_starts /
+// local_ends, each [num_rows] int32) + split_kv. grid = num_rows * split_kv.
+//   prefill: split_kv = 1 (one CTA per row).
+//   decode : split_kv > 1 splits each row's context across CTAs (cudagraph-safe;
+//            grid is a static shape, context_len values are only read in-kernel).
+// The window arrays are the same ones `pa_mqa_logits_mxfp8_varqlen_windows`
+// produces (device, in-graph). No compute_prefill_schedule / cta_info needed.
+void pa_mqa_logits_mxfp8_fwd_direct(aiter_tensor_t& q,
+                          aiter_tensor_t& q_scale,
+                          aiter_tensor_t& kv_cache,
+                          aiter_tensor_t& kv_scale,
+                          aiter_tensor_t& block_tables,
+                          aiter_tensor_t& weights,
+                          aiter_tensor_t& row_to_batch,
+                          aiter_tensor_t& local_starts,
+                          aiter_tensor_t& local_ends,
+                          aiter_tensor_t& out,
+                          int num_rows,
+                          int split_kv,
+                          float weight_scale,
+                          int block_k,
+                          int kv_block_size,
+                          int max_seq_len);
+
+// Schedule-free DECODE launch (3D grid (split_kv, next_n_max, batch)): the per-CTA
+// (batch, MTP position, context split) assignment + MTP tail-causal window are derived
+// entirely from blockIdx + per-batch cu_seq_q / context_lens (no per-row window arrays,
+// no window-build kernel). Q/weights/out are PACKED ([total_q, ...]); row = cu_seq_q[batch]+n.
+//   uniform MTP : cu_seq_q = [0, next_n, 2*next_n, ...], next_n_max = next_n.
+//   varqlen     : cu_seq_q = per-batch qlen prefix sum, next_n_max = max qlen (pad grid, mask).
+// grid dims are static shapes -> cudagraph-safe (context_lens only read in-kernel).
+void pa_mqa_logits_mxfp8_fwd_decode(aiter_tensor_t& q,
+                          aiter_tensor_t& q_scale,
+                          aiter_tensor_t& kv_cache,
+                          aiter_tensor_t& kv_scale,
+                          aiter_tensor_t& block_tables,
+                          aiter_tensor_t& weights,
+                          aiter_tensor_t& cu_seq_q,
+                          aiter_tensor_t& context_lens,
+                          aiter_tensor_t& out,
+                          int batch,
+                          int next_n_max,
+                          int split_kv,
+                          int axis,
+                          float weight_scale,
+                          int block_k,
+                          int kv_block_size,
+                          int max_seq_len);
+
 // Build the persistent-grid schedule `cta_info[P, CTA_INFO_WIDTH]` from ragged
 // windows (device, cudagraph-safe: all inputs/outputs are caller-allocated
 // device buffers; grid is derived from static shapes, not from window values).
@@ -102,8 +152,23 @@ struct opus_mqa_logits_kargs {
     const void* __restrict__ ptr_kv_scale;  // [num_blocks, K_TILES, K_CHUNKS, PAGE]         e8m0
     const int*  __restrict__ ptr_block_tables; // [batch, max_blocks_per_seq] int32
     const void* __restrict__ ptr_weights;   // [total_tokens, H] bf16
-    const int*  __restrict__ ptr_cta_info;   // [n_ctas, CTA_INFO_WIDTH] int32
+    const int*  __restrict__ ptr_cta_info;   // [n_ctas, CTA_INFO_WIDTH] int32 (cta_info mode only)
     float* __restrict__ ptr_out;             // [total_tokens, max_seq_len] fp32
+
+    // Direct-schedule mode (no cta_info table): the per-CTA assignment is derived
+    // in-kernel from blockIdx + these per-row window arrays (triton/deepgemm style).
+    //   grid = num_rows * split_kv; row = pid / split_kv; split = pid % split_kv.
+    // Prefill: split_kv == 1 (one CTA per row). Decode: split_kv > 1 splits each
+    // row's context across CTAs (balanced, remainder to the first splits).
+    const int* __restrict__ ptr_row_to_batch;  // [num_rows] int32 (prefill direct: SCHED 1)
+    const int* __restrict__ ptr_local_starts;   // [num_rows] int32 (prefill direct)
+    const int* __restrict__ ptr_local_ends;     // [num_rows] int32 (prefill direct)
+    // decode direct (SCHED 2): 3D grid (split, next_n_max, batch); windows derived inline
+    // from these per-batch arrays (no per-row window arrays / no window-build kernel).
+    const int* __restrict__ ptr_cu_seq_q;       // [batch+1] int32 (packed qlen prefix sum)
+    const int* __restrict__ ptr_context_lens;   // [batch]   int32
+    int   split_kv;            // context splits per row (>= 1)
+    int   num_rows;            // total query rows (prefill direct grid.y; extra -> idle)
 
     int   max_seq_len;
     int   stride_out_row;      // out row stride in elements (== max_seq_len for dense out)
@@ -115,11 +180,18 @@ struct opus_mqa_logits_kargs {
 
 // Compile-time config. Defaults target the 4-wave MXFP8 variant:
 //   NUM_WARPS=4 -> BLOCK=256, KV_TILE=256 (block_k), PAGE=64, D=128, H=64.
+//
+// Q_LDS_WARPS_ decouples the async-Q LDS layout (make_layout_gq/sq/rq) from the compute wave
+// count NUM_WARPS_. It defaults to NUM_WARPS_ (the 4-wave path is byte-identical). The single-wave
+// variant (NUM_WARPS_=1) sets Q_LDS_WARPS_=4 so the Q LDS bytes match the 4-wave layout (the
+// proven rq->MFMA a-operand path is reused verbatim); one physical warp then loads the whole Q via
+// the Q-warp dim being expressed as p_dim(NUM_WARPS) x y_dim(Q_VWARPS). See make_layout_gq/sq.
 template<int KV_TILE_SIZE_ = 256,
          int PAGE_SIZE_     = 64,
          int HEAD_DIM_      = 128,
          int N_HEADS_       = 64,
-         int NUM_WARPS_     = 4>
+         int NUM_WARPS_     = 4,
+         int Q_LDS_WARPS_   = NUM_WARPS_>
 struct opus_mqa_logits_traits {
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;  // block_k
     static constexpr int PAGE_SIZE    = PAGE_SIZE_;     // kv_block_size
@@ -129,6 +201,13 @@ struct opus_mqa_logits_traits {
 
     static constexpr int WARP_SIZE  = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;  // 256 (4-wave)
+
+    // async-Q LDS geometry (== NUM_WARPS for the 4-wave path). The single-wave variant keeps this
+    // at 4 so the Q LDS layout / rq read are byte-identical to the 4-wave kernel.
+    static constexpr int Q_LDS_WARPS = Q_LDS_WARPS_;
+    static constexpr int Q_LDS_BLOCK = Q_LDS_WARPS * WARP_SIZE;   // 256 (Q cooperative-load block)
+    // virtual Q-warps each physical warp emulates via the gq/sq y_dim (4-wave: 1; single: 4).
+    static constexpr int Q_VWARPS    = Q_LDS_WARPS / NUM_WARPS;
 
     // Data-type aliases the kernel refers to.
     using D_DATA   = mqa_logits_fp8_t;    // Q / KV data (E4M3), MFMA A/B operand element
@@ -222,6 +301,9 @@ struct opus_mqa_logits_traits {
     static_assert(KV_TILE_SIZE % PAGE_SIZE == 0, "KV_TILE must be a multiple of PAGE");
     static_assert(N_TILES == 4, "kernel currently assumes N_TILES == 4");
     static_assert(N_PHYS == 1, "kernel currently assumes N_PHYS == 1 (NTPW tiles share one page)");
+    static_assert(Q_LDS_WARPS % NUM_WARPS == 0, "Q_LDS_WARPS must be a multiple of NUM_WARPS");
+    static_assert(smem_n_q_rpt % Q_LDS_WARPS == 0, "smem_n_q_rpt must be a multiple of Q_LDS_WARPS");
+    static_assert(Q_LDS_BLOCK % (D_128B_SIZE / VEC_Q) == 0, "Q_LDS_BLOCK must cover threads_d");
 };
 
 __host__ __device__ inline int mqa_logits_ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -229,7 +311,7 @@ __host__ __device__ inline int mqa_logits_ceil_div(int a, int b) { return (a + b
 #ifndef __HIP_DEVICE_COMPILE__
 // Host pass: empty stub so the __device_stub__ symbol resolves for the launcher.
 namespace opus_logits {
-template<class T> __global__ void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs) {}
+template<class T, int SCHED = 0, int AXIS = 0> __global__ void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs) {}
 }
 #else
 // ============================================================================
@@ -317,24 +399,31 @@ __device__ inline auto make_layout_q(int lane_mod_16, int lane_div_16) {
 
 // ─── Q global→shared load layout (async-Q via LDS), parameterized on N tile size ───
 // Identical machinery to make_layout_gk_gv but for an arbitrary N tile (Q uses the whole
-// NUM_WARPS*Q_TILE block). Q shares K's head dim (128) so uses T::smem_d_rpt.
+// Q_LDS_WARPS*Q_TILE block). Q shares K's head dim (128) so uses T::smem_d_rpt.
+// Uses the Q-LDS geometry (Q_LDS_WARPS / Q_LDS_BLOCK), NOT the compute NUM_WARPS: the single-wave
+// variant reuses the 4-wave Q LDS layout with one physical warp iterating the whole Q.
 template<typename T>
 __device__ inline auto make_layout_gq(int warp_id, int lane_id, int stride_q_n) {
     constexpr int threads_d = T::D_128B_SIZE / T::VEC_Q;  // 8
-    constexpr int threads_n_per_block = T::BLOCK_SIZE / threads_d;
+    constexpr int threads_n_per_block = T::Q_LDS_BLOCK / threads_d;
     constexpr int threads_n_per_wave = opus::get_warp_size() / threads_d; // 8
 
+    // Q-warp dim = Q_VWARPS (y, virtual warps iterated by one physical warp) x NUM_WARPS (p,
+    // physical warp_id). Ordered virtual-outer / physical-inner so the logical warp index is
+    // phys + virt*NUM_WARPS (stride_q_n per unit), matching the sq store & 4-wave layout.
+    // 4-wave: Q_VWARPS==1 (the y-dim vanishes) -> identical to the original single p_dim.
     constexpr auto gq_block_shape = opus::make_tuple(
         opus::number<T::smem_d_rpt>{},
         opus::number<T::N_HEADS / threads_n_per_block>{},
         opus::number<threads_n_per_wave>{},
-        opus::number<T::NUM_WARPS>{},
+        opus::number<T::Q_VWARPS>{},                        // virtual Q-warps (y)
+        opus::number<T::NUM_WARPS>{},                       // physical warps (p: warp_id)
         opus::number<threads_d>{},
         opus::number<T::VEC_Q>{});
 
     constexpr auto gq_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}),
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::y_dim{}, opus::p_dim{}),
         opus::make_tuple(opus::p_dim{}, opus::y_dim{}));
 
     return opus::make_layout(
@@ -346,33 +435,48 @@ __device__ inline auto make_layout_gq(int warp_id, int lane_id, int stride_q_n) 
 // ─── Q shared store layout (async-Q), parameterized on d-chunk count + padding ───
 template<typename T>
 __device__ inline auto make_layout_sq(int warp_id) {
-    constexpr int n_q_rpt = T::smem_n_q_rpt / T::NUM_WARPS;
+    constexpr int n_q_rpt = T::smem_n_q_rpt / T::Q_LDS_WARPS;
+    constexpr int warp_stride = T::smem_linear_wave * n_q_rpt + T::smem_q_padding;   // 2080: per logical Q-warp
+    // Q-warp dim split into NUM_WARPS (p: warp_id) x Q_VWARPS (y: virtual warps). Explicit
+    // per-dim strides (each dim = its own group) place logical warp (phys + virt*NUM_WARPS) at
+    // offset logical*warp_stride, so the y-iteration order (smem_d_rpt, n_q_rpt, virt) matches gq
+    // and 1-wave/4-wave produce byte-identical LDS. y-issue order must mirror gq: n_q_rpt then virt.
     constexpr auto s_block_shape = opus::make_tuple(
-        opus::number<T::smem_d_rpt>{},
-        opus::number<T::NUM_WARPS>{},
-        opus::number<n_q_rpt>{},
-        opus::number<T::VEC_KV>{});
+        opus::number<T::smem_d_rpt>{},      // (y)
+        opus::number<T::NUM_WARPS>{},        // physical warps (p: warp_id)
+        opus::number<n_q_rpt>{},             // (y)
+        opus::number<T::Q_VWARPS>{},         // virtual warps (y)
+        opus::number<T::VEC_KV>{});          // (y)
 
     constexpr auto s_block_dim = opus::make_tuple(
-        opus::make_tuple(opus::y_dim{}, opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
+        opus::make_tuple(opus::p_dim{}),
+        opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}),
         opus::make_tuple(opus::y_dim{}));
 
     return opus::make_layout(
         s_block_shape,
-        opus::unfold_x_stride(s_block_dim, s_block_shape, opus::tuple{opus::number<T::smem_linear_wave * n_q_rpt + T::smem_q_padding>{}, opus::number<T::smem_linear_wave>{}, 1_I}),
+        opus::unfold_x_stride(s_block_dim, s_block_shape, opus::tuple{
+            opus::number<T::Q_LDS_WARPS * warp_stride>{},   // smem_d_rpt
+            opus::number<warp_stride>{},                    // phys warp
+            opus::number<T::smem_linear_wave>{},            // n_q_rpt
+            opus::number<T::NUM_WARPS * warp_stride>{},     // virt warp
+            1_I}),                                          // vec
         opus::unfold_p_coord(s_block_dim, opus::tuple{warp_id}));
 }
 
 // ─── Q shared→register read layout (async-Q, feeds gemm0 a-operand) ───
+// Read side is purely lane-based (no warp partition): uses Q_LDS_WARPS so both variants read the
+// same 4-wave LDS layout. The a-operand register structure is independent of Q_LDS_WARPS.
 template<typename T>
 __device__ inline auto make_layout_rq(int warp_id, int lane_id) {
-    constexpr int n_q_rpt = T::smem_n_q_rpt / T::NUM_WARPS;
+    constexpr int n_q_rpt = T::smem_n_q_rpt / T::Q_LDS_WARPS;
 
     constexpr auto rq_block_shape = opus::make_tuple(
-        opus::number<T::NUM_WARPS>{},
+        opus::number<T::Q_LDS_WARPS>{},
         opus::number<T::M_TILES>{},
-        opus::number<T::MFMA_M / T::NUM_WARPS>{},
+        opus::number<T::MFMA_M / T::Q_LDS_WARPS>{},
         opus::number<T::smem_d_rpt>{},
         opus::number<T::K_TILES / T::smem_d_rpt>{},
         opus::number<T::VGRP_PER_LANE>{},    // vgpr group
@@ -389,8 +493,8 @@ __device__ inline auto make_layout_rq(int warp_id, int lane_id) {
 
     return opus::make_layout(
         rq_block_shape,
-        opus::unfold_x_stride(rq_block_dim, rq_block_shape, opus::tuple{opus::number<T::smem_linear_wave * n_q_rpt + T::smem_q_padding>{}, opus::number<T::D_128B_SIZE>{}, opus::number<T::NUM_WARPS * (T::smem_linear_wave * n_q_rpt + T::smem_q_padding)>{}, 1_I}),
-        opus::unfold_p_coord(rq_block_dim, opus::tuple{lane_id_n % T::NUM_WARPS, lane_id_n / T::NUM_WARPS, lane_id / T::MFMA_M}));
+        opus::unfold_x_stride(rq_block_dim, rq_block_shape, opus::tuple{opus::number<T::smem_linear_wave * n_q_rpt + T::smem_q_padding>{}, opus::number<T::D_128B_SIZE>{}, opus::number<T::Q_LDS_WARPS * (T::smem_linear_wave * n_q_rpt + T::smem_q_padding)>{}, 1_I}),
+        opus::unfold_p_coord(rq_block_dim, opus::tuple{lane_id_n % T::Q_LDS_WARPS, lane_id_n / T::Q_LDS_WARPS, lane_id / T::MFMA_M}));
 }
 
 // Per-nt KV (B operand), paged [num_blocks,K_TILES,8(c),page,16] fp8: ONE token-tile's i32x8
@@ -497,7 +601,12 @@ __device__ inline auto make_layout_out(int warp_id, int lane_mod_16) {
         opus::unfold_p_coord(dim, opus::make_tuple(warp_id, lane_mod_16)));
 }
 
-template<class T>
+// SCHED: 0 = cta_info table; 1 = prefill direct (2D grid, per-row window arrays);
+//        2 = decode direct (3D grid, inline MTP windows).
+// AXIS (SCHED==2 only): blockIdx -> (split, n, batch) mapping, for L2-locality sweeps.
+//   0: split=x, n=y, batch=z   1: n=x, split=y, batch=z
+//   2: split=x, batch=y, n=z   3: batch=x, n=y, split=z
+template<class T, int SCHED = 0, int AXIS = 0>
 __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs kargs) {
     // ---- data-type aliases ----
     using D_DATA   = typename T::D_DATA;
@@ -526,13 +635,73 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     const int lane_div_16 = (lane_id >> 4) & (T::LANE_M_GROUPS - 1); // which 16-lane group (0..LANE_M_GROUPS-1)
 
     // ---- per-CTA assignment (uniform across block) ----
-    const int* ci = kargs.ptr_cta_info + (size_t)pid * CTA_INFO_WIDTH;
-    const int row_id      = ci[0];
-    const int batch_id    = ci[1];
-    const int chunk_start = ci[2];
-    const int tile_count  = ci[3];
-    const int local_start = ci[4];
-    const int local_end   = ci[5];
+    int row_id, batch_id, chunk_start, tile_count, local_start, local_end;
+    if constexpr(SCHED == 0) {
+        // cta_info mode: read the precomputed per-CTA schedule entry.
+        const int* ci = kargs.ptr_cta_info + (size_t)pid * CTA_INFO_WIDTH;
+        row_id      = ci[0];
+        batch_id    = ci[1];
+        chunk_start = ci[2];
+        tile_count  = ci[3];
+        local_start = ci[4];
+        local_end   = ci[5];
+    } else if constexpr(SCHED == 1) {
+        // Prefill direct (2D grid (split_kv, num_rows)): row = blockIdx.y, split = blockIdx.x.
+        // Arbitrary ragged windows -> read per-row window arrays. KV_TILE_SIZE is a compile-time
+        // power of two so the tile divisions fold to shifts; only win_tiles/split_kv is a real div.
+        constexpr int BK = T::KV_TILE_SIZE;
+        const int sk  = kargs.split_kv;
+        const int row = (int)__builtin_amdgcn_workgroup_id_y();
+        if(row >= kargs.num_rows) return;
+        row_id      = row;
+        batch_id    = kargs.ptr_row_to_batch[row];
+        local_start = kargs.ptr_local_starts[row];
+        local_end   = kargs.ptr_local_ends[row];
+        const int lo_tile   = local_start / BK;
+        const int hi_tile   = (local_end > 0) ? ((local_end + BK - 1) / BK) : 0;
+        const int win_tiles = hi_tile - lo_tile;
+        if(sk == 1) {
+            chunk_start = lo_tile;
+            tile_count  = win_tiles;
+        } else {
+            const int split = (int)__builtin_amdgcn_workgroup_id_x();
+            const int base  = win_tiles / sk;
+            const int res   = win_tiles - base * sk;
+            const int cs    = split * base + (split < res ? split : res);
+            chunk_start = lo_tile + cs;
+            tile_count  = (cs < win_tiles) ? (base + (split < res ? 1 : 0)) : 0;
+        }
+    } else {
+        // Decode direct (3D grid (split_kv, next_n_max, batch)): batch = blockIdx.z,
+        // n = blockIdx.y (MTP position), split = blockIdx.x. Q/weights/out are PACKED
+        // ([total_q, ...]); the (batch, n) -> packed row + MTP tail-causal window are derived
+        // inline from the per-batch cu_seq_q / context_lens (no per-row window arrays, no
+        // window-build kernel). Grid dims are static shapes -> cudagraph-safe.
+        constexpr int BK = T::KV_TILE_SIZE;
+        const int sk    = kargs.split_kv;
+        const int wx = (int)__builtin_amdgcn_workgroup_id_x();
+        const int wy = (int)__builtin_amdgcn_workgroup_id_y();
+        const int wz = (int)__builtin_amdgcn_workgroup_id_z();
+        int split, n, batch;
+        if constexpr(AXIS == 0)      { split = wx; n = wy; batch = wz; }
+        else if constexpr(AXIS == 1) { n = wx; split = wy; batch = wz; }
+        else if constexpr(AXIS == 2) { split = wx; batch = wy; n = wz; }
+        else                         { batch = wx; n = wy; split = wz; }
+        const int q0    = kargs.ptr_cu_seq_q[batch];
+        const int qlen  = kargs.ptr_cu_seq_q[batch + 1] - q0;
+        if(n >= qlen) return;                          // padded MTP slot (varqlen) -> idle
+        row_id      = q0 + n;                          // packed row
+        batch_id    = batch;
+        local_start = 0;
+        local_end   = kargs.ptr_context_lens[batch] - (qlen - 1 - n);   // MTP tail-causal
+        const int hi_tile   = (local_end > 0) ? ((local_end + BK - 1) / BK) : 0;
+        const int win_tiles = hi_tile;                 // lo_tile == 0 (local_start == 0)
+        const int base  = win_tiles / sk;              // only remaining real division
+        const int res   = win_tiles - base * sk;
+        const int cs    = split * base + (split < res ? split : res);
+        chunk_start = cs;
+        tile_count  = (cs < win_tiles) ? (base + (split < res ? 1 : 0)) : 0;
+    }
 
     // ---- GEMM object (scaled fp8 16x16x128); use its single-tile MMA + accumulator type ----
     auto mma = opus::make_tiled_mma<D_DATA, D_DATA, D_ACC>(
@@ -561,8 +730,10 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     // ---- Q/scale/weight partition layouts + register storage (ALL loads deferred to the
     // prologue; declared here so the compute lambdas can [&]-capture them). ----
     // Q staged through LDS (async global->LDS->reg), mirrors mha d128. Q is identical across
-    // warps (M/heads not split by wave: T_M==1) so make_layout_rq is warp-independent; all
-    // 4 warps cooperatively store one Q copy.
+    // warps (M/heads not split by wave: T_M==1) so make_layout_rq is warp-independent. The Q LDS
+    // layout is the Q_LDS_WARPS (=4) cooperative layout; make_layout_gq/sq express the Q-warp dim
+    // as p_dim(NUM_WARPS) x y_dim(Q_VWARPS), so one physical warp (1-wave) fills the whole tile via
+    // the y_dim iteration while 4 physical warps (4-wave) fill it via the p_dim -- same LDS bytes.
     __shared__ char smem_buf[T::smem_size_bytes()];
     auto s_q  = opus::make_smem(reinterpret_cast<D_DATA*>(smem_buf));
     auto u_gq = make_layout_gq<T>(warp_id, lane_id, HEAD_DIM);   // global head stride == HEAD_DIM

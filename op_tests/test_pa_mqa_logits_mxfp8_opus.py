@@ -28,11 +28,18 @@ import torch.nn.functional as F
 from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import (
     compute_prefill_schedule,
     compute_varqlen_windows,
+    pa_mqa_logits_mxfp8_decode,
     pa_mqa_logits_mxfp8_prefill,
+    pa_mqa_logits_mxfp8_prefill_direct,
     pa_mqa_logits_mxfp8_varqlen,
 )
 
 dev = "cuda"
+
+# When True, correctness cases route through the schedule-free "direct" kernel
+# (grid = num_rows * split_kv, no cta_info) instead of the cta_info schedule path.
+# Toggled by --direct; both paths must produce identical (cos=1.0) results.
+USE_DIRECT = False
 SCALE_BLOCK = 32
 MFMA_M = 16
 FP8_E4M3_MAX = 448.0
@@ -208,7 +215,7 @@ def run_prefill_case(
     heads=64,
     head_dim=128,
     kv_block_size=64,
-    block_k=256,
+    block_k=64,  # prefill -> 1-wave variant (block_k=64); varqlen/decode uses 256 (4-wave)
     parallel_unit_num=512,
     seed=0,
 ):
@@ -241,22 +248,39 @@ def run_prefill_case(
     ref_fp8 = ref_prefill_logits(q_dq, kv_dq, weights, row_to_batch, ls, le, max_seq_len, weight_scale)
     ref_bf16 = ref_prefill_logits(q_bf16, kv_bf16, weights, row_to_batch, ls, le, max_seq_len, weight_scale)
 
-    out = pa_mqa_logits_mxfp8_prefill(
-        q_fp8.view(torch.float8_e4m3fn),
-        q_scale,
-        kv_cache.view(torch.float8_e4m3fn),
-        kv_scale,
-        block_tables,
-        weights,
-        row_to_batch,
-        local_starts,
-        local_ends,
-        max_seq_len,
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        parallel_unit_num=parallel_unit_num,
-    )
+    if USE_DIRECT:
+        out = pa_mqa_logits_mxfp8_prefill_direct(
+            q_fp8.view(torch.float8_e4m3fn),
+            q_scale,
+            kv_cache.view(torch.float8_e4m3fn),
+            kv_scale,
+            block_tables,
+            weights,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            max_seq_len,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+        )
+    else:
+        out = pa_mqa_logits_mxfp8_prefill(
+            q_fp8.view(torch.float8_e4m3fn),
+            q_scale,
+            kv_cache.view(torch.float8_e4m3fn),
+            kv_scale,
+            block_tables,
+            weights,
+            row_to_batch,
+            local_starts,
+            local_ends,
+            max_seq_len,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+            parallel_unit_num=parallel_unit_num,
+        )
     torch.cuda.synchronize()
 
     m = ~torch.isneginf(ref_fp8)
@@ -320,29 +344,46 @@ def run_varqlen_case(
     ref_fp8 = ref_prefill_logits(q_dq, kv_dq, weights, row_to_batch, ls, le, max_seq_len, weight_scale)
     ref_bf16 = ref_prefill_logits(q_bf16, kv_bf16, weights, row_to_batch, ls, le, max_seq_len, weight_scale)
 
-    out = pa_mqa_logits_mxfp8_varqlen(
-        q_fp8.view(torch.float8_e4m3fn),
-        q_scale,
-        kv_cache.view(torch.float8_e4m3fn),
-        kv_scale,
-        block_tables,
-        weights,
-        max_seq_len,
-        cu_seq_q=cu_seq_q,
-        context_lens=ctx,
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-    )
+    if USE_DIRECT:
+        out = pa_mqa_logits_mxfp8_decode(
+            q_fp8.view(torch.float8_e4m3fn),
+            q_scale,
+            kv_cache.view(torch.float8_e4m3fn),
+            kv_scale,
+            block_tables,
+            weights,
+            ctx,
+            max_seq_len,
+            cu_seq_q=cu_seq_q,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+        )
+    else:
+        out = pa_mqa_logits_mxfp8_varqlen(
+            q_fp8.view(torch.float8_e4m3fn),
+            q_scale,
+            kv_cache.view(torch.float8_e4m3fn),
+            kv_scale,
+            block_tables,
+            weights,
+            max_seq_len,
+            cu_seq_q=cu_seq_q,
+            context_lens=ctx,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+        )
     torch.cuda.synchronize()
 
     m = ~torch.isneginf(ref_fp8)
     cos_fp8 = _cos(out[m], ref_fp8[m]).item()
     cos_bf16 = _cos(out[m], ref_bf16[m]).item()
     ok = cos_fp8 > 0.999 and cos_bf16 > 0.99
+    warp = 1 if block_k == 64 else 4
     print(
-        f"  [varqlen] bs={bs} total_q={total_q} cos_fp8={cos_fp8:.6f} "
-        f"cos_bf16={cos_bf16:.6f} {'PASS' if ok else 'FAIL'}"
+        f"  [varqlen] bs={bs} total_q={total_q} block_k={block_k}({warp}-warp) "
+        f"cos_fp8={cos_fp8:.6f} cos_bf16={cos_bf16:.6f} {'PASS' if ok else 'FAIL'}"
     )
     return 0 if ok else 1
 
@@ -495,7 +536,17 @@ def main():
     ap.add_argument("--ctx", type=int, default=5120)
     ap.add_argument("--n_q", type=int, default=256)
     ap.add_argument("--pun", type=int, default=512)
+    # block_k selects the compiled variant: 64 -> 1-wave (prefill), 256 -> 4-wave (decode).
+    ap.add_argument("--block_k", type=int, default=64, choices=[64, 256])
+    # route correctness cases through the schedule-free "direct" kernel.
+    ap.add_argument("--direct", action="store_true",
+                    help="use the schedule-free direct kernel (grid=num_rows*split_kv, no cta_info)")
     args = ap.parse_args()
+
+    global USE_DIRECT
+    USE_DIRECT = args.direct
+    if USE_DIRECT:
+        print("[mode] schedule-free DIRECT kernel (no cta_info)")
 
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -504,7 +555,9 @@ def main():
         return 0
 
     if args.bench:
-        return run_bench(args.bs, args.n_q, args.ctx, parallel_unit_num=args.pun)
+        return run_bench(
+            args.bs, args.n_q, args.ctx, block_k=args.block_k, parallel_unit_num=args.pun
+        )
 
     print("=== MXFP8 paged MQA logits (opus, gfx950) ===")
     rc = 0
@@ -519,14 +572,21 @@ def main():
     rc |= run_prefill_case(2, [[(0, 3000), (1000, 5000)], [(0, 6000), (2048, 6144)]], seed=14)
     rc |= run_prefill_case(2, [[(0, 4096)], [(0, 4096)]], parallel_unit_num=4, seed=16)
 
-    # varqlen / MTP (per-batch query length via qlens, tail-causal; may be ragged)
-    rc |= run_varqlen_case(3, [1, 1, 1], [200, 512, 1000], seed=20)
-    rc |= run_varqlen_case(2, [2, 2], [300, 1500], seed=22)
-    rc |= run_varqlen_case(4, [4, 4, 4, 4], [256, 800, 2048, 4096], seed=24)
-    # fully ragged per-batch query length (no single next_n)
-    rc |= run_varqlen_case(3, [1, 3, 2], [200, 1500, 800], seed=26)
-    # empty batch (qlen=0) mixed with non-empty batches
-    rc |= run_varqlen_case(3, [2, 0, 3], [384, 256, 640], seed=28)
+    # varqlen / MTP (per-batch query length via qlens, tail-causal; may be ragged).
+    # Run every case on BOTH warp variants: block_k=256 (4-warp, decode default)
+    # and block_k=64 (1-warp) -- same seed/data, so this verifies the 1-warp
+    # variant is bit-for-bit correct on the identical inputs.
+    varqlen_cases = [
+        (3, [1, 1, 1], [200, 512, 1000], 20),
+        (2, [2, 2], [300, 1500], 22),
+        (4, [4, 4, 4, 4], [256, 800, 2048, 4096], 24),
+        (3, [1, 3, 2], [200, 1500, 800], 26),  # fully ragged (no single next_n)
+        (3, [2, 0, 3], [384, 256, 640], 28),  # empty batch (qlen=0) mixed in
+    ]
+    for bk in (256, 64):
+        print(f"  -- varqlen (block_k={bk}, {1 if bk == 64 else 4}-warp) --")
+        for bs, qlens, ctx, seed in varqlen_cases:
+            rc |= run_varqlen_case(bs, qlens, ctx, block_k=bk, seed=seed)
 
     # ── prefill corner cases ──
     print("  -- prefill corner cases --")
@@ -544,12 +604,17 @@ def main():
     rc |= run_prefill_case(2, [[(0, 0), (0, 200)], [(100, 100), (0, 128)]], seed=40)  # zero-length windows mixed
     rc |= run_prefill_case(1, [[(0, 8192)]], seed=42)                        # single long row (32 tiles)
 
-    # ── varqlen corner cases ──
-    print("  -- varqlen corner cases --")
-    rc |= run_varqlen_case(2, [8, 3], [4, 500], seed=44)     # qlen > ctx -> some rows tail-clamped empty
-    rc |= run_varqlen_case(2, [8, 8], [1024, 2048], seed=46)  # next_n=8 uniform
-    rc |= run_varqlen_case(1, [1], [1000], seed=48)          # single batch, single decode token
-    rc |= run_varqlen_case(4, [16, 8, 24, 4], [4096, 2048, 4096, 1024], seed=50)  # larger / mixed
+    # ── varqlen corner cases (both warp variants) ──
+    varqlen_corner_cases = [
+        (2, [8, 3], [4, 500], 44),      # qlen > ctx -> some rows tail-clamped empty
+        (2, [8, 8], [1024, 2048], 46),  # next_n=8 uniform
+        (1, [1], [1000], 48),           # single batch, single decode token
+        (4, [16, 8, 24, 4], [4096, 2048, 4096, 1024], 50),  # larger / mixed
+    ]
+    for bk in (256, 64):
+        print(f"  -- varqlen corner cases (block_k={bk}, {1 if bk == 64 else 4}-warp) --")
+        for bs, qlens, ctx, seed in varqlen_corner_cases:
+            rc |= run_varqlen_case(bs, qlens, ctx, block_k=bk, seed=seed)
 
     print("  ALL PASS" if rc == 0 else "  SOME FAILED")
     return rc
