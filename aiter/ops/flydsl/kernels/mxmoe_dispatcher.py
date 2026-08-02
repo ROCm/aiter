@@ -39,6 +39,7 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
 
 
 # ---- gemm2 (down-proj) compile ----
+# Values passed through these helpers are nonnegative and must fit in i32.
 def _udiv_i32(a, c):
     return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
@@ -262,7 +263,7 @@ def compile_gemm2_a4w4_port(
                     BM=BM,
                 )
 
-        # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
+        # One (m_block, n_block) unit; optimized SPART may pass resolved coordinates directly.
         def run_unit(
             unit_bx, precomputed_m_block_idx=None, precomputed_n_block_idx=None
         ):
