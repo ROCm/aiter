@@ -7,7 +7,7 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton._gluon_kernels.helper import _strip_annotate
+from aiter.ops.triton.utils.common_utils import strip_annotate
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -26,7 +26,7 @@ def reduce_max_prop_nan(input, axis=None, keep_dims=False):
 
 
 @aggregate
-@_strip_annotate
+@strip_annotate
 class AttentionConfig:
     """Layouts and derived constants for the unified attention kernel."""
 
@@ -234,7 +234,7 @@ class AttentionConfig:
 
 
 @aggregate
-@_strip_annotate
+@strip_annotate
 class TDMKVLoaderConfig:
     """Derived layouts for TDM KV loaders (both TDMKVLoader and TDMGatherKVLoader).
 
@@ -282,7 +282,7 @@ class TDMKVLoaderConfig:
 
 
 @aggregate
-@_strip_annotate
+@strip_annotate
 class TDMKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
@@ -499,7 +499,7 @@ class TDMKVLoader:
 
 
 @aggregate
-@_strip_annotate
+@strip_annotate
 class TDMGatherKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
@@ -693,7 +693,7 @@ class TDMGatherKVLoader:
 
 
 @aggregate
-@_strip_annotate
+@strip_annotate
 class AttentionProgram:
     cfg: AttentionConfig
 
