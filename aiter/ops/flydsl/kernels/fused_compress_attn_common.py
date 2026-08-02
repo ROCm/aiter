@@ -51,6 +51,26 @@ def group_fp8_mx_dtype():
     return _MxD.FP8_E4M3_FNUZ if get_rocm_arch() == "gfx942" else _MxD.FP8_E4M3
 
 
+def state_slot_byte_offset(slot, slot_stride_f32_elems):
+    """`slot * slot_stride` in bytes, computed in 64 bits.
+
+    Both compress-attn kernels rebase their `kv_state` / `score_state` buffer
+    descriptors onto the program's own slot instead of carrying the slot term
+    in the load offset. A buffer offset is a 32-bit BYTE offset, so one
+    descriptor reaches at most 4 GiB from its base — which the slot term
+    alone can exceed once the caller's state tensor is a view whose slot
+    stride is a whole per-request arena entry rather than the field's own
+    size. `get_element_ptr` adds this in 64-bit pointer arithmetic, so only
+    the multiply needs widening, and the remaining offset covers one entry.
+    """
+    slot_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot))
+    stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(slot_stride_f32_elems))
+    return arith.muli(
+        arith.muli(slot_i64, stride_i64),
+        arith.constant(4, type=T.i64),  # sizeof(f32)
+    )
+
+
 def emit_group_fp8_nm_asm_scatter(
     *,
     normed_lane,  # list[VEC] f32: post-norm nope values (this lane's slice)
