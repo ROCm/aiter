@@ -107,6 +107,8 @@ def _mla_gluon(
     # --- dsv4-prefill knobs ---
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
+    # bh16 only: grid axes 0 and 1 carry (split, batch) rather than (batch, split).
+    SPLIT_MAJOR: gl.constexpr = False,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
@@ -125,8 +127,12 @@ def _mla_gluon(
         # identical to the original 2-D+qlen mapping. For nhead > 16 (e.g. 96) the
         # head range is tiled into NUM_M_BLOCKS = cdiv(NHEAD, BLOCK_H) blocks of 16.
         NUM_M_BLOCKS: gl.constexpr = (NHEAD + BLOCK_H - 1) // BLOCK_H
-        cur_batch = gl.program_id(0)
-        split_kv_id = gl.program_id(1)
+        if SPLIT_MAJOR:
+            split_kv_id = gl.program_id(0)
+            cur_batch = gl.program_id(1)
+        else:
+            cur_batch = gl.program_id(0)
+            split_kv_id = gl.program_id(1)
         cur_head_id = gl.program_id(2) % NUM_M_BLOCKS
         q_pos = gl.program_id(2) // NUM_M_BLOCKS
 
@@ -1038,6 +1044,7 @@ def mla_gluon(
         final_lse = None
         stride_final_lse_b, stride_final_lse_s, stride_final_lse_h = 0, 0, 0
 
+    split_major = False
     if REGIME == "bh64":
         grid = (
             NUM_XCDS,
@@ -1048,7 +1055,24 @@ def mla_gluon(
         # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
         # times qlen query positions. For nhead <= 16 this is just qlen (one head
         # block), i.e. the original grid-axis MTP mapping.
-        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
+        #
+        # Axes 0 and 1 carry (split, batch) when the split count is a multiple of
+        # the XCD count. Triton linearizes axis 0 fastest, so that ordering gives
+        # workgroup id `split + NUM_KV_SPLITS * batch + ...`, and the hardware
+        # round-robins the id over the XCDs; the multiple-of-NUM_XCD condition is
+        # what keeps the id congruent mod NUM_XCD for every batch, so all requests'
+        # workgroups for one split land on the same XCD and share its L2. Under
+        # prefix caching those workgroups read the same KV pages. Relabeling only:
+        # each program covers the same KV range either way.
+        num_xcds = get_num_xcds()
+        split_major = (
+            batch_size > 1 and NUM_KV_SPLITS > 1 and NUM_KV_SPLITS % num_xcds == 0
+        )
+        head_q_axis = triton.cdiv(nhead, BLOCK_H) * qlen
+        if split_major:
+            grid = (NUM_KV_SPLITS, batch_size, head_q_axis)
+        else:
+            grid = (batch_size, NUM_KV_SPLITS, head_q_axis)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_gluon[grid](
@@ -1100,6 +1124,7 @@ def mla_gluon(
         QLEN=qlen,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
+        SPLIT_MAJOR=split_major,
     )
 
     if NUM_KV_SPLITS == 1:
