@@ -134,7 +134,10 @@ def pa_mqa_logits_mxfp8_prefill(
     total_tokens = int(q_fp8.shape[0])
     if out is None:
         out = torch.full(
-            (total_tokens, max_seq_len), float("-inf"), dtype=torch.float32, device=q_fp8.device
+            (total_tokens, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
         )
     pa_mqa_logits_mxfp8_fwd_prefill(
         q_fp8,
@@ -201,7 +204,11 @@ def pa_mqa_logits_mxfp8_decode(
     next_n_max = int(next_n_max)
     if cu_seq_q is None:  # fixed-MTP: uniform per-batch qlen == next_n_max
         cu_seq_q = torch.arange(
-            0, (batch + 1) * next_n_max, next_n_max, dtype=torch.int32, device=q_fp8.device
+            0,
+            (batch + 1) * next_n_max,
+            next_n_max,
+            dtype=torch.int32,
+            device=q_fp8.device,
         )
     else:
         cu_seq_q = cu_seq_q.to(torch.int32)
@@ -215,7 +222,10 @@ def pa_mqa_logits_mxfp8_decode(
 
     if out is None:
         out = torch.full(
-            (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=q_fp8.device
+            (total_q, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp8.device,
         )
     pa_mqa_logits_mxfp8_fwd_decode(
         q_fp8,

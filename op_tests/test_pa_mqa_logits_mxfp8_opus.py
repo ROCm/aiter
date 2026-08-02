@@ -71,13 +71,13 @@ KVS_NTPW = 4
 WEIGHT_SCALE = 1.5
 
 # ── sweep defaults (model-derived) ───────────────────────────────────
-PREFILL_BLOCK_K = 64          # prefill -> 1-warp variant
-PREFILL_TOTAL_QLEN = 16384    # sum of per-batch qlen (== ctx, causal)
+PREFILL_BLOCK_K = 64  # prefill -> 1-warp variant
+PREFILL_TOTAL_QLEN = 16384  # sum of per-batch qlen (== ctx, causal)
 PREFILL_QMIN = 800
-DECODE_BLOCK_K = 64           # decode is 1-warp only
-DECODE_CTA_TARGET = 1024      # context-split fill target for the 1-warp decode
-TRITON_DECODE_CHUNKK = 256    # triton deepgemm's own KV tiling
-N_COS_SAMPLE = 8              # sampled query rows used for the correctness check
+DECODE_BLOCK_K = 64  # decode is 1-warp only
+DECODE_CTA_TARGET = 1024  # context-split fill target for the 1-warp decode
+TRITON_DECODE_CHUNKK = 256  # triton deepgemm's own KV tiling
+N_COS_SAMPLE = 8  # sampled query rows used for the correctness check
 
 # run_perftest knobs (set in main(); kept off the test-fn signature so the table's
 # left columns stay the shape params only).
@@ -173,7 +173,9 @@ def ref_row_logits(q_dq, kv_dq, weights, b, s, e, ws):
 def ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, ws):
     """Dense fp32 reference over ALL rows (only feasible for the small corner cases)."""
     total = q_dq.shape[0]
-    out = torch.full((total, max_seq_len), float("-inf"), device=dev, dtype=torch.float32)
+    out = torch.full(
+        (total, max_seq_len), float("-inf"), device=dev, dtype=torch.float32
+    )
     for r in range(total):
         b, s, e = int(rb[r]), int(ls[r]), int(le[r])
         if e > s:
@@ -199,7 +201,10 @@ def ref_sampled(q_dq, kv_dq, weights, samples, ws):
     if not samples:
         return torch.zeros(0, device=dev, dtype=torch.float32)
     return torch.cat(
-        [ref_row_logits(q_dq[r], kv_dq, weights[r], b, s, e, ws) for r, b, s, e in samples]
+        [
+            ref_row_logits(q_dq[r], kv_dq, weights[r], b, s, e, ws)
+            for r, b, s, e in samples
+        ]
     )
 
 
@@ -213,11 +218,19 @@ def candidate_err(name, out, extract, samples, ref_fp8, ref_bf16, tag):
         return None
     if name == "ours":
         return checkAllclose(
-            ref_fp8, extract(out), rtol=2e-2, atol=2e-2, tol_err_ratio=0.05,
+            ref_fp8,
+            extract(out),
+            rtol=2e-2,
+            atol=2e-2,
+            tol_err_ratio=0.05,
             msg=f"ours: {tag}",
         )
     return checkAllclose(
-        ref_bf16, extract(out), rtol=6e-2, atol=6e-2, tol_err_ratio=0.9,
+        ref_bf16,
+        extract(out),
+        rtol=6e-2,
+        atol=6e-2,
+        tol_err_ratio=0.9,
         msg=f"{name} (vs bf16): {tag}",
     )
 
@@ -260,12 +273,16 @@ def build_paged_kv(bs, max_end, kv_block_size, block_k, seed):
     kv_scale = torch.zeros(
         num_blocks, k_tiles, 4, kv_block_size, dtype=torch.uint8, device=dev
     )
-    indexer_k_fp8_paged_preshuffle(k_flat, slot_mapping, kv_cache, kv_scale, kv_block_size)
+    indexer_k_fp8_paged_preshuffle(
+        k_flat, slot_mapping, kv_cache, kv_scale, kv_block_size
+    )
     return kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len
 
 
 def build_q(total_tokens):
-    q_bf16 = torch.randn(total_tokens, HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    q_bf16 = torch.randn(
+        total_tokens, HEADS, HEAD_DIM, dtype=torch.bfloat16, device=dev
+    )
     weights = (
         torch.randn(total_tokens, HEADS, dtype=torch.float32, device=dev) * 0.1
     ).to(torch.bfloat16)
@@ -306,7 +323,9 @@ def make_triton_prefill(kv_bf16, block_tables, q_bf16, weights, ctxs, samples):
     kv_cache_fp8 = torch.zeros(
         (num_blocks, KV_BLOCK_SIZE, head_dim + 4), dtype=dtypes.fp8, device=dev
     )
-    indexer_k_quant_and_cache(k_flat, kv_cache_fp8, slot_mapping, head_dim, "ue8m0", True)
+    indexer_k_quant_and_cache(
+        k_flat, kv_cache_fp8, slot_mapping, head_dim, "ue8m0", True
+    )
 
     # committed context per batch == full seq (qlen == ctx); contiguous prefix.
     cu = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
@@ -352,8 +371,15 @@ def make_triton_prefill(kv_bf16, block_tables, q_bf16, weights, ctxs, samples):
 
 
 def make_triton_decode(
-    kv_bf16, block_tables, q_bf16_dec, weights, context_lens, t_max, num_blocks,
-    next_n, samples,
+    kv_bf16,
+    block_tables,
+    q_bf16_dec,
+    weights,
+    context_lens,
+    t_max,
+    num_blocks,
+    next_n,
+    samples,
 ):
     """Triton decode candidate: deepgemm reads paged KV directly (no host prep).
     Returns (launch_fn, extract_fn) or None if unavailable."""
@@ -376,8 +402,12 @@ def make_triton_decode(
     x_scaled = (kv_blocks * (1.0 / sf)).to(fp8_dtype)
 
     index_dim = HEAD_DIM + 4  # deepgemm layout: [nb, block, 1, D + 4B fp32 scale]
-    kv_cache_fp8 = torch.empty((num_blocks, kbs * index_dim), dtype=torch.uint8, device=dev)
-    kv_cache_fp8[:, : kbs * HEAD_DIM] = x_scaled.reshape(num_blocks, kbs * HEAD_DIM).view(torch.uint8)
+    kv_cache_fp8 = torch.empty(
+        (num_blocks, kbs * index_dim), dtype=torch.uint8, device=dev
+    )
+    kv_cache_fp8[:, : kbs * HEAD_DIM] = x_scaled.reshape(
+        num_blocks, kbs * HEAD_DIM
+    ).view(torch.uint8)
     kv_cache_fp8[:, kbs * HEAD_DIM :] = sf.reshape(num_blocks, kbs).view(torch.uint8)
     kv_cache_fp8 = kv_cache_fp8.view(num_blocks, kbs, 1, index_dim)
 
@@ -396,8 +426,17 @@ def make_triton_decode(
 
     def launch():
         deepgemm_fp8_paged_mqa_logits(
-            q_fp8, kv_cache_fp8, w_fp32, out_fp8, context_lens, block_tables, t_max,
-            ChunkK=TRITON_DECODE_CHUNKK, Preshuffle=True, KVBlockSize=kbs, WavePerEU=2,
+            q_fp8,
+            kv_cache_fp8,
+            w_fp32,
+            out_fp8,
+            context_lens,
+            block_tables,
+            t_max,
+            ChunkK=TRITON_DECODE_CHUNKK,
+            Preshuffle=True,
+            KVBlockSize=kbs,
+            WavePerEU=2,
         )
         return out_fp8
 
@@ -421,8 +460,8 @@ def make_triton_decode(
 
 def roofline(total_q, n_logits):
     """MQA logits does, per in-window logit, a Q[H,D]·k[D] mul-add over H heads.
-      FLOPs = 2 * H * D * n_logits         (the QKᵀ mul-add dominates relu + head-sum)
-      bytes = Q(fp8) read + K(fp8) read (once per row window) + out(fp32) write
+    FLOPs = 2 * H * D * n_logits         (the QKᵀ mul-add dominates relu + head-sum)
+    bytes = Q(fp8) read + K(fp8) read (once per row window) + out(fp32) write
     """
     flops = 2 * HEADS * HEAD_DIM * n_logits
     nbytes = total_q * HEADS * HEAD_DIM * 1 + n_logits * HEAD_DIM * 1 + n_logits * 4
@@ -448,7 +487,10 @@ def gen_decode_ctxs(batch, max_ctx, kv_block_size=KV_BLOCK_SIZE, seed=0):
     g = torch.Generator(device=dev).manual_seed(seed)
     raw = torch.randint(low, max_ctx + 1, (batch,), generator=g, device=dev).tolist()
     cap = (max_ctx // kv_block_size) * kv_block_size
-    return [min(((c + kv_block_size - 1) // kv_block_size) * kv_block_size, cap) for c in raw]
+    return [
+        min(((c + kv_block_size - 1) // kv_block_size) * kv_block_size, cap)
+        for c in raw
+    ]
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -463,10 +505,12 @@ def test_prefill(bs):
     ctxs = list(qlens)
     total_q = sum(qlens)
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = build_paged_kv(
-        bs, max(ctxs), KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+        build_paged_kv(bs, max(ctxs), KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed)
     )
-    cu = torch.tensor([0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev)
+    cu = torch.tensor(
+        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
+    )
     context_lens = torch.tensor(ctxs, dtype=torch.int32, device=dev)
     q_bf16, q_fp8, q_scale, q_dq, weights = build_q(total_q)
     q_fp8_v = q_fp8.view(torch.float8_e4m3fn)
@@ -478,16 +522,36 @@ def test_prefill(bs):
     flops, nbytes = roofline(total_q, n_logits)
 
     samples = sample_rows(total_q, rb, ls, le, seed=seed) if _CHECK else []
-    ref_fp8 = ref_sampled(q_dq, kv_dq, weights, samples, WEIGHT_SCALE) if samples else None
-    ref_bf16 = ref_sampled(q_bf16, kv_bf16, weights, samples, WEIGHT_SCALE) if samples else None
+    ref_fp8 = (
+        ref_sampled(q_dq, kv_dq, weights, samples, WEIGHT_SCALE) if samples else None
+    )
+    ref_bf16 = (
+        ref_sampled(q_bf16, kv_bf16, weights, samples, WEIGHT_SCALE)
+        if samples
+        else None
+    )
 
-    out = torch.full((total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev)
+    out = torch.full(
+        (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
 
     def ours_launch():
         pa_mqa_logits_mxfp8_fwd_prefill(
-            q_fp8_v, q_scale, kv_cache_v, kv_scale, block_tables, weights,
-            rb, ls, le, out, total_q,
-            WEIGHT_SCALE, PREFILL_BLOCK_K, KV_BLOCK_SIZE, max_seq_len,
+            q_fp8_v,
+            q_scale,
+            kv_cache_v,
+            kv_scale,
+            block_tables,
+            weights,
+            rb,
+            ls,
+            le,
+            out,
+            total_q,
+            WEIGHT_SCALE,
+            PREFILL_BLOCK_K,
+            KV_BLOCK_SIZE,
+            max_seq_len,
         )
         return out
 
@@ -499,7 +563,12 @@ def test_prefill(bs):
     if tri is not None:
         candidates["triton"] = tri
 
-    ret = {"gfx": get_gfx(), "total_q": total_q, "max_seq_len": max_seq_len, "n_ctas": total_q}
+    ret = {
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_seq_len": max_seq_len,
+        "n_ctas": total_q,
+    }
     for name, (launch, extract) in candidates.items():
         launch()
         torch.cuda.synchronize()
@@ -523,8 +592,8 @@ def test_decode(batch, max_ctx, next_n):
     ctxs = gen_decode_ctxs(batch, max_ctx, KV_BLOCK_SIZE, seed=seed)
     total_q = batch * next_n
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = build_paged_kv(
-        batch, max(ctxs), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+        build_paged_kv(batch, max(ctxs), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed)
     )
     num_blocks = block_tables.numel()
     cu = torch.arange(0, (batch + 1) * next_n, next_n, dtype=torch.int32, device=dev)
@@ -535,8 +604,10 @@ def test_decode(batch, max_ctx, next_n):
 
     # context-split only when the query rows alone can't fill the GPU (schedule-free).
     max_chunks = max(1, (max_seq_len + DECODE_BLOCK_K - 1) // DECODE_BLOCK_K)
-    split_kv = 1 if total_q >= DECODE_CTA_TARGET else min(
-        max_chunks, (DECODE_CTA_TARGET + total_q - 1) // total_q
+    split_kv = (
+        1
+        if total_q >= DECODE_CTA_TARGET
+        else min(max_chunks, (DECODE_CTA_TARGET + total_q - 1) // total_q)
     )
     n_ctas = split_kv * next_n * batch
 
@@ -546,16 +617,37 @@ def test_decode(batch, max_ctx, next_n):
     flops, nbytes = roofline(total_q, n_logits)
 
     samples = sample_rows(total_q, rb, ls, le, seed=seed) if _CHECK else []
-    ref_fp8 = ref_sampled(q_dq, kv_dq, weights, samples, WEIGHT_SCALE) if samples else None
-    ref_bf16 = ref_sampled(q_bf16, kv_bf16, weights, samples, WEIGHT_SCALE) if samples else None
+    ref_fp8 = (
+        ref_sampled(q_dq, kv_dq, weights, samples, WEIGHT_SCALE) if samples else None
+    )
+    ref_bf16 = (
+        ref_sampled(q_bf16, kv_bf16, weights, samples, WEIGHT_SCALE)
+        if samples
+        else None
+    )
 
-    out = torch.full((total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev)
+    out = torch.full(
+        (total_q, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+    )
 
     def ours_launch():
         pa_mqa_logits_mxfp8_fwd_decode(
-            q_fp8_v, q_scale, kv_cache_v, kv_scale, block_tables, weights,
-            cu, context_lens, out, batch, next_n, split_kv,
-            WEIGHT_SCALE, DECODE_BLOCK_K, KV_BLOCK_SIZE, max_seq_len,
+            q_fp8_v,
+            q_scale,
+            kv_cache_v,
+            kv_scale,
+            block_tables,
+            weights,
+            cu,
+            context_lens,
+            out,
+            batch,
+            next_n,
+            split_kv,
+            WEIGHT_SCALE,
+            DECODE_BLOCK_K,
+            KV_BLOCK_SIZE,
+            max_seq_len,
         )
         return out
 
@@ -565,21 +657,36 @@ def test_decode(batch, max_ctx, next_n):
     candidates = {"ours": (ours_launch, ours_extract)}
     q_bf16_dec = q_bf16.reshape(batch, next_n, HEADS, HEAD_DIM).contiguous()
     tri = make_triton_decode(
-        kv_bf16, block_tables, q_bf16_dec, weights, context_lens, t_max, num_blocks,
-        next_n, samples,
+        kv_bf16,
+        block_tables,
+        q_bf16_dec,
+        weights,
+        context_lens,
+        t_max,
+        num_blocks,
+        next_n,
+        samples,
     )
     if tri is not None:
         candidates["triton"] = tri
 
     ret = {
-        "gfx": get_gfx(), "total_q": total_q, "max_seq_len": max_seq_len, "n_ctas": n_ctas,
+        "gfx": get_gfx(),
+        "total_q": total_q,
+        "max_seq_len": max_seq_len,
+        "n_ctas": n_ctas,
     }
     for name, (launch, extract) in candidates.items():
         launch()
         torch.cuda.synchronize()
         o, us = run_perftest(launch, num_iters=_ITERS, num_warmup=_WARMUP)
         err = candidate_err(
-            name, o, extract, samples, ref_fp8, ref_bf16,
+            name,
+            o,
+            extract,
+            samples,
+            ref_fp8,
+            ref_bf16,
             f"decode logits (b={batch} mtp={next_n} ctx~{max_ctx})",
         )
         ret[f"{name} us"] = us
@@ -602,8 +709,8 @@ def _check_prefill_case(bs, windows_per_batch, seed):
     max_end = max(
         (w if isinstance(w, int) else w[1]) for ws in windows_per_batch for w in ws
     )
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = build_paged_kv(
-        bs, max_end, KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+        build_paged_kv(bs, max_end, KV_BLOCK_SIZE, PREFILL_BLOCK_K, seed)
     )
     rb, ls, le = [], [], []
     for b in range(bs):
@@ -619,32 +726,44 @@ def _check_prefill_case(bs, windows_per_batch, seed):
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_prefill
 
     out = pa_mqa_logits_mxfp8_prefill(
-        q_fp8.view(torch.float8_e4m3fn), q_scale, kv_cache.view(torch.float8_e4m3fn),
-        kv_scale, block_tables, weights,
+        q_fp8.view(torch.float8_e4m3fn),
+        q_scale,
+        kv_cache.view(torch.float8_e4m3fn),
+        kv_scale,
+        block_tables,
+        weights,
         torch.tensor(rb, dtype=torch.int32, device=dev),
         torch.tensor(ls, dtype=torch.int32, device=dev),
         torch.tensor(le, dtype=torch.int32, device=dev),
-        max_seq_len, weight_scale=WEIGHT_SCALE, block_k=PREFILL_BLOCK_K,
+        max_seq_len,
+        weight_scale=WEIGHT_SCALE,
+        block_k=PREFILL_BLOCK_K,
         kv_block_size=KV_BLOCK_SIZE,
     )
     torch.cuda.synchronize()
     m = ~torch.isneginf(ref)
     err = checkAllclose(
-        ref[m], out[m], rtol=2e-2, atol=2e-2, tol_err_ratio=0.05,
+        ref[m],
+        out[m],
+        rtol=2e-2,
+        atol=2e-2,
+        tol_err_ratio=0.05,
         msg=f"prefill corner bs={bs} tt={total}",
     )
     oob_ok = bool(torch.isneginf(out[~m]).all().item()) if (~m).any() else True
     ok = err < 0.05 and oob_ok
-    print(f"  [prefill] bs={bs} tt={total} err={err:.4f} oob_neginf={oob_ok} "
-          f"{'PASS' if ok else 'FAIL'}")
+    print(
+        f"  [prefill] bs={bs} tt={total} err={err:.4f} oob_neginf={oob_ok} "
+        f"{'PASS' if ok else 'FAIL'}"
+    )
     return 0 if ok else 1
 
 
 def _check_varqlen_case(bs, qlens, context_lens, seed):
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_decode
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = build_paged_kv(
-        bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+        build_paged_kv(bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed)
     )
     cu = [0]
     for q in qlens:
@@ -664,19 +783,34 @@ def _check_varqlen_case(bs, qlens, context_lens, seed):
     ref = ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, WEIGHT_SCALE)
 
     out = pa_mqa_logits_mxfp8_decode(
-        q_fp8.view(torch.float8_e4m3fn), q_scale, kv_cache.view(torch.float8_e4m3fn),
-        kv_scale, block_tables, weights, ctx, max_seq_len, max(int(q) for q in qlens),
-        split_ctx_len=max_seq_len, cu_seq_q=cu_seq_q, weight_scale=WEIGHT_SCALE,
+        q_fp8.view(torch.float8_e4m3fn),
+        q_scale,
+        kv_cache.view(torch.float8_e4m3fn),
+        kv_scale,
+        block_tables,
+        weights,
+        ctx,
+        max_seq_len,
+        max(int(q) for q in qlens),
+        split_ctx_len=max_seq_len,
+        cu_seq_q=cu_seq_q,
+        weight_scale=WEIGHT_SCALE,
         kv_block_size=KV_BLOCK_SIZE,
     )
     torch.cuda.synchronize()
     m = ~torch.isneginf(ref)
     err = checkAllclose(
-        ref[m], out[m], rtol=2e-2, atol=2e-2, tol_err_ratio=0.05,
+        ref[m],
+        out[m],
+        rtol=2e-2,
+        atol=2e-2,
+        tol_err_ratio=0.05,
         msg=f"varqlen corner bs={bs} total_q={total_q}",
     )
     ok = err < 0.05
-    print(f"  [varqlen] bs={bs} total_q={total_q} err={err:.4f} {'PASS' if ok else 'FAIL'}")
+    print(
+        f"  [varqlen] bs={bs} total_q={total_q} err={err:.4f} {'PASS' if ok else 'FAIL'}"
+    )
     return 0 if ok else 1
 
 
@@ -686,8 +820,8 @@ def _check_fixed_mtp_case(bs, next_n, context_lens, seed):
     built in-kernel). Windows are tail-causal: row (b, n) -> [0, ctx_b-(next_n-1-n))."""
     from aiter.ops.opus.pa_mqa_logits_mxfp8_opus import pa_mqa_logits_mxfp8_decode
 
-    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = build_paged_kv(
-        bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed
+    kv_bf16, kv_dq, kv_cache, kv_scale, block_tables, t_max, max_seq_len = (
+        build_paged_kv(bs, max(context_lens), KV_BLOCK_SIZE, DECODE_BLOCK_K, seed)
     )
     total_q = bs * next_n
     ctx = torch.tensor(context_lens, dtype=torch.int32, device=dev)
@@ -702,39 +836,62 @@ def _check_fixed_mtp_case(bs, next_n, context_lens, seed):
     ref = ref_full_prefill(q_dq, kv_dq, weights, rb, ls, le, max_seq_len, WEIGHT_SCALE)
 
     out = pa_mqa_logits_mxfp8_decode(  # cu_seq_q omitted -> fixed-MTP (uniform) path
-        q_fp8.view(torch.float8_e4m3fn), q_scale, kv_cache.view(torch.float8_e4m3fn),
-        kv_scale, block_tables, weights, ctx, max_seq_len, next_n,
-        split_ctx_len=max_seq_len, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
+        q_fp8.view(torch.float8_e4m3fn),
+        q_scale,
+        kv_cache.view(torch.float8_e4m3fn),
+        kv_scale,
+        block_tables,
+        weights,
+        ctx,
+        max_seq_len,
+        next_n,
+        split_ctx_len=max_seq_len,
+        weight_scale=WEIGHT_SCALE,
+        kv_block_size=KV_BLOCK_SIZE,
     )
     torch.cuda.synchronize()
     m = ~torch.isneginf(ref)
     err = checkAllclose(
-        ref[m], out[m], rtol=2e-2, atol=2e-2, tol_err_ratio=0.05,
+        ref[m],
+        out[m],
+        rtol=2e-2,
+        atol=2e-2,
+        tol_err_ratio=0.05,
         msg=f"fixed-mtp corner bs={bs} next_n={next_n}",
     )
     ok = err < 0.05
-    print(f"  [fixed-mtp] bs={bs} next_n={next_n} total_q={total_q} ctx={list(context_lens)} "
-          f"err={err:.4f} {'PASS' if ok else 'FAIL'}")
+    print(
+        f"  [fixed-mtp] bs={bs} next_n={next_n} total_q={total_q} ctx={list(context_lens)} "
+        f"err={err:.4f} {'PASS' if ok else 'FAIL'}"
+    )
     return 0 if ok else 1
 
 
 def run_corner_correctness():
-    print("=== MXFP8 paged MQA logits correctness "
-          "(ragged / unaligned / kv-tile boundary / varqlen / fixed-MTP) ===")
+    print(
+        "=== MXFP8 paged MQA logits correctness "
+        "(ragged / unaligned / kv-tile boundary / varqlen / fixed-MTP) ==="
+    )
     rc = 0
     # ragged windows (mix zero / non-zero lower bounds, short + long)
-    rc |= _check_prefill_case(2, [[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]], 0)
+    rc |= _check_prefill_case(
+        2, [[(0, 50), (0, 120), (0, 200)], [(0, 40), (0, 100)]], 0
+    )
     rc |= _check_prefill_case(2, [[(10, 50), (64, 200)], [(0, 100), (130, 256)]], 4)
     rc |= _check_prefill_case(2, [[(100, 2048), (512, 4096)], [(0, 8192)]], 12)
     # non-4-aligned local_start (guards the out-store alignment fix): 1-token + spanning.
     rc |= _check_prefill_case(2, [[(0, 1), (17, 33)], [(63, 65), (255, 257)]], 34)
     # exhaustive start sweep: every local_start in [0, 130) with a fixed 40-wide window.
     rc |= _check_prefill_case(1, [[(s, s + 40) for s in range(0, 130)]], 52)
-    rc |= _check_prefill_case(2, [[(0, 0), (0, 200)], [(100, 100), (0, 128)]], 40)  # zero-len mix
+    rc |= _check_prefill_case(
+        2, [[(0, 0), (0, 200)], [(100, 100), (0, 128)]], 40
+    )  # zero-len mix
     # kv-tile boundary (KV_BLOCK_SIZE == block_k == 64): window END at every multiple
     # of 64 +/- 2 -> guards win_tiles = ceil((le-chunk_start)/64) at exact / off-by-few.
     tile_ends = [
-        (0, base + d) for base in (64, 128, 256, 320, 512, 576) for d in (-2, -1, 0, 1, 2)
+        (0, base + d)
+        for base in (64, 128, 256, 320, 512, 576)
+        for d in (-2, -1, 0, 1, 2)
     ]
     rc |= _check_prefill_case(1, [tile_ends], 60)
     # window START/END straddling a tile boundary (start in tile A, end in tile B).
@@ -746,11 +903,15 @@ def run_corner_correctness():
     rc |= _check_varqlen_case(3, [2, 0, 3], [384, 256, 640], 28)
     rc |= _check_varqlen_case(2, [8, 3], [4, 500], 44)
     rc |= _check_varqlen_case(4, [16, 8, 24, 4], [4096, 2048, 4096, 1024], 50)
-    rc |= _check_varqlen_case(3, [2, 3, 1], [64, 127, 256], 72)  # boundary ctx, ragged qlen
+    rc |= _check_varqlen_case(
+        3, [2, 3, 1], [64, 127, 256], 72
+    )  # boundary ctx, ragged qlen
     # fixed-MTP decode (uniform next_n per batch, cu_seq_q=None path); ctx on / off tile edges.
-    rc |= _check_fixed_mtp_case(2, 1, [63, 129], 68)             # next_n=1 (pure decode), ctx +/-1
-    rc |= _check_fixed_mtp_case(4, 2, [64, 65, 128, 127], 64)    # next_n=2, tail across the edge
-    rc |= _check_fixed_mtp_case(3, 4, [256, 257, 320], 66)       # next_n=4
+    rc |= _check_fixed_mtp_case(2, 1, [63, 129], 68)  # next_n=1 (pure decode), ctx +/-1
+    rc |= _check_fixed_mtp_case(
+        4, 2, [64, 65, 128, 127], 64
+    )  # next_n=2, tail across the edge
+    rc |= _check_fixed_mtp_case(3, 4, [256, 257, 320], 66)  # next_n=4
     rc |= _check_fixed_mtp_case(4, 8, [512, 511, 576, 320], 70)  # next_n=8 uniform
     print("  ALL PASS" if rc == 0 else "  SOME FAILED")
     return rc
@@ -776,50 +937,80 @@ def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "pa_mqa_logits_mxfp8 unsupported on %s (needs %s); skipping",
-            get_gfx(), SUPPORTED_GFX,
+            get_gfx(),
+            SUPPORTED_GFX,
         )
         return
 
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.RawTextHelpFormatter, description="config input of test"
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
     )
     parser.add_argument(
-        "--scenario", type=str, choices=["prefill", "decode"], nargs="*",
-        default=["prefill", "decode"], help="which sweeps to run (each -> one table).",
+        "--scenario",
+        type=str,
+        choices=["prefill", "decode"],
+        nargs="*",
+        default=["prefill", "decode"],
+        help="which sweeps to run (each -> one table).",
     )
     parser.add_argument(
-        "--prefill-bs", type=int, nargs="*", default=list(range(1, 21)),
+        "--prefill-bs",
+        type=int,
+        nargs="*",
+        default=list(range(1, 21)),
         help="prefill batch sizes (per-batch qlen==ctx, sum==16384, causal).",
     )
     parser.add_argument(
-        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 16, 32, 64, 128],
+        "-b",
+        "--batch",
+        type=int,
+        nargs="*",
+        default=[1, 2, 4, 8, 16, 32, 64, 128],
         help="decode batch sizes.",
     )
     parser.add_argument(
-        "--max-ctx", type=int, nargs="*", default=[1024, 8192],
+        "--max-ctx",
+        type=int,
+        nargs="*",
+        default=[1024, 8192],
         help="decode per-batch ctx upper bound (ctx in [0.9*max, max]).",
     )
     parser.add_argument(
-        "--mtp", type=int, nargs="*", default=[1, 4, 8], help="decode next_n (MTP width).",
+        "--mtp",
+        type=int,
+        nargs="*",
+        default=[1, 4, 8],
+        help="decode next_n (MTP width).",
     )
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--no-check", action="store_true", help="skip the sampled correctness check.",
+        "--no-check",
+        action="store_true",
+        help="skip the sampled correctness check.",
     )
     parser.add_argument(
-        "--no-corner", action="store_true",
+        "--no-corner",
+        action="store_true",
         help="skip the ragged/unaligned/varqlen correctness pass before the sweep.",
     )
     parser.add_argument(
-        "--out", type=str, default=None,
+        "--out",
+        type=str,
+        default=None,
         help="optional prefix; also dump each table to <prefix>_<scenario>.csv/.json.",
     )
     args = parser.parse_args()
 
     global _ITERS, _WARMUP, _SEED, _CHECK
-    _ITERS, _WARMUP, _SEED, _CHECK = args.iters, args.warmup, args.seed, not args.no_check
+    _ITERS, _WARMUP, _SEED, _CHECK = (
+        args.iters,
+        args.warmup,
+        args.seed,
+        not args.no_check,
+    )
 
     if not args.no_corner:
         run_corner_correctness()
