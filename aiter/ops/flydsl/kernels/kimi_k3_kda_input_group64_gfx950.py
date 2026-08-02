@@ -27,8 +27,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 _INPUT_FEATURES = 7168
-_OUTPUT_FEATURES = 6288
-_STORED_OUTPUT_FEATURES = 6284
+_PADDED_OUTPUT_FEATURES = 6288
+_LOGICAL_OUTPUT_FEATURES = 6284
 _GROUP_SIZE = 64
 _GROUPS_PER_ROW = _INPUT_FEATURES // _GROUP_SIZE
 _WAVE_SIZE = 64
@@ -59,7 +59,7 @@ def build_kimi_k3_kda_input_group64_module(
     if weight_cache_modifier not in (0, 1, 2, 3):
         raise ValueError("weight_cache_modifier must be between 0 and 3")
 
-    output_groups = (_OUTPUT_FEATURES + rows_per_wave - 1) // rows_per_wave
+    output_groups = (_PADDED_OUTPUT_FEATURES + rows_per_wave - 1) // rows_per_wave
     waves_per_block = min(16, (output_groups + cu_count - 1) // cu_count)
     block_threads = waves_per_block * _WAVE_SIZE
     groups_per_grid = cu_count * waves_per_block
@@ -209,14 +209,14 @@ def build_kimi_k3_kda_input_group64_module(
                 row_in_range = arith.cmpi(
                     CmpIPredicate.ult,
                     row,
-                    arith.constant(_OUTPUT_FEATURES, type=i32),
+                    arith.constant(_PADDED_OUTPUT_FEATURES, type=i32),
                 )
                 row_if = scf.IfOp(row_in_range)
                 with ir.InsertionPoint(row_if.then_block):
                     row_has_weight = arith.cmpi(
                         CmpIPredicate.ult,
                         row,
-                        arith.constant(_STORED_OUTPUT_FEATURES, type=i32),
+                        arith.constant(_LOGICAL_OUTPUT_FEATURES, type=i32),
                     )
                     weighted_if = scf.IfOp(row_has_weight, results_=[], has_else=True)
                     with ir.InsertionPoint(weighted_if.then_block):

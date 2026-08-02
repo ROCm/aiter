@@ -15,8 +15,8 @@ from aiter.ops.flydsl.kernels.kimi_k3_kda_input_group64_gfx950 import (
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 _HIDDEN = 7168
-_OUTPUT = 6288
-_STORED_OUTPUT = 6284
+_PADDED_OUTPUT = 6288
+_LOGICAL_OUTPUT = 6284
 _GROUP = 64
 _GROUPS_PER_ROW = _HIDDEN // _GROUP
 _FP8_MAX = 448.0
@@ -50,8 +50,8 @@ def supports_kimi_k3_kda_input_group64(
         and weight.dtype == torch.float8_e4m3fn
         and scale.dtype == torch.float32
         and tuple(hidden.shape) == (1, _HIDDEN)
-        and tuple(weight.shape) == (_STORED_OUTPUT, _HIDDEN)
-        and tuple(scale.shape) == (_STORED_OUTPUT, _GROUPS_PER_ROW)
+        and tuple(weight.shape) == (_LOGICAL_OUTPUT, _HIDDEN)
+        and tuple(scale.shape) == (_LOGICAL_OUTPUT, _GROUPS_PER_ROW)
         and all(tensor.is_cuda and tensor.is_contiguous() for tensor in tensors)
         and len({tensor.device for tensor in tensors}) == 1
     )
@@ -65,15 +65,17 @@ def quantize_kimi_k3_kda_input_group64(
     if (
         not weight.is_cuda
         or weight.dtype != torch.bfloat16
-        or tuple(weight.shape) != (_OUTPUT, _HIDDEN)
+        or tuple(weight.shape) != (_PADDED_OUTPUT, _HIDDEN)
         or not weight.is_contiguous()
     ):
         raise ValueError("KDA source weight must be contiguous CUDA BF16 [6288,7168]")
-    padding = weight[_STORED_OUTPUT:]
+    padding = weight[_LOGICAL_OUTPUT:]
     if bool(torch.count_nonzero(padding).item()):
         raise ValueError("KDA projection padding rows must be exactly zero")
     source = (
-        weight[:_STORED_OUTPUT].float().reshape(_STORED_OUTPUT, _GROUPS_PER_ROW, _GROUP)
+        weight[:_LOGICAL_OUTPUT]
+        .float()
+        .reshape(_LOGICAL_OUTPUT, _GROUPS_PER_ROW, _GROUP)
     )
     amax = source.abs().amax(dim=-1)
     scale = torch.where(amax > 0, amax / _FP8_MAX, torch.ones_like(amax))
@@ -81,7 +83,7 @@ def quantize_kimi_k3_kda_input_group64(
         (source / scale[..., None])
         .clamp(min=-_FP8_MAX, max=_FP8_MAX)
         .to(torch.float8_e4m3fn)
-        .reshape(_STORED_OUTPUT, _HIDDEN)
+        .reshape(_LOGICAL_OUTPUT, _HIDDEN)
         .contiguous()
     )
     return packed, scale.contiguous()
@@ -109,10 +111,10 @@ def kimi_k3_kda_input_group64(
     if not supports_kimi_k3_kda_input_group64(hidden, weight, scale):
         raise ValueError("unsupported Kimi-K3 KDA group64 projection contract")
     if output is None:
-        output = hidden.new_empty((1, _OUTPUT))
+        output = hidden.new_empty((1, _PADDED_OUTPUT))
     elif (
         output.dtype != torch.bfloat16
-        or tuple(output.shape) != (1, _OUTPUT)
+        or tuple(output.shape) != (1, _PADDED_OUTPUT)
         or output.device != hidden.device
         or not output.is_contiguous()
     ):
