@@ -839,19 +839,19 @@ def _precompile_a16w4_to_cache(
     )
 
     z = torch.zeros(1, dtype=torch.int32, device="cpu")
-    common = dict(
-        sorted_expert_ids=z,
-        cumsum_tensor=z,
-        NE=experts,
-        D_HIDDEN=model_dim,
-        D_INTER=inter_dim,
-        topk=topk,
-        tile_m=tile_m,
-        b_nt=b_nt,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=None,
-        stream=0,
-    )
+    common = {
+        "sorted_expert_ids": z,
+        "cumsum_tensor": z,
+        "NE": experts,
+        "D_HIDDEN": model_dim,
+        "D_INTER": inter_dim,
+        "topk": topk,
+        "tile_m": tile_m,
+        "b_nt": b_nt,
+        "xcd_swizzle": xcd_swizzle,
+        "waves_per_eu": None,
+        "stream": 0,
+    }
     with compile_only_env():
         if stage == 1:
             flydsl_a16w4_gemm1(
