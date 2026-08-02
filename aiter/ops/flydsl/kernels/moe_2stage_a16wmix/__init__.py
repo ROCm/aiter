@@ -257,7 +257,6 @@ def flydsl_a16w4_gemm1(
     # Per-token tile config from the documented heuristic. Fills only the tile args the
     # caller left at default; explicit caller overrides always win.
     _o = resolve_a16wmix_gemm1_config(
-        w_dtype=w_dtype,
         model_dim=D_HIDDEN,
         inter_dim=D_INTER,
         experts=NE,
@@ -283,7 +282,7 @@ def flydsl_a16w4_gemm1(
         TILE_N = _o["tile_n"]
     b_cache_mod = (2 if (16 <= _m <= 1024) else 0) if b_nt is None else b_nt
     if TILE_N is None:
-        TILE_N = _default_tile_n(D_INTER, w_dtype=w_dtype)
+        TILE_N = _default_tile_n(D_INTER)
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
@@ -377,7 +376,6 @@ def flydsl_a16w4_gemm2(
     # caller left at default; explicit caller overrides always win. gemm2 defaults are
     # tile_n=256/tile_k=256/xcd_swizzle=1 (fixed 4-wave N-split, no k_wave).
     _o = resolve_a16wmix_gemm2_config(
-        w_dtype=w_dtype,
         model_dim=D_HIDDEN,
         inter_dim=D_INTER,
         experts=NE,
@@ -396,7 +394,7 @@ def flydsl_a16w4_gemm2(
         xcd_swizzle = _o["xcd_swizzle"]
     if TILE_N is None:
         # Adaptive default: largest N tile dividing model_dim (int4 prefers 128).
-        TILE_N = _default_tile_n(D_HIDDEN, w_dtype=w_dtype)
+        TILE_N = _default_tile_n(D_HIDDEN)
     if D_INTER % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm2 requires D_INTER (K) % {TILE_K} == 0, got D_INTER={D_INTER}"
