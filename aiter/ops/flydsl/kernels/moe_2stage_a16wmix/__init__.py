@@ -28,10 +28,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import a16wmix_use_k16, compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
-from .csv_dispatch import (
+from .tile_heuristic import (
     _default_tile_n,
-    pick_a16w4_config,
-    resolve_a16w4_gemm2_config,
     resolve_a16wmix_gemm1_config,
     resolve_a16wmix_gemm2_config,
 )
@@ -45,8 +43,6 @@ __all__ = [
     "flydsl_a16w4_gemm2",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
-    "pick_a16w4_config",
-    "resolve_a16w4_gemm2_config",
     "resolve_a16wmix_gemm1_config",
     "resolve_a16wmix_gemm2_config",
 ]

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Device-side SiLU / SiTUv2 activation helpers for the a16w-mix gemm1 epilog.
+"""Shared device-side SiLU / SiTUv2 activation helpers for FlyDSL MoE kernels.
 
-Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh) used
-by :mod:`gemm1`'s fused gate+up activation. Leaf module: depends only on flydsl and
-``tensor_shim._to_raw`` (no import from gemm1/gemm2).
+Elementwise f32-register helpers (exp2/rcp-based sigmoid, sign-restored tanh, and the
+gate*up batch forms) usable by any FlyDSL gemm1 fused gate+up epilog. Leaf module:
+depends only on flydsl and ``tensor_shim._to_raw``.
 """
 
 import flydsl.expr as fx

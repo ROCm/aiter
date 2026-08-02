@@ -1827,11 +1827,10 @@ def _flydsl_moe_stage2_impl(
         # a16w4 (bf16 A x MXFP4 W) down-proj: call the ported gemm2 launcher, which
         # consumes stage1's bf16 [sorted_size, inter_dim] intermediate and atomic-
         # scatters the routing-weighted result into the caller's moe_sorting-zeroed
-        # `out` (no alloc/zeroing here). gemm2 tiles from the tuned CSV.
-        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
-            flydsl_a16w4_gemm2,
-            resolve_a16w4_gemm2_config,
-        )
+        # `out` (no alloc/zeroing here). Tiles come from the metadata kernelName2
+        # (parsed by _flydsl_stage2_wrapper into tile_n/tile_k/b_nt/waves_per_eu/
+        # xcd_swizzle), same as the a4w4/a8w4 stage2 -- no separate CSV lookup.
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
 
         E = w2.shape[0]
         model_dim = w2.shape[1]
@@ -1840,20 +1839,10 @@ def _flydsl_moe_stage2_impl(
         M_logical = int(out.shape[0])
         max_sorted = int(inter_states.shape[0])
 
-        g2c = (
-            resolve_a16w4_gemm2_config(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tokens=M_logical,
-            )
-            or {}
-        )
-        g2_tile_n = g2c.get("tile_n", 256)
+        g2_tile_n = tile_n
         if model_dim % g2_tile_n != 0:
             g2_tile_n = 256 if model_dim % 256 == 0 else 128
-        g2_tile_k = g2c.get("tile_k", 256)
+        g2_tile_k = tile_k
         if inter_dim % g2_tile_k != 0:
             g2_tile_k = 128 if inter_dim % 128 == 0 else 64
 
@@ -1888,9 +1877,9 @@ def _flydsl_moe_stage2_impl(
             tile_m=int(tile_m),
             tile_n=g2_tile_n,
             tile_k=g2_tile_k,
-            b_nt=g2c.get("b_nt"),
-            waves_per_eu=g2c.get("waves_per_eu"),
-            xcd_swizzle=g2c.get("xcd_swizzle", 1),
+            b_nt=b_nt,
+            waves_per_eu=waves_per_eu,
+            xcd_swizzle=xcd_swizzle,
         )
         return out
 

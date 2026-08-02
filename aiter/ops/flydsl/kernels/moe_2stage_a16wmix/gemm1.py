@@ -10,9 +10,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.act import _silu_mul_batch, _situ_mul_batch
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
-from .act import _silu_mul_batch, _situ_mul_batch
 
 
 def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
