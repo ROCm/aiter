@@ -47,10 +47,7 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
-# isort and black disagree here: isort wants two blank lines after this block,
-# black folds them back to one because the `# fmt: off` below starts a
-# formatting-disabled region. black is the one CI enforces, so it wins.
-import torch  # noqa: I001
+import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -58,6 +55,26 @@ from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_xcds
+
+_MAX_NUM_KV_SPLITS = 256
+
+
+def _resolve_num_kv_splits(auto_num_kv_splits, num_kv_splits):
+    """Return the automatic split count or a validated caller override."""
+    if num_kv_splits is None:
+        return auto_num_kv_splits
+    if isinstance(num_kv_splits, bool) or not isinstance(num_kv_splits, int):
+        raise TypeError(
+            "num_kv_splits must be an int or None, "
+            f"got {type(num_kv_splits).__name__}"
+        )
+    if not 1 <= num_kv_splits <= _MAX_NUM_KV_SPLITS:
+        raise ValueError(
+            f"num_kv_splits must be in [1, {_MAX_NUM_KV_SPLITS}], "
+            f"got {num_kv_splits}"
+        )
+    return num_kv_splits
+
 
 # fmt: off
 @gluon.jit
@@ -1049,13 +1066,9 @@ def mla_gluon(
                     ),
                 )
                 DYNAMIC_KV_SPLITS = True
+        NUM_KV_SPLITS = _resolve_num_kv_splits(NUM_KV_SPLITS, num_kv_splits)
         if num_kv_splits is not None:
-            NUM_KV_SPLITS = int(num_kv_splits)
             DYNAMIC_KV_SPLITS = False
-            assert 1 <= NUM_KV_SPLITS <= min_kv_seq_len, (
-                "mla_gluon num_kv_splits override must be in "
-                f"[1, {min_kv_seq_len}], got {NUM_KV_SPLITS}"
-            )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
