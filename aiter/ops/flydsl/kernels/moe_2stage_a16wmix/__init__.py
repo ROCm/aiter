@@ -35,8 +35,6 @@ from .tile_heuristic import (
 )
 
 __all__ = [
-    "a16wi4_recommend_block_m",
-    "a16wi4_scale_to_kernel_layout",
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
     "flydsl_a16w4_gemm1",
@@ -65,29 +63,8 @@ def _get_compiled_gemm1_a16w4(
     w_layout="standard",
     k_wave=1,
 ):
-    # native mxfp4 guinterleave routes through the shared compile entry;
-    # FlyDSL-native standard/int4/bf16 call the builder directly.
-    if w_dtype == "mxfp4" and w_layout == "guinterleave":
-        from aiter.ops.flydsl.moe_kernels import compile_flydsl_moe_stage1
-
-        return compile_flydsl_moe_stage1(
-            model_dim=D_HIDDEN,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tile_m=BM,
-            tile_n=TILE_N,
-            tile_k=TILE_K,
-            doweight_stage1=False,
-            a_dtype="bf16",
-            b_dtype="mxfp4",
-            out_dtype="bf16",
-            act=act,
-            waves_per_eu=waves_per_eu,
-            b_nt=b_cache_mod,
-            xcd_swizzle=xcd_swizzle,
-            k_wave=k_wave,
-        )
+    # _get_compiled_* is @functools.cache'd, so this builder runs once; the
+    # returned @flyc.jit launcher is then dispatched via _run_compiled.
     return compile_gemm1_a16w4_port(
         BM=BM,
         D_HIDDEN=D_HIDDEN,
@@ -122,27 +99,6 @@ def _get_compiled_gemm2_a16w4(
     persist=False,
     topk=1,
 ):
-    # native mxfp4 down-proj routes through the shared compile entry;
-    # the persist opt-in stays on the direct path.
-    if w_dtype == "mxfp4" and not persist:
-        from aiter.ops.flydsl.moe_kernels import compile_flydsl_moe_stage2
-
-        return compile_flydsl_moe_stage2(
-            model_dim=N_OUT,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tile_m=BM,
-            tile_n=TILE_N,
-            tile_k=TILE_K,
-            doweight_stage2=True,
-            a_dtype="bf16",
-            b_dtype="mxfp4",
-            out_dtype="bf16",
-            b_nt=b_cache_mod,
-            xcd_swizzle=xcd_swizzle,
-            waves_per_eu=waves_per_eu,
-        )
     return compile_gemm2_a16w4_port(
         BM=BM,
         NE=NE,
@@ -157,41 +113,6 @@ def _get_compiled_gemm2_a16w4(
         persist=persist,
         use_k16=a16wmix_use_k16(get_rocm_arch()),
     )
-
-
-def a16wi4_recommend_block_m(tokens, experts, topk, *, base_block_m=32):
-    """Recommend the routing/gemm1 block_m (tile_m) for the a16wi4 (int4-W) stage1.
-
-    int4 gemm1 is W-load bound (W1 re-fetched per padded m-block). At the fill point
-    where each expert has exactly two half-full 32-row m-blocks, block_m=64 collapses
-    them into one full 64-row block, halving W1 HBM re-reads (~2.27x fewer misses, ~7%
-    stage1). Outside that band 64 wastes padding or halves grid parallelism.
-
-    Decides on ceil(tokens*topk/experts / base_block_m) (avg padded m-blocks/expert ==
-    aiter's estimated_m_per_expert): return 2*base_block_m iff that count == 2.
-    base_block_m==32 only; other block_m pass through.
-
-    IMPORTANT: block_m sizes the moe_sorting padding, so the caller MUST build the
-    routing buffers with the SAME block_m passed to gemm1 (this is a dispatcher-side
-    recommendation, not a gemm1-internal override).
-    """
-    if int(base_block_m) != 32 or int(experts) <= 0:
-        return int(base_block_m)
-    routes = int(tokens) * int(topk)
-    # ceil(avg routes-per-expert / 32) == avg padded m-blocks/expert at block_m=32.
-    m_blocks_32 = -(-routes // (int(experts) * 32))
-    return 64 if m_blocks_32 == 2 else int(base_block_m)
-
-
-def a16wi4_scale_to_kernel_layout(scale_ng):
-    """Re-layout a logical int4 scale ``[E, N, G]`` into the ``(E, N, G//2, 2)``
-    bf16-pair layout the kernel expects (dword = n*(G//2) + group//2, even/odd group ->
-    lo/hi bf16). ``G`` must be even; input is already N-major.
-    """
-    E, N, G = scale_ng.shape
-    assert G % 2 == 0, f"num_groups must be even for bf16-pair packing, got {G}"
-    s = scale_ng.to(torch.bfloat16).contiguous().view(E, N, G // 2, 2).contiguous()
-    return s
 
 
 def flydsl_a16w4_gemm1(
@@ -226,7 +147,7 @@ def flydsl_a16w4_gemm1(
 
     ``w_dtype="mxfp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
     W1 packed signed int4 (same preshuffle as mxfp4), ``w1_scale_u8`` groupwise bf16 in
-    the ``(E, N_OUT, G//2, 2)`` layout (see :func:`a16wi4_scale_to_kernel_layout`).
+    the ``(E, N_OUT, G//2, 2)`` bf16-pair layout (dword = n*(G//2)+group//2).
     ``"bf16"``: RAW bf16 W1 preshuffled ``shuffle_weight (16,16)``; ``w1_scale_u8`` unused.
 
     ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle. ``"guinterleave"``
