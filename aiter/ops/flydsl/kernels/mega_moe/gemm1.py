@@ -10,8 +10,6 @@ import torch
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
-
 from ..tensor_shim import _run_compiled
 from .gemm_util import (
     _PACK,
@@ -23,6 +21,8 @@ from .gemm_util import (
     MfmaScaleGU,
     SiluQuantEpilogue,
     TileScheduler,
+    _buffer_load,
+    _make_buffer,
     wait_lds_barrier,
 )
 
@@ -32,8 +32,8 @@ class _LdsF32View:
         self.ptr = ptr
 
 
-# fmt: off
 @flyc.jit
+# fmt: off
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
     mfma_amajor, async_a_copy, trb_rsrc):
@@ -46,7 +46,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
     )
     SB_STATE_END = B_STATE_END + NUM_B_SCALE
     last = fx.Int32(K_ITERS - 1)
-    tile_row_base = _buffer_ops.buffer_load(trb_rsrc, m_tile, vec_width=1, dtype=fx.Int32)
+    tile_row_base = _buffer_load(trb_rsrc, m_tile, fx.Int32)
     b_row = sched.gate_base_row(expert) + n_tile_base
     a_gather.for_tile(tile_row_base)
     if const_expr(pipe_weights):
@@ -266,8 +266,8 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 
 
 # fmt: off
-def build_fused_gemm1(*, x_rsrc, x_base_addr, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
-    out_rsrc, os_rsrc, trb_rsrc, expert_rsrc, out_base_addr, a_buf, a_scale_lds, c_tile,
+def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
+    out_rsrc, os_rsrc, trb_rsrc, expert_rsrc, out_tensor, a_buf, a_scale_lds, c_tile,
     model_dim, inter_dim, sort_block_m, tile_n, num_waves, n_per_wave, wave_id,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
@@ -282,10 +282,9 @@ def build_fused_gemm1(*, x_rsrc, x_base_addr, x_tensor, w_rsrc, sw_rsrc, sx_rsrc
     n_wave_base = wave_id * fx.Int32(n_per_wave)
 
     # fmt: off
-    a_gather = ATileLoader(x_rsrc=x_rsrc, row_bytes=model_dim, sort_block_m=sort_block_m,
+    a_gather = ATileLoader(row_bytes=model_dim, sort_block_m=sort_block_m,
         k_step_bytes=a_k_step_bytes, total_threads=total_threads, swizzle=swizzle_a,
-        x_base_addr=x_base_addr, x_tensor=x_tensor,
-        async_copy=async_a_copy)
+        x_tensor=x_tensor, async_copy=async_a_copy)
     # fmt: on
     a_s2r = AS2RLoader(k_step_bytes=a_k_step_bytes, swizzle=swizzle_a)
     b_loader = BWeightLoader(
@@ -307,7 +306,7 @@ def build_fused_gemm1(*, x_rsrc, x_base_addr, x_tensor, w_rsrc, sw_rsrc, sx_rsrc
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, always_valid=True,
-        out_base_addr=out_base_addr if use_tile_resource else None)
+        out_tensor=out_tensor if use_tile_resource else None)
     # fmt: on
 
     def _decode(flat):
@@ -335,7 +334,7 @@ def build_fused_gemm1(*, x_rsrc, x_base_addr, x_tensor, w_rsrc, sw_rsrc, sx_rsrc
 
 
 # fmt: off
-@functools.cache
+@functools.lru_cache(maxsize=None)
 def compile_gemm1(
     *, model_dim: int, inter_dim: int, expert_offset: int = 0, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, pipe_weights: bool = True,
@@ -382,30 +381,30 @@ def compile_gemm1(
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
 
-        x_rsrc = _buffer_ops.create_buffer_resource(x, max_size=True)
-        x_base_addr = fx.Int64(_buffer_ops.extract_base_index(x, address_space=1))
-        w_rsrc = _buffer_ops.create_buffer_resource(w, max_size=True)
-        sx_rsrc = _buffer_ops.create_buffer_resource(scale_x, max_size=True)
-        sw_rsrc = _buffer_ops.create_buffer_resource(scale_w, max_size=True)
-        trb_rsrc = _buffer_ops.create_buffer_resource(tile_row_base, max_size=True)
-        expert_rsrc = _buffer_ops.create_buffer_resource(expert_ids, max_size=True)
-        out_base_addr = fx.Int64(_buffer_ops.extract_base_index(out, address_space=1))
+        w_rsrc = _make_buffer(w, fx.Int32, 4)
+        sx_rsrc = _make_buffer(scale_x, fx.Int32, 4)
+        sw_rsrc = _make_buffer(scale_w, fx.Int32)
+        trb_rsrc = _make_buffer(tile_row_base, fx.Int32)
+        expert_rsrc = _make_buffer(expert_ids, fx.Int32)
         if const_expr(use_tile_resource):
-            out_rsrc = _buffer_ops.create_buffer_resource(out, max_size=True)
+            out_rsrc = None
         else:
-            out_rsrc = _buffer_ops.create_buffer_resource(
-                out, max_size=False, num_records_bytes=num_valid * fx.Int32(inter_dim)
+            out_rsrc = _make_buffer(
+                out, fx.Int16, max_size=False, num_records_bytes=num_valid * fx.Int32(inter_dim)
             )
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
-        os_rsrc = _buffer_ops.create_buffer_resource(
-            out_scale, max_size=False, num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192)
+        os_rsrc = _make_buffer(
+            out_scale,
+            fx.Int8,
+            max_size=False,
+            num_records_bytes=num_valid * fx.Int32(scale_cols) + fx.Int32(8192),
         )
         wave_id = fx.thread_idx.x // 64
 
         _, run_tile = build_fused_gemm1(
-            x_rsrc=x_rsrc, x_base_addr=x_base_addr, x_tensor=x, w_rsrc=w_rsrc, sw_rsrc=sw_rsrc,
+            x_tensor=x, w_rsrc=w_rsrc, sw_rsrc=sw_rsrc,
             sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc, trb_rsrc=trb_rsrc,
-            expert_rsrc=expert_rsrc, out_base_addr=out_base_addr, a_buf=a_buf,
+            expert_rsrc=expert_rsrc, out_tensor=out, a_buf=a_buf,
             a_scale_lds=a_scale_lds, c_tile=c_tile, model_dim=model_dim, inter_dim=inter_dim,
             sort_block_m=sort_block_m, tile_n=tile_n, num_waves=num_waves, n_per_wave=n_per_wave,
             wave_id=wave_id, m_repeat=m_repeat, num_acc_n=num_acc_n, a_k_step_bytes=a_k_step_bytes,
@@ -462,8 +461,7 @@ def gemm1_kernel(
         waves_per_eu_hint=waves_per_eu_hint, b_cache_modifier=b_cache_modifier,
     )
     _run_compiled(
-        launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8),
-        tile_row_base, expert_ids, out_scale,
+        launch, out, x, w.view(torch.uint8), scale_x, scale_w.view(torch.uint8), tile_row_base, expert_ids, out_scale,
         fx.Int32(num_valid), fx.Int32(grid_x), stream,
     )
     return out, out_scale

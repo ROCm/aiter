@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
-# ruff: noqa: SIM102
 """Fused stage1 with low-ID dispatch producers and oversubscribed FP8xFP4 grouped-GEMM1 consumers."""
 
 import functools
 
+import mori.ir.flydsl as mori_shmem
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import mori.ir.flydsl as mori_shmem
 from flydsl.expr import const_expr, range_constexpr
-from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import T, Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
-
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _run_compiled
@@ -25,6 +23,7 @@ from .dispatch import (
     emit_dispatch_plan,
 )
 from .gemm1 import _LdsF32View, build_fused_gemm1
+from .gemm_util import _buffer_load, _buffer_store, _make_buffer, _make_buffer_from_addr
 
 _SC0_CACHE = 1
 _BUFFER_OFFSET_ABI_BYTES = 1 << 32
@@ -68,14 +67,13 @@ def _validate_dispatch_capacity(
 
 
 # fmt: off
-@functools.cache
+@functools.lru_cache(maxsize=None)
 def compile_mega_moe_stage1(
     *, model_dim: int, inter_dim: int, rank: int, experts_per_rank: int, fuse_npes: int, fuse_topk: int,
     fuse_cap: int, fuse_mtpr: int, fuse_scale_dim: int, fixed_slot_dispatch: bool, sort_block_m: int = 32,
     tile_n: int = 256, tile_k: int = 256, num_waves: int = 4, grid_mult: int = 8,
     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
-    async_a_copy: bool = False, active_expert_producer: bool = False,
-    cooperative_payload_copy: bool = False, use_tile_resource: bool = True,
+    async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int | None = None, external_grouping: bool | None = None,
     external_counting: bool | None = None,
@@ -126,8 +124,12 @@ def compile_mega_moe_stage1(
 
     fz_npes, fz_epr, fz_k = int(fuse_npes), int(experts_per_rank), int(fuse_topk)
     fz_cap, fz_mtpr, fz_rank = int(fuse_cap), int(fuse_mtpr), int(rank)
+    if fz_npes * fz_mtpr > 1 << 24:
+        raise ValueError("MegaMoE v2 source-token encoding exceeds 24 bits")
+    if fz_k > 1 << 8:
+        raise ValueError("MegaMoE v2 top-k slot encoding exceeds 8 bits")
     if external_grouping is None:
-        external_grouping = fz_mtpr >= 2048 and fz_npes == 8 and fz_epr == 48 and not active_expert_producer
+        external_grouping = fz_mtpr >= 2048 and fz_npes == 8 and fz_epr == 48
     if external_counting is None:
         external_counting = external_grouping and fz_mtpr >= 8192
     assert not external_counting or external_grouping
@@ -142,6 +144,8 @@ def compile_mega_moe_stage1(
     fz_n_i32, fz_nbytes = model_dim // 4, model_dim
     fz_scale_bytes = int(fuse_scale_dim)
     fz_scale_n_i32 = (fz_scale_bytes + 3) // 4 if fz_scale_bytes > 0 else 0
+    if direct_fixed_slot and fz_scale_n_i32 > 64:
+        raise ValueError("direct fixed-slot dispatch supports at most 64 packed scale columns")
     fz_enable_scales = fz_scale_bytes > 0
     fz_safe_end_i32 = (fz_n_i32 // 512) * 512
     _validate_dispatch_capacity(
@@ -158,7 +162,7 @@ def compile_mega_moe_stage1(
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
         f"_w{NUM_WAVES}_gm{grid_mult}"
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
-        f"aa{int(async_a_copy)}_aep{int(active_expert_producer)}cpc{int(cooperative_payload_copy)}"
+        f"aa{int(async_a_copy)}"
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
     )
 
@@ -175,18 +179,21 @@ def compile_mega_moe_stage1(
         a_buf = lds.pool
         a_scale_lds = lds.A_scale
         c_tile = _LdsF32View(fx.recast_iter(fx.Float32, lds.pool.ptr))
-        disp_rsrc = _buffer_ops.create_buffer_resource_from_addr(addr_disp)
-        parity_rsrc = _buffer_ops.create_buffer_resource_from_addr(addr_parity)
-        expected_rsrc = _buffer_ops.create_buffer_resource_from_addr(addr_expected)
+        disp_rsrc = _make_buffer_from_addr(addr_disp, fx.Int64)
+        parity_rsrc = _make_buffer_from_addr(addr_parity, fx.Int32)
+        expected_rsrc = _make_buffer_from_addr(addr_expected, fx.Int32)
+
         def _disp_ptr(slot):
-            return _buffer_ops.buffer_load(disp_rsrc, fx.Int32(int(slot)), vec_width=1, dtype=fx.Int64)
+            return _buffer_load(disp_rsrc, fx.Int32(int(slot)), fx.Int64)
 
         a_entry_count = _disp_ptr(DispatchSlot.ENTRY_COUNT)
         a_epoch_gate = _disp_ptr(DispatchSlot.EPOCH_GATE)
         a_pair_order_ready = _disp_ptr(DispatchSlot.PAIR_ORDER_READY)
         a_work_head = _disp_ptr(DispatchSlot.WORK_HEAD)
         a_work_tail = _disp_ptr(DispatchSlot.WORK_TAIL)
-        a_group_done = _disp_ptr(DispatchSlot.ACTIVE_COUNT)
+        a_group_done = _disp_ptr(DispatchSlot.GROUP_DONE)
+        a_launch_ready = _disp_ptr(DispatchSlot.LAUNCH_READY)
+        p_launch_ready = _disp_ptr(DispatchSlot.P2P_LAUNCH_READY)
 
         ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
         ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
@@ -206,24 +213,43 @@ def compile_mega_moe_stage1(
         producer_slot = ticket - fx.Int32(1)
 
         if compact_owner:
+            next_parity_lane = fx.Int32(0)
+            launch_epoch_lane = fx.Int32(0)
             if tid == fx.Int32(0):
-                old_parity = _buffer_ops.buffer_load(parity_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32)
-                next_parity = old_parity ^ fx.Int32(1)
-                previous_expected = _buffer_ops.buffer_load(expected_rsrc, next_parity, vec_width=1, dtype=fx.Int32)
+                old_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32)
+                next_parity_lane = old_parity ^ fx.Int32(1)
+                previous_expected = _buffer_load(expected_rsrc, next_parity_lane, fx.Int32)
                 next_expected = previous_expected + fx.Int32(fz_npes)
-                _buffer_ops.buffer_store(next_expected, expected_rsrc, next_parity)
+                _buffer_store(expected_rsrc, next_parity_lane, next_expected, fx.Int32)
+                launch_epoch_lane = (
+                    (next_expected // fx.Int32(fz_npes)) * fx.Int32(2) - next_parity_lane
+                )
+            next_parity = fx.Int32(fx.rocdl.readfirstlane(T.i32, next_parity_lane))
+            launch_epoch = fx.Int32(fx.rocdl.readfirstlane(T.i32, launch_epoch_lane))
+            if tid < fx.Int32(fz_npes):
+                peer = (tid + fx.Int32(fz_rank)) % fx.Int32(fz_npes)
+                comm_ops.fence_system_release()
+                launch_ready_table = _make_buffer_from_addr(p_launch_ready, fx.Int64)
+                remote_launch_ready = _buffer_load(launch_ready_table, peer, fx.Int64)
+                comm_ops.store_i32_system(remote_launch_ready, fx.Int32(fz_rank), launch_epoch)
+                mori_shmem.int32_wait_until_greater_than(
+                    a_launch_ready + fx.Int64(peer) * fx.Int64(4), launch_epoch - fx.Int32(1)
+                )
+                comm_ops.fence_system_acquire()
+            if tid == fx.Int32(0):
+                work_head_rsrc = _make_buffer_from_addr(a_work_head, fx.Int32)
+                for shard in range_constexpr(8):
+                    _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
+                _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+                if const_expr(external_grouping or direct_fixed_slot):
+                    group_done_rsrc = _make_buffer_from_addr(a_group_done, fx.Int32)
+                    for destination in range_constexpr(fz_npes if direct_fixed_slot else 1):
+                        _buffer_store(group_done_rsrc, fx.Int32(destination), fx.Int32(0), fx.Int32)
+            fx.barrier()
+            if tid == fx.Int32(0):
                 fx.rocdl.s_waitcnt(0)
                 comm_ops.fence_agent_release()
-                _buffer_ops.buffer_store(next_parity, parity_rsrc, fx.Int32(0))
-                work_head_rsrc = _buffer_ops.create_buffer_resource_from_addr(a_work_head)
-                for shard in range_constexpr(8):
-                    _buffer_ops.buffer_store(fx.Int32(0), work_head_rsrc, fx.Int32(shard * 16))
-                _buffer_ops.buffer_store(fx.Int32(0), _buffer_ops.create_buffer_resource_from_addr(a_work_tail),
-                                         fx.Int32(0))
-                if const_expr(external_grouping or direct_fixed_slot):
-                    group_done_rsrc = _buffer_ops.create_buffer_resource_from_addr(a_group_done)
-                    for destination in range_constexpr(fz_npes if direct_fixed_slot else 1):
-                        _buffer_ops.buffer_store(fx.Int32(0), group_done_rsrc, fx.Int32(destination))
+                _buffer_store(parity_rsrc, fx.Int32(0), next_parity, fx.Int32)
                 fx.rocdl.s_waitcnt(0)
                 comm_ops.fence_agent_release()
                 comm_ops.store_i32_system(gate_addr, fx.Int32(0), gate_epoch)
@@ -235,12 +261,8 @@ def compile_mega_moe_stage1(
                 comm_ops.fence_agent_acquire()
             fx.barrier()
 
-        payload_parity = _buffer_ops.buffer_load(
-            parity_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32, cache_modifier=_SC0_CACHE
-        )
-        payload_expected = _buffer_ops.buffer_load(
-            expected_rsrc, payload_parity, vec_width=1, dtype=fx.Int32, cache_modifier=_SC0_CACHE
-        )
+        payload_parity = _buffer_load(parity_rsrc, fx.Int32(0), fx.Int32, cache_modifier=_SC0_CACHE)
+        payload_expected = _buffer_load(expected_rsrc, payload_parity, fx.Int32, cache_modifier=_SC0_CACHE)
 
         if compact_owner:
             if const_expr(not direct_fixed_slot):
@@ -248,8 +270,8 @@ def compile_mega_moe_stage1(
                     num_waves=NUM_WAVES, fz_npes=fz_npes, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr,
                     fz_rank=fz_rank, fz_tile_m=fz_tile_m, fz_total_experts=fz_total_experts, addr_disp=addr_disp,
                     i32_cur_tok=i32_cur_tok, addr_in_idx=addr_in_idx, parity=payload_parity,
-                    expected=payload_expected, active_expert_producer=active_expert_producer,
-                    external_grouping=external_grouping, external_counting=external_counting,
+                    expected=payload_expected, external_grouping=external_grouping,
+                    external_counting=external_counting,
                     dispatch_blocks=dispatch_blocks,
                 )
 
@@ -285,8 +307,6 @@ def compile_mega_moe_stage1(
                     fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
                     addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc, dispatch_blocks=dispatch_blocks,
                     producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
-                    active_expert_producer=active_expert_producer,
-                    cooperative_payload_copy=cooperative_payload_copy,
                 )
         if const_expr(direct_fixed_slot):
             if compact_owner:
@@ -296,35 +316,31 @@ def compile_mega_moe_stage1(
                     expected=payload_expected,
                 )
         else:
-            payload_table = _buffer_ops.buffer_load(
-                disp_rsrc, fx.Int32(int(DispatchSlot.P2P_PAYLOAD_READY)), vec_width=1, dtype=fx.Int64)
-            addr_payload_ready = _buffer_ops.buffer_load(
-                _buffer_ops.create_buffer_resource_from_addr(payload_table), fx.Int32(fz_rank), vec_width=1,
-                dtype=fx.Int64)
+            payload_table = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.P2P_PAYLOAD_READY)), fx.Int64)
+            addr_payload_ready = _buffer_load(
+                _make_buffer_from_addr(payload_table, fx.Int64), fx.Int32(fz_rank), fx.Int64
+            )
         wave_id = fx.thread_idx.x // 64
 
-        x_rsrc = _buffer_ops.create_buffer_resource(x, max_size=True)
-        x_base_addr = fx.Int64(_buffer_ops.extract_base_index(x, address_space=1))
-        w_rsrc = _buffer_ops.create_buffer_resource(w, max_size=True)
-        sx_rsrc = _buffer_ops.create_buffer_resource(scale_x, max_size=True)
-        sw_rsrc = _buffer_ops.create_buffer_resource(scale_w, max_size=True)
-        trb_rsrc = _buffer_ops.create_buffer_resource(sorted_token_ids, max_size=True)
-        expert_rsrc = _buffer_ops.create_buffer_resource(expert_ids, max_size=True)
-        nv_rsrc = _buffer_ops.create_buffer_resource(num_valid_ids, max_size=True)
+        w_rsrc = _make_buffer(w, fx.Int32, 4)
+        sx_rsrc = _make_buffer(scale_x, fx.Int32, 4)
+        sw_rsrc = _make_buffer(scale_w, fx.Int32)
+        trb_rsrc = _make_buffer(sorted_token_ids, fx.Int32)
+        expert_rsrc = _make_buffer(expert_ids, fx.Int32)
+        nv_rsrc = _make_buffer(num_valid_ids, fx.Int32)
         scale_cols = (inter_dim // 32 + 7) // 8 * 8
         os_nbytes = tokens * fx.Int32(scale_cols) + fx.Int32(8192)
-        out_base_addr = fx.Int64(_buffer_ops.extract_base_index(out, address_space=1))
         if const_expr(use_tile_resource):
-            out_rsrc = _buffer_ops.create_buffer_resource(out, max_size=True)
+            out_rsrc = None
         else:
             out_nbytes = tokens * fx.Int32(inter_dim)
-            out_rsrc = _buffer_ops.create_buffer_resource(out, max_size=False, num_records_bytes=out_nbytes)
-        os_rsrc = _buffer_ops.create_buffer_resource(out_scale, max_size=False, num_records_bytes=os_nbytes)
+            out_rsrc = _make_buffer(out, fx.Int16, max_size=False, num_records_bytes=out_nbytes)
+        os_rsrc = _make_buffer(out_scale, fx.Int8, max_size=False, num_records_bytes=os_nbytes)
 
         expert_of_flat, _do_scheduled_tile = build_fused_gemm1(
-            x_rsrc=x_rsrc, x_base_addr=x_base_addr, x_tensor=x, w_rsrc=w_rsrc,
+            x_tensor=x, w_rsrc=w_rsrc,
             sw_rsrc=sw_rsrc, sx_rsrc=sx_rsrc, out_rsrc=out_rsrc, os_rsrc=os_rsrc,
-            trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_base_addr=out_base_addr,
+            trb_rsrc=trb_rsrc, expert_rsrc=expert_rsrc, out_tensor=out,
             a_buf=a_buf, a_scale_lds=a_scale_lds, c_tile=c_tile,
             model_dim=model_dim, inter_dim=inter_dim, sort_block_m=sort_block_m,
             tile_n=tile_n, num_waves=NUM_WAVES, n_per_wave=n_per_wave, wave_id=wave_id,
@@ -336,15 +352,14 @@ def compile_mega_moe_stage1(
         )
 
         if tid == fx.Int32(0):
-            local_plan_ready = _buffer_ops.buffer_load(
-                disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_READY)), vec_width=1, dtype=fx.Int64)
+            local_plan_ready = _buffer_load(disp_rsrc, fx.Int32(int(DispatchSlot.PLAN_READY)), fx.Int64)
             ready_index = payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)
             mori_shmem.int32_wait_until_equals(
                 local_plan_ready + fx.Int64(ready_index) * fx.Int64(4), payload_expected)
             comm_ops.fence_agent_acquire()
         fx.barrier()
 
-        num_valid = _buffer_ops.buffer_load(nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32)
+        num_valid = _buffer_load(nv_rsrc, fx.Int32(0), fx.Int32)
         num_m_tiles = ceildiv(num_valid, fx.Int32(sort_block_m))
         total_work = num_m_tiles * fx.Int32(N_TILES)
 
@@ -407,8 +422,8 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     addr_parity, addr_expected, stream, *, model_dim, inter_dim, rank, experts_per_rank, fuse_npes,
     fuse_topk, fuse_cap, fuse_mtpr, fuse_scale_dim, fixed_slot_dispatch, num_cu,
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
-    mfma_amajor=False, swizzle_a=True, async_a_copy=False, active_expert_producer=False,
-    cooperative_payload_copy=False, num_dispatch_cu=32, use_tile_resource=True, waves_per_eu_hint=2,
+    mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
+    use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, work_shards=None, external_grouping=None, external_counting=None):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
@@ -416,8 +431,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         fuse_scale_dim=fuse_scale_dim, fixed_slot_dispatch=fixed_slot_dispatch,
         sort_block_m=sort_block_m, tile_n=tile_n, tile_k=tile_k, num_waves=num_waves,
         grid_mult=grid_mult, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
-        async_a_copy=async_a_copy, active_expert_producer=active_expert_producer,
-        cooperative_payload_copy=cooperative_payload_copy, use_tile_resource=use_tile_resource,
+        async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=work_shards, external_grouping=external_grouping,
         external_counting=external_counting,

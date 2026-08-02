@@ -286,7 +286,7 @@ class FlyDSLDispatchCombineConfig:
 
     @property
     def is_fp4(self):
-        return self.data_type == torch.float4_e2m1fn_x2
+        return (self.data_type or self.dispatch_dtype) == torch.float4_e2m1fn_x2
 
     @property
     def elem_size(self):

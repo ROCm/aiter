@@ -4,7 +4,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import _to_raw as _raw
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     Float4E2M1FN,
@@ -34,7 +33,7 @@ def scale_view(
     arg_scale, base_dw, K_TILES_TOTAL, k0_stride_dw=64, num_records_bytes=None
 ):
     """View one e8m0 scale word, optionally bounded to the real buffer extent."""
-    base_dw = rocdl.readfirstlane(T.i32, _raw(base_dw))
+    base_dw = rocdl.readfirstlane(T.i32, base_dw)
     i32_ptr_ty = fx.PointerType.get(
         T.i32, address_space=fx.AddressSpace.Global, alignment=4
     )
@@ -231,11 +230,11 @@ def gemm2_compute_v2(
     n_block_idx = bx_i32 - m_block_idx * num_n_blocks
     eids_ptr = global_typed_ptr(arg_eids, T.i32)
     if const_expr(SBM == BM):
-        e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_block_idx]))
+        e = rocdl.readfirstlane(T.i32, eids_ptr[m_block_idx])
         m_row = m_block_idx * BM
     else:
         m_row = m_block_idx * BM
-        e = rocdl.readfirstlane(T.i32, _raw(eids_ptr[m_row // fx.Int32(SBM)]))
+        e = rocdl.readfirstlane(T.i32, eids_ptr[m_row // fx.Int32(SBM)])
     if const_expr(expert_offset != 0):
         e = e - fx.Int32(expert_offset)
 
@@ -348,7 +347,7 @@ def gemm2_compute_v2(
                 ascale_views[sub][lane_div_16, lane_mod_16, chunk_kt, None],
                 saf,
             )
-            out.append(_raw(Vec(saf.load())[0]))
+            out.append(Vec(saf.load())[0])
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
@@ -429,7 +428,7 @@ def gemm2_compute_v2(
         if const_expr(tilesPerScaleChunk == 1):
             return scale
         scale_shift = (kt_rt % fx.Int32(tilesPerScaleChunk)) * fx.Int32(16)
-        return _raw(fx.Int32(scale).shrui(scale_shift))
+        return fx.Int32(scale).shrui(scale_shift)
 
     def mfma_cluster(bqf, bsf, sa, kt_rt):
         # opsel (no gate/up split): mni=J//2, in_b=J%2; sa is a per-32-row-chunk list.
@@ -437,7 +436,7 @@ def gemm2_compute_v2(
             shift_scale_word(sa[sub], kt_rt) for sub in range_constexpr(kScaleSubBlocks)
         ]
         sb_words = [
-            shift_scale_word(_raw(Vec(bsf[mni].load())[0]), kt_rt)
+            shift_scale_word(Vec(bsf[mni].load())[0], kt_rt)
             for mni in range_constexpr(nPairs)
         ]
         for J in range_constexpr(numAccN):
@@ -495,7 +494,7 @@ def gemm2_compute_v2(
         return n
 
     if const_expr(BM == 64 and BN == 256):
-        # BM64/BN256 uses the 1-stage B path unconditionally; do not depend on env knobs.
+        # BM64/BN256 uses the 1-stage B path unconditionally.
         for kt_iv, state in range(
             fx.Int32(0),
             K_TILES_RT,
@@ -583,7 +582,7 @@ def gemm2_compute_v2(
             # A-scale vmem load(s) for K-tile kt_rt into the given (per-stage) fragment(s).
             sa = load_a_scale_tile(kt_rt)
             for sub in range_constexpr(kScaleSubBlocks):
-                saf[sub].store(sa[sub])
+                saf[sub].store(Vec.filled(1, sa[sub], Int32))
 
         def load_carry():
             return load_c_carry() + load_b_carry()
@@ -636,7 +635,7 @@ def gemm2_compute_v2(
             # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.
             if const_expr(g2_ascale_pf):
                 sa = [
-                    _raw(Vec(cur_saf[sub].load())[0])
+                    Vec(cur_saf[sub].load())[0]
                     for sub in range_constexpr(kScaleSubBlocks)
                 ]
             else:
@@ -673,10 +672,10 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     group_id_y = block_1d_id // gn
     group_id_x = block_1d_id - group_id_y * gn
 
-    # remap = group_id_x <= big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
+    # remap = group_id_x < big_group_num ? gx*gs + gy : gx*gs + big - gx + gy
     remap_a = group_id_x * group_size + group_id_y
     remap_b = group_id_x * group_size + big_group_num - group_id_x + group_id_y
-    remap = (group_id_x <= big_group_num).select(remap_a, remap_b)
+    remap = (group_id_x < big_group_num).select(remap_a, remap_b)
 
     idx_M0 = remap // n0
     idx_N0 = remap - idx_M0 * n0

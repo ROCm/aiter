@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import replace
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
@@ -253,6 +254,59 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
         )
 
 
+def _run_burst(moe, x, weights, ids, depth, rank):
+    moe(x, weights, ids)
+    _barrier()
+    for _ in range(depth):
+        moe(x, weights, ids)
+    torch.cuda.synchronize()
+    if rank == 0:
+        print(f"[BURST] completed={depth}/{depth}", flush=True)
+
+
+def _install_config_policy(moe, config_tokens, unify_fields):
+    if not config_tokens:
+        return
+    reference = moe._select_config(config_tokens)
+    original_select = moe._select_config
+    fields = [field for field in unify_fields.split(",") if field]
+
+    if not fields:
+
+        def select_config(_tokens):
+            moe._active_config = reference
+            return reference
+
+    else:
+
+        def select_config(tokens):
+            local = original_select(tokens)
+            stage1_updates = {}
+            stage2_updates = {}
+            p2p_quant = local.p2p_quant
+            for field in fields:
+                if field.startswith("stage1."):
+                    name = field.removeprefix("stage1.")
+                    stage1_updates[name] = getattr(reference.stage1, name)
+                elif field.startswith("stage2."):
+                    name = field.removeprefix("stage2.")
+                    stage2_updates[name] = getattr(reference.stage2, name)
+                elif field == "p2p_quant":
+                    p2p_quant = reference.p2p_quant
+                else:
+                    raise ValueError(f"invalid config field {field!r}")
+            config = replace(
+                local,
+                stage1=replace(local.stage1, **stage1_updates),
+                stage2=replace(local.stage2, **stage2_updates),
+                p2p_quant=p2p_quant,
+            )
+            moe._active_config = config
+            return config
+
+    moe._select_config = select_config
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
@@ -262,10 +316,15 @@ def main():
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
     parser.add_argument("--rtol", type=float, default=0.10)
     parser.add_argument("--max-tok-per-rank", type=int)
+    parser.add_argument("--rank-tokens", default="")
+    parser.add_argument("--config-tokens", type=int, default=0)
+    parser.add_argument("--unify-fields", default="")
+    parser.add_argument("--burst-depth", type=int, default=0)
     args = parser.parse_args()
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
+    rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
 
     rank, world, device = _setup_dist()
     try:
@@ -278,6 +337,15 @@ def main():
             batch_sizes
         ):
             raise ValueError("--max-tok-per-rank must cover the largest batch size")
+        if args.config_tokens and args.max_tok_per_rank is None:
+            raise ValueError("--config-tokens requires --max-tok-per-rank")
+        if args.config_tokens < 0 or (
+            args.max_tok_per_rank is not None
+            and args.config_tokens > args.max_tok_per_rank
+        ):
+            raise ValueError(
+                "--config-tokens must be between zero and max-tok-per-rank"
+            )
         local_experts = network["experts"] // world
         packed = _quantize_weights(
             network["model_dim"],
@@ -288,7 +356,9 @@ def main():
             device,
         )
         w1, w1_scale, w2, w2_scale, w1_q, w1_ref_scale, w2_q, w2_ref_scale = packed
-        max_bs = max(batch_sizes)
+        if rank_tokens and len(rank_tokens) != world:
+            raise ValueError("--rank-tokens must contain one value per rank")
+        max_bs = max(batch_sizes + rank_tokens)
         x, weights, ids = _make_inputs(
             max_bs,
             network["model_dim"],
@@ -300,6 +370,7 @@ def main():
         )
         ref_weights = w1_q, w1_ref_scale, w2_q, w2_ref_scale
         for batch_size in batch_sizes:
+            local_batch_size = rank_tokens[rank] if rank_tokens else batch_size
             max_tok_per_rank = args.max_tok_per_rank or max(
                 16, _next_power_of_two(batch_size)
             )
@@ -314,17 +385,42 @@ def main():
                 max_tok_per_rank=max_tok_per_rank,
                 **network,
             )
-            _run_size(
-                moe,
-                x[:batch_size].contiguous(),
-                weights[:batch_size].contiguous(),
-                ids[:batch_size].contiguous(),
-                ref_weights,
-                args,
-                rank,
-                world,
-                device,
-            )
+            _install_config_policy(moe, args.config_tokens, args.unify_fields)
+            if rank_tokens:
+                selected = moe._select_config(local_batch_size)
+                configs = [None] * world
+                dist.all_gather_object(
+                    configs,
+                    (
+                        rank,
+                        local_batch_size,
+                        selected.stage1,
+                        selected.stage2,
+                        selected.p2p_quant,
+                    ),
+                )
+                if rank == 0:
+                    for config in configs:
+                        print(f"[CONFIG] {config}", flush=True)
+            local_x = x[:local_batch_size].contiguous()
+            local_weights = weights[:local_batch_size].contiguous()
+            local_ids = ids[:local_batch_size].contiguous()
+            if args.burst_depth:
+                _run_burst(
+                    moe, local_x, local_weights, local_ids, args.burst_depth, rank
+                )
+            else:
+                _run_size(
+                    moe,
+                    local_x,
+                    local_weights,
+                    local_ids,
+                    ref_weights,
+                    args,
+                    rank,
+                    world,
+                    device,
+                )
     finally:
         _cleanup()
 

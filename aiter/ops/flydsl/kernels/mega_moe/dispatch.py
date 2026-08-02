@@ -45,10 +45,11 @@ class DispatchSlot(IntEnum):
     WORK_HEAD = 25
     WORK_TAIL = 26
     EXPERT_TILE_END = 27
-    ACTIVE_EXPERTS = 28
-    ACTIVE_COUNT = 29
-    RUNNING = 30
-    P2P_RUNNING = 31
+    GROUP_DONE = 28
+    RUNNING = 29
+    P2P_RUNNING = 30
+    LAUNCH_READY = 31
+    P2P_LAUNCH_READY = 32
 
 
 DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
@@ -91,12 +92,13 @@ def emit_direct_fixed_slot_payload(
     p_sm = dp(DispatchSlot.P2P_SRCMAP)
     p_running = dp(DispatchSlot.P2P_RUNNING)
     p_source_done = dp(DispatchSlot.P2P_COUNT_DONE)
-    a_producer_done = dp(DispatchSlot.ACTIVE_COUNT)
+    a_producer_done = dp(DispatchSlot.GROUP_DONE)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
     warp = tid >> fx.Int32(6)
     destination_groups = 2
+    assert dispatch_blocks % destination_groups == 0, "direct fixed-slot dispatch needs even producer groups"
     producers_per_group = dispatch_blocks // destination_groups
     producer_group = producer_slot % fx.Int32(destination_groups)
     group_slot = producer_slot // fx.Int32(destination_groups)
@@ -262,7 +264,7 @@ def emit_direct_fixed_slot_finalize(
 @flyc.jit
 def emit_dispatch_plan(
     *, num_waves, fz_npes, fz_epr, fz_k, fz_mtpr, fz_rank, fz_tile_m, fz_total_experts, addr_disp,
-    i32_cur_tok, addr_in_idx, parity, expected, active_expert_producer, external_grouping, external_counting,
+    i32_cur_tok, addr_in_idx, parity, expected, external_grouping, external_counting,
     dispatch_blocks,
 ):
 # fmt: on
@@ -290,9 +292,7 @@ def emit_dispatch_plan(
     a_pair_ready = dp(DispatchSlot.PAIR_READY)
     a_pair_order_ready = dp(DispatchSlot.PAIR_ORDER_READY)
     a_expert_tile_end = dp(DispatchSlot.EXPERT_TILE_END)
-    a_active_experts = dp(DispatchSlot.ACTIVE_EXPERTS)
-    a_active_count = dp(DispatchSlot.ACTIVE_COUNT)
-    p_payload_ready = dp(DispatchSlot.P2P_PAYLOAD_READY)
+    a_group_done = dp(DispatchSlot.GROUP_DONE)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -308,16 +308,11 @@ def emit_dispatch_plan(
     r_pair_base = crfa(a_pair_base)
     r_pair = crfa(a_pair_order)
     r_lc = crfa(a_lc)
-    if const_expr(active_expert_producer):
-        if tid == fx.Int32(0):
-            buffer_ops.buffer_store(fx.Int32(0), crfa(a_active_count), fx.Int32(0))
-        fx.rocdl.s_waitcnt(0)
-        fx.barrier()
     if const_expr(external_counting):
         if tid == fx.Int32(0):
-            mori_shmem.int32_wait_until_equals(a_active_count, fx.Int32(dispatch_blocks))
+            mori_shmem.int32_wait_until_equals(a_group_done, fx.Int32(dispatch_blocks))
             comm_ops.fence_agent_acquire()
-            buffer_ops.buffer_store(fx.Int32(0), crfa(a_active_count), fx.Int32(0))
+            buffer_ops.buffer_store(fx.Int32(0), crfa(a_group_done), fx.Int32(0))
             fx.rocdl.s_waitcnt(0)
             comm_ops.fence_agent_release()
     else:
@@ -378,7 +373,6 @@ def emit_dispatch_plan(
             ge = fx.Int32(fz_rank * fz_epr + local_expert)
             source_counts = []
             total_count = fx.Int32(0)
-            zero_sources = fx.Int32(0)
             for source in range_constexpr(fz_npes):
                 source_count = buffer_ops.buffer_load(
                     r_bc, fx.Int32(source * fz_epr) + safe_expert, vec_width=1, dtype=fx.Int32
@@ -386,16 +380,6 @@ def emit_dispatch_plan(
                 source_count = valid_expert.select(source_count, fx.Int32(0))
                 source_counts.append(source_count)
                 total_count = total_count + source_count
-                zero_sources = zero_sources + (source_count == fx.Int32(0)).select(fx.Int32(1), fx.Int32(0))
-            if const_expr(active_expert_producer):
-                if valid_expert & (zero_sources > fx.Int32(0)):
-                    local_payload_ready = buffer_ops.buffer_load(
-                        crfa(p_payload_ready), fx.Int32(fz_rank), vec_width=1, dtype=fx.Int64
-                    )
-                    ready_index = parity * fx.Int32(fz_epr) + local_expert
-                    comm_ops.store_i32_system(
-                        local_payload_ready, ready_index, expected - fx.Int32(fz_npes) + zero_sources
-                    )
             num_tiles = (total_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
             padded_rows = num_tiles * fx.Int32(fz_tile_m)
             inclusive_rows = _wave_inclusive_scan_i32(padded_rows, lane)
@@ -444,13 +428,6 @@ def emit_dispatch_plan(
             safe_ge = valid_ge.select(ge, fx.Int32(0))
             source_count = buffer_ops.buffer_load(r_lh, safe_ge, vec_width=1, dtype=fx.Int32)
             source_count = valid_ge.select(source_count, fx.Int32(0))
-            if const_expr(active_expert_producer):
-                if valid_ge & (source_count > fx.Int32(0)):
-                    active_slot = fx.Int32(comm_ops.atomic_add_agent(a_active_count, fx.Int32(1)))
-                    buffer_ops.buffer_store(
-                        (ge % fx.Int32(fz_epr)) * fx.Int32(fz_npes) + ge // fx.Int32(fz_epr),
-                        crfa(a_active_experts), active_slot,
-                    )
             lane_counts.append(source_count)
             lane_total = lane_total + source_count
         lane_prefix = _wave_inclusive_scan_i32(lane_total, lane) - lane_total
@@ -489,7 +466,7 @@ def emit_dispatch_plan(
     fx.barrier()
     if tid == fx.Int32(0):
         if const_expr(external_grouping):
-            mori_shmem.int32_wait_until_equals(a_active_count, fx.Int32(dispatch_blocks))
+            mori_shmem.int32_wait_until_equals(a_group_done, fx.Int32(dispatch_blocks))
             comm_ops.fence_agent_acquire()
         comm_ops.fence_agent_release()
         buffer_ops.buffer_store(expected, crfa(a_pair_order_ready), parity)
@@ -514,7 +491,7 @@ def emit_dispatch_group(
     a_local_hist = dp(DispatchSlot.LOCAL_HIST)
     a_local_cursor = dp(DispatchSlot.LOCAL_CURSOR)
     a_pair_order = dp(DispatchSlot.PAIR_ORDER)
-    a_group_done = dp(DispatchSlot.ACTIVE_COUNT)
+    a_group_done = dp(DispatchSlot.GROUP_DONE)
     r_idx = crfa(addr_in_idx)
     r_pair = crfa(a_pair_order)
     tid = fx.thread_idx.x
@@ -562,7 +539,7 @@ def emit_dispatch_group(
 def emit_dispatch_payload(
     *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32, fz_safe_end_i32,
     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_wts, addr_in_sc, dispatch_blocks,
-    producer_slot, parity, expected, active_expert_producer, cooperative_payload_copy,
+    producer_slot, parity, expected,
 ):
 # fmt: on
     """Produce independently publishable expert payloads from a compact plan."""
@@ -582,8 +559,6 @@ def emit_dispatch_payload(
     p_payload_ready = dp(DispatchSlot.P2P_PAYLOAD_READY)
     a_pair_order = dp(DispatchSlot.PAIR_ORDER)
     a_plan_ready = dp(DispatchSlot.PLAN_READY)
-    a_active_experts = dp(DispatchSlot.ACTIVE_EXPERTS)
-    a_active_count = dp(DispatchSlot.ACTIVE_COUNT)
 
     tid = fx.thread_idx.x
     lane = tid & fx.Int32(63)
@@ -593,18 +568,11 @@ def emit_dispatch_payload(
     r_mb = crfa(a_mb)
     r_pair = crfa(a_pair_order)
     r_wts = crfa(addr_in_wts)
-    if const_expr(active_expert_producer):
-        task_limit = buffer_ops.buffer_load(crfa(a_active_count), fx.Int32(0), vec_width=1, dtype=fx.Int32)
-    else:
-        task_limit = fx.Int32(fz_total_experts)
+    task_limit = fx.Int32(fz_total_experts)
     task0 = producer_slot
     task_stride = fx.Int32(dispatch_blocks)
-    if const_expr(cooperative_payload_copy):
-        row0 = fx.Int32(0)
-        row_stride = fx.Int32(1)
-    else:
-        row0 = warp
-        row_stride = fx.Int32(num_waves)
+    row0 = warp
+    row_stride = fx.Int32(num_waves)
 
     def _publish_task(destination, local_expert, ge):
         comm_ops.fence_system_release()
@@ -615,27 +583,15 @@ def emit_dispatch_payload(
 
     num_destinations = fz_total_experts // fz_epr
     hoist_remote_resources = fz_mtpr >= 1024
-    if const_expr(not active_expert_producer):
-        producer_destination = producer_slot % fx.Int32(num_destinations)
-        ready_index = parity * fx.Int32(num_destinations) + producer_destination
-        if tid == fx.Int32(0):
-            mori_shmem.int32_wait_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
-            comm_ops.fence_system_acquire()
-        fx.barrier()
+    producer_destination = producer_slot % fx.Int32(num_destinations)
+    ready_index = parity * fx.Int32(num_destinations) + producer_destination
+    if tid == fx.Int32(0):
+        mori_shmem.int32_wait_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
+        comm_ops.fence_system_acquire()
+    fx.barrier()
     for task_index in range(task0, task_limit, task_stride):
-        if const_expr(active_expert_producer):
-            task = buffer_ops.buffer_load(crfa(a_active_experts), task_index, vec_width=1, dtype=fx.Int32)
-            local_expert = task // fx.Int32(num_destinations)
-            destination = task % fx.Int32(num_destinations)
-            ready_index = parity * fx.Int32(num_destinations) + destination
-            if tid == fx.Int32(0):
-                mori_shmem.int32_wait_until_equals(a_plan_ready + fx.Int64(ready_index) * fx.Int64(4), expected)
-                comm_ops.fence_system_acquire()
-            fx.barrier()
-        else:
-            task = task_index
-            local_expert = task // fx.Int32(num_destinations)
-            destination = producer_destination
+        local_expert = task_index // fx.Int32(num_destinations)
+        destination = producer_destination
         ge = destination * fx.Int32(fz_epr) + local_expert
         source_count_lane = fx.Int32(0)
         source_base_lane = fx.Int32(0)
@@ -675,18 +631,11 @@ def emit_dispatch_payload(
                     srcmap_remote = buffer_ops.buffer_load(crfa(p_sm), destination, vec_width=1, dtype=fx.Int64)
                     buffer_ops.buffer_store(source_encoding, crfa(srcmap_remote), destination_row)
 
-            if const_expr(not cooperative_payload_copy):
-                if lane == fx.Int32(0):
-                    _copy_route_header()
-            else:
-                if tid == fx.Int32(0):
-                    _copy_route_header()
+            if lane == fx.Int32(0):
+                _copy_route_header()
 
             if const_expr(fz_enable_scales):
-                if const_expr(not cooperative_payload_copy):
-                    scale_lane = lane
-                else:
-                    scale_lane = tid
+                scale_lane = lane
                 if const_expr(fz_scale_n_i32 % 4 == 0):
                     scale_offset = scale_lane * fx.Int32(4)
                     if scale_offset < fx.Int32(fz_scale_n_i32):
@@ -727,24 +676,17 @@ def emit_dispatch_payload(
             else:
                 row_token_remote = buffer_ops.buffer_load(crfa(p_rx), destination, vec_width=1, dtype=fx.Int64)
                 destination_rsrc = crfa(row_token_remote + fx.Int64(destination_row) * fx.Int64(fz_nbytes))
-            if const_expr(not cooperative_payload_copy):
-                lane_offset = lane * fx.Int32(4)
-                if const_expr(fz_safe_end_i32 > 0):
-                    for column in range(lane_offset, fz_safe_end_i32, 512):
-                        value0 = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
-                        value1 = buffer_ops.buffer_load(
-                            source_rsrc, column + fx.Int32(256), vec_width=4, dtype=fx.Int32
-                        )
-                        buffer_ops.buffer_store(value0, destination_rsrc, column)
-                        buffer_ops.buffer_store(value1, destination_rsrc, column + fx.Int32(256))
-                if const_expr(fz_safe_end_i32 < fz_n_i32):
-                    for column in range(lane_offset + fz_safe_end_i32, fz_n_i32, 256):
-                        value = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
-                        buffer_ops.buffer_store(value, destination_rsrc, column)
-            else:
-                thread_offset = tid * fx.Int32(4)
-                thread_stride = fx.Int32(num_waves * 64 * 4)
-                for column in range(thread_offset, fz_n_i32, thread_stride):
+            lane_offset = lane * fx.Int32(4)
+            if const_expr(fz_safe_end_i32 > 0):
+                for column in range(lane_offset, fz_safe_end_i32, 512):
+                    value0 = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
+                    value1 = buffer_ops.buffer_load(
+                        source_rsrc, column + fx.Int32(256), vec_width=4, dtype=fx.Int32
+                    )
+                    buffer_ops.buffer_store(value0, destination_rsrc, column)
+                    buffer_ops.buffer_store(value1, destination_rsrc, column + fx.Int32(256))
+            if const_expr(fz_safe_end_i32 < fz_n_i32):
+                for column in range(lane_offset + fz_safe_end_i32, fz_n_i32, 256):
                     value = buffer_ops.buffer_load(source_rsrc, column, vec_width=4, dtype=fx.Int32)
                     buffer_ops.buffer_store(value, destination_rsrc, column)
 
