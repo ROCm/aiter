@@ -599,7 +599,6 @@
     "module_pa_mqa_logits_mxfp8_opus": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp8_kernels.cu'",
-            "f'{AITER_CSRC_DIR}/py_itfs_cu/pa_mqa_logits_mxfp8_metadata.cu'",
             "f'{AITER_CSRC_DIR}/pybind/pa_mqa_logits_mxfp8_pybind.cu'"
         ],
         "flags_extra_cc": [],

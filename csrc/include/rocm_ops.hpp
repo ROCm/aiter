@@ -1467,23 +1467,8 @@ namespace py = pybind11;
           py::arg("softmax_scale"));
 
 #define PA_MQA_LOGITS_MXFP8_PYBIND                        \
-    m.def("pa_mqa_logits_mxfp8_fwd",                      \
-          &pa_mqa_logits_mxfp8_fwd,                       \
-          py::arg("q"),                                \
-          py::arg("q_scale"),                          \
-          py::arg("kv_cache"),                         \
-          py::arg("kv_scale"),                         \
-          py::arg("block_tables"),                     \
-          py::arg("weights"),                          \
-          py::arg("cta_info"),                         \
-          py::arg("out"),                              \
-          py::arg("n_ctas"),                           \
-          py::arg("weight_scale"),                     \
-          py::arg("block_k"),                          \
-          py::arg("kv_block_size"),                    \
-          py::arg("max_seq_len"));                     \
-    m.def("pa_mqa_logits_mxfp8_fwd_direct",               \
-          &pa_mqa_logits_mxfp8_fwd_direct,                \
+    m.def("pa_mqa_logits_mxfp8_fwd_prefill",               \
+          &pa_mqa_logits_mxfp8_fwd_prefill,                \
           py::arg("q"),                                \
           py::arg("q_scale"),                          \
           py::arg("kv_cache"),                         \
@@ -1495,7 +1480,6 @@ namespace py = pybind11;
           py::arg("local_ends"),                       \
           py::arg("out"),                              \
           py::arg("num_rows"),                         \
-          py::arg("split_kv"),                         \
           py::arg("weight_scale"),                     \
           py::arg("block_k"),                          \
           py::arg("kv_block_size"),                    \
@@ -1514,24 +1498,12 @@ namespace py = pybind11;
           py::arg("batch"),                            \
           py::arg("next_n_max"),                       \
           py::arg("split_kv"),                         \
-          py::arg("axis"),                             \
           py::arg("weight_scale"),                     \
           py::arg("block_k"),                          \
           py::arg("kv_block_size"),                    \
           py::arg("max_seq_len"));                     \
-    m.def("pa_mqa_logits_mxfp8_prefill_schedule",         \
-          &pa_mqa_logits_mxfp8_prefill_schedule,          \
-          py::arg("row_to_batch"),                     \
-          py::arg("local_starts"),                     \
-          py::arg("local_ends"),                       \
-          py::arg("scratch"),                          \
-          py::arg("cta_info"),                         \
-          py::arg("total_tokens"),                     \
-          py::arg("parallel_unit_num"),                \
-          py::arg("block_k"),                          \
-          py::arg("max_seq_len"));                     \
-    m.def("pa_mqa_logits_mxfp8_varqlen_windows",          \
-          &pa_mqa_logits_mxfp8_varqlen_windows,           \
+    m.def("pa_mqa_logits_mxfp8_prefill_windows",          \
+          &pa_mqa_logits_mxfp8_prefill_windows,           \
           py::arg("cu_seq_q"),                         \
           py::arg("context_lens"),                     \
           py::arg("row_to_batch"),                     \

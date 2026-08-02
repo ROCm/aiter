@@ -7,63 +7,22 @@
 //   out[r, s:e] = sum_H( relu(Q[r] . Kᵀ) * weight[r] ) * weight_scale
 //
 // This op is a thin launcher: Q/KV must already be MXFP8-quantized and
-// preshuffled into the kernel ABI, and the persistent-grid schedule
-// (`cta_info[n_ctas, CTA_INFO_WIDTH]`) must already be built (see the schedule
-// builders below). Quant/preshuffle is the caller's responsibility.
+// preshuffled into the kernel ABI. The per-CTA assignment is derived entirely
+// in-kernel from blockIdx + per-row windows / per-batch metadata (schedule-free,
+// cudagraph-safe); quant/preshuffle is the caller's responsibility.
 
 #pragma once
 #include "aiter_tensor.h"
 #include <cstdint>
 
-// cta_info packed fields per CTA ([n_ctas, CTA_INFO_WIDTH] int32) — public ABI:
-//   0: row_id       -- output row / flat query-token index
-//   1: batch_id     -- sequence index (indexes block_tables)
-//   2: chunk_start  -- first KV chunk (block_k units) this CTA handles
-//   3: chunk_count  -- number of chunks this CTA handles
-//   4: local_start  -- window lower bound [start, end)
-//   5: local_end    -- window upper bound
-static constexpr int CTA_INFO_WIDTH = 6;
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-// Launch the MXFP8 MQA logits kernel over a prebuilt persistent-grid schedule.
-//
-// Tensor expectations (row-major, last dim contiguous):
-//   q            : [total_tokens, H, D]                               fp8  (E4M3)
-//   q_scale      : [total_tokens, K_TILES, K_CHUNKS, 16, QS_PAD]      uint8 (E8M0, preshuffled)
-//   kv_cache     : [num_blocks, K_TILES, 8, PAGE, 16]                 fp8  (E4M3, paged+preshuffled)
-//   kv_scale     : [num_blocks, K_TILES, K_CHUNKS, PAGE]             uint8 (E8M0)
-//   block_tables : [batch, max_blocks_per_seq]                        int32
-//   weights      : [total_tokens, H]                                  bf16
-//   cta_info     : [n_ctas, CTA_INFO_WIDTH]                           int32 (persistent-grid schedule)
-//   out          : [total_tokens, max_seq_len]                        fp32  (caller-allocated; OOB left as-is)
-// `weight_scale` is folded into the per-head weighting; `block_k` / `kv_block_size`
-// must match the compiled traits (256 / 64 for the 4-wave variant).
-void pa_mqa_logits_mxfp8_fwd(aiter_tensor_t& q,
-                          aiter_tensor_t& q_scale,
-                          aiter_tensor_t& kv_cache,
-                          aiter_tensor_t& kv_scale,
-                          aiter_tensor_t& block_tables,
-                          aiter_tensor_t& weights,
-                          aiter_tensor_t& cta_info,
-                          aiter_tensor_t& out,
-                          int n_ctas,
-                          float weight_scale,
-                          int block_k,
-                          int kv_block_size,
-                          int max_seq_len);
-
-// Schedule-free launch (no cta_info table): the per-CTA assignment is derived
-// in-kernel from blockIdx + per-row windows (row_to_batch / local_starts /
-// local_ends, each [num_rows] int32) + split_kv. grid = num_rows * split_kv.
-//   prefill: split_kv = 1 (one CTA per row).
-//   decode : split_kv > 1 splits each row's context across CTAs (cudagraph-safe;
-//            grid is a static shape, context_len values are only read in-kernel).
-// The window arrays are the same ones `pa_mqa_logits_mxfp8_varqlen_windows`
-// produces (device, in-graph). No compute_prefill_schedule / cta_info needed.
-void pa_mqa_logits_mxfp8_fwd_direct(aiter_tensor_t& q,
+// PREFILL launch: 1D grid (num_rows), one CTA per query row covering its whole
+// window, read from per-row [num_rows] int32 arrays (row_to_batch/local_starts/
+// local_ends, e.g. built by pa_mqa_logits_mxfp8_prefill_windows). No context split.
+void pa_mqa_logits_mxfp8_fwd_prefill(aiter_tensor_t& q,
                           aiter_tensor_t& q_scale,
                           aiter_tensor_t& kv_cache,
                           aiter_tensor_t& kv_scale,
@@ -74,19 +33,15 @@ void pa_mqa_logits_mxfp8_fwd_direct(aiter_tensor_t& q,
                           aiter_tensor_t& local_ends,
                           aiter_tensor_t& out,
                           int num_rows,
-                          int split_kv,
                           float weight_scale,
                           int block_k,
                           int kv_block_size,
                           int max_seq_len);
 
-// Schedule-free DECODE launch (3D grid (split_kv, next_n_max, batch)): the per-CTA
-// (batch, MTP position, context split) assignment + MTP tail-causal window are derived
-// entirely from blockIdx + per-batch cu_seq_q / context_lens (no per-row window arrays,
-// no window-build kernel). Q/weights/out are PACKED ([total_q, ...]); row = cu_seq_q[batch]+n.
-//   uniform MTP : cu_seq_q = [0, next_n, 2*next_n, ...], next_n_max = next_n.
-//   varqlen     : cu_seq_q = per-batch qlen prefix sum, next_n_max = max qlen (pad grid, mask).
-// grid dims are static shapes -> cudagraph-safe (context_lens only read in-kernel).
+// DECODE launch: 3D grid (batch, next_n_max, split_kv). Q/weights/out PACKED
+// ([total_q, ...]); the packed row (cu_seq_q[batch]+n) and MTP tail-causal window
+// are derived inline from per-batch cu_seq_q / context_lens (no window arrays).
+// cudagraph-safe (grid from static shapes; context_lens only read in-kernel).
 void pa_mqa_logits_mxfp8_fwd_decode(aiter_tensor_t& q,
                           aiter_tensor_t& q_scale,
                           aiter_tensor_t& kv_cache,
@@ -99,34 +54,16 @@ void pa_mqa_logits_mxfp8_fwd_decode(aiter_tensor_t& q,
                           int batch,
                           int next_n_max,
                           int split_kv,
-                          int axis,
                           float weight_scale,
                           int block_k,
                           int kv_block_size,
                           int max_seq_len);
 
-// Build the persistent-grid schedule `cta_info[P, CTA_INFO_WIDTH]` from ragged
-// windows (device, cudagraph-safe: all inputs/outputs are caller-allocated
-// device buffers; grid is derived from static shapes, not from window values).
-//   row_to_batch / local_starts / local_ends : [total_tokens] int32
-//   scratch                                  : [>= total_tokens + 2] int32 workspace
-//   cta_info                                 : [parallel_unit_num, CTA_INFO_WIDTH] int32 (out)
-void pa_mqa_logits_mxfp8_prefill_schedule(aiter_tensor_t& row_to_batch,
-                                       aiter_tensor_t& local_starts,
-                                       aiter_tensor_t& local_ends,
-                                       aiter_tensor_t& scratch,
-                                       aiter_tensor_t& cta_info,
-                                       int total_tokens,
-                                       int parallel_unit_num,
-                                       int block_k,
-                                       int max_seq_len);
-
-// Build ragged-row metadata for per-batch variable query length (MTP decode).
-// MTP tail-causal: batch b's n-th query token sees [0, context_len[b] - (qlen-1-n)).
-//   cu_seq_q     : [B+1]      int32 (prefix sum of per-batch qlen)
-//   context_lens : [B]        int32
-//   row_to_batch / local_starts / local_ends : [total_q] int32 (out)
-void pa_mqa_logits_mxfp8_varqlen_windows(aiter_tensor_t& cu_seq_q,
+// Build the per-row [local_start, local_end) window arrays the PREFILL launch
+// consumes, from cu_seq_q [B+1] + context_lens [B] (MTP tail-causal: batch b's
+// n-th row sees [0, context_len[b] - (qlen-1-n)); plain causal when qlen == ctx).
+// Outputs row_to_batch / local_starts / local_ends, each [total_q] int32. Device-side.
+void pa_mqa_logits_mxfp8_prefill_windows(aiter_tensor_t& cu_seq_q,
                                       aiter_tensor_t& context_lens,
                                       aiter_tensor_t& row_to_batch,
                                       aiter_tensor_t& local_starts,
@@ -134,58 +71,39 @@ void pa_mqa_logits_mxfp8_varqlen_windows(aiter_tensor_t& cu_seq_q,
                                       int total_q);
 
 #ifdef PA_MQA_LOGITS_MXFP8_IMPL
-// ============================================================================
-// Implementation section - only compiled in the .cu translation unit(s).
-// Kernel-arg / traits plumbing (ABI-identical to the standalone
-// gcnasm/opus_logits/logits_defs.h) + the device kernel template.
-// ============================================================================
+// ==== Implementation (compiled only in the .cu TU): kargs + traits + kernel. ====
 
-// Scalar data types (host+device safe; identical to opus::bf16_t / opus::fp8_t).
 using mqa_logits_bf16_t = __bf16;
 using mqa_logits_fp8_t  = _BitInt(8);   // fp8 E4M3 storage (== opus::fp8_t)
 
 // Kernel arguments. Pointers are opaque; the kernel reinterprets per its ABI.
 struct opus_mqa_logits_kargs {
     const void* __restrict__ ptr_q;         // [total_tokens, H, D]                          fp8 (E4M3)
-    const void* __restrict__ ptr_q_scale;   // [total_tokens, K_TILES, K_CHUNKS, 16, QS_PAD] e8m0
+    const void* __restrict__ ptr_q_scale;   // [total_tokens, K_TILES, K_CHUNKS, 16, round_up(M_TILES,4)] e8m0
     const void* __restrict__ ptr_kv;        // [num_blocks, K_TILES, 8, PAGE, 16]            fp8 (E4M3)
     const void* __restrict__ ptr_kv_scale;  // [num_blocks, K_TILES, K_CHUNKS, PAGE]         e8m0
     const int*  __restrict__ ptr_block_tables; // [batch, max_blocks_per_seq] int32
     const void* __restrict__ ptr_weights;   // [total_tokens, H] bf16
-    const int*  __restrict__ ptr_cta_info;   // [n_ctas, CTA_INFO_WIDTH] int32 (cta_info mode only)
     float* __restrict__ ptr_out;             // [total_tokens, max_seq_len] fp32
 
-    // Direct-schedule mode (no cta_info table): the per-CTA assignment is derived
-    // in-kernel from blockIdx + these per-row window arrays (triton/deepgemm style).
-    //   grid = num_rows * split_kv; row = pid / split_kv; split = pid % split_kv.
-    // Prefill: split_kv == 1 (one CTA per row). Decode: split_kv > 1 splits each
-    // row's context across CTAs (balanced, remainder to the first splits).
-    const int* __restrict__ ptr_row_to_batch;  // [num_rows] int32 (prefill direct: SCHED 1)
-    const int* __restrict__ ptr_local_starts;   // [num_rows] int32 (prefill direct)
-    const int* __restrict__ ptr_local_ends;     // [num_rows] int32 (prefill direct)
-    // decode direct (SCHED 2): 3D grid (split, next_n_max, batch); windows derived inline
-    // from these per-batch arrays (no per-row window arrays / no window-build kernel).
+    // Prefill (SCHED Prefill): per-row window arrays, each [num_rows] int32.
+    const int* __restrict__ ptr_row_to_batch;
+    const int* __restrict__ ptr_local_starts;
+    const int* __restrict__ ptr_local_ends;
+    // Decode (SCHED Decode): per-batch arrays; windows derived inline in-kernel.
     const int* __restrict__ ptr_cu_seq_q;       // [batch+1] int32 (packed qlen prefix sum)
     const int* __restrict__ ptr_context_lens;   // [batch]   int32
-    int   split_kv;            // context splits per row (>= 1)
-    int   num_rows;            // total query rows (prefill direct grid.y; extra -> idle)
+    int   split_kv;            // context splits per row (>= 1); SCHED Decode only
+    int   num_rows;            // total query rows (prefill grid.x)
 
     int   max_seq_len;
     int   stride_out_row;      // out row stride in elements (== max_seq_len for dense out)
     float weight_scale;
-    int   block_k;             // KV tile size along seq_kv (== Traits::KV_TILE_SIZE)
+    int   block_k;             // KV tile size (== Traits::KV_TILE_SIZE)
     int   kv_block_size;       // paged block (page) size (== Traits::PAGE_SIZE)
     int   max_blocks_per_seq;  // block_tables row stride
 };
 
-// Compile-time config. Defaults target the 4-wave MXFP8 variant:
-//   NUM_WARPS=4 -> BLOCK=256, KV_TILE=256 (block_k), PAGE=64, D=128, H=64.
-//
-// Q_LDS_WARPS_ decouples the async-Q LDS layout (make_layout_gq/sq/rq) from the compute wave
-// count NUM_WARPS_. It defaults to NUM_WARPS_ (the 4-wave path is byte-identical). The single-wave
-// variant (NUM_WARPS_=1) sets Q_LDS_WARPS_=4 so the Q LDS bytes match the 4-wave layout (the
-// proven rq->MFMA a-operand path is reused verbatim); one physical warp then loads the whole Q via
-// the Q-warp dim being expressed as p_dim(NUM_WARPS) x y_dim(Q_VWARPS). See make_layout_gq/sq.
 template<int KV_TILE_SIZE_ = 256,
          int PAGE_SIZE_     = 64,
          int HEAD_DIM_      = 128,
@@ -200,95 +118,76 @@ struct opus_mqa_logits_traits {
     static constexpr int NUM_WARPS    = NUM_WARPS_;
 
     static constexpr int WARP_SIZE  = 64;
-    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;  // 256 (4-wave)
+    static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
 
-    // async-Q LDS geometry (== NUM_WARPS for the 4-wave path). The single-wave variant keeps this
-    // at 4 so the Q LDS layout / rq read are byte-identical to the 4-wave kernel.
+    // async-Q LDS geometry: Q_LDS_WARPS == NUM_WARPS for 4-wave; the 1-wave variant keeps it
+    // at 4 so the Q LDS layout / rq read stay byte-identical (Q_VWARPS = virtual Q-warps each
+    // physical warp emulates via the gq/sq y_dim).
     static constexpr int Q_LDS_WARPS = Q_LDS_WARPS_;
-    static constexpr int Q_LDS_BLOCK = Q_LDS_WARPS * WARP_SIZE;   // 256 (Q cooperative-load block)
-    // virtual Q-warps each physical warp emulates via the gq/sq y_dim (4-wave: 1; single: 4).
+    static constexpr int Q_LDS_BLOCK = Q_LDS_WARPS * WARP_SIZE;
     static constexpr int Q_VWARPS    = Q_LDS_WARPS / NUM_WARPS;
 
-    // Data-type aliases the kernel refers to.
-    using D_DATA   = mqa_logits_fp8_t;    // Q / KV data (E4M3), MFMA A/B operand element
+    using D_DATA   = mqa_logits_fp8_t;    // Q / KV data (E4M3), MFMA A/B operand
     using D_WEIGHT = mqa_logits_bf16_t;   // per-head weights
-    using D_ACC    = float;    // MFMA accumulator (C)
-    using D_OUT    = float;    // output logits
-    using D_SCALE  = int;      // E8M0 blockscale, packed as an int32 dword per lane
+    using D_ACC    = float;               // MFMA accumulator (C)
+    using D_OUT    = float;               // output logits
+    using D_SCALE  = int;                 // E8M0 blockscale, packed int32 dword/lane
 
-    // MFMA: scaled f8f6f4, 16x16x128 (M x N x K). K covers 128 head_dim in one shot.
+    // MFMA: scaled f8f6f4, 16x16x128 (M x N x K); K covers 128 head_dim in one shot.
     static constexpr int MFMA_M = 16;
     static constexpr int MFMA_N = 16;
     static constexpr int MFMA_K = 128;
 
-    static constexpr int SCALE_BLOCK = 32;                 // E8M0 blockscale granularity
-    static constexpr int K_CHUNKS    = MFMA_K / SCALE_BLOCK; // 4 (32-elem chunks per 128-K)
+    static constexpr int SCALE_BLOCK = 32;                   // E8M0 blockscale granularity
+    static constexpr int K_CHUNKS    = MFMA_K / SCALE_BLOCK; // 32-elem chunks per 128-K
+    static constexpr int M_TILES = N_HEADS / MFMA_M;         // head tiles along M
+    static constexpr int K_TILES = HEAD_DIM / MFMA_K;        // outer K loop
 
-    static constexpr int M_TILES = N_HEADS / MFMA_M;       // 4  (head tiles along M)
-    static constexpr int K_TILES = HEAD_DIM / MFMA_K;      // 1  (outer K loop)
+    static constexpr int N_TOTAL_TILES   = KV_TILE_SIZE / MFMA_N;
+    static constexpr int N_TILES         = N_TOTAL_TILES / NUM_WARPS;   // KV token-tiles per warp (NTPW)
+    static constexpr int TILES_PER_BLOCK = PAGE_SIZE / MFMA_N;          // MFMA_N tiles per page
+    static constexpr int N_PHYS = (N_TILES + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK; // pages a warp's NTPW span
 
-    static constexpr int N_TOTAL_TILES          = KV_TILE_SIZE / MFMA_N;    // 16
-    static constexpr int N_TILES = N_TOTAL_TILES / NUM_WARPS;      // 4
-    static constexpr int TILES_PER_BLOCK  = PAGE_SIZE / MFMA_N;       // 4 (MFMA_N tiles per page)
-    // #physical blocks a warp's NTPW tiles span (1 => all NTPW share one page).
-    static constexpr int N_PHYS = (N_TILES + TILES_PER_BLOCK - 1) / TILES_PER_BLOCK; // 1
-
-    static constexpr int ELEM_BYTES = sizeof(D_DATA);   // fp8 = 1 byte/elem
+    static constexpr int ELEM_BYTES = sizeof(D_DATA);   // fp8 = 1 byte
     static constexpr int DWORDx4_BYTES = 16;
 
     // MI350 fp8 16x16x128 register layout: lane g=lane/16 holds
     //   vgpr0-3 = K[g*16 : +16]  and  vgpr4-7 = K[64 + g*16 : +16]  (two 16-K groups).
     // (fp4 differs: lane g holds one contiguous K[g*32:+32].)
-    static constexpr int KV_GRP_ELEMS = 16;                   // 16 fp8 per vgpr group
-    static constexpr int KV_GRP_BYTES = KV_GRP_ELEMS;         // 16 bytes
-    static constexpr int A_BYTES_PER_LANE = (MFMA_M * MFMA_K / WARP_SIZE) * ELEM_BYTES; // 32 (i32x8)
-    static constexpr int VGRP_K_OFFSET = 64;                  // K gap between the two groups (Q gather)
+    static constexpr int KV_GRP_ELEMS = 16;                   // fp8 elems per vgpr group
+    static constexpr int KV_GRP_BYTES = KV_GRP_ELEMS;         // == elems (fp8 = 1 B/elem)
+    static constexpr int A_BYTES_PER_LANE = (MFMA_M * MFMA_K / WARP_SIZE) * ELEM_BYTES; // i32x8
+    static constexpr int VGRP_K_OFFSET = 64;                  // K gap between the two groups
 
-    static constexpr int C_FRAG        = MFMA_M * MFMA_N / WARP_SIZE;      // 4: C frag / head rows per lane per m-tile (== weight VEC)
-    static constexpr int LANE_M_GROUPS = WARP_SIZE / MFMA_M;              // 4: 16-lane groups per wave (lane_div_16 range)
-    static constexpr int VGRP_PER_LANE = A_BYTES_PER_LANE / KV_GRP_BYTES;  // 2: 16-elem K groups per A/B fragment
+    static constexpr int C_FRAG        = MFMA_M * MFMA_N / WARP_SIZE;       // C frag rows/lane/m-tile (== weight VEC)
+    static constexpr int LANE_M_GROUPS = WARP_SIZE / MFMA_M;               // 16-lane groups/wave (lane_div_16 range)
+    static constexpr int VGRP_PER_LANE = A_BYTES_PER_LANE / KV_GRP_BYTES;  // 16-elem K groups per A/B fragment
 
-    // q_scale preshuffle: [T, K_TILES, 4, 16, QS_PAD]; QS_PAD = round_up(M_TILES,4).
-    static constexpr int QS_DW  = (M_TILES + 3) / 4;   // 1
-    static constexpr int QS_PAD = QS_DW * 4;           // 4
-
-    // ---- byte strides for paged KV cache [num_blocks, K_TILES, 8(c), PAGE, 16] ----
-    // chunk c = contiguous K[c*16 : +16] within a 128-K tile (c = 0..7). Lane g loads
-    // c=g (vgpr0-3) and c=g+4 (vgpr4-7). page kept after c so consecutive tokens are contiguous.
-    static constexpr int K16_PER_TILE   = MFMA_K / 16;                  // 8
+    // Byte strides for paged KV cache [num_blocks, K_TILES, 8(c), PAGE, 16]: chunk c = contiguous
+    // K[c*16:+16] within a 128-K tile (c=0..7); lane g loads c=g (vgpr0-3) and c=g+4 (vgpr4-7);
+    // page kept after c so consecutive tokens are contiguous.
+    static constexpr int K16_PER_TILE   = MFMA_K / 16;
     static constexpr int VGRP_CHUNK_HI  = 4;                            // vgpr4-7 chunk = g + 4
     static constexpr int stride_kv_chunk = PAGE_SIZE * KV_GRP_BYTES;    // one 16-K chunk across page
     static constexpr int stride_kv_ktile = K16_PER_TILE * stride_kv_chunk;
     static constexpr int stride_kv_block = K_TILES * stride_kv_ktile;
-    // ---- byte strides for kv_scale [num_blocks, K_TILES, 4, PAGE] (e8m0, 1 byte) ----
+    // Byte strides for kv_scale [num_blocks, K_TILES, 4, PAGE] (e8m0, 1 byte).
     static constexpr int stride_kvs_ktile = K_CHUNKS * PAGE_SIZE;
     static constexpr int stride_kvs_block = K_TILES  * stride_kvs_ktile;
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // async-Q via LDS (mirrors gqa_d128 trait names; fp8 => ELEM_BYTES == 1).
-    // Feeds make_layout_gq (global->LDS) / make_layout_sq (LDS store) / make_layout_rq
-    // (LDS->reg) in the kernel template.
-    // ─────────────────────────────────────────────────────────────────────────────
-    // Vector length (elements) for the async global load / LDS store of Q. 16 fp8 = 16 B = dwordx4.
-    static constexpr int VEC_Q  = DWORDx4_BYTES / ELEM_BYTES;
-    static constexpr int VEC_KV = 16;   // (make_layout_sq reuses this as the LDS-store VEC)
+    // async-Q via LDS: VEC_* = load/store vector length; feeds make_layout_gq/sq/rq.
+    static constexpr int VEC_Q  = DWORDx4_BYTES / ELEM_BYTES;   // 16 fp8 = dwordx4
+    static constexpr int VEC_KV = 16;                          // LDS-store / scale-word VEC
 
-    // 128-byte async-copy granule in elements. For fp8 the 128-elem head dim == one 128B
-    // granule, so smem_d_rpt == 1 (bf16 mha would get 2).
-    static constexpr int D_128B_SIZE      = 128 / ELEM_BYTES;                 // 128
-    static constexpr int smem_linear_wave = WARP_SIZE * DWORDx4_BYTES / ELEM_BYTES;      // 1024 (elems/wave/pass)
-    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;   // 8
-    static constexpr int smem_d_rpt       = HEAD_DIM / D_128B_SIZE;           // 1
+    // 128B async-copy granule in elements (fp8: head dim == one granule -> smem_d_rpt == 1).
+    static constexpr int D_128B_SIZE      = 128 / ELEM_BYTES;
+    static constexpr int smem_linear_wave = WARP_SIZE * DWORDx4_BYTES / ELEM_BYTES;   // elems/wave/pass
+    static constexpr int smem_n_per_wave  = smem_linear_wave / D_128B_SIZE;
+    static constexpr int smem_d_rpt       = HEAD_DIM / D_128B_SIZE;
+    static constexpr int smem_n_q_rpt     = N_HEADS / smem_n_per_wave;   // Q staged whole (N_HEADS rows)
 
-    // Q staged whole (all N_HEADS rows) through LDS -> the "n" tile size is N_HEADS.
-    static constexpr int smem_n_q_rpt = N_HEADS / smem_n_per_wave; // 8
-
-    static constexpr int smem_padding_16B = 16 / ELEM_BYTES;   // 16
-    static constexpr int smem_padding_32B = 32 / ELEM_BYTES;   // 32
-    static constexpr int smem_padding_64B = 64 / ELEM_BYTES;   // 64
-
-    // LDS tile for Q (padded, elements) + byte size for the __shared__ allocation.
-    static constexpr int smem_q_padding    = smem_padding_32B;
+    // LDS tile for Q: 32B row padding (avoids bank conflicts) + byte size for __shared__.
+    static constexpr int smem_q_padding    = 32 / ELEM_BYTES;
     static constexpr int smem_q_tile_elems = smem_n_q_rpt * smem_d_rpt * (smem_linear_wave + smem_q_padding);
     static constexpr size_t smem_size_bytes() { return (size_t)smem_q_tile_elems * ELEM_BYTES; }
 
@@ -306,12 +205,18 @@ struct opus_mqa_logits_traits {
     static_assert(Q_LDS_BLOCK % (D_128B_SIZE / VEC_Q) == 0, "Q_LDS_BLOCK must cover threads_d");
 };
 
-__host__ __device__ inline int mqa_logits_ceil_div(int a, int b) { return (a + b - 1) / b; }
+namespace opus_logits {
+enum class mqa_logits_sched {
+    Prefill,
+    Decode,
+};
+}
 
 #ifndef __HIP_DEVICE_COMPILE__
 // Host pass: empty stub so the __device_stub__ symbol resolves for the launcher.
 namespace opus_logits {
-template<class T, int SCHED = 0, int AXIS = 0> __global__ void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs) {}
+template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
+__global__ void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs) {}
 }
 #else
 // ============================================================================
@@ -332,14 +237,9 @@ namespace opus_logits {
 using opus::operator""_I;
 
 // ── sched_group_barrier co-exec control (mha idiom) ──────────────────────────────────────────
-// LLVM SchedGroup masks: pin which instruction classes land in each ordered group so the
-// scaled-MFMA shadow gets filled with exactly the ops that CAN co-execute with it.
 constexpr int VALU_MASK = 0x02;   // v_max / v_add / v_pk_fma ... (no MFMA/TRANS/mem)
 constexpr int MFMA_MASK = 0x08;   // v_mfma_*
 
-// Pairs × (1 MFMA, CNT of OTHER_MASK) in program order, same SyncID = Group. Interleaves each MFMA
-// with CNT co-exec ops issued in its shadow. The mxfp8 scaled MFMA can only co-exec with 4 insts,
-// so keep CNT<=4.
 template<int Pairs, int OTHER_MASK, int CNT, int Group>
 __device__ inline void sched_mfma_pairs() {
     __builtin_amdgcn_sched_group_barrier(MFMA_MASK, 1, Group);
@@ -348,11 +248,7 @@ __device__ inline void sched_mfma_pairs() {
 }
 
 // Head reduction across the 4 lane-groups (lane_div_16 = 0..3): butterfly-add over lane^32
-// then lane^16 via v_permlane{32,16}_swap_b32 (ALU cross-lane, no LDS / no lgkmcnt) instead
-// of 2x ds_bpermute. hk_mla idiom: seed both regs from val with an OPAQUE v_mov (blocks the
-// optimizer coalescing a onto b, and gives the scheduler slack for the swap's HW wait state),
-// then a=self / b=partner after the swap -> a+b = the butterfly add. (The permlane16 *builtin*
-// is unused across the codebase / mis-lowers; the asm form is the proven-correct path.)
+// then lane^16 via v_permlane{32,16}_swap_b32 (ALU cross-lane, no LDS / no lgkmcnt).
 __device__ inline float permlane_head_reduce(float v) {
     int a = __builtin_bit_cast(int, v), b = a;
     asm("v_mov_b32_e32 %0, %1\n\t" : "=v"(a) : "v"(b));
@@ -398,20 +294,12 @@ __device__ inline auto make_layout_q(int lane_mod_16, int lane_div_16) {
 
 
 // ─── Q global→shared load layout (async-Q via LDS), parameterized on N tile size ───
-// Identical machinery to make_layout_gk_gv but for an arbitrary N tile (Q uses the whole
-// Q_LDS_WARPS*Q_TILE block). Q shares K's head dim (128) so uses T::smem_d_rpt.
-// Uses the Q-LDS geometry (Q_LDS_WARPS / Q_LDS_BLOCK), NOT the compute NUM_WARPS: the single-wave
-// variant reuses the 4-wave Q LDS layout with one physical warp iterating the whole Q.
 template<typename T>
 __device__ inline auto make_layout_gq(int warp_id, int lane_id, int stride_q_n) {
     constexpr int threads_d = T::D_128B_SIZE / T::VEC_Q;  // 8
     constexpr int threads_n_per_block = T::Q_LDS_BLOCK / threads_d;
     constexpr int threads_n_per_wave = opus::get_warp_size() / threads_d; // 8
 
-    // Q-warp dim = Q_VWARPS (y, virtual warps iterated by one physical warp) x NUM_WARPS (p,
-    // physical warp_id). Ordered virtual-outer / physical-inner so the logical warp index is
-    // phys + virt*NUM_WARPS (stride_q_n per unit), matching the sq store & 4-wave layout.
-    // 4-wave: Q_VWARPS==1 (the y-dim vanishes) -> identical to the original single p_dim.
     constexpr auto gq_block_shape = opus::make_tuple(
         opus::number<T::smem_d_rpt>{},
         opus::number<T::N_HEADS / threads_n_per_block>{},
@@ -437,10 +325,6 @@ template<typename T>
 __device__ inline auto make_layout_sq(int warp_id) {
     constexpr int n_q_rpt = T::smem_n_q_rpt / T::Q_LDS_WARPS;
     constexpr int warp_stride = T::smem_linear_wave * n_q_rpt + T::smem_q_padding;   // 2080: per logical Q-warp
-    // Q-warp dim split into NUM_WARPS (p: warp_id) x Q_VWARPS (y: virtual warps). Explicit
-    // per-dim strides (each dim = its own group) place logical warp (phys + virt*NUM_WARPS) at
-    // offset logical*warp_stride, so the y-iteration order (smem_d_rpt, n_q_rpt, virt) matches gq
-    // and 1-wave/4-wave produce byte-identical LDS. y-issue order must mirror gq: n_q_rpt then virt.
     constexpr auto s_block_shape = opus::make_tuple(
         opus::number<T::smem_d_rpt>{},      // (y)
         opus::number<T::NUM_WARPS>{},        // physical warps (p: warp_id)
@@ -467,8 +351,6 @@ __device__ inline auto make_layout_sq(int warp_id) {
 }
 
 // ─── Q shared→register read layout (async-Q, feeds gemm0 a-operand) ───
-// Read side is purely lane-based (no warp partition): uses Q_LDS_WARPS so both variants read the
-// same 4-wave LDS layout. The a-operand register structure is independent of Q_LDS_WARPS.
 template<typename T>
 __device__ inline auto make_layout_rq(int warp_id, int lane_id) {
     constexpr int n_q_rpt = T::smem_n_q_rpt / T::Q_LDS_WARPS;
@@ -601,12 +483,9 @@ __device__ inline auto make_layout_out(int warp_id, int lane_mod_16) {
         opus::unfold_p_coord(dim, opus::make_tuple(warp_id, lane_mod_16)));
 }
 
-// SCHED: 0 = cta_info table; 1 = prefill direct (2D grid, per-row window arrays);
-//        2 = decode direct (3D grid, inline MTP windows).
-// AXIS (SCHED==2 only): blockIdx -> (split, n, batch) mapping, for L2-locality sweeps.
-//   0: split=x, n=y, batch=z   1: n=x, split=y, batch=z
-//   2: split=x, batch=y, n=z   3: batch=x, n=y, split=z
-template<class T, int SCHED = 0, int AXIS = 0>
+// SCHED (mqa_logits_sched): Prefill = 2D grid, per-row window arrays;
+//                           Decode  = 3D grid (batch, next_n_max, split_kv), inline MTP windows.
+template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
 __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_logits_mxfp8_kernel(opus_mqa_logits_kargs kargs) {
     // ---- data-type aliases ----
     using D_DATA   = typename T::D_DATA;
@@ -616,7 +495,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     using D_OUT    = typename T::D_OUT;
 
     constexpr int WARP     = T::WARP_SIZE;          // 64
-    constexpr int NTPW     = T::N_TILES;   // 4
+    constexpr int NTPW     = T::N_TILES;            // 4
     constexpr int MT       = T::M_TILES;            // 4
     constexpr int PAGE     = T::PAGE_SIZE;          // 64
     constexpr int HEAD_DIM = T::HEAD_DIM;           // 128
@@ -628,79 +507,51 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     const int max_blk = kargs.max_blocks_per_seq;
 
     const int tid = opus::thread_id_x();
-    const int pid = opus::block_id_x();
     const int warp_id     = tid >> 6;
     const int lane_id     = tid & (WARP - 1);
     const int lane_mod_16 = lane_id & (T::MFMA_M - 1);               // position within a 16-lane group
     const int lane_div_16 = (lane_id >> 4) & (T::LANE_M_GROUPS - 1); // which 16-lane group (0..LANE_M_GROUPS-1)
 
     // ---- per-CTA assignment (uniform across block) ----
+    // Outputs consumed by the compute core: the query row (row_id), its sequence
+    // (batch_id), the KV-tile range [chunk_start, chunk_start+tile_count) this CTA
+    // handles (tile_count==0 => idle CTA), and the row's KV window [local_start, local_end).
     int row_id, batch_id, chunk_start, tile_count, local_start, local_end;
-    if constexpr(SCHED == 0) {
-        // cta_info mode: read the precomputed per-CTA schedule entry.
-        const int* ci = kargs.ptr_cta_info + (size_t)pid * CTA_INFO_WIDTH;
-        row_id      = ci[0];
-        batch_id    = ci[1];
-        chunk_start = ci[2];
-        tile_count  = ci[3];
-        local_start = ci[4];
-        local_end   = ci[5];
-    } else if constexpr(SCHED == 1) {
-        // Prefill direct (2D grid (split_kv, num_rows)): row = blockIdx.y, split = blockIdx.x.
-        // Arbitrary ragged windows -> read per-row window arrays. KV_TILE_SIZE is a compile-time
-        // power of two so the tile divisions fold to shifts; only win_tiles/split_kv is a real div.
-        constexpr int BK = T::KV_TILE_SIZE;
-        const int sk  = kargs.split_kv;
-        const int row = (int)__builtin_amdgcn_workgroup_id_y();
-        if(row >= kargs.num_rows) return;
-        row_id      = row;
-        batch_id    = kargs.ptr_row_to_batch[row];
-        local_start = kargs.ptr_local_starts[row];
-        local_end   = kargs.ptr_local_ends[row];
-        const int lo_tile   = local_start / BK;
-        const int hi_tile   = (local_end > 0) ? ((local_end + BK - 1) / BK) : 0;
-        const int win_tiles = hi_tile - lo_tile;
-        if(sk == 1) {
-            chunk_start = lo_tile;
-            tile_count  = win_tiles;
-        } else {
-            const int split = (int)__builtin_amdgcn_workgroup_id_x();
-            const int base  = win_tiles / sk;
-            const int res   = win_tiles - base * sk;
-            const int cs    = split * base + (split < res ? split : res);
-            chunk_start = lo_tile + cs;
-            tile_count  = (cs < win_tiles) ? (base + (split < res ? 1 : 0)) : 0;
-        }
+    constexpr int kv_tile_size = T::KV_TILE_SIZE;   // == block_k, compile-time power of two (tile div -> shift)
+    if constexpr(SCHED == mqa_logits_sched::Prefill) {
+        // 1D grid: one CTA per query row, covering its whole ragged window (no split).
+        const int query_row = opus::block_id_x();
+        if(query_row >= kargs.num_rows) return;
+        row_id      = query_row;
+        batch_id    = kargs.ptr_row_to_batch[query_row];
+        local_start = kargs.ptr_local_starts[query_row];
+        local_end   = kargs.ptr_local_ends[query_row];
+        const int first_kv_tile = local_start / kv_tile_size;
+        const int end_kv_tile   = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
+        chunk_start = first_kv_tile;
+        tile_count  = end_kv_tile - first_kv_tile;
     } else {
-        // Decode direct (3D grid (split_kv, next_n_max, batch)): batch = blockIdx.z,
-        // n = blockIdx.y (MTP position), split = blockIdx.x. Q/weights/out are PACKED
-        // ([total_q, ...]); the (batch, n) -> packed row + MTP tail-causal window are derived
-        // inline from the per-batch cu_seq_q / context_lens (no per-row window arrays, no
-        // window-build kernel). Grid dims are static shapes -> cudagraph-safe.
-        constexpr int BK = T::KV_TILE_SIZE;
-        const int sk    = kargs.split_kv;
-        const int wx = (int)__builtin_amdgcn_workgroup_id_x();
-        const int wy = (int)__builtin_amdgcn_workgroup_id_y();
-        const int wz = (int)__builtin_amdgcn_workgroup_id_z();
-        int split, n, batch;
-        if constexpr(AXIS == 0)      { split = wx; n = wy; batch = wz; }
-        else if constexpr(AXIS == 1) { n = wx; split = wy; batch = wz; }
-        else if constexpr(AXIS == 2) { split = wx; batch = wy; n = wz; }
-        else                         { batch = wx; n = wy; split = wz; }
-        const int q0    = kargs.ptr_cu_seq_q[batch];
-        const int qlen  = kargs.ptr_cu_seq_q[batch + 1] - q0;
-        if(n >= qlen) return;                          // padded MTP slot (varqlen) -> idle
-        row_id      = q0 + n;                          // packed row
+        // 3D grid (batch, next_n_max, split_kv): packed row + MTP tail-causal window derived
+        // inline from per-batch cu_seq_q / context_lens. batch on the fast x-axis clusters a
+        // batch's split CTAs (shared-KV L2 locality) -- the min-of-N sweep winner.
+        const int num_splits = kargs.split_kv;
+        const int batch      = opus::block_id_x();
+        const int mtp_pos    = opus::block_id_y();     // MTP token position in batch
+        const int split_idx  = opus::block_id_z();     // which context split
+        const int q_start    = kargs.ptr_cu_seq_q[batch];
+        const int qlen       = kargs.ptr_cu_seq_q[batch + 1] - q_start;
+        if(mtp_pos >= qlen) return;                    // padded MTP slot (varqlen) -> idle CTA
+        row_id      = q_start + mtp_pos;               // packed query row
         batch_id    = batch;
         local_start = 0;
-        local_end   = kargs.ptr_context_lens[batch] - (qlen - 1 - n);   // MTP tail-causal
-        const int hi_tile   = (local_end > 0) ? ((local_end + BK - 1) / BK) : 0;
-        const int win_tiles = hi_tile;                 // lo_tile == 0 (local_start == 0)
-        const int base  = win_tiles / sk;              // only remaining real division
-        const int res   = win_tiles - base * sk;
-        const int cs    = split * base + (split < res ? split : res);
-        chunk_start = cs;
-        tile_count  = (cs < win_tiles) ? (base + (split < res ? 1 : 0)) : 0;
+        local_end   = kargs.ptr_context_lens[batch] - (qlen - 1 - mtp_pos);   // MTP tail-causal
+        // distribute [0, window_tiles) across num_splits CTAs (first `remainder` splits get +1).
+        const int window_tiles    = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
+        const int tiles_per_split = window_tiles / num_splits;            // only remaining runtime division
+        const int remainder       = window_tiles - tiles_per_split * num_splits;
+        const int my_first_tile   = split_idx * tiles_per_split + (split_idx < remainder ? split_idx : remainder);
+        chunk_start = my_first_tile;
+        tile_count  = (my_first_tile < window_tiles) ? (tiles_per_split + (split_idx < remainder ? 1 : 0)) : 0;
     }
 
     // ---- GEMM object (scaled fp8 16x16x128); use its single-tile MMA + accumulator type ----
@@ -727,13 +578,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
     auto g_w   = opus::make_gmem(w_base);
     auto g_out = opus::make_gmem(out_base, out_bytes);   // OOB size == local_end: masks upper bound + neg-biased lanes
 
-    // ---- Q/scale/weight partition layouts + register storage (ALL loads deferred to the
-    // prologue; declared here so the compute lambdas can [&]-capture them). ----
-    // Q staged through LDS (async global->LDS->reg), mirrors mha d128. Q is identical across
-    // warps (M/heads not split by wave: T_M==1) so make_layout_rq is warp-independent. The Q LDS
-    // layout is the Q_LDS_WARPS (=4) cooperative layout; make_layout_gq/sq express the Q-warp dim
-    // as p_dim(NUM_WARPS) x y_dim(Q_VWARPS), so one physical warp (1-wave) fills the whole tile via
-    // the y_dim iteration while 4 physical warps (4-wave) fill it via the p_dim -- same LDS bytes.
+    // ---- Q/scale/weight partition layouts + register storage 
     __shared__ char smem_buf[T::smem_size_bytes()];
     auto s_q  = opus::make_smem(reinterpret_cast<D_DATA*>(smem_buf));
     auto u_gq = make_layout_gq<T>(warp_id, lane_id, HEAD_DIM);   // global head stride == HEAD_DIM
@@ -785,9 +630,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
                 g_kv, u_kv_nt + page_id * T::stride_kv_block + nt * (T::MFMA_N * T::KV_GRP_BYTES));
         });
     };
-    // One nt's score = ONE CONTIGUOUS MT*EC-wide accumulator (a slice of the conceptual whole-S).
-    // A single vector (not an MT-array of EC-wide frags) keeps its (mi,e) layout contiguous & even-
-    // aligned, so the packed reduce reads v_pk_fma operands as free sub-slices (no v_mov to assemble).
+
     using sfrag = opus::vector_t<float, MT * EC>;
     // gemm for one nt -> the sfrag (MT scaled MFMAs written via set_slice; op_sel_a=mi, op_sel_b=nt).
     auto gemm_nt = [&](sfrag& accs, kv_nt_t& kvnt, int kvs_w, auto ntc) {
@@ -800,8 +643,7 @@ __global__ __launch_bounds__(T::BLOCK_SIZE, OPUS_LOGITS_MIN_WAVES) void pa_mqa_l
             opus::set_slice(accs, acc, opus::number<mi * EC>{}, opus::number<mi * EC + EC>{});
         });
     };
-    // relu split OUT of the reduce: standalone in-place v_max over the 16 accumulators. No w / bperm
-    // dependency, so the scheduler is free to slot these v_max into an MFMA shadow (mfma+max co-exec).
+
     auto relu_nt = [&](sfrag& accs) {
         opus::static_for<MT * EC>([&](auto ic) {
             constexpr int i = ic.value;
