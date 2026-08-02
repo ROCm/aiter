@@ -306,7 +306,6 @@ def _gemm1_body_a16w4(
         wave_n_id = wave % fx.Int32(num_n_waves)
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
     else:
-        # k_wave=1: wave_n_id==wave, wave_k_id==0 (byte-identical ISA).
         wave_n_id = wave
         wave_k_id = fx.Int32(0)
     _n_per_wave = TILE_N // num_n_waves
@@ -385,7 +384,6 @@ def _gemm1_body_a16w4(
     else:
         _w_bytes = NE * N_OUT * K_HALF
         w_tiles = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
-    # W dwordx4 load via BufferCopy128b atom (cache modifier in the aux field).
     w_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
     w_reg_lay = fx.make_layout(4, 1)
     if _is_int4:

@@ -61,7 +61,7 @@ def _atomic_bf16_epilog(
     # 4 waves split the BN(=TILE_N) tile (generic over BN, e.g. int4 tile_n=128).
     _n_per_wave = BN // 4
     num_acc_n = _n_per_wave // 16
-    _s_count = BN // 64  # readback: each s-iter covers 64 cols (32 lanes x vec2)
+    _s_count = BN // 64  # each s-iter covers 64 cols (32 lanes x vec2)
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
     lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
@@ -394,7 +394,7 @@ def _gemm2_body_a16w4(
         return raw
 
     def load_b_scale(base_k, mni, n_pack):
-        # Per-lane scalar e8m0 gather (dict-cached across ku).
+        # per-lane scalar e8m0 gather, dict-cached across ku
         scales = []
         cache = {}
         for ku in range_constexpr(k_unroll):

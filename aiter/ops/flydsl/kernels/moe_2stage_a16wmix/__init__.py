@@ -65,9 +65,8 @@ def _get_compiled_gemm1_a16w4(
     w_layout="standard",
     k_wave=1,
 ):
-    # aiter's native a16w4 (mxfp4 guinterleave) build routes through the shared
-    # compile entry `compile_flydsl_moe_stage1`; FlyDSL-native standard/int4/bf16
-    # builds call the kernel builder directly.
+    # native mxfp4 guinterleave routes through the shared compile entry;
+    # FlyDSL-native standard/int4/bf16 call the builder directly.
     if w_dtype == "mxfp4" and w_layout == "guinterleave":
         from aiter.ops.flydsl.moe_kernels import compile_flydsl_moe_stage1
 
@@ -122,8 +121,8 @@ def _get_compiled_gemm2_a16w4(
     persist=False,
     topk=1,
 ):
-    # aiter's native a16w4 (mxfp4) down-proj build routes through the shared compile
-    # entry `compile_flydsl_moe_stage2` (the persist opt-in stays on the direct path).
+    # native mxfp4 down-proj routes through the shared compile entry;
+    # the persist opt-in stays on the direct path.
     if w_dtype == "mxfp4" and not persist:
         from aiter.ops.flydsl.moe_kernels import compile_flydsl_moe_stage2
 
@@ -169,13 +168,10 @@ def _default_tile_n(N, *, w_dtype="mxfp4"):
     return 256 if N % 256 == 0 else 128
 
 
-# =============================================================================
-# Documented heuristic tile-config defaults for the a16w4/a16wi4 launchers. These
-# pick the tile geometry when the caller leaves tile args at their defaults and no
-# aiter tuned-CSV row applies. gemm1 deliberately uses this heuristic rather than
-# aiter's kimik3 CSV gemm1 tiles (which regress mid/high-M on the ported body);
-# gemm2 prefers the aiter CSV via ``resolve_a16w4_gemm2_config``.
-# =============================================================================
+# Heuristic tile-config defaults for the a16w4/a16wi4 launchers (used when tile args
+# are left at default and no tuned-CSV row applies). gemm1 uses this heuristic rather
+# than the kimik3 CSV gemm1 tiles (which regress mid/high-M on the ported body); gemm2
+# prefers the aiter CSV via ``resolve_a16w4_gemm2_config``.
 
 
 def _default_tiles_fallback(*, D_HIDDEN, D_INTER, tokens, w_dtype, tile_m, stage):
@@ -317,7 +313,7 @@ def flydsl_a16w4_gemm1(
     act="silu",
     w_dtype="mxfp4",
     w_layout="standard",
-    use_csv_config=False,  # opt-in: default uses our tuned tile_n; CSV params for aiter-compare / when requested
+    use_csv_config=False,  # opt-in: CSV params for aiter-compare; default uses tuned tile_n
     csv_path=None,
     stream=None,
 ):
@@ -481,7 +477,7 @@ def flydsl_a16w4_gemm2(
     b_nt=None,
     xcd_swizzle=1,
     w_dtype="mxfp4",
-    use_csv_config=False,  # opt-in: default uses our tuned tile_n; CSV params for aiter-compare / when requested
+    use_csv_config=False,  # opt-in: CSV params for aiter-compare; default uses tuned tile_n
     csv_path=None,
     persist=None,
     stream=None,
@@ -600,12 +596,9 @@ def flydsl_a16w4_gemm2(
     return flat_out
 
 
-# =============================================================================
-# aiter tuned-CSV config loader for bf16-A MoE. Decodes each
+# aiter tuned-CSV config loader for bf16-A MoE: decodes each
 # ``flydsl_moe{1,2}_abf16_w{fp4,int4,bf16}`` kernelName into a tile-config dict.
 # Only the tile GEOMETRY is used (aiter's gemm bodies differ).
-# =============================================================================
-
 # kernelName tokens:  flydsl_moe{stage}_abf16_w{fmt}_bf16_t{m}x{n}x{k}
 #   [_w{N}]=waves_per_eu [_xcd{N}]=xcd_swizzle [_bnt{N}]=b_nt [_kw{N}]=k_wave
 #   [_kb{N}]=k_batch (aiter grid split-K, mapped onto k_wave; see _kwave_from_kbatch).
