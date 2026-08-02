@@ -791,15 +791,11 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    # a16w4 (bf16 A x MXFP4 W) SiTUv2: served by the numerically-correct ported
-    # FlyDSL kernel (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). This fully
-    # replaces aiter's former compile_mixed_moe_gemm{1,2}_a16w4, which failed
-    # aiter's own strict accuracy gate on this path (logits_diff ~1.0); the port
-    # passes at ~1.5e-5. CDNA (gfx942 / gfx950) only -- gfx1250 is handled by the
-    # q_dtype_a override above and never reaches here as bf16-a16w4. Gate mode is
-    # irrelevant to this kernel (bf16 activation, guinterleave weights either
-    # way); only the SEPARATED/INTERLEAVE-bf16 activation-dtype routing above
-    # decides whether q_dtype_a stays bf16 (a16w4) or downgrades to fp8 (a8w4).
+    # a16w4 (bf16 A x MXFP4 W) SiTUv2: served by the ported FlyDSL kernel
+    # (moe_2stage_a16wmix), replacing the former compile_mixed_moe_gemm{1,2}_a16w4
+    # (which failed the strict gate at logits_diff ~1.0; the port passes at ~1.5e-5).
+    # CDNA gfx942/gfx950 only. The q_dtype_a routing above already picks bf16 (a16w4,
+    # here) vs fp8 (a8w4); reaching this point implies bf16.
     _is_a16w4 = (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
@@ -813,10 +809,9 @@ def _fused_moe_impl(
                 f"CDNA gfx942/gfx950; got gfx={get_gfx()!r}, "
                 f"flydsl_available={is_flydsl_available()}."
             )
-        # The ported kernel bakes SiTUv2 beta/linear_beta at 1.0 and does not yet
-        # support per-expert bias or expert-parallel masking. The old (broken)
-        # kernel used to cover these; fail explicitly rather than route to a
-        # kernel known to be numerically wrong.
+        # The port bakes beta/linear_beta at 1.0 and has no per-expert bias or
+        # expert-parallel masking; fail explicitly rather than fall back to the
+        # numerically-broken old kernel.
         if beta not in (None, 1.0) or linear_beta not in (None, 1.0):
             raise NotImplementedError(
                 "a16w4 SiTUv2 with non-default beta/linear_beta is not supported "
