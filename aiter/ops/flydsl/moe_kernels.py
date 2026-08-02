@@ -192,15 +192,19 @@ def get_flydsl_stage1_kernels(
     kernels = {}
     is_fp4_a = a_dtype == "fp4"
     is_fp4_b = b_dtype == "fp4"
+    # a16w4 (bf16 A x MXFP4 W) gemm1 is fully CSV/registry-driven: register the
+    # extra tile_k=128 and xcd_swizzle=1 variants its tuned kernelNames name
+    # (t32x{64,128}x128 / _xcd1), which the other dtypes don't use.
+    is_a16w4 = a_dtype == "bf16" and is_fp4_b
 
     tile_ns = [32, 64, 128] if is_fp4_b else [128]
-    tile_ks = [256]
+    tile_ks = [128, 256] if is_a16w4 else [256]
     tile_ms = [32, 64, 128]
 
     waves_per_eus = [1, 2, 3, 4]
     k_batches = [1, 2, 4, 7, 14]
     b_nts = [0, 2]
-    xcd_swizzles = [0, 4]
+    xcd_swizzles = [0, 1, 4] if is_a16w4 else [0, 4]
 
     for tm in tile_ms:
         if tm == 32:
@@ -1368,8 +1372,11 @@ def _flydsl_moe_stage1_impl(
     _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
     if _is_a16w4:
         # a16w4 (bf16 A x MXFP4 W) SiTUv2: call the ported gemm1 launcher, which
-        # writes a bf16 sorted intermediate [sorted_size, inter_dim] (heuristic
-        # tiles, tile_n=None). fused_moe_2stages threads it to stage2 unchanged.
+        # writes a bf16 sorted intermediate [sorted_size, inter_dim] using the
+        # tiles the wrapper parsed from the CSV kernelName1 (fully registry-
+        # driven, no built-in heuristic). fused_moe_2stages threads it to stage2
+        # unchanged. waves_per_eu=None (kernel default) is forced: a no-`_w`
+        # kernelName parses to wpe=1, a different kernel.
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
         _act = "situv2" if act in ("situv2", "situ") else act
@@ -1396,7 +1403,12 @@ def _flydsl_moe_stage1_impl(
             D_INTER=inter_dim,
             topk=topk,
             tile_m=int(tile_m),
-            tile_n=None,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            k_wave=k_wave,
+            b_nt=b_nt,
+            xcd_swizzle=xcd_swizzle,
+            waves_per_eu=None,
             act=_act,
             w_layout="guinterleave",
         )

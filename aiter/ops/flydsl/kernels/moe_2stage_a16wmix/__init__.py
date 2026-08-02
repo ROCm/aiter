@@ -28,11 +28,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import a16wmix_use_k16, compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
-from .tile_heuristic import (
-    _default_tile_n,
-    resolve_a16wmix_gemm1_config,
-    resolve_a16wmix_gemm2_config,
-)
 
 __all__ = [
     "compile_gemm1_a16w4_port",
@@ -41,8 +36,6 @@ __all__ = [
     "flydsl_a16w4_gemm2",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
-    "resolve_a16wmix_gemm1_config",
-    "resolve_a16wmix_gemm2_config",
 ]
 
 
@@ -161,8 +154,8 @@ def flydsl_a16w4_gemm1(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier (0=cached, 2=nt),
     ``xcd_swizzle`` -> XCD/HBM grid remap, ``k_wave`` -> intra-block slice-K ({1,2,4}).
     ``k_batch``/``gate_mode`` accepted for parity (only k_batch=1/separated supported).
-    ``tile_n=None`` picks the largest N tile dividing D_INTER. ``b_nt=None`` uses the
-    per-M U-shape (nt mid-band, cached at ends).
+    Tiles are CSV/registry-driven and always supplied by the caller; ``b_nt=None``
+    falls back to the per-M U-shape (nt mid-band, cached at ends).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -173,37 +166,10 @@ def flydsl_a16w4_gemm1(
 
     BM = tile_m
     TILE_K = tile_k
-    _m = int(n_tokens)
     TILE_N = tile_n
-    # Per-token tile config from the documented heuristic. Fills only the tile args the
-    # caller left at default; explicit caller overrides always win.
-    _o = resolve_a16wmix_gemm1_config(
-        model_dim=D_HIDDEN,
-        inter_dim=D_INTER,
-        experts=NE,
-        topk=topk,
-        tokens=_m,
-        tile_m=BM,
-    )
-    if b_nt is None:
-        b_nt = _o["b_nt"]
-    if xcd_swizzle == 0:
-        xcd_swizzle = _o["xcd_swizzle"]
-    # The slice-K config (k_wave > 1: the tok<=2 4-way split) is coupled to the
-    # tile_n=64 branch and to tile_k/k_wave being at defaults -- apply it as one
-    # unit only when the caller left tile_n unset. The k_wave==1 tile_k bump
-    # (tok>=16 shorter K-tiles) is independent of tile_n.
-    if _o["k_wave"] > 1:
-        if TILE_N is None and tile_k == 256 and k_wave == 1:
-            TILE_K = _o["tile_k"]
-            k_wave = _o["k_wave"]
-    elif tile_k == 256:
-        TILE_K = _o["tile_k"]
-    if TILE_N is None:
-        TILE_N = _o["tile_n"]
-    b_cache_mod = (2 if (16 <= _m <= 1024) else 0) if b_nt is None else b_nt
-    if TILE_N is None:
-        TILE_N = _default_tile_n(D_INTER)
+    # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
+    # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
+    b_cache_mod = (2 if (16 <= int(n_tokens) <= 1024) else 0) if b_nt is None else b_nt
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
@@ -293,29 +259,8 @@ def flydsl_a16w4_gemm2(
     TILE_N = tile_n
     TILE_K = tile_k
     _m = int(M_logical)
-    # Per-token tile config from the documented heuristic. Fills only the tile args the
-    # caller left at default; explicit caller overrides always win. gemm2 defaults are
-    # tile_n=256/tile_k=256/xcd_swizzle=1 (fixed 4-wave N-split, no k_wave).
-    _o = resolve_a16wmix_gemm2_config(
-        model_dim=D_HIDDEN,
-        inter_dim=D_INTER,
-        experts=NE,
-        topk=topk,
-        tokens=_m,
-        tile_m=BM,
-    )
-    # gemm2 tile_n is not token-dependent (fixed 256 default; explicit tile_n=None
-    # means adaptive _default_tile_n, handled below), so only tile_k/b_nt/xcd are
-    # filled from the resolver here.
-    if tile_k == 256:
-        TILE_K = _o["tile_k"]
-    if b_nt is None:
-        b_nt = _o["b_nt"]
-    if xcd_swizzle == 1:
-        xcd_swizzle = _o["xcd_swizzle"]
-    if TILE_N is None:
-        # Adaptive default: largest N tile dividing model_dim (int4 prefers 128).
-        TILE_N = _default_tile_n(D_HIDDEN)
+    # Tile config is CSV/registry-driven: the caller resolves tile_n/tile_k/b_nt/
+    # xcd_swizzle from the tuned kernelName2 and always passes them.
     if D_INTER % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm2 requires D_INTER (K) % {TILE_K} == 0, got D_INTER={D_INTER}"
