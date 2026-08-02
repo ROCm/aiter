@@ -426,10 +426,7 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
         # mode, so a "reduce"-named a16w4 config must still get accumulate=True
         # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
-        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in (
-            "fp4",
-            "mxfp4",
-        ):
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") == "fp4":
             return False
         return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
@@ -817,8 +814,10 @@ def _fused_moe_impl(
         for _bad, _why in (
             (
                 get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
-                f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
-                f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})",
+                (
+                    f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
+                    f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})"
+                ),
             ),
             (
                 beta not in (None, 1.0) or linear_beta not in (None, 1.0),

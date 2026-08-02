@@ -52,7 +52,7 @@ def _get_compiled_gemm1_a16w4(
     b_cache_mod,
     xcd_swizzle,
     waves_per_eu,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
 ):
@@ -88,7 +88,7 @@ def _get_compiled_gemm2_a16w4(
     b_cache_mod=2,
     xcd_swizzle=1,
     waves_per_eu=None,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     persist=False,
     topk=1,
 ):
@@ -132,13 +132,13 @@ def flydsl_a16w4_gemm1(
     xcd_swizzle=0,
     gate_mode="separated",
     act="silu",
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     w_layout="standard",
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
-    ``w_dtype="mxfp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
+    ``w_dtype="fp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
     W1 packed signed int4 (same preshuffle as mxfp4), ``w1_scale_u8`` groupwise bf16 in
     the ``(E, N_OUT, G//2, 2)`` bf16-pair layout (dword = n*(G//2)+group//2).
     ``"bf16"``: RAW bf16 W1 preshuffled ``shuffle_weight (16,16)``; ``w1_scale_u8`` unused.
@@ -240,7 +240,7 @@ def flydsl_a16w4_gemm2(
     k_batch=1,
     b_nt=None,
     xcd_swizzle=1,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     persist=None,
     stream=None,
 ):

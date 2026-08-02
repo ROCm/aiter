@@ -209,7 +209,7 @@ def _gemm1_body_a16w4(
     TOPK,
     act="silu",
     b_cache_mod=2,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
     use_k16=False,
@@ -880,14 +880,14 @@ def compile_gemm1_a16w4_port(
     b_cache_mod=2,
     xcd_swizzle=0,
     waves_per_eu=None,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
     use_k16,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
-    ``w_dtype="mxfp4"`` (default): in-kernel mxfp4->bf16 upconvert, per-1x32 e8m0 scale.
+    ``w_dtype="fp4"`` (default): in-kernel mxfp4->bf16 upconvert, per-1x32 e8m0 scale.
     ``"int4"`` (a16wi4): packed signed int4 (SAME preshuffle byte layout as mxfp4) +
     groupwise bf16 scale (group_size=32), dequant via v_cvt_off_f32_i4. ``"bf16"``
     (a16w16): RAW bf16 W preshuffled N-major (shuffle_weight (16,16)); each dwordx4 IS
@@ -904,7 +904,7 @@ def compile_gemm1_a16w4_port(
     D_HIDDEN % (k_wave*TILE_K) == 0.
     """
     assert w_dtype in (
-        "mxfp4",
+        "fp4",
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
@@ -913,7 +913,7 @@ def compile_gemm1_a16w4_port(
         "guinterleave",
     ), f"w_layout must be 'standard' or 'guinterleave', got {w_layout!r}"
     assert not (
-        w_layout == "guinterleave" and w_dtype != "mxfp4"
+        w_layout == "guinterleave" and w_dtype != "fp4"
     ), f"w_layout='guinterleave' is mxfp4-only, got w_dtype={w_dtype!r}"
     assert k_wave in (1, 2, 4), f"k_wave must be 1, 2, or 4, got {k_wave}"
     assert 4 % k_wave == 0, f"4 must be divisible by k_wave, got {k_wave}"
@@ -959,7 +959,7 @@ def compile_gemm1_a16w4_port(
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
-    _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
+    _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"

@@ -491,12 +491,9 @@ def compile_flydsl_moe_stage1(
     k_wave: int = 1,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x mxfp4 W) SiTUv2: the numerically-correct ported FlyDSL kernel
-    # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). It consumes aiter's NATIVE
-    # guinterleave W1+scale layout directly (w_layout="guinterleave"), replacing the
-    # former (broken) compile_mixed_moe_gemm1_a16w4. Launched via flydsl_a16w4_gemm1
-    # from _flydsl_moe_stage1_impl's a16w4 branch.
-    if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+    # a16w4 (bf16 A x fp4 W) SiTUv2: build the ported gemm1 (moe_2stage_a16wmix),
+    # consuming aiter's native guinterleave W1+scale (w_layout="guinterleave").
+    if a_dtype == "bf16" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm1 import (
@@ -516,12 +513,12 @@ def compile_flydsl_moe_stage1(
             b_cache_mod=b_nt,
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
-            w_dtype="mxfp4",
+            w_dtype="fp4",
             w_layout="guinterleave",
             k_wave=k_wave,
             use_k16=a16wmix_use_k16(get_rocm_arch()),
         )
-    if b_dtype in ("fp4", "mxfp4", "fp8"):
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
 
         return compile_mixed_moe_gemm1(
@@ -606,12 +603,9 @@ def compile_flydsl_moe_stage2(
     enable_bias: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
-    # a16w4 (bf16 A x mxfp4 W) down-proj: the ported FlyDSL kernel. Its native
-    # gate_up=False W2+scale layout is byte-identical to the standard
-    # shuffle_weight/e8m0_shuffle layout (E*model_dim % 256 == 0), so no layout mode
-    # is needed. Launched via flydsl_a16w4_gemm2 from _flydsl_moe_stage2_impl's
-    # a16w4 branch.
-    if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+    # a16w4 (bf16 A x fp4 W) down-proj: build the ported gemm2 (moe_2stage_a16wmix);
+    # its gate_up=False W2+scale layout matches the standard shuffle_weight/e8m0.
+    if a_dtype == "bf16" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm1 import a16wmix_use_k16
@@ -627,10 +621,10 @@ def compile_flydsl_moe_stage2(
             xcd_swizzle=xcd_swizzle,
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
-            w_dtype="mxfp4",
+            w_dtype="fp4",
             use_k16=a16wmix_use_k16(get_rocm_arch()),
         )
-    if b_dtype in ("fp4", "mxfp4", "fp8"):
+    if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
 
         return compile_mixed_moe_gemm2(
@@ -1369,22 +1363,17 @@ def _flydsl_moe_stage1_impl(
     gate_up_interleave = gate_mode == "interleave"
 
     dev = a.device
-    _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+    _is_a16w4 = a_dtype == "bf16" and b_dtype == "fp4"
     if _is_a16w4:
-        # a16w4 (bf16 A x MXFP4 W) SiTUv2: call the ported gemm1 launcher, which
-        # writes a bf16 sorted intermediate [sorted_size, inter_dim] using the
-        # tiles the wrapper parsed from the CSV kernelName1 (fully registry-
-        # driven, no built-in heuristic). fused_moe_2stages threads it to stage2
-        # unchanged. waves_per_eu=None (kernel default) is forced: a no-`_w`
-        # kernelName parses to wpe=1, a different kernel.
+        # a16w4 (bf16 A x fp4 W): ported gemm1 -> bf16 sorted intermediate,
+        # threaded to stage2 unchanged. Tiles from the CSV kernelName;
+        # waves_per_eu=None (a no-_w name parses to wpe=1, a different kernel).
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
 
         _act = "situv2" if act in ("situv2", "situ") else act
         sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
         _alloc = torch.zeros if inter_dim_pad > 0 else torch.empty
-        inter_sorted = _alloc(
-            sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
-        )
+        inter_sorted = _alloc(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
         flydsl_a16w4_gemm1(
             a_bf16=a.to(torch.bfloat16).contiguous(),
             w1_u8=w1.view(torch.uint8).contiguous(),
@@ -1417,7 +1406,7 @@ def _flydsl_moe_stage1_impl(
     # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
     # or memfault). Downgrade to a divisor (128). Applies to both a16w4
     # (bf16 x mxfp4) and a8w4 (fp8 x mxfp4); a4w4 is unaffected.
-    if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
+    if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
         tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
     _splitk_fp4 = _is_splitk and _need_fp4
     _gui_sk = gate_up_interleave and _is_splitk
@@ -1835,13 +1824,9 @@ def _flydsl_moe_stage2_impl(
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
-    if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
-        # a16w4 (bf16 A x MXFP4 W) down-proj: call the ported gemm2 launcher, which
-        # consumes stage1's bf16 [sorted_size, inter_dim] intermediate and atomic-
-        # scatters the routing-weighted result into the caller's moe_sorting-zeroed
-        # `out` (no alloc/zeroing here). Tiles come from the metadata kernelName2
-        # (parsed by _flydsl_stage2_wrapper into tile_n/tile_k/b_nt/waves_per_eu/
-        # xcd_swizzle), same as the a4w4/a8w4 stage2 -- no separate CSV lookup.
+    if a_dtype == "bf16" and b_dtype == "fp4":
+        # a16w4 (bf16 A x fp4 W) down-proj: ported gemm2 atomic-scatters into the
+        # caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like a4w4/a8w4).
         from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm2
 
         E = w2.shape[0]

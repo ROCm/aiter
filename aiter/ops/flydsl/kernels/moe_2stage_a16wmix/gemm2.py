@@ -147,7 +147,7 @@ def _gemm2_body_a16w4(
     INTER,
     NE,
     b_cache_mod=2,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     use_k16=False,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
@@ -592,7 +592,7 @@ def compile_gemm2_a16w4_port(
     xcd_swizzle=1,
     b_cache_mod=2,
     waves_per_eu=None,
-    w_dtype="mxfp4",
+    w_dtype="fp4",
     persist=False,
     use_k16,
 ):
@@ -606,7 +606,7 @@ def compile_gemm2_a16w4_port(
     per-XCD L2 locality (group = xcd_swizzle m-blocks).
     """
     assert w_dtype in (
-        "mxfp4",
+        "fp4",
         "int4",
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
@@ -626,7 +626,7 @@ def compile_gemm2_a16w4_port(
     _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
     _lds_bytes = _a_bytes + _acc_bytes
 
-    _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
+    _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"

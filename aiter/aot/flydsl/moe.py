@@ -400,7 +400,7 @@ def _precompile_to_cache(
         sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
 
         if stage == 1:
-            if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
+            if b_dtype == "fp4" and a_dtype in ("bf16", "fp8"):
                 tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
 
             a = _make_a_user(_user_a_shape())
@@ -544,9 +544,7 @@ def _precompile_to_cache(
                     ),
                     stream=0,
                     swiglu_limit=runtime_swiglu_limit(None, act),
-                    pass_swiglu_limit=not (
-                        a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
-                    ),
+                    pass_swiglu_limit=not (a_dtype == "bf16" and b_dtype == "fp4"),
                 )
             else:
                 args = _s1_args_std(
