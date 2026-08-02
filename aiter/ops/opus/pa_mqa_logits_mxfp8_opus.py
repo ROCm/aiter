@@ -146,9 +146,9 @@ def pa_mqa_logits_mxfp8_prefill(
         kv_scale,
         block_tables,
         weights,
-        row_to_batch.to(torch.int32),
-        local_starts.to(torch.int32),
-        local_ends.to(torch.int32),
+        row_to_batch.to(torch.int32).contiguous(),
+        local_starts.to(torch.int32).contiguous(),
+        local_ends.to(torch.int32).contiguous(),
         out,
         total_tokens,
         float(weight_scale),
@@ -211,7 +211,7 @@ def pa_mqa_logits_mxfp8_decode(
             device=q_fp8.device,
         )
     else:
-        cu_seq_q = cu_seq_q.to(torch.int32)
+        cu_seq_q = cu_seq_q.to(torch.int32).contiguous()
 
     # split context across CTAs only when query rows alone under-fill the GPU.
     max_chunks = max(1, (int(split_ctx_len) + block_k - 1) // block_k)
@@ -235,7 +235,7 @@ def pa_mqa_logits_mxfp8_decode(
         block_tables,
         weights,
         cu_seq_q,
-        context_lens.to(torch.int32),
+        context_lens.to(torch.int32).contiguous(),
         out,
         int(batch),
         int(next_n_max),
