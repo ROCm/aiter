@@ -815,22 +815,21 @@ def _precompile_a16w4_to_cache(
     b_nt: int = 2,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
-    token_num: int = 0,
-    block_m: int = 0,
-    cu_num: int = 0,
     **kwargs,
 ):
     """AOT for the folded a16w4 (bf16 A x fp4 W) port (moe_2stage_a16wmix).
 
-    The port launch ABI differs from the generic MX gemm (``_s1_args_fp4``), so
-    it can't share ``_precompile_to_cache``'s arg builders.  Instead this drives
-    the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``) the fused-MoE op uses,
-    with real (non-fake) CPU dummies under ``COMPILE_ONLY=1`` — the cache key is
-    then identical to runtime by construction (``waves_per_eu=None``,
-    ``persist=False``, and the runtime g2 tile downgrade all applied inside the
-    launcher).  Real tensors are required because the port takes raw
-    ``.data_ptr()`` device pointers (fake tensors have no storage); COMPILE_ONLY
-    guarantees the host pointers are never dereferenced on a device.
+    The port launch ABI (raw fx.Int64 device pointers) differs from the generic MX
+    gemm (``_s1_args_fp4``), so it can't reuse ``_precompile_to_cache``'s arg
+    builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
+    the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
+    runtime by construction (``waves_per_eu=None``, ``persist=False``,
+    ``w_layout="guinterleave"``, g2 tile downgrade are all applied inside the
+    launcher).  The compiled artifact is keyed only on the kernel's constexpr
+    params (shapes/tiles/topk/act), never on the launch pointers, grid, or
+    ``n_tokens``, so a single 1-elem real placeholder covers every buffer (real,
+    not fake, because the launcher calls ``.data_ptr()``; COMPILE_ONLY guarantees
+    it is never dereferenced).
     """
     import torch
 
@@ -839,104 +838,62 @@ def _precompile_a16w4_to_cache(
         flydsl_a16w4_gemm2,
     )
 
-    dev = torch.device("cpu")
-    E = experts
-    tokens = token_num if token_num > 0 else tile_m
-    _bm = block_m if block_m > 0 else tile_m
-    max_num_tokens_padded = tokens * topk + E * _bm - topk
-    max_num_m_blocks = (max_num_tokens_padded + _bm - 1) // _bm
-    sorted_size = max(max_num_tokens_padded, max_num_m_blocks * tile_m)
-    _act = "situv2" if act in ("situv2", "situ") else act
-
-    _cu_num_str = str(cu_num) if cu_num > 0 else None
-    with compile_only_env(), override_env("CU_NUM", _cu_num_str):
-        from aiter.jit.utils.chip_info import get_cu_num
-
-        get_cu_num.cache_clear()
-
-        eids = torch.zeros(max_num_m_blocks, dtype=torch.int32, device=dev)
-        cumsum = torch.zeros(2, dtype=torch.int32, device=dev)
-        stids = torch.zeros(max_num_tokens_padded, dtype=torch.int32, device=dev)
-
+    z = torch.zeros(1, dtype=torch.int32, device="cpu")
+    common = dict(
+        sorted_expert_ids=z,
+        cumsum_tensor=z,
+        NE=experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        tile_m=tile_m,
+        b_nt=b_nt,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=None,
+        stream=0,
+    )
+    with compile_only_env():
         if stage == 1:
-            a = torch.zeros((tokens, model_dim), dtype=torch.bfloat16, device=dev)
-            w1 = torch.zeros(
-                (E, 2 * inter_dim, model_dim // 2), dtype=torch.uint8, device=dev
-            )
-            w1_scale = torch.zeros(
-                E * 2 * inter_dim * (model_dim // 32), dtype=torch.uint8, device=dev
-            )
-            inter = torch.zeros(
-                (sorted_size, inter_dim), dtype=torch.bfloat16, device=dev
-            )
             flydsl_a16w4_gemm1(
-                a_bf16=a,
-                w1_u8=w1,
-                w1_scale_u8=w1_scale,
-                sorted_expert_ids=eids,
-                cumsum_tensor=cumsum,
-                m_indices=stids,
-                inter_sorted_bf16=inter,
-                n_tokens=tokens,
-                NE=E,
-                D_HIDDEN=model_dim,
-                D_INTER=inter_dim,
-                topk=topk,
-                tile_m=tile_m,
+                a_bf16=z,
+                w1_u8=z,
+                w1_scale_u8=z,
+                m_indices=z,
+                inter_sorted_bf16=z,
+                n_tokens=1,
                 tile_n=tile_n,
                 tile_k=tile_k,
                 k_wave=k_wave,
-                b_nt=b_nt,
-                xcd_swizzle=xcd_swizzle,
-                waves_per_eu=None,
-                act=_act,
+                act=("situv2" if act in ("situv2", "situ") else act),
                 w_layout="guinterleave",
-                stream=0,
+                **common,
             )
         else:
             # Mirror the runtime stage2 g2 tile downgrade (moe_kernels
             # _flydsl_moe_stage2_impl a16w4 branch).
-            g2_tile_n = tile_n
-            if model_dim % g2_tile_n != 0:
-                g2_tile_n = 256 if model_dim % 256 == 0 else 128
-            g2_tile_k = tile_k
-            if inter_dim % g2_tile_k != 0:
-                g2_tile_k = 128 if inter_dim % 128 == 0 else 64
-
-            inter = torch.zeros(
-                (sorted_size, inter_dim), dtype=torch.bfloat16, device=dev
+            g2_tile_n = (
+                tile_n
+                if model_dim % tile_n == 0
+                else (256 if model_dim % 256 == 0 else 128)
             )
-            w2 = torch.zeros(
-                (E, model_dim, inter_dim // 2), dtype=torch.uint8, device=dev
+            g2_tile_k = (
+                tile_k
+                if inter_dim % tile_k == 0
+                else (128 if inter_dim % 128 == 0 else 64)
             )
-            w2_scale = torch.zeros(
-                E * model_dim * (inter_dim // 32), dtype=torch.uint8, device=dev
-            )
-            sw = torch.zeros(max_num_tokens_padded, dtype=torch.float32, device=dev)
-            out = torch.zeros((tokens, model_dim), dtype=torch.bfloat16, device=dev)
             flydsl_a16w4_gemm2(
-                inter_sorted_bf16=inter,
-                w2_u8=w2,
-                w2_scale_u8=w2_scale,
-                sorted_expert_ids=eids,
-                cumsum_tensor=cumsum,
-                sorted_token_ids=stids,
-                sorted_weights=sw,
-                flat_out=out.view(-1),
-                M_logical=tokens,
-                max_sorted=sorted_size,
-                NE=E,
-                D_HIDDEN=model_dim,
-                D_INTER=inter_dim,
-                topk=topk,
-                tile_m=tile_m,
+                inter_sorted_bf16=z,
+                w2_u8=z,
+                w2_scale_u8=z,
+                sorted_token_ids=z,
+                sorted_weights=z,
+                flat_out=z,
+                M_logical=1,
+                max_sorted=1,
                 tile_n=g2_tile_n,
                 tile_k=g2_tile_k,
-                b_nt=b_nt,
-                waves_per_eu=None,
-                xcd_swizzle=xcd_swizzle,
                 w_dtype="fp4",
-                stream=0,
+                **common,
             )
 
 
