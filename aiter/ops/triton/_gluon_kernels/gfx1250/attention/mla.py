@@ -11,11 +11,13 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.ops.triton._gluon_kernels.helper import _strip_annotate
 
 float8_info = torch.finfo(e4m3_dtype)
 
 
 @aggregate
+@_strip_annotate
 class MLAConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -473,6 +475,7 @@ class MLAConfig:
 
 
 @aggregate
+@_strip_annotate
 class MLAProgram:
     """Program state and core operations for the unified attention kernel."""
 
