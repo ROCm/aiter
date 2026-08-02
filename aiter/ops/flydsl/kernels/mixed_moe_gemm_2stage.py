@@ -9,9 +9,9 @@ from aiter.ops.flydsl.moe_common import GateMode
 
 # a16w4 (bf16 A x mxfp4 W) SiTUv2 is now served by the ported FlyDSL kernel
 # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix), built via compile_flydsl_moe_stage{1,2}
-# and launched by run_flydsl_a16w4_moe (aiter/ops/flydsl/moe_kernels.py); its old
-# builders were removed from mixed_moe_gemm_2stage_common. The a8w4/mxfp8/a4w4 builders
-# are unchanged.
+# and launched by flydsl_a16w4_gemm{1,2} from the a16w4 branches of
+# _flydsl_moe_stage{1,2}_impl (aiter/ops/flydsl/moe_kernels.py); its old builders were
+# removed from mixed_moe_gemm_2stage_common. The a8w4/mxfp8/a4w4 builders are unchanged.
 from .mixed_moe_gemm_2stage_common import (
     compile_mixed_moe_gemm1_common,
     compile_mixed_moe_gemm2_common,

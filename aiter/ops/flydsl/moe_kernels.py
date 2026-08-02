@@ -490,7 +490,8 @@ def compile_flydsl_moe_stage1(
     # a16w4 (bf16 A x mxfp4 W) SiTUv2: the numerically-correct ported FlyDSL kernel
     # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix). It consumes aiter's NATIVE
     # guinterleave W1+scale layout directly (w_layout="guinterleave"), replacing the
-    # former (broken) compile_mixed_moe_gemm1_a16w4. Launched via run_flydsl_a16w4_moe.
+    # former (broken) compile_mixed_moe_gemm1_a16w4. Launched via flydsl_a16w4_gemm1
+    # from _flydsl_moe_stage1_impl's a16w4 branch.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
         from flydsl.runtime.device import get_rocm_arch
 
@@ -604,7 +605,8 @@ def compile_flydsl_moe_stage2(
     # a16w4 (bf16 A x mxfp4 W) down-proj: the ported FlyDSL kernel. Its native
     # gate_up=False W2+scale layout is byte-identical to the standard
     # shuffle_weight/e8m0_shuffle layout (E*model_dim % 256 == 0), so no layout mode
-    # is needed. Launched via run_flydsl_a16w4_moe.
+    # is needed. Launched via flydsl_a16w4_gemm2 from _flydsl_moe_stage2_impl's
+    # a16w4 branch.
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
         from flydsl.runtime.device import get_rocm_arch
 
@@ -679,144 +681,6 @@ def compile_flydsl_moe_stage2(
         raise ValueError(
             f"Unsupported stage2 dtype combination: a_dtype={a_dtype}, b_dtype={b_dtype}"
         )
-
-
-def run_flydsl_a16w4_moe(
-    hidden_states,
-    w1,  # [E, 2*inter_dim, model_dim//2] fp4x2, NATIVE guinterleave (gate_up) shuffled
-    w2,  # [E, model_dim, inter_dim//2] fp4x2, NATIVE guinterleave (gate_up=False) shuffled
-    topk_weight,
-    topk_ids,
-    *,
-    E,
-    model_dim,
-    inter_dim,
-    topk,
-    dtype,
-    w1_scale,  # [E*2*inter_dim, model_dim//32] e8m0, NATIVE guinterleave (gate_up)
-    w2_scale,  # [E*model_dim, inter_dim//32] e8m0, NATIVE guinterleave (gate_up=False)
-    block_size_M,
-    kernel_bench_callable=None,
-):
-    """Run the ported FlyDSL a16w4 (bf16 A x MXFP4 W) SiTUv2 2-stage MoE.
-
-    Numerically correct where aiter's former ``compile_mixed_moe_gemm{1,2}_a16w4`` was
-    not. Consumes aiter's NATIVE guinterleave weight+scale layout directly (no host
-    relayout): stage1 via ``w_layout="guinterleave"``; stage2's gate_up=False layout is
-    byte-identical to the standard layout the gemm2 kernel already reads
-    (E*model_dim % 256 == 0). Both stages build through
-    ``compile_flydsl_moe_stage{1,2}``. gemm2 tiles come from aiter's tuned CSV via
-    ``resolve_a16w4_gemm2_config``; gemm1 keeps the kernel's tuned default (the CSV gemm1
-    tiles regress mid/high-M). Returns ``[tokens, model_dim]``.
-    """
-    from aiter.fused_moe import moe_sorting
-    from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
-        flydsl_a16w4_gemm1,
-        flydsl_a16w4_gemm2,
-        resolve_a16w4_gemm2_config,
-    )
-
-    dev = hidden_states.device
-    tokens = hidden_states.shape[0]
-    BM = int(block_size_M) if block_size_M else 32
-    assert (E * model_dim) % 256 == 0, (
-        "a16w4 stage2 native scale layout requires E*model_dim % 256 == 0, got "
-        f"E={E}, model_dim={model_dim}"
-    )
-    w1_shuf = w1.view(torch.uint8).contiguous()
-    w2_shuf = w2.view(torch.uint8).contiguous()
-    w1_scale_1d = w1_scale.view(torch.uint8).contiguous().view(-1)
-    w2_scale_1d = w2_scale.view(torch.uint8).contiguous().view(-1)
-
-    # moe_sorting returns moe_buf [tokens, model_dim], already zero-inited on-device
-    # by the sort (accumulate=True); reuse it as the gemm2 atomic-scatter target
-    # instead of a separate zeroed output (matches the a8w4/mxfp4 sibling path).
-    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
-        topk_ids, topk_weight, E, model_dim, dtype, BM
-    )
-    sorted_size = int(sorted_expert_ids.shape[0]) * BM
-    cumsum = num_valid_ids.to(torch.int32).contiguous()
-    m_indices = sorted_ids.to(torch.int32).contiguous()
-    x_bf16 = hidden_states.to(torch.bfloat16).contiguous()
-    # gemm1 writes only valid sorted rows (masked store, num_records=cumsum) and gemm2
-    # gates every scatter on token_id < M, so intermediate padding never reaches the
-    # output -- no pre-zeroing needed.
-    inter_sorted = torch.empty(sorted_size, inter_dim, dtype=torch.bfloat16, device=dev)
-
-    def g1():
-        # gemm1 keeps the kernel's tuned default (tile_n=None); CSV tiles regress here.
-        flydsl_a16w4_gemm1(
-            a_bf16=x_bf16,
-            w1_u8=w1_shuf,
-            w1_scale_u8=w1_scale_1d,
-            sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum,
-            m_indices=m_indices,
-            inter_sorted_bf16=inter_sorted,
-            n_tokens=tokens,
-            NE=E,
-            D_HIDDEN=model_dim,
-            D_INTER=inter_dim,
-            topk=topk,
-            tile_m=BM,
-            tile_n=None,
-            act="situv2",
-            w_layout="guinterleave",
-        )
-
-    out_buf = moe_buf.view(-1)  # sort-zeroed atomic-scatter target
-
-    # gemm2 uses aiter's tuned CSV tiles (on-par-to-faster); None -> kernel default.
-    g2c = (
-        resolve_a16w4_gemm2_config(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=E,
-            topk=topk,
-            tokens=tokens,
-        )
-        or {}
-    )
-    g2_tile_n = g2c.get("tile_n", 256)
-    if model_dim % g2_tile_n != 0:
-        g2_tile_n = 256 if model_dim % 256 == 0 else 128
-    g2_tile_k = g2c.get("tile_k", 256)
-    if inter_dim % g2_tile_k != 0:
-        g2_tile_k = 128 if inter_dim % 128 == 0 else 64
-
-    def g2():
-        flydsl_a16w4_gemm2(
-            inter_sorted_bf16=inter_sorted,
-            w2_u8=w2_shuf,
-            w2_scale_u8=w2_scale_1d,
-            sorted_expert_ids=sorted_expert_ids,
-            cumsum_tensor=cumsum,
-            sorted_token_ids=sorted_ids,
-            sorted_weights=sorted_weights,
-            flat_out=out_buf,
-            M_logical=tokens,
-            max_sorted=sorted_size,
-            NE=E,
-            D_HIDDEN=model_dim,
-            D_INTER=inter_dim,
-            topk=topk,
-            tile_m=BM,
-            tile_n=g2_tile_n,
-            tile_k=g2_tile_k,
-            b_nt=g2c.get("b_nt"),
-            waves_per_eu=g2c.get("waves_per_eu"),
-            xcd_swizzle=g2c.get("xcd_swizzle", 1),
-        )
-
-    # Same stream: g2 reads inter_sorted after g1 writes it; no host sync needed.
-    g1()
-    g2()
-    out = out_buf.view(tokens, model_dim)
-
-    if kernel_bench_callable is not None:
-        kernel_bench_callable.append(("stage1", g1))
-        kernel_bench_callable.append(("stage2", g2))
-    return out
 
 
 # Private helpers
@@ -1502,6 +1366,46 @@ def _flydsl_moe_stage1_impl(
 
     dev = a.device
     _is_a16w4 = a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4")
+    if _is_a16w4:
+        # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the ported FlyDSL
+        # gemm1 launcher (moe_2stage_a16wmix). Its ABI differs from the
+        # standard _s1_args_fp4 path: it consumes aiter's NATIVE guinterleave
+        # W1+scale layout directly (w_layout="guinterleave"), writes a bf16
+        # intermediate [sorted_size, inter_dim] by sorted position, and keeps
+        # gemm1 on the kernel's tuned tile heuristic (tile_n=None; CSV gemm1
+        # tiles regress). We ignore any caller-provided `out` and return our
+        # own sorted intermediate, which fused_moe_2stages threads to stage2
+        # unchanged (a2_scale=None, no reshape).
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import flydsl_a16w4_gemm1
+
+        _act = "situv2" if act in ("situv2", "situ") else act
+        sorted_size = int(sorted_expert_ids.shape[0]) * int(tile_m)
+        inter_sorted = torch.empty(
+            sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
+        )
+        flydsl_a16w4_gemm1(
+            a_bf16=a.to(torch.bfloat16).contiguous(),
+            w1_u8=w1.view(torch.uint8).contiguous(),
+            w1_scale_u8=(
+                w1_scale.view(torch.uint8).contiguous().view(-1)
+                if w1_scale is not None
+                else torch.empty(0, dtype=torch.uint8, device=dev)
+            ),
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
+            m_indices=sorted_token_ids.to(torch.int32).contiguous(),
+            inter_sorted_bf16=inter_sorted,
+            n_tokens=token_num,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=int(tile_m),
+            tile_n=None,
+            act=_act,
+            w_layout="guinterleave",
+        )
+        return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned
     # inter_dim, tile_n=256 over-reads/writes the N axis (OOB -> wrong output
     # or memfault). Downgrade to a divisor (128). Applies to both a16w4
@@ -1522,18 +1426,12 @@ def _flydsl_moe_stage1_impl(
                 (token_num, topk, inter_dim), dtype=dtypes.fp8, device=dev
             )
         else:
-            _alloc = torch.zeros if (_is_a16w4 and inter_dim_pad > 0) else torch.empty
-            out = _alloc(
+            out = torch.empty(
                 (token_num, topk, inter_dim), dtype=torch_out_dtype, device=dev
             )
 
     if _is_splitk:
-        if _is_a16w4:
-            torch_tmp_out_dtype = torch.float32
-        else:
-            torch_tmp_out_dtype = (
-                dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
-            )
+        torch_tmp_out_dtype = dtypes.bf16 if _base_out_dtype == "bf16" else dtypes.fp16
         tmp_out = torch.zeros(
             (token_num, topk, inter_dim * 2), dtype=torch_tmp_out_dtype, device=dev
         )
@@ -1615,7 +1513,6 @@ def _flydsl_moe_stage1_impl(
                 else torch.empty(0, device=dev)
             ),
             swiglu_limit=_swiglu_limit_val,
-            pass_swiglu_limit=not _is_a16w4,
         )
     else:
         args = _s1_args_std(
@@ -1663,9 +1560,6 @@ def _flydsl_moe_stage1_impl(
         k_wave=k_wave,
     )
     _run_compiled(exe, args)
-
-    if _is_splitk and _is_a16w4:
-        tmp_out = tmp_out.to(dtypes.bf16)
 
     num_sorted_rows = sorted_token_ids.shape[0]
     use_splitk_bias = _is_splitk and bias is not None
@@ -1933,6 +1827,80 @@ def _flydsl_moe_stage2_impl(
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
+
+    if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+        # a16w4 (bf16 A x MXFP4 W) down-proj via the ported FlyDSL gemm2
+        # launcher (moe_2stage_a16wmix). Consumes the bf16 [sorted_size,
+        # inter_dim] intermediate from stage1 (inter_states) and scatters the
+        # routing-weighted bf16 result into the caller's `out` (the
+        # moe_sorting-zeroed moe_buf) via atomic scatter -- no alloc/zeroing
+        # here. gemm2 tiles come from the tuned CSV (resolve_a16w4_gemm2_config);
+        # the port ABI differs from _s2_args_fp4.
+        from aiter.ops.flydsl.kernels.moe_2stage_a16wmix import (
+            flydsl_a16w4_gemm2,
+            resolve_a16w4_gemm2_config,
+        )
+
+        E = w2.shape[0]
+        model_dim = w2.shape[1]
+        inter_dim = inter_states.shape[1]
+        assert out is not None, "a16w4 stage2 requires a caller-provided output buffer"
+        M_logical = int(out.shape[0])
+        max_sorted = int(inter_states.shape[0])
+
+        g2c = (
+            resolve_a16w4_gemm2_config(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                experts=E,
+                topk=topk,
+                tokens=M_logical,
+            )
+            or {}
+        )
+        g2_tile_n = g2c.get("tile_n", 256)
+        if model_dim % g2_tile_n != 0:
+            g2_tile_n = 256 if model_dim % 256 == 0 else 128
+        g2_tile_k = g2c.get("tile_k", 256)
+        if inter_dim % g2_tile_k != 0:
+            g2_tile_k = 128 if inter_dim % 128 == 0 else 64
+
+        _sw = (
+            sorted_weights
+            if sorted_weights is not None
+            else torch.empty(
+                sorted_token_ids.shape,
+                dtype=torch.float32,
+                device=inter_states.device,
+            )
+        )
+        flydsl_a16w4_gemm2(
+            inter_sorted_bf16=inter_states,
+            w2_u8=w2.view(torch.uint8).contiguous(),
+            w2_scale_u8=(
+                w2_scale.view(torch.uint8).contiguous().view(-1)
+                if w2_scale is not None
+                else torch.empty(0, dtype=torch.uint8, device=inter_states.device)
+            ),
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids.to(torch.int32).contiguous(),
+            sorted_token_ids=sorted_token_ids,
+            sorted_weights=_sw,
+            flat_out=out.view(-1),
+            M_logical=M_logical,
+            max_sorted=max_sorted,
+            NE=E,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            topk=topk,
+            tile_m=int(tile_m),
+            tile_n=g2_tile_n,
+            tile_k=g2_tile_k,
+            b_nt=g2c.get("b_nt"),
+            waves_per_eu=g2c.get("waves_per_eu"),
+            xcd_swizzle=g2c.get("xcd_swizzle", 1),
+        )
+        return out
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]

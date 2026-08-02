@@ -4,10 +4,12 @@
 
 Exercises the NEW shared a16w-mix a16w4 kernel
 (``aiter/ops/flydsl/kernels/moe_2stage_a16wmix``) through the production
-``fused_moe`` a16w4 path (``run_flydsl_a16w4_moe`` in
-``aiter/ops/flydsl/moe_kernels.py``, built via ``compile_flydsl_moe_stage{1,2}``),
-in the SiTUv2 / SEPARATED bf16-activation x mxfp4-weight configuration, against a
-bf16 SiTUv2 torch reference with a strict cos/logits_diff gate.
+``fused_moe`` a16w4 path (the standard 2-stage FlyDSL dispatch:
+``get_2stage_cfgs`` -> ``fused_moe_2stages`` -> the a16w4 branches of
+``_flydsl_moe_stage{1,2}_impl`` -> ``flydsl_a16w4_gemm{1,2}``, built via
+``compile_flydsl_moe_stage{1,2}``), in the SiTUv2 / SEPARATED bf16-activation x
+mxfp4-weight configuration, against a bf16 SiTUv2 torch reference with a strict
+cos/logits_diff gate.
 
 This is the explicit FlyDSL-side test complementing the routed a16w4 rows of
 ``op_tests/test_moe_2stage.py``. It goes through ``fused_moe`` (or

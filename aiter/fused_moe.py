@@ -420,7 +420,18 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
     if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
         parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
-        return parsed is not None and parsed.get("mode", "atomic") == "reduce"
+        if parsed is None:
+            return False
+        # a16w4 (bf16 A x mxfp4 W) down-proj only supports atomic scatter into a
+        # pre-zeroed buffer; the ported gemm2 launcher ignores the kernelName's
+        # mode, so a "reduce"-named a16w4 config must still get accumulate=True
+        # sorting (moe_buf zeroed). Treat any a16w4 stage2 as atomic here.
+        if parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in (
+            "fp4",
+            "mxfp4",
+        ):
+            return False
+        return parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
     return False
@@ -791,11 +802,13 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    # a16w4 (bf16 A x MXFP4 W) SiTUv2: served by the ported FlyDSL kernel
-    # (moe_2stage_a16wmix), replacing the former compile_mixed_moe_gemm{1,2}_a16w4
-    # (which failed the strict gate at logits_diff ~1.0; the port passes at ~1.5e-5).
-    # CDNA gfx942/gfx950 only. The q_dtype_a routing above already picks bf16 (a16w4,
-    # here) vs fp8 (a8w4); reaching this point implies bf16.
+    # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the STANDARD 2-stage FlyDSL
+    # path (get_2stage_cfgs -> fused_moe_2stages), which dispatches the ported
+    # gemm1/gemm2 launchers (moe_2stage_a16wmix) via the a_dtype=="bf16" branch
+    # in the stage impls. The q_dtype_a routing above already picks bf16 (a16w4)
+    # vs fp8 (a8w4); reaching this point with those dtypes implies a16w4. Guard
+    # here for the feature combinations the port genuinely cannot serve, so they
+    # fail loudly instead of silently mis-running.
     _is_a16w4 = (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
@@ -810,8 +823,7 @@ def _fused_moe_impl(
                 f"flydsl_available={is_flydsl_available()}."
             )
         # The port bakes beta/linear_beta at 1.0 and has no per-expert bias or
-        # expert-parallel masking; fail explicitly rather than fall back to the
-        # numerically-broken old kernel.
+        # expert-parallel masking.
         if beta not in (None, 1.0) or linear_beta not in (None, 1.0):
             raise NotImplementedError(
                 "a16w4 SiTUv2 with non-default beta/linear_beta is not supported "
@@ -832,27 +844,6 @@ def _fused_moe_impl(
                 "a16w4 SiTUv2 requires preshuffled g1u1 weights and "
                 "doweight_stage1=False."
             )
-
-        from aiter.ops.flydsl.moe_kernels import run_flydsl_a16w4_moe
-
-        _bm = block_size_M if block_size_M not in (None, -1) else None
-        out = run_flydsl_a16w4_moe(
-            hidden_states,
-            w1,
-            w2,
-            topk_weight,
-            topk_ids,
-            E=E,
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            topk=topk,
-            dtype=dtype,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            block_size_M=_bm,
-            kernel_bench_callable=kernel_bench_callable,
-        )
-        return out.to(dtype)
 
     metadata = get_2stage_cfgs(
         get_padded_M(M),  # consider token_num > 1024 as prefill
@@ -2421,10 +2412,22 @@ def get_2stage_cfgs(
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
-    # NB: a16w4 (bf16 A x mxfp4 W) SiTUv2 is intercepted earlier in fused_moe_
-    # and served by the ported FlyDSL kernel, so it never reaches this metadata
-    # path; only quantized-activation (fp4/fp8) mxfp4/mxfp8 route here.
-    use_mxfp4_flydsl = (
+    # a16w4 (bf16 A x mxfp4 W) SiTUv2: bf16 activation (no A quant), mxfp4 weight.
+    # Routed through the same FlyDSL 2-stage path as a4w4/a8w4; the impls detect
+    # a_dtype=="bf16" and dispatch to the ported gemm1/gemm2 launchers, reusing the
+    # standard skip-quant logic (fuse_quant="", a2_scale=None, no inter-stage quant).
+    _is_a16w4 = (
+        dtype in [dtypes.bf16, dtypes.fp16]
+        and q_type == QuantType.per_1x32
+        and activation == ActivationType.Situv2
+        and q_dtype_a == dtypes.bf16
+        and q_dtype_w == dtypes.fp4x2
+        and is_shuffled
+        and use_g1u1
+        and not doweight_stage1
+        and is_flydsl_available()
+    )
+    use_mxfp4_flydsl = _is_a16w4 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
@@ -2449,9 +2452,12 @@ def get_2stage_cfgs(
 
         _out_type = "bf16" if dtype == dtypes.bf16 else "f16"
         # a-dtype routing:
-        #   "fp4" => a4w4 fp4/fp4
-        #   "fp8" => a8w4 fp8/fp4 (or a8w8 with w=fp8)
-        if q_dtype_a == dtypes.fp4x2:
+        #   "bf16" => a16w4 bf16/fp4 (no A quant, SiTUv2)
+        #   "fp4"  => a4w4 fp4/fp4
+        #   "fp8"  => a8w4 fp8/fp4 (or a8w8 with w=fp8)
+        if _is_a16w4:
+            _a_type = "bf16"
+        elif q_dtype_a == dtypes.fp4x2:
             _a_type = "fp4"
         else:
             _a_type = "fp8"
