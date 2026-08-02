@@ -2371,10 +2371,8 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.fp4x2
         and is_shuffled
     )
-    # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel via
-    # fused_moe_'s a16wi4 dispatch (aiter/ops/flydsl/moe_2stage_a16wi4_dispatch.py),
-    # which intercepts before this metadata builder. The old heuristic
-    # _flydsl_stage1/2_wrapper int4 dispatch was removed here.
+    # a16wi4 is intercepted earlier by fused_moe_'s fused_moe_a16wi4_flydsl dispatch,
+    # so it never reaches this metadata builder.
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
     use_mxfp4_flydsl = (

@@ -478,10 +478,7 @@ def compile_flydsl_moe_stage1(
             k_wave=k_wave,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel
-        # (aiter/ops/flydsl/kernels/moe_2stage_a16wmix) via
-        # aiter/ops/flydsl/moe_2stage_a16wi4_dispatch.py, dispatched directly from
-        # fused_moe_; it no longer routes through this stage1 compile path.
+        # a16wi4: served by moe_2stage_a16wi4_dispatch (shared a16w-mix kernel), not here.
         raise NotImplementedError(
             "a16wi4 (bf16 A x int4 W) stage1 is served by the shared FlyDSL kernel "
             "via fused_moe_'s a16wi4 dispatch, not compile_flydsl_moe_stage1."
@@ -574,8 +571,7 @@ def compile_flydsl_moe_stage2(
             enable_bias=enable_bias,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
-        # a16wi4 (bf16 A x int4 W) is served by the shared FlyDSL a16w-mix kernel;
-        # see the note in compile_flydsl_moe_stage1. It no longer routes here.
+        # a16wi4: served by moe_2stage_a16wi4_dispatch (shared a16w-mix kernel), not here.
         raise NotImplementedError(
             "a16wi4 (bf16 A x int4 W) stage2 is served by the shared FlyDSL kernel "
             "via fused_moe_'s a16wi4 dispatch, not compile_flydsl_moe_stage2."
