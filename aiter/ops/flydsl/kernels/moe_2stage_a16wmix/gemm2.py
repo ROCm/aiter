@@ -8,6 +8,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
 
@@ -611,7 +612,7 @@ def compile_gemm2_a16w4_port(
         "bf16",
     ), f"w_dtype must be 'mxfp4', 'int4' or 'bf16', got {w_dtype!r}"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); see a16wmix_use_k16.
-    _use_k16 = a16wmix_use_k16()
+    _use_k16 = a16wmix_use_k16(get_rocm_arch())
     _K = D_INTER
     assert _K % TILE_K == 0, f"D_INTER (K) must be a multiple of {TILE_K}, got {_K}"
     assert (

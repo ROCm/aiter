@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-import os
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -34,23 +32,13 @@ _PTR3 = "!llvm.ptr<3>"
 LOG2E = 1.4426950408889634
 
 
-def a16wmix_use_k16(arch=None):
+def a16wmix_use_k16(arch):
     """True for the gfx942 (CDNA3) codepath: K=16 MFMA + scalar int4 dequant.
 
     Arch-gate: gfx950 (CDNA4) has K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32;
-    gfx942 has neither and falls back to K=16 MFMA + scalar-trunc dequant.
-    ``FLYDSL_A16WMIX_FORCE_K16=1`` forces the gfx942 path (a strict ISA subset) for
-    validation on a gfx950 box.
+    gfx942 has neither and falls back to K=16 MFMA + scalar-trunc dequant. The caller
+    passes the target arch (e.g. ``get_rocm_arch()``).
     """
-    if os.environ.get("FLYDSL_A16WMIX_FORCE_K16", "0") not in (
-        "0",
-        "",
-        "false",
-        "False",
-    ):
-        return True
-    if arch is None:
-        arch = get_rocm_arch() or ""
     return "gfx95" not in str(arch)
 
 
@@ -1017,8 +1005,8 @@ def compile_gemm1_a16w4_port(
         "situv2",
     ), f"a16w4 gemm1 act must be 'silu' or 'situv2', got {act!r}"
     # Arch-gate K=16 (gfx942) vs K=32 (gfx950); not in name_suffix (ARCH is already in
-    # the JIT cache key, FORCE_K16 is a test hook).
-    _use_k16 = a16wmix_use_k16()
+    # the JIT cache key).
+    _use_k16 = a16wmix_use_k16(get_rocm_arch())
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
