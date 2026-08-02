@@ -1,34 +1,20 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Ordinary MoE facades for the shared MXFP4/FP8 kernel builders."""
+"""Heterogeneous MoE facades for the shared MXFP4/FP8 kernel builders."""
 
 import functools
 
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .mixed_moe_gemm_2stage_common import (
-    compile_a16w4_moe_gemm2,
-    compile_mixed_moe_gemm1_a16w4,
     compile_mixed_moe_gemm1_common,
-    compile_mixed_moe_gemm2_a16w4,
     compile_mixed_moe_gemm2_common,
-    validate_moe_dtypes,
 )
-
-__all__ = [
-    "GateMode",
-    "compile_a16w4_moe_gemm2",
-    "compile_mixed_moe_gemm1",
-    "compile_mixed_moe_gemm1_a16w4",
-    "compile_mixed_moe_gemm2",
-    "compile_mixed_moe_gemm2_a16w4",
-    "validate_moe_dtypes",
-]
 
 
 @functools.cache
-def compile_mixed_moe_gemm1(
+def compile_mixed_fhmoe_gemm1(
     *,
     model_dim: int,
     inter_dim: int,
@@ -57,8 +43,14 @@ def compile_mixed_moe_gemm1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    shared_expert_id: int,
 ):
-    """Compile an ordinary stage1 MoE kernel."""
+    """Compile a stage1 kernel with an FP8 shared expert."""
+    if shared_expert_id is None:
+        raise ValueError(
+            "FHMoE stage1 requires shared_expert_id == experts - 1; "
+            f"got {shared_expert_id=} and {experts=}"
+        )
     return compile_mixed_moe_gemm1_common(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -87,11 +79,12 @@ def compile_mixed_moe_gemm1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        shared_expert_id=shared_expert_id,
     )
 
 
 @functools.cache
-def compile_mixed_moe_gemm2(
+def compile_mixed_fhmoe_gemm2(
     *,
     model_dim: int,
     inter_dim: int,
@@ -116,8 +109,14 @@ def compile_mixed_moe_gemm2(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    shared_expert_id: int,
 ):
-    """Compile an ordinary stage2 MoE kernel."""
+    """Compile a stage2 kernel with an FP8 shared expert."""
+    if shared_expert_id is None:
+        raise ValueError(
+            "FHMoE stage2 requires shared_expert_id == experts - 1; "
+            f"got {shared_expert_id=} and {experts=}"
+        )
     return compile_mixed_moe_gemm2_common(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -142,4 +141,5 @@ def compile_mixed_moe_gemm2(
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
+        shared_expert_id=shared_expert_id,
     )
