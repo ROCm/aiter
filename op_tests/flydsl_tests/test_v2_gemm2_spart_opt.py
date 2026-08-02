@@ -46,6 +46,17 @@ def test_get_g2_keys_and_forwards_spart_opt(monkeypatch):
     assert [call["g2_kstages"] for call in compile_calls] == [2, 2]
 
 
+def test_get_g2_defaults_spart_opt_on_when_env_is_unset(monkeypatch):
+    compile_calls = _install_g2_compile_collector(monkeypatch, spart=402)
+    monkeypatch.delenv("MXFP4_G2_SPART_OPT", raising=False)
+
+    dispatcher.get_g2(**G2_COMMON)
+
+    assert len(compile_calls) == 1
+    assert compile_calls[0]["g2_spart_opt"] is True
+    assert compile_calls[0]["g2_kstages"] == 2
+
+
 def test_get_g2_normalizes_spart_opt_off_when_spart_is_disabled(monkeypatch):
     compile_calls = _install_g2_compile_collector(monkeypatch, spart=0)
 
