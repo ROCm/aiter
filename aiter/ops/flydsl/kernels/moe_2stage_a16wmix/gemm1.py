@@ -12,6 +12,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from .act import _silu_mul_batch, _situ_mul_batch
 
 
@@ -40,12 +41,6 @@ def a16wmix_use_k16(arch):
     passes the target arch (e.g. ``get_rocm_arch()``).
     """
     return "gfx95" not in str(arch)
-
-
-def _raw(v):
-    if not isinstance(v, ir.Value) and hasattr(v, "ir_value"):
-        return v.ir_value()
-    return v
 
 
 def _udiv(a, c):
