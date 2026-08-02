@@ -169,8 +169,7 @@ def _gemm2_body_a16w4(
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64
     _k0_count = TILE_K // 128
-    # 4 waves split the TILE_N tile (matches the atomic-epilog wave-split).
-    _n_per_wave = TILE_N // 4
+    _n_per_wave = TILE_N // 4  # 4 waves split TILE_N (matches the atomic-epilog split)
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KH_TILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N

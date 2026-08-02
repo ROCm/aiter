@@ -25,10 +25,8 @@ def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
     return rocdl.s_waitcnt(encoded_vmcnt | (lk << 8) | (e << 4))
 
 
-# =============================================================================
-# Shared low-level helpers for the a16w4/a16wi4/a16w16 fused MoE kernels. Used by
-# both stage1 (this module) and stage2 (:mod:`gemm2`, imported from here).
-# =============================================================================
+# Shared low-level helpers for the a16w4/a16wi4/a16w16 fused MoE kernels, used by
+# both stage1 (this module) and stage2 (gemm2, imported from here).
 
 _PTR3 = "!llvm.ptr<3>"
 LOG2E = 1.4426950408889634
@@ -230,9 +228,7 @@ def lds_acc_bytes_for(rows, BN):
     return rows * BN * 4
 
 
-# =============================================================================
 # Stage1 (gate+up GEMM + SiLU/SiTUv2)
-# =============================================================================
 
 # a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
 # K-group). Scale packed bf16 pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
@@ -289,7 +285,7 @@ def _gemm1_body_a16w4(
         w_dtype == "bf16"
     )  # a16w16: raw bf16 W (unpacked, no scale, no upconvert)
     N_OUT = 2 * INTER
-    elem_bytes = 2  # bf16
+    elem_bytes = 2
     a_elem_bytes = 2
     KH_TILE_BYTES = TILE_K * a_elem_bytes  # A-LDS bytes per row per K-tile
     LDS_STRIDE = TILE_K  # bf16 elems per LDS row (pad_k=0, LDS128)
@@ -305,7 +301,6 @@ def _gemm1_body_a16w4(
         wave_n_id = wave % fx.Int32(num_n_waves)
         wave_k_id = rocdl.readfirstlane(T.i32, wave // fx.Int32(num_n_waves))
     else:
-        # k_wave=1: wave_n_id==wave, wave_k_id==0 (byte-identical ISA).
         wave_n_id = wave
         wave_k_id = fx.Int32(0)
     _n_per_wave = TILE_N // num_n_waves
@@ -421,7 +416,7 @@ def _gemm1_body_a16w4(
     tile_k_dwords = (TILE_K * elem_bytes) // 4
     c_k_div4 = (K * elem_bytes) // 4
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    chunk_i32 = x_load_bytes // 4  # 4
+    chunk_i32 = x_load_bytes // 4
     if const_expr(k_wave > 1):
         x_load_tid = tx_i32 % fx.Int32(a_load_threads)
     else:
@@ -816,7 +811,6 @@ def _gemm1_body_a16w4(
         compute_tile(b0, preload_a(0))
         gpu.barrier()
     else:
-        # prologue: tile-0 A DMA + B loads in flight.
         dma_x_tile_to_lds(k_base, slot=0)
         b_cur = load_b_tile(k_base)
         for kt in range_constexpr(K_TILES_TOTAL):
