@@ -4,6 +4,7 @@
 
 #include "opus_moe.h"
 
+#include "aiter_enum.h"
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
 
@@ -618,7 +619,10 @@ void opus_moe_stage1_a8w4_fwd(
     int block_m,
     const std::string& kernelName,
     int inter_dim_pad,
-    float swiglu_limit)
+    int activation,
+    float swiglu_limit,
+    float situ_beta,
+    float situ_linear_beta)
 {
     check_tensor(hidden_states,
                  "hidden_states",
@@ -665,7 +669,19 @@ void opus_moe_stage1_a8w4_fwd(
     const int sorted_blocks = static_cast<int>(sorted_expert_ids.size(0));
     const int effective_inter_dim = inter_dim - inter_dim_pad;
     const int kernel_id = opus_moe::stage1_a8w4_kid_from_name(kernelName.c_str());
+    const ActivationType activation_type = static_cast<ActivationType>(activation);
+    AITER_CHECK(activation_type == ActivationType::Silu ||
+                    activation_type == ActivationType::Swiglu ||
+                    activation_type == ActivationType::Situv2,
+                "Opus A8W4 stage1 activation must be Silu (0), Swiglu (2), or "
+                "Situv2 (3), got ",
+                activation);
     AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
+    if(activation_type == ActivationType::Situv2)
+    {
+        AITER_CHECK(situ_beta > 0.0f, "situ_beta must be positive");
+        AITER_CHECK(situ_linear_beta > 0.0f, "situ_linear_beta must be positive");
+    }
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",
                 kernelName);
@@ -696,13 +712,6 @@ void opus_moe_stage1_a8w4_fwd(
                 inter_dim_pad,
                 " effective_inter_dim=",
                 effective_inter_dim);
-    AITER_CHECK(!opus_moe::stage1_a8w4_kid_requires_bias(kernel_id) ||
-                    bias.has_value(),
-                "Opus A8W4 stage1 kernel_id=",
-                kernel_id,
-                " (",
-                opus_moe::stage1_a8w4_kid_name(kernel_id),
-                ") requires bias");
     const int hidden_scale_cols = model_dim / scale_group;
     const int out_scale_cols = inter_dim / scale_group;
     const int k_steps = model_dim / mfma_k;
@@ -762,7 +771,10 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.inter_dim = inter_dim;
     kargs.hidden_scale_cols = hidden_scale_cols;
     kargs.k_steps = k_steps;
+    kargs.activation = activation_type;
     kargs.swiglu_limit = swiglu_limit;
+    kargs.situ_beta = situ_beta;
+    kargs.situ_linear_beta = situ_linear_beta;
 
     // Byte extent per global tensor (1-byte dtypes: size(0)*stride(0)) -> make_gmem bounds check.
     kargs.hidden_size_bytes = checked_u32_extent_bytes(hidden_states, "hidden_states");

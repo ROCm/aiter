@@ -539,31 +539,49 @@ __device__ __forceinline__ void reduce_single_group_kwave(
     }
 }
 
-template<Stage1Activation Act>
 __device__ __forceinline__ float
-activation_mul_stage1(float gate_raw, float up_raw, float swiglu_limit)
+sigmoid_stage1(float value)
 {
-    if constexpr(Act == Stage1Activation::Swiglu)
+    constexpr float kNegLog2E = -1.4426950408889634f;
+    const float emu = __builtin_amdgcn_exp2f(value * kNegLog2E);
+    return __builtin_amdgcn_rcpf(1.0f + emu);
+}
+
+__device__ __forceinline__ float tanh_stage1(float value)
+{
+    constexpr float kNegTwoLog2E = -2.8853900817779268f;
+    const float abs_value = __builtin_fabsf(value);
+    const float emu = __builtin_amdgcn_exp2f(abs_value * kNegTwoLog2E);
+    const float tanh_abs = (1.0f - emu) * __builtin_amdgcn_rcpf(1.0f + emu);
+    return value > 0.0f ? tanh_abs : -tanh_abs;
+}
+
+__device__ __forceinline__ float activation_mul_stage1(
+    float gate_raw,
+    float up_raw,
+    ActivationType activation,
+    float swiglu_limit,
+    float situ_beta,
+    float situ_linear_beta)
+{
+    const float gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
+    const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
+    const float linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
+
+    if(activation == ActivationType::Swiglu)
     {
-        constexpr float kLimit = 7.0f;
-        constexpr float kNegAlphaLog2E = -1.4426950408889634f * 1.702f;
-        const float gate = gate_raw < kLimit ? gate_raw : kLimit;
-        const float up_hi = up_raw < kLimit ? up_raw : kLimit;
-        const float linear = up_hi > -kLimit ? up_hi : -kLimit;
-        const float emu = __builtin_amdgcn_exp2f(gate * kNegAlphaLog2E);
-        const float sig = __builtin_amdgcn_rcpf(1.0f + emu);
-        return gate * sig * (linear + 1.0f);
+        return gate * sigmoid_stage1(1.702f * gate) * (linear + 1.0f);
     }
-    else
+    if(activation == ActivationType::Situv2)
     {
-        constexpr float kNegLog2E = -1.4426950408889634f;
-        const float gate = gate_raw < swiglu_limit ? gate_raw : swiglu_limit;
-        const float up_hi = up_raw < swiglu_limit ? up_raw : swiglu_limit;
-        const float linear = up_hi > -swiglu_limit ? up_hi : -swiglu_limit;
-        const float emu = __builtin_amdgcn_exp2f(gate * kNegLog2E);
-        const float sig = __builtin_amdgcn_rcpf(1.0f + emu);
-        return gate * sig * linear;
+        const float situ_gate = situ_beta *
+            tanh_stage1(gate * __builtin_amdgcn_rcpf(situ_beta)) *
+            sigmoid_stage1(gate);
+        const float situ_linear = situ_linear_beta *
+            tanh_stage1(linear * __builtin_amdgcn_rcpf(situ_linear_beta));
+        return situ_gate * situ_linear;
     }
+    return gate * sigmoid_stage1(gate) * linear;
 }
 
 __device__ __forceinline__ float load_w1_bias_stage1(
@@ -601,8 +619,13 @@ __device__ __forceinline__ void epilogue_store_group_to_smem(
             up_value += load_w1_bias_stage1(
                 kargs, expert_id, kargs.inter_dim + output_col);
         }
-        const float value = activation_mul_stage1<Traits::ACTIVATION>(
-            gate, up_value, kargs.swiglu_limit);
+        const float value = activation_mul_stage1(
+            gate,
+            up_value,
+            kargs.activation,
+            kargs.swiglu_limit,
+            kargs.situ_beta,
+            kargs.situ_linear_beta);
         const int offset = epilogue_smem_offset<Traits>(
             smem_row, group, local_col);
         smem_values[offset] = value;

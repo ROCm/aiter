@@ -2,6 +2,7 @@
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#include "aiter_enum.h"
 #include "opus_moe_common.cuh"
 
 #include "opus/opus.hpp"
@@ -39,7 +40,10 @@ struct OpusMoeStage1A8W4Kargs
     int inter_dim;
     int hidden_scale_cols;
     int k_steps;
+    ActivationType activation;
     float swiglu_limit;
+    float situ_beta;
+    float situ_linear_beta;
 
     // Byte extents per global tensor -> make_gmem, so the HW OOB bounds check stays active.
     unsigned int hidden_size_bytes;
@@ -59,12 +63,6 @@ constexpr int kDefaultCtaThreads = 256;
 constexpr int kMinBlocksPerCu = 2;
 constexpr int kGfx950LdsBytes = 163840;
 constexpr int kDedicatedEpilogueScratchLdsLimit = 48 * 1024;
-
-enum class Stage1Activation
-{
-    Silu,
-    Swiglu,
-};
 
 template<int BlockM,
          int BlockN,
@@ -97,8 +95,6 @@ struct OpusMoeStage1A8W4Shape
         Policy::MIN_BLOCKS_PER_CU_OVERRIDE :
         K_WAVE == 1 ? kMinBlocksPerCu :
         1;
-    static constexpr Stage1Activation ACTIVATION = Policy::ACTIVATION;
-
     static constexpr int SCALE_GROUP_LOGICAL_K = kScaleGroupLogicalK;
     static constexpr int OUTPUT_SCALE_GROUPS_PER_TILE =
         GATE_UP_GROUP_SPLIT ? (B_N / 2) / SCALE_GROUP_LOGICAL_K : 1;
@@ -172,7 +168,6 @@ template<bool GateUpGroupSplit = false,
          int KWave = 1,
          int MinBlocksPerCuOverride = 0,
          int QuantGroupBlocks = 1,
-         Stage1Activation Activation = Stage1Activation::Silu,
          int BlockThreads = kDefaultCtaThreads,
          bool WeightLoadStream = false,
          int KLoopSwizzleColors = 0,
@@ -186,7 +181,6 @@ struct OpusMoeStage1A8W4Policy
     static constexpr int K_WAVE = KWave;
     static constexpr int MIN_BLOCKS_PER_CU_OVERRIDE = MinBlocksPerCuOverride;
     static constexpr int QUANT_GROUP_BLOCKS = QuantGroupBlocks;
-    static constexpr Stage1Activation ACTIVATION = Activation;
     static constexpr int BLOCK_THREADS = BlockThreads;
     static constexpr bool WEIGHT_LOAD_STREAM = WeightLoadStream;
     static constexpr int K_LOOP_SWIZZLE_COLORS = KLoopSwizzleColors;

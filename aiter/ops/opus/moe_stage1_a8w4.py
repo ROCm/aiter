@@ -7,6 +7,7 @@ import torch
 from torch import Tensor
 
 from ...jit.core import compile_ops
+from ..enum import ActivationType
 
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
 
@@ -50,7 +51,10 @@ def _opus_moe_stage1_a8w4_fwd_raw(
     block_m: int,
     kernelName: str,
     inter_dim_pad: int,
+    activation: int,
     swiglu_limit: float,
+    situ_beta: float,
+    situ_linear_beta: float,
 ) -> Tensor: ...
 
 
@@ -88,13 +92,21 @@ def opus_moe_stage1_a8w4_fwd(
     inter_dim_pad: int,
     block_m: int,
     kernelName: str,
+    activation: int = ActivationType.Silu.value,
     bias: Tensor | None = None,
     out: Tensor | None = None,
     out_scale: Tensor | None = None,
     swiglu_limit: float | None = None,
+    situ_beta: float = 2.0,
+    situ_linear_beta: float = 1.5,
 ) -> tuple[Tensor, Tensor]:
     block_m = int(block_m)
     kernelName = str(kernelName)
+    activation = int(getattr(activation, "value", activation))
+    if swiglu_limit is None:
+        swiglu_limit = (
+            7.0 if activation == ActivationType.Swiglu.value else float("inf")
+        )
     inter_dim = int(w1.shape[1]) // 2
     if out is None:
         out = torch.empty(
@@ -124,7 +136,10 @@ def opus_moe_stage1_a8w4_fwd(
         int(block_m),
         kernelName,
         int(inter_dim_pad),
-        float(swiglu_limit) if swiglu_limit else float("inf"),
+        activation,
+        float(swiglu_limit),
+        float(situ_beta),
+        float(situ_linear_beta),
     )
     return out, out_scale
 
