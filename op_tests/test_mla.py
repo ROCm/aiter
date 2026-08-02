@@ -4,6 +4,8 @@
 import argparse
 import itertools
 import random
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -714,6 +716,84 @@ def test_mla(
     return ret
 
 
+# Regression: KV addresses are kv_loc * stride_kv_c_bs + offs_d, so with a
+# 576-wide bf16 row the int32 product wraps once a page id passes 3,728,270 and
+# the load lands below the cache base. The cases above never reach that row
+# (kv_max_sz caps page ids at 2,097,151), so this needs its own >4 GiB cache.
+# The launch is a subprocess because a memory fault aborts the interpreter
+# rather than raising, which would kill the rest of the CI shard.
+LARGE_KV_FLAG = "--_large-kv-child"
+LARGE_KV_ROWS = 4_400_000  # 4.72 GiB
+LARGE_KV_BASE = 4_255_488  # past 2**31 // 576
+
+
+def _large_kv_child():
+    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+
+    lora, rope, nhead = 512, 64, 16
+    row = lora + rope
+    scale = row**-0.5
+    torch.manual_seed(0)
+    kv = torch.zeros((LARGE_KV_ROWS, row), dtype=dtypes.bf16)
+    assert kv.shape[0] * kv.stride(0) * kv.element_size() > 0x80000000
+
+    for ctx in (128, 100):  # 100 leaves a partial trailing BLOCK_N tile
+        idx = torch.arange(LARGE_KV_BASE, LARGE_KV_BASE + ctx, dtype=torch.int32)
+        kv[idx.long()] = torch.randn(ctx, row).to(dtypes.bf16)
+        q = torch.randn(1, nhead, lora).to(dtypes.bf16)
+        qpe = torch.randn(1, nhead, rope).to(dtypes.bf16)
+        out = torch.empty(1, nhead, lora, dtype=dtypes.bf16)
+        seqlen = torch.tensor([ctx], dtype=torch.int32)
+        mla_gluon(q, qpe, kv, out, idx.view(1, ctx), seqlen, scale, kv_pe_offset=lora)
+        torch.cuda.synchronize()
+
+        gathered = kv[idx.long()].float()
+        scores = (
+            q[0].float() @ gathered[:, :lora].T + qpe[0].float() @ gathered[:, lora:].T
+        ) * scale
+        ref = torch.softmax(scores, dim=-1) @ gathered[:, :lora]
+        checkAllclose(ref, out[0].float(), msg=f"mla_gluon >2GB kv ctx={ctx} ")
+
+
+def test_mla_gluon_large_kv_cache():
+    need = LARGE_KV_ROWS * 576 * 2 * 1.3
+    if get_gfx() != "gfx950" or torch.cuda.mem_get_info()[0] < need:
+        aiter.logger.info(
+            "mla_gluon >2GB kv cache: skipped, needs gfx950 and %.1fGB free",
+            need / 1e9,
+        )
+        return
+
+    cmd = [sys.executable, __file__, LARGE_KV_FLAG]
+
+    def _no_core_dump():
+        import resource
+
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    # check=False: the exit code is the assertion below, not an exception
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+        preexec_fn=_no_core_dump,
+    )
+    assert proc.returncode == 0, (
+        f"mla_gluon >2GB kv cache failed (exit {proc.returncode}); "
+        f"likely an int32 KV row-offset overflow.\n{proc.stdout[-2000:]}{proc.stderr[-2000:]}"
+    )
+    # The child's output is captured, so say so here or a pass is indistinguishable
+    # from a skip -- which is the exact failure mode this test exists to fix.
+    aiter.logger.info("mla_gluon >2GB kv cache: passed")
+
+
+if LARGE_KV_FLAG in sys.argv:  # before argparse sees it
+    _large_kv_child()
+    sys.exit(0)
+
+
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
     description="config input of test",
@@ -858,6 +938,11 @@ parser.add_argument(
 
 
 args = parser.parse_args()
+
+# Before the sweep: this must not be hostage to it, and the VRAM gate wants a
+# clean pool. aiter_test.sh also runs this file 5x with sweep args -- skip those.
+if len(sys.argv) == 1:
+    test_mla_gluon_large_kv_cache()
 
 for nhead, decode_qlen in args.nhead:
     df = []
