@@ -12,6 +12,7 @@ from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from .act import _silu_mul_batch, _situ_mul_batch
 
 
 def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
@@ -29,7 +30,6 @@ def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
 # =============================================================================
 
 _PTR3 = "!llvm.ptr<3>"
-LOG2E = 1.4426950408889634
 
 
 def a16wmix_use_k16(arch):
@@ -118,53 +118,6 @@ def _global_i32_ptr(addr_i64):
 
 def _global_i32_at(addr_i64, idx):
     return _global_i32_ptr(addr_i64)[idx]
-
-
-def _silu_mul_batch(gs, us):
-    e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
-    sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
-    return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
-
-
-def _sigmoid_f32(g):
-    e = fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E))))
-    return fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
-
-
-def _tanh_f32(x):
-    # tanh via exp2/rcp, sign-restored (aiter mixed_moe tanh_elem):
-    #   t = (1-exp(-2|x|))/(1+exp(-2|x|)),  tanh(x) = sign(x)*t
-    neg_two_log2e = fx.Float32(-2.0 * LOG2E)
-    abs_x = x.maximumf(-x)
-    e = fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * neg_two_log2e)))
-    recip = fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + e)))
-    tanh_abs = (fx.Float32(1.0) - e) * recip
-    is_pos = arith.cmpf(arith.CmpFPredicate.OGT, _raw(x), _raw(fx.Float32(0.0)))
-    return fx.Float32(arith.select(is_pos, _raw(tanh_abs), _raw(-tanh_abs)))
-
-
-def _situ_mul_batch(gs, us, situ_beta=1.0, situ_linear_beta=1.0, clamp_limit=7.0):
-    """SiTUv2 activation (aiter mixed_moe situ_mul_vec4):
-        situ(g)    = beta * tanh(g / beta) * sigmoid(g)
-        situ_up(u) = linear_beta * tanh(u / linear_beta)
-        out        = situ(clamp_gate(g)) * situ_up(clamp_lin(u))
-    clamp_gate: g <= +limit (upper only); clamp_lin: u in [-limit, +limit].
-    """
-    neg_lim = fx.Float32(-clamp_limit)
-    beta = fx.Float32(situ_beta)
-    beta_rcp = fx.Float32(1.0 / situ_beta)
-    lbeta = fx.Float32(situ_linear_beta)
-    lbeta_rcp = fx.Float32(1.0 / situ_linear_beta)
-
-    out = []
-    for i in range(len(gs)):
-        # clamp_gate: g <= +lim (upper only, via -max(-g,-lim)); clamp_lin: u in [-lim,+lim].
-        g = -((-gs[i]).maximumf(neg_lim))
-        u = (-((-us[i]).maximumf(neg_lim))).maximumf(neg_lim)
-        situ_g = beta * _tanh_f32(g * beta_rcp) * _sigmoid_f32(g)
-        situ_u = lbeta * _tanh_f32(u * lbeta_rcp)
-        out.append(situ_g * situ_u)
-    return out
 
 
 def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
