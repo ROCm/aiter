@@ -15,42 +15,13 @@ stage1/stage2 GEMM builders in that module.
 """
 
 import functools
-from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
-
-
-@contextmanager
-def _if_then(if_op):
-    """SCF IfOp then-region helper (compat across old/new Python APIs)."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
-
-
-@contextmanager
-def _if_else(if_op):
-    """SCF IfOp else-region helper (compat across old/new Python APIs)."""
-    if getattr(if_op, "else_block", None) is None:
-        raise RuntimeError("IfOp has no else block")
-    with ir.InsertionPoint(if_op.else_block):
-        try:
-            yield if_op.else_block
-        finally:
-            blk = if_op.else_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 @functools.lru_cache(maxsize=1024)
@@ -72,27 +43,11 @@ def compile_moe_reduction(
     BLOCK_SIZE = 256
     VEC_WIDTH = 8
 
-    if dtype_str == "f32":
-        elem_type_tag = "f32"
-    elif dtype_str == "f16":
-        elem_type_tag = "f16"
-    elif dtype_str == "bf16":
-        elem_type_tag = "bf16"
-    else:
+    if dtype_str not in ("f32", "f16", "bf16"):
         raise ValueError(f"Unsupported dtype: {dtype_str}")
 
-    def compute_type():
-        return T.f32
-
-    def i32_type():
-        return T.i32
-
     def elem_type():
-        ty = (
-            T.f32
-            if elem_type_tag == "f32"
-            else (T.f16 if elem_type_tag == "f16" else T.bf16)
-        )
+        ty = T.f32 if dtype_str == "f32" else (T.f16 if dtype_str == "f16" else T.bf16)
         return ty() if callable(ty) else ty
 
     module_name = (
@@ -100,7 +55,10 @@ def compile_moe_reduction(
         f"_{dtype_str}_topk{topk}_md{model_dim}"
     )
 
-    elem_bytes_c = (32 if dtype_str == "f32" else 16) // 8
+    elem_bits = 32 if dtype_str == "f32" else 16
+    elem_bytes_c = elem_bits // 8
+    copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
+    n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
 
     @flyc.kernel(name=module_name)
     def moe_reduction_kernel(
@@ -111,17 +69,12 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
     ):
         m_tokens = fx.Index(i32_m_tokens)
-        c_topk = fx.Index(topk)
         c_model_dim = fx.Index(model_dim)
-        elem_bits = 32 if dtype_str == "f32" else 16
-        copy_vec_width = 128 // elem_bits  # 8 for f16/bf16, 4 for f32
-        n_sub = VEC_WIDTH // copy_vec_width  # 1 for f16/bf16, 2 for f32
 
         def _ptr_buffer_resource_off(ptr, num_records_bytes, byte_off_i64=None):
             # Build a buffer resource from a raw pointer, folding an optional
             # per-WG i64 byte offset into the descriptor's 48-bit base.
-            addr = fx.ptrtoint(ptr)
-            addr_i64 = arith.index_cast(T.i64, addr)
+            addr_i64 = arith.index_cast(T.i64, fx.ptrtoint(ptr))
             if byte_off_i64 is not None:
                 addr_i64 = addr_i64 + byte_off_i64
             return buffer_ops.create_buffer_resource_from_addr(
@@ -136,152 +89,117 @@ def compile_moe_reduction(
         # can exceed 4 GiB (e.g. 131072*6*4096*2 = 6 GiB), overflowing the i32
         # voffset used by buffer_load. Fold the per-WG token byte offset into the
         # descriptor's 48-bit base (i64) so in-kernel voffsets address one token slab.
-        slab_elems_x = c_topk * c_model_dim
-        x_slab_nbytes = slab_elems_x * fx.Index(elem_bytes_c)
+        x_slab_nbytes = fx.Index(topk) * c_model_dim * fx.Index(elem_bytes_c)
         y_slab_nbytes = c_model_dim * fx.Index(elem_bytes_c)
-        x_base_off_i64 = fx.Int64(token_idx * x_slab_nbytes)
-        y_base_off_i64 = fx.Int64(token_idx * c_model_dim * fx.Index(elem_bytes_c))
-
-        x_rsrc = _ptr_buffer_resource_off(X, fx.Int64(x_slab_nbytes), x_base_off_i64)
-        y_rsrc = _ptr_buffer_resource_off(Y, fx.Int64(y_slab_nbytes), y_base_off_i64)
+        x_rsrc = _ptr_buffer_resource_off(
+            X, fx.Int64(x_slab_nbytes), fx.Int64(token_idx * x_slab_nbytes)
+        )
+        y_rsrc = _ptr_buffer_resource_off(
+            Y, fx.Int64(y_slab_nbytes), fx.Int64(token_idx * y_slab_nbytes)
+        )
 
         if const_expr(use_mask):
-            tk_slab_nbytes = c_topk * fx.Index(4)
-            tk_base_off_i64 = fx.Int64(token_idx * tk_slab_nbytes)
+            tk_slab_nbytes = fx.Index(topk) * fx.Index(4)
             topk_ids_rsrc = _ptr_buffer_resource_off(
-                topk_ids, fx.Int64(tk_slab_nbytes), tk_base_off_i64
+                topk_ids, fx.Int64(tk_slab_nbytes), fx.Int64(token_idx * tk_slab_nbytes)
             )
             # expert_mask: [num_experts] i32, sized exactly from the compile-time count.
-            em_nbytes = fx.Index(num_experts * 4)
             expert_mask_rsrc = _ptr_buffer_resource_off(
-                expert_mask, fx.Int64(em_nbytes), None
+                expert_mask, fx.Int64(fx.Index(num_experts * 4)), None
             )
 
-        # Index is unsigned, so every comparison below lowers to ult.
-        tok_ok = token_idx < m_tokens
-        _if_tok = scf.IfOp(tok_ok)
-        with _if_then(_if_tok):
-            tile_cols = BLOCK_SIZE * VEC_WIDTH
-            c_tile_cols = fx.Index(tile_cols)
-            c_vecw = fx.Index(VEC_WIDTH)
+        c_vecw = fx.Index(VEC_WIDTH)
+        col_base = tile_idx * fx.Index(BLOCK_SIZE * VEC_WIDTH) + tid * c_vecw
 
-            col_base = tile_idx * c_tile_cols + tid * c_vecw
+        # fx.Index is unsigned, so every bounds compare below lowers to ult.
+        if (token_idx < m_tokens) & (col_base < c_model_dim):
+            if col_base + c_vecw <= c_model_dim:
+                # Fast path: full 128b vector in-bounds. buffer_load moves
+                # copy_vec_width elems (8 bf16/f16, 4 f32) per op; n_sub ops
+                # cover the VEC_WIDTH stride.
+                vec_type_c = T.vec(copy_vec_width, T.f32)
+                vec_type_e = T.vec(copy_vec_width, elem_type())
+                acc_vecs = [
+                    vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
+                    for _ in range(n_sub)
+                ]
 
-            col_ok = col_base < c_model_dim
-            _if_col = scf.IfOp(col_ok)
-            with _if_then(_if_col):
-                end_ok = col_base + c_vecw <= c_model_dim
-                _if_full = scf.IfOp(end_ok, has_else=True)
-                with _if_then(_if_full):
-                    # Fast path: full 128b vector in-bounds. buffer_load moves
-                    # copy_vec_width elems (8 bf16/f16, 4 f32) per op; n_sub ops
-                    # cover the VEC_WIDTH stride.
-                    vec_type_c = T.vec(copy_vec_width, compute_type())
-                    vec_type_e = T.vec(copy_vec_width, elem_type())
+                for k in range_constexpr(topk):
+                    # Within one token slab k indexes topk with stride model_dim.
+                    k_off_elems = fx.Index(k) * c_model_dim + col_base
 
-                    acc_vecs = [
-                        vector.broadcast(vec_type_c, fx.Float32(0.0).ir_value())
-                        for _ in range(n_sub)
-                    ]
-
-                    for k in range_constexpr(topk):
-                        # Within one token slab k indexes topk with stride model_dim.
-                        k_off_elems = fx.Index(k) * c_model_dim + col_base
-
-                        if const_expr(use_mask):
-                            # topk_ids_rsrc is already shifted by token_idx*topk.
-                            tk_idx_i32 = fx.Int32(fx.Index(k))
-                            eid_i32 = buffer_ops.buffer_load(
-                                topk_ids_rsrc, tk_idx_i32, vec_width=1, dtype=i32_type()
-                            )
-                            valid_i32 = buffer_ops.buffer_load(
-                                expert_mask_rsrc, eid_i32, vec_width=1, dtype=i32_type()
-                            )
-                            mv_ok = valid_i32 != fx.Int32(0)
-
-                        for si in range_constexpr(n_sub):
-                            off_elems_i32 = fx.Int32(
-                                k_off_elems + fx.Index(si * copy_vec_width)
-                            )
-                            vec_e = buffer_ops.buffer_load(
-                                x_rsrc,
-                                off_elems_i32,
-                                vec_width=copy_vec_width,
-                                dtype=elem_type(),
-                            )
-
-                            if const_expr(use_mask):
-                                zero_e = vector.broadcast(
-                                    vec_type_e, arith.constant(0.0, type=elem_type())
-                                )
-                                vec_e = mv_ok.select(vec_e, zero_e)
-
-                            if const_expr(elem_bits < 32):
-                                vec_c = vec_e.extf(vec_type_c)
-                            else:
-                                vec_c = vec_e
-                            acc_vecs[si] = acc_vecs[si] + vec_c
+                    if const_expr(use_mask):
+                        # topk_ids_rsrc is already shifted by token_idx*topk.
+                        eid_i32 = buffer_ops.buffer_load(
+                            topk_ids_rsrc,
+                            fx.Int32(fx.Index(k)),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                        valid_i32 = buffer_ops.buffer_load(
+                            expert_mask_rsrc, eid_i32, vec_width=1, dtype=T.i32
+                        )
+                        mv_ok = valid_i32 != fx.Int32(0)
 
                     for si in range_constexpr(n_sub):
-                        out_vec = acc_vecs[si]
-                        if const_expr(elem_bits < 32):
-                            out_vec = out_vec.truncf(vec_type_e)
-                        y_off_elems_i32 = fx.Int32(
-                            col_base + fx.Index(si * copy_vec_width)
+                        off_i32 = fx.Int32(k_off_elems + fx.Index(si * copy_vec_width))
+                        vec_e = buffer_ops.buffer_load(
+                            x_rsrc, off_i32, vec_width=copy_vec_width, dtype=elem_type()
                         )
-                        buffer_ops.buffer_store(out_vec, y_rsrc, y_off_elems_i32)
+                        if const_expr(use_mask):
+                            zero_e = vector.broadcast(
+                                vec_type_e, arith.constant(0.0, type=elem_type())
+                            )
+                            vec_e = mv_ok.select(vec_e, zero_e)
+                        if const_expr(elem_bits < 32):
+                            vec_e = vec_e.extf(vec_type_c)
+                        acc_vecs[si] = acc_vecs[si] + vec_e
 
-                with _if_else(_if_full):
-                    # Tail path: scalar load/store per lane. Offsets are slab-local
-                    # since token_idx is folded into the base ptr.
-                    for lane in range_constexpr(VEC_WIDTH):
-                        col = col_base + fx.Index(lane)
-                        lane_ok = col < c_model_dim
-                        _if_lane = scf.IfOp(lane_ok)
-                        with _if_then(_if_lane):
-                            a = arith.constant(0.0, type=compute_type())
-                            for k in range_constexpr(topk):
-                                k_idx = fx.Index(k)
-                                x_idx_i32 = fx.Int32(k_idx * c_model_dim + col)
-                                if const_expr(use_mask):
-                                    tk_idx_i32 = fx.Int32(k_idx)
-                                    eid_i32 = buffer_ops.buffer_load(
-                                        topk_ids_rsrc,
-                                        tk_idx_i32,
-                                        vec_width=1,
-                                        dtype=i32_type(),
-                                    )
-                                    valid_i32 = buffer_ops.buffer_load(
-                                        expert_mask_rsrc,
-                                        eid_i32,
-                                        vec_width=1,
-                                        dtype=i32_type(),
-                                    )
-                                    v = (valid_i32 != fx.Int32(0)).select(
-                                        buffer_ops.buffer_load(
-                                            x_rsrc,
-                                            x_idx_i32,
-                                            vec_width=1,
-                                            dtype=elem_type(),
-                                        ),
-                                        arith.constant(0.0, type=elem_type()),
-                                    )
-                                else:
-                                    v = buffer_ops.buffer_load(
+                for si in range_constexpr(n_sub):
+                    out_vec = acc_vecs[si]
+                    if const_expr(elem_bits < 32):
+                        out_vec = out_vec.truncf(vec_type_e)
+                    y_off_i32 = fx.Int32(col_base + fx.Index(si * copy_vec_width))
+                    buffer_ops.buffer_store(out_vec, y_rsrc, y_off_i32)
+            else:
+                # Tail path: scalar load/store per lane. Offsets are slab-local
+                # since token_idx is folded into the base ptr.
+                for lane in range_constexpr(VEC_WIDTH):
+                    col = col_base + fx.Index(lane)
+                    if col < c_model_dim:
+                        a = arith.constant(0.0, type=T.f32)
+                        for k in range_constexpr(topk):
+                            x_idx_i32 = fx.Int32(fx.Index(k) * c_model_dim + col)
+                            if const_expr(use_mask):
+                                eid_i32 = buffer_ops.buffer_load(
+                                    topk_ids_rsrc,
+                                    fx.Int32(fx.Index(k)),
+                                    vec_width=1,
+                                    dtype=T.i32,
+                                )
+                                valid_i32 = buffer_ops.buffer_load(
+                                    expert_mask_rsrc, eid_i32, vec_width=1, dtype=T.i32
+                                )
+                                v = (valid_i32 != fx.Int32(0)).select(
+                                    buffer_ops.buffer_load(
                                         x_rsrc,
                                         x_idx_i32,
                                         vec_width=1,
                                         dtype=elem_type(),
-                                    )
-                                if const_expr(dtype_str in ("f16", "bf16")):
-                                    v = v.extf(compute_type())
-                                a = a + v
+                                    ),
+                                    arith.constant(0.0, type=elem_type()),
+                                )
+                            else:
+                                v = buffer_ops.buffer_load(
+                                    x_rsrc, x_idx_i32, vec_width=1, dtype=elem_type()
+                                )
+                            if const_expr(elem_bits < 32):
+                                v = v.extf(T.f32)
+                            a = a + v
 
-                            out = a
-                            if const_expr(dtype_str in ("f16", "bf16")):
-                                out = out.truncf(elem_type())
-                            y_idx_i32 = fx.Int32(col)
-                            buffer_ops.buffer_store(out, y_rsrc, y_idx_i32)
+                        if const_expr(elem_bits < 32):
+                            a = a.truncf(elem_type())
+                        buffer_ops.buffer_store(a, y_rsrc, fx.Int32(col))
 
     tile_size = BLOCK_SIZE * VEC_WIDTH
     gy_static = (model_dim + tile_size - 1) // tile_size
@@ -295,9 +213,8 @@ def compile_moe_reduction(
         i32_m_tokens: fx.Int32,
         stream: fx.Stream,
     ):
-        gx = fx.Index(i32_m_tokens)
         moe_reduction_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
-            grid=(gx, gy_static, 1),
+            grid=(fx.Index(i32_m_tokens), gy_static, 1),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
         )
