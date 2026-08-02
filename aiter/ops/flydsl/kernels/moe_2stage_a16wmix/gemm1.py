@@ -135,7 +135,7 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
     and scales the mantissa by 16, so the x16 is folded into eff = scale*16.
     ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar .to(BFloat16).
     """
-    eff = fx.Float32(scale_f32 * fx.Float32(16.0))
+    eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
     if use_k16:
@@ -566,8 +566,8 @@ def _gemm1_body_a16w4(
                 sw_tiles, base_dword + pair_idx, sw_read_atom
             )
             # even adj_ku -> low bf16, odd -> high.
-            lo = fx.Float32(_raw(packed << fx.Int32(16)).bitcast(T.f32))
-            hi = fx.Float32(_raw(packed & fx.Int32(0xFFFF0000)).bitcast(T.f32))
+            lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
+            hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)
             scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
         return scales
 
@@ -858,7 +858,7 @@ def _gemm1_body_a16w4(
 def _e8m0_byte_to_f32(packed_i32, byte_pos):
     shift = byte_pos * fx.Int32(8)
     b = packed_i32.shrui(shift) & fx.Int32(0xFF)
-    return fx.Float32(_raw(b << fx.Int32(23)).bitcast(T.f32))
+    return (b << fx.Int32(23)).bitcast(fx.Float32)
 
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):

@@ -428,8 +428,8 @@ def _gemm2_body_a16w4(
             packed = _buffer_i32_scalar_read(
                 sw_tiles, base_dword + pair_idx, sw_read_atom
             )
-            lo = fx.Float32(_raw(packed << fx.Int32(16)).bitcast(T.f32))
-            hi = fx.Float32(_raw(packed & fx.Int32(0xFFFF0000)).bitcast(T.f32))
+            lo = (packed << fx.Int32(16)).bitcast(fx.Float32)
+            hi = (packed & fx.Int32(0xFFFF0000)).bitcast(fx.Float32)
             scales.append((adj_ku % fx.Int32(2) == fx.Int32(0)).select(lo, hi))
         return scales
 
