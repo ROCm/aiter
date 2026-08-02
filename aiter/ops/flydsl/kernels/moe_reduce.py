@@ -20,9 +20,7 @@ _NUMERIC = {"f32": fx.Float32, "f16": fx.Float16, "bf16": fx.BFloat16}
 
 
 @functools.lru_cache(maxsize=1024)
-def compile_moe_reduction(
-    *, topk, model_dim, dtype_str="f16", use_mask=False, num_experts=0
-):
+def compile_moe_reduction(*, topk, model_dim, dtype_str, use_mask, num_experts):
     if dtype_str not in _NUMERIC:
         raise ValueError(f"Unsupported dtype: {dtype_str}")
     elem_cls = _NUMERIC[dtype_str]
