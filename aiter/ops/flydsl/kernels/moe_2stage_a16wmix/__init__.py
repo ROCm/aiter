@@ -31,7 +31,6 @@ from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
 from .csv_dispatch import (
     _default_tile_n,
     pick_a16w4_config,
-    resolve_a16w4_gemm1_config,
     resolve_a16w4_gemm2_config,
     resolve_a16wmix_gemm1_config,
     resolve_a16wmix_gemm2_config,
@@ -47,7 +46,6 @@ __all__ = [
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
     "pick_a16w4_config",
-    "resolve_a16w4_gemm1_config",
     "resolve_a16w4_gemm2_config",
     "resolve_a16wmix_gemm1_config",
     "resolve_a16wmix_gemm2_config",
@@ -226,8 +224,6 @@ def flydsl_a16w4_gemm1(
     act="silu",
     w_dtype="mxfp4",
     w_layout="standard",
-    use_csv_config=False,  # opt-in: CSV params for aiter-compare; default uses tuned tile_n
-    csv_path=None,
     stream=None,
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
@@ -258,64 +254,37 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 only supports gate_mode='separated', got {gate_mode!r}"
         )
 
-    # CSV-driven per-token config (mxfp4 only, opt-in): aiter's tuned tile geometry.
-    # Falls back to adaptive default on no match; explicit caller overrides win.
-    if use_csv_config and w_dtype == "mxfp4":
-        cfg = resolve_a16w4_gemm1_config(
-            model_dim=D_HIDDEN,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tokens=int(n_tokens),
-            csv_path=csv_path,
-        )
-        if cfg is not None:
-            if tile_n is None:
-                tile_n = cfg["tile_n"]
-            if tile_k == 256:
-                tile_k = cfg["tile_k"]
-            if k_wave == 1:
-                k_wave = cfg["k_wave"]
-            if waves_per_eu is None:
-                waves_per_eu = cfg["waves_per_eu"]
-            if xcd_swizzle == 0:
-                xcd_swizzle = cfg["xcd_swizzle"]
-            if b_nt is None:
-                b_nt = cfg["b_nt"]
-
     BM = tile_m
     TILE_K = tile_k
     _m = int(n_tokens)
     TILE_N = tile_n
     # Per-token tile config from the documented heuristic. Fills only the tile args the
-    # caller left at default; explicit caller overrides always win. The aiter-compare CSV
-    # path (use_csv_config, resolved above) takes precedence when enabled.
-    if not use_csv_config:
-        _o = resolve_a16wmix_gemm1_config(
-            w_dtype=w_dtype,
-            model_dim=D_HIDDEN,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tokens=_m,
-            tile_m=BM,
-        )
-        if b_nt is None:
-            b_nt = _o["b_nt"]
-        if xcd_swizzle == 0:
-            xcd_swizzle = _o["xcd_swizzle"]
-        # The slice-K config (k_wave > 1: the tok<=2 4-way split) is coupled to the
-        # tile_n=64 branch and to tile_k/k_wave being at defaults -- apply it as one
-        # unit only when the caller left tile_n unset. The k_wave==1 tile_k bump
-        # (tok>=16 shorter K-tiles) is independent of tile_n.
-        if _o["k_wave"] > 1:
-            if TILE_N is None and tile_k == 256 and k_wave == 1:
-                TILE_K = _o["tile_k"]
-                k_wave = _o["k_wave"]
-        elif tile_k == 256:
+    # caller left at default; explicit caller overrides always win.
+    _o = resolve_a16wmix_gemm1_config(
+        w_dtype=w_dtype,
+        model_dim=D_HIDDEN,
+        inter_dim=D_INTER,
+        experts=NE,
+        topk=topk,
+        tokens=_m,
+        tile_m=BM,
+    )
+    if b_nt is None:
+        b_nt = _o["b_nt"]
+    if xcd_swizzle == 0:
+        xcd_swizzle = _o["xcd_swizzle"]
+    # The slice-K config (k_wave > 1: the tok<=2 4-way split) is coupled to the
+    # tile_n=64 branch and to tile_k/k_wave being at defaults -- apply it as one
+    # unit only when the caller left tile_n unset. The k_wave==1 tile_k bump
+    # (tok>=16 shorter K-tiles) is independent of tile_n.
+    if _o["k_wave"] > 1:
+        if TILE_N is None and tile_k == 256 and k_wave == 1:
             TILE_K = _o["tile_k"]
-        if TILE_N is None:
-            TILE_N = _o["tile_n"]
+            k_wave = _o["k_wave"]
+    elif tile_k == 256:
+        TILE_K = _o["tile_k"]
+    if TILE_N is None:
+        TILE_N = _o["tile_n"]
     b_cache_mod = (2 if (16 <= _m <= 1024) else 0) if b_nt is None else b_nt
     if TILE_N is None:
         TILE_N = _default_tile_n(D_INTER, w_dtype=w_dtype)
@@ -390,8 +359,6 @@ def flydsl_a16w4_gemm2(
     b_nt=None,
     xcd_swizzle=1,
     w_dtype="mxfp4",
-    use_csv_config=False,  # opt-in: CSV params for aiter-compare; default uses tuned tile_n
-    csv_path=None,
     persist=None,
     stream=None,
 ):
@@ -406,54 +373,31 @@ def flydsl_a16w4_gemm2(
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
 
-    # CSV-driven per-token config (mxfp4 only, opt-in). Falls back to adaptive default
-    # on no match / divisibility violation; explicit caller overrides win.
-    if use_csv_config and w_dtype == "mxfp4":
-        cfg = resolve_a16w4_gemm2_config(
-            model_dim=D_HIDDEN,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tokens=int(M_logical),
-            csv_path=csv_path,
-        )
-        if cfg is not None:
-            if tile_n == 256 and D_HIDDEN % cfg["tile_n"] == 0:
-                tile_n = cfg["tile_n"]
-            if tile_k == 256:
-                tile_k = cfg["tile_k"]
-            if b_nt is None:
-                b_nt = cfg["b_nt"]
-            if xcd_swizzle == 1:
-                xcd_swizzle = cfg["xcd_swizzle"]
-
     BM = tile_m
     TILE_N = tile_n
     TILE_K = tile_k
     _m = int(M_logical)
     # Per-token tile config from the documented heuristic. Fills only the tile args the
     # caller left at default; explicit caller overrides always win. gemm2 defaults are
-    # tile_n=256/tile_k=256/xcd_swizzle=1 (fixed 4-wave N-split, no k_wave). The
-    # aiter-compare CSV path (use_csv_config, resolved above) takes precedence when enabled.
-    if not use_csv_config:
-        _o = resolve_a16wmix_gemm2_config(
-            w_dtype=w_dtype,
-            model_dim=D_HIDDEN,
-            inter_dim=D_INTER,
-            experts=NE,
-            topk=topk,
-            tokens=_m,
-            tile_m=BM,
-        )
-        # gemm2 tile_n is not token-dependent (fixed 256 default; explicit tile_n=None
-        # means adaptive _default_tile_n, handled below), so only tile_k/b_nt/xcd are
-        # filled from the resolver here.
-        if tile_k == 256:
-            TILE_K = _o["tile_k"]
-        if b_nt is None:
-            b_nt = _o["b_nt"]
-        if xcd_swizzle == 1:
-            xcd_swizzle = _o["xcd_swizzle"]
+    # tile_n=256/tile_k=256/xcd_swizzle=1 (fixed 4-wave N-split, no k_wave).
+    _o = resolve_a16wmix_gemm2_config(
+        w_dtype=w_dtype,
+        model_dim=D_HIDDEN,
+        inter_dim=D_INTER,
+        experts=NE,
+        topk=topk,
+        tokens=_m,
+        tile_m=BM,
+    )
+    # gemm2 tile_n is not token-dependent (fixed 256 default; explicit tile_n=None
+    # means adaptive _default_tile_n, handled below), so only tile_k/b_nt/xcd are
+    # filled from the resolver here.
+    if tile_k == 256:
+        TILE_K = _o["tile_k"]
+    if b_nt is None:
+        b_nt = _o["b_nt"]
+    if xcd_swizzle == 1:
+        xcd_swizzle = _o["xcd_swizzle"]
     if TILE_N is None:
         # Adaptive default: largest N tile dividing model_dim (int4 prefers 128).
         TILE_N = _default_tile_n(D_HIDDEN, w_dtype=w_dtype)

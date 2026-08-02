@@ -126,15 +126,6 @@ _A16W4_W_RE = re.compile(r"_w(\d+)")
 _A16W4_XCD_RE = re.compile(r"_xcd(\d+)")
 _A16W4_BNT_RE = re.compile(r"_bnt(\d+)")
 _A16W4_KW_RE = re.compile(r"_kw(\d+)")
-_A16W4_KB_RE = re.compile(r"_kb(\d+)")
-
-
-def _kwave_from_kbatch(k_batch):
-    """Map aiter's grid split-K (``_kb{N}``) onto intra-block slice-K: kb<=1 -> 1,
-    kb==2 -> 2, kb>2 -> 4 (k_wave only supports {1,2,4})."""
-    if k_batch <= 1:
-        return 1
-    return 2 if k_batch == 2 else 4
 
 
 def _decode_a16w4_kname(kname):
@@ -147,10 +138,6 @@ def _decode_a16w4_kname(kname):
     xcd = _A16W4_XCD_RE.search(kname)
     bnt = _A16W4_BNT_RE.search(kname)
     kw = _A16W4_KW_RE.search(kname)
-    kb = _A16W4_KB_RE.search(kname)
-    k_batch = int(kb.group(1)) if kb else 1
-    # Explicit _kw wins; else derive k_wave from aiter's split-K (_kb).
-    k_wave = int(kw.group(1)) if kw else _kwave_from_kbatch(k_batch)
     return {
         "tile_m": tile_m,
         "tile_n": tile_n,
@@ -158,8 +145,7 @@ def _decode_a16w4_kname(kname):
         "b_nt": int(bnt.group(1)) if bnt else 2,  # aiter default 2 when token absent
         "waves_per_eu": int(w.group(1)) if w else None,
         "xcd_swizzle": int(xcd.group(1)) if xcd else 0,
-        "k_wave": k_wave,
-        "k_batch": k_batch,
+        "k_wave": int(kw.group(1)) if kw else 1,
     }
 
 
@@ -231,65 +217,6 @@ def _default_a16w4_csv_path():
         if os.path.isfile(p):
             return p
     return None
-
-
-def _kw_tile_k_for(cfg, *, K):
-    """Return (k_wave, tile_k, note) from ``cfg`` correct for contraction ``K``.
-
-    gemm1 requires ``K % (k_wave * tile_k) == 0``. Keep the CSV's k_wave and pick the
-    largest tile_k in {256,128,64} that divides; if none works, drop k_wave to 1.
-    ``note`` is set when a fallback was applied.
-    """
-    kw = int(cfg.get("k_wave", 1))
-    tk = int(cfg["tile_k"])
-    if kw == 1:
-        return 1, tk, ""
-    if K % (kw * tk) == 0:
-        return kw, tk, ""
-    for cand_tk in (256, 128, 64):
-        if cand_tk <= tk and K % (kw * cand_tk) == 0:
-            return kw, cand_tk, f"kw{kw}:tile_k {tk}->{cand_tk}"
-    # No tile_k divides for this k_wave; fall back to no slice-K.
-    return 1, tk, f"kw{kw}->1 (no divisible tile_k at K={K})"
-
-
-def resolve_a16w4_gemm1_config(
-    *, model_dim, inter_dim, experts, topk, tokens, csv_path=None
-):
-    """Resolve the per-token gemm1 tile-config from the tuned CSV.
-
-    Returns a kwargs dict (+ ``_note``), or None when no CSV/row matches (caller uses
-    adaptive default). K=model_dim; the kw/tile_k pair is corrected for it.
-    """
-    path = csv_path or _default_a16w4_csv_path()
-    if path is None:
-        return None
-    cfg = pick_a16w4_config(
-        path,
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=experts,
-        topk=topk,
-        tokens=tokens,
-        stage=1,
-    )
-    if cfg is None:
-        return None
-    # gemm1 requires inter_dim % tile_n == 0; skip CSV tile_n if it does not divide.
-    tile_n = int(cfg["tile_n"])
-    if inter_dim % tile_n != 0:
-        return None
-    kw, tile_k, note = _kw_tile_k_for(cfg, K=model_dim)
-    return {
-        "tile_m": int(cfg["tile_m"]),
-        "tile_n": tile_n,
-        "tile_k": tile_k,
-        "waves_per_eu": cfg.get("waves_per_eu"),
-        "xcd_swizzle": int(cfg.get("xcd_swizzle", 0)),
-        "b_nt": int(cfg["b_nt"]),
-        "k_wave": kw,
-        "_note": note,
-    }
 
 
 def resolve_a16w4_gemm2_config(
