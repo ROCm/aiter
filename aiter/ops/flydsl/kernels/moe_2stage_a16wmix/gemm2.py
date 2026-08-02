@@ -16,8 +16,7 @@ from .gemm1 import (
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
     _e8m0_byte_to_f32,
-    _gep1,
-    _gep3,
+    _gep,
     _global_base_ptr1,
     _global_i32_at,
     _global_i32_buffer_tiles,
@@ -78,13 +77,11 @@ def _atomic_bf16_epilog(
     for mr in range_constexpr(M_REPS):
         sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
         packed.append(
-            llvm.load(
-                T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True
-            )
+            llvm.load(T.i32, _gep(stids_base, sorted_pos * fx.Int32(4)), invariant=True)
         )
         weight.append(
             llvm.load(
-                T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
+                T.f32, _gep(sweights_base, sorted_pos * fx.Int32(4)), invariant=True
             )
         )
 
@@ -95,7 +92,7 @@ def _atomic_bf16_epilog(
             vec = Vec(accm[i][J])
             for v in range_constexpr(4):
                 idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
-                llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+                llvm.StoreOp(_raw(vec[v]), _gep(lds_base, idx * fx.Int32(4)))
 
     gpu.barrier()
 
@@ -108,14 +105,12 @@ def _atomic_bf16_epilog(
             )
             for s in range_constexpr(_s_count):
                 idx0 = row_in_block * fx.Int32(BN) + col_start + fx.Int32(s * 64)
-                v2 = Vec(
-                    llvm.load(T.vec(2, T.f32), _gep3(lds_base, idx0 * fx.Int32(4)))
-                )
+                v2 = Vec(llvm.load(T.vec(2, T.f32), _gep(lds_base, idx0 * fx.Int32(4))))
                 pk = Vec.from_elements(
                     [v2[0] * weight[mr], v2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
                 off = (row_base_addr + fx.Int32(s * 64)) * fx.Int32(2)
-                out_ptr = _gep1(out_base, off)
+                out_ptr = _gep(out_base, off)
                 llvm.AtomicRMWOp(
                     llvm.AtomicBinOp.fadd,
                     out_ptr,

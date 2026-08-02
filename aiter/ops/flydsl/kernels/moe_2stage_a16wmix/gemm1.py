@@ -52,15 +52,26 @@ def _umod(a, c):
     return fx.Int32(arith.remui(_raw(a), _raw(cc)))
 
 
+def _global_i32_ptr(addr_i64):
+    ptr_ty = fx.PointerType.get(
+        T.i32, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+
+
+def _global_i32_at(addr_i64, idx):
+    return _global_i32_ptr(addr_i64)[idx]
+
+
 def _global_i32_buffer_view(addr_i64, num_bytes):
     # fx.copy BufferCopy atoms take soffset as an element count (not bytes); the
     # make_layout dynamic-shape leaf must be i32/i64, not fx.Index.
     num_bytes_i64 = fx.Int64(num_bytes)
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
+    view = fx.Tensor(
+        fx.make_view(
+            _global_i32_ptr(addr_i64), fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)
+        )
     )
-    ptr = fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-    view = fx.Tensor(fx.make_view(ptr, fx.make_layout(num_bytes_i64 // fx.Int64(4), 1)))
     return fx.rocdl.make_buffer_tensor(
         view, max_size=False, num_records_bytes=num_bytes_i64
     )
@@ -87,31 +98,15 @@ def _lds_ptr3(base_i32, byte_off_i32):
     return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
 
 
-def _gep3(base_ptr, byte_off_i32):
-    return buffer_ops.get_element_ptr(
-        base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
-    )
-
-
 def _global_base_ptr1(addr_i64):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), _raw(fx.Int64(addr_i64)))
 
 
-def _gep1(base_ptr, byte_off_i32):
+def _gep(base_ptr, byte_off_i32):
+    # Byte GEP; polymorphic in the base ptr's address space (global ptr<1> / LDS ptr<3>).
     return buffer_ops.get_element_ptr(
         base_ptr, byte_offset=_raw(byte_off_i32), elem_type=T.i8
     )
-
-
-def _global_i32_ptr(addr_i64):
-    ptr_ty = fx.PointerType.get(
-        T.i32, address_space=fx.AddressSpace.Global, alignment=4
-    )
-    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
-
-
-def _global_i32_at(addr_i64, idx):
-    return _global_i32_ptr(addr_i64)[idx]
 
 
 def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
@@ -808,7 +803,7 @@ def _gemm1_body_a16w4(
                 for vv in range_constexpr(4):
                     llvm.StoreOp(
                         _raw(v[vv]),
-                        _gep3(scr_base, (sidx + fx.Int32(vv)) * fx.Int32(4)),
+                        _gep(scr_base, (sidx + fx.Int32(vv)) * fx.Int32(4)),
                     )
             gpu.barrier()
             for ai in range_constexpr(nm):
@@ -819,7 +814,7 @@ def _gemm1_body_a16w4(
                     peer = fx.Int32(g * num_n_waves) + wave_n_id
                     pidx = peer * fx.Int32(grp_stride) + ai_off
                     pv = Vec(
-                        llvm.load(T.vec(4, T.f32), _gep3(scr_base, pidx * fx.Int32(4)))
+                        llvm.load(T.vec(4, T.f32), _gep(scr_base, pidx * fx.Int32(4)))
                     )
                     s = Vec.from_elements(
                         [s[vv] + pv[vv] for vv in range_constexpr(4)], fx.Float32
