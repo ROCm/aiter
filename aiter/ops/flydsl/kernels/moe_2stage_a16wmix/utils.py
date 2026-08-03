@@ -148,28 +148,24 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
     ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the
     mxfp4 sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8,
     and scales the mantissa by 16, so the x16 is folded into eff = scale*16.
-    ``use_k16`` (gfx942): v_cvt_pk_bf16_f32 is gfx950-only -> scalar .to(BFloat16).
+    bf16 conversion uses the scalar ``.to(BFloat16)`` truncation (arith.truncf), NOT
+    the side-effecting ``v_cvt_pk_bf16_f32``: truncf is a plain schedulable op so the
+    compiler packs the per-nibble ``* eff`` scale (v_pk_mul_f32) instead of emitting 8
+    scalar v_mul_f32/K32, and it sidesteps the stateless-cvt_pk mis-CSE that forced the
+    side-effecting pin. This is the original a16wi4 dequant (pre-"unify" regression),
+    which beat main. ``use_k16`` (gfx942) already used this path.
     """
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
-    if use_k16:
-        # gfx942 fallback: scalar f32 -> bf16 truncation (no v_cvt_pk_bf16_f32).
-        bf16s = []
-        for j in range_constexpr(4):
-            f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
-            f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-            bf16s.append(f_lo.to(fx.BFloat16))
-            bf16s.append(f_hi.to(fx.BFloat16))
-        return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
-    # byte_sel loads (1 shift total); side-effecting pk-convert.
-    i32s = []
+    # byte_sel loads (1 shift total); scalar f32 -> bf16 truncation.
+    bf16s = []
     for j in range_constexpr(4):
         f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
         f_hi = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_odd), byte_sel=j)) * eff
-        i32s.append(fx.Int32(_cvt_pk_bf16_f32_se(_raw(f_lo), _raw(f_hi))))
-    v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
-    return v4i32.bitcast(fx.BFloat16)  # v8bf16
+        bf16s.append(f_lo.to(fx.BFloat16))
+        bf16s.append(f_hi.to(fx.BFloat16))
+    return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
 
 
 def kmchunks_for(BM):
