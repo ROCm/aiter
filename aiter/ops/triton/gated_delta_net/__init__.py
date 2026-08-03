@@ -20,8 +20,14 @@ from .gated_delta_rule import (
     chunk_gated_delta_rule_opt_vk,
     fused_recurrent_gated_delta_rule,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
+)
 
 __all__ = [
+    "GatedDeltaRulePrefillMetadata",
+    "build_gated_delta_rule_prefill_metadata",
     "causal_conv1d_split_qkv_triton_fn",
     "causal_conv1d_split_qkv_triton_tile_fn",
     "causal_conv1d_update_split_qkv",

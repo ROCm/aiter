@@ -16,6 +16,8 @@ Important Note:
     These implementations are optimized for inference and forward-only operations.
 """
 
+from typing import Sequence
+
 import torch
 import triton
 
@@ -26,6 +28,7 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule import (
     chunk_gated_delta_rule_fwd_opt_vk,
 )
 from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
@@ -458,6 +461,8 @@ def chunk_gated_delta_rule_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""
     Optimized chunk-based gated delta rule with h layout [V, K] (Forward only).
@@ -500,6 +505,12 @@ def chunk_gated_delta_rule_opt_vk(
             calls (no per-forward `.tolist()` D2H).
         num_decode_tokens (int): number of leading decode tokens stripped from
             the data tensors; subtracted from the rebased offsets.
+        seq_lens_cpu: Original sequence lengths on the host, including any
+            leading decode-only sequences. When supplied, one shared metadata
+            schedule is built for K1--K6 without reading device values.
+        prefill_metadata: Reusable schedule created by
+            ``build_gated_delta_rule_prefill_metadata``. Prefer this over
+            ``seq_lens_cpu`` when several GDR layers process the same batch.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]:
@@ -549,5 +560,7 @@ def chunk_gated_delta_rule_opt_vk(
         o=o,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        seq_lens_cpu=seq_lens_cpu,
+        prefill_metadata=prefill_metadata,
     )
     return o.to(q.dtype), final_state
