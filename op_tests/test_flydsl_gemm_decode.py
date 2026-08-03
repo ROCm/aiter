@@ -30,6 +30,12 @@ pytestmark = pytest.mark.skipif(
 
 ATOL = 0.125
 RTOL = 0.01
+BENCHMARK_PROVIDERS = (
+    "flydsl",
+    "wvsplitk",
+    "wvsplitk_small",
+    "hipblaslt",
+)
 
 CORRECTNESS_CASES = [
     (1, 1, 1),
@@ -211,29 +217,82 @@ def _measure_us(fn, warmup, repeat):
     return statistics.median(samples), min(samples), max(samples)
 
 
-def _benchmark(M, N, K, rounding, warmup, repeat):
+def _prepare_provider(provider, A, B, C, M, N, K):
+    if provider == "flydsl":
+        return (
+            lambda: gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(None)),
+            "",
+        )
+
+    if provider in {"wvsplitk", "wvsplitk_small"}:
+        if K % 8 != 0:
+            return None, "requires K divisible by 8"
+        if provider == "wvsplitk" and M > 4:
+            return None, "supports M in [1, 4]"
+        from aiter.ops.custom import wvSpltK, wv_splitk_small_fp16_bf16
+
+        cu_count = torch.cuda.get_device_properties(0).multi_processor_count
+        op = wvSpltK if provider == "wvsplitk" else wv_splitk_small_fp16_bf16
+        return lambda: op(B, A, C, M, cu_count), ""
+
+    if provider == "hipblaslt":
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
+        B_t = B.T
+        return lambda: torch.mm(A, B_t, out=C), ""
+
+    raise ValueError(f"unknown benchmark provider: {provider}")
+
+
+def _benchmark(M, N, K, rounding, providers, warmup, repeat):
     torch.manual_seed(0)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
-    C = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-    launcher = _launcher(rounding)
-
-    def run():
-        launcher(A, B, C, M, N, K, stream=fx.Stream(None))
-
-    median, minimum, maximum = _measure_us(run, warmup, repeat)
     ref = (A.float() @ B.float().T).bfloat16()
-    torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
-    metrics = _error_metrics(C, ref)
     bytes_transferred = (M * K + N * K + M * N) * 2
-    bandwidth = bytes_transferred / (median * 1e-6) / 1e9
-    print(
-        f"M={M} N={N} K={K} rounding={rounding.value}: "
-        f"median={median:.2f} us range=[{minimum:.2f}, {maximum:.2f}] us "
-        f"bandwidth={bandwidth:.0f} GB/s "
-        f"max_abs={metrics['max_abs']:.6g} max_rel={metrics['max_rel']:.6g} "
-        f"mismatch={metrics['mismatch']:.3%} max_ulp={metrics['max_ulp']}"
-    )
+    results = {}
+    for provider in providers:
+        C = torch.full((M, N), torch.nan, dtype=torch.bfloat16, device="cuda")
+        run, skip_reason = _prepare_provider(provider, A, B, C, M, N, K)
+        if run is None:
+            print(f"M={M} N={N} K={K} provider={provider}: SKIP {skip_reason}")
+            continue
+
+        # Compile/JIT and validate outside the timed region.
+        run()
+        torch.cuda.synchronize()
+        assert torch.isfinite(C).all(), f"{provider} did not fully write its output"
+        torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
+
+        median, minimum, maximum = _measure_us(run, warmup, repeat)
+        metrics = _error_metrics(C, ref)
+        bandwidth = bytes_transferred / (median * 1e-6) / 1e9
+        tflops = 2 * M * N * K / (median * 1e-6) / 1e12
+        results[provider] = {
+            "median": median,
+            "minimum": minimum,
+            "maximum": maximum,
+            "bandwidth": bandwidth,
+            "tflops": tflops,
+            **metrics,
+        }
+
+    baseline = results.get("wvsplitk")
+    for provider in providers:
+        if provider not in results:
+            continue
+        result = results[provider]
+        relative = ""
+        if baseline is not None:
+            relative = f" speedup_vs_wvsplitk={baseline['median'] / result['median']:.3f}x"
+        print(
+            f"M={M} N={N} K={K} provider={provider} rounding={rounding.value}: "
+            f"median={result['median']:.2f} us "
+            f"range=[{result['minimum']:.2f}, {result['maximum']:.2f}] us "
+            f"bandwidth={result['bandwidth']:.0f} GB/s "
+            f"throughput={result['tflops']:.2f} TFLOP/s{relative} "
+            f"max_abs={result['max_abs']:.6g} max_rel={result['max_rel']:.6g} "
+            f"mismatch={result['mismatch']:.3%} max_ulp={result['max_ulp']}"
+        )
 
 
 def main():
@@ -247,13 +306,27 @@ def main():
         nargs="+",
         default=[OutputRounding.RNE.value],
     )
+    parser.add_argument(
+        "--providers",
+        choices=BENCHMARK_PROVIDERS,
+        nargs="+",
+        default=list(BENCHMARK_PROVIDERS),
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     args = parser.parse_args()
     for rounding_name in args.rounding:
         rounding = OutputRounding(rounding_name)
         for M in args.M:
-            _benchmark(M, args.N, args.K, rounding, args.warmup, args.repeat)
+            _benchmark(
+                M,
+                args.N,
+                args.K,
+                rounding,
+                args.providers,
+                args.warmup,
+                args.repeat,
+            )
 
 
 if __name__ == "__main__":
