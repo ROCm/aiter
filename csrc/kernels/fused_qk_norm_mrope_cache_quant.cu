@@ -35,7 +35,12 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
     AITER_CHECK(mrope_section_.size() == 3);
     AITER_CHECK(qkv.is_contiguous() && qw.is_contiguous() && kw.is_contiguous() &&
                 cos_sin.is_contiguous());
-    AITER_CHECK(k_cache.is_contiguous() && v_cache.is_contiguous() && slot_mapping.is_contiguous());
+    // k_cache/v_cache may be a strided flash KV view (num_blocks, 2, block, heads, hs)[:, 0],
+    // which is non-contiguous but well-formed. The per-block stride is passed to the kernel
+    // below (k_block_stride/v_block_stride), so only slot_mapping must be contiguous here.
+    AITER_CHECK(slot_mapping.is_contiguous());
+    int64_t k_block_stride_ = k_cache.stride(0);  // real per-block stride (flash: 2*block*heads*hs)
+    int64_t v_block_stride_ = v_cache.stride(0);
     std::array<int64_t, 3> mrope_section;
     mrope_section[0] = mrope_section_[0];
     mrope_section[1] = mrope_section_[1];
@@ -91,6 +96,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                     block_size,
                     x,
                     rotary_dim,
+                    k_block_stride_,
+                    v_block_stride_,
                     gemma_norm);
             }
             else
@@ -137,6 +144,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             block_size,
                             x,
                             rotary_dim,
+                            k_block_stride_,
+                            v_block_stride_,
                             gemma_norm);
                     }
                     else
@@ -181,6 +190,8 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                             block_size,
                             x,
                             rotary_dim,
+                            k_block_stride_,
+                            v_block_stride_,
                             gemma_norm);
                     }
                 }
