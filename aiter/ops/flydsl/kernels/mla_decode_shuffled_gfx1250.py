@@ -205,10 +205,11 @@ def compile_mla_decode_main(
         raise ValueError(
             f"KV_COMPUTE_BLOCK_SIZE must be multiple of WMMA_K={WMMA_K}, got {KV_COMPUTE_BLOCK_SIZE}"
         )
-    if KV_COMPUTE_BLOCK_SIZE % KV_BLOCK_SIZE != 0:
+    # A compute tile may span whole pages, or cover part of one page.
+    if KV_COMPUTE_BLOCK_SIZE % KV_BLOCK_SIZE and KV_BLOCK_SIZE % KV_COMPUTE_BLOCK_SIZE:
         raise ValueError(
-            f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE} must be multiple of "
-            f"KV_BLOCK_SIZE {KV_BLOCK_SIZE}"
+            f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE} and KV_BLOCK_SIZE "
+            f"{KV_BLOCK_SIZE} must divide one another"
         )
     N_PV_TILES = V_HEAD_DIM // WMMA_N
     WARP_DC_SPLIT = not (WARP_HEAD_SPLIT or WARP_TOKEN_SPLIT)
@@ -220,7 +221,9 @@ def compile_mla_decode_main(
         raise ValueError(f"dtype must be 'bf16' or 'f16', got {dtype!r}")
 
     # One compute tile gathers BLOCKS_PER_COMPUTE physical pages
-    BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // KV_BLOCK_SIZE
+    TOKENS_PER_LOAD = min(KV_BLOCK_SIZE, KV_COMPUTE_BLOCK_SIZE)
+    BLOCKS_PER_COMPUTE = KV_COMPUTE_BLOCK_SIZE // TOKENS_PER_LOAD
+    TILES_PER_BLOCK = KV_BLOCK_SIZE // TOKENS_PER_LOAD
     BT_LOAD_WIDTHS = _decompose_bt_widths(BLOCKS_PER_COMPUTE)
     BT_LOAD_OFFSETS = [sum(BT_LOAD_WIDTHS[:i]) for i in range(len(BT_LOAD_WIDTHS))]
 
@@ -279,8 +282,10 @@ def compile_mla_decode_main(
     Q_LORA_ROW = KV_LORA_RANK + Q_LORA_PAD
     Q_ROPE_ROW = QK_ROPE_HEAD_DIM + Q_ROPE_PAD
 
-    lora_compute_block_elems = KV_BLOCK_SIZE * KV_LORA_RANK
-    rope_compute_block_elems = KV_BLOCK_SIZE * QK_ROPE_HEAD_DIM
+    lora_compute_block_elems = TOKENS_PER_LOAD * KV_LORA_RANK
+    rope_compute_block_elems = TOKENS_PER_LOAD * QK_ROPE_HEAD_DIM
+    # A page's rope blob starts after its whole lora blob, however finely we slice the page.
+    page_lora_elems = KV_BLOCK_SIZE * KV_LORA_RANK
 
     # KV LDS slabs
     kv_lora_elems = BLOCKS_PER_COMPUTE * lora_compute_block_elems
@@ -442,7 +447,8 @@ def compile_mla_decode_main(
         # Returns the BLOCKS_PER_COMPUTE physical page IDs
         # Any logical page past live_blocks is forced to page 0
         def _phys_blks_for_compute(tile_global_idx):
-            base_logical = tile_global_idx * fx.Index(BLOCKS_PER_COMPUTE)
+            base_logical = (tile_global_idx / fx.Index(TILES_PER_BLOCK) if TILES_PER_BLOCK > 1
+                            else tile_global_idx * fx.Index(BLOCKS_PER_COMPUTE))
             bt_base = seq_idx * stride_bt_seq + base_logical
             out = []
             for ldi in range_constexpr(len(BT_LOAD_WIDTHS)):
@@ -470,11 +476,12 @@ def compile_mla_decode_main(
 
         BLOCK_STRIDE = KV_BLOCK_SIZE * QK_HEAD_DIM
 
-        def _issue_kv_load_single_block(phys_blk, lora_byte_off, rope_byte_off):
+        # sub_tok = first token of this load within its page (0 unless KVC < KVB).
+        def _issue_kv_load_single_block(phys_blk, lora_byte_off, rope_byte_off, sub_tok):
             lora_desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_kv_cache,
                 lds_memref=kv_lora_lds.get(),
-                global_offset=(phys_blk, fx.Index(0)),
+                global_offset=(phys_blk, sub_tok * fx.Index(KV_LORA_RANK)),
                 tensor_shape=(1, lora_compute_block_elems),
                 strides=(BLOCK_STRIDE, 1),
                 tile_shape=(1, lora_compute_block_elems),
@@ -486,7 +493,8 @@ def compile_mla_decode_main(
             rope_desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_kv_cache,
                 lds_memref=kv_rope_lds.get(),
-                global_offset=(phys_blk, fx.Index(lora_compute_block_elems)),
+                global_offset=(phys_blk, fx.Index(page_lora_elems)
+                               + sub_tok * fx.Index(QK_ROPE_HEAD_DIM)),
                 tensor_shape=(1, rope_compute_block_elems),
                 strides=(BLOCK_STRIDE, 1),
                 tile_shape=(1, rope_compute_block_elems),
@@ -497,7 +505,7 @@ def compile_mla_decode_main(
             tdm_ops.tensor_load_2d(rope_desc)
 
         # Issue loads for a whole compute tile: each of the BLOCKS_PER_COMPUTE
-        def _issue_kv_tile_loads(phys_blks_list, lora_stage_off, rope_stage_off):
+        def _issue_kv_tile_loads(phys_blks_list, lora_stage_off, rope_stage_off, sub_tok):
             lora_block_bytes = lora_compute_block_elems * elem_bytes
             rope_block_bytes = rope_compute_block_elems * elem_bytes
             for b in range_constexpr(BLOCKS_PER_COMPUTE):
@@ -505,7 +513,12 @@ def compile_mla_decode_main(
                     phys_blks_list[b],
                     lora_stage_off + fx.Index(b * lora_block_bytes),
                     rope_stage_off + fx.Index(b * rope_block_bytes),
+                    sub_tok,
                 )
+
+        def _sub_tok(tile_global_idx):
+            return ((tile_global_idx % fx.Index(TILES_PER_BLOCK)) * fx.Index(TOKENS_PER_LOAD)
+                    if TILES_PER_BLOCK > 1 else fx.Index(0))
 
         def _issue_q_load():
             q_outer_off = seq_idx * num_q_heads_idx
@@ -545,7 +558,7 @@ def compile_mla_decode_main(
         if Q_ON_STAGE0:
             tdm_ops.tensor_wait(0)              # nothing else in flight; drain Q
         else:
-            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0))
+            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0), _sub_tok(tile_start))
             tdm_ops.tensor_wait(K_OPS_PER_WAVE) # only waiting for Q
         gpu.barrier()
 
@@ -564,7 +577,7 @@ def compile_mla_decode_main(
 
         # Q is dead now: safe to overwrite stage 0.
         if Q_ON_STAGE0:
-            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0))
+            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0), _sub_tok(tile_start))
 
         def _unwrap(v):
             return v.ir_value() if hasattr(v, "ir_value") else v
@@ -622,7 +635,8 @@ def compile_mla_decode_main(
             # Prefetch the NEXT tile
             if is_not_last:
                 next_phys = _phys_blks_for_compute(g + fx.Index(1))
-                _issue_kv_tile_loads(next_phys, nxt_lora_byte_off, nxt_rope_byte_off)
+                _issue_kv_tile_loads(next_phys, nxt_lora_byte_off, nxt_rope_byte_off,
+                                     _sub_tok(g + fx.Index(1)))
                 tdm_ops.tensor_wait(K_OPS_PER_WAVE)
             else:
                 tdm_ops.tensor_wait(0)
