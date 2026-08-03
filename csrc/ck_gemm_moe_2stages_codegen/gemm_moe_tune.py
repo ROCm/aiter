@@ -102,6 +102,13 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
+# SiTUv2 params (Kimi-K3 config.json), passed to BOTH the torch reference and
+# the kernel launch -- they used to fall back to their own differing defaults
+# ((2.0, 1.5) vs (1.0, 1.0)), which scored every SiTUv2 stage1 candidate at
+# ~35% err and failed them all against --errRatio.
+_TUNER_SITU_BETA = 4.0
+_TUNER_SITU_LINEAR_BETA = 25.0
+
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
@@ -143,11 +150,31 @@ def torch_dynamic_mxfp8_quant(x: torch.Tensor):
     )
 
 
+_E2M1_MAG = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1_LUT = _E2M1_MAG + tuple(-v for v in _E2M1_MAG)
+
+
+def _to_f64_flat(t):
+    """Flatten to float64, unpacking fp4x2 by hand.
+
+    ``fp4x2.double()`` faults the queue (HIP unspecified launch failure), and
+    viewing it as uint8 would compare two packed e2m1 codes as one byte value,
+    so decode the nibbles into their represented values instead.
+    """
+    if t.dtype == dtypes.fp4x2:
+        b = t.reshape(-1).view(torch.uint8)
+        lut = torch.tensor(_E2M1_LUT, device=b.device, dtype=torch.float64)
+        return torch.stack(
+            [lut[(b & 0xF).long()], lut[((b >> 4) & 0xF).long()]], dim=-1
+        ).flatten()
+    return t.double().flatten()
+
+
 def cosine_diff_compare(ref, res, msg="", printLog=True):
     from aiter import logger
 
-    x = ref.double().flatten()
-    y = res.double().flatten()
+    x = _to_f64_flat(ref)
+    y = _to_f64_flat(res)
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
@@ -645,6 +672,8 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=_out_dtype,
             act=act,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
@@ -1704,6 +1733,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -1982,6 +2013,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
@@ -2999,6 +3032,24 @@ class FmoeTuner(TunerCommon):
             for kname, kparams in flydsl_s1_kernels.items():
                 is_splitk = kparams.get("k_batch", 1) > 1
 
+                # Drop k_batch/k_wave splits that do not divide the K axis.
+                # compile_mixed_moe_gemm1 rejects them, but only after the
+                # candidate has been dispatched, and on some shapes the launch
+                # faults the queue (HSA_STATUS_ERROR_EXCEPTION) instead of
+                # raising, taking the worker pool down with it.
+                _kb = kparams.get("k_batch", 1)
+                _kw = kparams.get("k_wave", 1)
+                _tk = kparams["tile_k"]
+                if model_dim % _kb != 0:
+                    continue
+                _k_per_batch = model_dim // _kb
+                if _k_per_batch % _tk != 0:
+                    continue
+                if _kw > 1 and (
+                    _k_per_batch % _kw != 0 or (_k_per_batch // _kw) % _tk != 0
+                ):
+                    continue
+
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
                 #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations -> out_dtype="fp8"
@@ -3040,7 +3091,10 @@ class FmoeTuner(TunerCommon):
 
                 for s1_name, s1_params, is_fp4, is_fp8 in s1_variants:
                     s1_compare_fn = None
-                    if is_fp8 or a_dtype_str == "fp8":
+                    if is_fp8 or is_fp4 or a_dtype_str in ("fp8", "fp4"):
+                        # Fused stage1 emits packed mx values; the default
+                        # comparison reads fp4x2 as raw bytes (two e2m1 codes
+                        # each), which rejects >99% code-identical candidates.
                         s1_compare_fn = cosine_diff_compare
                     ref_args_extra = (
                         [

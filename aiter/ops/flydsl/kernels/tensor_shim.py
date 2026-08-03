@@ -347,6 +347,7 @@ class GTensor(TensorBase):
         )
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
+        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
         bytes_offset_i64 = _to_raw(fx.Int64(bytes_offset_i64))
         _ptr_type = ir.Type.parse(ptr_type)
         raw = extract_to_ir_values(ptr)[0]
