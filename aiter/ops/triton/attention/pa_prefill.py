@@ -9,6 +9,7 @@
 
 import torch
 import triton
+
 from aiter.ops.triton._triton_kernels.attention.pa_prefill import (
     _fwd_kernel,
     _fwd_kernel_alibi,
@@ -154,6 +155,7 @@ def context_attention_fwd(
             BLOCK_N=BLOCK,
             SKIP_DECODE=skip_decode,
             num_warps=NUM_WARPS,
+            waves_per_eu=2,
             num_stages=1,
         )
         return
@@ -205,6 +207,7 @@ def context_attention_fwd(
         SLIDING_WINDOW=sliding_window,
         SKIP_DECODE=skip_decode,
         num_warps=NUM_WARPS,
+        waves_per_eu=2,
         num_stages=1,
     )
     return

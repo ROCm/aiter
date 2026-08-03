@@ -1,10 +1,10 @@
 import pytest
 import torch
-from typing import Optional
 
 from aiter.ops.triton.attention.hstu_attention import (
     _AttentionFunction,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.hstu_attention_ref import (
     torch_hstu_attention,
 )
@@ -35,7 +35,7 @@ def generate_sparse_seq_len(
         return torch.ones(size=(size,), device=device, dtype=torch.int) * max_seq_len
     elif sparsity >= 0.5:
         min_seq_len: int = int((2 * sparsity - 1.0) * max_seq_len)
-        max_seq_len: int = max_seq_len
+        max_seq_len: int = max_seq_len  # noqa: PLW0127
     else:
         min_seq_len: int = 0
         max_seq_len: int = int(2 * sparsity * max_seq_len)
@@ -72,9 +72,9 @@ def sanity_check_attention(
     seq_offsets: torch.Tensor,
     invalid_attn_mask_type: str,
     dropout_pr: float,
-    seq2_offsets: Optional[torch.Tensor] = None,
-    attn_bias: Optional[torch.Tensor] = None,
-    max_attn_len: Optional[int] = None,
+    seq2_offsets: torch.Tensor | None = None,
+    attn_bias: torch.Tensor | None = None,
+    max_attn_len: int | None = None,
     contextual_seq_len: int = 0,
 ) -> None:
     _, H, _ = q.shape
@@ -150,6 +150,9 @@ def test_hstu_attention(
     max_seq_len: int,  # for repro
     sparsity: float,  # for repro
 ):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("HSTU attention has no gfx1250 Triton config")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dropout_pr = 0.0

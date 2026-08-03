@@ -39,13 +39,15 @@ Python surface is deliberately per-dtype: a16w16 here, a8w8 in its own
 module when that lands.
 """
 
+import functools
 import logging
-from typing import Optional
+import os
+import sys
 
 import torch
 from torch import Tensor
 
-from ...jit.core import compile_ops
+from ...jit.core import AITER_ROOT_DIR, compile_ops
 from . import common as _opus_common
 
 logger = logging.getLogger("aiter")
@@ -57,7 +59,8 @@ def _gen_opus_gemm_a16w16_tune_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor:
@@ -80,7 +83,8 @@ def _opus_gemm_a16w16_tune_raw(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
     kernelId: int = 0,
     splitK: int = 0,
 ) -> torch.Tensor: ...
@@ -128,24 +132,145 @@ def _check_a16w16_tune_layout(XQ: torch.Tensor, WQ: torch.Tensor, Y: torch.Tenso
             f"Y.shape={tuple(Y.shape)}, expected ({batch}, {M}, {N}))"
         )
 
-    # Strides must match the launcher's hardcoded assumptions.
-    expected = {
-        "XQ": (XQ, (M * K, K, 1)),
-        "WQ": (WQ, (N * K, K, 1)),
-        "Y": (Y, (M * N, N, 1)),
-    }
-    for name, (t, want) in expected.items():
-        got = tuple(t.stride())
-        if got != want:
+    # XQ / WQ: the K (innermost / contraction) dimension may be padded -- the
+    # launcher passes the tensor's real leading stride as kargs.stride_a/stride_b
+    # and the kernels use it as the lda for BOTH addressing and the gmem buffer
+    # bound, so a row pitch > K (e.g. a 2880-wide tensor stored at lda 3072) is
+    # served correctly. We only require:
+    #   * innermost stride == 1   (the kernel layout hardcodes the K stride to 1)
+    #   * row pitch (stride[1]) >= K
+    #   * batch stride == rows * row pitch (or batch == 1) -- rejects broadcast
+    #     (stride 0) and transposed / overlapping views.
+    for name, t, rows in (("XQ", XQ, M), ("WQ", WQ, N)):
+        s0, s1, s2 = t.stride()
+        k_inner = t.shape[2]
+        ok = s2 == 1 and s1 >= k_inner and (batch == 1 or s0 == rows * s1)
+        if not ok:
             raise NotImplementedError(
-                f"opus_gemm_a16w16_tune: {name} must have contiguous "
-                f"strides {want} (got {name}.stride()={got}, "
-                f"{name}.shape={tuple(t.shape)}). The launcher hardcodes "
-                f"stride_*_batch and stride_* values; any broadcast / "
-                f"transpose / slice produces wrong results or a memory "
-                f"access fault. Materialize with `{name} = {name}."
-                f"contiguous()` before calling."
+                f"opus_gemm_a16w16_tune: {name} must be K-contiguous with an "
+                f"optional padded leading dim -- need stride[2]==1, "
+                f"stride[1]>={k_inner}, and stride[0]==size(1)*stride[1] (or "
+                f"batch==1). Got {name}.stride()={tuple(t.stride())}, "
+                f"{name}.shape={tuple(t.shape)}. Broadcast / transpose / "
+                f"non-K-contiguous slices are not supported; materialize with "
+                f"`{name} = {name}.contiguous()` before calling."
             )
+    # Y is the output: the launcher hardcodes stride_c == N and
+    # stride_c_batch == M*N, so it must be fully contiguous.
+    y_want = (M * N, N, 1)
+    if tuple(Y.stride()) != y_want:
+        raise NotImplementedError(
+            f"opus_gemm_a16w16_tune: Y must have contiguous strides {y_want} "
+            f"(got Y.stride()={tuple(Y.stride())}, Y.shape={tuple(Y.shape)}). "
+            f"The launcher hardcodes stride_c == N and stride_c_batch == M*N; "
+            f"materialize with `Y = Y.contiguous()` before calling."
+        )
+
+
+# gfx1250 split-K workspace element dtype (kid property) -> torch dtype. The
+# main kernel WRITES partials in this dtype and the reduce kernel READS them
+# back, so the buffer MUST be allocated with the matching element type: a
+# bf16-sized buffer handed to an fp32-workspace kid is half the bytes the kernel
+# writes -> global-memory overrun -> machine hang. Sizing is therefore done by
+# ELEMENT COUNT in this dtype, never by a raw byte size.
+_OPUS_WS_TORCH_DTYPE = {
+    "bf16_t": torch.bfloat16,
+    "fp32_t": torch.float32,
+}
+
+
+@functools.lru_cache(maxsize=1)
+def _gfx1250_kids() -> dict:
+    """Lazily load the opus kid table (csrc/opus_gemm/opus_gemm_common.py).
+
+    Lets the split-K workspace be sized from each kid's ACTUAL kernel
+    definition (tile B_M/B_N, split_k, workspace dtype) instead of a byte
+    guess. The module is pure-Python (no torch/JIT deps); returns ``{}`` if it
+    can't be located so the caller can fall back to a safe over-estimate.
+    """
+    csrc = os.path.join(AITER_ROOT_DIR, "csrc", "opus_gemm")
+    if csrc not in sys.path:
+        sys.path.insert(0, csrc)
+    try:
+        from opus_gemm_common import kernels_list  # type: ignore[import-not-found]
+
+        return kernels_list
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+@functools.cache
+def _get_opus_workspace(
+    device: torch.device, ws_shape: tuple, dtype: torch.dtype
+) -> torch.Tensor:
+    """Cached split-K workspace with a data_ptr() stable across HIP graph
+    capture and replay.
+
+    Allocated with its natural ``[batch, split_k, padded_M, padded_N]`` element
+    shape (never a raw byte count) so the tensor is self-describing and matches
+    the kernel's ``ptr_ws`` layout; the launcher only reads ``data_ptr()``, so
+    the extra dims cost nothing.
+
+    A single torch.empty path serves eager AND capture: torch's caching
+    allocator is HIP graph-capture aware, so a torch.empty issued while a
+    capture is active is drawn from the graph's mempool and gets a stable
+    address that stays valid on replay -- exactly how a captured graph allocates
+    all of its other intermediates. lru_cache (keyed by device/ws_shape/dtype)
+    keeps the tensor alive for the process lifetime, so a shape first seen in an
+    eager pass is simply reused (cache hit) when its cudagraph is later captured,
+    and a shape first seen inside capture keeps that buffer pinned for every
+    subsequent replay. No eager pre-warm is required.
+    """
+    return torch.empty(ws_shape, dtype=dtype, device=device)
+
+
+def _alloc_splitk_workspace(
+    kernelId: int,
+    batch: int,
+    M: int,
+    N: int,
+    splitK: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Allocate the gfx1250 split-K partial workspace by ELEMENT COUNT in
+    ``[batch, split_k, padded_M, padded_N]`` -- never by a raw byte size.
+
+    Extents and element dtype come from the selected kid's own kernel
+    definition, so the buffer is exactly what the kernel writes and reads back:
+
+      * fuse kids (``a16w16_clusterlaunch_tdm_splitk_fuse``): ``split_k`` and the
+        workspace dtype are COMPILE-TIME per kid and the runtime ``splitK`` arg
+        is IGNORED, so the buffer is sized from ``fuse_split_k`` /
+        ``fuse_ws_dtype`` (a bf16- or fp32-workspace kid).
+      * ws-variant kids (``*_tdm_splitk_ws``): fp32 workspace with a runtime
+        ``split_k`` the launcher clamps DOWN from ``splitK`` (so ``splitK`` is a
+        safe upper bound).
+
+    Falls back to a safe over-estimate (fp32 element, split_k=16, 128x512 tile
+    padding -- the widest gfx1250 split-K tile is B_M<=128, B_N<=256) when the
+    kid table can't be loaded.
+    """
+    inst = _gfx1250_kids().get(int(kernelId))
+    if inst is not None:
+        b_m, b_n = int(inst.B_M), int(inst.B_N)
+        if inst.kernel_tag == "a16w16_clusterlaunch_tdm_splitk_fuse":
+            split_k = max(int(inst.fuse_split_k), 1)
+            ws_dtype = _OPUS_WS_TORCH_DTYPE.get(inst.fuse_ws_dtype, torch.float32)
+        else:
+            # ws-variant: fp32 workspace; launcher clamps split_k down from splitK.
+            split_k = max(1, int(splitK))
+            ws_dtype = torch.float32
+    else:
+        # Kid table unavailable: widest-element (fp32) upper bound. split_k must
+        # cover a fuse kid's max baked split_k (15) and any runtime splitK.
+        b_m, b_n = 128, 512
+        split_k = max(int(splitK), 16)
+        ws_dtype = torch.float32
+
+    padded_M = ((int(M) + b_m - 1) // b_m) * b_m
+    padded_N = ((int(N) + b_n - 1) // b_n) * b_n
+    ws_shape = (int(batch), split_k, padded_M, padded_N)
+    return _get_opus_workspace(device, ws_shape, ws_dtype)
 
 
 def opus_gemm_a16w16_tune(
@@ -196,6 +321,12 @@ def opus_gemm_a16w16_tune(
         splitK = new_splitK
         bias = None
     _check_a16w16_tune_layout(XQ, WQ, Y)
+    # gfx1250 split-K kids [20000, 30000) need a workspace tensor allocated
+    # externally (torch.empty) and passed to the C++ launcher.
+    workspace = None
+    if 20000 <= kernelId < 30000:
+        batch, M, N = Y.shape
+        workspace = _alloc_splitk_workspace(kernelId, batch, M, N, splitK, XQ.device)
     # Mono-tile kid guard: the launcher requires N / K to be tile-aligned
     # (the kernel has no N-tail mask and no K-tail mask; M-tail IS handled
     # via the bounded gmem desc). A CSV winner picked through
@@ -220,7 +351,7 @@ def opus_gemm_a16w16_tune(
     # refactor to aiter_tensor_t). Keep the wrapper's `return Y`
     # contract so callers that did `Y = opus_gemm_a16w16_tune(...)`
     # still see the populated Y.
-    _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, kernelId, splitK)
+    _opus_gemm_a16w16_tune_raw(XQ, WQ, Y, bias, workspace, kernelId, splitK)
     return Y
 
 
@@ -238,10 +369,10 @@ def _gen_opus_gemm_bf16_dispatch_fake_tensors(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return Y
 
@@ -256,21 +387,44 @@ def _opus_gemm_bf16_dispatch(
     XQ: torch.Tensor,
     WQ: torch.Tensor,
     Y: torch.Tensor,
-    group_layout: Optional[torch.Tensor] = None,
-    x_scale: Optional[torch.Tensor] = None,
-    w_scale: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
+    group_layout: torch.Tensor | None = None,
+    x_scale: torch.Tensor | None = None,
+    w_scale: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor: ...
 
 
 # ---- High-level shape-driven API -----------------------------------------
 
-# splitk kids (200..299) main kernel only has the <fp32_t> instantiation
-# (traits static_assert D_C==float, fp32 workspace). The reduce kernel
+# splitk kids main kernel only has the <fp32_t> instantiation (traits
+# static_assert D_C==float, fp32 workspace). The reduce kernel
 # (splitk_reduce_kernel) is templated on D_OUT and dispatches to either
 # __bf16 or float at launch time based on Y.dtype(), so both bf16 and fp32
-# outputs are valid. Kept here only as a documentation anchor; the dispatch
-# code below no longer needs to special-case Y.dtype against splitk kids.
+# outputs are valid. The dispatch code below no longer needs to special-case
+# Y.dtype against splitk kids.
+#
+# splitk kid ranges, one half-open [lo, hi) interval per device family. Kept
+# in exact lockstep with the C++ authority `opus_kid_is_splitk` in
+# csrc/opus_gemm/opus_gemm.cu -- adding a new device's splitk band means
+# appending one row HERE and there. Consumed by is_splitk_kid() below, which
+# gates the split-K workspace prewarm in aiter/tuned_gemm.py (non-splitk kids
+# never touch the workspace, so warming it for them is pure waste).
+_SPLITK_KID_RANGES = (
+    (200, 300),  # gfx950 base
+    (1200, 1300),  # gfx950 non-OOB mirror (+1000)
+    (10200, 10300),  # gfx942 (+10000)
+    (20000, 21000),  # gfx1250 cluster/TDM split-K
+)
+
+
+def is_splitk_kid(kid: int) -> bool:
+    """True iff `kid` selects a split-K opus a16w16 kernel (fp32 workspace +
+    reduce). Mirrors C++ `opus_kid_is_splitk`; keep the two in sync."""
+    kid = int(kid)
+    return any(lo <= kid < hi for lo, hi in _SPLITK_KID_RANGES)
+
+
+# Back-compat: the old gfx950-only single-band constants some callers imported.
 _SPLITK_KID_MIN = 200
 _SPLITK_KID_MAX = 299
 
@@ -356,7 +510,7 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
         WQ = B
     else:
         raise ValueError(
-            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape " f"{tuple(B.shape)})"
+            f"B must be 2D [N, K] or 3D [batch, N, K] (got shape {tuple(B.shape)})"
         )
 
     if out is not None:
@@ -364,16 +518,19 @@ def _validate_and_reshape(A: Tensor, B: Tensor, bias, dtype, out):
     else:
         Y = torch.empty(batch, M, N, dtype=dtype, device=A.device)
 
-    # Bias validation. dtype must match Y dtype (match_d_out convention).
-    # Bias is per-output-feature [N] (F.linear convention). Shape protocol:
+    # Bias validation. Bias may be fp32 OR match the output dtype: the gfx1250
+    # splitk main kernel always writes an fp32 workspace and the reduce kernel
+    # folds bias in fp32 before the final cast to Y, so an fp32 bias is exact
+    # and free regardless of Y dtype (the common accuracy-friendly case for a
+    # bf16 output). Bias is per-output-feature [N] (F.linear convention):
     #   * [N]          -> stride_bias_batch = 0 (broadcast across batch)
     #   * [batch, N]   -> stride_bias_batch = N
-    # Matches the C++-side BIAS_HOST_VALIDATE in gen_instances.py.
+    # Matches the C++-side gfx1250 bias validation in gen_instances_gfx1250.py.
     if bias is not None:
-        if bias.dtype != dtype:
+        if bias.dtype not in (dtype, torch.float32):
             raise ValueError(
-                f"gemm_a16w16_opus: bias dtype must match output dtype "
-                f"(got bias.dtype={bias.dtype}, dtype={dtype})"
+                f"gemm_a16w16_opus: bias dtype must be fp32 or match output "
+                f"dtype (got bias.dtype={bias.dtype}, dtype={dtype})"
             )
         if not bias.is_contiguous():
             raise ValueError(
@@ -408,12 +565,12 @@ def _finalize_output(Y: Tensor, reshape_out_to_2d: bool) -> Tensor:
 def gemm_a16w16_opus(
     A: Tensor,
     B: Tensor,
-    bias: Optional[Tensor] = None,
+    bias: Tensor | None = None,
     dtype: torch.dtype = torch.bfloat16,
     *,
-    kernelId: Optional[int] = None,
-    splitK: Optional[int] = None,
-    out: Optional[Tensor] = None,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    out: Tensor | None = None,
 ) -> Tensor:
     """Shape-driven opus a16w16 GEMM.
 
@@ -453,7 +610,7 @@ def gemm_a16w16_opus(
     -------
     Tensor with shape [M, N] when A was 2D, [batch, M, N] when A was 3D.
     """
-    XQ, WQ, Y, M, N, K, batch, reshape_out_to_2d = _validate_and_reshape(
+    XQ, WQ, Y, M, N, K, _batch, reshape_out_to_2d = _validate_and_reshape(
         A, B, bias, dtype, out
     )
 
@@ -503,16 +660,39 @@ def gemm_a16w16_opus(
 # Per-stream splitk workspace init. Call once inside `with torch.cuda.stream(s):`
 # (eagerly, before HIP graph capture) to register a workspace handle for that
 # stream. Needed under vLLM/sglang-style TBO where two CPU threads drive two
-# streams concurrently — each captured graph must bake in its own buffer
+# streams concurrently -- each captured graph must bake in its own buffer
 # pointer; the prior thread_local cache would fail capture on the second
 # stream. After init, run the largest expected gemm eagerly on the same
 # stream to grow the buffer, then capture.
-@compile_ops("module_deepgemm_opus", fc_name="opus_gemm_workspace_init")
+@compile_ops("module_deepgemm_opus", fc_name="opus_gemm_workspace_init", develop=True)
 def opus_gemm_workspace_init() -> None: ...
 
 
+# Free the per-stream splitk workspace registered by opus_gemm_workspace_init
+# (and grown by the splitk launchers). Call inside `with torch.cuda.stream(s):`
+# in eager mode (not during HIP graph capture) to reclaim the GPU buffer +
+# handles for that stream; no-op if the stream was never registered. Use this
+# for explicit teardown of streams the framework will not reuse.
+@compile_ops(
+    "module_deepgemm_opus", fc_name="opus_gemm_workspace_release", develop=True
+)
+def opus_gemm_workspace_release() -> None: ...
+
+
+# Free the splitk workspace for all registered streams and clear the registry.
+# Eager mode only. Use for a full teardown before the framework reclaims its
+# stream pool / at process shutdown.
+@compile_ops(
+    "module_deepgemm_opus", fc_name="opus_gemm_workspace_release_all", develop=True
+)
+def opus_gemm_workspace_release_all() -> None: ...
+
+
 __all__ = [
-    "opus_gemm_a16w16_tune",
     "gemm_a16w16_opus",
+    "is_splitk_kid",
+    "opus_gemm_a16w16_tune",
     "opus_gemm_workspace_init",
+    "opus_gemm_workspace_release",
+    "opus_gemm_workspace_release_all",
 ]

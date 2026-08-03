@@ -1,64 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
-import triton
 import torch
+import triton
+
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as triton_gemm_afp4wfp4,
+)
+from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
     gemm_afp4wfp4_preshuffle,
 )
 from aiter.ops.triton.gluon.gemm_afp4wfp4 import (
     gemm_afp4wfp4 as gluon_gemm_afp4wfp4_CDNA4,
 )
-
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
-from aiter.ops.shuffle import shuffle_weight, shuffle_weight_gfx1250
 
 DEVICE_ARCH = arch_info.get_arch()
 
 pytestmark = pytest.mark.skipif(
     not arch_info.is_fp4_avail(), reason="MXFP4 not supported on this architecture"
 )
-
-
-def shuffle_scales(scales: torch.Tensor):
-    scales_shuffled = scales.clone()
-    sm, sn = scales_shuffled.shape
-    scales_shuffled = scales_shuffled.view(sm // 32, 2, 16, sn // 8, 2, 4, 1)
-    scales_shuffled = scales_shuffled.permute(0, 3, 5, 2, 4, 1, 6).contiguous()
-    scales_shuffled = scales_shuffled.view(sm // 32, sn * 32)
-    return scales_shuffled
-
-
-def un_shuffle_scales(scales_shuffled: torch.Tensor):
-    scales = scales_shuffled.clone()
-    sm, sn = scales.shape
-    scales = scales.view(sm * 32, sn // 32)
-    sm, sn = scales.shape
-    scales = scales.view(sm // 32, sn // 8, 4, 16, 2, 2, 1)
-    scales = scales.permute(0, 5, 3, 1, 4, 2, 6).contiguous()
-    scales = scales.view(sm, sn)
-    return scales
-
-
-def shuffle_scales_gfx1250(scales: torch.Tensor):
-    # PRESHUFFLE_FACTOR = 16        rows packed per stripe
-    # SCALE_KWIDTH      = 4         scale-groups contiguous per row
-    # (4 scale-groups × 32 K-per-group = 128 K elems contiguous per row)
-    PRESHUFFLE_FACTOR = 16
-    SCALE_KWIDTH = 4
-    M, K_groups = scales.shape
-
-    out = scales.view(
-        M // PRESHUFFLE_FACTOR,
-        PRESHUFFLE_FACTOR,  # rows  →  (m_tile, lane)
-        K_groups // SCALE_KWIDTH,
-        SCALE_KWIDTH,  # cols  →  (k_tile, kg_in_lane)
-    )
-    out = out.permute(0, 2, 1, 3).contiguous()  # (m_tile, k_tile, lane, kg_in_lane)
-    out = out.view(M // PRESHUFFLE_FACTOR, K_groups * PRESHUFFLE_FACTOR)
-    return out
 
 
 # Note this is specified by the HW and cannot be changed.
@@ -116,35 +79,28 @@ def generate_gemm_afp4wfp4_inputs(
     x_scales = x_scales.T
     w_scales = w_scales.T
     if shuffle_scales_fg:
-        if DEVICE_ARCH == "gfx1250":
-            if M >= 32:
-                x_scales_shuffled = shuffle_scales_gfx1250(x_scales)
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales_gfx1250(w_scales)
+        # Arch-independent aiter.ops.shuffle.shuffle_scale layout (shared with
+        # the CK/asm GEMMs): 32-row stripes of 8 k-groups, returned flat as
+        # (pad256(rows), pad8(K//32)). The kernels index one row per 32-row
+        # stripe, so view it as (pad256(rows)//32, pad8(K//32)*32) -- taken off
+        # the shuffled tensor's own shape, which is padded on both dims.
+        # M < 32 stays un-shuffled (M, K//32) row-major.
+        if M >= 32:
+            xs = shuffle_scale(x_scales[:M])
+            x_scales_shuffled = xs.view(-1, xs.shape[1] * 32)
         else:
-            if M >= 32:
-                x_scales_shuffled = shuffle_scales(x_scales)
-            else:
-                x_scales_shuffled = x_scales.contiguous()
-            w_scales_shuffled = shuffle_scales(w_scales)
+            x_scales_shuffled = x_scales[:M].contiguous()
+        ws = shuffle_scale(w_scales)
+        w_scales_shuffled = ws.view(-1, ws.shape[1] * 32)
     else:
-        x_scales_shuffled = x_scales
+        x_scales_shuffled = x_scales[:M]
         w_scales_shuffled = w_scales
 
     if shuffle_weight_fg:
-        if DEVICE_ARCH == "gfx1250":
-            # gfx1250: simple reshape for TDM coalescing (no tile permutation)
-            w_shuffed = shuffle_weight_gfx1250(w)
-        else:
-            use_int4 = False
-            weight_shuffle_layout = (16, 16)
-            w_shuffed = shuffle_weight(
-                w, layout=weight_shuffle_layout, use_int4=use_int4
-            ).reshape(
-                w.shape[0] // weight_shuffle_layout[0],
-                w.shape[1] * weight_shuffle_layout[0],
-            )
+        # aiter.ops.shuffle.shuffle_weight (layout=(16, 16)) returns the (N, K)
+        # shuffled weight, byte-identical on both arches; reshape to the
+        # (N//16, K*16) layout the kernel consumes
+        w_shuffed = shuffle_weight(w).reshape(w.shape[0] // 16, w.shape[1] * 16)
     else:
         w_shuffed = w
 
@@ -161,7 +117,7 @@ def generate_gemm_afp4wfp4_inputs(
         w_shuffed,
         x_scales[:M],
         w_scales,
-        x_scales_shuffled[:M],
+        x_scales_shuffled,
         w_scales_shuffled,
         out_dtype,
         y,
@@ -267,7 +223,7 @@ def test_gemm_afp4_wfp4(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,
@@ -347,7 +303,7 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
         w_scales,
         x_scales_shuffled,
         w_scales_shuffled,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

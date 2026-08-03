@@ -2,22 +2,23 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import pytest
 import torch
+
 from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_mul_add import (
     fused_gemm_afp4wfp4_mul_add,
     fused_gemm_afp4wfp4_preshuffle_add_mul,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    generate_gemm_afp4wfp4_inputs,
-)
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    run_torch as run_torch_gemm_afp4wfp4,
-)
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     generate_fused_mul_add_inputs,
 )
 from op_tests.triton_tests.fusions.test_fused_mul_add import (
     run_torch as run_torch_fused_mul_add,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    generate_gemm_afp4wfp4_inputs,
+)
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    run_torch as run_torch_gemm_afp4wfp4,
 )
 
 
@@ -60,6 +61,8 @@ def test_fused_gemm_afp4wfp4_mul_add(
     b_type_is_scalar,
     fuse_type,
 ):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("fused mul/add has no gfx1250 Triton config")
     if not (arch_info.is_fp4_avail()):
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -84,7 +87,7 @@ def test_fused_gemm_afp4wfp4_mul_add(
         w_scales,
         x_scales_triton,
         w_scales_triton,
-        out_dtype,
+        _out_dtype,
         y,
     ) = generate_gemm_afp4wfp4_inputs(
         M,

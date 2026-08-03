@@ -34,4 +34,5 @@ void fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(aiter_tensor_t& qkv,
                                                     bool use_shuffle_layout,
                                                     int64_t block_size,
                                                     int64_t x,
-                                                    int64_t rotary_dim = 0);
+                                                    int64_t rotary_dim = 0,
+                                                    bool gemma_norm = false);

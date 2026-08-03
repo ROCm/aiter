@@ -8,25 +8,25 @@
 
 ### Aiter
 - runs used: `10`
-- discovered files: `77`
-- with samples: `77`
+- discovered files: `113`
+- with samples: `113`
 - added: `5`
-- updated: `70`
-- unchanged: `2`
+- updated: `67`
+- unchanged: `41`
 - defaulted (no history): `0`
 - removed stale entries: `0`
 - defaulted files list: `none`
 
 ### Triton
 - runs used: `10`
-- discovered files: `99`
-- with samples: `99`
-- added: `5`
-- updated: `76`
-- unchanged: `18`
-- defaulted (no history): `0`
-- removed stale entries: `3`
-- defaulted files list: `none`
+- discovered files: `108`
+- with samples: `107`
+- added: `3`
+- updated: `85`
+- unchanged: `20`
+- defaulted (no history): `1`
+- removed stale entries: `0`
+- defaulted files list: `op_tests/triton_tests/chunk_delta_attn/test_chunk_delta_attn_fwd.py`
 
 ## Test plan
 - [x] bash .github/scripts/split_tests.sh --shards 8 --test-type aiter --dry-run

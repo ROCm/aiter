@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from aiter import dtypes
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.moe_kernels import _get_compiled_silu_fused, _run_compiled
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant
@@ -13,6 +14,71 @@ def _swiglu_ref(x: torch.Tensor, inter_dim: int) -> torch.Tensor:
     gate = gate.clamp(max=7.0)
     up = up.clamp(min=-7.0, max=7.0)
     return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+
+
+def _situv2_ref(
+    x: torch.Tensor, inter_dim: int, beta: float, linear_beta: float
+) -> torch.Tensor:
+    gate, up = x.float().split([inter_dim, inter_dim], dim=-1)
+    return (
+        beta
+        * torch.tanh(gate / beta)
+        * torch.sigmoid(gate)
+        * linear_beta
+        * torch.tanh(up / linear_beta)
+    )
+
+
+@pytest.mark.parametrize("beta, linear_beta", [(1.0, 1.0), (4.0, 25.0)])
+def test_flydsl_situv2_fused_uses_runtime_betas(beta: float, linear_beta: float):
+    if not is_flydsl_available():
+        pytest.skip("FlyDSL is not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    token_num, topk, inter_dim = 4, 2, 256
+    rows = token_num * topk
+    x = torch.randn(rows, inter_dim * 2, dtype=torch.bfloat16, device=device)
+    out = torch.empty(rows, inter_dim, dtype=torch.bfloat16, device=device)
+    row_ids = torch.arange(rows, dtype=torch.int32, device=device)
+    sorted_ids = (row_ids // topk) | ((row_ids % topk) << 24)
+    num_valid_ids = torch.tensor([rows], dtype=torch.int32, device=device)
+
+    kernel = _get_compiled_silu_fused(
+        inter_dim,
+        topk,
+        quant_mode="none",
+        gui_layout=False,
+        act="situv2",
+        enable_bias=False,
+    )
+    _run_compiled(
+        kernel,
+        (
+            ptr_arg(x),
+            ptr_arg(out.view(torch.uint8)),
+            ptr_arg(torch.empty(0, dtype=torch.uint8, device=device)),
+            ptr_arg(sorted_ids),
+            ptr_arg(num_valid_ids),
+            ptr_arg(sorted_ids),
+            ptr_arg(torch.empty(0, dtype=torch.float32, device=device)),
+            token_num,
+            rows,
+            beta,
+            1.0 / beta,
+            linear_beta,
+            1.0 / linear_beta,
+            float("inf"),
+            torch.cuda.current_stream(),
+        ),
+    )
+
+    torch.testing.assert_close(
+        out.float(),
+        _situv2_ref(x, inter_dim, beta, linear_beta),
+        rtol=2e-2,
+        atol=2e-2,
+    )
 
 
 @pytest.mark.parametrize("token_num, topk, inter_dim", [(4, 2, 256)])
@@ -63,15 +129,20 @@ def test_flydsl_swiglu_fused_fp4_quant_matches_reference(
     _run_compiled(
         kernel,
         (
-            x,
-            out.view(-1).view(torch.uint8),
-            out_scale_sorted,
-            sorted_ids,
-            num_valid_ids,
-            sorted_ids,
-            torch.empty(0, dtype=torch.float32, device=device),
+            ptr_arg(x),
+            ptr_arg(out.view(-1).view(torch.uint8)),
+            ptr_arg(out_scale_sorted),
+            ptr_arg(sorted_ids),
+            ptr_arg(num_valid_ids),
+            ptr_arg(sorted_ids),
+            ptr_arg(torch.empty(0, dtype=torch.float32, device=device)),
             token_num,
             sorted_ids.numel(),
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            7.0,
             torch.cuda.current_stream(),
         ),
     )

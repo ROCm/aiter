@@ -1,15 +1,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
 import copy
+
+import pandas as pd
 import torch
 from torch import Tensor
+
 import aiter
-from aiter.test_common import checkAllclose, perftest, benchmark
-from aiter.utility.dtypes import get_dtype_fp8
+from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import dtypes
-import argparse
-import pandas as pd
+from aiter.utility.dtypes import get_dtype_fp8
 
 
 def rms_norm_forward(x: Tensor, weight: Tensor, eps: float):
@@ -199,7 +201,7 @@ def run_torch_qk_norm_rope_cache_quant_shuffle(
 
     v = v.view(num_tokens, -1, head_size)
 
-    from aiter import reshape_and_cache_with_pertoken_quant, reshape_and_cache
+    from aiter import reshape_and_cache, reshape_and_cache_with_pertoken_quant
 
     if kv_cache_dtype == "auto":
         reshape_and_cache(
@@ -1560,6 +1562,181 @@ def test_qk_norm_rope_1way(
     return ret
 
 
+def minimax_rms_norm_forward(x: Tensor, weight: Tensor, eps: float) -> Tensor:
+    input_dtype = x.dtype
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    x = x.float() * torch.rsqrt(variance + eps) * weight.float()
+    return x.to(input_dtype)
+
+
+@perftest()
+def run_torch_minimax_qk_norm_rope(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_tokens: int,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    eps: float,
+):
+    q_size = num_heads_q * head_size
+    kv_size = num_heads_k * head_size
+    q, k, v = qkv.view(num_tokens, q_size + 2 * kv_size).split(
+        [q_size, kv_size, kv_size], dim=-1
+    )
+
+    q = minimax_rms_norm_forward(q, q_weight, eps)
+    k = minimax_rms_norm_forward(k, k_weight, eps)
+
+    cos_sin = cos_sin.view(cos_sin.shape[0], rotary_dim)[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    q = apply_rotary_emb_dispatch(
+        q.view(num_tokens, num_heads_q, head_size),
+        cos,
+        sin,
+        is_neox_style,
+        rotary_dim,
+    ).reshape(num_tokens, q_size)
+    k = apply_rotary_emb_dispatch(
+        k.view(num_tokens, num_heads_k, head_size),
+        cos,
+        sin,
+        is_neox_style,
+        rotary_dim,
+    ).reshape(num_tokens, kv_size)
+    return q, k, v
+
+
+@perftest()
+def run_aiter_minimax_qk_norm_rope(
+    qkv: Tensor,
+    q_weight: Tensor,
+    k_weight: Tensor,
+    cos_sin: Tensor,
+    positions: Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    head_size: int,
+    rotary_dim: int,
+    is_neox_style: bool,
+    eps: float,
+):
+    num_tokens = qkv.size(0)
+    q_out = torch.empty(
+        (num_tokens, num_heads_q * head_size), dtype=qkv.dtype, device=qkv.device
+    )
+    k_out = torch.empty(
+        (num_tokens, num_heads_k * head_size), dtype=qkv.dtype, device=qkv.device
+    )
+    v_out = torch.empty_like(k_out)
+    q_ret, k_ret, v_ret = aiter.minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_heads_q=num_heads_q,
+        num_heads_k=num_heads_k,
+        head_dim=head_size,
+        rotary_dim=rotary_dim,
+        eps=eps,
+        is_neox_style=is_neox_style,
+        q_out=q_out,
+        k_out=k_out,
+        v_out=v_out,
+    )
+    assert q_ret.data_ptr() == q_out.data_ptr()
+    assert k_ret.data_ptr() == k_out.data_ptr()
+    assert v_ret.data_ptr() == v_out.data_ptr()
+    return q_ret, k_ret, v_ret
+
+
+@benchmark()
+def test_minimax_qk_norm_rope(
+    dtype,
+    num_tokens,
+    num_heads_q,
+    num_heads_k,
+    head_size,
+    rotary_dim,
+    is_neox_style,
+    eps=1e-6,
+):
+    torch.manual_seed(0)
+    q_size = num_heads_q * head_size
+    kv_size = num_heads_k * head_size
+    max_positions = max(num_tokens * 2, 128)
+    qkv = torch.randn(
+        (num_tokens, q_size + 2 * kv_size),
+        dtype=dtype,
+        device="cuda",
+    )
+    q_weight = torch.randn(q_size, dtype=torch.float32, device="cuda")
+    k_weight = torch.randn(kv_size, dtype=torch.float32, device="cuda")
+    cos_sin = torch.randn(
+        (max_positions, rotary_dim),
+        dtype=dtype,
+        device="cuda",
+    )
+    positions = torch.randint(
+        0, max_positions, (num_tokens,), dtype=torch.int64, device="cuda"
+    )
+
+    (q_ref, k_ref, v_ref), avg_torch = run_torch_minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_tokens,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
+    )
+    (q_out, k_out, v_out), avg_cu = run_aiter_minimax_qk_norm_rope(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin,
+        positions,
+        num_heads_q,
+        num_heads_k,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        eps,
+    )
+
+    info = f"dtype:{dtype}, num_tokens:{num_tokens}, num_heads_q:{num_heads_q}, num_heads_k:{num_heads_k}"
+    info += f", head_size:{head_size}, rotary_dim:{rotary_dim}, is_neox_style:{is_neox_style}, eps:{eps}"
+    msg = f"[perf] === {info} === torch avg: {avg_torch:<8.2f} us, cu avg: {avg_cu:<8.2f} us, uplift: {avg_torch/avg_cu-1:<5.1%}"
+    checkAllclose(q_ref, q_out, msg="minimax q", rtol=1e-2, atol=0.05)
+    checkAllclose(k_ref, k_out, msg="minimax k", rtol=1e-2, atol=0.05)
+    checkAllclose(v_ref, v_out, msg="minimax v", rtol=1e-2, atol=0.05)
+    print(msg, flush=True)
+
+    ret = {}
+    ret["dtype"] = dtype
+    ret["num_tokens"] = num_tokens
+    ret["num_heads_q"] = num_heads_q
+    ret["num_heads_k"] = num_heads_k
+    ret["head_size"] = head_size
+    ret["rotary_dim"] = rotary_dim
+    ret["is_neox_style"] = "1" if is_neox_style else "0"
+    ret["avg_torch"] = avg_torch
+    ret["avg_cu"] = avg_cu
+    ret["speedup"] = avg_torch / avg_cu
+    return ret
+
+
 @benchmark()
 def test_qk_norm_rope_cache_block_quant(
     dtype,
@@ -1640,13 +1817,11 @@ def test_qk_norm_rope_cache_block_quant(
     elif total_len < num_tokens:
         seq_lens[-1] += num_tokens - total_len
     max_tpb = max(seq_lens)
-    #
     cu_q_len = torch.zeros(batch_size + 1, dtype=torch.int64, device="cuda")
 
     cu_q_len[0] = 0
     for i in range(batch_size):
         cu_q_len[i + 1] = cu_q_len[i] + seq_lens[i]
-    #
     assert (
         cu_q_len[-1].item() == num_tokens
     ), f"cu_q_len[-1]={cu_q_len[-1].item()} != num_tokens={num_tokens}"
@@ -1798,7 +1973,6 @@ def test_qk_norm_rope_cache_block_quant(
     ]  # k_cache: [num_blocks, num_kv_heads, head_size//x, page_size, x]
     chunk_left_ctx_lens = page_size - 1
     chunk_total_tokens = batch_size * chunk_left_ctx_lens
-    #
     chunk_qkv = torch.randn(
         (chunk_total_tokens, (num_heads_q + num_heads_k + num_heads_v) * head_size),
         dtype=dtype,
@@ -1838,7 +2012,6 @@ def test_qk_norm_rope_cache_block_quant(
     v_scale_chunk_ref = v_scale_ref.clone()
     k_scale_chunk = k_scale.clone()
     v_scale_chunk = v_scale.clone()
-    #
     (
         q_chunk_ref,
         k_chunk_ref,
@@ -1889,7 +2062,6 @@ def test_qk_norm_rope_cache_block_quant(
             max_tokens_per_batch=chunk_left_ctx_lens,
         )
     )
-    #
     print(
         f"chunk-prefill: torch avg: {avg_torch_chunk:.2f} us, cu avg: {avg_cu_chunk:.2f} us"
     )
@@ -1899,14 +2071,14 @@ def test_qk_norm_rope_cache_block_quant(
     # Combine prefill + chunk slots to check all pages with data
     all_slots_so_far = torch.cat([slot_mapping, chunk_slot_mapping])
     chunk_slots_edit = torch.unique(all_slots_so_far // page_size)
-    chunk_k_cache_err = checkAllclose(
+    checkAllclose(
         k_cache_ref.float()[chunk_slots_edit],
         k_cache.float()[chunk_slots_edit],
         msg="chunk k_cache",
         rtol=5e-2,
         atol=0.05,
     )
-    chunk_v_cache_err = checkAllclose(
+    checkAllclose(
         v_cache_ref.float()[chunk_slots_edit],
         v_cache.float()[chunk_slots_edit],
         msg="chunk v_cache",
@@ -2699,7 +2871,10 @@ def test_pts_quant_shuffle_block_layout_parity(
     eps=1e-6,
     use_shuffle_layout=True,
 ):
-    """Parity: the pts write must give identical KV cache for the original [2, num_blocks, ...] and new [num_blocks, 2, ...] (unbind(1)) paged layouts, for both use_shuffle_layout=True and False (both honor the cache's per-block stride)."""
+    """Parity: the pts write must give an identical KV cache across paged layouts
+    that differ only in block/token/head strides -- [2, num_blocks, ...],
+    [num_blocks, 2, ...] (unbind(1)), and the packed
+    [num_blocks, num_heads_kv, block_size, 2*head_size] (non-shuffle only)."""
     cache_dtype = cache_dtype or dtype  # None => auto (cache dtype == qkv dtype)
     x = (
         16 // torch.empty(0, dtype=cache_dtype).element_size()
@@ -2729,22 +2904,42 @@ def test_pts_quant_shuffle_block_layout_parity(
     per_tensor_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
     per_tensor_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
 
-    def run(blocks_first: bool):
-        # blocks_first=True: new [num_blocks,2,...] (K=cache[:,0], stride 2x); False: original [2,num_blocks,...] (K=cache[0], contiguous).
-        if blocks_first:
-            kv = torch.zeros(
-                (num_blocks, 2, block_size, num_heads_kv, head_size),
-                dtype=cache_dtype,
-                device="cuda",
-            )
-            k_cache, v_cache = kv[:, 0], kv[:, 1]
-        else:
+    def run(layout: str):
+        # Three physically distinct paged KV layouts that must all write the same
+        # logical [num_blocks, block_size, num_heads_kv, head_size] K/V cache. The
+        # kernel is stride-aware in block/token/head; only the innermost head_size
+        # dim must stay contiguous (stride 1).
+        if layout == "kv_first":
+            # original [2, num_blocks, ...]: K=cache[0], per-block contiguous.
             kv = torch.zeros(
                 (2, num_blocks, block_size, num_heads_kv, head_size),
                 dtype=cache_dtype,
                 device="cuda",
             )
             k_cache, v_cache = kv[0], kv[1]
+        elif layout == "blocks_first":
+            # [num_blocks, 2, ...]: K=cache[:,0], K/V interleaved per block (block stride 2x).
+            kv = torch.zeros(
+                (num_blocks, 2, block_size, num_heads_kv, head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache, v_cache = kv[:, 0], kv[:, 1]
+        elif layout == "packed_headdim":
+            # [num_blocks, num_heads_kv, block_size, 2*head_size]: K/V packed along
+            # the innermost dim (K=[...,:D], V=[...,D:]) with head/token order
+            # transposed vs the others. permute(0,2,1,3) ->
+            # [num_blocks, block_size, num_heads_kv, head_size] so the kernel's
+            # (block, token, head) stride reads line up; head_size stays contiguous.
+            kv = torch.zeros(
+                (num_blocks, num_heads_kv, block_size, 2 * head_size),
+                dtype=cache_dtype,
+                device="cuda",
+            )
+            k_cache = kv[..., :head_size].permute(0, 2, 1, 3)
+            v_cache = kv[..., head_size:].permute(0, 2, 1, 3)
+        else:
+            raise ValueError(f"unknown layout {layout!r}")
         q_out = torch.empty(
             (num_tokens, num_heads_q, head_size), dtype=dtype, device="cuda"
         )
@@ -2783,8 +2978,20 @@ def test_pts_quant_shuffle_block_layout_parity(
         )
         return q_out, k_cache, v_cache
 
-    q_orig, k_orig, v_orig = run(blocks_first=False)  # [2, num_blocks, ...]
-    q_new, k_new, v_new = run(blocks_first=True)  # [num_blocks, 2, ...]
+    # Reference layout + the variants under test; every layout must produce a
+    # bit-identical logical K/V cache (only block/token/head strides differ).
+    q_ref, k_ref, v_ref = run("kv_first")  # [2, num_blocks, ...]
+    variants = {
+        "blocks_first": run("blocks_first"),  # [num_blocks, 2, ...]
+    }
+    # Packed [num_blocks, Hkv, block_size, 2*head_size]: head_size contiguous in the
+    # innermost dim (K=[...,:D], V=[...,D:]). Non-shuffle only -- the x-shuffle repacks
+    # head_size non-contiguously and honors only the block stride, so a contiguous-head
+    # packed layout can't be represented under it.
+    if not use_shuffle_layout:
+        variants["packed_headdim"] = run(
+            "packed_headdim"
+        )  # [num_blocks, Hkv, block_size, 2*D]
 
     tag = (
         f"block_layout_parity qkv={dtype}, cache={cache_dtype}, tokens={num_tokens}, "
@@ -2792,16 +2999,25 @@ def test_pts_quant_shuffle_block_layout_parity(
         f"block_size={block_size}, blocks={num_blocks}, neox={is_neox_style}, "
         f"shuffle={use_shuffle_layout}"
     )
-    # Only the block stride differs -> must match exactly; checkAllclose logs but doesn't raise, so assert on its ratio.
-    for name, a, b in (
-        ("q_out", q_orig, q_new),
-        ("k_cache", k_orig, k_new),
-        ("v_cache", v_orig, v_new),
-    ):
-        err = checkAllclose(
-            a.float(), b.float(), rtol=0, atol=0, printLog=False, msg=f"{name} {tag}"
-        )
-        assert err == 0, f"{name} [2,B] vs [B,2] parity MISMATCH (err={err}): {tag}"
+    # Only block/token/head strides differ -> must match exactly; checkAllclose
+    # logs but doesn't raise, so assert on its returned ratio.
+    for layout, (q_v, k_v, v_v) in variants.items():
+        for name, a, b in (
+            ("q_out", q_ref, q_v),
+            ("k_cache", k_ref, k_v),
+            ("v_cache", v_ref, v_v),
+        ):
+            err = checkAllclose(
+                a.float(),
+                b.float(),
+                rtol=0,
+                atol=0,
+                printLog=False,
+                msg=f"{name} kv_first vs {layout} {tag}",
+            )
+            assert (
+                err == 0
+            ), f"{name} kv_first vs {layout} parity MISMATCH (err={err}): {tag}"
     print(f"[PASS] {tag}", flush=True)
     return {
         "qkv_dtype": str(dtype),
@@ -3102,7 +3318,6 @@ if __name__ == "__main__":
                     num_prefill_batches=8,
                     prefill_seq_len=100,
                 )
-    #
     dtype = torch.bfloat16
     batch_size = 2
     num_tokens1 = 3608
@@ -3148,6 +3363,33 @@ if __name__ == "__main__":
     df_md = df.to_markdown(index=False)
     aiter.logger.info("qk_norm_rope_1way summary (markdown):\n%s", df_md)
 
+    # MiniMax TP1: q/k are normalized across the full flattened q/k vector.
+    df = []
+    minimax_heads_q = 8
+    minimax_heads_k = 2
+    for head_size in args.head_sizes:
+        for num_tokens in args.token:
+            rotary_dims = {head_size}
+            partial_rotary_dim = partial_rotary_configs.get(head_size)
+            if partial_rotary_dim is not None:
+                rotary_dims.add(partial_rotary_dim)
+            for rotary_dim in sorted(rotary_dims):
+                for is_neox_style in args.is_neox_styles:
+                    ret = test_minimax_qk_norm_rope(
+                        args.dtype,
+                        num_tokens,
+                        minimax_heads_q,
+                        minimax_heads_k,
+                        head_size,
+                        rotary_dim,
+                        is_neox_style,
+                        eps=1e-6,
+                    )
+                    df.append(ret)
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("minimax_qk_norm_rope summary (markdown):\n%s", df_md)
+
     # partial rotary tests (Qwen3.5-style: head_size=256, rotary_dim=64)
     df = []
     partial_rotary_configs = {256: 64, 128: 32, 64: 16}
@@ -3174,7 +3416,9 @@ if __name__ == "__main__":
     df_md = df.to_markdown(index=False)
     aiter.logger.info("partial_rotary_pts_quant summary (markdown):\n%s", df_md)
 
-    # Stride-aware shuffle parity: original [2, num_blocks, ...] vs new [num_blocks, 2, ...] paged layout must give identical KV cache.
+    # Stride-aware shuffle parity: [2, num_blocks, ...], [num_blocks, 2, ...] and
+    # packed [num_blocks, Hkv, block_size, 2*head_size] paged layouts must all
+    # give an identical KV cache.
     fp8 = get_dtype_fp8()
     df = []
     for is_neox_style in args.is_neox_styles:

@@ -1,10 +1,11 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import torch
 import triton
 import triton.language as tl
-import torch
-from aiter.ops.triton.utils.types import e4m3_dtype
+
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
@@ -218,7 +219,7 @@ def _mla_prefill_fwd_kernel(
     seq_offset = offs_t
 
     # iterate through tiles (now limited to the sliding window range)
-    for j in range(tile_start, tile_end):
+    for j in tl.range(tile_start, tile_end, num_stages=1):
         physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
 
         kv_offset = (
@@ -494,9 +495,10 @@ def _mla_decode_fwd_kernel(
     seq_offset = segm_idx * tiles_per_segment * TILE_SIZE + offs_t
 
     # iterate through tiles within current segment
-    for j in range(
+    for j in tl.range(
         segm_idx * tiles_per_segment,
         min((segm_idx + 1) * tiles_per_segment, num_tiles),
+        num_stages=1,
     ):
         physical_block_idx = tl.load(block_tables_ptr_shifted + j).to(tl.int64)
 
