@@ -24,10 +24,21 @@ torch.set_default_device("cuda")
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 # `e4m3_type` is arch-dependent (get_fp8_dtypes): FNUZ on gfx942, FN on gfx950.
-# So on gfx950 both keys resolve to float8_e4m3fn and the two dtype cases
-# coincide -- the sweep still runs both, but it is not FN-vs-FNUZ coverage
-# there. Only gfx942 has a genuine FN/FNUZ split.
+# So on gfx950 both keys resolve to float8_e4m3fn and the two cases coincide --
+# only gfx942 has a genuine FN/FNUZ split.
 DTYPE_MAP = {"fnuz": e4m3_type, "fn": torch.float8_e4m3fn}
+
+# Default operand-dtype sweep, per arch.
+#
+# gfx942's native MFMA operand format is FNUZ, so the kernel takes FN operands
+# by patching them (see `convert_q_fn`/`convert_kv_fn`). Both fnuz/fnuz and the
+# live DeepSeek-V4 indexer combo fn/fnuz are therefore real, distinct paths.
+#
+# gfx950's native format is FN and its CDNA4 scaled atoms reject FNUZ outright,
+# so the kernel never converts there and fn/fn is the only combination that can
+# occur.
+_DEFAULT_Q_DTYPES = ["fn"] if get_gfx() == "gfx950" else ["fnuz", "fn"]
+_DEFAULT_KV_DTYPES = ["fn"] if get_gfx() == "gfx950" else ["fnuz"]
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
@@ -115,8 +126,8 @@ def test_fp8_mqa_logits(
     # diff and says nothing about kernel correctness.
     q = q_fp8.to(torch.float32).to(torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
-    if kv_dtype != "fnuz":
-        kv_fp8 = _kv_in_dtype(kv_fp8, DTYPE_MAP[kv_dtype])
+    # A no-op when the request is already the arch-native format.
+    kv_fp8 = _kv_in_dtype(kv_fp8, DTYPE_MAP[kv_dtype])
 
     with torch.inference_mode():
         ref, cost = ref_fp8_mqa_logits(
@@ -138,7 +149,7 @@ def test_fp8_mqa_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits
         ),
     }
-    if kv_dtype == "fnuz":
+    if DTYPE_MAP[kv_dtype] == e4m3_type:
         candidates["triton"] = lambda: triton_logits(
             q_fp8, kv_fp8, scales, weights, ks, ke, clean_logits
         )
@@ -233,14 +244,14 @@ def main():
         "--q-dtype",
         type=str,
         nargs="*",
-        default=["fnuz", "fn"],
+        default=_DEFAULT_Q_DTYPES,
         choices=["fnuz", "fn"],
     )
     parser.add_argument(
         "--kv-dtype",
         type=str,
         nargs="*",
-        default=["fnuz"],
+        default=_DEFAULT_KV_DTYPES,
         choices=["fnuz", "fn"],
     )
     parser.add_argument(
