@@ -217,6 +217,7 @@ def fmoe_g1u1_a16(
     fc1_smooth_scale: Tensor,
     fc2_smooth_scale: Tensor,
     activation: Optional[int] = ActivationType.Silu.value,
+    flat_mode: Optional[int] = 0,
 ) -> None: ...
 
 

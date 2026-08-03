@@ -75,9 +75,9 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 # so there is no overhead.
 kernel_bench_callable = None
 
-# FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
-# topk_weights through the sorted_* kernarg slots and accumulate via
-# global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
+# FLAT 1stage asm kernels ingest raw topk_ids/topk_weights through the
+# sorted_* kernarg slots, so moe_sorting is a pass-through. flat=1 uses the
+# one-token-per-TG grid; flat=2 performs embedded sorting on a persistent grid.
 
 
 def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
@@ -104,8 +104,8 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
         if topk_weights.dtype == dtypes.fp32 and topk_weights.is_contiguous()
         else topk_weights.to(dtypes.fp32).contiguous()
     )
-    # sorted_expert_ids / num_valid_ids slots are unread by FLAT kernels,
-    # but must be valid device pointers -- alias topk_ids as scratch.
+    # Both modes read token_cnt from the scalar kernarg. The remaining metadata
+    # slots only need valid device pointers, so alias raw topk ids as scratch.
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
@@ -367,7 +367,7 @@ def moe_sorting(
             num_local_tokens,
             accumulate=accumulate,
         )
-    # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
+    # FLAT modes: routing is handled in-kernel; pass through unsorted topk.
     if flat:
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
