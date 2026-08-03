@@ -186,33 +186,32 @@ def compile_hgemm_kernel(
     assert BLOCK_MN_SIZE % BLOCK_VECS == 0
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
-    # LDS parameters:
-    # C output reuses A's LDS field after the GEMM pipeline is complete.
-    # SharedAllocator emits struct leaves as independent static LDS globals, so
-    # C must fit entirely in a_lds; it cannot spill into the b_lds field.
+    # LDS parameters: the A/B pipeline and C scratch are live at disjoint times,
+    # so model their storage overlap explicitly with a union. SharedAllocator
+    # emits one static LDS symbol for a union, preserving the old contiguous
+    # A-then-B layout without relying on separate struct leaves being adjacent.
     AS_ELEMS = STAGES * BLOCK_M * BLOCK_K
     BS_ELEMS = STAGES * BLOCK_N * BLOCK_K
     CMN_ELEMS = BLOCK_K_WARPS * BLOCK_M * BLOCK_N
-    if B_TO_LDS:
-        A_FIELD_ELEMS = max(AS_ELEMS, CMN_ELEMS)
-        B_FIELD_ELEMS = BS_ELEMS
-        assert ASYNC_COPY
-    else:
-        A_FIELD_ELEMS = max(AS_ELEMS, CMN_ELEMS)
-        B_FIELD_ELEMS = 0
     fx_dtype = fx.Float16 if dtype == "f16" else fx.BFloat16
     if B_TO_LDS:
+        assert ASYNC_COPY
 
         @fx.struct
-        class SharedStorage:
-            a_lds: fx.Array[fx_dtype, A_FIELD_ELEMS, 16]
-            b_lds: fx.Array[fx_dtype, B_FIELD_ELEMS, 16]
+        class PipelineStorage:
+            a_lds: fx.Array[fx_dtype, AS_ELEMS, 16]
+            b_lds: fx.Array[fx_dtype, BS_ELEMS, 16]
 
     else:
 
         @fx.struct
-        class SharedStorage:
-            a_lds: fx.Array[fx_dtype, A_FIELD_ELEMS, 16]
+        class PipelineStorage:
+            a_lds: fx.Array[fx_dtype, AS_ELEMS, 16]
+
+    @fx.union
+    class SharedStorage:
+        pipeline: PipelineStorage
+        c_lds: fx.Array[fx_dtype, CMN_ELEMS, 16]
 
     LDG_ASYNC_VEC_SIZE = DMA_BYTES // DTYPE_BYTES
     LDG_A_X_THREADS_AS = BLOCK_K // LDG_ASYNC_VEC_SIZE
@@ -263,11 +262,12 @@ def compile_hgemm_kernel(
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        a_lds_ptr = lds.a_lds.ptr
+        lds = fx.SharedAllocator().allocate(SharedStorage)
+        a_lds_ptr = lds.pipeline.a_lds.peek().ptr
+        c_lds_ptr = lds.c_lds.peek().ptr
         a_lds_i64 = fx.Int64(fx.ptrtoint(a_lds_ptr))
         if const_expr(B_TO_LDS):
-            b_lds_ptr = lds.b_lds.ptr
+            b_lds_ptr = lds.pipeline.b_lds.peek().ptr
             b_lds_i64 = fx.Int64(fx.ptrtoint(b_lds_ptr))
 
         def _lds_a3_ptr(base_i64, elem_off):
@@ -281,7 +281,7 @@ def compile_hgemm_kernel(
         # LDS accessors: linear element offsets mirroring the old STensor shapes
         # as_/bs_ = (stage, row, col) over (STAGES, BLOCK*, BLOCK_K);
         # cs_ = (k_slice, row, col) over (BLOCK_K_WARPS, BLOCK_M, BLOCK_N),
-        # aliasing the A field.
+        # using the C variant of the pipeline/C union.
         def as_store(stage, row, col, value):
             elem_off = (
                 fx.Int64(stage) * (BLOCK_M * BLOCK_K)
@@ -326,7 +326,7 @@ def compile_hgemm_kernel(
                 + fx.Int64(row) * BLOCK_N
                 + fx.Int64(col)
             )
-            fx.ptr_store(value, a_lds_ptr + elem_off)
+            fx.ptr_store(value, c_lds_ptr + elem_off)
 
         def cs_load_vec(k_slice, row, col, vec_size):
             elem_off = (
@@ -335,7 +335,7 @@ def compile_hgemm_kernel(
                 + fx.Int64(col)
             )
             return fx.ptr_load(
-                a_lds_ptr + elem_off,
+                c_lds_ptr + elem_off,
                 result_type=fx.Vector.make_type(vec_size, fx_dtype),
             )
 
