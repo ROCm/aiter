@@ -10,17 +10,15 @@ torch.cumsum (avoids rocprim trampoline overhead for small E).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T, Int32
-from flydsl.expr.arith import ArithValue, CmpIPredicate, _to_raw as _raw
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr.typing import Int32, T
 
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.tensor_shim import (
-    ptr_rsrc,
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
@@ -28,12 +26,25 @@ MAX_EXPERTS_PER_BLOCK = 512
 
 @fx.struct
 class _PsumStorage:
+    """LDS for the prefix-scan kernels.
+
+    ``lds0``/``lds1`` are ping-pong buffers: each Hillis-Steele step reads one
+    and writes the other, then the two swap. The trailing 16 is the byte
+    alignment of each array.
+    """
+
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
 
 
 @fx.struct
 class _RoutePsumStorage:
+    """LDS for the fused route+psum kernel.
+
+    Adds ``cnt`` -- the per-expert counter the route phase bumps with LDS
+    atomics -- to the ping-pong scan buffers of :class:`_PsumStorage`.
+    """
+
     cnt: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds0: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
     lds1: fx.Array[fx.Int32, MAX_EXPERTS_PER_BLOCK, 16]
@@ -65,9 +76,12 @@ def build_moe_contiguous_psum_module():
         tile_m: Int32,
     ):
         i32 = T.i32
-        tid = ArithValue(fx.thread_idx.x)
-        tile_v = ArithValue(tile_m)
-        tile_minus_1 = tile_v - arith.constant(1, type=i32)
+        # Uint32: every value here is a non-negative count/index, so `<`, `>=`
+        # and `//` lower to ult/uge/divui exactly like the arith.* calls they
+        # replace.
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
 
         lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
         lds0 = lds.lds0.ptr
@@ -78,14 +92,10 @@ def build_moe_contiguous_psum_module():
         p_rsrc = ptr_rsrc(psum)
         c_rsrc = ptr_rsrc(contiguous_m)
 
-        in_range = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
-        _if_load = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_load.then_block):
-            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            q = arith.divui(ArithValue(m) + tile_minus_1, tile_v)
-            aligned = ArithValue(q) * tile_v
-            _lds_store(lds0, aligned, tid)
-            scf.YieldOp([])
+        in_range = tid < fx.Uint32(experts)
+        if in_range:
+            m = fx.Uint32(buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32))
+            _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
 
         gpu.barrier()
 
@@ -94,50 +104,32 @@ def build_moe_contiguous_psum_module():
         for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
-            _if_scan = scf.IfOp(in_range)
-            with ir.InsertionPoint(_if_scan.then_block):
+            if in_range:
                 val = _lds_load(src, tid)
-                has_prev = arith.cmpi(
-                    CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
-                )
-                prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
-                with ir.InsertionPoint(prev_if.then_block):
-                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
-                    scf.YieldOp([_raw(prev)])
-                with ir.InsertionPoint(prev_if.else_block):
-                    scf.YieldOp([arith.constant(0, type=i32)])
-                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
-                scf.YieldOp([])
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
-        _if_store = scf.IfOp(in_range)
-        with ir.InsertionPoint(_if_store.then_block):
-            is_first = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
-            start_if = scf.IfOp(is_first, results_=[i32], has_else=True)
-            with ir.InsertionPoint(start_if.then_block):
-                scf.YieldOp([arith.constant(0, type=i32)])
-            with ir.InsertionPoint(start_if.else_block):
-                prev = _lds_load(src, tid - arith.constant(1, type=i32))
-                scf.YieldOp([_raw(prev)])
-            start = fx.Int32(start_if.results[0])
-            m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+        if in_range:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = _lds_load(src, tid - 1)
+            m_tid = fx.Int32(
+                buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            )
             buffer_ops.buffer_store(start, s_rsrc, tid)
             buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
 
-            is_last = arith.cmpi(
-                CmpIPredicate.eq,
-                tid,
-                ArithValue(experts) - arith.constant(1, type=i32),
-            )
-            _if_last = scf.IfOp(is_last)
-            with ir.InsertionPoint(_if_last.then_block):
+            is_last = tid == fx.Uint32(experts) - 1
+            if is_last:
                 final_cur = _lds_load(src, tid)
-                gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
-                cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
-                buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
-                scf.YieldOp([])
-            scf.YieldOp([])
+                gt = final_cur > fx.Int32(tile_v)
+                buffer_ops.buffer_store(gt.select(final_cur, tile_v), c_rsrc, 0)
 
     @flyc.jit
     def launch_psum(
@@ -147,7 +139,7 @@ def build_moe_contiguous_psum_module():
         contiguous_m: fx.Pointer,
         experts: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_kernel(masked_m, starts, psum, contiguous_m, experts, tile_m).launch(
             grid=(arith.index(1), 1, 1),
@@ -182,11 +174,15 @@ def build_moe_contiguous_psum_remap_module():
         experts: Int32,
         route_max_m: Int32,
         tile_m: Int32,
+        num_valid_routes: fx.Pointer,  # (1,) int32: only remap routes < this (EP dead-tail skip)
     ):
         i32 = T.i32
-        tid = ArithValue(fx.thread_idx.x)
-        tile_v = ArithValue(tile_m)
-        tile_minus_1 = tile_v - arith.constant(1, type=i32)
+        # Uint32: every value here is a non-negative count/index, so `<`, `>=`
+        # and `//` lower to ult/uge/divui exactly like the arith.* calls they
+        # replace.
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
 
         lds = fx.SharedAllocator().allocate(_PsumStorage).peek()
         lds0 = lds.lds0.ptr
@@ -198,14 +194,10 @@ def build_moe_contiguous_psum_remap_module():
         p_rsrc = ptr_rsrc(psum)
         c_rsrc = ptr_rsrc(contiguous_m)
 
-        in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
-        _if_load = scf.IfOp(in_expert)
-        with ir.InsertionPoint(_if_load.then_block):
-            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
-            q = arith.divui(ArithValue(m) + tile_minus_1, tile_v)
-            aligned = ArithValue(q) * tile_v
-            _lds_store(lds0, aligned, tid)
-            scf.YieldOp([])
+        in_expert = tid < fx.Uint32(experts)
+        if in_expert:
+            m = fx.Uint32(buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32))
+            _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
 
         gpu.barrier()
 
@@ -214,67 +206,58 @@ def build_moe_contiguous_psum_remap_module():
         for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
-            _if_scan = scf.IfOp(in_expert)
-            with ir.InsertionPoint(_if_scan.then_block):
+            if in_expert:
                 val = _lds_load(src, tid)
-                has_prev = arith.cmpi(
-                    CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
-                )
-                prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
-                with ir.InsertionPoint(prev_if.then_block):
-                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
-                    scf.YieldOp([_raw(prev)])
-                with ir.InsertionPoint(prev_if.else_block):
-                    scf.YieldOp([arith.constant(0, type=i32)])
-                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
-                scf.YieldOp([])
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
-        _if_store = scf.IfOp(in_expert)
-        with ir.InsertionPoint(_if_store.then_block):
-            is_first = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
-            start_if = scf.IfOp(is_first, results_=[i32], has_else=True)
-            with ir.InsertionPoint(start_if.then_block):
-                scf.YieldOp([arith.constant(0, type=i32)])
-            with ir.InsertionPoint(start_if.else_block):
-                prev = _lds_load(src, tid - arith.constant(1, type=i32))
-                scf.YieldOp([_raw(prev)])
-            start = fx.Int32(start_if.results[0])
-            m_tid = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+        if in_expert:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = _lds_load(src, tid - 1)
+            m_tid = fx.Int32(
+                buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=i32)
+            )
             buffer_ops.buffer_store(start, s_rsrc, tid)
             buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
-            is_last = arith.cmpi(
-                CmpIPredicate.eq,
-                tid,
-                ArithValue(experts) - arith.constant(1, type=i32),
-            )
-            _if_last = scf.IfOp(is_last)
-            with ir.InsertionPoint(_if_last.then_block):
+            is_last = tid == fx.Uint32(experts) - 1
+            if is_last:
                 final_cur = _lds_load(src, tid)
-                gt = arith.cmpi(CmpIPredicate.sgt, final_cur, tile_v)
-                cm = arith.select(gt, _raw(final_cur), _raw(tile_v))
-                buffer_ops.buffer_store(cm, c_rsrc, arith.constant(0, type=i32))
-                scf.YieldOp([])
-            scf.YieldOp([])
+                gt = final_cur > fx.Int32(tile_v)
+                buffer_ops.buffer_store(gt.select(final_cur, tile_v), c_rsrc, 0)
 
         gpu.barrier()
 
-        tid_idx = arith.index_cast(T.index, tid)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
-        stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        remap_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
-        with ir.InsertionPoint(remap_loop.body):
-            route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
-            row = ArithValue(
+        # Only remap valid routes ([0, valid_route_count)); dead-tail routes
+        # hold unwritten/garbage rows from the route kernel and must NOT be used
+        # as a row index (would OOB-read starts[expert]). They are never read
+        # downstream. When truncation is disabled the caller passes a null pointer
+        # instead of a (1,) tensor, so the load must not run unconditionally.
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        valid_route_count = fx.Uint32(numel)
+        if num_valid_routes_is_set:
+            valid_route_count = fx.Uint32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(num_valid_routes), fx.Uint32(0), vec_width=1, dtype=i32
+                )
+            )
+        for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
+            row = fx.Uint32(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(route_max_m)
-            expert = ArithValue(arith.divui(row, m))
+            m = fx.Uint32(route_max_m)
+            expert = row // m
             slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
-            scf.YieldOp([])
+            start = fx.Uint32(
+                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+            )
+            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
 
     @flyc.jit
     def launch_psum_remap(
@@ -287,7 +270,8 @@ def build_moe_contiguous_psum_remap_module():
         experts: fx.Int32,
         route_max_m: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        num_valid_routes: fx.Pointer,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         psum_remap_kernel(
             masked_m,
@@ -299,6 +283,7 @@ def build_moe_contiguous_psum_remap_module():
             experts,
             route_max_m,
             tile_m,
+            num_valid_routes,
         ).launch(
             grid=(arith.index(1), 1, 1),
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
@@ -344,9 +329,12 @@ def build_moe_route_psum_fused_module():
         tile_m: Int32,
     ):
         i32 = T.i32
-        tid = ArithValue(fx.thread_idx.x)
-        tile_v = ArithValue(tile_m)
-        tile_minus_1 = tile_v - arith.constant(1, type=i32)
+        # Uint32: every value here is a non-negative count/index, so `<`, `>=`
+        # and `//` lower to ult/uge/divui exactly like the arith.* calls they
+        # replace.
+        tid = fx.Uint32(fx.thread_idx.x)
+        tile_v = fx.Uint32(tile_m)
+        tile_minus_1 = tile_v - 1
 
         lds = fx.SharedAllocator().allocate(_RoutePsumStorage).peek()
         lds_cnt = lds.cnt.ptr
@@ -359,25 +347,25 @@ def build_moe_route_psum_fused_module():
         s_rsrc = ptr_rsrc(starts)
         p_rsrc = ptr_rsrc(psum)
 
-        in_expert = arith.cmpi(CmpIPredicate.ult, tid, ArithValue(experts))
+        in_expert = tid < fx.Uint32(experts)
 
         # Phase A: zero the LDS per-expert atomic counter.
-        _if_zero = scf.IfOp(in_expert)
-        with ir.InsertionPoint(_if_zero.then_block):
-            _lds_store(lds_cnt, arith.constant(0, type=i32), tid)
-            scf.YieldOp([])
+        if in_expert:
+            _lds_store(lds_cnt, fx.Int32(0), tid)
         gpu.barrier()
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
-        tid_idx = arith.index_cast(T.index, tid)
-        numel_idx = arith.index_cast(T.index, ArithValue(numel))
-        stride_idx = arith.index(MAX_EXPERTS_PER_BLOCK)
-        route_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
-        with ir.InsertionPoint(route_loop.body):
-            route_i32 = arith.index_cast(i32, route_loop.induction_variable)
+        # The atomic needs a raw addrspace(3) pointer, so the counter array's
+        # base is taken as an integer here; SharedAllocator has already folded
+        # its offset in, leaving only the per-expert element offset to add.
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+        numel_i32 = fx.Uint32(numel)
+        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = buffer_ops.buffer_load(topk_rsrc, route_i32, vec_width=1, dtype=i32)
-            addr = fx.ptrtoint(lds_cnt + fx.Int64(e))
-            ptr = buffer_ops.create_llvm_ptr(addr, address_space=3)
+            off_i64 = fx.Int64(e) * 4
+            ptr = buffer_ops.create_llvm_ptr(
+                cnt_base_i64 + fx.Int64(off_i64), address_space=3
+            )
             ptr = ptr._value if hasattr(ptr, "_value") else ptr
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -387,20 +375,15 @@ def build_moe_route_psum_fused_module():
                 syncscope="workgroup",
                 alignment=4,
             ).result
-            row = ArithValue(slot) + ArithValue(e) * ArithValue(max_m)
+            row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             buffer_ops.buffer_store(row, rows_rsrc, route_i32)
-            scf.YieldOp([])
         gpu.barrier()
 
         # Phase C: tile-aligned inclusive scan of per-expert counts.
-        _if_load = scf.IfOp(in_expert)
-        with ir.InsertionPoint(_if_load.then_block):
-            m = _lds_load(lds_cnt, tid)
-            q = arith.divui(_raw(m) + tile_minus_1, tile_v)
-            aligned = ArithValue(q) * tile_v
-            _lds_store(lds0, aligned, tid)
+        if in_expert:
+            m = fx.Uint32(_lds_load(lds_cnt, tid))
+            _lds_store(lds0, (m + tile_minus_1) // tile_v * tile_v, tid)
             buffer_ops.buffer_store(m, m_rsrc, tid)
-            scf.YieldOp([])
         gpu.barrier()
 
         src = lds0
@@ -408,52 +391,38 @@ def build_moe_route_psum_fused_module():
         for offset in range_constexpr(1, MAX_EXPERTS_PER_BLOCK):
             if const_expr((offset & (offset - 1)) != 0):
                 continue
-            _if_scan = scf.IfOp(in_expert)
-            with ir.InsertionPoint(_if_scan.then_block):
+            if in_expert:
                 val = _lds_load(src, tid)
-                has_prev = arith.cmpi(
-                    CmpIPredicate.uge, tid, arith.constant(offset, type=i32)
-                )
-                prev_if = scf.IfOp(has_prev, results_=[i32], has_else=True)
-                with ir.InsertionPoint(prev_if.then_block):
-                    prev = _lds_load(src, tid - arith.constant(offset, type=i32))
-                    scf.YieldOp([_raw(prev)])
-                with ir.InsertionPoint(prev_if.else_block):
-                    scf.YieldOp([arith.constant(0, type=i32)])
-                _lds_store(dst, val + fx.Int32(prev_if.results[0]), tid)
-                scf.YieldOp([])
+                has_prev = tid >= offset
+                prev = fx.Int32(0)
+                if has_prev:
+                    prev = _lds_load(src, tid - offset)
+                _lds_store(dst, val + prev, tid)
             gpu.barrier()
             src, dst = dst, src
 
-        _if_store = scf.IfOp(in_expert)
-        with ir.InsertionPoint(_if_store.then_block):
-            is_first = arith.cmpi(CmpIPredicate.eq, tid, arith.constant(0, type=i32))
-            start_if = scf.IfOp(is_first, results_=[i32], has_else=True)
-            with ir.InsertionPoint(start_if.then_block):
-                scf.YieldOp([arith.constant(0, type=i32)])
-            with ir.InsertionPoint(start_if.else_block):
-                prev = _lds_load(src, tid - arith.constant(1, type=i32))
-                scf.YieldOp([_raw(prev)])
-            start = fx.Int32(start_if.results[0])
+        if in_expert:
+            is_not_first = tid != 0
+            start = fx.Int32(0)
+            if is_not_first:
+                start = _lds_load(src, tid - 1)
             m_tid = _lds_load(lds_cnt, tid)
             buffer_ops.buffer_store(start, s_rsrc, tid)
             buffer_ops.buffer_store(start + m_tid, p_rsrc, tid)
-            scf.YieldOp([])
         gpu.barrier()
 
         # Phase D: in-place masked -> contiguous row remap.
-        remap_loop = scf.ForOp(tid_idx, numel_idx, stride_idx)
-        with ir.InsertionPoint(remap_loop.body):
-            route_i32 = arith.index_cast(i32, remap_loop.induction_variable)
-            row = ArithValue(
+        for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
+            row = fx.Uint32(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(max_m)
-            expert = ArithValue(arith.divui(row, m))
+            m = fx.Uint32(max_m)
+            expert = row // m
             slot = row - expert * m
-            start = buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            buffer_ops.buffer_store(ArithValue(start) + slot, rows_rsrc, route_i32)
-            scf.YieldOp([])
+            start = fx.Uint32(
+                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+            )
+            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
 
     @flyc.jit
     def launch_route_psum_fused(
@@ -466,7 +435,7 @@ def build_moe_route_psum_fused_module():
         experts: fx.Int32,
         max_m: fx.Int32,
         tile_m: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         route_psum_fused_kernel(
             topk_ids,
@@ -486,7 +455,7 @@ def build_moe_route_psum_fused_module():
 
     launch_route_psum_fused.compile_hints = {
         "llvm_options": {
-            "amdgpu-kernarg-preload": True,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
             "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }

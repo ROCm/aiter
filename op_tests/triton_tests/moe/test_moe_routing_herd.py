@@ -14,9 +14,9 @@ import triton
 
 import aiter.ops.triton.moe.moe_routing.routing as routing_mod
 from aiter.ops.triton.moe.moe_routing.routing import (
+    compute_expt_data_torch,
     routing,
     routing_torch,
-    compute_expt_data_torch,
 )
 from aiter.ops.triton.moe.moe_routing.topk import topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -318,7 +318,7 @@ def test_topk_pop_out(n_tokens, n_expts_tot, n_expts_act):
     kp1 = n_expts_act + 1
 
     pop = torch.zeros(n_expts_tot, dtype=torch.int32, device=logits.device)
-    expt_scal, expt_indx, _ = topk(
+    _expt_scal, expt_indx, _ = topk(
         logits, kp1, apply_softmax=False, HIST_BLOCK_M=32, pop_out=pop
     )
     assert expt_indx.shape == (n_tokens, kp1)
@@ -356,7 +356,7 @@ def _minunique_select_sqrtsoftplus_torch(
     biased = transformed + bias.float() if bias is not None else transformed
 
     _, cand_idx = torch.topk(biased, kp1, dim=1)
-    cand_idx, order = torch.sort(cand_idx, dim=1)
+    cand_idx, _order = torch.sort(cand_idx, dim=1)
 
     cand_val = torch.gather(transformed, 1, cand_idx)
 
@@ -530,7 +530,7 @@ def test_topk_pop_out_sqrtsoftplus(n_tokens, n_expts_tot, n_expts_act):
     kp1 = n_expts_act + 1
 
     pop = torch.zeros(n_expts_tot, dtype=torch.int32, device=logits.device)
-    expt_scal, expt_indx, _ = topk(
+    _expt_scal, expt_indx, _ = topk(
         logits,
         kp1,
         apply_softmax=False,
