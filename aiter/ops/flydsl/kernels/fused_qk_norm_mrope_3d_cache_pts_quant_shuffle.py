@@ -172,19 +172,18 @@ def _align_up(value: int, alignment: int) -> int:
 # ============================================================================
 def _build_q_kernel(
     *,
-    num_heads_q: int,
     head_size: int,
     mrope_section: list[int],
     eps: float,
     is_interleaved: bool,
     gemma_norm: bool,
 ):
-    H_Q, D = num_heads_q, head_size
+    D = head_size
     HALF = D // 2
     PROD_VEC_SIZE = D // RMS_GROUP
     VEC_PAIRS = max(1, HALF // WAVE)
 
-    kname = f"qk_norm_mrope_q_H{H_Q}_D{D}_flydsl"
+    kname = f"qk_norm_mrope_q_D{D}_flydsl"
 
     @flyc.kernel(name=kname)
     def kernel(
@@ -279,6 +278,7 @@ def _build_q_kernel(
         cos_sin: fx.Tensor,
         q_norm_w: fx.Tensor,
         q_out: fx.Tensor,
+        num_heads_q: fx.Int32,
         num_tokens: fx.Int32,
         token_offset: fx.Int32,
         positions_stride_0: fx.Int32,
@@ -303,7 +303,7 @@ def _build_q_kernel(
             token_offset,
         )
         k.launch(
-            grid=(H_Q, fx.Int64(num_tokens), 1),
+            grid=(fx.Int64(num_heads_q), fx.Int64(num_tokens), 1),
             block=(WAVE, 1, 1),
             stream=stream,
         )
@@ -732,7 +732,6 @@ def _build_kv_kernel(
 @lru_cache(maxsize=32)
 def _compile_q(
     *,
-    num_heads_q,
     head_size,
     mrope_section,
     eps,
@@ -740,7 +739,6 @@ def _compile_q(
     gemma_norm,
 ):
     return _build_q_kernel(
-        num_heads_q=num_heads_q,
         head_size=head_size,
         mrope_section=list(mrope_section),
         eps=eps,
@@ -1032,7 +1030,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         return
 
     q_launch = _compile_q(
-        num_heads_q=H_Q,
         head_size=D,
         mrope_section=tuple(mrope_section_),
         eps=eps,
@@ -1060,6 +1057,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             cos_sin,
             qw,
             q_out_view,
+            H_Q,
             chunk_tokens,
             token_offset,
             positions_stride_0,
