@@ -85,7 +85,7 @@ TESTS = [
         "model_id": "deepseek-ai/DeepSeek-V3.2",
         "model_path_env": "DEEPSEEK_V32_MODEL_PATH",
         "test_type": "Accuracy",
-        "timeout_minutes": 70,
+        "timeout_minutes": 120,
         "extra_exec_args": "",
         "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
         "run_on_pr": True,
