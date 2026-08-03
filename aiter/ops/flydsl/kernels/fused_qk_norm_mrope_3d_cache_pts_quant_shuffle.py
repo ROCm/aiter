@@ -121,6 +121,15 @@ def rms_reduce_add(x, lane):
     other_half = v.shuffle_xor(RMS_GROUP, WAVE)
     return (lane < RMS_GROUP).select(v, other_half)
 
+@lru_cache(maxsize=1)
+def _fp8_range():
+    from aiter.utility import dtypes as aiter_dtypes
+
+    fp8_dtype = aiter_dtypes.fp8
+    fp8_max = float(torch.finfo(fp8_dtype).max)
+    fp8_min = float(torch.finfo(fp8_dtype).min)
+    return fp8_min, fp8_max
+
 # ============================================================================
 # Q kernel builder
 # ============================================================================
@@ -385,6 +394,12 @@ def _build_kv_kernel(
         )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
 
+        def _fp8_clamp(value: fx.Float32):
+            fp8_min, fp8_max = _fp8_range()
+            vout = value if value > fp8_min else fp8_min
+            vout = vout if vout < fp8_max else fp8_max
+            return vout
+
         def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
             if const_expr(is_interleaved):
                 mid = col % fx.Int32(3)
@@ -409,8 +424,9 @@ def _build_kv_kernel(
             return cos_v, sin_v
 
         def quant_pair_fp8(v0, v1, scale):
-            s0 = v0 / scale
-            s1 = v1 / scale
+            s0 = _fp8_clamp(v0 / scale)
+            s1 = _fp8_clamp(v1 / scale)
+
             if const_expr(CACHE_IS_FNUZ):
                 # On gfx942, v_cvt_pk_fp8_f32 encodes values that round to
                 # negative zero as 0x80. In e4m3fnuz that byte is NaN, so
