@@ -502,6 +502,29 @@ _PREFILL_GROUPS = [
 
 PREFILL_PARAMS = expand_groups(_PREFILL_GROUPS)
 
+# Explicit empty-TAIL varlen case (cu_seqlens=[0, 6384, 16384, 16384]; last
+# segment length 0). The existing empty-segment group only covers an empty
+# FIRST segment (bos=0), which can only read token 0 and never reaches the
+# buffer tail; the original OOB was a tail prologue over-read that requires
+# bos==eos==T_total. ``context_lens`` is used verbatim (bypasses the
+# ``expand_groups`` tail>0 guard), and the 0-length tail also validates the
+# reference passes ``initial_state`` straight through to ``final_state``.
+PREFILL_PARAMS = list(PREFILL_PARAMS) + [
+    PrefillArgs(
+        K=128,
+        V=128,
+        Hk=16,
+        Hv=32,
+        tp=1,
+        full_prompt_len=16384,
+        model_name="flydsl-k5-empty-tail",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=16384,
+        context_lens=[6384, 10000, 0],
+    ),
+]
+
 
 PREFILL_TEST_IDS = [repr(p) for p in PREFILL_PARAMS]
 
@@ -898,12 +921,10 @@ def _assert_mean_abs_within(out, ref, *, mean_atol, label):
     """Guard the *mean* absolute error, not just the per-element worst case.
 
     ``torch.testing.assert_close``'s ``atol`` only bounds the single worst
-    element, which for bf16 K5 over a long chunked recurrence sits close to
-    the 5e-2 element tolerance (a few outlier tokens at the tail of the
-    33-segment chain). The mean abs error, by contrast, is ~2-3e-3 in
-    practice and is what actually moves when an implementation regresses the
-    *whole* distribution (e.g. a gating / accumulation bug) without yet
-    tripping any single element past 5e-2. Bound it here.
+    element. The mean abs error is what actually moves when an implementation
+    regresses the *whole* distribution (e.g. a gating / accumulation bug)
+    without yet tripping any single element past the elementwise tolerance.
+    Bound it independently here.
     """
     mean_abs = (out.float() - ref.float()).abs().mean().item()
     assert mean_abs <= mean_atol, (
@@ -968,8 +989,8 @@ def _assert_k5_outputs_match_ref(
     *,
     output_final_state,
     label,
-    atol=5e-2,
-    rtol=5e-2,
+    atol=2e-2,
+    rtol=2e-2,
     mean_atol=5e-3,
 ):
     """Compare a K5 backend's outputs against the PyTorch FP32 reference.
@@ -985,11 +1006,15 @@ def _assert_k5_outputs_match_ref(
     margins.
 
     Two complementary bounds are enforced per output:
-      * ``atol`` / ``rtol`` (5e-2): the per-element worst case.
+      * ``atol`` / ``rtol`` (2e-2): the per-element worst case.
       * ``mean_atol`` (5e-3): the mean abs error, which catches a regression
         that shifts the whole distribution before any single element trips
-        the looser element tolerance. Measured mean abs is ~2-3e-3 on the
-        varlen-32k-aws shape, so 5e-3 leaves ~2x headroom over bf16 noise.
+        the element tolerance. After natural-log gate alignment, the full
+        54-shape gfx942 sweep (17B+ compared elements) has zero failures at
+        2e-2/2e-2. Ten seeds of the worst no-g shape peak at mean abs 3.47e-3;
+        5e-3 retains headroom for random input and cross-architecture variance.
+        The next tighter elementwise candidate (1.5e-2/1.5e-2) already fails
+        one final-state element in that multi-seed sweep.
     """
     h_out_f = h_out.float()
     vn_out_f = _normalize_opt_v_new(vn_out).float()
@@ -1031,6 +1056,16 @@ def _assert_k5_outputs_match_ref(
 class TestCorrectness:
     """Correctness against PyTorch FP32 reference for all three K5 backends."""
 
+    @staticmethod
+    def _minimal_inputs():
+        """Smallest validated mfma16_hip input set for contract tests."""
+        device = "cuda"
+        B, T, Hg, H, K, V = 1, 64, 2, 4, 128, 128
+        k = torch.zeros(B, T, Hg, K, dtype=torch.bfloat16, device=device)
+        w = torch.zeros(B, H, T, K, dtype=torch.bfloat16, device=device)
+        u = torch.zeros(B, H, T, V, dtype=torch.bfloat16, device=device)
+        return k, w, u
+
     @pytest.mark.parametrize("args", PREFILL_PARAMS, ids=PREFILL_TEST_IDS)
     def test_correctness_flydsl_mfma16_hip(self, args: PrefillArgs):
         """mfma16 / HIP-aligned FlyDSL K5 impl (formerly the "vk" fork): 16x16x16
@@ -1050,6 +1085,13 @@ class TestCorrectness:
             output_final_state=args.output_final_state,
             cu_seqlens=cu,
             g_head_major=args.g_head_major,
+            # ``g`` is generated in natural-log space (see ``_make_inputs``) and
+            # the reference decays with ``exp``. Pass ``use_exp2=False`` so the
+            # kernel's ``_fast_exp`` applies the LOG2E scale (exp2(x*LOG2E)==exp(x))
+            # and both sides compare the SAME formula. With the default
+            # ``use_exp2=True`` the kernel would treat ``g`` as log2-space and
+            # compute ``exp2(x)``, a mismatch masked only by gates decaying to 0.
+            use_exp2=False,
         )
         h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
             k,
@@ -1072,6 +1114,261 @@ class TestCorrectness:
             output_final_state=args.output_final_state,
             label="flydsl_mfma16_hip",
         )
+
+    def test_natural_log_gate_formula(self):
+        """Natural-log gates must use exp(x), not exp2(x).
+
+        Only token 0 contributes to the state, and its gate is fixed at
+        exp(g_last-g_0)=exp(-1). Using the wrong ``use_exp2=True`` contract with
+        this unscaled natural-log gate produces exp2(-1)=0.5 instead, an explicit
+        ~0.132 error that cannot be hidden by random decay or mean-error dilution.
+        """
+        device = "cuda"
+        B, T, Hg, H, K, V = 1, 64, 2, 4, 128, 128
+
+        k = torch.zeros(B, T, Hg, K, dtype=torch.bfloat16, device=device)
+        w = torch.zeros(B, T, H, K, dtype=torch.bfloat16, device=device)
+        u = torch.zeros(B, T, H, V, dtype=torch.bfloat16, device=device)
+        k[:, 0, :, 0] = 1
+        u[:, 0, :, 0] = 1
+
+        # Token-major natural-log cumulative gate [B,T,H]: g_0=0 and
+        # g_last=-1, so the only nonzero outer-product contribution is exp(-1).
+        g = torch.full((B, T, H), -1.0, dtype=torch.float32, device=device)
+        g[:, 0, :] = 0
+        h0 = torch.zeros(B, H, V, K, dtype=torch.float32, device=device)
+        w_c = w.permute(0, 2, 1, 3).contiguous()
+        u_c = u.permute(0, 2, 1, 3).contiguous()
+
+        _, _, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            use_exp2=False,
+        )
+        _, _, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w,
+            u,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+        )
+
+        expected = torch.tensor(
+            math.exp(-1), dtype=torch.bfloat16, device=device
+        ).float()
+        torch.testing.assert_close(
+            fs_ref[0, :, 0, 0],
+            expected.expand(H),
+            atol=0,
+            rtol=0,
+            msg="targeted gate setup no longer isolates bf16(exp(-1))",
+        )
+        torch.testing.assert_close(
+            fs_fly.float(),
+            fs_ref.float(),
+            atol=2e-3,
+            rtol=0,
+            msg="natural-log gate path must compute exp(x), not exp2(x)",
+        )
+
+    def test_portable_rne_preserves_nan_and_inf(self):
+        """RNE conversion must not turn low-payload f32 NaNs into bf16 Inf."""
+        k, w, u = self._minimal_inputs()
+        H, K, V = 4, 128, 128
+
+        # Inject exact f32 bit patterns into h0. The first chunk snapshot converts
+        # these f32 values to bf16 through the selected RNE converter before any
+        # recurrence update can alter them.
+        h0_bits = torch.zeros(1, H, V, K, dtype=torch.int32, device="cuda")
+        h0_bits[0, 0, 0, 0] = 0x7F800001  # +NaN, mantissa only below bit 16
+        h0_bits[0, 0, 0, 1] = -8388607  # 0xFF800001: -NaN, same low payload
+        h0_bits[0, 0, 0, 2] = 0x7F800000  # +Inf
+        h0_bits[0, 0, 0, 3] = -8388608  # 0xFF800000: -Inf
+        h0 = h0_bits.view(torch.float32)
+
+        h, _, _ = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w,
+            u,
+            initial_state=h0,
+            output_final_state=False,
+            save_new_value=False,
+            bf16_convert_trunc=False,
+        )
+        converted = h[0, 0, 0, 0, :4].float()
+        assert torch.isnan(
+            converted[:2]
+        ).all(), "portable RNE converted a low-payload NaN to a non-NaN value"
+        assert torch.isposinf(converted[2]), "portable RNE did not preserve +Inf"
+        assert torch.isneginf(converted[3]), "portable RNE did not preserve -Inf"
+
+    @pytest.mark.parametrize(
+        "indices,index_dtype,match",
+        [
+            ([-1, 0], torch.int32, "out of range"),
+            ([0, 3], torch.int64, "out of range"),
+            ([1, 1], torch.int64, "duplicate initial_state_indices"),
+            ([2**32, 1], torch.int64, "out of range"),
+            ([0.0, 1.0], torch.float32, "must be int32 or int64"),
+        ],
+    )
+    def test_initial_state_indices_validation(self, indices, index_dtype, match):
+        """Indexed state-pool access validates before narrowing to int32."""
+        k, w, u = self._minimal_inputs()
+        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        state_indices = torch.tensor(indices, dtype=index_dtype, device="cuda")
+
+        with pytest.raises(ValueError, match=match):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=h0_pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                initial_state_indices=state_indices,
+            )
+
+    def test_initial_state_indices_rank_and_device_validation(self):
+        """Indexed state-pool indices must be 1-D and colocated with the pool."""
+        k, w, u = self._minimal_inputs()
+        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+
+        with pytest.raises(ValueError, match="must be 1-D"):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=h0_pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                initial_state_indices=torch.tensor(
+                    [[0, 1]], dtype=torch.int64, device="cuda"
+                ),
+            )
+
+        with pytest.raises(ValueError, match="must be on the same device"):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+                k,
+                w,
+                u,
+                initial_state=h0_pool,
+                output_final_state=True,
+                cu_seqlens=cu,
+                initial_state_indices=torch.tensor(
+                    [0, 1], dtype=torch.int64, device="cpu"
+                ),
+            )
+
+    def test_valid_int64_initial_state_indices(self):
+        """Validated int64 indices narrow safely and execute the int32 kernel ABI."""
+        k, w, u = self._minimal_inputs()
+        H, V, K = w.shape[1], u.shape[-1], k.shape[-1]
+        h0_pool = torch.zeros(3, H, V, K, dtype=torch.float32, device="cuda")
+        cu = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+        indices = torch.tensor([2, 0], dtype=torch.int64, device="cuda")
+
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w,
+            u,
+            initial_state=h0_pool,
+            output_final_state=True,
+            cu_seqlens=cu,
+            initial_state_indices=indices,
+        )
+        assert final_state.data_ptr() == h0_pool.data_ptr()
+        assert torch.count_nonzero(h) == 0
+        assert torch.count_nonzero(v_new) == 0
+        assert torch.count_nonzero(final_state) == 0
+
+    @pytest.mark.parametrize(
+        "case,match",
+        [
+            ("rank", "must be 4-D"),
+            ("dtype", "dtype must match"),
+            ("contiguous", "must be contiguous"),
+            ("time_shape", "k T dim"),
+            ("gk_dtype", "gk must be float32"),
+            ("gk_shape", "gk must use token-major"),
+        ],
+    )
+    def test_mfma16_input_validation(self, case, match):
+        """Raw-buffer kernel inputs fail early on invalid dtype/layout/shape."""
+        k, w, u = self._minimal_inputs()
+        kwargs = {}
+        if case == "rank":
+            k = k.squeeze(0)
+        elif case == "dtype":
+            w = w.float()
+        elif case == "contiguous":
+            k = k.transpose(1, 2)
+        elif case == "time_shape":
+            w = w[:, :, :-1].contiguous()
+            u = u[:, :, :-1].contiguous()
+        elif case == "gk_dtype":
+            kwargs["gk"] = torch.zeros(
+                1, 64, 4, 128, dtype=torch.bfloat16, device="cuda"
+            )
+        elif case == "gk_shape":
+            kwargs["gk"] = torch.zeros(1, 64, 4, 64, dtype=torch.float32, device="cuda")
+
+        with pytest.raises(ValueError, match=match):
+            chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(k, w, u, **kwargs)
+
+    def test_gk_token_major_contract(self):
+        """A valid contiguous float32 gk uses [B,T,H,K] and runs successfully."""
+        k, w, u = self._minimal_inputs()
+        gk = torch.zeros(1, 64, 4, 128, dtype=torch.float32, device="cuda")
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w,
+            u,
+            gk=gk,
+            output_final_state=True,
+        )
+        assert torch.count_nonzero(h) == 0
+        assert torch.count_nonzero(v_new) == 0
+        assert torch.count_nonzero(final_state) == 0
+
+    def test_reference_empty_tail_passthrough(self):
+        """The FP32 reference must pass ``initial_state`` straight through to
+        ``final_state`` for an empty (zero-length) trailing segment, not leave
+        it at the zero-initialised buffer value. Guards the reference itself
+        (independent of the kernel) so the empty-tail correctness check above
+        cannot be silently satisfied by a wrong reference."""
+        device = "cuda"
+        BT = 64
+        H, V, K, Hg = 4, 128, 128, 2
+        # cu_seqlens=[0, BT, BT]: segment 0 has BT tokens, segment 1 is empty.
+        _, cu = _build_cu_seqlens([BT, 0], device=device)
+        T_total = int(cu[-1].item())
+        k = torch.randn(1, T_total, Hg, K, dtype=torch.bfloat16, device=device) * 0.1
+        w = torch.randn(1, T_total, H, K, dtype=torch.bfloat16, device=device) * 0.1
+        u = torch.randn(1, T_total, H, V, dtype=torch.bfloat16, device=device) * 0.1
+        h0 = torch.randn(2, H, V, K, dtype=torch.float32, device=device) * 0.01
+        _, _, fs = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w,
+            u,
+            g=None,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+        )
+        # Empty trailing segment: final_state must equal the passed-in h0.
+        assert torch.equal(fs[1], h0[1]), "empty tail segment did not pass h0 through"
+        # Non-empty segment must have been updated (differs from h0).
+        assert not torch.equal(fs[0], h0[0]), "non-empty segment was not updated"
 
 
 # -- Performance benchmark (flydsl-hip vs hip vs triton) -----------------

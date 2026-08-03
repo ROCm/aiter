@@ -123,21 +123,43 @@ def _f32x4_to_bf16x4_rne_portable(vec_f32x4):
         rounding_bias = 0x7FFF + ((x >> 16) & 1)   # even-tie -> +0x7FFF, odd -> +0x8000
         bf16_bits    = (x + rounding_bias) >> 16
 
-    This matches torch/HIP RNE (not FlyDSL's default ``truncf`` truncation).
-    Inf/NaN survive: the bias never carries a finite value up to Inf, and a
-    NaN keeps a non-zero mantissa. Returns a vector<4xbf16> ir.Value, a
-    drop-in replacement for the gfx950 path.
+    NaN fix-up: the plain bias sequence turns some NaNs (e.g. 0x7F800001)
+    into +Inf (0x7F80), because the only set mantissa bits live below bit 16
+    and are dropped by the shift. To match torch/HIP ``__float2bfloat16_rn``
+    we detect NaN (``|x| > 0x7F800000``) and force the canonical quiet-NaN
+    pattern 0x7FC0. The detection is branch-free: for finite/Inf/NaN inputs
+    ``|x|`` is always < 2^31, so ``0x7F800000 - |x|`` is negative exactly when
+    ``|x| > 0x7F800000`` (i.e. NaN); its sign bit is broadcast to a full mask.
+    +/-Inf (``|x| == 0x7F800000``) already round-trips correctly through the
+    bias path and is intentionally left untouched. Returns a vector<4xbf16>
+    ir.Value, a drop-in replacement for the gfx950 path.
     """
     i32x4 = T.vec(4, T.i32)
     x = vector.bitcast(i32x4, vec_f32x4)
     c16 = arith.constant_vector(16, i32x4)
     c1 = arith.constant_vector(1, i32x4)
+    c31 = arith.constant_vector(31, i32x4)
     c7fff = arith.constant_vector(0x7FFF, i32x4)
+    c0 = arith.constant_vector(0, i32x4)
+    c_ones = arith.constant_vector(0xFFFFFFFF, i32x4)
+    c_absmask = arith.constant_vector(0x7FFFFFFF, i32x4)
+    c_inf = arith.constant_vector(0x7F800000, i32x4)
+    c_qnan = arith.constant_vector(0x7FC0, i32x4)
+
     lsb = arith.andi(arith.shrui(x, c16), c1)
     rounding_bias = arith.addi(lsb, c7fff)
     rounded = arith.addi(x, rounding_bias)
-    hi = arith.shrui(rounded, c16)
-    hi16 = arith.trunci(T.vec(4, T.i16), hi)
+    rne = arith.shrui(rounded, c16)
+
+    # Branch-free NaN mask: sign bit of (0x7F800000 - |x|) is 1 iff NaN.
+    absx = arith.andi(x, c_absmask)
+    diff = arith.subi(c_inf, absx)
+    nan_bit = arith.andi(arith.shrui(diff, c31), c1)  # 1 for NaN, else 0
+    nan_mask = arith.subi(c0, nan_bit)  # 0xFFFFFFFF for NaN, else 0
+    keep_mask = arith.xori(nan_mask, c_ones)  # ~nan_mask
+    fixed = arith.ori(arith.andi(rne, keep_mask), arith.andi(c_qnan, nan_mask))
+
+    hi16 = arith.trunci(T.vec(4, T.i16), fixed)
     return vector.bitcast(T.vec(4, T.bf16), hi16)
 
 

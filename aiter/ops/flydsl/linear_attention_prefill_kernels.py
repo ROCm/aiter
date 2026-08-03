@@ -811,11 +811,76 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
 
     # mfma16_hip keeps the token-major [B, T_flat, Hg, K] k layout (no
     # host-side pre-transpose), matching the Triton VK convention.
+    if k.dim() != 4 or w.dim() != 4 or u.dim() != 4:
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be 4-D (k=[B,T,Hg,K], "
+            f"w=[B,H,T,K], u=[B,H,T,V]); got k={tuple(k.shape)}, "
+            f"w={tuple(w.shape)}, u={tuple(u.shape)}."
+        )
     B, T, Hg, K = k.shape
     H = w.shape[1]
     V = u.shape[-1]
     T_flat = w.shape[2]
     BT = chunk_size
+
+    # -- Input validation (k/w/u/gk). These feed the kernel's raw buffer loads
+    # with no further checks, so a dtype / layout / shape mismatch would
+    # silently read OOB or return wrong results. Fail early with a clear error.
+    if not (k.dtype == w.dtype == u.dtype):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: k/w/u dtype must match; got k={k.dtype}, "
+            f"w={w.dtype}, u={u.dtype}."
+        )
+    if k.dtype != torch.bfloat16:
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be bfloat16 (the 16x16x16 bf16 "
+            f"MFMA path), got {k.dtype}."
+        )
+    if not (w.device == k.device and u.device == k.device):
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be on the same device; got "
+            f"k={k.device}, w={w.device}, u={u.device}."
+        )
+    if not (k.is_contiguous() and w.is_contiguous() and u.is_contiguous()):
+        raise ValueError(
+            "FlyDSL K5 mfma16_hip: k/w/u must be contiguous; got strides "
+            f"k={k.stride()}, w={w.stride()}, u={u.stride()}."
+        )
+    if k.shape[1] != T_flat:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: k T dim ({k.shape[1]}) must equal w/u T "
+            f"({T_flat})."
+        )
+    if w.shape != (B, H, T_flat, K):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: expected w=[B,H,T,K]=({B},{H},{T_flat},{K}), "
+            f"got {tuple(w.shape)}."
+        )
+    if u.shape != (B, H, T_flat, V):
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: expected u=[B,H,T,V]=({B},{H},{T_flat},{V}), "
+            f"got {tuple(u.shape)}."
+        )
+    if H % Hg != 0:
+        raise ValueError(
+            f"FlyDSL K5 mfma16_hip: H ({H}) must be a multiple of Hg ({Hg})."
+        )
+    if gk is not None:
+        if gk.device != k.device:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: gk must be on k's device ({k.device}); "
+                f"got {gk.device}."
+            )
+        if gk.dtype != torch.float32:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: gk must be float32, got " f"{gk.dtype}."
+            )
+        expected_gk_shape = (B, T_flat, H, K)
+        if tuple(gk.shape) != expected_gk_shape:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: gk must use token-major [B,T,H,K] "
+                f"layout with shape {expected_gk_shape}, got {tuple(gk.shape)}."
+            )
 
     # Explicitly reject unvalidated configs: this kernel's wave mapping
     # (wid*16, 4 waves cover 64 rows), the gated_v alias-reuse of h_state
@@ -844,6 +909,64 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             cu_seqlens, BT, num_decodes, num_decode_tokens
         )
         is_varlen = True
+
+    # Validate indexed pool access before selecting/compiling a kernel. Indices
+    # gather from and scatter into ``initial_state[pool_size, H, V, K]``:
+    # out-of-range values access OOB, while duplicates race on in-place write-back.
+    if use_state_indices:
+        indices = initial_state_indices
+        if indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be int32 or int64, "
+                f"got {indices.dtype}."
+            )
+        if indices.dim() != 1:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be 1-D, "
+                f"got shape {tuple(indices.shape)}."
+            )
+        if initial_state.device != k.device:
+            raise ValueError(
+                "FlyDSL K5: initial_state must be on the same device as k; "
+                f"got initial_state={initial_state.device}, k={k.device}."
+            )
+        if indices.device != k.device:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices must be on the same device as "
+                f"k and initial_state; got indices={indices.device}, k={k.device}."
+            )
+        if indices.numel() != N:
+            raise ValueError(
+                "FlyDSL K5: initial_state_indices length "
+                f"({indices.numel()}) must equal the number of sequences N={N}."
+            )
+        pool_size = initial_state.shape[0]
+        if indices.numel():
+            # Validate in the ORIGINAL integer dtype. Narrowing first would let
+            # int64 values such as 2**32 wrap to a valid-looking int32 zero.
+            idx_min = int(indices.min())
+            idx_max = int(indices.max())
+            if idx_min < 0 or idx_max >= pool_size:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices out of range for a state pool "
+                    f"of size {pool_size}; got [{idx_min}, {idx_max}], expected "
+                    f"values in [0, {pool_size})."
+                )
+            if idx_max > torch.iinfo(torch.int32).max:
+                raise ValueError(
+                    "FlyDSL K5: initial_state_indices values must fit in int32; "
+                    f"got maximum {idx_max}."
+                )
+            if inplace and torch.unique(indices).numel() != indices.numel():
+                raise ValueError(
+                    "FlyDSL K5: duplicate initial_state_indices with in-place "
+                    "final-state write-back race on the shared pool slot; indices "
+                    "must be unique."
+                )
+        # The kernel ABI is int32; narrow only after all checks pass.
+        si_i32 = indices.to(torch.int32).contiguous()
+    else:
+        si_i32 = None
 
     # BV selection: reuse the hip K5 analytic selector so the fork picks the
     # same BV as ``chunk_gated_delta_rule_fwd_h_hip_fn`` (lazy import avoids a
@@ -981,14 +1104,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
 
     # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
     # arg): a real int32 [N] index array when indexed, else a 1-elem int32 dummy.
-    if use_state_indices:
-        si_i32 = initial_state_indices.to(torch.int32).contiguous()
-        if si_i32.numel() != N:
-            raise ValueError(
-                "FlyDSL K5: initial_state_indices length "
-                f"({si_i32.numel()}) must equal the number of sequences N={N}."
-            )
-    else:
+    if not use_state_indices:
         si_i32 = dummy.to(torch.int32)
     tensor_args = tensor_args + (_as_ptr(si_i32),)
 

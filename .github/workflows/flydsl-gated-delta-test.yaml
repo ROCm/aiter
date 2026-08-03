@@ -49,7 +49,14 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
 
   flydsl_gated_delta:
-    if: ${{ !github.event.pull_request || github.event.pull_request.draft == false }}
+    # Runs PR-head code on a TRUSTED self-hosted GPU runner (GPU + host access),
+    # so never auto-run it for fork PRs: a fork could push arbitrary test code
+    # onto our hardware. Fork PRs are skipped here; a maintainer can run them via
+    # workflow_dispatch or by pushing the branch inside this repo after review.
+    if: >-
+      ${{ (!github.event.pull_request || github.event.pull_request.draft == false)
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository) }}
     name: FlyDSL Gated Delta - Correctness / ${{ matrix.label }} (1 GPU)
     needs: [check-signal]
     runs-on: ${{ matrix.runner }}
@@ -103,7 +110,6 @@ jobs:
           docker run -dt \
           --device=/dev/kfd $DEVICE_FLAG \
           --shm-size=16G \
-          --network=host \
           --group-add $(getent group render | cut -d: -f3) \
           --group-add $(getent group video | cut -d: -f3) \
           -v "${{ github.workspace }}:/workspace" \
