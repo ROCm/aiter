@@ -8136,6 +8136,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t block_size       = 0,
                             int64_t x                = 0,
                             int64_t rotary_dim       = 0,
+                            int64_t k_block_stride   = 0,
+                            int64_t v_block_stride   = 0,
                             bool gemma_norm          = false)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
@@ -8183,8 +8185,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         block_size,                  \
                                                         x,                           \
                                                         (int)rotary_dim,             \
-                                                        (int64_t)0,                  \
-                                                        (int64_t)0,                  \
+                                                        k_block_stride,              \
+                                                        v_block_stride,              \
                                                         gemma_norm);                 \
     }                                                                                \
     else                                                                             \
@@ -8216,8 +8218,8 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         block_size,                  \
                                                         x,                           \
                                                         (int)rotary_dim,             \
-                                                        (int64_t)0,                  \
-                                                        (int64_t)0,                  \
+                                                        k_block_stride,              \
+                                                        v_block_stride,              \
                                                         gemma_norm);                 \
     }
 
