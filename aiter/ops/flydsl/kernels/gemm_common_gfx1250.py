@@ -122,21 +122,25 @@ def _tanh_f32(x, tanh_mul):
 SituV2Consts = namedtuple("SituV2Consts", "beta gate_tanh_mul linear_beta up_tanh_mul")
 
 
-def situv2_consts(beta, inv_beta, linear_beta, inv_linear_beta):
+def situv2_consts(beta, linear_beta):
     """Fold the SiTUv2 betas into the per-element multipliers, once per kernel.
 
-    ``inv_beta`` / ``inv_linear_beta`` are the host-computed reciprocals (exact,
-    unlike an in-kernel v_rcp_f32). Everything here is uniform across the tile,
-    so hoisting it keeps the inner loop at 3 exp2 + 3 rcp per element.
+    The two reciprocals are taken here with v_rcp_f32 rather than passed in from
+    the host: both are uniform across the tile, so this is two extra VALU ops per
+    kernel, hoisted out of the inner loop, in exchange for two fewer kernel args
+    and no way for a caller to hand in a beta and a reciprocal that disagree.
+    v_rcp_f32's ~1 ulp sits far below the MXFP4 quantisation this feeds.
+
+    Hoisting keeps the inner loop at 3 exp2 + 3 rcp per element.
     """
     import flydsl.expr as _fx
 
     neg_two_log2e = _fx.Float32(-2.0 * LOG2E)
     return SituV2Consts(
         beta=beta,
-        gate_tanh_mul=neg_two_log2e * inv_beta,
+        gate_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(beta))),
         linear_beta=linear_beta,
-        up_tanh_mul=neg_two_log2e * inv_linear_beta,
+        up_tanh_mul=neg_two_log2e * _fx.Float32(rocdl.rcp(T.f32, _raw(linear_beta))),
     )
 
 

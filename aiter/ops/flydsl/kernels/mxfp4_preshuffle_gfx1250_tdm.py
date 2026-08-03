@@ -62,9 +62,7 @@ def launch_gemm_a8w4_tdm(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
-    f32_situ_inv_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
-    f32_situ_inv_linear_beta: fx.Float32 = 1.0,
 ):
     cache_tag = (
         K,
@@ -157,9 +155,7 @@ def launch_gemm_a8w4_tdm(
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
-        f32_situ_inv_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
-        f32_situ_inv_linear_beta: fx.Float32,
     ):
         # rocdl.disable_xdl_arb_stall()
 
@@ -562,12 +558,7 @@ def launch_gemm_a8w4_tdm(
             # Uniform across the tile, so fold the betas once here rather than
             # per element. Only materialised on the SiTUv2 path.
             situ_c = (
-                situv2_consts(
-                    f32_situ_beta,
-                    f32_situ_inv_beta,
-                    f32_situ_linear_beta,
-                    f32_situ_inv_linear_beta,
-                )
+                situv2_consts(f32_situ_beta, f32_situ_linear_beta)
                 if const_expr(is_situv2)
                 else None
             )
@@ -765,9 +756,7 @@ def launch_gemm_a8w4_tdm(
         N,
         f32_swiglu_limit,
         f32_situ_beta,
-        f32_situ_inv_beta,
         f32_situ_linear_beta,
-        f32_situ_inv_linear_beta,
     ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
 

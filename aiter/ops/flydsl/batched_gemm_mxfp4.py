@@ -70,8 +70,7 @@ def flydsl_grouped_gemm_a8w4_masked(
     ``stage1_act`` selects the stage1 epilogue: 0 none, 1 silu, 2 swiglu,
     3 SiTUv2 (``situ_beta`` / ``situ_linear_beta``, the Kimi-K3 activation).
     The betas are runtime kernel arguments, so all SiTUv2 shapes share one
-    compiled kernel; their reciprocals are taken here rather than by an
-    in-kernel v_rcp_f32 so the fold stays exact.
+    compiled kernel.
 
     When ``stage1_quant_out=1`` (fp8), the epilogue fuses the activation + MX
     fp8 quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives
@@ -126,9 +125,7 @@ def flydsl_grouped_gemm_a8w4_masked(
         quant_wmma_rep,
         quant_scale_tensor,
         float(situ_beta),
-        1.0 / float(situ_beta),
         float(situ_linear_beta),
-        1.0 / float(situ_linear_beta),
     )
     return out
 

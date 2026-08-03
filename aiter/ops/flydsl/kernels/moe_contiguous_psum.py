@@ -109,11 +109,20 @@ def build_moe_contiguous_psum_module():
             _lds_store(carry, fx.Int32(0), 0)
         gpu.barrier()
 
-        # E is not bounded by the block width: sweep the experts in block-sized
-        # chunks, offsetting each chunk by the running total of the ones before
-        # it. That total lives in LDS (``carry``) because a register would not
-        # survive the runtime chunk loop. Lanes past ``experts`` feed 0 into the
-        # scan so the last lane still holds the chunk total, and write nothing.
+        # One Hillis-Steele scan spans exactly one thread per lane, so a single
+        # pass covers at most MAX_EXPERTS_PER_BLOCK experts -- it used to be the
+        # whole kernel, which silently left starts/psum unwritten for every
+        # expert past 512 (Kimi-K3 has 896: garbage offsets, then a memory fault
+        # in the GEMM that indexes with them).
+        #
+        # So sweep E in block-sized chunks instead. Each chunk scans as before
+        # and then adds ``carry``, the tile-aligned total of all chunks already
+        # scanned, which is what makes the per-chunk scans one continuous prefix
+        # sum. ``carry`` has to be LDS, not a register: it is produced by lane 0
+        # and consumed by all of them on the next iteration.
+        #
+        # Lanes past ``experts`` feed 0 into the scan -- they keep the last lane
+        # holding the true chunk total, and write no output.
         for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
             e = fx.Uint32(base) + tid
             in_expert = e < fx.Uint32(experts)
@@ -230,11 +239,20 @@ def build_moe_contiguous_psum_remap_module():
             _lds_store(carry, fx.Int32(0), 0)
         gpu.barrier()
 
-        # E is not bounded by the block width: sweep the experts in block-sized
-        # chunks, offsetting each chunk by the running total of the ones before
-        # it. That total lives in LDS (``carry``) because a register would not
-        # survive the runtime chunk loop. Lanes past ``experts`` feed 0 into the
-        # scan so the last lane still holds the chunk total, and write nothing.
+        # One Hillis-Steele scan spans exactly one thread per lane, so a single
+        # pass covers at most MAX_EXPERTS_PER_BLOCK experts -- it used to be the
+        # whole kernel, which silently left starts/psum unwritten for every
+        # expert past 512 (Kimi-K3 has 896: garbage offsets, then a memory fault
+        # in the GEMM that indexes with them).
+        #
+        # So sweep E in block-sized chunks instead. Each chunk scans as before
+        # and then adds ``carry``, the tile-aligned total of all chunks already
+        # scanned, which is what makes the per-chunk scans one continuous prefix
+        # sum. ``carry`` has to be LDS, not a register: it is produced by lane 0
+        # and consumed by all of them on the next iteration.
+        #
+        # Lanes past ``experts`` feed 0 into the scan -- they keep the last lane
+        # holding the true chunk total, and write no output.
         for base in range(0, experts, MAX_EXPERTS_PER_BLOCK):
             e = fx.Uint32(base) + tid
             in_expert = e < fx.Uint32(experts)

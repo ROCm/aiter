@@ -1094,8 +1094,10 @@ def _get_compiled_route_psum_fused():
     return build_moe_route_psum_fused_module()
 
 
-# One workgroup handles every route, so the fused kernel only applies while the
-# route count fits a single block's grid-stride sweep and E fits the scan.
+# One workgroup handles every route. NUMEL is advisory -- the route sweep is
+# grid-stride, so a larger count is correct but stops being worth fusing.
+# EXPERTS is a hard limit, enforced below: the scan and the LDS route counter
+# are both one slot per lane.
 _FUSED_ROUTE_PSUM_MAX_NUMEL = 4096
 _FUSED_ROUTE_PSUM_MAX_EXPERTS = 512
 
@@ -1116,6 +1118,16 @@ def fused_route_psum_remap(
     token_num, topk = topk_ids.shape
     numel = token_num * topk
     experts = int(experts)
+    # Unlike contiguous_psum/_remap, this kernel's scan is still single-pass:
+    # its LDS route counter is one slot per expert, so widening E needs a bigger
+    # allocation, not just a carry. Fail loudly rather than silently drop the
+    # experts past the block, which is the bug the chunked scan fixed there.
+    if experts > _FUSED_ROUTE_PSUM_MAX_EXPERTS:
+        raise ValueError(
+            f"fused_route_psum_remap supports at most "
+            f"{_FUSED_ROUTE_PSUM_MAX_EXPERTS} experts, got {experts}; "
+            f"use flydsl_moe_topids_to_rows + contiguous_psum_remap instead"
+        )
     topids_to_rows = torch.empty(numel, dtype=torch.int32, device=device)
     masked_m = torch.empty(experts, dtype=torch.int32, device=device)
     starts = torch.empty(experts, dtype=torch.int32, device=device)
