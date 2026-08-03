@@ -1,34 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 #
-# ===========================================================================
-#
-# WHAT THIS VERSION IS:
-#   BF16 warp-per-scalar GEMM with all non-pipeline optimizations applied.
-#   This is the current best working version before software pipelining.
-#
-# OPTIMIZATIONS APPLIED (vs Phase 1 baseline KVEC=8, NP=1):
-#   KVEC=8        : 64-bit loads per lane per K-iter
-#   NP=2          : A-reuse — one wavefront computes 2 adjacent output columns
-#                   A[m,:] loaded once, reused for B[n,:] AND B[n+1,:]
-#                   -> grid shrinks by 2x in N direction
-#   Constexpr M   : separate kernel per M=1,2,3,4 — no runtime clamping/branches
-#   B bypass L2   : 0x2000 cache modifier — B (234MB) too large for L2
-#                   A (<=57KB) goes through L2 and benefits from caching
-# ===========================================================================
-#
-# gemm_decode: warp-per-scalar small-M GEMM for LLM autoregressive decode.
+# gfx950-only BF16 warp-per-scalar GEMM for autoregressive decode.
 #
 # C[M, N] = A[M, K] @ B[N, K]^T   (B row-major weight matrix)
 #
-# One wavefront (64 threads) computes MPxNP output scalars C[m..m+MP-1, n..n+NP-1]:
-#   - 64 lanes split K, each owns KVEC=8 BF16 elements per K-iteration
+# One wavefront computes a compile-time MxN register tile:
+#   - 64 lanes split K, each owns KVEC adjacent BF16 elements per full iteration
 #   - Accumulate via v_dot2_f32_bf16 (2 BF16 MACs -> FP32)
-#   - A rows loaded once, reused across NP=2 B columns (A-reuse)
-#   - B loaded with L2 bypass (0x2000) — 234MB too large for L2
+#   - A and B vectors are reused across the register tile
+#   - A separate predicated scalar tail handles K outside the vectorized loop
+#   - Partial output-column tiles use safe B loads and conditional stores
 #   - 6-stage butterfly XOR reduce per accumulator (no LDS)
-#   - Lane 0 stores MPxNP FP32->BF16 results to C
-#   - Separate kernel per M=1,2,3,4 (Constexpr M — no clamping)
+#   - Lane 0 converts FP32 to BF16 with configurable compile-time rounding
+
+from dataclasses import dataclass
+from enum import Enum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -40,10 +27,47 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
-KVEC = 8  # BF16 elements per lane per K-iteration (K must be divisible by 64*KVEC)
-NP = 2  # output columns per wavefront (N must be divisible by NP)
-MP = 4  # output rows per wavefront; one wavefront computes MPxNP outputs
-WAVES_PER_EU = 2  # rocdl hint: 2 waves per SIMD — standard for memory-bound kernels
+
+class OutputRounding(str, Enum):
+    """Compile-time FP32-to-BF16 conversion choices."""
+
+    RNE = "rne"
+    RTZ = "rtz"
+    TRUNCATE = "truncate"
+    STOCHASTIC = "stochastic"
+
+
+@dataclass(frozen=True)
+class GemmDecodeConfig:
+    """Named compile-time defaults for the direct kernel."""
+
+    kvec: int = 8
+    n_per_wave: int = 2
+    n_per_wave_m1: int = 1
+    m_per_wave: int = 4
+    waves_per_eu: int = 2
+    b_cache_modifier: int = 0x2000
+    output_rounding: OutputRounding = OutputRounding.RNE
+
+    def validate(self) -> None:
+        if self.kvec <= 0 or self.kvec % 4 != 0:
+            raise ValueError("kvec must be a positive multiple of 4")
+        if self.n_per_wave != 2 or self.n_per_wave_m1 != 1:
+            raise ValueError("this kernel mapping requires N tiles of 2 (1 for M=1)")
+        if self.m_per_wave != 4:
+            raise ValueError("this kernel mapping requires an M tile of 4")
+        if self.waves_per_eu <= 0:
+            raise ValueError("waves_per_eu must be positive")
+
+
+DEFAULT_CONFIG = GemmDecodeConfig()
+DEFAULT_CONFIG.validate()
+KVEC = DEFAULT_CONFIG.kvec
+NP = DEFAULT_CONFIG.n_per_wave
+MP = DEFAULT_CONFIG.m_per_wave
+WAVES_PER_EU = DEFAULT_CONFIG.waves_per_eu
+B_CACHE_MODIFIER = DEFAULT_CONFIG.b_cache_modifier
+OUTPUT_ROUNDING = DEFAULT_CONFIG.output_rounding
 
 
 # -- helpers -------------------------------------------------------------------
@@ -60,6 +84,13 @@ def _const_f32(val: float) -> ir.Value:
     """Create a constant FP32 MLIR value."""
     return _arith_dialect.ConstantOp(
         ir.F32Type.get(), ir.FloatAttr.get(ir.F32Type.get(), val)
+    ).result
+
+
+def _const_bf16(val: float) -> ir.Value:
+    """Create a constant BF16 MLIR value."""
+    return _arith_dialect.ConstantOp(
+        ir.BF16Type.get(), ir.FloatAttr.get(ir.BF16Type.get(), val)
     ).result
 
 
@@ -88,17 +119,54 @@ def pack_bf16x2(lo, hi) -> ir.Value:
     return ArithValue(lo_i32) | (ArithValue(hi_i32) << fx.Int32(16))
 
 
-def store_bf16(acc: ir.Value, rsrc_c, c_elem) -> None:
-    """Convert FP32 accumulator to BF16 and store to C."""
-    acc_i32 = ArithValue(acc).bitcast(T.i32)
-    bf16_i32 = ArithValue(acc_i32).shrui(fx.Int32(16))
+def _stochastic_seed(c_elem):
+    """Deterministic per-output seed for repeatable stochastic conversion."""
+    x = ArithValue(_to_ir(c_elem))
+    return (x * fx.Int32(0x45D9F3B)) ^ (x << fx.Int32(16)) ^ fx.Int32(0x27D4EB2D)
+
+
+def _convert_bf16(acc: ir.Value, c_elem, rounding: OutputRounding) -> ir.Value:
+    """Convert one FP32 value to BF16 with a compile-time rounding mode."""
+    if rounding == OutputRounding.RNE:
+        return _arith_dialect.TruncFOp(ir.BF16Type.get(), acc).result
+    if rounding == OutputRounding.RTZ:
+        acc_i32 = ArithValue(acc).bitcast(T.i32)
+        bf16_i32 = ArithValue(acc_i32).shrui(fx.Int32(16))
+        abs_i32 = ArithValue(acc_i32) & fx.Int32(0x7FFFFFFF)
+        is_nan = abs_i32 > fx.Int32(0x7F800000)
+        quiet_nan = ArithValue(bf16_i32) | fx.Int32(0x40)
+        bf16_i32 = ArithValue(_to_ir(is_nan)).select(quiet_nan, bf16_i32)
+    elif rounding == OutputRounding.STOCHASTIC:
+        bf16_i32 = _llvm.inline_asm(
+            ir.IntegerType.get_signless(32),
+            [acc, _to_ir(_stochastic_seed(c_elem))],
+            "v_cvt_sr_bf16_f32 $0, $1, $2",
+            "=v,v,v",
+            has_side_effects=False,
+        )
+    elif rounding == OutputRounding.TRUNCATE:
+        acc_i32 = ArithValue(acc).bitcast(T.i32)
+        bf16_i32 = ArithValue(acc_i32).shrui(fx.Int32(16))
+    else:
+        raise ValueError(f"unsupported output rounding: {rounding}")
+
     bf16_i16 = ArithValue(_to_ir(bf16_i32)).trunci(T.i16)
-    bf16_val = ArithValue(bf16_i16).bitcast(T.bf16)
+    return ArithValue(bf16_i16).bitcast(T.bf16)
+
+
+def store_bf16(
+    acc: ir.Value,
+    rsrc_c,
+    c_elem,
+    rounding: OutputRounding,
+) -> None:
+    """Convert FP32 accumulator to BF16 and store to C."""
+    bf16_val = _convert_bf16(acc, c_elem, rounding)
     buffer_ops.buffer_store(bf16_val, rsrc_c, c_elem)
 
 
 def wavefront_reduce_sum_f32(val: ir.Value, lane) -> ir.Value:
-    """6-stage butterfly XOR reduce. Returns full sum in all 64 lanes."""
+    """6-stage butterfly XOR reduce. Returns the full sum in all 64 lanes."""
     for stage in range_constexpr(6):
         partner = lane ^ fx.Int32(1 << stage)
         val_i32 = ArithValue(val).bitcast(T.i32)
@@ -108,19 +176,7 @@ def wavefront_reduce_sum_f32(val: ir.Value, lane) -> ir.Value:
 
 
 def load_kvec_a(rsrc, base_elem):
-    """Load KVEC BF16 values from A — through L2 (small matrix, reused)."""
-    return tuple(
-        Vec(
-            buffer_ops.buffer_load(
-                rsrc, base_elem + fx.Int32(i * 4), vec_width=4, dtype=T.bf16
-            )
-        )
-        for i in range(KVEC // 4)
-    )
-
-
-def load_kvec_b(rsrc, base_elem):
-    """Load KVEC BF16 values from B — bypass L2 (0x2000), large matrix."""
+    """Load the fixed default K vector through L2."""
     return tuple(
         Vec(
             buffer_ops.buffer_load(
@@ -128,32 +184,74 @@ def load_kvec_b(rsrc, base_elem):
                 base_elem + fx.Int32(i * 4),
                 vec_width=4,
                 dtype=T.bf16,
-                cache_modifier=0x2000,
             )
         )
         for i in range(KVEC // 4)
     )
 
 
-def dot2_kvec(acc: ir.Value, av0, av1, av2, av3, bv0, bv1, bv2, bv3) -> ir.Value:
-    """4 x dot2 covering KVEC=8 BF16 elements. acc += dot(a, b)."""
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av0[0], av0[1]), pack_bf16x2(bv0[0], bv0[1]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av0[2], av0[3]), pack_bf16x2(bv0[2], bv0[3]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av1[0], av1[1]), pack_bf16x2(bv1[0], bv1[1]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av1[2], av1[3]), pack_bf16x2(bv1[2], bv1[3]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av2[0], av2[1]), pack_bf16x2(bv2[0], bv2[1]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av2[2], av2[3]), pack_bf16x2(bv2[2], bv2[3]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av3[0], av3[1]), pack_bf16x2(bv3[0], bv3[1]))
-    acc = dot2_f32_bf16(acc, pack_bf16x2(av3[2], av3[3]), pack_bf16x2(bv3[2], bv3[3]))
-    return acc
+def load_kvec_b(rsrc, base_elem):
+    """Load the fixed default K vector with the configured B cache policy."""
+    return tuple(
+        Vec(
+            buffer_ops.buffer_load(
+                rsrc,
+                base_elem + fx.Int32(i * 4),
+                vec_width=4,
+                dtype=T.bf16,
+                cache_modifier=B_CACHE_MODIFIER,
+            )
+        )
+        for i in range(KVEC // 4)
+    )
 
 
-# -- GPU kernels: one specialization per M value -------------------------------
-# M known at compile time -> no clamping, no branches, no dead loads/stores.
+def _load_tail_pair(
+    rsrc,
+    row,
+    K,
+    tail_lane_base,
+    pair,
+    cache_modifier=0,
+    row_valid=None,
+):
+    """Load one masked BF16 pair from the scalar K tail."""
+    k0 = tail_lane_base + fx.Int32(pair * 2)
+    k1 = k0 + fx.Int32(1)
+    valid0 = k0 < fx.Int32(K)
+    valid1 = k1 < fx.Int32(K)
+    safe_row = row
+    if row_valid is not None:
+        valid0 = valid0 & row_valid
+        valid1 = valid1 & row_valid
+        safe_row = ArithValue(_to_ir(row_valid)).select(row, fx.Int32(0))
+    safe_k0 = ArithValue(_to_ir(valid0)).select(k0, fx.Int32(0))
+    safe_k1 = ArithValue(_to_ir(valid1)).select(k1, fx.Int32(0))
+    row_base = ArithValue(_to_ir(safe_row)) * fx.Int32(K)
+    lo = buffer_ops.buffer_load(
+        rsrc,
+        row_base + safe_k0,
+        vec_width=1,
+        dtype=T.bf16,
+        cache_modifier=cache_modifier,
+    )
+    hi = buffer_ops.buffer_load(
+        rsrc,
+        row_base + safe_k1,
+        vec_width=1,
+        dtype=T.bf16,
+        cache_modifier=cache_modifier,
+    )
+    zero = _const_bf16(0.0)
+    lo = ArithValue(_to_ir(valid0)).select(lo, zero)
+    hi = ArithValue(_to_ir(valid1)).select(hi, zero)
+    return pack_bf16x2(lo, hi)
 
 
-def _dots(M, lane, m_base, n_base, K, nv, kTileN, rsrc_a, rsrc_b):
-    """Pure dot-product loop, returns accumulators. M is a Python int (Constexpr)."""
+def _dots_multi(M, lane, m_base, n_base, N, K, rsrc_a, rsrc_b):
+    """Original M=2..4 hot loop plus a separately compiled scalar K tail."""
+    k_tile = 64 * KVEC
+    nv = KVEC // 4
     acc00 = _const_f32(0.0)
     acc01 = _const_f32(0.0)
     acc10 = _const_f32(0.0)
@@ -166,8 +264,16 @@ def _dots(M, lane, m_base, n_base, K, nv, kTileN, rsrc_a, rsrc_b):
     m1 = m_base + fx.Int32(1)
     m2 = m_base + fx.Int32(2)
     m3 = m_base + fx.Int32(3)
-    for i in range_constexpr(K // kTileN):
-        k_elem = fx.Int32(i * kTileN) + lane * fx.Int32(KVEC)
+    n0 = n_base
+    n1 = n_base + fx.Int32(1)
+    n1_valid = None
+    n1_load = n1
+    if N % 2 != 0:
+        n1_valid = n1 < fx.Int32(N)
+        n1_load = ArithValue(_to_ir(n1_valid)).select(n1, fx.Int32(0))
+
+    for i in range_constexpr(K // k_tile):
+        k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(KVEC)
         av0 = load_kvec_a(rsrc_a, m0 * fx.Int32(K) + k_elem)
         if M > 1:
             av1 = load_kvec_a(rsrc_a, m1 * fx.Int32(K) + k_elem)
@@ -175,8 +281,8 @@ def _dots(M, lane, m_base, n_base, K, nv, kTileN, rsrc_a, rsrc_b):
             av2 = load_kvec_a(rsrc_a, m2 * fx.Int32(K) + k_elem)
         if M > 3:
             av3 = load_kvec_a(rsrc_a, m3 * fx.Int32(K) + k_elem)
-        bv0 = load_kvec_b(rsrc_b, n_base * fx.Int32(K) + k_elem)
-        bv1 = load_kvec_b(rsrc_b, (n_base + fx.Int32(1)) * fx.Int32(K) + k_elem)
+        bv0 = load_kvec_b(rsrc_b, n0 * fx.Int32(K) + k_elem)
+        bv1 = load_kvec_b(rsrc_b, n1_load * fx.Int32(K) + k_elem)
         for v in range_constexpr(nv):
             p0a = pack_bf16x2(av0[v][0], av0[v][1])
             p0b = pack_bf16x2(av0[v][2], av0[v][3])
@@ -209,12 +315,68 @@ def _dots(M, lane, m_base, n_base, K, nv, kTileN, rsrc_a, rsrc_b):
                 acc31 = dot2_f32_bf16(acc31, p3a, q1a)
                 acc30 = dot2_f32_bf16(acc30, p3b, q0b)
                 acc31 = dot2_f32_bf16(acc31, p3b, q1b)
-    return acc00, acc01, acc10, acc11, acc20, acc21, acc30, acc31, m0, m1, m2, m3
+
+    if K % k_tile != 0:
+        tail_lane_base = fx.Int32((K // k_tile) * k_tile) + lane * fx.Int32(KVEC)
+        for pair in range_constexpr(KVEC // 2):
+            p0 = _load_tail_pair(rsrc_a, m0, K, tail_lane_base, pair)
+            if M > 1:
+                p1 = _load_tail_pair(rsrc_a, m1, K, tail_lane_base, pair)
+            if M > 2:
+                p2 = _load_tail_pair(rsrc_a, m2, K, tail_lane_base, pair)
+            if M > 3:
+                p3 = _load_tail_pair(rsrc_a, m3, K, tail_lane_base, pair)
+            q0 = _load_tail_pair(
+                rsrc_b,
+                n0,
+                K,
+                tail_lane_base,
+                pair,
+                cache_modifier=B_CACHE_MODIFIER,
+            )
+            q1 = _load_tail_pair(
+                rsrc_b,
+                n1,
+                K,
+                tail_lane_base,
+                pair,
+                cache_modifier=B_CACHE_MODIFIER,
+                row_valid=n1_valid,
+            )
+            acc00 = dot2_f32_bf16(acc00, p0, q0)
+            acc01 = dot2_f32_bf16(acc01, p0, q1)
+            if M > 1:
+                acc10 = dot2_f32_bf16(acc10, p1, q0)
+                acc11 = dot2_f32_bf16(acc11, p1, q1)
+            if M > 2:
+                acc20 = dot2_f32_bf16(acc20, p2, q0)
+                acc21 = dot2_f32_bf16(acc21, p2, q1)
+            if M > 3:
+                acc30 = dot2_f32_bf16(acc30, p3, q0)
+                acc31 = dot2_f32_bf16(acc31, p3, q1)
+
+    return (
+        acc00,
+        acc01,
+        acc10,
+        acc11,
+        acc20,
+        acc21,
+        acc30,
+        acc31,
+        m0,
+        m1,
+        m2,
+        m3,
+        n0,
+        n1,
+        n1_valid,
+    )
 
 
-def _make_kern(M_val):
+def _make_kernel_multi(M):
     @flyc.kernel
-    def kern(
+    def kernel(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
@@ -223,107 +385,133 @@ def _make_kern(M_val):
     ):
         lane = gpu.thread_idx.x
         m_base = gpu.block_idx.x * fx.Int32(MP)
-        n_base = gpu.block_idx.y * fx.Int32(NP)
+        n_base = gpu.block_idx.y * fx.Int32(2)
         rsrc_a = buffer_ops.create_buffer_resource(A)
         rsrc_b = buffer_ops.create_buffer_resource(B)
         rsrc_c = buffer_ops.create_buffer_resource(C)
-        kTileN = 64 * KVEC
-        nv = KVEC // 4
-        acc00, acc01, acc10, acc11, acc20, acc21, acc30, acc31, m0, m1, m2, m3 = _dots(
-            M_val, lane, m_base, n_base, K, nv, kTileN, rsrc_a, rsrc_b
+        (
+            acc00,
+            acc01,
+            acc10,
+            acc11,
+            acc20,
+            acc21,
+            acc30,
+            acc31,
+            m0,
+            m1,
+            m2,
+            m3,
+            n0,
+            n1,
+            n1_valid,
+        ) = _dots_multi(
+            M,
+            lane,
+            m_base,
+            n_base,
+            N,
+            K,
+            rsrc_a,
+            rsrc_b,
         )
         acc00 = wavefront_reduce_sum_f32(acc00, lane)
         acc01 = wavefront_reduce_sum_f32(acc01, lane)
-        if M_val > 1:
+        if M > 1:
             acc10 = wavefront_reduce_sum_f32(acc10, lane)
             acc11 = wavefront_reduce_sum_f32(acc11, lane)
-        if M_val > 2:
+        if M > 2:
             acc20 = wavefront_reduce_sum_f32(acc20, lane)
             acc21 = wavefront_reduce_sum_f32(acc21, lane)
-        if M_val > 3:
+        if M > 3:
             acc30 = wavefront_reduce_sum_f32(acc30, lane)
             acc31 = wavefront_reduce_sum_f32(acc31, lane)
         if lane == fx.Int32(0):
-            store_bf16(acc00, rsrc_c, m0 * fx.Int32(N) + n_base)
-            store_bf16(acc01, rsrc_c, m0 * fx.Int32(N) + n_base + fx.Int32(1))
-            if M_val > 1:
-                store_bf16(acc10, rsrc_c, m1 * fx.Int32(N) + n_base)
-                store_bf16(acc11, rsrc_c, m1 * fx.Int32(N) + n_base + fx.Int32(1))
-            if M_val > 2:
-                store_bf16(acc20, rsrc_c, m2 * fx.Int32(N) + n_base)
-                store_bf16(acc21, rsrc_c, m2 * fx.Int32(N) + n_base + fx.Int32(1))
-            if M_val > 3:
-                store_bf16(acc30, rsrc_c, m3 * fx.Int32(N) + n_base)
-                store_bf16(acc31, rsrc_c, m3 * fx.Int32(N) + n_base + fx.Int32(1))
+            store_bf16(acc00, rsrc_c, m0 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
+            if n1_valid is None:
+                store_bf16(acc01, rsrc_c, m0 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+            elif n1_valid:
+                store_bf16(acc01, rsrc_c, m0 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+            if M > 1:
+                store_bf16(acc10, rsrc_c, m1 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
+                if n1_valid is None:
+                    store_bf16(acc11, rsrc_c, m1 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+                elif n1_valid:
+                    store_bf16(acc11, rsrc_c, m1 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+            if M > 2:
+                store_bf16(acc20, rsrc_c, m2 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
+                if n1_valid is None:
+                    store_bf16(acc21, rsrc_c, m2 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+                elif n1_valid:
+                    store_bf16(acc21, rsrc_c, m2 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+            if M > 3:
+                store_bf16(acc30, rsrc_c, m3 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
+                if n1_valid is None:
+                    store_bf16(acc31, rsrc_c, m3 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
+                elif n1_valid:
+                    store_bf16(acc31, rsrc_c, m3 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
 
-    return kern
+    return kernel
 
 
-gemm_decode_bf16_kernel_m2 = _make_kern(2)
-gemm_decode_bf16_kernel_m3 = _make_kern(3)
-gemm_decode_bf16_kernel_m4 = _make_kern(4)
-
-
-# -- M=1: NP=1, MP=1, grid=(1,N,1) -------------------------------------------
-# Single output per wavefront — no A-reuse needed, simpler than MP=4 kernel.
-
-
-@flyc.kernel
-def gemm_decode_bf16_kernel_m1(
-    A: fx.Tensor,
-    B: fx.Tensor,
-    C: fx.Tensor,
-    K: fx.Constexpr[int],
-    N: fx.Constexpr[int],
-):
-    lane = gpu.thread_idx.x
-    m = gpu.block_idx.x  # always 0 for M=1
-    n = gpu.block_idx.y
-    rsrc_a = buffer_ops.create_buffer_resource(A)
-    rsrc_b = buffer_ops.create_buffer_resource(B)
-    rsrc_c = buffer_ops.create_buffer_resource(C)
-    acc = _const_f32(0.0)
-    kTileN = 64 * KVEC
-    num_iter = K // kTileN
-    nv = KVEC // 4
-    for i in range_constexpr(num_iter):
-        k_elem = fx.Int32(i * kTileN) + lane * fx.Int32(KVEC)
-        av = tuple(
-            Vec(
-                buffer_ops.buffer_load(
-                    rsrc_a,
-                    m * fx.Int32(K) + k_elem + fx.Int32(j * 4),
-                    vec_width=4,
-                    dtype=T.bf16,
+def _make_kernel_m1():
+    @flyc.kernel
+    def kernel(
+        A: fx.Tensor,
+        B: fx.Tensor,
+        C: fx.Tensor,
+        K: fx.Constexpr[int],
+        N: fx.Constexpr[int],
+    ):
+        lane = gpu.thread_idx.x
+        m = gpu.block_idx.x
+        n = gpu.block_idx.y
+        rsrc_a = buffer_ops.create_buffer_resource(A)
+        rsrc_b = buffer_ops.create_buffer_resource(B)
+        rsrc_c = buffer_ops.create_buffer_resource(C)
+        acc = _const_f32(0.0)
+        k_tile = 64 * KVEC
+        nv = KVEC // 4
+        for i in range_constexpr(K // k_tile):
+            k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(KVEC)
+            av = load_kvec_a(rsrc_a, m * fx.Int32(K) + k_elem)
+            bv = load_kvec_b(rsrc_b, n * fx.Int32(K) + k_elem)
+            for v in range_constexpr(nv):
+                acc = dot2_f32_bf16(
+                    acc,
+                    pack_bf16x2(av[v][0], av[v][1]),
+                    pack_bf16x2(bv[v][0], bv[v][1]),
                 )
-            )
-            for j in range(nv)
-        )
-        bv = tuple(
-            Vec(
-                buffer_ops.buffer_load(
+                acc = dot2_f32_bf16(
+                    acc,
+                    pack_bf16x2(av[v][2], av[v][3]),
+                    pack_bf16x2(bv[v][2], bv[v][3]),
+                )
+        if K % k_tile != 0:
+            tail_lane_base = fx.Int32((K // k_tile) * k_tile) + lane * fx.Int32(KVEC)
+            for pair in range_constexpr(KVEC // 2):
+                av = _load_tail_pair(rsrc_a, m, K, tail_lane_base, pair)
+                bv = _load_tail_pair(
                     rsrc_b,
-                    n * fx.Int32(K) + k_elem + fx.Int32(j * 4),
-                    vec_width=4,
-                    dtype=T.bf16,
-                    cache_modifier=0x2000,
+                    n,
+                    K,
+                    tail_lane_base,
+                    pair,
+                    cache_modifier=B_CACHE_MODIFIER,
                 )
-            )
-            for j in range(nv)
-        )
-        for v in range_constexpr(nv):
-            acc = dot2_f32_bf16(
-                acc, pack_bf16x2(av[v][0], av[v][1]), pack_bf16x2(bv[v][0], bv[v][1])
-            )
-            acc = dot2_f32_bf16(
-                acc, pack_bf16x2(av[v][2], av[v][3]), pack_bf16x2(bv[v][2], bv[v][3])
-            )
-    acc = wavefront_reduce_sum_f32(acc, lane)
-    if lane == fx.Int32(0):
-        store_bf16(acc, rsrc_c, m * fx.Int32(N) + n)
+                acc = dot2_f32_bf16(acc, av, bv)
+        acc = wavefront_reduce_sum_f32(acc, lane)
+        if lane == fx.Int32(0):
+            c_elem = m * fx.Int32(N) + n
+            store_bf16(acc, rsrc_c, c_elem, OUTPUT_ROUNDING)
+
+    return kernel
 
 
-# -- JIT launcher --------------------------------------------------------------
+gemm_decode_bf16_kernel_m1 = _make_kernel_m1()
+gemm_decode_bf16_kernel_m2 = _make_kernel_multi(2)
+gemm_decode_bf16_kernel_m3 = _make_kernel_multi(3)
+gemm_decode_bf16_kernel_m4 = _make_kernel_multi(4)
 
 
 @flyc.jit
@@ -336,31 +524,36 @@ def gemm_decode_bf16(
     K: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
+    if M < 1 or M > 4:
+        raise ValueError("gemm_decode_bf16 supports M in [1, 4]")
+    if N <= 0 or K <= 0:
+        raise ValueError("gemm_decode_bf16 requires positive N and K")
+    attrs = {"rocdl.waves_per_eu": WAVES_PER_EU}
     if M == 1:
         gemm_decode_bf16_kernel_m1(A, B, C, K, N).launch(
             grid=(1, N, 1),
             block=(64, 1, 1),
             stream=stream,
-            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+            value_attrs=attrs,
         )
     elif M == 2:
         gemm_decode_bf16_kernel_m2(A, B, C, K, N).launch(
-            grid=(1, N // NP, 1),
+            grid=(1, (N + NP - 1) // NP, 1),
             block=(64, 1, 1),
             stream=stream,
-            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+            value_attrs=attrs,
         )
     elif M == 3:
         gemm_decode_bf16_kernel_m3(A, B, C, K, N).launch(
-            grid=(1, N // NP, 1),
+            grid=(1, (N + NP - 1) // NP, 1),
             block=(64, 1, 1),
             stream=stream,
-            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+            value_attrs=attrs,
         )
-    elif M == 4:
+    else:
         gemm_decode_bf16_kernel_m4(A, B, C, K, N).launch(
-            grid=(1, N // NP, 1),
+            grid=(1, (N + NP - 1) // NP, 1),
             block=(64, 1, 1),
             stream=stream,
-            value_attrs={"rocdl.waves_per_eu": WAVES_PER_EU},
+            value_attrs=attrs,
         )
