@@ -1,0 +1,567 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// HiSparse swap-in for GLM-5.2 DSA decode. Keeps the full KV in a pinned host
+// cold pool and a fixed GPU hot buffer per request; each decode step, per layer,
+// miss-detects the indexer top-k against the resident hot set, evicts the
+// least-recently-used slots for the misses, gathers the missing tokens from the
+// cold pool over PCIe/XGMI, and translates the top-k into hot-buffer rows.
+//
+// One wavefront64 copies one token's item_size_bytes word-wise (mirrors SGLang
+// transfer_item_warp, ROCm branch of hisparse.cuh). The cold pool pointer must
+// be the device-mapped pointer from hisparse_host_get_device_pointer (xnack-).
+
+#include "hisparse_swap.h"
+
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <cstdint>
+
+namespace {
+
+constexpr int WARP_SIZE = 64;  // wavefront64 on gfx950
+constexpr int BLOCK     = 256;
+constexpr int EMPTY     = -1;
+
+// Word-wise warp copy of one item between two mapped addresses (host<->device).
+__device__ __forceinline__ void transfer_item_warp(int lane_id,
+                                                    const void* __restrict__ src_addr,
+                                                    void* __restrict__ dst_addr,
+                                                    int64_t item_size_bytes)
+{
+    const auto* src = static_cast<const char*>(src_addr);
+    auto* dst       = static_cast<char*>(dst_addr);
+    const int64_t word_count = item_size_bytes / (int64_t)sizeof(uint64_t);
+    const auto* src_words = reinterpret_cast<const uint64_t*>(src);
+    auto* dst_words       = reinterpret_cast<uint64_t*>(dst);
+    for (int64_t i = lane_id; i < word_count; i += WARP_SIZE) {
+        dst_words[i] = src_words[i];
+    }
+    const int64_t tail = word_count * (int64_t)sizeof(uint64_t);
+    for (int64_t i = tail + lane_id; i < item_size_bytes; i += WARP_SIZE) {
+        dst[i] = src[i];
+    }
+}
+
+// Count hot slots for this request whose recency tick is <= tau (block-wide).
+__device__ int block_count_le(const int64_t* __restrict__ lu_base,
+                              int hot_slots, int64_t tau, int* s_count)
+{
+    if (threadIdx.x == 0) *s_count = 0;
+    __syncthreads();
+    int loc = 0;
+    for (int s = threadIdx.x; s < hot_slots; s += blockDim.x) {
+        if (lu_base[s] <= tau) loc++;
+    }
+    atomicAdd(s_count, loc);
+    __syncthreads();
+    int c = *s_count;
+    __syncthreads();
+    return c;
+}
+
+// Plain gather: one warp per miss, host cold pool -> device hot buffer.
+__global__ void hisparse_gather_kernel(const char* __restrict__ host_cache,
+                                       char* __restrict__ device_buffer,
+                                       const int32_t* __restrict__ src_locs,
+                                       const int32_t* __restrict__ dst_locs,
+                                       int num_misses, int64_t item_size_bytes)
+{
+    const int warp_id   = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    const int lane_id   = threadIdx.x % WARP_SIZE;
+    const int num_warps = (gridDim.x * blockDim.x) / WARP_SIZE;
+    for (int m = warp_id; m < num_misses; m += num_warps) {
+        const int64_t src = (int64_t)src_locs[m] * item_size_bytes;
+        const int64_t dst = (int64_t)dst_locs[m] * item_size_bytes;
+        transfer_item_warp(lane_id, host_cache + src, device_buffer + dst,
+                           item_size_bytes);
+    }
+}
+
+// Fused per-layer hot path. One block per decode query token. Requires each
+// request to own at most one query token in the batch (non-MTP decode); the
+// caller keeps MTP on the reference path. Dynamic shared memory holds two int
+// arrays of length `topk`: the miss token list and the victim slot list.
+__global__ void hisparse_swap_and_translate_kernel(
+    const char* __restrict__ cold_pool,   // device-mapped host cold pool, this layer
+    char* __restrict__ hot_buffer,        // GPU hot buffer, this layer
+    const int32_t* __restrict__ topk_logical,  // [n, topk]
+    const int32_t* __restrict__ indptr,        // [n+1]
+    const int32_t* __restrict__ req_slots,     // [n]
+    int32_t* __restrict__ slot_token,          // [R, hot_slots]
+    int64_t* __restrict__ last_used,           // [R, hot_slots]
+    int32_t* __restrict__ token_to_slot,       // [R, cold_depth]
+    int64_t* __restrict__ recency,             // [R]
+    int32_t* __restrict__ out_translated,      // [total_topk]
+    int32_t* __restrict__ plan_miss_tok,       // [n, topk] or nullptr
+    int32_t* __restrict__ plan_miss_slot,      // [n, topk] or nullptr
+    int32_t* __restrict__ plan_miss_count,     // [n] or nullptr
+    int record_plan,
+    int64_t item_size_bytes, int hot_slots, int cold_depth, int topk)
+{
+    extern __shared__ int smem[];
+    int* miss_tok = smem;            // topk ints
+    int* vic      = smem + topk;     // topk ints
+
+    __shared__ int s_miss_count;
+    __shared__ int s_scratch;
+    __shared__ int64_t s_tick;
+
+    const int q = blockIdx.x;
+    const int start = indptr[q];
+    const int end   = indptr[q + 1];
+    const int runlen = end - start;
+    if (runlen <= 0) {
+        if (record_plan && threadIdx.x == 0) plan_miss_count[q] = 0;
+        return;  // padding / inactive query token
+    }
+
+    const int r = req_slots[q];
+    int32_t* st_base       = slot_token + (int64_t)r * hot_slots;
+    int64_t* lu_base       = last_used + (int64_t)r * hot_slots;
+    int32_t* tts_base      = token_to_slot + (int64_t)r * cold_depth;
+    const int32_t* topk_q  = topk_logical + (int64_t)q * topk;
+
+    if (threadIdx.x == 0) {
+        s_miss_count = 0;
+        s_tick = atomicAdd((unsigned long long*)&recency[r], 1ULL) + 1;
+    }
+    __syncthreads();
+    const int64_t tick = s_tick;
+
+    // Miss detect: refresh hits, collect misses. The indexer guarantees the
+    // top-k ids are unique, so a token appears in miss_tok at most once (a
+    // duplicate would resolve to two slots — self-healing, never wrong output).
+    for (int k = threadIdx.x; k < runlen; k += blockDim.x) {
+        int tok = topk_q[k];
+        if (tok < 0 || tok >= cold_depth) continue;
+        int s = tts_base[tok];
+        if (s >= 0) {
+            lu_base[s] = tick;  // hit: most recent
+        } else {
+            int idx = atomicAdd(&s_miss_count, 1);
+            miss_tok[idx] = tok;
+        }
+    }
+    __syncthreads();
+    const int m = s_miss_count;
+    if (record_plan && threadIdx.x == 0) plan_miss_count[q] = m;
+
+    if (m > 0) {
+        // Find tau* = min tick with count(last_used <= tau) >= m. Hits are at
+        // `tick` (the max) so victims (all < tick) never include them.
+        int64_t lo = -1, hi = tick;
+        while (lo < hi) {
+            int64_t mid = lo + (hi - lo) / 2;
+            int c = block_count_le(lu_base, hot_slots, mid, &s_scratch);
+            if (c >= m) hi = mid; else lo = mid + 1;
+        }
+        const int64_t tau = lo;
+
+        // Victims: all slots strictly below tau, then fill the remainder from
+        // slots exactly at tau (arbitrary order among equals — eviction policy
+        // does not affect correctness, only future miss rate).
+        if (threadIdx.x == 0) s_scratch = 0;
+        __syncthreads();
+        for (int s = threadIdx.x; s < hot_slots; s += blockDim.x) {
+            if (lu_base[s] < tau) {
+                int idx = atomicAdd(&s_scratch, 1);
+                vic[idx] = s;
+            }
+        }
+        __syncthreads();
+        const int c_lt = s_scratch;
+        const int extra = m - c_lt;
+        if (threadIdx.x == 0) s_scratch = 0;
+        __syncthreads();
+        if (extra > 0) {
+            for (int s = threadIdx.x; s < hot_slots; s += blockDim.x) {
+                if (lu_base[s] == tau) {
+                    int idx = atomicAdd(&s_scratch, 1);
+                    if (idx < extra) vic[c_lt + idx] = s;
+                }
+            }
+        }
+        __syncthreads();
+
+        // Assign each miss token to a distinct victim slot. Miss tokens are not
+        // resident and evicted tokens are resident, so the two sets are disjoint
+        // and every write below targets a distinct location.
+        for (int i = threadIdx.x; i < m; i += blockDim.x) {
+            int tok = miss_tok[i];
+            int v   = vic[i];
+            int evicted = st_base[v];
+            if (evicted >= 0) tts_base[evicted] = EMPTY;
+            st_base[v] = tok;
+            lu_base[v] = tick;
+            tts_base[tok] = v;
+            if (record_plan) {
+                plan_miss_tok[(int64_t)q * topk + i]  = tok;
+                plan_miss_slot[(int64_t)q * topk + i] = v;
+            }
+        }
+        __syncthreads();
+
+        // Gather: one warp per miss token.
+        const int warp_id = threadIdx.x / WARP_SIZE;
+        const int lane_id = threadIdx.x % WARP_SIZE;
+        const int warps_per_block = blockDim.x / WARP_SIZE;
+        for (int i = warp_id; i < m; i += warps_per_block) {
+            int tok = miss_tok[i];
+            int v   = vic[i];
+            const int64_t src = ((int64_t)r * cold_depth + tok) * item_size_bytes;
+            const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
+            transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
+                               item_size_bytes);
+        }
+        __syncthreads();
+    }
+
+    // Translate: every top-k entry now maps to a resident hot-buffer row.
+    for (int k = threadIdx.x; k < runlen; k += blockDim.x) {
+        int tok = topk_q[k];
+        int s = (tok >= 0 && tok < cold_depth) ? tts_base[tok] : 0;
+        if (s < 0) s = 0;  // defensive; should not happen after swap
+        out_translated[start + k] = (int32_t)((int64_t)r * hot_slots + s);
+    }
+}
+
+// Backup a freshly generated token's KV into cold pool + a fresh hot slot.
+// One block per decode query token.
+__global__ void hisparse_backup_kernel(
+    char* __restrict__ cold_pool,          // device-mapped host cold pool, layer
+    char* __restrict__ hot_buffer,         // GPU hot buffer, this layer
+    const char* __restrict__ layer_kv,     // GPU layer KV cache (flat rows)
+    const int32_t* __restrict__ src_slots, // [n] physical row in layer_kv
+    const int32_t* __restrict__ req_slots, // [n]
+    const int32_t* __restrict__ logical_pos, // [n]
+    int32_t* __restrict__ slot_token,      // [R, hot_slots]
+    int64_t* __restrict__ last_used,       // [R, hot_slots]
+    int32_t* __restrict__ token_to_slot,   // [R, cold_depth]
+    int64_t* __restrict__ recency,         // [R]
+    int64_t item_size_bytes, int hot_slots, int cold_depth)
+{
+    __shared__ int64_t s_min;
+    __shared__ int s_argmin;
+    __shared__ int64_t s_tick;
+
+    const int q = blockIdx.x;
+    const int pos = logical_pos[q];
+    const int src = src_slots[q];
+    if (pos < 0 || pos >= cold_depth || src < 0) return;
+
+    const int r = req_slots[q];
+    int32_t* st_base  = slot_token + (int64_t)r * hot_slots;
+    int64_t* lu_base  = last_used + (int64_t)r * hot_slots;
+    int32_t* tts_base = token_to_slot + (int64_t)r * cold_depth;
+
+    if (threadIdx.x == 0) {
+        s_min = INT64_MAX;
+        s_argmin = INT32_MAX;
+        s_tick = atomicAdd((unsigned long long*)&recency[r], 1ULL) + 1;
+    }
+    __syncthreads();
+
+    // Argmin last_used -> victim slot (lowest index breaks ties via atomicMin).
+    int64_t loc_min = INT64_MAX;
+    int loc_arg = 0;
+    for (int s = threadIdx.x; s < hot_slots; s += blockDim.x) {
+        int64_t v = lu_base[s];
+        if (v < loc_min) { loc_min = v; loc_arg = s; }
+    }
+    atomicMin((long long*)&s_min, (long long)loc_min);
+    __syncthreads();
+    if (loc_min == s_min) atomicMin(&s_argmin, loc_arg);
+    __syncthreads();
+    const int v = s_argmin;
+    const int64_t tick = s_tick;
+
+    if (threadIdx.x == 0) {
+        int evicted = st_base[v];
+        if (evicted >= 0) tts_base[evicted] = EMPTY;
+        st_base[v] = pos;
+        lu_base[v] = tick;
+        tts_base[pos] = v;
+    }
+    __syncthreads();
+
+    // Copy the new token's KV: layer_kv[src] -> cold pool[r*C+pos] and hot[r*H1+v].
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    if (threadIdx.x < WARP_SIZE) {
+        const int64_t kv_off   = (int64_t)src * item_size_bytes;
+        const int64_t cold_off = ((int64_t)r * cold_depth + pos) * item_size_bytes;
+        transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                           item_size_bytes);
+    } else if (threadIdx.x < 2 * WARP_SIZE) {
+        const int64_t kv_off  = (int64_t)src * item_size_bytes;
+        const int64_t hot_off = ((int64_t)r * hot_slots + v) * item_size_bytes;
+        transfer_item_warp(lane_id, layer_kv + kv_off, hot_buffer + hot_off,
+                           item_size_bytes);
+    }
+}
+
+// Replay a recorded miss plan (from an anchor layer's swap+translate) into a
+// shared-index layer's buffers. Pure IO: no miss-detect, no LRU, no state
+// writes. One block per decode query token; the hot-slot assignments come from
+// the anchor, so the shared layer's slot table stays in lockstep by construction.
+__global__ void hisparse_copy_planned_kernel(
+    const char* __restrict__ cold_pool,        // device-mapped host cold pool, layer
+    char* __restrict__ hot_buffer,             // GPU hot buffer, this layer
+    const int32_t* __restrict__ req_slots,     // [n]
+    const int32_t* __restrict__ plan_miss_tok, // [n, topk]
+    const int32_t* __restrict__ plan_miss_slot,// [n, topk]
+    const int32_t* __restrict__ plan_miss_count,// [n]
+    int64_t item_size_bytes, int hot_slots, int cold_depth, int topk)
+{
+    const int q = blockIdx.x;
+    const int m = plan_miss_count[q];
+    if (m <= 0) return;
+    const int r = req_slots[q];
+    const int32_t* tok_q  = plan_miss_tok + (int64_t)q * topk;
+    const int32_t* slot_q = plan_miss_slot + (int64_t)q * topk;
+
+    const int warp_id = threadIdx.x / WARP_SIZE;
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    const int warps_per_block = blockDim.x / WARP_SIZE;
+    for (int i = warp_id; i < m; i += warps_per_block) {
+        const int tok = tok_q[i];
+        const int v   = slot_q[i];
+        if (tok < 0 || tok >= cold_depth || v < 0 || v >= hot_slots) continue;
+        const int64_t src = ((int64_t)r * cold_depth + tok) * item_size_bytes;
+        const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
+        transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
+                           item_size_bytes);
+    }
+}
+
+// Backup a shared-index layer's freshly generated token into the hot slot the
+// anchor already assigned to it (token_to_slot is the ANCHOR's table). Data
+// only: no LRU/recency writes, so the group's shared slot table is untouched.
+// One block per decode query token.
+__global__ void hisparse_backup_into_assigned_kernel(
+    char* __restrict__ cold_pool,          // device-mapped host cold pool, layer
+    char* __restrict__ hot_buffer,         // GPU hot buffer, this layer
+    const char* __restrict__ layer_kv,     // GPU layer KV cache (flat rows)
+    const int32_t* __restrict__ src_slots, // [n] physical row in layer_kv
+    const int32_t* __restrict__ req_slots, // [n]
+    const int32_t* __restrict__ logical_pos, // [n]
+    const int32_t* __restrict__ token_to_slot, // [R, cold_depth] (anchor's)
+    int64_t item_size_bytes, int hot_slots, int cold_depth)
+{
+    const int q = blockIdx.x;
+    const int pos = logical_pos[q];
+    const int src = src_slots[q];
+    if (pos < 0 || pos >= cold_depth || src < 0) return;
+    const int r = req_slots[q];
+    const int v = token_to_slot[(int64_t)r * cold_depth + pos];
+    if (v < 0 || v >= hot_slots) return;  // anchor must have made pos resident
+
+    const int lane_id = threadIdx.x % WARP_SIZE;
+    if (threadIdx.x < WARP_SIZE) {
+        const int64_t kv_off   = (int64_t)src * item_size_bytes;
+        const int64_t cold_off = ((int64_t)r * cold_depth + pos) * item_size_bytes;
+        transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                           item_size_bytes);
+    } else if (threadIdx.x < 2 * WARP_SIZE) {
+        const int64_t kv_off  = (int64_t)src * item_size_bytes;
+        const int64_t hot_off = ((int64_t)r * hot_slots + v) * item_size_bytes;
+        transfer_item_warp(lane_id, layer_kv + kv_off, hot_buffer + hot_off,
+                           item_size_bytes);
+    }
+}
+
+}  // namespace
+
+int64_t hisparse_host_get_device_pointer(at::Tensor pinned_host_tensor)
+{
+    TORCH_CHECK(pinned_host_tensor.is_pinned(),
+                "hisparse_host_get_device_pointer: tensor must be pinned host memory");
+    void* host_ptr = pinned_host_tensor.data_ptr();
+    void* dev_ptr = nullptr;
+    hipError_t e = hipHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    TORCH_CHECK(e == hipSuccess,
+                "hipHostGetDevicePointer failed: ", hipGetErrorString(e));
+    return reinterpret_cast<int64_t>(dev_ptr);
+}
+
+void hisparse_swap_in(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+                      at::Tensor src_locs, at::Tensor dst_locs,
+                      int64_t item_size_bytes)
+{
+    const int num_misses = (int)src_locs.numel();
+    if (num_misses == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda(), "hot_buffer must be CUDA");
+    TORCH_CHECK(src_locs.is_cuda() && dst_locs.is_cuda(),
+                "src_locs/dst_locs must be CUDA");
+    TORCH_CHECK(src_locs.scalar_type() == at::kInt &&
+                    dst_locs.scalar_type() == at::kInt,
+                "src_locs/dst_locs must be int32");
+    TORCH_CHECK(dst_locs.numel() == num_misses, "src/dst length mismatch");
+
+    const char* host_cache = reinterpret_cast<const char*>(cold_pool_dev_ptr);
+    char* dev_buf = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const int grid = (num_misses * WARP_SIZE + BLOCK - 1) / BLOCK;
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_gather_kernel<<<dim3(grid), dim3(BLOCK), 0, stream>>>(
+        host_cache, dev_buf, src_locs.data_ptr<int32_t>(),
+        dst_locs.data_ptr<int32_t>(), num_misses, item_size_bytes);
+}
+
+void hisparse_swap_and_translate(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+                                 at::Tensor topk_logical, at::Tensor indptr,
+                                 at::Tensor req_slots, at::Tensor slot_token,
+                                 at::Tensor last_used, at::Tensor token_to_slot,
+                                 at::Tensor recency, at::Tensor out_translated,
+                                 int64_t item_size_bytes, int64_t hot_slots,
+                                 int64_t cold_depth, int64_t topk)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && topk_logical.is_cuda() &&
+                    indptr.is_cuda() && req_slots.is_cuda() &&
+                    slot_token.is_cuda() && last_used.is_cuda() &&
+                    token_to_slot.is_cuda() && recency.is_cuda() &&
+                    out_translated.is_cuda(),
+                "all hisparse_swap_and_translate tensors must be CUDA");
+    TORCH_CHECK(last_used.scalar_type() == at::kLong &&
+                    recency.scalar_type() == at::kLong,
+                "last_used/recency must be int64");
+
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* cold = reinterpret_cast<const char*>(cold_pool_dev_ptr);
+    const size_t shmem = (size_t)(2 * topk) * sizeof(int);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_swap_and_translate_kernel<<<dim3(n), dim3(BLOCK), shmem, stream>>>(
+        cold, hot, topk_logical.data_ptr<int32_t>(), indptr.data_ptr<int32_t>(),
+        req_slots.data_ptr<int32_t>(), slot_token.data_ptr<int32_t>(),
+        last_used.data_ptr<int64_t>(), token_to_slot.data_ptr<int32_t>(),
+        recency.data_ptr<int64_t>(), out_translated.data_ptr<int32_t>(),
+        nullptr, nullptr, nullptr, 0,
+        item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
+}
+
+void hisparse_swap_and_translate_record(
+    int64_t cold_pool_dev_ptr, at::Tensor hot_buffer, at::Tensor topk_logical,
+    at::Tensor indptr, at::Tensor req_slots, at::Tensor slot_token,
+    at::Tensor last_used, at::Tensor token_to_slot, at::Tensor recency,
+    at::Tensor out_translated, at::Tensor plan_miss_tok, at::Tensor plan_miss_slot,
+    at::Tensor plan_miss_count, int64_t item_size_bytes, int64_t hot_slots,
+    int64_t cold_depth, int64_t topk)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && topk_logical.is_cuda() &&
+                    indptr.is_cuda() && req_slots.is_cuda() &&
+                    slot_token.is_cuda() && last_used.is_cuda() &&
+                    token_to_slot.is_cuda() && recency.is_cuda() &&
+                    out_translated.is_cuda() && plan_miss_tok.is_cuda() &&
+                    plan_miss_slot.is_cuda() && plan_miss_count.is_cuda(),
+                "all hisparse_swap_and_translate_record tensors must be CUDA");
+    TORCH_CHECK(last_used.scalar_type() == at::kLong &&
+                    recency.scalar_type() == at::kLong,
+                "last_used/recency must be int64");
+
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* cold = reinterpret_cast<const char*>(cold_pool_dev_ptr);
+    const size_t shmem = (size_t)(2 * topk) * sizeof(int);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_swap_and_translate_kernel<<<dim3(n), dim3(BLOCK), shmem, stream>>>(
+        cold, hot, topk_logical.data_ptr<int32_t>(), indptr.data_ptr<int32_t>(),
+        req_slots.data_ptr<int32_t>(), slot_token.data_ptr<int32_t>(),
+        last_used.data_ptr<int64_t>(), token_to_slot.data_ptr<int32_t>(),
+        recency.data_ptr<int64_t>(), out_translated.data_ptr<int32_t>(),
+        plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
+        plan_miss_count.data_ptr<int32_t>(), 1,
+        item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
+}
+
+void hisparse_copy_planned(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+                           at::Tensor req_slots, at::Tensor plan_miss_tok,
+                           at::Tensor plan_miss_slot, at::Tensor plan_miss_count,
+                           int64_t item_size_bytes, int64_t hot_slots,
+                           int64_t cold_depth, int64_t topk)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && req_slots.is_cuda() &&
+                    plan_miss_tok.is_cuda() && plan_miss_slot.is_cuda() &&
+                    plan_miss_count.is_cuda(),
+                "all hisparse_copy_planned tensors must be CUDA");
+    TORCH_CHECK(req_slots.scalar_type() == at::kInt &&
+                    plan_miss_tok.scalar_type() == at::kInt &&
+                    plan_miss_slot.scalar_type() == at::kInt &&
+                    plan_miss_count.scalar_type() == at::kInt,
+                "hisparse_copy_planned req_slots/plan tensors must be int32");
+
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* cold = reinterpret_cast<const char*>(cold_pool_dev_ptr);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_copy_planned_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
+        cold, hot, req_slots.data_ptr<int32_t>(),
+        plan_miss_tok.data_ptr<int32_t>(), plan_miss_slot.data_ptr<int32_t>(),
+        plan_miss_count.data_ptr<int32_t>(),
+        item_size_bytes, (int)hot_slots, (int)cold_depth, (int)topk);
+}
+
+void hisparse_backup_into_assigned(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+                                   at::Tensor layer_kv, at::Tensor src_slots,
+                                   at::Tensor req_slots, at::Tensor logical_pos,
+                                   at::Tensor token_to_slot, int64_t item_size_bytes,
+                                   int64_t hot_slots, int64_t cold_depth)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && layer_kv.is_cuda() &&
+                    token_to_slot.is_cuda(),
+                "hot_buffer/layer_kv/token_to_slot must be CUDA");
+    TORCH_CHECK(src_slots.scalar_type() == at::kInt &&
+                    req_slots.scalar_type() == at::kInt &&
+                    logical_pos.scalar_type() == at::kInt &&
+                    token_to_slot.scalar_type() == at::kInt,
+                "hisparse_backup_into_assigned int32 index tensors required");
+    char* cold = reinterpret_cast<char*>(cold_pool_dev_ptr);
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* kv = reinterpret_cast<const char*>(layer_kv.data_ptr());
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_backup_into_assigned_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
+        cold, hot, kv, src_slots.data_ptr<int32_t>(),
+        req_slots.data_ptr<int32_t>(), logical_pos.data_ptr<int32_t>(),
+        token_to_slot.data_ptr<int32_t>(),
+        item_size_bytes, (int)hot_slots, (int)cold_depth);
+}
+
+void hisparse_backup_new_token(int64_t cold_pool_dev_ptr, at::Tensor hot_buffer,
+                               at::Tensor layer_kv, at::Tensor src_slots,
+                               at::Tensor req_slots, at::Tensor logical_pos,
+                               at::Tensor slot_token, at::Tensor last_used,
+                               at::Tensor token_to_slot, at::Tensor recency,
+                               int64_t item_size_bytes, int64_t hot_slots,
+                               int64_t cold_depth)
+{
+    const int n = (int)req_slots.numel();
+    if (n == 0) return;
+    TORCH_CHECK(item_size_bytes % 8 == 0,
+                "item_size_bytes must be a multiple of 8 (uint64 word copy)");
+    TORCH_CHECK(hot_buffer.is_cuda() && layer_kv.is_cuda(),
+                "hot_buffer/layer_kv must be CUDA");
+    char* cold = reinterpret_cast<char*>(cold_pool_dev_ptr);
+    char* hot = reinterpret_cast<char*>(hot_buffer.data_ptr());
+    const char* kv = reinterpret_cast<const char*>(layer_kv.data_ptr());
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    hisparse_backup_kernel<<<dim3(n), dim3(BLOCK), 0, stream>>>(
+        cold, hot, kv, src_slots.data_ptr<int32_t>(),
+        req_slots.data_ptr<int32_t>(), logical_pos.data_ptr<int32_t>(),
+        slot_token.data_ptr<int32_t>(), last_used.data_ptr<int64_t>(),
+        token_to_slot.data_ptr<int32_t>(), recency.data_ptr<int64_t>(),
+        item_size_bytes, (int)hot_slots, (int)cold_depth);
+}

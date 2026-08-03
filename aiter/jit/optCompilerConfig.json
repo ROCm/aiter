@@ -534,6 +534,18 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_hisparse_swap": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/hisparse_swap_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/hisparse_swap_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_moe_topk": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/moe_topk_pybind.cu'",
