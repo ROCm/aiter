@@ -22,7 +22,11 @@ from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
 
 torch.set_default_device("cuda")
 
-SUPPORTED_GFX = ["gfx942"]
+SUPPORTED_GFX = ["gfx942", "gfx950"]
+# `e4m3_type` is arch-dependent (get_fp8_dtypes): FNUZ on gfx942, FN on gfx950.
+# So on gfx950 both keys resolve to float8_e4m3fn and the two dtype cases
+# coincide -- the sweep still runs both, but it is not FN-vs-FNUZ coverage
+# there. Only gfx942 has a genuine FN/FNUZ split.
 DTYPE_MAP = {"fnuz": e4m3_type, "fn": torch.float8_e4m3fn}
 
 try:
@@ -77,6 +81,11 @@ def test_fp8_mqa_logits(
     ks, ke = _make_windows(s_q, s_k, window)
 
     q_fp8 = q.to(DTYPE_MAP[q_dtype])
+    # Grade against what the kernels actually consume: kv is already fake-
+    # quantized above, so round-trip q through fp8 too. Otherwise q's
+    # quantization error is charged to the kernel, which dominates the measured
+    # diff and says nothing about kernel correctness.
+    q = q_fp8.to(torch.float32).to(torch.bfloat16)
     kv_fp8, scales = per_custom_dims_cast_to_fp8(kv, (0,), False)
     if kv_dtype != "fnuz":
         kv_fp8 = _kv_in_dtype(kv_fp8, DTYPE_MAP[kv_dtype])
@@ -118,7 +127,16 @@ def test_fp8_mqa_logits(
         err = 0.0
         if not ref_mask.all():
             diff = calc_diff(out.masked_fill(out_mask, 0), ref.masked_fill(ref_mask, 0))
-            assert diff < 1e-3, f"{name} calc_diff={diff}"
+            # calc_diff is 1 - 2xy/(x^2+y^2), an aggregate similarity. Over a
+            # single finite element it degenerates to (a-b)^2/(a^2+b^2), where
+            # one borderline ReLU term (a dot product near zero flipping sign
+            # between fp32 accumulation orders) moves it by percent. Both the
+            # FlyDSL and Triton kernels land on the same value there and differ
+            # from the fp32 reference identically, so assert the aggregate only
+            # where it is meaningful; checkAllclose below still bounds the
+            # magnitude in every case.
+            if int((~ref_mask).sum()) > 1:
+                assert diff < 1e-3, f"{name} calc_diff={diff}"
             err = diff.item()
             checkAllclose(
                 ref.masked_fill(ref_mask, 0).to(dtypes.fp32),
