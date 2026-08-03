@@ -9,7 +9,7 @@ This module implements the chunk-based parallel computation for the gated delta 
 Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 

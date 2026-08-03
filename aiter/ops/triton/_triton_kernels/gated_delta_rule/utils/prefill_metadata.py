@@ -4,20 +4,20 @@
 """Compatibility exports for shared prefill batch metadata."""
 
 from aiter.ops.prefill_batch_metadata import (
-    ChunkGrid,
     CausalConvPrefillMetadata,
-    GatedDeltaRulePrefillMetadata,
+    ChunkGrid,
     GatedDeltaRuleChunkSchedule,
+    GatedDeltaRulePrefillMetadata,
     PrefillBatchLayout,
     build_causal_conv_prefill_metadata,
     build_gated_delta_rule_prefill_metadata,
 )
 
 __all__ = [
-    "ChunkGrid",
     "CausalConvPrefillMetadata",
-    "GatedDeltaRulePrefillMetadata",
+    "ChunkGrid",
     "GatedDeltaRuleChunkSchedule",
+    "GatedDeltaRulePrefillMetadata",
     "PrefillBatchLayout",
     "build_causal_conv_prefill_metadata",
     "build_gated_delta_rule_prefill_metadata",

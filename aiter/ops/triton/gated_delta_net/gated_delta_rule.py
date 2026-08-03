@@ -16,7 +16,7 @@ Important Note:
     These implementations are optimized for inference and forward-only operations.
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import torch
 import triton
