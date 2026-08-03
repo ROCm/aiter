@@ -2373,16 +2373,19 @@ def get_2stage_cfgs(
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        # Decode (small M) is wave-starved: the port has no grid split-K, so maximize
-        # the N-tile grid (tile_n=32) and add intra-block k_wave K-slicing. tile_n=32 +
-        # k_wave=4 roughly halves the small-M gemm1 vs tile_n=64/k_wave=2. Needs
-        # 4*tile_n <= tile_k (32*4=128) and D_HIDDEN % (k_wave*tile_k) == 0. Larger M is
-        # grid-parallel enough that tile_n=128 / k_wave=1 wins.
-        if token <= 64 and model_dim % 512 == 0 and inter_dim % 32 == 0:
+        # The port has no grid split-K, so small-M uses intra-block k_wave K-slicing.
+        # token<64: tile_n=64/k_wave=2 (32KB LDS) BEATS tile_n=32/k_wave=4 (64KB LDS,
+        # occupancy-starved to ~1 wave/SIMD) by ~13-19% -- the wider N-tile halves the
+        # A-LDS staging and lifts occupancy (needs 4*tile_n<=tile_k, D_HIDDEN%(kw*tk)==0).
+        # token>=64: the grid is parallel enough that plain tile_n=64/k_wave=1 wins (no
+        # K-slice overhead). Larger still -> tile_n=128.
+        if token < 64 and model_dim % 512 == 0 and inter_dim % 64 == 0:
             kn1 = (
-                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 32, 256)
-                + "_kw4"
+                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 64, 256)
+                + "_kw2"
             )
+        elif token < 256 and inter_dim % 64 == 0:
+            kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 64, 128)
         else:
             kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 128, 128)
         kn2 = flydsl_kernel_name(
