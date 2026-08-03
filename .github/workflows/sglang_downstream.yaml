@@ -116,7 +116,7 @@ jobs:
           set -ex
           docker rm -f ci_sglang || true
           cd "${SGLANG_WORKSPACE}"
-          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh
+          GITHUB_WORKSPACE="${SGLANG_WORKSPACE}" HF_TOKEN="${{ secrets.HF_TOKEN_TEST }}" bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm720
           docker exec ci_sglang bash -lc 'pwd; ls -la /sglang-checkout; test -d /sglang-checkout/python/sglang/kernels/aot; test -d /sglang-checkout/python; test -d /models'
 
       - name: Setup pip config

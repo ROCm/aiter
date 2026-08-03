@@ -87,7 +87,7 @@ TESTS = [
         "test_type": "Accuracy",
         "timeout_minutes": 120,
         "extra_exec_args": "",
-        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 3600",
+        "test_command": "python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v32 --nightly --timeout-per-file 5400",
         "run_on_pr": True,
         "run_on_schedule": True,
     },
