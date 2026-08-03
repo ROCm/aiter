@@ -432,9 +432,73 @@ def hipblaslt_grouped_gemm_reference(
     return output
 
 
+def hipblaslt_moonep_grouped_gemm_reference(
+    hidden: torch.Tensor,
+    home_weights: torch.Tensor,
+    prefetched_weights: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    group_expert_ids: torch.Tensor,
+    *,
+    rank: int,
+    experts_per_rank: int,
+    num_experts: int,
+    output: torch.Tensor,
+    solution_index: int = -1,
+) -> torch.Tensor:
+    """Execute MoonEP physical groups using home or dynamic-slot weights.
+
+    Groups ``[0, E)`` must resolve to an expert owned by this rank.  Groups
+    ``[E, E+B)`` resolve to the corresponding prefetched slot.  This is the
+    correctness baseline for the physical VM layout, not a grouped-GEMM
+    performance implementation.
+    """
+
+    group_count = num_experts + prefetched_weights.shape[0]
+    if cu_seqlens.numel() != group_count or group_expert_ids.numel() != group_count:
+        raise ValueError("MoonEP group metadata has the wrong length")
+    if tuple(home_weights.shape[1:]) != (hidden.shape[1], output.shape[1]):
+        raise ValueError("home expert weight shape is incompatible")
+    if tuple(prefetched_weights.shape[1:]) != (hidden.shape[1], output.shape[1]):
+        raise ValueError("prefetched expert weight shape is incompatible")
+
+    from aiter.ops.gradlib import hipb_create_extension, hipb_mm
+
+    hipb_create_extension()
+    ends = cu_seqlens.to(device="cpu").tolist()
+    expert_ids = group_expert_ids.to(device="cpu").tolist()
+    start = 0
+    for group, (end, expert) in enumerate(zip(ends, expert_ids)):
+        end = int(end)
+        expert = int(expert)
+        if end < start or end > hidden.shape[0]:
+            raise ValueError("cu_seqlens must be monotonic and within hidden")
+        if end > start:
+            if expert < 0:
+                raise ValueError("non-empty group is missing its expert id")
+            if group < num_experts:
+                owner = expert // experts_per_rank
+                if owner != rank:
+                    raise ValueError(
+                        "remote expert group has no dynamic prefetch slot"
+                    )
+                weight = home_weights[expert % experts_per_rank]
+            else:
+                weight = prefetched_weights[group - num_experts]
+            group_out = hipb_mm(
+                hidden[start:end],
+                weight,
+                solution_index=solution_index,
+                out_dtype=torch.bfloat16,
+            )
+            output[start:end].copy_(group_out)
+        start = end
+    return output
+
+
 __all__ = [
     "MoonEPPlanConfig",
     "MoonEPReferencePlan",
     "build_reference_plan",
     "hipblaslt_grouped_gemm_reference",
+    "hipblaslt_moonep_grouped_gemm_reference",
 ]

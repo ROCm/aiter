@@ -23,14 +23,12 @@ import torch.distributed as dist
 from aiter.ops.flydsl.kernels.moonep_dispatch_op import (
     MoonEPPreplannedDispatchOp,
 )
-from aiter.ops.flydsl.kernels.moonep_weight_prefetch import (
-    MoonEPWeightPrefetchOp,
-)
 from aiter.ops.flydsl.moonep import (
     MoonEPPlanConfig,
     build_reference_plan,
     hipblaslt_grouped_gemm_reference,
 )
+from aiter.ops.flydsl.moonep_ep import MoonEPBF16ReferenceEP
 
 
 def _share_shmem_unique_id(rank: int) -> bytes:
@@ -189,7 +187,10 @@ def _run_two_rank_direct_scatter() -> None:
             [identity * (group + 1) for group in range(group_count)]
         ).contiguous()
         gemm_output = hipblaslt_grouped_gemm_reference(
-            recv_hidden, expert_weights, plan.cu_seqlens
+            recv_hidden,
+            expert_weights,
+            plan.cu_seqlens,
+            output=op.expert_output,
         )
         if rank == 0:
             expected_gemm_values = [0, 10, 0, 0, 0, 20, 0, 0]
@@ -200,6 +201,19 @@ def _run_two_rank_direct_scatter() -> None:
         )[:, None].expand(-1, hidden_dim)
         torch.testing.assert_close(
             gemm_output[:8], expected_gemm, rtol=0, atol=0
+        )
+
+        combined_output = op.combine(route_weights, plan)
+        torch.cuda.synchronize()
+        expert_scales = (local_topk.to(torch.float32) + 1.0)
+        expected_combined_values = (
+            route_weights * expert_scales * row_values.to(torch.float32)[:, None]
+        ).sum(dim=1).to(torch.bfloat16)
+        expected_combined = expected_combined_values[:, None].expand(
+            -1, hidden_dim
+        )
+        torch.testing.assert_close(
+            combined_output, expected_combined, rtol=0, atol=0
         )
 
         op.close()
@@ -225,24 +239,21 @@ def _run_two_rank_direct_scatter() -> None:
         hot_plan = build_reference_plan(
             hot_config, hot_topk, hot_tokens_per_expert
         )
-        op = MoonEPPreplannedDispatchOp(
-            hot_config, hidden_dim, block_num=8
+        ep = MoonEPBF16ReferenceEP(
+            hot_config,
+            hidden_dim,
+            dispatch_block_num=8,
+            prefetch_block_num=8,
         )
-        prefetch_op = MoonEPWeightPrefetchOp(
-            rank=rank,
-            world_size=world_size,
-            num_experts=4,
-            prefetch_slots=2,
-            weight_shape=(hidden_dim, hidden_dim),
-            block_num=8,
-        )
+        op = ep.dispatch_op
+        prefetch_op = ep.weight_op
         home_weights = torch.stack(
             [
                 identity * (rank * hot_config.experts_per_rank + local + 1)
                 for local in range(hot_config.experts_per_rank)
             ]
         ).contiguous()
-        prefetch_op.load_home_weights(home_weights)
+        ep.load_home_weights(home_weights)
         hot_values = (
             torch.arange(4, dtype=torch.float32, device="cuda") + rank * 10
         ).to(torch.bfloat16)
@@ -252,10 +263,14 @@ def _run_two_rank_direct_scatter() -> None:
             + rank * 10
             + 0.125
         )[:, None].contiguous()
-        hot_recv, hot_recv_weights, prefetched = op.dispatch_and_prefetch(
-            hot_hidden, hot_route_weights, hot_plan, prefetch_op
+        hot_output, returned_hot_plan = ep.forward(
+            hot_hidden, hot_route_weights, plan=hot_plan
         )
         torch.cuda.synchronize()
+        assert returned_hot_plan is hot_plan
+        hot_recv = op.recv_hidden
+        hot_recv_weights = op.recv_route_weights
+        prefetched = prefetch_op.prefetched_weights
         expected_hot_values = torch.arange(
             rank * 10,
             rank * 10 + 4,
@@ -281,6 +296,17 @@ def _run_two_rank_direct_scatter() -> None:
             torch.testing.assert_close(
                 prefetched[0], identity, rtol=0, atol=0
             )
+
+        expected_hot_output_values = (
+            hot_values.to(torch.float32)
+            * hot_route_weights[:, 0]
+        ).to(torch.bfloat16)
+        expected_hot_output = expected_hot_output_values[:, None].expand(
+            -1, hidden_dim
+        )
+        torch.testing.assert_close(
+            hot_output, expected_hot_output, rtol=0, atol=0
+        )
     finally:
         if prefetch_op is not None:
             prefetch_op.close()

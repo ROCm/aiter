@@ -18,6 +18,7 @@ from aiter.ops.flydsl.moonep import MoonEPPlanConfig, MoonEPReferencePlan
 from .moonep_dispatch import make_moonep_preplanned_dispatch_jit
 from .moonep_dispatch_epilogue import make_moonep_dispatch_epilogue_jit
 from .moonep_dispatch_prefetch import make_moonep_dispatch_prefetch_jit
+from .moonep_combine import make_moonep_combine_jit
 
 
 class MoonEPPreplannedDispatchOp:
@@ -71,6 +72,9 @@ class MoonEPPreplannedDispatchOp:
             (rows,), torch.float32
         )
         self.recv_duplicate_src = mori_shmem_create_tensor((rows,), torch.int32)
+        self.expert_output = mori_shmem_create_tensor(
+            (rows, hidden_dim), torch.bfloat16
+        )
         self.recv_duplicate_src.fill_(-1)
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
@@ -84,6 +88,9 @@ class MoonEPPreplannedDispatchOp:
         self.peer_duplicate_src_ptrs = torch.empty(
             config.world_size, dtype=torch.int64, device=self.device
         )
+        self.peer_expert_output_ptrs = torch.empty(
+            config.world_size, dtype=torch.int64, device=self.device
+        )
         for peer in range(config.world_size):
             self.peer_hidden_ptrs[peer] = ms.shmem_ptr_p2p(
                 self.recv_hidden.data_ptr(), config.rank, peer
@@ -93,6 +100,9 @@ class MoonEPPreplannedDispatchOp:
             )
             self.peer_duplicate_src_ptrs[peer] = ms.shmem_ptr_p2p(
                 self.recv_duplicate_src.data_ptr(), config.rank, peer
+            )
+            self.peer_expert_output_ptrs[peer] = ms.shmem_ptr_p2p(
+                self.expert_output.data_ptr(), config.rank, peer
             )
 
         self._jit = make_moonep_preplanned_dispatch_jit(
@@ -114,6 +124,18 @@ class MoonEPPreplannedDispatchOp:
         self._combined_jit: Any | None = None
         self._combined_compiled: Any | None = None
         self._combined_key: tuple[int, int, int] | None = None
+        self.combine_output = torch.empty(
+            (config.num_tokens, hidden_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._combine_jit = make_moonep_combine_jit(
+            num_tokens=config.num_tokens,
+            hidden_dim=hidden_dim,
+            top_k=config.top_k,
+            num_dispatch_rows=rows,
+        )
+        self._combine_compiled: Any | None = None
         self._closed = False
 
     def _check_inputs(
@@ -317,6 +339,51 @@ class MoonEPPreplannedDispatchOp:
             weight_prefetch_op.prefetched_weights,
         )
 
+    def combine(
+        self,
+        route_weights: torch.Tensor,
+        plan: MoonEPReferencePlan,
+    ) -> torch.Tensor:
+        """Gather expert outputs from their execution ranks and top-k reduce.
+
+        Expert compute must write this op's symmetric ``expert_output`` buffer.
+        The device barrier publishes every rank's writes before direct peer
+        loads begin on the same current stream.
+        """
+
+        if self._closed:
+            raise RuntimeError("dispatch op is closed")
+        if plan.config != self.config:
+            raise ValueError("plan config does not match this combine op")
+        expected = (self.config.num_tokens, self.config.top_k)
+        if tuple(route_weights.shape) != expected:
+            raise ValueError(f"route_weights must have shape {expected}")
+        if route_weights.dtype != torch.float32 or not route_weights.is_contiguous():
+            raise ValueError("route_weights must be contiguous FP32")
+        if route_weights.device != self.device or plan.dst.device != self.device:
+            raise ValueError("combine inputs must be on this op's ROCm device")
+
+        stream = torch.cuda.current_stream(self.device)
+        ms.shmem_barrier_on_stream(stream)
+        args = (
+            fx.Int64(plan.dst.data_ptr()),
+            fx.Int64(route_weights.data_ptr()),
+            fx.Int64(self.peer_expert_output_ptrs.data_ptr()),
+            fx.Int64(self.combine_output.data_ptr()),
+            stream,
+        )
+        if self._combine_compiled is None:
+            self._combine_compiled = flyc.compile(self._combine_jit, *args)
+        else:
+            self._combine_compiled(
+                plan.dst.data_ptr(),
+                route_weights.data_ptr(),
+                self.peer_expert_output_ptrs.data_ptr(),
+                self.combine_output.data_ptr(),
+                stream,
+            )
+        return self.combine_output
+
     def close(self) -> None:
         """Collectively release the symmetric receive buffers."""
 
@@ -327,6 +394,7 @@ class MoonEPPreplannedDispatchOp:
         mori_shmem_free_tensor(self.recv_hidden)
         mori_shmem_free_tensor(self.recv_route_weights)
         mori_shmem_free_tensor(self.recv_duplicate_src)
+        mori_shmem_free_tensor(self.expert_output)
         self._closed = True
 
 
