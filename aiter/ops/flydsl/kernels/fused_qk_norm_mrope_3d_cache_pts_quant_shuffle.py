@@ -443,21 +443,8 @@ def _build_kv_kernel(
         tok0 = (blk + page_block_offset) * block_size
 
         # ---------------- Phase 1: compute -> LDS stage ----------------
-        # `num_tokens` need not be a multiple of `block_size` -- the very
-        # last page-block (blk == num_page_blocks - 1) may have fewer than
-        # `block_size` real tokens. `tok0` itself is always a valid row
-        # (the host chunks page blocks but preserves their global offset, and
-        # ceil_div(num_tokens, block_size) guarantees tok0 < num_tokens), but
-        # individual `tok` values within that last block's `token_local` range
-        # can run past `num_tokens`. Guard every `qkv`/`positions` read (and, in the
-        # return_kv path, every `k_out`/`v_out` write, which are sized to
-        # exactly `num_tokens` rows) behind `tok < num_tokens`, and zero-fill
-        # the LDS staging row for out-of-range tokens instead of leaving it
-        # uninitialized, so the unconditional Phase-2 coalesced copy (which
-        # always moves a full `block_size` worth of bytes per page, since
-        # that's the fixed physical page granularity) writes deterministic
-        # zero padding into the tail page's unused slots rather than
-        # propagating garbage shared memory.
+        # The final logical page may be partial, so guard token-sized inputs
+        # and outputs. Phase 2 sends partial pages through the scatter path.
         coord_wl = fx.idx2crd(fx.Int32(t), layout_tx_wave_lane)
         wid = fx.get(coord_wl, 0)
         lane = fx.get(coord_wl, 1)
@@ -549,33 +536,27 @@ def _build_kv_kernel(
                                     v_out[tok, head, col] = vb0
                                     v_out[tok, head, col + HALF] = vb1
 
-        # The first wave cooperatively validates this token group while the
-        # other waves finish staging. The wave reduction completes before the
-        # existing compute->copy barrier, so aligned prefill pays no additional
-        # block barriers. For block_size > WAVE, each lane checks multiple slots.
-        mapping_valid = fx.Int32(1)
+        # Wave 0 checks whether the whole logical page maps to one aligned
+        # physical page. Other mappings use the scatter path.
         if wid == 0:
             base_slot = fx.Int64(slot_mapping[tok0])
             full_page = tok0 + block_size <= num_tokens
-            page_aligned = (base_slot % fx.Int64(block_size)) == fx.Int64(0)
-            for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
-                token_local = lane + WAVE * check_it
-                if token_local < block_size:
-                    tok = tok0 + fx.Int32(token_local)
-                    if tok < num_tokens:
+            valid_base = (
+                full_page
+                and (base_slot >= fx.Int64(0))
+                and ((base_slot % fx.Int64(block_size)) == fx.Int64(0))
+            )
+            mapping_valid = valid_base.select(fx.Int32(1), fx.Int32(0))
+            if full_page:
+                for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
+                    token_local = lane + WAVE * check_it
+                    if token_local < block_size:
+                        tok = tok0 + fx.Int32(token_local)
                         slot = fx.Int64(slot_mapping[tok])
                         expected = base_slot + fx.Int64(token_local)
-                        valid = (
-                            full_page
-                            and (base_slot >= fx.Int64(0))
-                            and page_aligned
-                            and (slot == expected)
-                        )
-                        mapping_valid = mapping_valid & valid.select(
+                        mapping_valid = mapping_valid & (slot == expected).select(
                             fx.Int32(1), fx.Int32(0)
                         )
-                    else:
-                        mapping_valid = fx.Int32(0)
             for sh_exp in range_constexpr(_LOG2_WAVE):
                 off = WAVE // (2 << sh_exp)
                 peer_valid = mapping_valid.shuffle_xor(off, WAVE)
@@ -1069,11 +1050,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         gemma_norm=gemma_norm,
         cache_is_fp8=cache_is_fp8,
     )
-    # num_tokens need not be a multiple of block_size -- the last page-block
-    # may be a ragged tail with fewer than block_size real tokens; the
-    # kernel's Phase 1 guards every per-token read/write behind
-    # `tok < num_tokens` and zero-fills the corresponding LDS staging rows
-    # for the out-of-range tail positions (see _build_kv_kernel).
+    # Include a final partial page; the kernel handles it with guarded staging
+    # and scatter writes.
     num_page_blocks = _ceil_div(num_tokens, block_size)
     k_out_arg = (
         k_out.view(num_tokens, H_K, D)
