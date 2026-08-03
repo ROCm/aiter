@@ -67,44 +67,6 @@ from triton.runtime.errors import OutOfResources as TritonOutOfResources
 from aiter.ops.flydsl import is_flydsl_available
 from flydsl.runtime.device import get_rocm_arch
 
-# Import the standalone GEAK v4 kernel.
-_GEAK_V4_PATH = os.path.join(
-    _REPO_ROOT,
-    "aiter", "ops", "flydsl", "kernels", "fp8_mqa_logits_flydsl_geak_v4.py",
-)
-
-_GEAK_V5_PATH = os.path.join(
-    _REPO_ROOT,
-    "aiter", "ops", "flydsl", "kernels", "fp8_mqa_logits_flydsl_geak_v5.py",
-)
-
-_geak_v4_mod = None
-if os.path.exists(_GEAK_V4_PATH):
-    import importlib.util as _imputil
-    _spec = _imputil.spec_from_file_location("fp8_mqa_logits_flydsl_geak_v4", _GEAK_V4_PATH)
-    _geak_v4_mod = _imputil.module_from_spec(_spec)
-    try:
-        _spec.loader.exec_module(_geak_v4_mod)
-    except Exception as _e:
-        print(f"[warn] failed to load geak_v4 kernel: {_e}", file=sys.stderr)
-        exit(1)
-
-if os.path.exists(_GEAK_V5_PATH):
-    import importlib.util as _imputil
-    _spec = _imputil.spec_from_file_location(
-        "aiter.ops.flydsl.kernels.fp8_mqa_logits_flydsl_geak_v5",  # full dotted name
-        _GEAK_V5_PATH,
-        submodule_search_locations=[],  # marks it as a package member
-    )
-    _geak_v5_mod = _imputil.module_from_spec(_spec)
-    import sys as _sys
-    _sys.modules[_spec.name] = _geak_v5_mod  # register so relative imports resolve
-    try:
-        _spec.loader.exec_module(_geak_v5_mod)
-    except Exception as _e:
-        print(f"[warn] failed to load geak_v5 kernel: {_e}", file=sys.stderr)
-        exit(1)
-
 def _triton_logits_fallback(Q, KV, kv_scales, weights, cu_starts, cu_ends,
                             clean_logits=True, block_kv=64):
     """Direct-launch Triton kernel with reduced BLOCK_KV for mixed-dtype combos.
@@ -340,7 +302,6 @@ PRESET_SHAPES = [
 ]
 
 FLYDSL_PREFIX = "flydsl:"
-GEAK_IMPL_NAMES = ["geak_v4", "geak_v5"]
 
 def _flydsl_variant_of(name):
     """Return the variant tag for a 'flydsl:<variant>' impl name."""
@@ -351,8 +312,6 @@ def _impl_label(name):
     """Short, column-friendly label for an impl name (e.g. 'triton', 'fly:mfma')."""
     if name == "triton":
         return "triton"
-    if name in GEAK_IMPL_NAMES:
-        return "flydsl:" + name
     if name.startswith(FLYDSL_PREFIX):
         return "flydsl:" + _flydsl_variant_of(name)
     return name
@@ -360,9 +319,6 @@ def _impl_label(name):
 
 def _available_variants():
     """Return ``(tuple_of_variant_tags, default_tag)`` or ``(None, None)``.
-
-    ``None`` when FlyDSL isn't importable (so the bench can still run Triton-only).
-    The standalone "geak_v4" variant is appended if the v4 module loaded.
     """
     if not is_flydsl_available():
         return None, None
@@ -371,16 +327,7 @@ def _available_variants():
         FP8_MQA_LOGITS_DEFAULT_VARIANT,
     )
 
-    arch = get_rocm_arch()
-    is_gfx942 = arch == "gfx942"
-
     variants = list(FP8_MQA_LOGITS_VARIANTS)
-    if is_gfx942:
-        # The GEAK optimized kernel is valid only for gfx942
-        if _geak_v4_mod is not None:
-            variants.append("geak_v4")
-        if _geak_v5_mod is not None:
-            variants.append("geak_v5")
     return tuple(variants), FP8_MQA_LOGITS_DEFAULT_VARIANT
 
 
@@ -390,8 +337,7 @@ def _select_impls(which, flydsl_variants):
     ``which`` is the impl-family selection ('all'/'triton'/'flydsl').
     ``flydsl_variants`` is the resolved list of FlyDSL kernel-version tags to
     benchmark; each becomes its own impl named ``flydsl:<variant>`` bound to that
-    variant via ``functools.partial``. The special ``"geak"`` tag maps to the
-    standalone v4 module (imported at the top of this file).
+    variant via ``functools.partial``. 
     """
     flydsl_fn = None
     available_variants = ()
@@ -403,10 +349,6 @@ def _select_impls(which, flydsl_variants):
 
         flydsl_fn = flydsl_fp8_mqa_logits
         available_variants = list(FP8_MQA_LOGITS_VARIANTS)
-        if _geak_v4_mod is not None:
-            available_variants.append("geak_v4")
-        if _geak_v5_mod is not None:
-            available_variants.append("geak_v5")
         available_variants = tuple(available_variants)
 
     want_triton = which in ("all", "triton")

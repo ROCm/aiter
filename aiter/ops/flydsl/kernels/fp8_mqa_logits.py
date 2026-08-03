@@ -1387,25 +1387,28 @@ def _mfma16k128_lds_bkv(bkv, r, w, sw=False, nb=2, pd=2):
         num_buffers=nb, prefetch_depth=pd,
     )
 
-_VARIANT_BUILDERS = {
-    # --- 16x16x32 fp8 variants (bkv=64) ---
-    "mfma16x16x32_bkv64_r1_w1":   _mfma16_bkv(64,  1, 1),
-    # --- 16x16x32 fp8 variants (bkv=128) ---
-    "mfma16x16x32_bkv128_r1_w1":  _mfma16_bkv(128, 1, 1),
-    "mfma16x16x32_bkv128_r2_w1":  _mfma16_bkv(128, 2, 1),
-    "mfma16x16x32_bkv128_r4_w1":  _mfma16_bkv(128, 4, 1),
-    "mfma16x16x32_bkv128_r1_w4":  _mfma16_bkv(128, 1, 4),
-    "mfma16x16x32_bkv128_r2_w2":  _mfma16_bkv(128, 2, 2),
-    "mfma16x16x32_bkv128_r2_w4":  _mfma16_bkv(128, 2, 4),
-    "mfma16x16x32_bkv128_r4_w2":  _mfma16_bkv(128, 4, 2),
-    # --- 16x16x32 fp8 variants (bkv=256) ---
-    "mfma16x16x32_bkv256_r1_w1":  _mfma16_bkv(256, 1, 1),
-    "mfma16x16x32_bkv256_r2_w2":  _mfma16_bkv(256, 2, 2),
-    # --- 32x32x16 fp8 variants (bkv=128) ---
-    "mfma32x32x16_bkv128_r1_w1":  _mfma32_bkv(128, 1, 1),
-    "mfma32x32x16_bkv128_r2_w1":  _mfma32_bkv(128, 2, 1),
-    "mfma32x32x16_bkv128_r2_w2":  _mfma32_bkv(128, 2, 2),
-}
+_VARIANT_BUILDERS = {}
+
+if arch == "gfx942":
+    _VARIANT_BUILDERS.update({
+        # --- 16x16x32 fp8 variants (bkv=64) ---
+        "mfma16x16x32_bkv64_r1_w1":   _mfma16_bkv(64,  1, 1),
+        # --- 16x16x32 fp8 variants (bkv=128) ---
+        "mfma16x16x32_bkv128_r1_w1":  _mfma16_bkv(128, 1, 1),
+        "mfma16x16x32_bkv128_r2_w1":  _mfma16_bkv(128, 2, 1),
+        "mfma16x16x32_bkv128_r4_w1":  _mfma16_bkv(128, 4, 1),
+        "mfma16x16x32_bkv128_r1_w4":  _mfma16_bkv(128, 1, 4),
+        "mfma16x16x32_bkv128_r2_w2":  _mfma16_bkv(128, 2, 2),
+        "mfma16x16x32_bkv128_r2_w4":  _mfma16_bkv(128, 2, 4),
+        "mfma16x16x32_bkv128_r4_w2":  _mfma16_bkv(128, 4, 2),
+        # --- 16x16x32 fp8 variants (bkv=256) ---
+        "mfma16x16x32_bkv256_r1_w1":  _mfma16_bkv(256, 1, 1),
+        "mfma16x16x32_bkv256_r2_w2":  _mfma16_bkv(256, 2, 2),
+        # --- 32x32x16 fp8 variants (bkv=128) ---
+        "mfma32x32x16_bkv128_r1_w1":  _mfma32_bkv(128, 1, 1),
+        "mfma32x32x16_bkv128_r2_w1":  _mfma32_bkv(128, 2, 1),
+        "mfma32x32x16_bkv128_r2_w2":  _mfma32_bkv(128, 2, 2),
+    })
 
 if arch == "gfx950":
     # CDNA4 scaled MFMA atoms (K=128/64) -- gfx950-only: these instructions
