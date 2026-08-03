@@ -1109,6 +1109,16 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
         auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
         auto v_o_out            = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
+        if(lane_id < T::W_M)
+        {
+            const int lse_offset = q_len_ptr_s * kargs.H;
+            auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
+                                   q_len * kargs.H * sizeof(D_ACC));
+            constexpr float INV_LOG2_E = 0.69314718055994531f; // 1 / LOG2_E == ln(2)
+            const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
+                                                    : opus::numeric_limits<D_ACC>::lowest();
+            g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);
+        }
     }
     if(slot >= 0)
     {
