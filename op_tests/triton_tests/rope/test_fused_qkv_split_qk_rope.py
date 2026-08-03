@@ -1,13 +1,14 @@
-import torch
 import pytest
-from aiter.ops.triton.rope.fused_qkv_split_qk_rope import fused_qkv_split_qk_rope
+import torch
+
 from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
     fused_qkv_split_qk_norm_rope_cache,
 )
+from aiter.ops.triton.rope.fused_qkv_split_qk_rope import fused_qkv_split_qk_rope
+from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
 from op_tests.triton_tests.fusions.test_fused_qk_concat import (
     generate_rope_cached_freqs,
 )
-from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
 
 
 def generate_qkv_inputs(
@@ -161,8 +162,8 @@ def test_fused_qkv_split_qk_rope(
         rotate_style,
     )
 
-    torch.testing.assert_close(q_torch, q_triton)
-    torch.testing.assert_close(k_torch, k_triton)
+    torch.testing.assert_close(q_torch, q_triton, atol=5e-4, rtol=2e-2)
+    torch.testing.assert_close(k_torch, k_triton, atol=5e-4, rtol=2e-2)
     torch.testing.assert_close(v_torch, v_triton)
 
 

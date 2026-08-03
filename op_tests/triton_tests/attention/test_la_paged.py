@@ -1,7 +1,9 @@
+import os
+import random
 import sys
+
 import pytest
 import torch
-import random
 
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 
@@ -31,6 +33,9 @@ def test_persistent_lean_attention(
     waves_per_eu,
     num_warps,
 ):
+    if os.environ.get("HSA_MODEL_LIB"):
+        pytest.skip("persistent lean attention does not complete under FFM")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     torch.manual_seed(20)
@@ -97,7 +102,7 @@ def test_persistent_lean_attention(
         ref_b_ctx = []
         kv_n_ctx_idx = 0
 
-        r = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        r = random.sample(range(num_kv_blocks), num_kv_blocks)
         for i in range(num_kv_blocks):
             ref_b.append(r[i])
             if i == kv_n_ctx[kv_n_ctx_idx] - 1:
@@ -120,29 +125,29 @@ def test_persistent_lean_attention(
     start_q = 0
     ref_out = torch.empty_like(q, dtype=v.dtype)
     # qb = torch.empty((h, n_ctx_q*batch, d), dtype=init_dtype)
-    for h in range(h):
+    for hi in range(h):
         for b in range(len(n_ctx)):
-            # print(f"h={h}")
+            # print(f"hi={hi}")
             # print(f"n_ctx_q={N_CTX_Q}")
             # print(f"M shape: {M.shape}")
-            qb = q[h, start_q : (start_q + int(n_ctx_q)), :]
+            qb = q[hi, start_q : (start_q + int(n_ctx_q)), :]
             # print(f"qb shape: {qb.shape}")
             idxs = [
-                ref_block_tables[h][b][kv_b_i] * BLOCK_N + b_i
-                for kv_b_i in range(len(ref_block_tables[h][b]))
+                ref_block_tables[hi][b][kv_b_i] * BLOCK_N + b_i
+                for kv_b_i in range(len(ref_block_tables[hi][b]))
                 for b_i in range(BLOCK_N)
             ]
             # print(f'idxs: {idxs}')
             idxs = torch.tensor(idxs, dtype=torch.int32, device="cuda")
-            kb = torch.index_select(k[h], dim=0, index=idxs)
+            kb = torch.index_select(k[hi], dim=0, index=idxs)
             # print(f"{kb} kb shape: {kb.shape}")
-            vb = torch.index_select(v[h], dim=0, index=idxs)
+            vb = torch.index_select(v[hi], dim=0, index=idxs)
             # print(f"{vb} vb shape: {vb.shape}")
             p = torch.matmul(qb, kb.transpose(0, 1)) * sm_scale
             # print(f"p shape: {p.shape}")
             p = torch.softmax(p.float(), dim=-1).to(q.dtype)
             refb = torch.matmul(p, vb)
-            ref_out[h, start_q : (start_q + int(n_ctx_q)), :] = refb
+            ref_out[hi, start_q : (start_q + int(n_ctx_q)), :] = refb
             # print(f"refb={refb}")
             # print(f"refb shape: {refb.shape}")
             start += b
@@ -231,7 +236,7 @@ def main():
 
     block_tables = []
     for head in range(h):
-        b = random.sample(range(0, num_kv_blocks), num_kv_blocks)
+        b = random.sample(range(num_kv_blocks), num_kv_blocks)
         block_tables.append(b)
     kv_block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
     print(f"KV block tables shape={kv_block_tables.shape}")

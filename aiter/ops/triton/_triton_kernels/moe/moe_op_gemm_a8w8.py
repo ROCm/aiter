@@ -4,13 +4,14 @@
 import torch
 import triton
 import triton.language as tl
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
-from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
+from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
 def matmul_launch_metadata(grid, kernel, args):
-    ret = dict()
+    ret = {}
     M, N, K = None, args["N"], args["K"]
     Y, X, W = args["Y"], args["X"], args["W"]
     hist = args["ExptHist"]
@@ -352,9 +353,8 @@ def _moe_gemm_a8w8(
     if not EVEN_K:
         mask_x_k = offs_x_k < MASK_K_LIMIT
         mask_w_k = offs_w_k < (MASK_K_LIMIT)
-        if is_w_microscaled:
-            if SWIZZLE_MX_SCALE is None:
-                mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
+        if is_w_microscaled and SWIZZLE_MX_SCALE is None:
+            mask_w_k_scale = offs_w_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
         if is_x_microscaled:
             mask_x_k_scale = offs_x_k_scale * MX_PACK_DIVISOR < MASK_K_LIMIT
 

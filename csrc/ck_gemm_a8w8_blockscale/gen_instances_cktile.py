@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 import argparse
 import os
-import sys
 import shutil
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -17,17 +17,16 @@ AITER_CORE_DIR = (
     else os.path.abspath(f"{this_dir}/../../aiter/jit/utils")
 )
 sys.path.insert(0, AITER_CORE_DIR)
-from chip_info import (  # noqa: E402
+from chip_info import (
     build_tune_dict,
     write_lookup_header,
     write_name_keyed_lookup_header,
 )
-
-from gemm_a8w8_blockscale_cktile_instance import (  # noqa: E402
-    default_kernels_cktile_dict,
+from gemm_a8w8_blockscale_cktile_instance import (
     TileKernelInstance,
-    candidate_kernels_cktile_dict,
     candidate_kernels_by_name,
+    candidate_kernels_cktile_dict,
+    default_kernels_cktile_dict,
 )
 
 """
@@ -252,8 +251,10 @@ torch::Tensor
             "w",
         ) as f:
             f.write(MAINFEST_head)
-            for _, k in kernels_dict.items():
-                f.write(MAINFEST_template.format(kernel_name=k.name))
+            f.writelines(
+                MAINFEST_template.format(kernel_name=k.name)
+                for _, k in kernels_dict.items()
+            )
             f.write(MAINFEST_end)
 
     def gen_code(self, kernels_dict: dict):
@@ -262,7 +263,7 @@ torch::Tensor
         """
 
         # generate instances code
-        for _, k in kernels_dict.items():
+        for k in kernels_dict.values():
             self.gen_cktile_instance(k)
 
         # generate lookup dict for kernel instances
@@ -289,8 +290,12 @@ torch::Tensor
             # generate code for default kernels
             self.gen_code(candidate_kernels_cktile_dict)
         else:
-            # generate code for tuned kernels from tune_file
-            self.gen_code(self.get_tune_dict(self.tune_file))
+            # Runtime dispatch is keyed by kernelName from Python-selected tuned
+            # rows. Build the full CKTile candidate registry so a newly tuned CSV
+            # cannot reference a valid candidate that is absent from the .so.
+            runtime_kernels = self.get_tune_dict(self.tune_file)
+            runtime_kernels.update(candidate_kernels_cktile_dict)
+            self.gen_code(runtime_kernels)
 
 
 if __name__ == "__main__":

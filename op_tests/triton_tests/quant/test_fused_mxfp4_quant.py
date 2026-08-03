@@ -1,26 +1,24 @@
+import pytest
 import torch
 import torch.nn.functional as F
-import pytest
+
+from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
     fused_flatten_mxfp4_quant,
-    fused_rms_mxfp4_quant,
     fused_reduce_act_mul_and_mxfp4_quant,
     fused_reduce_rms_mxfp4_quant,
-    fused_dynamic_mxfp4_quant_moe_sort,
+    fused_rms_mxfp4_quant,
+)
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
+from aiter.utility.fp4_utils import dynamic_mxfp4_quant, moe_mxfp4_sort
+from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
+    SCALE_GROUP_SIZE,
+    e8m0_to_f32,
+    mxfp4_to_f32,
 )
 from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dynamic_mxfp4_quant
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    mxfp4_to_f32,
-    e8m0_to_f32,
-    SCALE_GROUP_SIZE,
-)
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
-    shuffle_scales,
-    un_shuffle_scales,
-)
-from aiter.ops.quant import per_1x32_f4_quant_hip
-from aiter.utility.fp4_utils import moe_mxfp4_sort, dynamic_mxfp4_quant
 
 
 def rmsnorm(input, weight, eps=1e-6):
@@ -78,7 +76,9 @@ def calculate_target_w_torch(
             (scaleM, scaleN), dtype=out1_scale.dtype, device=out1_scale.device
         )
         out1_scale_pad[:M, :scaleN_valid] = out1_scale[:M, :scaleN_valid]
-        out1_scale = shuffle_scales(out1_scale_pad)
+        out1_scale = shuffle_scale_gemm(
+            out1_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out1_scale = out1_scale.view(out1_scale.shape[0] * 32, -1)
 
     if x3 is not None:
@@ -208,11 +208,11 @@ def test_fused_rms_quant(
         torch.testing.assert_close(y1_torch, y1_triton)
 
     if shuffle:
-        y1_scales_triton = un_shuffle_scales(
-            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1)
+        y1_scales_triton = unshuffle_scale_gemm(
+            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1), arch="gfx950"
         )
-        y1_scales_torch = un_shuffle_scales(
-            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1)
+        y1_scales_torch = unshuffle_scale_gemm(
+            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1), arch="gfx950"
         )
 
     scaleN_valid = (N1 + 31) // 32
@@ -257,7 +257,9 @@ def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle
             (scaleM, scaleN), dtype=out_scale.dtype, device=out_scale.device
         )
         out_scale_pad[:M, :scaleN] = out_scale[:M, :scaleN]
-        out_scale = shuffle_scales(out_scale_pad)
+        out_scale = shuffle_scale_gemm(
+            out_scale_pad, arch="gfx950", preshuffle_factor=32, scale_kwidth=8
+        )
         out_scale = out_scale.view(out_scale.shape[0] * 32, -1)
     return (out, out_scale), y2
 
@@ -332,8 +334,12 @@ def test_fused_reduce_act_mul_mxfp4_group_quant(
     )
 
     if shuffle:
-        y_s_triton = un_shuffle_scales(y_s_triton.view(y_s_triton.shape[0] // 32, -1))
-        y_s_torch = un_shuffle_scales(y_s_torch.view(y_s_torch.shape[0] // 32, -1))
+        y_s_triton = unshuffle_scale_gemm(
+            y_s_triton.view(y_s_triton.shape[0] // 32, -1), arch="gfx950"
+        )
+        y_s_torch = unshuffle_scale_gemm(
+            y_s_torch.view(y_s_torch.shape[0] // 32, -1), arch="gfx950"
+        )
 
     torch.testing.assert_close(y2_torch, y2_triton, atol=0.1, rtol=0.1)
 
@@ -447,11 +453,11 @@ def test_fuse_reduce_rms_quant(
         torch.testing.assert_close(y3_torch, y3_triton)
 
     if shuffle:
-        y1_scales_triton = un_shuffle_scales(
-            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1)
+        y1_scales_triton = unshuffle_scale_gemm(
+            y1_scales_triton.view(y1_scales_triton.shape[0] // 32, -1), arch="gfx950"
         )
-        y1_scales_torch = un_shuffle_scales(
-            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1)
+        y1_scales_torch = unshuffle_scale_gemm(
+            y1_scales_torch.view(y1_scales_torch.shape[0] // 32, -1), arch="gfx950"
         )
 
     scaleN_valid = (N1 + 31) // 32

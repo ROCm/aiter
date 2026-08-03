@@ -5,7 +5,9 @@ from functools import partial
 
 import pytest
 import torch
+
 from aiter.ops.triton.moe.moe_routing_sigmoid_top1_fused import routing_sigmoid_top1
+from aiter.ops.triton.utils._triton import arch_info
 
 
 def torch_routing_sigmoid_top1(
@@ -44,6 +46,8 @@ def torch_routing_sigmoid_top1(
 @pytest.mark.parametrize("K", [16, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_routing_sigmoid_top1(M, N, K, dtype):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("sigmoid top-1 routing has no gfx1250 Triton config")
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     TOPK = 1

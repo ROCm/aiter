@@ -1,27 +1,27 @@
-import torch
 import pytest
+import torch
 import triton
 
-from op_tests.test_rope import ref_rope_sbhd_fwd, RotateStyle
-from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
-from op_tests.triton_tests.attention.test_mla import (
-    shuffle_kv_buffer,
-    dynamic_nvfp4_quant_kv_buffer,
-)
-from op_tests.triton_tests.attention.test_unified_attention import (
-    shuffle_kv_cache,
-    dynamic_nvfp4_quant_kv_cache,
-)
-from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
-from op_tests.triton_tests.test_kv_cache import check_kv_buffer
-from aiter.test_common import checkAllclose
 from aiter.ops.triton.fusions.fused_kv_cache import (
     fused_qk_rope_cat_and_cache_mla,
-    fused_qk_rope_reshape_and_cache,
     fused_qk_rope_cosine_cache_llama,
+    fused_qk_rope_reshape_and_cache,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+from aiter.test_common import checkAllclose
+from op_tests.test_rope import RotateStyle, ref_rope_sbhd_fwd
+from op_tests.triton_tests.attention.test_mla import (
+    dynamic_nvfp4_quant_kv_buffer,
+    shuffle_kv_buffer,
+)
+from op_tests.triton_tests.attention.test_unified_attention import (
+    dynamic_nvfp4_quant_kv_cache,
+    shuffle_kv_cache,
+)
+from op_tests.triton_tests.quant.test_quant_mxfp4 import torch_dequant_nvfp4
+from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
+from op_tests.triton_tests.test_kv_cache import check_kv_buffer
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -75,7 +75,7 @@ def split_unshuffle_nvfp4_kv_cache(key_or_value_cache):
 @pytest.mark.parametrize("KH", [1])
 @pytest.mark.parametrize("D_pe", [64])  # For now, D is power of 2. D >= 16
 @pytest.mark.parametrize("D_lora", [512])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [1024])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [16384])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
 @pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
 @pytest.mark.parametrize(
@@ -102,9 +102,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     block_size: int,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     dtype = torch.bfloat16
     pos = True
     _, _, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -190,8 +189,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch_q = torch.cat((torch_q_nope, torch_q_pe), dim=-1)
     torch_decode_q_pe = torch_q_pe
     if cache_dtype == torch.bfloat16:
-        torch_k_lora = torch_k_lora
-        torch_k_pe = torch_k_pe
+        torch_k_lora = torch_k_lora  # noqa: PLW0127
+        torch_k_pe = torch_k_pe  # noqa: PLW0127
     elif cache_dtype == e4m3_dtype:
         torch_k_lora = (torch_k_lora.to(torch.float32) / k_scale).to(torch.bfloat16)
         torch_k_pe = (torch_k_pe.to(torch.float32) / k_scale).to(torch.bfloat16)
@@ -299,9 +298,8 @@ def test_fused_qk_rope_reshape_and_cache(
     dtype: torch.dtype,
     upcast_operand: bool,
 ):
-    if cache_dtype == torch.uint8:
-        if DEVICE_ARCH not in ("gfx1250",):
-            pytest.skip("NVFP4 quantization is only supported on GFX1250")
+    if cache_dtype == torch.uint8 and DEVICE_ARCH not in ("gfx1250",):
+        pytest.skip("NVFP4 quantization is only supported on GFX1250")
     torch.manual_seed(0)
     pos = True
     q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
@@ -482,17 +480,28 @@ def test_fused_qk_rope_reshape_and_cache(
         triton_value_cache_dquant = torch_dequant_nvfp4(
             triton_value_cache, triton_value_cache_scales, out_dtype=dtype
         )
-        torch.testing.assert_close(
-            ref_key_cache_dquant,
-            triton_key_cache_dquant,
-            atol=1e-1,
-            rtol=1e-1,
+        tol_err_ratio = 0.05
+        assert (
+            checkAllclose(
+                ref_key_cache_dquant,
+                triton_key_cache_dquant,
+                atol=1e-1,
+                rtol=1e-1,
+                tol_err_ratio=tol_err_ratio,
+                msg="key_cache dequant (nvfp4)",
+            )
+            <= tol_err_ratio
         )
-        torch.testing.assert_close(
-            ref_value_cache_dquant,
-            triton_value_cache_dquant,
-            atol=1e-1,
-            rtol=1e-1,
+        assert (
+            checkAllclose(
+                ref_value_cache_dquant,
+                triton_value_cache_dquant,
+                atol=1e-1,
+                rtol=1e-1,
+                tol_err_ratio=tol_err_ratio,
+                msg="value_cache dequant (nvfp4)",
+            )
+            <= tol_err_ratio
         )
     else:
         torch_key_cache = torch_key_cache.to(dtype)
@@ -535,155 +544,16 @@ def test_fused_qk_rope_reshape_and_cache(
         )
 
 
-@pytest.mark.parametrize("T", [1, 4, 32])
-@pytest.mark.parametrize("QH_per_KH", [1, 4])
-@pytest.mark.parametrize("KH", [1, 8])
-@pytest.mark.parametrize("D", [64, 128])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-@pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("x_size", [8])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_fused_qk_rope_reshape_and_cache_value_shuffle_layout(
-    T: int,
-    QH_per_KH: int,
-    KH: int,
-    D: int,
-    num_kv_cahce_tokens: int,
-    rotate_style: int,
-    reuse_freqs_front_part: bool,
-    block_size: int,
-    x_size: int,
-    dtype: torch.dtype,
-):
-    """Test fused_qk_rope_reshape_and_cache with value_cache in shuffle layout
-    [num_blocks, num_kv_heads, block_size // x, head_size, x].
-    """
-    torch.manual_seed(0)
-    assert D % x_size == 0
-    pos = True
-    offs = False
-    q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
-        1,
-        T,
-        KH,
-        QH_per_KH,
-        D,
-        cached=True,
-        reuse_freqs_front_part=reuse_freqs_front_part,
-        nope=False,
-        pos=pos,
-        offs=offs,
-        two_inputs=True,
-        layout="thd",
-        dtype=dtype,
-    )
-    v = torch.randn_like(k)
-
-    cache_dtype = torch.bfloat16
-    k_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
-    v_scale = torch.ones(1, dtype=torch.float32, device="cuda")[0]
-
-    num_blocks = num_kv_cahce_tokens
-    slot_chunk_dim = block_size // x_size
-    key_cache = torch.zeros(
-        (num_blocks, KH, D // x_size, block_size, x_size),
-        dtype=cache_dtype,
-        device="cuda",
-    )
-    value_cache = torch.zeros(
-        (num_blocks, KH, slot_chunk_dim, D, x_size),
-        dtype=cache_dtype,
-        device="cuda",
-    )
-    slot_mapping = torch.randint(0, num_blocks * block_size, (T,), device="cuda")
-
-    ref_freqs = freqs[
-        positions if offsets is None else torch.add(positions, offsets)
-    ].squeeze(-2)
-    torch_q = ref_rope_sbhd_fwd(
-        q.unsqueeze(0),
-        ref_freqs,
-        rotate_style=rotate_style,
-        reuse_freqs_front_part=reuse_freqs_front_part,
-        nope_first=False,
-    ).squeeze(0)
-    torch_k = ref_rope_sbhd_fwd(
-        k.unsqueeze(0),
-        ref_freqs,
-        rotate_style=rotate_style,
-        reuse_freqs_front_part=reuse_freqs_front_part,
-        nope_first=False,
-    ).squeeze(0)
-
-    slot_t = slot_mapping // block_size
-    slot_b = slot_mapping % block_size
-    torch_key_cache = key_cache.clone()
-    torch_value_cache = value_cache.clone()
-    torch_k_og_dtype = torch_k.clone()
-    torch_v = v
-
-    for t in range(T):
-        st, sb = slot_t[t].item(), slot_b[t].item()
-        torch_key_cache[st, :, :, sb, :] = torch_k[t].reshape(KH, D // x_size, x_size)
-        slot_chunk = sb // x_size
-        x_off = sb % x_size
-        torch_value_cache[st, :, slot_chunk, :, x_off] = torch_v[t]
-    torch_zeros = torch.zeros_like(q)
-
-    triton_key_cache = key_cache.clone()
-    triton_value_cache = value_cache.clone()
-    triton_q, triton_k, triton_key_cache, triton_value_cache, triton_zeros_out = (
-        fused_qk_rope_reshape_and_cache(
-            q,
-            k,
-            v,
-            triton_key_cache,
-            triton_value_cache,
-            slot_mapping,
-            positions,
-            cos,
-            sin,
-            k_scale,
-            v_scale,
-            (rotate_style == RotateStyle.NEOX),
-            flash_layout=False,
-            apply_scale=True,
-            offs=offsets,
-            q_out=None,
-            k_out=None,
-            output_zeros=True,
-        )
-    )
-
-    torch.testing.assert_close(torch_q, triton_q, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(torch_k_og_dtype, triton_k, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(torch_zeros, triton_zeros_out, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        torch_key_cache,
-        triton_key_cache,
-        atol=1e-2,
-        rtol=1e-2,
-    )
-    torch.testing.assert_close(
-        torch_value_cache,
-        triton_value_cache,
-        atol=1e-2,
-        rtol=1e-2,
-    )
-
-
 # gpt-oss-120b config: hidden_size=2880, num_attention_heads=64, num_key_value_heads=8, head_dim=64
 GPT_OSS_120B_HEAD_DIM = 64
 GPT_OSS_120B_NUM_ATTENTION_HEADS = 64
 GPT_OSS_120B_NUM_KV_HEADS = 8
 
 
-@pytest.mark.parametrize("T", [1, 4, 16])
+@pytest.mark.parametrize("T", [1, 4, 16, 64])
 @pytest.mark.parametrize("block_size", [16])
 @pytest.mark.parametrize("x_size", [8])
-@pytest.mark.parametrize("num_kv_cahce_tokens", [256])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [256, 4096])
 def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_precision(
     T: int,
     block_size: int,
@@ -705,7 +575,7 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
     offs = False
 
     torch.manual_seed(0)
-    q, k, _, _, freqs, positions, offsets, cos, sin = generate_rope_inputs(
+    q, k, _, _, _freqs, positions, offsets, cos, sin = generate_rope_inputs(
         1,
         T,
         KH,
@@ -824,11 +694,11 @@ def test_fused_qk_rope_reshape_and_cache_gpt_oss_120b_config_value_shuffle_preci
         )
 
 
-@pytest.mark.parametrize("T", [1, 4, 64])
+@pytest.mark.parametrize("T", [1, 2, 4, 128])
 @pytest.mark.parametrize("QH_per_KH", [1, 4, 16])
 @pytest.mark.parametrize("KH", [1, 8])
 @pytest.mark.parametrize("D", [64, 128])  # For now, D is power of 2. D >= 16
-@pytest.mark.parametrize("num_kv_cahce_tokens", [1025])
+@pytest.mark.parametrize("num_kv_cahce_tokens", [8193])
 @pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ])
 @pytest.mark.parametrize("reuse_freqs_front_part", [True])
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16])

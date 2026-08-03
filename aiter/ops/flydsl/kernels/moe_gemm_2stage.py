@@ -12,24 +12,23 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 - `tests/` holds correctness/perf harnesses
 """
 
-import logging
-import os
 import functools
+import os
 from contextlib import contextmanager
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith
-from flydsl.expr import gpu, buffer_ops, vector, rocdl
-from flydsl.expr import range_constexpr, const_expr
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+
 try:
     from flydsl.runtime.device import (
-        supports_bf16_global_atomics,
         bf16_global_atomics_arch_description,
+        supports_bf16_global_atomics,
     )
 except ImportError:
     # Backward compatibility for runtime.device versions that only expose get_rocm_arch.
@@ -44,23 +43,22 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr.typing import T
 
-
+from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .mfma_preshuffle_pipeline import (
     buffer_copy_gmem16_dwordx4,
+    crd2idx,
+    extract_bf16_scale,
     lds_store_4b_xor16,
     lds_store_8b_xor16,
     lds_store_16b_xor16,
-    make_preshuffle_b_layout,
     load_b_pack_k32,
     load_b_raw_w4a16,
-    unpack_b_w4a16,
     load_b_raw_w4a16_groupwise,
-    extract_bf16_scale,
-    tile_chunk_coord_i32,
+    make_preshuffle_b_layout,
     swizzle_xor16,
-    crd2idx,
+    tile_chunk_coord_i32,
+    unpack_b_w4a16,
 )
-from .mfma_epilogues import c_shuffle_epilog, default_epilog, mfma_epilog
 from .tensor_shim import _run_compiled
 
 
@@ -146,9 +144,8 @@ def compile_moe_gemm1(
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
-        return (lambda ty: ty() if callable(ty) else ty)(
-            T.f16 if out_dtype == "f16" else T.bf16
-        )
+        ty = T.f16 if out_dtype == "f16" else T.bf16
+        return ty() if callable(ty) else ty
 
     tile_k_bytes = int(tile_k) * int(elem_bytes)
     # K64-byte micro-step: always 64 bytes per `ku`. For fp16 this is 32 elements.
@@ -680,10 +677,10 @@ def compile_moe_gemm1(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -728,11 +725,11 @@ def compile_moe_gemm1(
                     row_gate = expert_off_idx + col_g
                     row_up = row_gate + inter_idx
 
-                    coord_gate = fx.idx2crd(row_gate, layout_n_blk_intra)
+                    coord_gate = fx.idx2crd(fx.Int32(row_gate), layout_n_blk_intra)
                     n_blk_gate.append(fx.get(coord_gate, 0))
                     n_intra_gate.append(fx.get(coord_gate, 1))
 
-                    coord_up = fx.idx2crd(row_up, layout_n_blk_intra)
+                    coord_up = fx.idx2crd(fx.Int32(row_up), layout_n_blk_intra)
                     n_blk_up.append(fx.get(coord_up, 0))
                     n_intra_up.append(fx.get(coord_up, 1))
 
@@ -899,7 +896,9 @@ def compile_moe_gemm1(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)
@@ -2170,11 +2169,10 @@ def compile_moe_gemm2(
     # gfx942 only has global_atomic_pk_add_bf16 → must use global atomics with raw pointer.
     _has_buffer_atomic_bf16 = str(gpu_arch).startswith(("gfx95", "gfx12"))
     _needs_global_atomic_bf16 = out_is_bf16 and not _has_buffer_atomic_bf16
-    if out_is_bf16:
-        if not supports_bf16_global_atomics(gpu_arch):
-            raise ValueError(
-                f"out_dtype='bf16' requires bf16 global atomics ({bf16_global_atomics_arch_description()}), got arch={gpu_arch!r}"
-            )
+    if out_is_bf16 and not supports_bf16_global_atomics(gpu_arch):
+        raise ValueError(
+            f"out_dtype='bf16' requires bf16 global atomics ({bf16_global_atomics_arch_description()}), got arch={gpu_arch!r}"
+        )
 
     if out_is_f32:
         # Match origin/dev_a16w4: f32 output uses scalar atomics and does NOT use the CShuffle epilogue.
@@ -2548,10 +2546,10 @@ def compile_moe_gemm2(
                     return parts
 
                 # tx -> wave/lane (GEMM-style decomposition).
-                coord_wl = fx.idx2crd(tx, layout_tx_wave_lane)
+                coord_wl = fx.idx2crd(fx.Int32(tx), layout_tx_wave_lane)
                 wave_id = fx.get(coord_wl, 0)
                 lane_id = fx.get(coord_wl, 1)
-                coord_l16 = fx.idx2crd(lane_id, layout_lane16)
+                coord_l16 = fx.idx2crd(fx.Int32(lane_id), layout_lane16)
                 lane_div_16 = fx.get(coord_l16, 0)
                 lane_mod_16 = fx.get(coord_l16, 1)
 
@@ -2587,7 +2585,7 @@ def compile_moe_gemm2(
                     col_g_list.append(col_g)
 
                     row_w = expert_off_idx + col_g
-                    coord_w = fx.idx2crd(row_w, layout_n_blk_intra)
+                    coord_w = fx.idx2crd(fx.Int32(row_w), layout_n_blk_intra)
                     n_blk_list.append(fx.get(coord_w, 0))
                     n_intra_list.append(fx.get(coord_w, 1))
 
@@ -2751,7 +2749,9 @@ def compile_moe_gemm2(
                         if elem_bytes == 1
                         else (col_base_swz_bytes // arith.index(int(elem_bytes)))
                     )
-                    idx_a16 = crd2idx((curr_row_a_lds, col_base_swz), layout_lds)
+                    idx_a16 = crd2idx(
+                        (fx.Int32(curr_row_a_lds), fx.Int32(col_base_swz)), layout_lds
+                    )
                     idx_a16 = idx_a16 + lds_base
                     loaded_a16 = vector.load_op(vec16_x, lds_x, [idx_a16])
                     a_i64x2 = vector.bitcast(T.i64x2, loaded_a16)

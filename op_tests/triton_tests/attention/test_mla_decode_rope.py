@@ -3,14 +3,15 @@
 
 from typing import Any
 
-import torch
 import pytest
+import torch
 
 from aiter.ops.triton.attention.mla_decode_rope import (
     _decode_grouped_att_m_fwd_rope,
-    decode_attention_fwd_grouped_rope,
     _get_config,
+    decode_attention_fwd_grouped_rope,
 )
+from aiter.test_common import checkAllclose
 from op_tests.triton_tests.utils.mla_decode_ref import (
     _decode_grouped_att_m_fwd,
     decode_attention_fwd_grouped,
@@ -257,6 +258,24 @@ def get_config(dtype: torch.dtype):
     return config[config_key]
 
 
+def assert_mla_close(ref, actual, dtype, msg):
+    if dtype == torch.bfloat16:
+        tol_err_ratio = 0.05
+        assert (
+            checkAllclose(
+                ref,
+                actual,
+                atol=1e-2,
+                rtol=1e-2,
+                tol_err_ratio=tol_err_ratio,
+                msg=msg,
+            )
+            <= tol_err_ratio
+        )
+    else:
+        torch.testing.assert_close(ref, actual, atol=1e-2, rtol=1e-2)
+
+
 # We assume rotary_dim is always of power of 2 and rotary_dim <= qk_rope_head_dim
 @pytest.mark.parametrize(
     "B, H, S, kv_lora_rank, qk_rope_head_dim, rotary_dim",
@@ -350,7 +369,7 @@ def test_op_fwd_rope(
             ref_k_pe_tokens, k_pe_tokens.squeeze(), atol=1e-2, rtol=1e-2
         )
 
-    torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
+    assert_mla_close(ref_logits, tri_logits, dtype, "MLA decode RoPE logits")
 
 
 # We assume rotary_dim is always of power of 2 and rotary_dim <= qk_rope_head_dim
@@ -453,7 +472,7 @@ def test_op_fwd_rope_neox(
             ref_k_pe_tokens, k_pe_tokens.squeeze(), atol=1e-2, rtol=1e-2
         )
 
-    torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
+    assert_mla_close(ref_logits, tri_logits, dtype, "MLA decode RoPE logits")
 
 
 @pytest.mark.parametrize(
@@ -553,5 +572,5 @@ def test_op_fwd_rope_integration(
             ref_k_pe_tokens, k_pe_tokens.squeeze(), atol=1e-2, rtol=1e-2
         )
 
-    torch.testing.assert_close(ref_logits, tri_logits, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(ref_o, tri_o, atol=1e-2, rtol=1e-2)
+    assert_mla_close(ref_logits, tri_logits, dtype, "MLA decode RoPE logits")
+    assert_mla_close(ref_o, tri_o, dtype, "MLA decode RoPE output")

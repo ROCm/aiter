@@ -5,24 +5,43 @@ but this module is intentionally small and MLIR-dialect facing.
 """
 
 from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as _std_arith
+from flydsl._mlir.dialects import builtin
+from flydsl._mlir.dialects import gpu as _gpu
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
-from flydsl._mlir.dialects import (
-    arith as _std_arith,
-    builtin,
-    gpu as _gpu,
-    llvm as _llvm,
-)
-from flydsl.expr import buffer_ops
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
+
+from aiter.ops.flydsl.kernels import buffer_ops
+
+
+def format_kernel_name(name: str) -> str:
+    """Sanitize a kernel symbol name for the amdhsa assembler.
+
+    Config values interpolated into a kernel name may be negative (e.g. the
+    grouped-contiguous sentinel ``topk=-1`` renders as ``tk-1``). A hyphen is
+    not a legal symbol character, so the assembler misparses the
+    ``.amdhsa_kernel`` directive and the whole module fails to link.
+    """
+    return name.replace("-", "_")
 
 
 def get_warp_size(arch=None):
     """Return the wavefront/warp size for the given GPU architecture.
 
     CDNA (gfx9xx) uses wave64, RDNA (gfx10xx/gfx11xx/gfx12xx) uses wave32.
+    NOTE: we do not defer the gfx12 case to ``flydsl.runtime.device.is_rdna_arch``:
+    that helper only matches ``gfx120*`` and so misclassifies gfx1250 (which is
+    wave32, RDNA-family) as CDNA, yielding wave64. Building a kernel for wave64
+    while gfx1250 dispatches wave32 corrupts every >1-warp-per-block kernel
+    (the phantom upper lanes silently drop their work). Classify all gfx10/11/12
+    as wave32 directly here so the kernel body matches the wave32 dispatch.
     """
     if arch is None:
         arch = get_rocm_arch()
+    arch_l = (arch or "").lower()
+    if arch_l.startswith(("gfx10", "gfx11", "gfx12")):
+        return 32
     return 32 if is_rdna_arch(arch) else 64
 
 

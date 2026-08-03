@@ -11,8 +11,10 @@ through ``AITER_CONFIGS`` so model-specific tuned CSVs can be merged the same
 way as runtime JIT config lookup.
 
 Supported kernel families:
-  - ``flydsl_gemm2_*``           split-K HGEMM kernels
-  - ``flydsl_bpreshuflle_*``     a8w8 preshuffle GEMM kernels
+  - ``flydsl_gemm2_*``                        split-K HGEMM kernels
+  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
+  - ``flydsl_blockscale_bpreshuffle_wmma_*``  gfx1250 a8w8 blockscale GEMM kernels
 
 Usage:
     # Compile all unique FlyDSL GEMM kernels from default CSVs
@@ -34,7 +36,6 @@ import os
 import re
 import sys
 import time
-from typing import Dict, Optional
 
 import flydsl.expr as fx
 
@@ -44,14 +45,21 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
+from aiter.ops.flydsl.blockscale_bpreshuffle_gemm_gfx1250 import (
+    parse_wmma_kernel_name as parse_blockscale_wmma_kernel_name,
+)
+from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
+    parse_wmma_kernel_name as parse_ptpc_wmma_kernel_name,
+)
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_splitk_hgemm_kernel_params,
 )
 from aiter.ops.flydsl.kernels.hgemm_dispatch import compile_flydsl_hgemm_kernel
-from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -70,8 +78,7 @@ _PRESHUFFLE_RE = re.compile(
     r"^flydsl_bpreshuflle_"
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
-    r"(?P<lds_stage>\d+)x(?P<cshuffle>\d+)x(?P<async_copy>\d+)x"
-    r"(?P<waves_per_eu>\d+)x(?P<xcd_swizzle>\d+)_"
+    r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
     r"(?P<scheduler>[A-Za-z][A-Za-z0-9]*)$"
 )
 _SHORT_DTYPE = {
@@ -82,7 +89,7 @@ _SHORT_DTYPE = {
 }
 
 
-def _parse_bool(value: Optional[str]) -> bool:
+def _parse_bool(value: str | None) -> bool:
     if value is None:
         return False
     normalized = value.strip().lower()
@@ -95,7 +102,7 @@ def _parse_bool(value: Optional[str]) -> bool:
     raise ValueError(f"Expected True/False, got {value!r}")
 
 
-def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
+def _parse_preshuffle_kernel_name(name: str) -> dict | None:
     m = _PRESHUFFLE_RE.fullmatch(name)
     if m is None:
         return None
@@ -117,12 +124,11 @@ def _parse_preshuffle_kernel_name(name: str) -> Optional[Dict]:
         "tile_k": int(m.group("tile_k")),
         "in_dtype": qa,
         "out_dtype": out,
-        "lds_stage": int(m.group("lds_stage")),
-        "use_cshuffle_epilog": int(m.group("cshuffle")),
         "use_async_copy": int(m.group("async_copy")),
         "waves_per_eu": int(m.group("waves_per_eu")),
+        "xcd_swizzle": int(m.group("xcd_swizzle")) if m.group("xcd_swizzle") else 0,
+        "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
-        "xcd_swizzle": int(m.group("xcd_swizzle")),
     }
 
 
@@ -143,9 +149,20 @@ def parse_csv(csv_path: str):
             n = int(row["N"])
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
+            gfx = row.get("gfx", "").strip()
 
             if kernel_name.startswith("flydsl_bpreshuflle_"):
                 params = _parse_preshuffle_kernel_name(kernel_name)
+            elif kernel_name.startswith("flydsl_blockscale_bpreshuffle_wmma_"):
+                params = parse_blockscale_wmma_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "blockscale_wmma"
+            elif kernel_name.startswith("flydsl_bpreshuffle_wmma_"):
+                params = parse_ptpc_wmma_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "ptpc_wmma"
             elif kernel_name.startswith("flydsl_gemm"):
                 params = get_flydsl_splitk_hgemm_kernel_params(kernel_name)
                 if params is not None:
@@ -166,6 +183,7 @@ def parse_csv(csv_path: str):
                 "n": n,
                 "k": k,
                 "cu_num": cu_num,
+                "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
                 **params,
             }
@@ -198,9 +216,9 @@ def _compile_executable_to_cache(exe, *args) -> None:
 
 
 def _ptr_view_safe(t):
-    from aiter.ops.flydsl.gemm_kernels import _ptr_view_safe as _wrap
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
-    return _wrap(t)
+    return ptr_arg(t)
 
 
 def _compile_hgemm_to_cache(
@@ -303,14 +321,15 @@ def _compile_preshuffle_to_cache(
     tile_m: int,
     tile_n: int,
     tile_k: int,
-    lds_stage: int,
-    use_cshuffle_epilog: int,
     use_async_copy: int,
     waves_per_eu: int,
     xcd_swizzle: int = 0,
+    lds_stage: int = 2,
+    scheduler: str = "Default",
     **kwargs,
 ):
     del kwargs
+    enable_scheduler = str(scheduler).lower() != "off"
 
     import torch
 
@@ -326,7 +345,7 @@ def _compile_preshuffle_to_cache(
     bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
     stream = fx.Stream(0)
 
-    exe = compile_preshuffle_gemm_a8(
+    exe = compile_preshuffle_gemm(
         N=n,
         K=k,
         tile_m=tile_m,
@@ -334,33 +353,162 @@ def _compile_preshuffle_to_cache(
         tile_k=tile_k,
         in_dtype=in_dtype,
         out_dtype="bf16" if out_torch_dtype == torch.bfloat16 else "fp16",
-        lds_stage=lds_stage,
-        use_cshuffle_epilog=bool(use_cshuffle_epilog),
         use_async_copy=bool(use_async_copy),
         waves_per_eu=None if waves_per_eu <= 0 else waves_per_eu,
+        enable_scheduler=enable_scheduler,
         xcd_swizzle=xcd_swizzle,
+        lds_stage=lds_stage,
     )
+    # The layout-API launcher uses fx.Tensor args (it builds views via
+    # fx.get_iter/make_view), so pass flat torch tensors directly rather
+    # than raw pointers (pointer args would fail GetIterOp type checks).
     _compile_executable_to_cache(
         exe,
-        _ptr_view_safe(out),
-        _ptr_view_safe(a),
-        _ptr_view_safe(b),
-        _ptr_view_safe(scale_a),
-        _ptr_view_safe(scale_b),
-        _ptr_view_safe(bias),
+        out,
+        a,
+        b,
+        scale_a,
+        scale_b,
+        bias,
         m,
         n,
         stream,
     )
 
 
+def _compile_blockscale_wmma_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    split_k: int,
+    cluster_m: int,
+    cluster_n: int,
+    **kwargs,
+):
+    del kwargs, split_k
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_gfx1250 import (
+        launch_gemm_a8w8_bsc_col,
+    )
+
+    dev = torch.device("cpu")
+    k_blocks = (k + 127) // 128
+    xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
+    wq = torch.empty((n, k), device=dev, dtype=torch.uint8)
+    a_scale = torch.empty((m, k_blocks), device=dev, dtype=torch.uint8)
+    b_scale = torch.empty(((n + 127) // 128, k_blocks), device=dev, dtype=torch.uint8)
+    out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
+    stream = fx.Stream(0)
+
+    with compile_only_env():
+        launch_gemm_a8w8_bsc_col(
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(a_scale),
+            _ptr_view_safe(b_scale),
+            m,
+            stream,
+            n,
+            k,
+            a_scale.numel() // a_scale.stride(0),
+            xq.stride(0),
+            out.stride(0),
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            0,
+            num_buffers,
+            cluster_m,
+            cluster_n,
+        )
+
+
+def _compile_ptpc_wmma_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    m_warp: int,
+    n_warp: int,
+    num_buffers: int,
+    split_k: int,
+    cluster_m: int,
+    cluster_n: int,
+    **kwargs,
+):
+    del kwargs, split_k
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.gemm_a8w8_ptpc_gfx1250 import launch_gemm_a8w8_ptpc
+
+    dev = torch.device("cpu")
+    xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
+    wq = torch.empty((n, k), device=dev, dtype=torch.uint8)
+    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    out = torch.empty((m, n), device=dev, dtype=torch.bfloat16)
+    stream = fx.Stream(0)
+
+    with compile_only_env():
+        launch_gemm_a8w8_ptpc(
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(scale_a),
+            _ptr_view_safe(scale_b),
+            m,
+            stream,
+            n,
+            k,
+            xq.stride(0),
+            out.stride(0),
+            tile_m,
+            tile_n,
+            tile_k,
+            m_warp,
+            n_warp,
+            0,
+            num_buffers,
+            cluster_m,
+            cluster_n,
+        )
+
+
+def job_arch(cu_num: int = 0, gfx: str = "") -> str:
+    """Target arch a job would compile for -- shared by dispatch and ARCH filtering."""
+    return gfx or cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+
+
 def compile_one_config(
-    kernel_name: str, kind: str, m: int, n: int, k: int, cu_num: int = 0, **kwargs
+    kernel_name: str,
+    kind: str,
+    m: int,
+    n: int,
+    k: int,
+    cu_num: int = 0,
+    gfx: str = "",
+    **kwargs,
 ) -> dict:
     """Compile one GEMM kernel configuration and save it to cache."""
     from torch._subclasses.fake_tensor import FakeTensorMode
 
-    aot_arch = cu_num_to_arch(cu_num, default=GEMM_AOT_ARCH_DEFAULT)
+    aot_arch = job_arch(cu_num, gfx)
     shape_str = f"{kernel_name}  M={m} N={n} K={k}"
     result = {
         "kernel_name": kernel_name,
@@ -372,22 +520,27 @@ def compile_one_config(
 
     t0 = time.time()
     try:
-        with override_env("ARCH", aot_arch), override_env(
-            "FLYDSL_GPU_ARCH", aot_arch
-        ), FakeTensorMode():
+        with (
+            override_env("FLYDSL_GPU_ARCH", aot_arch),
+            FakeTensorMode(),
+        ):
             if kind == "hgemm":
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
             elif kind == "preshuffle":
                 _compile_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "blockscale_wmma":
+                _compile_blockscale_wmma_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "ptpc_wmma":
+                _compile_ptpc_wmma_to_cache(m=m, n=n, k=k, **kwargs)
             else:
                 raise ValueError(f"Unknown GEMM AOT kind: {kind}")
 
         elapsed = time.time() - t0
         result["compile_time"] = elapsed
         print(f"  [OK] compile  {elapsed:6.1f}s  {shape_str}  arch={aot_arch}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result
@@ -416,12 +569,22 @@ def main():
     cache_dir = os.path.expanduser(
         os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
     )
-    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS")
 
     all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    if arch:
+        # GPU_ARCHS may be a ';'- or ','-separated list (e.g. "gfx942;gfx950").
+        arch_set = {a.strip() for a in re.split(r"[;,]", arch) if a.strip()}
+        n_before = len(all_jobs)
+        all_jobs = [
+            j for j in all_jobs if job_arch(j["cu_num"], j.get("gfx", "")) in arch_set
+        ]
+        print(f"[aiter] ARCH={arch}: {len(all_jobs)}/{n_before} jobs match")
 
     hgemm_jobs = [j for j in all_jobs if j["kind"] == "hgemm"]
     preshuffle_jobs = [j for j in all_jobs if j["kind"] == "preshuffle"]
+    blockscale_wmma_jobs = [j for j in all_jobs if j["kind"] == "blockscale_wmma"]
+    ptpc_wmma_jobs = [j for j in all_jobs if j["kind"] == "ptpc_wmma"]
 
     print("=" * 72)
     print("FlyDSL GEMM AOT Pre-compilation")
@@ -430,26 +593,22 @@ def main():
         print(f"  CSV:              {csv_path}")
     print(f"  HGEMM jobs:       {len(hgemm_jobs)}")
     print(f"  Preshuffle jobs:  {len(preshuffle_jobs)}")
+    print(f"  Blockscale wmma jobs: {len(blockscale_wmma_jobs)}")
+    print(f"  PTPC wmma jobs:   {len(ptpc_wmma_jobs)}")
     print(f"  Total jobs:       {len(all_jobs)}")
-    print("  Compile arch:     (from cu_num)")
     print(f"  Cache dir:        {cache_dir}")
-    print(f"  Target arch:      {arch}")
+    print(f"  Target arch:      {arch or '(all archs found in CSVs)'}")
     print("=" * 72)
 
     total_t0 = time.time()
-    results = []
 
-    if hgemm_jobs:
-        print(f"\n--- HGEMM ({len(hgemm_jobs)} kernels) ---")
-        for i, job in enumerate(hgemm_jobs, 1):
-            print(f"\n[{i}/{len(hgemm_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
-
-    if preshuffle_jobs:
-        print(f"\n--- Preshuffle GEMM ({len(preshuffle_jobs)} kernels) ---")
-        for i, job in enumerate(preshuffle_jobs, 1):
-            print(f"\n[{i}/{len(preshuffle_jobs)}] ", end="")
-            results.append(compile_one_config(**job))
+    # Independent compiles that share one pool for maximum fan-out instead of
+    # separate serial passes per kind.
+    print(f"\n--- Compiling {len(all_jobs)} kernels ---")
+    results = run_jobs_parallel(
+        compile_one_config,
+        hgemm_jobs + preshuffle_jobs + blockscale_wmma_jobs + ptpc_wmma_jobs,
+    )
 
     total_elapsed = time.time() - total_t0
 

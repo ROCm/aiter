@@ -115,7 +115,6 @@ def _causal_conv1d_update_single_token_kernel(
     USE_PAD_SLOT: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
@@ -331,7 +330,6 @@ def _reshape_causal_conv1d_update_single_token_kernel(
     BLOCK_N: tl.constexpr,
     INTERLEAVED_QKVZ: tl.constexpr,
 ):
-    # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
         return
