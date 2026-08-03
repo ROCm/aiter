@@ -202,6 +202,9 @@ def _run_two_rank_direct_scatter() -> None:
             gemm_output[:8], expected_gemm, rtol=0, atol=0
         )
 
+        op.close()
+        op = None
+
         # Force hot expert 0 to spill from rank 0 onto rank 1.  The global
         # plan selects expert 0 for rank 1's first dynamic slot; verify that
         # rank 1 loads the owner rank's BF16 weight bytes directly.
@@ -222,6 +225,9 @@ def _run_two_rank_direct_scatter() -> None:
         hot_plan = build_reference_plan(
             hot_config, hot_topk, hot_tokens_per_expert
         )
+        op = MoonEPPreplannedDispatchOp(
+            hot_config, hidden_dim, block_num=8
+        )
         prefetch_op = MoonEPWeightPrefetchOp(
             rank=rank,
             world_size=world_size,
@@ -237,8 +243,37 @@ def _run_two_rank_direct_scatter() -> None:
             ]
         ).contiguous()
         prefetch_op.load_home_weights(home_weights)
-        prefetched = prefetch_op.prefetch(hot_plan.experts_to_copy)
+        hot_values = (
+            torch.arange(4, dtype=torch.float32, device="cuda") + rank * 10
+        ).to(torch.bfloat16)
+        hot_hidden = hot_values[:, None].expand(-1, hidden_dim).contiguous()
+        hot_route_weights = (
+            torch.arange(4, dtype=torch.float32, device="cuda")
+            + rank * 10
+            + 0.125
+        )[:, None].contiguous()
+        hot_recv, hot_recv_weights, prefetched = op.dispatch_and_prefetch(
+            hot_hidden, hot_route_weights, hot_plan, prefetch_op
+        )
         torch.cuda.synchronize()
+        expected_hot_values = torch.arange(
+            rank * 10,
+            rank * 10 + 4,
+            dtype=torch.float32,
+            device="cuda",
+        ).to(torch.bfloat16)
+        expected_hot_hidden = expected_hot_values[:, None].expand(
+            -1, hidden_dim
+        )
+        torch.testing.assert_close(
+            hot_recv[:4], expected_hot_hidden, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            hot_recv_weights[:4],
+            expected_hot_values.to(torch.float32) + 0.125,
+            rtol=0,
+            atol=0,
+        )
         if rank == 0:
             assert bool((hot_plan.experts_to_copy[rank] == -1).all())
         else:

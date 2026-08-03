@@ -152,6 +152,9 @@ class MoonEPWeightPrefetchOp:
         self.experts_per_rank = num_experts // world_size
         self.prefetch_slots = prefetch_slots
         self.weight_shape = weight_shape
+        self.weight_numel = weight_numel
+        self.block_num = block_num
+        self.block_threads = block_threads
         self.device = torch.device("cuda", rank)
 
         self.home_weights = mori_shmem_create_tensor(

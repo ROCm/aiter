@@ -17,6 +17,7 @@ from aiter.ops.flydsl.moonep import MoonEPPlanConfig, MoonEPReferencePlan
 
 from .moonep_dispatch import make_moonep_preplanned_dispatch_jit
 from .moonep_dispatch_epilogue import make_moonep_dispatch_epilogue_jit
+from .moonep_dispatch_prefetch import make_moonep_dispatch_prefetch_jit
 
 
 class MoonEPPreplannedDispatchOp:
@@ -27,9 +28,8 @@ class MoonEPPreplannedDispatchOp:
     collective operation because it appends ``shmem_barrier_on_stream`` after
     the direct peer writes.
 
-    The returned buffers contain directly scattered real route entries only.
-    Segment padding and negative-encoded duplicate hidden rows are intentionally
-    left for the next local epilogue milestone.
+    The returned buffers have already passed the local duplicate-expansion and
+    padding-zero epilogue; rows outside the plan's cu_seqlens remain undefined.
     """
 
     def __init__(
@@ -111,6 +111,9 @@ class MoonEPPreplannedDispatchOp:
             warp_num_per_block=warp_num_per_block,
         )
         self._epilogue_compiled: Any | None = None
+        self._combined_jit: Any | None = None
+        self._combined_compiled: Any | None = None
+        self._combined_key: tuple[int, int, int] | None = None
         self._closed = False
 
     def _check_inputs(
@@ -191,6 +194,14 @@ class MoonEPPreplannedDispatchOp:
             )
 
         ms.shmem_barrier_on_stream(stream)
+        self._run_epilogue(plan, stream)
+        return self.recv_hidden, self.recv_route_weights
+
+    def _run_epilogue(
+        self,
+        plan: MoonEPReferencePlan,
+        stream: torch.cuda.Stream,
+    ) -> None:
         epilogue_args = (
             fx.Int64(self.recv_hidden.data_ptr()),
             fx.Int64(self.recv_route_weights.data_ptr()),
@@ -210,7 +221,101 @@ class MoonEPPreplannedDispatchOp:
                 plan.zero_fill_ranges.data_ptr(),
                 stream,
             )
-        return self.recv_hidden, self.recv_route_weights
+
+    def dispatch_and_prefetch(
+        self,
+        hidden: torch.Tensor,
+        route_weights: torch.Tensor,
+        plan: MoonEPReferencePlan,
+        weight_prefetch_op: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run token scatter and remote weight prefetch in one kernel launch.
+
+        The launch contains two disjoint CTA ranges on the current stream.  It
+        has no second-stream contract: dispatch CTAs and prefetch CTAs become
+        concurrently schedulable only because they belong to the same grid.
+        """
+
+        if self._closed:
+            raise RuntimeError("dispatch op is closed")
+        self._check_inputs(hidden, route_weights, plan)
+        cfg = self.config
+        if getattr(weight_prefetch_op, "_closed", True):
+            raise ValueError("weight prefetch op is closed or invalid")
+        if (
+            weight_prefetch_op.rank != cfg.rank
+            or weight_prefetch_op.world_size != cfg.world_size
+            or weight_prefetch_op.num_experts != cfg.num_experts
+            or weight_prefetch_op.prefetch_slots != int(cfg.prefetch_slots)
+        ):
+            raise ValueError("dispatch and weight-prefetch configurations differ")
+        expected_threads = self.warp_num_per_block * 64
+        if weight_prefetch_op.block_threads != expected_threads:
+            raise ValueError(
+                "combined launch requires prefetch block_threads == "
+                "dispatch warp_num_per_block * 64"
+            )
+
+        combined_key = (
+            weight_prefetch_op.weight_numel,
+            weight_prefetch_op.block_num,
+            weight_prefetch_op.block_threads,
+        )
+        if self._combined_key is not None and self._combined_key != combined_key:
+            raise ValueError("one dispatch op cannot change combined weight geometry")
+        if self._combined_jit is None:
+            self._combined_key = combined_key
+            self._combined_jit = make_moonep_dispatch_prefetch_jit(
+                hidden_dim=self.hidden_dim,
+                top_k=cfg.top_k,
+                num_dispatch_rows=cfg.num_dispatch_rows,
+                dispatch_block_num=self.block_num,
+                warp_num_per_block=self.warp_num_per_block,
+                experts_per_rank=weight_prefetch_op.experts_per_rank,
+                prefetch_slots=weight_prefetch_op.prefetch_slots,
+                weight_numel=weight_prefetch_op.weight_numel,
+                prefetch_block_num=weight_prefetch_op.block_num,
+            )
+
+        stream = torch.cuda.current_stream(self.device)
+        local_selection = plan.experts_to_copy[cfg.rank]
+        args = (
+            fx.Int64(hidden.data_ptr()),
+            fx.Int64(route_weights.data_ptr()),
+            fx.Int64(plan.dst.data_ptr()),
+            fx.Int64(self.peer_hidden_ptrs.data_ptr()),
+            fx.Int64(self.peer_weight_ptrs.data_ptr()),
+            fx.Int64(self.peer_duplicate_src_ptrs.data_ptr()),
+            cfg.num_tokens,
+            fx.Int64(local_selection.data_ptr()),
+            fx.Int64(weight_prefetch_op.peer_home_weight_ptrs.data_ptr()),
+            fx.Int64(weight_prefetch_op.prefetched_weights.data_ptr()),
+            stream,
+        )
+        if self._combined_compiled is None:
+            self._combined_compiled = flyc.compile(self._combined_jit, *args)
+        else:
+            self._combined_compiled(
+                hidden.data_ptr(),
+                route_weights.data_ptr(),
+                plan.dst.data_ptr(),
+                self.peer_hidden_ptrs.data_ptr(),
+                self.peer_weight_ptrs.data_ptr(),
+                self.peer_duplicate_src_ptrs.data_ptr(),
+                cfg.num_tokens,
+                local_selection.data_ptr(),
+                weight_prefetch_op.peer_home_weight_ptrs.data_ptr(),
+                weight_prefetch_op.prefetched_weights.data_ptr(),
+                stream,
+            )
+
+        ms.shmem_barrier_on_stream(stream)
+        self._run_epilogue(plan, stream)
+        return (
+            self.recv_hidden,
+            self.recv_route_weights,
+            weight_prefetch_op.prefetched_weights,
+        )
 
     def close(self) -> None:
         """Collectively release the symmetric receive buffers."""
