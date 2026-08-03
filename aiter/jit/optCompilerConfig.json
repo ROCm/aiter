@@ -568,7 +568,10 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-mllvm --amdgpu-mfma-vgpr-form'",
-            "'-mllvm -enable-post-misched=1'"
+            "'-mllvm -enable-post-misched=1'",
+            "'--save-temps=obj'",
+            "'-gline-tables-only'",
+            "'-Wno-gnu-line-marker'"
         ],
         "md_name": "'module_moe_opus'",
         "extra_ldflags": "None",
