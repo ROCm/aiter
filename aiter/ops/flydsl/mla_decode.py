@@ -90,6 +90,7 @@ def flydsl_mla_decode(
     num_warps: int = _DEFAULT_NUM_WARPS,
     kv_compute_block_size: int = _DEFAULT_KV_COMPUTE_BLOCK_SIZE,
     warp_token_split: bool = True,
+    warp_head_split: bool = False,
     skip_reduce: bool = False,
     partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     stream: torch.cuda.Stream | None = None,
@@ -240,6 +241,7 @@ def flydsl_mla_decode(
             NUM_WARPS=num_warps,
             dtype=dtype_str,
             WARP_TOKEN_SPLIT=warp_token_split,
+            WARP_HEAD_SPLIT=warp_head_split,
         )
         reduce_launch = compile_mla_decode_reduce(
             KV_LORA_RANK=kv_lora_rank,

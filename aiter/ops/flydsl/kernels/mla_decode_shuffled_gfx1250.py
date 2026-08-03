@@ -178,8 +178,12 @@ def compile_mla_decode_main(
     dtype: str = "bf16",
     waves_per_eu: int = 1,
     WARP_TOKEN_SPLIT: bool = True,
+    WARP_HEAD_SPLIT: bool = False,
 ):
 
+    # Warps split exactly one axis: Q head tiles, tokens, or d_c.
+    if WARP_HEAD_SPLIT and WARP_TOKEN_SPLIT:
+        raise ValueError("WARP_HEAD_SPLIT and WARP_TOKEN_SPLIT are mutually exclusive")
     SPLIT = NUM_WARPS if WARP_TOKEN_SPLIT else 1
     NUM_PARTITIONS = NUM_SEGS * SPLIT
 
@@ -207,7 +211,8 @@ def compile_mla_decode_main(
             f"KV_BLOCK_SIZE {KV_BLOCK_SIZE}"
         )
     N_PV_TILES = V_HEAD_DIM // WMMA_N
-    if N_PV_TILES % NUM_WARPS != 0:
+    WARP_DC_SPLIT = not (WARP_HEAD_SPLIT or WARP_TOKEN_SPLIT)
+    if WARP_DC_SPLIT and N_PV_TILES % NUM_WARPS != 0:
         raise ValueError(
             f"NUM_WARPS ({NUM_WARPS}) must divide V_HEAD_DIM/WMMA_N ({N_PV_TILES})"
         )
@@ -224,6 +229,12 @@ def compile_mla_decode_main(
 
     NUM_QGSP_TILES = (NUM_Q_HEADS + WMMA_M - 1) // WMMA_M
     QGSP_PADDED = NUM_QGSP_TILES * WMMA_M
+    if WARP_HEAD_SPLIT and NUM_QGSP_TILES % NUM_WARPS:
+        raise ValueError(
+            f"WARP_HEAD_SPLIT needs NUM_WARPS ({NUM_WARPS}) to divide the "
+            f"{NUM_QGSP_TILES} 16-head tiles"
+        )
+    NQGSP_LOCAL = (NUM_QGSP_TILES // NUM_WARPS) if WARP_HEAD_SPLIT else NUM_QGSP_TILES
 
     K_QK_LORA_TILES = KV_LORA_RANK // WMMA_K
     K_QK_ROPE_TILES = QK_ROPE_HEAD_DIM // WMMA_K
@@ -320,6 +331,9 @@ def compile_mla_decode_main(
         # Lane decomposition
         lane_kgrp = lane_id / fx.Index(WMMA_M)
         lane16 = lane_id % fx.Index(WMMA_M)
+        # Under a head split each warp owns NQGSP_LOCAL consecutive head tiles.
+        head_row_off = (wave_id * fx.Index(NQGSP_LOCAL * WMMA_M) if WARP_HEAD_SPLIT
+                        else fx.Index(0))
 
         max_blocks = fx.Index(i32_max_blocks_per_seq)
 
@@ -536,10 +550,10 @@ def compile_mla_decode_main(
         gpu.barrier()
 
         # Read ALL of Q's WMMA fragments into registers
-        q_lora_frags = [[None] * K_QK_LORA_TILES for _ in range(NUM_QGSP_TILES)]
-        q_rope_frags = [[None] * K_QK_ROPE_TILES for _ in range(NUM_QGSP_TILES)]
-        for qt in range_constexpr(NUM_QGSP_TILES):
-            q_row = fx.Index(qt * WMMA_M) + lane16
+        q_lora_frags = [[None] * K_QK_LORA_TILES for _ in range(NQGSP_LOCAL)]
+        q_rope_frags = [[None] * K_QK_ROPE_TILES for _ in range(NQGSP_LOCAL)]
+        for qt in range_constexpr(NQGSP_LOCAL):
+            q_row = head_row_off + fx.Index(qt * WMMA_M) + lane16
             for ks in range_constexpr(K_QK_LORA_TILES):
                 q_lora_frags[qt][ks] = _load_q_frag(q_lora_lds, q_row, ks * WMMA_K, Q_LORA_ROW)
             for ks in range_constexpr(K_QK_ROPE_TILES):
@@ -557,11 +571,11 @@ def compile_mla_decode_main(
 
         # if WARP_TOKEN_SPLIT on then we don't split PV accross warps
         # each warp owns the full PV  accumulator with their subset of tokens and then combined in reduce kernel
-        P = N_PV_TILES if WARP_TOKEN_SPLIT else N_PV_TILES_PER_WARP
+        P = N_PV_TILES_PER_WARP if WARP_DC_SPLIT else N_PV_TILES
 
         def _pack(m_list, l_list, pv_list, cur_stage):
             out = []
-            for qt in range_constexpr(NUM_QGSP_TILES):
+            for qt in range_constexpr(NQGSP_LOCAL):
                 out.append(_unwrap(m_list[qt]))
                 out.append(_unwrap(l_list[qt]))
                 out.extend(pv_list[qt])
@@ -570,11 +584,11 @@ def compile_mla_decode_main(
 
         # Initial state: m = -inf, l = 0, PV accumulators = 0, double-buffer stage = 0.
         def _init_state():
-            m_list = [neg_inf_f32 for _ in range(NUM_QGSP_TILES)]
-            l_list = [zero_f32 for _ in range(NUM_QGSP_TILES)]
+            m_list = [neg_inf_f32 for _ in range(NQGSP_LOCAL)]
+            l_list = [zero_f32 for _ in range(NQGSP_LOCAL)]
             pv_list = [
                 [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(P)]
-                for _ in range(NUM_QGSP_TILES)
+                for _ in range(NQGSP_LOCAL)
             ]
             return _pack(m_list, l_list, pv_list, fx.Index(0))
 
@@ -584,7 +598,7 @@ def compile_mla_decode_main(
         for iv, state in range(fx.Index(0), iters_this_seg, fx.Index(1), init=init_state):
             m_list, l_list, pv_list = [], [], []
             si = 0
-            for qt in range_constexpr(NUM_QGSP_TILES):
+            for qt in range_constexpr(NQGSP_LOCAL):
                 m_list.append(fx.Float32(state[si])); si += 1
                 l_list.append(fx.Float32(state[si])); si += 1
                 pv_list.append([fx.Vector(v) for v in state[si : si + P]]); si += P
@@ -616,12 +630,12 @@ def compile_mla_decode_main(
 
             qk_accs = [
                 [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(NQK_LOCAL)]
-                for _ in range(NUM_QGSP_TILES)
+                for _ in range(NQGSP_LOCAL)
             ]
             for ks in range_constexpr(K_QK_LORA_TILES):
                 for n_tile in range_constexpr(NQK_LOCAL):
                     k_frag = _load_shuf_K(kv_lora_lds, n_tile, ks, LORA_BSG_STRIDE, qk_lora_off)
-                    for qt in range_constexpr(NUM_QGSP_TILES):
+                    for qt in range_constexpr(NQGSP_LOCAL):
                         qk_accs[qt][n_tile] = fx.Vector(
                             wmma_op(
                                 T.vec(8, T.f32), k_frag, q_lora_frags[qt][ks], qk_accs[qt][n_tile],
@@ -631,7 +645,7 @@ def compile_mla_decode_main(
             for ks in range_constexpr(K_QK_ROPE_TILES):
                 for n_tile in range_constexpr(NQK_LOCAL):
                     k_frag = _load_shuf_K(kv_rope_lds, n_tile, ks, ROPE_BSG_STRIDE, qk_rope_off)
-                    for qt in range_constexpr(NUM_QGSP_TILES):
+                    for qt in range_constexpr(NQGSP_LOCAL):
                         qk_accs[qt][n_tile] = fx.Vector(
                             wmma_op(
                                 T.vec(8, T.f32), k_frag, q_rope_frags[qt][ks], qk_accs[qt][n_tile],
@@ -640,7 +654,7 @@ def compile_mla_decode_main(
                         )
 
             # ---- online-softmax update ----
-            for qt in range_constexpr(NUM_QGSP_TILES):
+            for qt in range_constexpr(NQGSP_LOCAL):
                 # Apply scale*log2e so so we can use exp2
                 for n_tile in range_constexpr(NQK_LOCAL):
                     qk_accs[qt][n_tile] = qk_accs[qt][n_tile] * qk_scale_log2_scalar
@@ -663,8 +677,9 @@ def compile_mla_decode_main(
                     qk_accs[qt][n_tile] = fx.Vector.from_elements(new_vals, fx.Float32)
 
                 # row mask when NUM_Q_HEADS isn't a multiple of 16:
-                if qt * WMMA_M + WMMA_M > NUM_Q_HEADS:
-                    is_row_valid = (fx.Index(qt * WMMA_M) + lane16) < num_q_heads_idx
+                if QGSP_PADDED != NUM_Q_HEADS or WARP_HEAD_SPLIT:
+                    is_row_valid = (head_row_off + fx.Index(qt * WMMA_M)
+                                    + lane16) < num_q_heads_idx
                     for n_tile in range_constexpr(NQK_LOCAL):
                         qk_accs[qt][n_tile] = fx.Vector(
                             arith.select(
@@ -717,9 +732,9 @@ def compile_mla_decode_main(
             # if not WARP_TOEKN_SPLIT then each warp has a copy of full P and PV is split accross warps in N dim
             K_PV_LOCAL = (NQK_LOCAL // 2) if WARP_TOKEN_SPLIT else K_PV_TILES
             pv_v_off = pv_lora_off if WARP_TOKEN_SPLIT else cur_lora_elem_off
-            for qt in range_constexpr(NUM_QGSP_TILES):
+            for qt in range_constexpr(NQGSP_LOCAL):
                 for pv_n in range_constexpr(P):
-                    pv_n_global = fx.Index(pv_n) if WARP_TOKEN_SPLIT else wave_id * fx.Index(P) + fx.Index(pv_n)
+                    pv_n_global = (wave_id * fx.Index(P) + fx.Index(pv_n) if WARP_DC_SPLIT else fx.Index(pv_n))
                     for ks in range_constexpr(K_PV_LOCAL):
                         p_f32 = qk_accs[qt][2 * ks].shuffle(
                             qk_accs[qt][2 * ks + 1], list(range(16))
@@ -741,7 +756,7 @@ def compile_mla_decode_main(
         # ---- epilogue ----
         m_final, l_final, pv_final = [], [], []
         si = 0
-        for qt in range_constexpr(NUM_QGSP_TILES):
+        for qt in range_constexpr(NQGSP_LOCAL):
             m_final.append(fx.Float32(results[si])); si += 1
             l_final.append(fx.Float32(results[si])); si += 1
             pv_final.append([fx.Vector(v) for v in results[si : si + P]]); si += P
@@ -754,12 +769,12 @@ def compile_mla_decode_main(
         out_base = seq_idx * stride_o_seq + part_idx * stride_o_part
         lse_base = seq_idx * stride_lse_seq + part_idx * stride_lse_part
 
-        for qt in range_constexpr(NUM_QGSP_TILES):
-            row = fx.Index(qt * WMMA_M) + lane16    # output row = Q head = lane16
+        for qt in range_constexpr(NQGSP_LOCAL):
+            row = head_row_off + fx.Index(qt * WMMA_M) + lane16
             row_valid = row < num_q_heads_idx       # skip padded head rows
 
             for pv_n in range_constexpr(P):
-                pv_n_global = fx.Index(pv_n) if WARP_TOKEN_SPLIT else wave_id * fx.Index(P) + fx.Index(pv_n)
+                pv_n_global = (wave_id * fx.Index(P) + fx.Index(pv_n) if WARP_DC_SPLIT else fx.Index(pv_n))
                 head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
                 off_lo = out_base + row * stride_o_row + head_col_base
                 off_hi = off_lo + fx.Index(4)
@@ -777,6 +792,7 @@ def compile_mla_decode_main(
     cache_tag = (
         KV_LORA_RANK, QK_ROPE_HEAD_DIM, KV_BLOCK_SIZE, NUM_Q_HEADS, NUM_SEGS,
         KV_COMPUTE_BLOCK_SIZE, NUM_WARPS, dtype, waves_per_eu, WARP_TOKEN_SPLIT,
+        WARP_HEAD_SPLIT,
     )
 
     @flyc.jit
