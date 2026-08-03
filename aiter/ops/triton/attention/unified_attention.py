@@ -41,8 +41,9 @@ from aiter.ops.triton.utils.types import e4m3_dtype
 _GLUON_REDUCE_MAX_SEGMENTS = 8
 
 DEVICE_ARCH = arch_info.get_arch()
-IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
-WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+IS_DEVICE_ARCH_GFX1250 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH.startswith("gfx12")
+WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX1250 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
@@ -688,7 +689,7 @@ def unified_attention(
         # Gluon reduce (one workgroup/token, in-wave segment merge); valid for all-decode with small split counts, else the Triton reduce_segments.
         gluon_num_warps = 8 if num_query_heads % 8 == 0 else 4
         use_gluon_reduce = (
-            IS_DEVICE_ARCH_GFX12
+            IS_DEVICE_ARCH_GFX1250
             and _reduce_segments_gluon is not None
             and ALL_DECODE
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
