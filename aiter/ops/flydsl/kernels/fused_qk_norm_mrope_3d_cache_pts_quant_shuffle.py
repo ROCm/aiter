@@ -12,12 +12,12 @@ Two kernel launches, not one -- see the design note below for why.
 
 Grid / thread mapping
 ----------------------
-Q (built by ``_build_q_kernel``): grid = (num_heads_q, num_tokens), block =
-one wave (``WAVE`` threads). Thread ``t`` in ``[0, WAVE)`` owns the NEOX
-pair columns ``{t + k*WAVE, t + k*WAVE + head_size//2}`` for
-``k in [0, VEC_PAIRS)``, where ``VEC_PAIRS = (head_size // 2) // WAVE``. No
-cache write, so no write-amplification problem -- this stays a plain
-one-wave-per-(token, head) kernel.
+Q (built by ``_build_q_kernel``): block = one native wave (``WAVE`` threads).
+For head sizes 128/256, thread ``t`` owns the NEOX pair columns
+``{t + k*WAVE, t + k*WAVE + head_size//2}``. For head size 64 on wave64,
+the two independent 32-lane halves process two heads for the same token, so
+all lanes participate while preserving the production kernel's 32-lane
+RMSNorm groups.
 
 KV (built by ``_build_kv_kernel``): grid = (num_kv_heads, num_page_blocks),
 block = ``KV_THREADS`` threads (``KV_THREADS // WAVE`` waves). K
@@ -113,13 +113,14 @@ def _v_per_block(head_size, block_size, x, num_kv_heads):
 
 # Other helpers
 
-def rms_reduce_add(x, lane):
+
+def rms_reduce_add(x, lane, broadcast_half=True):
     v = x
     for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
         off = RMS_GROUP // (2 << sh_exp)
         peer = v.shuffle_xor(off, RMS_GROUP)
         v = v.addf(peer, fastmath=arith.FastMathFlags.fast)
-    if const_expr(WAVE > RMS_GROUP):
+    if const_expr(WAVE > RMS_GROUP and broadcast_half):
         other_half = v.shuffle_xor(RMS_GROUP, WAVE)
         return (lane < RMS_GROUP).select(v, other_half)
     return v
@@ -181,6 +182,7 @@ def _build_q_kernel(
     HALF = D // 2
     PROD_VEC_SIZE = D // RMS_GROUP
     VEC_PAIRS = max(1, HALF // WAVE)
+    Q_ROWS_PER_WAVE = WAVE // RMS_GROUP if D == 64 else 1
 
     kname = f"qk_norm_mrope_q_D{D}_flydsl"
 
@@ -191,35 +193,34 @@ def _build_q_kernel(
         cos_sin: fx.Tensor,  # [max_pos, D] bf16 (cos=[:, :D/2], sin=[:, D/2:])
         q_norm_w: fx.Tensor,  # [D] bf16
         q_out: fx.Tensor,  # [T, H_Q, D] bf16
+        num_heads_q: fx.Int32,
         token_offset: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
 
-        bid_x = fx.block_idx.x  # 0..H_Q-1
+        bid_x = fx.block_idx.x
         bid_t = fx.block_idx.y  # token id within this launch chunk
         tok = fx.Int32(bid_t) + token_offset
         tid = fx.thread_idx.x  # 0..WAVE-1
 
         if const_expr(D == 64):
-            # Both half-waves reproduce production's contiguous D/32
-            # accumulation and XOR-by-16..1 reduction. Only the lower half
-            # owns output for D=64.
-            x0 = fx.Float32(0.0)
-            x1 = fx.Float32(0.0)
-            sumsq_local = fx.Float32(0.0)
-            if tid < RMS_GROUP:
+            # Each 32-lane half-wave owns a separate head. This preserves the
+            # production reduction order while using both halves of wave64.
+            logical_lane = tid % RMS_GROUP
+            logical_group = tid // RMS_GROUP
+            head = fx.Int32(bid_x) * Q_ROWS_PER_WAVE + logical_group
+            if head < num_heads_q:
+                x0 = fx.Float32(qkv[tok, head, logical_lane])
+                x1 = fx.Float32(qkv[tok, head, logical_lane + HALF])
+                sumsq_local = fx.Float32(0.0)
                 for i in range_constexpr(PROD_VEC_SIZE):
-                    norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.Float32(qkv[tok, bid_x, norm_col])
+                    norm_col = fx.Int32(logical_lane) * PROD_VEC_SIZE + i
+                    norm_x = fx.Float32(qkv[tok, head, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
-            if tid < HALF:
-                x0 = fx.Float32(qkv[tok, bid_x, tid])
-                x1 = fx.Float32(qkv[tok, bid_x, tid + HALF])
-            sumsq = rms_reduce_add(sumsq_local, tid)
-            rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
-            if tid < HALF:
-                w0 = fx.Float32(q_norm_w[tid])
-                w1 = fx.Float32(q_norm_w[tid + HALF])
+                sumsq = rms_reduce_add(sumsq_local, logical_lane, broadcast_half=False)
+                rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
+                w0 = fx.Float32(q_norm_w[logical_lane])
+                w1 = fx.Float32(q_norm_w[logical_lane + HALF])
                 if const_expr(gemma_norm):
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
@@ -228,12 +229,21 @@ def _build_q_kernel(
                 # so values near an FP8 bin boundary follow the same path.
                 xn0 = (x0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                 xn1 = (x1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(tid, tok, positions, cos_sin, mrope_section, is_interleaved, HALF)
+                cos_v, sin_v = mrope_cos_sin(
+                    logical_lane,
+                    tok,
+                    positions,
+                    cos_sin,
+                    mrope_section,
+                    is_interleaved,
+                    HALF,
+                )
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
-                q_out[tok, bid_x, tid] = o0.to(fx.BFloat16)
-                q_out[tok, bid_x, tid + HALF] = o1.to(fx.BFloat16)
+                q_out[tok, head, logical_lane] = o0.to(fx.BFloat16)
+                q_out[tok, head, logical_lane + HALF] = o1.to(fx.BFloat16)
         else:
+            head = bid_x
             # ---- Pass 1: load this thread's VEC_PAIRS pairs, reduce sum-sq
             # over the full D-wide row via one wave butterfly. ----
             x0s, x1s = [], []
@@ -241,12 +251,12 @@ def _build_q_kernel(
             if tid < RMS_GROUP:
                 for i in range_constexpr(PROD_VEC_SIZE):
                     norm_col = fx.Int32(tid) * PROD_VEC_SIZE + i
-                    norm_x = fx.Float32(qkv[tok, bid_x, norm_col])
+                    norm_x = fx.Float32(qkv[tok, head, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
             for k in range_constexpr(VEC_PAIRS):
                 col = tid + WAVE * k
-                x0 = fx.Float32(qkv[tok, bid_x, col])
-                x1 = fx.Float32(qkv[tok, bid_x, col + HALF])
+                x0 = fx.Float32(qkv[tok, head, col])
+                x1 = fx.Float32(qkv[tok, head, col + HALF])
                 x0s.append(x0)
                 x1s.append(x1)
             sumsq = rms_reduce_add(sumsq_local, tid)
@@ -267,8 +277,8 @@ def _build_q_kernel(
                 cos_v, sin_v = mrope_cos_sin(col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
-                q_out[tok, bid_x, col] = o0.to(fx.BFloat16)
-                q_out[tok, bid_x, col + HALF] = o1.to(fx.BFloat16)
+                q_out[tok, head, col] = o0.to(fx.BFloat16)
+                q_out[tok, head, col + HALF] = o1.to(fx.BFloat16)
 
     @flyc.jit
     def launch(
@@ -299,10 +309,14 @@ def _build_q_kernel(
             cos_sin,
             q_norm_w,
             q_out,
+            num_heads_q,
             token_offset,
         )
+        grid_heads = (
+            fx.Int64(num_heads_q) + fx.Int64(Q_ROWS_PER_WAVE - 1)
+        ) // fx.Int64(Q_ROWS_PER_WAVE)
         k.launch(
-            grid=(fx.Int64(num_heads_q), fx.Int64(num_tokens), 1),
+            grid=(grid_heads, fx.Int64(num_tokens), 1),
             block=(WAVE, 1, 1),
             stream=stream,
         )
@@ -335,7 +349,9 @@ def _build_kv_kernel(
     PAIR_LANES = min(WAVE, HALF)
     PAIRS_PER_LANE = HALF // PAIR_LANES
     WAVES_PER_BLOCK = KV_THREADS // WAVE
-    PHASE1_ITERS = _ceil_div(block_size, WAVES_PER_BLOCK)
+    COMPUTE_GROUP = RMS_GROUP if D == 64 else WAVE
+    COMPUTE_GROUPS_PER_BLOCK = KV_THREADS // COMPUTE_GROUP
+    PHASE1_ITERS = _ceil_div(block_size, COMPUTE_GROUPS_PER_BLOCK)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
     CACHE_IS_FNUZ = cache_is_fp8 and aiter_dtypes.fp8 == getattr(
         torch, "float8_e4m3fnuz", None
@@ -519,8 +535,14 @@ def _build_kv_kernel(
         coord_wl = fx.idx2crd(fx.Int32(t), layout_tx_wave_lane)
         wid = fx.get(coord_wl, 0)
         lane = fx.get(coord_wl, 1)
+        if const_expr(D == 64):
+            compute_group = t // RMS_GROUP
+            pair_lane = t % RMS_GROUP
+        else:
+            compute_group = wid
+            pair_lane = lane
         for it in range_constexpr(PHASE1_ITERS):
-            token_local = wid + WAVES_PER_BLOCK * it
+            token_local = compute_group + COMPUTE_GROUPS_PER_BLOCK * it
             if token_local < block_size:
                 tok = tok0 + fx.Int32(token_local)
                 if tok < num_tokens:
@@ -533,34 +555,38 @@ def _build_kv_kernel(
                     # loop per thread (see _build_q_kernel for the same
                     # pattern). ----
                     sumsq_local = fx.Float32(0.0)
-                    # The lower half-wave reproduces production's
-                    # vec_t<T, D/32> accumulation and XOR-by-16..1 tree, then
-                    # broadcasts the result to the upper output-owning lanes.
-                    if lane < RMS_GROUP:
-                        sumsq_local = load_rms_sumsq(k_row, lane)
-                    sumsq = rms_reduce_add(sumsq_local, lane)
+                    # D=64 assigns a different token to each 32-lane half.
+                    # Larger heads retain one row per native wave and
+                    # broadcast the lower half's reduction result.
+                    if pair_lane < RMS_GROUP:
+                        sumsq_local = load_rms_sumsq(k_row, pair_lane)
+                    sumsq = rms_reduce_add(
+                        sumsq_local,
+                        pair_lane,
+                        broadcast_half=D != 64,
+                    )
                     rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
-                    if lane < PAIR_LANES:
-                        k_pairs = partition_pairs(k_row, lane)
-                        v_pairs = partition_pairs(v_row, lane)
-                        w_pairs = partition_pairs(k_norm_w, lane)
+                    if pair_lane < PAIR_LANES:
+                        k_pairs = partition_pairs(k_row, pair_lane)
+                        v_pairs = partition_pairs(v_row, pair_lane)
+                        w_pairs = partition_pairs(k_norm_w, pair_lane)
                         k_lds_pairs = partition_pairs(
-                            fx.slice(k_lds_view, (token_local, None)), lane
+                            fx.slice(k_lds_view, (token_local, None)), pair_lane
                         )
                         v_lds_pairs = partition_pairs(
-                            fx.slice(v_lds_view, (token_local, None)), lane
+                            fx.slice(v_lds_view, (token_local, None)), pair_lane
                         )
                         row_coords = fx.Tensor(
                             fx.make_view(fx.make_int_tuple(0), layout_head)
                         )
-                        pair_coords = partition_pairs(row_coords, lane)
+                        pair_coords = partition_pairs(row_coords, pair_lane)
                         if const_expr(emit_flat_kv):
                             k_out_pairs = partition_pairs(
-                                fx.slice(k_out, (tok, head, None)), lane
+                                fx.slice(k_out, (tok, head, None)), pair_lane
                             )
                             v_out_pairs = partition_pairs(
-                                fx.slice(v_out, (tok, head, None)), lane
+                                fx.slice(v_out, (tok, head, None)), pair_lane
                             )
                         for p in range_constexpr(PAIRS_PER_LANE):
                             col = fx.Int32(fx.get_scalar(pair_coords[p, 0]))
