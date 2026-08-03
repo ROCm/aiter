@@ -31,6 +31,7 @@ import flydsl.compiler as flyc
 from aiter import pertoken_quant
 from aiter.fused_moe import moe_sorting
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
+    _stage1_activation_module_tag,
     compile_moe_gemm1,
     compile_moe_gemm2,
 )
@@ -213,7 +214,17 @@ def _decode_stage_w(w_codes, scale_groups, group_size, dtype: str) -> torch.Tens
     raise ValueError(f"unsupported weight dtype {dtype!r}")
 
 
-def _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size, dtype: str = "fp4_bf16"):
+def _ref_stage1(
+    g,
+    w1_codes,
+    scale_w1_groups,
+    inter_dim,
+    group_size,
+    dtype: str = "fp4_bf16",
+    act: str = "silu",
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
+):
     dev = g["dev"]
     w1_scaled = _decode_stage_w(w1_codes, scale_w1_groups, group_size, dtype).to(torch.bfloat16)
     x = g["x"]
@@ -224,7 +235,16 @@ def _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size, dtype: str 
             e = int(g["topk_ids"][t, j])
             acc = x[t].float() @ w1_scaled[e].float().t()  # [2*inter]
             gate, up = acc[:inter_dim], acc[inter_dim:]
-            ref[t, j] = torch.nn.functional.silu(gate) * up
+            if act == "situv2":
+                situ_gate = (
+                    situ_beta
+                    * torch.tanh(gate / situ_beta)
+                    * torch.sigmoid(gate)
+                )
+                situ_up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+                ref[t, j] = situ_gate * situ_up
+            else:
+                ref[t, j] = torch.nn.functional.silu(gate) * up
     return ref
 
 
@@ -241,7 +261,20 @@ def _ref_stage2(g, a2, w2_codes, scale_w2_groups, model_dim, group_size, dtype: 
     return ref
 
 
-def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, tile_k, group_size=32):
+def _run_stage1(
+    tokens,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    tile_m,
+    tile_n,
+    tile_k,
+    group_size=32,
+    act="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+):
     """Direct compile_moe_gemm1 call (validates the vendored kernel in isolation)."""
     g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
     dev = g["dev"]
@@ -257,6 +290,7 @@ def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, til
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k, doweight_stage1=False,
         in_dtype="fp4_bf16", group_size=group_size, out_dtype="bf16",
         use_cshuffle_epilog=False, scale_is_bf16=True,
+        act=act, situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
     )
     # Pass tensors directly (memref-typed) -- matches the moe_gemm launcher
     # signature: out, a, w, a_scale, w_scale, sorted_ids, sorted_eids,
@@ -272,7 +306,16 @@ def _run_stage1(tokens, model_dim, inter_dim, experts, topk, tile_m, tile_n, til
     compiled(*args)
     torch.cuda.synchronize()
 
-    ref = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size)
+    ref = _ref_stage1(
+        g,
+        w1_codes,
+        scale_w1_groups,
+        inter_dim,
+        group_size,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
     return g, out, ref, w1_codes, scale_w1_groups
 
 
@@ -310,8 +353,21 @@ def _run_stage2(g, a2, tokens, model_dim, inter_dim, experts, topk,
     return target, ref
 
 
-def _run_stage1_bridge(tokens, model_dim, inter_dim, experts, topk,
-                       tile_m, tile_n, tile_k, group_size=32):
+def _run_stage1_bridge(
+    tokens,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    tile_m,
+    tile_n,
+    tile_k,
+    group_size=32,
+    act="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+    k_batch=1,
+):
     """Public flydsl_moe_stage1 API (validates the gfx942 a16w4 arg-fork)."""
     g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
     dev = g["dev"]
@@ -325,11 +381,22 @@ def _run_stage1_bridge(tokens, model_dim, inter_dim, experts, topk,
         sorted_token_ids=g["sorted_ids"], sorted_expert_ids=g["sorted_expert_ids"],
         num_valid_ids=g["num_valid_ids"], topk=topk,
         tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-        a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act="silu",
+        a_dtype="bf16", b_dtype="fp4", out_dtype="bf16", act=act,
+        situ_beta=situ_beta, situ_linear_beta=situ_linear_beta,
         w1_scale=scale_w1_1d, a1_scale=None, sorted_weights=None,
+        k_batch=k_batch,
     )
     torch.cuda.synchronize()
-    ref = _ref_stage1(g, w1_codes, scale_w1_groups, inter_dim, group_size)
+    ref = _ref_stage1(
+        g,
+        w1_codes,
+        scale_w1_groups,
+        inter_dim,
+        group_size,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
     return g, out, ref
 
 
@@ -361,12 +428,58 @@ def _run_stage2_bridge(g, a2, tokens, model_dim, inter_dim, experts, topk,
 # torch reference needs no slot re-weighting.
 _SHAPE = dict(tokens=64, model_dim=256, inter_dim=128, experts=4, topk=1,
               tile_m=16, tile_n=64, tile_k=128)
+_SPLITK_SHAPE = dict(
+    tokens=64,
+    model_dim=2048,
+    inter_dim=128,
+    experts=4,
+    topk=1,
+    tile_m=16,
+    tile_n=64,
+    tile_k=128,
+)
+_SITU_BETA = 4.0
+_SITU_LINEAR_BETA = 25.0
 
 
 @pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
 def test_a16w4_stage1_gfx942():
     g, out, ref, _, _ = _run_stage1(**_SHAPE)
     assert _check(ref, out, "stage1_a16w4")
+
+
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a16w4_stage1_situv2_direct_gfx942():
+    _, out, ref, _, _ = _run_stage1(
+        **_SHAPE,
+        act="situv2",
+        situ_beta=_SITU_BETA,
+        situ_linear_beta=_SITU_LINEAR_BETA,
+    )
+    assert _check(ref, out, "stage1_a16w4_situv2_direct")
+
+
+@pytest.mark.parametrize("k_batch", [2, 4])
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a16w4_stage1_situv2_splitk_gfx942(k_batch):
+    _, out, ref = _run_stage1_bridge(
+        **_SPLITK_SHAPE,
+        act="situv2",
+        situ_beta=_SITU_BETA,
+        situ_linear_beta=_SITU_LINEAR_BETA,
+        k_batch=k_batch,
+    )
+    assert _check(ref, out.reshape(ref.shape), f"stage1_a16w4_situv2_kb{k_batch}")
+
+
+def test_stage1_module_name_distinguishes_situv2_betas():
+    tags = {
+        _stage1_activation_module_tag("silu", 1.0, 1.0),
+        _stage1_activation_module_tag("situv2", 1.0, 1.0),
+        _stage1_activation_module_tag("situv2", 4.0, 1.0),
+        _stage1_activation_module_tag("situv2", 4.0, 25.0),
+    }
+    assert len(tags) == 4
 
 
 @pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")

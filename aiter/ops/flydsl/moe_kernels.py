@@ -567,6 +567,8 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -620,6 +622,11 @@ def compile_flydsl_moe_stage1(
                 # shuffle_scale_for_int4(bf16) from repack_mxfp4_for_gfx942_fp4_bf16.
                 scale_is_bf16=(_decode_in_dtype in ("fp4_bf16", "a8w4_bf16", "a8w4_fp8")),
                 k_batch=k_batch,
+                # This legacy epilogue historically treated every non-SiTUv2
+                # activation as SiLU. Preserve that behavior while adding SiTUv2.
+                act="situv2" if act == "situv2" else "silu",
+                situ_beta=situ_beta,
+                situ_linear_beta=situ_linear_beta,
             )
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
         from .moe_common import GateMode
@@ -672,6 +679,9 @@ def compile_flydsl_moe_stage1(
             use_cshuffle_epilog=_use_cshuffle,
             scale_is_bf16=True,
             k_batch=k_batch,
+            act="situv2" if act == "situv2" else "silu",
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
     else:
         raise ValueError(
@@ -1298,6 +1308,8 @@ def _get_compiled_silu_fused(
     act: str = "silu",
     enable_bias: bool = False,
     swiglu_limit: float = 0.0,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -1310,6 +1322,8 @@ def _get_compiled_silu_fused(
         act=act,
         enable_bias=enable_bias,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -1407,6 +1421,8 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
@@ -1607,6 +1623,8 @@ def flydsl_moe_stage1(
         b_dtype=b_dtype,
         out_dtype=_gemm_out_dtype,
         act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
         persist_m=_persist_m,
         use_async_copy=use_async_copy,
         k_batch=k_batch,
@@ -1652,6 +1670,8 @@ def flydsl_moe_stage1(
             act=act,
             enable_bias=use_splitk_bias,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1677,6 +1697,8 @@ def flydsl_moe_stage1(
             act=act,
             enable_bias=use_splitk_bias,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,
@@ -1693,13 +1715,16 @@ def flydsl_moe_stage1(
                 torch.cuda.current_stream(),
             ),
         )
-    elif _splitk_fp4:
+    elif _splitk_fp4 or (_is_splitk and act == "situv2"):
         _silu_fused_k = _get_compiled_silu_fused(
             inter_dim,
             topk,
+            quant_mode="fp4" if _splitk_fp4 else "none",
             act=act,
             enable_bias=use_splitk_bias,
             swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         _run_compiled(
             _silu_fused_k,

@@ -17,7 +17,7 @@ Compile options:
   quant_mode : "fp4" | "fp8" | "none"
   gui_layout : False -> gate-up separated  [gate_0:N, up_0:N]
                True  -> block-interleaved  [gate_0:16, up_0:16, gate_16:32, ...]
-  act        : "silu" | "swiglu"
+  act        : "silu" | "swiglu" | "situv2"
 """
 
 import flydsl.compiler as flyc
@@ -50,6 +50,8 @@ def build_silu_and_mul_fq_module(
     act: str = "silu",
     enable_bias: bool = False,
     swiglu_limit: float = 0.0,
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 
@@ -75,8 +77,15 @@ def build_silu_and_mul_fq_module(
     _need_fp8 = quant_mode == "fp8"
     _need_quant = _need_fp4 or _need_fp8
     assert _need_fp4 or _need_fp8 or quant_mode == "none"
-    if act not in ("silu", "swiglu"):
+    if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"Unsupported activation for split-K path: {act!r}")
+    if act == "situv2":
+        if situ_beta <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+        if situ_linear_beta <= 0.0:
+            raise ValueError(
+                f"situ_linear_beta must be > 0, got {situ_linear_beta!r}"
+            )
 
     scale_cols = inter_dim // 32
     ELEMS_PER_THREAD = (inter_dim + BLOCK_THREADS - 1) // BLOCK_THREADS
@@ -277,6 +286,32 @@ def build_silu_and_mul_fq_module(
                     swiglu_neg_alpha_log2e = arith.constant(
                         -1.4426950408889634 * 1.702, type=f32
                     )
+                    two_f32 = arith.constant(2.0, type=f32)
+                    situ_beta_f32 = arith.constant(float(situ_beta), type=f32)
+                    situ_beta_rcp = arith.constant(1.0 / float(situ_beta), type=f32)
+                    situ_linear_beta_f32 = arith.constant(
+                        float(situ_linear_beta), type=f32
+                    )
+                    situ_linear_beta_rcp = arith.constant(
+                        1.0 / float(situ_linear_beta), type=f32
+                    )
+
+                    def sigmoid(value):
+                        exp_arg = value * neg_log2e
+                        exp_value = llvm.call_intrinsic(
+                            f32, "llvm.amdgcn.exp2.f32", [exp_arg], [], []
+                        )
+                        return llvm.call_intrinsic(
+                            f32,
+                            "llvm.amdgcn.rcp.f32",
+                            [c1_f32 + exp_value],
+                            [],
+                            [],
+                        )
+
+                    def tanh(value):
+                        return two_f32 * sigmoid(two_f32 * value) - c1_f32
+
                     if const_expr(swiglu_limit != 0):
                         _limit = arith.constant(float(swiglu_limit), type=f32)
                         _neg_limit = arith.constant(-float(swiglu_limit), type=f32)
@@ -299,31 +334,42 @@ def build_silu_and_mul_fq_module(
                             u = u + _load_bias_scalar(
                                 bias_row + inter_dim_i32 + bias_col
                             )
-                        gate = g
-                        linear = u
-                        t = gate * neg_log2e
-                        if const_expr(act == "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
-                            t = gate * swiglu_neg_alpha_log2e
-                        elif const_expr(swiglu_limit != 0 and act != "swiglu"):
-                            gate = arith.minimumf(gate, _limit)
-                            linear = arith.minimumf(linear, _limit)
-                            linear = arith.maximumf(linear, _neg_limit)
-                            t = gate * swiglu_neg_alpha_log2e
-
-                        emu = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.exp2.f32", [t], [], []
-                        )
-                        den = c1_f32 + emu
-                        sig = llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [den], [], []
-                        )
-                        if const_expr(act == "swiglu"):
-                            act_v = gate * sig * (linear + c1_f32)
+                        if const_expr(act == "situv2"):
+                            situ_gate = (
+                                situ_beta_f32
+                                * tanh(g * situ_beta_rcp)
+                                * sigmoid(g)
+                            )
+                            situ_up = situ_linear_beta_f32 * tanh(
+                                u * situ_linear_beta_rcp
+                            )
+                            act_v = situ_gate * situ_up
                         else:
-                            act_v = gate * sig * linear
+                            gate = g
+                            linear = u
+                            t = gate * neg_log2e
+                            if const_expr(act == "swiglu"):
+                                gate = arith.minimumf(gate, _limit)
+                                linear = arith.minimumf(linear, _limit)
+                                linear = arith.maximumf(linear, _neg_limit)
+                                t = gate * swiglu_neg_alpha_log2e
+                            elif const_expr(swiglu_limit != 0 and act != "swiglu"):
+                                gate = arith.minimumf(gate, _limit)
+                                linear = arith.minimumf(linear, _limit)
+                                linear = arith.maximumf(linear, _neg_limit)
+                                t = gate * swiglu_neg_alpha_log2e
+
+                            emu = llvm.call_intrinsic(
+                                f32, "llvm.amdgcn.exp2.f32", [t], [], []
+                            )
+                            den = c1_f32 + emu
+                            sig = llvm.call_intrinsic(
+                                f32, "llvm.amdgcn.rcp.f32", [den], [], []
+                            )
+                            if const_expr(act == "swiglu"):
+                                act_v = gate * sig * (linear + c1_f32)
+                            else:
+                                act_v = gate * sig * linear
                         act_vals.append(act_v)
 
                     if const_expr(_need_quant):
