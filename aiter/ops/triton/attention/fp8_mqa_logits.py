@@ -199,11 +199,15 @@ def fp8_mqa_logits(
         if arch == "gfx950":
             num_buffers = 2
             loop_variant = 0
-            waves_per_eu = 3
+            waves_per_eu = 4
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 1
             block_kv = 32
-            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            block_m = 2 if num_heads <= 32 and seq_len >= 2 else 1
+            other = {
+                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                "BLOCK_M": block_m,
+            }
         else:
             loop_variant = 1
             waves_per_eu = 1
@@ -217,7 +221,7 @@ def fp8_mqa_logits(
         BUFFER_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
         use_buffer_load = KV.numel() * KV.element_size() < BUFFER_LIMIT_BYTES
         use_buffer_store = logits.numel() * logits.element_size() < BUFFER_LIMIT_BYTES
-        _gluon_fp8_mqa_logits_kernel[(seq_len,)](
+        _gluon_fp8_mqa_logits_kernel[((seq_len + block_m - 1) // block_m,)](
             Q_ptr=Q,
             KV_ptr=KV,
             kv_scales_ptr=kv_scales,
