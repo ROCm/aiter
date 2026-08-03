@@ -439,6 +439,31 @@ def _build_kv_kernel(
                 acc = acc + value * value
             return acc
 
+        def page_is_coalescible(tok0, lane):
+            base_slot = fx.Int64(slot_mapping[tok0])
+            full_page = tok0 + block_size <= num_tokens
+            valid_base = (
+                full_page
+                and (base_slot >= fx.Int64(0))
+                and ((base_slot % fx.Int64(block_size)) == fx.Int64(0))
+            )
+            mapping_valid = valid_base.select(fx.Int32(1), fx.Int32(0))
+            if full_page:
+                for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
+                    token_local = lane + WAVE * check_it
+                    if token_local < block_size:
+                        tok = tok0 + fx.Int32(token_local)
+                        slot = fx.Int64(slot_mapping[tok])
+                        expected = base_slot + fx.Int64(token_local)
+                        mapping_valid = mapping_valid & (slot == expected).select(
+                            fx.Int32(1), fx.Int32(0)
+                        )
+            for sh_exp in range_constexpr(_LOG2_WAVE):
+                off = WAVE // (2 << sh_exp)
+                peer_valid = mapping_valid.shuffle_xor(off, WAVE)
+                mapping_valid = mapping_valid & peer_valid
+            return mapping_valid
+
         def _fp8_clamp(value: fx.Float32):
             fp8_min, fp8_max = _fp8_range()
             # Note: min(), max() here cannot be traced by FlyDSL correctly
@@ -565,28 +590,7 @@ def _build_kv_kernel(
         # Wave 0 checks whether the whole logical page maps to one aligned
         # physical page. Other mappings use the scatter path.
         if wid == 0:
-            base_slot = fx.Int64(slot_mapping[tok0])
-            full_page = tok0 + block_size <= num_tokens
-            valid_base = (
-                full_page
-                and (base_slot >= fx.Int64(0))
-                and ((base_slot % fx.Int64(block_size)) == fx.Int64(0))
-            )
-            mapping_valid = valid_base.select(fx.Int32(1), fx.Int32(0))
-            if full_page:
-                for check_it in range_constexpr(_ceil_div(block_size, WAVE)):
-                    token_local = lane + WAVE * check_it
-                    if token_local < block_size:
-                        tok = tok0 + fx.Int32(token_local)
-                        slot = fx.Int64(slot_mapping[tok])
-                        expected = base_slot + fx.Int64(token_local)
-                        mapping_valid = mapping_valid & (slot == expected).select(
-                            fx.Int32(1), fx.Int32(0)
-                        )
-            for sh_exp in range_constexpr(_LOG2_WAVE):
-                off = WAVE // (2 << sh_exp)
-                peer_valid = mapping_valid.shuffle_xor(off, WAVE)
-                mapping_valid = mapping_valid & peer_valid
+            mapping_valid = page_is_coalescible(tok0, lane)
             if lane == 0:
                 mapping_ok[0] = mapping_valid
         gpu.barrier()
