@@ -102,7 +102,7 @@ class MoonEPPreplannedDispatchOp:
                 self.recv_duplicate_src.data_ptr(), config.rank, peer
             )
             self.peer_expert_output_ptrs[peer] = ms.shmem_ptr_p2p(
-                self.expert_output.data_ptr(), config.rank, peer
+                self.recv_hidden.data_ptr(), config.rank, peer
             )
 
         self._jit = make_moonep_preplanned_dispatch_jit(
@@ -127,6 +127,11 @@ class MoonEPPreplannedDispatchOp:
         self.combine_output = torch.empty(
             (config.num_tokens, hidden_dim),
             dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self.gathered_route_weights = torch.empty(
+            (config.num_tokens, config.top_k),
+            dtype=torch.float32,
             device=self.device,
         )
         self._combine_jit = make_moonep_combine_jit(
@@ -341,12 +346,11 @@ class MoonEPPreplannedDispatchOp:
 
     def combine(
         self,
-        route_weights: torch.Tensor,
         plan: MoonEPReferencePlan,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather expert outputs from their execution ranks and top-k reduce.
 
-        Expert compute must write this op's symmetric ``expert_output`` buffer.
+        Expert outputs must be staged in the symmetric ``recv_hidden`` shard.
         The device barrier publishes every rank's writes before direct peer
         loads begin on the same current stream.
         """
@@ -355,21 +359,17 @@ class MoonEPPreplannedDispatchOp:
             raise RuntimeError("dispatch op is closed")
         if plan.config != self.config:
             raise ValueError("plan config does not match this combine op")
-        expected = (self.config.num_tokens, self.config.top_k)
-        if tuple(route_weights.shape) != expected:
-            raise ValueError(f"route_weights must have shape {expected}")
-        if route_weights.dtype != torch.float32 or not route_weights.is_contiguous():
-            raise ValueError("route_weights must be contiguous FP32")
-        if route_weights.device != self.device or plan.dst.device != self.device:
+        if plan.dst.device != self.device:
             raise ValueError("combine inputs must be on this op's ROCm device")
 
         stream = torch.cuda.current_stream(self.device)
         ms.shmem_barrier_on_stream(stream)
         args = (
             fx.Int64(plan.dst.data_ptr()),
-            fx.Int64(route_weights.data_ptr()),
             fx.Int64(self.peer_expert_output_ptrs.data_ptr()),
+            fx.Int64(self.peer_weight_ptrs.data_ptr()),
             fx.Int64(self.combine_output.data_ptr()),
+            fx.Int64(self.gathered_route_weights.data_ptr()),
             stream,
         )
         if self._combine_compiled is None:
@@ -377,12 +377,13 @@ class MoonEPPreplannedDispatchOp:
         else:
             self._combine_compiled(
                 plan.dst.data_ptr(),
-                route_weights.data_ptr(),
                 self.peer_expert_output_ptrs.data_ptr(),
+                self.peer_weight_ptrs.data_ptr(),
                 self.combine_output.data_ptr(),
+                self.gathered_route_weights.data_ptr(),
                 stream,
             )
-        return self.combine_output
+        return self.combine_output, self.gathered_route_weights
 
     def close(self) -> None:
         """Collectively release the symmetric receive buffers."""

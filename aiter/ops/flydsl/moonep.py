@@ -99,6 +99,44 @@ class MoonEPReferencePlan:
     alloc: torch.Tensor
     group_expert_ids: torch.Tensor
 
+    @property
+    def N(self) -> int:
+        return self.config.capacity
+
+    @property
+    def R(self) -> int:
+        return self.config.world_size
+
+    @property
+    def E(self) -> int:
+        return self.config.num_experts
+
+    @property
+    def B(self) -> int:
+        return int(self.config.prefetch_slots)
+
+    @property
+    def NvS(self) -> int:
+        return self.config.num_dispatch_rows
+
+    @property
+    def K(self) -> int:
+        return self.config.top_k
+
+    def clone(self) -> "MoonEPReferencePlan":
+        """Clone plan-owned tensors for safe reuse, matching MoonEPCommPlan."""
+
+        return type(self)(
+            config=self.config,
+            dst=self.dst.clone(),
+            cu_seqlens=self.cu_seqlens.clone(),
+            experts_to_copy=self.experts_to_copy.clone(),
+            zero_fill_ranges=self.zero_fill_ranges.clone(),
+            remote_stats=self.remote_stats.clone(),
+            alloc=self.alloc.clone(),
+            group_expert_ids=self.group_expert_ids.clone(),
+        )
+
     @staticmethod
     def decode_dst(dst: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(raw_dst, is_primary)`` without losing duplicate slots."""
@@ -511,6 +549,9 @@ def hipblaslt_moonep_mlp_reference(
     num_experts: int,
     output: torch.Tensor,
     solution_index: int = -1,
+    full_gate: torch.Tensor | None = None,
+    full_up: torch.Tensor | None = None,
+    full_down: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run ``down(silu(gate(x)) * up(x))`` for every physical VM group."""
 
@@ -556,15 +597,20 @@ def hipblaslt_moonep_mlp_reference(
             if expert < 0:
                 raise ValueError("non-empty group is missing its expert id")
             if group < num_experts:
-                owner = expert // experts_per_rank
-                if owner != rank:
-                    raise ValueError(
-                        "remote expert group has no dynamic prefetch slot"
-                    )
-                local = expert % experts_per_rank
-                gate_w = home_gate[local]
-                up_w = home_up[local]
-                down_w = home_down[local]
+                if full_gate is not None and full_up is not None and full_down is not None:
+                    gate_w = full_gate[expert]
+                    up_w = full_up[expert]
+                    down_w = full_down[expert]
+                else:
+                    owner = expert // experts_per_rank
+                    if owner != rank:
+                        raise ValueError(
+                            "remote expert group has no dynamic prefetch slot or full weight view"
+                        )
+                    local = expert % experts_per_rank
+                    gate_w = home_gate[local]
+                    up_w = home_up[local]
+                    down_w = home_down[local]
             else:
                 slot = group - num_experts
                 gate_w = prefetched_gate[slot]

@@ -38,8 +38,10 @@ def make_moonep_combine_jit(
     top_k: int,
     num_dispatch_rows: int,
     block_threads: int = 256,
+    gather_route_weights: bool = True,
+    apply_route_weights: bool = False,
 ):
-    """Build source-rank combine: peer gather, route weighting, top-k sum."""
+    """Build source-rank combine: peer gather, optional weighting, top-k sum."""
 
     if num_tokens <= 0 or hidden_dim <= 0 or hidden_dim % 8 != 0:
         raise ValueError("token count and 16-byte-aligned hidden_dim are required")
@@ -50,50 +52,86 @@ def make_moonep_combine_jit(
     row_dwords = hidden_dim // 2
     name = (
         f"moonep_combine_bf16_s{num_tokens}_h{hidden_dim}_k{top_k}"
-        f"_nvs{num_dispatch_rows}_t{block_threads}"
+        f"_nvs{num_dispatch_rows}_t{block_threads}_gw{int(gather_route_weights)}"
+        f"_aw{int(apply_route_weights)}"
     )
 
     @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def combine_kernel(
         addr_dst: fx.Int64,  # INT32 [S,K]
-        addr_route_weights: fx.Int64,  # FP32 [S,K]
         addr_peer_expert_output_ptrs: fx.Int64,  # INT64 [world_size]
+        addr_peer_route_weight_ptrs: fx.Int64,  # INT64 [world_size]
         addr_output: fx.Int64,  # BF16 [S,H]
+        addr_gathered_route_weights: fx.Int64,  # FP32 [S,K]
     ):
         token = fx.block_idx.x
         tid = fx.thread_idx.x
         dst_rsrc = create_buffer_resource_from_addr(addr_dst)
-        weights_rsrc = create_buffer_resource_from_addr(addr_route_weights)
         peer_ptrs_rsrc = create_buffer_resource_from_addr(
             addr_peer_expert_output_ptrs
         )
+        peer_weight_ptrs_rsrc = create_buffer_resource_from_addr(
+            addr_peer_route_weight_ptrs
+        )
         output_rsrc = create_buffer_resource_from_addr(addr_output)
+        gathered_weights_rsrc = create_buffer_resource_from_addr(
+            addr_gathered_route_weights
+        )
+
+        if tid < top_k:
+            route_idx = token * top_k + tid
+            encoded = buffer_load(
+                dst_rsrc, route_idx, vec_width=1, dtype=T.i32
+            )
+            raw = (encoded >= 0).select(encoded, -encoded - 1)
+            peer = raw // num_dispatch_rows
+            row = raw % num_dispatch_rows
+            peer_weight_base = buffer_load(
+                peer_weight_ptrs_rsrc, peer, vec_width=1, dtype=T.i64
+            )
+            peer_weight_rsrc = create_buffer_resource_from_addr(
+                peer_weight_base
+            )
+            route_weight = buffer_load(
+                peer_weight_rsrc, row, vec_width=1, dtype=T.f32
+            )
+            if gather_route_weights:
+                buffer_store(
+                    route_weight,
+                    gathered_weights_rsrc,
+                    route_idx,
+                )
 
         for dw_base in range(tid * vec_dwords, row_dwords, block_threads * vec_dwords):
             acc = [fx.Float32(0.0) for _ in range(2 * vec_dwords)]
             for k_idx in range_constexpr(top_k):
                 route_idx = token * top_k + k_idx
                 encoded = buffer_load(
-                    dst_rsrc, route_idx, vec_width=1, dtype=T.i32()
+                    dst_rsrc, route_idx, vec_width=1, dtype=T.i32
                 )
                 raw = (encoded >= 0).select(encoded, -encoded - 1)
                 peer = raw // num_dispatch_rows
                 row = raw % num_dispatch_rows
                 peer_base = buffer_load(
-                    peer_ptrs_rsrc, peer, vec_width=1, dtype=T.i64()
+                    peer_ptrs_rsrc, peer, vec_width=1, dtype=T.i64
                 )
                 row_addr = peer_base + fx.Int64(row) * hidden_dim * 2
                 row_rsrc = create_buffer_resource_from_addr(row_addr)
-                weight = fx.Float32(
-                    buffer_load(
-                        weights_rsrc,
-                        route_idx,
-                        vec_width=1,
-                        dtype=T.f32(),
+                weight = fx.Float32(1.0)
+                if apply_route_weights:
+                    peer_weight_base = buffer_load(
+                        peer_weight_ptrs_rsrc, peer, vec_width=1, dtype=T.i64
                     )
-                )
+                    peer_weight_rsrc = create_buffer_resource_from_addr(
+                        peer_weight_base
+                    )
+                    weight = fx.Float32(
+                        buffer_load(
+                            peer_weight_rsrc, row, vec_width=1, dtype=T.f32
+                        )
+                    )
                 raw_vec = buffer_load(
-                    row_rsrc, dw_base, vec_width=vec_dwords, dtype=T.i32()
+                    row_rsrc, dw_base, vec_width=vec_dwords, dtype=T.i32
                 )
                 for lane in range_constexpr(vec_dwords):
                     raw_dw = vector.extract(
@@ -107,23 +145,25 @@ def make_moonep_combine_jit(
                 _pack_bf16_pair(acc[2 * lane], acc[2 * lane + 1])
                 for lane in range(vec_dwords)
             ]
-            out_vec = vector.from_elements(T.vec(vec_dwords, T.i32()), packed)
+            out_vec = vector.from_elements(T.vec(vec_dwords, T.i32), packed)
             output_dw = token * row_dwords + dw_base
             buffer_store(out_vec, output_rsrc, output_dw)
 
     @flyc.jit
     def launch(
         addr_dst: fx.Int64,
-        addr_route_weights: fx.Int64,
         addr_peer_expert_output_ptrs: fx.Int64,
+        addr_peer_route_weight_ptrs: fx.Int64,
         addr_output: fx.Int64,
+        addr_gathered_route_weights: fx.Int64,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         combine_kernel(
             addr_dst,
-            addr_route_weights,
             addr_peer_expert_output_ptrs,
+            addr_peer_route_weight_ptrs,
             addr_output,
+            addr_gathered_route_weights,
         ).launch(
             grid=(num_tokens, 1, 1),
             block=(block_threads, 1, 1),

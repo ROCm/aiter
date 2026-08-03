@@ -109,3 +109,19 @@ def test_reference_plan_rejects_inconsistent_local_histogram():
         assert "histogram" in str(exc)
     else:
         raise AssertionError("expected an inconsistent histogram failure")
+
+
+def test_reference_plan_clone_and_moonep_dimensions():
+    tokens_per_expert = torch.tensor(
+        [[2, 2, 0, 0], [0, 0, 2, 2]], dtype=torch.int32
+    )
+    plan = build_reference_plan(
+        _config(rank=0, tokens=4, top_k=1),
+        torch.tensor([[0], [0], [1], [1]], dtype=torch.int32),
+        tokens_per_expert,
+    )
+    cloned = plan.clone()
+    assert (plan.N, plan.R, plan.E, plan.B, plan.NvS, plan.K) == (4, 2, 4, 2, 4, 1)
+    assert cloned is not plan
+    assert torch.equal(cloned.dst, plan.dst)
+    assert cloned.dst.data_ptr() != plan.dst.data_ptr()

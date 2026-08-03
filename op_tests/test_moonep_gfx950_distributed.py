@@ -204,12 +204,21 @@ def _run_two_rank_direct_scatter() -> None:
             gemm_output[:8], expected_gemm, rtol=0, atol=0
         )
 
-        combined_output = op.combine(route_weights, plan)
+        op.expert_output.mul_(op.recv_route_weights[:, None])
+        op.recv_hidden.copy_(op.expert_output)
+        combined_output, gathered_weights = op.combine(plan)
         torch.cuda.synchronize()
+        torch.testing.assert_close(
+            gathered_weights, route_weights, rtol=0, atol=0
+        )
         expert_scales = (local_topk.to(torch.float32) + 1.0)
-        expected_combined_values = (
-            route_weights * expert_scales * row_values.to(torch.float32)[:, None]
-        ).sum(dim=1).to(torch.bfloat16)
+        expected_contributions = (
+            expert_scales * row_values.to(torch.float32)[:, None]
+        ).to(torch.bfloat16)
+        expected_contributions.mul_(route_weights)
+        expected_combined_values = expected_contributions.to(torch.float32).sum(
+            dim=1
+        ).to(torch.bfloat16)
         expected_combined = expected_combined_values[:, None].expand(
             -1, hidden_dim
         )
@@ -255,16 +264,23 @@ def _run_two_rank_direct_scatter() -> None:
         down_base = torch.eye(
             64, hidden_dim, dtype=torch.bfloat16, device="cuda"
         )
-        home_gate = torch.stack(
-            [gate_base for _ in range(hot_config.experts_per_rank)]
-        ).contiguous()
-        home_up = torch.stack(
-            [up_base for _ in range(hot_config.experts_per_rank)]
-        ).contiguous()
-        home_down = torch.stack(
-            [down_base for _ in range(hot_config.experts_per_rank)]
-        ).contiguous()
-        ep.load_home_weights(home_gate, home_up, home_down)
+        group_count = hot_config.num_experts + int(hot_config.prefetch_slots)
+        full_gate = torch.zeros(
+            group_count, hidden_dim, 64, dtype=torch.bfloat16, device="cuda"
+        )
+        full_up = torch.zeros_like(full_gate)
+        full_down = torch.zeros(
+            group_count, 64, hidden_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        full_gate[: hot_config.num_experts] = gate_base
+        full_up[: hot_config.num_experts] = up_base
+        full_down[: hot_config.num_experts] = down_base
+        ep.prefetch_weight(
+            hot_plan,
+            full_gate_weight=full_gate,
+            full_up_weight=full_up,
+            full_down_weight=full_down,
+        )
         hot_values = (
             torch.arange(4, dtype=torch.float32, device="cuda") + rank * 10
         ).to(torch.bfloat16)
@@ -274,7 +290,28 @@ def _run_two_rank_direct_scatter() -> None:
             + rank * 10
             + 0.125
         )[:, None].contiguous()
-        hot_output, returned_hot_plan = ep.forward(
+        zc_hidden, zc_weights, zc_cu, zc_plan = ep.dispatch(
+            hot_hidden,
+            hot_route_weights,
+            hot_topk,
+            hot_tokens_per_expert[rank],
+            zero_copy=True,
+        )
+        torch.cuda.synchronize()
+        assert zc_hidden.data_ptr() == op.recv_hidden.data_ptr()
+        assert zc_weights.data_ptr() == op.recv_route_weights.data_ptr()
+        assert zc_cu is not None
+        copied_hidden, copied_weights, reused_cu, _ = ep.dispatch(
+            hot_hidden,
+            hot_route_weights,
+            plan=zc_plan,
+            zero_copy=False,
+        )
+        torch.cuda.synchronize()
+        assert copied_hidden.data_ptr() != op.recv_hidden.data_ptr()
+        assert copied_weights.data_ptr() != op.recv_route_weights.data_ptr()
+        assert reused_cu is None
+        hot_output, gathered_hot_weights, returned_hot_plan = ep.forward(
             hot_hidden,
             hot_route_weights,
             topk_experts=hot_topk,
@@ -283,8 +320,11 @@ def _run_two_rank_direct_scatter() -> None:
         torch.cuda.synchronize()
         assert torch.equal(returned_hot_plan.dst, hot_plan.dst)
         assert hot_output.data_ptr() != op.combine_output.data_ptr()
-        hot_recv = op.recv_hidden
-        hot_recv_weights = op.recv_route_weights
+        torch.testing.assert_close(
+            gathered_hot_weights, hot_route_weights, rtol=0, atol=0
+        )
+        hot_recv = copied_hidden
+        hot_recv_weights = copied_weights
         prefetched_gate = ep.gate_op.prefetched_weights
         expected_hot_values = torch.arange(
             rank * 10,
@@ -311,6 +351,15 @@ def _run_two_rank_direct_scatter() -> None:
             torch.testing.assert_close(
                 prefetched_gate[0], gate_base, rtol=0, atol=0
             )
+            torch.testing.assert_close(
+                full_gate[hot_config.num_experts], gate_base, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                full_up[hot_config.num_experts], up_base, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                full_down[hot_config.num_experts], down_base, rtol=0, atol=0
+            )
 
         ref_gate = hot_hidden @ gate_base
         ref_up = hot_hidden @ up_base
@@ -328,7 +377,7 @@ def _run_two_rank_direct_scatter() -> None:
 
         reused_hidden = (hot_hidden + 1.0).contiguous()
         reused_route_weights = (hot_route_weights * 0.5).contiguous()
-        reused_output, reused_plan = ep.forward(
+        reused_output, gathered_reused_weights, reused_plan = ep.forward(
             reused_hidden,
             reused_route_weights,
             plan=returned_hot_plan,
@@ -336,7 +385,14 @@ def _run_two_rank_direct_scatter() -> None:
         )
         torch.cuda.synchronize()
         assert reused_plan is returned_hot_plan
-        assert reused_output.data_ptr() == op.combine_output.data_ptr()
+        assert reused_output.data_ptr() != op.combine_output.data_ptr()
+        assert (
+            gathered_reused_weights.data_ptr()
+            != op.gathered_route_weights.data_ptr()
+        )
+        torch.testing.assert_close(
+            gathered_reused_weights, reused_route_weights, rtol=0, atol=0
+        )
         reused_gate = reused_hidden @ gate_base
         reused_up = reused_hidden @ up_base
         reused_act = (
@@ -350,6 +406,17 @@ def _run_two_rank_direct_scatter() -> None:
         ).to(torch.bfloat16)
         torch.testing.assert_close(
             reused_output, expected_reused, rtol=1e-2, atol=2e-2
+        )
+
+        unweighted_output, no_gathered_weights, cloned_plan = ep.forward(
+            reused_hidden,
+            plan=returned_hot_plan.clone(),
+        )
+        torch.cuda.synchronize()
+        assert no_gathered_weights is None
+        assert cloned_plan is not returned_hot_plan
+        torch.testing.assert_close(
+            unweighted_output, reused_expert, rtol=1e-2, atol=2e-2
         )
     finally:
         if ep is not None:
