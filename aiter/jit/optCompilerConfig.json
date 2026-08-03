@@ -1780,7 +1780,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-ffast-math'"
+            "'-ffast-math'",
+            "'-mwavefrontsize64'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

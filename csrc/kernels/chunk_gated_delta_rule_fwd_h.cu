@@ -320,7 +320,11 @@ __device__ __forceinline__ floatx4 zero_floatx4()
 
 __device__ __forceinline__ floatx4 mfma16x16x16_bf16(const _B16x4& a, const _B16x4& b, const floatx4& c)
 {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w64_gfx12(a, b, c);
+#else
     return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
+#endif
 }
 
 template <bool USE_EXP2>
@@ -1080,7 +1084,14 @@ void chunk_gated_delta_rule_fwd_h_hip_kernel(
     __shared__ bf16_t h_transpose_buf[BV_P * K_DIM];
 
     const int v_idx = lane_id & 15;
-    const int row_group = lane_id >> 4;
+    const int physical_row_group = lane_id >> 4;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    // Wave64 WMMA maps lane groups 0..3 to result-row chunks 0, 2, 1, 3.
+    const int row_group = ((physical_row_group & 1) << 1) |
+                          ((physical_row_group & 2) >> 1);
+#else
+    const int row_group = physical_row_group;
+#endif
     const int h_row_base_lo = wave_id * MFMA_M + row_group * 4;
     const int h_row_base_hi = h_row_base_lo + 64;
     float h_reg[8 * NUM_BV_TILES];

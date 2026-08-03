@@ -696,10 +696,6 @@ def test_chunk_opt(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
-@pytest.mark.skipif(
-    _is_gfx12_runtime(),
-    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
-)
 def test_chunk_opt_hip(
     B: int,
     T: int,
@@ -872,10 +868,6 @@ def test_chunk_opt_varlen(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
-@pytest.mark.skipif(
-    _is_gfx12_runtime(),
-    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
-)
 def test_chunk_opt_varlen_hip(
     H: int,
     D: int,
@@ -948,15 +940,7 @@ def test_chunk_opt_varlen_hip(
         pytest.param(
             "hip",
             id="hip",
-            marks=[
-                pytest.mark.skipif(
-                    not IS_AMD, reason="HIP backend requires an AMD device"
-                ),
-                pytest.mark.skipif(
-                    _is_gfx12_runtime(),
-                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
-                ),
-            ],
+            marks=[pytest.mark.skipif(not IS_AMD, reason="HIP backend requires an AMD device")],
         ),
     ],
 )
