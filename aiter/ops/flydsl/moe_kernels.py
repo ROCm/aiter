@@ -420,6 +420,10 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
                 # legacy split-K names (k_batch ignored by the port) -- CSV compat.
                 for kb in k_batches:
                     _emit(tm, tn, tk, kb=kb)
+                # kw1 cached (b_nt=0) variant: large-M weight reuse wants L2-cached
+                # loads (matches main's use_nt: cached for token*topk//E >= 64), vs the
+                # default nt/streaming; the base kw1 name is nt (b_nt=2).
+                _emit(tm, tn, tk, bnt=0)
                 # k_wave (intra-block K-slice): the port's decode/wave-starvation
                 # lever. The kernel splits the 4 waves into (4/kw) N-waves x kw
                 # K-waves, so each N-wave covers tn/(4/kw) cols and needs >=16 for
