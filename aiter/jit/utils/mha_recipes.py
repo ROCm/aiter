@@ -1,3 +1,9 @@
+def _ck_targets_flag_for_arch(gfx: str) -> str:
+    if gfx.startswith("gfx9"):
+        return ""
+    return f" --targets {gfx}"
+
+
 def _ck_targets_flag() -> str:
     """Return ``--targets <runtime arch>`` when the runtime GPU is not gfx9.
 
@@ -12,9 +18,7 @@ def _ck_targets_flag() -> str:
         gfx = get_gfx()
     except Exception:  # noqa: BLE001
         return ""
-    if gfx.startswith("gfx9"):
-        return ""
-    return f" --targets {gfx}"
+    return _ck_targets_flag_for_arch(gfx)
 
 
 def compose_mha_fwd_variant_suffix_and_filter(

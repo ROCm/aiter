@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+#if defined(_WIN32)
+// hipcc pre-includes <cmath>, so include UCRT <math.h> after enabling its M_* constants.
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
+#endif
 #include <cmath>
 
 #include "aiter_hip_common.h"

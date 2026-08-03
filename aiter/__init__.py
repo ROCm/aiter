@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+# ruff: noqa: F403
 
 import logging
 import os
@@ -58,11 +59,20 @@ def getLogger():
 
 logger = getLogger()
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
+from .utility import dtypes as dtypes  # noqa: E402
+
 # Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
-# JIT build. Always on for Windows (no CK/HIP there); elsewhere opt in via the
-# env var, e.g. Triton-backend users with no C++ toolchain or CK.
+# JIT build. Native Windows ROCm support is opt-in so existing Windows installs
+# keep the upstream Triton-only default unless AITER_ENABLE_HIP=1 is set.
+AITER_ENABLE_HIP = os.getenv("AITER_ENABLE_HIP", "0") == "1" or (
+    sys.platform == "win32"
+    and os.path.isfile(
+        os.path.join(os.path.dirname(__file__), "jit", "module_aiter_core.pyd")
+    )
+)
 AITER_TRITON_ONLY = (
-    os.getenv("AITER_TRITON_ONLY", "0") == "1" or sys.platform == "win32"
+    os.getenv("AITER_TRITON_ONLY", "0") == "1"
+    or (sys.platform == "win32" and not AITER_ENABLE_HIP)
 )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
@@ -90,7 +100,6 @@ else:
     # (mla.py among others) gets pulled in, otherwise that resolves against a
     # partially initialised aiter and raises ImportError.
     from .jit import core as core
-    from .utility import dtypes as dtypes
     from .ops.enum import *
     from .ops.norm import *
     from .ops.quant import *
@@ -116,7 +125,8 @@ else:
     from .ops.pos_encoding import *
     from .ops.cache import *
     from .ops.rmsnorm import *
-    from .ops.communication import *
+    if sys.platform != "win32" or torch.distributed.is_available():
+        from .ops.communication import *
     from .ops.rope import *
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401

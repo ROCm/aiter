@@ -105,9 +105,35 @@ If you happen to forget the `--recursive` during `clone`, you can use the follow
 git submodule sync && git submodule update --init --recursive
 ```
 
+### Native Windows ROCm (experimental)
+
+Windows keeps the Triton-only installation mode by default. To build the HIP
+and Composable Kernel extensions, opt in with `AITER_ENABLE_HIP=1`. Native GPU
+detection supports gfx1100 through gfx1103, gfx1151, and gfx1201; `GPU_ARCHS`
+can be set explicitly for an offline or cross build.
+
+```powershell
+$env:AITER_ENABLE_HIP = "1"
+$env:GPU_ARCHS = "gfx1100" # optional when building on the target GPU
+python -m pip install --no-build-isolation .
+```
+
+GPU models sharing an architecture can expose different CU counts. When
+cross-building for a binned model, set `CU_NUM` to the target device's actual
+compute-unit count.
+
+The first use of each CK FMHA variant triggers a large JIT build; later calls
+reuse the disk cache. Build time depends on the host and parallelism. An
+[independent gfx1101 report](https://github.com/ROCm/aiter/pull/4340#issuecomment-5108330794)
+measured 341.8 seconds with 12 build workers, so interactive users should expect
+the uncached first call to take several minutes.
+
 ### FlyDSL
 
 AITER uses [FlyDSL](https://github.com/ROCm/FlyDSL)-based kernels across a range of operators (e.g., GEMM and MoE). FlyDSL is a required dependency and is installed automatically when you run `python3 setup.py develop`.
+
+FlyDSL is not installed or AOT-compiled on Windows; the experimental native
+Windows build uses Composable Kernel instead.
 
 To install it manually:
 
