@@ -82,23 +82,69 @@ def _load_pack_i32x8(i32_view, byte_off_i32):
 
 # Default KV tile width (columns processed per inner-loop iteration).
 _BLOCK_KV = 128
-# Don't split a row's KV window into chunks smaller than this many BKV tiles --
-# below it the per-block Q/weight preload stops being amortized.
-_MIN_TILES_PER_SPLIT = 8
 
 _DEFAULT_COMPILE_HINTS = {
     "waves_per_eu": 2,
     "fast_fp_math": True,
 }
 
+_ARCH = get_gfx()
+
+
+@dataclass(frozen=True)
+class _SplitPolicy:
+    """Per-arch tuning for the ``grid.y`` KV-column split (``_auto_num_splits``).
+
+    Fields
+    ------
+    min_seq_len_kv : int
+        Never split below this ``seq_len_kv``. 0 means "no gate" -- let
+        ``min_tiles_per_split`` do the limiting, which it does automatically
+        once the window holds fewer than that many tiles.
+    min_tiles_per_split : int
+        Smallest chunk, in BKV tiles, a split may own. Below it the per-block
+        fixed cost (Q/weight preload, plus the LDS builder's pipeline prologue)
+        stops being amortized. Note this is denominated in *tiles*, so its
+        column-equivalent scales with the variant's ``block_kv``.
+    cu_oversub : int
+        Target total blocks as a multiple of the device CU count.
+    fallback_cu : int
+        Nominal CU count to assume when the device query fails.
+    """
+
+    min_seq_len_kv: int
+    min_tiles_per_split: int
+    cu_oversub: int
+    fallback_cu: int
+
+
+_SPLIT_POLICIES = {
+    # Tuned on MI300X (304 CU) against the direct-load builder at BKV=128,
+    # where min_tiles_per_split=8 is 1024 KV columns.
+    "gfx942": _SplitPolicy(
+        min_seq_len_kv=4096, min_tiles_per_split=8, cu_oversub=4, fallback_cu=304
+    ),
+    # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
+    "gfx950": _SplitPolicy(
+        min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
+    ),
+}
+
+
+def _split_policy() -> _SplitPolicy:
+    """Split-policy constants for the current arch (gfx942's, conservatively,
+    for anything unrecognized)."""
+    return _SPLIT_POLICIES.get(_ARCH, _SPLIT_POLICIES["gfx942"])
+
 
 @lru_cache(maxsize=8)
 def _device_cu_count(device_index: int) -> int:
-    """Compute-unit count for a CUDA/HIP device (cached); 304 if unavailable."""
+    """Compute-unit count for a CUDA/HIP device (cached); the arch's nominal
+    count if the query fails."""
     try:
         return torch.cuda.get_device_properties(device_index).multi_processor_count
     except Exception:  # noqa: BLE001
-        return 304
+        return _split_policy().fallback_cu
 
 
 def _auto_num_splits(
@@ -113,16 +159,17 @@ def _auto_num_splits(
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
-    Returns 1 once the row grid alone oversubscribes the device. Constants tuned
-    on MI300X (304 CU): ~4x oversubscription, chunks >= _MIN_TILES_PER_SPLIT.
+    Returns 1 once the row grid alone oversubscribes the device. The three
+    tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
     """
+    pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
-    if grid_x == 0 or seq_len_kv < 4096:
+    if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
-    target_blocks = 4 * _device_cu_count(device_index)
+    target_blocks = pol.cu_oversub * _device_cu_count(device_index)
     if grid_x >= target_blocks:
         return 1
-    max_splits = max(1, (seq_len_kv // block_kv) // _MIN_TILES_PER_SPLIT)
+    max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
@@ -559,6 +606,11 @@ def _build_kernel_mfma_r_w(
             arith.divui(tile_start, _to_raw(fx.Int32(BKV))),
             _to_raw(fx.Int32(BKV)),
         )
+        # Collapse an empty union window to a zero-width one at tile_start.
+        # ``ends`` is clamped above by seq_len_kv but not below, so a row whose
+        # cu_ends is negative or any row with cu_ends <= cu_starts 
+        # can leave tile_end < tile_start.
+        tile_end = arith.maxsi(tile_end, tile_start)
 
         # ---- KV-column split across grid.y. Block (.,by) takes a BKV-aligned
         # slice of the union window; logits[m,n] are independent across n, so
@@ -1014,7 +1066,8 @@ def _build_kernel_mfma_lds_pipe(
             arith.divui(u_start, _to_raw(fx.Int32(BKV))),
             _to_raw(fx.Int32(BKV)),
         )
-        tile_end = u_end
+        # Collapse an empty union window to zero width.
+        tile_end = arith.maxsi(u_end, tile_start)
 
         # KV-column split across grid.y (identical to the direct-load builder).
         by = fx.block_idx.y
@@ -1278,8 +1331,6 @@ def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True):
     )
 
 
-_ARCH = get_gfx()
-
 _VARIANT_BUILDERS = {}
 
 if _ARCH == "gfx942":
@@ -1482,7 +1533,7 @@ def flydsl_fp8_mqa_logits(
     stream=None,
     variant=None,
 ):
-    """FlyDSL gfx942 FP8 MQA logits -- drop-in for the Triton ``fp8_mqa_logits``.
+    """FlyDSL gfx942/gfx950 FP8 MQA logits -- drop-in replacement for the Triton ``fp8_mqa_logits``.
 
     Q:            [seq_len, NUM_HEADS, HEAD_SIZE], dtype float8
     KV:           [seq_len_kv, HEAD_SIZE], dtype float8

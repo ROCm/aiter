@@ -313,6 +313,15 @@ PRESET_SHAPES = [
     (1, 8192, 8192, 64, 128),
     (1, 128, 32768, 64, 128),
     (1, 671, 131072, 64, 128),
+    # Very small s_q against a moderate KV window. The DS4 group above already
+    # covers small-M / long-KV (128x32768, 671x131072), but only at a KV length
+    # long enough to keep the device busy on its own. These three sit in the
+    # gap: 64 query rows is a 16-block grid on the gfx950 default variant
+    # (against 256 CUs), and the KV window is too short to make that up, so they
+    # are the worst-case launch geometry the kernel sees.
+    (1, 64, 2048, 64, 128),
+    (1, 64, 4096, 64, 128),
+    (1, 64, 8192, 64, 128),
 ]
 
 FLYDSL_PREFIX = "flydsl:"
@@ -381,19 +390,16 @@ def _select_impls(which, flydsl_variants):
         impls["triton"] = triton_logits
     if want_flydsl:
         for v in flydsl_variants:
-            if v == "auto":
-                # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive
-                # selection (variant=None -> _auto_variant per shape).
-                impls[FLYDSL_PREFIX + "auto"] = functools.partial(
-                    flydsl_fn, variant=None
-                )
-                continue
-            if v not in available_variants:
+            if v != "auto" and v not in available_variants:
                 raise SystemExit(
                     f"[error] unknown FlyDSL variant {v!r}; available: "
                     f"{list(available_variants)}."
                 )
-            impls[FLYDSL_PREFIX + v] = functools.partial(flydsl_fn, variant=v)
+            # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive selection
+            # (variant=None -> _auto_variant per shape).
+            impls[FLYDSL_PREFIX + v] = functools.partial(
+                flydsl_fn, variant=None if v == "auto" else v
+            )
 
     if not impls:
         raise SystemExit("[error] no implementations selected.")
@@ -551,7 +557,7 @@ def _run_one(idx, impls, shape, args, q_fp8_dtype=None, kv_fp8_dtype=None):
             t = _median_ms(times[name].get(mode))
             speedups[name][mode] = f"{base / t:.2f}x" if base and t else "-"
 
-    # For the "auto" impl, record which concrete variant was chosen for this
+    # For the "auto" impls, record which concrete variant was chosen for this
     # shape so the table can show the real name rather than just "auto".
     auto_resolved = {}
     auto_key = FLYDSL_PREFIX + "auto"
@@ -831,7 +837,7 @@ def _per_shape_rows(row, impls, modes):
     """Return (header_names, data_rows) for a single shape's result table.
 
     Each impl becomes one data row with columns:
-      impl | time_us (per mode) | TFLOPs (per mode) | verify | vs_triton (per mode)
+      impl | time_us (per mode) | TFLOPs (per mode) | verify | vs_triton
     """
     names = list(impls)
     has_tri = "triton" in names

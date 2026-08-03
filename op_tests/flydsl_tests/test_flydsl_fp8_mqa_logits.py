@@ -49,6 +49,26 @@ def _make_windows(s_q, s_k, mode):
             torch.int32
         )
         return ks, ke
+    if mode == "empty":
+        # Rows with no window at all, interleaved with normal ones so a single
+        # block's union window mixes the two. Both spellings of "empty" appear:
+        #
+        #   r%3==0  cu_ends < 0        -- what a causal mask yields whenever
+        #                                 s_kv < s_q, so this is ordinary input,
+        #                                 not a synthetic edge case
+        #   r%3==1  cu_ends <= cu_starts
+        #   r%3==2  an ordinary non-empty window
+        #
+        # Both leave the union tile_end below tile_start, which the kernel must
+        # collapse to zero width before the (unsigned) grid.y split arithmetic.
+        rows = torch.arange(s_q, device="cuda")
+        ks = torch.where(rows % 3 == 1, min(100, s_k), 0)
+        ke = torch.where(
+            rows % 3 == 0,
+            -1 - (rows % 7),
+            torch.where(rows % 3 == 1, 0, torch.minimum(rows + 1, ks + s_k)),
+        )
+        return ks.to(torch.int32), ke.to(torch.int32)
     raise ValueError(f"unknown window mode: {mode}")
 
 
@@ -56,8 +76,16 @@ def _rehydrate(out, ks, ke, s_q, s_k, clean_logits):
     if clean_logits:
         return out
     full = torch.full((s_q, s_k), float("-inf"), device="cuda")
+    # Clamp into [0, s_k] before slicing: cu_ends is allowed to be negative or
+    # to sit below cu_starts (both mean "this row has no window"), and a raw
+    # negative bound would wrap into a from-the-end slice and copy most of the
+    # row instead of none of it.
+    lo = ks.clamp(0, s_k)
+    hi = ke.clamp(0, s_k)
     for i in range(s_q):
-        full[i, ks[i] : ke[i]] = out[i, ks[i] : ke[i]]
+        a, b = int(lo[i]), int(hi[i])
+        if a < b:
+            full[i, a:b] = out[i, a:b]
     return full
 
 
@@ -186,7 +214,17 @@ def main():
             (128, 1024),
             (1024, 1024),
             (1024, 1560),
+            # Small-M / long-KV. The row grid alone is far too small to fill the
+            # device here (64 rows is a 16-block grid on the gfx950 default
+            # variant), so the launcher splits each row's KV window hard across
+            # grid.y -- these are the only shapes reaching a split count high
+            # enough that most blocks end up owning an empty column range.
+            (64, 2048),
             (64, 8192),
+            # s_kv < s_q. A causal mask then puts cu_ends below zero on the
+            # leading rows, so these cover the negative-window path end to end.
+            (128, 64),
+            (1024, 1000),
         ],
     )
     parser.add_argument("--num-heads", type=int, nargs="*", default=[64, 128])
@@ -217,8 +255,8 @@ def main():
         "--window",
         type=str,
         nargs="*",
-        default=["causal", "cp", "misaligned"],
-        choices=["causal", "cp", "misaligned"],
+        default=["causal", "cp", "misaligned", "empty"],
+        choices=["causal", "cp", "misaligned", "empty"],
     )
     args = parser.parse_args()
 
