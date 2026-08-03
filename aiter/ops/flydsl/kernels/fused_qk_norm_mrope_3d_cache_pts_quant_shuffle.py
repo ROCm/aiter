@@ -542,17 +542,6 @@ def _build_kv_kernel(
                                 if slot >= fx.Int64(0):
                                     v_out[tok, head, col] = vb0
                                     v_out[tok, head, col + HALF] = vb1
-                else:
-                    # Tail page-block padding row: no real token here (would
-                    # be OOB on qkv/positions, and on k_out/v_out which are
-                    # sized to exactly num_tokens rows) -- zero-fill instead.
-                    for p in range_constexpr(VEC_PAIRS):
-                        col = fx.Int32(lane) + WAVE * p
-                        if col < HALF:
-                            k_lds_view[token_local, col] = CACHE_FX_TYPE(0)
-                            k_lds_view[token_local, col + HALF] = CACHE_FX_TYPE(0)
-                            v_lds_view[token_local, col] = CACHE_FX_TYPE(0)
-                            v_lds_view[token_local, col + HALF] = CACHE_FX_TYPE(0)
 
         # The first wave cooperatively validates this token group while the
         # other waves finish staging. The wave reduction completes before the
