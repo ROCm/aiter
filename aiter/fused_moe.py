@@ -1437,16 +1437,19 @@ def _mxfp4_a4w4_stage1(
     # -- gemm1: A_q x w1 -> inter (packed MXFP4, sorted layout) ----------
     # The flydsl port reads/writes D_INTER directly (no K-pad tail to zero).
     BM_MIN = 64
-    _ia = torch.empty
     inter_cols = D_INTER if out_dtype == "fp8" else D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
     inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
-    inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=inter_dtype)
+    inter_sorted_quant = torch.empty(
+        (max_sorted, inter_cols), device=device, dtype=inter_dtype
+    )
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_scale_dtype = dtypes.fp8_e8m0 if out_dtype == "fp8" else torch.uint8
-    inter_sorted_shuffled_scale = torch.zeros(
+    # BM16 is zeroed by a preceding FlyDSL dispatch; larger tiles overwrite all
+    # scale bytes consumed by GEMM2.
+    inter_sorted_shuffled_scale = torch.empty(
         (inter_scale_rows, inter_scale_cols),
         device=device,
         dtype=inter_scale_dtype,

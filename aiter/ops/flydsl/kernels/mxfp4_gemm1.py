@@ -177,7 +177,22 @@ def _gemm1_body(
     else:
         for sub in range_constexpr(kSubBlocks):
             idx = m_row + wave * fx.Int32(BM // 4) + fx.Int32(sub * 8) + lane_div_8
-            cached_actual_row.append(_global_i32_at(arg_mind, idx))
+            actual_row = _global_i32_at(arg_mind, idx)
+            if const_expr(a_dtype == "fp8" and BM >= 64):
+                cached_actual_row.append(
+                    [
+                        fx.Int32(
+                            rocdl.ds_bpermute(
+                                T.i32,
+                                (lane_div_16 + fx.Int32(row_group * 4)) * fx.Int32(32),
+                                as_ir_value(actual_row),
+                            )
+                        )
+                        for row_group in range_constexpr(2)
+                    ]
+                )
+            else:
+                cached_actual_row.append(actual_row)
 
     # -- b_load_s_base[j], readfirstlane'd uniform per wave --------------------
     N0_HALF = N_OUT // 32
@@ -240,14 +255,28 @@ def _gemm1_body(
     i32x4_reg_lay = fx.make_layout(4, 1)
 
     def issue_a_load_lds(slot, kt):
-        # BufferCopyLDS128b maps a wave contiguously, which matches FP4's
-        # 128-byte row but not FP8's 256-byte row. Use an explicit register
-        # staging copy for FP8 so each lane writes its 16-byte segment with the
-        # correct row stride and LDS swizzle.
+        # A wave-wide BufferCopyLDS128b writes 1024 contiguous bytes. That is
+        # eight FP4 rows or four FP8 rows. Larger FP8 tiles use two four-row
+        # passes; BM32 keeps register staging, which is faster at low occupancy.
         for sub in range_constexpr(kSubBlocks):
             lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
-            off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
-            if const_expr(a_dtype == "fp8"):
+            if const_expr(a_dtype == "fp8" and BM >= 64):
+                for row_group in range_constexpr(2):
+                    dst_row_base = lds_row + fx.Int32(row_group * 4)
+                    mask = _lds_swizzle_mask(dst_row_base + lane_div_16)
+                    voffset = ((lane_mod_16 * fx.Int32(16)) ^ mask) + cached_actual_row[
+                        sub
+                    ][row_group] * fx.Int32(A_ROW_BYTES)
+                    off = fx.Int32(slot * (BM * KH_TILE)) + dst_row_base * fx.Int32(
+                        KH_TILE
+                    )
+                    fx.copy(
+                        aq_dma_atom,
+                        fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
+                        fx.slice(s_aq_i32x4_tiles, (None, off // fx.Int32(16))),
+                        soffset=fx.Int32(kt * KH_TILE) // fx.Int32(4),
+                    )
+            elif const_expr(a_dtype == "fp8"):
                 actual_row = cached_actual_row[sub]
                 dst_row = lds_row + lane_div_8
                 mask = _lds_swizzle_mask(dst_row)
@@ -281,6 +310,7 @@ def _gemm1_body(
                 voffset = ((lane_mod_8 * fx.Int32(16)) ^ mask) + cached_actual_row[
                     sub
                 ] * fx.Int32(A_ROW_BYTES)
+                off = fx.Int32(slot * (BM * KH_TILE)) + lds_row * fx.Int32(KH_TILE)
                 fx.copy(
                     aq_dma_atom,
                     fx.slice(aq_dma_tiles4, (None, voffset // fx.Int32(16))),
@@ -1043,6 +1073,7 @@ def compile_gemm1_a4w4_port(
     _NE = NE
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
+    _OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(_INTER)
 
     _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, _K_TILES_TOTAL)
 
@@ -1072,6 +1103,33 @@ def compile_gemm1_a4w4_port(
     @fx.struct
     class SharedStorage:
         raw: fx.Array[fx.Uint8, lds_bytes, 16]
+
+    @flyc.kernel(name=f"gemm1_scale_zero_{name_suffix}", known_block_size=[256, 1, 1])
+    def scale_zero_kernel(
+        arg_ascaleout: fx.Int64,
+        i32_num_vec4: fx.Int32,
+    ):
+        tx = fx.Int32(gpu.thread_id("x"))
+        bx = fx.Int32(gpu.block_id("x"))
+        vec_idx = bx * fx.Int32(256) + tx
+        scale_ptr_ty = fx.PointerType.get(
+            T.i32, address_space=fx.AddressSpace.Global, alignment=16
+        )
+        scale_ptr = fx.inttoptr(scale_ptr_ty, arg_ascaleout)
+        scale_flat = fx.make_view(
+            scale_ptr,
+            fx.make_layout(fx.Int64(i32_num_vec4) * fx.Int64(4), 1),
+        )
+        scale_tiles = fx.logical_divide(scale_flat, fx.make_layout(4, 1))
+        zero_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+        zero_reg = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+        zero_reg.store(fx.Vector.filled(4, 0, fx.Int32))
+        if vec_idx < i32_num_vec4:
+            fx.copy_atom_call(
+                zero_atom,
+                zero_reg,
+                fx.slice(scale_tiles, (None, vec_idx)),
+            )
 
     @flyc.kernel(name=f"gemm1_a4w4_port_{name_suffix}", known_block_size=[256, 1, 1])
     def gemm1_kernel(
@@ -1176,6 +1234,18 @@ def compile_gemm1_a4w4_port(
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
+        if const_expr(BM == 16):
+            # Two M blocks atomically pack scale bytes into each dword. A prior
+            # dispatch is required because in-kernel cross-workgroup zeroing races.
+            max_m_blocks = i32_grid // fx.Int32(_NUM_N_BLOCKS)
+            scale_chunks = (max_m_blocks + fx.Int32(1)) // fx.Int32(2)
+            num_vec4 = scale_chunks * fx.Int32(_OUT_AS_PER_CHUNK_DW // 4)
+            zero_grid_x = fx.Int64((num_vec4 + fx.Int32(255)) // fx.Int32(256))
+            scale_zero_kernel(arg_ascaleout, num_vec4).launch(
+                grid=(zero_grid_x, 1, 1),
+                block=(256, 1, 1),
+                stream=stream,
+            )
         gemm1_kernel(
             arg_aq,
             arg_ascale,
