@@ -276,6 +276,14 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         )
     if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
         use_chunk_hip = False
+    if use_chunk_flydsl:
+        if _is_gfx12_runtime():
+            use_chunk_flydsl = False
+        elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
+            raise ValueError(
+                "use_chunk_flydsl requires bfloat16 inputs with K=128 and V=128; "
+                f"got dtype={k.dtype}, K={k.shape[-1]}, V={v.shape[-1]}."
+            )
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         k=k,

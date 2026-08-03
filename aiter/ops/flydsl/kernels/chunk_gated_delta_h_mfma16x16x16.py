@@ -329,8 +329,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # on revision change (port of FlyDSL commit d4643e0e).
     # fp32->bf16 output conversion is a compile option (BF16_CONVERT_TRUNC):
     # truncate to match hip float_to_bf16, or RNE.
-    # rev123: g offset generalized to head-major/token-major via G_HEAD_MAJOR
-    _K5_KERNEL_REVISION = 123
+    # rev124: global-memory address arithmetic widened to i64.
+    _K5_KERNEL_REVISION = 124
 
     GPU_ARCH = get_rocm_arch()
     allocator = SmemAllocator(
@@ -601,39 +601,50 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             boh = i_n * NT
 
         # -- Base pointer offsets (element counts) --
+        # Keep all global-memory address arithmetic in i64. Long-context
+        # snapshot tensors can exceed 2^31 elements even though per-chunk and
+        # LDS coordinates remain comfortably within i32.
+        i_n64 = fx.Int64(i_n)
+        i_h64 = fx.Int64(i_h)
+        bos64 = fx.Int64(bos)
+        boh64 = fx.Int64(boh)
+        t_flat64 = fx.Int64(T_flat)
+
         # h: [B, NT, H, V, K] (VK) -- base = (boh*H + i_h) * V * K
-        h_base = (boh * fx.Int32(H) + i_h) * fx.Int32(V * K)
-        stride_h = fx.Int32(H * V * K)
+        h_base = (boh64 * fx.Int64(H) + i_h64) * fx.Int64(V * K)
+        stride_h = fx.Int64(H * V * K)
 
         # k: [B, T, Hg, K] -- base = (bos*Hg + i_h//(H//Hg)) * K
         gqa_ratio = H // Hg
-        k_base = (bos * fx.Int32(Hg) + i_h // fx.Int32(gqa_ratio)) * fx.Int32(K)
-        stride_k = fx.Int32(Hg * K)
+        k_base = (
+            bos64 * fx.Int64(Hg) + fx.Int64(i_h // fx.Int32(gqa_ratio))
+        ) * fx.Int64(K)
+        stride_k = fx.Int64(Hg * K)
 
         if const_expr(WU_CONTIGUOUS):
             if const_expr(IS_VARLEN):
-                v_base = (i_h * T_flat + bos) * fx.Int32(V)
-                w_base = (i_h * T_flat + bos) * fx.Int32(K)
+                v_base = (i_h64 * t_flat64 + bos64) * fx.Int64(V)
+                w_base = (i_h64 * t_flat64 + bos64) * fx.Int64(K)
             else:
-                v_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(V)
-                w_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(K)
-            stride_v = fx.Int32(V)
-            stride_w = fx.Int32(K)
+                v_base = ((i_n64 * fx.Int64(H) + i_h64) * t_flat64) * fx.Int64(V)
+                w_base = ((i_n64 * fx.Int64(H) + i_h64) * t_flat64) * fx.Int64(K)
+            stride_v = fx.Int64(V)
+            stride_w = fx.Int64(K)
         else:
-            v_base = (bos * fx.Int32(H) + i_h) * fx.Int32(V)
-            w_base = (bos * fx.Int32(H) + i_h) * fx.Int32(K)
-            stride_v = fx.Int32(H * V)
-            stride_w = fx.Int32(H * K)
+            v_base = (bos64 * fx.Int64(H) + i_h64) * fx.Int64(V)
+            w_base = (bos64 * fx.Int64(H) + i_h64) * fx.Int64(K)
+            stride_v = fx.Int64(H * V)
+            stride_w = fx.Int64(H * K)
 
         if const_expr(IS_VARLEN):
-            vn_base = (i_h * T_flat + bos) * fx.Int32(V)
+            vn_base = (i_h64 * t_flat64 + bos64) * fx.Int64(V)
         else:
-            vn_base = ((i_n * fx.Int32(H) + i_h) * T_flat) * fx.Int32(V)
+            vn_base = ((i_n64 * fx.Int64(H) + i_h64) * t_flat64) * fx.Int64(V)
 
         if const_expr(USE_INITIAL_STATE):
-            h0_base = state_nh * fx.Int32(V * K)
+            h0_base = fx.Int64(state_nh) * fx.Int64(V * K)
         if const_expr(STORE_FINAL_STATE):
-            ht_base = state_nh * fx.Int32(V * K)
+            ht_base = fx.Int64(state_nh) * fx.Int64(V * K)
 
         # g gate offset. Mirrors the HIP kernel's load_g_value:
         #   idx = i_n*g_stride_b + i_h*g_stride_h + token*g_stride_t
@@ -648,15 +659,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         #   token * g_stride_t (token = last_idx_raw / safe_row, relative).
         if const_expr(USE_G):
             if const_expr(G_HEAD_MAJOR):
-                g_stride_h = T_flat
-                g_stride_t = fx.Int32(1)
+                g_stride_h = t_flat64
+                g_stride_t = fx.Int64(1)
             else:
-                g_stride_h = fx.Int32(1)
-                g_stride_t = fx.Int32(H)
+                g_stride_h = fx.Int64(1)
+                g_stride_t = fx.Int64(H)
             if const_expr(IS_VARLEN):
-                g_sh_base = i_h * g_stride_h + bos * g_stride_t
+                g_sh_base = i_h64 * g_stride_h + bos64 * g_stride_t
             else:
-                g_sh_base = (i_n * fx.Int32(H)) * T_flat + i_h * g_stride_h
+                g_sh_base = i_n64 * fx.Int64(H) * t_flat64 + i_h64 * g_stride_h
 
         # -- MFMA lane mapping for 16x16 tiles --
         lane_n = lane % fx.Int32(16)
@@ -684,7 +695,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + wid * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                     )
-                    h0_off_base = h0_base + h0_col * fx.Int32(K) + h0_row_base
+                    h0_off_base = (
+                        h0_base + fx.Int64(h0_col) * fx.Int64(K) + fx.Int64(h0_row_base)
+                    )
                     loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
@@ -732,7 +745,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     abs_row = _prol_it * fx.Int32(BT) + row
                     safe_row = (abs_row < T_local).select(abs_row, fx.Int32(0))
                     w_g_off = (
-                        w_base + safe_row * stride_w + fx.Int32(kb * 64) + load_col_base
+                        w_base
+                        + fx.Int64(safe_row) * stride_w
+                        + fx.Int64(kb * 64)
+                        + fx.Int64(load_col_base)
                     )
                     wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
                     swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
@@ -755,8 +771,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(NUM_K_BLOCKS):
                 kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
                 k_col_off = fx.Int32(kb * 64) + k_row_base_pf
-                k_g_off_t0 = k_base + k_safe_t0_prol * stride_k + k_col_off
-                k_g_off_t1 = k_base + k_safe_t1_prol * stride_k + k_col_off
+                k_g_off_t0 = (
+                    k_base + fx.Int64(k_safe_t0_prol) * stride_k + fx.Int64(k_col_off)
+                )
+                k_g_off_t1 = (
+                    k_base + fx.Int64(k_safe_t1_prol) * stride_k + fx.Int64(k_col_off)
+                )
                 kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
                 kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
                 for i in range_constexpr(LOAD_VEC_WIDTH):
@@ -843,11 +863,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     safe_u_row = (u_bt_row_raw < T_local).select(
                         u_bt_row_raw, fx.Int32(0)
                     )
-                    u_off = v_base + safe_u_row * stride_v + u_col_pf
+                    u_off = (
+                        v_base + fx.Int64(safe_u_row) * stride_v + fx.Int64(u_col_pf)
+                    )
                     u_prefetch.append(v_[fx.Index(u_off)])
 
             if const_expr(USE_G):
-                g_last = g_[fx.Index(g_sh_base + last_idx_raw * g_stride_t)]
+                g_last = g_[fx.Index(g_sh_base + fx.Int64(last_idx_raw) * g_stride_t)]
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
                     abs_row = (
@@ -859,7 +881,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     in_bounds = abs_row < T_local
                     safe_row = in_bounds.select(abs_row, fx.Int32(0))
                     g_row_pf.append(
-                        (g_[fx.Index(g_sh_base + safe_row * g_stride_t)], in_bounds)
+                        (
+                            g_[fx.Index(g_sh_base + fx.Int64(safe_row) * g_stride_t)],
+                            in_bounds,
+                        )
                     )
 
             # -- GEMM1: b_v = w @ h_state, with w_next prefetch interleaved.
@@ -926,9 +951,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     )
                     w_g_off_next = (
                         w_base
-                        + safe_row_next * stride_w
-                        + fx.Int32(kb * 64)
-                        + load_col_base
+                        + fx.Int64(safe_row_next) * stride_w
+                        + fx.Int64(kb * 64)
+                        + fx.Int64(load_col_base)
                     )
                     w_next_vecs.append(
                         w_.vec_load((fx.Index(w_g_off_next),), LOAD_VEC_WIDTH)
@@ -1037,7 +1062,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         )
                         if (vn_bt_row < T_local).ir_value():
                             bf16_v = vn_bf16[elem_i]
-                            vn_off = vn_base + vn_bt_row * fx.Int32(V) + u_col
+                            vn_off = (
+                                vn_base
+                                + fx.Int64(vn_bt_row) * fx.Int64(V)
+                                + fx.Int64(u_col)
+                            )
                             _emit_vn_store(vn_off, bf16_v)
 
                 # gate_vec: with USE_G it is the decay gate (with the OOB mask
@@ -1069,13 +1098,25 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 k_col_off_pf = fx.Int32(kb * 64) + k_row_base_pf
                 k_next_vecs_t0.append(
                     k_.vec_load(
-                        (fx.Index(k_base + k_safe_t0_next * stride_k + k_col_off_pf),),
+                        (
+                            fx.Index(
+                                k_base
+                                + fx.Int64(k_safe_t0_next) * stride_k
+                                + fx.Int64(k_col_off_pf)
+                            ),
+                        ),
                         LOAD_VEC_WIDTH,
                     )
                 )
                 k_next_vecs_t1.append(
                     k_.vec_load(
-                        (fx.Index(k_base + k_safe_t1_next * stride_k + k_col_off_pf),),
+                        (
+                            fx.Index(
+                                k_base
+                                + fx.Int64(k_safe_t1_next) * stride_k
+                                + fx.Int64(k_col_off_pf)
+                            ),
+                        ),
                         LOAD_VEC_WIDTH,
                     )
                 )
@@ -1090,9 +1131,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # Per-K decay: h[v, k] *= exp(gk_last[k]) at chunk end.
             if const_expr(USE_GK):
-                gk_chunk_base = (bos + last_idx_raw) * fx.Int32(H * K) + i_h * fx.Int32(
-                    K
-                )
+                gk_chunk_base = (bos64 + fx.Int64(last_idx_raw)) * fx.Int64(
+                    H * K
+                ) + i_h64 * fx.Int64(K)
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     gk_elems = []
                     for elem_i in range_constexpr(4):
@@ -1102,7 +1143,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        gk_raw = gk_[fx.Index(gk_chunk_base + global_k)]
+                        gk_raw = gk_[fx.Index(gk_chunk_base + fx.Int64(global_k))]
                         gk_elems.append(_fast_exp(gk_raw))
                     gk_vec = vector.from_elements(T.f32x4, gk_elems)
                     for nr in range_constexpr(N_REPEAT):
@@ -1141,7 +1182,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 )
                 vec8 = val_lo.shuffle(val_hi, [0, 1, 2, 3, 4, 5, 6, 7])
                 v_global = i_v * fx.Int32(BV) + v_loc
-                h_off = h_base + i_t_i32 * stride_h + v_global * fx.Int32(K) + k8
+                h_off = (
+                    h_base
+                    + fx.Int64(i_t_i32) * stride_h
+                    + fx.Int64(v_global) * fx.Int64(K)
+                    + fx.Int64(k8)
+                )
                 h_.vec_store((fx.Index(h_off),), vec8, LOAD_VEC_WIDTH)
 
             # -- 6. GEMM2: h += k^T @ v_new_gated (no w prefetch/interleave).
@@ -1244,7 +1290,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + wid * fx.Int32(16)
                         + lane_m_base * fx.Int32(4)
                     )
-                    ht_off_base = ht_base + ht_col * fx.Int32(K) + ht_row_base
+                    ht_off_base = (
+                        ht_base + fx.Int64(ht_col) * fx.Int64(K) + fx.Int64(ht_row_base)
+                    )
                     if const_expr(STATE_DTYPE_BF16):
                         out_vec = _f32x4_to_bf16x4(acc_val)
                     else:

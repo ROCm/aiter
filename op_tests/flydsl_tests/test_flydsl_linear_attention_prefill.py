@@ -34,6 +34,9 @@ try:
     from aiter.ops.flydsl.linear_attention_prefill_kernels import (
         chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip,
     )
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk import (
+        chunk_gated_delta_rule_fwd_opt_vk,
+    )
     from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.chunk_delta_h import (
         chunk_gated_delta_rule_fwd_h_opt_vk,
     )
@@ -546,6 +549,7 @@ STATE_BF16_PARAMS = [
         is_varlen=False,
         output_final_state=True,
         max_num_batched_tokens=2500,
+        ssm_state_dtype=torch.bfloat16,
     ),
     PrefillArgs(
         K=128,
@@ -558,6 +562,7 @@ STATE_BF16_PARAMS = [
         is_varlen=True,
         output_final_state=True,
         max_num_batched_tokens=8192,
+        ssm_state_dtype=torch.bfloat16,
     ),
 ]
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
@@ -1054,7 +1059,7 @@ def _assert_k5_outputs_match_ref(
 
 
 class TestCorrectness:
-    """Correctness against PyTorch FP32 reference for all three K5 backends."""
+    """Correctness and integration coverage for the FlyDSL mfma16 K5 backend."""
 
     @staticmethod
     def _minimal_inputs():
@@ -1114,6 +1119,99 @@ class TestCorrectness:
             output_final_state=args.output_final_state,
             label="flydsl_mfma16_hip",
         )
+
+    @pytest.mark.parametrize("args", STATE_BF16_PARAMS, ids=STATE_BF16_TEST_IDS)
+    def test_correctness_bf16_state(self, args: PrefillArgs):
+        """Validate bf16 initial/final state on dense and varlen launch paths."""
+        context_lens = args.resolve_context_lens()
+        k, w_orig, u_orig, w_c, u_c, g, h0, cu, _ = _make_inputs(
+            context_lens, args=args
+        )
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
+            k,
+            w_c,
+            u_c,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=args.g_head_major,
+            use_exp2=False,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            g=g,
+            initial_state=h0,
+            output_final_state=True,
+            cu_seqlens=cu,
+            g_head_major=args.g_head_major,
+        )
+
+        assert fs_fly.dtype == torch.bfloat16
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=True,
+            label="flydsl_mfma16_hip_bf16_state",
+        )
+
+    def test_e2e_dispatch_matches_triton(self):
+        """Exercise K1-K6 with use_chunk_flydsl=True through public dispatch."""
+        torch.manual_seed(42)
+        B, T, H, D = 1, 64, 4, 128
+        q = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        k = torch.nn.functional.normalize(
+            torch.randn(B, T, H, D, dtype=torch.float32), p=2, dim=-1
+        ).to(torch.bfloat16)
+        v = torch.randn(B, T, H, D, dtype=torch.bfloat16)
+        g = torch.nn.functional.logsigmoid(torch.rand(B, T, H, dtype=torch.float32))
+        beta = torch.rand(B, T, H, dtype=torch.bfloat16).sigmoid()
+        h0 = torch.randn(B, H, D, D, dtype=torch.float32)
+        kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
+            "beta": beta,
+            "scale": D**-0.5,
+            "initial_state": h0,
+            "output_final_state": True,
+            "use_exp2": True,
+        }
+
+        _, out_fly, fs_fly = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, use_chunk_flydsl=True
+        )
+        _, out_tri, fs_tri = chunk_gated_delta_rule_fwd_opt_vk(
+            **kwargs, use_chunk_flydsl=False
+        )
+        torch.testing.assert_close(
+            out_fly.float(), out_tri.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(fs_fly.float(), fs_tri.float(), atol=2e-2, rtol=2e-2)
+
+    def test_e2e_dispatch_rejects_k64(self):
+        """K=64 is unsupported and must fail before launching any K1-K6 kernel."""
+        B, T, H, D = 1, 64, 4, 64
+        with pytest.raises(ValueError, match="K=128 and V=128"):
+            chunk_gated_delta_rule_fwd_opt_vk(
+                q=torch.zeros(B, T, H, D, dtype=torch.bfloat16),
+                k=torch.zeros(B, T, H, D, dtype=torch.bfloat16),
+                v=torch.zeros(B, T, H, 128, dtype=torch.bfloat16),
+                g=torch.zeros(B, T, H, dtype=torch.float32),
+                beta=torch.zeros(B, T, H, dtype=torch.bfloat16),
+                scale=D**-0.5,
+                initial_state=None,
+                output_final_state=False,
+                use_chunk_flydsl=True,
+            )
 
     def test_natural_log_gate_formula(self):
         """Natural-log gates must use exp(x), not exp2(x).
@@ -1298,8 +1396,12 @@ class TestCorrectness:
             ("dtype", "dtype must match"),
             ("contiguous", "must be contiguous"),
             ("time_shape", "k T dim"),
+            ("unsupported_v", "only V=128 is supported"),
             ("gk_dtype", "gk must be float32"),
             ("gk_shape", "gk must use token-major"),
+            ("state_shape", "initial_state must have shape"),
+            ("state_contiguous", "initial_state must be contiguous"),
+            ("g_device", "g must be on k's device"),
         ],
     )
     def test_mfma16_input_validation(self, case, match):
@@ -1315,12 +1417,24 @@ class TestCorrectness:
         elif case == "time_shape":
             w = w[:, :, :-1].contiguous()
             u = u[:, :, :-1].contiguous()
+        elif case == "unsupported_v":
+            u = u[..., :64].contiguous()
         elif case == "gk_dtype":
             kwargs["gk"] = torch.zeros(
                 1, 64, 4, 128, dtype=torch.bfloat16, device="cuda"
             )
         elif case == "gk_shape":
             kwargs["gk"] = torch.zeros(1, 64, 4, 64, dtype=torch.float32, device="cuda")
+        elif case == "state_shape":
+            kwargs["initial_state"] = torch.zeros(
+                1, 4, 64, 128, dtype=torch.float32, device="cuda"
+            )
+        elif case == "state_contiguous":
+            kwargs["initial_state"] = torch.zeros(
+                1, 4, 128, 128, dtype=torch.float32, device="cuda"
+            ).transpose(-1, -2)
+        elif case == "g_device":
+            kwargs["g"] = torch.zeros(1, 64, 4, dtype=torch.float32, device="cpu")
 
         with pytest.raises(ValueError, match=match):
             chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(k, w, u, **kwargs)

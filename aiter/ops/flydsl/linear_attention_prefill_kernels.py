@@ -608,6 +608,7 @@ def _resolve_prologue(
     BT: int,
     num_decodes: int,
     num_decode_tokens: int,
+    T_flat: int,
 ):
     """Resolve the per-shape varlen prologue in one cached lookup.
 
@@ -618,7 +619,7 @@ def _resolve_prologue(
 
     Returns ``(NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)``.
     """
-    cache_key = (BT, num_decodes, num_decode_tokens)
+    cache_key = (BT, num_decodes, num_decode_tokens, T_flat)
     cache = getattr(cu_seqlens, _PROLOGUE_ATTR, None)
     if cache is None:
         cache = {}
@@ -642,6 +643,14 @@ def _resolve_prologue(
     if N >= 1:
         seg_lens = kernel_cu_seqlens[1:] - kernel_cu_seqlens[:-1]
         min_seqlen = int(seg_lens.min().item())
+        first = int(kernel_cu_seqlens[0].item())
+        last = int(kernel_cu_seqlens[-1].item())
+        if first != 0 or last != T_flat or min_seqlen < 0:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: rebased cu_seqlens must start at 0, "
+                f"end at T_flat={T_flat}, and be nondecreasing; got "
+                f"first={first}, last={last}, min_seqlen={min_seqlen}."
+            )
     else:
         min_seqlen = None
     result = (NT, chunk_offsets, kernel_cu_seqlens, N, min_seqlen)
@@ -805,6 +814,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             )
     elif inplace and initial_state is None:
         raise ValueError("FlyDSL K5: inplace_final_state requires initial_state.")
+    elif inplace and not output_final_state:
+        raise ValueError(
+            "FlyDSL K5: inplace_final_state requires output_final_state=True."
+        )
 
     resolved_state_dtype = _resolve_state_dtype(initial_state, state_dtype)
     state_bf16 = resolved_state_dtype is torch.bfloat16
@@ -896,7 +909,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         )
     if K != 128:
         raise ValueError(f"FlyDSL K5 mfma16_hip: only K=128 is supported, got K={K}.")
-    assert K <= 256
+    if V != 128:
+        raise ValueError(f"FlyDSL K5 mfma16_hip: only V=128 is supported, got V={V}.")
 
     if cu_seqlens is None:
         N = B
@@ -905,10 +919,51 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         kernel_cu_seqlens = None
         is_varlen = False
     else:
+        if B != 1:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: varlen mode requires B=1, got B={B}."
+            )
+        if cu_seqlens.device != k.device:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be on k's device "
+                f"({k.device}), got {cu_seqlens.device}."
+            )
+        if cu_seqlens.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be int32 or int64, "
+                f"got {cu_seqlens.dtype}."
+            )
+        if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: cu_seqlens must be a 1-D tensor with "
+                f"at least two elements, got shape {tuple(cu_seqlens.shape)}."
+            )
+        if not cu_seqlens.is_contiguous():
+            raise ValueError("FlyDSL K5 mfma16_hip: cu_seqlens must be contiguous.")
         NT, chunk_offsets, kernel_cu_seqlens, N, _min_seqlen = _resolve_prologue(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
+            cu_seqlens, BT, num_decodes, num_decode_tokens, T_flat
         )
         is_varlen = True
+
+    if initial_state is not None:
+        if initial_state.device != k.device:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: initial_state must be on k's device "
+                f"({k.device}), got {initial_state.device}."
+            )
+        if not initial_state.is_contiguous():
+            raise ValueError("FlyDSL K5 mfma16_hip: initial_state must be contiguous.")
+        if initial_state.dim() != 4 or tuple(initial_state.shape[1:]) != (H, V, K):
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: initial_state must have shape "
+                f"[N,H,V,K] or [pool_size,H,V,K] with trailing shape "
+                f"({H},{V},{K}), got {tuple(initial_state.shape)}."
+            )
+        if not use_state_indices and initial_state.shape[0] != N:
+            raise ValueError(
+                "FlyDSL K5 mfma16_hip: dense initial_state first dimension "
+                f"must equal N={N}, got {initial_state.shape[0]}."
+            )
 
     # Validate indexed pool access before selecting/compiling a kernel. Indices
     # gather from and scatter into ``initial_state[pool_size, H, V, K]``:
@@ -987,8 +1042,15 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # at BV=16 (FLYDSL_K5_MFMA16HIP_BV=16 reproduces it).
     _bv_env = os.environ.get("FLYDSL_K5_MFMA16HIP_BV")
     if _bv_env:
-        BV = int(_bv_env)
-    assert BV in (16, 32, 64), "mfma16_hip BV must be in {16,32,64}"
+        try:
+            BV = int(_bv_env)
+        except ValueError as exc:
+            raise ValueError(
+                "FLYDSL_K5_MFMA16HIP_BV must be one of 16, 32, or 64, "
+                f"got {_bv_env!r}."
+            ) from exc
+    if BV not in (16, 32, 64):
+        raise ValueError(f"mfma16_hip BV must be in {{16,32,64}}, got {BV}.")
     if V % BV != 0:
         raise ValueError(
             f"FlyDSL K5 mfma16_hip: requires V % BV == 0; got V={V}, BV={BV}."
@@ -1048,6 +1110,11 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     # In varlen mode the batch dim is 1 (flattened input, N segments live in
     # cu_seqlens), so B is k.shape[0] (==1). g=None keeps the USE_G=False path.
     if g is not None:
+        if g.device != k.device:
+            raise ValueError(
+                f"FlyDSL K5 mfma16_hip: g must be on k's device ({k.device}), "
+                f"got {g.device}."
+            )
         if g.dtype != torch.float32:
             g = g.to(torch.float32)
         if g.dim() != 3:
