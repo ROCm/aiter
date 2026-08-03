@@ -187,16 +187,15 @@ def compile_hgemm_kernel(
     BLOCK_K_BYTES = BLOCK_K * DTYPE_BYTES
 
     # LDS parameters:
-    # C output reuses A's LDS region (aliasing the A tile). When C overflows the
-    # A field it continues into the B field, which is why B is sized to hold the
-    # larger of the B tile or the C-tile overflow. Static shared leaves are laid
-    # out consecutively, so the A and B fields form one contiguous C region.
+    # C output reuses A's LDS field after the GEMM pipeline is complete.
+    # SharedAllocator emits struct leaves as independent static LDS globals, so
+    # C must fit entirely in a_lds; it cannot spill into the b_lds field.
     AS_ELEMS = STAGES * BLOCK_M * BLOCK_K
     BS_ELEMS = STAGES * BLOCK_N * BLOCK_K
     CMN_ELEMS = BLOCK_K_WARPS * BLOCK_M * BLOCK_N
     if B_TO_LDS:
-        A_FIELD_ELEMS = AS_ELEMS
-        B_FIELD_ELEMS = max(BS_ELEMS, CMN_ELEMS - AS_ELEMS)
+        A_FIELD_ELEMS = max(AS_ELEMS, CMN_ELEMS)
+        B_FIELD_ELEMS = BS_ELEMS
         assert ASYNC_COPY
     else:
         A_FIELD_ELEMS = max(AS_ELEMS, CMN_ELEMS)
