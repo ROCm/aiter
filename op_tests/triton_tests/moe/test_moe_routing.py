@@ -11,7 +11,6 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_torch,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
 from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 
 
@@ -106,7 +105,6 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     return logits
 
 
-
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
 
 
@@ -147,9 +145,7 @@ def test_routing_cuda_graph_nan_inf(n_tokens: int, n_expts_tot: int):
     # may read into these memory sections resulting in potential memory access fault.
     blocks = []
     for numel in (16, 32, 64, 128, 256, 512, 1024, 4096, 1 << 14, 1 << 16, 1 << 20):
-        blocks.append(
-            torch.full((numel,), 100e7, dtype=torch.int32, device=device)
-        )
+        blocks.append(torch.full((numel,), 100e7, dtype=torch.int32, device=device))
     # return blocks
     del blocks
     torch.cuda.synchronize()
@@ -184,7 +180,6 @@ def test_routing_cuda_graph_nan_inf(n_tokens: int, n_expts_tot: int):
 
     x_scale = hidden_states.abs().max().float() / 448.0
     hidden_states = downcast_to_static_fp8(hidden_states, x_scale)
-
 
     intermediate_cache1 = moe_gemm_a8w4(
         hidden_states,
@@ -263,7 +258,6 @@ def test_topk_in_range(n_tokens: int, n_expts_tot: int):
 
     assert torch.all(expt_indx >= 0)
     assert torch.all(expt_indx < n_expts_tot)
-
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)
