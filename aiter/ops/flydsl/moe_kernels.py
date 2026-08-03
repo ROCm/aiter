@@ -445,7 +445,7 @@ def get_flydsl_stage1_kernels_fp4_bf16(out_dtype: str) -> dict[str, dict]:
     b_dtype = "fp4bf16"
     tile_ks = [128, 256]
     tile_ms = [16, 32, 64, 128]
-    tile_ns = [64, 128]
+    tile_ns = [128]
     k_batches = [1, 2, 3, 4, 6, 7, 14]
 
     for gate_mode in ("interleave",):

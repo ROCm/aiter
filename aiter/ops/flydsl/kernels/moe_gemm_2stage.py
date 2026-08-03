@@ -277,14 +277,14 @@ def compile_moe_gemm1(
     # (2 scale bytes packed per int32 word). num_groups=1 above is wrong for this dtype;
     # compute the correct K-groups count directly.
     _fp4_bf16_k_groups = (model_dim // 32) if is_fp4_bf16 else 1
-    sw_nbytes = (
-        experts
-        * (2 * inter_dim)
-        * (num_groups * _fp4_bf16_k_groups)
-        * (2 if _scale_is_bf16 else 4)
-        if needs_scale_w
-        else 0
-    )
+    if is_fp4_bf16:
+        sw_nbytes = experts * (2 * inter_dim) * _fp4_bf16_k_groups * 1
+    elif needs_scale_w:
+        sw_nbytes = (
+            experts * (2 * inter_dim) * num_groups * (2 if _scale_is_bf16 else 4)
+        )
+    else:
+        sw_nbytes = 0
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(elem_bytes)
@@ -401,10 +401,12 @@ def compile_moe_gemm1(
             k_in = arith.index_cast(T.index, i32_k_in)
             size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
 
-            _swiglu_limit = fx.Float32(_swiglu_eff_limit)
-            _swiglu_neg_limit = fx.Float32(-_swiglu_eff_limit)
-            _swiglu_one = fx.Float32(1.0)
-            _swiglu_alpha_neg_log2e = fx.Float32(1.702 * (-1.4426950408889634))
+            _swiglu_limit = arith.constant(_swiglu_eff_limit, type=T.f32)
+            _swiglu_neg_limit = arith.constant(-_swiglu_eff_limit, type=T.f32)
+            _swiglu_one = arith.constant(1.0, type=T.f32)
+            _swiglu_alpha_neg_log2e = arith.constant(
+                1.702 * (-1.4426950408889634), type=T.f32
+            )
 
             # i32 versions for layout construction (fly.make_shape requires i32/i64)
             tokens_i32_v = i32_tokens_in
@@ -887,6 +889,11 @@ def compile_moe_gemm1(
                 num_waves = 4
                 n_per_wave = tile_n // num_waves
                 num_acc_n = n_per_wave // 16
+                if is_fp4_bf16 and num_acc_n < 2:
+                    raise ValueError(
+                        f"INTERLEAVE mode requires tile_n >= 128 (got tile_n={tile_n}, "
+                        f"num_acc_n={num_acc_n}). Each wave needs at least one gate+up pair."
+                    )
                 c_n_per_wave = fx.Index(n_per_wave)
                 wave_mod_4 = wave_id % fx.Index(4)
                 n_tile_base = wave_mod_4 * c_n_per_wave
@@ -2587,15 +2594,12 @@ def compile_moe_gemm2(
     # For MXFP4: E8M0 scale = 1 f32 per 32 K elements, N=model_dim.
     # For groupwise INT4: 1 scale per group_size K elements.
     _mxfp4_num_scale_groups = inter_dim // 32 if is_fp4_bf16 else 0
-    sw_nbytes = (
-        experts * model_dim * _mxfp4_num_scale_groups * 4
-        if is_fp4_bf16
-        else (
-            experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
-            if needs_scale_w
-            else 0
-        )
-    )
+    if is_fp4_bf16:
+        sw_nbytes = experts * model_dim * _mxfp4_num_scale_groups * 1
+    elif needs_scale_w:
+        sw_nbytes = experts * model_dim * num_groups * (2 if _scale_is_bf16 else 4)
+    else:
+        sw_nbytes = 0
 
     total_threads = 256
     tile_k_bytes = int(tile_k) * int(elem_bytes)

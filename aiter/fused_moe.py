@@ -2921,16 +2921,9 @@ def fused_moe_2stages(
         )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
-    if stage2_func is _flydsl_stage2_wrapper:
-        if (
-            gate_mode == GateMode.INTERLEAVE
-            and stage1_kernel_params
-            and stage1_kernel_params.get("b_dtype") == "fp4bf16"
-        ):
-            extra_stage2_args["klane_inner"] = True
-        if expert_mask is not None:
-            extra_stage2_args["expert_mask"] = expert_mask
-            extra_stage2_args["topk_ids"] = topk_ids
+    if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
+        extra_stage2_args["expert_mask"] = expert_mask
+        extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf

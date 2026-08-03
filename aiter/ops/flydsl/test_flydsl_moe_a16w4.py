@@ -59,6 +59,7 @@ def _generate_a16w4_data(
     dtype=torch.bfloat16,
     doweight_stage1: bool = False,
     gate_mode: str = "interleave",
+    spread_exponents: bool = False,
 ):
     torch_quant = aiter.get_torch_quant(Q_TYPE)
 
@@ -68,6 +69,23 @@ def _generate_a16w4_data(
     inp = torch.randn((token, model_dim), dtype=dtype) / 10
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10
+
+    if spread_exponents:
+        # Multiply each 32-element K block by a random power-of-two to spread
+        # E8M0 exponents across a realistic range (~55 distinct values vs ~4
+        # from plain randn/10).  This surfaces scale-addressing bugs that
+        # vanish with flat exponents.
+        def _spread(w):
+            shape = w.shape
+            K = shape[-1]
+            n_groups = K // 32
+            scales = (2.0 ** torch.randint(-8, 9, (n_groups,))).to(dtype)
+            scales = scales.repeat_interleave(32)[:K]
+            return (w.view(-1, K) * scales).view(shape)
+
+        w1 = _spread(w1)
+        w2 = _spread(w2)
+
     score = torch.randn((token, E), dtype=dtype)
     topk_weights, topk_ids = fused_topk(inp, score, topk, True)
 
@@ -154,13 +172,15 @@ def _generate_a16w4_data(
             ]
         )
 
-    # Shuffle weights for INTERLEAVE (klane_inner) or SEPARATED
+    # Shuffle weights for INTERLEAVE (klane_inner) or SEPARATED.
+    # w1 (gate+up) uses klane_inner when gate_mode=interleave.
+    # w2 (down-proj) never uses klane_inner — it has no gate/up split.
     klane_inner = gate_mode == "interleave"
     gate_up = gate_mode == "interleave"
     w1_qt_shuf = shuffle_weight_a16w4(w1_qt, 16, gate_up, klane_inner=klane_inner)
     w1_scale_shuf = shuffle_scale_a16w4(w1_scale, E, gate_up, klane_inner=klane_inner)
-    w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False, klane_inner=klane_inner)
-    w2_scale_shuf = shuffle_scale_a16w4(w2_scale, E, False, klane_inner=klane_inner)
+    w2_qt_shuf = shuffle_weight_a16w4(w2_qt, 16, False, klane_inner=False)
+    w2_scale_shuf = shuffle_scale_a16w4(w2_scale, E, False, klane_inner=False)
 
     return {
         "ref_stage1": ref1,
@@ -191,15 +211,26 @@ def _generate_a16w4_data(
     }
 
 
-def _check_result(ref_out, test_out, label, atol=1.0, rtol=0.05, pass_pct=95.0):
-    max_delta = (ref_out.float() - test_out.float()).abs().max().item()
-    close_mask = torch.isclose(ref_out.float(), test_out.float(), atol=atol, rtol=rtol)
+def _check_result(
+    ref_out, test_out, label, atol=1.0, rtol=0.05, pass_pct=95.0, min_cosine=0.99
+):
+    r = ref_out.float().flatten()
+    t = test_out.float().flatten()
+    max_delta = (r - t).abs().max().item()
+    close_mask = torch.isclose(r, t, atol=atol, rtol=rtol)
     pct_close = close_mask.float().mean().item() * 100
-    passed = pct_close > pass_pct
+
+    r_norm = r.norm()
+    t_norm = t.norm()
+    cosine = (r @ t / (r_norm * t_norm + 1e-12)).item()
+    rel_rms = ((r - t).norm() / (r_norm + 1e-12)).item()
+
+    passed = pct_close > pass_pct and cosine >= min_cosine
 
     print(
         f"  max_delta={max_delta:.4f}, {pct_close:.1f}% close (atol={atol}, rtol={rtol})"
     )
+    print(f"  cosine={cosine:.6f}, rel_rms={rel_rms:.6f}")
     status = "PASS" if passed else "FAIL"
     print(f"  [{status}] {label}")
     return passed, max_delta, pct_close
@@ -220,6 +251,9 @@ def test_flydsl_stage1_a16w4(
     gate_mode: str = "interleave",
     atol: float = 1.0,
     rtol: float = 0.05,
+    tile_n: int = 128,
+    spread_exponents: bool = False,
+    min_cosine: float = 0.99,
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1
 
@@ -238,6 +272,7 @@ def test_flydsl_stage1_a16w4(
         topk=topk,
         block_m=block_m,
         gate_mode=gate_mode,
+        spread_exponents=spread_exponents,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -250,7 +285,7 @@ def test_flydsl_stage1_a16w4(
         num_valid_ids=data["num_valid_ids"],
         topk=topk,
         tile_m=block_m,
-        tile_n=128,
+        tile_n=tile_n,
         tile_k=128,
         a_dtype="bf16",
         b_dtype="fp4bf16",
@@ -263,7 +298,14 @@ def test_flydsl_stage1_a16w4(
     torch.cuda.synchronize()
 
     ref = data["ref_stage1"]
-    return _check_result(ref, out, f"stage1_a16w4_{gate_mode}", atol=atol, rtol=rtol)
+    return _check_result(
+        ref,
+        out,
+        f"stage1_a16w4_{gate_mode}",
+        atol=atol,
+        rtol=rtol,
+        min_cosine=min_cosine,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +323,8 @@ def test_flydsl_stage2_a16w4(
     mode: str = "atomic",
     atol: float = 1.0,
     rtol: float = 0.05,
+    spread_exponents: bool = False,
+    min_cosine: float = 0.99,
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
 
@@ -298,6 +342,7 @@ def test_flydsl_stage2_a16w4(
         E=E,
         topk=topk,
         block_m=block_m,
+        spread_exponents=spread_exponents,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -324,7 +369,13 @@ def test_flydsl_stage2_a16w4(
 
     ref = data["ref_stage2"]
     return _check_result(
-        ref, out, f"stage2_a16w4_{mode}", atol=atol, rtol=rtol, pass_pct=90.0
+        ref,
+        out,
+        f"stage2_a16w4_{mode}",
+        atol=atol,
+        rtol=rtol,
+        pass_pct=90.0,
+        min_cosine=min_cosine,
     )
 
 
@@ -344,6 +395,9 @@ def test_flydsl_e2e_a16w4(
     gate_mode: str = "interleave",
     atol: float = 1.0,
     rtol: float = 0.05,
+    tile_n: int = 128,
+    spread_exponents: bool = False,
+    min_cosine: float = 0.99,
 ):
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
@@ -362,6 +416,7 @@ def test_flydsl_e2e_a16w4(
         topk=topk,
         block_m=block_m,
         gate_mode=gate_mode,
+        spread_exponents=spread_exponents,
     )
 
     out_dtype_str = "bf16" if data["dtype"] == torch.bfloat16 else "f16"
@@ -375,7 +430,7 @@ def test_flydsl_e2e_a16w4(
         num_valid_ids=data["num_valid_ids"],
         topk=topk,
         tile_m=block_m,
-        tile_n=128,
+        tile_n=tile_n,
         tile_k=128,
         a_dtype="bf16",
         b_dtype="fp4bf16",
@@ -416,6 +471,7 @@ def test_flydsl_e2e_a16w4(
         atol=atol,
         rtol=rtol,
         pass_pct=90.0,
+        min_cosine=min_cosine,
     )
 
 
@@ -465,6 +521,13 @@ def main():
     )
     parser.add_argument("--atol", type=float, default=1.0)
     parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument("--tile-n", type=int, default=128)
+    parser.add_argument("--min-cosine", type=float, default=0.99)
+    parser.add_argument(
+        "--spread-exponents",
+        action="store_true",
+        help="Spread E8M0 exponents across realistic range (default: off)",
+    )
     args = parser.parse_args()
 
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -489,6 +552,9 @@ def main():
                         gate_mode=args.gate_mode,
                         atol=args.atol,
                         rtol=args.rtol,
+                        tile_n=args.tile_n,
+                        spread_exponents=args.spread_exponents,
+                        min_cosine=args.min_cosine,
                     )
                     results.append(
                         (f"stage1_t{token}_bm{bm}", "PASS" if passed else "FAIL")
@@ -513,6 +579,8 @@ def main():
                             mode=mode,
                             atol=args.atol,
                             rtol=args.rtol,
+                            spread_exponents=args.spread_exponents,
+                            min_cosine=args.min_cosine,
                         )
                         results.append(
                             (
@@ -542,6 +610,9 @@ def main():
                             gate_mode=args.gate_mode,
                             atol=args.atol,
                             rtol=args.rtol,
+                            tile_n=args.tile_n,
+                            spread_exponents=args.spread_exponents,
+                            min_cosine=args.min_cosine,
                         )
                         results.append(
                             (

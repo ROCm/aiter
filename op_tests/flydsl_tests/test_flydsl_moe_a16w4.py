@@ -92,8 +92,8 @@ SHAPES = [
     # (model_dim, inter_dim, E, topk, tokens)
     (3072, 512, 128, 4, 1),  # GPT-OSS tok=1 decode
     (3072, 512, 128, 4, 4),  # GPT-OSS tok=4 decode
-    (7168, 256, 257, 9, 1),  # DSR1 tok=1 decode
-    (7168, 256, 257, 9, 4),  # DSR1 tok=4 decode
+    (7168, 256, 256, 8, 1),  # DSR1-like tok=1 decode
+    (7168, 256, 256, 8, 4),  # DSR1-like tok=4 decode
 ]
 
 
