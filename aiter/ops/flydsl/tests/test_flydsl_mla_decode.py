@@ -283,7 +283,7 @@ _BLOCK_SIZES = [
     (128, 128),    
 ]
 
-_NUM_Q_HEADS = [16, 32]
+_NUM_Q_HEADS = [16, 32, 128]
 
 @pytest.mark.parametrize("num_seqs,ctx_len,num_segs", _CASES)
 @pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)

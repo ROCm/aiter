@@ -282,18 +282,21 @@ def compile_mla_decode_main(
     q_rope_elems = QGSP_PADDED * Q_ROPE_ROW
 
     kv_lora_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = kv_lora_off + NUM_KV_STAGES * kv_lora_bytes
-    kv_rope_off = allocator._align(allocator.ptr, 16)
-    allocator.ptr = kv_rope_off + NUM_KV_STAGES * kv_rope_bytes
+    kv_rope_off = allocator._align(kv_lora_off + NUM_KV_STAGES * kv_lora_bytes, 16)
+    kv_end = kv_rope_off + NUM_KV_STAGES * kv_rope_bytes
 
-    # Q is read from LDS exactly once (prologue -> registers) and never touched again, so
-    # its LDS bytes are dead for the whole main loop. We place Q on top of kv_lora STAGE 1
-    assert (q_lora_elems + q_rope_elems) * elem_bytes <= kv_lora_bytes, (
-        "Q LDS does not fit within one kv_lora stage; cannot alias Q over stage 1"
-    )
-    q_lora_off = kv_lora_off + kv_lora_bytes          # base of kv_lora stage 1
+    # Q is read from LDS exactly once (prologue -> registers) and never touched again, so its
+    # LDS bytes are dead for the whole main loop. So it is aliased over the KV slabs
+    q_bytes = (q_lora_elems + q_rope_elems) * elem_bytes
+    Q_ON_STAGE0 = q_bytes > kv_lora_bytes
+
+    # if Q can fit within one kv lora slab we can just alias over second kv lora buffer
+    # which lets us issue the first kv load with the Q load instead of waiting for Q LDS
+    # to drain
+    q_lora_off = kv_lora_off if Q_ON_STAGE0 else kv_lora_off + kv_lora_bytes
     q_rope_off = q_lora_off + q_lora_elems * elem_bytes
     assert q_lora_off % 16 == 0 and q_rope_off % 16 == 0, "aliased Q offsets misaligned"
+    allocator.ptr = max(kv_end, q_rope_off + q_rope_elems * elem_bytes)
 
     @flyc.kernel
     def kernel_mla_decode_main(
@@ -520,11 +523,16 @@ def compile_mla_decode_main(
             tdm_ops.tensor_load_2d(rope_desc)
 
         # ---- prologue ----
-        # Kick off Q + the first KV tile
+        # we issue Q load first if it is small enough to fit within second kv buffer we issue
+        # fist kv load as well. otherwise if Q is big it will also need first kv buffer as well
+        # so we issue Q load drain it and only then issue the first kv load
         _issue_q_load()
         phys_blks_first = _phys_blks_for_compute(tile_start)
-        _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0))
-        tdm_ops.tensor_wait(K_OPS_PER_WAVE) # only waiting for Q
+        if Q_ON_STAGE0:
+            tdm_ops.tensor_wait(0)              # nothing else in flight; drain Q
+        else:
+            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0))
+            tdm_ops.tensor_wait(K_OPS_PER_WAVE) # only waiting for Q
         gpu.barrier()
 
         # Read ALL of Q's WMMA fragments into registers
@@ -537,10 +545,12 @@ def compile_mla_decode_main(
             for ks in range_constexpr(K_QK_ROPE_TILES):
                 q_rope_frags[qt][ks] = _load_q_frag(q_rope_lds, q_row, ks * WMMA_K, Q_ROPE_ROW)
 
-        # Drain the LDS reads (dscnt) and barrier so that iter-0's prefetch into kv_lora stage 1
-        # cannot overwrite Q while any wave is still reading it.
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
+
+        # Q is dead now: safe to overwrite stage 0.
+        if Q_ON_STAGE0:
+            _issue_kv_tile_loads(phys_blks_first, fx.Index(0), fx.Index(0))
 
         def _unwrap(v):
             return v.ir_value() if hasattr(v, "ir_value") else v
