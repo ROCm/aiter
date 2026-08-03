@@ -374,22 +374,6 @@ def _select_impls(which, flydsl_variants):
                     flydsl_fn, variant=None
                 )
                 continue
-            if v == "geak_v4":
-                if _geak_v4_mod is None:
-                    raise SystemExit(
-                        f"[error] geak variant requested but {_GEAK_V4_PATH} "
-                        f"failed to load."
-                    )
-                impls["geak_v4"] = _geak_v4_mod.flydsl_fp8_mqa_logits
-                continue
-            if v == "geak_v5":
-                if _geak_v5_mod is None:
-                    raise SystemExit(
-                        f"[error] geak variant requested but {_GEAK_V5_PATH} "
-                        f"failed to load."
-                    )
-                impls["geak_v5"] = _geak_v5_mod.flydsl_fp8_mqa_logits
-                continue
             if v not in available_variants:
                 raise SystemExit(
                     f"[error] unknown FlyDSL variant {v!r}; available: "
@@ -540,6 +524,16 @@ def _run_one(idx, impls, shape, args, q_fp8_dtype=None, kv_fp8_dtype=None):
                 f"{base / t:.2f}x" if base and t else "-"
             )
 
+    # For the "auto" impl, record which concrete variant was chosen for this
+    # shape so the table can show the real name rather than just "auto".
+    auto_resolved = {}
+    auto_key = FLYDSL_PREFIX + "auto"
+    if auto_key in impls:
+        from aiter.ops.flydsl.kernels.fp8_mqa_logits import _auto_variant
+        auto_resolved[auto_key] = _auto_variant(
+            shape.seq_q_l, shape.seq_kv_l, shape.num_heads_q
+        )
+
     return {
         "idx": idx,
         "shape": shape,
@@ -548,6 +542,7 @@ def _run_one(idx, impls, shape, args, q_fp8_dtype=None, kv_fp8_dtype=None):
         "verify": verify,
         "speedups": speedups,
         "triton_label": triton_label,
+        "auto_resolved": auto_resolved,
     }
 
 
@@ -799,11 +794,14 @@ def _per_shape_rows(row, impls, modes):
             headers.append(f"vs_triton_{m}")
 
     triton_label = row.get("triton_label")
+    auto_resolved = row.get("auto_resolved", {})
     data_rows = []
     for name in names:
         lbl = _impl_label(name)
         if name == "triton" and triton_label:
             lbl = triton_label
+        elif name in auto_resolved:
+            lbl = f"flydsl:{auto_resolved[name]}"
         cells = [lbl]
         for m in modes:
             cells.append(_time_cell(row["times"].get(name, {}).get(m)))
@@ -978,7 +976,7 @@ def main():
     p.add_argument(
         "--flydsl-variants",
         type=str,
-        default=None,
+        default="auto",
         metavar="V1,V2,...",
         help=(
             "comma-separated FlyDSL kernel-version tags to benchmark, each as its "
@@ -1103,16 +1101,14 @@ def main():
                   "_auto_variant)")
         return
 
-    # Resolve the requested FlyDSL variants (comma list), defaulting to all
-    # registered variants so new entries (e.g. "geak") appear automatically.
+    # Resolve the requested FlyDSL variants (comma list).
     # Validation against what's actually registered happens in _select_impls so
     # an unavailable-FlyDSL run still works for --impl triton.
-    if args.flydsl_variants:
-        args.flydsl_variants = [
-            v.strip() for v in args.flydsl_variants.split(",") if v.strip()
-        ]
+    args.flydsl_variants = [v.strip() for v in args.flydsl_variants.split(",") if v.strip()]
+    if len(args.flydsl_variants) == 1 and args.flydsl_variants[0] == "auto":
+        print("Using auto-deducted FlyDSL variant")
     else:
-        args.flydsl_variants = list(avail) if avail is not None else []
+        print("Using the following FlyDSL variants: " + ", ".join(args.flydsl_variants))
 
     run(args)
 
