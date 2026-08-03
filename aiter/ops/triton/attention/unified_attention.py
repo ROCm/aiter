@@ -108,6 +108,10 @@ def select_2d_config(
         TILE_SIZE = min(64, triton.next_power_of_2(block_size))
         if arch.is_rdna:
             num_stages_2d, num_warps = 1, 4
+        elif arch.name == "gfx950":
+            # release_tmp3 Triton software-pipeliner crashes on gfx950 with
+            # num_stages > 1 ("defs don't dominate"); keep it at 1.
+            num_stages_2d, num_warps = 1, 2
         else:
             if head_size >= 512:
                 num_stages_2d, num_warps = 1, 4
@@ -161,7 +165,8 @@ def select_3d_config(
     attn_warps = 2
     waves_per_eu = 2
     num_segments = 0
-    attn_stages = 2
+    # release_tmp3 Triton software-pipeliner crashes on gfx950 with num_stages > 1
+    attn_stages = 1 if DEVICE_ARCH == "gfx950" else 2
     if IS_DEVICE_ARCH_GFX12:
         attn_warps = 1
         TILE_SIZE = block_size
