@@ -18,25 +18,6 @@ def _is_accelerator_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "AcceleratorError"
 
 
-def _resolve_gpu_id(gpu_map, pid):
-    """Resolve the GPU id for a worker PID.
-
-    When a worker is killed (e.g. by a GPU memory-access fault) the pool
-    respawns a replacement process with a *new* PID that is not present in
-    ``gpu_map`` (which is only rebuilt on an explicit pool restart). Looking
-    that PID up directly used to raise ``KeyError``, which propagated to the
-    parent and left the task stuck in an infinite poll loop. Fall back to a
-    deterministic round-robin assignment so the respawned worker still runs on
-    a valid device; the parent will rebuild the map on its next restart.
-    """
-    if pid in gpu_map:
-        return gpu_map[pid]
-    device_count = torch.cuda.device_count()
-    if device_count <= 0:
-        return 0
-    return pid % device_count
-
-
 def worker(
     gpu_id,
     info,
@@ -186,7 +167,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         *rest,
     ) = group_task[0]
     pid = mp.current_process().pid
-    gpuID = _resolve_gpu_id(GPUIDMap, pid)
+    gpuID = GPUIDMap[pid]
     device = torch.device(f"cuda:{gpuID}")
     torch.cuda.set_device(device)
     assert ref_func is not None or ref is not None or fast_mode != 0
@@ -243,7 +224,7 @@ def work_group(GPUIDMap, fast_mode, err_ratio, in_data, tasks, verbose=False):
         #    raise KeyError(
         #        f"Process {pid} not found in GPUIDMap. Available PIDs: {list(GPUIDMap.keys())}"
         #    )
-        gpu_id = _resolve_gpu_id(GPUIDMap, pid)
+        gpu_id = GPUIDMap[pid]
 
         rets = []
         shape_grouped = isinstance(tasks, list)
@@ -476,15 +457,9 @@ def mp_tuner(
         set()
     )  # Track error types that already logged to avoid duplicates
 
-    # Number of times each task has been (re)submitted. Used to drop tasks that
-    # persistently kill their worker (e.g. a kernel that always GPU-faults) so
-    # that a single bad shape cannot livelock the whole tuning run when no
-    # per-task timeout is configured.
-    task_attempts = {k: 1 for k, _ in remaining_tasks}
-    max_task_attempts = 3
-
     while remaining_tasks:
         completed_this_round = []
+        dummy_failed_tasks = []
         consecutive_timeouts = 0
         half_gpu = max(1, (mp_num + 1) // 2)
 
@@ -551,25 +526,10 @@ def mp_tuner(
                 error_type = type(e).__name__
                 is_mapping_error = _is_mapping_error(e)
                 is_accelerator_error = _is_accelerator_error(e)
+                # not restart as this is not root use
                 if is_mapping_error:
-                    # A worker was killed (typically by a GPU memory-access
-                    # fault) and the pool respawned a new-PID worker that is not
-                    # in gpu_map. Recover instead of busy-looping: record a
-                    # failed result, drop the task, and trigger a pool restart
-                    # so gpu_map is rebuilt for the remaining tasks.
                     error_msg = f"[Mapping Error] Task {k} - Process PID not in GPU map: {error_type} - {e}"
-                    failed_tasks.append((k, "mapping error"))
-                    dummy_results = []
-                    add_dummy_result(k, dummy_results)
-                    result_dict[k] = (
-                        dummy_results if shape_grouped else [dummy_results[0]]
-                    )
-                    completed_this_round.append((k, async_result))
-                    pool_restart_needed = True
-                    if error_type not in logged_error_types:
-                        logger.error(error_msg)
-                        logged_error_types.add(error_type)
-                    break
+                    dummy_failed_tasks.append((k, "mapping error"))
                 elif is_accelerator_error:
                     # GPU fault (e.g. illegal memory access): worker returns exception instead of
                     # hanging. Unlike hang->timeout, the faulting worker may stay alive and accept
@@ -610,19 +570,6 @@ def mp_tuner(
         for item in completed_this_round:
             remaining_tasks.remove(item)
 
-        # Detect a silently respawned worker: if the live pool contains PIDs
-        # that are not in the current gpu_map, a worker was killed (e.g. by a
-        # GPU memory-access fault) and replaced by the pool. The in-flight task
-        # that dead worker held is lost and, when no per-task timeout is set,
-        # would otherwise hang the run forever. Force a restart to recover.
-        if not pool_restart_needed and remaining_tasks:
-            try:
-                current_pids = {w.pid for w in pool._pool}
-            except (AttributeError, TypeError):
-                current_pids = set()
-            if current_pids and (current_pids - set(gpu_map.keys())):
-                pool_restart_needed = True
-
         # If pool restart needed due to crash, restart pool and resubmit remaining tasks
         if pool_restart_needed and remaining_tasks:
             if verbose:
@@ -646,27 +593,8 @@ def mp_tuner(
             pids = [pool.apply_async(get_pid) for i in range(start_idx, mp_num)]
             gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
 
-            # Bump attempt counts and drop tasks that have exhausted their
-            # retries so a persistently faulting shape (whose kernel always
-            # kills its worker) cannot livelock the whole run.
-            remaining_task_indices = []
-            for k, _ in remaining_tasks:
-                task_attempts[k] = task_attempts.get(k, 1) + 1
-                if task_attempts[k] > max_task_attempts:
-                    failed_tasks.append((k, "persistent crash"))
-                    dummy_results = []
-                    add_dummy_result(k, dummy_results)
-                    result_dict[k] = (
-                        dummy_results if shape_grouped else [dummy_results[0]]
-                    )
-                    logger.warning(
-                        f"[Persistent Crash] Task {k} dropped after "
-                        f"{max_task_attempts} attempts (repeated worker death)"
-                    )
-                else:
-                    remaining_task_indices.append(k)
-
-            # Resubmit surviving tasks
+            # Resubmit remaining tasks
+            remaining_task_indices = [k for k, _ in remaining_tasks]
             new_rets_dict = submit_tasks(pool, gpu_map, remaining_task_indices)
             pool.close()
 
