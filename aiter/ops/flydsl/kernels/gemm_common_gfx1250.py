@@ -1,134 +1,41 @@
 """Shared utilities for gfx1250 GEMM kernels (fp16 / mxfp4 / mxfp8)."""
 
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import scf
+import flydsl.expr as fx
 from flydsl.expr import arith, gpu, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
-from flydsl.utils.smem_allocator import (
-    SmemPtr,
-    get_mlir_type_size,
-    get_op_result_or_value,
-)
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 
-def get_lds_memref(lds_ptr):
-    """Get the raw memref value from SmemPtr or raw memref."""
-    if isinstance(lds_ptr, SmemPtr):
-        return get_op_result_or_value(lds_ptr.get())
-    return get_op_result_or_value(lds_ptr)
-
-
-def _lds_vec_type(memref, total_bits):
-    """Build a vector type matching *memref*'s element type for *total_bits*."""
-    raw_mr = arith.unwrap(memref)
-    elem_type = ir.MemRefType(raw_mr.type).element_type
-    elem_bits = get_mlir_type_size(elem_type) * 8
-    n = total_bits // elem_bits
-    return ir.VectorType.get([n], elem_type)
-
-
-def lds_load_b128(memref, elem_off):
-    """Load 16 bytes from LDS as ``vector<4×i32>``.
-
-    Automatically adapts to the memref element type (f16, bf16, f32, etc.).
-    Produces ``ds_load_b128``.
-
-    Args:
-        memref: LDS memref (any 16-bit or 32-bit element type, address-space 3).
-        elem_off: Element offset in memref element units.
-    """
-    vec_ty = _lds_vec_type(memref, 128)
-    loaded = vector.load_op(vec_ty, memref, [elem_off])
-    return vector.bitcast(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), loaded
+def make_lds_copy_ops(bits):
+    """Create one reusable layout/copy atom and return its load/store callables."""
+    assert bits in (32, 64, 128), f"bits must be 32/64/128, got {bits}"
+    elem_count = bits // fx.Int32.width
+    layout = fx.make_layout(elem_count, 1)
+    atom = fx.make_copy_atom(fx.UniversalCopy(bits), fx.Int32)
+    ptr_ty = fx.PointerType.get(
+        elem_ty=fx.Int32.ir_type,
+        address_space=fx.AddressSpace.Shared,
+        alignment=bits // 8,
     )
 
+    def _view(lds_base_idx, byte_offset):
+        byte_offset = fx.index_cast(T.index, byte_offset)
+        addr_i32 = fx.index_cast(T.i32, lds_base_idx + byte_offset)
+        ptr = fx.inttoptr(ptr_ty, addr_i32)
+        return fx.Tensor(fx.make_view(ptr, layout))
 
-def lds_store_b128(memref, elem_off, data):
-    """Store 16 bytes to LDS.
+    def load(lds_base_idx, byte_offset):
+        rmem = fx.make_rmem_tensor(layout, fx.Int32)
+        fx.copy_atom_call(atom, _view(lds_base_idx, byte_offset), rmem)
+        return rmem.load()
 
-    Bitcasts *data* to match the memref element type, then calls
-    ``vector.store``.  Produces ``ds_store_b128``.
+    def store(lds_base_idx, byte_offset, data):
+        rmem = fx.make_rmem_tensor(layout, fx.Int32)
+        rmem.store(data)
+        fx.copy_atom_call(atom, rmem, _view(lds_base_idx, byte_offset))
 
-    Args:
-        memref: LDS memref (any 16-bit or 32-bit element type, address-space 3).
-        elem_off: Element offset in memref element units.
-        data: Any 128-bit vector (``vec<4×i32>``, ``vec<4×f32>``,
-              ``vec<8×f16>``, ``vec<8×bf16>``).
-    """
-    vec_ty = _lds_vec_type(memref, 128)
-    typed_vec = vector.bitcast(vec_ty, data)
-    vector.store(typed_vec, memref, [elem_off])
-
-
-def lds_store_b64(memref, elem_off, data):
-    """Store 8 bytes to LDS (``ds_store_b64``).
-
-    Bitcasts *data* (any 64-bit vector, e.g. ``vec<4×bf16>`` / ``vec<2×i32>``)
-    to match the memref element type, then ``vector.store``.
-    """
-    vec_ty = _lds_vec_type(memref, 64)
-    typed_vec = vector.bitcast(vec_ty, data)
-    vector.store(typed_vec, memref, [elem_off])
-
-
-def extract_lds_base_idx(smem_ptr):
-    """Extract the absolute LDS byte-base address as an index value."""
-    from flydsl._mlir.dialects import memref as _memref
-
-    membuf = get_lds_memref(smem_ptr)
-    raw_memref = arith.unwrap(membuf)
-    return _memref.extract_aligned_pointer_as_index(raw_memref)
-
-
-def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    from flydsl._mlir.dialects import llvm as _llvm
-    from flydsl.expr.arith import ArithValue as _AV
-
-    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = _AV(lds_base_idx) + byte_offset
-    addr_i32 = _raw(arith.index_cast(T.i32, total_byte))
-    return _llvm.inttoptr(lds_ptr_ty, addr_i32)
-
-
-def lds_load_b128_raw(lds_base_idx, byte_offset):
-    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM).
-
-    Args:
-        lds_base_idx: Index value from ``extract_lds_base_idx``.
-        byte_offset: Byte offset (index-type) relative to the base.
-    """
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
-
-
-def lds_load_b32_raw(lds_base_idx, byte_offset):
-    """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index.
-
-    Produces ``ds_load_b32``; ``byte_offset`` must be 4-byte aligned.
-
-    Args:
-        lds_base_idx: Index value from ``extract_lds_base_idx``.
-        byte_offset: Byte offset (index-type) relative to the base.
-    """
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
-
-
-def lds_transpose_load_raw(result_type, lds_base_idx, byte_offset):
-    """Transpose-load 16 bytes from LDS using a pre-extracted base index."""
-    from flydsl._mlir.dialects import rocdl as _rocdl
-
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return _rocdl.ds_load_tr16_b128(result_type, ptr_val)
+    return load, store
 
 
 def workgroup_barrier(use_cluster=False):
@@ -153,145 +60,99 @@ def pipeline_fence(outstanding=0, use_cluster=False):
     workgroup_barrier(use_cluster=use_cluster)
 
 
-WGP_BARRIER_ID = -1
+import math as _math
+
+LOG2E = _math.log2(_math.e)
 
 
-def pipeline_fence_signal(outstanding=0, use_cluster=False):
-    """Signal half of a split barrier fence.
+def fmin_f32(a, b):
+    """Scalar f32 min (maps to v_min_num_f32)."""
+    import flydsl.expr as _fx
 
-    Issues ``s_wait_tensorcnt`` then ``s_barrier_signal -1``.
-    The matching ``pipeline_fence_wait`` must be called later
-    (typically mid-compute) before reading the LDS data.
-
-    When *use_cluster* is True the intra-WG barrier is still required
-    so that all waves' TDM loads are visible before any wave reads LDS.
-    The cluster barrier is layered on top for inter-WG synchronisation.
-    """
-    tdm_ops.tensor_wait(outstanding)
-    rocdl.s_barrier_signal(WGP_BARRIER_ID)
-    if use_cluster:
-        cluster.cluster_signal_once_per_wg()
+    return _fx.Float32(arith.minnumf(_raw(a), _raw(b)))
 
 
-def pipeline_fence_wait(use_cluster=False):
-    """Wait half of a split barrier fence.
+def fclamp_f32(x, lo, hi):
+    """Scalar f32 clamp via v_med3_num_f32."""
+    import flydsl.expr as _fx
 
-    Issues ``s_barrier_wait -1``.  Must be preceded by a matching
-    ``pipeline_fence_signal`` from all waves in the workgroup.
-    """
-    rocdl.s_barrier_wait(WGP_BARRIER_ID)
-    if use_cluster:
-        cluster.cluster_wait()
+    return _fx.Float32(rocdl.fmed3(T.f32, _raw(x), _raw(lo), _raw(hi)))
 
 
-def issue_tdm_loads(*descs, wave_specialized=False, wave_id=None):
-    """Emit one or more TDM loads, optionally one descriptor per loader wave."""
-    if wave_specialized:
-        if wave_id is None:
-            wave_id = rocdl.wave_id()
-        for idx, desc in enumerate(descs):
-            is_loader_wave = arith.cmpi(
-                arith.CmpIPredicate.eq,
-                wave_id,
-                arith.constant(idx, type=T.i32),
-            )
-            if_op = scf.IfOp(is_loader_wave)
-            with ir.InsertionPoint(if_op.then_block):
-                tdm_ops.tensor_load_2d(desc)
-                scf.YieldOp([])
-        return
+def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
+    """One (gate, up) pair -> fused silu or swiglu scalar (gpt-oss clamp)."""
+    import flydsl.expr as _fx
 
-    for desc in descs:
-        tdm_ops.tensor_load_2d(desc)
+    _one = _fx.Float32(1.0)
+    g = fmin_f32(g, limit_f32)
+    u = fclamp_f32(u, neg_limit_f32, limit_f32)
+    if swiglu:
+        nlog2e = _fx.Float32(-1.702 * LOG2E)
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+        sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+        return g * sig * (u + _one)
+    nlog2e = _fx.Float32(-LOG2E)
+    exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(g * nlog2e)))
+    sig = _fx.Float32(rocdl.rcp(T.f32, _one + exp_val))
+    return g * sig * u
 
 
-def store_acc_vec8_to_lds(memref, base_elem_off, imm_elem_off, acc_vec8, out_elem=None):
-    """Write one 8-element f32 accumulator sub-vector to LDS.
-
-    For half output (out_elem = T.f16 or T.bf16):
-        trunc_f → bitcast(vec<4×i32>) → 1 × lds_store_b128  (16 bytes)
-    For f32 output (out_elem = None):
-        extract×4 → from_elements(vec<4×f32>) → 2 × lds_store_b128  (32 bytes)
+def batched_silu_swiglu(pairs, *, swiglu, limit_f32, neg_limit_f32, range_constexpr):
+    """Batched silu/swiglu with pipelined exp2/rcp for better TRANS utilisation.
 
     Args:
-        memref: D-output LDS memref (f16 element type).
-        base_elem_off: Per-lane base element offset (VGPR).
-        imm_elem_off: Compile-time element offset for this sub-tile.
-        acc_vec8: ``vector<8×f32>`` accumulator values.
-        out_elem: Output element type (``T.f16``, ``T.bf16``, or ``None`` for f32).
-    """
-    off = base_elem_off + arith.index(imm_elem_off)
-    if out_elem is not None:
-        h_vec = arith.trunc_f(T.vec(8, out_elem), acc_vec8)
-        i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
-        lds_store_b128(memref, off, i32_vec)
-    else:
-        for half in range(2):
-            vals = [
-                vector.extract(
-                    acc_vec8, static_position=[half * 4 + vi], dynamic_position=[]
-                )
-                for vi in range(4)
-            ]
-            vec4 = vector.from_elements(T.vec(4, T.f32), vals)
-            lds_store_b128(memref, off + arith.index(half * 8), vec4)
-
-
-def store_acc_vec8_to_buffer(
-    acc_vec8, c_rsrc, addr, out_elem=None, offset_is_bytes=False
-):
-    """Write one 8-element f32 accumulator sub-vector to global memory.
-
-    For half output (out_elem = T.f16 or T.bf16):
-        trunc_f → bitcast(vec<4×i32>) → 1 × buffer_store (16 bytes)
-    For f32 output (out_elem = None):
-        extract×4 → from_elements(vec<4×f32>) → 2 × buffer_store (16 bytes each)
-
-    Args:
-        acc_vec8: ``vector<8×f32>`` accumulator values.
-        c_rsrc: Buffer resource descriptor for the output matrix.
-        addr: Pre-computed address (single value for half, list of 2 for f32).
-        out_elem: Output element type (``T.f16``, ``T.bf16``, or ``None`` for f32).
-        offset_is_bytes: If True, treat addr as byte offset (half output path).
+        pairs: list of (gate, up) f32 value pairs.
+        swiglu: True for swiglu, False for silu.
+        limit_f32, neg_limit_f32: clamp bounds.
+        range_constexpr: the FlyDSL ``range_constexpr`` helper.
 
     Returns:
-        Number of addr slots consumed (1 for half, 2 for f32).
+        list of activated f32 values, same length as *pairs*.
     """
-    if out_elem is not None:
-        h_vec = arith.trunc_f(T.vec(8, out_elem), acc_vec8)
-        i32_vec = vector.bitcast(T.vec(4, T.i32), h_vec)
-        buffer_ops.buffer_store(i32_vec, c_rsrc, addr, offset_is_bytes=offset_is_bytes)
-        return 1
-    else:
-        for half in range(2):
-            vals = [
-                vector.extract(
-                    acc_vec8, static_position=[half * 4 + vi], dynamic_position=[]
-                )
-                for vi in range(4)
-            ]
-            vec4 = vector.from_elements(T.vec(4, T.f32), vals)
-            if isinstance(addr, (list, tuple)):
-                buffer_ops.buffer_store(vec4, c_rsrc, addr[half])
-            else:
-                buffer_ops.buffer_store(vec4, c_rsrc, addr)
-        return 2
+    import flydsl.expr as _fx
+
+    _one = _fx.Float32(1.0)
+    nlog2e = _fx.Float32((-1.702 * LOG2E) if swiglu else (-LOG2E))
+    N = len(pairs)
+    # Stage 1: clamp + exp2
+    gs, us, exp_vals = [], [], []
+    for i in range_constexpr(N):
+        g = fmin_f32(pairs[i][0], limit_f32)
+        u = fclamp_f32(pairs[i][1], neg_limit_f32, limit_f32)
+        gs.append(g)
+        us.append(u)
+    rocdl.sched_barrier(0)
+    for i in range_constexpr(N):
+        exp_val = _fx.Float32(rocdl.exp2(T.f32, _raw(gs[i] * nlog2e)))
+        exp_vals.append(exp_val)
+    # Stage 2a: add 1+exp
+    rocdl.sched_barrier(0)
+    sum_vals = []
+    for i in range_constexpr(N):
+        sum_vals.append(_one + exp_vals[i])
+    # Stage 2b: rcp
+    rocdl.sched_barrier(0)
+    rcp_vals = []
+    for i in range_constexpr(N):
+        rcp_vals.append(_fx.Float32(rocdl.rcp(T.f32, sum_vals[i])))
+    # Stage 3: final mul
+    rocdl.sched_barrier(0)
+    results = []
+    for i in range_constexpr(N):
+        if swiglu:
+            results.append(gs[i] * rcp_vals[i] * (us[i] + _one))
+        else:
+            results.append(gs[i] * rcp_vals[i] * us[i])
+    return results
 
 
 __all__ = [
-    # Raw LLVM path
-    "extract_lds_base_idx",
-    # LDS helpers
-    "get_lds_memref",
-    "issue_tdm_loads",
-    "lds_load_b128_raw",
-    "lds_transpose_load_raw",
+    "LOG2E",
+    "batched_silu_swiglu",
+    "fclamp_f32",
+    "fmin_f32",
+    "fused_silu_swiglu_elem",
+    "make_lds_copy_ops",
     "pipeline_fence",
-    "pipeline_fence_signal",
-    "pipeline_fence_wait",
-    "store_acc_vec8_to_buffer",
-    # Epilogue
-    "store_acc_vec8_to_lds",
-    # Pipeline
     "workgroup_barrier",
 ]
