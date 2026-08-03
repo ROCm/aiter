@@ -10,8 +10,9 @@ from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.layout_utils import crd2idx
+from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
-from .gemm1 import (
+from .utils import (
     A16WI4_GROUP_SIZE,
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
@@ -23,7 +24,6 @@ from .gemm1 import (
     _global_i32_buffer_view,
     _int4_nibble_to_bf16x8,
     _lds_ptr3,
-    _raw,
     _udiv,
     _umod,
     kmchunks_for,

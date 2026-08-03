@@ -216,6 +216,31 @@ def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.
     )
 
 
+def shuffle_weight_a16wi4(w_qt_i8: torch.Tensor) -> torch.Tensor:
+    """Preshuffle a signed-int4 weight for the FlyDSL a16wi4 (bf16 A x int4 W) kernel.
+
+    Input: ``w_qt_i8`` ``[..., N, K]`` int8 container holding signed int4 values in
+    ``[-7, 7]`` (the :func:`aiter.ops.quant.per_1x32_i4_quant` weight output).
+
+    Output: the FlyDSL a16wi4 kernel weight layout as ``float4_e2m1fn_x2`` (``[..., N,
+    K//2]``, 2 nibbles/byte). This is the SAME kpack=16 preshuffle byte layout the
+    mxfp4 (a16w4) path uses (``shuffle_weight`` on the packed fp4 view), so both the
+    a16w4 and a16wi4 families share one kernel: contiguous 2-nibble packing
+    (``low = even K, high = odd K``) matched to the kernel's ``_int4_nibble_to_bf16x8``
+    upconvert, then the standard ``shuffle_weight`` (16,16) N-major GGUU tiling.
+
+    Note: this is a FlyDSL-backend layout, NOT byte-identical to aiter's CK int4
+    packing (``pack_int8_to_packed_int4`` + ``shuffle_weight`` on the int8, which is
+    kpack=8 for the old int4_bf16 kernel). Prepare weights with this helper when
+    dispatching a16wi4 to the FlyDSL 2-stage MoE.
+    """
+    from aiter.utility.fp4_utils import pack_uint4
+
+    u = (w_qt_i8.to(torch.int16) & 0xF).to(torch.uint8).contiguous()
+    packed = pack_uint4(u)  # [..., N, K//2] uint8
+    return shuffle_weight(packed.view(torch.float4_e2m1fn_x2))
+
+
 def shuffle_weight_NK(
     x: torch.Tensor, inst_N: int, inst_K: int, use_int4=False
 ) -> torch.Tensor:
@@ -438,6 +463,23 @@ def shuffle_scale_a16w4(
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
     )
+
+
+def shuffle_scale_a16wi4(scale: torch.Tensor) -> torch.Tensor:
+    """Preshuffle a groupwise int4 scale for the FlyDSL a16wi4 kernel.
+
+    Input: ``scale`` ``[E, G, N]`` bf16 (the :func:`per_1x32_i4_quant` scale output,
+    ``G = K // 32`` groups). Output: ``(E, N, G//2, 2)`` bf16 -- N-major, two adjacent
+    groups packed into one dword (even/odd group -> low/high bf16), matching the
+    kernel's ``load_b_scale_int4`` addressing (``dword = n*(G//2) + group//2``).
+
+    This differs from :func:`shuffle_scale_for_int4` (the CK int4 layout
+    ``(E, G//2, N, 2)``); use this one for the FlyDSL a16wi4 path.
+    """
+    if scale.dtype != torch.bfloat16:
+        raise ValueError(f"a16wi4 scale must be bf16, got {scale.dtype}")
+    E, G, N = scale.shape
+    return scale.permute(0, 2, 1).contiguous().view(E, N, G // 2, 2).contiguous()
 
 
 def pack_int8_to_packed_int4(x_shuf_i8: torch.Tensor) -> torch.Tensor:

@@ -2363,24 +2363,30 @@ def get_2stage_cfgs(
         and q_dtype_w == dtypes.i4x2
         and is_flydsl_available()
     ):
-        # Heuristic kernel dispatch for a16wi4 (bf16 activations, packed int4 weights
-        # with groupwise scale). Tile sizes and k-split are chosen based on problem
-        # dimensions to balance occupancy and memory bandwidth:
-        #   - _tile_m: scales with token count to improve utilization at larger batch sizes
-        #   - _tile_n/_tile_k: fixed at 128, tuned for int4 weight packing granularity
-        #   - _ksplit: partitions the K dimension across workgroups for large reductions
+        # a16wi4 (bf16 A x int4 W): route to the shared FlyDSL a16w-mix port
+        # (moe_2stage_a16wmix, w_dtype="int4"), the same folded 2-stage path as a16w4.
+        # The port uses intra-block k_wave (not grid split-K), so no _kb suffix; tiles
+        # come from the tuned CSV kernelName when available (get_fmoe_config), else this
+        # per-token heuristic (tile_n/tile_k=128, tile_m scales with tokens). block_m
+        # (MOEMetadata arg 3) MUST equal tile_m -- it sizes moe_sorting AND gemm tile_m.
         _out_str = "bf16"
         _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        _ksplit = get_ksplit(token, topk, expert, inter_dim, model_dim)
         from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
 
-        kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k)
-        if _ksplit > 1:
-            kn1 += f"_kb{_ksplit}"
+        # Decode (small M) is wave-starved: the port has no grid split-K, so maximize
+        # the N-tile grid (tile_n=32) and add intra-block k_wave K-slicing. tile_n=32 +
+        # k_wave=4 roughly halves the small-M gemm1 vs tile_n=64/k_wave=2. Needs
+        # 4*tile_n <= tile_k (32*4=128) and D_HIDDEN % (k_wave*tile_k) == 0. Larger M is
+        # grid-parallel enough that tile_n=128 / k_wave=1 wins.
+        if token <= 64 and model_dim % 512 == 0 and inter_dim % 32 == 0:
+            kn1 = (
+                flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 32, 256)
+                + "_kw4"
+            )
+        else:
+            kn1 = flydsl_kernel_name(1, "bf16", "int4", _out_str, _tile_m, 128, 128)
         kn2 = flydsl_kernel_name(
-            2, "bf16", "int4", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
+            2, "bf16", "int4", _out_str, _tile_m, 128, 128, "atomic"
         )
         return MOEMetadata(
             functools.partial(
@@ -2397,7 +2403,7 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             ),
             _tile_m,
-            _ksplit,
+            0,
             False,
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.

@@ -51,12 +51,12 @@ from aiter.ops.flydsl.mxfp4_kname import (
 )
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.ops.shuffle import (
-    pack_int8_to_packed_int4,
     shuffle_scale,
     shuffle_scale_a16w4,
-    shuffle_scale_for_int4,
+    shuffle_scale_a16wi4,
     shuffle_weight,
     shuffle_weight_a16w4,
+    shuffle_weight_a16wi4,
 )
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
@@ -1320,23 +1320,23 @@ class FmoeTuner(TunerCommon):
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
-            # a16wi4 int4 FlyDSL path: pack int8 -> int4, shuffle scales
-            E1 = w1_qt.shape[0]
-            N1, K1 = w1_qt.shape[1], w1_qt.shape[2]
-            w1_qt_shffle_flydsl = pack_int8_to_packed_int4(
-                shuffle_weight(w1_qt, (16, 16))
-            ).view(E1, N1, K1 // 2)
-            E2 = w2_qt.shape[0]
-            N2, K2 = w2_qt.shape[1], w2_qt.shape[2]
-            w2_qt_shffle_flydsl = pack_int8_to_packed_int4(
-                shuffle_weight(w2_qt, (16, 16))
-            ).view(E2, N2, K2 // 2)
-            w1_scale_flydsl = (
-                shuffle_scale_for_int4(w1_scale, group_size=32).view(-1).contiguous()
+            # a16wi4 FlyDSL port layout (shuffle_weight_a16wi4, kpack=16 + (E,N,G//2,2)
+            # bf16 scale) -- MUST match op_tests/test_moe_2stage.py / production. NOT the
+            # CK int4 packing (pack_int8_to_packed_int4, kpack=8), which is the old kernel.
+            E1, N1, K1 = w1_qt.shape
+            E2, N2, K2 = w2_qt.shape
+            w1_qt_shffle_flydsl = (
+                shuffle_weight_a16wi4(w1_qt.view(dtypes.i8))
+                .view(E1, N1, K1 // 2)
+                .view(dtypes.i4x2)
             )
-            w2_scale_flydsl = (
-                shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
+            w2_qt_shffle_flydsl = (
+                shuffle_weight_a16wi4(w2_qt.view(dtypes.i8))
+                .view(E2, N2, K2 // 2)
+                .view(dtypes.i4x2)
             )
+            w1_scale_flydsl = shuffle_scale_a16wi4(w1_scale).view(-1).contiguous()
+            w2_scale_flydsl = shuffle_scale_a16wi4(w2_scale).view(-1).contiguous()
             w1_qt_shffle_ck = w1_qt_shffle
             w2_qt_shffle_ck = w2_qt_shffle
             w1_scale_aiter = w1_scale
@@ -3773,26 +3773,19 @@ class FmoeTuner(TunerCommon):
                 w1_scale_fmoe = w1_scale
                 w2_scale_fmoe = w2_scale
                 if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
+                    # a16wi4 FlyDSL port layout -- match production / test_moe_2stage.py.
                     w1_qt_fmoe = (
-                        pack_int8_to_packed_int4(shuffle_weight(w1_qt_fmoe, (16, 16)))
+                        shuffle_weight_a16wi4(w1_qt_fmoe.view(dtypes.i8))
                         .view(w1.shape[0], w1.shape[1], w1.shape[2] // 2)
                         .view(dtypes.i4x2)
                     )
                     w2_qt_fmoe = (
-                        pack_int8_to_packed_int4(shuffle_weight(w2_qt_fmoe, (16, 16)))
+                        shuffle_weight_a16wi4(w2_qt_fmoe.view(dtypes.i8))
                         .view(w2.shape[0], w2.shape[1], w2.shape[2] // 2)
                         .view(dtypes.i4x2)
                     )
-                    w1_scale_fmoe = (
-                        shuffle_scale_for_int4(w1_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
-                    w2_scale_fmoe = (
-                        shuffle_scale_for_int4(w2_scale, group_size=32)
-                        .view(-1)
-                        .contiguous()
-                    )
+                    w1_scale_fmoe = shuffle_scale_a16wi4(w1_scale).view(-1).contiguous()
+                    w2_scale_fmoe = shuffle_scale_a16wi4(w2_scale).view(-1).contiguous()
                 elif q_dtype_w == torch.int4:
                     w1_qt_fmoe = rearrange_4bit_elements(
                         convert_int8_to_uint32_int4(
