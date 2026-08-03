@@ -373,9 +373,20 @@ def _gemm_a16w16_bandwidth_bound_kernel(
         0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
 
-    offs_c = stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # buffer_store addresses through a 32-bit byte offset, so a C tile starting
+    # past 2 GiB is dropped by the bounds check with nothing raised.  Fold the
+    # origin into the base pointer in 64-bit and keep only tile-local offsets,
+    # which the block shape bounds, so the fast path holds at every size.
+    c_ptr += (pid_m * BLOCK_M).to(gl.int64) * stride_cm + (
+        pid_n * BLOCK_N
+    ).to(gl.int64) * stride_cn
+    offs_c = stride_cm * gl.arange(
+        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
+    )[:, None] + stride_cn * gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
+    )[None, :]
 
     # Store
     gl.amd.gfx1250.buffer_store(
