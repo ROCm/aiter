@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT pre-compile for the FlyDSL mxmoe a4w4 MoE port (gemm1 / gemm2).
+"""AOT pre-compile for the FlyDSL MXMOE a4w4/a8w4 port (GEMM1 / GEMM2).
 
 Parses the flydsl_mxmoe_* port rows from the fp4 tuned CSVs and warms the FlyDSL
 disk cache via the same runtime entry points, keyed identically so inference
@@ -22,7 +22,13 @@ from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override
 from aiter.jit.core import AITER_ROOT_DIR
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+DEFAULT_CSVS = sorted(
+    set(
+        glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp8fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a8w4_tuned_fmoe.csv")
+    )
+)
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
@@ -44,6 +50,11 @@ def _job_key(job: dict) -> tuple:
             job["topk"],
             job["xcd_swizzle"],
             job["a_dtype"],
+            job["out_dtype"],
+            job["act"],
+            job["situ_beta"],
+            job["situ_linear_beta"],
+            job["interleave"],
         )
     return (
         2,
@@ -59,12 +70,13 @@ def _job_key(job: dict) -> tuple:
 
 
 def parse_csv(csv_path: str):
-    """Parse an fp4 tuned CSV into unique mxmoe-port compile jobs (one per stage)."""
+    """Parse a tuned CSV into unique MXMOE-port compile jobs (one per stage)."""
     from aiter.ops.flydsl.mxfp4_gemm2_kernels import _epilog_of
     from aiter.ops.flydsl.mxfp4_kname import (
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
+        _select_mxfp4_g1_kernel,
         _select_mxfp4_a4w4_kernels,
     )
     from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_shape_supported
@@ -90,11 +102,35 @@ def parse_csv(csv_path: str):
             d_inter = ((inter_dim + 255) // 256) * 256
             d_inter_real = inter_dim if inter_dim != d_inter else None
 
+            configured_kn1 = (row.get("kernelName1") or "").strip()
+            configured_kn2 = (row.get("kernelName2") or "").strip()
+            act_type = row.get("act_type")
+            q_dtype_a = row.get("q_dtype_a")
+            shape = (expert, model_dim, d_inter, topk)
+            is_kimi_k3 = shape == (896, 3584, 512, 16)
+            is_dsv4 = shape in {
+                (384, 7168, 512, 6),
+                (384, 7168, 768, 6),
+                (384, 7168, 1536, 6),
+                (385, 7168, 512, 7),
+                (385, 7168, 768, 7),
+                (385, 7168, 1536, 7),
+                (48, 7168, 3072, 6),
+                (256, 4096, 256, 6),
+            }
+            is_a4w4_variant = (
+                q_dtype_a == "torch.float4_e2m1fn_x2"
+                and act_type == "ActivationType.Silu"
+                and not is_kimi_k3
+            )
+            is_a8w4_variant = q_dtype_a == "torch.float8_e4m3fn" and (
+                (act_type == "ActivationType.Silu" and is_dsv4)
+                or (act_type == "ActivationType.Situv2" and is_kimi_k3)
+            )
             use_replacement = (
                 row.get("gfx") == "gfx950"
-                and row.get("act_type") == "ActivationType.Silu"
                 and row.get("dtype") == "torch.bfloat16"
-                and row.get("q_dtype_a") == "torch.float4_e2m1fn_x2"
+                and (is_a4w4_variant or is_a8w4_variant)
                 and row.get("q_dtype_w") == "torch.float4_e2m1fn_x2"
                 and row.get("q_type") == "QuantType.per_1x32"
                 and int(row.get("use_g1u1") or 0) == 1
@@ -106,17 +142,38 @@ def parse_csv(csv_path: str):
                     topk,
                 )
             )
-            replacement = (
-                _select_mxfp4_a4w4_kernels(
+            if use_replacement and is_a8w4_variant:
+                act = "situv2" if act_type == "ActivationType.Situv2" else "silu"
+                default_beta = 2.0 if act == "situv2" else 1.0
+                default_linear_beta = 1.5 if act == "situv2" else 1.0
+                situ_beta = float(row.get("situ_beta") or default_beta)
+                situ_linear_beta = float(
+                    row.get("situ_linear_beta") or default_linear_beta
+                )
+                replacement = _select_mxfp4_g1_kernel(
+                    token=int(row["token"]),
+                    expert=expert,
+                    topk=topk,
+                    block_m=int(row.get("block_m") or 0) or None,
+                    a_dtype="fp8",
+                    out_dtype="fp8",
+                    act=act,
+                    interleave="_gui" in configured_kn1.lower(),
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                # GEMM1 emits the same FP8+E8M0 contract consumed by the tuned
+                # GEMM2, so stage2 remains byte-for-byte unchanged.
+                replacement["kernelName2"] = configured_kn2
+            elif use_replacement:
+                replacement = _select_mxfp4_a4w4_kernels(
                     token=int(row["token"]),
                     expert=expert,
                     topk=topk,
                 )
-                if use_replacement
-                else None
-            )
+            else:
+                replacement = None
 
-            configured_kn1 = (row.get("kernelName1") or "").strip()
             kn1 = (
                 configured_kn1
                 if _is_mxfp4_kname(configured_kn1)
@@ -142,14 +199,19 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
-                        "a_dtype": "fp4",
+                        "a_dtype": p1["a_dtype"],
+                        "out_dtype": p1["out_dtype"],
+                        "act": p1["act"],
+                        "situ_beta": p1["situ_beta"],
+                        "situ_linear_beta": p1["situ_linear_beta"],
+                        "interleave": p1["interleave"],
                     }
                 )
 
             kn2 = (
                 replacement["kernelName2"]
                 if replacement is not None
-                else (row.get("kernelName2") or "").strip()
+                else configured_kn2
             )
             if _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
@@ -211,6 +273,11 @@ def _compile_stage1(job):
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
         a_dtype=job["a_dtype"],
+        out_dtype=job["out_dtype"],
+        act=job["act"],
+        situ_beta=job["situ_beta"],
+        situ_linear_beta=job["situ_linear_beta"],
+        interleave=job["interleave"],
         stream=0,
     )
 
@@ -277,7 +344,7 @@ def compile_one_config(**job):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AOT pre-compile FlyDSL mxmoe a4w4 MoE port kernels from fp4 tuned CSVs",
+        description="AOT pre-compile FlyDSL MXMOE kernels from tuned MoE CSVs",
         formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
@@ -285,7 +352,7 @@ def main():
         type=str,
         nargs="+",
         default=DEFAULT_CSVS,
-        help="Path(s) to fp4 tuned CSV(s); default: all *_fp4_tuned_fmoe.csv",
+        help="Path(s) to tuned CSVs; default: fp4, fp8fp4, and a8w4 model CSVs",
     )
     args = parser.parse_args()
 
@@ -303,7 +370,7 @@ def main():
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
 
     print("=" * 72)
-    print("FlyDSL mxmoe a4w4 MoE-port AOT Pre-compilation")
+    print("FlyDSL MXMOE a4w4/a8w4 AOT Pre-compilation")
     print("=" * 72)
     for csv_path in csv_paths:
         print(f"  CSV:          {csv_path}")

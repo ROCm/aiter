@@ -161,26 +161,26 @@ def _fabs_f32(x):
     return fx.Float32(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(x)], [], []))
 
 
-def _e8m0_roundup(amax_f32):
-    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
+def _e8m0_roundup(amax_f32, max_norm=6.0):
+    wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / float(max_norm))).bitcast(T.i32))
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
     lt = arith.cmpi(arith.CmpIPredicate.ult, _raw(bexp), _raw(fx.Int32(254)))
     return fx.Int32(arith.select(lt, _raw(bexp), _raw(fx.Int32(254))))
 
 
-def _e8m0_from_amax(amax_f32):
-    e8m0 = _e8m0_roundup(amax_f32)
+def _e8m0_from_amax(amax_f32, max_norm=6.0):
+    e8m0 = _e8m0_roundup(amax_f32, max_norm=max_norm)
     qscale = fx.Float32(_raw(e8m0 << fx.Int32(23)).bitcast(T.f32))
     return e8m0, qscale
 
 
-def _inline_e8m0(amax_u16_i32):
+def _inline_e8m0(amax_u16_i32, max_norm=6.0):
     f32 = fx.Float32(
         _raw((fx.Int32(_raw(amax_u16_i32)) & fx.Int32(0xFFFF)) << fx.Int32(16)).bitcast(
             T.f32
         )
     )
-    return _e8m0_roundup(f32)
+    return _e8m0_roundup(f32, max_norm=max_norm)
 
 
 def _pkmax_u16(a_i32, b_i32):
@@ -204,6 +204,52 @@ def _silu_mul_batch(gate_values, up_values):
         gate_values[i] * sigmoid_values[i] * up_values[i]
         for i in range(len(gate_values))
     ]
+
+
+def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
+    one = fx.Float32(1.0)
+    zero = fx.Float32(0.0)
+    beta_f32 = fx.Float32(float(beta))
+    beta_rcp = fx.Float32(1.0 / float(beta))
+    linear_beta_f32 = fx.Float32(float(linear_beta))
+    linear_beta_rcp = fx.Float32(1.0 / float(linear_beta))
+
+    def tanh_elem(x):
+        abs_x = x.maximumf(-x)
+        e = fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * fx.Float32(-2.0 * LOG2E))))
+        tanh_abs = (one - e) * fx.Float32(rocdl.rcp(T.f32, _raw(one + e)))
+        return (x > zero).select(tanh_abs, -tanh_abs)
+
+    result = []
+    for gate, up in zip(gate_values, up_values):
+        situ = (
+            beta_f32
+            * tanh_elem(gate * beta_rcp)
+            * fx.Float32(
+                rocdl.rcp(
+                    T.f32,
+                    _raw(
+                        one
+                        + fx.Float32(rocdl.exp2(T.f32, _raw(gate * fx.Float32(-LOG2E))))
+                    ),
+                )
+            )
+        )
+        result.append(situ * linear_beta_f32 * tanh_elem(up * linear_beta_rcp))
+    return result
+
+
+def _activation_mul_batch(
+    gate_values, up_values, act="silu", situ_beta=1.0, situ_linear_beta=1.0
+):
+    if act == "situv2":
+        return _situ_mul_batch(
+            gate_values,
+            up_values,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+        )
+    return _silu_mul_batch(gate_values, up_values)
 
 
 def _umax_i32(a, b):

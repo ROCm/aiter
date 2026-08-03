@@ -35,7 +35,7 @@ def _warn_tile_override(axis: str, inter_dim: int, requested: int, resolved: int
         logger = logging.getLogger("aiter")
     logger.warning(
         "FlyDSL MoE: %s=%d does not divide inter_dim=%d (not 256-aligned); "
-        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape — any tuned "
+        "forcing %s=%d. tile=%d is NOT usable/tunable for this shape -- any tuned "
         "config naming tile=%d here actually runs %d.",
         axis,
         requested,
@@ -869,7 +869,7 @@ def _run_compiled(exe, args):
     except Exception:
         # JitFunction.__call__ leaks ir.Context on compilation failure,
         # causing all subsequent JitFunction calls to take a wrong code path
-        # (self.func(*args) without CompilationContext → gpu_module_body error).
+        # (self.func(*args) without CompilationContext -> gpu_module_body error).
         # Clean up leaked contexts to isolate failures.
         try:
             from flydsl._mlir import ir
@@ -887,6 +887,7 @@ def _run_moe_reduction(
     token_num,
     topk,
     model_dim,
+    model_dim_pad=0,
     expert_mask=None,
     topk_ids=None,
     stream=None,
@@ -908,7 +909,7 @@ def _run_moe_reduction(
         _reduce_dtype_str = None
 
     if _reduce_dtype_str is None:
-        # Unsupported dtype for the masked kernel — fall back to torch.sum.
+        # Unsupported dtype for the masked kernel -- fall back to torch.sum.
         # This drops the EP mask, so only valid for non-EP runs.
         if use_mask:
             raise NotImplementedError(
@@ -922,9 +923,10 @@ def _run_moe_reduction(
     reduce_exe = compile_moe_reduction(
         topk=topk,
         model_dim=model_dim,
+        model_dim_pad=model_dim_pad,
         dtype_str=_reduce_dtype_str,
         use_mask=use_mask,
-        # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
+        # expert_mask is sized by global expert count (!= w2.shape[0] under EP).
         num_experts=int(expert_mask.numel()) if use_mask else 0,
     )
     X = target.view(token_num, topk, model_dim)
@@ -964,7 +966,7 @@ def _run_moe_reduction(
 # largest legal tile_n that divides the required N dims, and (b) zero-pad
 # activations, weights and scales on the K dim to the next multiple of
 # tile_k. Zero padding is algebraically safe for mx-quantized GEMM (the
-# extra K-slice contributes 0·anything = 0), and is cheap relative to the
+# extra K-slice contributes 0.anything = 0), and is cheap relative to the
 # kernel cost (~2% for 2944 vs 2880).
 # ---------------------------------------------------------------------------
 
@@ -1853,8 +1855,19 @@ def flydsl_moe_stage2(
             )
     if not accumulate and not return_per_slot:
         _run_moe_reduction(
-            target, out, token_num, topk, model_dim, expert_mask, topk_ids
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim,
+            model_dim_pad,
+            expert_mask,
+            topk_ids,
         )
+    if return_per_slot and model_dim_pad > 0:
+        # No reduction kernel runs in this debug/raw-output mode, so normalize
+        # its unlaunched padded tiles here.
+        out.view(-1, model_dim)[:, model_dim - model_dim_pad :].zero_()
     return out
 
 

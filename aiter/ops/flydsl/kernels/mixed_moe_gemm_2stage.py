@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
 
@@ -3251,10 +3251,15 @@ def compile_mixed_moe_gemm2(
     cumul_tag = f"_cumul{int(cu_num_mul)}" if int(cu_num_mul) != 1 else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     acc_tag = "" if accumulate else "_acc0"
+    pad_tag = (
+        f"_mp{model_dim_pad}_ip{inter_dim_pad}"
+        if model_dim_pad or inter_dim_pad
+        else ""
+    )
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
         f"_t{tile_m}x{tile_n}x{tile_k}"
-        f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}"
+        f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}{cumul_tag}{xcd_tag}{acc_tag}{pad_tag}"
     ).replace("-", "_")
     lds_x_bytes = 2 * int(tile_m) * int(lds_stride) * int(a_elem_bytes)
     lds_out_bytes = 2 * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0
@@ -4770,47 +4775,59 @@ def compile_mixed_moe_gemm2(
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     _fused, row_byte_base, row_byte_off_i32 = row_ctx
-                    if const_expr(not bool(accumulate)):
-                        col_idx = col_g0
-                        byte_off_col = col_idx * arith.constant(
-                            out_elem_bytes, index=True
-                        )
-                        ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(
-                            frag_v,
-                            out_ptr_v,
-                            alignment=e_vec * out_elem_bytes,
-                            nontemporal=True,
-                        )
-                    elif const_expr(use_buf_atomic):
-                        col_i32 = arith.index_cast(T.i32, col_g0)
-                        col_byte_off_i32 = col_i32 * out_elem_bytes_i32
-                        byte_off_i32 = row_byte_off_i32 + col_byte_off_i32
-                        rocdl.raw_ptr_buffer_atomic_fadd(
-                            frag,
-                            out_rsrc,
-                            byte_off_i32,
-                            zero_i32,
-                            zero_i32,
-                        )
+
+                    def emit_store():
+                        if const_expr(not bool(accumulate)):
+                            col_idx = col_g0
+                            byte_off_col = col_idx * arith.constant(
+                                out_elem_bytes, index=True
+                            )
+                            ptr_addr_idx = row_byte_base + byte_off_col
+                            out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.StoreOp(
+                                frag_v,
+                                out_ptr_v,
+                                alignment=e_vec * out_elem_bytes,
+                                nontemporal=True,
+                            )
+                        elif const_expr(use_buf_atomic):
+                            col_i32 = arith.index_cast(T.i32, col_g0)
+                            col_byte_off_i32 = col_i32 * out_elem_bytes_i32
+                            byte_off_i32 = row_byte_off_i32 + col_byte_off_i32
+                            rocdl.raw_ptr_buffer_atomic_fadd(
+                                frag,
+                                out_rsrc,
+                                byte_off_i32,
+                                zero_i32,
+                                zero_i32,
+                            )
+                        else:
+                            col_idx = col_g0
+                            byte_off_col = col_idx * arith.constant(
+                                out_elem_bytes, index=True
+                            )
+                            ptr_addr_idx = row_byte_base + byte_off_col
+                            out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            llvm.AtomicRMWOp(
+                                llvm.AtomicBinOp.fadd,
+                                out_ptr_v,
+                                frag_v,
+                                llvm.AtomicOrdering.monotonic,
+                                syncscope="agent",
+                                alignment=e_vec * out_elem_bytes,
+                            )
+
+                    if const_expr(model_dim_pad > 0):
+                        valid_n = arith.constant(model_dim - model_dim_pad, index=True)
+                        pair_valid = col_g0 < valid_n
+                        _if_pair = scf.IfOp(pair_valid)
+                        with ir.InsertionPoint(_if_pair.then_block):
+                            emit_store()
+                            scf.YieldOp([])
                     else:
-                        col_idx = col_g0
-                        byte_off_col = col_idx * arith.constant(
-                            out_elem_bytes, index=True
-                        )
-                        ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            out_ptr_v,
-                            frag_v,
-                            llvm.AtomicOrdering.monotonic,
-                            syncscope="agent",
-                            alignment=e_vec * out_elem_bytes,
-                        )
+                        emit_store()
 
                 e_vec = 2 if accumulate else min(tile_n // 32, 8)
                 rocdl.s_setprio(3)
@@ -4986,7 +5003,7 @@ def compile_mixed_moe_gemm1_a16w4(
     xcd_swizzle: int = 0,
     split_k_intra: int = 1,
 ):
-    """A16W4 (bf16 x mxfp4) stage1 — separate from generic fp8/fp4 path."""
+    """A16W4 (bf16 x mxfp4) stage1 -- separate from generic fp8/fp4 path."""
     is_a16w4_stage1 = True
     if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"act must be silu/swiglu/situv2, got {act!r}")
@@ -5022,7 +5039,7 @@ def compile_mixed_moe_gemm1_a16w4(
     # gated by `if is_a16w4_stage1:` and generic-only blocks by
     # `if not is_a16w4_stage1:`.  This mirrors the stage2 design.
 
-    # A16W4 alias used throughout the body: gate_only ≡ mock_gate_only
+    # A16W4 alias used throughout the body: gate_only ? mock_gate_only
     gate_only = mock_gate_only
     if gate_only and gate_up_interleave:
         raise ValueError(
@@ -5563,7 +5580,7 @@ def compile_mixed_moe_gemm1_a16w4(
                 )
                 sw_rsrc = ptr_buffer_resource(arg_scale_w, _sw_nbytes_i32)
 
-                # Split-K uses f32 atomics → out_elem_bytes = 4
+                # Split-K uses f32 atomics -> out_elem_bytes = 4
                 # Rename to avoid shadowing the enclosing-scope setup var.
                 _a16_out_elem_bytes = 4 if _is_splitk else 2
                 out_nbytes_idx = (
@@ -5808,7 +5825,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                 _gui_col_g = by_n // arith.index(2) + lane_mod_16
                             else:
                                 # 4-wave xwave: per-pair output cols
-                                # pair (0,1)→cols[0:15], pair (2,3)→cols[16:31]
+                                # pair (0,1)->cols[0:15], pair (2,3)->cols[16:31]
                                 _xw_pair_off = (
                                     wave_id // arith.index(2)
                                 ) * c_n_per_wave
@@ -5817,7 +5834,7 @@ def compile_mixed_moe_gemm1_a16w4(
                                 )
                             col_g_list.append(_gui_col_g)
                         else:
-                            # Standard pair fusion: pairs of N subtiles → one output col
+                            # Standard pair fusion: pairs of N subtiles -> one output col
                             # Renamed from `pack_N` to avoid shadowing the enclosing scope.
                             _a16_pack_N = 2
                             _gui_num_acc_n_out = num_acc_n // _a16_pack_N
@@ -5963,7 +5980,7 @@ def compile_mixed_moe_gemm1_a16w4(
                     return raw_all
 
                 def load_b_scale(base_k, mni_list, n_pack_list, ku_limit=k_unroll):
-                    """Load scales for all ku × ni. Returns scales[ku][ni] = f32."""
+                    """Load scales for all ku x ni. Returns scales[ku][ni] = f32."""
                     scale_cache = {}
                     scales = []
                     for ku in range_constexpr(ku_limit):
@@ -6099,8 +6116,8 @@ def compile_mixed_moe_gemm1_a16w4(
                 ):
                     """Compute GEMM tile with preloaded A.
 
-                    Full preload (m_repeat=1): ni→ku, all A in VGPRs.
-                    Partial preload (m_repeat>1): ku→mi→ni, m_preload=2
+                    Full preload (m_repeat=1): ni->ku, all A in VGPRs.
+                    Partial preload (m_repeat>1): ku->mi->ni, m_preload=2
                     pipeline, reload remaining A from cur_lds_buffer.
 
                     ku_count: number of k_unroll iterations to execute
@@ -6114,7 +6131,7 @@ def compile_mixed_moe_gemm1_a16w4(
                     a_tiles_next = [None] * _m_preload
 
                     if _can_full_preload:
-                        # --- Full preload: ni → ku → mi ---
+                        # --- Full preload: ni -> ku -> mi ---
                         _is_last_ni = num_acc_n - 1
 
                         for ni in range_constexpr(num_acc_n):
@@ -6397,7 +6414,7 @@ def compile_mixed_moe_gemm1_a16w4(
                     _wg_k_off = arith.index(0)
 
                 # ---- CK-style pipeline: HEAD ----
-                # DMA A[0] → pong (full tile_k, shared by all wave groups)
+                # DMA A[0] -> pong (full tile_k, shared by all wave groups)
                 k0 = k_base
                 prefetch_x_to_lds(k0, lds_x_pong)
                 rocdl.sched_barrier(0)
@@ -6409,7 +6426,7 @@ def compile_mixed_moe_gemm1_a16w4(
 
                 rocdl.sched_barrier(0)
 
-                # DMA A[1] → ping
+                # DMA A[1] -> ping
                 _k1 = k_base + arith.index(tile_k)
 
                 prefetch_x_to_lds(_k1, lds_x_ping)
@@ -6424,7 +6441,7 @@ def compile_mixed_moe_gemm1_a16w4(
                 gpu.barrier()
                 rocdl.sched_barrier(0)
 
-                # Preload A[0] from pong LDS → VGPRs (safe: all threads' DMA done)
+                # Preload A[0] from pong LDS -> VGPRs (safe: all threads' DMA done)
                 a_cur = preload_a_from_lds(lds_x_pong)
                 rocdl.sched_barrier(0)
 
@@ -6562,10 +6579,10 @@ def compile_mixed_moe_gemm1_a16w4(
                     _num_accs = num_acc_n * m_repeat
                     _has_up = not _single_b
                     _streams = 2 if _has_up else 1
-                    # 4 f32 per vec4_f32 acc × _num_accs × _streams per thread
+                    # 4 f32 per vec4_f32 acc x _num_accs x _streams per thread
                     _f32_per_thread = 4 * _num_accs * _streams
                     _reduce_stride = arith.index(_f32_per_thread)
-                    # 4 waves × 64 threads × _f32_per_thread
+                    # 4 waves x 64 threads x _f32_per_thread
                     _reduce_f32_total = 4 * 64 * _f32_per_thread
 
                     reduce_lds = SmemPtr(
@@ -6617,7 +6634,7 @@ def compile_mixed_moe_gemm1_a16w4(
                             vector.store(acc_gate[_ai], reduce_lds, [_off])
                         gpu.barrier()
 
-                        # Read partner within same wave group (0↔1)
+                        # Read partner within same wave group (0<->1)
                         _xw_partner_in_grp = arith.index(1) - _wave_in_group
                         _xw_partner_wave = (
                             _wave_group * arith.index(_waves_per_group)
@@ -6628,7 +6645,7 @@ def compile_mixed_moe_gemm1_a16w4(
                             + tx_local * _reduce_stride
                         )
 
-                        # silu(gate) * up — gate is wave_in_group=0, up is wave_in_group=1
+                        # silu(gate) * up -- gate is wave_in_group=0, up is wave_in_group=1
                         _is_gate_wave = arith.cmpi(
                             arith.CmpIPredicate.eq,
                             arith.index_cast(i32, _wave_in_group),
@@ -6683,7 +6700,7 @@ def compile_mixed_moe_gemm1_a16w4(
 
                     gpu.barrier()
 
-                    # Partner: wave_id XOR 1 → pairs (0,1) and (2,3)
+                    # Partner: wave_id XOR 1 -> pairs (0,1) and (2,3)
                     _xw_wid_i32 = arith.index_cast(i32, wave_id)
                     _xw_pid_i32 = arith.xori(
                         _xw_wid_i32,
@@ -7236,7 +7253,7 @@ def compile_mixed_moe_gemm2_a16w4(
     xcd_swizzle: int = 0,
     k_batch: int = 1,
 ):
-    """A16W4 (bf16 x mxfp4) stage2 — separate from generic fp8/fp4 path."""
+    """A16W4 (bf16 x mxfp4) stage2 -- separate from generic fp8/fp4 path."""
     is_a16w4 = True
     # ---- Unified setup (A16W4 + Generic) ----
     gpu_arch = get_hip_arch()
@@ -8234,7 +8251,7 @@ def compile_mixed_moe_gemm2_a16w4(
                     _total_a_slots = k_unroll * m_repeat
 
                     def preload_a_from_lds(lds_buffer, ku_limit=k_unroll):
-                        """Load all A tiles for ku_limit × m_repeat from LDS into VGPRs."""
+                        """Load all A tiles for ku_limit x m_repeat from LDS into VGPRs."""
                         a_tiles = [None] * (ku_limit * m_repeat)
                         for ku in range_constexpr(ku_limit):
                             for mi in range_constexpr(m_repeat):

@@ -47,9 +47,11 @@ except ImportError:
 
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
+    _make_mxfp4_g1_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
     _select_mxfp4_a4w4_kernels,
+    _select_mxfp4_g1_kernel,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
@@ -700,6 +702,8 @@ def fused_moe_(
         gate_mode,
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
+        situ_beta=1.0 if beta is None else float(beta),
+        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
@@ -1334,6 +1338,9 @@ def _unsort_mxfp4_intermediate(
 ):
     """Scatter expert-sorted packed FP4 rows back to dense token-slot order."""
     sorted_rows = inter_sorted_quant.view(inter_sorted_quant.shape[0], -1)
+    output_dtype = sorted_rows.dtype
+    byte_view = sorted_rows.element_size() == 1 and output_dtype != torch.uint8
+    scatter_rows = sorted_rows.view(torch.uint8) if byte_view else sorted_rows
     packed_ids = sorted_token_ids.view(-1)
     row_count = min(sorted_rows.shape[0], packed_ids.numel())
     packed_ids = packed_ids[:row_count]
@@ -1346,12 +1353,14 @@ def _unsort_mxfp4_intermediate(
             torch.arange(row_count, device=packed_ids.device) < actual_rows
         )
     dense_rows = torch.zeros(
-        (token_num * topk, sorted_rows.shape[1]),
-        dtype=sorted_rows.dtype,
+        (token_num * topk, scatter_rows.shape[1]),
+        dtype=scatter_rows.dtype,
         device=sorted_rows.device,
     )
     dense_indices = (token_ids[valid] * topk + slot_ids[valid]).to(torch.int64)
-    dense_rows.index_copy_(0, dense_indices, sorted_rows[:row_count][valid])
+    dense_rows.index_copy_(0, dense_indices, scatter_rows[:row_count][valid])
+    if byte_view:
+        dense_rows = dense_rows.view(output_dtype)
     return dense_rows.view(token_num, topk, sorted_rows.shape[1])
 
 
@@ -1376,13 +1385,25 @@ def _mxfp4_a4w4_stage1(
     BM,
     BN,
     BK,
+    a_dtype,
+    out_dtype,
+    act,
+    situ_beta,
+    situ_linear_beta,
     max_sorted,
     kernelName1,
     device,
     use_nt=False,
     interleave=False,
 ):
-    if not inline_quant:
+    if a_dtype == "fp8" and not inline_quant:
+        if a_scale is None:
+            raise ValueError("MXMOE FP8 input requires sorted E8M0 activation scales")
+        a_scale_sorted_shuffled = a_scale
+    elif a_dtype == "fp8":
+        # Inline quant reads hidden_states directly and ignores both A buffers.
+        a_scale_sorted_shuffled = _empty_u8(device)
+    elif not inline_quant:
         aiter.mxfp4_moe_quant(
             a_input=hidden_states,
             a_quant=a_quant,
@@ -1417,14 +1438,18 @@ def _mxfp4_a4w4_stage1(
     # The flydsl port reads/writes D_INTER directly (no K-pad tail to zero).
     BM_MIN = 64
     _ia = torch.empty
-    inter_cols = D_INTER // 2
+    inter_cols = D_INTER if out_dtype == "fp8" else D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
-    inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=torch.uint8)
+    inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
+    inter_sorted_quant = _ia((max_sorted, inter_cols), device=device, dtype=inter_dtype)
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
+    inter_scale_dtype = dtypes.fp8_e8m0 if out_dtype == "fp8" else torch.uint8
     inter_sorted_shuffled_scale = torch.zeros(
-        (inter_scale_rows, inter_scale_cols), device=device, dtype=torch.uint8
+        (inter_scale_rows, inter_scale_cols),
+        device=device,
+        dtype=inter_scale_dtype,
     )
 
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
@@ -1453,7 +1478,11 @@ def _mxfp4_a4w4_stage1(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=_xcd1,
-        a_dtype="fp4",
+        a_dtype=a_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1620,10 +1649,19 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     **_kwargs,
 ):
     device = hidden_states.device
     p1 = _parse_mxfp4_g1_kname(kernelName1)
+    if p1["act"] == "situv2" and (
+        float(situ_beta) != p1["situ_beta"]
+        or float(situ_linear_beta) != p1["situ_linear_beta"]
+    ):
+        raise ValueError(
+            "MXMOE SiTUv2 runtime betas do not match the cache-safe kernel name"
+        )
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
@@ -1635,8 +1673,12 @@ def _mxfp4_a4w4_stage1_fw(
     M = hidden_states.shape[0]
     if m_indices is None:
         m_indices = (sorted_token_ids & 0xFFFFFF).contiguous()
-    a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
-    a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
+    if p1["a_dtype"] == "fp8":
+        a_quant = hidden_states
+        a_scale = a1_scale
+    else:
+        a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
+        a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
 
     bf16_zero = (
         moe_buf
@@ -1663,11 +1705,16 @@ def _mxfp4_a4w4_stage1_fw(
         BM=BM,
         BN=p1["BN"],
         BK=p1["BK"],
+        a_dtype=p1["a_dtype"],
+        out_dtype=p1["out_dtype"],
+        act=p1["act"],
+        situ_beta=p1["situ_beta"],
+        situ_linear_beta=p1["situ_linear_beta"],
         max_sorted=sorted_token_ids.shape[0],
         kernelName1=kernelName1,
         device=device,
         use_nt=p1["use_nt"],
-        interleave=interleave,
+        interleave=p1["interleave"] or interleave,
     )
     inter_dense_quant = _unsort_mxfp4_intermediate(
         inter_sorted_quant,
@@ -1775,14 +1822,42 @@ def _can_use_mxfp4_a4w4_backend(
     replacement_enabled,
 ):
     """Return whether the complete MXFP4 sort/GEMM1/GEMM2 path is compatible."""
+    padded_inter = ((inter_dim + 255) // 256) * 256
+    shape = (expert, model_dim, padded_inter, topk)
+    dsv4_a8w4_shapes = {
+        (384, 7168, 512, 6),
+        (384, 7168, 768, 6),
+        (384, 7168, 1536, 6),
+        (385, 7168, 512, 7),
+        (385, 7168, 768, 7),
+        (385, 7168, 1536, 7),
+        (48, 7168, 3072, 6),
+        (256, 4096, 256, 6),
+    }
+    kimi_k3_shape = (896, 3584, 512, 16)
+    if q_dtype_a == dtypes.fp8:
+        supported_a8w4_variant = (
+            activation == ActivationType.Silu and shape in dsv4_a8w4_shapes
+        ) or (
+            activation == getattr(ActivationType, "Situv2", None)
+            and shape == kimi_k3_shape
+        )
+    else:
+        # KimiK3's FP4-input variant is intentionally unsupported.
+        supported_a8w4_variant = shape != kimi_k3_shape
     return (
         replacement_enabled
         and flydsl_available
         and gfx == "gfx950"
-        and activation == ActivationType.Silu
+        and (
+            activation == ActivationType.Silu
+            or activation == getattr(ActivationType, "Situv2", None)
+        )
         and dtype == torch.bfloat16
-        and q_dtype_a == dtypes.fp4x2
+        and q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
         and q_dtype_w == dtypes.fp4x2
+        and (activation == ActivationType.Silu or q_dtype_a == dtypes.fp8)
+        and supported_a8w4_variant
         and q_type == QuantType.per_1x32
         and use_g1u1
         and not doweight_stage1
@@ -1819,6 +1894,8 @@ def get_2stage_cfgs(
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
     has_stage2_bias=False,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     gate_mode = GateMode(gate_mode)
     # Configs are keyed on (gfx, cu_num, ...) so archs that share a cu_num
@@ -2084,7 +2161,7 @@ def get_2stage_cfgs(
         else:
             cfg_flat = False
 
-    if _can_use_mxfp4_a4w4_backend(
+    can_use_mxmoe = _can_use_mxfp4_a4w4_backend(
         gfx=gfx,
         activation=activation,
         dtype=dtype,
@@ -2103,26 +2180,85 @@ def get_2stage_cfgs(
         flydsl_available=is_flydsl_available(),
         replacement_enabled=os.environ.get("AITER_MXFP4_GEMM1_REPLACEMENT", "1").lower()
         not in ("0", "false"),
+    )
+    is_a8w4_replacement = q_dtype_a == dtypes.fp8
+    locked_a8w4_g2 = isinstance(kernelName2, str) and kernelName2.startswith(
+        ("flydsl_moe2_afp8_wfp4_", "opus_moe2_afp8_wfp4_", "cktile_")
+    )
+    explicit_a8w4_replacement = _is_mxfp4_kname(kernelName1)
+    if can_use_mxmoe and (
+        not is_a8w4_replacement or (explicit_a8w4_replacement and locked_a8w4_g2)
     ):
-        has_tuned_replacement = _is_mxfp4_kname(kernelName1) and str(
-            kernelName2
-        ).startswith("flydsl_moe2_")
-        if has_tuned_replacement:
-            block_m = _parse_mxfp4_g1_kname(kernelName1)["BM"]
-        else:
-            replacement = _select_mxfp4_a4w4_kernels(
-                token=token,
-                expert=expert,
-                topk=topk,
+        if is_a8w4_replacement:
+            act = (
+                "situv2"
+                if activation == getattr(ActivationType, "Situv2", None)
+                else "silu"
             )
-            block_m = replacement["BM"]
-            kernelName1 = replacement["kernelName1"]
-            kernelName2 = replacement["kernelName2"]
+            interleave = (
+                gate_mode == GateMode.INTERLEAVE or "_gui" in str(kernelName1).lower()
+            )
+            p1 = None
+            if _is_mxfp4_kname(kernelName1):
+                try:
+                    p1 = _parse_mxfp4_g1_kname(kernelName1)
+                except ValueError:
+                    # Older provisional a8w4 names did not encode SiTU betas.
+                    p1 = None
+            if p1 is not None and p1["a_dtype"] == "fp8":
+                interleave = p1["interleave"] or interleave
+                block_m = p1["BM"]
+                kernelName1 = _make_mxfp4_g1_kname(
+                    BM=p1["BM"],
+                    BN=p1["BN"],
+                    BK=p1["BK"],
+                    a_dtype="fp8",
+                    out_dtype=p1["out_dtype"],
+                    act=act,
+                    inline_quant=p1["inline_quant"],
+                    use_nt=p1["use_nt"],
+                    interleave=interleave,
+                    kSplitK=p1["kSplitK"],
+                    xcd_swizzle=p1["xcd_swizzle"],
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+            else:
+                replacement = _select_mxfp4_g1_kernel(
+                    token=token,
+                    expert=expert,
+                    topk=topk,
+                    block_m=int(block_m),
+                    a_dtype="fp8",
+                    out_dtype="fp8",
+                    act=act,
+                    interleave=interleave,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
+                )
+                block_m = replacement["BM"]
+                kernelName1 = replacement["kernelName1"]
+        else:
+            has_tuned_replacement = _is_mxfp4_kname(kernelName1) and str(
+                kernelName2
+            ).startswith("flydsl_moe2_")
+            if has_tuned_replacement:
+                block_m = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+            else:
+                replacement = _select_mxfp4_a4w4_kernels(
+                    token=token,
+                    expert=expert,
+                    topk=topk,
+                )
+                block_m = replacement["BM"]
+                kernelName1 = replacement["kernelName1"]
+                kernelName2 = replacement["kernelName2"]
         ksplit = 0
         run_1stage = False
         run_1stage_xbf16 = False
         cfg_flat = False
         cfg = {
+            **(cfg or {}),
             "block_m": block_m,
             "ksplit": 0,
             "kernelName1": kernelName1,
@@ -2130,7 +2266,7 @@ def get_2stage_cfgs(
             "run_1stage": False,
         }
         logger.info(
-            "[fused_moe] replacing mixed A4W4 GEMM1 with MXFP4 backend "
+            "[fused_moe] replacing tuned GEMM1 with MXMOE backend "
             f"({kernelName1=}, {kernelName2=})"
         )
 
@@ -2158,31 +2294,54 @@ def get_2stage_cfgs(
         # any a4w4 kernelName to the port; the bound interleave flag picks the
         # compiled il/sep variant at runtime.
         try:
-            _bm = _parse_mxfp4_g1_kname(kernelName1)["BM"]
+            _p1 = _parse_mxfp4_g1_kname(kernelName1)
+            _bm = _p1["BM"]
         except ValueError:
+            _p1 = {
+                "a_dtype": "fp4",
+                "out_dtype": "fp4",
+                "interleave": gate_mode == GateMode.INTERLEAVE,
+            }
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
+        if _is_mxfp4_kname(kernelName2):
+            stage2_func = functools.partial(
+                _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
+            )
+        elif is_opus_cfg:
+            stage2_func = functools.partial(
+                _opus_a8w4.opus_a8w4_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+                **opus_stage2_cfg_values,
+            )
+        elif isinstance(kernelName2, str) and kernelName2.startswith("cktile_"):
+            stage2_func = functools.partial(
+                cktile_moe_stage2,
+                n_pad_zeros=hidden_pad // 64 * 64,
+                k_pad_zeros=intermediate_pad // 128 * 128,
+                activation=activation,
+            )
+        else:
+            stage2_func = functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernelName2,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            )
         return MOEMetadata(
             stage1=functools.partial(
                 _mxfp4_a4w4_stage1_fw,
                 kernelName1=kernelName1,
-                interleave=(gate_mode == GateMode.INTERLEAVE),
+                interleave=_p1["interleave"] or (gate_mode == GateMode.INTERLEAVE),
             ),
-            stage2=(
-                functools.partial(
-                    _mxfp4_a4w4_stage2_fw,
-                    kernelName2=kernelName2,
-                )
-                if _is_mxfp4_kname(kernelName2)
-                else functools.partial(
-                    _flydsl_stage2_wrapper,
-                    kernelName=kernelName2,
-                )
-            ),
+            stage2=stage2_func,
             block_m=_bm,
             ksplit=int(ksplit),
-            fuse_quant="fp4",
+            fuse_quant=_p1["out_dtype"],
             output_aux=False,
-            prequant=False,
+            prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
+            **route_bucket_metadata,
         )
 
     if run_1stage:
@@ -2707,6 +2866,8 @@ def fused_moe_2stages(
         gate_mode,
         is_ep=expert_mask is not None,
         has_stage2_bias=bias2 is not None,
+        situ_beta=1.0 if beta is None else float(beta),
+        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
     if not metadata.prequant:
         a1 = hidden_states
@@ -2820,8 +2981,9 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if metadata.stage1.func is _flydsl_stage1_wrapper:
-        extra_stage1_args["swiglu_limit"] = swiglu_limit
+    if stage1_func in (_flydsl_stage1_wrapper, _mxfp4_a4w4_stage1_fw):
+        if stage1_func is _flydsl_stage1_wrapper:
+            extra_stage1_args["swiglu_limit"] = swiglu_limit
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
         # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).

@@ -51,6 +51,10 @@ def _get_compiled_mxfp4_gemm1_port(
     interleave=False,
     xcd_swizzle=0,
     a_dtype="fp4",
+    out_dtype="fp4",
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -67,6 +71,10 @@ def _get_compiled_mxfp4_gemm1_port(
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
         a_dtype=a_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -82,12 +90,34 @@ def _assert_supported(
     BN=256,
     BK=256,
     a_dtype="fp4",
+    out_dtype="fp4",
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     if a_dtype not in _SUPPORTED_BY_DTYPE:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires a_dtype in {tuple(_SUPPORTED_BY_DTYPE)}, "
             f"got {a_dtype!r}"
         )
+    if out_dtype not in ("fp4", "fp8"):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires out_dtype in ('fp4', 'fp8'), got {out_dtype!r}"
+        )
+    if act not in ("silu", "situv2"):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires act in ('silu', 'situv2'), got {act!r}"
+        )
+    if act == "situv2":
+        if situ_beta <= 0.0:
+            raise NotImplementedError(
+                f"flydsl mxfp4 gemm1 requires situ_beta > 0, got {situ_beta!r}"
+            )
+        if situ_linear_beta <= 0.0:
+            raise NotImplementedError(
+                "flydsl mxfp4 gemm1 requires situ_linear_beta > 0, "
+                f"got {situ_linear_beta!r}"
+            )
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -134,6 +164,10 @@ def flydsl_mxfp4_gemm1(
     interleave=False,
     xcd_swizzle=0,
     a_dtype="fp4",
+    out_dtype="fp4",
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     stream=None,
 ):
     use_nt = _effective_use_nt(
@@ -155,6 +189,10 @@ def flydsl_mxfp4_gemm1(
         BN=BN,
         BK=BK,
         a_dtype=a_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -171,6 +209,10 @@ def flydsl_mxfp4_gemm1(
         interleave,
         xcd_swizzle,
         a_dtype,
+        out_dtype,
+        act,
+        situ_beta,
+        situ_linear_beta,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
