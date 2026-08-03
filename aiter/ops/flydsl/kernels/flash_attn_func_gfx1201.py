@@ -756,7 +756,7 @@ def build_flash_attn_func_module(
         Q,
         K,
         V,
-        O,  # noqa: E741
+        O,
         batch_size,
         seq_len,
         seq_len_real,

@@ -43,6 +43,13 @@ import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import (
+    llvm as _llvm,
+)
+from flydsl._mlir.dialects import (
+    memref as _memref,
+)
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
     arith,
@@ -53,17 +60,15 @@ from flydsl.expr import (
     rocdl,
 )
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T, Vector as Vec
-from flydsl.expr.utils.arith import ArithValue, _to_raw as _raw
-from .kernels_common import dtype_to_elem_type
-from .tensor_shim import _run_compiled
+from flydsl.expr.typing import T
+from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
+from flydsl.expr.utils.arith import _to_raw as _raw
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-    memref as _memref,
-)
+
+from .kernels_common import dtype_to_elem_type
+from .tensor_shim import _run_compiled
 
 _LOG2E = host_math.log2(host_math.e)
 
@@ -232,7 +237,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
         seq_len_kv: fx.Int32,
@@ -821,7 +826,7 @@ def build_flash_attn_func_module(
         Q: fx.Pointer,
         K: fx.Pointer,
         V: fx.Pointer,
-        O: fx.Pointer,  # noqa: E741
+        O: fx.Pointer,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_real: fx.Int32,
@@ -829,7 +834,7 @@ def build_flash_attn_func_module(
         q_scale_ptr: fx.Pointer,
         k_scale_ptr: fx.Pointer,
         v_scale_ptr: fx.Pointer,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         allocator.finalized = False
         ctx = CompilationContext.get_current()
@@ -944,7 +949,7 @@ def build_flash_attn_func_module(
         Q,
         K,
         V,
-        O,  # noqa: E741
+        O,
         batch_size,
         seq_len,
         seq_len_real,

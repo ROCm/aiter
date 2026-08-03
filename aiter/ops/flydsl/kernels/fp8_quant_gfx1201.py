@@ -35,18 +35,16 @@ other head_dims.
 import math
 from functools import lru_cache
 
-import torch
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, range_constexpr, buffer_ops
+import torch
+from flydsl._mlir.dialects import rocdl
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.typing import T, Stream
-from flydsl._mlir.dialects import rocdl
-from flydsl.expr import vector
+from flydsl.expr.typing import Stream, T
 
-from .tensor_shim import _to_raw, _run_compiled
+from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32
 _FP8_MAX = 448.0  # e4m3fn max normal (gfx1201 native fp8)
@@ -189,7 +187,7 @@ def _build_kernel(*, head_dim: int, rotate: bool, mode: str):
         x_out: fx.Pointer,
         scale_io: fx.Pointer,
         M: fx.Int32,
-        stream: fx.Stream = fx.Stream(None),
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         idx_m = arith.index_cast(T.index, _to_raw(M))
         k = kernel(x_in, x_out, scale_io)

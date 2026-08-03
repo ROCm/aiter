@@ -26,16 +26,16 @@ Correctness (functional coverage) lives in the pytest suite
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
+import aiter
 from aiter import dtypes
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_flash_attn_func, flydsl_fp8_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
-from aiter.jit.utils.chip_info import get_gfx
 
 torch.set_default_device("cuda")
 

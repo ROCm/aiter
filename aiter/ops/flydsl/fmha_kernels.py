@@ -35,10 +35,10 @@ import torch.nn.functional as F
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.flash_attn_func_fp8_gfx1201 import (
     build_flash_attn_func_module as build_flash_attn_fp8_func_module,
 )
+from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_kernel import flash_attn_varlen_d192_gfx1250
 
 __all__ = [

@@ -10,10 +10,10 @@ import torch
 import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
-from aiter.ops.flydsl import (  # noqa: E402
-    is_flydsl_available,
+from aiter.ops.flydsl import (
     flydsl_flash_attn_func,
     flydsl_fp8_quant,
+    is_flydsl_available,
 )
 
 if not is_flydsl_available():
