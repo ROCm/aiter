@@ -744,6 +744,13 @@ def gemm_a8w8_bpreshuffle(
         elif libtype == "cktile":
             return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
         elif libtype == "flydsl" and is_flydsl_available():
+            # GLM-5.2 q_b_proj workaround: route the faulting gfx950 shape
+            # to CKTile while preserving tuned FlyDSL dispatch for other GEMMs.
+            if get_gfx() == "gfx950" and n == 16384 and k == 2048:
+                return gemm_a8w8_bpreshuffle_cktile(
+                    XQ, WQ, x_scale, w_scale, Y, 0
+                )
+
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
