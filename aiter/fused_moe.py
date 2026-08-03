@@ -45,6 +45,7 @@ except ImportError:
         return False
 
 
+from aiter.ops.flydsl.multi_b import validate_multi_b_partitions
 from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
@@ -438,6 +439,19 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _mx_weight_scale_view(
+    weight: torch.Tensor, scale: torch.Tensor | None
+) -> torch.Tensor | None:
+    """Expose packed one-byte MX scales without reinterpreting FP32 scales."""
+    if (
+        scale is not None
+        and weight.dtype in (dtypes.fp4x2, dtypes.fp8)
+        and scale.element_size() == 1
+    ):
+        return scale.view(dtypes.fp8_e8m0)
+    return scale
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -541,6 +555,295 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+    )
+
+
+def fused_moe_multi_b(
+    hidden_states: torch.Tensor,
+    w1_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    w2_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation=ActivationType.Silu,
+    quant_type=QuantType.No,
+    doweight_stage1: bool = False,
+    w1_scale_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    w2_scale_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...] | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M=None,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    splitk: int = 0,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
+    gate_mode: str | None = GateMode.SEPARATED.value,
+    no_combine: bool = False,
+    *,
+    _q_dtype_a: torch.dtype | None = None,
+    _metadata_transform: Callable | None = None,
+    _stage1_extra_args: dict | None = None,
+    _stage2_extra_args: dict | None = None,
+):
+    """Eager gfx950 DWDP path for ordered, independently allocated expert weights.
+
+    A list of one deliberately delegates to :func:`fused_moe`, preserving the
+    existing custom-op schema, tuned-config lookup, and single-pointer ABI.
+    """
+
+    if not isinstance(w1_partitions, (list, tuple)) or not isinstance(
+        w2_partitions, (list, tuple)
+    ):
+        raise TypeError("w1_partitions and w2_partitions must be ordered sequences")
+
+    if len(w1_partitions) == len(w2_partitions) == 1:
+        if w1_scale_partitions is not None and len(w1_scale_partitions) != 1:
+            raise ValueError("list-of-one W1 scales must contain exactly one tensor")
+        if w2_scale_partitions is not None and len(w2_scale_partitions) != 1:
+            raise ValueError("list-of-one W2 scales must contain exactly one tensor")
+        if no_combine:
+            raise NotImplementedError(
+                "list-of-one delegates to the unchanged fused_moe path, which "
+                "does not expose no_combine"
+            )
+        return fused_moe(
+            hidden_states=hidden_states,
+            w1=w1_partitions[0],
+            w2=w2_partitions[0],
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
+            activation=activation,
+            quant_type=quant_type,
+            doweight_stage1=doweight_stage1,
+            w1_scale=(
+                w1_scale_partitions[0] if w1_scale_partitions is not None else None
+            ),
+            w2_scale=(
+                w2_scale_partitions[0] if w2_scale_partitions is not None else None
+            ),
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            splitk=splitk,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
+            gate_mode=gate_mode,
+        )
+
+    activation = (
+        activation
+        if isinstance(activation, ActivationType)
+        else ActivationType(activation)
+    )
+    quant_type = (
+        quant_type if isinstance(quant_type, QuantType) else QuantType(quant_type)
+    )
+    quant_type = quant_remap.get(quant_type, quant_type)
+    gate_mode = gate_mode if isinstance(gate_mode, GateMode) else GateMode(gate_mode)
+    if quant_type == QuantType.per_1x32:
+        scale_layout = "mx_1x32"
+        fp8_blockscale = False
+    elif quant_type == QuantType.per_1x128:
+        scale_layout = "fp8_128x128"
+        fp8_blockscale = True
+    else:
+        raise NotImplementedError(
+            "multi-B supports quant_type per_1x32 (MX E8M0) or "
+            "per_1x128/per_128x128 (conventional FP8 blockscale); "
+            f"got {quant_type}"
+        )
+
+    if fp8_blockscale:
+        if activation != ActivationType.Silu:
+            raise NotImplementedError(
+                "conventional FP8 multi-B currently supports SiLU only"
+            )
+        if gate_mode != GateMode.SEPARATED:
+            raise NotImplementedError(
+                "conventional FP8 multi-B requires separated gate/up weights"
+            )
+        if bias1 is not None or bias2 is not None:
+            raise NotImplementedError(
+                "conventional FP8 multi-B does not yet support bias"
+            )
+        if expert_mask is not None:
+            raise NotImplementedError(
+                "conventional FP8 multi-B does not yet support expert_mask"
+            )
+        if hidden_pad or intermediate_pad:
+            raise NotImplementedError(
+                "conventional FP8 multi-B does not support padded dimensions"
+            )
+        if splitk:
+            raise NotImplementedError(
+                "conventional FP8 multi-B stage1 does not support split-K"
+            )
+        if swiglu_limit is not None or beta is not None or linear_beta is not None:
+            raise NotImplementedError(
+                "conventional FP8 multi-B does not support activation modifiers"
+            )
+        if block_size_M not in (None, 0, -1, 32):
+            raise NotImplementedError(
+                "conventional FP8 multi-B uses fixed block_size_M=32"
+            )
+        if _q_dtype_a is not None and _q_dtype_a != dtypes.fp8:
+            raise ValueError(
+                "conventional FP8 multi-B requires FP8 activations after quantization"
+            )
+        _q_dtype_a = dtypes.fp8
+
+    spec = validate_multi_b_partitions(
+        w1_partitions,
+        w2_partitions,
+        w1_scale_partitions,
+        w2_scale_partitions,
+        bias1=bias1,
+        bias2=bias2,
+        scale_layout=scale_layout,
+    )
+    gfx = get_gfx()
+    if gfx != "gfx950":
+        raise NotImplementedError(
+            f"multi-B MoE is gfx950-only; refusing to use wave64 kernels on {gfx}"
+        )
+    if fp8_blockscale and not is_flydsl_available():
+        raise NotImplementedError(
+            "conventional FP8 multi-B requires the optional FlyDSL runtime"
+        )
+    if fp8_blockscale:
+        output_dtype = hidden_states.dtype if dtype is None else dtype
+        if output_dtype not in (dtypes.bf16, dtypes.fp16):
+            raise TypeError(
+                "conventional FP8 multi-B output dtype must be bf16 or fp16; "
+                f"got {output_dtype}"
+            )
+    if hidden_states.device != w1_partitions[0].device:
+        raise ValueError(
+            f"hidden_states is on {hidden_states.device}, expected "
+            f"{w1_partitions[0].device}"
+        )
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != spec.model_dim:
+        raise ValueError(
+            f"hidden_states must have shape [tokens, {spec.model_dim}], got "
+            f"{tuple(hidden_states.shape)}"
+        )
+    if topk_ids.dtype != dtypes.i32:
+        raise TypeError(f"multi-B topk_ids must be torch.int32, got {topk_ids.dtype}")
+    if (
+        topk_ids.ndim != 2
+        or topk_weight.shape != topk_ids.shape
+        or topk_ids.shape[0] != hidden_states.shape[0]
+    ):
+        raise ValueError(
+            "topk_ids/topk_weight must have matching [tokens, topk] shapes"
+        )
+    if (
+        topk_ids.device != hidden_states.device
+        or topk_weight.device != hidden_states.device
+    ):
+        raise ValueError("routing tensors and hidden_states must share a device")
+    if fp8_blockscale:
+        activation_scale_specs = (
+            ("a1_scale", a1_scale, (hidden_states.shape[0], spec.model_dim // 128)),
+            (
+                "a2_scale",
+                a2_scale,
+                (
+                    hidden_states.shape[0],
+                    topk_ids.shape[1],
+                    spec.inter_dim // 128,
+                ),
+            ),
+        )
+        for name, scale, expected_shape in activation_scale_specs:
+            if scale is None:
+                continue
+            if scale.device != hidden_states.device:
+                raise ValueError(
+                    f"{name} is on {scale.device}, expected {hidden_states.device}"
+                )
+            if (
+                scale.dtype != torch.float32
+                or tuple(scale.shape) != expected_shape
+                or not scale.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous FP32 with shape {expected_shape}"
+                )
+        if hidden_states.dtype == dtypes.fp8 and a1_scale is None:
+            raise ValueError(
+                "prequantized FP8 hidden_states require a1_scale [T, H/128]"
+            )
+        if hidden_states.dtype != dtypes.fp8 and a1_scale is not None:
+            raise NotImplementedError(
+                "a1_scale can only be supplied with prequantized FP8 hidden_states"
+            )
+        if a2_scale is not None:
+            raise NotImplementedError(
+                "conventional FP8 multi-B generates a2_scale internally"
+            )
+        _metadata_transform = _fixed_fp8_blockscale_multi_b_metadata(
+            hidden_states.dtype if dtype is None else dtype
+        )
+        block_size_M = 32
+    elif splitk:
+        # The active split-K factor still comes from the selected tuned metadata.
+        logger.debug("fused_moe_multi_b ignores legacy splitk=%s", splitk)
+
+    if not block_size_M:
+        block_size_M = -1
+    return _fused_moe_impl(
+        hidden_states=hidden_states,
+        w1=w1_partitions[0],
+        w2=w2_partitions[0],
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation.value,
+        quant_type=quant_type.value,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale_partitions[0],
+        w2_scale=w2_scale_partitions[0],
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+        _q_dtype_a=_q_dtype_a,
+        _metadata_transform=_metadata_transform,
+        _stage1_extra_args=_stage1_extra_args,
+        _stage2_extra_args=_stage2_extra_args,
+        _b_partition_sizes=spec.partition_sizes,
+        _w1_partitions=tuple(w1_partitions),
+        _w2_partitions=tuple(w2_partitions),
+        _w1_scale_partitions=tuple(w1_scale_partitions),
+        _w2_scale_partitions=tuple(w2_scale_partitions),
+        _no_combine=bool(no_combine),
     )
 
 
@@ -669,6 +972,12 @@ def _fused_moe_impl(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _b_partition_sizes: tuple[int, ...] | None = None,
+    _w1_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w2_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w1_scale_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w2_scale_partitions: tuple[torch.Tensor, ...] | None = None,
+    _no_combine: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -678,14 +987,20 @@ def _fused_moe_impl(
         block_size_M = None
     """user API"""
     M, topk = topk_ids.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    first_E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E = sum(_b_partition_sizes) if _b_partition_sizes is not None else first_E
 
     assert w1.shape[1] in [
         inter_dim,
         inter_dim * 2,
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
-    isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    weight_tensors = (
+        (*_w1_partitions, *_w2_partitions)
+        if _w1_partitions is not None and _w2_partitions is not None
+        else (w1, w2)
+    )
+    isShuffled = any(getattr(weight, "is_shuffled", False) for weight in weight_tensors)
 
     global_E = E
     if expert_mask is not None:
@@ -791,29 +1106,51 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    metadata = get_2stage_cfgs(
-        get_padded_M(M),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        isShuffled,
-        gate_mode,
-        is_ep=expert_mask is not None,
-        has_stage2_bias=bias2 is not None,
+    fixed_fp8_multi_b = (
+        _b_partition_sizes is not None
+        and quant_type == QuantType.per_1x128
+        and _metadata_transform is not None
     )
-
-    if _metadata_transform is not None:
-        metadata = _metadata_transform(metadata)
+    if fixed_fp8_multi_b:
+        metadata = _metadata_transform(None)
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(M),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            isShuffled,
+            gate_mode,
+            is_ep=expert_mask is not None,
+            has_stage2_bias=bias2 is not None,
+        )
+        if _metadata_transform is not None:
+            metadata = _metadata_transform(metadata)
+    if _b_partition_sizes is not None and metadata.run_1stage:
+        raise NotImplementedError(
+            "multi-B requires the current two-stage FlyDSL MoE path"
+        )
+    if _b_partition_sizes is not None:
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+        if (
+            stage1_func is not _flydsl_stage1_wrapper
+            or stage2_func is not _flydsl_stage2_wrapper
+        ):
+            raise NotImplementedError(
+                "selected MoE config is not backed by the gfx950 FlyDSL "
+                "stage1/stage2 builders required for multi-B"
+            )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -966,6 +1303,12 @@ def _fused_moe_impl(
             _metadata_transform=_metadata_transform,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            _b_partition_sizes=_b_partition_sizes,
+            _w1_partitions=_w1_partitions,
+            _w2_partitions=_w2_partitions,
+            _w1_scale_partitions=_w1_scale_partitions,
+            _w2_scale_partitions=_w2_scale_partitions,
+            _no_combine=_no_combine,
         )
 
 
@@ -1348,6 +1691,9 @@ def _flydsl_stage1_wrapper(
     situ_linear_beta: float = 1.0,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
+    w1_partitions=None,
+    w1_scale_partitions=None,
+    b_partition_sizes=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1363,39 +1709,50 @@ def _flydsl_stage1_wrapper(
     else:
         act = "silu"
     _a_scale_one = parsed.get("a_scale_one", False)
+    launch_kwargs = {
+        "a": hidden_states,
+        "sorted_token_ids": sorted_token_ids,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "out": out,
+        "topk": topk,
+        "tile_m": parsed["tile_m"],
+        "tile_n": parsed["tile_n"],
+        "tile_k": parsed["tile_k"],
+        "a_dtype": parsed["a_dtype"],
+        "b_dtype": parsed["b_dtype"],
+        "out_dtype": parsed["out_dtype"],
+        "act": act,
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+        "a1_scale": a1_scale,
+        "sorted_weights": sorted_weights,
+        "use_async_copy": True,
+        "k_batch": parsed.get("k_batch", 1),
+        "waves_per_eu": parsed.get("waves_per_eu", 3),
+        "b_nt": parsed.get("b_nt", 2),
+        "gate_mode": parsed.get("gate_mode", "separated"),
+        "inter_dim_pad": inter_dim_pad,
+        "model_dim_pad": model_dim_pad,
+        "bias": _normalize_bias_for_kernel(bias1),
+        "topk_ids": topk_ids,
+        "a_scale_one": _a_scale_one,
+        "xcd_swizzle": parsed.get("xcd_swizzle", 0),
+        "swiglu_limit": swiglu_limit,
+        "k_wave": parsed.get("k_wave", 1),
+        "fp8_blockscale": parsed.get("fp8_blockscale", False),
+    }
+    if w1_partitions is not None:
+        return aiter.ops.flydsl.flydsl_moe_stage1_multi_b(
+            w1_partitions=w1_partitions,
+            w1_scale_partitions=w1_scale_partitions,
+            b_partition_sizes=tuple(b_partition_sizes),
+            **launch_kwargs,
+        )
     return aiter.ops.flydsl.flydsl_moe_stage1(
-        a=hidden_states,
         w1=w1,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        out=out,
-        topk=topk,
-        tile_m=parsed["tile_m"],
-        tile_n=parsed["tile_n"],
-        tile_k=parsed["tile_k"],
-        a_dtype=parsed["a_dtype"],
-        b_dtype=parsed["b_dtype"],
-        out_dtype=parsed["out_dtype"],
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         w1_scale=w1_scale,
-        a1_scale=a1_scale,
-        sorted_weights=sorted_weights,
-        use_async_copy=True,
-        k_batch=parsed.get("k_batch", 1),
-        waves_per_eu=parsed.get("waves_per_eu", 3),
-        b_nt=parsed.get("b_nt", 2),
-        gate_mode=parsed.get("gate_mode", "separated"),
-        inter_dim_pad=inter_dim_pad,
-        model_dim_pad=model_dim_pad,
-        bias=_normalize_bias_for_kernel(bias1),
-        topk_ids=topk_ids,
-        a_scale_one=_a_scale_one,
-        xcd_swizzle=parsed.get("xcd_swizzle", 0),
-        swiglu_limit=swiglu_limit,
-        k_wave=parsed.get("k_wave", 1),
+        **launch_kwargs,
     )
 
 
@@ -1417,6 +1774,10 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    w2_partitions=None,
+    w2_scale_partitions=None,
+    b_partition_sizes=None,
+    return_per_slot: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1435,37 +1796,78 @@ def _flydsl_stage2_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    launch_kwargs = {
+        "inter_states": inter_states,
+        "sorted_token_ids": sorted_token_ids,
+        "sorted_expert_ids": sorted_expert_ids,
+        "num_valid_ids": num_valid_ids,
+        "out": None if return_per_slot else out,
+        "topk": topk,
+        "tile_m": parsed["tile_m"],
+        "tile_n": parsed["tile_n"],
+        "tile_k": parsed["tile_k"],
+        "a_dtype": parsed["a_dtype"],
+        "b_dtype": parsed["b_dtype"],
+        "out_dtype": parsed["out_dtype"],
+        "mode": parsed.get("mode", "atomic"),
+        "a2_scale": a2_scale,
+        "sorted_weights": sorted_weights,
+        "sort_block_m": parsed.get("sort_block_m", 0),
+        "waves_per_eu": parsed.get("waves_per_eu", None),
+        "use_async_copy": parsed.get("use_async_copy", False),
+        "cu_num_mul": parsed.get("cu_num_mul", 1),
+        "b_nt": parsed.get("b_nt", 0),
+        "persist": parsed.get("persist", None),
+        "inter_dim_pad": inter_dim_pad,
+        "model_dim_pad": model_dim_pad,
+        "bias": bias2,
+        "xcd_swizzle": parsed.get("xcd_swizzle", 0),
+        "expert_mask": expert_mask,
+        "topk_ids": topk_ids,
+        "return_per_slot": return_per_slot,
+        "fp8_blockscale": parsed.get("fp8_blockscale", False),
+    }
+    if w2_partitions is not None:
+        return aiter.ops.flydsl.flydsl_moe_stage2_multi_b(
+            w2_partitions=w2_partitions,
+            w2_scale_partitions=w2_scale_partitions,
+            b_partition_sizes=tuple(b_partition_sizes),
+            **launch_kwargs,
+        )
     return aiter.ops.flydsl.flydsl_moe_stage2(
-        inter_states=inter_states,
         w2=w2,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        num_valid_ids=num_valid_ids,
-        out=out,
-        topk=topk,
-        tile_m=parsed["tile_m"],
-        tile_n=parsed["tile_n"],
-        tile_k=parsed["tile_k"],
-        a_dtype=parsed["a_dtype"],
-        b_dtype=parsed["b_dtype"],
-        out_dtype=parsed["out_dtype"],
-        mode=parsed.get("mode", "atomic"),
         w2_scale=w2_scale,
-        a2_scale=a2_scale,
-        sorted_weights=sorted_weights,
-        sort_block_m=parsed.get("sort_block_m", 0),
-        waves_per_eu=parsed.get("waves_per_eu", None),
-        use_async_copy=parsed.get("use_async_copy", False),
-        cu_num_mul=parsed.get("cu_num_mul", 1),
-        b_nt=parsed.get("b_nt", 0),
-        persist=parsed.get("persist", None),
-        inter_dim_pad=inter_dim_pad,
-        model_dim_pad=model_dim_pad,
-        bias=bias2,
-        xcd_swizzle=parsed.get("xcd_swizzle", 0),
-        expert_mask=expert_mask,
-        topk_ids=topk_ids,
+        **launch_kwargs,
     )
+
+
+def _fixed_fp8_blockscale_multi_b_metadata(dtype: torch.dtype) -> Callable:
+    """Build the metadata override used at both two-stage lookup sites."""
+    out_dtype = "bf16" if dtype == dtypes.bf16 else "f16"
+
+    def _override(_metadata: MOEMetadata | None) -> MOEMetadata:
+        from aiter.ops.flydsl.moe_kernels import (
+            fp8_blockscale_multi_b_kernel_names,
+        )
+
+        kernel_name1, kernel_name2 = fp8_blockscale_multi_b_kernel_names(out_dtype)
+        return MOEMetadata(
+            stage1=functools.partial(
+                _flydsl_stage1_wrapper,
+                kernelName=kernel_name1,
+                activation=ActivationType.Silu,
+            ),
+            stage2=functools.partial(
+                _flydsl_stage2_wrapper,
+                kernelName=kernel_name2,
+            ),
+            block_m=32,
+            ksplit=1,
+            run_1stage=False,
+            prequant=True,
+        )
+
+    return _override
 
 
 def _empty_bf16(device):
@@ -2682,39 +3084,71 @@ def fused_moe_2stages(
     _metadata_transform: Callable | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _b_partition_sizes: tuple[int, ...] | None = None,
+    _w1_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w2_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w1_scale_partitions: tuple[torch.Tensor, ...] | None = None,
+    _w2_scale_partitions: tuple[torch.Tensor, ...] | None = None,
+    _no_combine: bool = False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
     token_num, _ = hidden_states.shape
-    E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    first_E, model_dim, inter_dim = get_inter_dim(w1.shape, w2.shape)
+    E = sum(_b_partition_sizes) if _b_partition_sizes is not None else first_E
     dtype = moe_out.dtype
     device = hidden_states.device
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
-    is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
-    metadata = get_2stage_cfgs(
-        get_padded_M(token_num),  # consider token_num > 1024 as prefill
-        model_dim,
-        inter_dim,
-        E,
-        topk,
-        dtype,
-        q_dtype_a,
-        q_dtype_w,
-        quant_type,
-        isG1U1,
-        activation,
-        doweight_stage1,
-        hidden_pad,
-        intermediate_pad,
-        is_shuffled,
-        gate_mode,
-        is_ep=expert_mask is not None,
-        has_stage2_bias=bias2 is not None,
+    weight_tensors = (
+        (*_w1_partitions, *_w2_partitions)
+        if _w1_partitions is not None and _w2_partitions is not None
+        else (w1, w2)
     )
-    if _metadata_transform is not None:
-        metadata = _metadata_transform(metadata)
+    is_shuffled = any(
+        getattr(weight, "is_shuffled", False) for weight in weight_tensors
+    )
+    fixed_fp8_multi_b = (
+        _b_partition_sizes is not None
+        and quant_type == QuantType.per_1x128
+        and _metadata_transform is not None
+    )
+    if fixed_fp8_multi_b:
+        metadata = _metadata_transform(None)
+    else:
+        metadata = get_2stage_cfgs(
+            get_padded_M(token_num),  # consider token_num > 1024 as prefill
+            model_dim,
+            inter_dim,
+            E,
+            topk,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            quant_type,
+            isG1U1,
+            activation,
+            doweight_stage1,
+            hidden_pad,
+            intermediate_pad,
+            is_shuffled,
+            gate_mode,
+            is_ep=expert_mask is not None,
+            has_stage2_bias=bias2 is not None,
+        )
+        if _metadata_transform is not None:
+            metadata = _metadata_transform(metadata)
+    if _b_partition_sizes is not None:
+        stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+        stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+        if metadata.run_1stage or (
+            stage1_func is not _flydsl_stage1_wrapper
+            or stage2_func is not _flydsl_stage2_wrapper
+        ):
+            raise NotImplementedError(
+                "multi-B metadata override must select two-stage FlyDSL kernels"
+            )
     if not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
@@ -2817,6 +3251,32 @@ def fused_moe_2stages(
         )
     extra_stage1_args = dict(_stage1_extra_args or {})
     extra_stage2_args = dict(_stage2_extra_args or {})
+    if _b_partition_sizes is not None:
+        extra_stage1_args.update(
+            {
+                "w1_partitions": _w1_partitions,
+                "w1_scale_partitions": tuple(
+                    _mx_weight_scale_view(weight, scale)
+                    for weight, scale in zip(
+                        _w1_partitions, _w1_scale_partitions, strict=True
+                    )
+                ),
+                "b_partition_sizes": _b_partition_sizes,
+            }
+        )
+        extra_stage2_args.update(
+            {
+                "w2_partitions": _w2_partitions,
+                "w2_scale_partitions": tuple(
+                    _mx_weight_scale_view(weight, scale)
+                    for weight, scale in zip(
+                        _w2_partitions, _w2_scale_partitions, strict=True
+                    )
+                ),
+                "b_partition_sizes": _b_partition_sizes,
+                "return_per_slot": _no_combine,
+            }
+        )
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
@@ -2865,11 +3325,7 @@ def fused_moe_2stages(
             # per_Token fp8 whose scale is fp32 -- reinterpreting fp32 bytes as
             # e8m0 makes the host stride (eGUQs = stride(0)*sizeof(float)) 4x too
             # large -> asm _pf stage1 reads weight scales OOB -> MEMORY_VIOLATION.
-            w1_scale.view(dtypes.fp8_e8m0)
-            if w1.dtype in (dtypes.fp4x2, dtypes.fp8)
-            and w1_scale is not None
-            and w1_scale.element_size() == 1
-            else w1_scale
+            _mx_weight_scale_view(w1, w1_scale)
         ),
         sorted_weights=sorted_weights if doweight_stage1 else None,
         **extra_stage1_args,
@@ -2974,11 +3430,7 @@ def fused_moe_2stages(
             # See stage1 w1_scale note: only reinterpret packed (e8m0) scales;
             # per_Token fp8 uses an fp32 scale and must be passed through as-is
             # (PR #3811 regression fix).
-            w2_scale.view(dtypes.fp8_e8m0)
-            if w2.dtype in (dtypes.fp4x2, dtypes.fp8)
-            and w2_scale is not None
-            and w2_scale.element_size() == 1
-            else w2_scale
+            _mx_weight_scale_view(w2, w2_scale)
         ),
         a2_scale=a2_scale,
         block_m=block_size_M,
@@ -2987,9 +3439,9 @@ def fused_moe_2stages(
     )
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage2", _stage2_call))
-    _stage2_call()
+    stage2_out = _stage2_call()
 
-    return moe_out
+    return stage2_out if _no_combine else moe_out
 
 
 def torch_moe_act(act_input, torch_act, inter_dim):

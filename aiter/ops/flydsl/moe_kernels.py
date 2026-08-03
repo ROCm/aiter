@@ -438,6 +438,49 @@ def get_flydsl_stage2_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+def fp8_blockscale_multi_b_kernel_names(out_dtype: str) -> tuple[str, str]:
+    """Return fixed correctness-first kernel names for conventional FP8 multi-B."""
+    out_dtype = str(out_dtype)
+    stage1 = (
+        flydsl_kernel_name(1, "fp8", "fp8", out_dtype, 32, 128, 128) + "_fp8_blockscale"
+    )
+    stage2 = (
+        flydsl_kernel_name(2, "fp8", "fp8", out_dtype, 32, 128, 128, "reduce")
+        + "_fp8_blockscale"
+    )
+    return stage1, stage2
+
+
+def _register_fp8_blockscale_multi_b_configs() -> None:
+    for out_dtype in ("bf16", "f16"):
+        stage1, stage2 = fp8_blockscale_multi_b_kernel_names(out_dtype)
+        _KERNEL_PARAMS[stage1] = {
+            "stage": 1,
+            "a_dtype": "fp8",
+            "b_dtype": "fp8",
+            "out_dtype": out_dtype,
+            "tile_m": 32,
+            "tile_n": 128,
+            "tile_k": 128,
+            "MPerBlock": 32,
+            "k_batch": 1,
+            "gate_mode": "separated",
+            "fp8_blockscale": True,
+        }
+        _KERNEL_PARAMS[stage2] = {
+            "stage": 2,
+            "a_dtype": "fp8",
+            "b_dtype": "fp8",
+            "out_dtype": out_dtype,
+            "tile_m": 32,
+            "tile_n": 128,
+            "tile_k": 128,
+            "mode": "reduce",
+            "MPerBlock": 32,
+            "fp8_blockscale": True,
+        }
+
+
 def _register_all_configs():
     """Pre-populate _KERNEL_PARAMS with all supported configs at import time."""
     for a in ("fp8", "fp4", "fp16", "bf16"):
@@ -453,6 +496,7 @@ def _register_all_configs():
     for out in ("bf16", "f16"):
         _KERNEL_PARAMS.update(get_flydsl_stage1_kernels_int4_bf16(out))
         _KERNEL_PARAMS.update(get_flydsl_stage2_kernels_int4_bf16(out))
+    _register_fp8_blockscale_multi_b_configs()
 
 
 _register_all_configs()
@@ -485,9 +529,52 @@ def compile_flydsl_moe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    b_partition_sizes: tuple[int, ...] | None = None,
+    fp8_blockscale: bool = False,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
+    if fp8_blockscale:
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError(
+                "fp8_blockscale requires a_dtype=b_dtype='fp8', got "
+                f"{a_dtype=}, {b_dtype=}"
+            )
+        if act != "silu" or gate_mode != "separated":
+            raise NotImplementedError(
+                "fp8_blockscale stage1 supports separated SiLU only"
+            )
+        if enable_bias or model_dim_pad or inter_dim_pad:
+            raise NotImplementedError(
+                "fp8_blockscale stage1 does not support bias or padding"
+            )
+        if a_scale_one or k_wave != 1:
+            raise NotImplementedError(
+                "fp8_blockscale stage1 requires per-token scales and k_wave=1"
+            )
+        from .kernels.moe_gemm_2stage import compile_moe_gemm1
+
+        return compile_moe_gemm1(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage1=doweight_stage1,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=False,
+            k_batch=k_batch,
+            fp8_blockscale=True,
+            b_partition_sizes=tuple(b_partition_sizes or ()),
+        )
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+        if b_partition_sizes:
+            raise NotImplementedError(
+                "multi-B A16W4 is not implemented; use a gfx950 MXFP4/A8W4 "
+                "configuration with fp4/fp8 activations"
+            )
         from .kernels.mixed_moe_gemm_2stage import (
             GateMode,
             compile_mixed_moe_gemm1_a16w4,
@@ -521,9 +608,21 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
         )
     elif b_dtype in ("fp4", "mxfp4", "fp8"):
-        from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
+        from .kernels.mixed_moe_gemm_2stage import (
+            GateMode,
+            compile_mixed_moe_gemm1,
+            compile_mixed_moe_gemm1_multi_b,
+        )
 
-        return compile_mixed_moe_gemm1(
+        compile_kernel = (
+            compile_mixed_moe_gemm1_multi_b
+            if b_partition_sizes
+            else compile_mixed_moe_gemm1
+        )
+        compile_kwargs = {}
+        if b_partition_sizes:
+            compile_kwargs["b_partition_sizes"] = tuple(b_partition_sizes)
+        return compile_kernel(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -550,8 +649,11 @@ def compile_flydsl_moe_stage1(
             a_scale_one=a_scale_one,
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
+            **compile_kwargs,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
+        if b_partition_sizes:
+            raise NotImplementedError("multi-B int4_bf16 MoE is not implemented")
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm1
 
@@ -603,9 +705,45 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    b_partition_sizes: tuple[int, ...] | None = None,
+    fp8_blockscale: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
+    if fp8_blockscale:
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError(
+                "fp8_blockscale requires a_dtype=b_dtype='fp8', got "
+                f"{a_dtype=}, {b_dtype=}"
+            )
+        if enable_bias or model_dim_pad or inter_dim_pad:
+            raise NotImplementedError(
+                "fp8_blockscale stage2 does not support bias or padding"
+            )
+        if sort_block_m not in (0, tile_m):
+            raise NotImplementedError(
+                "fp8_blockscale stage2 requires sorting tile_m to match GEMM tile_m"
+            )
+        from .kernels.moe_gemm_2stage import compile_moe_gemm2
+
+        return compile_moe_gemm2(
+            model_dim=model_dim,
+            inter_dim=inter_dim,
+            experts=experts,
+            topk=topk,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            doweight_stage2=doweight_stage2,
+            in_dtype="fp8",
+            out_dtype=out_dtype,
+            use_cshuffle_epilog=True,
+            accumulate=accumulate,
+            fp8_blockscale=True,
+            b_partition_sizes=tuple(b_partition_sizes or ()),
+        )
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
+        if b_partition_sizes:
+            raise NotImplementedError("multi-B A16W4 stage2 is not implemented")
         from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2_a16w4
 
         return compile_mixed_moe_gemm2_a16w4(
@@ -630,9 +768,20 @@ def compile_flydsl_moe_stage2(
             enable_bias=enable_bias,
         )
     elif b_dtype in ("fp4", "mxfp4", "fp8"):
-        from .kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
+        from .kernels.mixed_moe_gemm_2stage import (
+            compile_mixed_moe_gemm2,
+            compile_mixed_moe_gemm2_multi_b,
+        )
 
-        return compile_mixed_moe_gemm2(
+        compile_kernel = (
+            compile_mixed_moe_gemm2_multi_b
+            if b_partition_sizes
+            else compile_mixed_moe_gemm2
+        )
+        compile_kwargs = {}
+        if b_partition_sizes:
+            compile_kwargs["b_partition_sizes"] = tuple(b_partition_sizes)
+        return compile_kernel(
             model_dim=model_dim,
             inter_dim=inter_dim,
             experts=experts,
@@ -660,8 +809,11 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            **compile_kwargs,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
+        if b_partition_sizes:
+            raise NotImplementedError("multi-B int4_bf16 MoE is not implemented")
         # a16wi4: bf16 activations, int4 weights with groupwise scale
         from .kernels.moe_gemm_2stage import compile_moe_gemm2
 
@@ -698,6 +850,17 @@ def _view_safe(t: torch.Tensor) -> torch.Tensor:
         t.view(torch.uint8)
         if t is not None and t.numel() > 0 and t.dtype not in _DLPACK_SAFE
         else t
+    )
+
+
+def _device_pointer_table(
+    tensors: tuple[torch.Tensor, ...], device: torch.device
+) -> torch.Tensor:
+    """Materialize ordered tensor addresses for a same-stream FlyDSL launch."""
+    return torch.tensor(
+        [tensor.data_ptr() for tensor in tensors],
+        dtype=torch.int64,
+        device=device,
     )
 
 
@@ -1281,7 +1444,7 @@ def flydsl_silu_and_mul_interleaved(
 
 def _flydsl_moe_stage1_impl(
     a: torch.Tensor,
-    w1: torch.Tensor,
+    w1: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -1297,7 +1460,9 @@ def _flydsl_moe_stage1_impl(
     act: str = "silu",
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
-    w1_scale: torch.Tensor | None = None,
+    w1_scale: (
+        torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor] | None
+    ) = None,
     a1_scale: torch.Tensor | None = None,
     sorted_weights: torch.Tensor | None = None,
     persist_m: int = 0,
@@ -1315,6 +1480,8 @@ def _flydsl_moe_stage1_impl(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    b_partition_sizes: tuple[int, ...] | None = None,
+    fp8_blockscale: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1344,10 +1511,54 @@ def _flydsl_moe_stage1_impl(
     if k_batch_intra_block is not None:
         k_batch = k_batch_intra_block
 
+    multi_b = b_partition_sizes is not None
+    if fp8_blockscale and not multi_b:
+        raise ValueError("fp8_blockscale is currently supported only for multi-B")
+    if multi_b:
+        if not isinstance(w1, (list, tuple)) or not isinstance(w1_scale, (list, tuple)):
+            raise TypeError("multi-B stage1 requires weight and scale partitions")
+        w1_partitions = tuple(w1)
+        w1_scale_partitions = tuple(w1_scale)
+        if tuple(part.shape[0] for part in w1_partitions) != tuple(b_partition_sizes):
+            raise ValueError(
+                "stage1 weight partition sizes do not match b_partition_sizes"
+            )
+        if len(w1_scale_partitions) != len(w1_partitions):
+            raise ValueError("stage1 scale partitions must match weight partitions")
+        if fp8_blockscale:
+            dtypes = _get_dtypes()
+            if any(part.dtype != dtypes.fp8 for part in w1_partitions):
+                raise TypeError("fp8_blockscale stage1 requires FP8 weight partitions")
+            if any(scale.dtype != torch.float32 for scale in w1_scale_partitions):
+                raise TypeError(
+                    "fp8_blockscale stage1 requires FP32 weight scale partitions"
+                )
+        elif any(scale.element_size() != 1 for scale in w1_scale_partitions):
+            raise TypeError(
+                "mx_1x32 multi-B stage1 requires one-byte E8M0 weight scales"
+            )
+        w1 = w1_partitions[0]
+        w1_scale = w1_scale_partitions[0]
+    else:
+        w1_partitions = ()
+        w1_scale_partitions = ()
+
     token_num = a.shape[0]
-    E = w1.shape[0]
+    E = sum(b_partition_sizes) if multi_b else w1.shape[0]
     inter_dim = w1.shape[1] // 2
     model_dim = a.shape[1]
+    if fp8_blockscale:
+        expected_a_scale_shape = (token_num, model_dim // 128)
+        if (
+            a1_scale is None
+            or a1_scale.dtype != torch.float32
+            or tuple(a1_scale.shape) != expected_a_scale_shape
+            or not a1_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "fp8_blockscale stage1 requires contiguous FP32 a1_scale with "
+                f"shape {expected_a_scale_shape}"
+            )
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
@@ -1413,6 +1624,10 @@ def _flydsl_moe_stage1_impl(
     flat_w_scale = (
         w1_scale.view(-1) if w1_scale is not None else torch.empty(0, device=dev)
     )
+    kernel_w = _device_pointer_table(w1_partitions, dev) if multi_b else w1.view(-1)
+    kernel_w_scale = (
+        _device_pointer_table(w1_scale_partitions, dev) if multi_b else flat_w_scale
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1454,7 +1669,7 @@ def _flydsl_moe_stage1_impl(
     _kernel_out = tmp_out if _is_splitk else out
     kernel_bias = None if _is_splitk else bias
     # fp4 and fp8 weights both use the MX gemm kernel (bias/out_scale arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    use_mx_gemm = b_dtype in ("fp4", "fp8") and not fp8_blockscale
     _n_in = inter_dim * 2 if use_mx_gemm else inter_dim
     _k_in = model_dim
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
@@ -1463,9 +1678,9 @@ def _flydsl_moe_stage1_impl(
         args = _build_mx_args(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            kernel_w,
             flat_a_scale,
-            flat_w_scale,
+            kernel_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1488,9 +1703,9 @@ def _flydsl_moe_stage1_impl(
         args = _s1_args_std(
             _kernel_out.view(-1),
             a.view(-1),
-            w1.view(-1),
+            kernel_w if fp8_blockscale else w1.view(-1),
             flat_a_scale,
-            flat_w_scale,
+            kernel_w_scale if fp8_blockscale else flat_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1501,6 +1716,11 @@ def _flydsl_moe_stage1_impl(
             _grid_y,
         )
 
+    compile_kwargs = {}
+    if multi_b:
+        compile_kwargs["b_partition_sizes"] = tuple(b_partition_sizes)
+    if fp8_blockscale:
+        compile_kwargs["fp8_blockscale"] = True
     exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1528,6 +1748,7 @@ def _flydsl_moe_stage1_impl(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        **compile_kwargs,
     )
     _run_compiled(exe, args)
 
@@ -1705,6 +1926,7 @@ def flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    fp8_blockscale: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1761,12 +1983,41 @@ def flydsl_moe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        fp8_blockscale=fp8_blockscale,
+    )
+
+
+def flydsl_moe_stage1_multi_b(
+    a: torch.Tensor,
+    w1_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    w1_scale_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    b_partition_sizes: tuple[int, ...],
+    **kwargs,
+):
+    """Eager pointer-table stage1 entry point for ordered expert partitions."""
+    return _flydsl_moe_stage1_impl(
+        a=a,
+        w1=tuple(w1_partitions),
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        w1_scale=tuple(w1_scale_partitions),
+        b_partition_sizes=tuple(b_partition_sizes),
+        **kwargs,
     )
 
 
 def _flydsl_moe_stage2_impl(
     inter_states: torch.Tensor,
-    w2: torch.Tensor,
+    w2: torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor],
     sorted_token_ids: torch.Tensor,
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
@@ -1780,7 +2031,9 @@ def _flydsl_moe_stage2_impl(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     mode: str = "atomic",
-    w2_scale: torch.Tensor | None = None,
+    w2_scale: (
+        torch.Tensor | tuple[torch.Tensor, ...] | list[torch.Tensor] | None
+    ) = None,
     a2_scale: torch.Tensor | None = None,
     sorted_weights: torch.Tensor | None = None,
     sort_block_m: int = 0,
@@ -1796,15 +2049,61 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    b_partition_sizes: tuple[int, ...] | None = None,
+    fp8_blockscale: bool = False,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
+    multi_b = b_partition_sizes is not None
+    if fp8_blockscale and not multi_b:
+        raise ValueError("fp8_blockscale is currently supported only for multi-B")
+    if multi_b:
+        if not isinstance(w2, (list, tuple)) or not isinstance(w2_scale, (list, tuple)):
+            raise TypeError("multi-B stage2 requires weight and scale partitions")
+        w2_partitions = tuple(w2)
+        w2_scale_partitions = tuple(w2_scale)
+        if tuple(part.shape[0] for part in w2_partitions) != tuple(b_partition_sizes):
+            raise ValueError(
+                "stage2 weight partition sizes do not match b_partition_sizes"
+            )
+        if len(w2_scale_partitions) != len(w2_partitions):
+            raise ValueError("stage2 scale partitions must match weight partitions")
+        if fp8_blockscale:
+            dtypes = _get_dtypes()
+            if any(part.dtype != dtypes.fp8 for part in w2_partitions):
+                raise TypeError("fp8_blockscale stage2 requires FP8 weight partitions")
+            if any(scale.dtype != torch.float32 for scale in w2_scale_partitions):
+                raise TypeError(
+                    "fp8_blockscale stage2 requires FP32 weight scale partitions"
+                )
+        elif any(scale.element_size() != 1 for scale in w2_scale_partitions):
+            raise TypeError(
+                "mx_1x32 multi-B stage2 requires one-byte E8M0 weight scales"
+            )
+        w2 = w2_partitions[0]
+        w2_scale = w2_scale_partitions[0]
+    else:
+        w2_partitions = ()
+        w2_scale_partitions = ()
+
     token_num = inter_states.shape[0]
-    E = w2.shape[0]
+    E = sum(b_partition_sizes) if multi_b else w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
+    if fp8_blockscale:
+        expected_a_scale_shape = (token_num, topk, inter_dim // 128)
+        if (
+            a2_scale is None
+            or a2_scale.dtype != torch.float32
+            or tuple(a2_scale.shape) != expected_a_scale_shape
+            or not a2_scale.is_contiguous()
+        ):
+            raise ValueError(
+                "fp8_blockscale stage2 requires contiguous FP32 a2_scale with "
+                f"shape {expected_a_scale_shape}"
+            )
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -1855,6 +2154,10 @@ def _flydsl_moe_stage2_impl(
     flat_w_scale = (
         w2_scale.view(-1) if w2_scale is not None else torch.empty(0, device=dev)
     )
+    kernel_w = _device_pointer_table(w2_partitions, dev) if multi_b else w2
+    kernel_w_scale = (
+        _device_pointer_table(w2_scale_partitions, dev) if multi_b else flat_w_scale
+    )
     sw = (
         sorted_weights
         if sorted_weights is not None
@@ -1881,7 +2184,7 @@ def _flydsl_moe_stage2_impl(
     if bias is not None and bias.dtype != torch.float32:
         bias = bias.to(torch.float32)
     # fp4 and fp8 weights both use the MX gemm kernel (bias arg builder).
-    use_mx_gemm = b_dtype in ("fp4", "fp8")
+    use_mx_gemm = b_dtype in ("fp4", "fp8") and not fp8_blockscale
     _n_in = model_dim
     _k_in = inter_dim
 
@@ -1900,9 +2203,9 @@ def _flydsl_moe_stage2_impl(
         args = _build_mx_args(
             target,
             inter_states,
-            w2,
+            kernel_w,
             flat_a_scale,
-            flat_w_scale,
+            kernel_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1918,9 +2221,9 @@ def _flydsl_moe_stage2_impl(
         args = _s2_args_std(
             target,
             inter_states,
-            w2,
+            kernel_w if fp8_blockscale else w2,
             flat_a_scale,
-            flat_w_scale,
+            kernel_w_scale if fp8_blockscale else flat_w_scale,
             sorted_token_ids,
             sorted_expert_ids,
             sw,
@@ -1931,6 +2234,11 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
         )
 
+    compile_kwargs = {}
+    if multi_b:
+        compile_kwargs["b_partition_sizes"] = tuple(b_partition_sizes)
+    if fp8_blockscale:
+        compile_kwargs["fp8_blockscale"] = True
     exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1954,6 +2262,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        **compile_kwargs,
     )
     _run_compiled(exe, args)
 
@@ -2002,6 +2311,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    fp8_blockscale: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2055,6 +2365,35 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        fp8_blockscale=fp8_blockscale,
+    )
+
+
+def flydsl_moe_stage2_multi_b(
+    inter_states: torch.Tensor,
+    w2_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    w2_scale_partitions: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    b_partition_sizes: tuple[int, ...],
+    **kwargs,
+) -> torch.Tensor:
+    """Eager pointer-table stage2 entry point for ordered expert partitions."""
+    return _flydsl_moe_stage2_impl(
+        inter_states=inter_states,
+        w2=tuple(w2_partitions),
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        w2_scale=tuple(w2_scale_partitions),
+        b_partition_sizes=tuple(b_partition_sizes),
+        **kwargs,
     )
 
 
