@@ -160,6 +160,9 @@ def _fp8_range():
     fp8_min = float(torch.finfo(fp8_dtype).min)
     return fp8_min, fp8_max
 
+def _align_up(value: int, alignment: int) -> int:
+    return ((int(value) + int(alignment) - 1) // int(alignment)) * int(alignment)
+
 # ============================================================================
 # Q kernel builder
 # ============================================================================
@@ -923,7 +926,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"head_size*block_size ({head_size * block_size}) must be a "
             "multiple of 16 (dwordx4 K-cache run size)"
         )
-    lds_bytes = 2 * head_size * block_size * k_cache.element_size()
+    lds_bytes = _align_up(2 * head_size * block_size * k_cache.element_size() + 4, 16)
     if lds_bytes > _MAX_LDS_BYTES:
         raise ValueError(
             f"head_size={head_size} x block_size={block_size} needs "
