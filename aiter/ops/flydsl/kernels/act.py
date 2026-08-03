@@ -40,24 +40,26 @@ def _tanh_f32(x):
     return fx.Float32(arith.select(is_pos, _raw(tanh_abs), _raw(-tanh_abs)))
 
 
-def _situ_mul_batch(gs, us, situ_beta=1.0, situ_linear_beta=1.0, clamp_limit=7.0):
+def _situ_mul_batch(gs, us, beta, beta_rcp, lbeta, lbeta_rcp, clamp_limit=float("inf")):
     """SiTUv2 activation (aiter mixed_moe situ_mul_vec4):
         situ(g)    = beta * tanh(g / beta) * sigmoid(g)
         situ_up(u) = linear_beta * tanh(u / linear_beta)
         out        = situ(clamp_gate(g)) * situ_up(clamp_lin(u))
     clamp_gate: g <= +limit (upper only); clamp_lin: u in [-limit, +limit].
+
+    beta/beta_rcp/lbeta/lbeta_rcp are runtime fx.Float32 scalars (nothing baked; one kernel serves any beta). clamp_limit is compile-time, default +inf (no clamp) to match the situv2 ref -- a finite clamp diverges at large linear_beta.
     """
+    _no_clamp = clamp_limit == float("inf")
     neg_lim = fx.Float32(-clamp_limit)
-    beta = fx.Float32(situ_beta)
-    beta_rcp = fx.Float32(1.0 / situ_beta)
-    lbeta = fx.Float32(situ_linear_beta)
-    lbeta_rcp = fx.Float32(1.0 / situ_linear_beta)
 
     out = []
     for i in range(len(gs)):
-        # clamp_gate: g <= +lim (upper only, via -max(-g,-lim)); clamp_lin: u in [-lim,+lim].
-        g = -((-gs[i]).maximumf(neg_lim))
-        u = (-((-us[i]).maximumf(neg_lim))).maximumf(neg_lim)
+        # clamp_gate: g <= +lim (upper only); clamp_lin: u in [-lim, +lim].
+        if _no_clamp:
+            g, u = gs[i], us[i]
+        else:
+            g = -((-gs[i]).maximumf(neg_lim))
+            u = (-((-us[i]).maximumf(neg_lim))).maximumf(neg_lim)
         situ_g = beta * _tanh_f32(g * beta_rcp) * _sigmoid_f32(g)
         situ_u = lbeta * _tanh_f32(u * lbeta_rcp)
         out.append(situ_g * situ_u)

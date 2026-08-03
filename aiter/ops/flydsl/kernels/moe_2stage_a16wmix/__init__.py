@@ -132,6 +132,8 @@ def flydsl_a16w4_gemm1(
     xcd_swizzle=0,
     gate_mode="separated",
     act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
     w_dtype="fp4",
     w_layout="standard",
     stream=None,
@@ -156,6 +158,8 @@ def flydsl_a16w4_gemm1(
     ``k_batch``/``gate_mode`` accepted for parity (only k_batch=1/separated supported).
     Tiles are CSV/registry-driven and always supplied by the caller; ``b_nt=None``
     falls back to the per-M U-shape (nt mid-band, cached at ends).
+
+    ``situ_beta``/``situ_linear_beta`` (SiTUv2 only) are runtime f32 scalars (nothing baked).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -201,6 +205,13 @@ def flydsl_a16w4_gemm1(
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
+    # SiTUv2 beta/linear_beta -> runtime f32 scalars; host precomputes reciprocals (no device rcp).
+    _beta = float(situ_beta)
+    _lbeta = float(situ_linear_beta)
+    if _beta <= 0.0 or _lbeta <= 0.0:
+        raise ValueError(
+            f"situ_beta/situ_linear_beta must be > 0, got {_beta!r}/{_lbeta!r}"
+        )
     _run_compiled(
         launch,
         a_bf16.data_ptr(),
@@ -211,6 +222,10 @@ def flydsl_a16w4_gemm1(
         m_indices.data_ptr(),
         int(n_tokens),
         int(grid),
+        _beta,
+        1.0 / _beta,
+        _lbeta,
+        1.0 / _lbeta,
         inter_sorted_bf16.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
     )

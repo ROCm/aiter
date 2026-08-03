@@ -730,13 +730,7 @@ def _fused_moe_impl(
             else:
                 q_dtype_a = dtypes.fp8
         elif activation == ActivationType.Situv2:
-            # SiTUv2 + separated == a16w4 (bf16 activation x mxfp4 weight); keep
-            # the activation in bf16 (no fp4 quant). a4w4 SiTUv2 full 2-stage is
-            # unsupported (no CK situv2 stage2), so separated-mode SiTUv2 always
-            # maps to the mixed_moe a16w4 kernel. AITER_SITUV2_A8W4=1 overrides
-            # to fp8 activation (a8w4) via the tuned flydsl afp8_wfp4 config.
-            # NB: on gfx1250 this is overridden below (fp4x2 / a8w4), so K3 is
-            # unaffected by this branch.
+            # SiTUv2 -> a16w4 (bf16 A x mxfp4 W); AITER_SITUV2_A8W4=1 forces fp8 A (a8w4).
             q_dtype_a = (
                 dtypes.fp8
                 if os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
@@ -799,18 +793,14 @@ def _fused_moe_impl(
     if grouped_a8w4_out is not None:
         return grouped_a8w4_out
 
-    # a16w4 (bf16 A x MXFP4 W) SiTUv2 routes through the standard 2-stage path
-    # (get_2stage_cfgs -> fused_moe_2stages, a_dtype=="bf16" branch of the stage
-    # impls). Guard the feature combos the port can't serve so they fail loudly
-    # instead of silently mis-running (it bakes beta/linear_beta at 1.0 and has no
-    # per-expert bias / expert-parallel masking).
-    _is_a16w4 = (
+    # a16w4-SiTUv2 (bf16 A x MXFP4 W); SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
+    _is_a16w4_situv2 = (
         quant_type == QuantType.per_1x32
         and q_dtype_w == dtypes.fp4x2
         and q_dtype_a == dtypes.bf16
         and activation == ActivationType.Situv2
     )
-    if _is_a16w4:
+    if _is_a16w4_situv2:
         for _bad, _why in (
             (
                 get_gfx() not in ("gfx942", "gfx950") or not is_flydsl_available(),
@@ -818,10 +808,6 @@ def _fused_moe_impl(
                     f"requires the FlyDSL kernel on CDNA gfx942/gfx950 "
                     f"(gfx={get_gfx()!r}, flydsl_available={is_flydsl_available()})"
                 ),
-            ),
-            (
-                beta not in (None, 1.0) or linear_beta not in (None, 1.0),
-                "non-default beta/linear_beta (baked at 1.0)",
             ),
             (bias1 is not None or bias2 is not None, "per-expert bias"),
             (expert_mask is not None, "expert-parallel masking"),
@@ -2402,11 +2388,8 @@ def get_2stage_cfgs(
         )
     # Debug: AITER_FLYDSL_FORCE=1 is for debug use.
     _flydsl_force = os.environ.get("AITER_FLYDSL_FORCE", "1") == "1"
-    # a16w4 (bf16 A x mxfp4 W) SiTUv2: bf16 activation (no A quant), mxfp4 weight.
-    # Routed through the same FlyDSL 2-stage path as a4w4/a8w4; the impls detect
-    # a_dtype=="bf16" and dispatch to the ported gemm1/gemm2 launchers, reusing the
-    # standard skip-quant logic (fuse_quant="", a2_scale=None, no inter-stage quant).
-    _is_a16w4 = (
+    # a16w4-SiTUv2 (bf16 A x mxfp4 W) -> ported 2-stage path; SiTUv2 gate distinguishes gpt-oss (Swiglu -> cktile).
+    _is_a16w4_situv2 = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Situv2
@@ -2417,7 +2400,7 @@ def get_2stage_cfgs(
         and not doweight_stage1
         and is_flydsl_available()
     )
-    use_mxfp4_flydsl = _is_a16w4 or (
+    use_mxfp4_flydsl = _is_a16w4_situv2 or (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and (
@@ -2445,7 +2428,7 @@ def get_2stage_cfgs(
         #   "bf16" => a16w4 bf16/fp4 (no A quant, SiTUv2)
         #   "fp4"  => a4w4 fp4/fp4
         #   "fp8"  => a8w4 fp8/fp4 (or a8w8 with w=fp8)
-        if _is_a16w4:
+        if _is_a16w4_situv2:
             _a_type = "bf16"
         elif q_dtype_a == dtypes.fp4x2:
             _a_type = "fp4"
@@ -2877,9 +2860,7 @@ def fused_moe_2stages(
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:
-        # SiTUv2 beta/linear_beta are compile-time constants baked into the
-        # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
-        # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
+        # SiTUv2 beta/linear_beta -> runtime kernel scalars; None -> 1.0 (plain tanh).
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)

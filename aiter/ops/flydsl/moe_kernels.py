@@ -1399,6 +1399,8 @@ def _flydsl_moe_stage1_impl(
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=None,
             act=_act,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
             w_layout="guinterleave",
         )
         return inter_sorted

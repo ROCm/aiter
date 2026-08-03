@@ -194,6 +194,10 @@ def _gemm1_body_a16w4(
     lane,
     wave,
     i32_ntok,
+    f32_situ_beta,
+    f32_situ_beta_rcp,
+    f32_situ_linbeta,
+    f32_situ_linbeta_rcp,
     *,
     BM,
     TILE_N,
@@ -842,7 +846,14 @@ def _gemm1_body_a16w4(
                 g = fx.Float32(fx.Vector(fx.memref_load_vec(acc_gate[mi][ni]))[ii])
                 u = fx.Float32(fx.Vector(fx.memref_load_vec(acc_up[mi][ni]))[ii])
                 if const_expr(act == "situv2"):
-                    y = _situ_mul_batch([g], [u])[0]
+                    y = _situ_mul_batch(
+                        [g],
+                        [u],
+                        fx.Float32(f32_situ_beta),
+                        fx.Float32(f32_situ_beta_rcp),
+                        fx.Float32(f32_situ_linbeta),
+                        fx.Float32(f32_situ_linbeta_rcp),
+                    )[0]
                 else:
                     y = _silu_mul_batch([g], [u])[0]
                 yb = y.to(fx.BFloat16)
@@ -972,6 +983,10 @@ def compile_gemm1_a16w4_port(
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
         i32_ntok: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
         arg_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -1026,6 +1041,10 @@ def compile_gemm1_a16w4_port(
                 lane,
                 wave,
                 i32_ntok,
+                f32_situ_beta,
+                f32_situ_beta_rcp,
+                f32_situ_linbeta,
+                f32_situ_linbeta_rcp,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
@@ -1051,6 +1070,10 @@ def compile_gemm1_a16w4_port(
         arg_mind: fx.Int64,
         i32_ntok: fx.Int32,
         i32_grid: fx.Int32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_beta_rcp: fx.Float32,
+        f32_situ_linbeta: fx.Float32,
+        f32_situ_linbeta_rcp: fx.Float32,
         arg_out: fx.Int64,
         stream: fx.Stream,
     ):
@@ -1063,6 +1086,10 @@ def compile_gemm1_a16w4_port(
             arg_cumsum,
             arg_mind,
             i32_ntok,
+            f32_situ_beta,
+            f32_situ_beta_rcp,
+            f32_situ_linbeta,
+            f32_situ_linbeta_rcp,
             arg_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
