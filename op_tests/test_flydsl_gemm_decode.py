@@ -5,6 +5,7 @@
 
 import argparse
 import statistics
+from pathlib import Path
 
 import pytest
 import torch
@@ -32,9 +33,19 @@ ATOL = 0.125
 RTOL = 0.01
 BENCHMARK_PROVIDERS = (
     "flydsl",
-    "wvsplitk",
+    "aiter_wvsplitk",
+    "vllm_wvsplitk",
     "wvsplitk_small",
     "hipblaslt",
+)
+TP_RELEVANT_SHAPES = (
+    (16384, 7168),
+    (4096, 7168),
+    (2048, 7168),
+    (7168, 4096),
+    (7168, 2048),
+    (7168, 1792),
+    (7168, 896),
 )
 
 CORRECTNESS_CASES = [
@@ -217,23 +228,56 @@ def _measure_us(fn, warmup, repeat):
     return statistics.median(samples), min(samples), max(samples)
 
 
-def _prepare_provider(provider, A, B, C, M, N, K):
-    if provider == "flydsl":
-        return (
-            lambda: gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(None)),
-            "",
-        )
+def _load_vllm_wvsplitk(library):
+    if not hasattr(torch.ops, "_rocm_C") or not hasattr(torch.ops._rocm_C, "wvSplitK"):
+        if library is None:
+            raise ValueError(
+                "vllm_wvsplitk requires --vllm-rocm-library when _rocm_C "
+                "is not already loaded"
+            )
+        library = Path(library)
+        if not library.is_file():
+            raise ValueError(f"vLLM ROCm library does not exist: {library}")
+        torch.ops.load_library(str(library))
+    return torch.ops._rocm_C.wvSplitK
 
-    if provider in {"wvsplitk", "wvsplitk_small"}:
+
+def _prepare_provider(provider, A, B, C, M, N, K, vllm_rocm_library=None):
+    if provider == "flydsl":
+
+        def run_flydsl():
+            gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(None))
+            return C
+
+        return run_flydsl, ""
+
+    if provider in {"aiter_wvsplitk", "wvsplitk_small"}:
         if K % 8 != 0:
             return None, "requires K divisible by 8"
-        if provider == "wvsplitk" and M > 4:
+        if provider == "aiter_wvsplitk" and M > 4:
             return None, "supports M in [1, 4]"
         from aiter.ops.custom import wvSpltK, wv_splitk_small_fp16_bf16
 
         cu_count = torch.cuda.get_device_properties(0).multi_processor_count
-        op = wvSpltK if provider == "wvsplitk" else wv_splitk_small_fp16_bf16
-        return lambda: op(B, A, C, M, cu_count), ""
+        op = wvSpltK if provider == "aiter_wvsplitk" else wv_splitk_small_fp16_bf16
+
+        def run_aiter():
+            op(B, A, C, M, cu_count)
+            return C
+
+        return run_aiter, ""
+
+    if provider == "vllm_wvsplitk":
+        if K % 8 != 0:
+            return None, "requires K divisible by 8"
+        if M > 5:
+            return None, "supports M in [1, 5]"
+        try:
+            op = _load_vllm_wvsplitk(vllm_rocm_library)
+        except ValueError as error:
+            return None, str(error)
+        cu_count = torch.cuda.get_device_properties(0).multi_processor_count
+        return lambda: op(B, A, None, cu_count), ""
 
     if provider == "hipblaslt":
         torch.backends.cuda.preferred_blas_library("hipblaslt")
@@ -243,7 +287,16 @@ def _prepare_provider(provider, A, B, C, M, N, K):
     raise ValueError(f"unknown benchmark provider: {provider}")
 
 
-def _benchmark(M, N, K, rounding, providers, warmup, repeat):
+def _benchmark(
+    M,
+    N,
+    K,
+    rounding,
+    providers,
+    warmup,
+    repeat,
+    vllm_rocm_library=None,
+):
     torch.manual_seed(0)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
@@ -252,19 +305,28 @@ def _benchmark(M, N, K, rounding, providers, warmup, repeat):
     results = {}
     for provider in providers:
         C = torch.full((M, N), torch.nan, dtype=torch.bfloat16, device="cuda")
-        run, skip_reason = _prepare_provider(provider, A, B, C, M, N, K)
+        run, skip_reason = _prepare_provider(
+            provider,
+            A,
+            B,
+            C,
+            M,
+            N,
+            K,
+            vllm_rocm_library,
+        )
         if run is None:
             print(f"M={M} N={N} K={K} provider={provider}: SKIP {skip_reason}")
             continue
 
         # Compile/JIT and validate outside the timed region.
-        run()
+        out = run()
         torch.cuda.synchronize()
-        assert torch.isfinite(C).all(), f"{provider} did not fully write its output"
-        torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
+        assert torch.isfinite(out).all(), f"{provider} did not fully write its output"
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
 
         median, minimum, maximum = _measure_us(run, warmup, repeat)
-        metrics = _error_metrics(C, ref)
+        metrics = _error_metrics(out, ref)
         bandwidth = bytes_transferred / (median * 1e-6) / 1e9
         tflops = 2 * M * N * K / (median * 1e-6) / 1e12
         results[provider] = {
@@ -276,14 +338,17 @@ def _benchmark(M, N, K, rounding, providers, warmup, repeat):
             **metrics,
         }
 
-    baseline = results.get("wvsplitk")
+    baseline = results.get("aiter_wvsplitk")
     for provider in providers:
         if provider not in results:
             continue
         result = results[provider]
         relative = ""
         if baseline is not None:
-            relative = f" speedup_vs_wvsplitk={baseline['median'] / result['median']:.3f}x"
+            relative = (
+                f" speedup_vs_aiter_wvsplitk="
+                f"{baseline['median'] / result['median']:.3f}x"
+            )
         print(
             f"M={M} N={N} K={K} provider={provider} rounding={rounding.value}: "
             f"median={result['median']:.2f} us "
@@ -301,6 +366,19 @@ def main():
     parser.add_argument("-N", type=int, default=16384)
     parser.add_argument("-K", type=int, default=7168)
     parser.add_argument(
+        "--shape",
+        type=int,
+        nargs=2,
+        action="append",
+        metavar=("N", "K"),
+        help="benchmark an (N, K) pair; repeat for multiple shapes",
+    )
+    parser.add_argument(
+        "--tp-shapes",
+        action="store_true",
+        help="benchmark representative unsharded, column-TP, and row-TP shapes",
+    )
+    parser.add_argument(
         "--rounding",
         choices=[OutputRounding.RNE.value],
         nargs="+",
@@ -314,19 +392,32 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
+    parser.add_argument(
+        "--vllm-rocm-library",
+        help="path to vLLM's built _rocm_C shared library",
+    )
     args = parser.parse_args()
+    if args.tp_shapes and args.shape:
+        parser.error("--tp-shapes cannot be combined with --shape")
+    shapes = (
+        TP_RELEVANT_SHAPES
+        if args.tp_shapes
+        else (args.shape or [(args.N, args.K)])
+    )
     for rounding_name in args.rounding:
         rounding = OutputRounding(rounding_name)
-        for M in args.M:
-            _benchmark(
-                M,
-                args.N,
-                args.K,
-                rounding,
-                args.providers,
-                args.warmup,
-                args.repeat,
-            )
+        for N, K in shapes:
+            for M in args.M:
+                _benchmark(
+                    M,
+                    N,
+                    K,
+                    rounding,
+                    args.providers,
+                    args.warmup,
+                    args.repeat,
+                    args.vllm_rocm_library,
+                )
 
 
 if __name__ == "__main__":
