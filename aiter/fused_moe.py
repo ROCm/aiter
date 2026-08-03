@@ -722,20 +722,26 @@ def _fused_moe_impl(
         # mxfp8: both activation and weight are fp8 (per-1x32 e8m0 microscale).
         q_dtype_a = dtypes.fp8
     elif quant_type == QuantType.per_1x32:
-        if activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
+        if activation == ActivationType.Situv2:
+            # SiTUv2 defaults to a16w4 (bf16 activation x mxfp4 weight) on the
+            # mixed_moe kernels. AITER_SITUV2_A8W4 / AITER_SITUV2_A4W4 select the
+            # fp8 / fp4 activation instead; each has its own tuned config
+            # (kimik3_{a8w4,a4w4}_tuned_fmoe.csv). Tested before the INTERLEAVE
+            # branch below, which would otherwise claim SiTUv2 and pick the
+            # activation dtype itself.
+            if os.environ.get("AITER_SITUV2_A8W4", "0") == "1":
+                q_dtype_a = dtypes.fp8
+            elif os.environ.get("AITER_SITUV2_A4W4", "0") == "1":
+                q_dtype_a = dtypes.fp4x2
+            else:
+                q_dtype_a = dtypes.bf16
+        elif activation == ActivationType.Swiglu and gate_mode == GateMode.SEPARATED:
             q_dtype_a = dtypes.bf16 if M < _SWIGLU_MXFP4_BF16_BOUND else dtypes.fp4x2
         elif activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE:
             if get_gfx() != "gfx950" or M < bf16_fp8_bound:
                 q_dtype_a = dtypes.bf16
             else:
                 q_dtype_a = dtypes.fp8
-        elif activation == ActivationType.Situv2:
-            # SiTUv2 -> a16w4 (bf16 A x mxfp4 W); AITER_SITUV2_A8W4=1 forces fp8 A (a8w4).
-            q_dtype_a = (
-                dtypes.fp8
-                if os.environ.get("AITER_SITUV2_A8W4", "0") == "1"
-                else dtypes.bf16
-            )
         else:
             q_dtype_a = dtypes.fp4x2
 
@@ -2860,7 +2866,7 @@ def fused_moe_2stages(
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:
-        # SiTUv2 beta/linear_beta -> runtime kernel scalars; None -> 1.0 (plain tanh).
+        # SiTUv2 beta/linear_beta -> stage1 (runtime on the a16w4 port, baked on a8w4/a4w4); None -> 1.0.
         extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             1.0 if linear_beta is None else float(linear_beta)
