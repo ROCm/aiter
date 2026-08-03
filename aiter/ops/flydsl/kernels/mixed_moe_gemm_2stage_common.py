@@ -157,6 +157,7 @@ def compile_mixed_moe_gemm1_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -288,6 +289,7 @@ def compile_mixed_moe_gemm1_common(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
     # distinct symbol so they can't alias the silu kernel on disk. beta is
     # compile-time for situv2 (folded via arith.constant), so two different betas
@@ -305,7 +307,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 33 if heterogeneous_b else 32
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -2467,7 +2469,11 @@ def compile_mixed_moe_gemm1_common(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    row_byte_base = out_base_idx + ts_idx * arith.constant(
+                    if const_expr(v2_output_layout):
+                        payload_row_idx = row
+                    else:
+                        payload_row_idx = ts_idx
+                    row_byte_base = out_base_idx + payload_row_idx * arith.constant(
                         out_row_stride, index=True
                     )
                     return ((fused2, row_byte_base), row_valid)
@@ -3176,6 +3182,7 @@ def compile_mixed_moe_gemm1_common(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        v2_output_layout,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3487,16 +3494,32 @@ def compile_mixed_moe_gemm2_common(
 
     out_s = str(out_dtype).strip().lower()
     if const_expr(
-        out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float")
+        out_s
+        not in (
+            "f16",
+            "fp16",
+            "half",
+            "bf16",
+            "bfloat16",
+            "f32",
+            "fp32",
+            "float",
+            "fp8",
+        )
     ):
         raise ValueError(
-            f"out_dtype must be 'f16', 'bf16', or 'f32', got {out_dtype!r}"
+            f"out_dtype must be 'f16', 'bf16', 'f32', or 'fp8', got {out_dtype!r}"
         )
     out_is_f32 = out_s in ("f32", "fp32", "float")
-    out_is_bf16 = out_s in ("bf16", "bfloat16")
+    need_fp8_out = out_s == "fp8"
+    out_is_bf16 = out_s in ("bf16", "bfloat16") or need_fp8_out
+    if const_expr(need_fp8_out and bool(accumulate)):
+        raise ValueError(
+            "compile_mixed_moe_gemm2 fp8 output requires accumulate=False (reduce path)"
+        )
     if const_expr((not bool(accumulate)) and out_is_f32):
         raise ValueError(
-            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
+            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16','fp8'}"
         )
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
@@ -3768,7 +3791,12 @@ def compile_mixed_moe_gemm2_common(
             w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
-            out_elem_bytes = 4 if out_is_f32 else 2
+            out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
+            # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
+            scale_bytes_per_row = (int(model_dim) // 8) if need_fp8_out else 0
+            out_row_bytes_const = int(model_dim) * int(out_elem_bytes) + int(
+                scale_bytes_per_row
+            )
             out_nbytes_idx = (
                 tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
             )
@@ -3778,6 +3806,12 @@ def compile_mixed_moe_gemm2_common(
                     * arith.index(topk)
                     * n_in
                     * arith.constant(out_elem_bytes, index=True)
+                )
+            if const_expr(need_fp8_out):
+                out_nbytes_idx = (
+                    tokens_in
+                    * arith.index(topk)
+                    * arith.constant(out_row_bytes_const, index=True)
                 )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
@@ -5161,6 +5195,10 @@ def compile_mixed_moe_gemm2_common(
                         row_byte_base = out_base_idx + t_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
                         )
+                    elif const_expr(need_fp8_out):
+                        row_byte_base = out_base_idx + ts_idx * arith.constant(
+                            out_row_bytes_const, index=True
+                        )
                     else:
                         row_byte_base = out_base_idx + ts_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
@@ -5178,7 +5216,81 @@ def compile_mixed_moe_gemm2_common(
 
                 def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     _fused, row_byte_base, row_byte_off_i32 = row_ctx
-                    if const_expr(not bool(accumulate)):
+                    if const_expr(need_fp8_out):
+                        # frag is vector<e_vec x f32>; e_vec==8 == one opus
+                        # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.
+                        c0_i32_q = fx.Int32(0)
+                        c1_i32_q = fx.Int32(1)
+                        c7_i32_q = fx.Int32(7)
+                        c23_i32_q = fx.Int32(23)
+                        c254_i32_q = fx.Int32(254)
+                        c255_i32_q = fx.Int32(0xFF)
+                        c0_f32_q = fx.Float32(0.0)
+                        frag_vec = fx.Vector(frag)
+                        frag_vals = []
+                        for i in range_constexpr(e_vec):
+                            frag_vals.append(frag_vec[i].to(fx.Float32))
+                        local_max = c0_f32_q
+                        for i in range_constexpr(e_vec):
+                            abs_v = fx.Float32(
+                                llvm.call_intrinsic(
+                                    f32,
+                                    "llvm.fabs.f32",
+                                    [frag_vals[i].ir_value()],
+                                    [],
+                                    [],
+                                )
+                            )
+                            local_max = local_max.maximumf(abs_v)
+                        # opus: E = bf16/f32 biased exp(amax) - 7, clamp E>=1,
+                        # E=0 when amax==0. scale byte = E; dequant = fp8*2^(E-127).
+                        amax_bits = local_max.bitcast(fx.Int32)
+                        ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
+                        E = ax_e - c7_i32_q
+                        E = (E > c1_i32_q).select(E, c1_i32_q)
+                        E = (amax_bits == c0_i32_q).select(c0_i32_q, E)
+                        quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(
+                            fx.Float32
+                        )
+                        scaled_vals = []
+                        for i in range_constexpr(e_vec):
+                            scaled_vals.append(frag_vals[i] * quant_scale)
+                        ptr_addr_idx = row_byte_base + col_g0
+                        for wg in range_constexpr(e_vec // 4):
+                            b = wg * 4
+                            packed_w = c0_i32_q
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32, scaled_vals[b], scaled_vals[b + 1], packed_w, 0
+                            )
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32,
+                                scaled_vals[b + 2],
+                                scaled_vals[b + 3],
+                                packed_w,
+                                1,
+                            )
+                            word_ptr = ptr_addr_idx + arith.constant(wg * 4, index=True)
+                            out_ptr_v = idx_to_llvm_ptr(word_ptr)
+                            packed_raw = (
+                                packed_w._value
+                                if hasattr(packed_w, "_value")
+                                else packed_w
+                            )
+                            llvm.StoreOp(
+                                packed_raw, out_ptr_v, alignment=4, nontemporal=True
+                            )
+                        # e8m0 scale byte at [model_dim + col_g0/8].
+                        scale_byte_idx = (
+                            row_byte_base
+                            + arith.constant(model_dim, index=True)
+                            + (col_g0 // arith.constant(8, index=True))
+                        )
+                        scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
+                        e8m0_raw = fx.Int8(E).ir_value()
+                        llvm.StoreOp(
+                            e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
+                        )
+                    elif const_expr(not bool(accumulate)):
                         col_idx = col_g0
                         byte_off_col = col_idx * arith.constant(
                             out_elem_bytes, index=True
