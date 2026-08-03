@@ -34,7 +34,7 @@ From `rocprofv3` on the ps64 kernel @ 32k (267 TFLOPS):
 |---|---|---|
 | MFMA cadence | `SQ_VALU_MFMA_BUSY_CYCLES / SQ_INSTS_MFMA` | 32.0 cyc |
 | MFMA busy cycles | `SQ_VALU_MFMA_BUSY_CYCLES` | 2.16e9 |
-| VALU busy cycles | `SQ_INSTS_VALU * 4` | ~1.64e9 |
+| VALU busy cycles | `(SQ_INSTS_VALU - SQ_INSTS_MFMA) * 4` | ~1.64e9 |
 | **MFMA unit utilization** | `MfmaUtil` | **59.5%** |
 | **VALU issue utilization** | `VALUBusy` | **49.3%** |
 | SALU | `SALUBusy` | 2.2% |
@@ -69,6 +69,12 @@ wall = MFMA_busy + VALU_busy = 2.16e9 + 1.64e9 = 3.80e9
 ceiling = 458 * 2.16e9 / 3.80e9 = 458 * 0.568 = ~260 TFLOPS
 ```
 
+Measured across the sweep, the sum accounts for 97.3% of the wall clock at 40k tokens
+(96.5% at 32k) and never exceeds it, so serial execution is the right model, with a few
+percent left for launch, tail imbalance and exposed memory latency.
+
+![total cycles vs MFMA+VALU, ps64 4k-40k tokens](images/fp8_fmha_ps64_cycles.png)
+
 Equivalent, counter-based way to see it:
 ```
 achieved / peak  =  267 / 458  =  0.583   ~=   MfmaUtil (0.595)
@@ -95,6 +101,11 @@ Full perf sweep (causal=1, varlen, hq=8, hk=1, p_scale):
 
 HBM traffic (`FETCH_SIZE`+`WRITE_SIZE` counters) never exceeds **~2% of the 5.2 TB/s peak** and
 *falls* with seqlen (compute is O(seqlen^2), traffic ~O(seqlen)).
+
+The same sweep as utilization, MFU against a 406 TFLOPS fp8 roofline (the 458 measured peak
+of §1 gives 39.7% -> 54.6%, tracking `MfmaUtil`):
+
+![MBU and MFU vs tokens, ps64 4k-40k](images/fp8_fmha_ps64_utilization.png)
 
 Two distinct regimes drive the ramp:
 
@@ -147,7 +158,7 @@ FMHA HW counters (ps64 kernel):
 ```
 cd /workspace/aiter
 ASM_PAGE=64 AITER_ASM_PERF=1 rocprofv3 \
-  --pmc SQ_INSTS_MFMA SQ_VALU_MFMA_BUSY_CYCLES SQ_INSTS_VALU MfmaUtil VALUBusy \
+  --pmc GRBM_GUI_ACTIVE SQ_INSTS_MFMA SQ_VALU_MFMA_BUSY_CYCLES SQ_INSTS_VALU MfmaUtil VALUBusy \
   --kernel-include-regex fmha --output-format csv -d /tmp/rocprof_ps64 \
   -- python -m pytest "op_tests/test_batch_prefill.py::test_batch_prefill_asm_perf[32768]" -s
 ```
@@ -170,12 +181,23 @@ done
 # BW = (FETCH_SIZE + WRITE_SIZE) * 1024 / (End_Timestamp - Start_Timestamp)
 ```
 
----
+Utilization and cycle sweep (the §3 / §4 plots), scripts in `poc_kl/mi300/f8_fmha_prefill/`:
+```
+cd /workspace/aiter
+python3 asm_util_sweep.py       > /tmp/ps64_timing.csv   # latency + TFLOPS per seqlen
+bash    collect_util_sweep.sh                            # rocprof counters per seqlen
+python3 plot_util_sweep.py                               # tables + both plots
+```
+Definitions used there: total cycles = `GRBM_GUI_ACTIVE * CU_NUM` (rocprof's own `MfmaUtil`
+denominator), MFMA busy = `SQ_VALU_MFMA_BUSY_CYCLES`,
+VALU busy = `(SQ_INSTS_VALU - SQ_INSTS_MFMA) * 4`. Measured on the current ps64 build
+(246.6 TFLOPS @ 32k) rather than the earlier build of §2-§5 (269.7 TFLOPS @ 32k).
 
 ## Glossary
 
 - **MFMA_busy** — cycles the matrix pipe is busy. `SQ_INSTS_MFMA * 32`.
-- **VALU_busy** — cycles the vector unit is busy. `SQ_INSTS_VALU * 4` (wave64 rate).
+- **VALU_busy** — cycles the vector unit is busy. `(SQ_INSTS_VALU - SQ_INSTS_MFMA) * 4`
+  (wave64 rate); `SQ_INSTS_VALU` counts MFMA as VALU, hence the subtraction.
 - **MfmaUtil** — % of active time the matrix pipe is busy (rocprof, normalized).
 - **VALUBusy** — % of active time the VALU issues (rocprof, normalized).
 - **peak (458)** — measured max fp8 32x32x16 throughput on MI308.
