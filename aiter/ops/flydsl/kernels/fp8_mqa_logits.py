@@ -102,7 +102,11 @@ def _device_cu_count(device_index: int) -> int:
 
 
 def _auto_num_splits(
-    seq_len_padded: int, seq_len_kv: int, rpb: int, device_index: int
+    seq_len_padded: int,
+    seq_len_kv: int,
+    rows_per_block: int,
+    block_kv: int,
+    device_index: int,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
@@ -112,13 +116,13 @@ def _auto_num_splits(
     Returns 1 once the row grid alone oversubscribes the device. Constants tuned
     on MI300X (304 CU): ~4x oversubscription, chunks >= _MIN_TILES_PER_SPLIT.
     """
-    grid_x = seq_len_padded // rpb
+    grid_x = seq_len_padded // rows_per_block
     if grid_x == 0 or seq_len_kv < 4096:
         return 1
     target_blocks = 4 * _device_cu_count(device_index)
     if grid_x >= target_blocks:
         return 1
-    max_splits = max(1, (seq_len_kv // _BLOCK_KV) // _MIN_TILES_PER_SPLIT)
+    max_splits = max(1, (seq_len_kv // block_kv) // _MIN_TILES_PER_SPLIT)
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
@@ -1202,40 +1206,160 @@ def _build_kernel_mfma_lds_pipe(*, num_heads: int, head_size: int, block_kv: int
     return launch_fp8_mqa_logits_mfma_lds_pipe
 
 
-# Kernel variants are tagged ``"mfma_r<RPB>_w<WPB>"`` (RPB query rows per block,
-# WPB waves per block). All share the single ``_build_kernel_mfma_r_w`` factory.
-# WPB must divide the column-tile count BKV/16 (=8 at the default BKV=128).
-def _mk_builder(rpb, wpb):
-    return lambda **kw: _build_kernel_mfma_r_w(
-        **kw, rows_per_block=rpb, waves_per_block=wpb
+# --------------------------------------------------------------------------- #
+# Kernel-variant registry (arch-dependent).
+#
+# gfx942 keeps its original ``"mfma_r<RPB>_w<WPB>"`` tags unchanged: RPB query
+# rows per block, WPB waves per block, block_kv fixed at _BLOCK_KV.
+#
+# gfx950 variants carry the MFMA shape and block_kv in the tag, because there
+# the atom and tile width both vary:
+#     "mfma<MxNxK>_bkv<B>_r<RPB>_w<WPB>[_lds<NUM_BUFFERS>]"
+# The ``_lds`` suffix selects the LDS-pipelined builder, in which all WPB waves
+# share one staged KV tile and partition rows, so a block owns RPB*WPB rows.
+#
+# Each entry hardcodes its own block_kv, overriding whatever the caller passed
+# to ``compile_fp8_mqa_logits``.
+# --------------------------------------------------------------------------- #
+
+
+def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True):
+    """Registry entry factory.
+
+    ``lds`` is None for the direct-load builder, else the LDS buffer count
+    (prefetch depth is fixed at 2, the only configuration in use).
+    """
+    extra = {} if bkv is None else {"block_kv": bkv}
+    if lds is None:
+        return lambda **kw: _build_kernel_mfma_r_w(
+            **{**kw, **extra}, rows_per_block=rpb, waves_per_block=wpb, mfma=mfma
+        )
+    return lambda **kw: _build_kernel_mfma_lds_pipe(
+        **{**kw, **extra},
+        rows_per_block=rpb,
+        waves_per_block=wpb,
+        mfma=mfma,
+        swizzle=swizzle,
+        num_buffers=lds,
+        prefetch_depth=2,
     )
 
 
-_VARIANT_BUILDERS = {
-    f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)
-}
+_ARCH = get_gfx()
+
+_VARIANT_BUILDERS = {}
+
+if _ARCH == "gfx942":
+    _VARIANT_BUILDERS.update(
+        {f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)}
+    )
+
+if _ARCH == "gfx950":
+    # CDNA4 scaled MFMA atoms (K=128/64): gfx950-only, since those instructions
+    # require native FN operands and do not exist on gfx942.
+    _K64 = _MFMA32_K64
+    _K128 = _MFMA16_K128
+    _VARIANT_BUILDERS.update(
+        {
+            # -- direct load: every wave fetches its own KV tile, no LDS --
+            "mfma16x16x128_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K128, bkv=128),
+            "mfma16x16x128_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K128, bkv=128),
+            "mfma16x16x128_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K128, bkv=128),
+            "mfma16x16x128_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K128, bkv=128),
+            "mfma32x32x64_bkv128_r1_w1": _mk_builder(1, 1, mfma=_K64, bkv=128),
+            "mfma32x32x64_bkv128_r2_w1": _mk_builder(2, 1, mfma=_K64, bkv=128),
+            "mfma32x32x64_bkv128_r1_w2": _mk_builder(1, 2, mfma=_K64, bkv=128),
+            "mfma32x32x64_bkv128_r2_w2": _mk_builder(2, 2, mfma=_K64, bkv=128),
+            # -- LDS double-buffered: WPB waves share one staged KV tile --
+            "mfma32x32x64_bkv64_r1_w2_lds2": _mk_builder(1, 2, mfma=_K64, bkv=64, lds=2),
+            "mfma32x32x64_bkv64_r2_w2_lds2": _mk_builder(2, 2, mfma=_K64, bkv=64, lds=2),
+            "mfma32x32x64_bkv64_r2_w4_lds2": _mk_builder(2, 4, mfma=_K64, bkv=64, lds=2),
+            "mfma32x32x64_bkv128_r1_w2_lds2": _mk_builder(1, 2, mfma=_K64, bkv=128, lds=2),
+            "mfma32x32x64_bkv128_r2_w2_lds2": _mk_builder(2, 2, mfma=_K64, bkv=128, lds=2),
+            "mfma32x32x64_bkv128_r2_w4_lds2": _mk_builder(2, 4, mfma=_K64, bkv=128, lds=2),
+            "mfma32x32x64_bkv256_r1_w2_lds2": _mk_builder(1, 2, mfma=_K64, bkv=256, lds=2),
+            "mfma32x32x64_bkv256_r2_w2_lds2": _mk_builder(2, 2, mfma=_K64, bkv=256, lds=2),
+            "mfma16x16x128_bkv64_r2_w2_lds2": _mk_builder(2, 2, mfma=_K128, bkv=64, lds=2),
+            "mfma16x16x128_bkv128_r1_w2_lds2": _mk_builder(1, 2, mfma=_K128, bkv=128, lds=2),
+            "mfma16x16x128_bkv128_r2_w2_lds2": _mk_builder(2, 2, mfma=_K128, bkv=128, lds=2),
+            "mfma16x16x128_bkv128_r2_w4_lds2": _mk_builder(2, 4, mfma=_K128, bkv=128, lds=2),
+            "mfma16x16x128_bkv256_r2_w2_lds2": _mk_builder(2, 2, mfma=_K128, bkv=256, lds=2),
+            # -- LDS triple-buffered: same in-flight depth as _lds2 but the
+            #    reader/writer barrier is elided (num_buffers > prefetch_depth) --
+            "mfma32x32x64_bkv64_r1_w2_lds3": _mk_builder(1, 2, mfma=_K64, bkv=64, lds=3),
+            "mfma32x32x64_bkv64_r2_w2_lds3": _mk_builder(2, 2, mfma=_K64, bkv=64, lds=3),
+            "mfma32x32x64_bkv64_r2_w4_lds3": _mk_builder(2, 4, mfma=_K64, bkv=64, lds=3),
+            "mfma32x32x64_bkv128_r1_w2_lds3": _mk_builder(1, 2, mfma=_K64, bkv=128, lds=3),
+            "mfma32x32x64_bkv128_r2_w4_lds3": _mk_builder(2, 4, mfma=_K64, bkv=128, lds=3),
+        }
+    )
+
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-DEFAULT_VARIANT = "mfma_r2_w4"
+DEFAULT_VARIANT = (
+    "mfma_r2_w4" if _ARCH == "gfx942" else "mfma32x32x64_bkv64_r1_w2_lds3"
+)
+
+# Parses both tag schemes; group 1 is the shape (None for the gfx942 tags),
+# then block_kv (None -> _BLOCK_KV), RPB, WPB, and the LDS buffer count.
+_TAG_RE = re.compile(
+    r"^mfma(?P<shape>\d+x\d+x\d+)?(?:_bkv(?P<bkv>\d+))?"
+    r"_r(?P<rpb>\d+)_w(?P<wpb>\d+)(?:_lds(?P<lds>\d+))?$"
+)
 
 
-def _auto_variant(seq_len, seq_len_kv):
-    """Pick (RPB, WPB) from the problem shape: RPB=2 always; WPB=2 packs more
-    column tiles per wave when M and N are both large, else WPB=4 for more
-    wavefronts on small-M / short-window shapes."""
-    wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
-    return f"mfma_r2_w{wpb}"
+def _parse_variant(tag):
+    """(block_kv, rows_per_block_effective) for host-side padding and splitting.
+
+    For ``_lds`` variants the WPB waves partition rows within one shared KV
+    tile, so a block owns RPB*WPB rows and seq_len must be padded to that.
+    """
+    m = _TAG_RE.match(tag)
+    if m is None:
+        return _BLOCK_KV, 1
+    bkv = int(m.group("bkv")) if m.group("bkv") else _BLOCK_KV
+    rpb, wpb = int(m.group("rpb")), int(m.group("wpb"))
+    return bkv, (rpb * wpb if m.group("lds") else rpb)
 
 
-def _resolve_variant(variant, seq_len, seq_len_kv):
+def _auto_variant(seq_len, seq_len_kv, num_heads):
+    """Pick a variant from the problem shape.
+
+    gfx942 (unchanged): RPB=2 always; WPB=2 packs more column tiles per wave
+    when M and N are both large, else WPB=4 for more wavefronts on small-M /
+    short-window shapes.
+
+    gfx950: the LDS 3-buffer 32x32x64 atom at bkv=64, WPB=2. Rows-per-wave r
+    sets the KV reuse per block (reuse = r*WPB). r=1 gives more blocks and
+    better utilisation on small/square shapes; r=2 amortises the barrier cost
+    when KV streaming pressure is high (long KV) or the problem is large and
+    square. At H>=128 the compute-to-bandwidth ratio is already 2x that of
+    H64, so r=1 always suffices.
+    """
+    if _ARCH == "gfx942":
+        wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
+        return f"mfma_r2_w{wpb}"
+    if _ARCH == "gfx950":
+        if num_heads >= 128:
+            return "mfma32x32x64_bkv64_r1_w2_lds3"
+        streaming = seq_len_kv > 2 * seq_len
+        large_square = seq_len >= 8192 and seq_len_kv >= seq_len
+        return f"mfma32x32x64_bkv64_r{2 if streaming or large_square else 1}_w2_lds3"
+    raise NotImplementedError(
+        f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
+        "supported: gfx942, gfx950"
+    )
+
+
+def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
     tag = (
         variant
         or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        or _auto_variant(seq_len, seq_len_kv)
+        or _auto_variant(seq_len, seq_len_kv, num_heads)
     )
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
-            f"unknown fp8_mqa_logits variant {tag!r}; "
+            f"unknown fp8_mqa_logits variant {tag!r} for arch {_ARCH}; "
             f"available: {list(KERNEL_VARIANTS)}"
         )
     return tag
@@ -1345,26 +1469,27 @@ def flydsl_fp8_mqa_logits(
     if scale_mul != 1.0:
         kv_scales = kv_scales.to(torch.float32) * scale_mul
 
-    variant = _resolve_variant(variant, seq_len, seq_len_kv)
+    variant = _resolve_variant(variant, seq_len, seq_len_kv, num_heads)
+
+    _BKV, _ROWS_PER_BLOCK = _parse_variant(variant)
 
     launcher = compile_fp8_mqa_logits(
         num_heads=num_heads,
         head_size=head_size,
-        block_kv=_BLOCK_KV,
+        block_kv=_BKV,
         paged=False,
         variant=variant,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
     )
 
-    # mfma_r* kernels require seq_len padded to a multiple of rows_per_block so
-    # every block owns exactly RPB rows.  Padded rows get empty windows (start ==
-    # end == 0) so the kernel writes nothing for them; the output is sliced back
-    # to the original seq_len after the launch.
-    # Parse RPB from variant tag "mfma_r<N>_w<M>" -> N.
-    _rpb_match = re.match(r"mfma_r(\d+)", variant)
-    _RPB = int(_rpb_match.group(1)) if _rpb_match else 1
-    seq_len_padded = ((seq_len + _RPB - 1) // _RPB) * _RPB
+    # The kernels require seq_len padded to a multiple of the rows a block owns,
+    # so every block owns exactly that many. Padded rows get empty windows
+    # (start == end == 0) so the kernel writes nothing for them; the output is
+    # sliced back to the original seq_len after the launch.
+    seq_len_padded = (
+        (seq_len + _ROWS_PER_BLOCK - 1) // _ROWS_PER_BLOCK
+    ) * _ROWS_PER_BLOCK
     if seq_len_padded != seq_len:
         pad = seq_len_padded - seq_len
         Q = torch.cat([Q, Q.new_zeros((pad, num_heads, head_size))], dim=0)
@@ -1393,7 +1518,9 @@ def flydsl_fp8_mqa_logits(
             device=Q.device,
         )[:, :seq_len_kv]
 
-    num_splits = _auto_num_splits(seq_len_padded, seq_len_kv, _RPB, Q.device.index)
+    num_splits = _auto_num_splits(
+        seq_len_padded, seq_len_kv, _ROWS_PER_BLOCK, _BKV, Q.device.index
+    )
 
     if stream is None:
         stream = torch.cuda.current_stream()
