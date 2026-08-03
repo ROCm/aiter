@@ -1075,6 +1075,7 @@ def _get_ck_exclude_modules():
         "module_cache",
         "module_fused_qk_norm_mrope_cache_quant_shuffle",
         "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_inverse_rope_group_quant",
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
