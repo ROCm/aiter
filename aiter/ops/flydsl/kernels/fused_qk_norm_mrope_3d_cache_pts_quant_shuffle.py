@@ -55,6 +55,7 @@ from flydsl.expr.typing import T
 
 from aiter.utility import dtypes as aiter_dtypes
 
+from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
 # --- fixed HW assumption: wave64 (gfx942 / gfx950 CDNA). gfx1250 is wave32
@@ -859,14 +860,10 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         stream: fx.Stream to launch on; defaults to the current
             stream.
     """
-    from aiter.jit.utils.chip_info import get_gfx
-
-    if get_gfx() == "gfx1250":
+    wave_size = get_warp_size()
+    if wave_size != WAVE:
         raise NotImplementedError(
-            "flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle is wave64-"
-            "only (gfx942/gfx950); gfx1250 (wave32) needs a dedicated "
-            "variant, analogous to qk_norm_rope_quant_gfx1250.py, which does "
-            "not exist yet."
+            "Only wave64 is supported for not (detected wave{wave_size})"
         )
 
     # ---- validate the flag combination against this kernel's scope ----
