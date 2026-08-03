@@ -846,6 +846,7 @@ def fused_moe_1stage(
     quant_type=QuantType.No,
     xbf16=False,
     kernelName: str = "",
+    flat: int = 0,
     # following for quant
     q_dtype_a=None,
     q_dtype_w=None,
@@ -948,6 +949,7 @@ def fused_moe_1stage(
                 fc_scale_blkn=128,
                 fc_scale_blkk=128,
                 block_size_M=block_size_M,
+                flat_mode=flat,
             )
         elif isG1U1:
             fmoe_func = aiter.fmoe_g1u1
@@ -1105,7 +1107,7 @@ class MOEMetadata:
     use_non_temporal_load: bool = True
     fuse_quant: str = ""
     stage2_has_bias: bool = False
-    flat: bool = False
+    flat: int = 0
     # Feature flags:
     #  - output_aux: the sort emits the gemm/scatter extras (m_indices/reverse_sorted).
     #  - prequant: fused_moe_2stages quantizes a1 before stage1.
@@ -1883,7 +1885,7 @@ def get_2stage_cfgs(
         run_1stage = False
         run_1stage_xbf16 = False
         # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = False
+        cfg_flat = 0
         if (
             activation,
             q_type,
@@ -1948,9 +1950,9 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
-            cfg_flat = False
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
@@ -2005,6 +2007,7 @@ def get_2stage_cfgs(
                 activation=activation,
                 quant_type=q_type,
                 xbf16=run_1stage_xbf16,
+                flat=cfg_flat,
             ),
             None,
             block_m,
