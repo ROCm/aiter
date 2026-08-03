@@ -1017,13 +1017,13 @@ def compile_mixed_moe_gemm1_common(
                         s0, s1 = load_cell(
                             shared_w_rsrc,
                             shared_layout_b,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base,
                         )
                         s2, s3 = load_cell(
                             shared_w_rsrc,
                             shared_layout_b,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base + c1,
                         )
                         return s0, s1, s2, s3
@@ -4206,14 +4206,14 @@ def compile_mixed_moe_gemm2_common(
                             shared_w_rsrc,
                             arith.index(0),
                             shared_b_stride_n0,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base,
                         )
                         s2, s3 = load_cell(
                             shared_w_rsrc,
                             arith.index(0),
                             shared_b_stride_n0,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base + arith.index(1),
                         )
                         return s0, s1, s2, s3
