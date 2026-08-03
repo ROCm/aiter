@@ -126,6 +126,11 @@ SGLANG_CI_PATCHES = [
     },
     {
         "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
+        "old": "docker cp human-eval ci_sglang:/",
+        "new": "docker cp human-eval ci_sglang:/\n  docker exec ci_sglang git config --global --add safe.directory /human-eval",
+    },
+    {
+        "path": "scripts/ci/amd/amd_ci_install_dependency.sh",
         "old": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .",
         "new": "install_with_retry docker exec -w /human-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache --no-build-isolation -e .",
     },
