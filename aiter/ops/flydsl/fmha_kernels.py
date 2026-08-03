@@ -33,6 +33,8 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.flash_attn_func_fp8_gfx1201 import (
     build_flash_attn_func_module as build_flash_attn_fp8_func_module,
@@ -175,6 +177,20 @@ if _HAS_TRITON:
         tl.store(yp + offs, x.to(yp.dtype.element_ty), mask=rmask[:, None])
 
 
+def _live_gfx() -> str:
+    """Arch of the live GPU (e.g. ``"gfx1201"``), or ``""`` when it cannot be
+    determined.
+
+    Non-raising wrapper over the shared runtime detector, which is the arch
+    source for runtime dispatch (``get_gfx()`` honours ``GPU_ARCHS`` and so
+    describes the build target, not the GPU actually executing).
+    """
+    try:
+        return get_gfx_runtime()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _quant_pertensor_flydsl(x: torch.Tensor, rotate: bool):
     """Per-tensor rotate(optional)+fp8 quant of a single tensor via the fully
     FlyDSL 2-pass kernel. head_dim==128 only."""
@@ -207,9 +223,9 @@ def flydsl_fp8_quant(
     ``backend`` selects the producer: ``"flydsl"`` (default) runs the fully-FlyDSL
     2-pass rotate+quant kernels (in-register FWHT, no Triton); ``"triton"`` runs
     the fused Triton passes; ``"torch"`` runs the reference. All three keep rotated
-    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires head_dim==128
-    (per-tensor, so q/k/v may differ in size, e.g. cross-attention); it silently
-    falls back to Triton/torch for other head_dims. The Triton fused path
+    Q/K off HBM (2 reads + 0.5 write). The FlyDSL path requires gfx1201 and
+    head_dim==128 (per-tensor, so q/k/v may differ in size, e.g. cross-attention);
+    it silently falls back to Triton/torch otherwise. The Triton fused path
     additionally requires same-size q/k/v.
     """
     head_dim = q.shape[-1]
@@ -220,7 +236,7 @@ def flydsl_fp8_quant(
     # own independent launch, so q/k/v need not be the same size (cross-attention
     # is fine); only head_dim==128 (VEC=4) is required by the MVP kernel. Uses the
     # in-register FWHT, so it needs no host-side Hadamard matrix.
-    if be == "flydsl" and head_dim == 128:
+    if be == "flydsl" and head_dim == 128 and _live_gfx() == "gfx1201":
         q8, sq = _quant_pertensor_flydsl(q, rotate=rotation)
         k8, sk = _quant_pertensor_flydsl(k, rotate=rotation)
         v8, sv = _quant_pertensor_flydsl(v, rotate=False)
@@ -385,7 +401,8 @@ def flydsl_flash_attn_func(
         q: ``[batch, seqlen_q, num_heads, head_dim]`` (BSHD).
         k, v: ``[batch, seqlen_k, num_heads, head_dim]``. ``seqlen_k`` may differ
             from ``seqlen_q`` (cross-attention). ``k`` and ``v`` must share shape.
-        causal: apply causal masking when ``True``.
+        causal: apply causal masking when ``True``. Not supported together with
+            cross-attention (``seqlen_k != seqlen_q``).
         softmax_scale: QK^T scale; defaults to ``1/sqrt(head_dim)``. Baked into
             the compiled kernel, so non-default values compile a new variant.
         q_descale, k_descale, v_descale: per-tensor fp8 descales as 1-element
@@ -393,7 +410,9 @@ def flydsl_flash_attn_func(
             selects the fp8 kernel. Naming matches
             ``flash_attn_fp8_pertensor_func``.
         out: optional preallocated output buffer ``[batch, seqlen_q, num_heads,
-            head_dim]``. bf16 for the fp8 path, else ``q.dtype``.
+            head_dim]``. bf16 for the fp8 path, else ``q.dtype``. Used directly
+            as the kernel destination when ``seqlen_q`` needs no padding;
+            otherwise the padded result is copied into it.
         waves_per_eu: kernel occupancy hint.
         daz: enable denormals-are-zero.
         stream: optional CUDA/HIP stream; defaults to the current stream.
@@ -404,7 +423,8 @@ def flydsl_flash_attn_func(
 
     Raises:
         ValueError: on incompatible shapes/dtypes/devices, unmet ``head_dim``
-            constraints, or missing fp8 descales.
+            constraints, causal cross-attention, or missing/malformed fp8
+            descales.
     """
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         raise ValueError("flydsl_flash_attn_func requires CUDA/HIP tensors")
@@ -413,13 +433,11 @@ def flydsl_flash_attn_func(
             "q/k/v must reside on the same device, got "
             f"q={q.device} k={k.device} v={v.device}"
         )
-    try:
-        arch = torch.cuda.get_device_properties(q.device.index).gcnArchName
-    except Exception:  # noqa: BLE001
-        arch = ""
-    arch_base = arch.lower().split(":")[0] if arch else ""
-    if not arch_base.startswith("gfx1201"):
-        raise ValueError(f"flydsl_flash_attn_func requires gfx1201, got {arch!r}")
+    gfx = _live_gfx()
+    if gfx != "gfx1201":
+        raise ValueError(
+            f"flydsl_flash_attn_func requires gfx1201, got {gfx or 'unknown'!r}"
+        )
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             "expected 4D BSHD tensors, got ranks "
@@ -442,6 +460,16 @@ def flydsl_flash_attn_func(
     is_cross = seq_kv_real != seq_q_real
     is_fp8 = q.dtype in _FP8_DTYPES
 
+    # Both gfx1201 kernels bound the causal KV loop by the Q length, so a
+    # shorter K/V would be read past its allocation (garbage scores, no fault).
+    if causal and is_cross:
+        raise ValueError(
+            "causal cross-attention is unsupported: the kernel bounds the "
+            "causal KV loop by seqlen_q, which reads past a shorter K/V "
+            f"(seqlen_q={seq_q_real}, seqlen_k={seq_kv_real}). Use causal=False "
+            "or pad K/V to seqlen_q."
+        )
+
     if head_dim < 64 or head_dim % 32 != 0:
         raise ValueError(
             f"kernel requires head_dim >= 64 and head_dim % 32 == 0, got {head_dim}"
@@ -455,10 +483,36 @@ def flydsl_flash_attn_func(
                 "flydsl_flash_attn_func: fp8 inputs require q_descale, k_descale "
                 "and v_descale (1-element fp32 device tensors)."
             )
+        for name, sc in (
+            ("q_descale", q_descale),
+            ("k_descale", k_descale),
+            ("v_descale", v_descale),
+        ):
+            if (
+                not torch.is_tensor(sc)
+                or sc.dtype != torch.float32
+                or sc.numel() != 1
+                or sc.device != q.device
+            ):
+                raise ValueError(
+                    f"{name} must be a 1-element float32 tensor on {q.device}, "
+                    f"got {sc!r}"
+                )
         out_dtype = torch.bfloat16
     else:
         _torch_dtype_to_str(q.dtype)  # validate bf16/f16
         out_dtype = q.dtype
+
+    if out is not None:
+        expected = (batch, seq_q_real, num_heads, head_dim)
+        if tuple(out.shape) != expected:
+            raise ValueError(
+                f"`out` must have shape {expected}, got {tuple(out.shape)}"
+            )
+        if out.dtype != out_dtype:
+            raise ValueError(f"`out` must have dtype {out_dtype}, got {out.dtype}")
+        if out.device != q.device:
+            raise ValueError(f"`out` must be on {q.device}, got {out.device}")
 
     # Non-causal, non-BLOCK_N-aligned lengths need the kernel's per-column tail
     # mask so padded K/V columns do not leak exp(0)=1 into the softmax. Causal
@@ -472,8 +526,16 @@ def flydsl_flash_attn_func(
     q_p = _pad_seq(q, seq_q_pad - seq_q_real)
     k_p = _pad_seq(k, seq_kv_pad - seq_kv_real)
     v_p = _pad_seq(v, seq_kv_pad - seq_kv_real)
-    o_p = torch.empty(
-        (batch, seq_q_pad, num_heads, head_dim), dtype=out_dtype, device=q.device
+
+    # When Q needs no padding, `out` is itself a valid kernel destination, so
+    # skip the temporary buffer and the copy back into it.
+    write_in_place = out is not None and seq_q_pad == seq_q_real and out.is_contiguous()
+    o_p = (
+        out
+        if write_in_place
+        else torch.empty(
+            (batch, seq_q_pad, num_heads, head_dim), dtype=out_dtype, device=q.device
+        )
     )
 
     # Wrap kernel build + launch in q.device context so multi-GPU callers
@@ -544,15 +606,10 @@ def flydsl_flash_attn_func(
                 stream=launch_stream,
             )
 
+    if write_in_place:
+        return out
     result = o_p[:, :seq_q_real, :, :] if seq_q_pad != seq_q_real else o_p
     if out is not None:
-        expected = (batch, seq_q_real, num_heads, head_dim)
-        if tuple(out.shape) != expected:
-            raise ValueError(
-                f"`out` must have shape {expected}, got {tuple(out.shape)}"
-            )
-        if out.dtype != out_dtype:
-            raise ValueError(f"`out` must have dtype {out_dtype}, got {out.dtype}")
         out.copy_(result)
         return out
     return result.contiguous()

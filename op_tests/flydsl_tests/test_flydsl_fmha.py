@@ -229,6 +229,90 @@ def test_flydsl_fmha_rejects_dtype_mismatch():
         flydsl_flash_attn_func(q, k, v)
 
 
+@pytest.mark.parametrize("seq_len", [672, 640, 32])
+def test_flydsl_fmha_all_zero_head(seq_len):
+    """An all-zero head (Q=K=V=0) must give all-zero output, not NaN.
+
+    Head-padding schemes (e.g. Ulysses "pad heads to an SP-divisible count")
+    zero-pad extra heads, run attention, then slice the pads off. Every score in
+    such a head is 0, so softmax is uniform and ``o = (Σ 1·v)/S = 0``. A NaN here
+    propagates through the whole model, so this guards the degenerate
+    online-softmax row.
+    """
+    batch, num_heads, head_dim = 1, 8, 128
+    zero = slice(6, num_heads)  # the "padding" heads
+    real = slice(0, 6)
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+    q[:, :, zero] = 0
+    k[:, :, zero] = 0
+    v[:, :, zero] = 0
+
+    out = flydsl_flash_attn_func(q, k, v, causal=False)
+    ref = _ref_sdpa_bshd(q, k, v, causal=False)
+
+    assert not out.isnan().any().item(), "kernel produced NaN"
+    zero_max = out[:, :, zero].abs().max().item()
+    assert zero_max == 0.0, f"zero-head output not zero: max_abs={zero_max}"
+
+    cos = F.cosine_similarity(
+        out[:, :, real].float().reshape(-1, head_dim),
+        ref[:, :, real].float().reshape(-1, head_dim),
+        dim=1,
+    )
+    assert cos.min().item() > 0.99, f"min_cos={cos.min().item():.6f}"
+
+
+def test_flydsl_fmha_rejects_causal_cross_attention():
+    """Causal + cross-attention must raise. Both kernels bound the causal KV
+    loop by seqlen_q, so a shorter K/V is read past its allocation — measured
+    on gfx1201 this silently returns garbage (cos ~0.5 vs SDPA) rather than
+    faulting, so the wrapper has to reject it up front."""
+    q = torch.randn(1, 4096, 12, 128, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(1, 512, 12, 128, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="causal cross-attention"):
+        flydsl_flash_attn_func(q, k, v, causal=True)
+
+
+def test_flydsl_fmha_rejects_malformed_fp8_descale():
+    """FP8 descales must be 1-element fp32 tensors on q's device; a wrong dtype
+    or element count would otherwise be read as a bogus scale by the kernel."""
+    q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
+    qq, kk, vv, sq, sk, sv = flydsl_fp8_quant(q, k, v)
+
+    bad_dtype = sq.to(torch.float64)
+    with pytest.raises(ValueError, match="q_descale"):
+        flydsl_flash_attn_func(
+            qq, kk, vv, q_descale=bad_dtype, k_descale=sk, v_descale=sv
+        )
+
+    bad_numel = torch.ones(2, dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="k_descale"):
+        flydsl_flash_attn_func(
+            qq, kk, vv, q_descale=sq, k_descale=bad_numel, v_descale=sv
+        )
+
+    # A host float is the easy mistake; it must raise, not AttributeError.
+    with pytest.raises(ValueError, match="v_descale"):
+        flydsl_flash_attn_func(qq, kk, vv, q_descale=sq, k_descale=sk, v_descale=1.0)
+
+
+def test_flydsl_fmha_out_buffer_with_padding():
+    """Unaligned seqlen_q still needs the padded temporary, so ``out`` is filled
+    by a copy. Same observable contract as the in-place path."""
+    batch, seq_len, num_heads, head_dim = 1, 1000, 8, 128  # 1000 % 128 != 0
+    q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
+
+    out = torch.empty(
+        batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    ret = flydsl_flash_attn_func(q, k, v, causal=False, out=out)
+    assert ret.data_ptr() == out.data_ptr()
+
+    ref = flydsl_flash_attn_func(q, k, v, causal=False)
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
 def test_flydsl_fmha_rejects_gqa():
     """Grouped-query attention (num_heads_q != num_heads_k) is unsupported; the
     kernel assumes equal head counts."""
@@ -529,14 +613,23 @@ def test_flydsl_fmha_softmax_scale():
 
 
 def test_flydsl_fmha_out_buffer():
-    """Preallocated ``out=`` buffer is written in place and returned."""
+    """Preallocated ``out=`` buffer is written in place and returned.
+
+    ``seq_len`` is BLOCK_M-aligned, so this is the no-copy path where ``out`` is
+    the kernel's own destination; the NaN prefill proves it is fully overwritten
+    rather than partially filled.
+    """
     batch, seq_len, num_heads, head_dim = 2, 2048, 8, 128
     q, k, v = _make_qkv(batch, seq_len, num_heads, head_dim, torch.bfloat16)
-    out = torch.empty(
-        batch, seq_len, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    out = torch.full(
+        (batch, seq_len, num_heads, head_dim),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     ret = flydsl_flash_attn_func(q, k, v, causal=False, out=out)
     assert ret.data_ptr() == out.data_ptr()
+    assert not out.isnan().any().item(), "kernel did not overwrite the buffer"
 
     ref = flydsl_flash_attn_func(q, k, v, causal=False)
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -585,8 +678,9 @@ def test_flydsl_fmha_fp8_out_buffer_and_softmax_scale():
 
 
 def test_flydsl_fmha_rejects_bad_out_buffer():
-    """``out=`` with the wrong shape or dtype must raise (guards the
-    preallocated-buffer path)."""
+    """``out=`` with the wrong shape, dtype or device must raise (guards the
+    preallocated-buffer path). A foreign-device ``out`` matters most: on the
+    no-copy path it would be handed to the kernel as its destination."""
     q, k, v = _make_qkv(1, 1024, 8, 128, torch.bfloat16)
     bad_shape = torch.empty(1, 512, 8, 128, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="shape"):
@@ -594,6 +688,10 @@ def test_flydsl_fmha_rejects_bad_out_buffer():
     bad_dtype = torch.empty(1, 1024, 8, 128, dtype=torch.float16, device="cuda")
     with pytest.raises(ValueError, match="dtype"):
         flydsl_flash_attn_func(q, k, v, out=bad_dtype)
+    if torch.cuda.device_count() >= 2:
+        bad_device = torch.empty(1, 1024, 8, 128, dtype=torch.bfloat16, device="cuda:1")
+        with pytest.raises(ValueError, match="must be on"):
+            flydsl_flash_attn_func(q, k, v, out=bad_device)
 
 
 def test_flydsl_fmha_positional_backcompat():
