@@ -9,7 +9,6 @@ import torch
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith
     from flydsl.expr.typing import Int32, T
 
     from aiter.ops.flydsl.kernels import buffer_ops
@@ -402,8 +401,8 @@ def build_causal_conv1d_flydsl_module(
         grid_y_dim: Int32,
         stream: fx.Stream,
     ):
-        gx = arith.index_cast(T.index, num_programs)
-        gy = arith.index_cast(T.index, grid_y_dim)
+        gx = fx.Int64(num_programs)
+        gy = fx.Int64(grid_y_dim)
         conv1d_kernel(
             x_ptr,
             w_ptr,
