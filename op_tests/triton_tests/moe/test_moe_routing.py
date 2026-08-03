@@ -10,8 +10,9 @@ from aiter.ops.triton.moe.moe_routing.routing import (
     routing_from_hash,
     routing_torch,
 )
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -105,7 +106,164 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     return logits
 
 
+
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
+@pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
+def test_routing_cuda_graph_nan_inf(n_tokens: int, n_expts_tot: int):
+    """
+    A CUDA graph replay pads the batch to the captured size, so rows
+    [n_tokens_unpadded, n_tokens) hold whatever the router produced for
+    uninitialised hidden states, which may include nan/inf in vLLM.
+
+    This test validates this does not result in memory access faults.
+    """
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    device = "cuda"
+    n_expts_act = 4
+    sm_first = False
+
+    n_tokens_unpadded = n_tokens - 1
+    torch.manual_seed(0)
+    logits = torch.randn(
+        (n_tokens, n_expts_tot), dtype=torch.bfloat16, device=device
+    ).detach()
+
+    # streaming_topk masks columns [n_expts_tot, N_EXPTS_PAD) with -inf, which
+    # is not strictly below every real logit: a real -inf ties with it and a
+    # negative NaN sorts under it, and ties break towards the larger column
+    # index. Once fewer than n_expts_act real columns outrank the placeholder,
+    # top-k elects padded columns and returns expert ids >= n_expts_tot.
+    logits[n_tokens_unpadded:, :] = -float("inf")
+    logits[n_tokens_unpadded:, 0] = float("inf")
+    logits[n_tokens_unpadded:, 1] = float("nan")
+    logits[n_tokens_unpadded:, 2] = -float("nan")
+
+    # Poison memory: after `del blocks`, further `torch.empty` in routing with wrongful expert ids
+    # may read into these memory sections resulting in potential memory access fault.
+    blocks = []
+    for numel in (16, 32, 64, 128, 256, 512, 1024, 4096, 1 << 14, 1 << 16, 1 << 20):
+        blocks.append(
+            torch.full((numel,), 100e7, dtype=torch.int32, device=device)
+        )
+    # return blocks
+    del blocks
+    torch.cuda.synchronize()
+
+    routing_data, gather_idx, scatter_idx = routing(
+        logits,
+        n_expts_act,
+        sm_first=sm_first,
+    )
+    torch.cuda.synchronize()
+
+    hidden_dim = 2048
+    intermediate_dim = 512
+    from aiter.ops.triton.moe.moe_op_gemm_a8w4 import moe_gemm_a8w4
+    from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
+
+    hidden_states = torch.randn(
+        (n_tokens, hidden_dim), dtype=torch.bfloat16, device=device
+    )
+    w1 = torch.randn(
+        (n_expts_tot, hidden_dim, 2 * intermediate_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.randn(
+        (n_expts_tot, intermediate_dim, hidden_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w1, w1_scale = downcast_to_mxfp(w1, torch.uint8, axis=1)
+    w2, w2_scale = downcast_to_mxfp(w2, torch.uint8, axis=1)
+
+    x_scale = hidden_states.abs().max().float() / 448.0
+    hidden_states = downcast_to_static_fp8(hidden_states, x_scale)
+
+
+    intermediate_cache1 = moe_gemm_a8w4(
+        hidden_states,
+        w1,
+        None,
+        w1_scale,
+        x_scale,
+        x_scale,
+        None,
+        routing_data,
+        gather_indx=gather_idx,
+        out_dtype=torch.float8_e4m3fn,
+        apply_swiglu=True,
+        alpha=1.702,
+        limit=7.0,
+    )
+    torch.cuda.synchronize()
+
+    intermediate_cache3 = moe_gemm_a8w4(
+        intermediate_cache1,
+        w2,
+        None,
+        w2_scale,
+        x_scale,
+        None,
+        None,
+        routing_data,
+        scatter_indx=scatter_idx,
+        gammas=routing_data.gate_scal,
+    )
+    torch.cuda.synchronize()
+
+    # `token_offs_combined = torch.zeros` in routing fixes memory access faults
+    # but not the corrupted outputs.
+    assert torch.isfinite(intermediate_cache3[:n_tokens_unpadded]).all()
+
+
+@pytest.mark.parametrize("n_tokens", [8, 16, 24, 32])
+@pytest.mark.parametrize("n_expts_tot", [32, 64, 128])
+def test_topk_in_range(n_tokens: int, n_expts_tot: int):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    # A CUDA graph replay pads the batch to the captured size, so rows
+    # [n_tokens_unpadded, n_tokens) hold whatever the router produced for
+    # uninitialised hidden states.
+    n_tokens_unpadded = n_tokens - 1
+    torch.manual_seed(0)
+    logits = torch.randn(
+        (n_tokens, n_expts_tot), dtype=torch.bfloat16, device="cuda"
+    ).detach()
+
+    # streaming_topk masks columns [n_expts_tot, N_EXPTS_PAD) with -inf, which
+    # is not strictly below every real logit: a real -inf ties with it and a
+    # negative NaN sorts under it, and ties break towards the larger column
+    # index. Once fewer than n_expts_act real columns outrank the placeholder,
+    # top-k elects padded columns and returns expert ids >= n_expts_tot.
+    logits[n_tokens_unpadded:, :] = -float("inf")
+    logits[n_tokens_unpadded:, 0] = float("inf")
+    logits[n_tokens_unpadded:, 1] = float("nan")
+    logits[n_tokens_unpadded:, 2] = -float("nan")
+
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        HIST_BLOCK_M=hist_block_m,
+    )
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert bitmatrix.shape[0] == n_tokens
+
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
+
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)

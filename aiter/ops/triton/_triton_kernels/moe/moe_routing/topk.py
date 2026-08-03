@@ -92,6 +92,14 @@ def streaming_topk(
         x = tl.where(mask_m & mask_n, x, float("-inf"))
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+    
+    # The `other=-inf` placeholder above is NOT strictly below every real logit:
+    # -inf ties with a real -inf and sorts above a negative NaN, and ties are
+    # broken by the packed column index, which is largest for the padded
+    # columns. Such a row then selects `offs_x_n >= n_expts_tot`, i.e. an expert
+    # id that does not exist. Zero the whole packed key instead, which is the
+    # true minimum.
+    x = tl.where(mask_n, x, 0)
     acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
 
     # subsequent iterations: full blocks within n_expts_tot, no col mask
