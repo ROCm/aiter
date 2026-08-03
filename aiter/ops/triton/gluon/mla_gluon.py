@@ -10,21 +10,21 @@
 #                        Fast path: when NUM_KV_SPLITS==1, stage-1 writes the
 #                        final output directly to O and stage-2 reduce is skipped.
 #   REGIME='bh16bn128' - bf16 Q + fp8 KV, BLOCK_H=16, BLOCK_N=128,
-#                        nhead <= 16, batch_size=1, NUM_KV_SPLITS=256.
-#                        2-D (batch, split) grid. Always splits + always
-#                        reduces. NHEAD < BLOCK_H masks OOB heads on Q load
-#                        and O store.
+#                        nhead <= 96, batch_size=1, NUM_KV_SPLITS=256.
+#                        (batch, split, head_block*qlen) grid. Always splits +
+#                        always reduces. A partial last head block
+#                        (nhead % BLOCK_H != 0) masks OOB heads on Q load / O store.
 #   REGIME='bh16bn64'  - bf16 Q + bf16 KV, BLOCK_H=16, BLOCK_N=64,
-#                        nhead <= 16, batch_size >= 1, 2-D (batch, split) grid,
-#                        NUM_KV_SPLITS = max(1, 256 // batch_size). Full decode
-#                        (stage-1 + stage-2 reduce into the final O).
-#                        NHEAD < BLOCK_H masks OOB heads on Q load and O store.
+#                        nhead <= 96, batch_size >= 1,
+#                        (batch, split, head_block*qlen) grid. Full decode
+#                        (stage-1 + stage-2 reduce into the final O). A partial
+#                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
 #
-# Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 16 routes by KV dtype
-# (bf16 -> bh16bn64, fp8 -> bh16bn128).
+# Wrapper dispatch: nhead in {64,128} -> bh64; nhead <= 96 routes by KV dtype
+# (bf16 -> bh16bn64, fp8 -> bh16bn128), tiling heads into cdiv(nhead,16) blocks.
 #
 # Full decode for all regimes. For NUM_KV_SPLITS>1 stage-1 writes per-split acc +
 # fp32 lse; stage-2 (_mla_softmax_reducev_kernel) reduces into O. RETURN_LSE also
@@ -120,10 +120,15 @@ def _mla_gluon(
         q_pos = gl.program_id(1) // NUM_M_BLOCKS
         split_kv_id = gl.program_id(2) % NUM_KV_SPLITS
     else:
+        # bh16*: grid axis 2 carries (head_block, q_pos). For nhead <= 16 there is
+        # a single head block (NUM_M_BLOCKS==1) so cur_head_id==0 and q_pos==pid(2),
+        # identical to the original 2-D+qlen mapping. For nhead > 16 (e.g. 96) the
+        # head range is tiled into NUM_M_BLOCKS = cdiv(NHEAD, BLOCK_H) blocks of 16.
+        NUM_M_BLOCKS: gl.constexpr = (NHEAD + BLOCK_H - 1) // BLOCK_H
         cur_batch = gl.program_id(0)
-        cur_head_id = 0
         split_kv_id = gl.program_id(1)
-        q_pos = gl.program_id(2)
+        cur_head_id = gl.program_id(2) % NUM_M_BLOCKS
+        q_pos = gl.program_id(2) // NUM_M_BLOCKS
 
     # USE_2D_VIEW=True: fixed len or max padded VarLen
     # Req_to_tokens = block_table[batch, max_seqlen], B_seq_len = cache_seqlens[batch]
@@ -367,7 +372,7 @@ def _mla_gluon(
     cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
     offs_q_nope = cur_batch * stride_q_nope_bs + q_pos * stride_q_nope_s + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
     ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
@@ -375,7 +380,7 @@ def _mla_gluon(
         offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
         cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
         offs_q_pe = cur_batch * stride_q_pe_bs + q_pos * stride_q_pe_s + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD % BLOCK_H != 0 else None)
         gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
@@ -679,7 +684,7 @@ def _mla_gluon(
     if HAS_ATTN_SINK:
         # Fold the optional per-head sink into the softmax denom (no V contribution).
         # e_max/e_sum are natural-log units (the *LOG2E is inside exp2), so is sink.
-        if NHEAD < BLOCK_H:
+        if NHEAD % BLOCK_H != 0:
             sink = gl.load(Attn_sink + cur_head_o, mask=cur_head_o < NHEAD, other=float("-inf")).to(gl.float32)
         else:
             sink = gl.load(Attn_sink + cur_head_o).to(gl.float32)
@@ -692,7 +697,7 @@ def _mla_gluon(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-    if NHEAD < BLOCK_H:
+    if NHEAD % BLOCK_H != 0:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
     else:
         gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
@@ -705,7 +710,7 @@ def _mla_gluon(
         offs_final_lse = cur_batch * stride_final_lse_b + q_pos * stride_final_lse_s + cur_head_lse * stride_final_lse_h
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD < BLOCK_H:
+        if NHEAD % BLOCK_H != 0:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Final_lse, offsets=offs_final_lse)
@@ -714,7 +719,7 @@ def _mla_gluon(
         offs_mid_lse = cur_batch * stride_mid_lse_b + q_pos * stride_mid_lse_s + cur_head_lse * stride_mid_lse_h + split_kv_id * stride_mid_lse_split
         lse = e_max + gl.log(e_sum)
         lse = gl.convert_layout(lse, blocked_lse)
-        if NHEAD < BLOCK_H:
+        if NHEAD % BLOCK_H != 0:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse, mask=(cur_head_lse < NHEAD))
         else:
             gl.amd.cdna4.buffer_store(lse, ptr=Mid_lse, offsets=offs_mid_lse)
@@ -881,7 +886,11 @@ def mla_gluon(
     # q_pos is grid axis 2, so each query position is a separate program.
     if nhead in (64, 128):
         REGIME = "bh64"
-    elif 1 <= nhead <= 16:
+    elif 1 <= nhead <= 96:
+        # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
+        # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
+        # nhead > 16 (e.g. 96) adds head-block programs. A partial last block
+        # (nhead % 16 != 0) masks OOB heads on Q load / O store.
         if kv_c.dtype == torch.bfloat16:
             REGIME = "bh16bn64"
         elif kv_c.dtype == torch.float8_e4m3fn:  # gfx950 fp8 (e4m3fn, not e4m3fnuz)
@@ -892,7 +901,7 @@ def mla_gluon(
             )
     else:
         raise AssertionError(
-            f"mla_gluon requires nhead <= 16 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
+            f"mla_gluon requires nhead <= 96 [bh16bn128/bh16bn64] or nhead in (64,128) [bh64], got {nhead}"
         )
 
     PAGE_SIZE = 1
@@ -928,6 +937,11 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
+        # nhead > 16 tiles heads into cdiv(nhead, BLOCK_H) blocks on grid axis 2.
+        # Total stage-1 WGs = batch * NUM_KV_SPLITS * (NUM_M_BLOCKS * qlen), so the
+        # ~256-WG split budget divides by NUM_M_BLOCKS as well (head blocks already
+        # fill the machine, mirroring how bh64 folds head blocks into the grid).
+        NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
         # 2-D grid (batch, split). Both bh16 regimes support num_iter in {1, 2, ...}
         # (no gl.assume(num_iter >= 3) in the kernel); the only correctness need is
         # that every split is non-empty (floor split size = min_kv_seq_len //
@@ -936,7 +950,9 @@ def mla_gluon(
             assert (
                 batch_size == 1
             ), f"mla_gluon[bh16bn128] requires batch_size=1, got {batch_size}"
-            NUM_KV_SPLITS = max(1, min(256 // (batch_size * qlen), min_kv_seq_len))
+            NUM_KV_SPLITS = max(
+                1, min(256 // (batch_size * qlen * NUM_M_BLOCKS), min_kv_seq_len)
+            )
         else:  # bh16bn64
             # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
             # but never split a sequence into more blocks than it has: bound by the
@@ -944,7 +960,11 @@ def mla_gluon(
             # partial-block MFMA). For min_kv_seq_len <= BLOCK_N this collapses to
             # NUM_KV_SPLITS=1, i.e. one WG per batch computing the whole (short) seq.
             NUM_KV_SPLITS = max(
-                1, min(256 // (batch_size * qlen), triton.cdiv(min_kv_seq_len, BLOCK_N))
+                1,
+                min(
+                    256 // (batch_size * qlen * NUM_M_BLOCKS),
+                    triton.cdiv(min_kv_seq_len, BLOCK_N),
+                ),
             )
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
@@ -1025,8 +1045,10 @@ def mla_gluon(
             (batch_size // NUM_XCDS) * NUM_KV_SPLITS,
         )
     else:
-        # Grid axis 2 is q_pos: one program per query position (grid-axis MTP).
-        grid = (batch_size, NUM_KV_SPLITS, qlen)
+        # Grid axis 2 carries (head_block, q_pos): cdiv(nhead, BLOCK_H) head blocks
+        # times qlen query positions. For nhead <= 16 this is just qlen (one head
+        # block), i.e. the original grid-axis MTP mapping.
+        grid = (batch_size, NUM_KV_SPLITS, triton.cdiv(nhead, BLOCK_H) * qlen)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
     _mla_gluon[grid](

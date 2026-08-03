@@ -48,6 +48,7 @@ from aiter.ops.flydsl.moe_kernels import (
     compile_flydsl_moe_stage1,
     compile_flydsl_moe_stage2,
     get_flydsl_kernel_params,
+    resolve_flydsl_stage1_tile_n,
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
@@ -84,11 +85,8 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             act_type = row.get("act_type", "")
-            act = (
-                "swiglu"
-                if act_type.strip().split(".")[-1].lower() == "swiglu"
-                else "silu"
-            )
+            act_name = act_type.strip().split(".")[-1].lower()
+            act = act_name if act_name in ("swiglu", "situv2") else "silu"
             q_type = row.get("q_type", "")
             dtype = row.get("dtype", "")
             q_dtype_w = row.get("q_dtype_w", "")
@@ -177,7 +175,9 @@ def parse_csv(csv_path: str):
 
                     jobs.append(full_job)
 
-    return jobs
+    from aiter.aot.flydsl.fhmoe import extend_fhmoe_jobs
+
+    return extend_fhmoe_jobs(csv_path, jobs, seen)
 
 
 def _precompile_to_cache(
@@ -221,6 +221,7 @@ def _precompile_to_cache(
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
     use_async_copy: bool = False,
     cu_num_mul: int = 1,
+    _aot_backend=None,
     **kwargs,
 ):
     """Trigger MLIR compilation by calling the runtime stage1/stage2 entry points
@@ -399,6 +400,9 @@ def _precompile_to_cache(
         sorted_token_ids, sorted_expert_ids, num_valid_ids = _make_routing()
 
         if stage == 1:
+            if b_dtype in ("fp4", "mxfp4") and a_dtype in ("bf16", "fp8"):
+                tile_n = resolve_flydsl_stage1_tile_n(inter_dim, tile_n)
+
             a = _make_a_user(_user_a_shape())
             w1_shape = _user_w1_shape()
             w1 = _alloc(w1_shape, _storage_dtype(b_dtype))
@@ -512,7 +516,12 @@ def _precompile_to_cache(
             )
 
             if use_mx_gemm:
-                args = _s1_args_fp4(
+                build_stage1_args = (
+                    _s1_args_fp4
+                    if _aot_backend is None
+                    else _aot_backend.build_stage1_args
+                )
+                args = build_stage1_args(
                     _kernel_out.view(-1),
                     a.view(-1),
                     w1.view(-1),
@@ -557,7 +566,12 @@ def _precompile_to_cache(
                     stream=0,
                 )
 
-            exe = compile_flydsl_moe_stage1(
+            compile_stage1 = (
+                compile_flydsl_moe_stage1
+                if _aot_backend is None
+                else _aot_backend.compile_stage1
+            )
+            exe = compile_stage1(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 experts=E,
@@ -699,7 +713,12 @@ def _precompile_to_cache(
             _k_in = inter_dim
 
             if use_mx_gemm:
-                args = _s2_args_fp4(
+                build_stage2_args = (
+                    _s2_args_fp4
+                    if _aot_backend is None
+                    else _aot_backend.build_stage2_args
+                )
+                args = build_stage2_args(
                     target,
                     a,
                     w2,
@@ -735,7 +754,12 @@ def _precompile_to_cache(
                     stream=0,
                 )
 
-            exe = compile_flydsl_moe_stage2(
+            compile_stage2 = (
+                compile_flydsl_moe_stage2
+                if _aot_backend is None
+                else _aot_backend.compile_stage2
+            )
+            exe = compile_stage2(
                 model_dim=model_dim,
                 inter_dim=inter_dim,
                 experts=E,
@@ -891,7 +915,17 @@ def compile_one_config(
                     topk=topk,
                 )
             else:
-                _precompile_to_cache(
+                shared_expert_id = kwargs.pop("shared_expert_id", -1)
+                if shared_expert_id >= 0:
+                    from aiter.aot.flydsl.fhmoe import (
+                        precompile_fhmoe_to_cache,
+                    )
+
+                    precompile = precompile_fhmoe_to_cache
+                    kwargs["shared_expert_id"] = shared_expert_id
+                else:
+                    precompile = _precompile_to_cache
+                precompile(
                     model_dim=model_dim,
                     inter_dim=inter_dim,
                     experts=experts,
