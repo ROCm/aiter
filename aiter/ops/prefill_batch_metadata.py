@@ -60,17 +60,14 @@ def _host_cu_seqlens(seq_lens_cpu: Sequence[int]) -> list[int]:
 def _assert_layout_matches(
     cu_seqlens: torch.Tensor, kernel_cu_seqlens: torch.Tensor
 ) -> None:
+    message = "`seq_lens_cpu` does not match the cumulative sequence lengths."
     expected = kernel_cu_seqlens.to(cu_seqlens.dtype)
     matches = torch.all(cu_seqlens == expected)
-    if cu_seqlens.device.type == "cuda":
-        torch._assert_async(
-            matches,
-            "`seq_lens_cpu` does not match the cumulative sequence lengths.",
-        )
+    assert_async = getattr(torch, "_assert_async", None)
+    if cu_seqlens.device.type == "cuda" and assert_async is not None:
+        assert_async(matches, message)
     elif not bool(matches):
-        raise ValueError(
-            "`seq_lens_cpu` does not match the cumulative sequence lengths."
-        )
+        raise ValueError(message)
 
 
 def _normalize_layout(
