@@ -1,6 +1,16 @@
 #pragma once
 
 #include "defs.h"
+
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
+
+template <class Traits>
+__global__ void dsa_v32_decode_16mx8_32nx1_fp8_kernel(dsa_kargs)
+{
+}
+
+#else
+
 #include <bit>
 #include <cstdint>
 #include <opus/opus.hpp>
@@ -1766,3 +1776,5 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE,
         dsa_v32_decode_one_req<Traits>(kargs, w, smem_kv, smem_kv_scale, temperature_scale);
     }
 }
+
+#endif // !__HIP_DEVICE_COMPILE__ || !__gfx950__
