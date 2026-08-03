@@ -1,30 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MLA (Multi-head Latent Attention) decode kernel for gfx1250 — PRE-SHUFFLED KV cache.
-
-Computes, per (sequence, query head):
-    out = Softmax(Q @ K^T * scale) @ V              (decode, query_len == 1)
-
-KV cache:
-    cache[token] = [ lora (d_c = KV_LORA_RANK) | rope (d_rope = QK_ROPE_HEAD_DIM) ]
-  * QK uses the whole row   (K = lora ++ rope, width QK_HEAD_DIM = d_c + d_rope)
-  * PV uses only the lora part (V = lora,       width V_HEAD_DIM = d_c)
-
-This is the "main" of a 2-kernel split:
-  The KV sequence is cut into NUM_SEGS segments; grid = (num_seqs, NUM_SEGS). Each
-  (seq, seg) block runs an online-softmax pass over its slice of KV tiles and writes
-  the partials:
-      tmp_out    [num_seqs, NUM_SEGS, num_q_heads, d_c]
-      max_logits [num_seqs, NUM_SEGS, num_q_heads]
-      exp_sums   [num_seqs, NUM_SEGS, num_q_heads]
-  The companion reduce kernel merges the NUM_SEGS partials.
-
-Work distribution accross warps:
-  * QK is computed REDUNDANTLY by every warp so the full tile lives in each warp's 
-    registers and an LDS roundtrip can be avoided.
-  * PV is SPLIT across warps along the output's N dimension (d_c)
-"""
+import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -47,7 +24,7 @@ from flydsl.expr.vector import ReductionOp
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-
+# should move this to a common utility file since pa_decode also uses this
 def _build_v4i32_buffer_rsrc(tensor, num_records_bytes=0xFFFFFFFF, arch=None):
     """Build a ``<4 x i32>`` V# (buffer resource descriptor) for ``s_buffer_load``.
 
@@ -155,6 +132,14 @@ def _s_buffer_load_vec(rsrc_v4i32, byte_offset_i32, width):
     )
 
 
+# using fmath.exp2 lowers to llvm.exp2.f32 which adds extra instructions
+# to guard x < -126 underflow. We do not need to waste instrucitons on the 
+# guard here because ULP of sum is big enough that we donot care.
+# instead we use bare hardware exp2
+def _amdgcn_exp2_f32(x):
+    return _llvm.call_intrinsic(T.f32, "llvm.amdgcn.exp2.f32", [_raw(x)], [], [])
+
+
 WAVE_SIZE = 32
 WMMA_M = 16
 WMMA_N = 16
@@ -180,6 +165,7 @@ def _decompose_bt_widths(n):
     return widths
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_mla_decode_main(
     *,
     KV_LORA_RANK: int = 512,
@@ -191,7 +177,11 @@ def compile_mla_decode_main(
     NUM_WARPS: int = 2,
     dtype: str = "bf16",
     waves_per_eu: int = 1,
+    WARP_TOKEN_SPLIT: bool = True,
 ):
+
+    SPLIT = NUM_WARPS if WARP_TOKEN_SPLIT else 1
+    NUM_PARTITIONS = NUM_SEGS * SPLIT
 
     QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # K width for QK (lora + rope)
     V_HEAD_DIM = KV_LORA_RANK                      # V width for PV (lora only)
@@ -240,6 +230,27 @@ def compile_mla_decode_main(
     N_QK_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_N
     K_PV_TILES = KV_COMPUTE_BLOCK_SIZE // WMMA_K
     N_PV_TILES_PER_WARP = N_PV_TILES // NUM_WARPS
+
+    # without WARP_TOKEN_SPLIT each warp redundantly does QK to avoid LDS roundtrip for PV.
+    # with WARP_TOKEN_SPLIT we split QK along token dimension among warps. each warp owns
+    # N_QK_TILES/NUM_WARPS 16 token QK tiles. for PV each warp pairs two QK tiles to make a 
+    # 32 token tile (needed since WMMA_K=32). So KV_COMPUTE_BLOCK_SIZE needs to be a multiple 
+    # of 32*NUM_WARPS.
+    if WARP_TOKEN_SPLIT:
+        if N_QK_TILES % NUM_WARPS != 0:
+            raise ValueError(
+                f"WARP_TOKEN_SPLIT requires N_QK_TILES ({N_QK_TILES}) divisible by "
+                f"NUM_WARPS ({NUM_WARPS}); KV_COMPUTE_BLOCK_SIZE={KV_COMPUTE_BLOCK_SIZE}."
+            )
+        _nqk_local = N_QK_TILES // NUM_WARPS
+        if _nqk_local < 2 or _nqk_local % 2 != 0:
+            raise ValueError(
+                f"WARP_TOKEN_SPLIT requires each warp to own an even number (>=2) of "
+                f"16-token score-tiles so they pair into 32-token PV K-steps; got "
+                f"NQK_LOCAL={_nqk_local} (KV_COMPUTE_BLOCK_SIZE={KV_COMPUTE_BLOCK_SIZE}, "
+                f"NUM_WARPS={NUM_WARPS}). Require KV_COMPUTE_BLOCK_SIZE to be a multiple "
+                f"of 32*NUM_WARPS={32 * NUM_WARPS}."
+            )
 
     block_threads = NUM_WARPS * WAVE_SIZE
     NUM_KV_STAGES = 2
@@ -332,11 +343,12 @@ def compile_mla_decode_main(
         iters_this_seg = arith.select(is_live, tile_end - tile_start, fx.Index(0))
 
         num_q_heads_idx = fx.Index(NUM_Q_HEADS)
-        stride_o_seq = fx.Index(NUM_SEGS * NUM_Q_HEADS * V_HEAD_DIM)
-        stride_o_seg = fx.Index(NUM_Q_HEADS * V_HEAD_DIM)
+
+        stride_o_seq = fx.Index(NUM_PARTITIONS * NUM_Q_HEADS * V_HEAD_DIM)
+        stride_o_part = fx.Index(NUM_Q_HEADS * V_HEAD_DIM)
         stride_o_row = fx.Index(V_HEAD_DIM)
-        stride_lse_seq = fx.Index(NUM_SEGS * NUM_Q_HEADS)
-        stride_lse_seg = fx.Index(NUM_Q_HEADS)
+        stride_lse_seq = fx.Index(NUM_PARTITIONS * NUM_Q_HEADS)
+        stride_lse_part = fx.Index(NUM_Q_HEADS)
         stride_bt_seq = max_blocks
 
         bt_rsrc_v4i32 = _build_v4i32_buffer_rsrc(arg_block_tables, arch=gpu_arch)
@@ -358,10 +370,11 @@ def compile_mla_decode_main(
 
         neg_inf_f32 = fx.Float32(float("-inf"))
         zero_f32 = fx.Float32(0.0)
-        # Padded (unused) head rows are masked to a large FINITE negative, not -inf, so the
+        # Padded rows are masked to a large FINITE negative, not -inf, so the
         # softmax of an all-masked row stays finite (-inf - -inf would be NaN).
         NEG_FINITE_MAX = -3.4e38
         neg_finite_max_vec8 = fx.Vector.filled(8, NEG_FINITE_MAX, fx.Float32)
+        neg_finite_max_f32 = fx.Float32(NEG_FINITE_MAX)
         zero_i32 = arith.constant(0, type=T.i32)
 
         # Loads one 16-row x 32-K WMMA fragment for Q from Q LDS.
@@ -532,7 +545,9 @@ def compile_mla_decode_main(
         def _unwrap(v):
             return v.ir_value() if hasattr(v, "ir_value") else v
 
-        P = N_PV_TILES_PER_WARP  # d_c output tiles this warp owns
+        # if WARP_TOKEN_SPLIT on then we don't split PV accross warps
+        # each warp owns the full PV  accumulator with their subset of tokens and then combined in reduce kernel
+        P = N_PV_TILES if WARP_TOKEN_SPLIT else N_PV_TILES_PER_WARP
 
         def _pack(m_list, l_list, pv_list, cur_stage):
             out = []
@@ -571,6 +586,11 @@ def compile_mla_decode_main(
             cur_lora_elem_off = cur_stage * fx.Index(kv_lora_elems)
             cur_rope_elem_off = cur_stage * fx.Index(kv_rope_elems)
 
+            NQK_LOCAL = (N_QK_TILES // NUM_WARPS) if WARP_TOKEN_SPLIT else N_QK_TILES
+            qk_lora_off = (cur_lora_elem_off + wave_id * fx.Index(NQK_LOCAL * LORA_BSG_STRIDE)) if WARP_TOKEN_SPLIT else cur_lora_elem_off
+            qk_rope_off = (cur_rope_elem_off + wave_id * fx.Index(NQK_LOCAL * ROPE_BSG_STRIDE)) if WARP_TOKEN_SPLIT else cur_rope_elem_off
+            pv_lora_off = qk_lora_off
+
             g = tile_start + iv               # global tile index in this sequence
             tile_first_tok = g * KVC
             is_not_last = iv < (iters_this_seg - fx.Index(1))
@@ -584,14 +604,13 @@ def compile_mla_decode_main(
                 tdm_ops.tensor_wait(0)
             gpu.barrier()
 
-            # Every warp runs QK redundantly
             qk_accs = [
-                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(N_QK_TILES)]
+                [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(NQK_LOCAL)]
                 for _ in range(NUM_QGSP_TILES)
             ]
-            for n_tile in range_constexpr(N_QK_TILES):
-                for ks in range_constexpr(K_QK_LORA_TILES):
-                    k_frag = _load_shuf_K(kv_lora_lds, n_tile, ks, LORA_BSG_STRIDE, cur_lora_elem_off)
+            for ks in range_constexpr(K_QK_LORA_TILES):
+                for n_tile in range_constexpr(NQK_LOCAL):
+                    k_frag = _load_shuf_K(kv_lora_lds, n_tile, ks, LORA_BSG_STRIDE, qk_lora_off)
                     for qt in range_constexpr(NUM_QGSP_TILES):
                         qk_accs[qt][n_tile] = fx.Vector(
                             wmma_op(
@@ -599,8 +618,9 @@ def compile_mla_decode_main(
                                 signA=False, signB=False, modC=0, reuseA=False, reuseB=False,
                             ).result
                         )
-                for ks in range_constexpr(K_QK_ROPE_TILES):
-                    k_frag = _load_shuf_K(kv_rope_lds, n_tile, ks, ROPE_BSG_STRIDE, cur_rope_elem_off)
+            for ks in range_constexpr(K_QK_ROPE_TILES):
+                for n_tile in range_constexpr(NQK_LOCAL):
+                    k_frag = _load_shuf_K(kv_rope_lds, n_tile, ks, ROPE_BSG_STRIDE, qk_rope_off)
                     for qt in range_constexpr(NUM_QGSP_TILES):
                         qk_accs[qt][n_tile] = fx.Vector(
                             wmma_op(
@@ -612,26 +632,30 @@ def compile_mla_decode_main(
             # ---- online-softmax update ----
             for qt in range_constexpr(NUM_QGSP_TILES):
                 # Apply scale*log2e so so we can use exp2
-                for n_tile in range_constexpr(N_QK_TILES):
+                for n_tile in range_constexpr(NQK_LOCAL):
                     qk_accs[qt][n_tile] = qk_accs[qt][n_tile] * qk_scale_log2_scalar
 
-                # Token mask
-                for n_tile in range_constexpr(N_QK_TILES):
+                tile_n_base = (wave_id * fx.Index(NQK_LOCAL * WMMA_M)) if WARP_TOKEN_SPLIT else fx.Index(0)
+
+                # Token mask: set any tile token at/after seq_len to a large FINITE negative
+                seq_len_i32_v = fx.Int32(seq_len_i32)
+                for n_tile in range_constexpr(NQK_LOCAL):
                     new_vals = []
                     for mi in range_constexpr(8):
                         v = qk_accs[qt][n_tile][mi]
-                        tok_abs = (
-                            tile_first_tok + fx.Index(n_tile * WMMA_M)
-                            + lane_kgrp * fx.Index(8) + fx.Index(mi)
+                        tok_abs_i32 = arith.index_cast(
+                            T.i32,
+                            tile_first_tok + tile_n_base + fx.Index(n_tile * WMMA_M)
+                            + lane_kgrp * fx.Index(8) + fx.Index(mi),
                         )
-                        in_range = tok_abs < seq_len
-                        new_vals.append(arith.select(in_range, v, neg_inf_f32))
+                        in_range = fx.Int32(tok_abs_i32) < seq_len_i32_v
+                        new_vals.append(arith.select(in_range, v, neg_finite_max_f32))
                     qk_accs[qt][n_tile] = fx.Vector.from_elements(new_vals, fx.Float32)
 
                 # row mask when NUM_Q_HEADS isn't a multiple of 16:
                 if qt * WMMA_M + WMMA_M > NUM_Q_HEADS:
                     is_row_valid = (fx.Index(qt * WMMA_M) + lane16) < num_q_heads_idx
-                    for n_tile in range_constexpr(N_QK_TILES):
+                    for n_tile in range_constexpr(NQK_LOCAL):
                         qk_accs[qt][n_tile] = fx.Vector(
                             arith.select(
                                 is_row_valid, qk_accs[qt][n_tile], neg_finite_max_vec8
@@ -642,7 +666,7 @@ def compile_mla_decode_main(
                 m_state = m_list[qt]
                 l_state = l_list[qt]
                 local_max = qk_accs[qt][0].reduce(ReductionOp.MAX)
-                for n_tile in range_constexpr(1, N_QK_TILES):
+                for n_tile in range_constexpr(1, NQK_LOCAL):
                     local_max = local_max.maximumf(
                         qk_accs[qt][n_tile].reduce(ReductionOp.MAX)
                     )
@@ -650,16 +674,17 @@ def compile_mla_decode_main(
                 row_max = local_max.maximumf(peer)
 
                 new_m = m_state.maximumf(row_max)
-                alpha = (m_state - new_m).exp2(fastmath=arith.FastMathFlags.fast)
 
-                # Probabilities p = exp2(score - new_m), written back IN-PLACE into qk_accs so
-                # PV can read them straight from these registers. Sum the lane-local part.
+                alpha = fx.Float32(_amdgcn_exp2_f32(m_state - new_m))
+
+                # Probabilities p = exp2(score - new_m)
                 row_sum_partial = zero_f32
-                for n_tile in range_constexpr(N_QK_TILES):
-                    p_vec = fx.Vector(
-                        fmath.exp2(
-                            qk_accs[qt][n_tile] - new_m, fastmath=arith.FastMathFlags.fast
-                        )
+                for n_tile in range_constexpr(NQK_LOCAL):
+                    diff = qk_accs[qt][n_tile] - new_m
+                    p_vec = fx.Vector.from_elements(
+                        [fx.Float32(_amdgcn_exp2_f32(diff[mi]))
+                         for mi in range_constexpr(8)],
+                        fx.Float32,
                     )
                     qk_accs[qt][n_tile] = p_vec
                     row_sum_partial = row_sum_partial + p_vec.reduce(
@@ -678,16 +703,19 @@ def compile_mla_decode_main(
                     pv_list[qt][pv_n] = pv_list[qt][pv_n] * alpha
 
             # ---- PV ----
-            # Split across warps along d_c
+            # if WARP_TOKEN_SPLIT each warp responsible for it's share of token's PV and PV not split accross warps
+            # if not WARP_TOEKN_SPLIT then each warp has a copy of full P and PV is split accross warps in N dim
+            K_PV_LOCAL = (NQK_LOCAL // 2) if WARP_TOKEN_SPLIT else K_PV_TILES
+            pv_v_off = pv_lora_off if WARP_TOKEN_SPLIT else cur_lora_elem_off
             for qt in range_constexpr(NUM_QGSP_TILES):
                 for pv_n in range_constexpr(P):
-                    pv_n_global = wave_id * fx.Index(P) + fx.Index(pv_n)
-                    for ks in range_constexpr(K_PV_TILES):
+                    pv_n_global = fx.Index(pv_n) if WARP_TOKEN_SPLIT else wave_id * fx.Index(P) + fx.Index(pv_n)
+                    for ks in range_constexpr(K_PV_LOCAL):
                         p_f32 = qk_accs[qt][2 * ks].shuffle(
                             qk_accs[qt][2 * ks + 1], list(range(16))
                         )
                         p_frag = p_f32.to(elem_dtype)
-                        v_frag = _load_shuf_V_tr(pv_n_global, ks, cur_lora_elem_off)
+                        v_frag = _load_shuf_V_tr(pv_n_global, ks, pv_v_off)
                         pv_list[qt][pv_n] = fx.Vector(
                             wmma_op(
                                 T.vec(8, T.f32), v_frag, p_frag, pv_list[qt][pv_n],
@@ -712,15 +740,16 @@ def compile_mla_decode_main(
         ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
         es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
 
-        out_base = seq_idx * stride_o_seq + seg_idx * stride_o_seg
-        lse_base = seq_idx * stride_lse_seq + seg_idx * stride_lse_seg
+        part_idx = seg_idx * fx.Index(SPLIT) + (wave_id if WARP_TOKEN_SPLIT else fx.Index(0))
+        out_base = seq_idx * stride_o_seq + part_idx * stride_o_part
+        lse_base = seq_idx * stride_lse_seq + part_idx * stride_lse_part
 
         for qt in range_constexpr(NUM_QGSP_TILES):
             row = fx.Index(qt * WMMA_M) + lane16    # output row = Q head = lane16
             row_valid = row < num_q_heads_idx       # skip padded head rows
 
             for pv_n in range_constexpr(P):
-                pv_n_global = wave_id * fx.Index(P) + fx.Index(pv_n)
+                pv_n_global = fx.Index(pv_n) if WARP_TOKEN_SPLIT else wave_id * fx.Index(P) + fx.Index(pv_n)
                 head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
                 off_lo = out_base + row * stride_o_row + head_col_base
                 off_hi = off_lo + fx.Index(4)
@@ -730,17 +759,14 @@ def compile_mla_decode_main(
                     buffer_ops.buffer_store(lo, out_rsrc, off_lo)
                     buffer_ops.buffer_store(hi, out_rsrc, off_hi)
 
-            # m and l are identical across warps (QK is redundant), so only wave 0 writes
-            # the log-sum-exp stats, once per head row.
-            if wave_id == fx.Index(0):
-                off_lse = lse_base + row
-                if row_valid:
-                    buffer_ops.buffer_store(m_final[qt], ml_rsrc, off_lse)
-                    buffer_ops.buffer_store(l_final[qt], es_rsrc, off_lse)
+            off_lse = lse_base + row
+            if row_valid:
+                buffer_ops.buffer_store(m_final[qt], ml_rsrc, off_lse)
+                buffer_ops.buffer_store(l_final[qt], es_rsrc, off_lse)
 
     cache_tag = (
         KV_LORA_RANK, QK_ROPE_HEAD_DIM, KV_BLOCK_SIZE, NUM_Q_HEADS, NUM_SEGS,
-        KV_COMPUTE_BLOCK_SIZE, NUM_WARPS, dtype, waves_per_eu,
+        KV_COMPUTE_BLOCK_SIZE, NUM_WARPS, dtype, waves_per_eu, WARP_TOKEN_SPLIT,
     )
 
     @flyc.jit
@@ -797,6 +823,7 @@ def compile_mla_decode_main(
 # ============================================================================
 
 
+@functools.lru_cache(maxsize=1024)
 def compile_mla_decode_reduce(
     *,
     KV_LORA_RANK: int = 512,
@@ -804,11 +831,15 @@ def compile_mla_decode_reduce(
     NUM_SEGS: int = 8,
     KV_COMPUTE_BLOCK_SIZE: int = 64,
     dtype: str = "bf16",
+    ATTN_NUM_WARPS: int = 2,
+    WARP_TOKEN_SPLIT: bool = True,
 ):
     """
-    Merges the NUM_SEGS partials written by the main kernel into the final output.
-    Grid = (num_seqs,).
+    Merges the partials written by the main kernel into the final output.
+    Grid = (num_seqs,). With WARP_TOKEN_SPLIT there are NUM_SEGS*ATTN_NUM_WARPS paritions.
     """
+    SPLIT = ATTN_NUM_WARPS if WARP_TOKEN_SPLIT else 1
+    NUM_PARTITIONS = NUM_SEGS * SPLIT
     V_HEAD_DIM = KV_LORA_RANK
     VEC = 4  # f32 cols per lane per chunk -> 128-bit buffer load/store
     if V_HEAD_DIM % (WAVE_SIZE * VEC) != 0:
@@ -816,7 +847,7 @@ def compile_mla_decode_reduce(
             f"V_HEAD_DIM ({V_HEAD_DIM}) must be a multiple of WAVE_SIZE*VEC "
             f"({WAVE_SIZE * VEC})"
         )
-    # Each lane owns VEC d_c cols in each of N_COL_CHUNKS block-cyclic stripes.
+    # Each lane owns N_COL_CHUNKS of VEC cols
     N_COL_CHUNKS = V_HEAD_DIM // (WAVE_SIZE * VEC)
 
     # Use up to 4 warps, as many as evenly divide the head count; each warp reduces
@@ -853,19 +884,21 @@ def compile_mla_decode_reduce(
         seq_len_i32 = buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
         seq_len = fx.Index(seq_len_i32)
 
-        # Re-derive the main kernel's tiling to learn how many segments actually produced partials.
-        # num_segs_actual = ceil(num_tiles / tiles_per_seg) = number of live partition slots.
+        # Re-derive the main kernel's tiling to learn how many segments actually produced
+        # partials, then scale by SPLIT for the per-warp partitions (Scheme A). Each live
+        # segment contributes SPLIT contiguous live partitions (seg*SPLIT + warp).
         KVC = fx.Index(KV_COMPUTE_BLOCK_SIZE)
         num_tiles = (seq_len + KVC - fx.Index(1)) // KVC
         tiles_per_seg = (num_tiles + fx.Index(NUM_SEGS) - fx.Index(1)) // fx.Index(NUM_SEGS)
         nonzero_tps = tiles_per_seg > fx.Index(0)
         tiles_per_seg = arith.select(nonzero_tps, tiles_per_seg, fx.Index(1))
         num_segs_actual = (num_tiles + tiles_per_seg - fx.Index(1)) // tiles_per_seg
+        num_parts_actual = num_segs_actual * fx.Index(SPLIT)
 
-        stride_tmp_seq = fx.Index(NUM_SEGS * NUM_Q_HEADS * V_HEAD_DIM)
+        stride_tmp_seq = fx.Index(NUM_PARTITIONS * NUM_Q_HEADS * V_HEAD_DIM)
         stride_tmp_seg = fx.Index(NUM_Q_HEADS * V_HEAD_DIM)
         stride_tmp_row = fx.Index(V_HEAD_DIM)
-        stride_lse_seq = fx.Index(NUM_SEGS * NUM_Q_HEADS)
+        stride_lse_seq = fx.Index(NUM_PARTITIONS * NUM_Q_HEADS)
         stride_lse_seg = fx.Index(NUM_Q_HEADS)
         stride_out_seq = fx.Index(NUM_Q_HEADS * V_HEAD_DIM)
         stride_out_row = fx.Index(V_HEAD_DIM)
@@ -914,17 +947,13 @@ def compile_mla_decode_reduce(
                     )
                 return m_f, l_f, v_chunks
 
-            # The merge loop is unrolled over the compile-time NUM_SEGS, but only
-            # num_segs_actual segments are live. Clamp any out-of-range index to the last
-            # live one (so the load is always in-bounds) and return is_valid; invalid
-            # partitions get weighted 0 in the merge below.
-            last_p_raw = num_segs_actual - one_idx
-            nonzero_n = num_segs_actual > zero_idx
+            last_p_raw = num_parts_actual - one_idx
+            nonzero_n = num_parts_actual > zero_idx
             last_p = arith.select(nonzero_n, last_p_raw, zero_idx)
 
             def _prefetch_clamped(p_py):
                 p_const = fx.Index(p_py)
-                is_valid = p_const < num_segs_actual
+                is_valid = p_const < num_parts_actual
                 p_safe = arith.select(is_valid, p_const, last_p)
                 m_p, l_p, v_chunks = _prefetch_partition(p_safe)
                 return m_p, l_p, v_chunks, is_valid
@@ -939,8 +968,8 @@ def compile_mla_decode_reduce(
 
             # Software-pipelined merge: combine the current partition while the next one's
             # loads are already in flight.
-            for p in range_constexpr(NUM_SEGS):
-                next_p_py = min(p + 1, NUM_SEGS - 1)
+            for p in range_constexpr(NUM_PARTITIONS):
+                next_p_py = min(p + 1, NUM_PARTITIONS - 1)
                 m_p_next, l_p_next, v_p_next, valid_next = _prefetch_clamped(next_p_py)
 
                 new_m = m_state.maximumf(m_p)
@@ -963,10 +992,8 @@ def compile_mla_decode_reduce(
                 v_p_chunks = v_p_next
                 valid = valid_next
 
-            # Normalize (numerator / total l), cast to bf16/f16, store. An empty sequence has
-            # no live segments -> write zeros instead of the 0/0 = NaN the merge would give.
             inv_l = fx.Float32(rocdl.rcp(T.f32, l_state.ir_value()))
-            is_empty = num_segs_actual == zero_idx
+            is_empty = num_parts_actual == zero_idx
             zero_vec_half = fx.Vector.filled(VEC, 0.0, elem_dtype)
 
             for c in range_constexpr(N_COL_CHUNKS):
@@ -978,7 +1005,8 @@ def compile_mla_decode_reduce(
                 out_off = seq_idx * stride_out_seq + r * stride_out_row + _lane_col(c)
                 buffer_ops.buffer_store(out_vec_half, out_rsrc, out_off)
 
-    cache_tag = (KV_LORA_RANK, NUM_Q_HEADS, NUM_SEGS, KV_COMPUTE_BLOCK_SIZE, dtype, NUM_WARPS)
+    cache_tag = (KV_LORA_RANK, NUM_Q_HEADS, NUM_SEGS, KV_COMPUTE_BLOCK_SIZE, dtype,
+                 NUM_WARPS, ATTN_NUM_WARPS, WARP_TOKEN_SPLIT)
 
     @flyc.jit
     def launch_mla_decode_reduce(

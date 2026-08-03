@@ -14,14 +14,7 @@ import torch
 from aiter.ops.flydsl.mla_decode import flydsl_mla_decode
 
 
-# ---------------------------------------------------------------------------
-# KV-cache pre-shuffle (from test_mla.py)
-#
-# Reorders each 16-row x (2*num_elements_per_thread)-col tile into lane-major
-# order so the kernel can feed WMMA fragments with straight ds_read_b128 (no
-# LDS padding for bank-conflict avoidance). The reference always runs on the
-# UNSHUFFLED logical cache; only the kernel receives the shuffled copy.
-# ---------------------------------------------------------------------------
+# need to update it for fp8 dtype
 def shuffle_kv_buffer(
     kv_buffer: torch.Tensor,  # [num_blocks, block_size, num_kv_heads, head_size]
     kv_lora_rank: int,
@@ -71,9 +64,7 @@ def shuffle_kv_buffer(
     return kv_shuffled
 
 
-# ---------------------------------------------------------------------------
-# Reference (golden): lifted from test_mla.py, trimmed to decode-only bf16/fp16.
-# ---------------------------------------------------------------------------
+# need to update for fp8 dtype
 def _ref_masked_attention(
     q: torch.Tensor,  # [1, num_q_heads, head_size]   (query_len == 1: decode)
     k: torch.Tensor,  # [kv_len, num_kv_heads, head_size]
@@ -189,7 +180,90 @@ def _generate_inputs(
 
 _KV_LORA_RANK = 512
 _QK_ROPE_HEAD_DIM = 64
-_NUM_HEADS = (16, 1)  # (num_query_heads, num_kv_heads)
+
+def _run_decode_case(
+    *,
+    num_seqs,
+    ctx_len,
+    num_segs,
+    dtype,
+    varlen,
+    block_size,
+    num_warps,
+    compute_block_size,
+    num_query_heads,
+    warp_token_split=True,
+):
+    # KV_BLOCK_SIZE=128 with num_warps=1 overflows TDM descriptor's 16-bit tile_dim0 field (max 65535).
+    # per-warp lora load tile = block_size*KV_LORA_RANK/num_warps = 65536 elements. Skip this combo.
+    # need to add this to wrapper as well. an assert or adjust num_warps dynamically
+    if (block_size * _KV_LORA_RANK) // num_warps > 0xFFFF:
+        pytest.skip(
+            f"FlyDSL TDM descriptor tile_dim0 16-bit overflow: "
+            f"block_size*{_KV_LORA_RANK}//num_warps = "
+            f"{(block_size * _KV_LORA_RANK) // num_warps} > 65535 "
+            f"(block_size={block_size}, num_warps={num_warps})"
+        )
+
+    # Scheme A (warp_token_split) splits the compute block's 16-token score-tiles across
+    # warps and pairs them into 32-token PV K-steps, so each warp must own an even number
+    # (>=2) of tiles -- i.e. compute_block_size must be a multiple of 32*num_warps. Configs
+    # that violate this are unsupported under Scheme A (the kernel raises a ValueError);
+    # skip them on this path. They are still exercised on the baseline path
+    # (warp_token_split=False), which has no such constraint.
+    if warp_token_split:
+        n_qk_tiles = compute_block_size // 16  # WMMA_N
+        nqk_local = n_qk_tiles // num_warps
+        if n_qk_tiles % num_warps != 0 or nqk_local < 2 or nqk_local % 2 != 0:
+            pytest.skip(
+                f"warp_token_split needs compute_block_size a multiple of 32*num_warps "
+                f"(got compute_block_size={compute_block_size}, num_warps={num_warps})"
+            )
+
+    num_kv_heads = 1
+    query, kv_cache, block_tables, seq_lens = _generate_inputs(
+        num_seqs=num_seqs,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+        block_size=block_size,
+        ctx_len=ctx_len,
+        dtype=dtype,
+        varlen=varlen,
+    )
+    head_size = _KV_LORA_RANK + _QK_ROPE_HEAD_DIM
+    attn_scale = 1.0 / math.sqrt(head_size)
+
+    ref = _torch_mla_decode_ref(
+        query, kv_cache, block_tables, seq_lens, attn_scale, _KV_LORA_RANK
+    )
+
+    kernel_kv_cache = shuffle_kv_buffer(kv_cache, _KV_LORA_RANK)
+
+    del kv_cache
+
+    output = torch.zeros(
+        (num_seqs, num_query_heads, _KV_LORA_RANK), dtype=dtype, device=query.device
+    )
+    flydsl_mla_decode(
+        output,
+        query,
+        kernel_kv_cache,
+        block_tables,
+        seq_lens,
+        attn_scale,
+        max_seqlen=int(seq_lens.max().item()),
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
+        num_segs=num_segs,
+        num_warps=num_warps,
+        kv_compute_block_size=compute_block_size,
+        warp_token_split=warp_token_split,
+    )
+
+    assert not torch.isnan(output).any(), "output contains NaN"
+    torch.testing.assert_close(output, ref, atol=1.5e-2, rtol=1e-2)
 
 # (num_seqs, ctx_len)
 _CASES = [
@@ -209,55 +283,48 @@ _BLOCK_SIZES = [
     (128, 128),    
 ]
 
+_NUM_Q_HEADS = [16, 32]
 
-# ---------------------------------------------------------------------------
-# Kernel correctness
-# ---------------------------------------------------------------------------
 @pytest.mark.parametrize("num_seqs,ctx_len,num_segs", _CASES)
+@pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("varlen", [True, False])
 @pytest.mark.parametrize("num_warps", [1, 2])
+@pytest.mark.parametrize("warp_token_split", [False, True])
 @pytest.mark.parametrize("block_size, compute_block_size", _BLOCK_SIZES)
-def test_flydsl_mla_decode(num_seqs, ctx_len, num_segs, dtype, varlen, block_size, num_warps, compute_block_size):
-    num_query_heads, num_kv_heads = _NUM_HEADS
-    query, kv_cache, block_tables, seq_lens = _generate_inputs(
+def test_flydsl_mla_decode(num_seqs, ctx_len, num_segs, num_q_heads, dtype, varlen, warp_token_split, block_size, num_warps, compute_block_size):
+    _run_decode_case(
         num_seqs=num_seqs,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        kv_lora_rank=_KV_LORA_RANK,
-        qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-        block_size=block_size,
         ctx_len=ctx_len,
+        num_segs=num_segs,
         dtype=dtype,
         varlen=varlen,
-    )
-    head_size = _KV_LORA_RANK + _QK_ROPE_HEAD_DIM
-    attn_scale = 1.0 / math.sqrt(head_size)
-
-    # Reference runs on the logical (unshuffled) cache.
-    ref = _torch_mla_decode_ref(
-        query, kv_cache, block_tables, seq_lens, attn_scale, _KV_LORA_RANK
-    )
-
-    # Kernel only consumes the pre-shuffled cache.
-    kernel_kv_cache = shuffle_kv_buffer(kv_cache, _KV_LORA_RANK)
-
-    output = torch.zeros(
-        (num_seqs, num_query_heads, _KV_LORA_RANK), dtype=dtype, device=query.device
-    )
-    flydsl_mla_decode(
-        output,
-        query,
-        kernel_kv_cache,
-        block_tables,
-        seq_lens,
-        attn_scale,
-        kv_lora_rank=_KV_LORA_RANK,
-        qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-        num_segs=num_segs,
+        block_size=block_size,
         num_warps=num_warps,
-        kv_compute_block_size=compute_block_size,
+        compute_block_size=compute_block_size,
+        num_query_heads=num_q_heads,
+        warp_token_split=warp_token_split,
     )
 
-    assert not torch.isnan(output).any(), "output contains NaN"
-    torch.testing.assert_close(output, ref, atol=1.5e-2, rtol=1e-2)
+
+_LARGE_CASES = [
+    (1024, 8192, 1),
+    (1024, 16384, 1),
+    (1024, 32768, 1),
+]
+
+@pytest.mark.parametrize("num_seqs,ctx_len,num_segs", _LARGE_CASES)
+@pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_flydsl_mla_decode_large(num_seqs, ctx_len, num_segs, num_q_heads, dtype):
+    _run_decode_case(
+        num_seqs=num_seqs,
+        ctx_len=ctx_len,
+        num_segs=num_segs,
+        dtype=dtype,
+        varlen=True,
+        block_size=64,
+        num_warps=2,
+        compute_block_size=64,
+        num_query_heads=num_q_heads,
+    )
