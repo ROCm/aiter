@@ -20,6 +20,8 @@ drop-in interchangeable in tests and benchmarks.
 import math
 import os
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
 
 import flydsl.compiler as flyc
@@ -85,6 +87,85 @@ def _auto_num_splits(
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
+# --------------------------------------------------------------------------- #
+# MfmaAtom -- bundles every MFMA-shape-derived constant plus the rocdl functor,
+# so the kernel builder carries no hardcoded tile shape. Supporting a new MFMA
+# instruction is then a new MfmaAtom instance plus a _VARIANT_BUILDERS entry.
+# --------------------------------------------------------------------------- #
+
+
+def _make_operands_dense(a, b, acc):
+    """Default ``MfmaAtom.make_operands``: the dense-MFMA 6-operand convention
+    ``[a, b, c, cbsz, abid, blgp]`` (all zero besides the fragments)."""
+    return [a, b, acc, 0, 0, 0]
+
+
+@dataclass(frozen=True)
+class MfmaAtom:
+    """MFMA-shape descriptor for the fp8 MQA-logits kernel.
+
+    Fields
+    ------
+    name : str
+        Shape tag, e.g. ``"16x16x32"``.
+    MFMA_M, MFMA_N, MFMA_K : int
+        Output tile is MFMA_M x MFMA_N; MFMA_K fp8 elements reduced per step.
+    ACC_ELEMS : int
+        f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``).
+    fn : Callable
+        FlyDSL ``rocdl.mfma_*`` functor taking ``(result_type, operands)``.
+    shuffle_offsets : tuple[int, ...]
+        ``shuffle_xor`` offsets for the in-wave head-reduce butterfly; must
+        cover every lane group so the full H-wide sum is produced.
+    acc_head_static_offsets : tuple[int, ...]
+        Compile-time head offset within one MFMA_M tile, per accumulator
+        element. Length == ACC_ELEMS. For element ``ii`` in lane group ``g``::
+
+            head_within_tile = acc_head_static_offsets[ii]
+                               + g * acc_head_group_stride
+            weight_index     = mi * MFMA_M + head_within_tile
+
+        For 16x16x32 (4 groups, ACC_ELEMS=4) the layout is sequential, so the
+        offsets are ``(0, 1, 2, 3)`` with stride 4.
+    acc_head_group_stride : int
+        Multiplier for the lane-group index (4 on gfx942/gfx950 fp8 MFMA).
+    frag_bytes : int
+        A/B fragment bytes owned by one lane for one K-step. 8 for the dense
+        atoms (one i64 load).
+    make_operands : Callable
+        Builds the ``fn`` operand list from ``(a_frag, b_frag, acc)``.
+    """
+
+    name: str
+    MFMA_M: int
+    MFMA_N: int
+    MFMA_K: int
+    ACC_ELEMS: int
+    fn: Callable
+    shuffle_offsets: tuple
+    acc_head_static_offsets: tuple  # length == ACC_ELEMS
+    acc_head_group_stride: int
+    frag_bytes: int = 8
+    make_operands: Callable = _make_operands_dense
+
+
+#: 16x16 output tile, K=32 fp8 elements/step. Acc: vec<4 x f32>.
+#: Fragment layout: lane l -> A[row=l%16, k=(l//16)*8 + 0..7], col=l%16.
+#: Writer lanes: l//16 == 0 (16 distinct output columns per tile).
+#: Acc layout: acc[ii] in lane group g -> head g*4 + ii.
+_MFMA16 = MfmaAtom(
+    name="16x16x32",
+    MFMA_M=16,
+    MFMA_N=16,
+    MFMA_K=32,
+    ACC_ELEMS=4,
+    fn=rocdl.mfma_f32_16x16x32_fp8_fp8,
+    shuffle_offsets=(16, 32),
+    acc_head_static_offsets=(0, 1, 2, 3),
+    acc_head_group_stride=4,
+)
+
+
 def _build_kernel_mfma_r_w(
     *,
     num_heads: int,
@@ -92,6 +173,7 @@ def _build_kernel_mfma_r_w(
     block_kv: int,
     rows_per_block: int,
     waves_per_block: int,
+    mfma: MfmaAtom = _MFMA16,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
 ):
@@ -120,11 +202,13 @@ def _build_kernel_mfma_r_w(
     WPB = waves_per_block
     MR_BLOCK_THREADS = 64 * WPB
 
-    # MFMA tile dims of the fp8 16x16x32 atom: MFMA_M x MFMA_N output tile,
-    # MFMA_K fp8 elements reduced per MFMA step.
-    MFMA_M = 16
-    MFMA_N = 16
-    MFMA_K = 32
+    # MFMA tile dims come from the atom: MFMA_M x MFMA_N output tile, MFMA_K
+    # fp8 elements reduced per MFMA step.
+    MFMA_M = mfma.MFMA_M
+    MFMA_N = mfma.MFMA_N
+    MFMA_K = mfma.MFMA_K
+    ACC_ELEMS = mfma.ACC_ELEMS
+    FRAG_BYTES = mfma.frag_bytes
 
     assert H % MFMA_M == 0, f"num_heads={H} must be a multiple of MFMA_M={MFMA_M}"
     assert BKV % MFMA_N == 0, f"block_kv={BKV} must be a multiple of MFMA_N={MFMA_N}"
@@ -140,7 +224,7 @@ def _build_kernel_mfma_r_w(
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
     fm_fast = arith.FastMathFlags.fast
-    mfma_fn = rocdl.mfma_f32_16x16x32_fp8_fp8
+    mfma_fn = mfma.fn
 
     _cvt_tag = ""
     if convert_q_fn:
@@ -164,7 +248,7 @@ def _build_kernel_mfma_r_w(
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
-        mfma_res_ty = Vec.make_type(4, fx.Float32)
+        mfma_res_ty = Vec.make_type(ACC_ELEMS, fx.Float32)
 
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -182,7 +266,11 @@ def _build_kernel_mfma_r_w(
         lane = fx.Int32(arith.remui(_to_raw(tid), _to_raw(fx.Int32(64))))
         lane_div_N = fx.Int32(arith.divui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
         lane_mod_N = fx.Int32(arith.remui(_to_raw(lane), _to_raw(fx.Int32(MFMA_N))))
-        lane8 = fx.Int32(arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(8))))
+        # Byte offset of this lane's fragment within the K-step (FRAG_BYTES per
+        # lane group). 8 for the dense atoms.
+        lane_frag_off = fx.Int32(
+            arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(FRAG_BYTES)))
+        )
 
         # fp8 operands are read 8 bytes at a time as 2 i32 dwords (v8i8
         # buffer_load fails to lower on gfx942), bitcast to i64 for the MFMA.
@@ -275,23 +363,25 @@ def _build_kernel_mfma_r_w(
                 )
                 base_a = fx.Int32(arith.muli(_to_raw(row_h), _to_raw(fx.Int32(D))))
                 for kk in range_constexpr(K_STEPS):
-                    d_a = _i32_add(fx.Int32(kk * MFMA_K), lane8)
+                    d_a = _i32_add(fx.Int32(kk * MFMA_K), lane_frag_off)
                     raw = _load_pack_i64(q_i32, _i32_add(base_a, d_a))
                     row_a[mi][kk] = _fn_to_fnuz_i64(raw) if convert_q_fn else raw
             a_packs[j] = row_a
 
-            # weights[row, h] per (mi, ii): head = mi*MFMA_M + lane_div_N*4 + ii
-            row_w = [[None] * 4 for _ in range_constexpr(M_TILES)]
+            # weights[row, h] per (mi, ii): the head this accumulator element
+            # belongs to is mi*MFMA_M + acc_head_static_offsets[ii]
+            # + lane_div_N*acc_head_group_stride (see MfmaAtom).
+            row_w = [[None] * ACC_ELEMS for _ in range_constexpr(M_TILES)]
+            lane_head = fx.Int32(
+                arith.muli(
+                    _to_raw(lane_div_N), _to_raw(fx.Int32(mfma.acc_head_group_stride))
+                )
+            )
             for mi in range_constexpr(M_TILES):
-                for ii in range_constexpr(4):
+                for ii in range_constexpr(ACC_ELEMS):
                     h_w = _i32_add(
-                        fx.Int32(mi * MFMA_M),
-                        _i32_add(
-                            fx.Int32(
-                                arith.muli(_to_raw(lane_div_N), _to_raw(fx.Int32(4)))
-                            ),
-                            fx.Int32(ii),
-                        ),
+                        fx.Int32(mi * MFMA_M + mfma.acc_head_static_offsets[ii]),
+                        lane_head,
                     )
                     row_w[mi][ii] = _to_raw(fx.Float32(w_t[row, h_w]))
             w_frag[j] = row_w
@@ -361,7 +451,7 @@ def _build_kernel_mfma_r_w(
                     arith.muli(_to_raw(col_clamped), _to_raw(fx.Int32(D)))
                 )
                 for kk in range_constexpr(K_STEPS):
-                    d_b = _i32_add(fx.Int32(kk * MFMA_K), lane8)
+                    d_b = _i32_add(fx.Int32(kk * MFMA_K), lane_frag_off)
                     raw = _load_pack_i64(kv_i32, _i32_add(base_b, d_b))
                     b_packs[ni][kk] = _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
 
@@ -374,17 +464,19 @@ def _build_kernel_mfma_r_w(
                     kv_scale = kv_scales_tile[ni]
                     col_sum = _to_raw(f32_0)
                     for mi in range_constexpr(M_TILES):
-                        acc = Vec.filled(4, 0.0, fx.Float32)
+                        acc = Vec.filled(ACC_ELEMS, 0.0, fx.Float32)
                         for kk in range_constexpr(K_STEPS):
                             acc = mfma_fn(
                                 mfma_res_ty,
-                                [a_packs[j][mi][kk], b_packs[ni][kk], acc, 0, 0, 0],
+                                mfma.make_operands(
+                                    a_packs[j][mi][kk], b_packs[ni][kk], acc
+                                ),
                             )
                         # kv_scale (>=0) is hoisted out of the head sum: ReLU is
                         # positive-homogeneous, so ReLU(s*x)=s*ReLU(x) and the
                         # whole column sum is scaled once (below) instead of every
                         # head term -- drops M_TILES*4 muls to one.
-                        for ii in range_constexpr(4):
+                        for ii in range_constexpr(ACC_ELEMS):
                             score = Vec(acc)[ii].ir_value()
                             relu = arith.maximumf(score, _to_raw(f32_0))
                             wsc = arith.MulFOp(
@@ -395,8 +487,9 @@ def _build_kernel_mfma_r_w(
                             ).result
                     col_sum = arith.MulFOp(col_sum, kv_scale, fastmath=fm_fast).result
 
-                    # Head-reduce within the wave (width=64): shuffle_xor offsets 16, 32.
-                    for sh in [16, 32]:
+                    # Head-reduce within the wave (width=64) via the atom's
+                    # shuffle_xor butterfly (16, 32 for the 16x16 atoms).
+                    for sh in mfma.shuffle_offsets:
                         peer = _to_raw(ArithValue(col_sum).shuffle_xor(sh, 64))
                         col_sum = arith.AddFOp(col_sum, peer, fastmath=fm_fast).result
 
