@@ -140,14 +140,23 @@ def launch_gemm_a8w4_tdm(
     # AS_SUPERS*AS_INNER is the true A-scale footprint (SA_SUPERS*SC_INNER collapses for tile_m<32)
     STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
-    SA_OFF = STAGE_A + STAGE_B
-    SB_OFF = STAGE_A + STAGE_B + STAGE_SA
-    # 512-align so per-buffer ptr offset preserves LDS alignment for TDM/ds_b128
-    PITCH = ((STAGE_A + STAGE_B + STAGE_SA + STAGE_SB + 511) // 512) * 512
+
+    # LDS is grouped by tensor, not by stage: all A-scale buffers, then all A
+    # buffers, then all B-scale buffers, then all B buffers. Buffer s of tensor t
+    # therefore sits at <T>_BASE + s * STAGE_<T>, and one tensor's whole
+    # multi-buffer footprint is a single contiguous range.
+    # Each region start is 512-aligned so the per-buffer offset keeps the
+    # alignment TDM / ds_b128 need; the per-buffer strides stay 16-aligned, the
+    # same granularity the sub-regions of the old per-stage pitch had.
+    SA_BASE = 0
+    A_BASE = ((SA_BASE + num_buffers * STAGE_SA + 511) // 512) * 512
+    SB_BASE = ((A_BASE + num_buffers * STAGE_A + 511) // 512) * 512
+    B_BASE = ((SB_BASE + num_buffers * STAGE_SB + 511) // 512) * 512
+    PIPE_B = B_BASE + num_buffers * STAGE_B
 
     out_elem = T.f16 if out_is_f16 else T.bf16
     C_STORE_B = ((tile_m * tile_n * 2 + 127) // 128) * 128
-    ARENA_B = max(num_buffers * PITCH, C_STORE_B)
+    ARENA_B = max(PIPE_B, C_STORE_B)
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -264,10 +273,7 @@ def launch_gemm_a8w4_tdm(
         def ptr_to_idx(p):
             return fx.index_cast(T.index, fx.ptrtoint(p))
 
-        stC_idx = ptr_to_idx(base_ptr)
-
-        def buf_ptr(s):
-            return base_ptr + s * PITCH
+        lds_idx = ptr_to_idx(base_ptr)
 
         def global_view(base, off, shape, stride):
             return fx.Tensor(fx.make_view(base + off, fx.make_layout(shape, stride)))
@@ -307,8 +313,13 @@ def launch_gemm_a8w4_tdm(
         else:
             waves, nw = [(None,)] * 4, num_waves
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
+        base_i8 = fx.recast_iter(p8_shared, base_ptr)
 
-        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
+        # lds_off / buf_off are in the job's own element units: bytes for the
+        # payload jobs, dwords for the i32 (scale) jobs.
+        Job = namedtuple(
+            "Job", "atom gt on_i32 lds_off buf_off lds_row inner outer k_adv wave"
+        )
         jobs = []
 
         def add_tdm_loads(
@@ -321,6 +332,7 @@ def launch_gemm_a8w4_tdm(
             *,
             on_i32,
             lds_off,
+            buf_off,
             lds_row,
             k_adv,
             wv,
@@ -361,6 +373,7 @@ def launch_gemm_a8w4_tdm(
                         gt,
                         on_i32,
                         lds_off + i * seg * lds_row,
+                        buf_off,
                         lds_row,
                         inner,
                         seg,
@@ -377,7 +390,8 @@ def launch_gemm_a8w4_tdm(
             A_ROW_B,
             tile_m,
             on_i32=False,
-            lds_off=0,
+            lds_off=A_BASE,
+            buf_off=STAGE_A,
             lds_row=A_LDS_ROW,
             k_adv=A_ROW_B,
             wv=waves[0],
@@ -392,7 +406,8 @@ def launch_gemm_a8w4_tdm(
             PACK_TK * 16,
             tile_n // 16,
             on_i32=False,
-            lds_off=STAGE_A,
+            lds_off=B_BASE,
+            buf_off=STAGE_B,
             lds_row=B_LDS_ROW,
             k_adv=PACK_TK * 16,
             wv=waves[1],
@@ -405,7 +420,8 @@ def launch_gemm_a8w4_tdm(
             AS_INNER,
             AS_SUPERS,
             on_i32=True,
-            lds_off=SA_OFF // 4,
+            lds_off=SA_BASE // 4,
+            buf_off=STAGE_SA // 4,
             lds_row=AS_INNER,
             k_adv=AS_INNER * 4,
             wv=waves[2],
@@ -418,19 +434,18 @@ def launch_gemm_a8w4_tdm(
             SC_INNER,
             SB_SUPERS,
             on_i32=True,
-            lds_off=SB_OFF // 4,
+            lds_off=SB_BASE // 4,
+            buf_off=STAGE_SB // 4,
             lds_row=SC_INNER,
             k_adv=SC_INNER * 4,
             wv=waves[3],
         )
 
         def issue(s, kt):
-            pa = fx.recast_iter(p8_shared, buf_ptr(s))
-            so4 = s * (PITCH // 4)
             for j in jobs:
-                base = base_i32 if j.on_i32 else pa
+                base = base_i32 if j.on_i32 else base_i8
                 dst = lds_view(
-                    base + j.lds_off + (so4 if j.on_i32 else 0),
+                    base + j.lds_off + s * j.buf_off,
                     (j.outer, j.inner),
                     (j.lds_row, 1),
                 )
@@ -444,45 +459,46 @@ def launch_gemm_a8w4_tdm(
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
 
-        def load_a(buf, wm, ksl):
+        def load_a(s, wm, ksl):
             row = wmb + wm * 16 + lane16
-            b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
+            b0 = A_BASE + s * STAGE_A + row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                    Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8))
+                return Vec(lds_load_b128_raw(lds_idx, b0)).shuffle(
+                    Vec(lds_load_b128_raw(lds_idx, b0 + 32)), list(range(8))
                 )
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [
+                Vec(lds_load_b128_raw(lds_idx, b0 + 32 * j)) for j in range_constexpr(4)
+            ]
             return (
                 v[0]
                 .shuffle(v[1], list(range(8)))
                 .shuffle(v[2].shuffle(v[3], list(range(8))), list(range(16)))
             )
 
-        def load_b(buf, wn, ksl):
+        def load_b(s, wn, ksl):
             b0 = (
-                STAGE_A
+                B_BASE
+                + s * STAGE_B
                 + (wnb // 16 + wn) * B_LDS_ROW
                 + ksl * 1024
                 + kgrp * 256
                 + lane16 * 16
             )
-            return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8))
+            return Vec(lds_load_b128_raw(lds_idx, b0)).shuffle(
+                Vec(lds_load_b128_raw(lds_idx, b0 + 512)), list(range(8))
             )
 
-        def load_sa(buf, wm, ksl):
+        def load_sa(s, wm, ksl):
             warp_lds_row = wmb // wmma_m_rep + lane16
             byte = (
                 warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
             )
-            return lds_load_b32_raw(buf, SA_OFF + byte)
+            return lds_load_b32_raw(lds_idx, SA_BASE + s * STAGE_SA + byte)
 
-        def load_sb(buf, wn, ksl):
+        def load_sb(s, wn, ksl):
             col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32_raw(
-                buf,
-                SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4,
-            )
+            byte = ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4
+            return lds_load_b32_raw(lds_idx, SB_BASE + s * STAGE_SB + byte)
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMAScale(
@@ -522,18 +538,16 @@ def launch_gemm_a8w4_tdm(
         DS_B = 2
         BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
 
-        def load_b_and_scales(buf, ksl):
-            wt = [
-                to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)
-            ]
-            sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
-            sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
+        def load_b_and_scales(s, ksl):
+            wt = [to_rmem(8, load_b(s, wn, ksl)) for wn in range_constexpr(wmma_n_rep)]
+            sb_k = [load_sb(s, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
+            sa_k = [load_sa(s, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl):
-            act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
+        def k_step(s, ksl, wt, sb_k, sa_k, nxt_ksl):
+            act_f = [to_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
-                act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
+                act_b = [to_rmem(ACT_NDW, load_a(s, wm, ksl)) for wm in BACK]
                 rocdl.s_wait_dscnt(len(BACK) * DS_A)
             else:
                 rocdl.s_wait_dscnt(0)
@@ -542,20 +556,20 @@ def launch_gemm_a8w4_tdm(
                 rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
             return (
-                load_b_and_scales(buf, nxt_ksl)
+                load_b_and_scales(s, nxt_ksl)
                 if const_expr(nxt_ksl is not None)
                 else None
             )
 
-        def compute_ktile(buf, prefetch_kt):
+        def compute_ktile(s, prefetch_kt):
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
-            prev = load_b_and_scales(buf, 0)
+            prev = load_b_and_scales(s, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl)
+                prev = k_step(s, ksl, prev[0], prev[1], prev[2], nxt_ksl)
             fr, bk = front_wm * wmma_n_rep, len(BACK) * wmma_n_rep
             for ks in range_constexpr(KWS):
                 rocdl.sched_dsrd((BS_DS if ks == 0 else 0) + front_wm * DS_A)
@@ -580,17 +594,15 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - num_buffers
                 for kt in range(n_steady):
                     s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
-                    compute_ktile(buf, None)
+                    compute_ktile(s, None)
                     workgroup_barrier()
                     issue(s, kt + num_buffers)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    compute_ktile(buf, None)
+                    compute_ktile(kt % num_buffers, None)
             else:
                 # Mid-compute prefetch: better for prefill (large tile_m).
                 for i in range_constexpr(num_buffers - 1):
@@ -598,14 +610,12 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - (num_buffers - 1)
                 for kt in range(n_steady):
                     s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-                    compute_ktile(buf, kt + (num_buffers - 1))
+                    compute_ktile(s, kt + (num_buffers - 1))
                 for j in range_constexpr(num_buffers - 1):
                     kt = n_steady + j
-                    buf = ptr_to_idx(buf_ptr(kt % num_buffers))
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-                    compute_ktile(buf, None)
+                    compute_ktile(kt % num_buffers, None)
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             # The epilogue below reuses this LDS arena to stage C. Draining this
@@ -690,7 +700,7 @@ def launch_gemm_a8w4_tdm(
                                 )
                                 col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
                                 lds_store_b32_raw(
-                                    stC_idx, row_rel * STORE_N + col_fp8, packed_i32
+                                    lds_idx, row_rel * STORE_N + col_fp8, packed_i32
                                 )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
@@ -738,7 +748,7 @@ def launch_gemm_a8w4_tdm(
                                 fx.Float32,
                             ).to(oc)
                             lds_store_b64_raw(
-                                stC_idx,
+                                lds_idx,
                                 (row_rel * STORE_N + col_rel // 2) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
                             )
@@ -747,7 +757,7 @@ def launch_gemm_a8w4_tdm(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
                             lds_store_b128_raw(
-                                stC_idx,
+                                lds_idx,
                                 (row_rel * STORE_N + col_rel) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
                             )
