@@ -2937,11 +2937,17 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
-    # FlyDSL stage2 uses atomic accumulation (mode='atomic') and expects a
-    # zeroed output buffer. moe_out comes from moe_sorting (torch.empty, not
-    # zeroed), so zero it here when the stage2 function is our FlyDSL wrapper.
+    # fp4bf16 stage2 uses buffer_atomic_pk_add_bf16 and expects a zeroed output
+    # buffer. moe_out comes from moe_sorting (torch.empty, uninitialized), so
+    # zero it here. Only needed for fp4bf16; other dtypes handle zeroing
+    # themselves or don't require it.
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
-    if stage2_func is _flydsl_stage2_wrapper and not fuse_stage2_zero:
+    if (
+        stage2_func is _flydsl_stage2_wrapper
+        and not fuse_stage2_zero
+        and stage1_kernel_params
+        and stage1_kernel_params.get("b_dtype") == "fp4bf16"
+    ):
         moe_out.zero_()
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
