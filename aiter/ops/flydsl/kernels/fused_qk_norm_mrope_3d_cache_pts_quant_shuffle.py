@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Fused RMSNorm + 3D-MRoPE + optional per-tensor FP8 quant, with a hybrid
-coalesced/scatter write into a shuffle-layout paged KV cache (FlyDSL, wave64).
+coalesced/scatter write into a shuffle-layout paged KV cache (FlyDSL).
 
 Not yet fully feature-complete with the hip version
 (``aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle`);
@@ -58,13 +58,13 @@ from aiter.utility import dtypes as aiter_dtypes
 from .kernels_common import get_warp_size
 from .tensor_shim import _run_compiled
 
-# --- fixed HW assumption: wave64 (gfx942 / gfx950 CDNA). gfx1250 is wave32
-# and needs a dedicated variant (mirrors qk_norm_rope_quant_gfx1250.py) --
-# not implemented here; the public API raises clearly on that arch.
-WAVE = 64
+# The output mapping follows the target's native wave size. RMSNorm still uses
+# the production kernel's 32-lane logical reduction groups on both wave32 and
+# wave64 targets.
+WAVE = get_warp_size()
 _LOG2_WAVE = int(math.log2(WAVE))
-# The production HIP kernel reduces RMSNorm over 32-lane logical warps.
-# Keep wave64 for the output mapping, but reduce each half-wave independently.
+
+# The HIP kernel always reduces RMSNorm over 32 lanes, keep to match
 RMS_GROUP = 32
 _LOG2_RMS_GROUP = int(math.log2(RMS_GROUP))
 
@@ -119,8 +119,10 @@ def rms_reduce_add(x, lane):
         off = RMS_GROUP // (2 << sh_exp)
         peer = v.shuffle_xor(off, RMS_GROUP)
         v = v.addf(peer, fastmath=arith.FastMathFlags.fast)
-    other_half = v.shuffle_xor(RMS_GROUP, WAVE)
-    return (lane < RMS_GROUP).select(v, other_half)
+    if const_expr(WAVE > RMS_GROUP):
+        other_half = v.shuffle_xor(RMS_GROUP, WAVE)
+        return (lane < RMS_GROUP).select(v, other_half)
+    return v
 
 def mrope_cos_sin(col, tok, positions_t, cos_sin_t, mrope_section, is_interleaved, HALF):
     """Interleaved 3D-mrope cos/sin gather for column ``col`` in
@@ -860,12 +862,6 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         stream: fx.Stream to launch on; defaults to the current
             stream.
     """
-    wave_size = get_warp_size()
-    if wave_size != WAVE:
-        raise NotImplementedError(
-            "Only wave64 is supported for not (detected wave{wave_size})"
-        )
-
     # ---- validate the flag combination against this kernel's scope ----
     if not is_neox_style:
         raise NotImplementedError(
