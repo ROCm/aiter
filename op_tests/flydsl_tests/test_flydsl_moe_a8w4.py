@@ -252,26 +252,26 @@ def test_flydsl_stage2_a8w4_route_fp8(monkeypatch, model_dim, model_dim_pad, til
     data = _generate_a8w4_gui_data(
         token, model_dim, inter_dim, E, topk, block_m, seed=103
     )
-    kwargs = dict(
-        inter_states=data["a2_q"],
-        w2=data["w2_shuf"],
-        sorted_token_ids=data["sorted_ids"],
-        sorted_expert_ids=data["sorted_expert_ids"],
-        num_valid_ids=data["num_valid_ids"],
-        topk=topk,
-        tile_m=32,
-        tile_n=tile_n,
-        tile_k=128,
-        a_dtype="fp8",
-        b_dtype="fp4",
-        out_dtype="bf16",
-        mode="reduce",
-        w2_scale=data["w2_scale_shuf"],
-        a2_scale=data["a2_scale_sort"],
-        sorted_weights=data["sorted_weights"],
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=data["inter_pad"],
-    )
+    kwargs = {
+        "inter_states": data["a2_q"],
+        "w2": data["w2_shuf"],
+        "sorted_token_ids": data["sorted_ids"],
+        "sorted_expert_ids": data["sorted_expert_ids"],
+        "num_valid_ids": data["num_valid_ids"],
+        "topk": topk,
+        "tile_m": 32,
+        "tile_n": tile_n,
+        "tile_k": 128,
+        "a_dtype": "fp8",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "mode": "reduce",
+        "w2_scale": data["w2_scale_shuf"],
+        "a2_scale": data["a2_scale_sort"],
+        "sorted_weights": data["sorted_weights"],
+        "model_dim_pad": model_dim_pad,
+        "inter_dim_pad": data["inter_pad"],
+    }
 
     monkeypatch.delenv("AITER_FLYDSL_STAGE2_ROUTE_FP8", raising=False)
     baseline = flydsl_moe_stage2(**kwargs)
