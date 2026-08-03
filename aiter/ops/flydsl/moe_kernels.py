@@ -1375,7 +1375,7 @@ def flydsl_silu_and_mul_interleaved(
 # Public API
 
 
-def flydsl_moe_stage1(
+def _flydsl_moe_stage1_impl(
     a: torch.Tensor,
     w1: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -1412,6 +1412,8 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    _compile_kernel=compile_flydsl_moe_stage1,
+    _build_mx_args=_s1_args_fp4,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1428,6 +1430,9 @@ def flydsl_moe_stage1(
     add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
 
     gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    `_compile_kernel` and `_build_mx_args` are injectable so the heterogeneous
+    shared-expert path can reuse this launcher with its own kernel builders.
 
     Returns:
         Basic:                      out
@@ -1566,7 +1571,7 @@ def flydsl_moe_stage1(
     _swiglu_limit_val = runtime_swiglu_limit(swiglu_limit, act)
 
     if use_mx_gemm:
-        args = _s1_args_fp4(
+        args = _build_mx_args(
             _kernel_out.view(-1),
             a.view(-1),
             w1.view(-1),
@@ -1607,35 +1612,38 @@ def flydsl_moe_stage1(
             _grid_y,
         )
 
-    exe = compile_flydsl_moe_stage1(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        experts=E,
-        topk=topk,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        tile_k=tile_k,
-        doweight_stage1=(sorted_weights is not None),
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        out_dtype=_gemm_out_dtype,
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-        persist_m=_persist_m,
-        use_async_copy=use_async_copy,
-        k_batch=k_batch,
-        waves_per_eu=waves_per_eu,
-        b_nt=b_nt,
-        gate_mode=gate_mode,
-        model_dim_pad=model_dim_pad,
-        inter_dim_pad=inter_dim_pad,
-        enable_bias=(kernel_bias is not None),
-        a_scale_one=a_scale_one,
-        xcd_swizzle=xcd_swizzle,
-        k_wave=k_wave,
-        v2_output_layout=_v2_output_layout,
-    )
+    compile_kwargs = {
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "experts": E,
+        "topk": topk,
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "doweight_stage1": sorted_weights is not None,
+        "a_dtype": a_dtype,
+        "b_dtype": b_dtype,
+        "out_dtype": _gemm_out_dtype,
+        "act": act,
+        "situ_beta": situ_beta,
+        "situ_linear_beta": situ_linear_beta,
+        "persist_m": _persist_m,
+        "use_async_copy": use_async_copy,
+        "k_batch": k_batch,
+        "waves_per_eu": waves_per_eu,
+        "b_nt": b_nt,
+        "gate_mode": gate_mode,
+        "model_dim_pad": model_dim_pad,
+        "inter_dim_pad": inter_dim_pad,
+        "enable_bias": kernel_bias is not None,
+        "a_scale_one": a_scale_one,
+        "xcd_swizzle": xcd_swizzle,
+        "k_wave": k_wave,
+    }
+    # The injected FHMoE compiler does not implement the v2 sorted-row layout.
+    if _v2_output_layout:
+        compile_kwargs["v2_output_layout"] = True
+    exe = _compile_kernel(**compile_kwargs)
     _run_compiled(exe, args)
 
     if _is_splitk and _is_a16w4:
@@ -1776,7 +1784,104 @@ def flydsl_moe_stage1(
     return out
 
 
-def flydsl_moe_stage2(
+def flydsl_moe_stage1(
+    a: torch.Tensor,
+    w1: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 256,
+    tile_k: int = 256,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    act: str = "silu",
+    situ_beta: float = 1.0,
+    situ_linear_beta: float = 1.0,
+    w1_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
+    persist_m: int = 0,
+    use_async_copy: bool = False,
+    k_batch: int = 1,
+    k_batch_intra_block: int | None = None,
+    waves_per_eu: int = 3,
+    b_nt: int = 0,
+    gate_mode: str = "separated",
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
+    bias: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+    a_scale_one: bool = False,
+    xcd_swizzle: int = 0,
+    swiglu_limit: float | None = None,
+    k_wave: int = 1,
+    v2_output_layout: bool = False,
+):
+    """Fused gate+up GEMM (MOE stage1).
+
+    a: (token_num, model_dim), w1: (E, 2*inter_dim, model_dim) pre-shuffled.
+    model_dim and inter_dim INCLUDE padding (model_dim_pad, inter_dim_pad).
+    bias: optional (E, 2*inter_dim) f32 bias added before activation.
+    For fp4 stage1, `w1`/`w1_scale` must use the same preshuffle layout as
+    `shuffle_weight_a16w4(w1, 16, True)` and `shuffle_scale_a16w4(w1_scale, E, True)`.
+
+    When fuse_quant=True, the kernel fuses quantization (fp4/fp8, inferred from
+    out_dtype) and writes e8m0 scales in sorted tiled layout directly.
+
+    When k_batch>1 (split-K), the kernel outputs gate/up partials via atomic
+    add into a zeroed buffer, then silu_and_mul fuses activation + reduction.
+
+    gate_mode controls the gate/up computation strategy (see GateMode enum).
+
+    Returns:
+        Basic:                      out
+        fuse_quant:                 (out, out_scale_sorted)
+    """
+    return _flydsl_moe_stage1_impl(
+        a=a,
+        w1=w1,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+        w1_scale=w1_scale,
+        a1_scale=a1_scale,
+        sorted_weights=sorted_weights,
+        persist_m=persist_m,
+        use_async_copy=use_async_copy,
+        k_batch=k_batch,
+        k_batch_intra_block=k_batch_intra_block,
+        waves_per_eu=waves_per_eu,
+        b_nt=b_nt,
+        gate_mode=gate_mode,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        bias=bias,
+        topk_ids=topk_ids,
+        a_scale_one=a_scale_one,
+        xcd_swizzle=xcd_swizzle,
+        swiglu_limit=swiglu_limit,
+        k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
+    )
+
+
+def _flydsl_moe_stage2_impl(
     inter_states: torch.Tensor,
     w2: torch.Tensor,
     sorted_token_ids: torch.Tensor,
@@ -1808,28 +1913,10 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    _compile_kernel=compile_flydsl_moe_stage2,
+    _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
-    """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
-
-    a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
-    Returns (token_num, model_dim) by default.
-    bias: optional (E, model_dim) f32 bias added after GEMM.
-
-    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
-        assumed equal to tile_m. When set, stage2 can use a different tile_m
-        from sorting/stage1.
-    persist: if True, use persistent round-robin mode (grid_y=cu_num);
-        if False, use legacy persist_m mode; if None, auto-select.
-
-    return_per_slot: when True, return the raw per-(token, slot) output as a
-        contiguous (token_num, topk, model_dim) tensor without applying the
-        topk reduction.
-
-    expert_mask, topk_ids: when both are provided and mode="reduce", the
-        post-GEMM reduction fuses the EP validity gather
-        ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
-        slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
-    """
+    """Run stage2 with injectable compiler and launch-argument builders."""
 
     token_num = inter_states.shape[0]
     E = w2.shape[0]
@@ -1940,7 +2027,7 @@ def flydsl_moe_stage2(
             )
 
     if use_mx_gemm:
-        args = _s2_args_fp4(
+        args = _build_mx_args(
             target,
             inter_states,
             w2,
@@ -1974,7 +2061,7 @@ def flydsl_moe_stage2(
             m_blocks,
         )
 
-    exe = compile_flydsl_moe_stage2(
+    exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
         experts=E,
@@ -2018,6 +2105,94 @@ def flydsl_moe_stage2(
             is_fp8=_s2_fp8_inter,
         )
     return out
+
+
+def flydsl_moe_stage2(
+    inter_states: torch.Tensor,
+    w2: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    sorted_expert_ids: torch.Tensor,
+    num_valid_ids: torch.Tensor,
+    out: torch.Tensor | None = None,
+    topk: int = 1,
+    *,
+    tile_m: int = 32,
+    tile_n: int = 128,
+    tile_k: int = 256,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp4",
+    out_dtype: str = "bf16",
+    mode: str = "atomic",
+    w2_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    sorted_weights: torch.Tensor | None = None,
+    sort_block_m: int = 0,
+    persist: bool | None = None,
+    waves_per_eu: int | None = None,
+    use_async_copy: bool = False,
+    cu_num_mul: int = 1,
+    b_nt: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
+    xcd_swizzle: int = 0,
+    bias: torch.Tensor | None = None,
+    return_per_slot: bool = False,
+    expert_mask: torch.Tensor | None = None,
+    topk_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
+
+    a: (token_num, topk, inter_dim), w1: (E, model_dim, inter_dim) pre-shuffled.
+    Returns (token_num, model_dim) by default.
+    bias: optional (E, model_dim) f32 bias added after GEMM.
+
+    sort_block_m: block_size used by moe_sorting / stage1. When 0 (default),
+        assumed equal to tile_m. When set, stage2 can use a different tile_m
+        from sorting/stage1.
+    persist: if True, use persistent round-robin mode (grid_y=cu_num);
+        if False, use legacy persist_m mode; if None, auto-select.
+
+    return_per_slot: when True, return the raw per-(token, slot) output as a
+        contiguous (token_num, topk, model_dim) tensor without applying the
+        topk reduction.
+
+    expert_mask, topk_ids: when both are provided and mode="reduce", the
+        post-GEMM reduction fuses the EP validity gather
+        ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
+        slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+    """
+    return _flydsl_moe_stage2_impl(
+        inter_states=inter_states,
+        w2=w2,
+        sorted_token_ids=sorted_token_ids,
+        sorted_expert_ids=sorted_expert_ids,
+        num_valid_ids=num_valid_ids,
+        out=out,
+        topk=topk,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        tile_k=tile_k,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        mode=mode,
+        w2_scale=w2_scale,
+        a2_scale=a2_scale,
+        sorted_weights=sorted_weights,
+        sort_block_m=sort_block_m,
+        persist=persist,
+        waves_per_eu=waves_per_eu,
+        use_async_copy=use_async_copy,
+        cu_num_mul=cu_num_mul,
+        b_nt=b_nt,
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=inter_dim_pad,
+        xcd_swizzle=xcd_swizzle,
+        bias=bias,
+        return_per_slot=return_per_slot,
+        expert_mask=expert_mask,
+        topk_ids=topk_ids,
+    )
 
 
 # Fused route-map + MX quant + scatter-copy + scale-preshuffle kernels
@@ -2290,10 +2465,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     out_E = E if out_E is None else int(out_E)
     out_max_m = max_m if out_max_m is None else int(out_max_m)
-    assert out_max_m % rows_per_tile == 0, (
-        f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 "
-        f"({rows_per_tile})"
-    )
+    assert (
+        out_max_m % rows_per_tile == 0
+    ), f"out_max_m ({out_max_m}) must be a multiple of wmma_rep*16 ({rows_per_tile})"
 
     payload_bytes_per_row = model_dim if quant_mode == "fp8" else model_dim // 2
     scale_bytes_per_row = model_dim // 32
@@ -2653,10 +2827,9 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
-    assert grouped_in.dtype == torch.bfloat16, (
-        "fused grouped quant+preshuffle requires bf16 input "
-        f"(got {grouped_in.dtype})"
-    )
+    assert (
+        grouped_in.dtype == torch.bfloat16
+    ), f"fused grouped quant+preshuffle requires bf16 input (got {grouped_in.dtype})"
     device = grouped_in.device
     feat_dim = grouped_in.shape[-1]
     rows_per_tile = wmma_rep * 16

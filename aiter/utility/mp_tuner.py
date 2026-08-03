@@ -626,12 +626,12 @@ def mp_tuner(
         # If pool restart needed due to crash, restart pool and resubmit remaining tasks
         if pool_restart_needed and remaining_tasks:
             if verbose:
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(
                     "? Pool restart needed due to crash. Restarting pool...", flush=True
                 )
                 print(f"Remaining tasks: {len(remaining_tasks)}", flush=True)
-                print(f"{'='*60}\n", flush=True)
+                print(f"{'=' * 60}\n", flush=True)
 
             # Terminate old pool
             try:
@@ -666,7 +666,7 @@ def mp_tuner(
             )
 
         # Small sleep to avoid busy waiting
-        if remaining_tasks:
+        if remaining_tasks and not completed_this_round:
             time.sleep(1)
 
     # Reconstruct results in original task order
