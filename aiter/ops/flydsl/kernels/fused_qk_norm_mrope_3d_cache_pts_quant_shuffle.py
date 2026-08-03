@@ -56,7 +56,6 @@ from flydsl.expr.typing import T
 from aiter.utility import dtypes as aiter_dtypes
 
 from .kernels_common import get_warp_size
-from .layout_utils import crd2idx
 from .tensor_shim import _run_compiled
 
 # The output mapping follows the target's native wave size. RMSNorm still uses
@@ -398,6 +397,7 @@ def _build_kv_kernel(
         layout_pair_ownership = fx.make_layout(
             (PAIR_LANES, PAIRS_PER_LANE), stride=(1, PAIR_LANES)
         )
+        layout_head = fx.make_layout(D, stride=1)
         layout_stage = fx.make_layout((block_size, D), stride=(D, 1))
         layout_k_runs = fx.make_layout((D // x, block_size), stride=(block_size, 1))
         layout_v_runs = fx.make_layout((block_size // x, D), stride=(D, 1))
@@ -416,12 +416,16 @@ def _build_kv_kernel(
         )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
 
-        def pair_col(lane: fx.Int32, p: fx.Int32):
-            return fx.Int32(
-                crd2idx(
-                    (lane, p),
-                    layout_pair_ownership,
-                )
+        def partition_pairs(row, lane):
+            """Partition a D-wide row into this lane's NEOX pairs.
+
+            The resulting coordinates are [pair, half], where half 0/1
+            selects columns col/col+D/2 without flattening the ownership
+            layout into an explicitly calculated column index.
+            """
+            return fx.slice(
+                fx.logical_divide(row, layout_pair_ownership),
+                ((lane, None), None),
             )
 
         def load_rms_sumsq(row, lane):
@@ -538,12 +542,32 @@ def _build_kv_kernel(
                     rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
                     if lane < PAIR_LANES:
+                        k_pairs = partition_pairs(k_row, lane)
+                        v_pairs = partition_pairs(v_row, lane)
+                        w_pairs = partition_pairs(k_norm_w, lane)
+                        k_lds_pairs = partition_pairs(
+                            fx.slice(k_lds_view, (token_local, None)), lane
+                        )
+                        v_lds_pairs = partition_pairs(
+                            fx.slice(v_lds_view, (token_local, None)), lane
+                        )
+                        row_coords = fx.Tensor(
+                            fx.make_view(fx.make_int_tuple(0), layout_head)
+                        )
+                        pair_coords = partition_pairs(row_coords, lane)
+                        if const_expr(emit_flat_kv):
+                            k_out_pairs = partition_pairs(
+                                fx.slice(k_out, (tok, head, None)), lane
+                            )
+                            v_out_pairs = partition_pairs(
+                                fx.slice(v_out, (tok, head, None)), lane
+                            )
                         for p in range_constexpr(PAIRS_PER_LANE):
-                            col = pair_col(lane, p)
-                            k0 = fx.Float32(k_row[col])
-                            k1 = fx.Float32(k_row[col + HALF])
-                            w0 = fx.Float32(k_norm_w[col])
-                            w1 = fx.Float32(k_norm_w[col + HALF])
+                            col = fx.Int32(fx.get_scalar(pair_coords[p, 0]))
+                            k0 = fx.Float32(k_pairs[p, 0])
+                            k1 = fx.Float32(k_pairs[p, 1])
+                            w0 = fx.Float32(w_pairs[p, 0])
+                            w1 = fx.Float32(w_pairs[p, 1])
                             if const_expr(gemma_norm):
                                 w0 = w0 + fx.Float32(1.0)
                                 w1 = w1 + fx.Float32(1.0)
@@ -565,27 +589,26 @@ def _build_kv_kernel(
                             else:
                                 kb0 = o0.to(fx.BFloat16)
                                 kb1 = o1.to(fx.BFloat16)
-                            k_lds_view[token_local, col] = kb0
-                            k_lds_view[token_local, col + HALF] = kb1
+                            k_lds_pairs[p, 0] = kb0
+                            k_lds_pairs[p, 1] = kb1
                             if const_expr(emit_flat_kv) and flat_slot_valid:
-                                k_out[tok, head, col] = kb0
-                                k_out[tok, head, col + HALF] = kb1
+                                k_out_pairs[p, 0] = kb0
+                                k_out_pairs[p, 1] = kb1
 
                         # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
                         for p in range_constexpr(PAIRS_PER_LANE):
-                            col = pair_col(lane, p)
-                            v0 = fx.Float32(v_row[col])
-                            v1 = fx.Float32(v_row[col + HALF])
+                            v0 = fx.Float32(v_pairs[p, 0])
+                            v1 = fx.Float32(v_pairs[p, 1])
                             if const_expr(cache_is_fp8):
                                 vb0, vb1 = quant_pair_fp8(v0, v1, v_scale_value)
                             else:
                                 vb0 = v0.to(fx.BFloat16)
                                 vb1 = v1.to(fx.BFloat16)
-                            v_lds_view[token_local, col] = vb0
-                            v_lds_view[token_local, col + HALF] = vb1
+                            v_lds_pairs[p, 0] = vb0
+                            v_lds_pairs[p, 1] = vb1
                             if const_expr(emit_flat_kv) and flat_slot_valid:
-                                v_out[tok, head, col] = vb0
-                                v_out[tok, head, col + HALF] = vb1
+                                v_out_pairs[p, 0] = vb0
+                                v_out_pairs[p, 1] = vb1
 
         # Wave 0 checks whether the whole logical page maps to one aligned
         # physical page. Other mappings use the scatter path.
