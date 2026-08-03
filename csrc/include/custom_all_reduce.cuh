@@ -709,6 +709,7 @@ __global__ void __launch_bounds__(512, 1) allgather_naive(
         int write_idx     = warp_id * size + idx;
         result[write_idx] = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -736,6 +737,7 @@ __global__ void __launch_bounds__(512, 1) allgather_vec(
         int write_idx                                   = warp_id * size + idx;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 template <typename T, int ngpus>
@@ -772,6 +774,7 @@ __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
         int write_idx                                   = (ngpus * y + warp_id) * last_dim_size + x;
         *(reinterpret_cast<P*>(&result[0]) + write_idx) = ptrs[warp_id][idx];
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
 // ========== reduce_scatter kernel start ==========
@@ -813,9 +816,10 @@ __global__ void __launch_bounds__(512, 1) reduce_scatter_split_first_dim(
         *(reinterpret_cast<P*>(result) + store_index) =
             packed_reduce<P, ngpus, A>(ptrs, load_index);
     }
+    end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// reduce_scatter, scatter on last dim — naive (non-vectorized) fallback.
+// reduce_scatter, scatter on last dim -- naive (non-vectorized) fallback.
 // Use when the last dim cannot be vectorized along pack_size
 // (e.g. n % (ngpus * pack_size) != 0). Slower than the vectorized version.
 // Params: `n` is the input's last-dim length; output's last dim = n / ngpus.
@@ -850,9 +854,10 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// reduce_scatter, scatter on last dim — vectorized (16B / thread).
+// reduce_scatter, scatter on last dim -- vectorized (16B / thread).
 // Params: `n` is the input's last-dim length; output's last dim = n / ngpus.
 // cond: n % (ngpus * pack_size) == 0
 // shape: input (m, n) -> output (m, n / ngpus)
@@ -883,9 +888,10 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_lastdim(
     int load_index = index_y * packed_dim_n + rank * splited_n + index_x;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// reduce_scatter, scatter on middle dim — naive (non-vectorized) fallback.
+// reduce_scatter, scatter on middle dim -- naive (non-vectorized) fallback.
 // Use when the inner dim `k` cannot be vectorized (k % pack_size != 0).
 // Params: `n` is the input's middle-dim length; output's middle dim = n / ngpus.
 // cond: n % ngpus == 0
@@ -920,9 +926,10 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim_naive(
     }
     result[i] = downcast_s<T>(rslt_reg);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// reduce_scatter, scatter on middle dim — vectorized (16B / thread along k).
+// reduce_scatter, scatter on middle dim -- vectorized (16B / thread along k).
 // Params: `n` is the input's middle-dim length; output's middle dim = n / ngpus.
 // cond: n % ngpus == 0 && k % pack_size == 0
 // shape: input (m, n, k) -> output (m, n / ngpus, k)
@@ -954,6 +961,7 @@ __global__ void __launch_bounds__(256, 1) reduce_scatter_split_middim(
     int load_index = index_m * (n * packed_dim_k) + (rank * splited_n + index_n) * packed_dim_k + index_k;
     *(reinterpret_cast<P*>(result) + i) = packed_reduce<P, ngpus, A>(ptrs, load_index);
   }
+  end_sync<ngpus, true>(sg, self_sg, rank);
 }
 // ========== reduce_scatter kernel end ==========
 
@@ -1066,7 +1074,7 @@ struct AbsMaxFunctor
 template<typename T>
 DINLINE T shfl_xor(T var, int mask, int width = opus::get_warp_size())
 {
-    static_assert(sizeof(T) == 4); 
+    static_assert(sizeof(T) == 4);
     int self = opus::lane_id();
     int index = (self & ~(width - 1)) + ((self ^ mask) & (width - 1));
     return __builtin_bit_cast(T, __builtin_amdgcn_ds_bpermute(index << 2, __builtin_bit_cast(int, var)));

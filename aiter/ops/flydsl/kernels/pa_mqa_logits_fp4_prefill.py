@@ -71,7 +71,7 @@ def compute_prefill_schedule(
     ls = local_starts.to(torch.int32)
     le = local_ends.to(torch.int32)
 
-    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
+    # chunk count per row = ceil(le / block_k); le<=0 -> 0 chunks.
     chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
 
     s_max = max(1, (max_seq_len + block_k - 1) // block_k)
@@ -82,17 +82,17 @@ def compute_prefill_schedule(
     total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
     feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
     max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
-    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
+    # smallest feasible s, via arithmetic (no tensor gather -> no capture sync).
     first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
     safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
 
-    # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
+    # -- per-row number of CTAs (chunk-splits); 0 for empty rows --
     ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
     incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
     excl = incl - ctas_r  # exclusive prefix sum
     total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
 
-    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
+    # -- map each fixed slot -> (row, split) + emit cta_info in ONE kernel --
     # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
     if cta_info_out is None:
         cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
@@ -313,13 +313,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(row_id))
-        _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_row))
-        _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
-        _row_bytes_i64 = arith.muli(
-            _row_elems_i64,
-            arith.constant(4, type=T.i64),  # sizeof(f32)
-        )
+        # sizeof(f32) = 4; compute the per-row base byte offset in i64.
+        _row_bytes_i64 = (fx.Int64(row_id) * fx.Int64(stride_out_row) * 4).ir_value()
         out_rsrc = buffer_ops.create_buffer_resource(
             out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
         )
@@ -389,7 +384,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             w_f32 = fx.Vector(fx.memref_load_vec(r).to(fx.Float32))
             w_per_lane.append(w_f32 * ws_vec)
 
-        # ── prologue + N-1 prefetch loop + epilogue ──
+        # -- prologue + N-1 prefetch loop + epilogue --
 
         def _load_phys(c_i32_arg):
             ni_base = warp_id * fx.Int32(N_TILES_PER_WARP)
@@ -515,7 +510,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
             # Row base is folded into `out_rsrc`'s i64 base pointer (see above),
-            # so the per-token store offset is just the (small) token index —
+            # so the per-token store offset is just the (small) token index --
             # no i32 overflow even for very large stride_out_row * row_id.
             out_off_real = out_token
             out_off = in_window.select(out_off_real, oob_off)
@@ -562,7 +557,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
         # === Main loop: chunk_count - 1 iterations ===
         N_KVS = k_tiles
         chunk_count_minus_1_i32 = chunk_count - fx.Int32(1)
-        chunk_count_minus_1_idx = fx.Index(chunk_count_minus_1_i32)
+        chunk_count_minus_1_idx = fx.Int64(chunk_count_minus_1_i32)
         init_args = (
             list(kv_pre) + list(kvs_pre) + list(phys_next_pre) + nt0_init_scalars
         )
@@ -661,7 +656,7 @@ def compile_pa_mqa_logits_fp4_prefill(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        gxi = arith.index_cast(T.index, gx.ir_value())
+        gxi = fx.Int64(gx)
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
@@ -782,7 +777,7 @@ def _varqlen_windows_kernel(
     n = r - cu_b
     qlen = cu_b1 - cu_b
     le = tl.maximum(ctx_b - qlen + n + 1, 0)
-    # Rows beyond the real total Σ (cu[B]) are FLAT tail-padding — force an empty
+    # Rows beyond the real total ? (cu[B]) are FLAT tail-padding -- force an empty
     # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
     # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
     real_total = tl.load(cu_ptr + B)
@@ -797,7 +792,7 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
     Pass `out=(row_to_batch, local_starts, local_ends)` (fixed int32 buffers each
-    >= total_q long) to write into stable addresses — the CUDAGraph decode path
+    >= total_q long) to write into stable addresses -- the CUDAGraph decode path
     scores all padded rows, so top_k replays from these window pointers while
     `build()` refreshes their contents. Rows past the real total (cu[B]) get an
     empty window (local_ends == 0) so they are skipped.

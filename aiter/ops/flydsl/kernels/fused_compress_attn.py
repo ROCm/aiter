@@ -16,8 +16,8 @@ Two kernel families share this file:
     online-softmax reduce, single dispatch. Parallelizes the serial softmax
     chain that bottlenecks the latency-bound small-N decode regime. On the
     CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8/FP4) shapes it
-    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4×
-    (BF16) / ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at
+    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4x
+    (BF16) / ~1.15-1.24x (FP8) at decode bs=1-32; it falls back to legacy at
     high N where CU occupancy already saturates. The K-split win comes from
     parallelizing the dtype-agnostic online-softmax pool, so FP4 reuses the
     FP8 wave-count heuristic. See ``flydsl_fused_compress_attn``'s
@@ -25,9 +25,9 @@ Two kernel families share this file:
 
 Grid: ``(plan_capacity, 1, 1)`` -- one program per packed plan row
 ``[ragged_id, batch_id, position, window_len]``. Position == -1 rows
-sentinel-skip; sentinel-skip is implemented as an scf.IfOp that wraps the
-entire body (flydsl ``if cond: return`` does NOT actually early-exit inside
-a @flyc.kernel -- same trap as ``qk_norm_rope_quant``'s grid-Y chunk loop).
+sentinel-skip; the whole body is a closure invoked under a runtime ``if``
+(flydsl ``if cond: return`` does NOT actually early-exit inside a
+@flyc.kernel, but ``if cond: _body()`` lowers to scf.if and guards it).
 
 Per-thread layout (single wave64, BLOCK_THREADS=64):
   - VEC = D / 64 (V4-Pro Main: D=512 -> VEC=8; Indexer: D=128 -> VEC=2)
@@ -70,14 +70,12 @@ previous-fwd. Caller MUST invoke BEFORE ``update_compressor_states``.
 # triggering a JIT recompile per dynamic-arg value).
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl, scf
+from flydsl._mlir.dialects import rocdl
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -139,18 +137,6 @@ _FP4_K_TILE = 128
 # ============================================================================
 
 
-@contextmanager
-def _if_then(if_op):
-    """SCF IfOp then-region context manager. Auto-yields empty if missing."""
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
-
-
 # ============================================================================
 # Kernel builder
 # ============================================================================
@@ -187,16 +173,16 @@ def _build_kernel(
       - overlap: True -> K = 2*RATIO (CSA), False -> K = RATIO (HCA, no overlap)
       - state_size: ring-buffer modulo of kv_state.shape[1] (>= K)
       - k_per_block: paged cache tokens per block (= block_size // ratio)
-      - has_block_table: False → skip cache scatter (warmup path)
+      - has_block_table: False -> skip cache scatter (warmup path)
       - quant_mode: single quant selector (the booleans below are derived):
-          "none"        → bf16 paged write (Main)            → quant=False
-          "per_row_fp8" → FP8 e4m3 per-row scale (Indexer)   → quant=True
-          "group_fp8"   → FP8 1xG group scale (Main nm-asm)  → quant=True, nm_asm
-          "fp4"         → FP4 (E2M1) per-group(32) e8m0 scale → quant=True, quant_fp4
+          "none"        -> bf16 paged write (Main)            -> quant=False
+          "per_row_fp8" -> FP8 e4m3 per-row scale (Indexer)   -> quant=True
+          "group_fp8"   -> FP8 1xG group scale (Main nm-asm)  -> quant=True, nm_asm
+          "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale -> quant=True, quant_fp4
       - use_ue8m0: only for fp8 (round scale to power-of-2); the FP4 path
         always uses the MX RoundUp e8m0 scale regardless.
       - preshuffle: only when quant (MFMA 16x16 tile / FP4 KV tile layout)
-      - enable_prefetch_input: True → Phase 2 carries k+1 loads through
+      - enable_prefetch_input: True -> Phase 2 carries k+1 loads through
         scf.for iter-args so the buffer_load issue overlaps current iter's
         softmax compute. Helps long K (HCA K=128). Larger VEC pays a register
         cost (loop-carry grows by 3*VEC fp32) -- gate off if it regresses.
@@ -244,7 +230,7 @@ def _build_kernel(
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
     if quant_fp4:
-        # FP4 KV preshuffle: k_tile = 128 elems → 4 groups of 32; data tile is
+        # FP4 KV preshuffle: k_tile = 128 elems -> 4 groups of 32; data tile is
         # [..., kv_block_size, 16] bytes (16 bytes = 32 fp4). Require D a
         # multiple of 128 and k_per_block a multiple of the 16-token tile.
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
@@ -337,9 +323,7 @@ def _build_kernel(
 
         def fexp_f32(x):
             """exp(x) via exp2(x * log2e). Single v_exp_f32 on AMD."""
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         def wave_reduce_add(x):
             """Butterfly sum across wave64."""
@@ -373,14 +357,12 @@ def _build_kernel(
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
         # ---- Step 2: sentinel-skip ----
-        # Wrap the entire body in scf.IfOp(position >= 0). flydsl's
-        # `if cond: return` does NOT actually early-exit (tail kernel body
-        # still runs with stale values, OOB faults). The IfOp does.
-        is_active = arith.cmpi(
-            CmpIPredicate.sge, _to_raw(position), arith.constant(0, type=i32)
-        )
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0. A bare
+        # `if cond: return` does NOT early-exit under the tracer (tail still
+        # runs with stale values -> OOB), so the body is a closure invoked
+        # under a runtime `if`: the rewriter sees an opaque call (no state to
+        # thread) and lowers it to scf.if, guarding every store inside.
+        def _body():
             # ---- Step 3: per-seq state slot ----
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
@@ -748,54 +730,44 @@ def _build_kernel(
                     )
                     loop_final = yield new_state
 
-                # Tail iter at k=K-1. Gated by `window_len < K`: when wl==K
-                # Phase 2 is empty and the IfOp returns phase1_state.
-                is_phase2_nonempty = arith.cmpi(
-                    CmpIPredicate.slt,
-                    _to_raw(window_len),
-                    arith.constant(K, type=i32),
+                # Tail iter at k=K-1. When window_len == K phase 2 is empty and
+                # the accumulator passes through phase1_state. Both arms are pure
+                # arithmetic (no loads), so compute the update unconditionally and
+                # per-lane select -- bit-identical to the old value-yielding IfOp.
+                is_phase2_nonempty = fx.Int32(window_len) < K
+                m_lane_t = list(loop_final[0:VEC])
+                kv_lane_t = list(loop_final[VEC : 2 * VEC])
+                w_lane_t = list(loop_final[2 * VEC : 3 * VEC])
+                pre_kv_t = list(loop_final[3 * VEC : 4 * VEC])
+                pre_sc_t = list(loop_final[4 * VEC : 5 * VEC])
+                pre_ape_t = list(loop_final[5 * VEC : 6 * VEC])
+                score_k_lane_t = [
+                    arith.AddFOp(pre_sc_t[i], pre_ape_t[i], fastmath=fm_fast).result
+                    for i in range(VEC)
+                ]
+                _, new_kv_t, new_w_t = _online_softmax_update(
+                    m_lane_t,
+                    kv_lane_t,
+                    w_lane_t,
+                    score_k_lane_t,
+                    pre_kv_t,
+                    score_can_be_neg_inf=False,
                 )
-                tail_result_types = [f32] * (3 * VEC)
-                _if_tail = scf.IfOp(
-                    is_phase2_nonempty, tail_result_types, has_else=True
-                )
-                with ir.InsertionPoint(_if_tail.then_block):
-                    m_lane_t = list(loop_final[0:VEC])
-                    kv_lane_t = list(loop_final[VEC : 2 * VEC])
-                    w_lane_t = list(loop_final[2 * VEC : 3 * VEC])
-                    pre_kv_t = list(loop_final[3 * VEC : 4 * VEC])
-                    pre_sc_t = list(loop_final[4 * VEC : 5 * VEC])
-                    pre_ape_t = list(loop_final[5 * VEC : 6 * VEC])
-                    score_k_lane_t = [
-                        arith.AddFOp(pre_sc_t[i], pre_ape_t[i], fastmath=fm_fast).result
-                        for i in range(VEC)
-                    ]
-                    new_m_t, new_kv_t, new_w_t = _online_softmax_update(
-                        m_lane_t,
-                        kv_lane_t,
-                        w_lane_t,
-                        score_k_lane_t,
-                        pre_kv_t,
-                        score_can_be_neg_inf=False,
-                    )
-                    scf.YieldOp(list(new_m_t) + list(new_kv_t) + list(new_w_t))
-                with ir.InsertionPoint(_if_tail.else_block):
-                    # Phase 2 empty (window_len == K): pass through phase1
-                    # accumulator unchanged.
-                    m_p1 = list(phase1_state[0:VEC])
-                    kv_p1 = list(phase1_state[VEC : 2 * VEC])
-                    w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
-                    scf.YieldOp(list(m_p1) + list(kv_p1) + list(w_p1))
-
-                kv_final = list(_if_tail.results[VEC : 2 * VEC])
-                w_final = list(_if_tail.results[2 * VEC : 3 * VEC])
+                kv_p1 = list(phase1_state[VEC : 2 * VEC])
+                w_p1 = list(phase1_state[2 * VEC : 3 * VEC])
+                kv_final = [
+                    is_phase2_nonempty.select(new_kv_t[i], kv_p1[i]).ir_value()
+                    for i in range(VEC)
+                ]
+                w_final = [
+                    is_phase2_nonempty.select(new_w_t[i], w_p1[i]).ir_value()
+                    for i in range(VEC)
+                ]
 
             # ---- Step 8: compressed = kv_acc / w_acc (per-lane) ----
             comp_lane = []
             for i in range_constexpr(VEC):
-                rcp_w = llvm.call_intrinsic(
-                    f32, "llvm.amdgcn.rcp.f32", [w_final[i]], [], []
-                )
+                rcp_w = fx.rocdl.rcp(f32, w_final[i])
                 comp_lane.append(
                     arith.MulFOp(kv_final[i], rcp_w, fastmath=fm_fast).result
                 )
@@ -1017,7 +989,7 @@ def _build_kernel(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── QUANT=1: FP8 per-row scaled write + fp32 scale ──
+                    # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
                     #   (b) scale = amax / FP8_MAX (with safety floor); for
@@ -1068,9 +1040,7 @@ def _build_kernel(
                         scale_v = scale_raw
 
                     # (c) inv_scale via rcp.f32
-                    inv_scale = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [scale_v], [], []
-                    )
+                    inv_scale = fx.rocdl.rcp(f32, scale_v)
 
                     # (d) per-lane fp8 cast: clamp + NaN guard
                     #     NaN guard: cvt_pk_fp8_f32 on fnuz returns 0x80 (NaN)
@@ -1180,13 +1150,7 @@ def _build_kernel(
 
                     if const_expr(VEC == 2):
                         # Only even tid stores (its dword covers peer's bytes too).
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(tid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        if (tid & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword,
                                 out_rsrc,
@@ -1210,27 +1174,21 @@ def _build_kernel(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    is_lane0 = arith.cmpi(
-                        CmpIPredicate.eq,
-                        _to_raw(tid),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_l0 = scf.IfOp(is_lane0)
-                    with _if_then(_if_l0):
+                    if tid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
+                        cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
+                        ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
+                    # -- QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write --
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
                     # FlyDSL IR builders (emit_mx_e8m0_scale / emit_f32_to_e2m1,
                     # used by silu_and_mul_fq). Each group of 32 elements shares
                     # one e8m0 byte; NTG = 32//VEC lanes cooperate per group.
-                    #   (a) per-lane amax over VEC → group-reduce-max over NTG
+                    #   (a) per-lane amax over VEC -> group-reduce-max over NTG
                     #   (b) e8m0 = ceil_pow2(amax/6) (MX RoundUp); quant_scale =
                     #       (254 - e8m0) << 23
                     #   (c) per-element E2M1 nibble, pack VEC/2 bytes
@@ -1247,7 +1205,7 @@ def _build_kernel(
                     c16_i32 = arith.constant(16, type=i32)
                     c64_i32 = arith.constant(64, type=i32)
                     c32_i32 = arith.constant(_FP4_GROUP_SIZE, type=i32)
-                    # smallest-normal * fp4_max floor — guards all-zero groups,
+                    # smallest-normal * fp4_max floor -- guards all-zero groups,
                     # matches dsv4_rotate_quant.cu eps_amax (bit-exact w/ ref).
                     c_eps_amax = arith.constant(
                         6.0 * float.fromhex("0x1p-126"), type=f32
@@ -1328,13 +1286,7 @@ def _build_kernel(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(tid_x_vec, c32_i32)
-                    is_grp_rep = arith.cmpi(
-                        CmpIPredicate.eq,
-                        arith.remui(_to_raw(tid), arith.constant(NTG, type=i32)),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_grp = scf.IfOp(is_grp_rep)
-                    with _if_then(_if_grp):
+                    if tid % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -1370,7 +1322,10 @@ def _build_kernel(
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8
-            # else: warmup — no scatter, just consume compute.
+            # else: warmup -- no scatter, just consume compute.
+
+        if fx.Int32(position) >= 0:
+            _body()
 
     @flyc.jit
     def launch_fused_compress_attn(
@@ -1403,7 +1358,7 @@ def _build_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
+        idx_p = fx.Int64(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -1487,7 +1442,7 @@ def _build_kernel_ksplit(
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
     minus ``enable_prefetch_input`` (each wave runs so few iters that prefetch
     is moot). The FP8 / FP4 / ue8m0 / preshuffle scatter is emitted in wave 0,
-    where ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
+    where ``lid`` (0..63) plays the single-wave ``tid`` role -- pair-coop
     shuffle_xor and wave_reduce_max stay within wave 0's 64 lanes, identical
     to the legacy kernel's semantics.
 
@@ -1638,9 +1593,7 @@ def _build_kernel_ksplit(
         c_D = arith.constant(D, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
         lid = arith.remui(_to_raw(tid), c_64)  # ? [0, 64)
@@ -1654,9 +1607,9 @@ def _build_kernel_ksplit(
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
-        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: whole body runs only for position >= 0, as a closure
+        # under a runtime `if` (see the CSA kernel above for the rationale).
+        def _body():
             slot_map_rsrc = buffer_ops.create_buffer_resource(
                 state_slot_mapping, max_size=True
             )
@@ -1873,9 +1826,7 @@ def _build_kernel_ksplit(
             gpu.barrier()
 
             # ---- wave 0: cross-wave reduce + norm + rope + scatter ----
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_lane = []
                 for i in range_constexpr(VEC):
                     lane_off = lid_x_vec + arith.constant(i, type=i32)
@@ -1895,11 +1846,7 @@ def _build_kernel_ksplit(
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_arr[w] - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
                     comp_lane.append(_to_raw(kv_sum * rcp_w))
 
                 # ---- RMSNorm (wave-reduce sum-of-squares over wave 0) ----
@@ -2096,7 +2043,7 @@ def _build_kernel_ksplit(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
+                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
                     def wave_reduce_max(x):
@@ -2137,9 +2084,7 @@ def _build_kernel_ksplit(
                         scale_v = scale_raw
 
                     # (c) inv_scale via rcp.f32
-                    inv_scale = llvm.call_intrinsic(
-                        f32, "llvm.amdgcn.rcp.f32", [scale_v], [], []
-                    )
+                    inv_scale = fx.rocdl.rcp(f32, scale_v)
 
                     # (d) per-lane fp8 cast: clamp + fnuz NaN guard
                     c_neg_uf = arith.constant(-(2.0**-8), type=f32)
@@ -2223,13 +2168,7 @@ def _build_kernel_ksplit(
                     byte_off = block_byte_base + in_block_off
 
                     if const_expr(VEC == 2):
-                        is_even = arith.cmpi(
-                            CmpIPredicate.eq,
-                            arith.andi(_to_raw(lid), arith.constant(1, type=i32)),
-                            arith.constant(0, type=i32),
-                        )
-                        _if_even = scf.IfOp(is_even)
-                        with _if_then(_if_even):
+                        if (lid & 1) == 0:
                             buffer_ops.buffer_store(
                                 dword, out_rsrc, byte_off, offset_is_bytes=True
                             )
@@ -2246,27 +2185,21 @@ def _build_kernel_ksplit(
                         )
 
                     # (f) lane-0 writes fp32 scale at cache_scale[phys, slot]
-                    is_lane0 = arith.cmpi(
-                        CmpIPredicate.eq,
-                        _to_raw(lid),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_l0 = scf.IfOp(is_lane0)
-                    with _if_then(_if_l0):
+                    if lid == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
-                        cs_off = ArithValue(physical_block) * ArithValue(
+                        cs_off = fx.Int32(physical_block) * fx.Int32(
                             cache_scale_block_stride
-                        ) + ArithValue(slot_in_block)
+                        ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
+                    # -- FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
                     # (0..63) is the single-wave ``tid`` equivalent; the
                     # butterfly group-reduce over NTG lanes stays within wave
                     # 0's 64 physical lanes. ``lid_x_vec`` replaces the legacy
-                    # ``tid_x_vec``. See _build_kernel for the full rationale. ──
+                    # ``tid_x_vec``. See _build_kernel for the full rationale. --
                     lid_x_vec_i = lid_x_vec
                     NTG = _FP4_GROUP_SIZE // VEC
                     LOG2_NTG = int(math.log2(NTG))
@@ -2357,13 +2290,7 @@ def _build_kernel_ksplit(
 
                     # (e) group-rep lane writes the e8m0 scale byte.
                     scale_group_idx = arith.divsi(lid_x_vec_i, c32_i32)
-                    is_grp_rep = arith.cmpi(
-                        CmpIPredicate.eq,
-                        arith.remui(_to_raw(lid), arith.constant(NTG, type=i32)),
-                        arith.constant(0, type=i32),
-                    )
-                    _if_grp = scf.IfOp(is_grp_rep)
-                    with _if_then(_if_grp):
+                    if lid % NTG == 0:
                         cs_rsrc = buffer_ops.create_buffer_resource(
                             cache_scale, max_size=True
                         )
@@ -2398,6 +2325,12 @@ def _build_kernel_ksplit(
                             _to_raw(cs_off),
                         )  # e8m0 uint8
 
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
+
     @flyc.jit
     def launch_fused_compress_attn_ksplit(
         kv_in: fx.Tensor,
@@ -2429,7 +2362,7 @@ def _build_kernel_ksplit(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
+        idx_p = fx.Int64(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -2652,9 +2585,9 @@ def flydsl_fused_compress_attn(
 
     ``quant_mode`` selects the scatter quantization (default derived from the
     legacy ``quant`` bool: ``"fp8" if quant else "none"``):
-      - ``"none"`` → BF16 paged write (CSA / HCA Main).
-      - ``"fp8"``  → FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
-      - ``"fp4"``  → FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
+      - ``"none"`` -> BF16 paged write (CSA / HCA Main).
+      - ``"fp8"``  -> FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
+      - ``"fp4"``  -> FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
         (``kv_cache`` uint8 [NB, k_tiles, 4, k_per_block, 16];
         ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]).
 
@@ -2856,7 +2789,7 @@ def flydsl_fused_compress_attn(
         bt_seq_stride = block_tables.stride(0)
         kv_cache_arg = kv_cache
         # FP4 store derives byte offsets from constants (k_tiles/group/tile),
-        # not these strides — bind the outer block stride for completeness.
+        # not these strides -- bind the outer block stride for completeness.
         kv_cache_block_stride = kv_cache.stride(0)
         kv_cache_token_stride = kv_cache.stride(1) if not _fp4 else 0
     else:
@@ -2900,8 +2833,8 @@ def flydsl_fused_compress_attn(
         krope_token_stride = 0
 
     # ---- K-split fast path (BF16 + FP8 + FP4 scatter) ----
-    # k_split_num_waves: None ⟹ auto-pick (tuned geometries only); int>1 ⟹
-    # forced NW; 1 ⟹ forced legacy. Auto triggers for the CSA Main (BF16),
+    # k_split_num_waves: None ? auto-pick (tuned geometries only); int>1 ?
+    # forced NW; 1 ? forced legacy. Auto triggers for the CSA Main (BF16),
     # CSA Indexer (FP8), and CSA Indexer (FP4) shapes the K-split kernel
     # supports; other shapes fall through to the legacy single-wave kernel.
     _is_csa_main = (

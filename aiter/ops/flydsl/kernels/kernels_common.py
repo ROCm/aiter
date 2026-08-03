@@ -5,22 +5,25 @@ but this module is intentionally small and MLIR-dialect facing.
 """
 
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import (
-    arith as _std_arith,
-)
-from flydsl._mlir.dialects import (
-    builtin,
-)
-from flydsl._mlir.dialects import (
-    gpu as _gpu,
-)
-from flydsl._mlir.dialects import (
-    llvm as _llvm,
-)
+from flydsl._mlir.dialects import arith as _std_arith
+from flydsl._mlir.dialects import builtin
+from flydsl._mlir.dialects import gpu as _gpu
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
+
+
+def format_kernel_name(name: str) -> str:
+    """Sanitize a kernel symbol name for the amdhsa assembler.
+
+    Config values interpolated into a kernel name may be negative (e.g. the
+    grouped-contiguous sentinel ``topk=-1`` renders as ``tk-1``). A hyphen is
+    not a legal symbol character, so the assembler misparses the
+    ``.amdhsa_kernel`` directive and the whole module fails to link.
+    """
+    return name.replace("-", "_")
 
 
 def get_warp_size(arch=None):

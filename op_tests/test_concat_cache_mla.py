@@ -44,6 +44,7 @@ def aiter_fused_rope_concat_and_cache_mla(
     is_neox,
     is_nope_first,
     q_out_dtype=None,
+    compute_all_q_rope=False,
 ):
     aiter.fused_qk_rope_concat_and_cache_mla(
         q_nope,
@@ -62,6 +63,7 @@ def aiter_fused_rope_concat_and_cache_mla(
         is_neox,
         is_nope_first,
         # q_out_dtype,
+        compute_all_q_rope=compute_all_q_rope,
     )
     return kv_cache, q_out
 
@@ -330,6 +332,8 @@ def test_fused_rope_concat_and_cache_mla(
     q_dtype: str,
     is_neox: bool,
     q_nope_layout: str = "contiguous",
+    valid_frac: float = 1.0,
+    compute_all_q_rope: bool = False,
 ):
     ret = {}
     torch.set_default_device(device)
@@ -337,6 +341,16 @@ def test_fused_rope_concat_and_cache_mla(
     total_slots = num_blocks * block_size
     slot_mapping_lst = random.sample(range(total_slots), num_tokens)
     slot_mapping = torch.tensor(slot_mapping_lst, dtype=torch.long, device=device)
+    # DCP/cudagraph padded-token simulation: keep the first `num_valid` tokens
+    # owned (slot >= 0) and mark the tail as padded (slot = -1). The original CK
+    # kernel early-returns on slot < 0 (no Q RoPE, no q_out); the fixed kernel
+    # computes Q RoPE + q_out unconditionally. Comparing the two at the same
+    # (num_tokens total, num_valid owned) isolates the padded-token overhead.
+    num_valid = (
+        num_tokens if valid_frac >= 1.0 else max(1, round(num_tokens * valid_frac))
+    )
+    if num_valid < num_tokens:
+        slot_mapping[num_valid:] = -1
 
     kv_c = torch.randn(
         num_tokens, num_kv_heads, kv_lora_rank, dtype=dtype, device=device
@@ -470,6 +484,7 @@ def test_fused_rope_concat_and_cache_mla(
         is_neox,
         is_nope_first,
         q_out_dtype,
+        compute_all_q_rope=compute_all_q_rope,
     )
     # err_triton_kv = 0
     # err_triton_q_out = 0
@@ -537,13 +552,19 @@ def test_fused_rope_concat_and_cache_mla(
     # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
+    # With compute_all_q_rope=True every token's q_out is computed -> check all.
+    # With compute_all_q_rope=False (default) padded-token q_out is left
+    # uninitialized (early-return), so only check the owned (valid-slot) tokens.
+    n_chk = num_tokens if compute_all_q_rope else num_valid
+    q_out_chk = q_out[:n_chk]
+    ref_q_out_chk = ref_q_out[:n_chk]
     q_nope_delta = (
-        q_out[..., :kv_lora_rank].to(torch.float32)
-        - ref_q_out[..., :kv_lora_rank].to(torch.float32)
+        q_out_chk[..., :kv_lora_rank].to(torch.float32)
+        - ref_q_out_chk[..., :kv_lora_rank].to(torch.float32)
     ).abs()
     q_rope_delta = (
-        q_out[..., kv_lora_rank:].to(torch.float32)
-        - ref_q_out[..., kv_lora_rank:].to(torch.float32)
+        q_out_chk[..., kv_lora_rank:].to(torch.float32)
+        - ref_q_out_chk[..., kv_lora_rank:].to(torch.float32)
     ).abs()
     q_nope_max_abs = float(q_nope_delta.max().item())
     q_rope_max_abs = float(q_rope_delta.max().item())
@@ -554,6 +575,9 @@ def test_fused_rope_concat_and_cache_mla(
             f"max_abs={q_nope_max_abs}"
         )
     ret["fused_qk_us"] = avg_us
+    ret["num_valid"] = num_valid
+    ret["padded"] = num_tokens - num_valid
+    ret["compute_all_q_rope"] = compute_all_q_rope
     # ret["unfused_us"] = ref_us
     ret["hip_kv_err"] = err_kv
     ret["hip_q_err"] = err_q_out
@@ -702,6 +726,30 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "-vf",
+    "--valid_frac",
+    type=float,
+    nargs="*",
+    default=[1.0, 0.5],
+    help="""fraction of tokens with a valid slot (>=0); the tail is padded
+    (slot=-1) to simulate DCP/cudagraph padded tokens. Default covers full
+    (1.0) and half-padded (0.5) so the DCP slot=-1 path is exercised.
+    e.g.: -vf 1.0 0.5""",
+)
+
+parser.add_argument(
+    "-caqr",
+    "--compute_all_q_rope",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False, True],
+    help="""compute Q RoPE for all tokens incl. slot=-1 padded (DCP path).
+    False = non-DCP early-return on padded tokens; True = DCP (every rank
+    RoPEs all queries). Default covers both.
+    e.g.: -caqr false true""",
+)
+
+parser.add_argument(
     "-c",
     "--case",
     type=str,
@@ -745,26 +793,55 @@ if "fused_qk" in args.case:
                     for is_neox in args.is_neox:
                         for q_dtype in args.q_dtype:
                             for q_nope_layout in args.q_nope_layout:
-                                if q_dtype == "fp8" and kv_cache_dtype != "fp8":
-                                    continue
-                                if num_kv_heads > num_heads:
-                                    continue
-                                ret = test_fused_rope_concat_and_cache_mla(
-                                    args.kv_lora_rank,
-                                    args.qk_rope_head_dim,
-                                    num_token,
-                                    args.block_size,
-                                    num_blocks,
-                                    num_heads,
-                                    num_kv_heads,
-                                    args.dtype,
-                                    args.device,
-                                    kv_cache_dtype,
-                                    q_dtype,
-                                    is_neox,
-                                    q_nope_layout,
-                                )
-                                df.append(ret)
+                                for valid_frac in args.valid_frac:
+                                    for compute_all_q_rope in args.compute_all_q_rope:
+                                        if q_dtype == "fp8" and kv_cache_dtype != "fp8":
+                                            continue
+                                        if num_kv_heads > num_heads:
+                                            continue
+                                        # compute_all_q_rope (DCP: RoPE all queries
+                                        # incl. padded slot=-1) is implemented only in
+                                        # the per-head and opt MLA *decode* kernels
+                                        # (num_kv_heads==1). It is absent from the
+                                        # general decode kernel (num_tokens>=256 and
+                                        # kv_lora_rank*num_heads<2048, e.g. num_heads=2)
+                                        # and from the GQA prefill kernels
+                                        # (num_kv_heads>1). Production DCP always hits
+                                        # per-head/opt (num_kv_heads==1, num_heads>=16),
+                                        # so restrict the sweep to those. Constants
+                                        # mirror the host dispatch (MAX_TOKENS_PER_HEAD
+                                        # =256, MIN_SIZE_FOR_OPT=2048).
+                                        hits_flag_kernel = num_kv_heads == 1 and (
+                                            num_token < 256
+                                            or args.kv_lora_rank * num_heads >= 2048
+                                        )
+                                        if compute_all_q_rope and not hits_flag_kernel:
+                                            continue
+                                        # Pair padding with compute_all_q_rope: only
+                                        # run (full, non-DCP) and (padded, DCP
+                                        # compute-all). Skip the redundant
+                                        # (full, compute-all) and the
+                                        # uninteresting (padded, early-return).
+                                        if compute_all_q_rope != (valid_frac < 1.0):
+                                            continue
+                                        ret = test_fused_rope_concat_and_cache_mla(
+                                            args.kv_lora_rank,
+                                            args.qk_rope_head_dim,
+                                            num_token,
+                                            args.block_size,
+                                            num_blocks,
+                                            num_heads,
+                                            num_kv_heads,
+                                            args.dtype,
+                                            args.device,
+                                            kv_cache_dtype,
+                                            q_dtype,
+                                            is_neox,
+                                            q_nope_layout,
+                                            valid_frac,
+                                            compute_all_q_rope,
+                                        )
+                                        df.append(ret)
     df = pd.DataFrame(df)
     df_md = df.to_markdown(index=False)
     aiter.logger.info("fused_rope_concat_and_cache_mla summary (markdown):\n%s", df_md)

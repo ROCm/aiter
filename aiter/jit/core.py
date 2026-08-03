@@ -69,7 +69,7 @@ def mp_lock(
             return ret
         # Could not acquire: another process holds the lock. Wait for it.
         # wait() returns True if the holder released normally (work done),
-        # or False if it broke a stale lock left by a dead/abandoned holder —
+        # or False if it broke a stale lock left by a dead/abandoned holder --
         # in which case we loop and try to acquire + build ourselves.
         if baton.wait():
             if WaitFunc is not None:
@@ -1075,6 +1075,7 @@ def _get_ck_exclude_modules():
         "module_cache",
         "module_fused_qk_norm_mrope_cache_quant_shuffle",
         "module_fused_qk_norm_rope_cache_quant_shuffle",
+        "module_inverse_rope_group_quant",
         "module_mla_metadata",
         "module_mla_reduce",
         "module_moe_asm",
@@ -1233,6 +1234,21 @@ def _is_union(origin):
     return origin is typing.Union or origin is types.UnionType
 
 
+# Per-parameter conversion kinds, resolved once per op from the type hints (see
+# _ensure_loaded) so the per-call loop is an int compare instead of a fresh
+# typing.get_origin/get_args round trip. _ARG_SCALAR covers int/float/anything
+# else: with c_func.argtypes declared, ctypes converts the raw Python value.
+(
+    _ARG_TENSOR,
+    _ARG_OPT_TENSOR,
+    _ARG_OPT_INT,
+    _ARG_OPT_STR,
+    _ARG_STR,
+    _ARG_BOOL,
+    _ARG_SCALAR,
+) = range(7)
+
+
 def _ctypes_call(func, fc_name, md_name):
     """Build a ctypes-based caller for a torch-free .so module.
 
@@ -1312,33 +1328,61 @@ def _ctypes_call(func, fc_name, md_name):
         else:
             c_func.restype = None
 
+        # `argtypes` and `kinds` are produced by the SAME pass over the type
+        # hints, so the ctypes type a parameter is declared as and the branch
+        # caller() takes for it can never drift apart. Hints are static, so this
+        # runs once per op instead of on every call.
         argtypes = []
+        kinds = []
         has_tensor = False
         for pname in _sig.parameters:
             hint = _hints.get(pname)
             origin = typing.get_origin(hint)
             type_args = typing.get_args(hint)
-            if hint is torch.Tensor or _is_union(origin) and torch.Tensor in type_args:
+            if hint is torch.Tensor:
                 argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_TENSOR)
+                has_tensor = True
+            elif _is_union(origin) and torch.Tensor in type_args:
+                argtypes.append(ctypes.POINTER(aiter_tensor_t))
+                kinds.append(_ARG_OPT_TENSOR)
                 has_tensor = True
             elif _is_union(origin) and int in type_args:
                 argtypes.append(ctypes.c_int64)
-            elif _is_union(origin) and str in type_args or hint is str:
+                kinds.append(_ARG_OPT_INT)
+            elif _is_union(origin) and str in type_args:
                 argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_OPT_STR)
+            elif hint is str:
+                argtypes.append(ctypes.c_char_p)
+                kinds.append(_ARG_STR)
             elif hint is bool:
                 argtypes.append(ctypes.c_int)
+                kinds.append(_ARG_BOOL)
             elif hint is int:
                 argtypes.append(ctypes.c_int64)
+                kinds.append(_ARG_SCALAR)
             elif hint is float:
                 argtypes.append(ctypes.c_float)
+                kinds.append(_ARG_SCALAR)
             else:
                 argtypes.append(ctypes.c_void_p)
+                kinds.append(_ARG_SCALAR)
         # hipStream_t: the caller always appends the current stream to the args, so the
         # argtypes must always declare it -- otherwise ctypes takes the variadic path
         # (ffi_prep_cif_var) for torch-free modules whose params are all non-tensor, which
         # fails on stricter libffi builds.
         argtypes.append(ctypes.c_void_p)  # hipStream_t
         c_func.argtypes = argtypes
+
+        # Positional fast path in caller(): with no *args/**kwargs/keyword-only
+        # parameters, the values are already in parameter order, so inspect's
+        # binding machinery has nothing to figure out. Anything else (kwargs,
+        # too few args) falls back to _sig.bind so error messages and binding
+        # semantics stay exactly as they were.
+        params = list(_sig.parameters.values())
+        fast_ok = all(p.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for p in params)
+        empty = inspect.Parameter.empty
 
         _cache["lib"] = lib
         _cache["c_func"] = c_func
@@ -1347,6 +1391,17 @@ def _ctypes_call(func, fc_name, md_name):
         _cache["ctypes_status_mode"] = ctypes_status_mode
         _cache["ctypes_data_return"] = ctypes_data_return
         _cache["has_tensor"] = has_tensor
+        _cache["kinds"] = tuple(kinds)
+        _cache["names"] = tuple(_sig.parameters)
+        _cache["defaults"] = tuple(
+            None if p.default is empty else p.default for p in params
+        )
+        _cache["n_params"] = len(params)
+        _cache["n_required"] = sum(1 for p in params if p.default is empty)
+        _cache["fast_ok"] = fast_ok
+        # A NULL aiter_tensor_t* carries no state, so one instance is reused for
+        # every omitted Optional[Tensor] instead of allocating per call.
+        _cache["null_tensor"] = ctypes.POINTER(aiter_tensor_t)()
 
     def _check_args_before_convert(bound_args, hints):
         for pname, value in bound_args.items():
@@ -1412,51 +1467,65 @@ def _ctypes_call(func, fc_name, md_name):
             from ..test_common import log_args
 
             log_args(func, *args, **kwargs)
-        bound = _sig.bind(*args, **kwargs)
-        bound.apply_defaults()
+
+        kinds = _cache["kinds"]
+        n_params = _cache["n_params"]
+        n_args = len(args)
+        if (
+            _cache["fast_ok"]
+            and not kwargs
+            and _cache["n_required"] <= n_args <= n_params
+        ):
+            # Already in parameter order; only the omitted tail needs defaults.
+            defaults = _cache["defaults"]
+            values = args if n_args == n_params else args + defaults[n_args:]
+        else:
+            # kwargs, a missing required arg, or an exotic signature -- let
+            # inspect do the binding (and raise the usual TypeError).
+            bound = _sig.bind(*args, **kwargs)
+            bound.apply_defaults()
+            values = tuple(bound.arguments.values())
 
         if not _arg_checked:
-            _check_args_before_convert(bound.arguments, _hints)
+            _check_args_before_convert(dict(zip(_cache["names"], values)), _hints)
             _arg_checked = True
 
         c_args = []
         aiter_refs = []
         tensor_device = None
+        add_arg = c_args.append
+        keep_alive = aiter_refs.append
 
-        for pname, value in bound.arguments.items():
-            hint = _hints.get(pname)
-            origin = typing.get_origin(hint)
-            type_args = typing.get_args(hint)
+        null_tensor = _cache["null_tensor"]
 
-            if hint is torch.Tensor:
+        for kind, value in zip(kinds, values):
+            if kind == _ARG_SCALAR:
+                # int / float / anything else: c_func.argtypes drives the
+                # conversion, so the raw Python value goes straight through.
+                add_arg(value)
+            elif kind == _ARG_TENSOR:
                 if tensor_device is None:
                     tensor_device = value.device
                 at = torch_to_aiter(value)
-                aiter_refs.append(at)
-                c_args.append(ctypes.byref(at))
-            elif _is_union(origin) and torch.Tensor in type_args:
+                keep_alive(at)
+                add_arg(ctypes.byref(at))
+            elif kind == _ARG_OPT_TENSOR:
                 if value is not None:
                     if tensor_device is None:
                         tensor_device = value.device
                     at = torch_to_aiter(value)
-                    aiter_refs.append(at)
-                    c_args.append(ctypes.byref(at))
+                    keep_alive(at)
+                    add_arg(ctypes.byref(at))
                 else:
-                    c_args.append(ctypes.POINTER(aiter_tensor_t)())
-            elif _is_union(origin) and int in type_args:
-                c_args.append(value if value is not None else -1)
-            elif _is_union(origin) and str in type_args:
-                c_args.append(value.encode() if value is not None else None)
-            elif hint is str:
-                c_args.append(value.encode())
-            elif hint is bool:
-                c_args.append(1 if value else 0)
-            elif hint is int:
-                c_args.append(ctypes.c_int64(value))
-            elif hint is float:
-                c_args.append(ctypes.c_float(value))
-            else:
-                c_args.append(value)
+                    add_arg(null_tensor)
+            elif kind == _ARG_OPT_INT:
+                add_arg(value if value is not None else -1)
+            elif kind == _ARG_OPT_STR:
+                add_arg(value.encode() if value is not None else None)
+            elif kind == _ARG_STR:
+                add_arg(value.encode())
+            else:  # _ARG_BOOL
+                add_arg(1 if value else 0)
 
         c_args.append(
             ctypes.c_void_p(torch.cuda.current_stream(tensor_device).cuda_stream)
