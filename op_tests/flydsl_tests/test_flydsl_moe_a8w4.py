@@ -238,6 +238,60 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
 
 
+@_SKIP_GFX950_FLYDSL
+@pytest.mark.parametrize(
+    "model_dim,model_dim_pad",
+    [(512, 0), (640, 128), (3584, 0)],
+)
+@pytest.mark.parametrize("tile_n", [128, 256])
+def test_flydsl_stage2_a8w4_route_fp8(monkeypatch, model_dim, model_dim_pad, tile_n):
+    """Route-FP8 output stays close to BF16 reduce across model dimensions."""
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage2
+
+    token, inter_dim, E, topk, block_m = 4, 384, 16, 16, 32
+    data = _generate_a8w4_gui_data(
+        token, model_dim, inter_dim, E, topk, block_m, seed=103
+    )
+    kwargs = dict(
+        inter_states=data["a2_q"],
+        w2=data["w2_shuf"],
+        sorted_token_ids=data["sorted_ids"],
+        sorted_expert_ids=data["sorted_expert_ids"],
+        num_valid_ids=data["num_valid_ids"],
+        topk=topk,
+        tile_m=32,
+        tile_n=tile_n,
+        tile_k=128,
+        a_dtype="fp8",
+        b_dtype="fp4",
+        out_dtype="bf16",
+        mode="reduce",
+        w2_scale=data["w2_scale_shuf"],
+        a2_scale=data["a2_scale_sort"],
+        sorted_weights=data["sorted_weights"],
+        model_dim_pad=model_dim_pad,
+        inter_dim_pad=data["inter_pad"],
+    )
+
+    monkeypatch.delenv("AITER_FLYDSL_STAGE2_ROUTE_FP8", raising=False)
+    baseline = flydsl_moe_stage2(**kwargs)
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_ROUTE_FP8", "1")
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_ROUTE_FP8_MIN_TOKENS", "0")
+    route_fp8 = flydsl_moe_stage2(**kwargs)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(route_fp8).all()
+    valid_dim = model_dim - model_dim_pad
+    baseline_f = baseline[:, :valid_dim].float()
+    route_f = route_fp8[:, :valid_dim].float()
+    cosine_diff = 1.0 - 2.0 * (baseline_f * route_f).sum() / (
+        baseline_f.square().sum() + route_f.square().sum()
+    )
+    assert cosine_diff.item() < 1e-3
+    if model_dim_pad:
+        assert torch.count_nonzero(route_fp8[:, valid_dim:]) == 0
+
+
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
 @_SKIP_GFX950_FLYDSL
 def test_flydsl_e2e_a8w4_gui(inter_dim):

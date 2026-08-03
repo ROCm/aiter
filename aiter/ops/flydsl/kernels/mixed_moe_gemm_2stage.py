@@ -116,6 +116,7 @@ def compile_mixed_moe_gemm2(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    route_fp8: bool = False,
 ):
     """Compile an ordinary stage2 MoE kernel."""
     return compile_mixed_moe_gemm2_common(
@@ -142,4 +143,5 @@ def compile_mixed_moe_gemm2(
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
+        route_fp8=route_fp8,
     )

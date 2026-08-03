@@ -116,6 +116,45 @@ def requires_flydsl_stage2_reduce(
     return int(token_num) * int(model_dim) * int(element_size) > 0xFFFFFFFF
 
 
+def _use_flydsl_stage2_route_fp8(
+    *,
+    token_num: int,
+    mode: str,
+    return_per_slot: bool,
+    compile_kernel,
+    expert_mask,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    model_dim: int,
+    tile_n: int,
+) -> bool:
+    """Whether the generic A8W4 reduce path can use compressed route output."""
+    if os.environ.get("AITER_FLYDSL_STAGE2_ROUTE_FP8", "0") != "1":
+        return False
+    min_tokens = int(os.environ.get("AITER_FLYDSL_STAGE2_ROUTE_FP8_MIN_TOKENS", "4096"))
+    if token_num < min_tokens or mode != "reduce" or return_per_slot:
+        return False
+    return (
+        compile_kernel is compile_flydsl_moe_stage2
+        and expert_mask is None
+        and (a_dtype, b_dtype, out_dtype) == ("fp8", "fp4", "bf16")
+        and model_dim % 8 == 0
+        and tile_n >= 128
+        and tile_n % 128 == 0
+    )
+
+
+def _route_fp8_reduce_block_n(model_dim: int) -> int | None:
+    """Prefer an exact registered reducer tile, otherwise use Opus auto-select."""
+    from aiter.ops.opus.moe_stage2_a8w4_meta import (
+        OPUS_A8W4_ROUTE_REDUCE_INSTANCES,
+    )
+
+    registered = {instance.block_n for instance in OPUS_A8W4_ROUTE_REDUCE_INSTANCES}
+    return model_dim if model_dim in registered else None
+
+
 def resolve_flydsl_stage2_tile_k(inter_dim: int, tile_k: int) -> int:
     """Return a ``tile_k`` that divides ``inter_dim``, preferring the caller value.
 
@@ -603,6 +642,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    route_fp8: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
@@ -660,6 +700,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            route_fp8=route_fp8,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -1819,6 +1860,18 @@ def _flydsl_moe_stage2_impl(
         mode = "reduce"
 
     accumulate = mode != "reduce" and not return_per_slot
+    route_fp8 = _use_flydsl_stage2_route_fp8(
+        token_num=token_num,
+        mode=mode,
+        return_per_slot=return_per_slot,
+        compile_kernel=_compile_kernel,
+        expert_mask=expert_mask,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        out_dtype=out_dtype,
+        model_dim=model_dim,
+        tile_n=tile_n,
+    )
 
     if a_dtype == "fp4":
         inter_dim = inter_dim * 2
@@ -1887,7 +1940,14 @@ def _flydsl_moe_stage2_impl(
 
     target = out
     if not accumulate:
-        if return_per_slot:
+        if route_fp8:
+            alloc_route = torch.zeros if model_dim_pad else torch.empty
+            target = alloc_route(
+                (token_num * topk, model_dim + model_dim // 8),
+                device=out.device,
+                dtype=torch.uint8,
+            )
+        elif return_per_slot:
             target = out.view(-1)
         else:
             target = torch.empty(
@@ -1931,6 +1991,7 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
         )
 
+    route_fp8_compile_kwargs = {"route_fp8": True} if route_fp8 else {}
     exe = _compile_kernel(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -1954,6 +2015,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        **route_fp8_compile_kwargs,
     )
     _run_compiled(exe, args)
 
@@ -1963,7 +2025,18 @@ def _flydsl_moe_stage2_impl(
             raise ValueError(
                 "topk_ids is required when expert_mask is provided for reduce mode"
             )
-    if not accumulate and not return_per_slot:
+    if route_fp8:
+        from aiter.ops.opus.moe_stage2_a8w4 import (
+            opus_moe_stage2_reduce_token_slot_route_output_fwd,
+        )
+
+        opus_moe_stage2_reduce_token_slot_route_output_fwd(
+            target,
+            out=out,
+            topk=topk,
+            block_n=_route_fp8_reduce_block_n(model_dim),
+        )
+    elif not accumulate and not return_per_slot:
         _run_moe_reduction(
             target, out, token_num, topk, model_dim, expert_mask, topk_ids
         )
