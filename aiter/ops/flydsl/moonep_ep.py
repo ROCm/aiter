@@ -17,23 +17,23 @@ from aiter.ops.flydsl.moonep import (
     MoonEPPlanConfig,
     MoonEPReferencePlan,
     build_reference_plan,
-    hipblaslt_moonep_grouped_gemm_reference,
+    hipblaslt_moonep_mlp_reference,
 )
 
 
 class MoonEPBF16ReferenceEP:
-    """End-to-end MoonEP communication plus expert-projection baseline.
+    """End-to-end MoonEP communication plus a gated expert MLP.
 
     The physical EP path is complete: planning, direct peer dispatch, dynamic
     weight-slot prefetch, variable-M expert GEMM, and direct peer weighted
-    combine.  Expert compute is deliberately one BF16 ``H x H`` projection so
-    communication correctness stays independent of a model-specific gated MLP.
+    combine. Expert compute is ``down(silu(gate(x)) * up(x))`` in BF16.
     """
 
     def __init__(
         self,
         config: MoonEPPlanConfig,
         hidden_dim: int,
+        intermediate_dim: int,
         *,
         dispatch_block_num: int = 128,
         prefetch_block_num: int = 128,
@@ -41,27 +41,43 @@ class MoonEPBF16ReferenceEP:
     ) -> None:
         self.config = config
         self.hidden_dim = hidden_dim
+        self.intermediate_dim = intermediate_dim
         self.dispatch_op = MoonEPPreplannedDispatchOp(
             config,
             hidden_dim,
             block_num=dispatch_block_num,
             warp_num_per_block=warp_num_per_block,
         )
-        self.weight_op = MoonEPWeightPrefetchOp(
+        common = dict(
             rank=config.rank,
             world_size=config.world_size,
             num_experts=config.num_experts,
             prefetch_slots=int(config.prefetch_slots),
-            weight_shape=(hidden_dim, hidden_dim),
             block_num=prefetch_block_num,
             block_threads=warp_num_per_block * 64,
         )
+        self.gate_op = MoonEPWeightPrefetchOp(
+            weight_shape=(hidden_dim, intermediate_dim), **common
+        )
+        self.up_op = MoonEPWeightPrefetchOp(
+            weight_shape=(hidden_dim, intermediate_dim), **common
+        )
+        self.down_op = MoonEPWeightPrefetchOp(
+            weight_shape=(intermediate_dim, hidden_dim), **common
+        )
         self._closed = False
 
-    def load_home_weights(self, weights: torch.Tensor) -> None:
-        """Publish this rank's ``[experts_per_rank,H,H]`` BF16 weights."""
+    def load_home_weights(
+        self,
+        gate: torch.Tensor,
+        up: torch.Tensor,
+        down: torch.Tensor,
+    ) -> None:
+        """Publish this rank's resident gate/up/down expert weights."""
 
-        self.weight_op.load_home_weights(weights)
+        self.gate_op.load_home_weights(gate)
+        self.up_op.load_home_weights(up)
+        self.down_op.load_home_weights(down)
 
     def forward(
         self,
@@ -83,13 +99,18 @@ class MoonEPBF16ReferenceEP:
                 self.config, topk_experts, tokens_per_expert
             )
 
-        dispatched, _, prefetched = self.dispatch_op.dispatch_and_prefetch(
-            hidden, route_weights, plan, self.weight_op
-        )
-        hipblaslt_moonep_grouped_gemm_reference(
+        dispatched, _ = self.dispatch_op.dispatch(hidden, route_weights, plan)
+        prefetched_gate = self.gate_op.prefetch(plan.experts_to_copy)
+        prefetched_up = self.up_op.prefetch(plan.experts_to_copy)
+        prefetched_down = self.down_op.prefetch(plan.experts_to_copy)
+        hipblaslt_moonep_mlp_reference(
             dispatched,
-            self.weight_op.home_weights,
-            prefetched,
+            self.gate_op.home_weights,
+            self.up_op.home_weights,
+            self.down_op.home_weights,
+            prefetched_gate,
+            prefetched_up,
+            prefetched_down,
             plan.cu_seqlens,
             plan.group_expert_ids,
             rank=self.config.rank,
@@ -104,7 +125,9 @@ class MoonEPBF16ReferenceEP:
 
         if self._closed:
             return
-        self.weight_op.close()
+        self.down_op.close()
+        self.up_op.close()
+        self.gate_op.close()
         self.dispatch_op.close()
         self._closed = True
 

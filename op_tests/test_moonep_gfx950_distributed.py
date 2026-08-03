@@ -54,6 +54,7 @@ def _run_two_rank_direct_scatter() -> None:
 
     op = None
     prefetch_op = None
+    ep = None
     try:
         num_tokens = 4
         hidden_dim = 128
@@ -242,18 +243,28 @@ def _run_two_rank_direct_scatter() -> None:
         ep = MoonEPBF16ReferenceEP(
             hot_config,
             hidden_dim,
+            64,
             dispatch_block_num=8,
             prefetch_block_num=8,
         )
         op = ep.dispatch_op
-        prefetch_op = ep.weight_op
-        home_weights = torch.stack(
-            [
-                identity * (rank * hot_config.experts_per_rank + local + 1)
-                for local in range(hot_config.experts_per_rank)
-            ]
+        gate_base = torch.eye(
+            hidden_dim, 64, dtype=torch.bfloat16, device="cuda"
+        )
+        up_base = gate_base.clone()
+        down_base = torch.eye(
+            64, hidden_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        home_gate = torch.stack(
+            [gate_base for _ in range(hot_config.experts_per_rank)]
         ).contiguous()
-        ep.load_home_weights(home_weights)
+        home_up = torch.stack(
+            [up_base for _ in range(hot_config.experts_per_rank)]
+        ).contiguous()
+        home_down = torch.stack(
+            [down_base for _ in range(hot_config.experts_per_rank)]
+        ).contiguous()
+        ep.load_home_weights(home_gate, home_up, home_down)
         hot_values = (
             torch.arange(4, dtype=torch.float32, device="cuda") + rank * 10
         ).to(torch.bfloat16)
@@ -270,7 +281,7 @@ def _run_two_rank_direct_scatter() -> None:
         assert returned_hot_plan is hot_plan
         hot_recv = op.recv_hidden
         hot_recv_weights = op.recv_route_weights
-        prefetched = prefetch_op.prefetched_weights
+        prefetched_gate = ep.gate_op.prefetched_weights
         expected_hot_values = torch.arange(
             rank * 10,
             rank * 10 + 4,
@@ -294,20 +305,50 @@ def _run_two_rank_direct_scatter() -> None:
         else:
             assert int(hot_plan.experts_to_copy[rank, 0]) == 0
             torch.testing.assert_close(
-                prefetched[0], identity, rtol=0, atol=0
+                prefetched_gate[0], gate_base, rtol=0, atol=0
             )
 
-        expected_hot_output_values = (
-            hot_values.to(torch.float32)
-            * hot_route_weights[:, 0]
+        ref_gate = hot_hidden @ gate_base
+        ref_up = hot_hidden @ up_base
+        ref_act = (
+            torch.nn.functional.silu(ref_gate.to(torch.float32))
+            * ref_up.to(torch.float32)
         ).to(torch.bfloat16)
-        expected_hot_output = expected_hot_output_values[:, None].expand(
-            -1, hidden_dim
-        )
+        ref_expert = ref_act @ down_base
+        expected_hot_output = (
+            ref_expert.to(torch.float32) * hot_route_weights[:, 0, None]
+        ).to(torch.bfloat16)
         torch.testing.assert_close(
-            hot_output, expected_hot_output, rtol=0, atol=0
+            hot_output, expected_hot_output, rtol=1e-2, atol=2e-2
+        )
+
+        reused_hidden = (hot_hidden + 1.0).contiguous()
+        reused_route_weights = (hot_route_weights * 0.5).contiguous()
+        reused_output, reused_plan = ep.forward(
+            reused_hidden,
+            reused_route_weights,
+            plan=returned_hot_plan,
+        )
+        torch.cuda.synchronize()
+        assert reused_plan is returned_hot_plan
+        reused_gate = reused_hidden @ gate_base
+        reused_up = reused_hidden @ up_base
+        reused_act = (
+            torch.nn.functional.silu(reused_gate.to(torch.float32))
+            * reused_up.to(torch.float32)
+        ).to(torch.bfloat16)
+        reused_expert = reused_act @ down_base
+        expected_reused = (
+            reused_expert.to(torch.float32)
+            * reused_route_weights[:, 0, None]
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(
+            reused_output, expected_reused, rtol=1e-2, atol=2e-2
         )
     finally:
+        if ep is not None:
+            ep.close()
+            op = None
         if prefetch_op is not None:
             prefetch_op.close()
         if op is not None:

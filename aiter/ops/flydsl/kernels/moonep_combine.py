@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import T, range_constexpr
-from flydsl.expr.typing import Stream
+from flydsl.expr import range_constexpr
+from flydsl.expr.typing import Stream, T
 
 from aiter.ops.flydsl.kernels import vector
 from aiter.ops.flydsl.kernels.buffer_ops import (

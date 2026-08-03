@@ -495,10 +495,109 @@ def hipblaslt_moonep_grouped_gemm_reference(
     return output
 
 
+def hipblaslt_moonep_mlp_reference(
+    hidden: torch.Tensor,
+    home_gate: torch.Tensor,
+    home_up: torch.Tensor,
+    home_down: torch.Tensor,
+    prefetched_gate: torch.Tensor,
+    prefetched_up: torch.Tensor,
+    prefetched_down: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    group_expert_ids: torch.Tensor,
+    *,
+    rank: int,
+    experts_per_rank: int,
+    num_experts: int,
+    output: torch.Tensor,
+    solution_index: int = -1,
+) -> torch.Tensor:
+    """Run ``down(silu(gate(x)) * up(x))`` for every physical VM group."""
+
+    slots = prefetched_gate.shape[0]
+    group_count = num_experts + slots
+    if cu_seqlens.numel() != group_count or group_expert_ids.numel() != group_count:
+        raise ValueError("MoonEP group metadata has the wrong length")
+    if prefetched_up.shape[0] != slots or prefetched_down.shape[0] != slots:
+        raise ValueError("prefetched gate/up/down slot counts differ")
+    hidden_dim = hidden.shape[1]
+    intermediate_dim = home_gate.shape[2]
+    expected_gate = (hidden_dim, intermediate_dim)
+    expected_down = (intermediate_dim, hidden_dim)
+    for name, tensor in (
+        ("home_gate", home_gate),
+        ("home_up", home_up),
+        ("prefetched_gate", prefetched_gate),
+        ("prefetched_up", prefetched_up),
+    ):
+        if tuple(tensor.shape[1:]) != expected_gate:
+            raise ValueError(f"{name} has the wrong shape")
+    for name, tensor in (
+        ("home_down", home_down),
+        ("prefetched_down", prefetched_down),
+    ):
+        if tuple(tensor.shape[1:]) != expected_down:
+            raise ValueError(f"{name} has the wrong shape")
+    if tuple(output.shape) != (hidden.shape[0], hidden_dim):
+        raise ValueError("expert MLP output shape mismatch")
+
+    from aiter.ops.gradlib import hipb_create_extension, hipb_mm
+
+    hipb_create_extension()
+    ends = cu_seqlens.to(device="cpu").tolist()
+    expert_ids = group_expert_ids.to(device="cpu").tolist()
+    start = 0
+    for group, (end, expert) in enumerate(zip(ends, expert_ids)):
+        end = int(end)
+        expert = int(expert)
+        if end < start or end > hidden.shape[0]:
+            raise ValueError("cu_seqlens must be monotonic and within hidden")
+        if end > start:
+            if expert < 0:
+                raise ValueError("non-empty group is missing its expert id")
+            if group < num_experts:
+                owner = expert // experts_per_rank
+                if owner != rank:
+                    raise ValueError(
+                        "remote expert group has no dynamic prefetch slot"
+                    )
+                local = expert % experts_per_rank
+                gate_w = home_gate[local]
+                up_w = home_up[local]
+                down_w = home_down[local]
+            else:
+                slot = group - num_experts
+                gate_w = prefetched_gate[slot]
+                up_w = prefetched_up[slot]
+                down_w = prefetched_down[slot]
+
+            x = hidden[start:end]
+            gate = hipb_mm(
+                x, gate_w, solution_index=solution_index, out_dtype=torch.bfloat16
+            )
+            up = hipb_mm(
+                x, up_w, solution_index=solution_index, out_dtype=torch.bfloat16
+            )
+            activated = (
+                torch.nn.functional.silu(gate.to(torch.float32))
+                * up.to(torch.float32)
+            ).to(torch.bfloat16)
+            group_out = hipb_mm(
+                activated,
+                down_w,
+                solution_index=solution_index,
+                out_dtype=torch.bfloat16,
+            )
+            output[start:end].copy_(group_out)
+        start = end
+    return output
+
+
 __all__ = [
     "MoonEPPlanConfig",
     "MoonEPReferencePlan",
     "build_reference_plan",
     "hipblaslt_grouped_gemm_reference",
     "hipblaslt_moonep_grouped_gemm_reference",
+    "hipblaslt_moonep_mlp_reference",
 ]
