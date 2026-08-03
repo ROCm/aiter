@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import torch
+import torch.distributed as dist
 
 from aiter.ops.flydsl.kernels.moonep_dispatch_op import (
     MoonEPPreplannedDispatchOp,
@@ -87,6 +88,7 @@ class MoonEPBF16ReferenceEP:
         topk_experts: torch.Tensor | None = None,
         tokens_per_expert: torch.Tensor | None = None,
         plan: MoonEPReferencePlan | None = None,
+        zero_copy: bool = False,
     ) -> tuple[torch.Tensor, MoonEPReferencePlan]:
         """Run one complete correctness-first BF16 EP forward."""
 
@@ -95,6 +97,14 @@ class MoonEPBF16ReferenceEP:
         if plan is None:
             if topk_experts is None or tokens_per_expert is None:
                 raise ValueError("routing inputs are required when plan is absent")
+            if tokens_per_expert.ndim == 1:
+                if tokens_per_expert.numel() != self.config.num_experts:
+                    raise ValueError("local tokens_per_expert has the wrong length")
+                gathered = [torch.empty_like(tokens_per_expert) for _ in range(
+                    self.config.world_size
+                )]
+                dist.all_gather(gathered, tokens_per_expert)
+                tokens_per_expert = torch.stack(gathered)
             plan = build_reference_plan(
                 self.config, topk_experts, tokens_per_expert
             )
@@ -118,7 +128,8 @@ class MoonEPBF16ReferenceEP:
             num_experts=self.config.num_experts,
             output=self.dispatch_op.expert_output,
         )
-        return self.dispatch_op.combine(route_weights, plan), plan
+        result = self.dispatch_op.combine(route_weights, plan)
+        return (result if zero_copy else result.clone()), plan
 
     def close(self) -> None:
         """Collectively release symmetric EP buffers in reverse order."""

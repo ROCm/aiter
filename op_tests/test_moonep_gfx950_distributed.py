@@ -275,10 +275,14 @@ def _run_two_rank_direct_scatter() -> None:
             + 0.125
         )[:, None].contiguous()
         hot_output, returned_hot_plan = ep.forward(
-            hot_hidden, hot_route_weights, plan=hot_plan
+            hot_hidden,
+            hot_route_weights,
+            topk_experts=hot_topk,
+            tokens_per_expert=hot_tokens_per_expert[rank],
         )
         torch.cuda.synchronize()
-        assert returned_hot_plan is hot_plan
+        assert torch.equal(returned_hot_plan.dst, hot_plan.dst)
+        assert hot_output.data_ptr() != op.combine_output.data_ptr()
         hot_recv = op.recv_hidden
         hot_recv_weights = op.recv_route_weights
         prefetched_gate = ep.gate_op.prefetched_weights
@@ -328,9 +332,11 @@ def _run_two_rank_direct_scatter() -> None:
             reused_hidden,
             reused_route_weights,
             plan=returned_hot_plan,
+            zero_copy=True,
         )
         torch.cuda.synchronize()
         assert reused_plan is returned_hot_plan
+        assert reused_output.data_ptr() == op.combine_output.data_ptr()
         reused_gate = reused_hidden @ gate_base
         reused_up = reused_hidden @ up_base
         reused_act = (
