@@ -30,6 +30,12 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 CTA_INFO_WIDTH = 6
 
 
+def _resolve_prefill_block_k(block_k: int, max_seq_len: int) -> int:
+    if block_k == 256 and max_seq_len <= 256:
+        return 64
+    return block_k
+
+
 def _pack_i32_pair_to_i64(a_i32, b_i32):
     return fx.Vector.from_elements([a_i32, b_i32], dtype=fx.Int32).bitcast(fx.Int64)[0]
 
@@ -57,6 +63,7 @@ def compute_prefill_schedule(
     to write the schedule into a stable address (CUDAGraph decode: the captured
     kernel replays from this pointer while `build()` refreshes its contents).
     """
+    block_k = _resolve_prefill_block_k(block_k, max_seq_len)
     device = local_ends.device
     P = parallel_unit_num
     T = local_ends.shape[0]  # fixed total_tokens (rows)
@@ -679,7 +686,7 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     weight_scale: float = 1.0,
     block_k: int = 256,
     kv_block_size: int = 64,
-    num_warps: int = DEFAULT_NUM_WARPS,
+    num_warps: int | None = None,
     parallel_unit_num: int = 512,
     out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
@@ -690,6 +697,10 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     total_tokens, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]
+    requested_block_k = block_k
+    block_k = _resolve_prefill_block_k(block_k, max_seq_len)
+    if num_warps is None or block_k != requested_block_k:
+        num_warps = block_k // 64
 
     if (cta_info is None) != (n_ctas is None):
         raise ValueError("Pass both cta_info and n_ctas, or neither.")
