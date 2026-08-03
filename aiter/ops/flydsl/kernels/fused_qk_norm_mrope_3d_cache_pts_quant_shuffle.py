@@ -121,6 +121,36 @@ def rms_reduce_add(x, lane):
     other_half = v.shuffle_xor(RMS_GROUP, WAVE)
     return (lane < RMS_GROUP).select(v, other_half)
 
+def mrope_cos_sin(col, tok, positions_t, cos_sin_t, mrope_section, is_interleaved, HALF):
+    """Interleaved 3D-mrope cos/sin gather for column ``col`` in
+    [0, HALF). Mirrors ``apply_interleaved_rope``: column ``col``
+    takes its position from section ``col % 3`` if that section
+    "owns" the column (``col < mrope_section[col % 3] * 3``), else
+    falls back to section 0 (temporal). Two ``select()`` ternaries,
+    no branching -- valid for any ``col``, not just ``col < WAVE``
+    (this is a pure function of the column value)."""
+    if const_expr(is_interleaved):
+        mid = col % fx.Int32(3)
+        is_mid1 = mid == fx.Int32(1)
+        boundary = is_mid1.select(
+            fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
+        )
+        in_range = col < boundary
+        use_mid = (mid != fx.Int32(0)) & in_range
+        sect_idx = use_mid.select(mid, fx.Int32(0))
+    else:
+        in_section_0 = col < fx.Int32(mrope_section[0])
+        in_section_1 = col < fx.Int32(mrope_section[0] + mrope_section[1])
+        sect_idx = in_section_0.select(
+            fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
+        )
+
+    pos_i64 = fx.Int64(positions_t[sect_idx, tok])
+    pos = pos_i64.to(fx.Int32)
+    cos_v = fx.Float32(cos_sin_t[pos, col])
+    sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
+    return cos_v, sin_v
+
 @lru_cache(maxsize=1)
 def _fp8_range():
     from aiter.utility import dtypes as aiter_dtypes
@@ -160,36 +190,6 @@ def _build_q_kernel(
     ):
         fm_fast = arith.FastMathFlags.fast
 
-        def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
-            """Interleaved 3D-mrope cos/sin gather for column ``col`` in
-            [0, HALF). Mirrors ``apply_interleaved_rope``: column ``col``
-            takes its position from section ``col % 3`` if that section
-            "owns" the column (``col < mrope_section[col % 3] * 3``), else
-            falls back to section 0 (temporal). Two ``select()`` ternaries,
-            no branching -- valid for any ``col``, not just ``col < WAVE``
-            (this is a pure function of the column value)."""
-            if const_expr(is_interleaved):
-                mid = col % fx.Int32(3)
-                is_mid1 = mid == fx.Int32(1)
-                boundary = is_mid1.select(
-                    fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
-                )
-                in_range = col < boundary
-                use_mid = (mid != fx.Int32(0)) and in_range
-                sect_idx = use_mid.select(mid, fx.Int32(0))
-            else:
-                in_section_0 = col < fx.Int32(mrope_section[0])
-                in_section_1 = col < fx.Int32(mrope_section[0] + mrope_section[1])
-                sect_idx = in_section_0.select(
-                    fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
-                )
-
-            pos_i64 = fx.Int64(positions_t[sect_idx, tok])
-            pos = pos_i64.to(fx.Int32)
-            cos_v = fx.Float32(cos_sin_t[pos, col])
-            sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
-            return cos_v, sin_v
-
         bid_x = fx.block_idx.x  # 0..H_Q-1
         bid_t = fx.block_idx.y  # token id within this launch chunk
         tok = fx.Int32(bid_t) + token_offset
@@ -223,7 +223,7 @@ def _build_q_kernel(
                 # so values near an FP8 bin boundary follow the same path.
                 xn0 = (x0 * rstd * w0).to(fx.Float32)
                 xn1 = (x1 * rstd * w1).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(tid, tok, positions, cos_sin)
+                cos_v, sin_v = mrope_cos_sin(tid, tok, positions, cos_sin, mrope_section, is_interleaved, HALF)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
                 q_out[tok, bid_x, tid] = o0.to(fx.BFloat16)
@@ -259,7 +259,7 @@ def _build_q_kernel(
                 # kernel before the fp32 RoPE arithmetic.
                 xn0 = (x0s[k] * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                 xn1 = (x1s[k] * rstd * w1).to(fx.BFloat16).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(col, tok, positions, cos_sin)
+                cos_v, sin_v = mrope_cos_sin(col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF)
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
                 q_out[tok, bid_x, col] = o0.to(fx.BFloat16)
@@ -400,29 +400,6 @@ def _build_kv_kernel(
             vout = vout if vout < fp8_max else fp8_max
             return vout
 
-        def mrope_cos_sin(col, tok, positions_t, cos_sin_t):
-            if const_expr(is_interleaved):
-                mid = col % fx.Int32(3)
-                is_mid1 = mid == fx.Int32(1)
-                boundary = is_mid1.select(
-                    fx.Int32(mrope_section[1] * 3), fx.Int32(mrope_section[2] * 3)
-                )
-                in_range = col < boundary
-                use_mid = (mid != fx.Int32(0)) and in_range
-                sect_idx = use_mid.select(mid, fx.Int32(0))
-            else:
-                in_section_0 = col < fx.Int32(mrope_section[0])
-                in_section_1 = col < fx.Int32(mrope_section[0] + mrope_section[1])
-                sect_idx = in_section_0.select(
-                    fx.Int32(0), in_section_1.select(fx.Int32(1), fx.Int32(2))
-                )
-
-            pos_i64 = fx.Int64(positions_t[sect_idx, tok])
-            pos = pos_i64.to(fx.Int32)
-            cos_v = fx.Float32(cos_sin_t[pos, col])
-            sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
-            return cos_v, sin_v
-
         def quant_pair_fp8(v0, v1, scale):
             s0 = _fp8_clamp(v0 / scale)
             s1 = _fp8_clamp(v1 / scale)
@@ -526,7 +503,7 @@ def _build_kv_kernel(
                                 fx.Float32
                             )
                             cos_v, sin_v = mrope_cos_sin(
-                                col, tok, positions, cos_sin
+                                col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF
                             )
                             o0 = xn0 * cos_v - xn1 * sin_v
                             o1 = xn1 * cos_v + xn0 * sin_v
