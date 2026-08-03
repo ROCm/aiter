@@ -500,7 +500,7 @@ def mp_tuner(
                     if elapsed > timeout:
                         consecutive_timeouts += 1
 
-                        error_msg = f"[!] Task {k} timed out after {elapsed:.1f}s (limit: {timeout}s) - likely GPU hang or infinite loop"
+                        error_msg = f"[!] Task {k} produced no result within {elapsed:.1f}s (limit: {timeout}s) - its worker is wedged or died"
                         print(error_msg)
                         failed_tasks.append((k, "timeout"))
 
@@ -650,7 +650,7 @@ def mp_tuner(
             f"  Total tasks: {len(rets)}\n"
             f"  Successful: {len(rets) - len(failed_tasks)}\n"
             f"  Failed: {len(failed_tasks)}\n"
-            f"    - Timeouts (GPU hang): {timeout_count}\n"
+            f"    - No result within timeout (wedged or dead worker): {timeout_count}\n"
             f"    - Crashes (memory fault): {crash_count}\n"
             f"{'=' * 60}"
         )
