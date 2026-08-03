@@ -696,10 +696,6 @@ def test_chunk_opt(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
-@pytest.mark.skipif(
-    _is_gfx12_runtime(),
-    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
-)
 def test_chunk_opt_hip(
     B: int,
     T: int,
@@ -872,10 +868,6 @@ def test_chunk_opt_varlen(
     ],
 )
 @pytest.mark.skipif(not IS_AMD, reason="Skipping HIP-only test on non-AMD backend")
-@pytest.mark.skipif(
-    _is_gfx12_runtime(),
-    reason="chunk_gated_delta_rule_fwd_h_hip_fn kernel does not support gfx12!",
-)
 def test_chunk_opt_varlen_hip(
     H: int,
     D: int,
@@ -951,11 +943,7 @@ def test_chunk_opt_varlen_hip(
             marks=[
                 pytest.mark.skipif(
                     not IS_AMD, reason="HIP backend requires an AMD device"
-                ),
-                pytest.mark.skipif(
-                    _is_gfx12_runtime(),
-                    reason="chunk_gated_delta_rule_fwd_h_hip_fn does not support gfx12!",
-                ),
+                )
             ],
         ),
     ],
@@ -1269,6 +1257,103 @@ def test_chunk_opt_vk_varlen(
     assert_close("o", ref, tri, 0.005)
     # ref_ht is [N, H, K, V], tri_ht is [N, H, V, K]
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
+
+
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        pytest.param(torch.float32, id="state_fp32"),
+        pytest.param(torch.bfloat16, id="state_bf16"),
+    ],
+)
+@pytest.mark.skipif(not IS_AMD, reason="HIP backend requires an AMD device")
+def test_chunk_opt_vk_full_pipeline_indexed_state_pool(state_dtype: torch.dtype):
+    """Full K1-K6 HIP path supports an indexed SGLang-style state pool."""
+    torch.manual_seed(42)
+    os.environ["TRITON_F32_DEFAULT"] = "ieee"
+    H, D = 4, 128
+    cu_seqlens = torch.tensor([0, 63, 192, 449], device=device, dtype=torch.long)
+    T = int(cu_seqlens[-1])
+    N = len(cu_seqlens) - 1
+
+    q = F.normalize(
+        torch.randn(1, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    k = F.normalize(
+        torch.randn(1, T, H, D, dtype=torch.float32, device=device),
+        p=2,
+        dim=-1,
+    ).to(torch.bfloat16)
+    v = (
+        torch.randn(1, T, H, D, dtype=torch.float32, device=device) * 0.1
+    ).to(torch.bfloat16)
+    beta = torch.rand(1, T, H, dtype=torch.float32, device=device).sigmoid().to(
+        torch.bfloat16
+    )
+    g = F.logsigmoid(torch.rand(1, T, H, dtype=torch.float32, device=device))
+    h0 = (
+        torch.randn(N, H, D, D, dtype=torch.float32, device=device) * 0.02
+    ).to(state_dtype)
+
+    output_ref, state_ref = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=h0.clone(),
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+        use_exp2=False,
+    )
+
+    pool_size = N + 7
+    indices = torch.tensor([5, 1, 8], device=device, dtype=torch.int32)
+    pool = torch.randn(pool_size, H, D, D, dtype=state_dtype, device=device)
+    pool_before = pool.clone()
+    pool[indices.long()] = h0
+
+    output_indexed, returned_pool = chunk_gated_delta_rule_opt_vk(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state=pool,
+        initial_state_indices=indices,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_chunk_hip=True,
+        state_dtype=state_dtype,
+        use_exp2=False,
+    )
+
+    assert returned_pool is pool
+    tol = 0.005 if state_dtype == torch.float32 else 0.02
+    assert_close("indexed full-pipeline output", output_ref, output_indexed, tol)
+    assert_close("indexed full-pipeline state", state_ref, pool[indices.long()], tol)
+
+    untouched = torch.ones(pool_size, dtype=torch.bool, device=device)
+    untouched[indices.long()] = False
+    assert torch.equal(pool[untouched], pool_before[untouched])
+
+
+def test_chunk_opt_vk_rejects_indexed_flydsl_state_pool():
+    with pytest.raises(ValueError, match="not supported by the FlyDSL K5 path"):
+        chunk_gated_delta_rule_opt_vk(
+            q=torch.empty(1, 1, 1, 128),
+            k=torch.empty(1, 1, 1, 128),
+            v=torch.empty(1, 1, 1, 128),
+            g=torch.empty(1, 1, 1),
+            beta=torch.empty(1, 1, 1),
+            initial_state=torch.empty(1, 1, 128, 128),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32),
+            use_chunk_flydsl=True,
+        )
 
 
 if __name__ == "__main__":
