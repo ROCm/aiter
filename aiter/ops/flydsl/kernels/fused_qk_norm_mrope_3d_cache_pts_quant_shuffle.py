@@ -56,6 +56,7 @@ from flydsl.expr.typing import T
 from aiter.utility import dtypes as aiter_dtypes
 
 from .kernels_common import get_warp_size
+from .layout_utils import crd2idx
 from .tensor_shim import _run_compiled
 
 # The output mapping follows the target's native wave size. RMSNorm still uses
@@ -332,7 +333,8 @@ def _build_kv_kernel(
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
     PROD_VEC_SIZE = D // RMS_GROUP
-    VEC_PAIRS = max(1, HALF // WAVE)
+    PAIR_LANES = min(WAVE, HALF)
+    PAIRS_PER_LANE = HALF // PAIR_LANES
     WAVES_PER_BLOCK = KV_THREADS // WAVE
     PHASE1_ITERS = _ceil_div(block_size, WAVES_PER_BLOCK)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
@@ -385,6 +387,17 @@ def _build_kv_kernel(
     ):
         fm_fast = arith.FastMathFlags.fast
         layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
+        # Two different logical ownership maps are used by each wave:
+        #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
+        #  * NEOX pairs: active lanes own strided columns in [0, D/2).
+        # Keeping these as layouts makes the distribution independent of the
+        # arithmetic used to enumerate each thread's values.
+        # logical_divide(row, layout_rms_values) assigns one contiguous vector
+        # to each of the RMS_GROUP participating lanes.
+        layout_rms_values = fx.make_layout(PROD_VEC_SIZE, stride=1)
+        layout_pair_ownership = fx.make_layout(
+            (PAIR_LANES, PAIRS_PER_LANE), stride=(1, PAIR_LANES)
+        )
         layout_stage = fx.make_layout((block_size, D), stride=(D, 1))
         layout_k_runs = fx.make_layout((D // x, block_size), stride=(block_size, 1))
         layout_v_runs = fx.make_layout((block_size // x, D), stride=(D, 1))
@@ -398,7 +411,33 @@ def _build_kv_kernel(
             (H_KV, block_size // x, D, x),
             stride=(block_size * D, D * x, x, 1),
         )
+        copy_rms = fx.make_copy_atom(
+            fx.UniversalCopy(PROD_VEC_SIZE * fx.BFloat16.width), fx.BFloat16
+        )
         copy_128b = fx.make_copy_atom(fx.UniversalCopy128b(), CACHE_FX_TYPE)
+
+        def pair_col(lane: fx.Int32, p: fx.Int32):
+            return fx.Int32(
+                crd2idx(
+                    (lane, p),
+                    layout_pair_ownership,
+                )
+            )
+
+        def load_rms_sumsq(row, lane):
+            tiles = fx.logical_divide(row, layout_rms_values)
+            reg = fx.make_rmem_tensor(layout_rms_values, fx.BFloat16)
+            fx.copy_atom_call(
+                copy_rms,
+                fx.slice(tiles, (None, fx.Int32(lane))),
+                reg,
+            )
+            values = reg.load().to(fx.Float32)
+            acc = fx.Float32(0.0)
+            for i in range_constexpr(PROD_VEC_SIZE):
+                value = values[i]
+                acc = acc + value * value
+            return acc
 
         def _fp8_clamp(value: fx.Float32):
             fp8_min, fp8_max = _fp8_range()
@@ -433,6 +472,8 @@ def _build_kv_kernel(
         if const_expr(cache_is_fp8):
             k_scale_value = fx.Float32(k_scale[0])
             v_scale_value = fx.Float32(v_scale[0])
+        k_head_rows = fx.slice(qkv, (None, H_Q + head, None))
+        v_head_rows = fx.slice(qkv, (None, H_Q + H_KV + head, None))
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_lds = lds.k_lds
         v_lds = lds.v_lds
@@ -453,35 +494,28 @@ def _build_kv_kernel(
             if token_local < block_size:
                 tok = tok0 + fx.Int32(token_local)
                 if tok < num_tokens:
+                    k_row = fx.slice(k_head_rows, (tok, None))
+                    v_row = fx.slice(v_head_rows, (tok, None))
+                    if const_expr(emit_flat_kv):
+                        flat_slot_valid = fx.Int64(slot_mapping[tok]) >= fx.Int64(0)
                     # ---- K: RMSNorm (over full D) + interleaved-mrope RoPE +
-                    # per-tensor fp8 quant, one wave butterfly + VEC_PAIRS
+                    # per-tensor fp8 quant, one wave butterfly + PAIRS_PER_LANE
                     # loop per thread (see _build_q_kernel for the same
                     # pattern). ----
-                    k0s, k1s = [], []
                     sumsq_local = fx.Float32(0.0)
                     # The lower half-wave reproduces production's
                     # vec_t<T, D/32> accumulation and XOR-by-16..1 tree, then
                     # broadcasts the result to the upper output-owning lanes.
                     if lane < RMS_GROUP:
-                        for i in range_constexpr(PROD_VEC_SIZE):
-                            norm_col = fx.Int32(lane) * PROD_VEC_SIZE + i
-                            norm_x = fx.Float32(qkv[tok, H_Q + head, norm_col])
-                            sumsq_local = sumsq_local + norm_x * norm_x
-                    for p in range_constexpr(VEC_PAIRS):
-                        col = fx.Int32(lane) + WAVE * p
-                        k0 = fx.Float32(0.0)
-                        k1 = fx.Float32(0.0)
-                        if col < HALF:
-                            k0 = fx.Float32(qkv[tok, H_Q + head, col])
-                            k1 = fx.Float32(qkv[tok, H_Q + head, col + HALF])
-                        k0s.append(k0)
-                        k1s.append(k1)
+                        sumsq_local = load_rms_sumsq(k_row, lane)
                     sumsq = rms_reduce_add(sumsq_local, lane)
                     rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
-                    for p in range_constexpr(VEC_PAIRS):
-                        col = fx.Int32(lane) + WAVE * p
-                        if col < HALF:
+                    if lane < PAIR_LANES:
+                        for p in range_constexpr(PAIRS_PER_LANE):
+                            col = pair_col(lane, p)
+                            k0 = fx.Float32(k_row[col])
+                            k1 = fx.Float32(k_row[col + HALF])
                             w0 = fx.Float32(k_norm_w[col])
                             w1 = fx.Float32(k_norm_w[col + HALF])
                             if const_expr(gemma_norm):
@@ -489,12 +523,8 @@ def _build_kv_kernel(
                                 w1 = w1 + fx.Float32(1.0)
                             # Production materializes the weighted RMSNorm
                             # result as bf16 before RoPE.
-                            xn0 = (k0s[p] * rstd * w0).to(fx.BFloat16).to(
-                                fx.Float32
-                            )
-                            xn1 = (k1s[p] * rstd * w1).to(fx.BFloat16).to(
-                                fx.Float32
-                            )
+                            xn0 = (k0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
+                            xn1 = (k1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
                             cos_v, sin_v = mrope_cos_sin(
                                 col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF
                             )
@@ -511,18 +541,15 @@ def _build_kv_kernel(
                                 kb1 = o1.to(fx.BFloat16)
                             k_lds_view[token_local, col] = kb0
                             k_lds_view[token_local, col + HALF] = kb1
-                            if const_expr(emit_flat_kv):
-                                slot = fx.Int64(slot_mapping[tok])
-                                if slot >= fx.Int64(0):
-                                    k_out[tok, head, col] = kb0
-                                    k_out[tok, head, col + HALF] = kb1
+                            if const_expr(emit_flat_kv) and flat_slot_valid:
+                                k_out[tok, head, col] = kb0
+                                k_out[tok, head, col + HALF] = kb1
 
-                    # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
-                    for p in range_constexpr(VEC_PAIRS):
-                        col = fx.Int32(lane) + WAVE * p
-                        if col < HALF:
-                            v0 = fx.Float32(qkv[tok, H_Q + H_KV + head, col])
-                            v1 = fx.Float32(qkv[tok, H_Q + H_KV + head, col + HALF])
+                        # ---- V: raw + per-tensor fp8 quant (no norm/rope) ----
+                        for p in range_constexpr(PAIRS_PER_LANE):
+                            col = pair_col(lane, p)
+                            v0 = fx.Float32(v_row[col])
+                            v1 = fx.Float32(v_row[col + HALF])
                             if const_expr(cache_is_fp8):
                                 vb0, vb1 = quant_pair_fp8(v0, v1, v_scale_value)
                             else:
@@ -530,11 +557,9 @@ def _build_kv_kernel(
                                 vb1 = v1.to(fx.BFloat16)
                             v_lds_view[token_local, col] = vb0
                             v_lds_view[token_local, col + HALF] = vb1
-                            if const_expr(emit_flat_kv):
-                                slot = fx.Int64(slot_mapping[tok])
-                                if slot >= fx.Int64(0):
-                                    v_out[tok, head, col] = vb0
-                                    v_out[tok, head, col + HALF] = vb1
+                            if const_expr(emit_flat_kv) and flat_slot_valid:
+                                v_out[tok, head, col] = vb0
+                                v_out[tok, head, col + HALF] = vb1
 
         # Wave 0 checks whether the whole logical page maps to one aligned
         # physical page. Other mappings use the scatter path.
