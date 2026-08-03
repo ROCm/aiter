@@ -102,8 +102,9 @@ Full perf sweep (causal=1, varlen, hq=8, hk=1, p_scale):
 HBM traffic (`FETCH_SIZE`+`WRITE_SIZE` counters) never exceeds **~2% of the 5.2 TB/s peak** and
 *falls* with seqlen (compute is O(seqlen^2), traffic ~O(seqlen)).
 
-The same sweep as utilization, MFU against a 406 TFLOPS fp8 roofline (the 458 measured peak
-of §1 gives 39.7% -> 54.6%, tracking `MfmaUtil`):
+The same sweep expressed as utilization — **MBU** (left) and **MFU** (right) vs tokens, over
+4k-40k on the ps64 kernel. MFU is against a 406 TFLOPS fp8 roofline; against the 458 TFLOPS
+measured peak of §1 it reads 39.7% -> 54.6%, which tracks `MfmaUtil` closely:
 
 ![MBU and MFU vs tokens, ps64 4k-40k](images/fp8_fmha_ps64_utilization.png)
 
