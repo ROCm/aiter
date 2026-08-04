@@ -197,43 +197,6 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
             }
         }
 
-        if(scalar_tail == 0)
-        {
-#pragma unroll
-            for(int slot = 0; slot < topk_loop; ++slot)
-            {
-                const int route_row = route_row_base + slot;
-#pragma unroll
-                for(int group = 0; group < groups_per_thread; ++group)
-                {
-                    if(group < valid_groups4)
-                    {
-                        const int col = col_base + group * 4;
-                        const uint64_t packed =
-                            *reinterpret_cast<const uint64_t*>(
-                                route_out_bf16 +
-                                static_cast<int64_t>(route_row) * kargs.stride_route_out_t + col);
-                        opus_moe_stage2_route_reduce_accum_bf16x4(acc, group * 4, packed);
-                    }
-                }
-            }
-
-#pragma unroll
-            for(int group = 0; group < groups_per_thread; ++group)
-            {
-                if(group < valid_groups4)
-                {
-                    const int col = col_base + group * 4;
-                    *reinterpret_cast<uint64_t*>(kargs.out_bf16 +
-                                                 static_cast<int64_t>(token) *
-                                                     kargs.stride_o_t +
-                                                 col) =
-                        opus_moe_stage2_route_reduce_pack_bf16x4(acc, group * 4);
-                }
-            }
-            return;
-        }
-
 #pragma unroll
         for(int tail = 0; tail < max_scalar_tail; ++tail)
         {

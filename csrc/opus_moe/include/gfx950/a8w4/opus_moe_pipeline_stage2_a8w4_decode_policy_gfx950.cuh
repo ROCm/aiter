@@ -101,21 +101,7 @@ inline __device__ int opus_moe_stage2_a8w4_a_payload_byte_offset(int a_base,
                                                                  int k_base,
                                                                  int ga_offset)
 {
-    constexpr auto block_shape = opus::make_tuple(
-        opus::number<1>{},
-        opus::number<1>{},
-        opus::number<T::K_STEP_PACKED>{});
-    constexpr auto block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}));
-    constexpr auto u = opus::make_layout<-1>(
-        block_shape,
-        opus::unfold_x_stride(
-            block_dim,
-            block_shape,
-            opus::tuple{opus::number<1>{}, opus::number<1>{}, opus::number<1>{}}));
-    return static_cast<int>(u(a_base, k_base, opus_moe_stage2_a8w4_a_k_byte<T>(ga_offset)));
+    return a_base + k_base + opus_moe_stage2_a8w4_a_k_byte<T>(ga_offset);
 }
 
 template<typename T>
@@ -255,23 +241,8 @@ inline __device__ int opus_moe_stage2_a8w4_b_scale_word_offset(int base_word_off
                                                                int k_group_word_base,
                                                                int pair)
 {
-    constexpr auto block_shape = opus::make_tuple(
-        opus::number<1>{},
-        opus::number<1>{},
-        opus::number<T::HALF_N_MFMA_PER_WAVE>{});
-    constexpr auto block_dim = opus::make_tuple(
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}),
-        opus::make_tuple(opus::p_dim{}));
-    constexpr auto u = opus::make_layout<-1>(
-        block_shape,
-        opus::unfold_x_stride(
-            block_dim,
-            block_shape,
-            opus::tuple{opus::number<1>{},
-                        opus::number<1>{},
-                        opus::number<T::SCALE_WORDS_PER_ROW_PACK>{}}));
-    return static_cast<int>(u(base_word_offset, k_group_word_base, pair));
+    return base_word_offset + k_group_word_base +
+           pair * T::SCALE_WORDS_PER_ROW_PACK;
 }
 
 template<typename T>
@@ -315,11 +286,10 @@ struct OpusMoeStage2A8W4CShuffleLayout
     }
 
     inline __device__ static int
-    output_byte_offset(int token, int64_t row_stride, int col_base, int col)
+    output_elem_offset(int token, int64_t row_stride, int col_base, int col)
     {
-        return static_cast<int>((static_cast<int64_t>(token) * row_stride +
-                                 col_base + col) *
-                                static_cast<int>(sizeof(hip_bfloat16)));
+        return static_cast<int>(static_cast<int64_t>(token) * row_stride +
+                                col_base + col);
     }
 
     inline __device__ int acc_local_m(int mi, int elem_in_vec) const
