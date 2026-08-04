@@ -1377,7 +1377,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         tid = fx.Uint32(fx.thread_idx.x)
         bid = fx.Uint32(fx.block_idx.x)
 
-        warp_in_block = tid // c_wave
+        # One warp owns one route, so tid // wave is wave-invariant -- but the
+        # backend cannot see that. readfirstlane says it, which keeps `route`
+        # (and the row and destination descriptor derived from it) uniform;
+        # otherwise every payload store goes through a readfirstlane waterfall.
+        warp_in_block = fx.Uint32(rocdl.readfirstlane(i32, fx.Uint32(tid // c_wave)))
         lane = tid - warp_in_block * c_wave
         route = bid * arith.constant(warps_per_block, type=i32) + warp_in_block
 
@@ -1402,8 +1406,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # default to the same sentinel, so one predicate covers both.
         row_raw = fx.Int32(DROPPED_ROUTE_ROW)
         if route_in_range:
-            row_raw = fx.Int32(
-                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
+            rows_rsrc = ptr_rsrc(topids_to_rows)
+            # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
+            # an SGPR is what makes the per-row destination descriptor uniform.
+            row = fx.Uint32(
+                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, is_scalar=True)
             )
         row_is_mapped = row_raw >= fx.Int32(0)
         if row_is_mapped:
@@ -1413,10 +1420,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 expert = fx.Uint32(row) // m
                 slot = row - expert * m
                 starts_rsrc = ptr_rsrc(row_starts)
+                # Overwrites `row`, so it has to stay scalar too.
                 row = (
                     fx.Uint32(
                         buffer_ops.buffer_load(
-                            starts_rsrc, expert, vec_width=1, dtype=i32
+                            starts_rsrc, expert, vec_width=1, is_scalar=True
                         )
                     )
                     + slot
