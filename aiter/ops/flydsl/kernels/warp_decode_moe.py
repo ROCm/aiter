@@ -33,6 +33,9 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu, llvm
 from flydsl._mlir.extras import types as T
+from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import math as fxmath
+from flydsl.expr.typing import BFloat16
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -78,6 +81,11 @@ def fp8x2_to_bf16x2(src_i32, scale_f32, *, hi: bool):
     """
     bf16x2_ty = ir.VectorType.get([2], T.bf16())
     return fx.rocdl.cvt_scalef32_pk_bf16_fp8(bf16x2_ty, src_i32, scale_f32, hi)
+
+
+def bf16x2_to_i32(pair_vec):
+    """Reinterpret a ``vector<2xbf16>`` as an i32 (dot2 packs 2 bf16 per VGPR)."""
+    return llvm.bitcast(T.i32(), pair_vec)
 
 
 def _i32_const(value: int):
@@ -177,6 +185,163 @@ def build_warp_decode_primitives_module(*, serialize_dot2: bool = True):
             out_red_ptr,
         ).launch(
             grid=(1, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch
+
+
+# -------------------------------------------------------------------------
+# Phase 2 -- gate_up FP8 fast path (BF16 activation, FP8 e4m3 weights)
+# -------------------------------------------------------------------------
+def pick_kvector(hidden: int) -> int:
+    """kVector = 16 (one 128-bit FP8 transaction) when it tiles HIDDEN, else 8."""
+    if hidden % (WARP_SIZE * 16) == 0:
+        return 16
+    if hidden % (WARP_SIZE * 8) == 0:
+        return 8
+    raise ValueError(
+        f"HIDDEN={hidden} not divisible by 64*8; unsupported for warp-decode gate_up"
+    )
+
+
+def build_gate_up_fp8_module(
+    hidden: int,
+    inter: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    w_scale_mode: str = "pertensor",
+    serialize_dot2: bool = True,
+):
+    """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
+
+    One wave (64 lanes) computes one ``inter[b, k, j]`` scalar:
+    grid ``B*TOPK*INTER`` blocks of 64 lanes.  Lane ``l`` owns hidden K-range
+    ``[l*kVector, (l+1)*kVector)`` each iteration; the wave accumulates
+    ``gate_dot``/``up_dot`` in f32 via ``v_dot2_f32_bf16`` over FP8->BF16-converted
+    weights, butterfly-reduces, applies the (PerTensor/PerToken) weight scales,
+    and writes ``silu(gate_acc)*up_acc`` as BF16.
+
+    Shapes / layout (row-major, contiguous):
+      * x            [B, HIDDEN]         bf16
+      * w_gate/w_up  [E, INTER, HIDDEN]  fp8_e4m3  (row = e*INTER + j)
+      * w_*_scale    f32; PerTensor -> [1], PerToken -> [E*INTER] (per weight row)
+      * router_ids   [B, TOPK]           int32
+      * out (inter)  [B, TOPK, INTER]    bf16      (row = b*TOPK + k)
+    """
+    if kvector is None:
+        kvector = pick_kvector(hidden)
+    if kvector % 2 != 0:
+        raise ValueError(f"kVector must be even for dot2, got {kvector}")
+    ktile_n = WARP_SIZE * kvector
+    if hidden % ktile_n != 0:
+        raise ValueError(f"HIDDEN={hidden} not divisible by 64*kVector={ktile_n}")
+    num_iter = hidden // ktile_n
+    n_pairs = kvector // 2  # x uint32 words / weight pairs per lane per iter
+    per_token_scale = const_expr(w_scale_mode == "pertoken")
+
+    @flyc.kernel
+    def _kernel(
+        x_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        wgs_ptr: fx.Pointer,
+        wus_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        neuron_j = bid % inter
+        d = bid // inter
+        expert_k = d % top_k
+        token_b = d // top_k
+
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        e = fx.Int32(
+            buffer_ops.buffer_load(
+                rid_rsrc, token_b * top_k + expert_k, vec_width=1, dtype=T.i32()
+            )
+        )
+        w_row = e * inter + neuron_j
+
+        x_rsrc = _ptr_rsrc(x_ptr)
+        wg_rsrc = _ptr_rsrc(wg_ptr)
+        wu_rsrc = _ptr_rsrc(wu_ptr)
+
+        one_f32 = fx.Float32(1.0).ir_value()
+        gate_dot = fx.Float32(0.0).ir_value()
+        up_dot = fx.Float32(0.0).ir_value()
+
+        for i in range_constexpr(num_iter):
+            k_base = i * ktile_n + lane * kvector
+            # element bases -> word (i32) offsets: x is 2 bf16/word, w is 4 fp8/word.
+            x_word0 = (token_b * hidden + k_base) // 2
+            wg_word0 = (w_row * hidden + k_base) // 4
+            wu_word0 = (w_row * hidden + k_base) // 4
+            for ipair in range_constexpr(n_pairs):
+                w_word = ipair // 2
+                w_hi = (ipair % 2) == 1
+                x_i32 = buffer_ops.buffer_load(
+                    x_rsrc, x_word0 + ipair, vec_width=1, dtype=T.i32()
+                )
+                gword = buffer_ops.buffer_load(
+                    wg_rsrc, wg_word0 + w_word, vec_width=1, dtype=T.i32()
+                )
+                uword = buffer_ops.buffer_load(
+                    wu_rsrc, wu_word0 + w_word, vec_width=1, dtype=T.i32()
+                )
+                g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gword, one_f32, hi=w_hi))
+                u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uword, one_f32, hi=w_hi))
+                gate_dot = dot2_f32_bf16(
+                    x_i32, g_i32, gate_dot, serialize=serialize_dot2
+                )
+                up_dot = dot2_f32_bf16(x_i32, u_i32, up_dot, serialize=serialize_dot2)
+
+        gate_sum = wave_reduce_add_f32(gate_dot)
+        up_sum = wave_reduce_add_f32(up_dot)
+
+        # Weight scales (PerTensor -> p[0]; PerToken -> p[w_row]).
+        wgs_rsrc = _ptr_rsrc(wgs_ptr)
+        wus_rsrc = _ptr_rsrc(wus_ptr)
+        if const_expr(per_token_scale):
+            scale_off = w_row
+        else:
+            scale_off = fx.Int32(0)
+        gs = buffer_ops.buffer_load(wgs_rsrc, scale_off, vec_width=1, dtype=T.f32())
+        us = buffer_ops.buffer_load(wus_rsrc, scale_off, vec_width=1, dtype=T.f32())
+
+        gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
+        up_acc = fx.Float32(up_sum) * fx.Float32(us)
+        sig = fx.Float32(1.0) / (
+            fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
+        )
+        out_val = gate_acc * sig * up_acc
+
+        # Every lane holds the identical reduced result; all write the same
+        # scalar to the same address (store cost is negligible vs the weight
+        # reads). A lane-0 guard is a later perf refinement.
+        out_off = (token_b * top_k + expert_k) * inter + neuron_j
+        out_rsrc = _ptr_rsrc(out_ptr)
+        buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+
+    @flyc.jit
+    def _launch(
+        x_ptr: fx.Pointer,
+        wg_ptr: fx.Pointer,
+        wu_ptr: fx.Pointer,
+        wgs_ptr: fx.Pointer,
+        wus_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        out_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(x_ptr, wg_ptr, wu_ptr, wgs_ptr, wus_ptr, rid_ptr, out_ptr).launch(
+            grid=(grid_x, 1, 1),
             block=(WARP_SIZE, 1, 1),
             stream=stream,
         )
