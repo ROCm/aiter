@@ -155,7 +155,7 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 
 ## Attention Kernels
 
-### `mla_gluon.py` — MLA Decode + DeepSeek V4 Sparse Prefill
+### `_gluon_kernels/gfx950/attention/mla.py` — MLA Decode + DeepSeek V4 Sparse Prefill
 
 **Function:** `mla_gluon(q_nope, q_pe, kv_c, o, page_table, seq_info, sm_scale, k_pe=None, kv_pe_offset=512, use_2d_view=True, kv_scale=1.0, min_kv_seq_len=1, return_lse=False, has_pe=True, attn_sink=None, num_kv_splits=None)`
 

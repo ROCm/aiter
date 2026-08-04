@@ -422,6 +422,63 @@ def test_mla_decode_fwd(
     ), f"{torch.max(torch.abs(output.to(torch.bfloat16) - ref_output.to(torch.bfloat16)))}"
 
 
+@pytest.mark.skipif(DEVICE_ARCH != "gfx950", reason="gfx950 Gluon decode only")
+@pytest.mark.parametrize(
+    ("ctx_len", "decode_qlen"), [(4096, 1), (100000, 1), (4096, 3)]
+)
+@torch.inference_mode()
+def test_gfx950_low_head_gluon_decode(ctx_len: int, decode_qlen: int):
+    batch_size = 1
+    num_query_heads = 12
+    num_kv_heads = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+
+    query = torch.randn(
+        (batch_size * decode_qlen, num_query_heads, qk_head_dim),
+        dtype=torch.bfloat16,
+    )
+    kv_buffer = torch.randn(
+        (ctx_len, 1, num_kv_heads, qk_head_dim), dtype=torch.bfloat16
+    )
+    block_tables = torch.randperm(ctx_len, dtype=torch.int32).view(batch_size, -1)
+    cu_seqlens_q = torch.tensor([0, decode_qlen], dtype=torch.int32)
+    seq_lens_kv = torch.tensor([ctx_len], dtype=torch.int32)
+    output = torch.empty(
+        (batch_size * decode_qlen, num_query_heads, kv_lora_rank),
+        dtype=torch.bfloat16,
+    )
+    sm_scale = 1.0 / (qk_head_dim**0.5)
+
+    mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=ctx_len,
+        block_tables=block_tables,
+        softmax_scale=sm_scale,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+    )
+
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        kv_lora_rank,
+        sm_scale,
+    )
+    torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])

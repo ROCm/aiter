@@ -35,12 +35,63 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_kernel = None
     gluon_mla_decode_fwd_reduce_kernel = None
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import (
+        mla_gluon as gfx950_mla_decode_fwd,
+    )
+except:  # noqa: E722
+    gfx950_mla_decode_fwd = None
+
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+IS_DEVICE_ARCH_GFX950 = DEVICE_ARCH == "gfx950"
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+
+def _use_gfx950_gluon_decode(
+    num_query_heads,
+    num_kv_heads,
+    block_size,
+    q_dtype,
+    kv_dtype,
+    out_dtype,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    shuffled_kv_cache,
+    q_descale,
+    kv_descale,
+    q_scales,
+    out_scale,
+    skip_reduce,
+    q_is_contiguous,
+    kv_buffer_is_contiguous,
+    out_is_contiguous,
+):
+    """Use the gfx950 Gluon path only for its validated low-head configuration."""
+    return (
+        IS_DEVICE_ARCH_GFX950
+        and gfx950_mla_decode_fwd is not None
+        and 0 < num_query_heads < 16
+        and num_kv_heads == 1
+        and block_size == 1
+        and q_dtype == torch.bfloat16
+        and kv_dtype == torch.bfloat16
+        and out_dtype == torch.bfloat16
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 64
+        and not shuffled_kv_cache
+        and q_descale is None
+        and kv_descale is None
+        and q_scales is None
+        and out_scale is None
+        and not skip_reduce
+        and q_is_contiguous
+        and kv_buffer_is_contiguous
+        and out_is_contiguous
+    )
 
 
 def select_2d_config(
@@ -339,6 +390,48 @@ def mla_decode_fwd(
     assert (
         kv_lora_rank + qk_rope_head_dim == qk_head_dim
     ), "qk_head_dim must be equal to kv_lora_rank + qk_rope_head_dim"
+
+    if _use_gfx950_gluon_decode(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        block_size=block_size,
+        q_dtype=q_dtype,
+        kv_dtype=kv_buffer_dtype,
+        out_dtype=out.dtype,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        shuffled_kv_cache=shuffled_kv_cache,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        q_scales=q_scales,
+        out_scale=out_scale,
+        skip_reduce=skip_reduce,
+        q_is_contiguous=q.is_contiguous(),
+        kv_buffer_is_contiguous=kv_buffer.is_contiguous(),
+        out_is_contiguous=out.is_contiguous(),
+    ):
+        q_view = q.view(num_seqs, num_tokens_per_seq, num_query_heads, qk_head_dim)
+        out_view = out.view(num_seqs, num_tokens_per_seq, num_query_heads, kv_lora_rank)
+        if num_tokens_per_seq == 1:
+            q_view = q_view[:, 0]
+            out_view = out_view[:, 0]
+
+        q_nope = q_view[..., :kv_lora_rank]
+        q_pe = q_view[..., kv_lora_rank:]
+        kv_cache = kv_buffer.view(-1, qk_head_dim)
+        gfx950_mla_decode_fwd(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            kv_c=kv_cache,
+            o=out_view,
+            page_table=block_tables,
+            seq_info=seqused_k,
+            sm_scale=softmax_scale,
+            kv_pe_offset=kv_lora_rank,
+            use_2d_view=True,
+            min_kv_seq_len=max_seqlen_kv,
+        )
+        return out
 
     MAX_BLOCK_M = 128 if kv_buffer_dtype == e4m3_dtype else 64
     if num_queries_per_kv <= 16:

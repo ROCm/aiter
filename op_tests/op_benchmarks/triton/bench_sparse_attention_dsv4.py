@@ -27,7 +27,7 @@ from aiter.ops.triton._triton_kernels.attention.sparse_attention_dsv4 import (
 # import time; the benchmark falls back to Triton-only when unavailable.
 try:
     from aiter.jit.utils.chip_info import get_gfx
-    from aiter.ops.triton.gluon.mla_gluon import mla_gluon
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import mla_gluon
 
     HAS_GLUON = get_gfx() == "gfx950"
 except ImportError:
