@@ -98,7 +98,8 @@ Status legend: [ ] todo · [~] in progress · [x] done
 ### Phase 4 — Scale layouts + integration  [ ]
 - [ ] Support PerTensor / PerToken / Block2D scale layouts.
 - [ ] Python entry point in `aiter/ops/flydsl/`.
-- [ ] op_test per `aiter-op-test` skill (candidate loop + torch reference + markdown perf table + `__main__` guard).
+- [ ] op_test at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`, conforming to §8
+      (CONTRIBUTE + `aiter-op-test` skill; reuse existing MoE oracle/harness helpers).
 - [ ] Benchmark on gfx950 vs reference numbers in the ticket.
 
 ### Follow-on (out of first baseline scope)
@@ -209,7 +210,60 @@ reference replicating §7.1 for the op_test.
 - down full-wave: `INTER % (64*kVector) == 0`; H2 requires `HIDDEN % 2 == 0`, one warp/block.
 - Block2D scales: `HIDDEN%BK==0` and `(E*INTER)%BN==0` (gate_up); `INTER%BK==0` and `(E*HIDDEN)%BN==0` (down).
 
-## 8. Open questions / risks
+## 8. Testing conventions & reuse
+
+Tests must conform to the `CONTRIBUTE.md` "Testing" section and to the
+`.claude/skills/aiter-op-test` skill, and should reuse the existing MoE test
+machinery rather than re-deriving it.
+
+### 8.1 CONTRIBUTE.md conventions (must follow)
+
+- Tests are **standalone Python scripts** under `op_tests/`. Ours lives at
+  `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` (alongside the other FlyDSL
+  MoE tests). Must be both `pytest`-collectable (`test_*` functions) and runnable as
+  `python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` with a `__main__` guard.
+- Use `aiter.test_common`: `checkAllclose` for numeric compare, `perftest` / `run_perftest`
+  for timing. Provide an `argparse` CLI (dtype/shape/B knobs) and clear PASS/FAIL prints.
+- Runs under `bash .github/scripts/aiter_test.sh`; CI covers MI300X (gfx942) + MI350X (gfx950).
+- Format with **black** and **ruff** (`black aiter/ op_tests/`, `ruff check aiter/ op_tests/`).
+- Arch/availability guard (from `test_flydsl_moe_a16wfp4.py`):
+  `skipif(get_gfx() not in ("gfx950",) or not is_flydsl_available())`
+  (`aiter.jit.utils.chip_info.get_gfx`, `aiter.ops.flydsl.utils.is_flydsl_available`).
+- Follow the `aiter-op-test` skill layout: `@benchmark` + `run_perftest` candidate loop,
+  a torch reference, a final **markdown summary table**, and a `__main__` guard so the
+  module stays importable.
+
+### 8.2 Reusable helpers from existing MoE op_tests
+
+Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
+`op_tests/test_moe_2stage.py`.
+
+- **Torch oracle (use directly, do not re-derive from CK's `reference_warp_decode.hpp`):**
+  `aiter.fused_moe.torch_moe_stage1` (gate_up + activation) and `torch_moe_stage2`
+  (down + top-k weighted reduce) match our two kernels exactly. They operate on
+  `topk_ids`/`topk_weights` directly and need **no** `moe_sorting`, which suits the
+  sorting-free warp-decode design.
+- **Routing:** `aiter.fused_moe.fused_topk(inp, score, topk, True)` →
+  `topk_weights, topk_ids` (our `router_wts`/`router_ids`), fed to both kernel and oracle.
+- **Quant + scales (Phase 4 FP8 layouts):** `aiter.get_torch_quant(QuantType...)`,
+  `aiter.ops.quant.per_1x32_f8_scale_f8_quant`, `mxfp4_moe_sort_fwd`; `aiter.utility.fp4_utils`
+  for MXFP4 dequant/e8m0 (later phase).
+- **Compare + perf:** the `_check_result` idiom (cosine-sim primary gate `cos > 0.999`
+  plus `%`-close) and/or `checkAllclose`; `run_perftest(..., num_iters=, use_cuda_event/
+  testGraph)` for the perf table. Align tolerances with the CK atol guidance (§7.6): small
+  block2d ≈ 0.3, full DeepSeek/MiniMax ≈ 5.0 (BF16 long-K drift).
+- **Skip/param patterns:** the `_SKIP_GFX950_FLYDSL` skipif + `pytest.mark.parametrize`
+  shape/seed sweeps.
+
+### 8.3 Caveats on reuse
+
+- Our baseline kernels take **unsorted** `x[B,HIDDEN]`, plain row-major weights
+  (`w_gate/w_up[E,INTER,HIDDEN]`, `w_down[E,HIDDEN,INTER]`, FP8), and `router_ids/wts`
+  directly — so we reuse the **data-gen + torch oracles** but **not** the
+  `moe_sorting`/`sorted_ids`/`shuffle_weight_a16w4` plumbing those tests use for the
+  tiled-GEMM kernels. Keep the harness minimal for the warp-decode path.
+
+## 9. Open questions / risks
 
 - [resolved] FP8/FP4→BF16 converts: exact 2-wide ROCDL ops exist
   (`cvt_scalef32_pk_bf16_fp8/fp4`), matching the reference builtins — no inline asm.
@@ -223,7 +277,7 @@ reference replicating §7.1 for the op_test.
   the LDS-broadcast optimization from §5.4 is gate_up-only and can come later).
 - [deferred] MXFP4 s_nop-free dot2 + `dot2_drain4` scheduling (MXFP4 phase).
 
-## 9. Changelog
+## 10. Changelog
 
 - _init_ — plan created; scope, decisions, feasibility, phases recorded.
 - _phase 0_ — deep read of reference kernels + numeric primitives + CPU oracle done;
@@ -232,3 +286,7 @@ reference replicating §7.1 for the op_test.
 - _phase 0 close-out_ — locked two baseline choices in §2: `kVector=16` (→8 fallback)
   and serialized `s_nop 2` dot2 for the FP8 baseline (ILP/drain deferred to MXFP4).
   Paused before Phase 1.
+- _testing plan_ — added §8 (testing conventions & reuse): conform to CONTRIBUTE +
+  `aiter-op-test`; reuse `torch_moe_stage1/2`, `fused_topk`, quant helpers, `run_perftest`,
+  and the gfx950/FlyDSL skip guard from existing MoE op_tests. Renumbered open questions →§9,
+  changelog →§10; Phase 4 op_test item points at §8.
