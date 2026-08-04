@@ -267,9 +267,7 @@ def _deepgemm_fp8_paged_mqa_logits_stage1(
     ):
         logical_kv_idx = context_idx + tl.arange(0, ChunkK)
         logical_block_idx = logical_kv_idx // KVBlockSize
-        mask_kv = (logical_kv_idx < context_length) & (
-            logical_block_idx < max_blk_len
-        )
+        mask_kv = (logical_kv_idx < context_length) & (logical_block_idx < max_blk_len)
         physical_block_idx = tl.load(
             kv_indices + pid_batch * max_blk_len + logical_block_idx,
             mask=mask_kv,
