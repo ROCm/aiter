@@ -154,6 +154,44 @@ static void _reduce_scatter(fptr_t _fa, void* inp, void* out,
     }
 }
 
+static void _add_fused_allreduce(fptr_t _fa, void* inp_a, void* inp_b, void* out,
+                                 int64_t numel, AiterDtype dtype, int algo)
+{
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    switch(dtype)
+    {
+    case AITER_DTYPE_fp32: {
+        fa->dispatchAddFusedAllReduce<opus::fp32_t>(stream,
+                                    reinterpret_cast<opus::fp32_t*>(inp_a),
+                                    reinterpret_cast<opus::fp32_t*>(inp_b),
+                                    reinterpret_cast<opus::fp32_t*>(out),
+                                    numel, algo);
+        break;
+    }
+    case AITER_DTYPE_fp16: {
+        fa->dispatchAddFusedAllReduce<opus::fp16_t>(stream,
+                                    reinterpret_cast<opus::fp16_t*>(inp_a),
+                                    reinterpret_cast<opus::fp16_t*>(inp_b),
+                                    reinterpret_cast<opus::fp16_t*>(out),
+                                    numel, algo);
+        break;
+    }
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case AITER_DTYPE_bf16: {
+        fa->dispatchAddFusedAllReduce<opus::bf16_t>(stream,
+                                    reinterpret_cast<opus::bf16_t*>(inp_a),
+                                    reinterpret_cast<opus::bf16_t*>(inp_b),
+                                    reinterpret_cast<opus::bf16_t*>(out),
+                                    numel, algo);
+        break;
+    }
+#endif
+    default:
+        throw std::runtime_error("custom allreduce only supports float32, float16 and bfloat16");
+    }
+}
+
 static void _all_gather(fptr_t _fa, void* inp, void* out,
                         int64_t size, AiterDtype dtype,
                         int64_t last_dim_size, int64_t gather_dim)
@@ -469,6 +507,21 @@ void reduce_scatter(fptr_t _fa,
                         static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
                         sd, dtype);
     }
+}
+
+void add_fused_allreduce(fptr_t _fa,
+                         const aiter_tensor_t& inp_a,
+                         const aiter_tensor_t& inp_b,
+                         const aiter_tensor_t& out,
+                         int64_t algo)
+{
+    HipDeviceGuard device_guard(inp_a.device_id);
+    auto dtype    = inp_a.dtype();
+    int64_t numel = inp_a.numel();
+    // A/B are read locally by the kernel and never accessed cross-device, so no
+    // IPC-registered buffer copy is required (unlike reduce_scatter/all_reduce).
+    _add_fused_allreduce(_fa, inp_a.data_ptr(), inp_b.data_ptr(), out.data_ptr(),
+                         numel, dtype, (int)algo);
 }
 
 void all_gather_reg(fptr_t _fa,

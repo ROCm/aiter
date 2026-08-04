@@ -54,6 +54,15 @@ void reduce_scatter(fptr_t _fa,
                     int64_t split_dim,
                     int64_t reg_ptr,
                     int64_t reg_bytes);
+// Fused element-wise add followed by all-reduce:
+//   out = allreduce_over_ranks(inp_a + inp_b)
+// inp_a/inp_b/out are same-shape, same-dtype tensors. numel must be a multiple
+// of (16/sizeof(dtype)) * world_size.
+void add_fused_allreduce(fptr_t _fa,
+                         const aiter_tensor_t& inp_a,
+                         const aiter_tensor_t& inp_b,
+                         const aiter_tensor_t& out,
+                         int64_t algo = 0);
 void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
