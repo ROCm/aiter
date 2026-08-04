@@ -1793,18 +1793,9 @@ def _mxfp4_a4w4_stage1_fw(
 ):
     device = hidden_states.device
     p1 = _parse_mxfp4_g1_kname(kernelName1)
-    if p1["act"] == "situv2" and (
-        float(situ_beta) != p1["situ_beta"]
-        or float(situ_linear_beta) != p1["situ_linear_beta"]
-    ):
-        raise ValueError(
-            "MXMOE SiTUv2 runtime betas do not match the cache-safe kernel name"
-        )
+    runtime_situ_beta = float(situ_beta)
+    runtime_situ_linear_beta = float(situ_linear_beta)
     runtime_swiglu_limit = 7.0 if swiglu_limit is None else float(swiglu_limit)
-    if p1["act"] == "swiglu" and runtime_swiglu_limit != p1["swiglu_limit"]:
-        raise ValueError(
-            "MXMOE Swiglu runtime limit does not match the cache-safe kernel name"
-        )
     if not p1.get("enable_bias", False) and bias1 is not None:
         raise ValueError(
             "MXMOE bias presence does not match the cache-safe kernel name"
@@ -1857,9 +1848,9 @@ def _mxfp4_a4w4_stage1_fw(
         a_dtype=p1["a_dtype"],
         out_dtype=p1["out_dtype"],
         act=p1["act"],
-        situ_beta=p1["situ_beta"],
-        situ_linear_beta=p1["situ_linear_beta"],
-        swiglu_limit=p1["swiglu_limit"],
+        situ_beta=runtime_situ_beta,
+        situ_linear_beta=runtime_situ_linear_beta,
+        swiglu_limit=runtime_swiglu_limit,
         bias1=bias1,
         max_sorted=sorted_token_ids.shape[0],
         kernelName1=kernelName1,
@@ -2504,8 +2495,6 @@ def get_2stage_cfgs(
                     interleave=interleave,
                     kSplitK=p1["kSplitK"],
                     xcd_swizzle=p1["xcd_swizzle"],
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
                 )
             else:
                 replacement = _select_mxfp4_g1_kernel(
@@ -2517,8 +2506,6 @@ def get_2stage_cfgs(
                     out_dtype="fp8",
                     act=act,
                     interleave=interleave,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
                 )
                 block_m = replacement["BM"]
                 kernelName1 = replacement["kernelName1"]

@@ -5717,9 +5717,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         out_dtype="fp4",
         act="silu",
         interleave=False,
-        situ_beta=1.0,
-        situ_linear_beta=1.0,
-        swiglu_limit=7.0,
         enable_bias=False,
     ):
         # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x256[_f16in][_nt]; see mxfp4_kname.py.
@@ -5736,9 +5733,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             use_nt=use_nt,
             interleave=interleave,
             xcd_swizzle=xcd_swizzle,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            swiglu_limit=swiglu_limit,
             enable_bias=enable_bias,
         )
 
@@ -5869,8 +5863,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
         if is_a8w4:
             bm = int(row["block_m"])
             act = "situv2" if str(row["act_type"]).endswith("Situv2") else "silu"
-            situ_beta = 2.0 if act == "situv2" else 1.0
-            situ_linear_beta = 1.5 if act == "situv2" else 1.0
             for _, use_nt, inline_quant in sorted(
                 variant for variant in _SUPPORTED_BY_DTYPE["fp8"] if variant[0] == bm
             ):
@@ -5887,8 +5879,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         out_dtype="fp8",
                         act=act,
                         interleave=True,
-                        situ_beta=situ_beta,
-                        situ_linear_beta=situ_linear_beta,
                     )
                     cands.append(self._candidate_row(row, bm, kn1, locked_g2))
             return cands
@@ -5901,13 +5891,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             bm = int(row["block_m"])
             if str(row["act_type"]).endswith("Situv2"):
                 act = "situv2"
-                situ_beta, situ_linear_beta = 2.0, 1.5
             elif str(row["act_type"]).endswith("Swiglu"):
                 act = "swiglu"
-                situ_beta, situ_linear_beta = 1.0, 1.0
             else:
                 act = "silu"
-                situ_beta, situ_linear_beta = 1.0, 1.0
             for _, use_nt, inline_quant in sorted(
                 variant for variant in _SUPPORTED_BY_DTYPE["fp4"] if variant[0] == bm
             ):
@@ -5920,9 +5907,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
                             inline_quant,
                             xcd_swizzle,
                             act=act,
-                            situ_beta=situ_beta,
-                            situ_linear_beta=situ_linear_beta,
-                            swiglu_limit=7.0,
                             enable_bias=act == "swiglu",
                         )
                         cands.append(self._candidate_row(row, bm, kn1, locked_g2))
@@ -6120,8 +6104,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 m_indices=m_indices,
                 moe_buf=moe_buf,
                 interleave=p1["interleave"],
-                situ_beta=p1["situ_beta"],
-                situ_linear_beta=p1["situ_linear_beta"],
+                situ_beta=_TUNER_SITU_BETA if p1["act"] == "situv2" else 1.0,
+                situ_linear_beta=(
+                    _TUNER_SITU_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+                ),
             )
             return _flydsl_stage2_wrapper(
                 inter_q,
@@ -6171,9 +6157,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             moe_buf=moe_buf,
             interleave=p1["interleave"],
             bias1=data["bias1"],
-            swiglu_limit=p1.get("swiglu_limit", 7.0),
-            situ_beta=p1["situ_beta"],
-            situ_linear_beta=p1["situ_linear_beta"],
+            swiglu_limit=7.0,
+            situ_beta=_TUNER_SITU_BETA if p1["act"] == "situv2" else 1.0,
+            situ_linear_beta=(
+                _TUNER_SITU_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+            ),
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,

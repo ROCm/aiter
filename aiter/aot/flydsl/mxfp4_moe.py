@@ -169,12 +169,6 @@ def parse_csv(csv_path: str):
             )
             if use_replacement and is_a8w4_variant:
                 act = "situv2" if act_type == "ActivationType.Situv2" else "silu"
-                default_beta = 2.0 if act == "situv2" else 1.0
-                default_linear_beta = 1.5 if act == "situv2" else 1.0
-                situ_beta = float(row.get("situ_beta") or default_beta)
-                situ_linear_beta = float(
-                    row.get("situ_linear_beta") or default_linear_beta
-                )
                 replacement = _select_mxfp4_g1_kernel(
                     token=int(row["token"]),
                     expert=expert,
@@ -184,8 +178,6 @@ def parse_csv(csv_path: str):
                     out_dtype="fp8",
                     act=act,
                     interleave="_gui" in configured_kn1.lower(),
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
                 )
                 # GEMM1 emits the same FP8+E8M0 contract consumed by the tuned
                 # GEMM2, so stage2 remains byte-for-byte unchanged.
@@ -203,9 +195,6 @@ def parse_csv(csv_path: str):
                     topk=topk,
                     block_m=int(row.get("block_m") or 0) or None,
                     act=act,
-                    situ_beta=2.0 if act == "situv2" else 1.0,
-                    situ_linear_beta=1.5 if act == "situv2" else 1.0,
-                    swiglu_limit=7.0,
                     enable_bias=act == "swiglu",
                 )
                 replacement["kernelName2"] = configured_kn2
@@ -254,9 +243,9 @@ def parse_csv(csv_path: str):
                         "a_dtype": p1["a_dtype"],
                         "out_dtype": p1["out_dtype"],
                         "act": p1["act"],
-                        "situ_beta": p1["situ_beta"],
-                        "situ_linear_beta": p1["situ_linear_beta"],
-                        "swiglu_limit": p1["swiglu_limit"],
+                        "situ_beta": 2.0 if p1["act"] == "situv2" else 1.0,
+                        "situ_linear_beta": 1.5 if p1["act"] == "situv2" else 1.0,
+                        "swiglu_limit": 7.0,
                         "enable_bias": p1["enable_bias"],
                         "interleave": p1["interleave"],
                     }

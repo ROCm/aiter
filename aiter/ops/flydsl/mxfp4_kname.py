@@ -25,9 +25,6 @@ _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
-_SITUV2_BETA = 2.0
-_SITUV2_LINEAR_BETA = 1.5
-_SWIGLU_LIMIT = 7.0
 
 
 def _select_mxfp4_block_m(*, token: int, expert: int, topk: int) -> int:
@@ -60,9 +57,6 @@ def _make_mxfp4_g1_kname(
     interleave: bool = False,
     kSplitK: int = 0,
     xcd_swizzle: int = 0,
-    situ_beta: float = _SITUV2_BETA,
-    situ_linear_beta: float = _SITUV2_LINEAR_BETA,
-    swiglu_limit: float = _SWIGLU_LIMIT,
     enable_bias: bool = False,
 ) -> str:
     """Build a cache-safe GEMM1 name; legacy a4w4 names remain byte-for-byte."""
@@ -75,9 +69,6 @@ def _make_mxfp4_g1_kname(
         raise ValueError(f"unsupported mxmoe GEMM1 out_dtype: {out_dtype!r}")
     if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"unsupported mxmoe GEMM1 activation: {act!r}")
-    if act == "situv2" and (float(situ_beta) <= 0.0 or float(situ_linear_beta) <= 0.0):
-        raise ValueError("SiTUv2 beta values must be positive")
-
     family = "a8w4" if a_dtype == "fp8" else "a4w4"
     name = f"flydsl_mxmoe_g1_{family}_{int(BM)}x{int(BN)}x{int(BK)}"
     if inline_quant:
@@ -91,11 +82,9 @@ def _make_mxfp4_g1_kname(
     if act == "situv2":
         name += "_situv2"
     elif act == "swiglu":
-        if float(swiglu_limit) <= 0.0:
-            raise ValueError("Swiglu limit must be positive")
         name += "_swiglu"
-        if enable_bias:
-            name += "_bias"
+    if enable_bias:
+        name += "_bias"
     if kSplitK:
         name += f"_sk{int(kSplitK)}"
     if xcd_swizzle:
@@ -115,9 +104,6 @@ def _select_mxfp4_g1_kernel(
     out_dtype: str = "fp4",
     act: str = "silu",
     interleave: bool = False,
-    situ_beta: float = _SITUV2_BETA,
-    situ_linear_beta: float = _SITUV2_LINEAR_BETA,
-    swiglu_limit: float = _SWIGLU_LIMIT,
     enable_bias: bool = False,
 ) -> dict:
     """Select an MXMOE GEMM1 while retaining a tuned block_m when supplied."""
@@ -147,9 +133,6 @@ def _select_mxfp4_g1_kernel(
             use_nt=True if block_m == 16 else use_nt,
             interleave=interleave,
             xcd_swizzle=xcd_swizzle,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            swiglu_limit=swiglu_limit,
             enable_bias=enable_bias,
         ),
     }
@@ -226,9 +209,6 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "out_dtype": "fp8" if "FP8OUT" in flags else "fp4",
         "interleave": "IL" in flags,
         "act": act,
-        "situ_beta": _SITUV2_BETA if act == "situv2" else 1.0,
-        "situ_linear_beta": _SITUV2_LINEAR_BETA if act == "situv2" else 1.0,
-        "swiglu_limit": _SWIGLU_LIMIT,
         "enable_bias": "BIAS" in flags,
     }
 
