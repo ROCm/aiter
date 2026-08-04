@@ -367,11 +367,12 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
         + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
     )
-    offs_c = stride_cm * gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )[:, None] + stride_cn * gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )[None, :]
+    offs_c = (
+        stride_cm
+        * gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))[:, None]
+        + stride_cn
+        * gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))[None, :]
+    )
 
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
@@ -806,11 +807,12 @@ def _batched_gemm_bf16_compute_bound_kernel(
         + (pid_m * BLOCK_M).to(gl.int64) * stride_cm
         + (pid_n * BLOCK_N).to(gl.int64) * stride_cn
     )
-    offs_c = stride_cm * gl.arange(
-        0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
-    )[:, None] + stride_cn * gl.arange(
-        0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
-    )[None, :]
+    offs_c = (
+        stride_cm
+        * gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))[:, None]
+        + stride_cn
+        * gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))[None, :]
+    )
 
     gl.amd.gfx1250.buffer_store(
         accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
