@@ -197,7 +197,15 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
             b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
         )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        # The wait argument counts TDM *tiles* that may stay in flight, not TDM
+        # ops.  A and B are issued from two different descriptors and retire on
+        # two independent in-order streams sharing one counter, so "at most N ops
+        # outstanding" does not imply the oldest pair has landed: with T tiles in
+        # flight, one stream can still hold all T of its own ops while the other
+        # has drained.  Only N <= T-1 forces both streams below their own depth.
+        # Here the load just issued brings T to NUM_BUFFERS, so the wait is
+        # NUM_BUFFERS-1 -- not doubled.
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
 
         if LAYOUT[0] == "T":
             a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
@@ -270,7 +278,8 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    # Tiles, not ops -- see the interior loop for why this count is not doubled.
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 1)
 
     load_idx += 1
 
@@ -298,9 +307,10 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
 
     compute_idx += 1
 
-    # Epilogue: no more loads
+    # Epilogue: no more loads.  NUM_BUFFERS-1-i tiles are still in flight on entry
+    # to iteration i, so the wait is one less than that -- tiles, not ops.
     for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2 - i)
 
         if LAYOUT[0] == "T":
             cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -531,8 +541,16 @@ def _batched_gemm_bf16_compute_bound_kernel(
 
         load_idx += 1
 
-    # Register pre-load prologue
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    # Register pre-load prologue.
+    #
+    # The wait argument counts TDM *tiles* that may stay in flight, not TDM ops.
+    # A and B are issued from two different descriptors and retire on two
+    # independent in-order streams sharing one counter, so "at most N ops
+    # outstanding" does not imply the oldest pair has landed: with T tiles in
+    # flight, one stream can still hold all T of its own ops while the other has
+    # drained. Only N <= T-1 forces both streams below their own depth. Here
+    # T = NUM_BUFFERS-1, so the wait is NUM_BUFFERS-2 -- not doubled.
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -582,7 +600,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
             b_desc, add_offsets=[0, BLOCK_K]
         )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     load_idx += 1
 
@@ -639,7 +657,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
         load_idx += 1
 
@@ -696,7 +714,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 2)
 
     load_idx += 1
 
@@ -726,7 +744,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
 
     # Epilogue: drain remaining tiles
     for i in gl.static_range(NUM_BUFFERS - 2):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
+        gl.amd.gfx1250.tdm.async_wait(NUM_BUFFERS - 3 - i)
 
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
