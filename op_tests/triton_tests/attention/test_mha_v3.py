@@ -2,25 +2,28 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+
 import pytest
 import torch
 from einops import rearrange, repeat
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.attention.mha_v3 import (
-    flash_attn_with_kvcache,
-    flash_attn_func,
-    flash_attn_varlen_func,
     flash_attn_fp8_func,
+    flash_attn_func,
     flash_attn_varlen_fp8_func,
-)
-from aiter.test_mha_common import (
-    attention_ref as _mha_common_attention_ref,
-    attention_ref_with_tol,
-    generate_random_padding_mask,
-    generate_qkv,
+    flash_attn_varlen_func,
+    flash_attn_with_kvcache,
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
+from aiter.test_mha_common import (
+    attention_ref as _mha_common_attention_ref,
+)
+from aiter.test_mha_common import (
+    attention_ref_with_tol,
+    generate_qkv,
+    generate_random_padding_mask,
+)
 
 _arch = get_arch()
 _supports_fp8 = _arch in FP8_ARCHS
@@ -59,14 +62,16 @@ def construct_local_mask(
         if query_padding_mask is None
         else rearrange(query_padding_mask.sum(-1), "b -> b 1 1 1")
     )
+    # Each side masks where its bound is set; a negative bound is UNBOUNDED on that side
+    # (matches the kernel's `WINDOW_SIZE_* < 0` semantics). (-1, -1) is dense and never
+    # reaches this helper. No right-edge cap is needed: col_idx < seqlen_k already.
+    right_mask = col_idx > row_idx + sk - sq + window_size[1]
+    left_mask = col_idx < row_idx + sk - sq - window_size[0]
     if window_size[0] < 0:
-        return col_idx > row_idx + sk - sq + window_size[1]
-    else:
-        sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
-        return torch.logical_or(
-            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-            col_idx < row_idx + sk - sq - window_size[0],
-        )
+        return right_mask
+    if window_size[1] < 0:
+        return left_mask
+    return torch.logical_or(left_mask, right_mask)
 
 
 def attention_ref(
@@ -285,7 +290,7 @@ def test_flash_attn_kvcache(
             block_table,
             k_cache_paged,
             v_cache_paged,
-            num_blocks,
+            _num_blocks,
         ) = _generate_block_kvcache(
             seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
         )
@@ -390,6 +395,99 @@ def test_flash_attn_kvcache(
     )
 
 
+# Decode + sliding window: test_flash_attn_kvcache's big matrix hardcodes a dense window,
+# so the decode kernel's SWA path was untested. This covers it over a few window shapes
+# without multiplying that matrix. The decode kernel masks the window off the same
+# `seqlen_k - seqlen_q` shift the reference uses (fwd_decode.py), so window_size threads
+# straight into the kernel call and attention_ref. The cache is FULL (cache_seqlens =
+# seqlen_k): a look-back window over a partial cache can fall entirely in the padding
+# (empty softmax -> NaN), which is a positioning concern, not the window path under test.
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize(
+    "causal, window_size",
+    [
+        (True, (256, 0)),  # causal sliding window (the common decode SWA)
+        (False, (256, 256)),  # non-causal symmetric window
+        (False, (-1, 128)),  # non-causal infinite-left window
+        (False, (128, -1)),  # non-causal infinite-right window
+    ],
+)
+@pytest.mark.parametrize("seqlen_q, seqlen_k", [(1, 1024), (8, 2048)])
+@pytest.mark.parametrize("d", [128])
+def test_flash_attn_kvcache_sliding_window(
+    seqlen_q, seqlen_k, d, causal, window_size, mha_type
+):
+    dtype = torch.bfloat16
+    device = "cuda"
+    torch.random.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    batch_size = 2
+    nheads = 6
+    nheads_k = nheads if mha_type == "mha" else 3
+    assert nheads % nheads_k == 0
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size, seqlen_k, nheads_k, d, device=device, dtype=dtype)
+
+    # Full cache -> no key padding, and the window always overlaps the valid region.
+    cache_seqlens = torch.full(
+        (batch_size,), seqlen_k, dtype=torch.int32, device=device
+    )
+    key_padding_mask = torch.ones(batch_size, seqlen_k, dtype=torch.bool, device=device)
+
+    k_cache_rep = repeat(k_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+    v_cache_rep = repeat(v_cache, "b s h d -> b s (h g) d", g=nheads // nheads_k)
+
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=causal,
+        window_size=window_size,
+    )
+    torch.cuda.synchronize()
+    if isinstance(out, tuple):
+        out = out[0]
+    out = out.to(dtype)
+
+    out_ref, _ = attention_ref(
+        q,
+        k_cache_rep,
+        v_cache_rep,
+        None,
+        key_padding_mask,
+        None,
+        0.0,
+        None,
+        causal=causal,
+        window_size=window_size,
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k_cache_rep,
+        v_cache_rep,
+        None,
+        key_padding_mask,
+        None,
+        0.0,
+        None,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    pt_max_diff = (out_pt - out_ref).abs().max().item()
+    our_max_diff = (out - out_ref).abs().max().item()
+    mult = 3
+    assert our_max_diff <= mult * pt_max_diff + 1e-5, (
+        f"Output max diff {our_max_diff:.6e} exceeds "
+        f"{mult}x Pytorch baseline diff {pt_max_diff:.6e} + 1e-5"
+    )
+
+
 @pytest.mark.parametrize("mha_type", ["mha", "gqa"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("paged_kv_block_size", [16, 256])
@@ -437,7 +535,7 @@ def test_flash_attn_kvcache_noncontiguous_paged(
         block_table,
         k_cache_paged,
         v_cache_paged,
-        num_blocks,
+        _num_blocks,
     ) = _generate_interleaved_block_kvcache(
         seqlen_k, paged_kv_block_size, batch_size, nheads_k, d, device, dtype
     )
@@ -850,8 +948,8 @@ def test_mha_varlen_fp8(
         k,
         v,
         output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     triton_out = flash_attn_varlen_fp8_func(
@@ -936,6 +1034,7 @@ def test_mha_backward_fp8(
         (True, (64, 0)),  # causal sliding window
         (False, (64, 64)),  # non-causal symmetric window
         (False, (-1, 64)),  # non-causal infinite-left window
+        (False, (64, -1)),  # non-causal infinite-right window
     ],
 )
 @pytest.mark.parametrize("SEQLEN_Q, SEQLEN_K", [(512, 512), (512, 1024)])
@@ -1107,6 +1206,7 @@ def test_mha_backward_varlen_fp8(
         (True, (32, 0)),  # causal sliding window
         (False, (16, 16)),  # non-causal symmetric window
         (False, (-1, 32)),  # non-causal infinite-left window
+        (False, (32, -1)),  # non-causal infinite-right window
     ],
 )
 @pytest.mark.parametrize(
@@ -1507,9 +1607,9 @@ def test_flash_attn_varlen_func_graph(mha_type):
         q,
         k,
         v,
-        output_pad_fn,
-        dq_pad_fn,
-        dk_pad_fn,
+        _output_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
     ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
 
     q_orig = q_unpad.clone()

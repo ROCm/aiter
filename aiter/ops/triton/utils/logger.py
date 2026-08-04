@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 
 
 # AITER Triton Logger which is singleton object around python logging.
@@ -15,12 +15,12 @@ import logging
 #   ERROR
 #   CRITICAL
 #
-class AiterTritonLogger(object):
+class AiterTritonLogger:
     _instance = None
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(AiterTritonLogger, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             log_level_str = os.getenv("AITER_TRITON_LOG_LEVEL", "WARNING").upper()
             numeric_level = getattr(logging, log_level_str, logging.WARNING)
             cls._instance._logger = logging.getLogger("AITER_TRITON")

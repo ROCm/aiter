@@ -1,16 +1,18 @@
 import argparse
+
 import torch
 import triton
+
 from aiter.ops.triton.normalization.rmsnorm import rms_norm
 from aiter.ops.triton.quant.fused_mxfp4_quant import fused_rms_mxfp4_quant
-from op_tests.triton_tests.normalization.test_rmsnorm import (
-    generate_rmsnorm_inputs,
-)
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_available_models,
     get_caller_name_no_ext,
+    get_model_configs,
     print_vgpr,
+)
+from op_tests.triton_tests.normalization.test_rmsnorm import (
+    generate_rmsnorm_inputs,
 )
 
 
@@ -19,7 +21,7 @@ def model_benchmark_shapes(args):
     configs = get_model_configs(
         config_path=config_file, models="llama3" if args.model is None else args.model
     )
-    M_list = [args.M] if args.model == "all" else [2**i for i in range(0, 15)]
+    M_list = [args.M] if args.model == "all" else [2**i for i in range(15)]
     shapes = []
     for M in M_list:
         for model_name, config in configs.items():
@@ -96,7 +98,7 @@ def run_benchmark(args):
             # Fused RMSNorm (+ optional residual add) + MXFP4 quant epilogue.
             assert N % 2 == 0, "fused mxfp4 quant requires an even N (two fp4 -> uint8)"
             res = torch.randn_like(x) if add_residual else None
-            fn = lambda: fused_rms_mxfp4_quant(x, w, eps, res1=res)  # noqa: E731
+            fn = lambda: fused_rms_mxfp4_quant(x, w, eps, res1=res)
             # Bytes moved: read x (+ residual), write packed fp4 (N/2 bytes/row)
             # + e8m0 block scales (cdiv(N,32) bytes/row) (+ residual passthrough).
             mxfp4_block = 32
@@ -107,7 +109,7 @@ def run_benchmark(args):
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
         else:
-            fn = lambda: rms_norm(x, w, eps)  # noqa: E731
+            fn = lambda: rms_norm(x, w, eps)
             # memory transfer
             mem_read = (M * 1) * N * x.element_size()  # x is (M,N) and g/weight is (N)
             mem_write = M * N * x.element_size()  # output
@@ -203,7 +205,7 @@ def main(args: list[str] | None = None) -> None:
     parsed_args = parse_args(args=args)
     if parsed_args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(parsed_args)  # noqa: E731
+        fun = lambda: run_benchmark(parsed_args)
         print_vgpr(fun, get_caller_name_no_ext())
         return
     run_benchmark(parsed_args)

@@ -1,29 +1,31 @@
+import math
 import sys
+
 import torch
 import triton
-import math
+
 from aiter.ops.triton.gemm.basic.gemm_a8wfp4 import (
     gemm_a8wfp4,
+)
+from aiter.ops.triton.utils.types import get_fp8_dtypes
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    add_argparse_ff,
+    get_ff_args,
+    get_parser,
+)
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
+    get_caller_name_no_ext,
+    get_model_benchmark_object,
+    get_shape_benchmark_object,
+    print_vgpr,
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8wfp4 import (
     generate_gemm_a8wfp4_inputs,
 )
-from op_tests.op_benchmarks.triton.utils.argparse import (
-    get_parser,
-    add_argparse_ff,
-    get_ff_args,
-)
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_benchmark_object,
-    get_shape_benchmark_object,
-    print_vgpr,
-    get_caller_name_no_ext,
-)
-from aiter.ops.triton.utils.types import get_fp8_dtypes
 
 
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str):
-    e5m2_type, e4m3_type = get_fp8_dtypes()
+    _e5m2_type, e4m3_type = get_fp8_dtypes()
     a_dtype = e4m3_type
     out_dtype = torch.float16
     x, w, x_scales, w_scales, _, _, y = generate_gemm_a8wfp4_inputs(
@@ -74,7 +76,7 @@ def run_benchmark(args, defaults):
         unsupported_args = []
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking with the --model flag."
                 )
         run_model_benchmark(args)
@@ -87,7 +89,7 @@ def run_benchmark(args, defaults):
         ]
         for arg in unsupported_args:
             if getattr(args, arg, None) != getattr(defaults, arg, None):
-                raise Exception(
+                raise RuntimeError(
                     f"Argument '{arg}' is not supported for benchmarking without the --model flag."
                 )
         run_shape_benchmark(args)
@@ -134,7 +136,7 @@ def parse_args():
 
 
 def main():
-    import aiter.ops.triton.utils._triton.arch_info as arch_info
+    from aiter.ops.triton.utils._triton import arch_info
 
     if not (arch_info.is_fp4_avail()):
         print("MXFP4 is not available on this architecture")
@@ -143,7 +145,7 @@ def main():
     args, defaults = parse_args()
     if args.print_vgpr:
         print("Retrieving VGPR usage for Triton kernels...")
-        fun = lambda: run_benchmark(args, defaults)  # noqa: E731
+        fun = lambda: run_benchmark(args, defaults)
         print_vgpr(fun, get_caller_name_no_ext())
         return 0
     run_benchmark(args, defaults)

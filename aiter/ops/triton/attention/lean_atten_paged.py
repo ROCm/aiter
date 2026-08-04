@@ -66,7 +66,7 @@ def persistent_lean_attention_paged(
         tiles_per_head,
         total_programs,
         num_splits,
-        even_split,
+        _even_split,
     ) = get_num_splits_and_buffer_sizes(
         N_CTX_Q, N_CTX_K, H, H, HEAD_DIM_Q, BLOCK_M, BLOCK_N, total_programs
     )
