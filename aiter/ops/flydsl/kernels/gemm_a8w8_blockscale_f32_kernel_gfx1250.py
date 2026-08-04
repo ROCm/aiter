@@ -3,8 +3,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
@@ -13,6 +11,8 @@ from flydsl.utils.smem_allocator import check_smem_capacity
 
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 128
 WAVE_SIZE = 32
+SCOPE_DEV = 16
+KERNARG_PRELOAD_COUNT = 8
 LDS_PAD_A_BYTES = 16
 B_CYCLE_BYTES = 16 * 16
 B_KSTEP_BYTES = WMMA_K * 16
@@ -28,13 +28,6 @@ def _vec(v):
 
 def _byte_off_i32(elem_off, elem_bytes):
     return (fx.Int32(elem_off) * elem_bytes).ir_value()
-
-
-def buffer_load_f32(rsrc, elem_off):
-    zero = fx.Int32(0).ir_value()
-    return rocdl.raw_ptr_buffer_load(
-        T.f32, rsrc, _byte_off_i32(elem_off, 4), zero, zero
-    )
 
 
 def store_acc_vec8_to_buffer(acc_vec8, c_rsrc, addr, out_dt=None, byte_addr=False):
@@ -146,11 +139,22 @@ def compile_gemm_a8w8_blockscale(
     xs_row_bytes = scales_per_tile * 4
     lds_x_scale_data_bytes = tile_m * xs_row_bytes
 
-    @fx.struct
-    class SharedStorage:
-        a: fx.Array[fx.Uint8, num_buffers * lds_a_data_bytes, 16]
-        b: fx.Array[fx.Uint8, num_buffers * lds_b_data_bytes, 16]
-        xs: fx.Array[fx.Uint8, num_buffers * lds_x_scale_data_bytes, 16]
+    if split_k > 1:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[fx.Uint8, num_buffers * lds_a_data_bytes, 16]
+            b: fx.Array[fx.Uint8, num_buffers * lds_b_data_bytes, 16]
+            xs: fx.Array[fx.Uint8, num_buffers * lds_x_scale_data_bytes, 16]
+            xt: fx.Array[fx.Float32, num_warps * WMMA_M * WMMA_N, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[fx.Uint8, num_buffers * lds_a_data_bytes, 16]
+            b: fx.Array[fx.Uint8, num_buffers * lds_b_data_bytes, 16]
+            xs: fx.Array[fx.Uint8, num_buffers * lds_x_scale_data_bytes, 16]
 
     check_smem_capacity(dsl_size_of(SharedStorage), gpu_arch)
 
@@ -178,13 +182,14 @@ def compile_gemm_a8w8_blockscale(
 
     @flyc.kernel
     def kernel_gemm_a8w8_blockscale(
-        arg_y: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_x_scale: fx.Tensor,
-        arg_w_scale: fx.Tensor,
+        arg_y: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_x_scale: fx.Pointer,
+        arg_w_scale: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_ldc: fx.Int32,
     ):
         tx, bx, by = gpu.thread_id("x"), gpu.block_id("x"), gpu.block_id("y")
         blk_m, blk_n = fx.Uint64(bx) * tile_m, fx.Uint64(by) * tile_n
@@ -206,16 +211,25 @@ def compile_gemm_a8w8_blockscale(
         )
         warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
         m_idx, n_idx = fx.Uint64(i32_m), fx.Uint64(i32_n)
+        ldc = fx.Uint64(i32_ldc)
 
         y_buf = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(fx.get_iter(arg_y), m_idx * n_idx * elem_bytes_d)
+            fx.rocdl.make_buffer_ptr(arg_y, m_idx * ldc * elem_bytes_d)
         )
-        n_scale_blocks = (n_idx + (scale_block_n - 1)) // scale_block_n
-        w_scale_buf = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(
-                fx.get_iter(arg_w_scale), n_scale_blocks * scale_k * 4
-            )
+        ws_elems = ((n_idx + (scale_block_n - 1)) // scale_block_n) * scale_k
+        ws_buf = fx.rocdl.make_buffer_tensor(
+            fx.make_view(arg_w_scale, fx.make_layout(ws_elems, 1)),
+            max_size=False,
+            num_records_bytes=ws_elems * 4,
         )
+        ws_lay = fx.make_layout(1, 1)
+        ws_tiles = fx.logical_divide(ws_buf, ws_lay)
+        ws_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+
+        def load_w_scale(elem_idx):
+            r = fx.make_rmem_tensor(ws_lay, fx.Float32)
+            fx.copy_atom_call(ws_atom, fx.slice(ws_tiles, (None, elem_idx)), r)
+            return r.load()[0]
 
         scale_zero = fx.Float32(0.0)
 
@@ -234,9 +248,7 @@ def compile_gemm_a8w8_blockscale(
         def _byte_view(tensor, byte_off, shape, stride):
             return fx.Tensor(
                 fx.make_view(
-                    fx.add_offset(
-                        fx.recast_iter(fx.Int8, fx.get_iter(tensor)), byte_off
-                    ),
+                    fx.add_offset(fx.recast_iter(fx.Int8, tensor), byte_off),
                     fx.make_layout(shape, stride),
                 )
             )
@@ -280,7 +292,7 @@ def compile_gemm_a8w8_blockscale(
             idx = wave_n_block * scale_k + lane_id_full + offset
             if const_expr(split_k > 1):
                 idx = idx + split_kb_base
-            return buffer_load_f32(w_scale_buf, idx)
+            return load_w_scale(idx)
 
         def _w_readlane(kb):
             if const_expr(NUM_W_CHUNKS == 1):
@@ -458,13 +470,15 @@ def compile_gemm_a8w8_blockscale(
         x_base_bytes = blk_m64 * K + split_k_base64
         w_base_bytes = (blk_n64 // 16) * (K * 16) + split_k_base64 * 16
 
+        mn_oob = fx.Int32(m_idx - blk_m)
+        nb_oob = fx.Int32((n_idx - blk_n) // 16)
         gX = _byte_view(arg_x, x_base_bytes, (tile_m, tile_k), (tile_k, 1))
         gW = _byte_view(
             arg_w, w_base_bytes, (tile_n // 16, tile_k * 16), (tile_k * 16, 1)
         )
         atom_x = fx.rocdl.make_tdm_atom(
             gX,
-            [None, None],
+            [mn_oob, None],
             strides=[K, None],
             num_warps=num_warps,
             pad_interval=tile_k,
@@ -472,7 +486,7 @@ def compile_gemm_a8w8_blockscale(
         )
         atom_w = fx.rocdl.make_tdm_atom(
             gW,
-            [None, None],
+            [nb_oob, None],
             strides=[K * 16, None],
             num_warps=num_warps,
         )
@@ -486,7 +500,7 @@ def compile_gemm_a8w8_blockscale(
         )
         atom_xs = fx.rocdl.make_tdm_atom(
             gXS,
-            [None, None],
+            [mn_oob, None],
             strides=[scale_k * 4, None],
             num_warps=num_warps,
         )
@@ -682,20 +696,37 @@ def compile_gemm_a8w8_blockscale(
 
         if const_expr(split_k > 1):
             zero_i32_s = fx.Int32(0).ir_value()
+            dev_scope = fx.Int32(SCOPE_DEV).ir_value()
+            xt = fx.add_offset(
+                lds.xt.ptr,
+                (wave_m_idx * n_warp + wave_n_idx) * (WMMA_M * WMMA_N),
+            )
         for wm, wn, idx in acc_coords:
             row = blk_m + warp_m_base + wm * WMMA_M + lane16
             col_base = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
-            elem_off = row * n_idx + col_base
+            elem_off = row * ldc + col_base
 
             if const_expr(split_k > 1):
                 for e in range_constexpr(8):
-                    rocdl.raw_ptr_buffer_atomic_fadd(
-                        _vec(accs[idx])[e].ir_value(),
-                        y_buf,
-                        _byte_off_i32(elem_off + e, 4),
-                        zero_i32_s,
-                        zero_i32_s,
+                    fx.ptr_store(
+                        _vec(accs[idx])[e],
+                        fx.add_offset(xt, lane16 * WMMA_N + lane_kgrp * 8 + e),
                     )
+                t_base = blk_m + warp_m_base + wm * WMMA_M
+                t_col = blk_n + warp_n_base + wn * WMMA_N + lane16
+                for e in range_constexpr(8):
+                    if t_base + 2 * e < m_idx:
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            fx.ptr_load(
+                                fx.add_offset(xt, (lane_kgrp + 2 * e) * WMMA_N + lane16)
+                            ).ir_value(),
+                            y_buf,
+                            _byte_off_i32(
+                                (t_base + lane_kgrp + 2 * e) * ldc + t_col, 4
+                            ),
+                            zero_i32_s,
+                            dev_scope,
+                        )
             elif const_expr(out_dt is not None):
                 store_acc_vec8_to_buffer(
                     accs[idx],
@@ -711,13 +742,14 @@ def compile_gemm_a8w8_blockscale(
 
     @flyc.jit
     def launch_gemm_a8w8_blockscale(
-        arg_y: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_x_scale: fx.Tensor,
-        arg_w_scale: fx.Tensor,
+        arg_y: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_x_scale: fx.Pointer,
+        arg_w_scale: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
+        i32_ldc: fx.Int32,
         stream: fx.Stream,
     ):
         gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
@@ -732,24 +764,12 @@ def compile_gemm_a8w8_blockscale(
             arg_w_scale,
             i32_m,
             i32_n,
+            i32_ldc,
             value_attrs={
                 "rocdl.flat_work_group_size": f"{block_threads},{block_threads}",
                 "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
             },
         )
-
-        # Mark kernel args as inreg so AMDGPU preloads them into user SGPRs at dispatch.
-        if kernarg_preload:
-            ctx = CompilationContext.get_current()
-            inreg_attr = ir.UnitAttr.get()
-            for op in ctx.gpu_module_body.operations:
-                if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                    num_args = len(op.regions[0].blocks[0].arguments)
-                    per_arg = [
-                        ir.DictAttr.get({"llvm.inreg": inreg_attr})
-                        for _ in range(num_args)
-                    ]
-                    op.attributes["arg_attrs"] = ir.ArrayAttr.get(per_arg)
 
         launcher.launch(
             grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
@@ -764,6 +784,8 @@ def compile_gemm_a8w8_blockscale(
         # "amdgpu-sched-strategy": "coexec",
         "unroll-threshold": 0,
         # "amdgpu-block-carried-latency": EnumOpt("all"),  # enable per the note above
+        "amdgpu-kernarg-preload": kernarg_preload,
+        "amdgpu-kernarg-preload-count": KERNARG_PRELOAD_COUNT,
     }
 
     return launch_gemm_a8w8_blockscale

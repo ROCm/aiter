@@ -14,14 +14,15 @@ import torch
 
 _compile_gemm_a8w8_blockscale = None
 _run_compiled = None
+_flyc = None
 _fx = None
 
 
 def _lazy_import():
-    """Defer the kernel import so ``import aiter`` does not pull in flydsl."""
-    global _compile_gemm_a8w8_blockscale, _run_compiled, _fx
+    global _compile_gemm_a8w8_blockscale, _run_compiled, _flyc, _fx
     if _compile_gemm_a8w8_blockscale is not None:
         return
+    import flydsl.compiler as flyc
     import flydsl.expr as fx
 
     from aiter.ops.flydsl.kernels.gemm_a8w8_blockscale_f32_kernel_gfx1250 import (
@@ -31,7 +32,24 @@ def _lazy_import():
 
     _compile_gemm_a8w8_blockscale = compile_gemm_a8w8_blockscale
     _run_compiled = run_compiled
+    _flyc = flyc
     _fx = fx
+
+
+_FX_DTYPE = {}
+
+
+def _p(t):
+    if not _FX_DTYPE:
+        _FX_DTYPE.update(
+            {
+                torch.float8_e4m3fn: _fx.Float8E4M3FN,
+                torch.bfloat16: _fx.BFloat16,
+                torch.float16: _fx.Float16,
+                torch.float32: _fx.Float32,
+            }
+        )
+    return _flyc.from_c_void_p(_FX_DTYPE[t.dtype], t.data_ptr())
 
 
 @functools.lru_cache(maxsize=1024)
@@ -147,7 +165,16 @@ def gemm_a8w8_blockscale(
 
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
     _run_compiled(
-        launcher, y_buf, x, w, x_scale, w_scale, M, N_stride, _fx.Stream(stream)
+        launcher,
+        _p(y_buf),
+        _p(x),
+        _p(w),
+        _p(x_scale),
+        _p(w_scale),
+        M,
+        N,
+        N_stride,
+        _fx.Stream(stream),
     )
 
     result = y_buf[:, :N] if N_stride != N else y_buf
