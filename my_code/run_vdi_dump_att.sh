@@ -23,6 +23,10 @@ AITER_TDM_NUM_BUFFERS="${AITER_TDM_NUM_BUFFERS:-3}"
 AITER_TDM_TILE_M2="${AITER_TDM_TILE_M2:-64}"
 AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2:-512}"
 AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2:-128}"
+# 1 = both K-slices' operands in flight before the first wait, 0 = split
+# FRONT/BACK. Unset lets the kernel decide from its VGPR budget. Measured slower
+# on b8-2 (gemm1 208.8 vs 203.7us), so set it explicitly when tracing either side.
+AITER_TDM_WIDE_KSL="${AITER_TDM_WIDE_KSL:-0}"
 AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2:-3}"
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}"
 
@@ -82,6 +86,7 @@ container_main() {
         echo "HIP_VISIBLE_DEVICES: ${HIP_VISIBLE_DEVICES:-unset}"
         echo "gemm1 tile: ${AITER_TDM_TILE_M}x${AITER_TDM_TILE_N}x${AITER_TDM_TILE_K} nb=${AITER_TDM_NUM_BUFFERS}"
         echo "gemm2 tile: ${AITER_TDM_TILE_M2}x${AITER_TDM_TILE_N2}x${AITER_TDM_TILE_K2} nb=${AITER_TDM_NUM_BUFFERS2}"
+        echo "wide_ksl: ${AITER_TDM_WIDE_KSL}"
         echo "python: $(command -v python || true)"
         python --version || true
         echo "rocprofv3: $(command -v rocprofv3 || true)"
@@ -431,6 +436,7 @@ YAML
         AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2}"
         AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2}"
         AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2}"
+        AITER_TDM_WIDE_KSL="${AITER_TDM_WIDE_KSL}"
     )
 
     # A stale cache would silently trace a previously-built tile config.
@@ -590,6 +596,7 @@ docker_env=(
     -e AITER_TDM_TILE_N2="${AITER_TDM_TILE_N2}"
     -e AITER_TDM_TILE_K2="${AITER_TDM_TILE_K2}"
     -e AITER_TDM_NUM_BUFFERS2="${AITER_TDM_NUM_BUFFERS2}"
+    -e AITER_TDM_WIDE_KSL="${AITER_TDM_WIDE_KSL}"
     -e HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES}"
 )
 
