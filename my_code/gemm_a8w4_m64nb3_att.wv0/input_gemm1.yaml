@@ -1,0 +1,16 @@
+jobs:
+ -
+  kernel_include_regex: '^gemm_a8w4_tdm_t64x256x256_w1x4_b3_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1$'
+  kernel_exclude_regex:
+  kernel_iteration_range: "[1]"
+  output_file: out
+  output_directory: my_code/.run_vdi_dump_att_gemm_a8w4_m64nb3_att.wv0_3085/thread_trace/gemm1/rpf_v3
+  output_format: [csv]
+  truncate_kernels: false
+  sys_trace: false
+  advanced_thread_trace: true
+  att_target_cu: 1
+  att_shader_engine_mask: "0xf"
+  att_simd_select: "0xf"
+  att_buffer_size: "0x10000000"
+  att_library_path: ["/data/yanguahe/code/wk_sp1/decoder_new"]
