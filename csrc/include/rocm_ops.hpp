@@ -1466,6 +1466,51 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("softmax_scale"));
 
+#define PA_MQA_LOGITS_MXFP8_PYBIND                        \
+    m.def("pa_mqa_logits_mxfp8_fwd_prefill",               \
+          &pa_mqa_logits_mxfp8_fwd_prefill,                \
+          py::arg("q"),                                \
+          py::arg("q_scale"),                          \
+          py::arg("kv_cache"),                         \
+          py::arg("kv_scale"),                         \
+          py::arg("block_tables"),                     \
+          py::arg("weights"),                          \
+          py::arg("row_to_batch"),                     \
+          py::arg("local_starts"),                     \
+          py::arg("local_ends"),                       \
+          py::arg("out"),                              \
+          py::arg("num_rows"),                         \
+          py::arg("weight_scale"),                     \
+          py::arg("block_k"),                          \
+          py::arg("kv_block_size"),                    \
+          py::arg("max_seq_len"));                     \
+    m.def("pa_mqa_logits_mxfp8_fwd_decode",               \
+          &pa_mqa_logits_mxfp8_fwd_decode,                \
+          py::arg("q"),                                \
+          py::arg("q_scale"),                          \
+          py::arg("kv_cache"),                         \
+          py::arg("kv_scale"),                         \
+          py::arg("block_tables"),                     \
+          py::arg("weights"),                          \
+          py::arg("cu_seq_q"),                         \
+          py::arg("context_lens"),                     \
+          py::arg("out"),                              \
+          py::arg("batch"),                            \
+          py::arg("next_n_max"),                       \
+          py::arg("split_kv"),                         \
+          py::arg("weight_scale"),                     \
+          py::arg("block_k"),                          \
+          py::arg("kv_block_size"),                    \
+          py::arg("max_seq_len"));                     \
+    m.def("pa_mqa_logits_mxfp8_prefill_windows",          \
+          &pa_mqa_logits_mxfp8_prefill_windows,           \
+          py::arg("cu_seq_q"),                         \
+          py::arg("context_lens"),                     \
+          py::arg("row_to_batch"),                     \
+          py::arg("local_starts"),                     \
+          py::arg("local_ends"),                       \
+          py::arg("total_q"));
+
 #define FMHA_FWD_BF16_OPUS_PYBIND                                  \
     m.def("fmha_fwd_bf16_opus_fwd",                                \
           &fmha_fwd_bf16_opus_fwd,                                 \
