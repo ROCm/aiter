@@ -548,11 +548,11 @@ class MfmaScaleGU:
 
 
 class SiluQuantEpilogue:
-    """silu(gate)*up -> fp8 + per-32 E8M0 out-scale (aiter/CK swizzled), via inline .ptr cshuffle."""
+    """SwiGLU followed by FP8 quantization and per-32 E8M0 output scales."""
 
     # fmt: off
     def __init__(self, *, out_rsrc, out_scale_rsrc, sorted_rsrc, tokens, inter_dim, m_repeat, num_acc_n,
-        sort_block_m, tile_n, num_waves, lds_out, always_valid=False, out_tensor=None):
+        sort_block_m, tile_n, num_waves, lds_out, swiglu_limit=0.0, always_valid=False, out_tensor=None):
     # fmt: on
         self._out_rsrc = out_rsrc
         self._out_scale_rsrc = out_scale_rsrc
@@ -565,6 +565,7 @@ class SiluQuantEpilogue:
         self._tile_n = tile_n
         self._num_waves = num_waves
         self._lds_out = lds_out
+        self._swiglu_limit = float(swiglu_limit)
         self._always_valid = always_valid
         self._out_tensor = out_tensor
         self._lane = fx.thread_idx.x % 64
@@ -586,7 +587,14 @@ class SiluQuantEpilogue:
     def _silu_mul(self, gate_v4, up_v4):
         gv = Vec(gate_v4)
         uv = Vec(up_v4)
-        elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
+        if self._swiglu_limit <= 0:
+            elems = [self._silu(gv[i]) * uv[i] for i in range_constexpr(4)]
+            return Vec.from_elements(elems, fx.Float32)
+        limit = fx.Float32(self._swiglu_limit)
+        elems = [
+            self._silu(-(-gv[i]).maximumf(-limit)) * fx.clampf(uv[i], -limit, limit)
+            for i in range_constexpr(4)
+        ]
         return Vec.from_elements(elems, fx.Float32)
 
     def store(self, acc, tile_i32, tile_row_base_i32, n_tile_base_i32):

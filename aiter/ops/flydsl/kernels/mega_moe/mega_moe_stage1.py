@@ -76,7 +76,7 @@ def compile_mega_moe_stage1(
     async_a_copy: bool = False, use_tile_resource: bool = True,
     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
     work_shards: int | None = None, external_grouping: bool | None = None,
-    external_counting: bool | None = None,
+    external_counting: bool | None = None, swiglu_limit: float = 0.0,
 ):
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
@@ -158,12 +158,14 @@ def compile_mega_moe_stage1(
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
 
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
+    swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     kernel_name = (
         f"megamoe_stage1_{dispatch_path}_t{sort_block_m}x{tile_n}x{tile_k}"
         f"_w{NUM_WAVES}_gm{grid_mult}"
         f"_dcu{dispatch_blocks}_pw{int(pipe_weights)}ma{int(mfma_amajor)}sw{int(swizzle_a)}"
         f"aa{int(async_a_copy)}"
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
+        f"{swiglu_suffix}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -349,6 +351,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+            swiglu_limit=swiglu_limit,
         )
 
         if tid == fx.Int32(0):
@@ -424,7 +427,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
     use_tile_resource=True, waves_per_eu_hint=2,
-    b_nt=-1, work_shards=None, external_grouping=None, external_counting=None):
+    b_nt=-1, work_shards=None, external_grouping=None, external_counting=None, swiglu_limit=0.0):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -434,7 +437,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
         b_nt=b_nt, work_shards=work_shards, external_grouping=external_grouping,
-        external_counting=external_counting,
+        external_counting=external_counting, swiglu_limit=swiglu_limit,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,

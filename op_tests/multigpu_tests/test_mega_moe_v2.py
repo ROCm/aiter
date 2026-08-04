@@ -22,7 +22,13 @@ from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.utility import fp4_utils
 
 NETWORKS = {
-    "v4_pro": {"model_dim": 7168, "inter_dim": 3072, "experts": 384, "topk": 6},
+    "v4_pro": {
+        "model_dim": 7168,
+        "inter_dim": 3072,
+        "experts": 384,
+        "topk": 6,
+        "swiglu_limit": 10.0,
+    },
 }
 
 
@@ -138,7 +144,16 @@ def _all_gather(tensor):
 
 @torch.no_grad()
 def _reference(
-    x, route_weights, ids, ref_weights, rank, world, model_dim, inter_dim, experts
+    x,
+    route_weights,
+    ids,
+    ref_weights,
+    rank,
+    world,
+    model_dim,
+    inter_dim,
+    experts,
+    swiglu_limit,
 ):
     x_all, weights_all, ids_all = (
         _all_gather(x),
@@ -163,7 +178,9 @@ def _reference(
         )
         w2 = _dequant_expert(w2_q[local_id], w2_scale[local_id], model_dim, inter_dim)
         inp = x_all[rows].float()
-        hidden = F.silu(inp @ w1[:inter_dim].T) * (inp @ w1[inter_dim:].T)
+        gate = (inp @ w1[:inter_dim].T).clamp(max=swiglu_limit)
+        up = (inp @ w1[inter_dim:].T).clamp(-swiglu_limit, swiglu_limit)
+        hidden = F.silu(gate) * up
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -213,6 +230,7 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.model_dim,
             moe.inter_dim,
             moe.experts,
+            moe.swiglu_limit,
         )
         rel_l2 = float(
             torch.linalg.vector_norm(output.float() - reference)
