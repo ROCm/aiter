@@ -19,10 +19,9 @@
 #                        (batch, split, head_block*qlen) grid. Full decode
 #                        (stage-1 + stage-2 reduce into the final O). A partial
 #                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
-#   REGIME='bh12bn64'  - Kimi K3 TP8 specialization of bh16bn64 for exactly
-#                        12 heads. The MFMA tile remains 16x16 (CDNA4 has no
-#                        12-row MFMA), with a context-bucketed 16-112 way KV
-#                        split policy measured using scattered physical pages.
+#                        Low-head decode (nhead <= 16) uses a context-bucketed
+#                        16-112 way KV split policy measured with scattered
+#                        physical pages. The MFMA tile remains 16x16.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
@@ -181,7 +180,7 @@ def _mla_gluon(
     active_kv_splits = NUM_KV_SPLITS
     if DYNAMIC_KV_SPLITS:
         # CUDA Graph capture freezes Python-side constexpr decisions. Select the
-        # measured h12 bucket from the runtime sequence length instead, while
+        # measured low-head bucket from the runtime sequence length instead, while
         # retaining a fixed 112-workgroup launch and workspace shape.
         active_kv_splits = gl.where(
             cur_batch_seq_len <= 4096,
@@ -966,11 +965,9 @@ def mla_gluon(
 
     # Pick regime by (nhead, kv dtype). MTP (qlen>1) uses the grid-axis path:
     # q_pos is grid axis 2, so each query position is a separate program.
-    # Exactly 12 BF16 heads gets the Kimi K3 TP8 launch specialization.
+    # Low-head BF16 decode reuses bh16bn64; partial tiles mask OOB heads.
     if nhead in (64, 128):
         REGIME = "bh64"
-    elif nhead == 12 and kv_c.dtype == torch.bfloat16:
-        REGIME = "bh12bn64"
     elif 1 <= nhead <= 96:
         # bh16 path: heads are tiled into cdiv(nhead, 16) blocks of BLOCK_H=16 on
         # grid axis 2 (alongside q_pos). nhead <= 16 is a single block (unchanged);
@@ -1039,7 +1036,7 @@ def mla_gluon(
             NUM_KV_SPLITS = max(
                 1, min(256 // (batch_size * qlen * NUM_M_BLOCKS), min_kv_seq_len)
             )
-        else:  # bh12bn64 or bh16bn64
+        else:  # bh16bn64
             # Fill ~256 WGs (total WGs = B * NUM_KV_SPLITS <= 256, one MI350 wave),
             # but never split a sequence into more blocks than it has: bound by the
             # shortest seq's block count so every split holds >= 1 block (no wasted
@@ -1052,11 +1049,11 @@ def mla_gluon(
                     triton.cdiv(min_kv_seq_len, BLOCK_N),
                 ),
             )
-            if REGIME == "bh12bn64":
+            if nhead <= BLOCK_H:
                 # Launch and allocate for the largest bucket. Stage-1 and
                 # stage-2 derive the active 16/48/64/96/112 split count from
                 # device-side sequence metadata, so CUDA Graph capture cannot
-                # freeze this path at the caller's default min_kv_seq_len=1.
+                # freeze low-head decode at the caller's default min_kv_seq_len=1.
                 # Keep the upstream MTP/head-block workgroup budget intact.
                 NUM_KV_SPLITS = max(
                     1,
