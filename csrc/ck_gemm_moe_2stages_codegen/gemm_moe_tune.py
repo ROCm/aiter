@@ -119,14 +119,6 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
-# SiTUv2 params (Kimi-K3 config.json), passed to BOTH the torch reference and
-# the kernel launch -- they used to fall back to their own differing defaults
-# ((2.0, 1.5) vs (1.0, 1.0)), which scored every SiTUv2 stage1 candidate at
-# ~35% err and failed them all against --errRatio.
-_TUNER_SITU_BETA = 4.0
-_TUNER_SITU_LINEAR_BETA = 25.0
-
-
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
 
@@ -2263,8 +2255,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=DEFAULT_SITUV2_BETA,
+            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
