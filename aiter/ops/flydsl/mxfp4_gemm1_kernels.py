@@ -230,6 +230,10 @@ def flydsl_mxfp4_gemm1(
         bias is not None,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
+    if BM == 16:
+        # Two M blocks atomically pack scale bytes into each dword. The GEMM
+        # uses the current/default stream, so this clear is ordered before it.
+        inter_sorted_shuffled_scale.zero_()
     _moe_kernels._run_compiled(
         launch,
         (

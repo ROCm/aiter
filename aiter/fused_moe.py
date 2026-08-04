@@ -1582,8 +1582,8 @@ def _mxfp4_a4w4_stage1(
     inter_scale_rows = (inter_scale_bytes + inter_scale_cols - 1) // inter_scale_cols
     inter_scale_rows = (inter_scale_rows + 31) // 32 * 32
     inter_scale_dtype = dtypes.fp8_e8m0 if out_dtype == "fp8" else torch.uint8
-    # BM16 is zeroed by a preceding FlyDSL dispatch; larger tiles overwrite all
-    # scale bytes consumed by GEMM2.
+    # The GEMM1 launcher clears BM16 scales before dispatch; larger tiles
+    # overwrite all scale bytes consumed by GEMM2.
     inter_sorted_shuffled_scale = torch.empty(
         (inter_scale_rows, inter_scale_cols),
         device=device,
