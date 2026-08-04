@@ -1,9 +1,9 @@
 import torch
 import triton.experimental.gluon.language as gl
 import triton.language as tl
+from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 from triton.experimental.gluon.language.amd.gfx1250 import async_copy
-from triton._C.libtriton.gluon_ir import make_cga_layout
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
