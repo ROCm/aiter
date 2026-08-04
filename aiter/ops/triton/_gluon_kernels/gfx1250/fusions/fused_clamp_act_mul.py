@@ -99,7 +99,12 @@ def _fused_clamp_silu_mul_kernel(
     colN: gl.constexpr = gl.SliceLayout(0, gLayout2D)   # [BN] col-index vector
     rowS: gl.constexpr = gl.SliceLayout(1, sLayout2D)   # [BM] row-index vector (scale tile)
     colS: gl.constexpr = gl.SliceLayout(0, sLayout2D)   # [G]  group-index vector
-    shared2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    # Padded LDS staging: pad the inner (N) dim by 8 elements every BLOCK_SIZE_N so
+    # consecutive rows land on different LDS banks (mirrors the gemm C-store /
+    # operand padding, e.g. with_identity_for([[BLOCK_N, 8]], [BLOCK_M, BLOCK_N])).
+    shared2D: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+    )
 
     pid = gl.program_id(0)
     m_start = pid * BLOCK_SIZE_M
