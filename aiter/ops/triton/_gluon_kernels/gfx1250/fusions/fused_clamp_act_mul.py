@@ -19,11 +19,23 @@ LDS, reads them into a 2D register tensor (``gLayout2D``), computes
 and column (power-of-two) overhang to OOB zero-fill.
 """
 
+import math
+
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from aiter.ops.triton._triton_kernels.activation import _apply_activation_from_str
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+
+def _wmma_warp_bases(num_warps):
+    """warp_bases for an AMDWMMALayout distributing ``num_warps`` warps: first
+    bit along N, remaining bits along M (same rule as the gemm's
+    ``create_wmma_layouts``). Returns a constexpr tuple of (m_shift, n_shift)."""
+    bases = []
+    for i in range(int(math.log2(num_warps))):
+        bases.append((0, 1) if i == 0 else (1 << (i - 1), 0))
+    return tuple(bases)
 
 # Human-readable repr for the compiled kernel: lists the constexpr keys that
 # identify a unique specialization (shown in traces / cache keys).
@@ -102,6 +114,16 @@ def _fused_clamp_silu_mul_kernel(
     # Padded LDS staging (bank-conflict avoidance, mirrors the gemm C-store).
     shared2D: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+    )
+    # Matrix-core (WMMA) accumulator layout. The output tile is converted onto
+    # this layout before the padded-LDS store so the store lowers the same way as
+    # the gemm C-store (a BlockedLayout -> PaddedSharedLayout store does not
+    # lower). Requires BLOCK_SIZE_M >= 16 (the WMMA instruction's M dimension).
+    accLayout: gl.constexpr = gl.amd.AMDWMMALayout(
+        version=3,
+        transposed=True,
+        warp_bases=_wmma_warp_bases(num_warps),
+        instr_shape=[16, 16, 32],
     )
 
     pid = gl.program_id(0)
@@ -223,12 +245,13 @@ def _fused_clamp_silu_mul_kernel(
                 gl.reshape(scale_out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS]), sLayout2D
             )
 
-        # Accumulate the output into `acc` (zero-init, so functionally identical),
-        # then 2D TDM store the accumulated tile.
+        # Accumulate the output into `acc` on the WMMA layout (zero-init, so
+        # functionally identical), then 2D TDM store the accumulated tile. The
+        # matrix-core layout is what lets the padded-LDS store lower.
         acc = gl.zeros(
-            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=gLayout2D
+            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=accLayout
         )
-        acc = acc + out_q
+        acc = acc + gl.convert_layout(out_q, accLayout)
         out_smem.store(acc.to(out_ptr.dtype.element_ty))
         if num_warps > 1:
             gl.barrier()
@@ -276,12 +299,12 @@ def _fused_clamp_silu_mul_kernel(
             )
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # no quant: accumulate into `acc` (zero-init, functionally identical),
-        # then 2D TDM store the native-dtype tile.
+        # no quant: accumulate into `acc` on the WMMA layout (zero-init,
+        # functionally identical), then 2D TDM store the native-dtype tile.
         acc = gl.zeros(
-            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=gLayout2D
+            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=accLayout
         )
-        acc = acc + gl.convert_layout(out, gLayout2D)
+        acc = acc + gl.convert_layout(out, accLayout)
         out_smem.store(acc.to(out_ptr.dtype.element_ty))
         if num_warps > 1:
             gl.barrier()

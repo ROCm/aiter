@@ -254,8 +254,10 @@ def fused_clamp_act_mul(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
         # Gluon runs a 2D [BLOCK_SIZE_M, BLOCK_SIZE_N] tile: grid = cdiv(M, BLOCK_SIZE_M).
-        # block_size_m is a tunable (1 = one row per program).
-        block_size_m = 1
+        # block_size_m must be >= 16: the output tile is staged through a WMMA
+        # (matrix-core) accumulator layout whose M dimension is the 16-row WMMA
+        # instruction, so the padded-LDS TDM store lowers like the gemm C-store.
+        block_size_m = 16
         # ".cg" matches the Triton reference's hardcoded cache hint.
         _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, block_size_m),)](
             *kernel_args,
