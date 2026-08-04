@@ -4,7 +4,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import _to_raw as _raw
+from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import (
     BFloat16,
