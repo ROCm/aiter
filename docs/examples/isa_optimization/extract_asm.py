@@ -50,6 +50,9 @@ from collections import defaultdict
 # e_flags & 0xff -> gfx name, for toolchains whose llvm-readobj does not decode it
 EF_AMDGPU_MACH = {0x3F: "gfx90a", 0x40: "gfx940", 0x4C: "gfx942", 0x4F: "gfx950"}
 
+# Trailing comment llvm-objdump appends to every AMDGPU instruction line
+ADDR_COMMENT = re.compile(r"\s*// [0-9A-Fa-f]{12}:.*$")
+
 # Highest SGPR count .amdhsa_next_free_sgpr accepts on GFX9; the assembler adds the
 # implicitly reserved VCC / FLAT_SCRATCH / XNACK_MASK registers on top of it.
 GFX9_MAX_USER_SGPRS = 102
@@ -129,7 +132,11 @@ def extract_text(tools: Tools, co: str, mcpu: str, kernel: str, labels) -> list:
                 out.extend(f"{lab}:" for lab in labels.get(addr, []))
             continue
         if in_kernel and line.startswith("\t") and "//" in line:
-            instr = line.split("//", 1)[0].rstrip()
+            # Strip the trailing "// ADDR: ENCODING" comment.  Anchor on the
+            # address rather than the first "//": on some targets objdump adds
+            # /*...*/ operand annotations, and on long lines the closing "*/"
+            # abuts the "//" with no space in between.
+            instr = ADDR_COMMENT.sub("", line).rstrip()
             if instr.lstrip().startswith((".long", ".byte")):
                 print(
                     f"warning: undecodable bytes kept as data: {instr.strip()} "

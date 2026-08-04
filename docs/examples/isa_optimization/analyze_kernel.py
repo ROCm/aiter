@@ -26,7 +26,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from extract_asm import Tools, default_llvm_bin, detect_mcpu  # noqa: E402
+from extract_asm import ADDR_COMMENT, Tools, default_llvm_bin, detect_mcpu  # noqa: E402
 
 # Ordered (first match wins), keyed on the instruction mnemonic.
 CATEGORIES = [
@@ -62,7 +62,7 @@ def analyze_isa(co_path: str, mcpu: str | None, llvm_bin: str):
         if m and not m.group(1).startswith("label_"):
             kernels.append(m.group(1))
         elif line.startswith("\t") and "//" in line:
-            text = line.split("//", 1)[0].strip()
+            text = ADDR_COMMENT.sub("", line).strip()
             if text and not text.startswith("."):
                 instrs.append(text)
 
