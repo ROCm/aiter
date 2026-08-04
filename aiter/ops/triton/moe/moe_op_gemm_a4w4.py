@@ -302,6 +302,14 @@ def moe_gemm_a4w4(
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
 
+    x_scales_tdm = False
+    if use_gluon:
+        mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
+        ASYNC_COPY_MIN_SCALE_WIDTH = 8
+        x_scales_tdm = (
+            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+        )
+
     if apply_swiglu and config["split_k"] > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
@@ -352,7 +360,6 @@ def moe_gemm_a4w4(
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
-        # decode reads the activation scales via TDM only
         num_ctas = 1 if gather_indx is not None else config["num_ctas"]
         layouts = get_moe_a4w4_layouts_decode(
             BLOCK_M=config["block_m"],
@@ -364,6 +371,7 @@ def moe_gemm_a4w4(
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             GatherIndx=gather_indx,
+            X_SCALES_TDM=x_scales_tdm,
         )
         # launch gluon kernel
         _moe_gemm_a4w4_decode[(grid,)](
@@ -413,6 +421,7 @@ def moe_gemm_a4w4(
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             NUM_BUFFERS=config["num_buffers"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
+            X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             **layouts,
             num_ctas=num_ctas,
@@ -422,11 +431,6 @@ def moe_gemm_a4w4(
         assert (
             config["split_k"] == 1
         ), "Split-k is not supported for Gluon backend on gfx1250"
-        mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
-        ASYNC_COPY_MIN_SCALE_WIDTH = 16
-        x_scales_tdm = (mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH) or (
-            K % config["block_k"] != 0
-        )
         # layouts
         layouts = get_moe_a4w4_layouts_prefill(
             BLOCK_M=config["block_m"],
