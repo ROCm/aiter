@@ -76,6 +76,44 @@ def _resolve_num_kv_splits(auto_num_kv_splits, num_kv_splits):
 
 
 # fmt: off
+@triton.jit
+def _mla_split_policy_kernel(
+    B_seq_len,
+    Active_kv_splits,
+    NUM_KV_SPLITS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    if USE_2D_VIEW:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        cur_batch_seq_len = (
+            tl.load(B_seq_len + cur_batch + 1) - tl.load(B_seq_len + cur_batch)
+        )
+
+    active_kv_splits = tl.where(
+        cur_batch_seq_len <= 4096,
+        16,
+        tl.where(
+            cur_batch_seq_len <= 16384,
+            48,
+            tl.where(
+                cur_batch_seq_len <= 65536,
+                64,
+                tl.where(cur_batch_seq_len <= 131072, 96, 112),
+            ),
+        ),
+    )
+    active_kv_splits = tl.minimum(
+        active_kv_splits, tl.cdiv(cur_batch_seq_len, BLOCK_N)
+    )
+    active_kv_splits = tl.maximum(1, tl.minimum(active_kv_splits, NUM_KV_SPLITS))
+    tl.store(Active_kv_splits + cur_batch, active_kv_splits)
+# fmt: on
+
+
+# fmt: off
 @gluon.jit
 def _mla_gluon(
     Q_nope,
@@ -84,6 +122,7 @@ def _mla_gluon(
     K_pe_cache,
     Req_to_tokens,
     B_seq_len,
+    Active_kv_splits,
     O,
     Attn_sink,
     sm_scale,
@@ -177,30 +216,13 @@ def _mla_gluon(
     # additionally bounds min_kv_seq_len so num_iter >= 3 for its gl.assume.
     # Trade-off: at seqs just above the wrapper minimum the last CU does up to
     # ~(floor + NUM_KV_SPLITS - 1)/floor more work than the others.
-    active_kv_splits = NUM_KV_SPLITS
-    if DYNAMIC_KV_SPLITS:
-        # CUDA Graph capture freezes Python-side constexpr decisions. Select the
-        # measured low-head bucket from the runtime sequence length instead, while
-        # retaining a fixed 112-workgroup launch and workspace shape.
-        active_kv_splits = gl.where(
-            cur_batch_seq_len <= 4096,
-            16,
-            gl.where(
-                cur_batch_seq_len <= 16384,
-                48,
-                gl.where(
-                    cur_batch_seq_len <= 65536,
-                    64,
-                    gl.where(cur_batch_seq_len <= 131072, 96, 112),
-                ),
-            ),
-        )
-        active_kv_splits = gl.minimum(
-            active_kv_splits, gl.cdiv(cur_batch_seq_len, BLOCK_N)
-        )
-        active_kv_splits = gl.minimum(active_kv_splits, NUM_KV_SPLITS)
-        if split_kv_id >= active_kv_splits:
-            return
+    active_kv_splits = (
+        gl.load(Active_kv_splits + cur_batch)
+        if DYNAMIC_KV_SPLITS
+        else NUM_KV_SPLITS
+    )
+    if DYNAMIC_KV_SPLITS and split_kv_id >= active_kv_splits:
+        return
 
     kv_len_per_split = cur_batch_seq_len // active_kv_splits
     split_kv_start = kv_len_per_split * split_kv_id
@@ -784,7 +806,8 @@ def _mla_softmax_reducev_kernel(
     Mid_lse,
     O,
     Final_lse,
-    B_seq_len,  # same seq_info as the decode kernel to derive empty kv splits
+    B_seq_len,  # same seq_info as stage-1; needed for explicit split overrides
+    Active_kv_splits,
     stride_l_b,
     stride_l_qs,  # MTP: q_pos (qlen) stride; 0 when QLEN==1
     stride_l_h,
@@ -818,25 +841,11 @@ def _mla_softmax_reducev_kernel(
     else:
         batch_page_start = tl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
-    active_kv_splits = NUM_KV_SPLITS
-    if DYNAMIC_KV_SPLITS:
-        active_kv_splits = tl.where(
-            cur_batch_seq_len <= 4096,
-            16,
-            tl.where(
-                cur_batch_seq_len <= 16384,
-                48,
-                tl.where(
-                    cur_batch_seq_len <= 65536,
-                    64,
-                    tl.where(cur_batch_seq_len <= 131072, 96, 112),
-                ),
-            ),
-        )
-        active_kv_splits = tl.minimum(
-            active_kv_splits, tl.cdiv(cur_batch_seq_len, 64)
-        )
-        active_kv_splits = tl.minimum(active_kv_splits, NUM_KV_SPLITS)
+    active_kv_splits = (
+        tl.load(Active_kv_splits + cur_batch)
+        if DYNAMIC_KV_SPLITS
+        else NUM_KV_SPLITS
+    )
     kv_len_per_split = cur_batch_seq_len // active_kv_splits
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
@@ -1138,6 +1147,24 @@ def mla_gluon(
         final_lse = None
         stride_final_lse_b, stride_final_lse_s, stride_final_lse_h = 0, 0, 0
 
+    if DYNAMIC_KV_SPLITS:
+        # Compute the runtime policy once on device so CUDA Graph replay sees
+        # updated sequence lengths, then share the result across both MLA stages.
+        active_kv_splits = torch.empty(
+            (batch_size,), dtype=torch.int32, device=seq_info.device
+        )
+        _mla_split_policy_kernel[(batch_size,)](
+            seq_info,
+            active_kv_splits,
+            NUM_KV_SPLITS=NUM_KV_SPLITS,
+            BLOCK_N=BLOCK_N,
+            USE_2D_VIEW=use_2d_view,
+        )
+    else:
+        # Compile-time disabled in both consumers; use an existing device pointer
+        # to keep their signatures uniform without an allocation or policy launch.
+        active_kv_splits = seq_info
+
     if REGIME == "bh64":
         grid = (
             NUM_XCDS,
@@ -1158,6 +1185,7 @@ def mla_gluon(
         k_pe,
         page_table,
         seq_info,
+        active_kv_splits,
         logits_buf,
         attn_sink,
         sm_scale,
@@ -1217,6 +1245,7 @@ def mla_gluon(
         o,
         final_lse,
         seq_info,
+        active_kv_splits,
         sl_b,
         sl_qs,
         sl_h,
