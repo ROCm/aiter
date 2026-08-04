@@ -52,7 +52,7 @@ def strip_annotate(cls):
     function, and the JIT's 'record_reference' rejects it with
     "Unsupported function referenced".
 
-    This annotation can be used like below to remove the problematic attribute:
+    'strip_annotate' can be used like below to remove the problematic attribute:
 
         @aggregate
         @strip_annotate
