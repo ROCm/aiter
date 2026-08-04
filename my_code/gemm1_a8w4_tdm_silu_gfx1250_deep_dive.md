@@ -362,13 +362,19 @@ balanced workload 中每个 expert 64 行、边界 16 对齐，所以四个有�
 <a id="sec-1-3-end-to-end-software-pipeline"></a>
 ### 1.3 End-to-end software pipeline
 
-下面按 `mxfp4_preshuffle_gfx1250_tdm.py` 中的实际变量名和控制流展开。当前
-specialization 的关键编译期常量为：
+下面按 `mxfp4_preshuffle_gfx1250_tdm.py` 中的实际变量名和控制流展开，并将
+`B = num_buffers` 参数化为 `2..6`。当前这份 ISA dump 对应 `B=2`；本节中的
+通用公式也适用于 `B=3..6`，但第 1.4 节之后的精确 PC、循环次数和寄存器映射
+仍只对应当前 `B=2` specialization。
+
+这里的“适用”指源码控制流和资源公式可展开；不表示所有组合都已通过硬件验证。
+尤其现有 sweep 已记录某个 `B=6` 组合会导致 GPU wedge，实际运行仍须同时检查
+LDS 占用、occupancy 和 TDM outstanding 深度。
 
 ```text
 K_TILES       = K / tile_k = 7168 / 256 = 28
 KWS           = tile_k / WMMA_K = 256 / 128 = 2
-num_buffers   = 2
+B              = num_buffers ∈ {2,3,4,5,6}   # 当前 dump: B=2
 PITCH         = 0x9a00 = 39,424 B
 TDM_PER       = 4                    # WAVE_SPEC=false
 wmma_m_rep    = 1
@@ -398,11 +404,20 @@ Setup / pre-dispatch:
        mn_oob = m_tile_map[min(expert, E-1)] - blk_m
 
   [S1] 分配 dynamic LDS：
-       logical ring = 2 * PITCH = 78,848 B
-       actual arena = align_up(78,848, 2,048) = 79,872 B
+       logical ring = B * PITCH
+       actual arena = align_up(max(B*PITCH, C_STORE_B), 2,048)
+
+       B=2: logical  78,848 B ( 77.0 KiB), actual  79,872 B ( 78 KiB)
+       B=3: logical 118,272 B (115.5 KiB), actual 118,784 B (116 KiB)
+       B=4: logical 157,696 B (154.0 KiB), actual 157,696 B (154 KiB)
+       B=5: logical 197,120 B (192.5 KiB), actual 198,656 B (194 KiB)
+       B=6: logical 236,544 B (231.0 KiB), actual 237,568 B (232 KiB)
 
   [S2] 因 tile_m <= 64，全部 128 threads 协作清零 LDS：
-       for zi in 0..38:                              # 39 rounds
+       zero_rounds = actual_arena / (128 threads * 16 B)
+                   = actual_arena / 2,048
+       # B=2/3/4/5/6 分别为 39/58/77/97/116 rounds
+       for zi in 0..zero_rounds-1:
          ds_store_b128(
            addr = (tid + zi*128) * 16,
            data = 16-byte zero
@@ -444,32 +459,48 @@ Setup / pre-dispatch:
 
 
 TDM prologue:
-  [P0] for i in range(num_buffers - 1):              # 只执行 i=0
-         issue(slot=0, kt=0)
+  [P0] for i in range(B - 1):
+         issue(slot=i, kt=i)
 
-       此时只预取第一个 K256 tile：
-         buffer0 = { A0, B0, SA0, SB0 }
-         buffer1 = empty
+       此时预取前 B-1 个 K256 tiles：
+         buffer[0]     = kt0
+         buffer[1]     = kt1
+         ...
+         buffer[B-2]   = kt(B-2)
+         buffer[B-1]   = empty
+
+       # B=2 时退化为当前 ISA：只 issue(0,0)，buffer1 为空。
 
 
 Steady loop:
-  n_steady = K_TILES - (num_buffers - 1)
-           = 28 - 1
-           = 27
+  n_steady = K_TILES - (B - 1)
+           = 29 - B
 
-  for kt in 0..26:
+  # B=2/3/4/5/6 时，n_steady 分别为 27/26/25/24/23。
+  # 对应 steady/drain K-tile 范围：
+  #   B=2: steady kt0..26, drain kt27
+  #   B=3: steady kt0..25, drain kt26..27
+  #   B=4: steady kt0..24, drain kt25..27
+  #   B=5: steady kt0..23, drain kt24..27
+  #   B=6: steady kt0..22, drain kt23..27
+
+  for kt in 0..n_steady-1:                           # kt = 0..(28-B)
     [C0 ready/reuse fence]
-      slot = kt % 2
+      slot = kt % B
       buf  = base_ptr + slot*0x9a00
 
-      pipeline_fence(outstanding=0):
-        s_wait_tensorcnt 0
+      outstanding = TDM_PER * (B - 2)
+                  = 4 * (B - 2)
+                  # B=2/3/4/5/6 -> 0/4/8/12/16
+      pipeline_fence(outstanding):
+        s_wait_tensorcnt outstanding
         workgroup_barrier()
 
       # fence 同时保证：
       # 1. 当前 slot 的 A/B/SA/SB 已由 TDM 写完；
       # 2. 所有 wave 都可以安全读取当前 slot；
-      # 3. 该 slot 上一轮的使用已经结束，可以在 alternate slot 上继续流水。
+      # 3. 更新的 B-2 个 K tiles 可以继续 outstanding，不必全部 drain；
+      # 4. 当前 slot 上一轮的读取已结束，后续可按 ring 顺序安全复用。
 
     [C1 issue current B/SB/SA LDS reads for KSL0]
       wt[0..3], sb_k[0..3], sa_k[0] =
@@ -482,20 +513,26 @@ Steady loop:
       sa_k[0]:
         1 x ds_load_b32  -> 4 E8M0 bytes for activation K0..127
 
-    [C2 mid-compute prefetch of next K256 tile]
-      prefetch_kt = kt + 1
+    [C2 mid-compute prefetch of the B-1-ahead K256 tile]
+      prefetch_kt = kt + (B - 1)
       sched_barrier(0)
       issue(
-        slot = prefetch_kt % 2,
+        slot = prefetch_kt % B,
         kt   = prefetch_kt
       )
       sched_barrier(0)
 
       # 当前 tile 的 B/scale DS reads 已经发出；
-      # 下一 tile 的 A/B/SA/SB TDM 写入 alternate buffer，
+      # 距当前 B-1 个位置的 tile 写入 ring 中对应的空闲/可复用 slot，
       # 与当前 tile 后续的 A LDS read + WMMAScale 重叠。
+      # B=2 时 prefetch_kt=kt+1，即当前 dump 的 alternate-buffer 双缓冲。
 
-    [C3 compute KSL0: local K 0..127 of current K256 tile]
+    [C3 compute KSL0（当前 K256 tile 的前半段）: local K 0..127]
+      # C3 只计算该 buffer 的第一个 K128 slice，并非整个 K256 tile。
+      # KWS = tile_k / WMMA_K = 256 / 128 = 2，因此 compute_ktile()
+      # 会依次执行 C3/KSL0 和 C5/KSL1。两者合起来覆盖：
+      #   local K [0, 256) = 0..255
+      #   global K [kt*256, (kt+1)*256)
       act = load_a(buf, wm=0, ksl=0)
             # 4 x ds_load_b128 -> 16 FP8 dwords/lane
 
@@ -517,7 +554,7 @@ Steady loop:
 
       # load_b/load_sb/load_sa 地址增加到当前 K256 tile 的后半个 K128。
 
-    [C5 compute KSL1: local K 128..255]
+    [C5 compute KSL1（当前 K256 tile 的后半段）: local K 128..255]
       act = load_a(buf, wm=0, ksl=1)
       s_wait_dscnt 0
 
@@ -536,17 +573,20 @@ Steady loop:
 
     yield:
       c_frags[0..3]                                  # loop-carried FP32 accumulators
-      alternate buffer contains tile kt+1
+      ring 中保留后续 K tiles；最新 issue 的是 kt+(B-1)
 
 
 Drain:
-  # steady loop 已计算 kt0..kt26，并在 kt26 中预取 kt27 到 slot1
-  for j in range(num_buffers - 1):                   # 只执行 j=0
-    [D0] kt   = n_steady + j = 27
-         slot = kt % 2 = 1
-         buf  = buffer1
+  # steady loop 已计算 kt0..kt(n_steady-1)，剩余 B-1 个已预取 tiles。
+  for j in range(B - 1):
+    [D0] kt   = n_steady + j                         # 覆盖 kt(29-B)..kt27
+         slot = kt % B
+         buf  = buffer[slot]
 
-    [D1] pipeline_fence(outstanding=0)
+    [D1] outstanding = TDM_PER * (B - 2 - j)
+                     = 4 * (B - 2 - j)
+         pipeline_fence(outstanding)
+         # drain 阈值逐轮下降，最后一轮为 0。
 
     [D2] compute_ktile(buf, prefetch_kt=None):
          load B/SB/SA KSL0
@@ -568,7 +608,7 @@ Post-compute fence and epilogue:
   [E0] accs = load(c_frags[0..3])
        pipeline_fence(outstanding=0)
        # 最终 tensor wait + WG barrier；
-       # buffer0 随后可安全复用为 output LDS staging。
+       # ring base（buffer0）随后可安全复用为 output LDS staging。
 
   [E1] compile-time branch selection：
        stage1_act       = 1      # SiLU
@@ -631,21 +671,22 @@ Post-compute fence and epilogue:
 
 该源码流水的关键点不是“先完整搬完所有 K，再开始 GEMM”，而是：
 
-1. prologue 只向 `buffer0` 预取 `kt0`；
+1. prologue 向 `buffer[0..B-2]` 预取前 `B-1` 个 K tiles；
 2. 每轮先确认当前 buffer ready，再发起当前 B/scale 的 LDS reads；
-3. 在读取当前 A 和执行 8 条 WMMAScale 之前，向 alternate buffer 发起下一 tile
-   的四路 TDM；
-4. 下一轮的 `pipeline_fence(0)` 再负责确认这些 TDM 写入完成；
+3. 在读取当前 A 和执行 8 条 WMMAScale 之前，向
+   `buffer[(kt+B-1)%B]` 发起 `kt+B-1` 的四路 TDM；
+4. steady fence 使用 `TDM_PER*(B-2)`，允许更新的 `B-2` 个 tile 继续
+   outstanding，同时保证当前最老 tile 已完成；
 5. `c_frags` 始终驻留在 VGPR，直到 28 个 K256 tile 全部累加结束。
 
 与源码一一对应的压缩阶段表：
 
 | Pipeline phase | Memory / descriptor work | Compute / epilogue work | Current state |
 |---|---|---|---|
-| Setup | expert lookup；39 轮 `ds_store_b128` 清零 79,872 B LDS；构造 A/B/SA/SB jobs | 4 个 FP32 accumulator fragments 清零 | no K tile resident |
-| TDM prologue | `issue(0,0)`，四路 TDM 将 kt0 写入 buffer0 | none | buffer0=kt0，buffer1 empty |
-| Steady `kt=0..26` | fence current；KSL0 中 `issue((kt+1)%2,kt+1)` | 每轮 2 KSL × 4 WN = 8 WMMAScale | current compute + alternate-buffer DMA |
-| Drain `kt=27` | fence buffer1；无下一次 issue | 最后 8 WMMAScale | full K accumulated |
+| Setup | expert lookup；按 B 清零 39/58/77/97/116 rounds；构造 A/B/SA/SB jobs | 4 个 FP32 accumulator fragments 清零 | no K tile resident |
+| TDM prologue | 对 `i=0..B-2` 执行 `issue(i,i)` | none | 前 B-1 个 tiles resident/pending，最后一个 slot empty |
+| Steady `kt=0..28-B` | fence current；KSL0 中 `issue((kt+B-1)%B,kt+B-1)` | 每轮 2 KSL × 4 WN = 8 WMMAScale | current compute + deeper ring DMA |
+| Drain `kt=29-B..27` | fence 阈值从 `4*(B-2)` 降至 0；无新 issue | 每轮 8 WMMAScale | full K accumulated |
 | Post fence | `pipeline_fence(0)`，允许 LDS base 被 output staging 复用 | none | final FP32 `c_frags` |
 | Bias + gated-SiLU | 4×`global_load_b128` bias / lane | BF16→FP32 add；clamp；exp2；rcp；两次 multiply | 16 BF16 results/lane |
 | Output staging | 4×`ds_store_b64` / lane；WG barrier | none | LDS BF16 `[16,128]` |
