@@ -22,6 +22,11 @@ progresses. Ticket description is in `SILOTIGER-667.md`.
 
 ## 2. Locked decisions
 
+- **Test environment:** run all tests in **`flydsl_venv`** (has the correct deps, incl.
+  triton 3.6.0):
+  `./flydsl_venv/bin/python -m pytest -q op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`
+  (or `./flydsl_venv/bin/python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`). The
+  default env's triton 3.3.1 < gluon's 3.6.0 requirement, which blocks `import aiter`.
 - **Kernel location:** `aiter/ops/flydsl/kernels/warp_decode_moe.py` (+ a Python
   wrapper/entry point in `aiter/ops/flydsl/`), matching the existing MoE FlyDSL layout.
 - **`v_dot2_f32_bf16` primitive:** implement as a **local helper inside the kernel
@@ -77,10 +82,19 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] Read the CPU reference in `test/ck_tile/warp_decode/` → this is the correctness oracle.
 - **Output:** concrete lane-mapping design notes recorded in §7 below.
 
-### Phase 1 — Primitives  [ ]
-- [ ] Local `v_dot2_f32_bf16` inline-asm helper in the kernel module; unit-test vs torch.
-- [ ] Validate `cvt_scalef32_pk8_fp8_bf16` convert (scaled) vs torch.
-- [ ] Validate 64-lane butterfly reduce vs torch.
+### Phase 1 — Primitives  [x]
+- [x] Local `v_dot2_f32_bf16` inline-asm helper in the kernel module; unit-test vs torch.
+      `dot2_f32_bf16(a_i32,b_i32,acc_f32, serialize=True)` → `"v_dot2_f32_bf16 $0,$1,$2,$0"`
+      (+`s_nop 2` when serialized), constraints `"=v,v,v,0"`. **Exact** vs torch (max_delta 0.0).
+- [x] Validate `cvt_scalef32_pk_bf16_fp8` convert (scaled) vs torch. `fp8x2_to_bf16x2(src_i32,
+      scale_f32, hi)` via the ROCDL op. **Exact** with power-of-two scales (max_delta 0.0).
+      **Finding:** the op applies **only the exponent (E8M0)** of the f32 scale, not the full
+      value — `scale=3.0` yields `fp8×2.0` (mantissa discarded). See §9/§7 notes.
+- [x] Validate 64-lane butterfly reduce vs torch. `wave_reduce_add_f32` over shifts
+      1,2,4,8,16,32 via `gpu.ShuffleOp(..., mode="xor")`. **Exact** (max_delta 0.0).
+- **Where:** primitives + `build_warp_decode_primitives_module` in
+  `aiter/ops/flydsl/kernels/warp_decode_moe.py`; test
+  `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` (`python …` or `pytest`, 4 pass).
 
 ### Phase 2 — `gate_up` FP8  [ ]
 - [ ] Grid `B*TOPK*INTER` waves; HIDDEN tiled in `64*kVector`.
@@ -268,8 +282,15 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
 - [resolved] FP8/FP4→BF16 converts: exact 2-wide ROCDL ops exist
   (`cvt_scalef32_pk_bf16_fp8/fp4`), matching the reference builtins — no inline asm.
 - [resolved] Only `v_dot2_f32_bf16` needs a local inline-asm helper.
-- [open] Exact FlyDSL `llvm.inline_asm` result type + tied-operand form for `v_dot2_f32_bf16`
-  (validate the `"=v,v,v,0"` + `s_nop 2` string emits correct ISA; check `FLYDSL_DUMP_IR`).
+- [resolved] FlyDSL `llvm.inline_asm` result/tied-operand form for `v_dot2_f32_bf16`:
+  `llvm.inline_asm(T.f32(), [a_i32,b_i32,acc_f32], "v_dot2_f32_bf16 $0,$1,$2,$0[\n s_nop 2]",
+  "=v,v,v,0", has_side_effects=False)` — validated exact on gfx950 (Phase 1).
+- [resolved] **`cvt_scalef32_pk_bf16_fp8` scale is exponent-only (E8M0).** The op multiplies
+  the decoded fp8 by `2^exponent(scale_f32)`, discarding the mantissa (`scale=3.0`→`×2.0`).
+  Implication: for **PerTensor/PerToken FP8** (arbitrary f32) scales, pass `scale=1.0` to the
+  convert (exponent 0 → ×1) and fold the real scale into the f32 accumulator after dot2 (this
+  is what the reference does, §7 uses `cvt(...,1.0,...)`). Only **Block2D/MX (e8m0)** scales
+  should be fed through the convert's scale operand.
 - [open] How the FlyDSL tile/copy path exposes each lane's `kVector` FP8/BF16 chunk as
   consecutive `uint32` words (reference relies on `get_as<uint32_t>(word)`); decide between
   copy-atom tiles vs. `make_buffer_tensor` raw loads.
@@ -290,3 +311,9 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   `aiter-op-test`; reuse `torch_moe_stage1/2`, `fused_topk`, quant helpers, `run_perftest`,
   and the gfx950/FlyDSL skip guard from existing MoE op_tests. Renumbered open questions →§9,
   changelog →§10; Phase 4 op_test item points at §8.
+- _phase 1_ — built + validated the three primitives on gfx950 (all exact vs torch,
+  max_delta 0.0): `dot2_f32_bf16` inline-asm helper, `fp8x2_to_bf16x2`
+  (`cvt_scalef32_pk_bf16_fp8`), and `wave_reduce_add_f32` butterfly reduce, in
+  `kernels/warp_decode_moe.py` + test `test_flydsl_warp_decode_moe.py` (4 pass, `pytest` + CLI).
+  Resolved the inline-asm form and the **exponent-only (E8M0) scale semantics** of the fp8
+  convert (§9) — drives the PerTensor/PerToken scale-fold decision for Phases 2–4.
