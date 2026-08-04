@@ -402,7 +402,9 @@ def _select_impls(which, flydsl_variants):
                     )
                 # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive selection
                 # (variant=None -> _auto_variant per shape).
-                impls[FLYDSL_PREFIX + v] = functools.partial(flydsl_fn, variant=None if v == "auto" else v)
+                impls[FLYDSL_PREFIX + v] = functools.partial(
+                    flydsl_fn, variant=None if v == "auto" else v
+                )
 
     if not impls:
         raise SystemExit("[error] no implementations selected.")
