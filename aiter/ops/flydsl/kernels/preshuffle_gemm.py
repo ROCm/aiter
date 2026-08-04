@@ -638,11 +638,6 @@ def compile_preshuffle_gemm(
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
-                # scale_a is per-row (one f32 per token) so it must be bounded to
-                # the real M extent -- like A/C above -- or the final ragged-M tile
-                # reads scales past row M into adjacent heap (silent garbage, and an
-                # intermittent HIP illegal access when the overshoot hits an unmapped
-                # page). Only scale_b/bias are per-N and safe to leave max_size.
                 scale_a_rsrc = buffer_ops.create_buffer_resource(
                     arg_scale_a,
                     max_size=False,
