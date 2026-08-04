@@ -6266,7 +6266,27 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return_kernel_times=True,
         )
         e2e_us = round(float(e2e_us), 4)
-        us1, us2 = self._extract_stage_kernel_times(kernel_times)
+        if "_source_index" in row:
+            us1 = round(
+                sum(
+                    float(value)
+                    for name, value in kernel_times.items()
+                    if any(marker in str(name) for marker in self.STAGE1_KERNEL_MARKERS)
+                ),
+                4,
+            )
+            us2 = round(
+                sum(
+                    float(value)
+                    for name, value in kernel_times.items()
+                    if any(marker in str(name) for marker in self.STAGE2_KERNEL_MARKERS)
+                ),
+                4,
+            )
+            if us1 <= 0:
+                raise RuntimeError("profiler did not report GEMM1 target kernel time")
+        else:
+            us1, us2 = self._extract_stage_kernel_times(kernel_times)
         us = round(us1 + us2, 4)
         candidate.update(
             {
