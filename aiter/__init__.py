@@ -111,7 +111,7 @@ else:
     from .ops.gemm_op_a16w16 import *
     from .ops.gradlib import *
     from .ops.groupnorm import *
-    from .ops.hisparse_swap import *
+    from .ops.sparsekv_swap import *
     from .ops.mha import *
     from .ops.mhc import *
     from .ops.moe_op import *

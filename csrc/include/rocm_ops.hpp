@@ -1402,19 +1402,19 @@ namespace py = pybind11;
           py::arg("out"),                              \
           py::arg("softmax_scale"));
 
-#define HISPARSE_SWAP_PYBIND                              \
-    m.def("hisparse_host_get_device_pointer",            \
-          &hisparse_host_get_device_pointer,             \
+#define SPARSEKV_SWAP_PYBIND                              \
+    m.def("sparsekv_host_get_device_pointer",            \
+          &sparsekv_host_get_device_pointer,             \
           py::arg("pinned_host_tensor"));                \
-    m.def("hisparse_swap_in",                            \
-          &hisparse_swap_in,                             \
+    m.def("sparsekv_swap_in",                            \
+          &sparsekv_swap_in,                             \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("src_locs"),                           \
           py::arg("dst_locs"),                           \
           py::arg("item_size_bytes"));                   \
-    m.def("hisparse_swap_and_translate",                 \
-          &hisparse_swap_and_translate,                  \
+    m.def("sparsekv_swap_and_translate",                 \
+          &sparsekv_swap_and_translate,                  \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("topk_logical"),                       \
@@ -1425,12 +1425,14 @@ namespace py = pybind11;
           py::arg("token_to_slot"),                      \
           py::arg("recency"),                            \
           py::arg("out_translated"),                     \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
           py::arg("topk"));                              \
-    m.def("hisparse_swap_and_translate_record",          \
-          &hisparse_swap_and_translate_record,           \
+    m.def("sparsekv_swap_and_translate_record",          \
+          &sparsekv_swap_and_translate_record,           \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("topk_logical"),                       \
@@ -1444,24 +1446,28 @@ namespace py = pybind11;
           py::arg("plan_miss_tok"),                      \
           py::arg("plan_miss_slot"),                     \
           py::arg("plan_miss_count"),                    \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
           py::arg("topk"));                              \
-    m.def("hisparse_copy_planned",                       \
-          &hisparse_copy_planned,                        \
+    m.def("sparsekv_copy_planned",                       \
+          &sparsekv_copy_planned,                        \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("req_slots"),                          \
           py::arg("plan_miss_tok"),                      \
           py::arg("plan_miss_slot"),                     \
           py::arg("plan_miss_count"),                    \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"),                         \
           py::arg("topk"));                              \
-    m.def("hisparse_backup_into_assigned",               \
-          &hisparse_backup_into_assigned,                \
+    m.def("sparsekv_backup_into_assigned",               \
+          &sparsekv_backup_into_assigned,                \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("layer_kv"),                           \
@@ -1469,11 +1475,13 @@ namespace py = pybind11;
           py::arg("req_slots"),                          \
           py::arg("logical_pos"),                        \
           py::arg("token_to_slot"),                      \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"));                        \
-    m.def("hisparse_backup_new_token",                   \
-          &hisparse_backup_new_token,                    \
+    m.def("sparsekv_backup_new_token",                   \
+          &sparsekv_backup_new_token,                    \
           py::arg("cold_pool_dev_ptr"),                  \
           py::arg("hot_buffer"),                         \
           py::arg("layer_kv"),                           \
@@ -1484,6 +1492,8 @@ namespace py = pybind11;
           py::arg("last_used"),                          \
           py::arg("token_to_slot"),                      \
           py::arg("recency"),                            \
+          py::arg("host_cache_locs"),                    \
+          py::arg("host_stride"),                        \
           py::arg("item_size_bytes"),                    \
           py::arg("hot_slots"),                          \
           py::arg("cold_depth"));

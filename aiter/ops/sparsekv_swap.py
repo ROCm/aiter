@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HiSparse swap-in ops for GLM-5.2 DSA decode.
+"""SparseKV swap-in ops for GLM-5.2 DSA decode.
 
 Keeps the full KV in a pinned host cold pool and a fixed-size GPU hot buffer per
 request. Each decode step, per layer, the fused kernel miss-detects the indexer
@@ -12,24 +12,24 @@ sync) and the launch shape is fixed, so the path is CUDAGraph-capturable.
 
 On an xnack- agent a GPU kernel faults on a raw host VA, so the cold-pool pointer
 passed to the kernels must be the device-mapped pointer from
-:func:`hisparse_host_get_device_pointer`; cache it once per cold-pool tensor.
+:func:`sparsekv_host_get_device_pointer`; cache it once per cold-pool tensor.
 
-See ``aiter/csrc/include/hisparse_swap.h`` for the C++ API.
+See ``aiter/csrc/include/sparsekv_swap.h`` for the C++ API.
 """
 
 import torch
 
 from ..jit.core import compile_ops
 
-MD_NAME = "module_hisparse_swap"
+MD_NAME = "module_sparsekv_swap"
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_host_get_device_pointer(pinned_host_tensor: torch.Tensor) -> int: ...
+@compile_ops("module_sparsekv_swap")
+def sparsekv_host_get_device_pointer(pinned_host_tensor: torch.Tensor) -> int: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_swap_in(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_swap_in(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     src_locs: torch.Tensor,
@@ -38,8 +38,8 @@ def hisparse_swap_in(
 ) -> None: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_swap_and_translate(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_swap_and_translate(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     topk_logical: torch.Tensor,
@@ -50,6 +50,8 @@ def hisparse_swap_and_translate(
     token_to_slot: torch.Tensor,
     recency: torch.Tensor,
     out_translated: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -57,8 +59,8 @@ def hisparse_swap_and_translate(
 ) -> None: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_swap_and_translate_record(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_swap_and_translate_record(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     topk_logical: torch.Tensor,
@@ -72,6 +74,8 @@ def hisparse_swap_and_translate_record(
     plan_miss_tok: torch.Tensor,
     plan_miss_slot: torch.Tensor,
     plan_miss_count: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -79,14 +83,16 @@ def hisparse_swap_and_translate_record(
 ) -> None: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_copy_planned(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_copy_planned(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     req_slots: torch.Tensor,
     plan_miss_tok: torch.Tensor,
     plan_miss_slot: torch.Tensor,
     plan_miss_count: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -94,8 +100,8 @@ def hisparse_copy_planned(
 ) -> None: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_backup_into_assigned(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_backup_into_assigned(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
@@ -103,14 +109,16 @@ def hisparse_backup_into_assigned(
     req_slots: torch.Tensor,
     logical_pos: torch.Tensor,
     token_to_slot: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
 ) -> None: ...
 
 
-@compile_ops("module_hisparse_swap")
-def hisparse_backup_new_token(
+@compile_ops("module_sparsekv_swap")
+def sparsekv_backup_new_token(
     cold_pool_dev_ptr: int,
     hot_buffer: torch.Tensor,
     layer_kv: torch.Tensor,
@@ -121,6 +129,8 @@ def hisparse_backup_new_token(
     last_used: torch.Tensor,
     token_to_slot: torch.Tensor,
     recency: torch.Tensor,
+    host_cache_locs: torch.Tensor,
+    host_stride: int,
     item_size_bytes: int,
     hot_slots: int,
     cold_depth: int,
@@ -128,11 +138,11 @@ def hisparse_backup_new_token(
 
 
 __all__ = [
-    "hisparse_backup_into_assigned",
-    "hisparse_backup_new_token",
-    "hisparse_copy_planned",
-    "hisparse_host_get_device_pointer",
-    "hisparse_swap_and_translate",
-    "hisparse_swap_and_translate_record",
-    "hisparse_swap_in",
+    "sparsekv_backup_into_assigned",
+    "sparsekv_backup_new_token",
+    "sparsekv_copy_planned",
+    "sparsekv_host_get_device_pointer",
+    "sparsekv_swap_and_translate",
+    "sparsekv_swap_and_translate_record",
+    "sparsekv_swap_in",
 ]

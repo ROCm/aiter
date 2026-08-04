@@ -8,11 +8,11 @@
 // Translate a pinned host allocation to a device-mapped pointer (int64 VA).
 // On an xnack- agent a GPU kernel faults on a raw host VA, so the swap kernels
 // must be fed the mapped pointer this returns instead of tensor.data_ptr().
-int64_t hisparse_host_get_device_pointer(at::Tensor pinned_host_tensor);
+int64_t sparsekv_host_get_device_pointer(at::Tensor pinned_host_tensor);
 
 // Gather scattered tokens from one layer's pinned host cold pool into that
 // layer's GPU hot buffer. One wavefront64 copies one token word-wise.
-void hisparse_swap_in(int64_t cold_pool_dev_ptr,
+void sparsekv_swap_in(int64_t cold_pool_dev_ptr,
                       at::Tensor hot_buffer,
                       at::Tensor src_locs,
                       at::Tensor dst_locs,
@@ -27,7 +27,7 @@ void hisparse_swap_in(int64_t cold_pool_dev_ptr,
 // flow), with no host synchronization. Capturing this in a CUDAGraph additionally
 // requires the caller to pass capture-stable input tensors (fixed addresses,
 // updated in place) — that plumbing is the caller's responsibility.
-void hisparse_swap_and_translate(int64_t cold_pool_dev_ptr,
+void sparsekv_swap_and_translate(int64_t cold_pool_dev_ptr,
                                  at::Tensor hot_buffer,
                                  at::Tensor topk_logical,
                                  at::Tensor indptr,
@@ -37,17 +37,19 @@ void hisparse_swap_and_translate(int64_t cold_pool_dev_ptr,
                                  at::Tensor token_to_slot,
                                  at::Tensor recency,
                                  at::Tensor out_translated,
+                                 at::Tensor host_cache_locs,
+                                 int64_t host_stride,
                                  int64_t item_size_bytes,
                                  int64_t hot_slots,
                                  int64_t cold_depth,
                                  int64_t topk);
 
-// IndexShare variant of hisparse_swap_and_translate that additionally records the
+// IndexShare variant of sparsekv_swap_and_translate that additionally records the
 // miss plan it computed (per query token: the logical cold positions it gathered
 // and the hot slots it assigned them, plus the count) so a group's shared-index
 // layers can replay the identical IO. Same kernel, semantics, and side effects
-// as hisparse_swap_and_translate otherwise.
-void hisparse_swap_and_translate_record(int64_t cold_pool_dev_ptr,
+// as sparsekv_swap_and_translate otherwise.
+void sparsekv_swap_and_translate_record(int64_t cold_pool_dev_ptr,
                                         at::Tensor hot_buffer,
                                         at::Tensor topk_logical,
                                         at::Tensor indptr,
@@ -60,6 +62,8 @@ void hisparse_swap_and_translate_record(int64_t cold_pool_dev_ptr,
                                         at::Tensor plan_miss_tok,
                                         at::Tensor plan_miss_slot,
                                         at::Tensor plan_miss_count,
+                                        at::Tensor host_cache_locs,
+                                        int64_t host_stride,
                                         int64_t item_size_bytes,
                                         int64_t hot_slots,
                                         int64_t cold_depth,
@@ -68,12 +72,14 @@ void hisparse_swap_and_translate_record(int64_t cold_pool_dev_ptr,
 // Replay a recorded miss plan (from an anchor's swap_and_translate_record) into a
 // shared-index layer's hot buffer. Pure host->device gather, no bookkeeping. One
 // block per decode query token; fixed launch shape (CUDAGraph-capturable).
-void hisparse_copy_planned(int64_t cold_pool_dev_ptr,
+void sparsekv_copy_planned(int64_t cold_pool_dev_ptr,
                            at::Tensor hot_buffer,
                            at::Tensor req_slots,
                            at::Tensor plan_miss_tok,
                            at::Tensor plan_miss_slot,
                            at::Tensor plan_miss_count,
+                           at::Tensor host_cache_locs,
+                           int64_t host_stride,
                            int64_t item_size_bytes,
                            int64_t hot_slots,
                            int64_t cold_depth,
@@ -83,13 +89,15 @@ void hisparse_copy_planned(int64_t cold_pool_dev_ptr,
 // anchor already assigned it (token_to_slot is the anchor's table). Data only:
 // writes cold pool + the assigned hot slot, no LRU/recency mutation. One block
 // per decode query token; no host sync.
-void hisparse_backup_into_assigned(int64_t cold_pool_dev_ptr,
+void sparsekv_backup_into_assigned(int64_t cold_pool_dev_ptr,
                                    at::Tensor hot_buffer,
                                    at::Tensor layer_kv,
                                    at::Tensor src_slots,
                                    at::Tensor req_slots,
                                    at::Tensor logical_pos,
                                    at::Tensor token_to_slot,
+                                   at::Tensor host_cache_locs,
+                                   int64_t host_stride,
                                    int64_t item_size_bytes,
                                    int64_t hot_slots,
                                    int64_t cold_depth);
@@ -97,7 +105,7 @@ void hisparse_backup_into_assigned(int64_t cold_pool_dev_ptr,
 // Persist a freshly generated token's KV (already resident in the layer cache at
 // src_slot) into the cold pool and allocate it a hot-buffer slot with maximal
 // recency. One block per decode query token; no host sync.
-void hisparse_backup_new_token(int64_t cold_pool_dev_ptr,
+void sparsekv_backup_new_token(int64_t cold_pool_dev_ptr,
                                at::Tensor hot_buffer,
                                at::Tensor layer_kv,
                                at::Tensor src_slots,
@@ -107,6 +115,8 @@ void hisparse_backup_new_token(int64_t cold_pool_dev_ptr,
                                at::Tensor last_used,
                                at::Tensor token_to_slot,
                                at::Tensor recency,
+                               at::Tensor host_cache_locs,
+                               int64_t host_stride,
                                int64_t item_size_bytes,
                                int64_t hot_slots,
                                int64_t cold_depth);
