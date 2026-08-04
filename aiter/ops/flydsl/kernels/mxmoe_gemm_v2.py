@@ -14,8 +14,8 @@ from flydsl.expr.typing import (
     Int32,
     T,
 )
-from flydsl.expr.typing import as_ir_value as _raw
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.typing import as_ir_value as _raw
 
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
