@@ -16,7 +16,7 @@ default `/opt/rocm/llvm/bin`) and Python 3.
 
 ```bash
 # Round-trip one of the shipped paged-attention kernels (arch is read from the ELF)
-./roundtrip.sh ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co --keep ./work
+bash roundtrip.sh ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co --keep ./work
 
 # What is in a .co: kernels, branch labels, register/LDS usage, instruction mix
 python3 extract_asm.py   ../../../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co --list
@@ -45,7 +45,7 @@ so exporting it in the shell does not redirect kernel loading; see the guide.
 docker build -t aiter-isa-opt .
 docker run -it --device=/dev/kfd --device=/dev/dri --group-add video \
     -v /path/to/aiter:/aiter aiter-isa-opt
-./roundtrip.sh /aiter/hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co
+bash roundtrip.sh /aiter/hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co
 ```
 
 ## Workflow

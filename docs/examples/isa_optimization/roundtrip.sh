@@ -9,7 +9,7 @@
 #      identical to the original
 #
 # Usage:
-#   ./roundtrip.sh [kernel.co] [--mcpu gfx942] [--keep DIR]
+#   bash roundtrip.sh [kernel.co] [--mcpu gfx942] [--keep DIR]
 #
 # With no kernel given, the first paged-attention kernel of the installed AITER
 # package is used.  Set ROCM_PATH if ROCm is not in /opt/rocm.
