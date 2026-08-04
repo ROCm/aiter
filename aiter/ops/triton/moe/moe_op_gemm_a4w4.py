@@ -305,7 +305,7 @@ def moe_gemm_a4w4(
     x_scales_tdm = False
     if use_gluon:
         mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
-        ASYNC_COPY_MIN_SCALE_WIDTH = 8
+        ASYNC_COPY_MIN_SCALE_WIDTH = 4
         x_scales_tdm = (
             mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
         )
