@@ -88,12 +88,12 @@ def _emit_neg_inf_range(out_row_t, neg_inf, lo_i32, hi_i32, tid_i32, nthreads):
     consecutive dwords, so one wave iteration coalesces into a single 256-byte
     store. Zero-trip on an empty range (``scf.for`` with ``lb >= ub``).
 
-    Plain dwords on purpose: the fill is bandwidth-bound rather than store-issue-bound. 
+    Plain dwords on purpose: the fill is bandwidth-bound rather than store-issue-bound.
     So dwordx4 doesn't improve performance.
     """
     lo = _to_raw(fx.Index(_i32_add(lo_i32, tid_i32)))
     hi = _to_raw(fx.Index(hi_i32))
-    step = _to_raw(fx.Index(fx.Int32(nthreads)))
+    step = _to_raw(fx.Index(nthreads))
     loop = scf.ForOp(lo, hi, step, [])
     with ir.InsertionPoint(loop.body):
         col = fx.Int32(arith.index_cast(T.i32, loop.induction_variable))
@@ -113,9 +113,12 @@ def _emit_row_neg_inf_fill(
     nthreads,  # int: 64 (one wave) or MR_BLOCK_THREADS (the whole block)
     by_i32,  # fx.Int32: block_idx.y
     num_splits,  # fx.Int32: grid.y (>= 1)
-    clean_logits,  # fx.Int32: 0/1
 ):
     """``clean_logits`` prefill, fused into the compute kernel.
+
+    Only called when the ``clean_logits`` build flag is set -- it is a
+    compile-time specialization, like ``convert_q_fn``/``convert_kv_fn``, so the
+    ``clean_logits=False`` kernel contains none of this code at all.
 
     The epilogue writes column ``c`` of row ``rows[j]`` only for
     ``c in [starts[j], ends[j])``, so the complement inside ``[0, seq_len_kv)``
@@ -150,27 +153,23 @@ def _emit_row_neg_inf_fill(
     """
     i32_0 = fx.Int32(0)
     slk = fx.Int32(seq_len_kv)
-    # Scalar-uniform branch: the flag is a kernarg, so this is s_cmp/s_cbranch.
-    cond = arith.cmpi(arith.CmpIPredicate.ne, _to_raw(clean_logits), _to_raw(i32_0))
-    with ir.InsertionPoint(scf.IfOp(cond).then_block):
-        neg_inf = arith.constant(float("-inf"), type=T.f32)
+    neg_inf = arith.constant(float("-inf"), type=T.f32)
 
-        def _split(lo_i32, hi_i32):
-            """This block's chunk of ``[lo, hi)``: the ``by``-th of num_splits."""
-            lo, hi = _to_raw(lo_i32), _to_raw(hi_i32)
-            chunk = arith.ceildivui(arith.subi(hi, lo), _to_raw(num_splits))
-            b_lo = arith.minsi(arith.addi(lo, arith.muli(_to_raw(by_i32), chunk)), hi)
-            b_hi = arith.minsi(arith.addi(b_lo, chunk), hi)
-            return fx.Int32(b_lo), fx.Int32(b_hi)
+    def _split(lo_i32, hi_i32):
+        """This block's chunk of ``[lo, hi)``: the ``by``-th of num_splits."""
+        lo, hi = _to_raw(lo_i32), _to_raw(hi_i32)
+        chunk = arith.ceildivui(arith.subi(hi, lo), _to_raw(num_splits))
+        b_lo = arith.minsi(arith.addi(lo, arith.muli(_to_raw(by_i32), chunk)), hi)
+        b_hi = arith.minsi(arith.addi(b_lo, chunk), hi)
+        return fx.Int32(b_lo), fx.Int32(b_hi)
 
-        for j in range_constexpr(len(rows)):
-            out_row_t = _make_out_row_t(logits, stride_i64, rows[j])
-            s = fx.Int32(arith.minsi(_to_raw(starts[j]), _to_raw(slk)))
-            e = fx.Int32(arith.maxsi(_to_raw(ends[j]), _to_raw(s)))
-            for lo_i32, hi_i32 in ((i32_0, s), (e, slk)):
-                b_lo, b_hi = _split(lo_i32, hi_i32)
-                _emit_neg_inf_range(out_row_t, neg_inf, b_lo, b_hi, tid_i32, nthreads)
-        scf.YieldOp([])
+    for j in range_constexpr(len(rows)):
+        out_row_t = _make_out_row_t(logits, stride_i64, rows[j])
+        s = fx.Int32(arith.minsi(_to_raw(starts[j]), _to_raw(slk)))
+        e = fx.Int32(arith.maxsi(_to_raw(ends[j]), _to_raw(s)))
+        for lo_i32, hi_i32 in ((i32_0, s), (e, slk)):
+            b_lo, b_hi = _split(lo_i32, hi_i32)
+            _emit_neg_inf_range(out_row_t, neg_inf, b_lo, b_hi, tid_i32, nthreads)
 
 
 # Default KV tile width (columns processed per inner-loop iteration).
@@ -464,6 +463,7 @@ def _build_kernel_mfma_r_w(
     mfma: MfmaAtom = _MFMA16,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
+    clean_logits: bool = True,
 ):
     """Multi-row, multi-wave MFMA kernel.
 
@@ -527,10 +527,13 @@ def _build_kernel_mfma_r_w(
         _cvt_tag += "_cq"
     if convert_kv_fn:
         _cvt_tag += "_ck"
+    # Only the non-default is tagged, so the common clean_logits=True symbols
+    # keep the names they have always had (same convention as _cvt_tag).
+    _cl_tag = "" if clean_logits else "_nocl"
     _shape_tag = mfma.kname_tag or f"mfma{mfma.name}"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_{_shape_tag}_r{RPB}_w{WPB}"
-        f"{_cvt_tag}_flydsl"
+        f"{_cvt_tag}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -546,7 +549,6 @@ def _build_kernel_mfma_r_w(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
-        clean_logits: fx.Int32,  # 0/1: also write -inf outside every row's window
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         mfma_res_ty = Vec.make_type(ACC_ELEMS, fx.Float32)
@@ -725,9 +727,9 @@ def _build_kernel_mfma_r_w(
         tile_start = arith.addi(tile_start, arith.muli(_to_raw(by), split_cols))
         tile_end = arith.minsi(arith.addi(tile_start, split_cols), tile_end)
 
-        tile_lo = _to_raw(fx.Index(fx.Int32(tile_start)))
-        tile_hi = _to_raw(fx.Index(fx.Int32(tile_end)))
-        tile_step = _to_raw(fx.Index(fx.Int32(BKV)))
+        tile_lo = _to_raw(fx.Index(tile_start))
+        tile_hi = _to_raw(fx.Index(tile_end))
+        tile_step = _to_raw(fx.Index(BKV))
         tile_loop = scf.ForOp(tile_lo, tile_hi, tile_step, [])
         with ir.InsertionPoint(tile_loop.body):
             col0 = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
@@ -841,19 +843,19 @@ def _build_kernel_mfma_r_w(
             scf.YieldOp([])
 
         # ---- Fused clean_logits prefill (must come after the tile loop) ----
-        _emit_row_neg_inf_fill(
-            logits=logits,
-            stride_i64=_stride_i64,
-            rows=[_i32_add(r0, fx.Int32(j)) for j in range_constexpr(RPB)],
-            starts=starts,
-            ends=ends,
-            seq_len_kv=seq_len_kv,
-            tid_i32=tid,  # every thread in the block cooperates
-            nthreads=MR_BLOCK_THREADS,
-            by_i32=by,
-            num_splits=num_splits,
-            clean_logits=clean_logits,
-        )
+        if const_expr(clean_logits):
+            _emit_row_neg_inf_fill(
+                logits=logits,
+                stride_i64=_stride_i64,
+                rows=[_i32_add(r0, fx.Int32(j)) for j in range_constexpr(RPB)],
+                starts=starts,
+                ends=ends,
+                seq_len_kv=seq_len_kv,
+                tid_i32=tid,  # every thread in the block cooperates
+                nthreads=MR_BLOCK_THREADS,
+                by_i32=by,
+                num_splits=num_splits,
+            )
 
     @flyc.jit
     def launch_fp8_mqa_logits_mfma_r_w(
@@ -868,7 +870,6 @@ def _build_kernel_mfma_r_w(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
-        clean_logits: fx.Int32,
         stream: fx.Stream,
     ):
         n_blocks = arith.ceildivui(_to_raw(seq_len), _to_raw(fx.Int32(RPB)))
@@ -887,7 +888,6 @@ def _build_kernel_mfma_r_w(
             seq_len_kv,
             stride_logits_s,
             num_splits,
-            clean_logits,
         ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_r_w
@@ -903,6 +903,7 @@ def _build_kernel_mfma_lds_pipe(
     mfma: MfmaAtom,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
+    clean_logits: bool = True,
     swizzle: bool = False,
     num_buffers: int = 2,
     prefetch_depth: int = 2,
@@ -1006,9 +1007,12 @@ def _build_kernel_mfma_lds_pipe(
     lds_off = allocator._align(allocator.ptr, 128)
     allocator.ptr = lds_off + NUM_BUFFERS * SLOT_BYTES
 
+    # As in the direct-load builder: only the non-default clean_logits is tagged.
+    _cl_tag = "" if clean_logits else "_nocl"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_mfma{mfma.name}"
-        f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}{'_swizzled' if swizzle else ''}_flydsl"
+        f"_bkv{BKV}_r{RPW}_w{WPB}_lds{NUM_BUFFERS}"
+        f"{'_swizzled' if swizzle else ''}{_cl_tag}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -1024,7 +1028,6 @@ def _build_kernel_mfma_lds_pipe(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
-        clean_logits: fx.Int32,  # 0/1: also write -inf outside every row's window
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         i32_64 = arith.constant(64, type=T.i32)
@@ -1223,17 +1226,15 @@ def _build_kernel_mfma_lds_pipe(
             )
 
         # ---- Steady-state software pipeline over BKV tiles ----
-        lo = _to_raw(fx.Index(fx.Int32(0)))
-        hi = _to_raw(fx.Index(fx.Int32(n_tiles)))
-        step = _to_raw(fx.Index(fx.Int32(1)))
+        lo = _to_raw(fx.Index(0))
+        hi = _to_raw(fx.Index(n_tiles))
+        step = _to_raw(fx.Index(1))
         tile_loop = scf.ForOp(lo, hi, step, [])
         with ir.InsertionPoint(tile_loop.body):
             t = fx.Int32(arith.index_cast(T.i32, tile_loop.induction_variable))
-            col0 = arith.addi(
-                tile_start, arith.muli(_to_raw(t), _to_raw(fx.Int32(BKV)))
-            )
-            slot_idx = arith.remui(_to_raw(t), _to_raw(fx.Int32(NUM_BUFFERS)))
-            slot_dword = arith.muli(slot_idx, _to_raw(fx.Int32(SLOT_I32)))
+            col0 = tile_start + t * fx.Int32(BKV)
+            slot_idx = t % fx.Int32(NUM_BUFFERS)
+            slot_dword = slot_idx * fx.Int32(SLOT_I32)
 
             # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
             # i.e. the current tile is complete; then sync so every wave sees the
@@ -1245,12 +1246,9 @@ def _build_kernel_mfma_lds_pipe(
             rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
             gpu.barrier()
 
-            # Read all B-frags for this tile from LDS into registers.  Hoisting
+            # Read all B-frags for this tile from LDS into registers. Hoisting
             # every (ni,kk) read ahead of the compute nest lets the compiler
-            # batch the LDS loads and hide their lgkmcnt latency behind the MFMA
-            # work (an interleaved per-ni read was measured strictly worse -- it
-            # exposes the read latency and loses ILP, even though it would cut
-            # live B-frag VGPRs; the hoist is the better trade here).
+            # batch the LDS loads and hide their lgkmcnt latency behind the MFMA work.
             b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
             cols = [None] * N_TILES
             kv_scales_tile = [None] * N_TILES
@@ -1298,7 +1296,7 @@ def _build_kernel_mfma_lds_pipe(
                         frag_dword = arith.divui(frag_byte, _to_raw(fx.Int32(4)))
 
                     read_dword = arith.index_cast(
-                        T.index, arith.addi(slot_dword, frag_dword)
+                        T.index, arith.addi(_to_raw(slot_dword), frag_dword)
                     )
                     b_packs[ni][kk] = lds_st.vec_load((read_dword,), vec_size=8)
 
@@ -1391,19 +1389,19 @@ def _build_kernel_mfma_lds_pipe(
         # s_waitcnt(vmcnt=_WAIT_VMCNT) counts vector stores too on gfx9, so a
         # fill store in flight inside it would let a half-written LDS tile
         # through. ----
-        _emit_row_neg_inf_fill(
-            logits=logits,
-            stride_i64=_stride_i64,
-            rows=[_i32_add(wave_row0, fx.Int32(j)) for j in range_constexpr(RPW)],
-            starts=starts,
-            ends=ends,
-            seq_len_kv=seq_len_kv,
-            tid_i32=lane,  # the 64 lanes of THIS wave
-            nthreads=64,
-            by_i32=block_y,
-            num_splits=num_splits,
-            clean_logits=clean_logits,
-        )
+        if const_expr(clean_logits):
+            _emit_row_neg_inf_fill(
+                logits=logits,
+                stride_i64=_stride_i64,
+                rows=[_i32_add(wave_row0, fx.Int32(j)) for j in range_constexpr(RPW)],
+                starts=starts,
+                ends=ends,
+                seq_len_kv=seq_len_kv,
+                tid_i32=lane,  # the 64 lanes of THIS wave
+                nthreads=64,
+                by_i32=block_y,
+                num_splits=num_splits,
+            )
 
     @flyc.jit
     def launch_fp8_mqa_logits_mfma_lds_pipe(
@@ -1418,7 +1416,6 @@ def _build_kernel_mfma_lds_pipe(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
-        clean_logits: fx.Int32,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -1442,7 +1439,6 @@ def _build_kernel_mfma_lds_pipe(
             seq_len_kv,
             stride_logits_s,
             num_splits,
-            clean_logits,
         ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_lds_pipe
@@ -1649,13 +1645,17 @@ def compile_fp8_mqa_logits(
     variant: str = DEFAULT_VARIANT,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
+    clean_logits: bool = True,
 ):
     """Return a cached, compiled FlyDSL launcher for the given shape config.
 
     ``num_heads``/``head_size`` are compile-time constants (powers of two, D in
     {64, 128}); ``variant`` is an ``mfma_r<RPB>_w<WPB>`` tag (see
     ``KERNEL_VARIANTS``); ``convert_q_fn``/``convert_kv_fn`` mark an FP8 FN
-    operand whose -0 (0x80) byte the kernel patches to FNUZ +0. ``paged`` is
+    operand whose -0 (0x80) byte the kernel patches to FNUZ +0.
+    ``clean_logits`` selects whether the kernel also writes -inf to the
+    out-of-window positions; like the convert flags it is a compile-time
+    specialization, so the False kernel carries none of that code. ``paged`` is
     reserved for a future variant and must be False.
     """
     if paged:
@@ -1673,6 +1673,7 @@ def compile_fp8_mqa_logits(
         block_kv=block_kv,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
+        clean_logits=clean_logits,
     )
     launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
     return launcher
@@ -1757,6 +1758,7 @@ def flydsl_fp8_mqa_logits(
         variant=variant,
         convert_q_fn=convert_q_fn,
         convert_kv_fn=convert_kv_fn,
+        clean_logits=bool(clean_logits),
     )
 
     # The kernels require seq_len padded to a multiple of the rows a block owns,
@@ -1814,7 +1816,6 @@ def flydsl_fp8_mqa_logits(
             int(seq_len_kv),
             int(logits.stride(0)),
             int(num_splits),
-            int(bool(clean_logits)),
             stream,
         )
 
