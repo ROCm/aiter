@@ -3,12 +3,10 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
-
 import torch
 from torch import Tensor
-from torch.utils.cpp_extension import load
+
+from aiter.jit.core import compile_ops
 
 NUM_QK_HEADS = 8
 NUM_V_HEADS = 32
@@ -17,22 +15,18 @@ HEAD_V_DIM = 128
 QKV_DIM = 6144
 
 
-@lru_cache(maxsize=1)
-def _load_extension():
-    source = Path(__file__).with_suffix(".cu")
-    return load(
-        name="aiter_gdn_decode_packed_bf16_gfx950",
-        sources=[str(source)],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=[
-            "-O3",
-            "-std=c++17",
-            "-ffast-math",
-            "--offload-arch=gfx950",
-        ],
-        with_cuda=True,
-        verbose=False,
-    )
+@compile_ops("module_gdn_decode_packed_bf16", fc_name="gdn_decode_packed_bf16")
+def _gdn_decode_packed_bf16(
+    mixed_qkv: Tensor,
+    a: Tensor,
+    b: Tensor,
+    dt_bias: Tensor,
+    A_log: Tensor,
+    indices: Tensor,
+    state: Tensor,
+    out: Tensor,
+    scale: float,
+) -> None: ...
 
 
 def gdn_decode_packed_bf16_hip(
@@ -108,7 +102,7 @@ def gdn_decode_packed_bf16_hip(
     if A_log.dtype != torch.float32 or indices.dtype != torch.int32:
         raise ValueError("A_log must be FP32 and indices must be INT32")
 
-    _load_extension().gdn_decode_packed_bf16(
+    _gdn_decode_packed_bf16(
         mixed_qkv,
         a,
         b,

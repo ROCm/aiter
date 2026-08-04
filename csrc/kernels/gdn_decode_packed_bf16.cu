@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAException.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 #include <torch/extension.h>
@@ -107,6 +106,7 @@ __global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdn_decode_packed_bf16_k
     int64_t b_row_stride,
     int64_t indices_stride,
     int64_t state_slot_stride,
+    int state_pool_size,
     float scale)
 {
     const int lane   = static_cast<int>(threadIdx.x) & (kWaveSize - 1);
@@ -125,7 +125,7 @@ __global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdn_decode_packed_bf16_k
 
     const int v_idx     = tile * kVPerBlock + warp * kVThreads + v_lane;
     const int state_idx = indices[static_cast<int64_t>(row) * indices_stride];
-    if(state_idx < 0)
+    if(static_cast<uint32_t>(state_idx) >= static_cast<uint32_t>(state_pool_size))
     {
         if(k_lane == 0)
         {
@@ -293,8 +293,8 @@ void gdn_decode_packed_bf16(const torch::Tensor& mixed_qkv,
                 "state shape mismatch");
     TORCH_CHECK(out.sizes() == at::IntArrayRef({batch, 1, kVHeads, kV}), "out shape mismatch");
 
-    c10::cuda::CUDAGuard guard(mixed_qkv.device());
-    hipStream_t stream = at::cuda::getCurrentCUDAStream(mixed_qkv.get_device());
+    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard{mixed_qkv.device()};
+    const hipStream_t stream = at::hip::getCurrentHIPStream();
     const dim3 block(kWarps * kWaveSize);
     const dim3 grid(batch * kVHeads * kVBlocks);
     hipLaunchKernelGGL(gdn_decode_packed_bf16_kernel,
@@ -316,8 +316,12 @@ void gdn_decode_packed_bf16(const torch::Tensor& mixed_qkv,
                        b.stride(0),
                        indices.stride(0),
                        state.stride(0),
+                       static_cast<int>(state.size(0)),
                        static_cast<float>(scale));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const hipError_t launch_error = hipGetLastError();
+    TORCH_CHECK(launch_error == hipSuccess,
+                "gdn_decode_packed_bf16 kernel launch failed: ",
+                hipGetErrorString(launch_error));
 }
 
 } // namespace

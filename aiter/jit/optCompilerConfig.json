@@ -1759,6 +1759,23 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_gdn_decode_packed_bf16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/gdn_decode_packed_bf16.cu'"
+        ],
+        "flags_extra_cc": [
+            "'-O3'"
+        ],
+        "flags_extra_hip": [
+            "'-O3'",
+            "'-ffast-math'",
+            "'--offload-arch=gfx950'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fused_split_gdr_update": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/fused_split_gdr_update_pybind.cu'",
