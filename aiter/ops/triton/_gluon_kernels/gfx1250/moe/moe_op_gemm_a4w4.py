@@ -209,20 +209,12 @@ def get_moe_a4w4_layouts_prefill(
     )
 
     # shared layouts
-    if PACKED_BLOCK_K_X <= 256:
-        SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[256, 16]],
-            shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
-    else:
-        SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
-            shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
+    SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
+        shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
+        order=[1, 0],
+        cga_layout=CGA_A,
+    )
     if PRESHUFFLE_WEIGHTS:
         SHARED_LAYOUT_W = gl.SwizzledSharedLayout(
             vec=1,
@@ -231,7 +223,7 @@ def get_moe_a4w4_layouts_prefill(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    elif SHUFFLED_BLOCK_K_W <= 256:
+    elif BLOCK_K <= 256:
         SHARED_LAYOUT_W = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_W, SHUFFLED_BLOCK_K_W],
@@ -267,7 +259,7 @@ def get_moe_a4w4_layouts_prefill(
             order=[1, 0],
             cga_layout=CGA_B_NMAJOR,
         )
-    elif SHUFFLED_BLOCK_K_WS <= 256:
+    elif MX_SCALE_BLOCK_K <= 256:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS],
@@ -457,20 +449,14 @@ def get_moe_a4w4_layouts_decode(
     )
 
     # shared layouts
-    if PACKED_BLOCK_K_X <= 256:
-        SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[256, 16]],
-            shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
-    else:
-        SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
-            shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
+    # x is a TDM gather destination, and the gather lowering requires the pad
+    # interval to divide the innermost block dim. Pad once per row.
+    SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
+        shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
+        order=[1, 0],
+        cga_layout=CGA_A,
+    )
     if PRESHUFFLE_WEIGHTS:
         SHARED_LAYOUT_W = gl.SwizzledSharedLayout(
             vec=1,
