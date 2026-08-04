@@ -256,8 +256,9 @@ def compile_preshuffle_gemm(
 
         # Bound A (read) and C (store) to the actual M extent so blocks covering
         # rows past M (ragged M) drop their OOB loads/stores at the descriptor
-        # instead of faulting / writing past the allocation. B and scales are
-        # exact-multiple in N and stay max_size.
+        # instead of faulting / writing past the allocation. B and scale_b/bias
+        # are per-N (exact multiple) and stay max_size; scale_a is per-row (M) and
+        # is bounded the same way below (see its epilogue load).
         gA = fx.rocdl.make_buffer_tensor(
             arg_a,
             max_size=False,
@@ -637,8 +638,15 @@ def compile_preshuffle_gemm(
                     )
                     for ni in range_constexpr(num_acc_n)
                 ]
+                # scale_a is per-row (one f32 per token) so it must be bounded to
+                # the real M extent -- like A/C above -- or the final ragged-M tile
+                # reads scales past row M into adjacent heap (silent garbage, and an
+                # intermittent HIP illegal access when the overshoot hits an unmapped
+                # page). Only scale_b/bias are per-N and safe to leave max_size.
                 scale_a_rsrc = buffer_ops.create_buffer_resource(
-                    arg_scale_a, max_size=True
+                    arg_scale_a,
+                    max_size=False,
+                    num_records_bytes=fx.Int64(i32_m) * fx.Int64(4),
                 )
                 s_a = [
                     Vec(
