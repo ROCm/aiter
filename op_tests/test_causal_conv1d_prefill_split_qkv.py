@@ -151,6 +151,7 @@ def _call_backend(
     v_dim,
     seq_lens_cpu,
     activation="silu",
+    metadata=None,
 ):
     """Dispatch to the requested backend namespace for comparison tests."""
     if backend == "hip":
@@ -169,6 +170,7 @@ def _call_backend(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             activation=activation,
+            metadata=metadata,
         )
     if backend == "flydsl":
         from aiter.ops.flydsl.causal_conv1d_flydsl import (
@@ -186,6 +188,7 @@ def _call_backend(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             activation=activation,
+            metadata=metadata,
         )
     if backend == "triton2d":
         from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
@@ -203,6 +206,7 @@ def _call_backend(
             cache_indices=cache_indices,
             has_initial_state=has_initial_state,
             activation=activation,
+            metadata=metadata,
         )
     if backend == "triton":
         from aiter.ops.triton.gated_delta_net.causal_conv1d_prefill import (
@@ -268,6 +272,60 @@ def test_backend_matches_reference(cu, with_is, backend):
     # conv_state writeback
     rel, absd = _max_abs_rel(cs_work, ref_cs)
     assert absd < 5e-2, f"{backend} conv_state mismatch: max_abs={absd:.4f}"
+
+
+@pytest.mark.parametrize("backend", ["hip", "triton2d", "flydsl"])
+def test_backend_accepts_causal_conv_prefill_metadata(backend):
+    if not torch.cuda.is_available():
+        pytest.skip("needs GPU")
+    if backend == "flydsl":
+        from aiter.ops.flydsl.causal_conv1d_flydsl import is_flydsl_available
+
+        if not is_flydsl_available():
+            pytest.skip("flydsl not available")
+
+    from aiter.ops.prefill_batch_metadata import (
+        build_causal_conv_prefill_metadata,
+    )
+
+    cu = [0, 8, 25]
+    seq_lens_cpu = [8, 17]
+    x, w, b, cs, ci, hi, qsl = make_inputs(cu)
+    metadata = build_causal_conv_prefill_metadata(
+        seq_lens_cpu,
+        query_start_loc=qsl,
+        block_sizes=(16, 64),
+    )
+    ref_q, ref_k, ref_v, ref_cs = torch_reference(
+        x, w, b, cs.clone(), qsl, ci, hi, K_DIM, V_DIM
+    )
+
+    cs_work = cs.clone()
+    q, k, v = _call_backend(
+        backend,
+        x=x,
+        weight=w,
+        bias=b,
+        conv_states=cs_work,
+        query_start_loc=qsl,
+        cache_indices=ci,
+        has_initial_state=hi,
+        k_dim=K_DIM,
+        v_dim=V_DIM,
+        seq_lens_cpu=seq_lens_cpu,
+        metadata=metadata,
+    )
+
+    for name, got, ref in (("q", q, ref_q), ("k", k, ref_k), ("v", v, ref_v)):
+        rel, absd = _max_abs_rel(got, ref)
+        assert (
+            absd < 5e-2
+        ), f"{backend} {name} mismatch: max_abs={absd:.4f} rel={rel:.4f}"
+
+    rel, absd = _max_abs_rel(cs_work, ref_cs)
+    assert (
+        absd < 5e-2
+    ), f"{backend} conv_state mismatch: max_abs={absd:.4f} rel={rel:.4f}"
 
 
 @pytest.mark.parametrize("cu", [[0, 1], [0, 2], [0, 1, 3, 6], [0, 512]])

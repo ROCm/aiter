@@ -6,16 +6,17 @@ import functools
 
 import torch
 
+from ..prefill_batch_metadata import CausalConvPrefillMetadata
+
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
-    from flydsl.expr import arith, buffer_ops
     from flydsl.expr.typing import Int32, T
 
+    from aiter.ops.flydsl.kernels import buffer_ops
+
     _FLYDSL_AVAILABLE = True
-except (
-    Exception  # noqa: BLE001  blanket catch is intentional here
-):  # pragma: no cover - flydsl optional
+except Exception:  # pragma: no cover - flydsl optional  # noqa: BLE001
     _FLYDSL_AVAILABLE = False
 
 
@@ -402,8 +403,8 @@ def build_causal_conv1d_flydsl_module(
         grid_y_dim: Int32,
         stream: fx.Stream,
     ):
-        gx = arith.index_cast(T.index, num_programs)
-        gy = arith.index_cast(T.index, grid_y_dim)
+        gx = fx.Int64(num_programs)
+        gy = fx.Int64(grid_y_dim)
         conv1d_kernel(
             x_ptr,
             w_ptr,
@@ -499,7 +500,17 @@ def causal_conv1d_split_qkv_flydsl_fn(
         )
 
     # Reuse precomputed chunk schedule metadata when provided.
-    if (
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=cu_seqlen,
+            num_sequences=query_start_loc.numel() - 1,
+        )
+        grid = metadata.get_chunk_grid(block_m)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        chunk_off_ptr = grid.chunk_ids
+    elif (
         metadata is not None
         and hasattr(metadata, "nums_dict")
         and block_m in metadata.nums_dict
