@@ -179,6 +179,7 @@ def compile_mla_decode_main(
     waves_per_eu: int = 1,
     WARP_TOKEN_SPLIT: bool = True,
     WARP_HEAD_SPLIT: bool = False,
+    WRITE_FINAL_OUTPUT: bool = False,
 ):
 
     # Warps split exactly one axis: Q head tiles, tokens, or d_c.
@@ -186,6 +187,12 @@ def compile_mla_decode_main(
         raise ValueError("WARP_HEAD_SPLIT and WARP_TOKEN_SPLIT are mutually exclusive")
     SPLIT = NUM_WARPS if WARP_TOKEN_SPLIT else 1
     NUM_PARTITIONS = NUM_SEGS * SPLIT
+
+    if WRITE_FINAL_OUTPUT and NUM_PARTITIONS != 1:
+        raise ValueError(
+            f"WRITE_FINAL_OUTPUT requires NUM_PARTITIONS == 1, got {NUM_PARTITIONS} "
+            f"(NUM_SEGS={NUM_SEGS}, SPLIT={SPLIT})"
+        )
 
     QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # K width for QK (lora + rope)
     V_HEAD_DIM = KV_LORA_RANK                      # V width for PV (lora only)
@@ -776,37 +783,58 @@ def compile_mla_decode_main(
             pv_final.append([fx.Vector(v) for v in results[si : si + P]]); si += P
 
         out_rsrc = buffer_ops.create_buffer_resource(arg_out, max_size=True)
-        ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
-        es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
 
-        part_idx = seg_idx * fx.Index(SPLIT) + (wave_id if WARP_TOKEN_SPLIT else fx.Index(0))
-        out_base = seq_idx * stride_o_seq + part_idx * stride_o_part
-        lse_base = seq_idx * stride_lse_seq + part_idx * stride_lse_part
+        if WRITE_FINAL_OUTPUT:
+            # since only one partition we normalize here so no need to call reduce kernel
+            out_seq_base = seq_idx * stride_o_seq
+            is_empty = seq_len == fx.Index(0)
+            zero_vec_half = fx.Vector.filled(8, 0.0, elem_dtype)
 
-        for qt in range_constexpr(NQGSP_LOCAL):
-            row = head_row_off + fx.Index(qt * WMMA_M) + lane16
-            row_valid = row < num_q_heads_idx       # skip padded head rows
+            for qt in range_constexpr(NQGSP_LOCAL):
+                row = head_row_off + fx.Index(qt * WMMA_M) + lane16
+                row_valid = row < num_q_heads_idx       # skip padded head rows
+                inv_l = fx.Float32(rocdl.rcp(T.f32, l_final[qt].ir_value()))
+                row_base = out_seq_base + row * stride_o_row
 
-            for pv_n in range_constexpr(P):
-                pv_n_global = (wave_id * fx.Index(P) + fx.Index(pv_n) if WARP_DC_SPLIT else fx.Index(pv_n))
-                head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
-                off_lo = out_base + row * stride_o_row + head_col_base
-                off_hi = off_lo + fx.Index(4)
-                lo = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [0, 1, 2, 3])
-                hi = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [4, 5, 6, 7])
+                for pv_n in range_constexpr(P):
+                    pv_n_global = (wave_id * fx.Index(P) + fx.Index(pv_n) if WARP_DC_SPLIT else fx.Index(pv_n))
+                    head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
+                    vec_half = (pv_final[qt][pv_n] * inv_l).to(elem_dtype)
+                    vec_half = fx.Vector(arith.select(is_empty, zero_vec_half, vec_half))
+                    if row_valid:
+                        buffer_ops.buffer_store(vec_half, out_rsrc, row_base + head_col_base)
+        else:
+            ml_rsrc = buffer_ops.create_buffer_resource(arg_max_logits, max_size=True)
+            es_rsrc = buffer_ops.create_buffer_resource(arg_exp_sums, max_size=True)
+
+            part_idx = seg_idx * fx.Index(SPLIT) + (wave_id if WARP_TOKEN_SPLIT else fx.Index(0))
+            out_base = seq_idx * stride_o_seq + part_idx * stride_o_part
+            lse_base = seq_idx * stride_lse_seq + part_idx * stride_lse_part
+
+            for qt in range_constexpr(NQGSP_LOCAL):
+                row = head_row_off + fx.Index(qt * WMMA_M) + lane16
+                row_valid = row < num_q_heads_idx       # skip padded head rows
+
+                for pv_n in range_constexpr(P):
+                    pv_n_global = (wave_id * fx.Index(P) + fx.Index(pv_n) if WARP_DC_SPLIT else fx.Index(pv_n))
+                    head_col_base = pv_n_global * fx.Index(WMMA_M) + lane_kgrp * fx.Index(8)
+                    off_lo = out_base + row * stride_o_row + head_col_base
+                    off_hi = off_lo + fx.Index(4)
+                    lo = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [0, 1, 2, 3])
+                    hi = pv_final[qt][pv_n].shuffle(pv_final[qt][pv_n], [4, 5, 6, 7])
+                    if row_valid:
+                        buffer_ops.buffer_store(lo, out_rsrc, off_lo)
+                        buffer_ops.buffer_store(hi, out_rsrc, off_hi)
+
+                off_lse = lse_base + row
                 if row_valid:
-                    buffer_ops.buffer_store(lo, out_rsrc, off_lo)
-                    buffer_ops.buffer_store(hi, out_rsrc, off_hi)
-
-            off_lse = lse_base + row
-            if row_valid:
-                buffer_ops.buffer_store(m_final[qt], ml_rsrc, off_lse)
-                buffer_ops.buffer_store(l_final[qt], es_rsrc, off_lse)
+                    buffer_ops.buffer_store(m_final[qt], ml_rsrc, off_lse)
+                    buffer_ops.buffer_store(l_final[qt], es_rsrc, off_lse)
 
     cache_tag = (
         KV_LORA_RANK, QK_ROPE_HEAD_DIM, KV_BLOCK_SIZE, NUM_Q_HEADS, NUM_SEGS,
         KV_COMPUTE_BLOCK_SIZE, NUM_WARPS, dtype, waves_per_eu, WARP_TOKEN_SPLIT,
-        WARP_HEAD_SPLIT,
+        WARP_HEAD_SPLIT, WRITE_FINAL_OUTPUT,
     )
 
     @flyc.jit

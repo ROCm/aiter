@@ -191,7 +191,14 @@ def flydsl_mla_decode(
     # tmp buffers may be preallocated and passed through partials=
     # otherwise we just allocate them here
     num_partitions = _mla_num_partitions(num_segs, num_warps, warp_token_split)
-    if partials is None:
+
+    # A single partition has nothing to merge, so the main kernel normalizes in-register and
+    # writes `output` directly and no need for reduce kernel
+    write_final_output = num_partitions == 1 and not skip_reduce
+
+    if write_final_output:
+        tmp_out = max_logits = exp_sums = output
+    elif partials is None:
         tmp_out, max_logits, exp_sums = alloc_mla_decode_partials(
             num_seqs=num_seqs,
             num_q_heads=num_q_heads,
@@ -242,16 +249,18 @@ def flydsl_mla_decode(
             dtype=dtype_str,
             WARP_TOKEN_SPLIT=warp_token_split,
             WARP_HEAD_SPLIT=warp_head_split,
+            WRITE_FINAL_OUTPUT=write_final_output,
         )
-        reduce_launch = compile_mla_decode_reduce(
-            KV_LORA_RANK=kv_lora_rank,
-            NUM_Q_HEADS=num_q_heads,
-            NUM_SEGS=num_segs,
-            KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
-            dtype=dtype_str,
-            ATTN_NUM_WARPS=num_warps,
-            WARP_TOKEN_SPLIT=warp_token_split,
-        )
+        if not write_final_output:
+            reduce_launch = compile_mla_decode_reduce(
+                KV_LORA_RANK=kv_lora_rank,
+                NUM_Q_HEADS=num_q_heads,
+                NUM_SEGS=num_segs,
+                KV_COMPUTE_BLOCK_SIZE=kv_compute_block_size,
+                dtype=dtype_str,
+                ATTN_NUM_WARPS=num_warps,
+                WARP_TOKEN_SPLIT=warp_token_split,
+            )
 
         main_launch(
             tmp_out.view(-1),
@@ -268,6 +277,8 @@ def flydsl_mla_decode(
         )
         if skip_reduce:
             return tmp_out, max_logits, exp_sums
+        if write_final_output:
+            return output
         reduce_launch(
             output.view(-1),
             tmp_out.view(-1),
