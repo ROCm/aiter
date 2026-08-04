@@ -194,8 +194,8 @@ def _hstu_attn_fwd_compute(
         offs_m = start_m + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
         offs_d_q = tl.arange(0, BLOCK_D_Q)
-        K_base=K + off_h * stride_kh + seq_start * stride_kn,
-        V_base=V + off_h * stride_vh + seq_start * stride_vn,
+        K_base=K + off_h * stride_kh + seq_start * stride_kn
+        V_base=V + off_h * stride_vh + seq_start * stride_vn
         mask_m = offs_m < seq_len
         if IS_DELTA_Q:
             Q_base = Q + off_h * stride_qh + off_z * DeltaSize * stride_qm
@@ -305,8 +305,8 @@ def _hstu_attn_fwd_compute(
                 BLOCK_D_Q=BLOCK_D_Q,
                 BLOCK_D_V=BLOCK_D_V,
             )
-            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
+            # K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
+            # V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
             # end_n += BLOCK_N
 
         # Not merged: the `# pyre-ignore[61]` between the two ifs applies to the inner one; merging would silently drop that suppression.
