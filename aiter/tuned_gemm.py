@@ -341,6 +341,7 @@ def gen_gemm_a16w16_fake_tensor(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    is_shuffled: bool | None = None,
 ) -> Tensor:
     return torch.empty(
         *A.shape[:-1],
@@ -359,10 +360,17 @@ def gemm_a16w16(
     scale_a: Tensor | None = None,
     scale_b: Tensor | None = None,
     scale_c: Tensor | None = None,
+    # Layout of B. None infers it from the `is_shuffled` attribute that
+    # shuffle_weight() leaves on its result -- that attribute is not tensor
+    # metadata, so clone() / to() / nn.Parameter() drop it and B would then be
+    # read back with the wrong layout. Pass it explicitly if B was copied.
+    is_shuffled: bool | None = None,
 ) -> Tensor:
-    bpreshuffle = False
-    if hasattr(B, "is_shuffled") and B.is_shuffled is True:
-        bpreshuffle = True
+    bpreshuffle = (
+        bool(is_shuffled)
+        if is_shuffled is not None
+        else bool(getattr(B, "is_shuffled", False))
+    )
     if A.dim() >= 3:
         try:
             inp_view = A.view(-1, A.size(-1))
