@@ -2518,6 +2518,12 @@ def compile_moe_gemm2(
         raise ValueError(
             "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
         )
+    if klane_inner:
+        raise ValueError(
+            "compile_moe_gemm2 does not support klane_inner=True: the klane_inner w2 "
+            "scale layout is unvalidated and produces incorrect results. Preshuffle "
+            "w2/w2_scale with klane_inner=False."
+        )
     is_int4 = in_dtype == "int4"
     # w_is_int4: True for any variant where weights are packed nibbles (INT4 or FP4).
     w_is_int4 = is_int4 or is_int4_bf16 or is_fp4_bf16
