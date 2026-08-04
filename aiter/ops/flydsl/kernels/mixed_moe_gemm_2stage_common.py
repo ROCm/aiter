@@ -51,6 +51,7 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.multi_b import partition_module_tag
 
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
@@ -96,6 +97,23 @@ def validate_moe_dtypes(a_dtype: str, b_dtype: str) -> None:
         raise ValueError(
             f"b_dtype must be one of {tuple(sorted(_VALID_B_DTYPES))}, got {b_dtype!r}"
         )
+
+
+def _validate_b_partition_sizes(
+    experts: int, b_partition_sizes: tuple[int, ...] | None
+) -> tuple[int, ...]:
+    if b_partition_sizes is None:
+        return ()
+    sizes = tuple(int(size) for size in b_partition_sizes)
+    if len(sizes) not in (2, 4, 8):
+        raise ValueError(f"multi-B requires 2/4/8 partitions, got {len(sizes)}")
+    if any(size <= 0 for size in sizes):
+        raise ValueError(f"multi-B partition sizes must be positive, got {sizes}")
+    if sum(sizes) != int(experts):
+        raise ValueError(
+            f"multi-B partition sizes must sum to experts={experts}, got {sizes}"
+        )
+    return sizes
 
 
 def _barrier(vmcnt=63, lgkmcnt=63):
@@ -158,15 +176,26 @@ def compile_mixed_moe_gemm1_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    b_partition_sizes: tuple[int, ...] | None = None,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    b_partition_sizes = _validate_b_partition_sizes(experts, b_partition_sizes)
+    multi_b = bool(b_partition_sizes)
     heterogeneous_b = shared_expert_id is not None
+    if multi_b and heterogeneous_b:
+        raise ValueError(
+            "multi-B and heterogeneous shared-expert B are mutually exclusive"
+        )
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
     gpu_arch = get_hip_arch()
+    if multi_b and not str(gpu_arch).startswith("gfx950"):
+        raise NotImplementedError(
+            f"multi-B mixed MoE is gfx950-only; refusing to compile for {gpu_arch}"
+        )
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem1")
 
@@ -303,10 +332,11 @@ def compile_mixed_moe_gemm1_common(
 
         act_tag += f"_sb{_beta_tag(situ_beta)}_slb{_beta_tag(situ_linear_beta)}"
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
-    kernel_version = 33 if heterogeneous_b else 32
+    multi_b_tag = partition_module_tag(b_partition_sizes) if multi_b else ""
+    kernel_version = 34 if multi_b else (33 if heterogeneous_b else 32)
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{heterogeneous_tag}{multi_b_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -506,6 +536,26 @@ def compile_mixed_moe_gemm1_common(
                     addr_i64, num_records_bytes=num_records_bytes
                 )
 
+            def load_pointer_from_table(table_rsrc, table_index):
+                """Load one wave-uniform 64-bit address from a device pointer table."""
+                dword_index = table_index * arith.constant(2, index=True)
+                lo_i32 = buffer_ops.buffer_load(
+                    table_rsrc, dword_index, vec_width=1, dtype=T.i32
+                )
+                hi_i32 = buffer_ops.buffer_load(
+                    table_rsrc,
+                    dword_index + arith.constant(1, index=True),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                lo_i32 = rocdl.ReadfirstlaneOp(T.i32, lo_i32).res
+                hi_i32 = rocdl.ReadfirstlaneOp(T.i32, hi_i32).res
+                lo_i64 = arith.extui(T.i64, lo_i32)
+                hi_i64 = arith.shli(
+                    arith.extui(T.i64, hi_i32), arith.constant(32, type=T.i64)
+                )
+                return arith.ori(lo_i64, hi_i64)
+
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
             c_n_total = arith.constant(experts * (2 * inter_dim), index=True)
@@ -646,6 +696,16 @@ def compile_mixed_moe_gemm1_common(
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
+            w_table_rsrc = (
+                ptr_buffer_resource(arg_w, len(b_partition_sizes) * 8)
+                if const_expr(multi_b)
+                else None
+            )
+            sw_table_rsrc = (
+                ptr_buffer_resource(arg_scale_w, len(b_partition_sizes) * 8)
+                if const_expr(multi_b)
+                else None
+            )
 
             numids_rsrc = ptr_buffer_resource(
                 arg_num_valid_ids, arith.constant(4, type=T.i32)
@@ -673,7 +733,8 @@ def compile_mixed_moe_gemm1_common(
             mn_w = arith.constant(experts * (2 * inter_dim), index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-            sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            if const_expr(not multi_b):
+                sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
             shared_scale_rows = arith.constant(
                 ((2 * inter_dim + 255) // 256) * 256, index=True
             )
@@ -744,6 +805,51 @@ def compile_mixed_moe_gemm1_common(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            if const_expr(multi_b):
+                partition_idx = arith.index(0)
+                local_expert_idx = expert_idx
+                partition_experts = arith.constant(b_partition_sizes[0], index=True)
+                partition_start = 0
+                for partition in range_constexpr(1, len(b_partition_sizes)):
+                    partition_start += b_partition_sizes[partition - 1]
+                    start_idx = arith.constant(partition_start, index=True)
+                    in_partition = arith.cmpi(CmpIPredicate.uge, expert_idx, start_idx)
+                    partition_idx = arith.select(
+                        in_partition,
+                        arith.constant(partition, index=True),
+                        partition_idx,
+                    )
+                    local_expert_idx = arith.select(
+                        in_partition, expert_idx - start_idx, local_expert_idx
+                    )
+                    partition_experts = arith.select(
+                        in_partition,
+                        arith.constant(b_partition_sizes[partition], index=True),
+                        partition_experts,
+                    )
+                selected_w_addr_i64 = load_pointer_from_table(
+                    w_table_rsrc, partition_idx
+                )
+                selected_sw_addr_i64 = load_pointer_from_table(
+                    sw_table_rsrc, partition_idx
+                )
+                scale_rows = partition_experts * arith.constant(
+                    2 * inter_dim, index=True
+                )
+                scale_rows_padded = (
+                    (scale_rows + arith.constant(255, index=True))
+                    // arith.constant(256, index=True)
+                    * arith.constant(256, index=True)
+                )
+                scale_cols_padded = arith.constant(
+                    ((model_dim // 32 + 7) // 8) * 8, index=True
+                )
+                selected_sw_nbytes = arith.index_cast(
+                    T.i32, scale_rows_padded * scale_cols_padded
+                )
+                selected_sw_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    selected_sw_addr_i64, num_records_bytes=selected_sw_nbytes
+                )
             if const_expr(heterogeneous_b):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
@@ -763,11 +869,19 @@ def compile_mixed_moe_gemm1_common(
                 )
                 expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
                 if const_expr(shared_b):
+                    weight_expert_idx = arith.index(0)
                     weight_expert_off_idx = arith.index(0)
                     weight_scale_rsrc = shared_sw_rsrc
                 else:
-                    weight_expert_off_idx = expert_off_idx
-                    weight_scale_rsrc = sw_rsrc
+                    weight_expert_idx = (
+                        local_expert_idx if const_expr(multi_b) else expert_idx
+                    )
+                    weight_expert_off_idx = weight_expert_idx * arith.constant(
+                        2 * inter_dim, index=True
+                    )
+                    weight_scale_rsrc = (
+                        selected_sw_rsrc if const_expr(multi_b) else sw_rsrc
+                    )
 
                 def mixed_b_mfma(
                     a128,
@@ -795,9 +909,14 @@ def compile_mixed_moe_gemm1_common(
 
                 # per-expert 64-bit re-base: 32-bit buffer voffset overflows when w1 > 4GB
                 per_expert_w_bytes = w_nbytes // experts
-                w_addr_i64 = arith.index_cast(T.i64, fx.ptrtoint(arg_w))
+                w_addr_i64 = (
+                    selected_w_addr_i64
+                    if const_expr(multi_b)
+                    else arith.index_cast(T.i64, fx.ptrtoint(arg_w))
+                )
                 expert_byte_off = arith.index_cast(
-                    T.i64, expert_idx * arith.constant(per_expert_w_bytes, index=True)
+                    T.i64,
+                    weight_expert_idx * arith.constant(per_expert_w_bytes, index=True),
                 )
                 w_rsrc_e = buffer_ops.create_buffer_resource_from_addr(
                     arith.addi(w_addr_i64, expert_byte_off),
@@ -3185,6 +3304,9 @@ def compile_mixed_moe_gemm1_common(
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
+    if multi_b:
+        # Include every partition, including the uneven terminal partition.
+        cache_tag += (b_partition_sizes,)
 
     def _launch_mixed_moe_gemm1(
         arg_out: fx.Pointer,
@@ -3411,9 +3533,16 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    b_partition_sizes: tuple[int, ...] | None = None,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
+    b_partition_sizes = _validate_b_partition_sizes(experts, b_partition_sizes)
+    multi_b = bool(b_partition_sizes)
     heterogeneous_b = shared_expert_id is not None
+    if multi_b and heterogeneous_b:
+        raise ValueError(
+            "multi-B and heterogeneous shared-expert B are mutually exclusive"
+        )
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
@@ -3437,6 +3566,10 @@ def compile_mixed_moe_gemm2_common(
     )
 
     gpu_arch = get_hip_arch()
+    if multi_b and not str(gpu_arch).startswith("gfx950"):
+        raise NotImplementedError(
+            f"multi-B mixed MoE is gfx950-only; refusing to compile for {gpu_arch}"
+        )
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem0")
 
     if const_expr(a_dtype not in ("fp8", "fp4")):
@@ -3574,11 +3707,17 @@ def compile_mixed_moe_gemm2_common(
     acc_tag = "" if accumulate else "_acc0"
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
+    multi_b_tag = partition_module_tag(b_partition_sizes) if multi_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
     if heterogeneous_b:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v2{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
             f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
+        )
+    elif multi_b:
+        variant_tags = (
+            f"_vscale_fix3_fp4opt_v3{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
+            f"{cumul_tag}{xcd_tag}{acc_tag}{multi_b_tag}"
         )
     else:
         variant_tags = (
@@ -3645,6 +3784,26 @@ def compile_mixed_moe_gemm2_common(
                 return buffer_ops.create_buffer_resource_from_addr(
                     addr_i64, num_records_bytes=num_records_bytes
                 )
+
+            def load_pointer_from_table(table_rsrc, table_index):
+                """Load one wave-uniform 64-bit address from a device pointer table."""
+                dword_index = table_index * arith.constant(2, index=True)
+                lo_i32 = buffer_ops.buffer_load(
+                    table_rsrc, dword_index, vec_width=1, dtype=T.i32
+                )
+                hi_i32 = buffer_ops.buffer_load(
+                    table_rsrc,
+                    dword_index + arith.constant(1, index=True),
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+                lo_i32 = rocdl.ReadfirstlaneOp(T.i32, lo_i32).res
+                hi_i32 = rocdl.ReadfirstlaneOp(T.i32, hi_i32).res
+                lo_i64 = arith.extui(T.i64, lo_i32)
+                hi_i64 = arith.shli(
+                    arith.extui(T.i64, hi_i32), arith.constant(32, type=T.i64)
+                )
+                return arith.ori(lo_i64, hi_i64)
 
             acc_init = arith.constant_vector(0.0, vec4_f32)
 
@@ -3771,7 +3930,19 @@ def compile_mixed_moe_gemm2_common(
             x_nbytes_i32 = arith.index_cast(T.i32, x_nbytes_idx)
             x_rsrc = ptr_buffer_resource(arg_x, x_nbytes_i32)
 
-            w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
+            w_rsrc = (
+                None if const_expr(multi_b) else ptr_buffer_resource(arg_w, w_nbytes)
+            )
+            w_table_rsrc = (
+                ptr_buffer_resource(arg_w, len(b_partition_sizes) * 8)
+                if const_expr(multi_b)
+                else None
+            )
+            sw_table_rsrc = (
+                ptr_buffer_resource(arg_scale_w, len(b_partition_sizes) * 8)
+                if const_expr(multi_b)
+                else None
+            )
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
             out_elem_bytes = 4 if out_is_f32 else 2
@@ -3817,7 +3988,11 @@ def compile_mixed_moe_gemm2_common(
             mn_w = arith.constant(experts * model_dim, index=True)
             sw_nbytes_idx = mn_w * kblk_w
             sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
-            sw_rsrc = ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            sw_rsrc = (
+                None
+                if const_expr(multi_b)
+                else ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
+            )
             shared_scale_rows = arith.constant(
                 ((model_dim + 255) // 256) * 256, index=True
             )
@@ -3909,6 +4084,58 @@ def compile_mixed_moe_gemm2_common(
             exp_valid = arith.cmpi(
                 CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32)
             )
+            if const_expr(multi_b):
+                partition_idx = arith.index(0)
+                local_expert_idx = expert_idx
+                partition_experts = arith.constant(b_partition_sizes[0], index=True)
+                partition_start = 0
+                for partition in range_constexpr(1, len(b_partition_sizes)):
+                    partition_start += b_partition_sizes[partition - 1]
+                    start_idx = arith.constant(partition_start, index=True)
+                    in_partition = arith.cmpi(CmpIPredicate.uge, expert_idx, start_idx)
+                    partition_idx = arith.select(
+                        in_partition,
+                        arith.constant(partition, index=True),
+                        partition_idx,
+                    )
+                    local_expert_idx = arith.select(
+                        in_partition, expert_idx - start_idx, local_expert_idx
+                    )
+                    partition_experts = arith.select(
+                        in_partition,
+                        arith.constant(b_partition_sizes[partition], index=True),
+                        partition_experts,
+                    )
+                selected_w_addr_i64 = load_pointer_from_table(
+                    w_table_rsrc, partition_idx
+                )
+                selected_sw_addr_i64 = load_pointer_from_table(
+                    sw_table_rsrc, partition_idx
+                )
+                per_expert_w_bytes = w_nbytes // experts
+                selected_w_expert_byte_off = arith.index_cast(
+                    T.i64,
+                    local_expert_idx * arith.constant(per_expert_w_bytes, index=True),
+                )
+                selected_w_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    arith.addi(selected_w_addr_i64, selected_w_expert_byte_off),
+                    num_records_bytes=per_expert_w_bytes,
+                )
+                scale_rows = partition_experts * arith.constant(model_dim, index=True)
+                scale_rows_padded = (
+                    (scale_rows + arith.constant(255, index=True))
+                    // arith.constant(256, index=True)
+                    * arith.constant(256, index=True)
+                )
+                scale_cols_padded = arith.constant(
+                    ((scale_kblk_padded + 7) // 8) * 8, index=True
+                )
+                selected_sw_nbytes = arith.index_cast(
+                    T.i32, scale_rows_padded * scale_cols_padded
+                )
+                selected_sw_rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    selected_sw_addr_i64, num_records_bytes=selected_sw_nbytes
+                )
             if const_expr(heterogeneous_b):
                 is_shared_expert = arith.cmpi(
                     CmpIPredicate.eq,
@@ -3916,7 +4143,9 @@ def compile_mixed_moe_gemm2_common(
                     arith.constant(shared_expert_id, type=T.i32),
                 )
 
-            if const_expr(persistent):
+            if const_expr(multi_b):
+                expert_b_base = arith.index(0)
+            elif const_expr(persistent):
                 expert_b_base = expert_idx * arith.constant(expert_b_stride, index=True)
             else:
                 delta_expert = arith.subi(expert_i32, prev_expert_i32)
@@ -3953,9 +4182,17 @@ def compile_mixed_moe_gemm2_common(
                 if const_expr(shared_b):
                     weight_expert_off_idx = arith.index(0)
                     weight_scale_rsrc = shared_sw_rsrc
+                    weight_rsrc = shared_w_rsrc
                 else:
-                    weight_expert_off_idx = expert_off_idx
-                    weight_scale_rsrc = sw_rsrc
+                    weight_expert_off_idx = (
+                        local_expert_idx * n_idx
+                        if const_expr(multi_b)
+                        else expert_off_idx
+                    )
+                    weight_scale_rsrc = (
+                        selected_sw_rsrc if const_expr(multi_b) else sw_rsrc
+                    )
+                    weight_rsrc = selected_w_rsrc if const_expr(multi_b) else w_rsrc
 
                 def mixed_b_mfma(
                     a128,
@@ -4138,7 +4375,10 @@ def compile_mixed_moe_gemm2_common(
                 )
 
                 if const_expr(pack_N < scale_pack_n):
-                    global_n_base = expert_off_idx + body_by_n + n_tile_base
+                    scale_expert_off_idx = (
+                        weight_expert_off_idx if const_expr(multi_b) else expert_off_idx
+                    )
+                    global_n_base = scale_expert_off_idx + body_by_n + n_tile_base
                     n_off = _mod_pow2(_div_pow2(global_n_base, 16), scale_pack_n)
                     n_scale_shift_i32 = arith.index_cast(
                         T.i32, n_off * arith.constant(8, index=True)
@@ -4229,7 +4469,7 @@ def compile_mixed_moe_gemm2_common(
                         return s0, s1, s2, s3
 
                     b0, b1 = load_cell(
-                        w_rsrc,
+                        weight_rsrc,
                         expert_b_base,
                         b_stride_n0,
                         w_elem_type(),
@@ -4237,7 +4477,7 @@ def compile_mixed_moe_gemm2_common(
                     )
                     if const_expr(is_f8_b):
                         b2, b3 = load_cell(
-                            w_rsrc,
+                            weight_rsrc,
                             expert_b_base,
                             b_stride_n0,
                             w_elem_type(),
@@ -5401,6 +5641,9 @@ def compile_mixed_moe_gemm2_common(
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
+    if multi_b:
+        # Module/cache identity must distinguish an uneven terminal partition.
+        cache_tag += (b_partition_sizes,)
 
     def _launch_mixed_moe_gemm2(
         arg_out: fx.Pointer,
