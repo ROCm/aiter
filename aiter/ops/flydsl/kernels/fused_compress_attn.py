@@ -2833,8 +2833,8 @@ def flydsl_fused_compress_attn(
         krope_token_stride = 0
 
     # ---- K-split fast path (BF16 + FP8 + FP4 scatter) ----
-    # k_split_num_waves: None ? auto-pick (tuned geometries only); int>1 ?
-    # forced NW; 1 ? forced legacy. Auto triggers for the CSA Main (BF16),
+    # k_split_num_waves: None => auto-pick (tuned geometries only); int>1 =>
+    # forced NW; 1 => forced legacy. Auto triggers for the CSA Main (BF16),
     # CSA Indexer (FP8), and CSA Indexer (FP4) shapes the K-split kernel
     # supports; other shapes fall through to the legacy single-wave kernel.
     _is_csa_main = (

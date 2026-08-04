@@ -440,7 +440,7 @@ def populate_v2_intermediate_from_ref(d, v, token, topk, BM_S1):
 def _v2_group_cosine(d, v, token, inter_dim, E, BM_S1, sample=64):
     """Per-32-group-normalized cosine of v2's dequant intermediate vs ref1.
     Group-normalizing removes the per-32 e8m0 scale, so we validate the gemm
-    math + fp8 values without de-shuffling the (kernel-written) e8m0 scale."""
+    math and quantized values without de-shuffling the kernel-written e8m0 scale."""
     isq, sti, sei = v["isq"], v["sti"], v["sei"]
     ref1 = d["ref1"]  # [token, topk, inter]
     topk_ids = d["topk_ids"]
@@ -539,9 +539,12 @@ def populate_baseline_v2_intermediate(
 def v2_stage1_sorted_ref(
     ref1, topk_ids, sti, sei, n, *, token, inter_dim, bm_s1, max_sorted
 ):
-    """? torch ref1 [token,topk,inter] gather ? v2 sorted-stream ?? [max_sorted,inter]
-    bf16 ??; ??/pad ?? 0?gather ??? _v2_group_cosine:
-    tok = sti & 0xFFFFFF, e = sei[row//bm_s1], slot = where(topk_ids[tok]==e)."""
+    """Gather dense torch reference rows into the v2 expert-sorted layout.
+
+    Each valid output row selects ``ref1[token_id, topk_slot]``, where
+    ``token_id`` comes from ``sti`` and ``topk_slot`` is the slot routed to the
+    row's expert from ``sei``. Padding rows remain zero.
+    """
     out = torch.zeros((max_sorted, inter_dim), dtype=torch.bfloat16, device=ref1.device)
     tok_of = sti[:n] & 0x00FFFFFF
     rows = (tok_of < token).nonzero(as_tuple=True)[0]
@@ -556,9 +559,11 @@ def v2_stage1_sorted_ref(
 
 
 def v2_stage1_dequant_cosine_err(ref, res, msg="", printLog=True, *, inter_dim, adtype):
-    """compare_fn: res=?? isq [max_sorted,inter_cols] uint8; ref=v2_stage1_sorted_ref
-    ??? [max_sorted,inter] bf16?????? (ref ?? 0) ? per-32-group cosine,
-    ?? err_ratio = 1 - mean_cos (? cosine_diff_compare ????)?"""
+    """Compare a packed v2 result with its sorted BF16 reference.
+
+    Zero-padding rows are excluded. The metric is one minus the mean per-32-group
+    cosine, which removes the e8m0 scale from the comparison.
+    """
     valid = (ref.abs().sum(dim=1) > 0).nonzero(as_tuple=True)[0]
     if valid.numel() == 0:
         return 1.0

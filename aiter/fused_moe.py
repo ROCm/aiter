@@ -1262,6 +1262,7 @@ class MOEMetadata:
     output_aux: bool = False
     prequant: bool = True
     skip_inter_quant: bool = False
+    intermediate_sorted: bool = False
     route_bucket: str = ""
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
@@ -1433,6 +1434,8 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    intermediate_sorted: bool = False,
+    logical_token_num: int | None = None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1481,6 +1484,8 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        intermediate_sorted=intermediate_sorted,
+        logical_token_num=logical_token_num,
     )
 
 
@@ -1490,41 +1495,6 @@ def _empty_bf16(device):
 
 def _empty_u8(device):
     return torch.empty((0,), dtype=torch.uint8, device=device)
-
-
-def _unsort_mxfp4_intermediate(
-    inter_sorted_quant,
-    sorted_token_ids,
-    token_num,
-    topk,
-    num_valid_ids=None,
-):
-    """Scatter expert-sorted packed FP4 rows back to dense token-slot order."""
-    sorted_rows = inter_sorted_quant.view(inter_sorted_quant.shape[0], -1)
-    output_dtype = sorted_rows.dtype
-    byte_view = sorted_rows.element_size() == 1 and output_dtype != torch.uint8
-    scatter_rows = sorted_rows.view(torch.uint8) if byte_view else sorted_rows
-    packed_ids = sorted_token_ids.view(-1)
-    row_count = min(sorted_rows.shape[0], packed_ids.numel())
-    packed_ids = packed_ids[:row_count]
-    token_ids = packed_ids & 0xFFFFFF
-    slot_ids = packed_ids >> 24
-    valid = (token_ids < token_num) & (slot_ids < topk)
-    if num_valid_ids is not None:
-        actual_rows = num_valid_ids.view(-1)[0]
-        valid = valid & (
-            torch.arange(row_count, device=packed_ids.device) < actual_rows
-        )
-    dense_rows = torch.zeros(
-        (token_num * topk, scatter_rows.shape[1]),
-        dtype=scatter_rows.dtype,
-        device=sorted_rows.device,
-    )
-    dense_indices = (token_ids[valid] * topk + slot_ids[valid]).to(torch.int64)
-    dense_rows.index_copy_(0, dense_indices, scatter_rows[:row_count][valid])
-    if byte_view:
-        dense_rows = dense_rows.view(output_dtype)
-    return dense_rows.view(token_num, topk, sorted_rows.shape[1])
 
 
 def _mxfp4_a4w4_stage1(
@@ -1897,14 +1867,7 @@ def _mxfp4_a4w4_stage1_fw(
         use_nt=p1["use_nt"],
         interleave=p1["interleave"] or interleave,
     )
-    inter_dense_quant = _unsort_mxfp4_intermediate(
-        inter_sorted_quant,
-        sorted_token_ids,
-        M,
-        topk,
-        num_valid_ids,
-    )
-    return inter_dense_quant, inter_sorted_scale
+    return inter_sorted_quant, inter_sorted_scale
 
 
 def _mxfp4_a4w4_stage2_fw(
@@ -2610,7 +2573,7 @@ def get_2stage_cfgs(
         else:
             return 16 if token < 2048 else 32 if token < 16384 else 64
 
-    if _is_mxfp4_kname(kernelName1) or _is_mxfp4_kname(kernelName2):
+    if _is_mxfp4_kname(kernelName1):
         # gate_mode is a runtime weight-layout property, not a tuning key: route
         # any a4w4 kernelName to the port; the bound interleave flag picks the
         # compiled il/sep variant at runtime.
@@ -2642,21 +2605,6 @@ def get_2stage_cfgs(
             stage2_func = functools.partial(
                 _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
             )
-        elif is_opus_cfg:
-            stage2_func = functools.partial(
-                _opus_a8w4.opus_a8w4_stage2_wrapper,
-                kernelName=kernelName2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-                **opus_stage2_cfg_values,
-            )
-        elif isinstance(kernelName2, str) and kernelName2.startswith("cktile_"):
-            stage2_func = functools.partial(
-                cktile_moe_stage2,
-                n_pad_zeros=hidden_pad // 64 * 64,
-                k_pad_zeros=intermediate_pad // 128 * 128,
-                activation=activation,
-            )
         elif isinstance(kernelName2, str) and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
@@ -2665,12 +2613,9 @@ def get_2stage_cfgs(
                 model_dim_pad=hidden_pad,
             )
         else:
-            stage2_func = functools.partial(
-                aiter.ck_moe_stage2_fwd,
-                kernelName=kernelName2,
-                activation=activation,
-                quant_type=q_type,
-                use_non_temporal_load=use_non_temporal_load,
+            raise ValueError(
+                "MXMOE GEMM1 requires a sorted-intermediate GEMM2 backend, "
+                f"got {kernelName2!r}"
             )
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -2692,6 +2637,7 @@ def get_2stage_cfgs(
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
             has_bias=enable_bias and _p1.get("enable_bias", False),
             stage2_has_bias=enable_bias and stage2_supports_bias,
+            intermediate_sorted=True,
             **route_bucket_metadata,
         )
 
@@ -3402,6 +3348,9 @@ def fused_moe_2stages(
         extra_stage1_args["m_indices"] = m_indices
         extra_stage1_args["moe_buf"] = _sort_moe_buf
         extra_stage2_args["reverse_sorted"] = reverse_sorted
+    if metadata.intermediate_sorted:
+        extra_stage2_args["intermediate_sorted"] = True
+        extra_stage2_args["logical_token_num"] = token_num
     _stage1_call = functools.partial(
         metadata.stage1,
         a1,
@@ -3433,11 +3382,10 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
-    if (
-        metadata.skip_inter_quant
-        and isinstance(a2, tuple)
+    if isinstance(a2, tuple) and (
+        metadata.intermediate_sorted
+        or metadata.skip_inter_quant
         or m_indices is not None
-        and isinstance(a2, tuple)
     ):
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):

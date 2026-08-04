@@ -410,7 +410,7 @@ def test_fmoe_ep_mxfp4(
     const_init=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
-    quant_label ? {"a8w4_mxfp4", "a4w4_mxfp4"}.
+    quant_label is one of {"a8w4_mxfp4", "a4w4_mxfp4"}.
 
     ep_mode selects how tokens/routing reach fused_moe:
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;

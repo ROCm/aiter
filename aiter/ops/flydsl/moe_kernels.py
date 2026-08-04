@@ -687,6 +687,7 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    a_sorted: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     if a_dtype == "bf16" and b_dtype in ("fp4", "mxfp4"):
@@ -744,6 +745,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            a_sorted=a_sorted,
         )
     elif a_dtype == "bf16" and b_dtype == "int4":
         # a16wi4: bf16 activations, int4 weights with groupwise scale
@@ -892,6 +894,7 @@ def _s2_args_fp4(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -918,6 +921,7 @@ def _s2_args_fp4(
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,
@@ -1915,15 +1919,45 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    intermediate_sorted: bool = False,
+    logical_token_num: int | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
-    token_num = inter_states.shape[0]
+    if intermediate_sorted:
+        if inter_states.ndim != 2:
+            raise ValueError(
+                "sorted stage2 intermediate must be 2D "
+                f"[sorted_rows, packed_inter_dim], got shape={tuple(inter_states.shape)}"
+            )
+        if logical_token_num is None:
+            if out is None:
+                raise ValueError(
+                    "logical_token_num or out is required for a sorted stage2 intermediate"
+                )
+            logical_token_num = out.shape[0]
+        token_num = int(logical_token_num)
+        x_rows = inter_states.shape[0]
+        if x_rows < sorted_token_ids.numel():
+            raise ValueError(
+                f"sorted intermediate has {x_rows} rows, but sorted_token_ids "
+                f"contains {sorted_token_ids.numel()} rows"
+            )
+        if a_dtype in ("fp4", "fp8") and a2_scale is None:
+            raise ValueError("sorted MX stage2 intermediate requires a2_scale")
+    else:
+        if inter_states.ndim != 3:
+            raise ValueError(
+                "dense stage2 intermediate must be 3D "
+                f"[token_num, topk, inter_dim], got shape={tuple(inter_states.shape)}"
+            )
+        token_num = inter_states.shape[0]
+        x_rows = inter_states.shape[0] * inter_states.shape[1]
     E = w2.shape[0]
     model_dim = w2.shape[1]
-    inter_dim = inter_states.shape[2]
+    inter_dim = inter_states.shape[-1]
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -2040,6 +2074,7 @@ def _flydsl_moe_stage2_impl(
             sw,
             num_valid_ids,
             token_num,
+            x_rows,
             _n_in,
             _k_in,
             m_blocks,
@@ -2086,6 +2121,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        a_sorted=intermediate_sorted,
     )
     _run_compiled(exe, args)
 
@@ -2146,6 +2182,8 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    intermediate_sorted: bool = False,
+    logical_token_num: int | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2199,6 +2237,8 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        intermediate_sorted=intermediate_sorted,
+        logical_token_num=logical_token_num,
     )
 
 

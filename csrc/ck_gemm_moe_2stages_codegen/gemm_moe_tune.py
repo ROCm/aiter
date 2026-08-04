@@ -5863,12 +5863,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         is_a4w4 = "float4" in str(row["q_dtype_a"]) and "float4" in str(
             row["q_dtype_w"]
         )
+        locked_g2 = str(row.get("kernelName2", ""))
+        if (is_a8w4 or is_a4w4) and locked_g2 and not locked_g2.startswith("flydsl_"):
+            return []
         if is_a8w4:
             bm = int(row["block_m"])
             act = "situv2" if str(row["act_type"]).endswith("Situv2") else "silu"
             situ_beta = 2.0 if act == "situv2" else 1.0
             situ_linear_beta = 1.5 if act == "situv2" else 1.0
-            locked_g2 = str(row["kernelName2"])
             for _, use_nt, inline_quant in sorted(
                 variant for variant in _SUPPORTED_BY_DTYPE["fp8"] if variant[0] == bm
             ):
@@ -5897,7 +5899,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ):
                 return []
             bm = int(row["block_m"])
-            locked_g2 = str(row["kernelName2"])
             if str(row["act_type"]).endswith("Situv2"):
                 act = "situv2"
                 situ_beta, situ_linear_beta = 2.0, 1.5

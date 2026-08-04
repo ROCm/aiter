@@ -777,7 +777,7 @@ def _varqlen_windows_kernel(
     n = r - cu_b
     qlen = cu_b1 - cu_b
     le = tl.maximum(ctx_b - qlen + n + 1, 0)
-    # Rows beyond the real total ? (cu[B]) are FLAT tail-padding -- force an empty
+    # Rows beyond the real total (cu[B]) are FLAT tail-padding -- force an empty
     # window so the mqa kernel / top_k skip them (used when `total_q` is the padded
     # count, e.g. the CUDAGraph decode path scores all padded rows in one shot).
     real_total = tl.load(cu_ptr + B)

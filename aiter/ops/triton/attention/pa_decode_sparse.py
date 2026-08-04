@@ -306,7 +306,7 @@ def pa_decode_sparse(
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
 
-    # One reduce CTA per head. For small per-rank H (TP=8 -> H ? {8, 16}) this
+    # One reduce CTA per head. For small per-rank H (TP=8 -> H in {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
     # latency. tl.arange(0, 1) is a valid power-of-2 range.
