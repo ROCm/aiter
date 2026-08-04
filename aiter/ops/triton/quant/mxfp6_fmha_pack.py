@@ -585,6 +585,90 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_N": 16}, num_warps=1),
+            triton.Config({"BLOCK_N": 32}, num_warps=1),
+            triton.Config({"BLOCK_N": 64}, num_warps=1),
+            triton.Config({"BLOCK_N": 128}, num_warps=2),
+        ],
+        key=["n_blocks"],
+    )
+    @triton.jit
+    def _pack_k_fp6_lds_direct_kernel(
+        x_ptr,  # float K [b, sk, h, 128]
+        buf_ptr,  # uint8 final K backing buffer [b, h, nt, 17408]
+        scale_ptr,  # uint8 dense scale [b, sk, h, 4]
+        cperm_ptr,  # int32 [32] field->source-element permutation
+        scatter_ptr,  # int32 [12288] token-major source byte->compact destination byte
+        SK,
+        H,
+        NT,
+        n_blocks,
+        TILE_BYTES: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        blk = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+        m = blk < n_blocks
+        block_in_row = blk & 3
+        padded_row = blk >> 2
+        token = padded_row % (NT * 128)
+        bh = padded_row // (NT * 128)
+        hidx = bh % H
+        bidx = bh // H
+        valid_token = token < SK
+
+        f = tl.arange(0, 32)
+        cp = tl.load(cperm_ptr + f)
+        elem = block_in_row[:, None] * 32 + cp[None, :]
+        xoff = ((bidx[:, None] * SK + token[:, None]) * H + hidx[:, None]) * 128 + elem
+        vals = tl.load(x_ptr + xoff, mask=m[:, None] & valid_token[:, None], other=0.0).to(tl.float32)
+
+        amax = tl.max(tl.abs(vals), axis=1)
+        bits = amax.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        E = tl.where(amax == 0.0, 0, exp - 129)
+        y = vals * tl.exp2((-E).to(tl.float32))[:, None]
+        mag = tl.minimum(tl.abs(y), 7.5)
+        magbits = mag.to(tl.int32, bitcast=True)
+        bits_r = magbits + 0x7FFFF + ((magbits >> 20) & 1)
+        exp2 = ((bits_r >> 23) & 0xFF) - 126
+        code_norm = (exp2 << 3) | ((bits_r >> 20) & 7)
+        t8 = mag * 8.0
+        fl = tl.floor(t8)
+        fli = fl.to(tl.int32)
+        frac = t8 - fl
+        up = (frac > 0.5) | ((frac == 0.5) & ((fli & 1) == 1))
+        code_sub = fli + up.to(tl.int32)
+        chosen = tl.where(mag >= 1.0, code_norm, code_sub)
+        chosen = tl.minimum(tl.maximum(chosen, 0), 31)
+        sign = (y.to(tl.int32, bitcast=True) < 0).to(tl.int32) * 32
+        codes = chosen | sign
+
+        cf = codes.reshape(BLOCK_N, 8, 4)
+        w = (1 << (6 * tl.arange(0, 4))).to(tl.int32)
+        u = tl.sum(cf * w[None, None, :], axis=2)
+        bytes0 = (u & 0xFF).to(tl.uint8)
+        bytes1 = ((u >> 8) & 0xFF).to(tl.uint8)
+        bytes2 = ((u >> 16) & 0xFF).to(tl.uint8)
+
+        byte_group = tl.arange(0, 8)
+        source_base = (token % 128) * 96 + block_in_row * 24
+        source0 = source_base[:, None] + byte_group[None, :] * 3
+        tile = token // 128
+        dest_base = bh * (NT * TILE_BYTES) + tile * TILE_BYTES
+        dest0 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 0)
+        dest1 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 1)
+        dest2 = dest_base[:, None] + tl.load(scatter_ptr + source0 + 2)
+        tl.store(buf_ptr + dest0, bytes0, mask=m[:, None])
+        tl.store(buf_ptr + dest1, bytes1, mask=m[:, None])
+        tl.store(buf_ptr + dest2, bytes2, mask=m[:, None])
+
+        scale_off = ((bidx * SK + token) * H + hidx) * 4 + block_in_row
+        scale_byte = ((E + 127) & 0xFF).to(tl.uint8)
+        tl.store(scale_ptr + scale_off, scale_byte, mask=m & valid_token)
+
     @triton.jit
     def _gather_k_lds_kernel(
         packed_ptr,  # uint8 packed K [b, sk, h, 96] flattened (contiguous)
@@ -662,6 +746,21 @@ def _qk_field_perm_dev(device):
         cperm = torch.from_numpy(_qk_field_perm()).to(device)
         _QK_FIELD_PERM_CACHE[device] = cperm
     return cperm
+
+
+_K_LDS_SCATTER_CACHE: dict = {}
+
+
+def _k_lds_scatter_index(device):
+    """Cached inverse of the compact K gather: token-major source byte -> final data byte."""
+    scatter = _K_LDS_SCATTER_CACHE.get(device)
+    if scatter is None:
+        gather = _k_lds_order_gather_index()
+        inverse = np.empty_like(gather, dtype=np.int32)
+        inverse[gather] = np.arange(gather.size, dtype=np.int32)
+        scatter = torch.from_numpy(inverse).to(device)
+        _K_LDS_SCATTER_CACHE[device] = scatter
+    return scatter
 
 
 def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
@@ -756,16 +855,21 @@ def _k_lds_src_within(nt: int, total: int, h: int, device):
     return g
 
 
-def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
-    """GPU pack of K into the kernel-ready LDS-order fp6 view WITH the E8M0 K-scale packed in the
+def reorder_fp6_k_lds_order_triton(
+    packed: "torch.Tensor",
+    scale: "torch.Tensor",
+    tile: int = 128,
+    return_raw: bool = False,
+):
+    """Reorder dense packed K into the kernel-ready LDS-order view WITH E8M0 scales in the
     per-tile tail. Each 128-token tile retains its 17408B global ABI: 12288B compact chunk-major
     fp6 K data + a 4096B unused hole + a 1024B lane-major K-scale image. The kernel loads the
     scale straight from the K buffer tail (coalesced buffer_load lds:1), so there is no separate
-    K-scale global-load stream. Runs the pack + gather + tail-fill entirely on-device. Supports
-    S % tile != 0 (the gather's valid mask zeroes the partial tail tile, which the kernel masks in
-    softmax).
+    K-scale global-load stream. Supports S % tile != 0 (the gather's valid mask zeroes the partial
+    tail tile, which the kernel masks in softmax).
 
-    k_thd : float K [b, sk, h, 128] on GPU.
+    packed : dense uint8 fp6 K [b, sk, h, 96] on GPU.
+    scale : dense uint8 E8M0 K scales [b, sk, h, 4] on GPU.
     Returns (k_view uint8 [b, sk, h, 96] strided (seq stride 136) over a [b,h,n_tiles*17408]
              buffer, scale uint8 [b, sk, h, 4]). `scale` only satisfies the k_descale ABI arg --
              the kernel reads scales from the K tail, not this tensor.
@@ -775,16 +879,20 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     tensor (dropping the seq-stride-136 LDS layout -> garbage). The caller rebuilds
     k_view = buf.as_strided((b, sk, h, 96), (h*nt*17408, 136, nt*17408, 1)) OUTSIDE the op."""
     assert _HAVE_TRITON, "triton/torch unavailable"
-    b, sk, h, d = k_thd.shape
-    assert d == 128 and tile == 128, (d, sk, tile)
+    b, sk, h, packed_d = packed.shape
+    assert packed_d == _K_PACKED_ROW_BYTES and tile == 128, (packed_d, sk, tile)
+    assert scale.shape == (b, sk, h, 4), scale.shape
+    assert packed.dtype == torch.uint8 and scale.dtype == torch.uint8, (packed.dtype, scale.dtype)
+    assert packed.device == scale.device, (packed.device, scale.device)
+    packed = packed.contiguous()
+    scale = scale.contiguous()
     nt = (sk + tile - 1) // tile  # ceil; partial tail handled by the valid mask
-    packed, scale = quantize_fp6_lastdim_triton(k_thd)  # [b,sk,h,96], [b,sk,h,4]
     total = sk * 96
     # Fused on-device LDS reorder: a single Triton gather (read `packed` via the cached
     # source offset, apply the valid mask, write the buffer) replaces the torch chain of
     # permute+contiguous / advanced-index gather / masked_fill / buffer-copy (~4 full-size
     # passes -> 1 gathered read + 1 write; ~1.35x faster on the K reorder at long seq).
-    srcw, valid8 = _k_lds_src_within(nt, total, h, k_thd.device)
+    srcw, valid8 = _k_lds_src_within(nt, total, h, packed.device)
     # Each 128-token tile remains 17408B: 12288B compact fp6 K data, a 4096B unused hole, then the
     # 1024B lane-major E8M0 K-scale tail.
     # The kernel loads that scale image with a coalesced buffer_load lds:1 straight from the K
@@ -793,7 +901,7 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     k_tile_bytes = _K_TILE_BYTES
     k_hs = nt * k_tile_bytes
     k_bs = h * k_hs
-    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k_thd.device)
+    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=packed.device)
     BLOCK = 1024
     data_hs = nt * _K_COMPACT_DATA_BYTES
     assert data_hs % BLOCK == 0, (data_hs, BLOCK)
@@ -837,6 +945,96 @@ def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, retu
     if return_raw:
         return buf, sbuf
     scale = sbuf[: sflat.numel()].view(b, sk, h, 4)
+    return k_view, scale
+
+
+def quantize_fp6_k_lds_order_triton(k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False):
+    """Quantize float K and reorder it into the kernel-ready LDS-order fp6 view.
+
+    Use ``quantize_fp6_lastdim_triton`` followed by ``reorder_fp6_k_lds_order_triton`` when dense
+    quantization should be scheduled independently from the kernel-specific LDS layout conversion.
+    """
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    packed, scale = quantize_fp6_lastdim_triton(k_thd)
+    return reorder_fp6_k_lds_order_triton(packed, scale, tile=tile, return_raw=return_raw)
+
+
+def quantize_fp6_k_lds_order_direct_triton(
+    k_thd: "torch.Tensor", tile: int = 128, return_raw: bool = False
+):
+    """Quantize K directly into the kernel-ready compact LDS-order backing buffer.
+
+    This removes the dense ``[b, sk, h, 96]`` packed intermediate and the subsequent full-size
+    gather. The proven scale-tail fill remains separate because its shifted duplicate crosses tile
+    boundaries.
+    """
+    assert _HAVE_TRITON, "triton/torch unavailable"
+    b, sk, h, d = k_thd.shape
+    assert d == 128 and tile == 128, (d, sk, tile)
+    k = k_thd.contiguous()
+    nt = (sk + tile - 1) // tile
+    k_hs = nt * _K_TILE_BYTES
+    k_bs = h * k_hs
+    buf = torch.empty(b * k_bs + 256, dtype=torch.uint8, device=k.device)
+    scale = torch.empty((b, sk, h, 4), dtype=torch.uint8, device=k.device)
+    cperm = _qk_field_perm_dev(k.device)
+    scatter = _k_lds_scatter_index(k.device)
+    n_blocks = b * h * nt * tile * 4
+    grid = lambda meta: (triton.cdiv(n_blocks, meta["BLOCK_N"]),)  # noqa: E731
+    _pack_k_fp6_lds_direct_kernel[grid](
+        k,
+        buf,
+        scale,
+        cperm,
+        scatter,
+        sk,
+        h,
+        nt,
+        n_blocks,
+        TILE_BYTES=_K_TILE_BYTES,
+    )
+    _fill_k_scale_tail_kernel[(b * h * nt,)](
+        scale.reshape(-1),
+        buf,
+        sk,
+        h,
+        nt,
+        TILE_BYTES=_K_TILE_BYTES,
+        SCALE_TAIL_OFFSET=_K_SCALE_TAIL_OFFSET,
+        BLOCK=1024,
+        num_warps=4,
+    )
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    sflat = scale.reshape(-1)
+    sbuf = torch.empty(sflat.numel() + 64, dtype=torch.uint8, device=k.device)
+    sbuf[: sflat.numel()] = sflat
+    if return_raw:
+        return buf, sbuf
+    return k_view, sbuf[: sflat.numel()].view_as(scale)
+
+
+def fp6_k_lds_order_views_from_raw(
+    buf: "torch.Tensor",
+    sbuf: "torch.Tensor",
+    b: int,
+    sk: int,
+    h: int,
+    tile: int = 128,
+):
+    """Rebuild the mxfp6 kernel ABI views from contiguous direct-packer buffers."""
+    assert tile == 128, tile
+    nt = (sk + tile - 1) // tile
+    k_hs = nt * _K_TILE_BYTES
+    k_bs = h * k_hs
+    k_view = buf.as_strided(
+        (b, sk, h, _K_PACKED_ROW_BYTES),
+        (k_bs, _K_SEQ_STRIDE_BYTES, k_hs, 1),
+    )
+    scale = sbuf[: b * sk * h * 4].view(b, sk, h, 4)
     return k_view, scale
 
 

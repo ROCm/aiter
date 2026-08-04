@@ -15,6 +15,11 @@ void rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
 void rotate_activation(aiter_tensor_t& out,
                        const aiter_tensor_t& input);
 
+void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
+                                   aiter_tensor_t& scale,
+                                   const aiter_tensor_t& input,
+                                   float multiplier);
+
 void rope_rotate_activation_fp4quant_inplace(aiter_tensor_t& out,
                                             const aiter_tensor_t& input,
                                             const aiter_tensor_t& cos,

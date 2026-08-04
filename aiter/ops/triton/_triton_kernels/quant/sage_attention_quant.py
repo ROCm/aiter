@@ -172,6 +172,67 @@ def sage_quant_v_kernel(
 
 
 @triton.jit
+def sage_quant_v_amax_partial_kernel(
+    V_Input,
+    Partial_Max,
+    stride_vb,
+    stride_vs,
+    stride_vh,
+    stride_vd,
+    SEQLEN_K,
+    K_HEAD,
+    NUM_SEQ_BLKS,
+    D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    seq_blk = pid % NUM_SEQ_BLKS
+    bh = pid // NUM_SEQ_BLKS
+    off_h = bh % K_HEAD
+    off_b = bh // K_HEAD
+    offs_k = seq_blk * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, D)
+    offsets = (
+        off_b * stride_vb
+        + offs_k[:, None] * stride_vs
+        + off_h * stride_vh
+        + offs_d[None, :] * stride_vd
+    )
+    values = tl.load(
+        V_Input + offsets,
+        mask=offs_k[:, None] < SEQLEN_K,
+        other=0.0,
+    ).to(tl.float32)
+    partial = tl.max(tl.abs(values), axis=0)
+    out = (bh * NUM_SEQ_BLKS + seq_blk) * D + offs_d
+    tl.store(Partial_Max + out, partial)
+
+
+@triton.jit
+def sage_quant_v_amax_finalize_kernel(
+    Partial_Max,
+    V_Scale,
+    NUM_SEQ_BLKS,
+    D: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_d = tl.program_id(0)
+    bh = tl.program_id(1)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offsets = (bh * NUM_SEQ_BLKS + offs_n[:, None]) * D + offs_d[None, :]
+    partial = tl.load(
+        Partial_Max + offsets,
+        mask=(offs_n[:, None] < NUM_SEQ_BLKS) & (offs_d[None, :] < D),
+        other=0.0,
+    )
+    scale = tl.max(partial, axis=0) * (1.0 / FP8_MAX)
+    tl.store(V_Scale + bh * D + offs_d, scale, mask=offs_d < D)
+
+
+@triton.jit
 def _e2m1_code(y):
     """E2M1 (fp4) nearest encode, ties toward lower magnitude (== numpy argmin
     first-min): idx = #{grid midpoints strictly below |y|}; sign bit = 8. The grid is

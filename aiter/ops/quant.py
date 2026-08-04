@@ -1080,6 +1080,17 @@ def rotate_activation(
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
+def rotate_activation_mxfp6_quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    multiplier: float,
+) -> None:
+    """Apply hd128 Walsh-Hadamard rotation and pack directly to MXFP6 E2M3."""
+    ...
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
 def rope_rotate_activation_fp4quant_inplace(
     out: torch.Tensor,
     input: torch.Tensor,
