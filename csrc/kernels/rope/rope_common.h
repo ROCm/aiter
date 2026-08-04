@@ -8138,7 +8138,11 @@ void fused_mrope_rms_set_kv(const T* qkv,
                             int64_t rotary_dim       = 0,
                             int64_t k_block_stride   = 0,
                             int64_t v_block_stride   = 0,
-                            bool gemma_norm          = false)
+                            bool gemma_norm          = false,
+                            int64_t k_token_stride   = 0,
+                            int64_t k_head_stride    = 0,
+                            int64_t v_token_stride   = 0,
+                            int64_t v_head_stride    = 0)
 {
     AITER_CHECK(head_size == 64 || head_size == 128 || head_size == 256);
     auto dim           = std::accumulate(mrope_section.begin(), mrope_section.end(), 0);
@@ -8187,7 +8191,11 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         (int)rotary_dim,             \
                                                         k_block_stride,              \
                                                         v_block_stride,              \
-                                                        gemma_norm);                 \
+                                                        gemma_norm,                  \
+                                                        k_token_stride,              \
+                                                        k_head_stride,               \
+                                                        v_token_stride,              \
+                                                        v_head_stride);              \
     }                                                                                \
     else                                                                             \
     {                                                                                \
@@ -8220,7 +8228,11 @@ void fused_mrope_rms_set_kv(const T* qkv,
                                                         (int)rotary_dim,             \
                                                         k_block_stride,              \
                                                         v_block_stride,              \
-                                                        gemma_norm);                 \
+                                                        gemma_norm,                  \
+                                                        k_token_stride,              \
+                                                        k_head_stride,               \
+                                                        v_token_stride,              \
+                                                        v_head_stride);              \
     }
 
     if(is_interleaved)
