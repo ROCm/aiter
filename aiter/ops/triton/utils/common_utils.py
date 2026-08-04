@@ -42,32 +42,3 @@ def serialize_dict(d: dict) -> str:
 
 def deserialize_str(s: str) -> dict:
     return json.loads(s)
-
-
-def strip_annotate(cls):
-    """Neutralize ``__annotate__`` so Triton's aggregate hash walker skips it.
-
-    Triton's ``@aggregate`` builds ``hash_attrs`` from ``inspect.getmembers``.
-    On Python 3.14 (PEP 649) that yields the compiler-generated annotate
-    function, and the JIT's ``record_reference`` rejects it with
-    "Unsupported function referenced". Apply *below* ``@aggregate`` so it runs
-    first (decorators apply bottom-up)::
-
-        @aggregate
-        @strip_annotate
-        class MyLoader:
-            field: gl.constexpr
-
-    Reading ``__annotations__`` first materializes and caches a real dict, so
-    ``_aggregate``'s runtime ``isinstance(value, cls.__annotations__[name])``
-    field checks keep working; setting ``__annotate__`` to None then makes
-    ``inspect.isfunction()`` False (and clears ``__annotate_func__``, the name
-    ``getmembers`` actually yields). No-op on Python < 3.14.
-
-    Fixed upstream in triton-lang/triton main (PR #9529 excludes
-    ``__annotate__``; a follow-up excludes ``__annotate_func__``), but NOT in
-    any 3.7.x release. Remove once Triton carries both.
-    """
-    _ = cls.__annotations__
-    cls.__annotate__ = None
-    return cls
