@@ -147,7 +147,7 @@ jobs:
                 filter="linux-aiter-oci-mi300x-1,linux-aiter-oci-mi300x-2,linux-aiter-oci-mi300x-4,linux-aiter-oci-mi300x-8,linux-aiter-oci-mi300x-1,linux-aiter-oci-mi300x-8"
                 ;;
               gfx950)
-                filter="linux-aiter-mi35x-1,linux-aiter-mi35x-8,linux-aiter-mi355-1,linux-aiter-mi355-8"
+                filter="linux-aiter-quality-do-mi350x-1,linux-aiter-quality-do-mi350x-8,linux-aiter-quality-do-mi350x-1,linux-aiter-quality-do-mi350x-8"
                 ;;
               *)
                 filter=""
