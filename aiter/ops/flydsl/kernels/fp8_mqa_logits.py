@@ -608,7 +608,7 @@ def _build_kernel_mfma_r_w(
         )
         # Collapse an empty union window to a zero-width one at tile_start.
         # ``ends`` is clamped above by seq_len_kv but not below, so a row whose
-        # cu_ends is negative or any row with cu_ends <= cu_starts 
+        # cu_ends is negative or any row with cu_ends <= cu_starts
         # can leave tile_end < tile_start.
         tile_end = arith.maxsi(tile_end, tile_start)
 
@@ -856,6 +856,14 @@ def _build_kernel_mfma_lds_pipe(
         f"MR_BLOCK_THREADS*DMA_BYTES={MR_BLOCK_THREADS * DMA_BYTES}"
     )
     NUM_ASYNC_LOADS = SLOT_BYTES // (MR_BLOCK_THREADS * DMA_BYTES)
+    # vmcnt to leave outstanding at the top of each tile: the DMAs of the
+    # PREFETCH_DEPTH-1 tiles queued behind the one about to be read.
+    _WAIT_VMCNT = (PREFETCH_DEPTH - 1) * NUM_ASYNC_LOADS
+    assert _WAIT_VMCNT <= 63, (
+        f"prefetch_depth={PREFETCH_DEPTH} x {NUM_ASYNC_LOADS} DMAs/tile needs "
+        f"vmcnt={_WAIT_VMCNT}, past the 63 the gfx9 encoding holds; "
+        "lower prefetch_depth or block_kv, or raise waves_per_block"
+    )
 
     # XOR swizzle (bank-conflict avoidance), aligned with the Gluon reference's
     # padded+swizzled shared K layout.  The slot stores [BKV, D] fp8 HEAD_SIZE-
@@ -1108,8 +1116,12 @@ def _build_kernel_mfma_lds_pipe(
 
             # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
             # i.e. the current tile is complete; then sync so every wave sees the
-            # full LDS tile.
-            rocdl.s_waitcnt((PREFETCH_DEPTH - 1) * NUM_ASYNC_LOADS)
+            # full LDS tile. Must be the keyword form: the positional argument is
+            # a raw gfx9 bitfield in which vmcnt is split across bits [3:0] and
+            # [15:14], so passing the count directly silently degrades to
+            # vmcnt(0) (plus a stray expcnt) once it reaches 16 -- which is
+            # exactly what the bkv256 variants hit, disabling their pipeline.
+            rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
             gpu.barrier()
 
             # Read all B-frags for this tile from LDS into registers.  Hoisting
