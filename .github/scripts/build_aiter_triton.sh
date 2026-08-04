@@ -56,8 +56,8 @@ echo "##################################################################"
 pip uninstall -y triton triton-kernels pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
 # Pin triton to a known commit so the build is reproducible.
-# Commit from June 24th, 2026 - [CI] Upgrade AMD CI to PyTorch 2.10 (#10625)
-TRITON_COMMIT='7917e3f62f17d4329b81c29e74d0bc6b8a9963c8'
+# Commit from August 4th, 2026 - [Examples][gluon] Cleanup attention example (#10255)
+TRITON_COMMIT='478af922627ad13318ed5a1fc329fd8140bac2b6'
 echo "[experiment] Target TRITON_COMMIT=${TRITON_COMMIT}"
 
 # Network in CI is flaky and a full clone of triton routinely times out
