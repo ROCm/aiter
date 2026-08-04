@@ -420,7 +420,10 @@ def launch_gemm_a8w4_tdm(
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
             # 5. B0/SB0/SA0 + A0 retired; only B1/SB1/SA1 may stay pending.
-            rocdl.s_wait_dscnt(BS_DS_PHYS)
+            # AITER_TDM_WIDE_WAIT: 0 = conservative full wait (isolates whether
+            # the partial wait is what breaks correctness), else the planned 12.
+            _pw = int(os.environ.get("AITER_TDM_WIDE_WAIT", BS_DS_PHYS))
+            rocdl.s_wait_dscnt(_pw)
             a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1))      # 6. all A1: DScnt 12 -> 28
                   for wm in range_constexpr(wmma_m_rep)]
             # load_b_and_scales gives (wt, sb_k, sa_k); mma_rows wants sa 4th and
