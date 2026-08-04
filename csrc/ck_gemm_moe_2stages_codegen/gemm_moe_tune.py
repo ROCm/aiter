@@ -10,11 +10,6 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from aiter.ops.flydsl.activation import (
-    DEFAULT_SITUV2_BETA,
-    DEFAULT_SITUV2_LINEAR_BETA,
-    get_flydsl_activation_name,
-)
 from einops import rearrange
 
 import aiter
@@ -123,6 +118,7 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.

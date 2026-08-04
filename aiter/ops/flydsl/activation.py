@@ -3,7 +3,6 @@
 
 from aiter import ActivationType
 
-
 DEFAULT_SITUV2_BETA = 4.0
 DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
@@ -18,4 +17,6 @@ def get_flydsl_activation_name(activation) -> str:
     try:
         return _FLYDSL_ACTIVATION_NAMES[activation]
     except KeyError as error:
-        raise ValueError(f"Unsupported FlyDSL MoE activation: {activation!r}") from error
+        raise ValueError(
+            f"Unsupported FlyDSL MoE activation: {activation!r}"
+        ) from error
