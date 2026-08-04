@@ -126,6 +126,17 @@ def test_shipped_gfx950_gate():
     assert gate.excluded_rows == frozenset({2})
 
 
+def test_shipped_gfx942_gate():
+    """Same pin for gfx942, set from the MI300X sweep. Narrower in rows than gfx950
+    because that arch runs the frozen kernel config, wider in k because all four
+    AOT-precompiled values measured alike."""
+    gate = topk_mod._FLYDSL_TOPK_DECODE_GATES["gfx942"]
+    assert gate.min_width == 131072
+    assert gate.max_rows == 8
+    assert gate.ks == frozenset({256, 512, 1024, 2048})
+    assert gate.excluded_rows == frozenset()
+
+
 def test_unlisted_arch_falls_back(gates, monkeypatch):
     monkeypatch.setattr(topk_mod, "get_gfx", lambda: "gfx1100")
     assert routed() is False
@@ -200,7 +211,7 @@ def make_inputs(rows: int, width: int, seq_len: int, k: int, seed: int = 0):
         (16, 65536, 65536, 512),
         (17, 65536, 65536, 512),  # one over the row cap -> HIP
         (1, 65536, 65536, 2048),
-        (1, 65536, 65536, 1024),  # k outside the set -> HIP
+        (1, 65536, 65536, 1024),  # outside every arch's window -> HIP
         (4, 131072, 70000, 512),  # padded buffer, poisoned tail
         (1, 8192, 8192, 512),
     ],
