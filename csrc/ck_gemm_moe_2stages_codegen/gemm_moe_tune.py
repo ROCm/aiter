@@ -5433,19 +5433,55 @@ class GroupedFmoeTuner(FmoeTuner):
     def _data_format(self, q_dtype_a: str) -> str:
         return "fp4" if ("fp4x2" in q_dtype_a or "float4" in q_dtype_a) else "a8w4"
 
+    @staticmethod
+    def _row_ep(row) -> int:
+        """EP degree for this untuned row (1 == non-EP dense). Tolerates a missing
+        or blank/NaN ``ep`` column so legacy dense untuned files keep working."""
+        ep_raw = row.get("ep") if hasattr(row, "get") else None
+        if ep_raw is None or (isinstance(ep_raw, str) and ep_raw.strip() == ""):
+            return 1
+        try:
+            if pd.isna(ep_raw):
+                return 1
+        except (TypeError, ValueError):
+            pass
+        try:
+            return max(1, int(ep_raw))
+        except (TypeError, ValueError):
+            return 1
+
     def _candidate_row(self, row, tile_m: int):
+        from aiter.ops.flydsl.grouped_moe_gfx1250 import _get_padded_m
+
         token = int(row["token"])
         expert = int(row["expert"])
         topk = int(row["topk"])
+        ep = self._row_ep(row)
         q_dtype_a = str(row["q_dtype_a"])
         gate_mode = str(row.get("gate_mode", "GateMode.SEPARATED"))
         layout = "gugu" if gate_mode.endswith("INTERLEAVE") else "gguu"
-        max_m_raw = (token * topk + expert - 1) // expert
-        max_m = max(tile_m, ((max_m_raw + tile_m - 1) // tile_m) * tile_m)
         data_format = self._data_format(q_dtype_a)
         n_warp = 4
+        if ep > 1:
+            # EP: `token` is the GLOBAL token count. The grouped path keys its
+            # config on padded(trim_M) with topk=-1 (topk/ep are not stable EP
+            # tuning keys), and the fused_moe input buffer has trim_M rows. Emit
+            # the tuned row under those exact keys so the EP lookup matches and
+            # no manual topk=-1 duplication is needed.
+            graph_bs = token // ep
+            trim_M = graph_bs * topk * ep
+            out_token = _get_padded_m(trim_M)
+            out_topk = -1
+            max_m_raw = (trim_M + expert - 1) // expert
+        else:
+            out_token = token
+            out_topk = topk
+            max_m_raw = (token * topk + expert - 1) // expert
+        max_m = max(tile_m, ((max_m_raw + tile_m - 1) // tile_m) * tile_m)
         return {
             **{k: row[k] for k in self.keys if k in row},
+            "token": out_token,
+            "topk": out_topk,
             "gate_mode": gate_mode,
             "max_m": max_m,
             "tile_m": tile_m,
@@ -5472,7 +5508,10 @@ class GroupedFmoeTuner(FmoeTuner):
         rk = torch.arange(topk, device="cuda").view(1, topk)
         ids = ((tok * topk + rk) % experts).to(torch.int32)
         weights = torch.full((token_num, topk), 1.0 / topk, device="cuda")
-        return ids, weights.to(torch.bfloat16)
+        # moe_sorting (incl. the opus path) requires FP32 topk_weights; the real
+        # fused_moe EP path also feeds FP32 here. Casting to bf16 tripped
+        # moe_sorting_opus_kernels.cu:32 ("topk_weights must be FP32").
+        return ids, weights.to(torch.float32)
 
     @staticmethod
     def _full_scale(experts: int, rows: int, k_blocks: int):
@@ -5488,18 +5527,66 @@ class GroupedFmoeTuner(FmoeTuner):
         inter_dim = int(row["inter_dim"])
         experts = int(row["expert"])
         topk = int(row["topk"])
+        ep = self._row_ep(row)
         data_format = self._data_format(str(row["q_dtype_a"]))
         gen = torch.Generator(device="cpu").manual_seed(0)
-        hidden = (
-            torch.randn(
-                (token, model_dim),
-                generator=gen,
-                dtype=torch.bfloat16,
-                device="cpu",
+        expert_mask = None
+        num_local_tokens = None
+        if ep > 1:
+            # Faithful MORI-dispatch model (mirrors op_tests/test_moe_ep.py
+            # test_fmoe_ep_mxfp4 real mode): `token` is the GLOBAL token count.
+            # `experts` is the LOCAL expert count on this rank (E_global/ep). Build
+            # the trim_M dispatch buffer where only total_recv rows are valid, the
+            # rest is padding, and expert_mask filters non-local experts. This is
+            # what fixes the dense/sparse mismatch that made dense-tuned tile_m
+            # regress on real EP shapes.
+            E_global = experts * ep
+            ep_id = ep - 1
+            graph_bs = token // ep
+            n_src = graph_bs * ep
+            trim_M = graph_bs * topk * ep
+            expert_mask = torch.zeros((E_global + 1,), dtype=dtypes.i32, device="cuda")
+            expert_mask[ep_id * experts : (ep_id + 1) * experts] = 1
+            torch.manual_seed(0)
+            src_input = (
+                torch.randn((n_src, model_dim), dtype=torch.bfloat16, device="cuda")
+                / 10
             )
-            / 10
-        ).cuda()
-        topk_ids, topk_weight = self._balanced_topk(token, topk, experts)
+            src_score = torch.randn(
+                (n_src, E_global), dtype=torch.bfloat16, device="cuda"
+            )
+            src_topk_ids = torch.empty((n_src, topk), dtype=dtypes.i32, device="cuda")
+            src_topk_weights = torch.empty(
+                (n_src, topk), dtype=dtypes.fp32, device="cuda"
+            )
+            fused_topk(src_input, src_score, topk, True, src_topk_ids, src_topk_weights)
+            recv_mask = expert_mask[src_topk_ids.long()].bool().any(dim=1)
+            recv_input = src_input[recv_mask].contiguous()
+            recv_topk_ids = src_topk_ids[recv_mask].contiguous()
+            recv_topk_weights = src_topk_weights[recv_mask].contiguous()
+            total_recv = min(int(recv_input.shape[0]), trim_M)
+            hidden = torch.zeros(
+                (trim_M, model_dim), dtype=torch.bfloat16, device="cuda"
+            )
+            hidden[:total_recv] = recv_input[:total_recv]
+            topk_ids = torch.zeros((trim_M, topk), dtype=dtypes.i32, device="cuda")
+            topk_ids[:total_recv] = recv_topk_ids[:total_recv]
+            topk_weight = torch.zeros((trim_M, topk), dtype=dtypes.fp32, device="cuda")
+            topk_weight[:total_recv] = recv_topk_weights[:total_recv]
+            num_local_tokens = torch.tensor(
+                [total_recv], dtype=dtypes.i32, device="cuda"
+            )
+        else:
+            hidden = (
+                torch.randn(
+                    (token, model_dim),
+                    generator=gen,
+                    dtype=torch.bfloat16,
+                    device="cpu",
+                )
+                / 10
+            ).cuda()
+            topk_ids, topk_weight = self._balanced_topk(token, topk, experts)
         w1 = torch.randint(
             0,
             256,
@@ -5541,7 +5628,17 @@ class GroupedFmoeTuner(FmoeTuner):
             tile_k=int(candidate["tile_k"]),
             device=hidden.device,
         )
-        return hidden, w1_arg, w2_arg, topk_weight, topk_ids, w1_scale, w2_scale
+        return (
+            hidden,
+            w1_arg,
+            w2_arg,
+            topk_weight,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+            expert_mask,
+            num_local_tokens,
+        )
 
     def _write_candidate_config(self, candidate):
         # delete=False on purpose: the path outlives the handle.
@@ -5591,7 +5688,14 @@ class GroupedFmoeTuner(FmoeTuner):
                 else GateMode.SEPARATED
             )
 
+            expert_mask = case[7] if len(case) > 7 else None
+            num_local_tokens = case[8] if len(case) > 8 else None
+
             def _call():
+                extra = {}
+                if expert_mask is not None:
+                    extra["expert_mask"] = expert_mask
+                    extra["num_local_tokens"] = num_local_tokens
                 return fused_moe(
                     case[0],
                     case[1],
@@ -5604,6 +5708,7 @@ class GroupedFmoeTuner(FmoeTuner):
                     w2_scale=case[6],
                     dtype=torch.bfloat16,
                     gate_mode=gate_mode.value,
+                    **extra,
                 )
 
             _call()
