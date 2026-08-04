@@ -4,6 +4,7 @@
 """Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
 
 import math
+import os
 from collections import namedtuple
 
 import flydsl.compiler as flyc
@@ -25,6 +26,33 @@ from .quant_utils import emit_amax_e8m0_recip, emit_cvt_pk4_fp8_f32
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 TDM_DESCRIPTOR_VERSION = 1
+
+
+def _waves_per_eu_value_attrs():
+    """Build the LLVM occupancy attribute from AITER_TDM_WAVES_PER_EU.
+
+    A single value locks min=max; use 0/off/none to leave occupancy uncapped.
+    """
+    raw = os.environ.get("AITER_TDM_WAVES_PER_EU", "1,1").strip()
+    if raw.lower() in ("", "0", "off", "none"):
+        return {}
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) == 1:
+        parts *= 2
+    if len(parts) != 2:
+        raise ValueError(
+            "AITER_TDM_WAVES_PER_EU must be N, min,max, or 0/off/none"
+        )
+    minimum, maximum = (int(part) for part in parts)
+    if minimum < 1 or maximum < minimum:
+        raise ValueError(
+            "AITER_TDM_WAVES_PER_EU requires 1 <= min <= max"
+        )
+    return {
+        "passthrough": [
+            ["amdgpu-waves-per-eu", f"{minimum},{maximum}"],
+        ],
+    }
 
 
 @flyc.jit
@@ -506,7 +534,20 @@ def launch_gemm_a8w4_tdm(
 
     m_tiles = (i32_m + (tile_m - 1)) // tile_m
     n_tiles = (N + (tile_n - 1)) // tile_n
-    kernel(arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map, arg_bias, arg_quant_scale, i32_m, N, f32_swiglu_limit).launch(
+    kernel(
+        arg_c,
+        arg_a,
+        arg_b,
+        arg_scale_a,
+        arg_scale_b,
+        arg_m_tile_map,
+        arg_bias,
+        arg_quant_scale,
+        i32_m,
+        N,
+        f32_swiglu_limit,
+        value_attrs=_waves_per_eu_value_attrs(),
+    ).launch(
         grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream
     )
 
