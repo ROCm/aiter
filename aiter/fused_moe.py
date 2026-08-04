@@ -486,6 +486,14 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: torch.Tensor | None = None,
 ):
     if (
         any(
@@ -554,6 +562,14 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        ep_scatter=ep_scatter,
+        ep_arena_handle=ep_arena_handle,
+        ep_comb_inp_off=ep_comb_inp_off,
+        ep_wire_nbytes=ep_wire_nbytes,
+        ep_rank=ep_rank,
+        ep_max_tok=ep_max_tok,
+        ep_topk=ep_topk,
+        ep_tis=ep_tis,
     )
 
 
@@ -621,6 +637,14 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -648,6 +672,14 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        ep_scatter=ep_scatter,
+        ep_arena_handle=ep_arena_handle,
+        ep_comb_inp_off=ep_comb_inp_off,
+        ep_wire_nbytes=ep_wire_nbytes,
+        ep_rank=ep_rank,
+        ep_max_tok=ep_max_tok,
+        ep_topk=ep_topk,
+        ep_tis=ep_tis,
     )
 
 
@@ -677,6 +709,14 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    ep_scatter: bool = False,
+    ep_arena_handle: int = 0,
+    ep_comb_inp_off: int = 0,
+    ep_wire_nbytes: int = 0,
+    ep_rank: int = 0,
+    ep_max_tok: int = 0,
+    ep_topk: int = 0,
+    ep_tis: torch.Tensor | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -799,6 +839,14 @@ def _fused_moe_impl(
                 num_local_tokens=num_local_tokens,
                 situ_beta=1.0 if beta is None else float(beta),
                 situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
+                ep_scatter=ep_scatter,
+                ep_arena_handle=ep_arena_handle,
+                ep_comb_inp_off=ep_comb_inp_off,
+                ep_wire_nbytes=ep_wire_nbytes,
+                ep_rank=ep_rank,
+                ep_max_tok=ep_max_tok,
+                ep_topk=ep_topk,
+                ep_tis=ep_tis,
             )
 
     if grouped_a8w4_out is not None:
