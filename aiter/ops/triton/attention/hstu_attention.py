@@ -96,7 +96,7 @@ def triton_hstu_attention_fwd(
         )
 
     grid = lambda meta: (
-        triton.cdiv(N, meta["BLOCK_M"]) *
+        triton.cdiv(N, meta["BLOCK_M"]),
         Z * H,
     )
 
@@ -117,7 +117,7 @@ def triton_hstu_attention_fwd(
         stride_om=out.stride(0),
         stride_oh=out.stride(1),
         alpha=alpha,
-        Z=Z,
+        # Z=Z,
         H=H,
         MAX_SEQ_LEN=N,
         DeltaSize=DeltaSize,

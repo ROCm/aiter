@@ -49,9 +49,9 @@ def _hstu_attn_fwd_one_block(
     start_n,
     seq_len,
     offs_m,
-    offs_n,
-    mask_m,
-    mask_n,
+    # offs_n,
+    # mask_m,
+    # mask_n,
     q,
     K_base,
     V_base,
@@ -72,7 +72,8 @@ def _hstu_attn_fwd_one_block(
     BLOCK_D_V: tl.constexpr,
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
-    
+    offs_n = tl.arange(0, BLOCK_N) + start_n
+    mask_n = offs_n < seq_len
     # -- compute qk ----
     offs_d_q = tl.arange(0, BLOCK_D_Q)
     offs_d_v = tl.arange(0, BLOCK_D_V)
@@ -164,14 +165,14 @@ def _hstu_attn_fwd_compute(
     HAS_MAX_ATTN_LEN: tl.constexpr,
 ):
     # add assumption to use buffer load and store
-    tl.assume(stride_qm > 0)
-    tl.assume(stride_qh > 0)
-    tl.assume(stride_kn > 0)
-    tl.assume(stride_kh > 0)
-    tl.assume(stride_vn > 0)
-    tl.assume(stride_vh > 0)
-    tl.assume(stride_om > 0)
-    tl.assume(stride_oh > 0)
+    # tl.assume(stride_qm > 0)
+    # tl.assume(stride_qh > 0)
+    # tl.assume(stride_kn > 0)
+    # tl.assume(stride_kh > 0)
+    # tl.assume(stride_vn > 0)
+    # tl.assume(stride_vh > 0)
+    # tl.assume(stride_om > 0)
+    # tl.assume(stride_oh > 0)
     
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     off_h = off_h.to(tl.int64)
@@ -277,15 +278,15 @@ def _hstu_attn_fwd_compute(
         #     V_block_ptr = tl.advance(V_block_ptr, (low, 0))
         # end_n = low
         for start_n in range(low, high, BLOCK_N):
-            cur_offs_n = offs_n + start_n
-            mask_n = cur_offs_n < seq_len
+            # cur_offs_n = offs_n + start_n
+            # mask_n = cur_offs_n < seq_len
             acc += _hstu_attn_fwd_one_block(
                 start_n=start_n,
                 seq_len=seq_len,
                 offs_m=offs_m,
-                offs_n=cur_offs_n,
-                mask_m=mask_m,
-                mask_n=mask_n,
+                # offs_n=cur_offs_n,
+                # mask_m=mask_m,
+                # mask_n=mask_n,
                 q=q,
                 K_base=K_base,
                 V_base=V_base,
@@ -321,15 +322,15 @@ def _hstu_attn_fwd_compute(
                 for start_delta in tl.range(
                     low_delta, high_delta, BLOCK_N, num_stages=0
                 ):
-                    cur_offs_n = offs_n + start_delta
-                    mask_n = cur_offs_n < seq_len
+                    # cur_offs_n = offs_n + start_delta
+                    # mask_n = cur_offs_n < seq_len
                     acc += _hstu_attn_fwd_one_block(
                         start_n=start_delta,
                         seq_len=seq_len,
                         offs_m=offs_m,
-                        offs_n=cur_offs_n,
-                        mask_m=mask_m,
-                        mask_n=mask_n,
+                        # offs_n=cur_offs_n,
+                        # mask_m=mask_m,
+                        # mask_n=mask_n,
                         q=q,
                         K_base=K_base,
                         V_base=V_base,
@@ -403,7 +404,7 @@ def _hstu_attn_fwd(
     stride_om,
     stride_oh,
     alpha,
-    Z,
+    # Z,
     H,
     MAX_SEQ_LEN,
     DeltaSize,
@@ -421,19 +422,27 @@ def _hstu_attn_fwd(
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
 ):
-    tpid = tl.program_id(0)
+    # tpid = tl.program_id(0)
 
-    num_tiles = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)
-    tpid = remap_xcd(tpid, num_tiles * Z * H, 8)
+    # num_tiles = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)
+    # tpid = remap_xcd(tpid, num_tiles * Z * H, 8)
 
-    off_h = tpid % H
-    off_nz = tpid // H
-    pid = off_nz % num_tiles
-    off_z = off_nz // num_tiles
+    # off_h = tpid % H
+    # off_nz = tpid // H
+    # pid = off_nz % num_tiles
+    # off_z = off_nz // num_tiles
 
+    # if HAS_SORT_BY_LENGTH_INDICES:
+    #     off_z = tl.load(sort_by_length_indices + off_z)
+
+
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
     if HAS_SORT_BY_LENGTH_INDICES:
         off_z = tl.load(sort_by_length_indices + off_z)
-
+    off_h = off_hz % H
+    pid = tl.program_id(0)
+            
     _hstu_attn_fwd_compute(
         Q=Q,
         K=K,
