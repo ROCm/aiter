@@ -61,50 +61,12 @@ def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
     )
 
 
-def _f32x4_to_bf16x4_rne_gfx950(vec_f32x4):
-    """RNE f32x4 -> bf16x4 via the gfx950 native ``v_cvt_pk_bf16_f32`` (matches
-    HIP ``float_to_bf16``). gfx950 (CDNA4) ONLY -- absent on gfx942."""
-    lo = rocdl.cvt_pk_bf16_f32(vec_f32x4[0], vec_f32x4[1])
-    hi = rocdl.cvt_pk_bf16_f32(vec_f32x4[2], vec_f32x4[3])
-    packed = vector.from_elements(T.vec(2, T.i32), [lo, hi])
-    return vector.bitcast(T.vec(4, T.bf16), packed)
-
-
-def _f32x4_to_bf16x4_rne_portable(vec_f32x4):
-    """Portable software RNE f32x4 -> bf16x4 for archs without
-    ``v_cvt_pk_bf16_f32`` (gfx942 / CDNA3). Standard RNE bias then keep the
-    high 16 bits: ``bf16 = (x + 0x7FFF + ((x>>16)&1)) >> 16``. NaN fix-up: the
-    bias sequence can turn some NaNs into +Inf (mantissa bits drop below bit
-    16), so detect NaN (``|x| > 0x7F800000``) branch-free and force qNaN 0x7FC0
-    to match torch/HIP ``__float2bfloat16_rn``; +/-Inf round-trips untouched.
-    """
-    i32x4 = T.vec(4, T.i32)
-    x = vector.bitcast(i32x4, vec_f32x4)
-    c16 = arith.constant_vector(16, i32x4)
-    c1 = arith.constant_vector(1, i32x4)
-    c31 = arith.constant_vector(31, i32x4)
-    c7fff = arith.constant_vector(0x7FFF, i32x4)
-    c0 = arith.constant_vector(0, i32x4)
-    c_ones = arith.constant_vector(0xFFFFFFFF, i32x4)
-    c_absmask = arith.constant_vector(0x7FFFFFFF, i32x4)
-    c_inf = arith.constant_vector(0x7F800000, i32x4)
-    c_qnan = arith.constant_vector(0x7FC0, i32x4)
-
-    lsb = arith.andi(arith.shrui(x, c16), c1)
-    rounding_bias = arith.addi(lsb, c7fff)
-    rounded = arith.addi(x, rounding_bias)
-    rne = arith.shrui(rounded, c16)
-
-    # Branch-free NaN mask: sign bit of (0x7F800000 - |x|) is 1 iff NaN.
-    absx = arith.andi(x, c_absmask)
-    diff = arith.subi(c_inf, absx)
-    nan_bit = arith.andi(arith.shrui(diff, c31), c1)  # 1 for NaN, else 0
-    nan_mask = arith.subi(c0, nan_bit)  # 0xFFFFFFFF for NaN, else 0
-    keep_mask = arith.xori(nan_mask, c_ones)  # ~nan_mask
-    fixed = arith.ori(arith.andi(rne, keep_mask), arith.andi(c_qnan, nan_mask))
-
-    hi16 = arith.trunci(T.vec(4, T.i16), fixed)
-    return vector.bitcast(T.vec(4, T.bf16), hi16)
+def _f32x4_to_bf16x4_rne(vec_f32x4):
+    """Round-to-nearest-even f32x4 -> bf16x4 via ``arith.truncf``. LLVM lowers
+    this to the native ``v_cvt_pk_bf16_f32`` on gfx950 and to a software RNE
+    sequence (bias + NaN->qNaN fix-up) on gfx942, both matching torch/HIP
+    ``__float2bfloat16_rn`` (verified bit-exact on gfx942)."""
+    return arith.truncf(T.vec(4, T.bf16), vec_f32x4)
 
 
 def _f32x4_to_bf16x4_trunc(vec_f32x4):
@@ -129,19 +91,11 @@ _BF16_CONVERT_TRUNC_DEFAULT = True
 
 
 def _make_bf16_converter(trunc: bool):
-    """Return the arch-aware fp32x4 -> bf16x4 output converter for this compile.
-
-    With ``trunc=True`` this truncates to match HIP exactly. Otherwise it uses
-    the native ``v_cvt_pk_bf16_f32`` RNE convert on gfx950 (CDNA4) and a
-    portable integer software RNE everywhere else (gfx942 / CDNA3 has no
-    ``v_cvt_pk_bf16_f32``). Called at trace time, so dispatching on
-    ``get_rocm_arch()`` here selects the right lowering per compile.
-    """
-    if trunc:
-        return _f32x4_to_bf16x4_trunc
-    if "gfx950" in get_rocm_arch():
-        return _f32x4_to_bf16x4_rne_gfx950
-    return _f32x4_to_bf16x4_rne_portable
+    """Return the fp32x4 -> bf16x4 output converter for this compile:
+    bit-truncation to match HIP ``float_to_bf16`` (``trunc=True``, default), or
+    RNE via ``arith.truncf`` (arch-optimal: native cvt on gfx950, software RNE
+    on gfx942)."""
+    return _f32x4_to_bf16x4_trunc if trunc else _f32x4_to_bf16x4_rne
 
 
 # -- Compile the kernel ---------------------------------------------------
