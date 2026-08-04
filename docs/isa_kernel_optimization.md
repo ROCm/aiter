@@ -5,7 +5,7 @@ assembly kernels that AITER ships as code objects (`hsa/<arch>/<family>/*.co`),
 using only the LLVM tools bundled with ROCm.
 
 > **Scripts and Dockerfile:** [`docs/examples/isa_optimization/`](examples/isa_optimization/).
-> Everything below can be reproduced with `roundtrip.sh <kernel.co>`.
+> Everything below can be reproduced with `bash docs/examples/isa_optimization/roundtrip.sh <kernel.co>`.
 
 ## Overview
 
@@ -279,7 +279,7 @@ accepts it directly.  `roundtrip.sh` does the extraction, the build and the
 comparison in one go:
 
 ```
-$ docs/examples/isa_optimization/roundtrip.sh $CO
+$ bash docs/examples/isa_optimization/roundtrip.sh $CO
 ...
 === Step 4: Verify against the original ===
   .text                        identical (19236 bytes)
