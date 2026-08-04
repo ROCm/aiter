@@ -260,16 +260,20 @@ def m2bucket(m):
 
 
 def get_gluon_a8w4_ctas_per_cga(m):
-    """
-    num_ctas = 1 - disables multicast
-    """
     num_ctas = 1
     if num_ctas == 1 or get_arch() != "gfx1250":
         return [1, 1]
+    # Decode: shard the cluster along N only.
     if m < 1024:
-        # Shard the cluster along N only for decode.
         return [1, num_ctas]
-    return {4: [2, 2], 8: [2, 4], 16: [4, 4]}.get(num_ctas, [1, num_ctas])
+    # Prefill: shard along both M and N.
+    if num_ctas == 4:
+        return [2, 2]
+    if num_ctas == 8:
+        return [2, 4]
+    if num_ctas == 16:
+        return [4, 4]
+    return [1, num_ctas]
 
 
 def get_kernel_config_gluon(m, n, k, routing_data, out_mx_quant=False):

@@ -10,9 +10,9 @@ from aiter.ops.shuffle import shuffle_weight_gfx1250
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
+    get_gluon_a8w4_ctas_per_cga,
     moe_gemm_a8w4,
     moe_gemm_torch,
-    get_gluon_a8w4_ctas_per_cga,
 )
 
 # routing utilities

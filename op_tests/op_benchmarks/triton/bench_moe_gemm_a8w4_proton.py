@@ -14,8 +14,8 @@ import triton.profiler as proton
 from aiter.ops.shuffle import shuffle_weight_gfx1250
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
-    moe_gemm_a8w4,
     get_gluon_a8w4_ctas_per_cga,
+    moe_gemm_a8w4,
 )
 from aiter.ops.triton.moe.moe_routing.routing import _USE_HERD, routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, downcast_to_static_fp8
