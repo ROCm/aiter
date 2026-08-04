@@ -1,475 +1,558 @@
 # ISA-Level Kernel Optimization with LLVM Tools
 
-A guide to inspecting, analyzing, modifying, and recompiling AITER GPU kernel ISA using the ROCm LLVM toolchain.
+How to inspect, extract, modify, reassemble, test and profile the pre-built
+assembly kernels that AITER ships as code objects (`hsa/<arch>/<family>/*.co`),
+using only the LLVM tools bundled with ROCm.
 
-> **Code examples and Dockerfile:** See [`docs/examples/isa_optimization/`](examples/isa_optimization/) for runnable scripts and a Docker development environment.
+> **Scripts and Dockerfile:** [`docs/examples/isa_optimization/`](examples/isa_optimization/).
+> Everything below can be reproduced with `roundtrip.sh <kernel.co>`.
 
 ## Overview
 
-AITER ships optimized GPU kernels as compiled code objects (`.co` files). Sometimes you need to go deeper than source-level optimization. This guide shows how to:
+AITER's fastest paged-attention, MLA, fMHA, fMoE, GEMM and top-k kernels are
+hand-written assembly, shipped as ELF code objects and loaded at runtime with
+`hipModuleLoad`.  Their source is not in the repository, but the code objects
+carry enough information to rebuild an equivalent, editable assembly file:
 
-1. Disassemble a `.co` kernel to human-readable ISA
-2. Analyze instruction mix (MFMA, memory, LDS, DPP)
-3. Extract a reassemblable `.s` file
-4. Modify ISA instructions and recompile
-5. Profile kernel performance with `rocprofv3`
+| In the `.co`                        | Contains                                                               | View with                                   |
+|-------------------------------------|------------------------------------------------------------------------|---------------------------------------------|
+| `.text`                             | the instructions                                                       | `llvm-objdump -d --mcpu=<gfx>`              |
+| `.symtab`                           | kernel entry symbol **and the original branch labels** (`label_XXXX`)  | `llvm-readelf -s`                           |
+| `.rodata` (`<kernel>.kd`, 64 bytes) | the *kernel descriptor*: VGPR/SGPR/AGPR allocation, LDS size, enabled system registers, FP modes | `llvm-objdump -D -j .rodata --mcpu=<gfx>` |
+| `.note` (`NT_AMDGPU_METADATA`)      | msgpack metadata: kernel-argument names/offsets/sizes, register counts, workgroup size | `llvm-readelf --notes`               |
 
-All tools used are open-source ROCm components. No proprietary tools required.
+The workflow is:
+
+1. **Extract** a standalone `.s` from the `.co` (instructions + kernel descriptor + metadata).
+2. **Reassemble** it with `clang` and **verify** the result is byte-identical to the original.
+3. **Edit** the `.s` — instructions *and*, when needed, the resource directives.
+4. **Test** the rebuilt `.co` with the existing op tests (drop it into the `hsa/` tree).
+5. **Profile** with `rocprofv3` (dispatch timing, counters, thread trace).
+
+What you do *not* get back: comments, macros, register aliases or any structure
+above the instruction level; the kernels were also not assembled with LLVM, so
+a few encodings do not survive the round trip bit-for-bit (listed below).
+Budget accordingly — a paged-attention kernel is ~3,000 instructions, an MLA
+decode kernel ~5,500.
 
 ## Prerequisites
 
-- ROCm 6.x or later (tested on ROCm 7.2.1)
-- LLVM tools: `llvm-objdump`, `clang++` (shipped with ROCm at `/opt/rocm/llvm/bin/`)
-- `rocprofv3` (shipped with ROCm at `/opt/rocm/bin/`)
-- Python 3.8+
-- An AMD GPU (gfx90a, gfx942, or newer)
+- ROCm with its LLVM tools in `$ROCM_PATH/llvm/bin` (default `/opt/rocm/llvm/bin`):
+  `llvm-objdump`, `llvm-readelf`/`llvm-readobj`, `llvm-objcopy`, `clang`, `ld.lld`.
+  The LLVM must know your target; check with
+  `clang --target=amdgcn-amd-amdhsa --print-supported-cpus 2>&1 | grep gfx950`.
+  (Verified with the LLVM in ROCm 6.x/7.x and with upstream LLVM 18 and newer.)
+- Python 3.8+ for the helper scripts.
+- A GPU is only needed for steps 4–5.
+- The ISA reference for your target, for instruction semantics, latencies and —
+  most importantly — the data-hazard rules:
+  [AMD Instinct MI300 / CDNA3 ISA](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-mi300-cdna3-instruction-set-architecture.pdf),
+  [CDNA4 ISA](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf)
+  (all generations: [GPUOpen ISA documentation](https://gpuopen.com/amd-gpu-architecture-programming-documentation/)),
+  plus the [LLVM AMDGPU usage guide](https://llvm.org/docs/AMDGPUUsage.html) for the
+  assembler directives, kernel descriptor layout and code-object format.
 
-## Step 1: Locate the Kernel Object
+## Step 1: Locate the kernel and understand how AITER uses it
 
-AITER kernel `.co` files are typically found in the build directory or installed package:
+### Files
+
+```
+hsa/
+├── codegen.py                 # turns the per-family CSVs into a C++ dispatch table at build time
+├── gfx942/
+│   ├── pa/
+│   │   ├── pa_asm.csv         # (dtype, kv dtype, GQA, mtp, ...) -> kernel symbol + .co file
+│   │   ├── pa_bf16_pertokenFp8_gqa16_2tg_4w.co
+│   │   └── ...
+│   ├── mla/  fmha_v3_fwd/  fmoe/  bf16gemm/  topksoftmax/  ...
+└── gfx950/
+    └── ...
+```
+
+The examples below use `hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co`
+(paged attention decode, bf16 queries, per-token FP8 KV cache, GQA ratio 16).
+
+### How a `.co` is selected and loaded
+
+- The host side of each family lives in `csrc/py_itfs_cu/asm_<family>.cu`
+  (`asm_pa.cu` here).  It picks a row of the CSV via a heuristic
+  (`get_heuristic_kernel`) and constructs `AiterAsmKernel(knl_name, co_name)`.
+- `AiterAsmKernel` (`csrc/include/aiter_hip_common.h`) reads
+  `$AITER_ASM_DIR/<arch>/<family>/<co_name>` and calls `hipModuleLoad` /
+  `hipModuleGetFunction(knl_name)`.  Each load is logged at INFO level:
+  `[aiter] LoadKernel: <knl_name> hsaco: <full path>` (`AITER_LOG_LEVEL`
+  controls verbosity).  Modules are cached per process, so restart the process
+  after swapping a file.
+- `import aiter` **sets** `AITER_ASM_DIR` to `<AITER_META_DIR>/hsa/` (see
+  `aiter/jit/core.py`), overriding anything exported in the shell.  For a
+  `python3 setup.py develop` install that directory is the repository's own
+  `hsa/` tree, so the simplest way to run a modified kernel is to replace the
+  file there (git keeps the original: `git checkout -- hsa/...` restores it).
+  From your own Python code you can instead point `os.environ["AITER_ASM_DIR"]`
+  at a modified copy of the tree after importing `aiter` and before the first
+  kernel launch.
+- The CSV is compiled into the extension when the module is (JIT-)built:
+  replacing a `.co` under the same file/symbol name needs no rebuild, adding a
+  new row does.
+- The loader validates the LDS size declared in the metadata against the device
+  limit (`validate_hsaco_lds`), so keep the metadata truthful when you change it.
+
+### Kernel arguments and launch geometry
+
+The kernel-argument buffer layout is defined twice and both are worth having
+open while reading the disassembly:
+
+- the packed `KernelArgs` struct in `csrc/py_itfs_cu/asm_pa.cu`
+  (`ptr_O`, `ptr_Q`, `ptr_K`, `ptr_V`, `ptr_BT` block tables, `ptr_CL` context
+  lengths, `ptr_KQ`/`ptr_VQ` KV scales, `sclg`, `mblk`, `batch`, `Qs`, `Bs`,
+  `KVs`, `mtp`, `GQA`, ...), together with the launch in the same file
+  (grid = `num_kv_heads x batch x ...`, block = 256 threads = 4 waves);
+- the `.args` list in the code object's metadata (`llvm-readelf --notes`), which
+  carries the same names with byte offsets:
+
+```
+$ llvm-readelf --notes pa_bf16_pertokenFp8_gqa16_2tg_4w.co
+amdhsa.kernels:
+  - .args:
+      - .name: O      .offset: 0     .size: 8   .value_kind: global_buffer
+      - .name: Q      .offset: 16    .size: 8   .value_kind: global_buffer
+      - .name: K      .offset: 32    ...
+      - .name: KQ     .offset: 96    ...
+      - .name: sclg   .offset: 128   .size: 4   .value_kind: by_value
+      - .name: mblk   .offset: 144   ...
+      ...
+    .group_segment_fixed_size: 32768
+    .kernarg_segment_size: 256
+    .sgpr_count:     96
+    .vgpr_count:     256
+    .wavefront_size: 64
+    .max_flat_workgroup_size: 256
+```
+
+The prologue of the kernel then reads directly: `s[0:1]` holds the kernarg
+pointer (the descriptor enables only `user_sgpr_kernarg_segment_ptr`), so
+`s_load_dwordx2 s[12:13], s[0:1], 0x10` is `ptr_Q`, `s_load_dword s64, s[0:1], 0x80`
+is `sclg`, and `s2/s3/s4` are the workgroup ids x/y/z.
+
+## Step 2: Inspect the code object
 
 ```bash
-# Find compiled kernel objects
-find $(python -c "import aiter; print(aiter.__path__[0])") -name "*.co" | head -20
+CO=hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co
+LLVM=${ROCM_PATH:-/opt/rocm}/llvm/bin
 
-# Or look in the HSA directory
-ls aiter/hsa/
+$LLVM/llvm-objdump -d --mcpu=gfx942 $CO > kernel.isa      # instructions
+$LLVM/llvm-objdump -D -j .rodata --mcpu=gfx942 $CO         # kernel descriptor, decoded
+$LLVM/llvm-readelf --notes $CO                             # metadata (YAML)
+$LLVM/llvm-readelf -sW $CO                                 # symbols: kernel, <kernel>.kd, label_*
+
+python3 docs/examples/isa_optimization/analyze_kernel.py isa $CO   # all of the above, summarized
 ```
 
-For this guide, we'll use a Paged Attention kernel as an example:
+The architecture is recorded in the ELF header (`llvm-readelf -h`: `Flags: 0x54c,
+gfx942, xnack, sramecc`); the scripts read it from there, and `--mcpu` must
+match it exactly or newer instructions decode as `.long 0x........`.
+
+### Disassembly format
+
+`llvm-objdump` prints AMDGPU code with the instruction first and the address
+and encoding as a trailing comment — the reverse of its x86 layout — precisely
+so that the text is (almost) valid assembler input:
+
+```
+0000000000002200 <_ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE>:
+        s_and_b32 s1, s1, 0xffff                                   // 000000002200: 8601FF01 0000FFFF
+        s_load_dwordx2 s[8:9], s[0:1], 0x0                         // 000000002208: C0060200 00000000
+        ...
+        s_cbranch_scc0 label_07A8                                  // 000000002B5C: BF840550
+
+0000000000002b60 <label_0258>:
+        s_waitcnt vmcnt(8) lgkmcnt(0)                              // 000000002B60: BF8C0078
+```
+
+Branch targets appear by name because the `label_XXXX` symbols are real local
+symbols in `.symtab`.  Two caveats the extraction script takes care of:
+several labels can alias one address while objdump prints only one of them as
+a header (the others still appear as branch operands), and the hexadecimal
+suffix is just the generator's naming scheme — do not derive addresses from it.
+
+### Kernel descriptor
+
+```
+$ llvm-objdump -D -j .rodata --mcpu=gfx942 $CO
+00000000000011c0 <_ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE.kd>:
+.amdhsa_kernel _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE
+        .amdhsa_group_segment_fixed_size 32768      <- static LDS bytes
+        .amdhsa_private_segment_fixed_size 0        <- scratch bytes per lane
+        .amdhsa_kernarg_size 0
+        .amdhsa_accum_offset 256                    <- first AGPR (gfx90a+ unified register file)
+        .amdhsa_next_free_vgpr 256                  <- VGPRs (arch + accum)
+        .amdhsa_next_free_sgpr 104                  <- see note in Step 3
+        .amdhsa_float_denorm_mode_32 0              <- f32 denormals flushed
+        .amdhsa_float_denorm_mode_16_64 3
+        .amdhsa_dx10_clamp 0                        <- NB: LLVM's default is 1
+        .amdhsa_ieee_mode 0                         <- NB: LLVM's default is 1
+        .amdhsa_system_sgpr_workgroup_id_x 1
+        .amdhsa_system_sgpr_workgroup_id_y 1
+        .amdhsa_system_sgpr_workgroup_id_z 1
+        .amdhsa_system_vgpr_workitem_id 0           <- only v0 = workitem id x
+        .amdhsa_user_sgpr_kernarg_segment_ptr 1     <- s[0:1] = kernarg pointer
+        ...
+.end_amdhsa_kernel
+```
+
+This block, not the metadata, is what the hardware is programmed from.  With
+256 VGPRs per lane a gfx942 SIMD holds two of these waves; that is the number
+to move if you are after occupancy.
+
+## Step 3: Extract a standalone `.s`
 
 ```bash
-KERNEL_CO="pa_bf16_pertokenFp8_gqa16_2tg_4w.co"
+python3 docs/examples/isa_optimization/extract_asm.py $CO -o kernel.s
+# _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE: 3085 instructions, 6 labels
 ```
 
-## Step 2: Disassemble to ISA
-
-Use `llvm-objdump` to produce a full disassembly:
-
-```bash
-/opt/rocm/llvm/bin/llvm-objdump -d --mcpu=gfx942 $KERNEL_CO > kernel.isa
-```
-
-Replace `gfx942` with your target GPU architecture.
-
-### Quick ISA Analysis
-
-Count key instruction types to understand the kernel profile:
-
-```bash
-# Instruction statistics
-echo "Total instructions: $(grep -cE '^\s+[0-9a-f]+:' kernel.isa)"
-echo "MFMA (matrix) ops:  $(grep -c 'v_mfma_' kernel.isa)"
-echo "Buffer loads:       $(grep -c 'buffer_load' kernel.isa)"
-echo "LDS ops:            $(grep -c 'ds_' kernel.isa)"
-echo "DPP ops:            $(grep -c '_dpp' kernel.isa)"
-echo "Scalar ops:         $(grep -c '^[[:space:]]*s_' kernel.isa)"
-```
-
-### Read Kernel Metadata
-
-```bash
-# Extract register usage and resource requirements
-/opt/rocm/llvm/bin/llvm-objdump --mcpu=gfx942 -s -j .note $KERNEL_CO
-```
-
-Key metrics to look for:
-- **SGPRs / VGPRs**: Register pressure limits occupancy
-- **LDS size**: Shared memory per workgroup
-- **Wavefront size**: 32 or 64
-
-## Step 3: Extract Reassemblable Assembly
-
-The raw `llvm-objdump` output is not directly reassemblable. A Python extraction script converts it to a valid `.s` file.
-
-Create `extract_asm.py`:
-
-```python
-#!/usr/bin/env python3
-"""Extract reassemblable .s from llvm-objdump -d output.
-
-Handles branch label resolution using word-offset addressing:
-  target_address = base_address + label_value * 4
-"""
-import re
-import sys
-
-def extract(isa_path, kernel_symbol, target="amdgcn-amd-amdhsa--gfx942"):
-    with open(isa_path) as f:
-        lines = f.readlines()
-
-    # Find kernel section
-    section_start = None
-    for i, line in enumerate(lines):
-        if f"<{kernel_symbol}>:" in line:
-            section_start = i
-            break
-    if section_start is None:
-        print(f"Kernel symbol '{kernel_symbol}' not found", file=sys.stderr)
-        sys.exit(1)
-
-    # Parse instruction address from first line
-    first_instr_line = lines[section_start + 1].strip()
-    base_addr = int(first_instr_line.split(":")[0].strip(), 16)
-
-    # Collect instructions
-    instructions = []
-    for line in lines[section_start + 1:]:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("Disassembly"):
-            break
-        m = re.match(r"\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]+\s+)+(.+)", stripped)
-        if m:
-            addr = int(m.group(1), 16)
-            instr = m.group(2).strip()
-            # Remove trailing hex comments
-            instr = re.sub(r"\s*//\s*[0-9A-Fa-f]+$", "", instr)
-            instructions.append((addr, instr))
-
-    # Resolve branch labels (word offset: label_val * 4 + base_addr)
-    branch_targets = {}
-    for addr, instr in instructions:
-        m = re.search(r"label_([0-9A-Fa-f]+)", instr)
-        if m:
-            label_val = int(m.group(1), 16)
-            target_addr = base_addr + label_val * 4
-            branch_targets[target_addr] = f"label_{m.group(1)}"
-
-    # Emit .s file
-    output = []
-    output.append(f'  .amdgcn_target "{target}"')
-    output.append(f"  .globl {kernel_symbol}")
-    output.append(f"  .type {kernel_symbol}, @function")
-    output.append(f"{kernel_symbol}:")
-
-    for addr, instr in instructions:
-        if addr in branch_targets:
-            output.append(f"{branch_targets[addr]}:")
-        output.append(f"  {instr}")
-
-    output.append(f"  .size {kernel_symbol}, .-{kernel_symbol}")
-    return "\n".join(output)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <isa_file> <kernel_symbol> [target]")
-        sys.exit(1)
-
-    isa_file = sys.argv[1]
-    symbol = sys.argv[2]
-    target = sys.argv[3] if len(sys.argv) > 3 else "amdgcn-amd-amdhsa--gfx942"
-
-    result = extract(isa_file, symbol, target)
-    print(result)
-```
-
-Run the extraction:
-
-```bash
-# Find the kernel symbol name
-grep "^[0-9a-f]" kernel.isa | head -1
-# Example output: 0000000000001000 <_ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE>:
-
-# Extract reassemblable .s
-python3 extract_asm.py kernel.isa \
-    _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4w > kernel_roundtrip.s
-```
-
-## Step 4: Recompile and Verify
-
-Recompile the `.s` file back to a `.co`:
-
-```bash
-/opt/rocm/llvm/bin/clang++ \
-    -x assembler \
-    -target amdgcn-amd-amdhsa \
-    -mcpu=gfx942 \
-    -o kernel_recompiled.co \
-    kernel_roundtrip.s
-```
-
-### Verify Binary Equivalence
-
-Compare the `.text` section of the original and recompiled kernels:
-
-```bash
-# Extract .text sections
-/opt/rocm/llvm/bin/llvm-objcopy -O binary -j .text $KERNEL_CO original_text.bin
-/opt/rocm/llvm/bin/llvm-objcopy -O binary -j .text kernel_recompiled.co recompiled_text.bin
-
-# Compare
-md5sum original_text.bin recompiled_text.bin
-diff <(xxd original_text.bin) <(xxd recompiled_text.bin) && echo "IDENTICAL" || echo "DIFFERS"
-```
-
-A successful round-trip produces identical `.text` sections. Metadata sections may differ (they are regenerated by the assembler), but the executable code is bit-exact.
-
-### Producing a Loadable Kernel Object
-
-The recompiled `.co` from Step 4 has a minimal `.note` section and may fail to load with `hipModuleLoad` ("no kernel image available"). The original `.co` contains rich AMDHSA metadata (kernel arguments, register counts, LDS size) that the HIP runtime requires.
-
-To produce a loadable `.co`, inject the modified `.text` section back into the original kernel object:
-
-```bash
-# Copy original .co (preserves all metadata)
-cp $KERNEL_CO kernel_modified.co
-
-# Replace only the .text section with recompiled code
-/opt/rocm/llvm/bin/llvm-objcopy --update-section .text=recompiled_text.bin kernel_modified.co
-```
-
-This preserves the original kernel descriptor, argument metadata, and ELF structure while swapping in the new executable code.
-
-### Verifying Performance Equivalence
-
-After swapping, benchmark both versions to confirm identical performance:
-
-```bash
-# Benchmark original
-cp original_kernel.co $INSTALL_PATH/kernel.co
-python benchmark.py  # record time
-
-# Benchmark modified
-cp kernel_modified.co $INSTALL_PATH/kernel.co
-python benchmark.py  # compare time
-```
-
-On a PA decode kernel (bf16+fp8, GQA16, SEQ=4096), 3 runs of 500 iterations each showed original vs recompiled within ±3% noise — confirming zero performance regression from the round-trip.
-
-## Step 5: Modify and Iterate
-
-With a working round-trip established, you can now modify the `.s` file:
-
-### Common ISA Optimizations
-
-**Instruction scheduling** — Fill MFMA co-execution slots with independent operations:
+`kernel.s` has three parts:
 
 ```asm
-; Before: MFMA followed by wait
-v_mfma_f32_32x32x16_bf16 a[0:15], v[0:1], v[2:3], a[0:15]
-s_nop 7        ; wasted cycles
+        .amdgcn_target "amdgcn-amd-amdhsa--gfx942"
+        .text
+        .globl  _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE
+        .p2align 8
+        .type   _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE,@function
+_ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE:
+        s_and_b32 s1, s1, 0xffff
+        s_load_dwordx2 s[8:9], s[0:1], 0x0
+        ...                                        (1) instructions and labels
+        s_endpgm
+        .size   _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE, .-_ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE
 
-; After: Fill with independent work
-v_mfma_f32_32x32x16_bf16 a[0:15], v[0:1], v[2:3], a[0:15]
-buffer_load_dwordx4 v[8:11], v4, s[0:3], 0  ; prefetch next tile
-ds_read_b128 v[12:15], v5                     ; load from LDS
+        .rodata
+        .p2align 6
+.amdhsa_kernel _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE
+        .amdhsa_group_segment_fixed_size 32768
+        ...                                        (2) kernel descriptor
+.end_amdhsa_kernel
+
+        .amdgpu_metadata
+---
+amdhsa.kernels:
+  - .args: ...
+    .vgpr_count: 256
+    ...                                            (3) metadata, verbatim
+amdhsa.version:
+  - 1
+  - 0
+...
+        .end_amdgpu_metadata
 ```
 
-**Register pressure reduction** — Reuse registers to improve occupancy:
+Two adjustments are made to the decoded descriptor so that LLVM's assembler
+accepts it and encodes the same 64 bytes:
+
+- `.amdhsa_next_free_sgpr`: the disassembler prints the *granulated total*
+  (`(field + 1) * 8`, e.g. 104 or 112), which already includes the six SGPRs the
+  assembler reserves implicitly (VCC, FLAT_SCRATCH, XNACK_MASK), together with
+  `.amdhsa_reserve_vcc 0`.  Feeding that back fails with `error: value out of
+  range` whenever the total exceeds 102.  The script emits `total - 8` (capped
+  at 102) with `.amdhsa_reserve_vcc 1`, which produces the identical
+  `GRANULATED_WAVEFRONT_SGPR_COUNT`.  When you change SGPR usage yourself, set it
+  to the highest SGPR number you use plus one.
+- `.amdhsa_reserve_xnack_mask` is dropped: it must agree with the target id, and
+  AITER's objects are built for plain `gfx942`/`gfx950` (xnack "any"), for which
+  the directive is rejected (`does not match target id`).  Keep the plain target
+  id — an object built for `gfx942:xnack-` will not load in a process running
+  with XNACK enabled.
+
+`extract_asm.py --text-only` emits part (1) alone, for the in-place patching
+flow described at the end.  `--symbol` selects a kernel if a `.co` contains
+several (the shipped ones contain one each).
+
+## Step 4: Reassemble and verify
+
+```bash
+$LLVM/clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -o kernel_rebuilt.co kernel.s
+```
+
+Without `-c`, clang runs `ld.lld` and produces a complete code object with the
+kernel descriptor relocated and the metadata note attached — `hipModuleLoad`
+accepts it directly.  `roundtrip.sh` does the extraction, the build and the
+comparison in one go:
+
+```
+$ docs/examples/isa_optimization/roundtrip.sh $CO
+...
+=== Step 4: Verify against the original ===
+  .text                        identical (19236 bytes)
+  .rodata (kernel descriptor)  identical (64 bytes)
+  metadata (.note)             identical
+  ELF e_flags (target id)      identical (0x54c)
+
+PASS: .../kernel_rebuilt.co is equivalent to the original and can replace it as-is.
+```
+
+Establish this baseline for the exact kernel you intend to modify *before*
+editing anything; from then on every difference is one you introduced.  The
+same check by hand:
+
+```bash
+for s in .text .rodata; do
+  $LLVM/llvm-objcopy -O binary -j $s $CO orig$s.bin
+  $LLVM/llvm-objcopy -O binary -j $s kernel_rebuilt.co new$s.bin
+  cmp orig$s.bin new$s.bin && echo "$s identical"
+done
+diff <($LLVM/llvm-readelf --notes $CO) <($LLVM/llvm-readelf --notes kernel_rebuilt.co)
+```
+
+### Known re-encoding differences
+
+All gfx942 kernels checked (paged attention, MLA, bf16 GEMM, top-k softmax) and
+all gfx950 paged-attention and MLA kernels round-trip byte-for-byte.  The
+gfx950 fMoE kernels that use `v_mfma_scale_f32_16x16x128_f8f6f4` do not: the
+shipped encoding has bits 13–14 of the leading `v_mfma_ld_scale_b32` word set
+(`op_sel`/`op_sel_hi` of the unused third source, e.g. `D3AC6000`), LLVM's
+disassembler ignores them and its assembler emits them cleared (`D3AC0000`).
+Everything else in those kernels is identical.  Treat such a rebuild as
+functionally unverified until the op test (Step 6) passes on hardware.
+
+When `.text` differs, `roundtrip.sh` prints the first differing instruction in
+both versions; by hand, `cmp -l orig.text.bin new.text.bin | head` gives the
+byte offset, and `.text` start + offset is the address to look up in the
+`// ADDR:` comments of both disassemblies.
+
+## Step 5: Modify
+
+Edit `kernel.s`, rebuild with the `clang` command above, re-run the verification
+to see exactly which bytes changed, then test (Step 6).  Because the descriptor
+and metadata are part of the source, code size, register allocation and LDS
+usage may all change.  Things the assembler will **not** do for you:
+
+### Data hazards and wait states are your responsibility
+
+LLVM inserts hazard `s_nop`s and `s_waitcnt`s when it *compiles* kernels; when
+it *assembles* hand-written code it encodes exactly what is written.  The
+`s_nop`s in these kernels are almost all mandatory wait states, for example:
 
 ```asm
-; Identify dead registers after their last use
-; and reassign them for new values
+        v_rcp_f32_e32 v50, v50
+        s_nop 1                     ; transcendental VALU result read by the next VALU op:
+        v_mul_f32_e32 v50, 0x43700000, v50      ; wait states required on gfx940+, nothing checks it
 ```
 
-**Memory access patterns** — Optimize buffer load/store coalescing and LDS bank conflicts.
+Others separate VALU writes of SGPRs/VCC from their readers, DPP operands from
+the instruction that produced them, and dependent MFMAs.  An `s_nop` directly
+after an MFMA is usually such a dependency distance, not idle time that can be
+filled for free — whatever replaces it must be independent of the MFMA *and*
+provide at least as many wait states.
 
-After modifying, recompile and benchmark:
+Before moving, removing or inserting instructions, check the "manually inserted
+wait states" (data dependency) table and the MFMA dependency rules in the ISA
+guide for your target: required distances between a VALU/MFMA writing a
+register and specific consumers, `s_setreg`/`s_getreg`, LDS-direct and DPP
+sources, and the number of independent instructions (or `s_nop` cycles)
+required between dependent MFMAs, which depends on the MFMA shape and pass
+count.  An `s_nop N` provides N+1 wait states; an unrelated instruction provides
+at least one.  Violations do not fault — they silently read stale data.
+
+Likewise every `s_waitcnt vmcnt(..) lgkmcnt(..)` encodes how many memory
+operations of each class may still be outstanding at that point.  Reordering
+loads, LDS operations or scalar loads changes those counts; recompute them
+rather than copying the old values (`vmcnt` counts VMEM/buffer/global ops in
+issue order, `lgkmcnt` counts LDS, SMEM and messages; SMEM may return out of
+order, so scalar loads are normally waited for with `lgkmcnt(0)`).
+
+### Changing register or LDS usage
+
+- More/fewer VGPRs or AGPRs: update `.amdhsa_next_free_vgpr` (total of both on
+  gfx90a/gfx942/gfx950) and `.amdhsa_accum_offset` (first AGPR, multiple of 4),
+  plus `.vgpr_count`/`.agpr_count` in the metadata.  Occupancy only changes at
+  allocation-granule boundaries (8 registers); the descriptor, not the metadata,
+  is what the hardware uses.
+- More SGPRs: `.amdhsa_next_free_sgpr` (max 102) and `.sgpr_count`.
+- More LDS: `.amdhsa_group_segment_fixed_size` and `.group_segment_fixed_size`
+  (64 KiB per workgroup on gfx942, 160 KiB on gfx950; AITER checks the metadata
+  value at load time).
+- Leave `ieee_mode`, `dx10_clamp` and the denorm modes as shipped unless you
+  mean to change numerical behaviour; note they differ from LLVM's defaults, so
+  do not delete the directives either.
+
+### Where the time goes
+
+Use the thread trace (Step 7) rather than guessing from the listing: it shows
+per-instruction issue and stall cycles for real waves, which makes it obvious
+whether a loop is bound by MFMA issue, `s_waitcnt` on memory, LDS bank
+conflicts or dependency stalls, and therefore whether rescheduling,
+prefetch-distance changes or LDS layout changes are worth attempting.
+
+## Step 6: Test the modified kernel
+
+Run the rebuilt kernel through the existing op tests before measuring anything.
+In a develop install the loader reads from the checkout's `hsa/` tree (Step 1),
+so build straight over the shipped file and let git keep the original:
 
 ```bash
-# Recompile modified kernel
-/opt/rocm/llvm/bin/clang++ -x assembler -target amdgcn-amd-amdhsa \
-    -mcpu=gfx942 -o kernel_modified.co kernel_modified.s
+$LLVM/clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 \
+    -o hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co kernel.s
 
-# Replace the .co in the AITER installation and re-run benchmark
+# run the family's test (see --help for dtype / head-count / context-length selection)
+python3 op_tests/test_pa.py
+# [aiter] LoadKernel: _ZN5aiter32pa_bf16_pertokenFp8_gqa16_2tg_4wE hsaco: .../hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co
+
+git checkout -- hsa/gfx942/pa/pa_bf16_pertokenFp8_gqa16_2tg_4w.co     # back to the original
 ```
 
-## Step 6: Profile with rocprofv3
+The tests compare against a reference implementation with tolerances.  For a
+pure rescheduling change the stronger check is bitwise equality with the
+original kernel's output on identical inputs: run the same case with the
+original and the modified object (same seed) and compare the saved tensors with
+`torch.equal`.  Make sure the configuration you test actually dispatches to the
+kernel you changed — the `LoadKernel` log line names the file, and
+`--kernel-trace` below names the symbol.
 
-### Kernel-Level Tracing
+## Step 7: Profile with rocprofv3
 
-Collect per-kernel dispatch timing with `--kernel-trace`:
+### Dispatch timing
 
 ```bash
-rocprofv3 --kernel-trace -d ./profile_out -- python your_benchmark.py
+rocprofv3 --kernel-trace --stats --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' \
+          -d ./prof_orig -- python3 op_tests/test_pa.py
+# swap in the modified .co (Step 6), then
+rocprofv3 --kernel-trace --stats --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' \
+          -d ./prof_mod  -- python3 op_tests/test_pa.py
 ```
 
-This produces a SQLite database (`.db`) under the output directory with all kernel dispatches, including timestamps, grid dimensions, and kernel metadata.
+`--stats` writes a per-kernel summary (count, total/mean/min/max duration) next
+to the trace; `--kernel-include-regex`/`--kernel-exclude-regex` keep the output
+to the kernels of interest.  The default output is a `rocpd` SQLite database
+(`-f csv`, `json`, `pftrace` for Perfetto, `otf2` are also available);
+`analyze_kernel.py profile ./prof_orig --filter pa_` prints per-kernel
+statistics and the VGPR/AGPR/SGPR/LDS values the runtime recorded, straight
+from the database.  Add `--memory-copy-trace --hip-trace` for an end-to-end
+timeline.
 
-### Output Formats
-
-rocprofv3 supports multiple output formats:
+### Hardware counters
 
 ```bash
-# CSV (human-readable, easy to grep)
-rocprofv3 --kernel-trace -f csv -d ./profile_out -- python your_benchmark.py
-
-# JSON
-rocprofv3 --kernel-trace -f json -d ./profile_out -- python your_benchmark.py
-
-# Perfetto trace (open in https://ui.perfetto.dev)
-rocprofv3 --kernel-trace -f pftrace -d ./profile_out -- python your_benchmark.py
+rocprofv3 -L                                     # list counters available on this GPU
+rocprofv3 --pmc SQ_WAVES SQ_BUSY_CYCLES --kernel-include-regex 'pa_bf16' -d ./pmc -- python3 ...
 ```
 
-### Querying the SQLite Database
+Only a handful of counters can be collected per pass; rocprofv3 re-runs the
+application when more are requested.  For derived metrics (occupancy limiters,
+LDS bank conflicts, cache hit rates, achieved bandwidth) use
+[ROCm Compute Profiler](https://rocm.docs.amd.com/projects/rocprofiler-compute/)
+which drives the same counters.
 
-The default output is a `.db` file. Table names include a UUID suffix. Use Python to query:
+### Thread trace (ATT): per-instruction timing
 
-```python
-import sqlite3, glob
-
-db_path = glob.glob("profile_out/**/*results.db", recursive=True)[0]
-conn = sqlite3.connect(db_path)
-c = conn.cursor()
-
-# Find table names (they have UUID suffixes)
-c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%kernel_dispatch%'")
-dispatch_table = c.fetchone()[0]
-
-c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%kernel_symbol%'")
-symbol_table = c.fetchone()[0]
-
-# Top kernels by average duration
-c.execute(f"""
-    SELECT ks.kernel_name, COUNT(*) as cnt,
-           AVG(d.end - d.start) as avg_ns,
-           MIN(d.end - d.start) as min_ns,
-           MAX(d.end - d.start) as max_ns
-    FROM {dispatch_table} d
-    JOIN {symbol_table} ks ON d.kernel_id = ks.id
-    GROUP BY ks.kernel_name
-    ORDER BY avg_ns DESC LIMIT 10
-""")
-print(f"{'Kernel':<60s} {'Count':>6s} {'Avg(us)':>10s} {'Min(us)':>10s} {'Max(us)':>10s}")
-for name, cnt, avg, mn, mx in c.fetchall():
-    print(f"  {name[:58]:<60s} {cnt:>6d} {avg/1000:>10.1f} {mn/1000:>10.1f} {mx/1000:>10.1f}")
-```
-
-### Filtering by Kernel Name
-
-To focus on a specific kernel (e.g., paged attention):
-
-```python
-# Filter dispatches for PA kernels only
-c.execute(f"""
-    SELECT ks.kernel_name, COUNT(*) as cnt,
-           AVG(d.end - d.start) as avg_ns,
-           ks.arch_vgpr_count, ks.accum_vgpr_count,
-           ks.sgpr_count, ks.group_segment_size
-    FROM {dispatch_table} d
-    JOIN {symbol_table} ks ON d.kernel_id = ks.id
-    WHERE ks.kernel_name LIKE '%paged_attn%'
-       OR ks.kernel_name LIKE '%pa_%'
-    GROUP BY ks.kernel_name
-    ORDER BY avg_ns DESC
-""")
-for name, cnt, avg, vgpr, agpr, sgpr, lds in c.fetchall():
-    print(f"  {name[:70]}")
-    print(f"    dispatches={cnt}, avg={avg/1000:.1f} us, "
-          f"VGPR={vgpr}, AGPR={agpr}, SGPR={sgpr}, LDS={lds}")
-```
-
-### Combining Tracing Modes
-
-Collect kernel, memory copy, and HIP runtime traces together for a full picture:
+ATT records the instruction stream of the waves on one compute unit with issue
+and stall cycles, and maps it back onto the disassembly — the tool of choice
+for judging an ISA change.  Decoding requires `librocprof-trace-decoder.so`,
+which is not part of the ROCm 7.2 packages: install a release from
+<https://github.com/ROCm/rocprof-trace-decoder/releases> into `/opt/rocm/lib`, or
+build it from source:
 
 ```bash
-rocprofv3 --kernel-trace --memory-copy-trace --hip-trace \
-    -d ./profile_out -- python your_benchmark.py
+git clone --depth 1 --branch develop --filter=blob:none --sparse https://github.com/ROCm/rocm-systems.git
+cd rocm-systems && git sparse-checkout set projects/rocprof-trace-decoder
+cd projects/rocprof-trace-decoder
+cmake -B build -DCMAKE_INSTALL_PREFIX=/opt/rocm -DLLVM_DIR=/opt/rocm/llvm/lib/cmake/llvm
+cmake --build build -j$(nproc) && cmake --install build
 ```
 
-### Comparing Original vs Modified Kernel
-
-After modifying the ISA and recompiling (Step 5), re-run the benchmark under `--kernel-trace` and compare:
+Trace the kernel of interest.  By default only the *first* dispatch of each
+matching kernel is traced; pick a warmed-up iteration explicitly:
 
 ```bash
-# Profile original
-rocprofv3 --kernel-trace -d ./profile_original -- python benchmark.py
-
-# Swap in modified .co, profile again
-rocprofv3 --kernel-trace -d ./profile_modified -- python benchmark.py
-
-# Compare average kernel durations
+rocprofv3 --att --kernel-include-regex 'pa_bf16_pertokenFp8_gqa16' --kernel-iteration-range 5-5 \
+          --att-target-cu 1 -d ./att_out -- python3 op_tests/test_pa.py
 ```
 
-### Advanced Thread Trace (ATT)
+Useful options: `--att-target-cu` (which CU to trace, default 1),
+`--att-shader-engine-mask`, `--att-simd-select`, `--att-buffer-size` (raise it
+if the tool reports lost data), `--att-perfcounter-ctrl`/`--att-perfcounters`/
+`--att-activity` (stream SQ activity counters alongside the trace on gfx9),
+`--att-consecutive-kernels`; see `rocprofv3 --help` for the defaults of your
+version.  The output directory contains `stats_*.csv` (per-instruction latency
+summary — often enough to compare two versions of a loop), a
+`ui_output_agent_<a>_dispatch_<d>/` directory to open in
+[ROCprof Compute Viewer](https://github.com/ROCm/rocprof-compute-viewer)
+(source/ISA view with per-instruction issue and stall cycles, wave timeline),
+the raw `.att` streams and the `.out` code objects they were decoded against.
+Compare the same dispatch of the original and the modified kernel.
 
-ATT captures instruction-level cycle counts, enabling precise bottleneck identification. It requires the `rocprof-trace-decoder` library, which is not shipped as a pre-built binary in ROCm 7.2.x but can be built from source:
+## Alternative: patching `.text` in place
+
+If you only reorder or replace instructions and the code size does not grow,
+you can splice new code into the original object instead of rebuilding it:
 
 ```bash
-# Build and install rocprof-trace-decoder
-git clone --depth 1 --branch develop https://github.com/ROCm/rocm-systems.git
-cd rocm-systems/projects/rocprof-trace-decoder
-cmake -B build -DCMAKE_INSTALL_PREFIX=/opt/rocm
-cmake --build build -j$(nproc)
-cmake --install build  # installs librocprof-trace-decoder.so to /opt/rocm/lib
+python3 extract_asm.py $CO --text-only -o text.s          # part (1) only
+# ... edit text.s ...
+$LLVM/clang -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx942 -c -o text.o text.s
+$LLVM/llvm-objcopy -O binary -j .text text.o text.bin
+cp $CO patched.co
+$LLVM/llvm-objcopy --update-section .text=text.bin patched.co
 ```
 
-Once installed, run ATT:
+Limitations: the section cannot grow (`llvm-objcopy: error: cannot fit data of
+size N into section '.text' with size M that is part of a segment`) — pad with
+`s_nop 0` or delete dead code to compensate, and remember that padding inside a
+loop costs issue slots; label addresses move if sizes change before them (the
+assembler recomputes branch offsets, but anything you keep must still fit); and
+the kernel descriptor and metadata stay exactly as shipped, so register and LDS
+usage cannot change.  The standalone rebuild has none of these restrictions and
+is the recommended path.
 
-```bash
-# Trace a single compute unit (CU 1)
-rocprofv3 --att --att-target-cu 1 --kernel-trace \
-    -d ./att_output -- python your_benchmark.py
-```
+## Architecture notes
 
-This produces:
-- `.att` files — raw per-wave binary trace data
-- `.out` files — disassembled code objects for each kernel
-- `results.db` — kernel dispatch database (same as `--kernel-trace`)
+| `--mcpu` | Products        | Notes                                                                                   |
+|----------|-----------------|-----------------------------------------------------------------------------------------|
+| gfx90a   | MI210 / MI250   | CDNA2, wave64, unified VGPR/AGPR file (`accum_offset`), 64 KiB LDS                        |
+| gfx942   | MI300A / MI300X | CDNA3; adds FP8 MFMA, transcendental-VALU hazards; 64 KiB LDS; XNACK-capable (MI300A)    |
+| gfx950   | MI350X / MI355X | CDNA4; adds `v_mfma_scale_*` / FP4-FP6 MFMA, 160 KiB LDS; needs an LLVM that lists gfx950 |
 
-ATT options:
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--att-target-cu CU_ID` | 1 | Which compute unit (WGP) to trace |
-| `--att-buffer-size BYTES` | 256MB | Trace buffer size per SE |
-| `--att-shader-engine-mask MASK` | all | Bitmask of shader engines |
-| `--att-gpu-index LIST` | all | Comma-separated GPU indices |
-
-## Key Technical Details
-
-### Branch Label Addressing
-
-In `llvm-objdump` output, branch instructions reference labels like `label_0694`. These use **word offsets**, not byte offsets:
-
-```
-target_address = base_address + label_value * 4
-```
-
-For example, with `base_address = 0x1000` and `label_0694`:
-```
-target = 0x1000 + 0x694 * 4 = 0x1000 + 0x1A50 = 0x2A50
-```
-
-The extraction script handles this automatically.
-
-### Architecture-Specific Considerations
-
-| Architecture | GPU | Notes |
-|-------------|-----|-------|
-| gfx90a | MI210, MI250 | CDNA2, wavefront 64 |
-| gfx942 | MI300X | CDNA3, wavefront 64, MFMA co-execution |
-
-This workflow applies to all AMDGPU architectures supported by LLVM. Adjust the `--mcpu` flag and `.amdgcn_target` string to match your target GPU.
-
-### Typical Kernel Instruction Profile
-
-For a well-optimized attention kernel on gfx942:
-
-| Instruction Category | Count | Purpose |
-|---------------------|-------|---------|
-| MFMA (v_mfma_*) | ~192 | Matrix multiply-accumulate |
-| Buffer loads | ~100 | Global memory reads |
-| LDS ops (ds_*) | ~300+ | Shared memory access |
-| DPP ops (*_dpp) | ~300+ | Cross-lane data movement |
-| Scalar ops (s_*) | ~200+ | Control flow, address calculation |
+AITER ships kernels for gfx942 and gfx950.  The `e_flags` of the shipped objects
+use the generic target id (xnack/sramecc "any"); keep it that way when
+rebuilding.
 
 ## Troubleshooting
 
-**llvm-objdump not found**: Use the full path `/opt/rocm/llvm/bin/llvm-objdump`.
+**`error: value out of range` on `.amdhsa_next_free_sgpr`** — the value is the
+granulated total printed by the disassembler; use the number of SGPRs the code
+actually addresses (≤ 102), see Step 3.
 
-**Recompiled .text differs from original**: Check that branch labels are resolved correctly. The extraction script must use word-offset addressing (multiply label value by 4).
+**`error: .amdhsa_reserve_xnack_mask does not match target id`** — delete the
+directive (generic target id) or make the target id explicit
+(`...--gfx942:xnack-` in `.amdgcn_target` and `-mcpu=gfx942 -mno-xnack`), consistently.
 
-**ATT trace fails with "trace-decoder not found"**: Build and install `librocprof-trace-decoder.so` from source (see the ATT section above). The library is not included in ROCm 7.2.x binary packages.
+**`error: undefined label 'label_XXXX'`** — a branch refers to a label alias that
+objdump did not print as a header; take labels from `llvm-readelf -s` (the
+script does) rather than from the objdump headers.
 
-**Metadata sections differ after round-trip**: This is expected. The `.text` (executable code) section should be identical. Metadata is regenerated by the assembler and may have different formatting.
+**Instructions shown as `.long 0x...`, or "Total instructions: 0"** — wrong or
+missing `--mcpu`, or an LLVM that predates the target.
+
+**`hipModuleLoad` fails / "no kernel image is available"** — the object was
+built with `-c` (relocatable, no program headers), for a different `--mcpu`, or
+with a specific xnack/sramecc setting the runtime does not match; compare
+`llvm-readelf -h` `Flags:` with the original.
+
+**`llvm-objcopy: cannot fit data of size ... that is part of a segment`** — the
+in-place flow cannot grow `.text`; use the standalone rebuild.
+
+**Rebuilt `.text` differs before you changed anything** — see "Known
+re-encoding differences"; locate the instruction with `roundtrip.sh` and decide
+from the ISA guide whether the differing bits are meaningful.
+
+**Results wrong after an edit, no fault raised** — almost always a violated
+data hazard or a stale `s_waitcnt`; re-read Step 5 with the ISA guide's
+dependency tables at hand and diff against the last known-good `.s`.
 
 ## References
 
-- [LLVM AMDGPU Backend](https://llvm.org/docs/AMDGPUUsage.html)
-- [ROCm Documentation](https://rocm.docs.amd.com/)
-- [AMDGPU ISA Reference (GFX9)](https://llvm.org/docs/AMDGPU/AMDGPUAsmGFX9.html)
-- [rocprofv3 Documentation](https://rocm.docs.amd.com/projects/rocprofiler-sdk/)
-- [rocprof-trace-decoder](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprof-trace-decoder) — ATT trace decoder library (build from source)
+- [LLVM AMDGPU backend usage](https://llvm.org/docs/AMDGPUUsage.html) — code object format, kernel descriptor fields, `.amdhsa_*` directives, metadata schema
+- [AMDGPU instruction syntax](https://llvm.org/docs/AMDGPUInstructionSyntax.html) and [operand syntax](https://llvm.org/docs/AMDGPUOperandSyntax.html)
+- [AMD Instinct MI300 (CDNA3) ISA reference guide](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-mi300-cdna3-instruction-set-architecture.pdf), [CDNA4 ISA reference guide](https://www.amd.com/content/dam/amd/en/documents/instinct-tech-docs/instruction-set-architectures/amd-instinct-cdna4-instruction-set-architecture.pdf), [all ISA documents](https://gpuopen.com/amd-gpu-architecture-programming-documentation/)
+- [rocprofv3 / ROCprofiler-SDK](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/latest/)
+- [ROCm Compute Profiler](https://rocm.docs.amd.com/projects/rocprofiler-compute/en/latest/)
+- [rocprof-trace-decoder](https://github.com/ROCm/rocm-systems/tree/develop/projects/rocprof-trace-decoder) ([binary releases](https://github.com/ROCm/rocprof-trace-decoder/releases)) and [ROCprof Compute Viewer](https://github.com/ROCm/rocprof-compute-viewer)
