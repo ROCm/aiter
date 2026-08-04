@@ -29,6 +29,7 @@ from op_tests.test_moonep_gfx950_real_shape import (
     R,
     S,
     TOKEN_PADDING,
+    _expected_output,
     _identity_home_weights,
     _share_shmem_unique_id,
 )
@@ -221,6 +222,35 @@ def main() -> None:
             torch.cuda.synchronize(device)
             planning_samples.append((time.perf_counter() - begin) * 1e3)
         planning_ms = sum(planning_samples) / len(planning_samples)
+
+        checked_output, checked_weights, _ = _run_pipeline(
+            ep, plan, hidden, route_weights, collect_events=False
+        )
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            checked_weights, route_weights, rtol=0, atol=0
+        )
+        expected_first = _expected_output(hidden, route_weights)
+        torch.testing.assert_close(
+            checked_output[:, :I], expected_first, rtol=0, atol=0
+        )
+        assert int(torch.count_nonzero(checked_output[:, I:]).item()) == 0
+        local_dynamic_slots = torch.tensor(
+            int((plan.experts_to_copy[rank] >= 0).sum().item()),
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(local_dynamic_slots, op=dist.ReduceOp.SUM)
+        assert int(local_dynamic_slots.item()) > 0
+        if rank == 0:
+            print(
+                "MOONEP_PROFILE_ACCURACY_PASS "
+                "route_weights_rtol=0_atol=0 "
+                "hidden_rtol=0_atol=0 "
+                f"dynamic_slots={int(local_dynamic_slots.item())}",
+                flush=True,
+            )
+        del checked_output, checked_weights, expected_first
 
         for _ in range(warmup):
             _run_pipeline(
