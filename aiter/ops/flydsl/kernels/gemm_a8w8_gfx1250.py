@@ -7,8 +7,8 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
-from flydsl.expr.rocdl import cluster
+from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr.rocdl import cluster, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -19,6 +19,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     pipeline_fence,
     workgroup_barrier,
 )
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 
 
 @flyc.jit
@@ -113,9 +114,7 @@ def launch_gemm_a8w8(
         wave_n = wave % n_warp
         if const_expr(use_cluster):
             local_x, local_y = cluster.compute_cluster_position()
-            a_mask, b_mask = cluster.compute_mcast_masks(
-                local_x, local_y, cluster_m, cluster_n
-            )
+            a_mask, b_mask = compute_mcast_masks(local_x, local_y, cluster_m, cluster_n)
         else:
             a_mask, b_mask = (0, 0)
         blk_m = bid_x * tile_m
@@ -127,12 +126,14 @@ def launch_gemm_a8w8(
         stride_ask64 = None
         if const_expr(is_bsc):
             nb_oob = (i32_n // 128 - blk_n // 128) if not ALIGNED_N else None
-        base_ptr = fx.SharedAllocator(static=False).allocate(ARENA_B)._ptr
+        arena = fx.SharedAllocator(static=False)
+        arena.allocate(ARENA_B)
+        base_ptr = arena.base_ptr
         if const_expr(is_bsc):
             stride_ask64 = fx.Int64(i32_stride_ascale_k)
 
         def _bidx(p):
-            return fx.index_cast(T.index, fx.ptrtoint(p))
+            return fx.Int64(fx.ptrtoint(p))
 
         def _buf_ptr(s):
             return fx.add_offset(base_ptr, s * PITCH)
@@ -197,11 +198,11 @@ def launch_gemm_a8w8(
 
             W_SA, W_SB = 2 % num_waves, 3 % num_waves
             sa_off0 = blk_m64
-            sb_off0 = blk_n64 // 128 * (fx.Int64(i32_k) // 128)
+            sb_off0 = blk_n64 // 128 * (k64 // 128)
             gSA = _gv(arg_scale_a, sa_off0, (K_WS, tile_m), (tile_m, 1))
             atomSA = _tdm1(gSA, None, mn_oob, stride_ask64, a_mask)
             gSB = _gv(arg_scale_b, sb_off0, (N_BLOCKS, K_WS), (K_WS, 1))
-            atomSB = _tdm1(gSB, nb_oob, None, fx.Int64(i32_k) // 128, b_mask)
+            atomSB = _tdm1(gSB, nb_oob, None, k64 // 128, b_mask)
 
         def _wcopy(w, atom, gt, lv, imm_offset):
             if wave == w:
@@ -214,7 +215,7 @@ def launch_gemm_a8w8(
                 atomA,
                 gA,
                 _lv(pa, (tile_m, tile_k), (A_LDS_ROW, 1)),
-                fx.Int64(kt) * fx.Int64(tile_k),
+                fx.Int64(kt) * tile_k,
             )
             _wcopy(
                 W_B,
@@ -225,7 +226,7 @@ def launch_gemm_a8w8(
                     (tile_n // 16, tile_k * 16),
                     (B_LDS_ROW, 1),
                 ),
-                fx.Int64(kt) * fx.Int64(tile_k * 16),
+                fx.Int64(kt) * (tile_k * 16),
             )
             if const_expr(is_bsc):
                 _wcopy(
@@ -240,7 +241,7 @@ def launch_gemm_a8w8(
                     atomSB,
                     gSB,
                     _lv(fx.add_offset(pa, SB_OFF), (N_BLOCKS, K_WS), (K_WS, 1)),
-                    fx.Int64(kt) * fx.Int64(K_WS),
+                    fx.Int64(kt) * K_WS,
                 )
 
         wmb = wave_m * warp_tile_m
@@ -248,7 +249,7 @@ def launch_gemm_a8w8(
 
         def load_a(buf, wm, ks):
             row = wmb + wm * 16 + lane16
-            b0 = fx.index_cast(T.index, row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
+            b0 = fx.Int64(row * A_LDS_ROW + ks * WMMA_K + kgrp * 16)
             v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
             v23 = v[2].shuffle(v[3], list(range(8)))
@@ -256,9 +257,8 @@ def launch_gemm_a8w8(
 
         def load_b(buf, wn, ks):
             nbl = wnb // 16 + wn
-            b0 = fx.index_cast(
-                T.index,
-                STAGE_A + nbl * B_LDS_ROW + ks * 2048 + kgrp * 256 + lane16 * 16,
+            b0 = fx.Int64(
+                STAGE_A + nbl * B_LDS_ROW + ks * 2048 + kgrp * 256 + lane16 * 16
             )
             v = [Vec(lds_load_b128(buf, b0 + 512 * j)) for j in range_constexpr(4)]
             v01 = v[0].shuffle(v[1], list(range(8)))
@@ -299,7 +299,7 @@ def launch_gemm_a8w8(
             )
         c_frags = [fx.make_rmem_tensor(8, fx.Float32) for _ in range_constexpr(n_acc)]
         for cf in c_frags:
-            cf.store(fx.constant_vector(0.0, T.vec(8, T.f32)))
+            cf.store(Vec.filled((8,), 0.0, fx.Float32))
 
         def _rmem(n, v):
             t = fx.make_rmem_tensor(n, fx.Int32)
@@ -469,8 +469,7 @@ def launch_gemm_a8w8(
             else:
                 compute_ktile_row(buf, pbuf, prefetch_kt)
 
-        def epilogue_apply_ptpc_scale():
-            accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+        def issue_ptpc_scale_loads():
             gSA_base = fx.recast_iter(
                 fx.PointerType.get(fx.Float32.ir_type, arg_scale_a.address_space),
                 arg_scale_a,
@@ -493,22 +492,36 @@ def launch_gemm_a8w8(
             sa_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
             sb_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
-            def _load(atom, tiles, lay, tile_idx):
+            def _issue(atom, tiles, lay, tile_idx):
                 r = fx.make_rmem_tensor(lay, fx.Float32)
                 fx.copy_atom_call(atom, fx.slice(tiles, (None, tile_idx)), r)
-                return r.load()
+                return r
 
-            sa = []
-            for wm in range_constexpr(wmma_m_rep):
-                row = blk_m + wmb + wm * 16 + lane16
-                sv = _load(sa_atom, sa_tiles, sa_lay, row)[0]
-                sa.append(Vec.from_elements([sv] * 8))
+            sa_r = [
+                _issue(sa_atom, sa_tiles, sa_lay, blk_m + wmb + wm * 16 + lane16)
+                for wm in range_constexpr(wmma_m_rep)
+            ]
             col4 = bid_y * (tile_n // 4) + wave_n * (warp_tile_n // 4) + kgrp * 2
-            sb = []
-            for wn in range_constexpr(wmma_n_rep):
-                lo = _load(sb_atom, sb_tiles, sb_lay, col4 + wn * 4)
-                hi = _load(sb_atom, sb_tiles, sb_lay, col4 + wn * 4 + 1)
-                sb.append(lo.shuffle(hi, list(range(8))))
+            sb_r = [
+                (
+                    _issue(sb_atom, sb_tiles, sb_lay, col4 + wn * 4),
+                    _issue(sb_atom, sb_tiles, sb_lay, col4 + wn * 4 + 1),
+                )
+                for wn in range_constexpr(wmma_n_rep)
+            ]
+            return sa_r, sb_r
+
+        def epilogue_apply_ptpc_scale(scale_regs):
+            sa_r, sb_r = scale_regs
+            accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
+            sa = [
+                Vec.from_elements([sa_r[wm].load()[0]] * 8)
+                for wm in range_constexpr(wmma_m_rep)
+            ]
+            sb = [
+                sb_r[wn][0].load().shuffle(sb_r[wn][1].load(), list(range(8)))
+                for wn in range_constexpr(wmma_n_rep)
+            ]
             for wm in range_constexpr(wmma_m_rep):
                 for wn in range_constexpr(wmma_n_rep):
                     idx = wm * wmma_n_rep + wn
@@ -528,19 +541,22 @@ def launch_gemm_a8w8(
             compute_ktile(buf, pbuf, kt + (num_buffers - 1))
             if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
                 cluster.cluster_barrier()
+        scale_regs = None
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
             s = kt % num_buffers
             pbuf = _buf_ptr(s)
             buf = _bidx(pbuf)
             pipeline_fence(outstanding=(num_buffers - 2 - j), use_cluster=False)
+            if const_expr(not is_bsc and j == num_buffers - 2):
+                scale_regs = issue_ptpc_scale_loads()
             compute_ktile(buf, pbuf, None)
         accs = None
         if const_expr(is_bsc):
             accs = [c_frags[idx].load() for idx in range_constexpr(n_acc)]
         pipeline_fence(outstanding=0, use_cluster=use_cluster)
         if const_expr(not is_bsc):
-            accs = epilogue_apply_ptpc_scale()
+            accs = epilogue_apply_ptpc_scale(scale_regs)
         for wm in range_constexpr(wmma_m_rep):
             row_rel = wmb + wm * 16 + lane16
             for wn in range_constexpr(wmma_n_rep):
