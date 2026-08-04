@@ -581,6 +581,9 @@ def _build_kv_kernel(
                             fx.make_view(fx.make_int_tuple(0), layout_head)
                         )
                         pair_coords = partition_pairs(row_coords, pair_lane)
+
+                        k_out_pairs = (0,0)
+                        v_out_pairs = (0,0)
                         if const_expr(emit_flat_kv):
                             k_out_pairs = partition_pairs(
                                 fx.slice(k_out, (tok, head, None)), pair_lane
