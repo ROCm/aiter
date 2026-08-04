@@ -2676,7 +2676,7 @@ def get_2stage_cfgs(
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
         )
         stage2_supports_bias = isinstance(kernelName2, str) and (
-            kernelName2.startswith("flydsl_") or kernelName2.startswith("cktile_")
+            kernelName2.startswith(("flydsl_", "cktile_"))
         )
         return MOEMetadata(
             stage1=functools.partial(
