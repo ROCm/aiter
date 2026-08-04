@@ -490,8 +490,9 @@ def _build_kv_kernel(
             return vout
 
         def quant_pair_fp8(v0, v1, scale):
-            s0 = _fp8_clamp(v0 / scale)
-            s1 = _fp8_clamp(v1 / scale)
+            inv_s = 1 / scale
+            s0 = _fp8_clamp(v0 * inv_s)
+            s1 = _fp8_clamp(v1 * inv_s)
 
             if const_expr(CACHE_IS_FNUZ):
                 # On gfx942, v_cvt_pk_fp8_f32 encodes values that round to
