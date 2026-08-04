@@ -85,7 +85,9 @@ __global__ void sparsekv_gather_kernel(const char* __restrict__ host_cache,
     const int lane_id   = threadIdx.x % WARP_SIZE;
     const int num_warps = (gridDim.x * blockDim.x) / WARP_SIZE;
     for (int m = warp_id; m < num_misses; m += num_warps) {
-        const int64_t src = (int64_t)src_locs[m] * item_size_bytes;
+        const int32_t src_row = src_locs[m];
+        if (src_row < 0) continue;  // unbacked cold row: no KV to gather
+        const int64_t src = (int64_t)src_row * item_size_bytes;
         const int64_t dst = (int64_t)dst_locs[m] * item_size_bytes;
         transfer_item_warp(lane_id, host_cache + src, device_buffer + dst,
                            item_size_bytes);
@@ -151,6 +153,15 @@ __global__ void sparsekv_swap_and_translate_kernel(
     for (int k = threadIdx.x; k < runlen; k += blockDim.x) {
         int tok = topk_q[k];
         if (tok < 0 || tok >= cold_depth) continue;
+        // Skip logical positions with no backing cold-pool row. With a paged host
+        // pool req_to_host_pool[r][tok] == -1 for any token outside the request's
+        // allocated range; gathering it would dereference cold_pool at row -1 ->
+        // GPU memory fault. Such a token has no KV to fetch, so treat it as
+        // padding: never make it resident (the translate loop maps any unresolved
+        // top-k entry to slot 0). This is the per-request length guard the dense
+        // r*cold_depth+tok path gets for free but the paged path must do here.
+        if (host_cache_locs &&
+            host_cache_locs[(int64_t)r * host_stride + tok] < 0) continue;
         int s = tts_base[tok];
         if (s >= 0) {
             lu_base[s] = tick;  // hit: most recent
@@ -308,12 +319,14 @@ __global__ void sparsekv_backup_kernel(
     // Copy the new token's KV: layer_kv[src] -> cold pool[r*C+pos] and hot[r*H1+v].
     const int lane_id = threadIdx.x % WARP_SIZE;
     if (threadIdx.x < WARP_SIZE) {
-        const int64_t kv_off   = (int64_t)src * item_size_bytes;
-        const int64_t cold_off =
-            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos) *
-            item_size_bytes;
-        transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
-                           item_size_bytes);
+        const int64_t cold_row =
+            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
+        if (cold_row >= 0) {  // pos is normally backed; guard against a fault
+            const int64_t kv_off   = (int64_t)src * item_size_bytes;
+            const int64_t cold_off = cold_row * item_size_bytes;
+            transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                               item_size_bytes);
+        }
     } else if (threadIdx.x < 2 * WARP_SIZE) {
         const int64_t kv_off  = (int64_t)src * item_size_bytes;
         const int64_t hot_off = ((int64_t)r * hot_slots + v) * item_size_bytes;
@@ -351,9 +364,10 @@ __global__ void sparsekv_copy_planned_kernel(
         const int tok = tok_q[i];
         const int v   = slot_q[i];
         if (tok < 0 || tok >= cold_depth || v < 0 || v >= hot_slots) continue;
-        const int64_t src =
-            cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok) *
-            item_size_bytes;
+        const int64_t cold_row =
+            cold_row_of(host_cache_locs, host_stride, r, cold_depth, tok);
+        if (cold_row < 0) continue;  // unbacked position: no KV to replay
+        const int64_t src = cold_row * item_size_bytes;
         const int64_t dst = ((int64_t)r * hot_slots + v) * item_size_bytes;
         transfer_item_warp(lane_id, cold_pool + src, hot_buffer + dst,
                            item_size_bytes);
@@ -386,12 +400,14 @@ __global__ void sparsekv_backup_into_assigned_kernel(
 
     const int lane_id = threadIdx.x % WARP_SIZE;
     if (threadIdx.x < WARP_SIZE) {
-        const int64_t kv_off   = (int64_t)src * item_size_bytes;
-        const int64_t cold_off =
-            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos) *
-            item_size_bytes;
-        transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
-                           item_size_bytes);
+        const int64_t cold_row =
+            cold_row_of(host_cache_locs, host_stride, r, cold_depth, pos);
+        if (cold_row >= 0) {  // pos is normally backed; guard against a fault
+            const int64_t kv_off   = (int64_t)src * item_size_bytes;
+            const int64_t cold_off = cold_row * item_size_bytes;
+            transfer_item_warp(lane_id, layer_kv + kv_off, cold_pool + cold_off,
+                               item_size_bytes);
+        }
     } else if (threadIdx.x < 2 * WARP_SIZE) {
         const int64_t kv_off  = (int64_t)src * item_size_bytes;
         const int64_t hot_off = ((int64_t)r * hot_slots + v) * item_size_bytes;
