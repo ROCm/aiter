@@ -637,7 +637,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
                 if(wave_id_n == 0)
                 {
                     g_a.template async_load<T::VEC_A>(
-                        reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_lo)),
+                        smem_lo,
                         a_offset_lo,
                         0,
                         opus::number<T::CACHECTL_A>{});
@@ -645,7 +645,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
                 else
                 {
                     g_a.template async_load<T::VEC_A>(
-                        reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_hi)),
+                        smem_hi,
                         a_offset_lo + T::K_STEP_PACKED / 2,
                         0,
                         opus::number<T::CACHECTL_A>{});
@@ -654,12 +654,12 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
             else
             {
                 g_a.template async_load<T::VEC_A>(
-                    reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_lo)),
+                    smem_lo,
                     a_offset_lo,
                     0,
                     opus::number<T::CACHECTL_A>{});
                 g_a.template async_load<T::VEC_A>(
-                    reinterpret_cast<void*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_hi)),
+                    smem_hi,
                     a_offset_lo + T::K_STEP_PACKED / 2,
                     0,
                     opus::number<T::CACHECTL_A>{});
@@ -823,24 +823,8 @@ inline __device__ void opus_moe_stage2_a8w4_decode_mainloop(
 typedef uint32_t opus_moe_stage2_a8w4_decode_u32x4_store_t
     __attribute__((ext_vector_type(4)));
 
-inline __device__ void opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-    opus::bf16x2_t data,
-    opus::i32x4_t out_rsrc,
-    int byte_offset)
-{
-#if OPUS_HAS_BUFFER_ATOMIC_PK_ADD_BF16
-    (void)opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(
-        data, out_rsrc, byte_offset, 0, 0);
-#else
-    (void)data;
-    (void)out_rsrc;
-    (void)byte_offset;
-    __builtin_trap();
-#endif
-}
-
-template<typename T, typename CAcc>
-inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
+template<typename T, bool CheckRoute, typename CAcc>
+inline __device__ void opus_moe_stage2_a8w4_decode_write_acc_to_smem(
     CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
     const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
     const int32_t* __restrict__ smem_route_base,
@@ -849,44 +833,16 @@ inline __device__ void opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem(
 {
     using namespace opus;
 
-    static_assert(T::DIRECT_ATOMIC_OUT);
-
     auto* smem_c_bf16 = reinterpret_cast<hip_bfloat16*>(smem_c_pair);
 
     static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
         static_for<T::VEC_C>([&](auto ii) {
             const int local_m = c_layout.acc_local_m(mi.value, ii.value);
-            if(smem_route_base[local_m] >= 0)
+            if constexpr(CheckRoute)
             {
-                const float weight = smem_weight[local_m];
-                static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
-                    const int local_col = c_layout.acc_local_col(ni.value);
-                    smem_c_bf16[c_layout.smem_scalar_index(local_m, local_col)] =
-                        opus_moe_gfx950_cvt_bf16_f32(
-                            static_cast<float>(v_c[mi.value][ni.value][ii.value]) *
-                            weight);
-                });
+                if(smem_route_base[local_m] < 0)
+                    return;
             }
-        });
-    });
-}
-
-template<typename T, typename CAcc>
-inline __device__ void opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem(
-    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
-    const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
-    const float* __restrict__ smem_weight,
-    uint32_t* __restrict__ smem_c_pair)
-{
-    using namespace opus;
-
-    static_assert(!T::DIRECT_ATOMIC_OUT);
-
-    auto* smem_c_bf16 = reinterpret_cast<hip_bfloat16*>(smem_c_pair);
-
-    static_for<T::M_MFMA_PER_WAVE>([&](auto mi) {
-        static_for<T::VEC_C>([&](auto ii) {
-            const int local_m = c_layout.acc_local_m(mi.value, ii.value);
             const float weight = smem_weight[local_m];
             static_for<T::N_MFMA_PER_WAVE>([&](auto ni) {
                 const int local_col = c_layout.acc_local_col(ni.value);
@@ -930,15 +886,17 @@ inline __device__ void opus_moe_stage2_a8w4_decode_atomic_smem_to_out(
         {
             const int token = smem_route_base[local_m];
             const int pair_base = c_layout.smem_pair_index(local_m, col0);
-            const int byte_offset =
-                c_layout.output_byte_offset(token, output_row_stride, col_base, col0);
+            const int byte0 =
+                c_layout.output_elem_offset(token, output_row_stride, col_base, col0) *
+                static_cast<int>(sizeof(opus::bf16_t));
             opus::static_for<ATOMIC_GROUPS>([&](auto group) {
                 constexpr int pair_delta = group.value * CSHUFFLE_NLANE;
-                constexpr int byte_delta = pair_delta * static_cast<int>(sizeof(uint32_t));
+                constexpr int byte_delta =
+                    pair_delta * T::ELEM_PER_ATOMIC * static_cast<int>(sizeof(opus::bf16_t));
                 const auto data = __builtin_bit_cast(
                     opus::bf16x2_t, smem_c_pair[pair_base + pair_delta]);
-                opus_moe_stage2_a8w4_decode_atomic_add_bf16x2(
-                    data, out_rsrc, byte_offset + byte_delta);
+                opus::llvm_amdgcn_raw_buffer_atomic_fadd_v2bf16(
+                    data, out_rsrc, byte0 + byte_delta, 0, 0);
             });
         }
     }
@@ -1078,7 +1036,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     uint32_t* __restrict__ smem_c_pair,
     int col_base,
     int64_t output_row_stride,
-    opus::i32x4_t output_rsrc)
+    opus::i32x4_t out_rsrc)
 {
     using namespace opus;
     using opus::operator""_I;
@@ -1086,7 +1044,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(T::DIRECT_ATOMIC_OUT);
 
-    opus_moe_stage2_a8w4_decode_write_direct_acc_to_smem<T>(
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, true>(
         v_c,
         c_layout,
         smem_route_base,
@@ -1100,7 +1058,7 @@ inline __device__ void opus_moe_stage2_a8w4_decode_direct_epilogue(
         c_layout,
         col_base,
         output_row_stride,
-        output_rsrc);
+        out_rsrc);
 }
 
 template<typename T, typename CAcc>
@@ -1120,9 +1078,10 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
     static_assert(T::B_N == T::C_LDS_N);
     static_assert(!T::DIRECT_ATOMIC_OUT);
 
-    opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem<T>(
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, false>(
         v_c,
         c_layout,
+        smem_route_base,
         smem_weight,
         smem_c_pair);
     s_waitcnt_lgkmcnt(0_I);
@@ -1134,6 +1093,42 @@ inline __device__ void opus_moe_stage2_a8w4_decode_route_out_epilogue(
         col_base,
         out,
         output_row_stride);
+}
+
+template<typename T, typename CAcc>
+inline __device__ void opus_moe_stage2_a8w4_decode_route_out_fp8_epilogue(
+    CAcc (&v_c)[T::M_MFMA_PER_WAVE][T::N_MFMA_PER_WAVE],
+    const OpusMoeStage2A8W4CShuffleLayout<T>& c_layout,
+    const int32_t* __restrict__ smem_route_base,
+    const float* __restrict__ smem_weight,
+    uint32_t* __restrict__ smem_c_pair,
+    int col_base,
+    uint8_t* __restrict__ out_base,
+    int64_t row_stride_bytes,
+    int scale_col_off)
+{
+    using namespace opus;
+    using opus::operator""_I;
+
+    static_assert(T::B_N == T::C_LDS_N);
+    static_assert(!T::DIRECT_ATOMIC_OUT);
+
+    opus_moe_stage2_a8w4_decode_write_acc_to_smem<T, false>(
+        v_c,
+        c_layout,
+        smem_route_base,
+        smem_weight,
+        smem_c_pair);
+    s_waitcnt_lgkmcnt(0_I);
+    __syncthreads();
+    opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T>(
+        smem_c_pair,
+        smem_route_base,
+        c_layout,
+        col_base,
+        out_base,
+        row_stride_bytes,
+        scale_col_off);
 }
 
 #endif // __gfx950__
@@ -1202,10 +1197,10 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
     if(!has_route)
         return;
 
-    auto mma = make_mfma<D_MFMA_A, D_MFMA_B, D_ACC>(
-        number<T::MMA_M>{},
-        number<T::MMA_N>{},
-        number<T::MMA_K>{});
+    auto mma = make_tiled_mma<D_MFMA_A, D_MFMA_B, D_ACC>(
+        seq<1, 1, 1>{},
+        seq<1, 1, 1>{},
+        seq<T::MMA_M, T::MMA_N, T::MMA_K>{});
 
     const D_A* __restrict__ inter_states =
         reinterpret_cast<const D_A*>(kargs.inter_states_fp8);
@@ -1270,8 +1265,14 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             static_cast<unsigned long long>(output_rows_per_token) *
             static_cast<unsigned long long>(kargs.stride_o_t) *
             static_cast<unsigned long long>(sizeof(hip_bfloat16)));
+        // Build the output buffer descriptor as a plain i32x4 rather than via
+        // make_gmem/make_buffer_rsrc: the __builtin_amdgcn_make_buffer_rsrc
+        // intrinsic result is held across the atomic loop at +2 VGPR, which tips
+        // the zero-headroom atomic decode kernels into 32 B/lane scratch (~4-7%
+        // regression). The plain descriptor packs into cheap registers. The
+        // atomic itself still uses the opus raw-buffer primitive.
         const auto output_ptr_bits = reinterpret_cast<__UINTPTR_TYPE__>(kargs.out_bf16);
-        const opus::i32x4_t output_rsrc{
+        const opus::i32x4_t out_rsrc{
             static_cast<int>(static_cast<unsigned int>(output_ptr_bits)),
             static_cast<int>((static_cast<unsigned long long>(output_ptr_bits) >> 32) &
                              0xffffu),
@@ -1285,18 +1286,20 @@ opus_moe_stage2_a8w4_decode_kernel_gfx950(opus_moe_stage2_a8w4_kargs kargs)
             smem_c_pair,
             col_base,
             kargs.stride_o_t,
-            output_rsrc);
+            out_rsrc);
     }
     else if(kargs.route_out_fp8)
     {
-        opus_moe_stage2_a8w4_decode_write_route_out_acc_to_smem<T>(
-            v_c, u_c, smem_weight, smem_c_pair);
-        s_waitcnt_lgkmcnt(0_I);
-        __syncthreads();
-        opus_moe_stage2_a8w4_decode_store_smem_to_route_out_fp8<T>(
-            smem_c_pair, smem_route_base, u_c, col_base,
+        opus_moe_stage2_a8w4_decode_route_out_fp8_epilogue<T>(
+            v_c,
+            u_c,
+            smem_route_base,
+            smem_weight,
+            smem_c_pair,
+            col_base,
             reinterpret_cast<uint8_t*>(kargs.out_bf16),
-            kargs.route_out_row_bytes, kargs.model_dim);
+            kargs.route_out_row_bytes,
+            kargs.model_dim);
     }
     else
     {
