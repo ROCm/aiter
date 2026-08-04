@@ -469,7 +469,7 @@ def emit_dispatch_plan(
             mori_shmem.int32_wait_until_equals(a_group_done, fx.Int32(dispatch_blocks))
             comm_ops.fence_agent_acquire()
         comm_ops.fence_agent_release()
-        buffer_ops.buffer_store(expected, crfa(a_pair_order_ready), parity)
+        comm_ops.store_i32_system(a_pair_order_ready, parity, expected)
 
 
 # fmt: off
