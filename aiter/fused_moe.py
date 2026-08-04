@@ -1885,7 +1885,7 @@ def get_2stage_cfgs(
         run_1stage = False
         run_1stage_xbf16 = False
         # No tuned config => default host moe_sort. For FLAT, run tuner and set flat=1.
-        cfg_flat = False
+        cfg_flat = 0
         if (
             activation,
             q_type,
@@ -1952,7 +1952,7 @@ def get_2stage_cfgs(
         if "flat" in cfg:
             cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
-            cfg_flat = False
+            cfg_flat = 0
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )

@@ -240,6 +240,7 @@ def fmoe_fp8_blockscale_g1u1(
     fc2_smooth_scale: Optional[Tensor] = None,
     activation: Optional[int] = ActivationType.Silu.value,
     block_size_M: int = 32,
+    flat_mode: int = 0,
 ) -> None: ...
 
 
