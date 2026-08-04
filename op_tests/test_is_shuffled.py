@@ -171,7 +171,7 @@ def test_gemm_a16w16_cloned_weight():
     tolerance = 2 * (reference - repeated).abs().max().item()
 
     # Declaring the layout has to reproduce it: same kernel over identical data.
-    declared = gemm_a16w16(x, clone, is_shuffled=True)
+    declared = gemm_a16w16(x, clone, bpreshuffle=True)
     torch.cuda.synchronize()
     torch.testing.assert_close(declared, reference, rtol=0, atol=tolerance)
 
@@ -181,7 +181,7 @@ def test_gemm_a16w16_cloned_weight():
     inferred = gemm_a16w16(x, clone)
     torch.cuda.synchronize()
     print(
-        "gemm_a16w16 clone without is_shuffled max diff: "
+        "gemm_a16w16 clone without bpreshuffle max diff: "
         f"{(reference - inferred).abs().max().item()}"
     )
 
