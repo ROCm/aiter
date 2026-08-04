@@ -4,8 +4,8 @@
 import pytest
 import torch
 
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.attention.pa_prefill_sparse import pa_prefill_sparse
+from aiter.ops.triton.utils._triton import arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -272,6 +272,7 @@ def test_pa_prefill_sparse_vs_reference(T, H, D, prefix_len, extend_len, sentine
         e_indptr,
         sink,
         scale,
+        has_invalid=sentinels,
     )
 
     torch.testing.assert_close(out, ref, atol=5e-3, rtol=5e-3)

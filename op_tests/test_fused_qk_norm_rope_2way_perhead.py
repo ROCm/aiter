@@ -25,7 +25,7 @@ FP8_DTYPE = dtypes.fp8
 
 def _torch_per_head_fp8_quant(x: Tensor) -> tuple[Tensor, Tensor]:
     """Reference per-(batch, head) fp8 quant (amax/240 descale)."""
-    batch_size, num_tokens, num_heads, head_size = x.shape
+    _batch_size, _num_tokens, _num_heads, _head_size = x.shape
     x32 = x.float()
     amax = x32.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-8)
     descale = amax / 240.0
@@ -35,7 +35,7 @@ def _torch_per_head_fp8_quant(x: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def _dequant_per_head(fp8: Tensor, descale: Tensor) -> Tensor:
-    b, t, h, d = fp8.shape
+    b, _t, h, _d = fp8.shape
     return fp8.float() * descale.view(b, 1, h, 1).float()
 
 
@@ -445,10 +445,10 @@ def _validate_v_perhead_case(
     v_ref = torch.cat([v0, v1], dim=1).contiguous()
 
     if collect_perf:
-        (v_pt, v_pt_s), baseline_us = _run_v_baseline(v0, v1)
+        (_v_pt, _v_pt_s), baseline_us = _run_v_baseline(v0, v1)
         (v_ph, v_ph_s), hip_us = _run_v_perhead(v0, v1)
     else:
-        v_pt, v_pt_s = _run_v_baseline(v0, v1)[0]
+        _v_pt, _v_pt_s = _run_v_baseline(v0, v1)[0]
         baseline_us = None
         v_ph, v_ph_s = _run_v_perhead(v0, v1)[0]
         hip_us = None

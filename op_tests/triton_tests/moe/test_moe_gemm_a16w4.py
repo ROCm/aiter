@@ -1,24 +1,21 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/tests/test_matmul.py
 
-import dataclasses
+from dataclasses import replace
 
 import pytest
 import torch
-
-# backend selection for moe_gemm_a16w4 (triton vs gfx1250 gluon)
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-
-# routing utilities
-from aiter.ops.triton.moe.moe_routing.routing import routing
 
 # matmul utilities
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
     moe_gemm_a16w4,
     moe_gemm_torch,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
+# routing utilities
+from aiter.ops.triton.moe.moe_routing.routing import routing
+
+# routing utilities
 # numerics utilities
 from aiter.ops.triton.moe.quant_moe import (
     # downcast_to_static_fp8,
@@ -27,7 +24,11 @@ from aiter.ops.triton.moe.quant_moe import (
 )
 
 # target-specific utilities
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils._triton import arch_info
+
+# backend selection for moe_gemm_a16w4 (triton vs gfx1250 gluon)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 # ---------------
@@ -133,21 +134,17 @@ def assert_close(ref, tri, maxtol=None, rmstol=None, description="--", verbose=T
 
     if verbose:
         print(
-            "%s maximum relative error = %s (threshold = %s)"
-            % (description, max_err, maxtol)
+            f"{description} maximum relative error = {max_err} (threshold = {maxtol})"
         )
-        print(
-            "%s RMS relative error = %s (threshold = %s)"
-            % (description, rms_err, rmstol)
-        )
+        print(f"{description} RMS relative error = {rms_err} (threshold = {rmstol})")
 
     if max_err > maxtol:
         bad_idxs = torch.nonzero(rel_err > maxtol)
         num_nonzero = bad_idxs.size(0)
         bad_idxs = bad_idxs[:1000]
         print(
-            "%d / %d mismatched elements (shape = %s) at coords %s"
-            % (num_nonzero, rel_err.numel(), tuple(rel_err.shape), bad_idxs.tolist())
+            f"{num_nonzero} / {rel_err.numel()} mismatched elements "
+            f"(shape = {tuple(rel_err.shape)}) at coords {bad_idxs.tolist()}"
         )
 
         bad_idxs = bad_idxs.unbind(-1)
@@ -336,7 +333,7 @@ def test_op(
     if golden_dev == "cpu":
         # moe_gemm_torch follows x.device; move all golden inputs to CPU (routing
         # histogram included) and run the reference matmul on CPU.
-        rdata_g = dataclasses.replace(
+        rdata_g = replace(
             rdata,
             expt_hist=None if rdata.expt_hist is None else rdata.expt_hist.cpu(),
         )

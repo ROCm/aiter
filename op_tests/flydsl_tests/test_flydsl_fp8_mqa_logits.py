@@ -4,19 +4,20 @@
 import argparse
 import itertools
 
-import aiter
 import pandas as pd
 import torch
+
+import aiter
 from aiter import dtypes
-from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits as triton_logits
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from op_tests.triton_tests.attention.test_fp8_mqa_logits import (
     calc_diff,
+    e4m3_type,
+    generate_cp_test_data,
     per_custom_dims_cast_to_fp8,
     ref_fp8_mqa_logits,
-    generate_cp_test_data,
-    e4m3_type,
 )
 
 torch.set_default_device("cuda")

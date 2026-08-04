@@ -5,21 +5,18 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Optional
-
-import torch
-import triton
-import triton.language as tl
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir as _ir
+import torch
+import triton
+import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
-from flydsl.utils.smem_allocator import SmemAllocator
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -40,9 +37,6 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
         fx.Int32
     )
-
-
-allocator = None
 
 
 @triton.jit
@@ -126,11 +120,14 @@ def compute_varctx_schedule(
     next_n=1,
     cta_info_out=None,
 ):
+    B = context_lens.shape[0]
+    if parallel_unit_num is None:
+        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
+        parallel_unit_num = B * next_n * chunks_per_seq
     P = parallel_unit_num
     if P % next_n != 0:
         raise ValueError(f"parallel_unit_num={P} must be a multiple of next_n={next_n}")
     S = P // next_n
-    B = context_lens.shape[0]
     if S < B:
         raise ValueError(
             f"compute_varctx_schedule: parallel_unit_num//next_n={S} < batches={B} "
@@ -185,7 +182,6 @@ def build_pa_mqa_logits_fp4_module(
         head_dim % 128 == 0
     ), f"head_dim must be a multiple of 128 (MFMA K), got {head_dim}"
     assert heads % MFMA_M == 0, f"heads must be a multiple of {MFMA_M}, got {heads}"
-    global allocator
 
     N_TILES = block_k // MFMA_N
     assert (
@@ -214,9 +210,6 @@ def build_pa_mqa_logits_fp4_module(
     # KV_scale: [block_id, K_TILES, K_chunks=4, block_size]
     _stride_kvs_ktile = 4 * kv_block_size  # bytes per K_TILE block
     _stride_kvs_block = k_tiles * _stride_kvs_ktile
-
-    allocator = SmemAllocator(None, arch="gfx950", global_sym_name="mqa_fp4_smem")
-    allocator.ptr = 16  # minimal, no LDS needed for this approach
 
     QS_DW = (m_tiles + 3) // 4
     qs_pad = QS_DW * 4
@@ -284,13 +277,10 @@ def build_pa_mqa_logits_fp4_module(
         chunk_count = cta_info_vec[2]
         context_len = cta_info_vec[3]
 
-        _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(batch_packed))
-        _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_batch))
-        _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
-        _row_bytes_i64 = arith.muli(
-            _row_elems_i64,
-            arith.constant(4, type=T.i64),  # sizeof(f32)
-        )
+        # sizeof(f32) = 4; compute the per-batch base byte offset in i64.
+        _row_bytes_i64 = (
+            fx.Int64(batch_packed) * fx.Int64(stride_out_batch) * 4
+        ).ir_value()
         out_rsrc = buffer_ops.create_buffer_resource(
             out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
         )
@@ -430,8 +420,8 @@ def build_pa_mqa_logits_fp4_module(
             for k_tile in range_constexpr(k_tiles):
                 packed = kvs_packed_list_in[k_tile]
                 for nt in range_constexpr(N_TILES_PER_WARP):
-                    shifted = arith.ArithValue(packed) >> fx.Int32(8 * nt)
-                    scales[nt][k_tile] = shifted & fx.Int32(0xFF)
+                    shifted = fx.Int32(packed) >> (8 * nt)
+                    scales[nt][k_tile] = shifted & 0xFF
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
@@ -551,7 +541,7 @@ def build_pa_mqa_logits_fp4_module(
         # === Main loop: chunk_count - 1 iterations ===
         N_KVS = k_tiles  # one packed i32 per k_tile (NTPW=4 nts packed in)
         chunk_count_minus_1_i32 = chunk_count - fx.Int32(1)
-        chunk_count_minus_1_idx = fx.Index(chunk_count_minus_1_i32)
+        chunk_count_minus_1_idx = fx.Int64(chunk_count_minus_1_i32)
         init_args = (
             list(kv_pre) + list(kvs_pre) + list(phys_next_pre) + nt0_init_scalars
         )
@@ -615,10 +605,9 @@ def build_pa_mqa_logits_fp4_module(
             kv_last_list, kvs_last_list, last_c_i32, nt0_accs_in=nt0_accs_last
         )
 
-    # Attach actual block threads count for the launcher (so the test can use
-    # the right block dim when num_warps != module-level default).
-    allocator.block_threads = block_threads_k
-    return pa_mqa_logits_fp4_kernel, allocator
+    # Return the actual block threads count for the launcher (so the test can
+    # use the right block dim when num_warps != module-level default).
+    return pa_mqa_logits_fp4_kernel, block_threads_k
 
 
 # ============================================================================
@@ -637,7 +626,7 @@ def compile_pa_mqa_logits_fp4(
     heads: int = DEFAULT_HEADS,
     head_dim: int = DEFAULT_HEAD_DIM,
 ):
-    kfn, alloc = build_pa_mqa_logits_fp4_module(
+    kfn, block_threads = build_pa_mqa_logits_fp4_module(
         block_k=block_k,
         kv_block_size=kv_block_size,
         max_blocks_per_seq=max_blocks_per_seq,
@@ -646,7 +635,6 @@ def compile_pa_mqa_logits_fp4(
         heads=heads,
         head_dim=head_dim,
     )
-    block_threads = getattr(alloc, "block_threads", DEFAULT_BLOCK_THREADS)
 
     @flyc.jit
     def launch_pa_mqa_logits_fp4(
@@ -663,12 +651,7 @@ def compile_pa_mqa_logits_fp4(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        # Re-finalize the smem allocator into this launch's gpu module body.
-        alloc.finalized = False
-        cctx = CompilationContext.get_current()
-        with _ir.InsertionPoint(cctx.gpu_module_body):
-            alloc.finalize()
-        gxi = arith.index_cast(T.index, gx.ir_value())
+        gxi = fx.Int64(gx)
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )
@@ -691,13 +674,20 @@ def flydsl_pa_mqa_logits_fp4(
     block_k: int = 256,
     kv_block_size: int = 64,
     num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: int = 512,
-    out: Optional[torch.Tensor] = None,
-    cta_info: Optional[torch.Tensor] = None,
-    total_ctas: Optional[int] = None,
-    stream: Optional[torch.cuda.Stream] = None,
+    parallel_unit_num: int | None = None,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    total_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Decode/varctx FP4 paged MQA logits (gfx950)."""
+    """Decode/varctx FP4 paged MQA logits (gfx950).
+
+    ``parallel_unit_num`` is the persistent-grid CTA count; when ``None`` it is
+    auto-derived (cudagraph-safe, no device→host sync) as
+    ``batch * next_n * ceil(max_seq_len / block_k)``, which is a multiple of
+    ``next_n`` and ``>= batch*next_n`` by construction. Pass a smaller explicit
+    value to trade parallelism for fewer no-op CTAs.
+    """
     batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
     head_dim = head_dim_packed * 2
     max_blocks_per_seq = block_tables.shape[1]

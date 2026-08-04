@@ -1,27 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import argparse
+import logging
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
+
+import pandas as pd
 import torch
 import torch.distributed as dist
-from typing import Optional
-import argparse
-import pandas as pd
-from aiter import dtypes
 
+from aiter import dtypes
+from aiter.dist.communication_op import tensor_model_parallel_reduce_scatter
 from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
     ensure_model_parallel_initialized,
+    get_tp_group,
     init_distributed_environment,
     set_custom_all_reduce,
-    get_tp_group,
-    destroy_model_parallel,
-    destroy_distributed_environment,
 )
-from aiter.dist.utils import get_open_port, get_distributed_init_method, get_ip
-from aiter.dist.communication_op import tensor_model_parallel_reduce_scatter
+from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.test_common import perftest
-from multiprocessing import set_start_method, Pool, freeze_support
-import logging
 
 logger = logging.getLogger("aiter")
 
@@ -35,7 +35,7 @@ def reduce_scatter(
     x,
     dim=0,
     use_custom=False,
-    distributed_init_method: Optional[str] = None,
+    distributed_init_method: str | None = None,
 ):
     """Per-rank worker. Runs reduce_scatter on x with the given dim and
     returns (output, per-call latency in us)."""

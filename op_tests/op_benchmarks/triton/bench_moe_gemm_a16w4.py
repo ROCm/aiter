@@ -1,25 +1,27 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/bench/bench_mlp.py
 
-from itertools import product
-from pathlib import Path
+import argparse
+import csv
 import dataclasses
 import os
 import statistics
-import triton.profiler as proton
+import tempfile
+from itertools import product
+from pathlib import Path
+
 import torch
-import argparse
-import csv
-from aiter.ops.triton.moe.moe_routing.routing import routing
+import triton.profiler as proton
+
 from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
+    _get_config,
     moe_gemm_a16w4,
     moe_gemm_torch,
-    _get_config,
 )
-from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-import tempfile
+from aiter.ops.triton.moe.moe_routing.routing import routing
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp, upcast_from_mxfp
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.shuffle import shuffle_scale_moe
 
 # Config dict forwarded to every moe_gemm_a16w4 call (set from --backend /
 # --gluon-stage in main). None -> let the op's `auto` config pick per shape.
@@ -400,13 +402,13 @@ def _eval_config(make_fn, make_time_fn, cfg, is_close, timing, warmup, iters):
     layer with only this GEMM's config varied for fused tuning)."""
     try:
         out = make_fn(cfg)()
-    except Exception:
+    except Exception:  # noqa: BLE001 - benchmark: any candidate failure -> skip
         return None, "fail"
     if is_close is not None and not is_close(out):
         return None, "wrong"
     try:
         return _measure(make_time_fn(cfg), timing, warmup, iters)["min_ms"], "ok"
-    except Exception:
+    except Exception:  # noqa: BLE001 - benchmark: any candidate failure -> skip
         return None, "fail"
 
 

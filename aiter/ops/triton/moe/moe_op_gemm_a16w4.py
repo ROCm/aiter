@@ -5,18 +5,19 @@ import functools
 import itertools
 import json
 import os
-from typing import Optional
+
 import torch
 import triton
-from aiter.ops.triton.moe.moe_routing.routing import RoutingData
-from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
-    _moe_gemm_a16w4_triton,
-)
+
 from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_gluon_stage1,
     _moe_gemm_a16w4_gluon_stage2,
     _moe_gemm_a16w4_gluon_stage3,
 )
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_triton,
+)
+from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
@@ -284,7 +285,7 @@ def moe_gemm_a16w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ):
     """
     Y[:, :] = 0.

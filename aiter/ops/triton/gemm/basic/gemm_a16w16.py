@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional
 import torch
 import triton
-from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
-    _gemm_a16_w16_kernel,
-    _get_config as _get_triton_config,
-)
+
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+    _gemm_a16_w16_kernel,
+)
+from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a16w16 import (
+    _get_config as _get_triton_config,
+)
+from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton.utils.common_utils import serialize_dict, deserialize_str
-from aiter.jit.utils.torch_guard import torch_compile_guard
 
 _LOGGER = AiterTritonLogger()
 
@@ -27,21 +29,21 @@ def _is_gluon_available():
     """Check if the gluon backend is available for the current GPU architecture."""
     try:
         return any(supported in get_arch() for supported in _GLUON_SUPPORTED_ARCHS)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def gemm_a16w16_fake_tensor(
     x: torch.Tensor,
     w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     M, K = x.shape
     N, _ = w.shape
@@ -60,14 +62,14 @@ def gemm_a16w16_fake_tensor(
 def gemm_a16w16_(
     x: torch.Tensor,
     w: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[str] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: str | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
@@ -285,7 +287,7 @@ def gemm_a16w16_(
     else:
         y_pp = None
 
-    grid = lambda META: (  # noqa: E731
+    grid = lambda META: (
         (
             META["NUM_KSPLIT"]
             * triton.cdiv(M, META["BLOCK_SIZE_M"])
@@ -353,14 +355,14 @@ def gemm_a16w16_(
 def gemm_a16w16(
     x,
     w,
-    bias: Optional[torch.Tensor] = None,
-    dtype: Optional[torch.dtype] = torch.bfloat16,
-    y: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-    activation: Optional[str] = None,
-    skip_reduce: Optional[bool] = False,
+    bias: torch.Tensor | None = None,
+    dtype: torch.dtype | None = torch.bfloat16,
+    y: torch.Tensor | None = None,
+    config: dict | None = None,
+    activation: str | None = None,
+    skip_reduce: bool | None = False,
     kernel_type: str = "bandwidth_bound",
-    backend: Optional[str] = None,
+    backend: str | None = None,
 ):
     """
     Computes 16 bit matrix multiplication Y = X @ W^T
