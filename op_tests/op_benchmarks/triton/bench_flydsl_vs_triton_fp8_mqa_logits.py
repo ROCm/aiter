@@ -448,22 +448,7 @@ def run(args):
 
 def _make_closure(name, fn, shape, q_fp8, kv_fp8, scales, weights, ks, ke):
     """Build a timed closure for one impl.
-
-    The geak v4 standalone kernel has a 6-arg ABI (no ``clean_logits``); all
-    other impls (triton, geak_v5, flydsl:mfma* variants) take the standard 7 args.
     """
-    if name == "geak_v4":
-        # GEAK cannot support H=128, return None in this case
-        if shape.num_heads_q == 128:
-            return None
-
-        # Geak v4 has a 6-arg ABI (no clean_logits); it always prefills with -inf.
-        def closure():
-            fn(q_fp8, kv_fp8, scales, weights, ks, ke)
-
-        return closure
-
-    # All other impls (triton, flydsl:* variants) take 7 args.
     def closure():
         fn(q_fp8, kv_fp8, scales, weights, ks, ke, shape.clean_logits)
 
