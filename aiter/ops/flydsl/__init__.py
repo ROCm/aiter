@@ -136,6 +136,7 @@ _LAZY_IMPORTS = {
     "dcp_lse_combine": (".dcp_mailbox", "dcp_lse_combine"),
     "dcp_quant_query_gather": (".dcp_mailbox", "dcp_quant_query_gather"),
     "dcp_query_gather": (".dcp_mailbox", "dcp_query_gather"),
+    "flydsl_rot_quant": (".kernels.rot_quant", "flydsl_rot_quant"),
     "gather_kv_b_proj_flydsl": (
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl",
@@ -243,6 +244,7 @@ __all__ = [
     "flydsl_pa_mqa_logits_fp4_varqlen",
     "flydsl_preshuffle_gemm_a8",
     "flydsl_qk_norm_rope_quant",
+    "flydsl_rot_quant",
     "gather_kv_b_proj_flydsl",
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
