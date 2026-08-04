@@ -431,6 +431,33 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
     return False
 
 
+def _maybe_force_atomic_flydsl_stage2(kernel_name: str) -> str:
+    """Use an available atomic variant of a tuned FlyDSL reduce kernel."""
+    if (
+        os.environ.get("AITER_FLYDSL_FORCE_ATOMIC", "0") != "1"
+        or os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+        or not kernel_name.startswith("flydsl_moe2_")
+        or "_reduce" not in kernel_name
+    ):
+        return kernel_name
+
+    atomic_kernel = kernel_name.replace("_reduce", "_atomic", 1)
+    params = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(atomic_kernel)
+    if params is None or params.get("mode", "atomic") != "atomic":
+        logger.warning(
+            "[fused_moe] cannot force atomic stage2; kernel is unavailable: %s",
+            atomic_kernel,
+        )
+        return kernel_name
+
+    logger.warning(
+        "[fused_moe] forcing atomic stage2: %s -> %s",
+        kernel_name,
+        atomic_kernel,
+    )
+    return atomic_kernel
+
+
 # Lru cache will using hash to create key, which makes error when w1,w2 shape is symint.
 # We can use torch.compile(dynamic=False) to avoid
 @functools.lru_cache(maxsize=2048)
@@ -2287,6 +2314,8 @@ def get_2stage_cfgs(
             cfg_flat = run_1stage and bool(int(cfg["flat"]))
         else:
             cfg_flat = False
+    if not run_1stage:
+        kernelName2 = _maybe_force_atomic_flydsl_stage2(kernelName2)
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
         cfg.get("kernelName2", "")
     )
