@@ -17,6 +17,7 @@ from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -28,6 +29,7 @@ DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 
 # cta_info packed fields per CTA.
 CTA_INFO_WIDTH = 6
+ROW_INFO_WIDTH = 4
 
 
 def _resolve_prefill_block_k(block_k: int, max_seq_len: int) -> int:
@@ -46,6 +48,70 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
         fx.Int32
     )
+
+
+@triton.jit
+def _pack_prefill_row_info_kernel(
+    rb_ptr,
+    ls_ptr,
+    le_ptr,
+    row_info_ptr,
+    total_rows,
+    BLOCK: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = row < total_rows
+    base = row * ROW_WIDTH
+    tl.store(row_info_ptr + base, tl.load(rb_ptr + row, mask=mask), mask=mask)
+    tl.store(row_info_ptr + base + 1, tl.load(ls_ptr + row, mask=mask), mask=mask)
+    tl.store(row_info_ptr + base + 2, tl.load(le_ptr + row, mask=mask), mask=mask)
+    tl.store(row_info_ptr + base + 3, 0, mask=mask)
+
+
+def pack_prefill_row_info(row_to_batch, local_starts, local_ends, *, out=None):
+    """Pack three row metadata arrays into aligned ``[rows, 4]`` int32 records.
+
+    Field order is ``(batch_id, local_start, local_end, reserved)``. Pass a
+    stable ``out`` buffer to avoid allocation and make the pack CUDAGraph-safe.
+    """
+    total_rows = row_to_batch.shape[0]
+    if local_starts.shape[0] != total_rows or local_ends.shape[0] != total_rows:
+        raise ValueError("row metadata arrays must have the same length")
+    if out is None:
+        out = torch.empty(
+            total_rows,
+            ROW_INFO_WIDTH,
+            dtype=torch.int32,
+            device=row_to_batch.device,
+        )
+    elif (
+        out.dtype != torch.int32
+        or out.ndim != 2
+        or out.shape[0] < total_rows
+        or out.shape[1] != ROW_INFO_WIDTH
+        or not out.is_contiguous()
+        or out.device != row_to_batch.device
+    ):
+        raise ValueError(
+            "row_info out must be contiguous int32 "
+            f"[>= {total_rows}, {ROW_INFO_WIDTH}] on the input device"
+        )
+    if total_rows > 0:
+        rb = row_to_batch.to(torch.int32).contiguous()
+        ls = local_starts.to(torch.int32).contiguous()
+        le = local_ends.to(torch.int32).contiguous()
+        block = 256
+        _pack_prefill_row_info_kernel[(triton.cdiv(total_rows, block),)](
+            rb,
+            ls,
+            le,
+            out,
+            total_rows,
+            BLOCK=block,
+            ROW_WIDTH=ROW_INFO_WIDTH,
+        )
+    return out
 
 
 def compute_prefill_schedule(
@@ -282,9 +348,10 @@ def build_pa_mqa_logits_fp4_prefill_module(
         kv_scale_ptr: fx.Tensor,
         kv_indices_ptr: fx.Tensor,
         weights_ptr: fx.Tensor,
-        cta_info_ptr: fx.Tensor,  # [n_ctas, 6] i32
+        row_info_ptr: fx.Tensor,
         stride_out_row: Int32,
         weight_scale: fx.Float32,
+        split_kv: Int32,
     ):
         tid = gpu.thread_idx.x
         pid = gpu.block_idx.x
@@ -294,18 +361,33 @@ def build_pa_mqa_logits_fp4_prefill_module(
         lane_mod_16 = lane_id & 15
         lane_div_16 = (lane_id >> 4) & 3
 
-        # Per-CTA assignment: first 4 fields via dwordx4, window bounds via 2 scalar loads.
-        cta_info_rsrc = buffer_ops.create_buffer_resource(cta_info_ptr, max_size=True)
-        cta_base = pid * fx.Int32(CTA_INFO_WIDTH)
-        cta_info_4xi32 = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base, vec_width=4, dtype=T.i32
+        row_info_rsrc = buffer_ops.create_buffer_resource(row_info_ptr, max_size=True)
+        row_id = pid // split_kv
+        split_idx = pid % split_kv
+        row_info = fx.Vector(
+            buffer_ops.buffer_load(
+                row_info_rsrc,
+                row_id * fx.Int32(ROW_INFO_WIDTH),
+                vec_width=ROW_INFO_WIDTH,
+                dtype=T.i32,
+            )
         )
-        local_start = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base + fx.Int32(4), vec_width=1, dtype=T.i32
-        )
-        local_end = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base + fx.Int32(5), vec_width=1, dtype=T.i32
-        )
+        batch_id = row_info[0]
+        local_start = row_info[1]
+        local_end = row_info[2]
+        first_chunk = local_start // fx.Int32(block_k)
+        chunk_end = (local_end + fx.Int32(block_k - 1)) // fx.Int32(block_k)
+        window_chunks = chunk_end - first_chunk
+        chunks_per_split = window_chunks // split_kv
+        remainder = window_chunks - chunks_per_split * split_kv
+        extra_before = (split_idx < remainder).select(split_idx, remainder)
+        chunk_start_raw = first_chunk + split_idx * chunks_per_split + extra_before
+        chunk_count_raw = chunks_per_split + (split_idx < remainder).to(fx.Int32)
+        valid_split = chunk_count_raw > fx.Int32(0)
+        chunk_start = valid_split.select(chunk_start_raw, fx.Int32(0))
+        chunk_count = valid_split.select(chunk_count_raw, fx.Int32(1))
+        local_start = valid_split.select(local_start, fx.Int32(0))
+        local_end = valid_split.select(local_end, fx.Int32(0))
 
         kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
         kvs_rsrc = buffer_ops.create_buffer_resource(kv_scale_ptr, max_size=True)
@@ -313,12 +395,6 @@ def build_pa_mqa_logits_fp4_prefill_module(
 
         ZERO_F = fx.Float32(0.0)
         c0_i32 = fx.Int32(0)
-
-        cta_info_vec = fx.Vector(cta_info_4xi32)
-        row_id = cta_info_vec[0]
-        batch_id = cta_info_vec[1]
-        chunk_start = cta_info_vec[2]
-        chunk_count = cta_info_vec[3]
 
         # sizeof(f32) = 4; compute the per-row base byte offset in i64.
         _row_bytes_i64 = (fx.Int64(row_id) * fx.Int64(stride_out_row) * 4).ir_value()
@@ -657,18 +733,188 @@ def compile_pa_mqa_logits_fp4_prefill(
         kvs,
         bt,
         w,
-        cta_info_,
+        row_info_,
         stride_out: fx.Int32,
         weight_scale: fx.Float32,
+        split_kv_: fx.Int32,
         gx: fx.Int32,
         stream: fx.Stream,
     ):
         gxi = fx.Int64(gx)
-        kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
-            grid=(gxi,), block=(block_threads, 1, 1), stream=stream
-        )
+        kfn(
+            out,
+            q,
+            qs,
+            kv,
+            kvs,
+            bt,
+            w,
+            row_info_,
+            stride_out,
+            weight_scale,
+            split_kv_,
+        ).launch(grid=(gxi,), block=(block_threads, 1, 1), stream=stream)
 
     return launch_pa_mqa_logits_fp4_prefill, block_threads
+
+
+class _PreparedPackedPrefillLauncher:
+    """Shape-specialized packed prefill launch with compiled fast dispatch."""
+
+    __slots__ = ("_launcher", "split_kv", "n_ctas")
+
+    def __init__(self, launcher, split_kv, n_ctas):
+        self._launcher = launcher
+        self.split_kv = split_kv
+        self.n_ctas = n_ctas
+
+    def __call__(
+        self,
+        out,
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_info,
+        *,
+        weight_scale=1.0,
+        stream=None,
+    ):
+        if stream is None:
+            stream = torch.cuda.current_stream()
+        args = (
+            out,
+            q_fp4,
+            q_scale,
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            row_info,
+            out.stride(0),
+            float(weight_scale),
+            self.split_kv,
+            self.n_ctas,
+            stream,
+        )
+        device_index = q_fp4.device.index
+        if device_index is None or device_index == torch.cuda.current_device():
+            _run_compiled(self._launcher, *args)
+        else:
+            with torch.cuda.device(device_index):
+                _run_compiled(self._launcher, *args)
+
+
+@lru_cache(maxsize=128)
+def prepare_pa_mqa_logits_fp4_prefill_packed(
+    *,
+    total_tokens: int,
+    heads: int,
+    head_dim: int,
+    max_blocks_per_seq: int,
+    max_seq_len: int,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: int = 512,
+):
+    """Return a cached shape-specialized packed prefill launcher.
+
+    The first call with runtime tensors compiles and executes the launcher;
+    subsequent calls invoke the cached ``CompiledFunction`` directly. Warm the
+    returned launcher once before CUDAGraph capture.
+    """
+    max_chunks = max(1, (max_seq_len + block_k - 1) // block_k)
+    target_ctas = max(parallel_unit_num, total_tokens)
+    split_kv = min(
+        max_chunks,
+        max(1, (target_ctas + total_tokens - 1) // total_tokens),
+    )
+    n_ctas = total_tokens * split_kv
+    launcher, _ = compile_pa_mqa_logits_fp4_prefill(
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        max_blocks_per_seq=max_blocks_per_seq,
+        num_warps=num_warps,
+        heads=heads,
+        head_dim=head_dim,
+    )
+    return _PreparedPackedPrefillLauncher(launcher, split_kv, n_ctas)
+
+
+def flydsl_pa_mqa_logits_fp4_prefill_packed(
+    q_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    weights: torch.Tensor,
+    row_info: torch.Tensor,
+    max_seq_len: int,
+    *,
+    weight_scale: float = 1.0,
+    block_k: int = 256,
+    kv_block_size: int = 64,
+    num_warps: int = DEFAULT_NUM_WARPS,
+    parallel_unit_num: int = 512,
+    out: torch.Tensor | None = None,
+    cta_info: torch.Tensor | None = None,
+    n_ctas: int | None = None,
+    stream: torch.cuda.Stream | None = None,
+) -> torch.Tensor:
+    """Bounded-split prefill using packed ``[row, 4]`` int32 row metadata."""
+    total_tokens, heads, head_dim_packed = q_fp4.shape
+    head_dim = head_dim_packed * 2
+    max_blocks_per_seq = block_tables.shape[1]
+    if (
+        row_info.dtype != torch.int32
+        or row_info.ndim != 2
+        or row_info.shape[0] < total_tokens
+        or row_info.shape[1] != ROW_INFO_WIDTH
+        or not row_info.is_contiguous()
+    ):
+        raise ValueError(
+            f"row_info must be contiguous int32 [>= {total_tokens}, {ROW_INFO_WIDTH}]"
+        )
+
+    # Retained temporarily for ATOM/source compatibility; bounded-split prefill
+    # derives its CTA assignment in-kernel and does not consume cta_info.
+    del cta_info, n_ctas
+
+    if out is None:
+        out = torch.full(
+            (total_tokens, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_fp4.device,
+        )
+
+    prepared = prepare_pa_mqa_logits_fp4_prefill_packed(
+        total_tokens=total_tokens,
+        heads=heads,
+        head_dim=head_dim,
+        max_blocks_per_seq=max_blocks_per_seq,
+        max_seq_len=max_seq_len,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        num_warps=num_warps,
+        parallel_unit_num=parallel_unit_num,
+    )
+    prepared(
+        out,
+        q_fp4,
+        q_scale,
+        kv_cache,
+        kv_scale,
+        block_tables,
+        weights,
+        row_info,
+        weight_scale=weight_scale,
+        stream=stream,
+    )
+    return out
 
 
 def flydsl_pa_mqa_logits_fp4_prefill(
@@ -689,69 +935,47 @@ def flydsl_pa_mqa_logits_fp4_prefill(
     num_warps: int | None = None,
     parallel_unit_num: int = 512,
     out: torch.Tensor | None = None,
+    row_info_out: torch.Tensor | None = None,
     cta_info: torch.Tensor | None = None,
     n_ctas: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Ragged-prefill FP4 paged MQA logits (gfx950)."""
-    total_tokens, heads, head_dim_packed = q_fp4.shape
-    head_dim = head_dim_packed * 2
-    max_blocks_per_seq = block_tables.shape[1]
+    """Compatibility wrapper for callers with three row metadata tensors.
+
+    This launches one fused metadata-pack kernel. Performance-sensitive or
+    CUDAGraph callers should build/reuse row info and call
+    :func:`flydsl_pa_mqa_logits_fp4_prefill_packed` directly.
+    """
     requested_block_k = block_k
     block_k = _resolve_prefill_block_k(block_k, max_seq_len)
     if num_warps is None or block_k != requested_block_k:
         num_warps = block_k // 64
 
-    if (cta_info is None) != (n_ctas is None):
-        raise ValueError("Pass both cta_info and n_ctas, or neither.")
-    schedule_internal = cta_info is None
-    if schedule_internal:
-        _, cta_info, n_ctas = compute_prefill_schedule(
-            row_to_batch,
-            local_starts,
-            local_ends,
-            block_k,
-            parallel_unit_num,
-            max_seq_len,
-        )
-
-    if out is None:
-        out = torch.full(
-            (total_tokens, max_seq_len),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp4.device,
-        )
-    elif schedule_internal:
-        out.fill_(float("-inf"))
-
-    launcher, _ = compile_pa_mqa_logits_fp4_prefill(
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
-        num_warps=num_warps,
-        heads=heads,
-        head_dim=head_dim,
+    row_info = pack_prefill_row_info(
+        row_to_batch,
+        local_starts,
+        local_ends,
+        out=row_info_out,
     )
-
-    if stream is None:
-        stream = torch.cuda.current_stream()
-
-    launcher(
-        out,
+    return flydsl_pa_mqa_logits_fp4_prefill_packed(
         q_fp4,
         q_scale,
         kv_cache,
         kv_scale,
         block_tables,
         weights,
-        cta_info,
-        out.stride(0),
-        float(weight_scale),
-        n_ctas,
-        stream,
+        row_info,
+        max_seq_len,
+        weight_scale=weight_scale,
+        block_k=block_k,
+        kv_block_size=kv_block_size,
+        num_warps=num_warps,
+        parallel_unit_num=parallel_unit_num,
+        out=out,
+        cta_info=cta_info,
+        n_ctas=n_ctas,
+        stream=stream,
     )
-    return out
 
 
 @triton.jit
@@ -799,6 +1023,50 @@ def _varqlen_windows_kernel(
     tl.store(local_ends_ptr + r, le, mask=rmask)
 
 
+@triton.jit
+def _varqlen_row_info_kernel(
+    cu_ptr,
+    ctx_ptr,
+    row_info_ptr,
+    total_q,
+    B,
+    BLOCK: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+):
+    """Build packed MTP row metadata directly from cu_seq_q/context_lens."""
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = row < total_q
+
+    lo = tl.zeros([BLOCK], tl.int32)
+    hi = tl.full([BLOCK], B, tl.int32)
+    for _ in tl.static_range(32):
+        mid = (lo + hi) // 2
+        cu_mid = tl.load(
+            cu_ptr + 1 + tl.minimum(mid, B - 1),
+            mask=(mid < B),
+            other=2147483647,
+        )
+        go_right = cu_mid <= row
+        lo = tl.where(go_right, mid + 1, lo)
+        hi = tl.where(go_right, hi, mid)
+    batch = tl.minimum(lo, B - 1)
+
+    cu_b = tl.load(cu_ptr + batch, mask=mask, other=0)
+    cu_b1 = tl.load(cu_ptr + batch + 1, mask=mask, other=0)
+    ctx_b = tl.load(ctx_ptr + batch, mask=mask, other=0)
+    mtp_pos = row - cu_b
+    qlen = cu_b1 - cu_b
+    local_end = tl.maximum(ctx_b - qlen + mtp_pos + 1, 0)
+    real_total = tl.load(cu_ptr + B)
+    local_end = tl.where(row < real_total, local_end, tl.zeros([BLOCK], tl.int32))
+
+    base = row * ROW_WIDTH
+    tl.store(row_info_ptr + base, batch, mask=mask)
+    tl.store(row_info_ptr + base + 1, 0, mask=mask)
+    tl.store(row_info_ptr + base + 2, local_end, mask=mask)
+    tl.store(row_info_ptr + base + 3, 0, mask=mask)
+
+
 def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     """Build ragged-row metadata for per-batch variable query length (MTP).
 
@@ -834,6 +1102,45 @@ def compute_varqlen_windows(cu_seq_q, context_lens, total_q, *, out=None):
     return row_to_batch, local_starts, local_ends
 
 
+def compute_varqlen_row_info(cu_seq_q, context_lens, total_q, *, out=None):
+    """Build packed ``[row, 4]`` MTP metadata into a stable buffer."""
+    dev = cu_seq_q.device
+    cu = cu_seq_q.to(torch.int32).contiguous()
+    ctx = context_lens.to(torch.int32).contiguous()
+    batch = ctx.shape[0]
+    if out is None:
+        out = torch.empty(
+            total_q,
+            ROW_INFO_WIDTH,
+            dtype=torch.int32,
+            device=dev,
+        )
+    elif (
+        out.dtype != torch.int32
+        or out.ndim != 2
+        or out.shape[0] < total_q
+        or out.shape[1] != ROW_INFO_WIDTH
+        or not out.is_contiguous()
+        or out.device != dev
+    ):
+        raise ValueError(
+            "row_info out must be contiguous int32 "
+            f"[>= {total_q}, {ROW_INFO_WIDTH}] on the input device"
+        )
+    if total_q > 0:
+        block = 256
+        _varqlen_row_info_kernel[(triton.cdiv(total_q, block),)](
+            cu,
+            ctx,
+            out,
+            total_q,
+            batch,
+            BLOCK=block,
+            ROW_WIDTH=ROW_INFO_WIDTH,
+        )
+    return out
+
+
 def flydsl_pa_mqa_logits_fp4_varqlen(
     q_fp4: torch.Tensor,
     q_scale: torch.Tensor,
@@ -845,7 +1152,10 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
     *,
     cu_seq_q: torch.Tensor | None = None,
     context_lens: torch.Tensor | None = None,
+    next_n_max: int | None = None,
+    split_ctx_len: int | None = None,
     windows: tuple | None = None,
+    row_info: torch.Tensor | None = None,
     weight_scale: float = 1.0,
     block_k: int = 256,
     kv_block_size: int = 64,
@@ -856,21 +1166,74 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
     n_ctas: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Variable-qlen (per-batch MTP) FP4 paged MQA logits (gfx950)."""
+    """Variable-qlen FP4 decode through the unified bounded-split kernel.
+
+    ``next_n_max`` is the static per-batch qlen bound used for the grid. Pass it
+    explicitly in CUDAGraph/ATOM integrations. Unified decode derives metadata
+    inline and does not consume row info; ``row_info`` and ``windows`` are
+    compatibility routes through bounded-split prefill.
+    """
     total_q = q_fp4.shape[0]
-    if windows is None:
-        if cu_seq_q is None or context_lens is None:
-            raise ValueError(
-                "flydsl_pa_mqa_logits_fp4_varqlen: pass windows=(row_to_batch, "
-                "local_starts, local_ends) built once via "
-                "compute_varqlen_windows, or both cu_seq_q and context_lens "
-                "to build them here."
-            )
-        windows = compute_varqlen_windows(cu_seq_q, context_lens, total_q)
-    row_to_batch, local_starts, local_ends = windows
+    if cu_seq_q is not None and context_lens is not None:
+        from .pa_mqa_logits_fp4 import flydsl_pa_mqa_logits_fp4_decode
+
+        # Falling back to total_q is synchronization-free and correct, but can
+        # overlaunch for ragged batches; graph integrations should pass the
+        # model's static MTP bound.
+        if next_n_max is None:
+            next_n_max = total_q
+        return flydsl_pa_mqa_logits_fp4_decode(
+            q_fp4,
+            q_scale,
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            context_lens,
+            max_seq_len,
+            next_n_max=next_n_max,
+            cu_seq_q=cu_seq_q,
+            split_ctx_len=split_ctx_len,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+            num_warps=num_warps,
+            parallel_unit_num=parallel_unit_num,
+            out=out,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
+            stream=stream,
+        )
+
     if parallel_unit_num is None:
-        chunks_per_seq = max(1, (max_seq_len + block_k - 1) // block_k)
-        parallel_unit_num = total_q * chunks_per_seq
+        parallel_unit_num = total_q * max(1, (max_seq_len + block_k - 1) // block_k)
+    if row_info is not None:
+        return flydsl_pa_mqa_logits_fp4_prefill_packed(
+            q_fp4,
+            q_scale,
+            kv_cache,
+            kv_scale,
+            block_tables,
+            weights,
+            row_info,
+            max_seq_len,
+            weight_scale=weight_scale,
+            block_k=block_k,
+            kv_block_size=kv_block_size,
+            num_warps=num_warps,
+            parallel_unit_num=parallel_unit_num,
+            out=out,
+            cta_info=cta_info,
+            n_ctas=n_ctas,
+            stream=stream,
+        )
+    if windows is None:
+        raise ValueError(
+            "flydsl_pa_mqa_logits_fp4_varqlen requires both cu_seq_q and "
+            "context_lens for unified decode, packed row_info, or "
+            "windows=(row_to_batch, local_starts, local_ends)."
+        )
+    row_to_batch, local_starts, local_ends = windows
     return flydsl_pa_mqa_logits_fp4_prefill(
         q_fp4,
         q_scale,

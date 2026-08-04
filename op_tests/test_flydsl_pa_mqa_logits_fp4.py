@@ -5,17 +5,20 @@
 """aiter op-test + benchmark for ``flydsl_pa_mqa_logits_fp4`` (decode / varctx).
 Usage:
     python op_tests/test_flydsl_pa_mqa_logits_fp4.py
-    python op_tests/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 131072 --next_n 1
+    python op_tests/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 8192 --next-n 1
 """
 
 import argparse
+import itertools
 import random
 
+import aiter
+import pandas as pd
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, is_flydsl_available
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.test_common import checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 dev = "cuda"
 SEED = 42
@@ -24,6 +27,8 @@ MFMA_M = 16
 KVS_NTPW = 4
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
+_ITERS = 50
+_WARMUP = 10
 
 
 def setup_seed(seed):
@@ -353,10 +358,8 @@ def _bench_gluon_fp8(
 
 # ── Test + Benchmark ─────────────────────────────────────────────────
 
-_PERF_SUMMARY = []
 
-
-def test_pa_mqa_logits_fp4_qfp4_kvfp4(
+def run_fixed_decode_case(
     batch,
     max_ctx,
     kv_block_size=64,
@@ -460,25 +463,16 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     )  # [B, NN, K_TILES, 4, 16, m_tiles]
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
 
-    # ---- Host schedule (precomputed once so the bench times only the launch) ----
-    from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4 import compute_varctx_schedule
-
-    # The persistent-grid schedule has S = parallel_unit_num // next_n batch
-    # slots; if batch_size exceeds S the surplus batches are silently dropped
-    # (their out stays -inf -> NaN cosine). For an explicit value grow the grid
-    # so every (batch, next_n) gets at least one slot; when None, let the
-    # scheduler auto-derive a cudagraph-safe grid (= batch*next_n*ceil(t_max/
-    # block_k)), which already satisfies both constraints.
-    if parallel_unit_num is not None:
-        parallel_unit_num = max(parallel_unit_num, batch_size * next_n)
-    safe, cta_info, total_ctas = compute_varctx_schedule(
-        context_lens, block_k, parallel_unit_num, t_max, next_n=next_n
+    target_ctas = 1024 if parallel_unit_num is None else parallel_unit_num
+    max_chunks = max(1, (t_max + block_k - 1) // block_k)
+    split_kv = min(
+        max_chunks,
+        max(1, (target_ctas + batch_size * next_n - 1) // (batch_size * next_n)),
     )
-    parallel_unit_num = total_ctas
     print(
-        f"  schedule: parallel_unit={parallel_unit_num} num_warps={num_warps} "
-        f"safe_chunks_per_cta={safe}  total_ctas={total_ctas}  "
-        f"(naive grid would be {naive_ctas})"
+        f"  bounded split: target_ctas={target_ctas} num_warps={num_warps} "
+        f"split_kv={split_kv} total_ctas={batch_size * next_n * split_kv} "
+        f"(one-chunk grid would be {naive_ctas})"
     )
 
     out_logits = torch.full(
@@ -502,9 +496,8 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
             num_warps=num_warps,
             parallel_unit_num=parallel_unit_num,
             out=out_logits,
-            cta_info=cta_info,
-            total_ctas=total_ctas,
         )
+        return out_logits
 
     # ---- Correctness: one launch + cosine_sim ----
     out_logits.fill_(float("-inf"))
@@ -545,209 +538,149 @@ def test_pa_mqa_logits_fp4_qfp4_kvfp4(
     if not bench:
         return
 
-    # ---- Perf: flydsl ----
-    _, us_fly = run_perftest(launch_flydsl, num_iters=num_iters, num_warmup=num_warmup)
-    torch.cuda.synchronize()
-
-    # ---- Perf: gluon FP8 baseline (E2E decode calling convention) ----
-    us_fp8, cos_fp8 = _bench_gluon_fp8(
-        q_bf16,
-        kv_bf16,
-        weights,
-        context_lens,
-        block_tables,
-        t_max,
-        num_blocks,
-        kv_block_size,
-        heads,
-        head_dim,
-        next_n,
-        ref_logits,
-        mask,
-        num_iters,
-        num_warmup,
-    )
-
-    # ---- USEFUL FLOPs / bytes (varctx — based on real ctx_lens, not max) ----
+    # Useful work uses real per-batch context lengths rather than max_ctx.
     flops = total_tokens * next_n * heads * (2 * head_dim + 3)
     bytes_q = batch_size * next_n * heads * (head_dim_packed + head_dim_scales)
     bytes_kv = total_tokens * (head_dim_packed + head_dim_scales)
-    bytes_w = batch_size * next_n * heads * 4
+    bytes_w = batch_size * next_n * heads * weights.element_size()
     bytes_bt = batch_size * max_blocks_per_seq * 4
     bytes_out = total_tokens * next_n * 4
     bytes_total = bytes_q + bytes_kv + bytes_w + bytes_bt + bytes_out
 
-    def metrics(us):
-        if us <= 0:
-            return 0.0, 0.0
-        sec = us * 1e-6
-        return flops / sec / 1e12, bytes_total / sec / 1e9
-
-    tflops_fly, gbps_fly = metrics(us_fly)
-
-    print(
-        f"\n  {'':>18} | {'us':>10} | {'TFLOPS':>8} | {'GB/s':>8} | {'vs flydsl':>10}"
-    )
-    print(
-        f"  {'flydsl-qfp4/kvfp4':>18} | {us_fly:>10.2f} | {tflops_fly:>8.2f} | {gbps_fly:>8.1f} |"
-    )
-    if us_fp8 is not None:
-        tflops_fp8, _ = metrics(us_fp8)
-        print(
-            f"  {'gluon-fp8 (E2E)':>18} | {us_fp8:>10.2f} | {tflops_fp8:>8.2f} | {'-':>8} | "
-            f"{us_fp8 / us_fly:>9.2f}x"
+    candidates = {"bounded": launch_flydsl}
+    ret = {"gfx": get_gfx(), "split_kv": split_kv}
+    for name, fn in candidates.items():
+        candidate_out, us = run_perftest(
+            fn,
+            num_iters=num_iters,
+            num_warmup=num_warmup,
+            use_cuda_event=True,
         )
-        print(f"  [accuracy] gluon fp8 vs fp4 ref cos={cos_fp8:.6f}")
-    print()
-
-    _PERF_SUMMARY.append(
-        (
-            batch_size,
-            heads,
-            head_dim,
-            max_ctx,
-            next_n,
-            kv_block_size,
-            block_k,
-            cos.item(),
-            us_fly,
-            tflops_fly,
-            gbps_fly,
-            us_fp8,
+        err = checkAllclose(
+            ref_logits[mask].to(torch.float32),
+            candidate_out[mask].to(torch.float32),
+            rtol=0.05,
+            atol=0.05,
+            msg=f"{name}: fixed FP4 decode",
+            printLog=False,
         )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = bytes_total / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+@benchmark()
+def test_decode(
+    batch,
+    max_ctx,
+    next_n,
+    heads,
+    head_dim,
+    kv_block_size,
+    block_k,
+    num_warps,
+    target_ctas,
+):
+    return run_fixed_decode_case(
+        batch=batch,
+        max_ctx=max_ctx,
+        next_n=next_n,
+        heads=heads,
+        head_dim=head_dim,
+        kv_block_size=kv_block_size,
+        block_k=block_k,
+        num_warps=num_warps,
+        parallel_unit_num=target_ctas,
+        num_iters=_ITERS,
+        num_warmup=_WARMUP,
+        bench=True,
     )
-
-
-def _print_perf_summary():
-    print("\n" + "=" * 96)
-    print("Perf summary (flydsl-qfp4/kvfp4 across shapes)")
-    print("=" * 96)
-    print(
-        f"  {'batch':>5} | {'heads':>5} | {'h_dim':>5} | {'ctx_len':>7} | {'next_n':>6} | "
-        f"{'kv_blk':>6} | {'block_k':>7} | {'cos_sim':>8} | {'us':>9} | {'TFLOPS':>7} | "
-        f"{'GB/s':>7} | {'fp8_us':>8} | {'fp8/fly':>7}"
-    )
-    print("  " + "-" * 127)
-    for b, h, hd, ctx, nn, kvb, blk, cos_v, us, tflops, gbps, us_fp8 in _PERF_SUMMARY:
-        fp8_us_str = f"{us_fp8:>8.2f}" if us_fp8 is not None else f"{'-':>8}"
-        ratio_str = (
-            f"{us_fp8 / us:>7.2f}" if us_fp8 is not None and us > 0 else f"{'-':>7}"
-        )
-        print(
-            f"  {b:>5} | {h:>5} | {hd:>5} | {ctx:>7} | {nn:>6} | {kvb:>6} | {blk:>7} | "
-            f"{cos_v:>8.4f} | {us:>9.2f} | {tflops:>7.2f} | {gbps:>7.1f} | "
-            f"{fp8_us_str} | {ratio_str}"
-        )
-    print()
 
 
 def main():
+    if get_gfx() != "gfx950":
+        aiter.logger.warning(
+            "flydsl_pa_mqa_logits_fp4 unsupported on %s; skipping", get_gfx()
+        )
+        return
+    if not is_flydsl_available():
+        aiter.logger.warning("flydsl is unavailable; skipping FP4 decode")
+        return
+
     parser = argparse.ArgumentParser(
         description="MQA Logits (Q FP4, KV FP4) decode Test + Benchmark (gfx950)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=argparse.RawTextHelpFormatter,
     )
     parser.add_argument(
-        "--batch", type=int, default=0, help="Batch size (0 = run default sweep)"
+        "-b", "--batch", type=int, nargs="*", default=[3], help="batch sizes"
     )
     parser.add_argument(
-        "--ctx", type=int, default=0, help="Context length (0 = run default sweep)"
+        "--ctx", type=int, nargs="*", default=[512], help="max context lengths"
     )
-    parser.add_argument("--kv_block_size", type=int, default=64)
     parser.add_argument(
-        "--block_k",
+        "--next-n",
         type=int,
-        default=256,
-        help="Tokens per chunk (multiple of MFMA_N=16, divisible by num_warps)",
+        nargs="*",
+        default=[1, 4, 8],
+        help="fixed MTP widths",
     )
-    parser.add_argument("--num_iters", type=int, default=30)
-    parser.add_argument("--num_warmup", type=int, default=5)
+    parser.add_argument("--heads", type=int, nargs="*", default=[DEFAULT_HEADS])
+    parser.add_argument("--head-dim", type=int, nargs="*", default=[DEFAULT_HEAD_DIM])
+    parser.add_argument("--kv-block-size", type=int, nargs="*", default=[64])
     parser.add_argument(
-        "--num_warps",
+        "--block-k",
         type=int,
-        default=4,
-        help="warps per CTA (pipelined kernel only); BLOCK=num_warps*64",
+        nargs="*",
+        default=[256],
+        help="tokens per chunk",
     )
+    parser.add_argument("--num-warps", type=int, nargs="*", default=[4])
     parser.add_argument(
-        "--parallel_unit_num",
+        "--target-ctas",
         type=int,
-        default=None,
-        help="target CTA count for host schedule "
-        "(default: auto = batch*next_n*ceil(max_seq_len/block_k))",
+        nargs="*",
+        default=[1024],
+        help="bounded-split CTA targets",
     )
-    parser.add_argument(
-        "--next_n",
-        type=int,
-        default=1,
-        help="MTP queries per batch (1 = standard MQA, 2 = MTP-1)",
-    )
-    parser.add_argument(
-        "--heads",
-        type=int,
-        default=DEFAULT_HEADS,
-        help=f"Number of Q heads (multiple of 16, <= 128). Default {DEFAULT_HEADS}.",
-    )
-    parser.add_argument(
-        "--head_dim",
-        type=int,
-        default=DEFAULT_HEAD_DIM,
-        help=f"Per-head dim (multiple of 128). Default {DEFAULT_HEAD_DIM}.",
-    )
+    parser.add_argument("--iters", type=int, default=50)
+    parser.add_argument("--warmup", type=int, default=10)
     args = parser.parse_args()
 
-    if get_arch() != "gfx950":
-        print(f"[skip] this kernel only supports gfx950 (current: {get_arch()}).")
-        return
-
-    if not is_flydsl_available():
-        print("[skip] flydsl is not available in this environment.")
-        return
-
-    print(
-        "[test] using pa_mqa_logits_fp4_qfp4_kvfp4 kernel "
-        "(Q FP4, KV FP4, MFMA(Q_fp4, KV_fp4))"
+    global _ITERS, _WARMUP
+    _ITERS, _WARMUP = args.iters, args.warmup
+    rows = [
+        test_decode(
+            batch, ctx, next_n, heads, head_dim, kv_block, block_k, warps, target
+        )
+        for (
+            batch,
+            ctx,
+            next_n,
+            heads,
+            head_dim,
+            kv_block,
+            block_k,
+            warps,
+            target,
+        ) in itertools.product(
+            args.batch,
+            args.ctx,
+            args.next_n,
+            args.heads,
+            args.head_dim,
+            args.kv_block_size,
+            args.block_k,
+            args.num_warps,
+            args.target_ctas,
+        )
+    ]
+    df = pd.DataFrame(rows)
+    aiter.logger.info(
+        "flydsl FP4 fixed decode summary (markdown):\n%s",
+        df.to_markdown(index=False),
     )
-
-    if args.batch > 0 and args.ctx > 0 and args.next_n > 0:
-        # (batch, max_ctx, next_n, heads)
-        configs = [(args.batch, args.ctx, args.next_n, args.heads)]
-    else:
-        # Default sweep: correctness + light perf on small/moderate ragged shapes,
-        # exercising next_n=1/2 and heads=64/128. Use --batch/--ctx for a big run.
-        configs = [
-            (2, 512, 1, 64),
-            (3, 1024, 1, 64),
-            (2, 512, 2, 64),
-            (2, 768, 1, 128),
-            (4, 2048, 1, 64),
-        ]
-
-    for b, c, nn, h in configs:
-        try:
-            test_pa_mqa_logits_fp4_qfp4_kvfp4(
-                batch=b,
-                max_ctx=c,
-                next_n=nn,
-                heads=h,
-                kv_block_size=args.kv_block_size,
-                block_k=args.block_k,
-                num_iters=args.num_iters,
-                num_warmup=args.num_warmup,
-                num_warps=args.num_warps,
-                parallel_unit_num=args.parallel_unit_num,
-                head_dim=args.head_dim,
-            )
-        except AssertionError as e:
-            print(f"  FAIL: {e}\n")
-            raise
-        except Exception:
-            import traceback
-
-            traceback.print_exc()
-            raise
-
-    if _PERF_SUMMARY:
-        _print_perf_summary()
-    print("  PASS")
 
 
 if __name__ == "__main__":
