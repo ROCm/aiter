@@ -27,9 +27,9 @@ from torch.distributed import ProcessGroup
 # import vllm.envs as envs
 # from vllm import _custom_ops as ops
 import aiter as ops
-from aiter.dist.utils import get_cuda_visible_devices
 from aiter import logger
 from aiter.dist.parallel_state import in_the_same_node_as
+from aiter.dist.utils import get_cuda_visible_devices
 from aiter.utility.dtypes import fp8
 
 from .rocm_version import get_rocm_version
@@ -241,9 +241,9 @@ def is_full_xgmi(physical_device_ids: list[int]) -> bool:
     # (Infinity Fabric) link; otherwise the caller falls back to RCCL.
     try:
         from amdsmi import (
+            amdsmi_get_processor_handles,
             amdsmi_init,
             amdsmi_shut_down,
-            amdsmi_get_processor_handles,
             amdsmi_topo_get_link_type,
         )
     except ImportError:
