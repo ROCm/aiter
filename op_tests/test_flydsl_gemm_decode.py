@@ -17,11 +17,17 @@ import flydsl.expr as fx
 from flydsl.expr import buffer_ops, gpu
 from flydsl.expr.typing import T
 
+import aiter.ops.flydsl.kernels.gemm_decode_common as gemm_decode_common
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.gemm_decode import (
+    GemmDecodeConfig,
     OutputRounding,
+    ReductionMode,
     _convert_bf16,
+    _launch_gemm_decode_bf16,
     gemm_decode_bf16,
+    gemm_decode_bf16_configured,
+    select_gemm_decode_config,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -87,12 +93,160 @@ def test_gemm_decode_bf16(M, N, K):
     torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
 
 
+def test_odd_k_uses_flydsl_tail(monkeypatch):
+    M, N, K = 3, 63, 127
+    torch.manual_seed(2)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    ref = (A.float() @ B.float().T).bfloat16()
+    C = torch.full((M, N), torch.nan, dtype=torch.bfloat16, device="cuda")
+
+    def reject_library_fallback(*args, **kwargs):
+        raise AssertionError("odd K must use the FlyDSL tail path")
+
+    monkeypatch.setattr(torch, "mm", reject_library_fallback)
+    gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(None))
+    torch.cuda.synchronize()
+    assert torch.isfinite(C).all(), "output sentinel was not fully overwritten"
+    torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
+
+
 def test_gemm_decode_rejects_unsupported_m():
     A = torch.zeros((5, 8), dtype=torch.bfloat16, device="cuda")
     B = torch.zeros((2, 8), dtype=torch.bfloat16, device="cuda")
     C = torch.zeros((5, 2), dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match=r"M in \[1, 4\]"):
         gemm_decode_bf16(A, B, C, 5, 2, 8, stream=fx.Stream(None))
+
+
+def test_gemm_decode_validates_tensor_contract(monkeypatch):
+    M, N, K = 2, 8, 8
+    A = torch.zeros((M, K), dtype=torch.bfloat16, device="cuda")
+    B = torch.zeros((N, K), dtype=torch.bfloat16, device="cuda")
+    C = torch.zeros((M, N), dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(TypeError, match="A must be a torch.Tensor"):
+        gemm_decode_bf16(object(), B, C, M, N, K)
+    with pytest.raises(ValueError, match="A must be rank 2"):
+        gemm_decode_bf16(A.flatten(), B, C, M, N, K)
+    with pytest.raises(ValueError, match="A must have dtype"):
+        gemm_decode_bf16(A.float(), B, C, M, N, K)
+    with pytest.raises(ValueError, match="A must be on"):
+        gemm_decode_bf16(A.cpu(), B, C, M, N, K)
+    with pytest.raises(ValueError, match="B must have shape"):
+        gemm_decode_bf16(A, B[:-1], C, M, N, K)
+    with pytest.raises(ValueError, match="packed row-major"):
+        gemm_decode_bf16(A, B.T, C, M, N, K)
+    with pytest.raises(ValueError, match="C must not overlap"):
+        gemm_decode_bf16(A, B, A, M, N, K)
+
+    monkeypatch.setattr(gemm_decode_common, "get_gfx", lambda: "gfx942")
+    with pytest.raises(ValueError, match="requires gfx950"):
+        gemm_decode_bf16(A, B, C, M, N, K)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        GemmDecodeConfig(kvec=2, m_per_wave=1, n_per_wave=1),
+        GemmDecodeConfig(kvec=4, m_per_wave=2, n_per_wave=2),
+        GemmDecodeConfig(kvec=8, m_per_wave=4, n_per_wave=4),
+        GemmDecodeConfig(
+            kvec=8,
+            m_per_wave=4,
+            n_per_wave=2,
+            waves_per_eu=1,
+            b_cache_modifier=0,
+            reduction=ReductionMode.BPERMUTE_REFERENCE,
+        ),
+    ],
+)
+def test_gemm_decode_compile_time_axes(config):
+    M, N, K = 4, 64, 128
+    torch.manual_seed(1)
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    C = torch.full((M, N), torch.nan, dtype=torch.bfloat16, device="cuda")
+    gemm_decode_bf16_configured(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        config,
+        stream=fx.Stream(None),
+    )
+    torch.cuda.synchronize()
+    ref = (A.float() @ B.float().T).bfloat16()
+    assert torch.isfinite(C).all()
+    torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
+
+
+def test_gemm_decode_config_selection():
+    assert select_gemm_decode_config(1, 7168, 896) == GemmDecodeConfig(
+        kvec=2,
+        m_per_wave=1,
+        n_per_wave=4,
+    )
+    assert select_gemm_decode_config(4, 16384, 7168) == GemmDecodeConfig(
+        kvec=8,
+        m_per_wave=4,
+        n_per_wave=4,
+        reduction=ReductionMode.BPERMUTE_REFERENCE,
+    )
+    assert select_gemm_decode_config(4, 65, 128).n_per_wave == 1
+
+
+def test_waves_per_eu_is_attached_to_direct_gpu_func():
+    M, N, K = 2, 64, 128
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    C = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    config = GemmDecodeConfig(
+        kvec=2,
+        m_per_wave=2,
+        n_per_wave=2,
+        waves_per_eu=1,
+    )
+    gemm_decode_bf16_configured(A, B, C, M, N, K, config)
+    torch.cuda.synchronize()
+
+    source_ir = _launch_gemm_decode_bf16._last_compiled[1].source_ir
+    assert source_ir.count("rocdl.waves_per_eu") == 1
+    attr_offset = source_ir.index("rocdl.waves_per_eu")
+    assert source_ir.rfind("gpu.func", 0, attr_offset) > source_ir.rfind(
+        "gpu.launch_func",
+        0,
+        attr_offset,
+    )
+
+
+def test_gemm_decode_graph_replay_on_non_default_stream():
+    M, N, K = 3, 63, 127
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    C = torch.full((M, N), torch.nan, dtype=torch.bfloat16, device="cuda")
+    ref = (A.float() @ B.float().T).bfloat16()
+    current = torch.cuda.current_stream()
+    side = torch.cuda.Stream()
+    side.wait_stream(current)
+
+    gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(side))
+    side.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        gemm_decode_bf16(A, B, C, M, N, K, stream=fx.Stream(side))
+    side.synchronize()
+
+    C.fill_(torch.nan)
+    side.wait_stream(current)
+    with torch.cuda.stream(side):
+        graph.replay()
+    current.wait_stream(side)
+    current.synchronize()
+    assert torch.isfinite(C).all(), "graph replay did not overwrite the output"
+    torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
 
 
 def _make_conversion_launcher(rounding):

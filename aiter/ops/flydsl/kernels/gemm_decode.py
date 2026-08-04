@@ -9,23 +9,29 @@
 #   - 64 lanes split K, each owns KVEC adjacent BF16 elements per full iteration
 #   - Accumulate via v_dot2_f32_bf16 (2 BF16 MACs -> FP32)
 #   - A and B vectors are reused across the register tile
-#   - A separate predicated scalar tail handles K outside the vectorized loop
-#   - Partial output-column tiles use safe B loads and conditional stores
-#   - 6-stage butterfly XOR reduce per accumulator (no LDS)
-#   - Lane 0 converts FP32 to BF16 with configurable compile-time rounding
+#   - K tails use wide loads plus an in-kernel masked BF16-pair remainder
+#   - Partial output-column tiles select an exact NP=1 instance
+#   - Configurable 6-stage wave64 DPP or bpermute reduction (no LDS)
+#   - Lane 63 converts FP32 to BF16 with configurable compile-time rounding
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
+
+import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as _arith_dialect
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import scf as _scf
 from flydsl.expr import buffer_ops, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+
+from .gemm_decode_common import validate_gemm_decode_tensors
 
 
 class OutputRounding(str, Enum):
@@ -37,37 +43,59 @@ class OutputRounding(str, Enum):
     STOCHASTIC = "stochastic"
 
 
+class ReductionMode(str, Enum):
+    """Compile-time wave reduction choices."""
+
+    DPP = "dpp"
+    BPERMUTE_REFERENCE = "bpermute_reference"
+
+
 @dataclass(frozen=True)
 class GemmDecodeConfig:
-    """Named compile-time defaults for the direct kernel."""
+    """Compile-time axes for one direct-kernel instance."""
 
     kvec: int = 8
     n_per_wave: int = 2
-    n_per_wave_m1: int = 1
     m_per_wave: int = 4
     waves_per_eu: int = 2
     b_cache_modifier: int = 0x2000
+    reduction: ReductionMode = ReductionMode.DPP
     output_rounding: OutputRounding = OutputRounding.RNE
 
     def validate(self) -> None:
-        if self.kvec <= 0 or self.kvec % 4 != 0:
-            raise ValueError("kvec must be a positive multiple of 4")
-        if self.n_per_wave != 2 or self.n_per_wave_m1 != 1:
-            raise ValueError("this kernel mapping requires N tiles of 2 (1 for M=1)")
-        if self.m_per_wave != 4:
-            raise ValueError("this kernel mapping requires an M tile of 4")
+        if self.kvec not in (2, 4, 8):
+            raise ValueError("kvec must be one of 2, 4, or 8")
+        if self.n_per_wave not in (1, 2, 4):
+            raise ValueError("n_per_wave must be one of 1, 2, or 4")
+        if self.m_per_wave not in (1, 2, 4):
+            raise ValueError("m_per_wave must be one of 1, 2, or 4")
         if self.waves_per_eu <= 0:
             raise ValueError("waves_per_eu must be positive")
 
 
 DEFAULT_CONFIG = GemmDecodeConfig()
 DEFAULT_CONFIG.validate()
-KVEC = DEFAULT_CONFIG.kvec
-NP = DEFAULT_CONFIG.n_per_wave
-MP = DEFAULT_CONFIG.m_per_wave
-WAVES_PER_EU = DEFAULT_CONFIG.waves_per_eu
-B_CACHE_MODIFIER = DEFAULT_CONFIG.b_cache_modifier
-OUTPUT_ROUNDING = DEFAULT_CONFIG.output_rounding
+_M1_LOW_K_CONFIG = GemmDecodeConfig(
+    kvec=2,
+    n_per_wave=4,
+    m_per_wave=1,
+)
+_M1_HIGH_K_CONFIG = GemmDecodeConfig(
+    kvec=8,
+    n_per_wave=1,
+    m_per_wave=1,
+)
+_M4_LOW_K_CONFIG = GemmDecodeConfig(
+    kvec=2,
+    n_per_wave=2,
+    m_per_wave=4,
+)
+_M4_HIGH_K_CONFIG = GemmDecodeConfig(
+    kvec=8,
+    n_per_wave=4,
+    m_per_wave=4,
+    reduction=ReductionMode.BPERMUTE_REFERENCE,
+)
 
 
 # -- helpers -------------------------------------------------------------------
@@ -103,7 +131,7 @@ def dot2_f32_bf16(acc: ir.Value, a_i32: ir.Value, b_i32: ir.Value) -> ir.Value:
     """acc += a.lo*b.lo + a.hi*b.hi  (2 BF16 MACs -> FP32 accumulator)."""
     return _llvm.inline_asm(
         ir.F32Type.get(),
-        [acc, _to_ir(a_i32), _to_ir(b_i32)],
+        [_to_ir(acc), _to_ir(a_i32), _to_ir(b_i32)],
         "v_dot2_f32_bf16 $0, $2, $3, $1",
         "=v,0,v,v",
         has_side_effects=False,
@@ -165,44 +193,36 @@ def store_bf16(
     buffer_ops.buffer_store(bf16_val, rsrc_c, c_elem)
 
 
-def wavefront_reduce_sum_f32(val: ir.Value, lane) -> ir.Value:
-    """6-stage butterfly XOR reduce. Returns the full sum in all 64 lanes."""
-    for stage in range_constexpr(6):
-        partner = lane ^ fx.Int32(1 << stage)
-        val_i32 = ArithValue(val).bitcast(T.i32)
-        peer_i32 = fx.rocdl.ds_bpermute(T.i32, partner * fx.Int32(4), val_i32)
-        val = _add_f32(val, ArithValue(peer_i32).bitcast(T.f32))
-    return val
-
-
-def load_kvec_a(rsrc, base_elem):
-    """Load the fixed default K vector through L2."""
-    return tuple(
-        Vec(
-            buffer_ops.buffer_load(
-                rsrc,
-                base_elem + fx.Int32(i * 4),
-                vec_width=4,
-                dtype=T.bf16,
-            )
-        )
-        for i in range(KVEC // 4)
+def _dpp_add_f32(val: ir.Value, control: str) -> ir.Value:
+    """Add a DPP-selected lane value to ``val``."""
+    return _llvm.inline_asm(
+        ir.F32Type.get(),
+        [_to_ir(val), _to_ir(val), _to_ir(val)],
+        f"s_nop 3\n\tv_add_f32 $0, $2, $3 {control} bound_ctrl:0",
+        "=v,0,v,v",
+        has_side_effects=False,
     )
 
 
-def load_kvec_b(rsrc, base_elem):
-    """Load the fixed default K vector with the configured B cache policy."""
-    return tuple(
-        Vec(
-            buffer_ops.buffer_load(
-                rsrc,
-                base_elem + fx.Int32(i * 4),
-                vec_width=4,
-                dtype=T.bf16,
-                cache_modifier=B_CACHE_MODIFIER,
-            )
+def wavefront_reduce_sum_f32(val: ir.Value) -> ir.Value:
+    """Reduce a wave64 sum with DPP; the complete sum is in lane 63."""
+    for shift in (8, 4, 2, 1):
+        val = _dpp_add_f32(val, f"row_shr:{shift}")
+    val = _dpp_add_f32(val, "row_bcast:15")
+    val = _dpp_add_f32(val, "row_bcast:31")
+    return val
+
+
+def _load_kvec(rsrc, base_elem, kvec, cache_modifier=0):
+    """Load one compile-time BF16 vector."""
+    return Vec(
+        buffer_ops.buffer_load(
+            rsrc,
+            base_elem,
+            vec_width=kvec,
+            dtype=T.bf16,
+            cache_modifier=cache_modifier,
         )
-        for i in range(KVEC // 4)
     )
 
 
@@ -221,6 +241,8 @@ def _load_tail_pair(
     valid0 = k0 < fx.Int32(K)
     valid1 = k1 < fx.Int32(K)
     safe_row = row
+    if isinstance(safe_row, int):
+        safe_row = fx.Int32(safe_row)
     if row_valid is not None:
         valid0 = valid0 & row_valid
         valid1 = valid1 & row_valid
@@ -248,133 +270,37 @@ def _load_tail_pair(
     return pack_bf16x2(lo, hi)
 
 
-def _dots_multi(M, lane, m_base, n_base, N, K, rsrc_a, rsrc_b):
-    """Original M=2..4 hot loop plus a separately compiled scalar K tail."""
-    k_tile = 64 * KVEC
-    nv = KVEC // 4
-    acc00 = _const_f32(0.0)
-    acc01 = _const_f32(0.0)
-    acc10 = _const_f32(0.0)
-    acc11 = _const_f32(0.0)
-    acc20 = _const_f32(0.0)
-    acc21 = _const_f32(0.0)
-    acc30 = _const_f32(0.0)
-    acc31 = _const_f32(0.0)
-    m0 = m_base
-    m1 = m_base + fx.Int32(1)
-    m2 = m_base + fx.Int32(2)
-    m3 = m_base + fx.Int32(3)
-    n0 = n_base
-    n1 = n_base + fx.Int32(1)
-    n1_valid = None
-    n1_load = n1
-    if N % 2 != 0:
-        n1_valid = n1 < fx.Int32(N)
-        n1_load = ArithValue(_to_ir(n1_valid)).select(n1, fx.Int32(0))
-
-    for i in range_constexpr(K // k_tile):
-        k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(KVEC)
-        av0 = load_kvec_a(rsrc_a, m0 * fx.Int32(K) + k_elem)
-        if M > 1:
-            av1 = load_kvec_a(rsrc_a, m1 * fx.Int32(K) + k_elem)
-        if M > 2:
-            av2 = load_kvec_a(rsrc_a, m2 * fx.Int32(K) + k_elem)
-        if M > 3:
-            av3 = load_kvec_a(rsrc_a, m3 * fx.Int32(K) + k_elem)
-        bv0 = load_kvec_b(rsrc_b, n0 * fx.Int32(K) + k_elem)
-        bv1 = load_kvec_b(rsrc_b, n1_load * fx.Int32(K) + k_elem)
-        for v in range_constexpr(nv):
-            p0a = pack_bf16x2(av0[v][0], av0[v][1])
-            p0b = pack_bf16x2(av0[v][2], av0[v][3])
-            q0a = pack_bf16x2(bv0[v][0], bv0[v][1])
-            q0b = pack_bf16x2(bv0[v][2], bv0[v][3])
-            q1a = pack_bf16x2(bv1[v][0], bv1[v][1])
-            q1b = pack_bf16x2(bv1[v][2], bv1[v][3])
-            acc00 = dot2_f32_bf16(acc00, p0a, q0a)
-            acc01 = dot2_f32_bf16(acc01, p0a, q1a)
-            acc00 = dot2_f32_bf16(acc00, p0b, q0b)
-            acc01 = dot2_f32_bf16(acc01, p0b, q1b)
-            if M > 1:
-                p1a = pack_bf16x2(av1[v][0], av1[v][1])
-                p1b = pack_bf16x2(av1[v][2], av1[v][3])
-                acc10 = dot2_f32_bf16(acc10, p1a, q0a)
-                acc11 = dot2_f32_bf16(acc11, p1a, q1a)
-                acc10 = dot2_f32_bf16(acc10, p1b, q0b)
-                acc11 = dot2_f32_bf16(acc11, p1b, q1b)
-            if M > 2:
-                p2a = pack_bf16x2(av2[v][0], av2[v][1])
-                p2b = pack_bf16x2(av2[v][2], av2[v][3])
-                acc20 = dot2_f32_bf16(acc20, p2a, q0a)
-                acc21 = dot2_f32_bf16(acc21, p2a, q1a)
-                acc20 = dot2_f32_bf16(acc20, p2b, q0b)
-                acc21 = dot2_f32_bf16(acc21, p2b, q1b)
-            if M > 3:
-                p3a = pack_bf16x2(av3[v][0], av3[v][1])
-                p3b = pack_bf16x2(av3[v][2], av3[v][3])
-                acc30 = dot2_f32_bf16(acc30, p3a, q0a)
-                acc31 = dot2_f32_bf16(acc31, p3a, q1a)
-                acc30 = dot2_f32_bf16(acc30, p3b, q0b)
-                acc31 = dot2_f32_bf16(acc31, p3b, q1b)
-
-    if K % k_tile != 0:
-        tail_lane_base = fx.Int32((K // k_tile) * k_tile) + lane * fx.Int32(KVEC)
-        for pair in range_constexpr(KVEC // 2):
-            p0 = _load_tail_pair(rsrc_a, m0, K, tail_lane_base, pair)
-            if M > 1:
-                p1 = _load_tail_pair(rsrc_a, m1, K, tail_lane_base, pair)
-            if M > 2:
-                p2 = _load_tail_pair(rsrc_a, m2, K, tail_lane_base, pair)
-            if M > 3:
-                p3 = _load_tail_pair(rsrc_a, m3, K, tail_lane_base, pair)
-            q0 = _load_tail_pair(
-                rsrc_b,
-                n0,
-                K,
-                tail_lane_base,
-                pair,
-                cache_modifier=B_CACHE_MODIFIER,
-            )
-            q1 = _load_tail_pair(
-                rsrc_b,
-                n1,
-                K,
-                tail_lane_base,
-                pair,
-                cache_modifier=B_CACHE_MODIFIER,
-                row_valid=n1_valid,
-            )
-            acc00 = dot2_f32_bf16(acc00, p0, q0)
-            acc01 = dot2_f32_bf16(acc01, p0, q1)
-            if M > 1:
-                acc10 = dot2_f32_bf16(acc10, p1, q0)
-                acc11 = dot2_f32_bf16(acc11, p1, q1)
-            if M > 2:
-                acc20 = dot2_f32_bf16(acc20, p2, q0)
-                acc21 = dot2_f32_bf16(acc21, p2, q1)
-            if M > 3:
-                acc30 = dot2_f32_bf16(acc30, p3, q0)
-                acc31 = dot2_f32_bf16(acc31, p3, q1)
-
-    return (
-        acc00,
-        acc01,
-        acc10,
-        acc11,
-        acc20,
-        acc21,
-        acc30,
-        acc31,
-        m0,
-        m1,
-        m2,
-        m3,
-        n0,
-        n1,
-        n1_valid,
+def _bpermute_reduce_sum_f32(val, lane):
+    """Reference butterfly reduction; the complete sum is in every lane."""
+    val = _llvm.inline_asm(
+        ir.F32Type.get(),
+        [_to_ir(val)],
+        "s_nop 3\n\tv_mov_b32 $0, $1",
+        "=v,v",
+        has_side_effects=False,
     )
+    for stage in range_constexpr(6):
+        partner = lane ^ fx.Int32(1 << stage)
+        val_i32 = ArithValue(_to_ir(val)).bitcast(T.i32)
+        peer_i32 = fx.rocdl.ds_bpermute(
+            T.i32,
+            partner * fx.Int32(4),
+            val_i32,
+        )
+        val = _add_f32(_to_ir(val), ArithValue(peer_i32).bitcast(T.f32))
+    return val
 
 
-def _make_kernel_multi(M):
+def _make_kernel(config: GemmDecodeConfig):
+    kvec = config.kvec
+    np = config.n_per_wave
+    mp = config.m_per_wave
+    cache_modifier = config.b_cache_modifier
+    reduction = config.reduction
+    rounding = config.output_rounding
+    use_dpp = reduction == ReductionMode.DPP
+    store_lane = 63 if use_dpp else 0
+
     @flyc.kernel
     def kernel(
         A: fx.Tensor,
@@ -384,138 +310,289 @@ def _make_kernel_multi(M):
         N: fx.Constexpr[int],
     ):
         lane = gpu.thread_idx.x
-        m_base = gpu.block_idx.x * fx.Int32(MP)
-        n_base = gpu.block_idx.y * fx.Int32(2)
+        m_base = gpu.block_idx.x * fx.Int32(mp)
+        n_base = gpu.block_idx.y * fx.Int32(np)
         rsrc_a = buffer_ops.create_buffer_resource(A)
         rsrc_b = buffer_ops.create_buffer_resource(B)
         rsrc_c = buffer_ops.create_buffer_resource(C)
-        (
-            acc00,
-            acc01,
-            acc10,
-            acc11,
-            acc20,
-            acc21,
-            acc30,
-            acc31,
-            m0,
-            m1,
-            m2,
-            m3,
-            n0,
-            n1,
-            n1_valid,
-        ) = _dots_multi(
+        m_rows = []
+        for row in range_constexpr(mp):
+            m_rows.append(m_base + fx.Int32(row))
+        n_cols = []
+        for col in range_constexpr(np):
+            n_col = n_base + fx.Int32(col)
+            n_cols.append(n_col)
+        n_load = n_cols
+
+        accs = [_const_f32(0.0) for _ in range_constexpr(mp * np)]
+        k_tile = 64 * kvec
+        npairs = kvec // 2
+        for i in range_constexpr(K // k_tile):
+            k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(kvec)
+            avs = [
+                _load_kvec(rsrc_a, row * fx.Int32(K) + k_elem, kvec)
+                for row in m_rows
+            ]
+            bvs = [
+                _load_kvec(
+                    rsrc_b,
+                    col * fx.Int32(K) + k_elem,
+                    kvec,
+                    cache_modifier,
+                )
+                for col in n_load
+            ]
+            for pair in range_constexpr(npairs):
+                ap = [
+                    pack_bf16x2(av[2 * pair], av[2 * pair + 1])
+                    for av in avs
+                ]
+                bp = [
+                    pack_bf16x2(bv[2 * pair], bv[2 * pair + 1])
+                    for bv in bvs
+                ]
+                for row in range_constexpr(mp):
+                    for col in range_constexpr(np):
+                        idx = row * np + col
+                        accs[idx] = dot2_f32_bf16(
+                            accs[idx],
+                            ap[row],
+                            bp[col],
+                        )
+
+        if K % k_tile != 0:
+            tail_start = (K // k_tile) * k_tile
+            tail_full_lanes = (K % k_tile) // kvec
+            tail_scalar = (K % k_tile) % kvec
+            if tail_full_lanes != 0:
+                incoming_accs = tuple(accs)
+                vector_tail = _scf.IfOp(
+                    _to_ir(lane < fx.Int32(tail_full_lanes)),
+                    results_=[T.f32] * len(accs),
+                    has_else=True,
+                )
+                with ir.InsertionPoint(vector_tail.then_block):
+                    k_elem = fx.Int32(tail_start) + lane * fx.Int32(kvec)
+                    avs = [
+                        _load_kvec(
+                            rsrc_a,
+                            row * fx.Int32(K) + k_elem,
+                            kvec,
+                        )
+                        for row in m_rows
+                    ]
+                    bvs = [
+                        _load_kvec(
+                            rsrc_b,
+                            col * fx.Int32(K) + k_elem,
+                            kvec,
+                            cache_modifier,
+                        )
+                        for col in n_load
+                    ]
+                    for pair in range_constexpr(npairs):
+                        ap = [
+                            pack_bf16x2(
+                                av[2 * pair],
+                                av[2 * pair + 1],
+                            )
+                            for av in avs
+                        ]
+                        bp = [
+                            pack_bf16x2(
+                                bv[2 * pair],
+                                bv[2 * pair + 1],
+                            )
+                            for bv in bvs
+                        ]
+                        for row in range_constexpr(mp):
+                            for col in range_constexpr(np):
+                                idx = row * np + col
+                                accs[idx] = dot2_f32_bf16(
+                                    accs[idx],
+                                    ap[row],
+                                    bp[col],
+                                )
+                    _scf.YieldOp([_to_ir(acc) for acc in accs])
+                with ir.InsertionPoint(vector_tail.else_block):
+                    _scf.YieldOp([_to_ir(acc) for acc in incoming_accs])
+                accs = list(vector_tail.results)
+
+            if tail_scalar != 0:
+                tail_lane_base = (
+                    fx.Int32(tail_start + tail_full_lanes * kvec)
+                    + lane * fx.Int32(kvec)
+                )
+                for pair in range_constexpr(npairs):
+                    ap = [
+                        _load_tail_pair(
+                            rsrc_a,
+                            row,
+                            K,
+                            tail_lane_base,
+                            pair,
+                        )
+                        for row in m_rows
+                    ]
+                    bp = [
+                        _load_tail_pair(
+                            rsrc_b,
+                            col,
+                            K,
+                            tail_lane_base,
+                            pair,
+                            cache_modifier=cache_modifier,
+                        )
+                        for col in n_cols
+                    ]
+                    for row in range_constexpr(mp):
+                        for col in range_constexpr(np):
+                            idx = row * np + col
+                            accs[idx] = dot2_f32_bf16(
+                                accs[idx],
+                                ap[row],
+                                bp[col],
+                            )
+
+        if use_dpp and K % kvec == 0:
+            accs = [wavefront_reduce_sum_f32(acc) for acc in accs]
+        else:
+            accs = [
+                _bpermute_reduce_sum_f32(acc, lane)
+                for acc in accs
+            ]
+
+        if lane == fx.Int32(store_lane):
+            for row in range_constexpr(mp):
+                for col in range_constexpr(np):
+                    c_elem = m_rows[row] * fx.Int32(N) + n_cols[col]
+                    store_bf16(
+                        accs[row * np + col],
+                        rsrc_c,
+                        c_elem,
+                        rounding,
+                    )
+
+    return kernel
+
+
+@lru_cache(maxsize=None)
+def get_gemm_decode_bf16(config: GemmDecodeConfig = DEFAULT_CONFIG):
+    """Return a stable launch callable for ``config``."""
+    config.validate()
+    def launch(A, B, C, M, N, K, stream=fx.Stream(None)):
+        return gemm_decode_bf16_configured(
+            A,
+            B,
+            C,
             M,
-            lane,
-            m_base,
-            n_base,
             N,
             K,
-            rsrc_a,
-            rsrc_b,
+            config,
+            stream,
         )
-        acc00 = wavefront_reduce_sum_f32(acc00, lane)
-        acc01 = wavefront_reduce_sum_f32(acc01, lane)
-        if M > 1:
-            acc10 = wavefront_reduce_sum_f32(acc10, lane)
-            acc11 = wavefront_reduce_sum_f32(acc11, lane)
-        if M > 2:
-            acc20 = wavefront_reduce_sum_f32(acc20, lane)
-            acc21 = wavefront_reduce_sum_f32(acc21, lane)
-        if M > 3:
-            acc30 = wavefront_reduce_sum_f32(acc30, lane)
-            acc31 = wavefront_reduce_sum_f32(acc31, lane)
-        if lane == fx.Int32(0):
-            store_bf16(acc00, rsrc_c, m0 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
-            if n1_valid is None:
-                store_bf16(acc01, rsrc_c, m0 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-            elif n1_valid:
-                store_bf16(acc01, rsrc_c, m0 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-            if M > 1:
-                store_bf16(acc10, rsrc_c, m1 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
-                if n1_valid is None:
-                    store_bf16(acc11, rsrc_c, m1 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-                elif n1_valid:
-                    store_bf16(acc11, rsrc_c, m1 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-            if M > 2:
-                store_bf16(acc20, rsrc_c, m2 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
-                if n1_valid is None:
-                    store_bf16(acc21, rsrc_c, m2 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-                elif n1_valid:
-                    store_bf16(acc21, rsrc_c, m2 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-            if M > 3:
-                store_bf16(acc30, rsrc_c, m3 * fx.Int32(N) + n0, OUTPUT_ROUNDING)
-                if n1_valid is None:
-                    store_bf16(acc31, rsrc_c, m3 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
-                elif n1_valid:
-                    store_bf16(acc31, rsrc_c, m3 * fx.Int32(N) + n1, OUTPUT_ROUNDING)
 
-    return kernel
-
-
-def _make_kernel_m1():
-    @flyc.kernel
-    def kernel(
-        A: fx.Tensor,
-        B: fx.Tensor,
-        C: fx.Tensor,
-        K: fx.Constexpr[int],
-        N: fx.Constexpr[int],
-    ):
-        lane = gpu.thread_idx.x
-        m = gpu.block_idx.x
-        n = gpu.block_idx.y
-        rsrc_a = buffer_ops.create_buffer_resource(A)
-        rsrc_b = buffer_ops.create_buffer_resource(B)
-        rsrc_c = buffer_ops.create_buffer_resource(C)
-        acc = _const_f32(0.0)
-        k_tile = 64 * KVEC
-        nv = KVEC // 4
-        for i in range_constexpr(K // k_tile):
-            k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(KVEC)
-            av = load_kvec_a(rsrc_a, m * fx.Int32(K) + k_elem)
-            bv = load_kvec_b(rsrc_b, n * fx.Int32(K) + k_elem)
-            for v in range_constexpr(nv):
-                acc = dot2_f32_bf16(
-                    acc,
-                    pack_bf16x2(av[v][0], av[v][1]),
-                    pack_bf16x2(bv[v][0], bv[v][1]),
-                )
-                acc = dot2_f32_bf16(
-                    acc,
-                    pack_bf16x2(av[v][2], av[v][3]),
-                    pack_bf16x2(bv[v][2], bv[v][3]),
-                )
-        if K % k_tile != 0:
-            tail_lane_base = fx.Int32((K // k_tile) * k_tile) + lane * fx.Int32(KVEC)
-            for pair in range_constexpr(KVEC // 2):
-                av = _load_tail_pair(rsrc_a, m, K, tail_lane_base, pair)
-                bv = _load_tail_pair(
-                    rsrc_b,
-                    n,
-                    K,
-                    tail_lane_base,
-                    pair,
-                    cache_modifier=B_CACHE_MODIFIER,
-                )
-                acc = dot2_f32_bf16(acc, av, bv)
-        acc = wavefront_reduce_sum_f32(acc, lane)
-        if lane == fx.Int32(0):
-            c_elem = m * fx.Int32(N) + n
-            store_bf16(acc, rsrc_c, c_elem, OUTPUT_ROUNDING)
-
-    return kernel
-
-
-gemm_decode_bf16_kernel_m1 = _make_kernel_m1()
-gemm_decode_bf16_kernel_m2 = _make_kernel_multi(2)
-gemm_decode_bf16_kernel_m3 = _make_kernel_multi(3)
-gemm_decode_bf16_kernel_m4 = _make_kernel_multi(4)
+    return launch
 
 
 @flyc.jit
-def gemm_decode_bf16(
+def _launch_gemm_decode_bf16(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    M: fx.Constexpr[int],
+    N: fx.Constexpr[int],
+    K: fx.Constexpr[int],
+    kvec: fx.Constexpr[int],
+    mp: fx.Constexpr[int],
+    np: fx.Constexpr[int],
+    waves_per_eu: fx.Constexpr[int],
+    cache_modifier: fx.Constexpr[int],
+    reduction_code: fx.Constexpr[int],
+    rounding_code: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    reduction = (
+        ReductionMode.DPP
+        if reduction_code == 0
+        else ReductionMode.BPERMUTE_REFERENCE
+    )
+    rounding = (
+        OutputRounding.RNE
+        if rounding_code == 0
+        else OutputRounding.RTZ
+        if rounding_code == 1
+        else OutputRounding.TRUNCATE
+        if rounding_code == 2
+        else OutputRounding.STOCHASTIC
+    )
+    config = GemmDecodeConfig(
+        kvec=kvec,
+        n_per_wave=np,
+        m_per_wave=mp,
+        waves_per_eu=waves_per_eu,
+        b_cache_modifier=cache_modifier,
+        reduction=reduction,
+        output_rounding=rounding,
+    )
+    kernel = _make_kernel(config)
+    kernel(
+        A,
+        B,
+        C,
+        K,
+        N,
+        value_attrs={"rocdl.waves_per_eu": waves_per_eu},
+    ).launch(
+        grid=(M // mp, N // np, 1),
+        block=(64, 1, 1),
+        stream=stream,
+    )
+
+
+def gemm_decode_bf16_configured(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    config: GemmDecodeConfig,
+    stream: fx.Stream = fx.Stream(None),
+):
+    """Launch one explicit compile-time configuration."""
+    validate_gemm_decode_tensors(A, B, C, M, N, K)
+    if N % config.n_per_wave != 0:
+        raise ValueError("N must be divisible by config.n_per_wave")
+    if M % config.m_per_wave != 0:
+        raise ValueError("M must be divisible by config.m_per_wave")
+    reduction_code = 0 if config.reduction == ReductionMode.DPP else 1
+    rounding_code = {
+        OutputRounding.RNE: 0,
+        OutputRounding.RTZ: 1,
+        OutputRounding.TRUNCATE: 2,
+        OutputRounding.STOCHASTIC: 3,
+    }[config.output_rounding]
+    return _launch_gemm_decode_bf16(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        config.kvec,
+        config.m_per_wave,
+        config.n_per_wave,
+        config.waves_per_eu,
+        config.b_cache_modifier,
+        reduction_code,
+        rounding_code,
+        stream=stream,
+    )
+
+
+@flyc.jit
+def _launch_m1_low_k(
     A: fx.Tensor,
     B: fx.Tensor,
     C: fx.Tensor,
@@ -524,36 +601,148 @@ def gemm_decode_bf16(
     K: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
+    kernel = _make_kernel(_M1_LOW_K_CONFIG)
+    kernel(
+        A,
+        B,
+        C,
+        K,
+        N,
+        value_attrs={"rocdl.waves_per_eu": 2},
+    ).launch(
+        grid=(1, N // 4, 1),
+        block=(64, 1, 1),
+        stream=stream,
+    )
+
+
+@flyc.jit
+def _launch_m1_high_k(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    M: fx.Constexpr[int],
+    N: fx.Constexpr[int],
+    K: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    kernel = _make_kernel(_M1_HIGH_K_CONFIG)
+    kernel(
+        A,
+        B,
+        C,
+        K,
+        N,
+        value_attrs={"rocdl.waves_per_eu": 2},
+    ).launch(
+        grid=(1, N, 1),
+        block=(64, 1, 1),
+        stream=stream,
+    )
+
+
+@flyc.jit
+def _launch_m4_low_k(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    M: fx.Constexpr[int],
+    N: fx.Constexpr[int],
+    K: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    kernel = _make_kernel(_M4_LOW_K_CONFIG)
+    kernel(
+        A,
+        B,
+        C,
+        K,
+        N,
+        value_attrs={"rocdl.waves_per_eu": 2},
+    ).launch(
+        grid=(1, N // 2, 1),
+        block=(64, 1, 1),
+        stream=stream,
+    )
+
+
+@flyc.jit
+def _launch_m4_high_k(
+    A: fx.Tensor,
+    B: fx.Tensor,
+    C: fx.Tensor,
+    M: fx.Constexpr[int],
+    N: fx.Constexpr[int],
+    K: fx.Constexpr[int],
+    stream: fx.Stream = fx.Stream(None),
+):
+    kernel = _make_kernel(_M4_HIGH_K_CONFIG)
+    kernel(
+        A,
+        B,
+        C,
+        K,
+        N,
+        value_attrs={"rocdl.waves_per_eu": 2},
+    ).launch(
+        grid=(1, N // 4, 1),
+        block=(64, 1, 1),
+        stream=stream,
+    )
+
+
+def select_gemm_decode_config(M: int, N: int, K: int) -> GemmDecodeConfig:
+    """Select a measured direct-family config for an even-K shape."""
     if M < 1 or M > 4:
         raise ValueError("gemm_decode_bf16 supports M in [1, 4]")
-    if N <= 0 or K <= 0:
-        raise ValueError("gemm_decode_bf16 requires positive N and K")
-    attrs = {"rocdl.waves_per_eu": WAVES_PER_EU}
     if M == 1:
-        gemm_decode_bf16_kernel_m1(A, B, C, K, N).launch(
-            grid=(1, N, 1),
-            block=(64, 1, 1),
-            stream=stream,
-            value_attrs=attrs,
-        )
-    elif M == 2:
-        gemm_decode_bf16_kernel_m2(A, B, C, K, N).launch(
-            grid=(1, (N + NP - 1) // NP, 1),
-            block=(64, 1, 1),
-            stream=stream,
-            value_attrs=attrs,
-        )
-    elif M == 3:
-        gemm_decode_bf16_kernel_m3(A, B, C, K, N).launch(
-            grid=(1, (N + NP - 1) // NP, 1),
-            block=(64, 1, 1),
-            stream=stream,
-            value_attrs=attrs,
-        )
+        config = _M1_LOW_K_CONFIG if K <= 1536 else _M1_HIGH_K_CONFIG
+    elif M == 4:
+        config = _M4_LOW_K_CONFIG if K <= 1536 else _M4_HIGH_K_CONFIG
     else:
-        gemm_decode_bf16_kernel_m4(A, B, C, K, N).launch(
-            grid=(1, (N + NP - 1) // NP, 1),
-            block=(64, 1, 1),
-            stream=stream,
-            value_attrs=attrs,
+        mp = 2 if M == 2 else 1
+        config = GemmDecodeConfig(
+            kvec=2 if K <= 1536 else 8,
+            n_per_wave=4 if K <= 1536 else 2,
+            m_per_wave=mp,
         )
+    np = config.n_per_wave
+    if N % np != 0:
+        return GemmDecodeConfig(
+            kvec=config.kvec,
+            n_per_wave=1,
+            m_per_wave=config.m_per_wave,
+        )
+    return config
+
+
+def gemm_decode_bf16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    M: int,
+    N: int,
+    K: int,
+    stream: fx.Stream = fx.Stream(None),
+):
+    """Launch the default direct-kernel configuration for ``M``."""
+    validate_gemm_decode_tensors(A, B, C, M, N, K)
+    if M == 1 and K <= 1536 and N % 4 == 0:
+        return _launch_m1_low_k(A, B, C, M, N, K, stream=stream)
+    if M == 1 and K > 1536:
+        return _launch_m1_high_k(A, B, C, M, N, K, stream=stream)
+    if M == 4 and K <= 1536 and N % 2 == 0:
+        return _launch_m4_low_k(A, B, C, M, N, K, stream=stream)
+    if M == 4 and K > 1536 and N % 4 == 0:
+        return _launch_m4_high_k(A, B, C, M, N, K, stream=stream)
+    config = select_gemm_decode_config(M, N, K)
+    return gemm_decode_bf16_configured(
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        config,
+        stream,
+    )

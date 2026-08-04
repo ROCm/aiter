@@ -307,7 +307,11 @@ class GTensor(TensorBase):
 
     def load(self, offset, vec_size=1):
         return buffer_ops.buffer_load(
-            self.rsrc, offset, vec_width=vec_size, dtype=self.dtype
+            self.rsrc,
+            offset,
+            vec_width=vec_size,
+            dtype=self.dtype,
+            cache_modifier=self.cache_modifier,
         )
 
     def store(self, offset, value, vec_size=1):
