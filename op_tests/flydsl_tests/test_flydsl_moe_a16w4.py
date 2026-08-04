@@ -96,6 +96,52 @@ SHAPES = [
     (7168, 256, 256, 8, 4),  # DSR1-like tok=4 decode
 ]
 
+A16W4_TUNED_CONFIGS = [
+    "gptoss_a16w4_tuned_fmoe.csv",
+    "qwen3_5_397b_a16w4_tuned_fmoe.csv",
+]
+
+
+def _a16w4_tuned_rows():
+    """Yield (config, row_index, kernelName1, kernelName2) for shipped a16w4 configs."""
+    import csv
+    from pathlib import Path
+
+    cfg_dir = Path(aiter.__file__).parent / "configs" / "model_configs"
+    for cfg in A16W4_TUNED_CONFIGS:
+        path = cfg_dir / cfg
+        if not path.exists():
+            continue
+        with open(path, newline="") as fh:
+            for i, row in enumerate(csv.DictReader(fh)):
+                kn1 = (row.get("kernelName1") or "").strip()
+                kn2 = (row.get("kernelName2") or "").strip()
+                if kn1.startswith("flydsl_") or kn2.startswith("flydsl_"):
+                    yield cfg, i, kn1, kn2
+
+
+@pytest.mark.parametrize("cfg,row,kn1,kn2", list(_a16w4_tuned_rows()))
+def test_a16w4_tuned_config_kernels_are_valid(cfg, row, kn1, kn2):
+    """Every flydsl kernel a shipped a16w4 config selects must exist and be buildable."""
+    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
+
+    for kn in (kn1, kn2):
+        if not kn.startswith("flydsl_"):
+            continue
+        params = get_flydsl_kernel_params(kn)
+        assert params is not None, f"{cfg} row {row}: unknown flydsl kernel {kn!r}"
+
+        if params["stage"] == 1 and params.get("b_dtype") == "fp4bf16":
+            assert kn.endswith("_gui") or "_gui_" in kn, (
+                f"{cfg} row {row}: {kn!r} is a SEPARATED fp4_bf16 stage1 kernel, but "
+                "flydsl fp4_bf16 stage1 is INTERLEAVE-only"
+            )
+            tile_n = params["tile_n"]
+            assert tile_n % 128 == 0, (
+                f"{cfg} row {row}: {kn!r} has tile_n={tile_n}; INTERLEAVE needs "
+                "tile_n >= 128 so each wave holds at least one gate+up pair"
+            )
+
 
 @pytest.mark.skipif(get_gfx() not in ["gfx950"], reason="fp4_bf16 requires gfx950")
 @pytest.mark.parametrize("model_dim,inter_dim,E,topk,tokens", SHAPES)

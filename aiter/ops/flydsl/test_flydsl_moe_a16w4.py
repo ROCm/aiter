@@ -144,13 +144,6 @@ def _generate_a16w4_data(
         topk_ids, topk_weights, E, model_dim, dtype, block_m
     )
 
-    if doweight_stage1:
-        sorted_weights_s1 = sorted_weights
-        sorted_weights_s2 = None
-    else:
-        sorted_weights_s1 = None
-        sorted_weights_s2 = sorted_weights
-
     # Pad sorted_ids if needed
     needed = sorted_expert_ids.shape[0] * block_m
     if sorted_ids.shape[0] < needed:
@@ -171,6 +164,13 @@ def _generate_a16w4_data(
                 ),
             ]
         )
+
+    if doweight_stage1:
+        sorted_weights_s1 = sorted_weights
+        sorted_weights_s2 = None
+    else:
+        sorted_weights_s1 = None
+        sorted_weights_s2 = sorted_weights
 
     # Shuffle weights for INTERLEAVE (klane_inner) or SEPARATED.
     # w1 (gate+up) uses klane_inner when gate_mode=interleave.
