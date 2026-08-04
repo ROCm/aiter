@@ -388,18 +388,21 @@ def _select_impls(which, flydsl_variants):
     impls = {}
     if want_triton:
         impls["triton"] = triton_logits
+
     if want_flydsl:
-        for v in flydsl_variants:
-            if v != "auto" and v not in available_variants:
-                raise SystemExit(
-                    f"[error] unknown FlyDSL variant {v!r}; available: "
-                    f"{list(available_variants)}."
-                )
-            # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive selection
-            # (variant=None -> _auto_variant per shape).
-            impls[FLYDSL_PREFIX + v] = functools.partial(
-                flydsl_fn, variant=None if v == "auto" else v
-            )
+        if len(flydsl_variants) == 1 and flydsl_variants[0] == "all":
+            for var in available_variants:
+                impls[FLYDSL_PREFIX + var] = functools.partial(flydsl_fn, variant=var)
+        else:
+            for v in flydsl_variants:
+                if v != "auto" and v not in available_variants:
+                    raise SystemExit(
+                        f"[error] unknown FlyDSL variant {v!r}; available: "
+                        f"{list(available_variants)}."
+                    )
+                # "auto" defers to flydsl_fp8_mqa_logits' shape-adaptive selection
+                # (variant=None -> _auto_variant per shape).
+                impls[FLYDSL_PREFIX + v] = functools.partial(flydsl_fn, variant=None if v == "auto" else v)
 
     if not impls:
         raise SystemExit("[error] no implementations selected.")
