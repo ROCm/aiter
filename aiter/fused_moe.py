@@ -2290,51 +2290,6 @@ def get_2stage_cfgs(
             **route_bucket_metadata,
         )
     if (
-        not kernelName1  # only fire when CSV produced no match; a CSV hit returns above
-        and q_type == QuantType.per_1x32
-        and q_dtype_w == dtypes.fp4x2
-        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
-        and gate_mode
-        == GateMode.SEPARATED  # INTERLEAVE falls through to ck2stages below
-        and is_flydsl_available()
-    ):
-        # fp4_bf16 SEPARATED: MXFP4 weights (FP4 E2M1 + E8M0 scales) with bf16 activations.
-        # INTERLEAVE shapes always use CSV rows; unmatched INTERLEAVE falls through to ck2stages.
-        _out_str = "bf16"
-        _tile_m = 16 if token < 2048 else 32 if token < 16384 else 64
-        _tile_n = 128
-        _tile_k = 128
-        _gui_tag = ""
-        from aiter.ops.flydsl.moe_kernels import flydsl_kernel_name
-
-        kn1 = (
-            flydsl_kernel_name(
-                1, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k
-            )
-            + _gui_tag
-        )
-        kn2 = flydsl_kernel_name(
-            2, "bf16", "fp4bf16", _out_str, _tile_m, _tile_n, _tile_k, "atomic"
-        )
-        return MOEMetadata(
-            functools.partial(
-                _flydsl_stage1_wrapper,
-                kernelName=kn1,
-                activation=activation,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            functools.partial(
-                _flydsl_stage2_wrapper,
-                kernelName=kn2,
-                inter_dim_pad=intermediate_pad,
-                model_dim_pad=hidden_pad,
-            ),
-            _tile_m,
-            1,  # no split-K for fp4_bf16 (not yet tuned)
-            False,
-        )
-    if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
