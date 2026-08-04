@@ -17,7 +17,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["BATCH_NUM"])
 def _fwd_kernel_stage2_asm(
     Mid_O,
     Mid_lse,
@@ -39,7 +39,7 @@ def _fwd_kernel_stage2_asm(
     MAYBE_FINAL_OUT: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_VALID_SPLIT_COUNT_REDUCE: tl.constexpr,
-    BATCH_NUM: tl.constexpr,
+    BATCH_NUM,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     mgc: tl.constexpr,
