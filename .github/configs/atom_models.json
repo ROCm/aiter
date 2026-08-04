@@ -5,7 +5,7 @@
     "extra_args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
     "threshold": "0.73",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-1"
+    "runner": "linux-aiter-quality-do-mi350x-1"
   },
   {
     "model_name": "Meta-Llama-3-8B-Instruct",
@@ -21,7 +21,7 @@
     "extra_args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
     "threshold": "0.38",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-1"
+    "runner": "linux-aiter-quality-do-mi350x-1"
   },
   {
     "model_name": "gpt-oss-120b",
@@ -37,7 +37,7 @@
     "extra_args": "--kv_cache_dtype fp8 --gpu-memory-utilization 0.3",
     "threshold": "0.88",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-1"
+    "runner": "linux-aiter-quality-do-mi350x-1"
   },
   {
     "model_name": "Llama-3.3-70B-Instruct-MXFP4-Preview",
@@ -53,7 +53,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 2 --enable-dp-attention --enable-expert-parallel --gpu-memory-utilization 0.3",
     "threshold": "0.38",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "gpt-oss-120b-2gpu",
@@ -69,7 +69,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 4",
     "threshold": "0.93",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "DeepSeek-R1-0528-FP4",
@@ -85,7 +85,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 4 --method mtp",
     "threshold": "0.93",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "DeepSeek-R1-0528-FP4-MTP",
@@ -101,7 +101,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 4 --trust-remote-code",
     "threshold": "0.93",
     "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "Kimi-K2.5-MXFP4",
@@ -117,7 +117,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8",
     "threshold": "0.94",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "DeepSeek-R1-0528",
@@ -133,7 +133,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8 --method mtp",
     "threshold": "0.94",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "DeepSeek-R1-0528-MTP",
@@ -149,7 +149,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel",
     "threshold": "0.87",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8",
@@ -165,7 +165,7 @@
     "extra_args": "-tp 8",
     "threshold": "0.65",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "Qwen3-Next-80B-A3B-Thinking",
@@ -181,7 +181,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8 --enable-expert-parallel",
     "threshold": "0.87",
     "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "Qwen3-235B-A22B-Instruct-2507-MXFP4",
@@ -197,7 +197,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8",
     "threshold": "0.93",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "GLM-5-FP8",
@@ -213,7 +213,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 8",
     "threshold": "0.88",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "GLM-5.1-FP8",
@@ -229,7 +229,7 @@
     "extra_args": "--kv_cache_dtype fp8 -tp 2 --trust-remote-code",
     "threshold": "0.92",
     "env_vars": "",
-    "runner": "linux-aiter-mi35x-8"
+    "runner": "linux-aiter-quality-do-mi350x-8"
   },
   {
     "model_name": "MiniMax-M2.5",
