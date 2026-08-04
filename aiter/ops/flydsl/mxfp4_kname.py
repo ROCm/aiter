@@ -14,10 +14,18 @@ import re
 import struct
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
-_MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN", "FP8OUT", "IL", "SITUV2"}
+_MXMOE_G1_FLAG_TOKENS = {
+    "NT",
+    "F16IN",
+    "FP8OUT",
+    "IL",
+    "SITUV2",
+    "SWIGLU",
+    "BIAS",
+}
 _MXMOE_G2_FLAG_TOKENS = {"NT", "ATOMIC", "F4OUT", "CSHUFFLE"}
 _MXMOE_NUMERIC_RE = re.compile(r"^([A-Z]+)(\d+)$")
-_MXMOE_FLOAT_RE = re.compile(r"^(SB|SLB)([0-9A-F]{16})$")
+_MXMOE_FLOAT_RE = re.compile(r"^(SB|SLB|SLIM)([0-9A-F]{16})$")
 _MXMOE_TILE_RE = re.compile(r"^(\d+)x(\d+)x(\d+)$")  # <BM>x<BN>x<BK>
 _MXMOE_PREFIX = {1: "flydsl_mxmoe_g1_a4w4_", 2: "flydsl_mxmoe_g2_a4w4_"}
 _MXMOE_G1_PREFIX_RE = re.compile(r"^flydsl_mxmoe_g1_a(?P<a>[48])w4_")
@@ -67,6 +75,8 @@ def _make_mxfp4_g1_kname(
     xcd_swizzle: int = 0,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
+    enable_bias: bool = False,
 ) -> str:
     """Build a cache-safe GEMM1 name; legacy a4w4 names remain byte-for-byte."""
     a_dtype = str(a_dtype).lower()
@@ -76,7 +86,7 @@ def _make_mxfp4_g1_kname(
         raise ValueError(f"unsupported mxmoe GEMM1 a_dtype: {a_dtype!r}")
     if out_dtype not in ("fp4", "fp8"):
         raise ValueError(f"unsupported mxmoe GEMM1 out_dtype: {out_dtype!r}")
-    if act not in ("silu", "situv2"):
+    if act not in ("silu", "swiglu", "situv2"):
         raise ValueError(f"unsupported mxmoe GEMM1 activation: {act!r}")
     if act == "situv2" and (float(situ_beta) <= 0.0 or float(situ_linear_beta) <= 0.0):
         raise ValueError("SiTUv2 beta values must be positive")
@@ -93,6 +103,12 @@ def _make_mxfp4_g1_kname(
         name += "_fp8out"
     if act == "situv2":
         name += "_situv2"
+    elif act == "swiglu":
+        if float(swiglu_limit) <= 0.0:
+            raise ValueError("Swiglu limit must be positive")
+        name += "_swiglu"
+        if enable_bias:
+            name += "_bias"
     if kSplitK:
         name += f"_sk{int(kSplitK)}"
     if xcd_swizzle:
@@ -102,6 +118,8 @@ def _make_mxfp4_g1_kname(
             f"_sb{_encode_mxfp4_float(situ_beta)}"
             f"_slb{_encode_mxfp4_float(situ_linear_beta)}"
         )
+    elif act == "swiglu":
+        name += f"_slim{_encode_mxfp4_float(swiglu_limit)}"
     return name
 
 
@@ -119,6 +137,8 @@ def _select_mxfp4_g1_kernel(
     interleave: bool = False,
     situ_beta: float = 1.0,
     situ_linear_beta: float = 1.0,
+    swiglu_limit: float = 7.0,
+    enable_bias: bool = False,
 ) -> dict:
     """Select an MXMOE GEMM1 while retaining a tuned block_m when supplied."""
     routed_rows = int(token) * int(topk)
@@ -149,6 +169,8 @@ def _select_mxfp4_g1_kernel(
             xcd_swizzle=xcd_swizzle,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
+            enable_bias=enable_bias,
         ),
     }
 
@@ -202,7 +224,11 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
             continue
         fm = _MXMOE_FLOAT_RE.match(utok)
         if fm:
-            field = "situ_beta" if fm.group(1) == "SB" else "situ_linear_beta"
+            field = {
+                "SB": "situ_beta",
+                "SLB": "situ_linear_beta",
+                "SLIM": "swiglu_limit",
+            }[fm.group(1)]
             floats[field] = _decode_mxfp4_float(fm.group(2))
             continue
         m = _MXMOE_NUMERIC_RE.match(utok)
@@ -217,7 +243,7 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
     parsed = _tokenize_mxfp4_kname(kname, 1, _MXMOE_G1_FLAG_TOKENS)
     nums, flags = parsed["nums"], parsed["flags"]
     floats = parsed["floats"]
-    act = "situv2" if "SITUV2" in flags else "silu"
+    act = "situv2" if "SITUV2" in flags else ("swiglu" if "SWIGLU" in flags else "silu")
     if act == "silu" and floats:
         raise ValueError(f"illegal mxmoe GEMM1 name {kname!r}: SiLU has beta tokens")
     if act == "situv2" and set(floats) != {"situ_beta", "situ_linear_beta"}:
@@ -230,6 +256,16 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
     ):
         raise ValueError(
             f"illegal mxmoe GEMM1 name {kname!r}: SiTUv2 betas must be finite and positive"
+        )
+    if act == "swiglu" and set(floats) != {"swiglu_limit"}:
+        raise ValueError(
+            f"illegal mxmoe GEMM1 name {kname!r}: Swiglu requires slim encoding"
+        )
+    if act == "swiglu" and (
+        not math.isfinite(floats["swiglu_limit"]) or floats["swiglu_limit"] <= 0.0
+    ):
+        raise ValueError(
+            f"illegal mxmoe GEMM1 name {kname!r}: Swiglu limit must be finite and positive"
         )
     return {
         "BM": nums["BM"],
@@ -246,6 +282,8 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
         "act": act,
         "situ_beta": floats.get("situ_beta", 1.0),
         "situ_linear_beta": floats.get("situ_linear_beta", 1.0),
+        "swiglu_limit": floats.get("swiglu_limit", 7.0),
+        "enable_bias": "BIAS" in flags,
     }
 
 

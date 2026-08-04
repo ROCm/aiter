@@ -1553,6 +1553,8 @@ def _mxfp4_a4w4_stage1(
     act,
     situ_beta,
     situ_linear_beta,
+    swiglu_limit,
+    bias1,
     max_sorted,
     kernelName1,
     device,
@@ -1649,6 +1651,8 @@ def _mxfp4_a4w4_stage1(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
+        bias=bias1,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1811,6 +1815,8 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
+    bias1=None,
+    swiglu_limit: float | None = None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
     **_kwargs,
@@ -1824,6 +1830,15 @@ def _mxfp4_a4w4_stage1_fw(
         raise ValueError(
             "MXMOE SiTUv2 runtime betas do not match the cache-safe kernel name"
         )
+    runtime_swiglu_limit = 7.0 if swiglu_limit is None else float(swiglu_limit)
+    if p1["act"] == "swiglu" and runtime_swiglu_limit != p1["swiglu_limit"]:
+        raise ValueError(
+            "MXMOE Swiglu runtime limit does not match the cache-safe kernel name"
+        )
+    if not p1.get("enable_bias", False) and bias1 is not None:
+        raise ValueError(
+            "MXMOE bias presence does not match the cache-safe kernel name"
+        )
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
     if w1.element_size() == 1 and w1.dtype != torch.uint8:
@@ -1831,6 +1846,8 @@ def _mxfp4_a4w4_stage1_fw(
     NE = w1.shape[0]
     D_HIDDEN = hidden_states.shape[1]
     D_INTER = w1.shape[1] // 2
+    if p1.get("enable_bias", False) and bias1 is None:
+        bias1 = torch.zeros((NE, D_INTER * 2), dtype=dtypes.fp32, device=device)
     Kpad_inter = ((D_INTER + 255) // 256) * 256
     M = hidden_states.shape[0]
     if m_indices is None:
@@ -1872,6 +1889,8 @@ def _mxfp4_a4w4_stage1_fw(
         act=p1["act"],
         situ_beta=p1["situ_beta"],
         situ_linear_beta=p1["situ_linear_beta"],
+        swiglu_limit=p1["swiglu_limit"],
+        bias1=bias1,
         max_sorted=sorted_token_ids.shape[0],
         kernelName1=kernelName1,
         device=device,
@@ -2541,9 +2560,9 @@ def get_2stage_cfgs(
                 block_m = replacement["BM"]
                 kernelName1 = replacement["kernelName1"]
         else:
-            has_tuned_replacement = _is_mxfp4_kname(kernelName1) and str(
-                kernelName2
-            ).startswith("flydsl_moe2_")
+            has_tuned_replacement = _is_mxfp4_kname(kernelName1) and bool(
+                str(kernelName2)
+            )
             if has_tuned_replacement:
                 block_m = _parse_mxfp4_g1_kname(kernelName1)["BM"]
             else:
@@ -2605,6 +2624,20 @@ def get_2stage_cfgs(
                 "interleave": gate_mode == GateMode.INTERLEAVE,
             }
             _bm = int(block_m) if block_m is not None else BLOCK_SIZE_M
+        expected_act = (
+            "swiglu"
+            if activation == ActivationType.Swiglu
+            else (
+                "situv2"
+                if activation == getattr(ActivationType, "Situv2", None)
+                else "silu"
+            )
+        )
+        if _p1.get("act", expected_act) != expected_act:
+            raise ValueError(
+                f"MXMOE GEMM1 activation {_p1.get('act')!r} does not match "
+                f"runtime activation {expected_act!r}"
+            )
         if _is_mxfp4_kname(kernelName2):
             stage2_func = functools.partial(
                 _mxfp4_a4w4_stage2_fw, kernelName2=kernelName2
@@ -2624,13 +2657,27 @@ def get_2stage_cfgs(
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
             )
-        else:
+        elif isinstance(kernelName2, str) and kernelName2.startswith("flydsl_"):
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
                 inter_dim_pad=intermediate_pad,
                 model_dim_pad=hidden_pad,
             )
+        else:
+            stage2_func = functools.partial(
+                aiter.ck_moe_stage2_fwd,
+                kernelName=kernelName2,
+                activation=activation,
+                quant_type=q_type,
+                use_non_temporal_load=use_non_temporal_load,
+            )
+        enable_bias = (
+            _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
+        )
+        stage2_supports_bias = isinstance(kernelName2, str) and (
+            kernelName2.startswith("flydsl_") or kernelName2.startswith("cktile_")
+        )
         return MOEMetadata(
             stage1=functools.partial(
                 _mxfp4_a4w4_stage1_fw,
@@ -2643,6 +2690,8 @@ def get_2stage_cfgs(
             fuse_quant=_p1["out_dtype"],
             output_aux=False,
             prequant=_p1["a_dtype"] == "fp8" and not _p1["inline_quant"],
+            has_bias=enable_bias and _p1.get("enable_bias", False),
+            stage2_has_bias=enable_bias and stage2_supports_bias,
             **route_bucket_metadata,
         )
 
@@ -3318,7 +3367,11 @@ def fused_moe_2stages(
                 extra_stage1_args["topk_ids"] = topk_ids
         if metadata.stage2_has_bias:
             extra_stage2_args["bias2"] = _normalize_bias_for_kernel(bias2)
-    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+    if stage1_func in (
+        _flydsl_stage1_wrapper,
+        _opus_a8w4_stage1_wrapper,
+        _mxfp4_a4w4_stage1_fw,
+    ):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if (
         stage1_func is _flydsl_stage1_wrapper

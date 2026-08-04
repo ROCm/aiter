@@ -118,6 +118,17 @@ def _global_i32_at(addr_i64, idx):
     return _global_i32_ptr(addr_i64)[idx]
 
 
+def _global_f32_ptr(addr_i64):
+    ptr_ty = fx.PointerType.get(
+        T.f32, address_space=fx.AddressSpace.Global, alignment=4
+    )
+    return fx.inttoptr(ptr_ty, fx.Int64(addr_i64))
+
+
+def _global_f32_at(addr_i64, idx):
+    return fx.Float32(_global_f32_ptr(addr_i64)[idx])
+
+
 def _global_i32_load(tiles, idx):
     atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Int32)
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
@@ -264,6 +275,32 @@ def _silu_mul_batch(gate_values, up_values):
     ]
 
 
+def _swiglu_mul_batch(gate_values, up_values, limit=7.0):
+    limit_f32 = fx.Float32(float(limit))
+    neg_limit_f32 = fx.Float32(-float(limit))
+    exp_values = []
+    gate_clamped = []
+    up_clamped = []
+    for gate, up in zip(gate_values, up_values):
+        gate_value = fx.Float32(arith.minimumf(_raw(gate), _raw(limit_f32)))
+        up_value = fx.Float32(
+            arith.maximumf(
+                arith.minimumf(_raw(up), _raw(limit_f32)), _raw(neg_limit_f32)
+            )
+        )
+        gate_clamped.append(gate_value)
+        up_clamped.append(up_value)
+        exp_values.append(
+            fx.Float32(rocdl.exp2(T.f32, _raw(gate_value * fx.Float32(-1.702 * LOG2E))))
+        )
+    return [
+        gate_clamped[i]
+        * fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + exp_values[i])))
+        * (up_clamped[i] + fx.Float32(1.0))
+        for i in range(len(gate_values))
+    ]
+
+
 def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
     one = fx.Float32(1.0)
     zero = fx.Float32(0.0)
@@ -298,8 +335,15 @@ def _situ_mul_batch(gate_values, up_values, beta=1.0, linear_beta=1.0):
 
 
 def _activation_mul_batch(
-    gate_values, up_values, act="silu", situ_beta=1.0, situ_linear_beta=1.0
+    gate_values,
+    up_values,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
+    swiglu_limit=7.0,
 ):
+    if act == "swiglu":
+        return _swiglu_mul_batch(gate_values, up_values, limit=swiglu_limit)
     if act == "situv2":
         return _situ_mul_batch(
             gate_values,

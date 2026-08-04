@@ -40,6 +40,19 @@ SHAPES = [
     (257, 6144, 512, 9),  # GLM-5.2 TP=4
     (257, 6144, 256, 9),  # GLM-5.2 TP=8
     (896, 3584, 512, 16),  # Kimi-K3 TP=1/2 (INTER 384 pads to 512)
+    (64, 7168, 2048, 8),  # DSV3 E64
+    (128, 3072, 512, 4),  # GPT-OSS TP=6
+    (128, 3072, 1536, 4),  # GPT-OSS TP=2
+    (128, 3072, 3072, 4),  # GPT-OSS TP=1
+    (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
+    (129, 6144, 768, 5),  # MiniMax-M3
+    (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
+    (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
+    (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256
+    (256, 7168, 512, 8),  # DSV3/Kimi-K2 E256
+    (384, 7168, 256, 8),  # Kimi-K2 TP=8
+    (512, 4096, 512, 10),  # Qwen3.5 TP=1
+    (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
 ]
 
 
@@ -422,7 +435,22 @@ class mxfp4_moe_aux_codegen:
 
     def run(self):
         self.working_path.mkdir(parents=True, exist_ok=True)
-        insts = list(self.enumerate_instances())
+        unique = {}
+        for inst in self.enumerate_instances():
+            previous = unique.get(inst.name)
+            if previous is not None:
+                if (
+                    previous.fn_type,
+                    previous.include,
+                    previous.params,
+                    previous.body,
+                ) != (inst.fn_type, inst.include, inst.params, inst.body):
+                    raise ValueError(
+                        f"conflicting MXFP4 auxiliary instances named {inst.name!r}"
+                    )
+                continue
+            unique[inst.name] = inst
+        insts = list(unique.values())
         self.gen_instances(insts)
         self.gen_lookup(insts)
         print(

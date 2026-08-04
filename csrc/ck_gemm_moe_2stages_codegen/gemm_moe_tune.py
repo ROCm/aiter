@@ -5719,6 +5719,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         interleave=False,
         situ_beta=1.0,
         situ_linear_beta=1.0,
+        swiglu_limit=7.0,
+        enable_bias=False,
     ):
         # flydsl_mxmoe_g1_a4w4_<BM>x<BN>x256[_f16in][_nt]; see mxfp4_kname.py.
         from aiter.ops.flydsl.mxfp4_kname import _make_mxfp4_g1_kname
@@ -5736,6 +5738,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             xcd_swizzle=xcd_swizzle,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=swiglu_limit,
+            enable_bias=enable_bias,
         )
 
     @staticmethod
@@ -5793,15 +5797,23 @@ class Mxfp4FlydslTuner(FmoeTuner):
             if missing:
                 raise ValueError(f"{path} is missing tuning keys: {missing}")
             keep_columns = list(self.keys)
-            if frame["q_dtype_a"].astype(str).str.contains("float8").any():
-                locked_columns = ["block_m", "kernelName2"]
+            has_mxfp4_activation = (
+                frame["q_dtype_a"]
+                .astype(str)
+                .str.contains("float4|float8", regex=True)
+                .any()
+            )
+            if has_mxfp4_activation:
+                locked_columns = ["block_m", "kernelName2", "run_1stage"]
                 missing_locked = [
                     column for column in locked_columns if column not in frame.columns
                 ]
                 if missing_locked:
                     raise ValueError(
-                        f"{path} is missing locked A8W4 columns: {missing_locked}"
+                        f"{path} is missing locked MXFP4 columns: {missing_locked}"
                     )
+                if "_tag" in frame.columns:
+                    locked_columns.append("_tag")
                 keep_columns.extend(locked_columns)
             frames.append(frame[keep_columns])
 
@@ -5813,6 +5825,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def _candidate_row(self, row, bm, kn1, kn2):
         cand = {k: row[k] for k in self.keys}
+        for column in ("_source_index", "_tag", "_source_hash"):
+            if column in row:
+                cand[column] = row[column]
         cand.update(
             {
                 "block_m": bm,
@@ -5845,6 +5860,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
         g2_bms = {v[0] for v in G2}
         cands = []
         is_a8w4 = "float8" in str(row["q_dtype_a"])
+        is_a4w4 = "float4" in str(row["q_dtype_a"]) and "float4" in str(
+            row["q_dtype_w"]
+        )
         if is_a8w4:
             bm = int(row["block_m"])
             act = "situv2" if str(row["act_type"]).endswith("Situv2") else "silu"
@@ -5871,6 +5889,42 @@ class Mxfp4FlydslTuner(FmoeTuner):
                         situ_linear_beta=situ_linear_beta,
                     )
                     cands.append(self._candidate_row(row, bm, kn1, locked_g2))
+            return cands
+        if is_a4w4 and "block_m" in row and "kernelName2" in row:
+            if (
+                int(row.get("run_1stage", 0) or 0) != 0
+                or not str(row["kernelName2"]).strip()
+            ):
+                return []
+            bm = int(row["block_m"])
+            locked_g2 = str(row["kernelName2"])
+            if str(row["act_type"]).endswith("Situv2"):
+                act = "situv2"
+                situ_beta, situ_linear_beta = 2.0, 1.5
+            elif str(row["act_type"]).endswith("Swiglu"):
+                act = "swiglu"
+                situ_beta, situ_linear_beta = 1.0, 1.0
+            else:
+                act = "silu"
+                situ_beta, situ_linear_beta = 1.0, 1.0
+            for _, use_nt, inline_quant in sorted(
+                variant for variant in _SUPPORTED_BY_DTYPE["fp4"] if variant[0] == bm
+            ):
+                for bn in (128, 256):
+                    for xcd_swizzle in self.XCD_SWIZZLES:
+                        kn1 = self._g1_kname(
+                            bm,
+                            bn,
+                            use_nt,
+                            inline_quant,
+                            xcd_swizzle,
+                            act=act,
+                            situ_beta=situ_beta,
+                            situ_linear_beta=situ_linear_beta,
+                            swiglu_limit=7.0,
+                            enable_bias=act == "swiglu",
+                        )
+                        cands.append(self._candidate_row(row, bm, kn1, locked_g2))
             return cands
 
         for bm in sorted({v[0] for v in G1}):
@@ -5956,6 +6010,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         topk,
         dtype,
         q_dtype_a=dtypes.fp4x2,
+        activation=ActivationType.Silu,
     ):
         data = FmoeTuner.generate_data(
             token,
@@ -5971,6 +6026,20 @@ class Mxfp4FlydslTuner(FmoeTuner):
             16,
             device="cuda",
         )
+        if activation == ActivationType.Swiglu:
+            data["bias1"] = torch.clamp(
+                torch.randn((expert, inter_dim * 2), dtype=dtypes.fp32, device="cuda"),
+                -1.0,
+                1.0,
+            )
+            data["bias2"] = torch.clamp(
+                torch.randn((expert, model_dim), dtype=dtypes.fp32, device="cuda"),
+                -1.0,
+                1.0,
+            )
+        else:
+            data["bias1"] = None
+            data["bias2"] = None
         if q_dtype_a == dtypes.fp8:
             data["w1_a16"] = shuffle_weight_a16w4(data["w1_qt"], 16, True)
             data["w1s_a16"] = shuffle_scale_a16w4(data["w1_scale"], expert, True)
@@ -5996,6 +6065,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         data["w2s_a16"] = shuffle_scale(
             data["w2_scale"], expert, is_guinterleave=False, gate_up=False
         )
+        data["w2_scale_ck"] = fp4_utils.e8m0_shuffle(data["w2_scale"])
         data["w2_mixed"] = shuffle_weight_a16w4(data["w2_qt"], 16, False)
         data["w2s_mixed"] = shuffle_scale_a16w4(data["w2_scale"], expert, False)
         return data
@@ -6098,6 +6168,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
+            interleave=p1["interleave"],
+            bias1=data["bias1"],
+            swiglu_limit=p1.get("swiglu_limit", 7.0),
+            situ_beta=p1["situ_beta"],
+            situ_linear_beta=p1["situ_linear_beta"],
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -6126,6 +6201,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["topk_ids"],
             data["a1_scale"],
             data["w1_scale"],
+            w1_bias=data["bias1"],
             dtype=dtype,
             activation=activation,
             quant_type=QuantType.per_1x32,
@@ -6140,6 +6216,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             data["topk_ids"],
             a2_scale=None,
             w2_scale=data["w2_scale"],
+            w2_bias=data["bias2"],
             dtype=dtype,
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
@@ -6155,15 +6232,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         dtype = dtypes.bf16
         q_dtype_a = eval(str(row["q_dtype_a"]))
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
+        if str(row["act_type"]).endswith("Situv2"):
+            activation = ActivationType.Situv2
+        elif str(row["act_type"]).endswith("Swiglu"):
+            activation = ActivationType.Swiglu
+        else:
+            activation = ActivationType.Silu
         if data is None:
-            data = self._prepare_case(token, h, e, ne, topk, dtype, q_dtype_a)
+            data = self._prepare_case(
+                token, h, e, ne, topk, dtype, q_dtype_a, activation
+            )
         if ref is None:
-            if str(row["act_type"]).endswith("Situv2"):
-                activation = ActivationType.Situv2
-            elif str(row["act_type"]).endswith("Swiglu"):
-                activation = ActivationType.Swiglu
-            else:
-                activation = ActivationType.Silu
             ref = self._torch_ref(data, topk, dtype, activation)
         out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype, model_dim_pad)
         if model_dim_pad > 0:
@@ -6242,6 +6321,10 @@ class Mxfp4FlydslTuner(FmoeTuner):
             activation = ActivationType.Silu
         q_dtype_a = eval(str(row["q_dtype_a"]))
         model_dim_pad = 192 if ne == 896 and model_dim == 3584 and topk == 16 else 0
+        seed = (
+            token * 1000003 + model_dim * 1009 + inter_dim * 101 + ne * 17 + topk
+        ) & 0x7FFFFFFF
+        torch.manual_seed(seed)
         data = self._prepare_case(
             token,
             model_dim,
@@ -6250,6 +6333,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             topk,
             dtype,
             q_dtype_a,
+            activation,
         )
         ref = self._torch_ref(data, topk, dtype, activation)
 
@@ -6276,9 +6360,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     f"kernel_us={candidate['us']} e2e_us={e2e_us}",
                     flush=True,
                 )
-                if best is None or e2e_us < best_e2e_us:
+                selection_us = (
+                    float(candidate["us1"]) if "_source_index" in row else e2e_us
+                )
+                if best is None or selection_us < best_e2e_us:
                     best = candidate
-                    best_e2e_us = e2e_us
+                    best_e2e_us = selection_us
             except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"

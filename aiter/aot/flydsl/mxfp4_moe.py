@@ -75,6 +75,8 @@ def _job_key(job: dict) -> tuple:
             job["act"],
             job["situ_beta"],
             job["situ_linear_beta"],
+            job["swiglu_limit"],
+            job["enable_bias"],
             job["interleave"],
         )
     return (
@@ -97,7 +99,6 @@ def parse_csv(csv_path: str):
         _is_mxfp4_kname,
         _parse_mxfp4_g1_kname,
         _parse_mxfp4_g2_kname,
-        _select_mxfp4_a4w4_kernels,
         _select_mxfp4_g1_kernel,
         parse_flydsl_v2_gemm2_kernel,
     )
@@ -139,17 +140,20 @@ def parse_csv(csv_path: str):
                 (48, 7168, 3072, 6),
                 (256, 4096, 256, 6),
             }
-            is_a4w4_variant = (
-                q_dtype_a == "torch.float4_e2m1fn_x2"
-                and act_type == "ActivationType.Silu"
-                and not is_kimi_k3
+            is_a4w4_variant = q_dtype_a == "torch.float4_e2m1fn_x2" and act_type in (
+                "ActivationType.Silu",
+                "ActivationType.Swiglu",
+                "ActivationType.Situv2",
             )
             is_a8w4_variant = q_dtype_a == "torch.float8_e4m3fn" and (
                 (act_type == "ActivationType.Silu" and is_dsv4)
                 or (act_type == "ActivationType.Situv2" and is_kimi_k3)
             )
+            row_gfx = row.get("gfx") or (
+                "gfx950" if int(row.get("cu_num") or 0) == 256 else "unknown"
+            )
             use_replacement = (
-                row.get("gfx") == "gfx950"
+                row_gfx == "gfx950"
                 and row.get("dtype") == "torch.bfloat16"
                 and (is_a4w4_variant or is_a8w4_variant)
                 and row.get("q_dtype_w") == "torch.float4_e2m1fn_x2"
@@ -187,11 +191,24 @@ def parse_csv(csv_path: str):
                 # GEMM2, so stage2 remains byte-for-byte unchanged.
                 replacement["kernelName2"] = configured_kn2
             elif use_replacement:
-                replacement = _select_mxfp4_a4w4_kernels(
+                if act_type == "ActivationType.Swiglu":
+                    act = "swiglu"
+                elif act_type == "ActivationType.Situv2":
+                    act = "situv2"
+                else:
+                    act = "silu"
+                replacement = _select_mxfp4_g1_kernel(
                     token=int(row["token"]),
                     expert=expert,
                     topk=topk,
+                    block_m=int(row.get("block_m") or 0) or None,
+                    act=act,
+                    situ_beta=2.0 if act == "situv2" else 1.0,
+                    situ_linear_beta=1.5 if act == "situv2" else 1.0,
+                    swiglu_limit=7.0,
+                    enable_bias=act == "swiglu",
                 )
+                replacement["kernelName2"] = configured_kn2
             else:
                 replacement = None
 
@@ -239,6 +256,8 @@ def parse_csv(csv_path: str):
                         "act": p1["act"],
                         "situ_beta": p1["situ_beta"],
                         "situ_linear_beta": p1["situ_linear_beta"],
+                        "swiglu_limit": p1["swiglu_limit"],
+                        "enable_bias": p1["enable_bias"],
                         "interleave": p1["interleave"],
                     }
                 )
@@ -341,6 +360,8 @@ def _compile_stage1(job):
         act=job["act"],
         situ_beta=job["situ_beta"],
         situ_linear_beta=job["situ_linear_beta"],
+        swiglu_limit=job["swiglu_limit"],
+        bias=d if job["enable_bias"] else None,
         interleave=job["interleave"],
         stream=0,
     )

@@ -11,6 +11,7 @@ from .mxfp4_gemm_common import (
     _activation_mul_batch,
     _e8m0_from_amax,
     _fabs_f32,
+    _global_f32_at,
     _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
@@ -79,6 +80,7 @@ def _gemm1_body(
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
+    arg_bias,
     bx_i32,
     lane,
     wave,
@@ -95,6 +97,8 @@ def _gemm1_body(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=7.0,
+    enable_bias=False,
     K,
     N_OUT,
     NE,
@@ -818,12 +822,22 @@ def _gemm1_body(
                 up_col = fx.Int32(BN_INT) + gate_col
                 gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
                 up_vs[ee] = acc_load(acc_idx(row_local, up_col))
+                if const_expr(enable_bias):
+                    out_col = n_block_idx * fx.Int32(BN_INT) + gate_col
+                    bias_base = e * fx.Int32(N_OUT)
+                    gate_vs[ee] = gate_vs[ee] + _global_f32_at(
+                        arg_bias, bias_base + out_col
+                    )
+                    up_vs[ee] = up_vs[ee] + _global_f32_at(
+                        arg_bias, bias_base + fx.Int32(inter) + out_col
+                    )
             result = _activation_mul_batch(
                 gate_vs,
                 up_vs,
                 act=act,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                swiglu_limit=swiglu_limit,
             )
             if const_expr(out_dtype == "fp8"):
                 # Match the existing two-stage path: activation is materialized
@@ -1044,6 +1058,8 @@ def compile_gemm1_a4w4_port(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=7.0,
+    enable_bias=False,
 ):
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
@@ -1053,10 +1069,12 @@ def compile_gemm1_a4w4_port(
         )
     if out_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"out_dtype must be 'fp4' or 'fp8', got {out_dtype!r}")
-    if act not in ("silu", "situv2"):
-        raise AssertionError(f"act must be 'silu' or 'situv2', got {act!r}")
+    if act not in ("silu", "swiglu", "situv2"):
+        raise AssertionError(f"act must be 'silu', 'swiglu', or 'situv2', got {act!r}")
     if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
         raise AssertionError("SiTUv2 beta values must be positive")
+    if act == "swiglu" and swiglu_limit <= 0.0:
+        raise AssertionError("Swiglu limit must be positive")
 
     assert (
         BN in (128, 256) and BK == 256
@@ -1084,7 +1102,7 @@ def compile_gemm1_a4w4_port(
     name_suffix = f"{a_dtype}_h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
-    if act != "silu":
+    if act == "situv2":
         beta_tag = (
             str(float(situ_beta)).replace("-", "m").replace("+", "p").replace(".", "p")
         )
@@ -1095,6 +1113,16 @@ def compile_gemm1_a4w4_port(
             .replace(".", "p")
         )
         name_suffix += f"_{act}_sb{beta_tag}_slb{linear_tag}"
+    elif act == "swiglu":
+        limit_tag = (
+            str(float(swiglu_limit))
+            .replace("-", "m")
+            .replace("+", "p")
+            .replace(".", "p")
+        )
+        name_suffix += f"_swiglu_slim{limit_tag}"
+    if enable_bias:
+        name_suffix += "_bias"
     if BN != 256:
         name_suffix += f"_bn{BN}"
     if xcd_swizzle > 0:
@@ -1144,6 +1172,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        arg_bias: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx = gpu.thread_id("x")
@@ -1196,6 +1225,7 @@ def compile_gemm1_a4w4_port(
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
+                arg_bias,
                 _tile,
                 lane,
                 wave,
@@ -1211,6 +1241,8 @@ def compile_gemm1_a4w4_port(
                 act=act,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                swiglu_limit=swiglu_limit,
+                enable_bias=enable_bias,
                 K=_K,
                 N_OUT=_N_OUT,
                 NE=_NE,
@@ -1231,6 +1263,7 @@ def compile_gemm1_a4w4_port(
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
         arg_hidden: fx.Int64,
+        arg_bias: fx.Int64,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -1258,6 +1291,7 @@ def compile_gemm1_a4w4_port(
             arg_aqout,
             arg_ascaleout,
             arg_hidden,
+            arg_bias,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
     return launch_gemm1

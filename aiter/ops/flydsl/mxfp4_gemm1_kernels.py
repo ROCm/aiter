@@ -55,6 +55,8 @@ def _get_compiled_mxfp4_gemm1_port(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=7.0,
+    enable_bias=False,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -75,6 +77,8 @@ def _get_compiled_mxfp4_gemm1_port(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
+        enable_bias=enable_bias,
     )
 
 
@@ -94,6 +98,7 @@ def _assert_supported(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=7.0,
 ):
     if a_dtype not in _SUPPORTED_BY_DTYPE:
         raise NotImplementedError(
@@ -104,9 +109,10 @@ def _assert_supported(
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires out_dtype in ('fp4', 'fp8'), got {out_dtype!r}"
         )
-    if act not in ("silu", "situv2"):
+    if act not in ("silu", "swiglu", "situv2"):
         raise NotImplementedError(
-            f"flydsl mxfp4 gemm1 requires act in ('silu', 'situv2'), got {act!r}"
+            "flydsl mxfp4 gemm1 requires act in "
+            f"('silu', 'swiglu', 'situv2'), got {act!r}"
         )
     if act == "situv2":
         if situ_beta <= 0.0:
@@ -118,6 +124,10 @@ def _assert_supported(
                 "flydsl mxfp4 gemm1 requires situ_linear_beta > 0, "
                 f"got {situ_linear_beta!r}"
             )
+    if act == "swiglu" and swiglu_limit <= 0.0:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires swiglu_limit > 0, got {swiglu_limit!r}"
+        )
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 requires D_HIDDEN (K) % {BK} == 0, got H={D_HIDDEN}"
@@ -168,6 +178,8 @@ def flydsl_mxfp4_gemm1(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=7.0,
+    bias=None,
     stream=None,
 ):
     use_nt = _effective_use_nt(
@@ -193,6 +205,7 @@ def flydsl_mxfp4_gemm1(
         act=act,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        swiglu_limit=swiglu_limit,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -213,6 +226,8 @@ def flydsl_mxfp4_gemm1(
         act,
         situ_beta,
         situ_linear_beta,
+        swiglu_limit,
+        bias is not None,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
@@ -230,6 +245,7 @@ def flydsl_mxfp4_gemm1(
             inter_sorted_quant.data_ptr(),
             inter_sorted_shuffled_scale.data_ptr(),
             hidden_states.data_ptr(),
+            0 if bias is None else bias.data_ptr(),
             torch.cuda.current_stream() if stream is None else stream,
         ),
     )
