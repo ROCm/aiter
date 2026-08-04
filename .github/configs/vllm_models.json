@@ -50,7 +50,7 @@
         "model_name": "Mistral-7B",
         "kv": "default",
         "tp": 1,
-        "runner": "linux-aiter-mi35x-1",
+        "runner": "linux-aiter-quality-do-mi350x-1",
         "label": "MI35X-1gpu",
         "test_type": "bench-latency"
     },
@@ -79,7 +79,7 @@
         "model_name": "Kimi-K2.5",
         "kv": "default",
         "tp": 8,
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-quality-do-mi350x-8",
         "label": "MI35X-8gpu-kimi",
         "test_type": "bench-latency",
         "extra_args": "--trust-remote-code"
@@ -99,7 +99,7 @@
         "model_name": "MiniMax-M2.5",
         "kv": "default",
         "tp": 8,
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-quality-do-mi350x-8",
         "label": "MI35X-8gpu-minimax",
         "test_type": "bench-latency",
         "extra_args": "--trust-remote-code"
@@ -109,7 +109,7 @@
         "model_name": "DeepSeek-V3",
         "kv": "default",
         "tp": 8,
-        "runner": "linux-aiter-mi35x-8",
+        "runner": "linux-aiter-quality-do-mi350x-8",
         "label": "MI35X-8gpu-deepseek",
         "test_type": "bench-latency",
         "extra_args": "--trust-remote-code"
@@ -119,7 +119,7 @@
         "model_name": "Mistral-7B",
         "kv": "fp8",
         "tp": 1,
-        "runner": "linux-aiter-mi35x-1",
+        "runner": "linux-aiter-quality-do-mi350x-1",
         "label": "MI35X-1gpu",
         "test_type": "bench-latency"
     }
