@@ -44,6 +44,11 @@ from flydsl.expr import arith, buffer_ops, gpu, rocdl
 from flydsl.expr.typing import T
 from ..tensor_shim import _run_compiled
 
+# Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
+# self-contained: this kernel maintains its own arch constants below and passes the
+# config each manager needs through its constructor.
+from .mha_buffer_managers import QManager16b, KManager16b, VManager16b, OManager16b
+
 # ============================================================================
 # Threadgroup / arch constants
 # ============================================================================
@@ -57,12 +62,6 @@ BLOCK_SIZE = WAVE_SIZE * NUM_WAVES  # 256 threads
 WMMA_M = 16
 BLOCK_M = WMMA_M * NUM_WAVES  # 128
 
-# v_wmma_f32_16x16x32_bf16/f16: K dimension of one WMMA step.
-WMMA_K = 32
-BF16_BYTES = 2
-Q_CHUNK_ELEMS = 8  # b128 = 8 bf16
-Q_CHUNK_BYTES = Q_CHUNK_ELEMS * BF16_BYTES  # 16
-
 # v1 defaults (compile-time; see module docstring).
 DEFAULT_QK_HDIM = 128
 DEFAULT_V_HDIM = 128
@@ -75,16 +74,9 @@ DEFAULT_N_BLOCK = 64
 # Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
 N_KV_PP = 2
 
-# K global->LDS async is streamed one 8(kv) x 32(hdim) tile per warp call: 32
-# lanes x one b128 (8 bf16) = 8 rows x 4 chunks. 32-wide hdim == WMMA_K, so each
-# 4-lane row group hits a fully-coalesced 64-byte global segment.
-K_WR_TILE_KV = 8
-K_WR_TILE_HD = WMMA_K
-
-
-def _assert_multiple(name, val, mult):
-    if isinstance(val, int):
-        assert val % mult == 0, f"{name} must be a multiple of {mult}; got {val}"
+# NOTE: the WMMA/tiling constants (WMMA_K, chunk sizes, K/V write-tile + V swizzle
+# granularity) live inside mha_buffer_managers.py — they are intrinsic to the
+# managers' LDS layouts, so the kernel no longer declares them here.
 
 
 # ============================================================================
@@ -137,325 +129,6 @@ def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
 
 
 # ============================================================================
-# Q loader (global -> LDS async -> VGPR WMMA fragments)
-# ============================================================================
-
-
-class QManager:
-    """Owns everything about Q: its LDS footprint and the global->LDS->VGPR load.
-
-    Keeping this behind one object means the compute core just asks the manager
-    how much LDS to reserve (``get_lds_size_in_byte``) and then hands the raw
-    allocation base to ``load_q_to_vgpr`` — the per-warp sub-offset and the
-    swizzled staging layout are entirely the manager's business. A future Q
-    strategy (different tiling / dtype) is a drop-in replacement.
-
-    Staging layout (per warp, tile-major): each of ``qk_hdim // WMMA_K`` K-tiles
-    is 16 rows x WMMA_K cols bf16 (1024 B). Within a tile, 4x4 subtiles of
-    4 rows x 8 cols; the 8-col b128 chunk index is XOR-swizzled with the 4-row
-    subtile index to spread LDS banks. The 8 warps stack their tiles contiguously.
-    """
-
-    def __init__(self, *, qk_hdim, gqa_ratio, lds_tiles=None):
-        if qk_hdim % WMMA_K != 0:
-            raise ValueError(f"qk_hdim must be a multiple of {WMMA_K}; got {qk_hdim}")
-        self.qk_hdim = qk_hdim  # compile-time
-        self.gqa_ratio = gqa_ratio  # compile-time
-        self.k_tiles = qk_hdim // WMMA_K
-
-        # Ring-buffer depth: how many K-tiles of a wave's Q live in LDS at once
-        # (2 async b128 per tile). Sets both the LDS footprint and the inflight-
-        # async budget so they can't drift. Default == k_tiles fully buffers Q, so
-        # every async copy is in flight at once and none waits on a ds_load to free
-        # a slot; smaller trades that overlap for less LDS (freeing it for K/V).
-        if lds_tiles is None:
-            lds_tiles = self.k_tiles
-        if not 1 <= lds_tiles <= self.k_tiles:
-            raise ValueError(
-                f"lds_tiles must be in [1, {self.k_tiles}]; got {lds_tiles}"
-            )
-        self.lds_tiles = lds_tiles
-        self._warp_stride = WMMA_M * self.lds_tiles * WMMA_K * BF16_BYTES
-
-    def get_lds_size_in_byte(self):
-        """LDS bytes the caller must reserve for Q staging (all 8 warps)."""
-        return NUM_WAVES * self._warp_stride
-
-    def _lds_byte(self, row, col_chunk, tile):
-        """Swizzled LDS byte offset (within a warp region) for a 8-col b128 chunk."""
-        sw = col_chunk ^ (row // 4)  # 4x4 subtile XOR swizzle
-        return (
-            tile * (WMMA_M * WMMA_K * BF16_BYTES)
-            + row * (WMMA_K * BF16_BYTES)
-            + sw * Q_CHUNK_BYTES
-        )
-
-    def _async_load_vram_to_lds(self, q_base_i64, g_off, lds_off):
-        """gfx1250 async 16B global->LDS copy. ``offset``=0: a nonzero imm shifts
-        BOTH src and dst by the same bytes, which our tile/half terms can't use."""
-        gptr = buffer_ops.create_llvm_ptr(q_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(lds_off, address_space=3)
-        rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, 0, 0)
-
-    def _load_lds_to_vgpr(self, lds_off, vec_ty):
-        """ds_load ``vec_ty`` from LDS byte offset ``lds_off`` into a VGPR vector."""
-        lds_ptr = buffer_ops.create_llvm_ptr(lds_off, address_space=3)
-        return fx.Vector(llvm_dialect.load(vec_ty, lds_ptr))
-
-    def load_q_to_vgpr(
-        self,
-        *,
-        ptr_Q,
-        stride_q_seq,
-        stride_q_head,
-        q_start,
-        q_len,
-        kv_head,
-        warp_idx,
-        lane_idx,
-        ptr_lds,  # fx.Int32: base byte addr of the caller's Q allocation
-        scale,  # fx.Float32: softmax scale, folded into Q (HK MLA v4 style)
-    ):
-        """Stage this warp's 16 x qk_hdim Q tile and return the WMMA A fragments.
-
-        Software-pipelined ring buffer of ``lds_tiles`` slots: prime the
-        first slots with async global->LDS (swizzled), then for each K-tile wait
-        (graduated ``s_wait_asynccnt``), ds_load_b128 the slot -> v16 bf16 frag,
-        refill the freed slot with a future tile, and pre-scale by ``scale``.
-        Rows with seq >= q_len are clamped in-bounds and masked later in softmax.
-        """
-        lds_q_base = ptr_lds + warp_idx * self._warp_stride
-        q_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_Q)))
-        warp_row0 = fx.Int32(gpu.block_id("x")) * BLOCK_M + warp_idx * WMMA_M
-
-        def _issue_async(tile, slot):
-            # Coalesced global read -> per-lane swizzled LDS write of logical
-            # ``tile`` into physical ring ``slot`` (2 half-loads).
-            for half in fx.range_constexpr(2):
-                row = lane_idx // 4 + half * 8  # row within warp [0,16)
-                col_chunk = lane_idx % 4  # 8-col chunk within the 32-col tile [0,4)
-                pr = warp_row0 + row
-                q_head = kv_head * self.gqa_ratio + pr % self.gqa_ratio
-                seq = pr // self.gqa_ratio
-                safe_seq = (seq < q_len).select(seq, fx.Int32(0))  # clamp OOB
-                token = q_start + safe_seq
-                g_off = (
-                    token * stride_q_seq
-                    + q_head * stride_q_head
-                    + fx.Int32(tile * WMMA_K * BF16_BYTES)
-                    + col_chunk * Q_CHUNK_BYTES
-                )
-                self._async_load_vram_to_lds(
-                    q_base_i64, g_off, lds_q_base + self._lds_byte(row, col_chunk, slot)
-                )
-
-        # Prime the ring: tiles 0..lds_tiles-1 map 1:1 onto slots 0..lds_tiles-1.
-        for tile in fx.range_constexpr(self.lds_tiles):
-            _issue_async(tile, tile)
-
-        v8_ty = fx.Vector.make_type(Q_CHUNK_ELEMS, fx.BFloat16)
-        # bf16 scale -> packed v_pk_mul_bf16 (no f32 round-trip); an fx.Float32
-        # scale would widen the fragment to f32.
-        scale_bf16 = scale.to(fx.BFloat16)
-        q_frags = []
-        for tile in fx.range_constexpr(self.k_tiles):
-            # Graduated wait: tile t's writes are async ops 2t/2t+1; wait until
-            # only its (and later primed/refilled) copies remain. While still
-            # refilling: 2*(lds_tiles-1); after: 2*(k_tiles-t-1). Equal at t==k-n.
-            if tile < self.k_tiles - self.lds_tiles:
-                rocdl.s_wait_asynccnt((self.lds_tiles - 1) * 2)
-            else:
-                rocdl.s_wait_asynccnt((self.k_tiles - tile - 1) * 2)
-            slot = tile % self.lds_tiles
-            row = lane_idx % WMMA_M
-            klane = lane_idx // WMMA_M  # 0 or 1
-            lo = self._load_lds_to_vgpr(lds_q_base + self._lds_byte(row, klane, slot), v8_ty)
-            hi = self._load_lds_to_vgpr(lds_q_base + self._lds_byte(row, klane + 2, slot), v8_ty)
-            # Refill the just-read slot with a future tile. The compiler tracks
-            # only the LDS->VGPR read dependency (dscnt before the mul), so guard
-            # it manually.
-            if tile < self.k_tiles - self.lds_tiles:
-                rocdl.s_wait_dscnt(0)
-                _issue_async(self.lds_tiles + tile, slot)
-            frag = lo.shuffle(hi, list(range(16)))  # v16 bf16, concat(lo, hi)
-            frag = frag * scale_bf16
-            # f32-precision fallback if bf16 scale hurts quality:
-            # frag = (frag.to(fx.Float32) * scale).to(fx.BFloat16)
-            q_frags.append(frag)
-        return q_frags
-
-
-# ============================================================================
-# K loader (global -> LDS async -> VGPR WMMA B-fragments)
-# ============================================================================
-
-
-class KManager:
-    """Owns K's LDS staging and the global->LDS->VGPR B-fragment load.
-
-    Unlike QManager there is no ring buffer here: KManager only reports the byte
-    size of ONE ``N_BLOCK x qk_hdim`` K block (``get_lds_size_in_byte``). The
-    caller reserves however many ping-pong buffers it wants and passes the chosen
-    buffer base (``ptr_lds``) into every method — the manager is not bound to a
-    buffer. The K block is shared by all 8 warps (each computes S[16, N_BLOCK]).
-
-    LDS layout mirrors QManager: ``(N_BLOCK/16)`` kv-subtiles x ``(qk_hdim/32)``
-    hdim-units, each a 16x32 bf16 tile (1024 B) with the 4x4 XOR swizzle
-    (``sw = chunk ^ row//4``). The global->LDS write API streams 8(kv)x32(hdim)
-    tiles (``row_idx`` = kv, mult of 8; ``col_idx`` = hdim, mult of 32) — one b128
-    per lane, each an 8-row half of a unit. The VGPR read API pulls 16x16 tiles
-    (``col_idx`` mult of 16); a ``col_idx``/``col_idx+16`` pair combines into one
-    16x32 WMMA B operand. Loads use ``cluster_load_async_to_lds_b128``
-    (MCAST-ready; mask 0 for now).
-    """
-
-    def __init__(self, *, qk_hdim, n_block=DEFAULT_N_BLOCK):
-        if qk_hdim % WMMA_K != 0:
-            raise ValueError(f"qk_hdim must be a multiple of {WMMA_K}; got {qk_hdim}")
-        if n_block not in N_BLOCK_CHOICES:
-            raise ValueError(f"n_block must be one of {N_BLOCK_CHOICES}; got {n_block}")
-        self.qk_hdim = qk_hdim  # compile-time
-        self.n_block = n_block  # compile-time
-        self.hd_units = qk_hdim // WMMA_K  # 32-hdim WMMA units
-        # 8x32 write-tile grid (async global->LDS): rows = kv, cols = hdim.
-        self.n_wr_tile_rows = n_block // K_WR_TILE_KV
-        self.n_wr_tile_cols = qk_hdim // K_WR_TILE_HD
-
-    def get_lds_size_in_byte(self):
-        """LDS bytes for one N_BLOCK x qk_hdim K block (one ping-pong buffer)."""
-        return self.n_block * self.qk_hdim * BF16_BYTES
-
-    def _lds_byte(self, tile_row, tile_col, row_in_tile, chunk):
-        """Swizzled LDS byte offset within one K block. LDS is a grid of 16x32
-        WMMA tiles; ``tile_row``/``tile_col`` index that grid (row = kv,
-        col = hdim). ``row_in_tile`` (0..15) is the row inside the tile and
-        ``chunk`` (0..3) the 8-hdim b128 within the 32-wide tile. Same 4x4 XOR
-        swizzle as QManager."""
-        tile_base = (
-            (tile_row * self.hd_units + tile_col) * (WMMA_M * WMMA_K * BF16_BYTES)
-        )
-        sw = chunk ^ (row_in_tile // 4)
-        return (
-            fx.Int32(tile_base)
-            + row_in_tile * (WMMA_K * BF16_BYTES)
-            + sw * Q_CHUNK_BYTES
-        )
-
-    def async_load_vram_to_lds_wr_tile(
-        self,
-        *,
-        ptr_lds,
-        k_base_i64,  # fx.Int64: ptrtoint(get_iter(ptr_K))
-        stride_k_seq,
-        stride_k_head,
-        kv_head,
-        kv_row0,  # fx.Int32: global token of this block's kv-row 0
-        kv_valid,  # fx.Int32: valid kv rows in this block (only read if check_oob)
-        row_idx,  # kv offset within block, mult of 8, < n_block
-        col_idx,  # hdim offset, mult of 32, < qk_hdim
-        lane_idx,
-        check_oob=True,  # compile-time: clamp rows >= kv_valid in-bounds
-    ):
-        """One warp streams an 8(kv) x 32(hdim) tile into ``ptr_lds`` — one b128
-        (8 bf16) per lane: lane -> (wr_row = lane//4, chunk = lane%4). ``row_idx``/
-        ``col_idx`` may be Python ints or fx values (all addressing below is plain
-        integer arithmetic). When ``check_oob`` is False the caller guarantees the
-        whole block is in-bounds and the clamp is skipped."""
-        _assert_multiple("row_idx", row_idx, K_WR_TILE_KV)
-        _assert_multiple("col_idx", col_idx, K_WR_TILE_HD)
-        wr_row = lane_idx // 4  # kv row within the 8-row write tile [0,8)
-        chunk = lane_idx % 4  # which 8-hdim b128 [0,4) -> spans the 32-wide tile
-        tile_row = row_idx // WMMA_M  # which 16-kv LDS tile
-        row_in_tile = (row_idx % WMMA_M) + wr_row  # row within that tile [0,16)
-        tile_col = col_idx // WMMA_K
-
-        kv_row = fx.Int32(row_idx) + wr_row
-        if check_oob:
-            kv_row = (kv_row < kv_valid).select(kv_row, fx.Int32(0))  # clamp OOB
-        token = kv_row0 + kv_row
-        g_off = (
-            token * stride_k_seq
-            + kv_head * stride_k_head
-            + (fx.Int32(col_idx) + chunk * Q_CHUNK_ELEMS) * BF16_BYTES
-        )
-        gptr = buffer_ops.create_llvm_ptr(k_base_i64 + fx.Int64(g_off), address_space=1)
-        lds_ptr = buffer_ops.create_llvm_ptr(
-            ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk),
-            address_space=3,
-        )
-        rocdl.cluster_load_async_to_lds(gptr, lds_ptr, Q_CHUNK_BYTES)
-
-    def async_load_vram_to_lds(
-        self,
-        *,
-        ptr_lds,
-        ptr_K,
-        stride_k_seq,
-        stride_k_head,
-        kv_head,
-        kv_row0,
-        kv_valid,
-        warp_idx,
-        lane_idx,
-        check_oob=True,
-    ):
-        """Load the whole ``N_BLOCK x qk_hdim`` K block into ``ptr_lds``.
-
-        The 8x32 write-tile grid (``n_wr_tile_rows x n_wr_tile_cols``) is spread
-        round-robin across the 8 warps: warp ``w`` streams tiles ``w, w+8, ...``.
-        ``row_idx``/``col_idx`` are derived from the runtime warp id, so the tile
-        method runs with runtime indices here (plain integer arithmetic).
-        ``check_oob`` is forwarded to each tile (skip the clamp for full blocks)."""
-        n_tiles = self.n_wr_tile_rows * self.n_wr_tile_cols
-        if n_tiles % NUM_WAVES != 0:
-            raise NotImplementedError(
-                f"K tile grid ({n_tiles}) must be divisible by {NUM_WAVES} warps; "
-                f"got n_block={self.n_block}, qk_hdim={self.qk_hdim}"
-            )
-        k_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_K)))
-        for i in fx.range_constexpr(n_tiles // NUM_WAVES):
-            tile_id = warp_idx + fx.Int32(i * NUM_WAVES)
-            row_idx = (tile_id // self.n_wr_tile_cols) * K_WR_TILE_KV
-            col_idx = (tile_id % self.n_wr_tile_cols) * K_WR_TILE_HD
-            self.async_load_vram_to_lds_wr_tile(
-                ptr_lds=ptr_lds,
-                k_base_i64=k_base_i64,
-                stride_k_seq=stride_k_seq,
-                stride_k_head=stride_k_head,
-                kv_head=kv_head,
-                kv_row0=kv_row0,
-                kv_valid=kv_valid,
-                row_idx=row_idx,
-                col_idx=col_idx,
-                lane_idx=lane_idx,
-                check_oob=check_oob,
-            )
-
-    # ------------------------------------------------------------------
-    def load_lds_to_vgpr_tile_as_k(self, *, ptr_lds, row_idx, col_idx, lane_idx):
-        """Read one 16x16 tile as a WMMA fragment via natural ``ds_load_b128``
-        (row_idx=kv, col_idx=hdim; both mult of 16) -> v8 bf16 per lane.
-
-        lane -> (row_in_tile = lane%16, col_half = lane//16); returns this lane's 8
-        hdim cols [col_idx + col_half*8 .. +8) of kv-row (row_idx + lane%16). Two
-        adjacent calls (col_idx, col_idx+16) shuffle into a 16x32 WMMA fragment."""
-        _assert_multiple("row_idx", row_idx, WMMA_M)
-        _assert_multiple("col_idx", col_idx, WMMA_M)
-        row_in_tile = lane_idx % WMMA_M
-        col_half = lane_idx // WMMA_M  # 0 or 1: which 8-hdim half of the 16 cols
-        tile_row = row_idx // WMMA_M
-        tile_col = col_idx // WMMA_K
-        chunk_base = (col_idx % WMMA_K) // Q_CHUNK_ELEMS  # 0 or 2
-        chunk = fx.Int32(chunk_base) + col_half
-        v8_ty = fx.Vector.make_type(Q_CHUNK_ELEMS, fx.BFloat16)
-        lds_ptr = buffer_ops.create_llvm_ptr(
-            ptr_lds + self._lds_byte(tile_row, tile_col, row_in_tile, chunk),
-            address_space=3,
-        )
-        return fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
-
-
-# ============================================================================
 # Shared, layout-agnostic compute core
 # ============================================================================
 
@@ -498,10 +171,14 @@ def _core_attention(
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(gqa_ratio, warp_idx, lane_idx)
 
-    # ---- Q staging in LDS: the caller only reserves the byte count the manager
-    # asks for; the swizzled per-warp layout is entirely QManager's business. ----
-    q_mgr = QManager(qk_hdim=qk_hdim, gqa_ratio=gqa_ratio)
-    q_smem = fx.SharedAllocator().allocate(q_mgr.get_lds_size_in_byte())
+    # One SharedAllocator per kernel (flydsl constraint); Q/K/V carve their regions
+    # from it. Each manager only reports the byte count it needs — the swizzled
+    # layout inside each region is the manager's own business.
+    smem = fx.SharedAllocator()
+
+    # ---- Q staging in LDS. ----
+    q_mgr = QManager16b(qk_hdim=qk_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES)
+    q_smem = smem.allocate(q_mgr.get_lds_size_in_byte())
     q_lds_base = fx.Int32(fx.ptrtoint(q_smem.peek().ptr))
 
     q_frags = q_mgr.load_q_to_vgpr(
@@ -511,6 +188,7 @@ def _core_attention(
         q_start=q_start,
         q_len=q_len,
         kv_head=kv_head,
+        block_x=fx.Int32(gpu.block_id("x")),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
         ptr_lds=q_lds_base,
@@ -519,9 +197,9 @@ def _core_attention(
 
     # ---- K staging: N_KV_PP ping-pong buffers the main loop rotates through.
     # KManager owns only one block's swizzle/size; the ring is the caller's. ----
-    k_mgr = KManager(qk_hdim=qk_hdim, n_block=n_block)
+    k_mgr = KManager16b(qk_hdim=qk_hdim, n_block=n_block, num_waves=NUM_WAVES)
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
-    k_smem = fx.SharedAllocator().allocate(N_KV_PP * k_blk_bytes)
+    k_smem = smem.allocate(N_KV_PP * k_blk_bytes)
     k_lds_base = fx.Int32(fx.ptrtoint(k_smem.peek().ptr))
 
     def _k_lds_buf(pp):  # base of ping-pong buffer ``pp`` in [0, N_KV_PP)
@@ -534,13 +212,33 @@ def _core_attention(
         rem = kv_len - blk_row0
         return (rem < fx.Int32(n_block)).select(rem, fx.Int32(n_block))
 
-    # Prologue: prime buffer 0 with the first K block so the main loop can enter
-    # assuming its current block is already resident (async in flight).
+    # ---- V staging: own swizzle (transpose-load friendly), N_KV_PP ping-pong. ----
+    v_mgr = VManager16b(v_hdim=v_hdim, n_block=n_block, num_waves=NUM_WAVES)
+    v_blk_bytes = v_mgr.get_lds_size_in_byte()
+    v_smem = smem.allocate(N_KV_PP * v_blk_bytes)
+    v_lds_base = fx.Int32(fx.ptrtoint(v_smem.peek().ptr))
+
+    def _v_lds_buf(pp):  # base of ping-pong buffer ``pp`` in [0, N_KV_PP)
+        return v_lds_base + fx.Int32(pp * v_blk_bytes)
+
+    # Prologue: prime buffer 0 with the first K and V blocks so the main loop can
+    # enter assuming its current block is already resident (async in flight).
     k_mgr.async_load_vram_to_lds(
         ptr_lds=_k_lds_buf(0),
         ptr_K=ptr_K,
         stride_k_seq=stride_k_seq,
         stride_k_head=stride_k_head,
+        kv_head=kv_head,
+        kv_row0=kv_start,
+        kv_valid=_kv_block_valid(fx.Int32(0)),
+        warp_idx=warp_idx,
+        lane_idx=lane_idx,
+    )
+    v_mgr.async_load_vram_to_lds(
+        ptr_lds=_v_lds_buf(0),
+        ptr_V=ptr_V,
+        stride_v_seq=stride_v_seq,
+        stride_v_head=stride_v_head,
         kv_head=kv_head,
         kv_row0=kv_start,
         kv_valid=_kv_block_valid(fx.Int32(0)),
