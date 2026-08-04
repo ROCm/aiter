@@ -162,6 +162,13 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16_or_bf16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
+    if is_fp4_bf16 and gate_mode != "interleave":
+        raise ValueError(
+            "in_dtype='fp4_bf16' stage1 is INTERLEAVE-only, got "
+            f"gate_mode={gate_mode!r}. "
+            "Preshuffle w13/w13_scale with gate_up=True and request an interleaved "
+            "('_gui') kernel."
+        )
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():
