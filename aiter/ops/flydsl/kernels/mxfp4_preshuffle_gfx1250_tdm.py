@@ -404,47 +404,36 @@ def launch_gemm_a8w4_tdm(
         # WMMAs cover KSL1's LDS latency instead of stalling on s_wait_dscnt 0
         # twice per tile. Costs ~2x operand VGPRs (both slices live at once), so
         # it is gated on the register budget below.
-        # A partial s_wait_dscnt is only safe when every op still outstanding is
-        # the SAME type as the ops it must not retire early: "instructions of
-        # different types are returned out-of-order" (MI400 Shader Programming
-        # #65 :5598), and b128 loads vs 2addr_b32 scale loads are different types.
-        # So issue KSL1's scales BEFORE the partial wait and leave only KSL1's
-        # b128 B-loads outstanding across it.
+        # s_wait_dscnt counts PHYSICAL ds ops: the backend pairs a K-slice's
+        # 2*wmma_n_rep scale b32 loads into ds_load_2addr_b32, so B+scales is
+        # wmma_n_rep*DS_B + (wmma_n_rep+wmma_m_rep)/2 -- 12 for t64x256x256,
+        # matching the 56 physical DS per K256 tile seen in the ATT trace.
+        BS_DS_PHYS = wmma_n_rep * DS_B + (wmma_n_rep + wmma_m_rep + 1) // 2
         A_DS = wmma_m_rep * DS_A          # all wm of one K-slice
-        B_DS_PHYS = wmma_n_rep * DS_B     # b128 loads for one K-slice's B
         def compute_ktile_wide(buf, prefetch_kt):
-            b0 = load_b_and_scales(buf, 0)                  # 1. B0/SB0/SA0
-            a0 = [to_rmem(ACT_NDW, load_a(buf, wm, 0)) for wm in range_constexpr(wmma_m_rep)]
-            # Scales for KSL1 first: they are a different DS type from the b128
-            # loads, so they must not straddle the partial wait below.
-            sb1 = [load_sb(buf, wn, 1) for wn in range_constexpr(wmma_n_rep)]
-            sa1 = [load_sa(buf, wm, 1) for wm in range_constexpr(wmma_m_rep)]
-            wt1 = [to_rmem(8, load_b(buf, wn, 1)) for wn in range_constexpr(wmma_n_rep)]
+            b0 = load_b_and_scales(buf, 0)                  # 1. B0/SB0/SA0  (12 DS)
+            a0 = [to_rmem(ACT_NDW, load_a(buf, wm, 0))      # 2. all A0      (16 DS)
+                  for wm in range_constexpr(wmma_m_rep)]
+            b1 = load_b_and_scales(buf, 1)                  # 3. B1/SB1/SA1  (12 DS)
             if const_expr(prefetch_kt is not None):         # 4. TDM -> TENSORcnt, not DScnt
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
-            # 5. Retire everything except KSL1's B b128 loads, which are the only
-            #    ops issued after the last thing KSL0 needs.
-            rocdl.s_wait_dscnt(B_DS_PHYS)
+            # 5. B0/SB0/SA0 + A0 retired; only B1/SB1/SA1 may stay pending.
+            rocdl.s_wait_dscnt(BS_DS_PHYS)
+            a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1))      # 6. all A1: DScnt 12 -> 28
+                  for wm in range_constexpr(wmma_m_rep)]
             # load_b_and_scales gives (wt, sb_k, sa_k); mma_rows wants sa 4th and
-            # sb 5th, hence [2] then [1] -- same swap k_step performs.
+            # sb 5th, hence [2] then [1] -- the same swap k_step performs.
             all_wm = list(range(wmma_m_rep))
-            a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1)) for wm in range_constexpr(wmma_m_rep)]
-            mma_rows(all_wm, a0, b0[0], b0[2], b0[1])   # 7. KSL0 consumes A0
+            mma_rows(all_wm, a0, b0[0], b0[2], b0[1])   # 7. KSL0 hides B1+A1 latency
             rocdl.s_wait_dscnt(0)                       # 8.
-            mma_rows(all_wm, a1, wt1, sa1, sb1)         # 9. KSL1 consumes A1
+            mma_rows(all_wm, a1, b1[0], b1[2], b1[1])   # 9. KSL1
             all_mma = wmma_m_rep * wmma_n_rep
-            # The sched_group sequence must describe the order actually wanted.
-            # Emitting "all DS, then all MFMA" lets the scheduler hoist A1's loads
-            # above KSL0's WMMAs; the allocator then reuses A0's registers for
-            # them and A0 is clobbered before it is read (NaN). Interleave the
-            # groups so A1's loads are scheduled against KSL0's MFMAs instead.
-            rocdl.sched_dsrd(BS_DS + A_DS + BS_DS)   # B0/SB0/SA0, A0, SB1/SA1/B1
-            for _i in range_constexpr(wmma_m_rep):
-                rocdl.sched_mfma(wmma_n_rep)         # one wm's worth of KSL0
-                rocdl.sched_dsrd(DS_A)               # ... overlapped with one A1 load
-            rocdl.sched_mfma(all_mma)                # KSL1
+            rocdl.sched_dsrd(BS_DS + A_DS + BS_DS)   # steps 1-3
+            rocdl.sched_dsrd(A_DS)                   # step 6
+            rocdl.sched_mfma(all_mma)                # step 7
+            rocdl.sched_mfma(all_mma)                # step 9
             rocdl.sched_barrier(0)
 
         # Accumulators + both K-slices' operands held live. gfx1250 wave32 compute
