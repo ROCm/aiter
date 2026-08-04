@@ -418,6 +418,7 @@ def test_mla(
             sm_scale,
             num_kv_splits=split_per_batch,
             return_lse=return_lse,
+            causal=is_causal,
         )
 
         err = checkAllclose(
@@ -467,6 +468,7 @@ def test_mla(
             q_scale=q_scale,
             kv_scale=kv_scale,
             num_kv_splits=split_per_batch,
+            causal=is_causal,
         )
 
         # print(f"{out_ref.view(total_q, -1)=}")

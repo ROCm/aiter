@@ -668,6 +668,7 @@ void mla_decode_stage1_asm_fwd(
     int cp_rank,                          //   round-robin CP rank id
     aiter_tensor_t* valid_split_count,    //   [batch_size] scratch for packed gfx1250 kernels (nullable)
     int use_valid_split_count_reduce,     //   enable packed-kernel valid split count writeback/reduce
+    int causal,                           //   apply the causal mask across the max_seqlen_q query tokens
     hipStream_t stream)
 {    
     int batch           = qo_indptr->size(0) - 1;
@@ -852,7 +853,7 @@ void mla_decode_stage1_asm_fwd(
     
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
-    int causal = 0;
+    int config_causal = causal;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
@@ -997,7 +998,7 @@ void mla_decode_stage1_asm_fwd(
     int lse_flag = (lse != nullptr && persistent) ? 1 : 0;
 
     int cprr_flag = (g_kv_indptr != nullptr && g_kv_indptr->data_ptr() != nullptr) ? 1 : 0;
-    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
+    std::string kernelName = get_heuristic_kernel_mla(q_type, kv_type, config_gqa_ratio, ps, prefill, config_causal, config_max_seqlen_q, arch_id, config_map, lse_flag, cprr_flag);
     AITER_CHECK(!kernelName.empty(), __func__, ": cannot find suitable kernel");
     
     AiterAsmKernel* impl_ptr = nullptr;
