@@ -400,6 +400,53 @@ def launch_gemm_a8w4_tdm(
                     rocdl.sched_dsrd(BS_DS)
             rocdl.sched_barrier(0)
 
+        # Both K-slices' operands issued up front, then one partial wait: KSL0's
+        # WMMAs cover KSL1's LDS latency instead of stalling on s_wait_dscnt 0
+        # twice per tile. Costs ~2x operand VGPRs (both slices live at once), so
+        # it is gated on the register budget below.
+        # s_wait_dscnt counts PHYSICAL ds ops. The backend pairs the 2*wmma_n_rep
+        # scale b32 loads into ds_load_2addr_b32, so a K-slice's B+scales is
+        # wmma_n_rep*DS_B + wmma_n_rep (not + wmma_n_rep + wmma_m_rep): measured
+        # 12 per slice for t64x256x256, 56 physical DS per K256 tile.
+        BS_DS_PHYS = wmma_n_rep * DS_B + (wmma_n_rep + wmma_m_rep + 1) // 2
+        A_DS = wmma_m_rep * DS_A          # all wm of one K-slice
+        def compute_ktile_wide(buf, prefetch_kt):
+            b0 = load_b_and_scales(buf, 0)                  # 1. B0/SB0/SA0
+            a0 = [to_rmem(ACT_NDW, load_a(buf, wm, 0)) for wm in range_constexpr(wmma_m_rep)]
+            b1 = load_b_and_scales(buf, 1)                  # 3. B1/SB1/SA1
+            if const_expr(prefetch_kt is not None):         # 4. TDM -> TENSORcnt, not DScnt
+                rocdl.sched_barrier(0)
+                issue(prefetch_kt % num_buffers, prefetch_kt)
+                rocdl.sched_barrier(0)
+            # 5. retire B0+A0 only; B1's loads stay in flight (same-type LDS ops
+            #    retire in issue order -- MI400 Shader Programming #65 :5599).
+            rocdl.s_wait_dscnt(BS_DS_PHYS)
+            a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1)) for wm in range_constexpr(wmma_m_rep)]
+            mma_rows(list(range(wmma_m_rep)), a0, b0[0], b0[2], b0[1])   # 7. KSL0
+            rocdl.s_wait_dscnt(0)                                        # 8.
+            mma_rows(list(range(wmma_m_rep)), a1, b1[0], b1[2], b1[1])   # 9. KSL1
+            all_mma = wmma_m_rep * wmma_n_rep
+            rocdl.sched_dsrd(BS_DS + A_DS + BS_DS)   # B0+SB0+SA0, A0, B1+SB1+SA1
+            rocdl.sched_dsrd(A_DS)                   # A1
+            rocdl.sched_mfma(all_mma)                # KSL0
+            rocdl.sched_mfma(all_mma)                # KSL1
+            rocdl.sched_barrier(0)
+
+        # Accumulators + both K-slices' operands held live. gfx1250 wave32 compute
+        # waves may allocate up to 1024 VGPRs (doc :2250); v256+ go through
+        # VGPR-MSB indexing, which the t64x256x256 build already relies on (264
+        # VGPRs, 41 s_set_vgpr_msb), so crossing 256 is not a new cost here. Cap
+        # at 512 to keep 2 waves/SIMD reachable.
+        _wide_vgpr = wmma_m_rep * wmma_n_rep * 8 + 2 * (wmma_m_rep * ACT_NDW + wmma_n_rep * 8)
+        _wide_env = os.environ.get("AITER_TDM_WIDE_KSL")
+        USE_WIDE = KWS == 2 and _wide_vgpr <= 512 and not stage1_quant_out
+        if _wide_env is not None:
+            USE_WIDE = _wide_env not in ("0", "false", "False")
+        print(f"[sched] {module_name}: KWS={KWS} wide_operand_vgpr~{_wide_vgpr} -> "
+              f"{'WIDE (both K-slices in flight)' if USE_WIDE else 'split FRONT/BACK'}", flush=True)
+        if const_expr(USE_WIDE):
+            compute_ktile = compute_ktile_wide
+
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
             TDM_PER = (1 if WS8 else 2) if WAVE_SPEC else 4
