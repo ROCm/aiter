@@ -204,9 +204,11 @@ def fp8_mqa_logits(
             num_warps = 2 if num_heads <= 32 else 1
             block_kv = 64 if num_heads <= 32 else 32
             block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
+            mfma_nonk_dim = 32 if (head_size <= 64 or num_heads == 32) else 16
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
+                "MFMA_NONK_DIM": mfma_nonk_dim,
             }
         else:
             loop_variant = 1

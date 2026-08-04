@@ -715,6 +715,7 @@ def _gluon_fp8_mqa_logits_kernel(
     USE_BUFFER_STORE: gl.constexpr,
     USE_PADDED_SHARED_LAYOUT: gl.constexpr,
     BLOCK_M: gl.constexpr = 1,  # query rows per workgroup
+    MFMA_NONK_DIM: gl.constexpr = 32,
 ):
 
     gl.static_assert(
@@ -743,7 +744,7 @@ def _gluon_fp8_mqa_logits_kernel(
     WARP_SIZE: gl.constexpr = 64
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[16, 16, 128] if HEAD_SIZE > 64 else [32, 32, 64],
+        instr_shape=[16, 16, 128] if MFMA_NONK_DIM == 16 else [32, 32, 64],
         transposed=False,
         warps_per_cta=[1, NUM_WARPS],
     )
