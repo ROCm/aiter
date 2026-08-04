@@ -1948,7 +1948,7 @@ def get_2stage_cfgs(
         else:
             run_1stage_xbf16 = run_1stage and "blockscaleBf16" in str(kernelName1)
         if "flat" in cfg:
-            cfg_flat = run_1stage and bool(int(cfg["flat"]))
+            cfg_flat = int(cfg["flat"]) if run_1stage else 0
         else:
             cfg_flat = False
     is_opus_cfg = cfg is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(
