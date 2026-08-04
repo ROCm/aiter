@@ -502,16 +502,6 @@ def _qk_field_perm() -> np.ndarray:
 
 if _HAVE_TRITON:
 
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_N": 16}, num_warps=1),
-            triton.Config({"BLOCK_N": 32}, num_warps=1),
-            triton.Config({"BLOCK_N": 64}, num_warps=1),
-            triton.Config({"BLOCK_N": 128}, num_warps=2),
-            triton.Config({"BLOCK_N": 256}, num_warps=4),
-        ],
-        key=["n_blocks", "D"],
-    )
     @triton.jit
     def _pack_qk_fp6_kernel(
         x_ptr,  # float [N, D] row-major (D % 32 == 0)
@@ -585,15 +575,6 @@ if _HAVE_TRITON:
         sb = ((E + 127) & 0xFF).to(tl.uint8)
         tl.store(scale_ptr + scale_off, sb, mask=m)
 
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_N": 16}, num_warps=1),
-            triton.Config({"BLOCK_N": 32}, num_warps=1),
-            triton.Config({"BLOCK_N": 64}, num_warps=1),
-            triton.Config({"BLOCK_N": 128}, num_warps=2),
-        ],
-        key=["n_blocks"],
-    )
     @triton.jit
     def _pack_k_fp6_lds_direct_kernel(
         x_ptr,  # float K [b, sk, h, 128]
@@ -783,12 +764,9 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
     scale = torch.empty(N, NB, dtype=torch.uint8, device=x.device)
     cperm = _qk_field_perm_dev(x.device)
     n_blocks = N * NB
-    # BLOCK_N / num_warps are @triton.autotune'd (key = n_blocks, D): the encode is
-    # bandwidth/latency-bound (permuted per-block gather + strided byte stores), and the
-    # best tile varies with shape (e.g. 64/1 measured ~14% faster than 32/1 at the Wan
-    # 720p seq). The packers run eagerly inside the f6f4 custom_op, so autotune is a
-    # one-time eager warmup with no torch.compile interaction.
-    grid = lambda meta: (triton.cdiv(n_blocks, meta["BLOCK_N"]),)  # noqa: E731
+    # The hd128 FMHA workloads consistently select 16/1. Pin it to avoid paying and logging
+    # the five-config autotune in every fresh benchmark process.
+    grid = (triton.cdiv(n_blocks, 16),)
     _pack_qk_fp6_kernel[grid](
         xflat,
         packed,
@@ -797,6 +775,8 @@ def quantize_fp6_lastdim_triton(x: "torch.Tensor"):
         D,
         NB,
         n_blocks,
+        BLOCK_N=16,
+        num_warps=1,
     )
     return (
         packed.reshape(*lead, NB * 24),
@@ -981,7 +961,7 @@ def quantize_fp6_k_lds_order_direct_triton(
     cperm = _qk_field_perm_dev(k.device)
     scatter = _k_lds_scatter_index(k.device)
     n_blocks = b * h * nt * tile * 4
-    grid = lambda meta: (triton.cdiv(n_blocks, meta["BLOCK_N"]),)  # noqa: E731
+    grid = (triton.cdiv(n_blocks, 32),)
     _pack_k_fp6_lds_direct_kernel[grid](
         k,
         buf,
@@ -993,6 +973,8 @@ def quantize_fp6_k_lds_order_direct_triton(
         nt,
         n_blocks,
         TILE_BYTES=_K_TILE_BYTES,
+        BLOCK_N=32,
+        num_warps=1,
     )
     _fill_k_scale_tail_kernel[(b * h * nt,)](
         scale.reshape(-1),
