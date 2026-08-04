@@ -201,9 +201,9 @@ def fp8_mqa_logits(
             loop_variant = 0
             waves_per_eu = 4
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
-            num_warps = 1
-            block_kv = 32
-            block_m = 2 if num_heads <= 32 and seq_len >= 2 else 1
+            num_warps = 2 if num_heads <= 32 else 1
+            block_kv = 64 if num_heads <= 32 else 32
+            block_m = 2 if (num_heads <= 32 and seq_len > 4096) else 1
             other = {
                 "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
                 "BLOCK_M": block_m,
