@@ -196,6 +196,12 @@ def moe_gemm_a4w4(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    # Per-gate validity, same layout as scatter_indx. Default None == every gate
+    # slot is live, which holds whenever routing() produced the indices. Pass a
+    # mask when only some of a token's n_expts_act slots are computed here --
+    # expert parallelism, where the other slots belong to another rank and are
+    # never written, so the reduce must not sum them. Mirrors moe_gemm_a8w4.
+    gate_valid=None,
 ):
     """
     Y[:, :] = 0.
@@ -324,6 +330,11 @@ def moe_gemm_a4w4(
         if scatter_indx is None
         else scatter_indx.view(-1, routing_data.n_expts_act)
     )
+    group_valid = (
+        None
+        if (gate_valid is None or scatter_indx is None)
+        else gate_valid.view(-1, routing_data.n_expts_act)
+    )
     y_final = reduce_grouped(
         y,
         group_indx,
@@ -334,6 +345,7 @@ def moe_gemm_a4w4(
         reduction_n_reduction,
         out_dtype=out_dtype,
         swiglu_add_residual=swiglu_add_residual,
+        indx_valid=group_valid,
     )
     return y_final
 
