@@ -12,6 +12,7 @@ from flydsl.expr.typing import T
 from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
     math as mlir_math,
+    vector as mlir_vector,
 )
 from flydsl.expr import range_constexpr, arith, vector, rocdl
 from flydsl._mlir import ir
@@ -174,7 +175,6 @@ def create_shuffle_gdr_decode_kernel(
         cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
         cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
         with ir.InsertionPoint(cond_valid_if.then_block):
-
             r_A_log = A_log_tensor[hv_i]
             r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
@@ -188,7 +188,6 @@ def create_shuffle_gdr_decode_kernel(
                     )
 
             for sq_i in range_constexpr(seq_length):
-
                 r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 x = r_a + r_dt_bias
@@ -244,11 +243,15 @@ def create_shuffle_gdr_decode_kernel(
                         sum_k_partial_vec = (
                             sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
                         )
-                        sum_q_partial = vector.ReductionOp(
-                            T.f32, vector.CombiningKind.ADD, sum_q_partial_vec
+                        sum_q_partial = mlir_vector.ReductionOp(
+                            T.f32,
+                            mlir_vector.CombiningKind.ADD,
+                            _to_raw(sum_q_partial_vec),
                         ).dest
-                        sum_k_partial = vector.ReductionOp(
-                            T.f32, vector.CombiningKind.ADD, sum_k_partial_vec
+                        sum_k_partial = mlir_vector.ReductionOp(
+                            T.f32,
+                            mlir_vector.CombiningKind.ADD,
+                            _to_raw(sum_k_partial_vec),
                         ).dest
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
                         sum_q_partial = (
@@ -293,7 +296,6 @@ def create_shuffle_gdr_decode_kernel(
                         sq_vecs[ki] = sq_vecs[ki] * scale_vec
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
-
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
@@ -307,8 +309,10 @@ def create_shuffle_gdr_decode_kernel(
                             state_vecs[vi * WARP_TILE_K_ITERS + ki], sk_vecs[ki], sum_hk
                         ).result
 
-                    sum_hk = vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hk
+                    sum_hk = mlir_vector.ReductionOp(
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_hk),
                     ).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
@@ -340,8 +344,10 @@ def create_shuffle_gdr_decode_kernel(
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
                         sum_hq = vector.FMAOp(h_new, r_q_val, sum_hq).result
 
-                    sum_hq = vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hq
+                    sum_hq = mlir_vector.ReductionOp(
+                        T.f32,
+                        mlir_vector.CombiningKind.ADD,
+                        _to_raw(sum_hq),
                     ).dest
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
