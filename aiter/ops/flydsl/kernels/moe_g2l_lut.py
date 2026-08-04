@@ -20,7 +20,8 @@ increments) into this same pre-route kernel.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
+from aiter.ops.flydsl.kernels import buffer_ops
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
