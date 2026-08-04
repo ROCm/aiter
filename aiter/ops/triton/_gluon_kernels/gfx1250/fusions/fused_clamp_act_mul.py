@@ -146,10 +146,17 @@ def _fused_clamp_silu_mul_kernel(
     # weights (loaded while the gate/up DMA is in flight)
     if HAVE_WEIGHTS:
         if WEIGHT_BROADCAST:
-            wrow = gl.load(
-                weights_ptr + rows * weights_stride_m, mask=row_ok, other=0.0
-            ).to(gl.float32)                                  # [BM]
-            w = wrow.reshape(BLOCK_SIZE_M, 1)                 # [BM, 1] (broadcasts over N)
+            # [M,1] broadcast: build a [BM, BN] tile where every column reads the
+            # row's single weight (col 0), so `out * w` is a same-layout multiply
+            # (avoids a broadcast between gLayout2D and a [BM,1] linear layout).
+            wptr = (
+                weights_ptr
+                + rows[:, None] * weights_stride_m
+                + (cols * 0)[None, :]
+            )
+            w = gl.load(
+                wptr, mask=tile_mask, other=0.0, cache_modifier=cache_modifier
+            ).to(gl.float32)                                  # [BM, BN]
         else:
             wptr = (
                 weights_ptr
