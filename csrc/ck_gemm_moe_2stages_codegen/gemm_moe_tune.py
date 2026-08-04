@@ -10,6 +10,11 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from aiter.ops.flydsl.activation import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from einops import rearrange
 
 import aiter
