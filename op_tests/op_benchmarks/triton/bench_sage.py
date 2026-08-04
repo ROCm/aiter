@@ -46,7 +46,17 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp6,
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
+    _rot_k_only_kernel,
+    sage_quant_v_amax_finalize_kernel,
+    sage_quant_v_amax_partial_kernel,
     sage_quant_v_kernel,
+)
+from aiter.ops.quant import (
+    rotate_activation_mxfp4_quant,
+    rotate_activation_mxfp6_quant,
+)
+from aiter.ops.triton.quant.mxfp6_fmha_pack import (
+    quantize_fp6_k_lds_order_direct_triton,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 
@@ -60,6 +70,126 @@ from op_tests.triton_tests.attention.test_fav3_sage import (
 
 logging.getLogger().setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _production_quantize_v(value: torch.Tensor):
+    """Exact tiled V quantization used by the xDiT MXFP4/MXFP6 backends."""
+    b, kv_len, h_kv, head_dim = value.shape
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+    scale_block_k = 256
+    scale_num_blks = triton.cdiv(kv_len, scale_block_k)
+    scale_reduce_block = triton.next_power_of_2(scale_num_blks)
+    partial = value.new_empty(
+        (b * h_kv, scale_num_blks, head_dim), dtype=torch.float32
+    )
+    scale = value.new_empty((b, h_kv, head_dim), dtype=torch.float32)
+    sage_quant_v_amax_partial_kernel[(b * h_kv * scale_num_blks,)](
+        value,
+        partial,
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        value.stride(3),
+        kv_len,
+        h_kv,
+        scale_num_blks,
+        D=head_dim,
+        BLOCK_K=scale_block_k,
+        num_warps=8,
+    )
+    sage_quant_v_amax_finalize_kernel[(triton.cdiv(head_dim, 32), b * h_kv)](
+        partial,
+        scale,
+        scale_num_blks,
+        D=head_dim,
+        FP8_MAX=fp8_max,
+        BLOCK_N=scale_reduce_block,
+        BLOCK_D=32,
+        num_warps=4,
+    )
+    block_k = 64
+    num_k_blocks = triton.cdiv(kv_len, block_k)
+    quantized = torch.empty_like(value, dtype=fp8_type)
+    sage_quant_v_kernel[(b * h_kv * num_k_blocks,)](
+        value,
+        quantized,
+        scale,
+        value.stride(0),
+        value.stride(2),
+        value.stride(1),
+        value.stride(3),
+        scale.stride(0),
+        scale.stride(1),
+        b,
+        h_kv,
+        num_k_blocks,
+        kv_len,
+        D=head_dim,
+        BLK_K=block_k,
+        num_stages=3,
+        num_warps=8,
+    )
+    return quantized, scale
+
+
+def _production_rotate_center_k(key: torch.Tensor, rotation: torch.Tensor, block_m: int):
+    b, seq_len, heads, head_dim = key.shape
+    block_r = rotation.shape[-1]
+    rotated = torch.empty_like(key)
+    num_blocks = triton.cdiv(seq_len, block_m)
+    _rot_k_only_kernel[(b * heads, num_blocks, head_dim // block_r)](
+        key,
+        rotated,
+        rotation,
+        key.stride(0),
+        key.stride(2),
+        key.stride(1),
+        key.stride(3),
+        rotated.stride(0),
+        rotated.stride(2),
+        rotated.stride(1),
+        rotated.stride(3),
+        rotation.stride(0),
+        rotation.stride(1),
+        heads,
+        seq_len,
+        head_dim,
+        BLOCK_M=block_m,
+        BLOCK_D=block_r,
+    )
+    return rotated - rotated.mean(dim=1, keepdim=True)
+
+
+def _production_quantize_mxfp4(query, key, value, softmax_scale):
+    b, seq_len, heads, head_dim = query.shape
+    q_fp4 = query.new_empty((b, seq_len, heads, head_dim // 2), dtype=torch.uint8)
+    q_scale = query.new_empty((b, seq_len, heads, head_dim // 32), dtype=torch.uint8)
+    k_fp4 = key.new_empty((b, key.shape[1], key.shape[2], head_dim // 2), dtype=torch.uint8)
+    k_scale = key.new_empty((b, key.shape[1], key.shape[2], head_dim // 32), dtype=torch.uint8)
+    rotate_activation_mxfp4_quant(
+        q_fp4, q_scale, query, softmax_scale * 1.4426950408889634
+    )
+    rotate_activation_mxfp4_quant(k_fp4, k_scale, key, 1.0)
+    v_fp8, v_scale = _production_quantize_v(value)
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale
+
+
+def _production_quantize_mxfp6(query, key, value, softmax_scale, rotation, block_m):
+    b, seq_len, heads, head_dim = query.shape
+    q_fp6 = query.new_empty(
+        (b, seq_len, heads, head_dim // 32 * 24), dtype=torch.uint8
+    )
+    q_scale = query.new_empty(
+        (b, seq_len, heads, head_dim // 32), dtype=torch.uint8
+    )
+    rotate_activation_mxfp6_quant(
+        q_fp6, q_scale, query, softmax_scale * 1.4426950408889634
+    )
+    centered_k = _production_rotate_center_k(key, rotation, block_m)
+    k_fp6, k_scale = quantize_fp6_k_lds_order_direct_triton(centered_k, tile=128)
+    v_fp8, v_scale = _production_quantize_v(value)
+    return q_fp6, q_scale, k_fp6, k_scale, v_fp8, v_scale
 
 
 arg_to_torch_dtype = {
@@ -1195,14 +1325,6 @@ def make_kernel_runner(
             os.environ["AITER_FMHA_F4F4"] = "1"
         else:
             os.environ.pop("AITER_FMHA_F4F4", None)
-        # Drive flash_attn_mxfp4_func with mxfp4 inputs from sage_quant_mxfp4 (the
-        # same quantizer fav3_sage_mxfp4 uses): q/k are uint8-packed fp4 (head dim
-        # 128 -> 64) with per-block E8M0 descales (head_dim/32), v is fp8 with
-        # per-channel fp32 descales (as in the i8fp8 path).
-        logger.info(
-            "aiter_mxfp4: using sage_quant_mxfp4 (real fp4 q/k, per-block "
-            "E8M0 descales, fp8 v with per-channel descales)."
-        )
         cfg = get_sage_fwd_configs_mxfp4()
         fp8_type = aiter.dtypes.fp8
         fp8_max = torch.finfo(fp8_type).max
@@ -1220,23 +1342,20 @@ def make_kernel_runner(
         # consumes a pre-scaled Q and must NOT re-apply the scale (doing so
         # double-scales the softmax). Pin the fold scale to the same softmax_scale
         # used by the reference and pass it through explicitly.
-        # f4f4 packs V as in-tree per-channel fp4 (sage_quant_f4f4, no external dep);
-        # mxfp4 keeps fp8 V (sage_quant_mxfp4). Q/K path is identical for both.
-        _quant_fn = sage_quant_f4f4 if args.kernel == "aiter_f4f4" else sage_quant_mxfp4
-
         def _quantize_mxfp4():
-            return _quant_fn(
-                q_bshd,
-                k_bshd,
-                v_bshd,
-                fp8_type,
-                fp8_max,
-                BLKQ=cfg["BLOCK_M"],
-                BLKK=64,
-                layout="bshd",
-                R=r,
-                BLOCK_R=block_r,
-                sm_scale=softmax_scale,
+            if args.kernel == "aiter_mxfp4":
+                if args.qsmooth or not args.hadamard_rotate or block_r != 128:
+                    raise ValueError(
+                        "production aiter_mxfp4 preprocessing requires Hadamard block_r=128 "
+                        "and does not support --qsmooth"
+                    )
+                return (*_production_quantize_mxfp4(
+                    q_bshd, k_bshd, v_bshd, softmax_scale
+                ), None)
+            return sage_quant_f4f4(
+                q_bshd, k_bshd, v_bshd, fp8_type, fp8_max,
+                BLKQ=cfg["BLOCK_M"], BLKK=64, layout="bshd", R=r,
+                BLOCK_R=block_r, sm_scale=softmax_scale,
                 q_smoothing=args.qsmooth,
             )
 
@@ -1328,6 +1447,15 @@ def make_kernel_runner(
         _v_fp4_packer = _build_fp4_v_packer(q_bshd.device) if _is_f6f4 else None
 
         def _quantize_mxfp6():
+            if args.kernel == "aiter_mxfp6" and _MXFP6_PACK_PATH is None:
+                if args.qsmooth or not args.hadamard_rotate or block_r != 128:
+                    raise ValueError(
+                        "production aiter_mxfp6 preprocessing requires Hadamard block_r=128 "
+                        "and does not support --qsmooth"
+                    )
+                return (*_production_quantize_mxfp6(
+                    q_bshd, k_bshd, v_bshd, softmax_scale, r, cfg["BLOCK_M"]
+                ), None)
             return sage_quant_mxfp6(
                 q_bshd,
                 k_bshd,
