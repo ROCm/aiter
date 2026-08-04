@@ -37,6 +37,9 @@ def create_vk_gdr_decode_kernel(
     a_strides: tuple,
     b_strides: tuple,
     use_qk_l2norm: bool,
+    q_strides: tuple | None = None,
+    k_strides: tuple | None = None,
+    v_strides: tuple | None = None,
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     NUM_BLOCKS_PER_V_DIM: int = 1,
@@ -131,14 +134,38 @@ def create_vk_gdr_decode_kernel(
         indices_tensor = GTensor(indices, dtype=T.i32, shape=(-1,))
         pool_idx = fx.Int32(indices_tensor[b_i])
 
+        _qk_contig = (
+            seq_length * num_k_heads * head_k_dim,
+            num_k_heads * head_k_dim,
+            head_k_dim,
+            1,
+        )
+        _v_contig = (
+            seq_length * num_v_heads * head_v_dim,
+            num_v_heads * head_v_dim,
+            head_v_dim,
+            1,
+        )
+        _q_str = q_strides if q_strides is not None else _qk_contig
+        _k_str = k_strides if k_strides is not None else _qk_contig
+        _v_str = v_strides if v_strides is not None else _v_contig
         q_tensor = GTensor(
-            query, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            query,
+            dtype=dtype_,
+            stride=_q_str,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
         )
         k_tensor = GTensor(
-            key, dtype=dtype_, shape=(-1, seq_length, num_k_heads, head_k_dim)
+            key,
+            dtype=dtype_,
+            stride=_k_str,
+            shape=(-1, seq_length, num_k_heads, head_k_dim),
         )
         v_tensor = GTensor(
-            value, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
+            value,
+            dtype=dtype_,
+            stride=_v_str,
+            shape=(-1, seq_length, num_v_heads, head_v_dim),
         )
         a_tensor = GTensor(
             a,

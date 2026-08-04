@@ -96,6 +96,7 @@ def flydsl_gdr_decode(
     use_qk_l2norm: bool,
     need_shuffle_state: bool,
     stream: torch.cuda.Stream = None,
+    qkv_contiguous: bool = True,
 ):
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -127,6 +128,19 @@ def flydsl_gdr_decode(
         head_k_dim,
         head_v_dim,
     )
+    if qkv_contiguous:
+        q_strides = k_strides = v_strides = None
+        q_arg, k_arg, v_arg = (
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+        )
+    else:
+        # Read strided (e.g. packed mixed_qkv) q/k/v directly -- no copy.
+        q_strides = tuple(int(x) for x in query.stride())
+        k_strides = tuple(int(x) for x in key.stride())
+        v_strides = tuple(int(x) for x in value.stride())
+        q_arg, k_arg, v_arg = query, key, value
     exe = create_vk_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
@@ -140,14 +154,17 @@ def flydsl_gdr_decode(
         a.stride(),
         b.stride(),
         use_qk_l2norm,
+        q_strides=q_strides,
+        k_strides=k_strides,
+        v_strides=v_strides,
         **kwargs_,
     )
     with torch.cuda.device(query.device.index):
         _run_compiled(
             exe,
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            q_arg,
+            k_arg,
+            v_arg,
             a,
             b,
             dt_bias.contiguous(),
