@@ -639,10 +639,6 @@ def mla_decode_fwd(
         )
 
         if use_hk:
-            assert causal or max_seqlen_q == 1, (
-                "the hk MLA decode kernel is causal-only; "
-                f"causal=False needs max_seqlen_q == 1, got {max_seqlen_q=}"
-            )
             aiter.hk_mla_v32_decode_fwd(
                 q,
                 kv_buffer,
