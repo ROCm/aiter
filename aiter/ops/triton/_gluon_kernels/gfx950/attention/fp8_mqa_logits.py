@@ -496,25 +496,34 @@ def _emit_row_logits(
     """Reduce + store one KV tile for each of the BLOCK_M query rows in this block."""
     for r in gl.static_range(0, BLOCK_M):
         scores = _row_logits(
-            mfma_qs[r], mfma_k, w_blocks[r], kv_scales,
-            NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS,
+            mfma_qs[r],
+            mfma_k,
+            w_blocks[r],
+            kv_scales,
+            NUM_HEADS,
+            BLOCK_KV,
+            mfma_layout,
+            NUM_CHAINS,
         )
         if BLOCK_M == 1:
             if MASKED:
                 _store_logits_block(
-                    logits_ptr, store_offsets, scores, USE_BUFFER_STORE,
+                    logits_ptr,
+                    store_offsets,
+                    scores,
+                    USE_BUFFER_STORE,
                     mask=store_arange < (end_ind - kv_pos),
                 )
             else:
-                _store_logits_block(
-                    logits_ptr, store_offsets, scores, USE_BUFFER_STORE
-                )
+                _store_logits_block(logits_ptr, store_offsets, scores, USE_BUFFER_STORE)
         else:
             # Multi-row: the loop walks the union of the rows ranges, so every
             # store is masked to the part this row owns
             pos = store_arange + kv_pos
             _store_logits_block(
-                logits_ptr + r * stride_logits_s, store_offsets, scores,
+                logits_ptr + r * stride_logits_s,
+                store_offsets,
+                scores,
                 USE_BUFFER_STORE,
                 mask=(pos >= row_starts[r]) & (pos < row_ends[r]),
             )
@@ -592,10 +601,25 @@ def mqa_logits_loop_double_buf(
             USE_BUFFER_LOAD=USE_BUFFER_LOAD,
         )
         _emit_row_logits(
-            mfma_qs, w_blocks, mfma_k, kv_scales, logits_ptr, stride_logits_s,
-            store_offsets, store_arange, kv_pos, end_ind, row_starts, row_ends,
-            NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS, USE_BUFFER_STORE,
-            BLOCK_M, False,
+            mfma_qs,
+            w_blocks,
+            mfma_k,
+            kv_scales,
+            logits_ptr,
+            stride_logits_s,
+            store_offsets,
+            store_arange,
+            kv_pos,
+            end_ind,
+            row_starts,
+            row_ends,
+            NUM_HEADS,
+            BLOCK_KV,
+            mfma_layout,
+            NUM_CHAINS,
+            USE_BUFFER_STORE,
+            BLOCK_M,
+            False,
         )
 
         kv_scales_off += BLOCK_KV
@@ -623,10 +647,25 @@ def mqa_logits_loop_double_buf(
             masked=True,
         )
         _emit_row_logits(
-            mfma_qs, w_blocks, mfma_k, kv_scales, logits_ptr, stride_logits_s,
-            store_offsets, store_arange, kv_pos, end_ind, row_starts, row_ends,
-            NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS, USE_BUFFER_STORE,
-            BLOCK_M, False,
+            mfma_qs,
+            w_blocks,
+            mfma_k,
+            kv_scales,
+            logits_ptr,
+            stride_logits_s,
+            store_offsets,
+            store_arange,
+            kv_pos,
+            end_ind,
+            row_starts,
+            row_ends,
+            NUM_HEADS,
+            BLOCK_KV,
+            mfma_layout,
+            NUM_CHAINS,
+            USE_BUFFER_STORE,
+            BLOCK_M,
+            False,
         )
 
         kv_scales_off += BLOCK_KV
@@ -649,10 +688,25 @@ def mqa_logits_loop_double_buf(
     )
     # Masked: handles num_full_tiles == 0 (segment shorter than BLOCK_KV).
     _emit_row_logits(
-        mfma_qs, w_blocks, mfma_k, kv_scales, logits_ptr, stride_logits_s,
-        store_offsets, store_arange, kv_pos, end_ind, row_starts, row_ends,
-        NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS, USE_BUFFER_STORE,
-        BLOCK_M, True,
+        mfma_qs,
+        w_blocks,
+        mfma_k,
+        kv_scales,
+        logits_ptr,
+        stride_logits_s,
+        store_offsets,
+        store_arange,
+        kv_pos,
+        end_ind,
+        row_starts,
+        row_ends,
+        NUM_HEADS,
+        BLOCK_KV,
+        mfma_layout,
+        NUM_CHAINS,
+        USE_BUFFER_STORE,
+        BLOCK_M,
+        True,
     )
 
     kv_scales_off += BLOCK_KV
@@ -674,10 +728,25 @@ def mqa_logits_loop_double_buf(
         wait_count=0, target_layout=dot_b_layout, buffer_id=buf_cur
     )
     _emit_row_logits(
-        mfma_qs, w_blocks, mfma_k, kv_scales, logits_ptr, stride_logits_s,
-        store_offsets, store_arange, kv_pos, end_ind, row_starts, row_ends,
-        NUM_HEADS, BLOCK_KV, mfma_layout, NUM_CHAINS, USE_BUFFER_STORE,
-        BLOCK_M, True,
+        mfma_qs,
+        w_blocks,
+        mfma_k,
+        kv_scales,
+        logits_ptr,
+        stride_logits_s,
+        store_offsets,
+        store_arange,
+        kv_pos,
+        end_ind,
+        row_starts,
+        row_ends,
+        NUM_HEADS,
+        BLOCK_KV,
+        mfma_layout,
+        NUM_CHAINS,
+        USE_BUFFER_STORE,
+        BLOCK_M,
+        True,
     )
 
 
