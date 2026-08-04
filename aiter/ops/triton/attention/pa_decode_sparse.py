@@ -10,21 +10,23 @@ This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
 where each token's K range is an unordered subset of a unified KV pool.
 """
 
-from typing import Optional
-
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse as gluon_pa_decode_sparse,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
+)
+from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as triton_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse as gluon_pa_decode_sparse,
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
-)
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -42,12 +44,12 @@ def pa_decode_sparse(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-    kv_scales: Optional[torch.Tensor] = None,
-    block_h: Optional[int] = None,
-    kv_splits: Optional[int] = None,
-    has_invalid: Optional[bool] = True,
-    skip_reduce: Optional[bool] = False,
-    USE_EXP2: Optional[bool] = None,
+    kv_scales: torch.Tensor | None = None,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool | None = True,
+    skip_reduce: bool | None = False,
+    USE_EXP2: bool | None = None,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -125,13 +127,31 @@ def pa_decode_sparse(
     out = torch.empty_like(q)
     assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
     assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
-    # kv_indices = kv_indices.to(torch.int32).contiguous()
-    # kv_indptr = kv_indptr.to(torch.int32).contiguous()
+
+    use_gluon = DEVICE_ARCH == "gfx1250"
 
     if block_h is None:
         # Default: one CTA per token (kills the H/BLOCK_H KV duplication).
         # If H is too large to fit a single tile, halve until it does.
-        block_h = triton.next_power_of_2(min(H, 16))
+        if use_gluon:
+            if H >= 128:
+                block_h = 128
+            elif H >= 64:
+                if T >= 2048:
+                    block_h = 64
+                elif T >= 32:
+                    block_h = 32
+                else:
+                    block_h = 16
+            elif H >= 32:
+                if T >= 256:
+                    block_h = 32
+                else:
+                    block_h = 16
+            else:
+                block_h = triton.next_power_of_2(H)
+        else:
+            block_h = triton.next_power_of_2(min(H, 16))
     else:
         block_h = triton.next_power_of_2(block_h)
     block_h = max(block_h, 16)  # AMD MFMA min tile
@@ -141,21 +161,32 @@ def pa_decode_sparse(
     block_d = triton.next_power_of_2(D)
     assert block_d == D
 
-    use_gluon = DEVICE_ARCH == "gfx1250"
-
     # gfx1250 stages slots through LDS via TDM async_load, which hides the
     # larger per-tile KV gather latency -> BLOCK_K=32 is fastest there. Other
     # arches use the synchronous slot path, where 32 exposes memory latency.
     if use_gluon:
         block_k = 16
-        attn_num_warps = 1
-        max_num_wg = 1024
+        waves_per_eu = 1
+        if block_h == 128:
+            block_k = 32
+            attn_num_warps = 8
+            max_num_wg = 256
+            waves_per_eu = 2
+        elif block_h == 64:
+            attn_num_warps = 4
+            max_num_wg = 256
+        elif block_h == 32:
+            attn_num_warps = 2
+            max_num_wg = 512
+        else:
+            attn_num_warps = 1
+            max_num_wg = 1024
     else:
         block_k = 16 if D >= 256 else 32
         attn_num_warps = 4
         max_num_wg = 256
+        waves_per_eu = 1
     num_stages = 2
-    waves_per_eu = 1
     # gluon reduce with BLOCK_H=1 keeps KV_SPLITS and BLOCK_H entirely
     # in-thread; a single warp suffices and avoids shared-memory layout
     # mismatches between 2D (m/l) and 3D (acc) loads.
@@ -178,6 +209,9 @@ def pa_decode_sparse(
         kv_splits = triton.next_power_of_2(kv_splits)
 
     if use_gluon:
+        _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+        _lds_cap = max(1, _lds_budget // (block_d * 4))
+        kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
         if kv_splits > 8:
             reduce_num_warps = 4
             reduce_waves_per_eu = 1

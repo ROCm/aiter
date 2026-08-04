@@ -6,7 +6,7 @@ the main attention kernels (fwd_prefill, fwd_decode, bwd). These are kept
 separate from utils.py to allow stricter type checking on pure Python utilities.
 """
 
-from typing import Literal, Optional, Tuple, Union
+from typing import Literal
 
 import torch
 import triton
@@ -89,7 +89,7 @@ def _cast_varlen_to_fp8_kernel_2d(
 
     # STEP 1: Find max absolute value across the entire sequence
     num_of_blocks = tl.cdiv(seqlen, BLOCK_SIZE)
-    for blk_idx in range(0, num_of_blocks):
+    for blk_idx in range(num_of_blocks):
         offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         offs_dim = tl.arange(0, HEAD_DIM)
 
@@ -121,7 +121,7 @@ def _cast_varlen_to_fp8_kernel_2d(
     tl.store(desc_ptr, descale)
 
     # STEP 2: Apply scaling and convert to FP8
-    for blk_idx in range(0, num_of_blocks):
+    for blk_idx in range(num_of_blocks):
         offs_seq = blk_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         offs_dim = tl.arange(0, HEAD_DIM)
 
@@ -271,8 +271,8 @@ def cast_to_fp8(
     fp8_dtype: torch.dtype,
     layout: Literal["bshd", "thd"],
     clamp_val: float = 1e-9,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Cast tensor to FP8 with per-(batch, head) scaling factors."""
     if DEBUG > 0:
@@ -347,9 +347,9 @@ def _apply_rotary_kernel(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
+    seqlen_offsets: int | torch.Tensor = 0,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
     interleaved: bool = False,
     inplace: bool = False,
     conjugate: bool = False,
@@ -362,7 +362,7 @@ def _apply_rotary_kernel(
         assert (
             max_seqlen is not None
         ), "If cu_seqlens is passed, max_seqlen must also be provided"
-        total_seqlen, nheads, headdim = x.shape
+        _total_seqlen, nheads, headdim = x.shape
         assert cu_seqlens is not None
         batch_p_1 = cu_seqlens.shape[0]
         batch = batch_p_1 - 1
@@ -432,9 +432,9 @@ class _ApplyRotary(torch.autograd.Function):
         sin: torch.Tensor,
         interleaved: bool,
         inplace: bool,
-        seqlen_offsets: Union[int, torch.Tensor],
-        cu_seqlens: Optional[torch.Tensor],
-        max_seqlen: Optional[int],
+        seqlen_offsets: int | torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        max_seqlen: int | None,
     ) -> torch.Tensor:
         out = _apply_rotary_kernel(
             x,
@@ -487,9 +487,9 @@ def apply_rotary_emb(
     sin: torch.Tensor,
     interleaved: bool = False,
     inplace: bool = False,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
+    seqlen_offsets: int | torch.Tensor = 0,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: int | None = None,
 ) -> torch.Tensor:
     """Apply rotary embeddings to tensor x.
 
@@ -535,15 +535,15 @@ def apply_rotary_emb(
 
 def apply_rotary(
     q: torch.Tensor,
-    k_new: Optional[torch.Tensor],
+    k_new: torch.Tensor | None,
     cos: torch.Tensor,
     sin: torch.Tensor,
     *,
     causal: bool,
     local: bool,
     interleaved: bool = False,
-    seqlen_offsets: Union[int, torch.Tensor] = 0,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    seqlen_offsets: int | torch.Tensor = 0,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply rotary embeddings to q and optionally k_new.
 
     Policy:

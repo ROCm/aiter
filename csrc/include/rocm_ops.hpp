@@ -31,6 +31,7 @@ namespace py = pybind11;
         .value("Silu", ActivationType::Silu)                                                \
         .value("Gelu", ActivationType::Gelu)                                                \
         .value("Swiglu", ActivationType::Swiglu)                                            \
+        .value("Situv2", ActivationType::Situv2)                                            \
         .export_values();                                                                   \
     pybind11::enum_<MlaVersion>(m, "MlaVersion")                                            \
         .value("V32", MlaVersion::V32)                                                      \
@@ -339,7 +340,24 @@ namespace py = pybind11;
           py::arg("route_out"),                                                     \
           py::arg("out"),                                                           \
           py::arg("topk"),                                                          \
-          py::arg("block_n") = -1)
+          py::arg("block_n") = -1);                                                  \
+    m.def("opus_moe_stage1_a8w4_fwd",                                                \
+          &opus_moe_stage1_a8w4_fwd,                                                 \
+          "A8W4 Opus MoE stage1 path",                                               \
+          py::arg("hidden_states"),                                                  \
+          py::arg("w1"),                                                             \
+          py::arg("hidden_scale"),                                                   \
+          py::arg("w1_scale"),                                                       \
+          py::arg("bias"),                                                           \
+          py::arg("sorted_token_ids"),                                               \
+          py::arg("sorted_expert_ids"),                                              \
+          py::arg("num_valid_ids"),                                                  \
+          py::arg("out"),                                                            \
+          py::arg("out_scale"),                                                      \
+          py::arg("block_m"),                                                        \
+          py::arg("kernelName"),                                                     \
+          py::arg("inter_dim_pad"),                                                  \
+          py::arg("swiglu_limit"))
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
@@ -455,7 +473,8 @@ namespace py = pybind11;
           py::arg("cos_cache"),                                                     \
           py::arg("sin_cache"),                                                     \
           py::arg("is_neox"),                                                       \
-          py::arg("is_nope_first"));                                                \
+          py::arg("is_nope_first"),                                                 \
+          py::arg("compute_all_q_rope") = false);                                   \
     m.def("fused_qk_rope_concat_and_cache_mla_seg",                                 \
           &aiter::fused_qk_rope_concat_and_cache_mla_seg,                           \
           py::arg("q_nope"),                                                        \
@@ -1311,6 +1330,7 @@ namespace py = pybind11;
           py::arg("topk_indices"),                                             \
           py::arg("token_expert_indices"),                                     \
           py::arg("gating_output"),                                            \
+          py::arg("softmax_workspace"),                                        \
           py::arg("need_renorm"),                                              \
           py::arg("num_shared_experts")         = 0,                           \
           py::arg("shared_expert_scoring_func") = "",                          \
@@ -1627,34 +1647,69 @@ namespace py = pybind11;
           py::arg("gate_up")        = false,                             \
           py::arg("shuffle_weight") = false);
 
-#define DSV4_ROTATE_QUANT_PYBIND                                                             \
-    m.def("rotate_activation_fp4quant_inplace",                                              \
-          &aiter::rotate_activation_fp4quant_inplace,                                        \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("group_size") = 32);                                                       \
-    m.def("rotate_activation", &aiter::rotate_activation, py::arg("out"), py::arg("input")); \
-    m.def("rope_rotate_activation_fp4quant_inplace",                                         \
-          &aiter::rope_rotate_activation_fp4quant_inplace,                                   \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("cos"),                                                                    \
-          py::arg("sin"),                                                                    \
-          py::arg("positions"),                                                              \
-          py::arg("rope_dim"),                                                               \
-          py::arg("group_size") = 32);                                                       \
-    m.def("rope_rotate_activation",                                                          \
-          &aiter::rope_rotate_activation,                                                    \
-          py::arg("out"),                                                                    \
-          py::arg("input"),                                                                  \
-          py::arg("cos"),                                                                    \
-          py::arg("sin"),                                                                    \
-          py::arg("positions"),                                                              \
-          py::arg("rope_dim"),                                                               \
-          py::arg("out_scale") = std::nullopt,                                               \
-          py::arg("group_size") = 128);
+#define DSV4_ROTATE_QUANT_PYBIND                                         \
+    m.def("rotate_activation_fp4quant",                                  \
+          &aiter::rotate_activation_fp4quant,                            \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true);                              \
+    m.def("rotate_activation",                                           \
+          &aiter::rotate_activation,                                     \
+          py::arg("out"),                                                \
+          py::arg("input"));                                             \
+    m.def("rope_rotate_activation_fp4quant",                             \
+          &aiter::rope_rotate_activation_fp4quant,                       \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true,                               \
+          py::arg("do_rotate_act") = true);                              \
+    m.def("rope_rotate_activation",                                      \
+          &aiter::rope_rotate_activation,                                \
+          py::arg("out"),                                                \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("do_rotate_act") = true);                             \
+    m.def("rope_rotate_activation_fp8quant",                             \
+          &aiter::rope_rotate_activation_fp8quant,                       \
+          py::arg("out"),                                                \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("rope_dim"),                                           \
+          py::arg("group_size") = 128,                                   \
+          py::arg("do_rotate_act") = true);                              \
+    m.def("rmsnorm_rope_rotate_activation_fp4quant_kvcache",             \
+          &aiter::rmsnorm_rope_rotate_activation_fp4quant_kvcache,       \
+          py::arg("kvcache"),                                            \
+          py::arg("scale"),                                              \
+          py::arg("input"),                                              \
+          py::arg("norm_weight"),                                        \
+          py::arg("cos"),                                                \
+          py::arg("sin"),                                                \
+          py::arg("positions"),                                          \
+          py::arg("slot_mapping"),                                       \
+          py::arg("epsilon"),                                            \
+          py::arg("rope_dim"),                                           \
+          py::arg("kv_block_size") = 16,                                 \
+          py::arg("group_size") = 32,                                    \
+          py::arg("shuffle_scale") = true,                               \
+          py::arg("do_rotate_act") = false);
 
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
+    AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
           &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
@@ -1685,12 +1740,16 @@ namespace py = pybind11;
           py::arg("hidden_dim"),                                                           \
           py::arg("quant_level"),                                                          \
           py::arg("cast_bf2half") = false);                                                \
-    m.def("qr_get_handle", &aiter::qr_get_handle, "qr_get_handle(int fa)", py::arg("fa")); \
+    m.def("qr_get_handle",                                                                 \
+          &aiter::qr_get_handle,                                                           \
+          "qr_get_handle(int fa, int out_ptr) -> ()",                                      \
+          py::arg("fa"),                                                                   \
+          py::arg("out_ptr"));                                                             \
     m.def("qr_open_handles",                                                               \
           &aiter::qr_open_handles,                                                         \
-          "qr_open_handles(int fa, Tensor[] handles)",                                     \
+          "qr_open_handles(int fa, int[] handle_ptrs) -> ()",                              \
           py::arg("fa"),                                                                   \
-          py::arg("handles"));                                                             \
+          py::arg("handle_ptrs"));                                                         \
     m.def("qr_max_size", &aiter::qr_max_size);
 
 #define ROPE_1C_UNCACHED_FWD_PYBIND m.def("rope_fwd_impl", &rope_fwd_impl);
@@ -1985,6 +2044,19 @@ namespace py = pybind11;
           py::arg("v_fp8"),                                                                 \
           py::arg("v_descale"));
 
+#define INVERSE_ROPE_GROUP_QUANT_PYBIND                \
+    m.def("inverse_rope_group_quant",                  \
+          &aiter::inverse_rope_group_quant,            \
+          py::arg("o"),                                \
+          py::arg("x_fp8"),                            \
+          py::arg("x_scale"),                          \
+          py::arg("positions"),                        \
+          py::arg("cos_cache"),                        \
+          py::arg("sin_cache"),                        \
+          py::arg("num_groups"),                       \
+          py::arg("quant_group_size") = 128,           \
+          py::arg("scale_shuffle")    = false);
+
 #define SMOOTHQUANT_PYBIND                      \
     m.def("smoothquant_fwd", &smoothquant_fwd); \
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
@@ -2204,6 +2276,7 @@ namespace py = pybind11;
           py::arg("stride1")   = 1);
 
 #define RMSNORM_QUANT_PYBIND                 \
+    AITER_SET_STREAM_PYBIND;                 \
     m.def("add_rmsnorm_quant",               \
           &aiter::add_rmsnorm_quant,         \
           py::arg("out"),                    \

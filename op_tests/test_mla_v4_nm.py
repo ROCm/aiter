@@ -41,7 +41,7 @@ V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 def _on_gfx950():
     try:
         return get_gfx() == "gfx950"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -873,21 +873,21 @@ def _build_inputs(
         device=device,
     )
 
-    return dict(
-        q=q,
-        qrope=qrope,
-        kv_buffer=kv_buffer,
-        kvrope=kvrope,
-        output=output,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        split_indptr=split_indptr,
-        max_seqlen_q=q_seq_logical,
-        sink=sink,
-        num_kv_splits=num_kv_splits,
-        out_16_nosplit=0,
-    )
+    return {
+        "q": q,
+        "qrope": qrope,
+        "kv_buffer": kv_buffer,
+        "kvrope": kvrope,
+        "output": output,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "split_indptr": split_indptr,
+        "max_seqlen_q": q_seq_logical,
+        "sink": sink,
+        "num_kv_splits": num_kv_splits,
+        "out_16_nosplit": 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1502,19 +1502,19 @@ def _build_bf16_inputs(
             (num_heads,), float("-inf"), dtype=torch.float32, device=device
         )
 
-    return dict(
-        q_bf16=q_bf16,
-        kv_bf16=kv_bf16,
-        qo_indptr=qo_indptr,
-        kv_indptr=kv_indptr,
-        kv_page_indices=kv_page_indices,
-        kv_last_page_lens=kv_last_page_lens,
-        sink=sink,
-        max_seqlen_q=q_seq_logical,
-        kv_seq_lens=kv_seq_lens,
-        batch=batch,
-        q_seq_logical=q_seq_logical,
-    )
+    return {
+        "q_bf16": q_bf16,
+        "kv_bf16": kv_bf16,
+        "qo_indptr": qo_indptr,
+        "kv_indptr": kv_indptr,
+        "kv_page_indices": kv_page_indices,
+        "kv_last_page_lens": kv_last_page_lens,
+        "sink": sink,
+        "max_seqlen_q": q_seq_logical,
+        "kv_seq_lens": kv_seq_lens,
+        "batch": batch,
+        "q_seq_logical": q_seq_logical,
+    }
 
 
 def _run_one_point(
@@ -2540,7 +2540,7 @@ def test_v4_nm_multi_split():
     args_ign["num_kv_splits"] = 2
     args_ign["out_16_nosplit"] = 1  # ignored; derived to 0 for multi-pass
     args_ign.pop("split_indptr")
-    out_ign, lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
+    out_ign, _lse_ign = aiter.mla.mla_decode_fwd_v4_nm(**args_ign)
     torch.cuda.synchronize()
     # Multi-pass returns fp32 split logits (NOT the bf16 single-pass alias).
     assert out_ign.dtype == torch.float32, (
@@ -2598,18 +2598,18 @@ def _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0):
         device=device,
     )
 
-    return dict(
-        q=q_packed,
-        qrope=q_rope.contiguous(),
-        kv_buffer=kv_packed,
-        kvrope=kv_rope.contiguous(),
-        output=output,
-        qo_indptr=bf["qo_indptr"],
-        kv_indptr=bf["kv_indptr"],
-        kv_page_indices=bf["kv_page_indices"],
-        max_seqlen_q=bf["max_seqlen_q"],
-        sink=sink,
-    )
+    return {
+        "q": q_packed,
+        "qrope": q_rope.contiguous(),
+        "kv_buffer": kv_packed,
+        "kvrope": kv_rope.contiguous(),
+        "output": output,
+        "qo_indptr": bf["qo_indptr"],
+        "kv_indptr": bf["kv_indptr"],
+        "kv_page_indices": bf["kv_page_indices"],
+        "max_seqlen_q": bf["max_seqlen_q"],
+        "sink": sink,
+    }
 
 
 @needs_gfx950
@@ -2631,20 +2631,23 @@ def test_v4_nm_sink():
     args_b = _build_sink_test_args(batch=2, kv_seq_lens=64, q_seq_logical=1, seed=0)
     args_b["sink"] = torch.full((sink_size,), 10.0, dtype=torch.float32, device=device)
 
-    logits_a, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_a)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_a)
     torch.cuda.synchronize()
-    # Single-pass (V3-style) now returns packed-BF16 (2-byte) logits aliased
-    # onto `output`, so reinterpret the raw bits as int16 (not int32) to keep
-    # the last-dim aligned with the finite mask for the byte-level sink diff.
-    logits_a_bits = logits_a.view(torch.int16).clone()
+    # `output` is the authoritative BF16 result for BOTH single-pass (kernel
+    # writes packed-BF16 into it) and multi-pass (stage2 merges into it). Read
+    # it directly instead of the returned `logits` so the byte-level sink diff
+    # is robust to whatever split count the heuristic picks — v4 nm forces
+    # occupancy-only splits (ignore_total_kv), which can be >1 even for short
+    # KV, making `logits` an FP32 partial buffer rather than packed BF16.
+    out_a = args_a["output"]  # [total_q, num_heads, dv] BF16
+    out_a_bits = out_a.view(torch.int16).clone()
 
-    logits_b, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_b)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_b)
     torch.cuda.synchronize()
-    logits_b_bits = logits_b.view(torch.int16)
+    out_b = args_b["output"]
+    out_b_bits = out_b.view(torch.int16)
 
-    # logits is 4D [total_q, num_kv_splits=1, num_heads, dv]; only [:, 0]
-    # is kernel-written.
-    finite_both = torch.isfinite(logits_a[:, 0]) & torch.isfinite(logits_b[:, 0])
+    finite_both = torch.isfinite(out_a) & torch.isfinite(out_b)
     assert finite_both.any(), (
         "All output cells were NaN/inf under both sink values — the quant "
         "pipeline returned junk OR sink=10 pushed the running max into a "
@@ -2652,7 +2655,7 @@ def test_v4_nm_sink():
         "sink_b's magnitude."
     )
 
-    diff_finite = (logits_a_bits[:, 0] != logits_b_bits[:, 0]) & finite_both
+    diff_finite = (out_a_bits != out_b_bits) & finite_both
     assert diff_finite.any(), (
         "PR-2 regression: sink=-inf and sink=10.0 produced bit-identical "
         "output among finite cells. Either the dispatcher stopped writing "
@@ -2671,12 +2674,13 @@ def test_v4_nm_sink():
         (sink_size,), -1.0e9, dtype=torch.float32, device=device
     )
 
-    logits_inf, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
-    logits_big, _ = aiter.mla.mla_decode_fwd_v4_nm(**args_big)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_inf)
+    aiter.mla.mla_decode_fwd_v4_nm(**args_big)
     torch.cuda.synchronize()
 
-    nan_inf = torch.isnan(logits_inf[:, 0])
-    nan_big = torch.isnan(logits_big[:, 0])
+    # Compare the authoritative BF16 `output` (single/multi-pass agnostic).
+    nan_inf = torch.isnan(args_inf["output"])
+    nan_big = torch.isnan(args_big["output"])
 
     # -inf must not produce *more* NaNs than the -1e9 control. The inverse
     # would mean sink=-inf hits a kernel-side division-by-zero or
@@ -2840,6 +2844,7 @@ def _run_oob_guardpage_worker(worker_args, fault_label):
         text=True,
         timeout=300,
         preexec_fn=_no_core_dump,
+        check=False,
     )
     combined = proc.stdout + proc.stderr
     faulted = (

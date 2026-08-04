@@ -14,21 +14,22 @@ import torch
 import triton
 import triton.language as tl
 
-from ..utils import (
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-    prepare_rebased_cu_seqlens,
-)
-from ..utils.op import exp
 from ..gated_delta_rule_utils import (
-    RCP_LN2,
     IS_AMD,
     IS_NVIDIA_HOPPER,
+    RCP_LN2,
     USE_CUDA_GRAPH,
     autotune_cache_kwargs,
     check_shared_mem,
     gated_delta_rule_autotune_configs,
 )
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    prepare_rebased_cu_seqlens,
+)
+from ..utils.op import exp
 
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 # Workaround: AMD ROCm Triton compiler fails with num_stages=4 in stream pipeline
@@ -1105,7 +1106,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         if IS_VARLEN:
             g += (i_h * T_flat + bos).to(tl.int64)
         else:
-            g += (((i_n * H + i_h) * T_flat)).to(tl.int64)
+            g += ((i_n * H + i_h) * T_flat).to(tl.int64)
 
     if USE_INITIAL_STATE:
         p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
@@ -1305,6 +1306,7 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     num_decode_tokens: int = 0,
     initial_state_indices: torch.Tensor | None = None,
     inplace_final_state: bool | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """
     Optimized hidden state forward with h layout [V, K].
@@ -1340,22 +1342,41 @@ def chunk_gated_delta_rule_fwd_h_opt_vk(
     T_flat = w.shape[2]
 
     if cu_seqlens is not None:
-        # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints into the
-        # cached prologue helpers so chunk_indices / chunk_offsets are built
-        # once per (cu_seqlens_id, BT, num_decodes, num_decode_tokens) tuple
-        # (no per-forward .tolist() D2H). The kernel walks the pre-sliced
-        # prefill data via the rebased cu_seqlens.
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, chunk_size, num_decodes, num_decode_tokens
-        )
-        chunk_offsets = prepare_chunk_offsets(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            chunk_indices = schedule.sequence_ids
+            chunk_offsets = schedule.chunk_offsets
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+        else:
+            # Pass the ORIGINAL (cache-stable) cu_seqlens + decode ints into the
+            # cached prologue helpers so repeated calls avoid host synchronization.
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, chunk_size, num_decodes, num_decode_tokens
+            )
+            chunk_offsets = prepare_chunk_offsets(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
         N = len(kernel_cu_seqlens) - 1
-        NT = len(chunk_indices)
+        NT = (
+            schedule.total_chunks
+            if prefill_metadata is not None
+            else len(chunk_indices)
+        )
     else:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
         kernel_cu_seqlens = None
