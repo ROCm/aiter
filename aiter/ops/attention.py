@@ -823,6 +823,7 @@ def mla_decode_stage1_asm_fwd(
     # [batch_size] scratch for gfx1250 packed MLA kernels
     valid_split_count: torch.Tensor | None = None,
     use_valid_split_count_reduce: int = 0,
+    causal: bool = True,
 ) -> None: ...
 
 
@@ -847,7 +848,7 @@ def mla_decode_v4_asm(
     kv_page_indices: torch.Tensor,
     # [num_seqs+1]
     split_indptr: torch.Tensor,
-    # [num_heads] FP32 — attention sink logit. Loaded by the kernel via
+    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
     # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
     # tensor; there is no nullable-sink convention on the C ABI. Pass
     # torch.full((num_heads,), float("-inf")) for "no sink" math.
@@ -1505,7 +1506,7 @@ def mla_reduce_v1(
         max_seqlen_q: max query length (tokens) per decode step.
         num_kv_splits: sizing hint for the reducer's per-split LDS scratch
             (``max_splits = max(device_cu_count, num_kv_splits)``).
-            **``0`` means auto** — size to the device CU count. Pass a value
+            **``0`` means auto** -- size to the device CU count. Pass a value
             larger than the CU count only to force a bigger split budget;
             values <= CU count (incl. 0) are clamped up to it.
         final_output: [bs, h, dv]. Combined, normalized output (written
