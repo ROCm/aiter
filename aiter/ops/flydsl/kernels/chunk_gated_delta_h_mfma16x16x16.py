@@ -257,57 +257,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     ROWS_PER_BATCH_64 = BLOCK_THREADS // THREADS_PER_ROW_64  # 32
     NUM_LOAD_BATCHES_64 = BT // ROWS_PER_BATCH_64  # 2
 
-    # ---- OPT-VC: precompute the GEMM1 prefetch interleaving schedule.
-    # All quantities here depend ONLY on compile-time constants
-    # (K, BV, USE_G, USE_GK) and live in the outer compile_*-function
-    # scope so they are pure Python ints/lists -- the FlyDSL AST rewriter
-    # only touches the @flyc.kernel body below, so any control flow here
-    # is safe to mix as ordinary Python.
-    # OPT-VC enablement gate: only spread prefetch into GEMM1 when N_REPEAT
-    # == 1 (i.e. BV == WMMA_N == 16). When OPT_VC_ENABLED is False (BV>=32),
-    # emit all g/gk/u prefetch in a BATCH BEFORE GEMM1 starts (via
-    # PROLOGUE_EMITTER_CT), exactly matching the pre-OPT-VC (rev5) layout --
-    # this leaves the full GEMM1 MFMA chain to overlap the HBM latency.
-    # An earlier attempt (rev21) routed disabled-BV prefetch to the GEMM1
-    # tail (TAIL_EMITTER_CT), which empirically lost 9-14% on BV>=32 shapes
-    # because the prefetched values had no MFMA to hide behind before being
-    # consumed by the gating / vn = u - bv computation.
+    # GEMM1 issues K_STEPS_PER_BLOCK 16x16x16 MFMA steps per 64-K block; the
+    # u/g/gk/w_next prefetch is emitted inline in the kernel body (before/within
+    # GEMM1) so the MFMA chain hides its HBM latency.
     K_STEPS_PER_BLOCK = 64 // WMMA_K
-    OPT_VC_ENABLED = N_REPEAT == 1
-    # OPT-W is gated together with OPT-VC. On BV>=32 (N_REPEAT>=2) the GEMM2
-    # inner loop is also thin enough that interleaving w_next vec_loads into
-    # it causes the SIMD's single VMEM port to bottleneck on certain varlen
-    # shapes. Disabling the interleave on BV>=32 falls back to the rev5-style
-    # batched issue right before GEMM2, where the full MFMA chain hides the
-    # HBM latency.
-    NUM_INNER_SLOTS = NUM_K_BLOCKS * K_STEPS_PER_BLOCK * N_REPEAT
-    NUM_GK_LOADS_CT = (NUM_K_BLOCKS * 4) if USE_GK else 0
-    # g_last + g_row are batched through the emitter queue (5 loads).
-    NUM_G_LOADS_CT = 5 if USE_G else 0
-    NUM_U_LOADS_CT = N_REPEAT * 4
-    _NUM_U_QUEUE_CT = NUM_U_LOADS_CT
-    NUM_EXTRA_LOADS_CT = NUM_GK_LOADS_CT + NUM_G_LOADS_CT + _NUM_U_QUEUE_CT
-    if OPT_VC_ENABLED and NUM_INNER_SLOTS > 0 and NUM_EXTRA_LOADS_CT > 0:
-        EXTRAS_PER_SLOT_CT = (
-            NUM_EXTRA_LOADS_CT + NUM_INNER_SLOTS - 1
-        ) // NUM_INNER_SLOTS
-    else:
-        EXTRAS_PER_SLOT_CT = 0
-    # Map each emitter idx (0..NUM_EXTRA_LOADS_CT-1) to one of three buckets:
-    #   * SLOT_ASSIGN_CT[slot_idx] -- emitted inside GEMM1 at (kb,ks,nr) slot
-    #     (used when OPT_VC_ENABLED is True, BV=16 path)
-    #   * PROLOGUE_EMITTER_CT     -- emitted right BEFORE GEMM1 main loop
-    #     (used when OPT_VC_ENABLED is False, BV>=32 path; matches rev5)
-    #   * TAIL_EMITTER_CT         -- emitted AFTER GEMM1 (kept as future-
-    #     facing safety net; not used by the current schedule).
-    SLOT_ASSIGN_CT: list[list[int]] = [[] for _ in range(NUM_INNER_SLOTS)]
-    PROLOGUE_EMITTER_CT: list[int] = []
-    for _e_idx in range(NUM_EXTRA_LOADS_CT):
-        if OPT_VC_ENABLED and NUM_INNER_SLOTS > 0:
-            _slot = min(_e_idx // max(EXTRAS_PER_SLOT_CT, 1), NUM_INNER_SLOTS - 1)
-            SLOT_ASSIGN_CT[_slot].append(_e_idx)
-        else:
-            PROLOGUE_EMITTER_CT.append(_e_idx)
 
     @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma16_hip")
     def gdn_h_kernel(
@@ -405,18 +358,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         def _lds_read_hp_bf16x4(elem_idx):
             return vector.load_op(v4bf16_hp_type, lds_hp_memref, [fx.Index(elem_idx)])
 
-        # HIP-ALIGN 2b: rotating-pair swizzled reads of k panel / plain b64 gated_v.
-        def _lds_read_kp_bf16x4(elem_idx):
-            return vector.load_op(v4bf16_hp_type, lds_kp_memref, [fx.Index(elem_idx)])
-
+        # GEMM2 B operand: plain b64 read of the gated_v shared2 panel.
         def _lds_read_gv_bf16x4(elem_idx):
             return vector.load_op(v4bf16_hp_type, lds_gv_memref, [fx.Index(elem_idx)])
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
-
-        # -- LDS vector read helpers (generates ds_read_b128 for 8xbf16) --
 
         # HIP-ALIGN 2a: w_panel swizzle (returns ELEMENT offset within a panel).
         # Port of w_panel_swizzle_base_bytes >> 1 (all bf16 = 2 B).
