@@ -124,7 +124,6 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
-
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
 
