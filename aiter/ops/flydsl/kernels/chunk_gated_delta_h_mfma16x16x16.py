@@ -33,45 +33,14 @@ from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 from .tensor_shim import GTensor, STensor, _to_raw
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
-_LLVM_GEP_DYNAMIC = -2147483648
-
-
-def _llvm_lds_ptr_ty():
-    return ir.Type.parse("!llvm.ptr<3>")
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
-    """Return the ``exp`` helper for this kernel compile.
-
-    If ``g_is_log2_scaled`` is False (default), ``g_cumsum`` is in the natural
-    log domain (matches upstream K12) and we lower ``exp(x)`` as
-    ``exp2(x * log2(e))`` so the multiplier merges into one ``v_exp_f32`` plus
-    one ``v_mul_f32`` on AMD.
-
-    If True, the caller has pre-scaled ``g_cumsum`` by ``log2(e)`` already
-    (the K12 prescale optimization), so we can drop the per-call ``* LOG2E``
-    multiply and lower directly to a single ``v_exp_f32``. NOTE: enabling
-    this flag without the matching K12 prescale produces incorrect outputs;
-    it exists for ISA-level perf probing of the prescale upper bound.
-    """
+    """``exp(x)`` lowered via ``exp2``. If ``g`` is already log2(e)-prescaled the
+    ``* LOG2E`` is dropped (single ``v_exp_f32``); otherwise it is folded in."""
     if g_is_log2_scaled:
-
-        def _fast_exp(x):
-            return rocdl.exp2(T.f32, x)
-
-    else:
-
-        def _fast_exp(x):
-            return rocdl.exp2(T.f32, x * _LOG2E)
-
-    return _fast_exp
-
-
-def _mfma_bf16_16x16x32(a_bf16x8, b_bf16x8, acc_f32x4):
-    """Single mfma_f32_16x16x32_bf16 instruction."""
-    return rocdl.mfma_f32_16x16x32_bf16(
-        T.f32x4, [a_bf16x8, b_bf16x8, acc_f32x4, 0, 0, 0]
-    )
+        return lambda x: rocdl.exp2(T.f32, x)
+    return lambda x: rocdl.exp2(T.f32, x * _LOG2E)
 
 
 def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
@@ -93,46 +62,21 @@ def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
 
 
 def _f32x4_to_bf16x4_rne_gfx950(vec_f32x4):
-    """Round-to-nearest-even f32x4 -> bf16x4 via the gfx950 native convert.
-
-    Mirrors HIP's ``float_to_bf16`` which uses the gfx950 native RNE convert
-    ``v_cvt_pk_bf16_f32`` (``static_cast<__bf16>``), NOT the FlyDSL default
-    ``arith.truncf`` (bit-truncation, differs from torch/HIP by ~1 ulp). Packs
-    the 4 lanes with two ``cvt_pk_bf16_f32`` (each 2xf32 -> i32 holding 2xbf16),
-    then bitcasts the 2xi32 back to a vector<4xbf16>. Returns a raw
-    vector<4xbf16> ir.Value (drop-in for the previous ``.truncf(vec4 bf16)``).
-
-    gfx950 (CDNA4) ONLY -- ``v_cvt_pk_bf16_f32`` does not exist on gfx942.
-    """
-    lo = rocdl.cvt_pk_bf16_f32(vec_f32x4[0], vec_f32x4[1])  # i32: [bf16(0), bf16(1)]
-    hi = rocdl.cvt_pk_bf16_f32(vec_f32x4[2], vec_f32x4[3])  # i32: [bf16(2), bf16(3)]
+    """RNE f32x4 -> bf16x4 via the gfx950 native ``v_cvt_pk_bf16_f32`` (matches
+    HIP ``float_to_bf16``). gfx950 (CDNA4) ONLY -- absent on gfx942."""
+    lo = rocdl.cvt_pk_bf16_f32(vec_f32x4[0], vec_f32x4[1])
+    hi = rocdl.cvt_pk_bf16_f32(vec_f32x4[2], vec_f32x4[3])
     packed = vector.from_elements(T.vec(2, T.i32), [lo, hi])
     return vector.bitcast(T.vec(4, T.bf16), packed)
 
 
 def _f32x4_to_bf16x4_rne_portable(vec_f32x4):
-    """Round-to-nearest-even f32x4 -> bf16x4 without ``v_cvt_pk_bf16_f32``.
-
-    Portable software RNE for architectures lacking the gfx950 native
-    ``v_cvt_pk_bf16_f32`` convert (e.g. gfx942 / CDNA3). Emulates HIP's
-    ``__float2bfloat16_rn`` software fallback with the standard "add a
-    round-to-nearest-even bias, then keep the high 16 bits" integer
-    sequence, applied lane-wise over the whole vector<4xf32>:
-
-        x            = bitcast<i32>(f)
-        rounding_bias = 0x7FFF + ((x >> 16) & 1)   # even-tie -> +0x7FFF, odd -> +0x8000
-        bf16_bits    = (x + rounding_bias) >> 16
-
-    NaN fix-up: the plain bias sequence turns some NaNs (e.g. 0x7F800001)
-    into +Inf (0x7F80), because the only set mantissa bits live below bit 16
-    and are dropped by the shift. To match torch/HIP ``__float2bfloat16_rn``
-    we detect NaN (``|x| > 0x7F800000``) and force the canonical quiet-NaN
-    pattern 0x7FC0. The detection is branch-free: for finite/Inf/NaN inputs
-    ``|x|`` is always < 2^31, so ``0x7F800000 - |x|`` is negative exactly when
-    ``|x| > 0x7F800000`` (i.e. NaN); its sign bit is broadcast to a full mask.
-    +/-Inf (``|x| == 0x7F800000``) already round-trips correctly through the
-    bias path and is intentionally left untouched. Returns a vector<4xbf16>
-    ir.Value, a drop-in replacement for the gfx950 path.
+    """Portable software RNE f32x4 -> bf16x4 for archs without
+    ``v_cvt_pk_bf16_f32`` (gfx942 / CDNA3). Standard RNE bias then keep the
+    high 16 bits: ``bf16 = (x + 0x7FFF + ((x>>16)&1)) >> 16``. NaN fix-up: the
+    bias sequence can turn some NaNs into +Inf (mantissa bits drop below bit
+    16), so detect NaN (``|x| > 0x7F800000``) branch-free and force qNaN 0x7FC0
+    to match torch/HIP ``__float2bfloat16_rn``; +/-Inf round-trips untouched.
     """
     i32x4 = T.vec(4, T.i32)
     x = vector.bitcast(i32x4, vec_f32x4)
@@ -164,11 +108,8 @@ def _f32x4_to_bf16x4_rne_portable(vec_f32x4):
 
 
 def _f32x4_to_bf16x4_trunc(vec_f32x4):
-    """Truncating f32x4 -> bf16x4: keep the high 16 bits, NO rounding bias.
-
-    Matches HIP's ``float_to_bf16`` (``__builtin_bit_cast<uint32_t>(x) >> 16``)
-    exactly, so outputs are bit-identical to the HIP/C++ K5 kernel. Arch-
-    independent (pure integer shift; no ``v_cvt_pk_bf16_f32``).
+    """Truncating f32x4 -> bf16x4 (keep high 16 bits, no rounding bias). Bit-
+    identical to HIP ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``); arch-neutral.
     """
     i32x4 = T.vec(4, T.i32)
     x = vector.bitcast(i32x4, vec_f32x4)
@@ -1226,8 +1167,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # >>> WRITE prefetched w_next/k_next to LDS for next iteration.
             # Barrier ensures GEMM2 done reading old panels (HIP .cu:794-798).
-            # Closures hide lds_wp/lds_kp (STensor) from the FlyDSL AST
-            # rewriter which otherwise tries to yield them through scf.if.
             # Closures hide lds_wp/lds_kp (STensor) from the FlyDSL AST
             # rewriter which otherwise tries to yield them through scf.if.
             def _emit_wp_vec_store(idx_tuple, val, width):
