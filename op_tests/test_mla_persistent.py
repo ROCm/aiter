@@ -1271,7 +1271,7 @@ def test_mla(
         kv_last_page_lens,
         nhead // nhead_kv,
         nhead_kv,
-        False,
+        causal,
         work_meta_data,
         work_info_set,
         work_indptr,
