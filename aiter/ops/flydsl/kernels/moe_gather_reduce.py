@@ -213,6 +213,12 @@ def build_moe_gather_reduce_module(
                 # .to(Float32) is a no-op when the route weights are already f32.
                 return row_i32, w_dt_fx(w_loaded).to(fx.Float32)
 
+            # (row, weight) depend only on (token, k): block-uniform and invariant
+            # in dw/lane, so load all topk slots once here instead of per lane in
+            # the tail branch.  Also breaks the row->grouped_out dependent load
+            # chain: the topk index loads now issue together, ahead of the data.
+            row_weights = [_load_row_weight(k) for k in range(topk)]
+
             dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
             dw_valid = dw_base < out_dwords_i32
             if dw_valid:
@@ -221,7 +227,7 @@ def build_moe_gather_reduce_module(
                     acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
 
                     for k in range_constexpr(topk):
-                        row_i32, w_f32 = _load_row_weight(k)
+                        row_i32, w_f32 = row_weights[k]
                         red = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         for sk in range_constexpr(split_k):
                             raw_vec = buffer_ops.buffer_load(
@@ -263,7 +269,7 @@ def build_moe_gather_reduce_module(
                             acc_lo = fx.Float32(0.0)
                             acc_hi = fx.Float32(0.0)
                             for k in range_constexpr(topk):
-                                row_i32, w_f32 = _load_row_weight(k)
+                                row_i32, w_f32 = row_weights[k]
                                 red_lo = fx.Float32(0.0)
                                 red_hi = fx.Float32(0.0)
                                 for sk in range_constexpr(split_k):
