@@ -390,7 +390,7 @@ def _moe_gemm_a8w4_decode_persistent(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
-        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
+        offs_xs_m = offs_xs_m % M
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
@@ -415,6 +415,10 @@ def _moe_gemm_a8w4_decode_persistent(
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
         xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
     if B is not None:
         BPtrs = B + expt_id * stride_b_e
         BPtrs += pid_n * BLOCK_N_PERSISTENT
@@ -789,7 +793,7 @@ def _moe_gemm_a8w4_decode_persistent(
                         set_bounds=[num_tokens, K_MX],
                     )
             else:
-                xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+                xs_ptrs -= num_k_iter * MX_SCALE_BLOCK_K
         if B is not None:
             bias_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 bias_desc, add_offsets=[0, BLOCK_N], clamp_bounds=True
@@ -1075,7 +1079,7 @@ def _moe_gemm_a8w4_decode(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
-        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
+        offs_xs_m = offs_xs_m % M
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
@@ -1100,6 +1104,10 @@ def _moe_gemm_a8w4_decode(
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
         xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -1689,7 +1697,7 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
-        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
+        offs_xs_m = offs_xs_m % M
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
@@ -1714,6 +1722,10 @@ def _moe_gemm_a8w4_prefill(
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
         xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
