@@ -1,162 +1,282 @@
 #!/usr/bin/env python3
-"""Extract reassemblable .s from llvm-objdump -d output.
+"""Rebuild a reassemblable, self-contained .s file from an AITER kernel object (.co).
 
-Handles branch label resolution using word-offset addressing:
-  target_address = base_address + label_value * 4
+The output contains three parts, all recovered from the .co with LLVM tools:
+
+  1. .text   - instructions from `llvm-objdump -d`, with branch labels taken from
+               the ELF symbol table (`llvm-readelf -s`)
+  2. .rodata - the 64-byte kernel descriptor, decoded by
+               `llvm-objdump -D -j .rodata` into `.amdhsa_*` directives
+  3. .note   - the AMDHSA metadata (kernel arguments, register counts, LDS size)
+               from `llvm-readelf --notes`, emitted as an `.amdgpu_metadata` block
+
+Assembling the result with
+
+    clang -x assembler -target amdgcn-amd-amdhsa -mcpu=<gfx> -o new.co kernel.s
+
+produces a code object that hipModuleLoad accepts directly, and whose .text,
+kernel descriptor and metadata are byte-identical to the input (see the guide
+for the known exceptions).  Because the kernel descriptor is now source, you can
+change register counts / LDS size / code size freely.
 
 Usage:
-  # Step 1: Disassemble a .co file
-  /opt/rocm/llvm/bin/llvm-objdump -d --mcpu=gfx942 kernel.co > kernel.isa
+  python3 extract_asm.py kernel.co                      # auto-detects --mcpu
+  python3 extract_asm.py kernel.co --mcpu gfx942 -o kernel.s
+  python3 extract_asm.py kernel.co --list               # list kernels and labels
+  python3 extract_asm.py kernel.co --text-only          # .text only (objcopy flow)
 
-  # Step 2: Find the kernel symbol
-  grep "^[0-9a-f]" kernel.isa | head -1
-  # Example: 0000000000001000 <_ZN5aiter...E>:
+Notes on the llvm-objdump format for AMDGPU (it differs from x86):
 
-  # Step 3: Extract reassemblable .s
-  python3 extract_asm.py kernel.isa _ZN5aiter...E > kernel.s
+    0000000000002200 <_ZN5aiter...E>:
+    <TAB>s_load_dwordx2 s[8:9], s[0:1], 0x0        // 000000002208: C0060200 00000000
+    <TAB>s_cbranch_scc1 label_0CF5                 // 000000002B54: BF850A9F
+    <blank line>
+    0000000000002b60 <label_0258>:
 
-  # Step 4: Recompile
-  /opt/rocm/llvm/bin/clang++ -x assembler -target amdgcn-amd-amdhsa \\
-      -mcpu=gfx942 -o kernel_recompiled.co kernel.s
+i.e. the instruction comes first and address/encoding are a trailing comment,
+so stripping the comment already yields assembler input.  `label_XXXX` are
+ordinary local symbols present in the .co's .symtab; several names can alias
+one address and objdump prints only one of them as a header, which is why the
+labels are taken from the symbol table instead.
 """
 
 import argparse
+import os
 import re
+import subprocess
 import sys
+from collections import defaultdict
+
+# e_flags & 0xff -> gfx name, for toolchains whose llvm-readobj does not decode it
+EF_AMDGPU_MACH = {0x3F: "gfx90a", 0x40: "gfx940", 0x4C: "gfx942", 0x4F: "gfx950"}
+
+# Highest SGPR count .amdhsa_next_free_sgpr accepts on GFX9; the assembler adds the
+# implicitly reserved VCC / FLAT_SCRATCH / XNACK_MASK registers on top of it.
+GFX9_MAX_USER_SGPRS = 102
 
 
-def extract(isa_path: str, kernel_symbol: str, target: str) -> str:
-    """Parse llvm-objdump output and emit a reassemblable .s file."""
-    with open(isa_path) as f:
-        lines = f.readlines()
+def default_llvm_bin() -> str:
+    return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "llvm", "bin")
 
-    # Find kernel section
-    section_start = None
-    for i, line in enumerate(lines):
-        if f"<{kernel_symbol}>:" in line:
-            section_start = i
-            break
-    if section_start is None:
-        print(
-            f"Error: kernel symbol '{kernel_symbol}' not found in {isa_path}",
-            file=sys.stderr,
-        )
-        # List available symbols
-        symbols = []
-        for line in lines:
-            m = re.match(r"[0-9a-fA-F]+ <(.+)>:", line)
-            if m:
-                symbols.append(m.group(1))
-        if symbols:
-            print("Available symbols:", file=sys.stderr)
-            for s in symbols:
-                print(f"  {s}", file=sys.stderr)
-        sys.exit(1)
 
-    # Parse base address from first instruction
-    first_instr_line = lines[section_start + 1].strip()
-    base_addr = int(first_instr_line.split(":")[0].strip(), 16)
+class Tools:
+    def __init__(self, llvm_bin: str):
+        self.bin = llvm_bin
 
-    # Collect instructions
-    instructions = []
-    for line in lines[section_start + 1 :]:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("Disassembly"):
-            break
-        # Match: "  addr: hex_bytes  instruction"
-        m = re.match(r"\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]+\s+)+(.+)", stripped)
+    def run(self, tool: str, *args: str) -> str:
+        exe = os.path.join(self.bin, tool)
+        if not os.path.exists(exe):
+            sys.exit(f"error: {exe} not found (set ROCM_PATH or pass --llvm-bin)")
+        res = subprocess.run([exe, *args], capture_output=True, text=True)
+        if res.returncode != 0:
+            sys.exit(f"error: {tool} {' '.join(args)} failed:\n{res.stderr}")
+        return res.stdout
+
+
+def detect_mcpu(tools: Tools, co: str) -> str:
+    hdr = tools.run("llvm-readobj", "--file-header", co)
+    m = re.search(r"EF_AMDGPU_MACH_AMDGCN_(\w+)\s", hdr)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r"^\s*Flags:\s*0x([0-9A-Fa-f]+)", hdr, re.M)
+    if m and (int(m.group(1), 16) & 0xFF) in EF_AMDGPU_MACH:
+        return EF_AMDGPU_MACH[int(m.group(1), 16) & 0xFF]
+    sys.exit("error: could not detect the GPU architecture, pass --mcpu")
+
+
+def read_symbols(tools: Tools, co: str):
+    """Return ([kernel entry symbols], {addr: [label, ...]}) for the .text section."""
+    text_ndx = None
+    for line in tools.run("llvm-readelf", "-SW", co).splitlines():
+        m = re.search(r"\[\s*(\d+)\]\s+\.text\s", line)
         if m:
-            addr = int(m.group(1), 16)
-            instr = m.group(2).strip()
-            # Remove trailing hex comments (e.g., "// 000000001234")
-            instr = re.sub(r"\s*//\s*[0-9A-Fa-f]+$", "", instr)
-            instructions.append((addr, instr))
+            text_ndx = m.group(1)
+    if text_ndx is None:
+        sys.exit("error: no .text section")
 
-    if not instructions:
-        print(f"Error: no instructions found for '{kernel_symbol}'", file=sys.stderr)
-        sys.exit(1)
+    kernels, labels, seen = [], defaultdict(list), set()
+    for line in tools.run("llvm-readelf", "-sW", co).splitlines():
+        f = line.split()
+        # Num: Value Size Type Bind Vis Ndx Name
+        if len(f) < 8 or not f[0].endswith(":") or f[6] != text_ndx:
+            continue
+        addr, typ, name = int(f[1], 16), f[3], f[7]
+        if (addr, name) in seen:  # .dynsym and .symtab both list the kernel
+            continue
+        seen.add((addr, name))
+        if typ == "FUNC":
+            kernels.append((addr, name))
+        elif typ == "NOTYPE":
+            labels[addr].append(name)
+    kernels.sort()
+    return kernels, labels
 
-    # Resolve branch labels (word offset: label_val * 4 + base_addr)
-    branch_targets = {}
-    for addr, instr in instructions:
-        m = re.search(r"label_([0-9A-Fa-f]+)", instr)
+
+def extract_text(tools: Tools, co: str, mcpu: str, kernel: str, labels) -> list:
+    """Instructions of `kernel` as assembler source lines, labels included."""
+    out, in_kernel, count = [], False, 0
+    dis = tools.run("llvm-objdump", "-d", f"--mcpu={mcpu}", co)
+    for line in dis.splitlines():
+        m = re.match(r"^([0-9a-fA-F]+) <(.+)>:$", line)
         if m:
-            label_val = int(m.group(1), 16)
-            target_addr = base_addr + label_val * 4
-            branch_targets[target_addr] = f"label_{m.group(1)}"
-
-    # Emit .s file
-    output = []
-    output.append(f'  .amdgcn_target "{target}"')
-    output.append(f"  .globl {kernel_symbol}")
-    output.append(f"  .type {kernel_symbol}, @function")
-    output.append(f"{kernel_symbol}:")
-
-    for addr, instr in instructions:
-        if addr in branch_targets:
-            output.append(f"{branch_targets[addr]}:")
-        output.append(f"  {instr}")
-
-    output.append(f"  .size {kernel_symbol}, .-{kernel_symbol}")
-
-    # Summary stats
-    n_mfma = sum(1 for _, i in instructions if "v_mfma_" in i)
-    n_buf = sum(1 for _, i in instructions if "buffer_load" in i)
-    n_lds = sum(1 for _, i in instructions if i.startswith("ds_"))
-    n_branch = len(branch_targets)
+            addr, name = int(m.group(1), 16), m.group(2)
+            if name == kernel:
+                in_kernel = True
+                out.append(f"{kernel}:")
+            elif in_kernel and name not in labels.get(addr, []):
+                break  # next kernel of a multi-kernel .co
+            if in_kernel:
+                out.extend(f"{lab}:" for lab in labels.get(addr, []))
+            continue
+        if in_kernel and line.startswith("\t") and "//" in line:
+            instr = line.split("//", 1)[0].rstrip()
+            if instr.lstrip().startswith((".long", ".byte")):
+                print(
+                    f"warning: undecodable bytes kept as data: {instr.strip()} "
+                    f"(wrong --mcpu?)",
+                    file=sys.stderr,
+                )
+            out.append(instr)
+            count += 1
+    if not count:
+        sys.exit(f"error: no instructions found for {kernel}")
     print(
-        f"Extracted {len(instructions)} instructions "
-        f"(MFMA={n_mfma}, buf_load={n_buf}, LDS={n_lds}, branches={n_branch})",
+        f"{kernel}: {count} instructions, "
+        f"{sum(len(v) for v in labels.values())} labels",
         file=sys.stderr,
     )
+    return out
 
-    return "\n".join(output)
+
+def extract_kernel_descriptor(tools: Tools, co: str, mcpu: str, kernel: str) -> list:
+    """The kernel descriptor (.rodata, <kernel>.kd) as an .amdhsa_kernel block."""
+    dis = tools.run("llvm-objdump", "-D", "-j", ".rodata", f"--mcpu={mcpu}", co)
+    m = re.search(
+        rf"^\.amdhsa_kernel {re.escape(kernel)}\n.*?^\.end_amdhsa_kernel$",
+        dis,
+        re.S | re.M,
+    )
+    if not m:
+        sys.exit(
+            f"error: could not decode the kernel descriptor {kernel}.kd "
+            f"(needs llvm-objdump >= 12)"
+        )
+    block = m.group(0).splitlines()
+
+    fixed = []
+    for line in block:
+        d = line.split()
+        if not d:
+            continue
+        if d[0] == ".amdhsa_reserve_xnack_mask":
+            # Must match the target-id's xnack setting; with the plain "gfxNNN"
+            # target (xnack "any", which is what AITER ships) the directive is
+            # rejected, and omitting it reproduces the original descriptor.
+            continue
+        if d[0] == ".amdhsa_next_free_sgpr":
+            # The disassembler prints the *granulated total* ((field+1)*8, which
+            # includes the implicitly reserved VCC/FLAT_SCRATCH/XNACK SGPRs) and
+            # sets .amdhsa_reserve_vcc 0.  The assembler rejects totals > 102, so
+            # re-express it as a user SGPR count with the default reservations;
+            # this encodes to the same GRANULATED_WAVEFRONT_SGPR_COUNT.
+            total = int(d[1])
+            user = min(max(total - 8, 0), GFX9_MAX_USER_SGPRS)
+            fixed.append(
+                f"\t.amdhsa_next_free_sgpr {user}"
+                f"\t\t// descriptor encodes {total} SGPRs incl. "
+                f"VCC/FLAT_SCRATCH/XNACK_MASK"
+            )
+            continue
+        if d[0] == ".amdhsa_reserve_vcc":
+            fixed.append("\t.amdhsa_reserve_vcc 1")
+            continue
+        fixed.append(line)
+    return ["\t.rodata", "\t.p2align 6"] + fixed
 
 
-def list_symbols(isa_path: str) -> list[str]:
-    """List all kernel symbols in an llvm-objdump output file."""
-    symbols = []
-    with open(isa_path) as f:
-        for line in f:
-            m = re.match(r"[0-9a-fA-F]+ <(.+)>:", line)
-            if m:
-                symbols.append(m.group(1))
-    return symbols
+def extract_metadata(tools: Tools, co: str) -> list:
+    """The NT_AMDGPU_METADATA note as an .amdgpu_metadata YAML block."""
+    notes = tools.run("llvm-readelf", "--notes", co)
+    m = re.search(r"^\s*---\n(.*?)^\.\.\.$", notes, re.S | re.M)
+    if not m:
+        sys.exit("error: no AMDGPU metadata note found")
+    return [
+        "\t.amdgpu_metadata",
+        "---",
+        m.group(1).rstrip("\n"),
+        "...",
+        "\t.end_amdgpu_metadata",
+    ]
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Extract reassemblable .s from llvm-objdump output"
+    ap = argparse.ArgumentParser(
+        description="Rebuild a reassemblable .s from an AMDGPU kernel object (.co)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("isa_file", help="llvm-objdump -d output file")
-    parser.add_argument(
-        "kernel_symbol",
-        nargs="?",
-        help="Kernel symbol name (omit to list available symbols)",
+    ap.add_argument("co", help="kernel object (.co / .hsaco)")
+    ap.add_argument("--mcpu", help="GPU architecture, e.g. gfx942 (default: from ELF)")
+    ap.add_argument("--symbol", help="kernel to extract (default: the first one)")
+    ap.add_argument(
+        "--llvm-bin",
+        default=default_llvm_bin(),
+        help=f"directory with llvm-objdump etc. (default: {default_llvm_bin()})",
     )
-    parser.add_argument(
-        "--target",
-        default="amdgcn-amd-amdhsa--gfx942",
-        help="AMDGCN target triple (default: amdgcn-amd-amdhsa--gfx942)",
+    ap.add_argument(
+        "--text-only",
+        action="store_true",
+        help="emit only .text (for the llvm-objcopy --update-section flow)",
     )
-    parser.add_argument("-o", "--output", help="Output .s file (default: stdout)")
-    args = parser.parse_args()
+    ap.add_argument(
+        "--list", action="store_true", help="list kernels and labels, then exit"
+    )
+    ap.add_argument("-o", "--output", help="output .s file (default: stdout)")
+    args = ap.parse_args()
 
-    if not args.kernel_symbol:
-        symbols = list_symbols(args.isa_file)
-        print("Available kernel symbols:")
-        for s in symbols:
-            print(f"  {s}")
+    tools = Tools(args.llvm_bin)
+    mcpu = args.mcpu or detect_mcpu(tools, args.co)
+    kernels, labels = read_symbols(tools, args.co)
+    if not kernels:
+        sys.exit("error: no kernel (FUNC) symbols in .text")
+
+    if args.list:
+        print(f"arch: {mcpu}")
+        for addr, name in kernels:
+            print(f"kernel 0x{addr:x} {name}")
+        for addr in sorted(labels):
+            print(f"label  0x{addr:x} {' = '.join(labels[addr])}")
         return
 
-    result = extract(args.isa_file, args.kernel_symbol, args.target)
+    names = [n for _, n in kernels]
+    kernel = args.symbol or names[0]
+    if kernel not in names:
+        sys.exit(f"error: kernel {kernel} not found; available: {', '.join(names)}")
+    if len(names) > 1:
+        print(
+            f"note: {args.co} contains {len(names)} kernels, extracting {kernel}",
+            file=sys.stderr,
+        )
 
+    out = [
+        f'\t.amdgcn_target "amdgcn-amd-amdhsa--{mcpu}"',
+        "\t.text",
+        f"\t.globl {kernel}",
+        "\t.p2align 8",
+        f"\t.type {kernel},@function",
+    ]
+    out += extract_text(tools, args.co, mcpu, kernel, labels)
+    out.append(f"\t.size {kernel}, .-{kernel}")
+    if not args.text_only:
+        out += [""] + extract_kernel_descriptor(tools, args.co, mcpu, kernel)
+        out += [""] + extract_metadata(tools, args.co)
+
+    text = "\n".join(out) + "\n"
     if args.output:
         with open(args.output, "w") as f:
-            f.write(result + "\n")
-        print(f"Written to {args.output}", file=sys.stderr)
+            f.write(text)
+        print(f"written to {args.output}", file=sys.stderr)
     else:
-        print(result)
+        sys.stdout.write(text)
 
 
 if __name__ == "__main__":
