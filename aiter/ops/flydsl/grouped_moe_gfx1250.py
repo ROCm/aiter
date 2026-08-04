@@ -1049,11 +1049,46 @@ def _get_compiled_gather_reduce(
     )
 
 
+@functools.cache
+def _get_compiled_gather_reduce_wave(
+    model_dim: int,
+    topk: int,
+    out_dtype: str,
+    split_k: int = 1,
+    w_dtype: str = "f32",
+):
+    """Compile and cache the wave-per-row MoE gather-reduce kernel."""
+    from aiter.ops.flydsl.kernels.moe_gather_reduce import (
+        build_moe_gather_reduce_wave_module,
+    )
+
+    return build_moe_gather_reduce_wave_module(
+        model_dim, topk, out_dtype, split_k, w_dtype
+    )
+
+
 def _choose_gather_reduce_vec(token_num: int, model_dim: int) -> int:
     """Prefer CTA parallelism first; use wider vec only once CTA count is ample."""
     out_dwords = int(model_dim) // 2
     n_iters_v4 = (out_dwords + 256 * 4 - 1) // (256 * 4)
     return 4 if int(token_num) * n_iters_v4 >= 256 else 2
+
+
+# Token count at or above which the epilogue switches to one wave per output row.
+# The wave-per-row kernel amortises the per-token prologue (route-index loads,
+# route-weight loads, source descriptors) over a whole row instead of over one
+# BLOCK_THREADS*vec slice of it, but produces only `token_num` waves -- so it
+# needs enough rows to fill the machine before it wins. Override to retune
+# without a rebuild; 0 disables the wave path entirely.
+AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS = int(
+    os.environ.get("AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS", "1024")
+)
+
+
+def _use_gather_reduce_wave(token_num: int) -> bool:
+    """One wave per row once there are enough rows to keep the machine busy."""
+    min_tokens = AITER_FLYDSL_GATHER_REDUCE_WAVE_MIN_TOKENS
+    return min_tokens > 0 and int(token_num) >= min_tokens
 
 
 @functools.cache
@@ -1284,10 +1319,15 @@ def flydsl_moe_gather_reduce(
             (token_num, model_dim), dtype=grouped_out.dtype, device=device
         )
 
-    gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
-    launch = _get_compiled_gather_reduce(
-        model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
-    )
+    if _use_gather_reduce_wave(token_num):
+        launch = _get_compiled_gather_reduce_wave(
+            model_dim, topk, out_dtype, split_k, w_dtype
+        )
+    else:
+        gather_vec = _choose_gather_reduce_vec(token_num, model_dim)
+        launch = _get_compiled_gather_reduce(
+            model_dim, topk, out_dtype, split_k, gather_vec, w_dtype
+        )
     slice_stride_dw = E * max_m * (model_dim // 2)
     # Skip dead-tail output tokens whose route map is unwritten. Default (no
     # truncation) processes every token.

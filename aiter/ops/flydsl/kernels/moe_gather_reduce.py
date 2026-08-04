@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""One-pass MoE gather-reduce (weighted) epilogue kernel (FlyDSL).
+"""One-pass MoE gather-reduce (weighted) epilogue kernels (FlyDSL).
 
 Background
 ----------
@@ -38,13 +38,17 @@ per-lane scalar tail (mirroring ``compile_moe_reduction`` in
 ``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
 slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
 nothing and need no branch.
+
+``build_moe_gather_reduce_wave_module`` is the wave-per-row variant: one wave
+owns a whole row and lanes stride it a dword at a time, so the per-token
+prologue is paid once per row instead of once per slice.
 """
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, ptrtoint, range_constexpr
+from flydsl.expr import arith, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
@@ -56,6 +60,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 BLOCK_THREADS = 256
+WAVE_SIZE = 32  # gfx1250 runs wave32
+WAVES_PER_BLOCK = BLOCK_THREADS // WAVE_SIZE  # rows resolved per block, wave-per-row
 
 
 def _unpack_pair_to_f32(raw_dw, out_dtype):
@@ -332,3 +338,186 @@ def build_moe_gather_reduce_module(
         },
     }
     return launch_moe_gather_reduce
+
+
+def build_moe_gather_reduce_wave_module(
+    model_dim: int,
+    topk: int,
+    out_dtype: str = "bf16",
+    split_k: int = 1,
+    w_dtype: str = "f32",
+):
+    """Return a JIT launcher for the wave-per-row MoE gather-reduce epilogue.
+
+    Parameters are the same as ``build_moe_gather_reduce_module`` minus
+    ``vec_dwords``: each lane handles one dword per step and strides by
+    ``WAVE_SIZE``, so any even ``model_dim`` is supported.
+    """
+    assert model_dim % 2 == 0, "model_dim must be even (2 elems per dword)"
+    assert out_dtype in ("bf16", "f16")
+    assert w_dtype in ("f32", "bf16", "f16")
+
+    out_dwords = model_dim // 2
+    n_steps = (out_dwords + WAVE_SIZE - 1) // WAVE_SIZE
+    needs_tail = out_dwords % WAVE_SIZE != 0
+
+    module_name = format_kernel_name(
+        f"moe_gather_reduce_wave_{out_dtype}_d{model_dim}_tk{topk}_sk{split_k}"
+        f"_w{w_dtype}"
+    )
+
+    @flyc.kernel(name=module_name)
+    def moe_gather_reduce_wave_kernel(
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
+        num_tokens: Int32,
+        slice_stride_dw: Int32,
+        num_valid_tokens: fx.Pointer,
+    ):
+        i32 = T.i32
+        w_dt = T.f32 if w_dtype == "f32" else (T.bf16 if w_dtype == "bf16" else T.f16)
+        w_dt_fx = (
+            fx.Float32
+            if w_dtype == "f32"
+            else (fx.BFloat16 if w_dtype == "bf16" else fx.Float16)
+        )
+
+        tid_i32 = fx.Int32(fx.thread_idx.x)
+        lane = fx.Uint32(tid_i32 % fx.Int32(WAVE_SIZE))
+        # readfirstlane makes the row wave-uniform to the backend, which is what
+        # keeps the descriptors built from it in SGPRs instead of a waterfall.
+        wave_id = fx.Uint32(rocdl.readfirstlane(i32, tid_i32 // fx.Int32(WAVE_SIZE)))
+
+        out_dwords_i32 = fx.Uint32(out_dwords)
+        topk_i32 = fx.Uint32(topk)
+        num_tokens_i32 = fx.Uint32(num_tokens)
+        slice_stride_dw_i32 = fx.Uint32(slice_stride_dw)
+
+        token = fx.Uint32(fx.block_idx.x) * WAVES_PER_BLOCK + wave_id
+
+        # The grid rounds up to whole blocks, so the last block carries waves
+        # past num_tokens.
+        tok_in_grid = token < num_tokens_i32
+        if tok_in_grid:
+            num_valid_tokens_is_set = fx.Int64(ptrtoint(num_valid_tokens)) != 0
+            valid_token_count = num_tokens_i32
+            if num_valid_tokens_is_set:
+                valid_token_count = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_tokens), fx.Uint32(0), vec_width=1, dtype=i32
+                    )
+                )
+            tok_valid = token < valid_token_count
+            if tok_valid:
+                rows_rsrc = ptr_rsrc(topids_to_rows)
+                w_rsrc = ptr_rsrc(gather_w)
+                out_rsrc = ptr_rsrc(out)
+                in_base_i64 = fx.Uint64(ptrtoint(grouped_out_flat))
+                slice_stride_by_i64 = fx.Uint64(slice_stride_dw_i32) * 4
+
+                def src_row_rsrc(row_i32, sk):
+                    base = in_base_i64 + fx.Uint64(row_i32) * (model_dim * 2)
+                    if sk != 0:
+                        base = base + sk * slice_stride_by_i64
+                    return buffer_ops.create_buffer_resource_from_addr(
+                        base, num_records_bytes=model_dim * 2
+                    )
+
+                map_base = token * topk_i32
+                out_row_dw_base = token * out_dwords_i32
+
+                def _load_row_weight(k):
+                    map_off = map_base + k
+                    # Scalar load: map_off is wave-uniform, and landing the row
+                    # in an SGPR is what makes src_row_rsrc uniform. A vector
+                    # load here costs a readfirstlane waterfall per payload load.
+                    row_i32 = fx.Uint32(
+                        buffer_ops.buffer_load(
+                            rows_rsrc, map_off, vec_width=1, is_scalar=True
+                        )
+                    )
+                    w_loaded = buffer_ops.buffer_load(
+                        w_rsrc, map_off, vec_width=1, dtype=w_dt
+                    )
+                    return row_i32, w_dt_fx(w_loaded).to(fx.Float32)
+
+                row_weights = [_load_row_weight(k) for k in range(topk)]
+                # Built before the column loop so all topk*split_k descriptors
+                # stay live and get an SGPR quad each.
+                src_rsrcs = [
+                    [src_row_rsrc(row_weights[k][0], sk) for sk in range(split_k)]
+                    for k in range(topk)
+                ]
+
+                def _reduce_dword(dw):
+                    acc_lo = fx.Float32(0.0)
+                    acc_hi = fx.Float32(0.0)
+                    for k in range_constexpr(topk):
+                        w_f32 = row_weights[k][1]
+                        red_lo = fx.Float32(0.0)
+                        red_hi = fx.Float32(0.0)
+                        for sk in range_constexpr(split_k):
+                            raw_dw = fx.Uint32(
+                                buffer_ops.buffer_load(
+                                    src_rsrcs[k][sk], dw, vec_width=1, dtype=i32
+                                )
+                            )
+                            lo_f32, hi_f32 = _unpack_pair_to_f32(raw_dw, out_dtype)
+                            red_lo = red_lo + lo_f32
+                            red_hi = red_hi + hi_f32
+                        acc_lo = acc_lo + w_f32 * red_lo
+                        acc_hi = acc_hi + w_f32 * red_hi
+                    packed = _pack_pair_from_f32(acc_lo, acc_hi, out_dtype)
+                    buffer_ops.buffer_store(packed, out_rsrc, out_row_dw_base + dw)
+
+                # A real scf.for, not range_constexpr: unrolling would emit
+                # n_steps * topk payload loads and sink the descriptors.
+                for step in range(fx.Int32(0), fx.Int32(n_steps), fx.Int32(1)):
+                    dw = lane + fx.Uint32(step) * WAVE_SIZE
+                    if needs_tail:
+                        dw_valid = dw < out_dwords_i32
+                        if dw_valid:
+                            _reduce_dword(dw)
+                    else:
+                        _reduce_dword(dw)
+
+    @flyc.jit
+    def launch_moe_gather_reduce_wave(
+        grouped_out_flat: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        gather_w: fx.Pointer,
+        out: fx.Pointer,
+        num_tokens: fx.Int32,
+        slice_stride_dw: fx.Int32,
+        num_valid_tokens: fx.Pointer,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            pass
+
+        n_blocks = (num_tokens + (WAVES_PER_BLOCK - 1)) // WAVES_PER_BLOCK
+        launcher = moe_gather_reduce_wave_kernel(
+            grouped_out_flat,
+            topids_to_rows,
+            gather_w,
+            out,
+            num_tokens,
+            slice_stride_dw,
+            num_valid_tokens,
+        )
+        launcher.launch(
+            grid=(n_blocks, 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_moe_gather_reduce_wave.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_moe_gather_reduce_wave
