@@ -1,11 +1,11 @@
 """Regression tests for the explicit `is_shuffled` layout argument.
 
 shuffle_weight() records the preshuffled MFMA layout in a plain `is_shuffled`
-attribute on the tensor it returns. That attribute is not tensor metadata, so
-clone(), to(), detach(), slicing, view() and nn.Parameter() all drop it. The
-kernels then read the weights back with the wrong layout and silently produce
-garbage. `is_shuffled` lets a caller state the layout when the tensor can no
-longer carry it.
+attribute on the Python tensor object. PyTorch does not manage or propagate that
+attribute, so clone(), to(), detach(), slicing, view() and nn.Parameter() all
+drop it. The kernels then read the weights back with the wrong layout and
+silently produce garbage. `is_shuffled` lets a caller state the layout when the
+tensor can no longer carry it.
 """
 
 import torch

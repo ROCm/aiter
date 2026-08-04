@@ -284,9 +284,9 @@ def test_fmoe(
         exp_bias2_aiter = exp_bias2 = None
 
     # pre-shuffle. shuffle_weight() marks its result with an `is_shuffled`
-    # attribute, but that is not tensor metadata: the packing/view chains below
-    # and run_perftest's deepcopy-based arg rotation both drop it. Track the
-    # layout here and hand it to fused_moe explicitly.
+    # attribute on that Python object; PyTorch does not propagate it through the
+    # packing/view chains below. Track the layout here and hand it to fused_moe
+    # explicitly.
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
     is_shuffled_aiter = False

@@ -441,11 +441,16 @@ def get_inter_dim(w1_shape, w2_shape):
 def _resolve_is_shuffled(w1, w2, is_shuffled: bool | None) -> bool:
     """Whether w1/w2 are in the preshuffled MFMA layout.
 
-    shuffle_weight() marks its result by setting an `is_shuffled` attribute on
-    the returned tensor. That attribute is not part of the tensor metadata, so
-    clone(), contiguous(), to(), detach() and nn.Parameter() all drop it and the
-    weights are then read back with the wrong layout. Callers that copy or wrap
-    their weights must pass `is_shuffled` explicitly.
+    Only that one question: which preshuffled layout is already pinned down by
+    the other dispatch keys, so `q_dtype_w` covers the int4 packing and
+    `gate_mode` the gate-up interleaving. The caller owes us a shuffle
+    consistent with those keys.
+
+    shuffle_weight() answers the question by setting an `is_shuffled` attribute
+    on the tensor it returns. It is only attached to that Python object, not
+    managed or propagated by PyTorch's TensorImpl or dispatcher, so clone(),
+    to(), detach(), view() and nn.Parameter() all drop it. Callers that copy or
+    wrap their weights have to pass `is_shuffled` instead.
     """
     if is_shuffled is not None:
         return bool(is_shuffled)
