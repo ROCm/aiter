@@ -45,7 +45,8 @@ def deserialize_str(s: str) -> dict:
 
 
 def strip_annotate(cls):
-    """Neutralize '__annotate__' so Triton's aggregate hash walker skips it.
+    """
+    Neutralize '__annotate__' so Triton's aggregate hash walker skips it.
 
     Triton's '@aggregate' builds 'hash_attrs' from 'inspect.getmembers'.
     On Python 3.14 (PEP 649) that yields the compiler-generated annotate
