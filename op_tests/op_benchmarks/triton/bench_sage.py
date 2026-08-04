@@ -470,6 +470,82 @@ def generate_test_tensors(
         )
         return q.to(dtype), k.to(dtype), v.to(dtype)
 
+    if distribution == "maxstair":
+        # Frozen-max rollback stress: make every 128-token KV tile establish a new row max, with
+        # alternating 128-query-row groups above and below the rollback threshold. This keeps
+        # freeze-max active for half the rows while stressing rollback in the other half.
+        # Build in the post-Hadamard domain so MXFP6 quantization preserves each tile step.
+        #
+        # Tunables (env):
+        #   AITER_MAXSTAIR_STEP       score increase in kernel log2 units per KV tile
+        #                              (default 12.0; rollback threshold is about 8.87).
+        #   AITER_MAXSTAIR_LOW_FACTOR alternate 128-query-row groups between factors 1 and this
+        #                              value (default 0.5: half the rows roll back). Set 1.0 for
+        #                              the less representative every-row/every-tile rollback mode.
+        #                              Values below ~0.74 with the default step keep low groups
+        #                              below the threshold and stress paired-wave disagreement.
+        step = float(os.environ.get("AITER_MAXSTAIR_STEP", "12.0"))
+        low_factor = float(os.environ.get("AITER_MAXSTAIR_LOW_FACTOR", "0.5"))
+        if step <= 0:
+            raise ValueError(f"AITER_MAXSTAIR_STEP must be positive, got {step}")
+        if not 0 < low_factor <= 1:
+            raise ValueError(
+                f"AITER_MAXSTAIR_LOW_FACTOR must be in (0, 1], got {low_factor}"
+            )
+        tile_size = 128
+        num_tiles = (sk + tile_size - 1) // tile_size
+        if sk % tile_size != 0:
+            raise ValueError(
+                f"maxstair requires sk divisible by {tile_size}, got {sk}"
+            )
+
+        anchor_mask = torch.arange(d_head, device=device) % 32 == 31
+        score_dims = (~anchor_mask).nonzero().flatten()
+        max_tiles = score_dims.numel() * 5 + 1
+        if num_tiles > max_tiles:
+            raise ValueError(
+                f"maxstair supports at most {max_tiles} KV tiles, got {num_tiles}"
+            )
+
+        tile_index = torch.arange(sk, device=device) // tile_size
+        state = torch.clamp(
+            (
+                tile_index[:, None]
+                + score_dims.numel()
+                - 1
+                - torch.arange(score_dims.numel(), device=device)[None, :]
+            )
+            // score_dims.numel(),
+            min=0,
+        ).to(torch.float32)
+        k_rotated = torch.zeros((sk, d_head), device=device, dtype=torch.float32)
+        k_rotated[:, score_dims] = state
+        k_rotated[:, anchor_mask] = 7.0
+        token_sign = 1.0 - 2.0 * (torch.arange(sk, device=device) & 1).float()
+        k_rotated = k_rotated * token_sign[:, None]
+
+        query_group = torch.arange(sq, device=device) // tile_size
+        query_factor = torch.where(
+            (query_group & 1) == 0,
+            torch.ones_like(query_group, dtype=torch.float32),
+            torch.full_like(query_group, low_factor, dtype=torch.float32),
+        )
+        q_rotated = torch.zeros((sq, d_head), device=device, dtype=torch.float32)
+        q_rotated[:, score_dims] = step * query_factor[:, None]
+
+        rotation = create_hadamard_matrix(
+            d_head, device=device, dtype=torch.float32
+        ) / (d_head**0.5)
+        q_scale_log2 = (d_head**-0.5) * 1.4426950408889634
+        q_base = torch.matmul(q_rotated, rotation) / q_scale_log2
+        k_base = torch.matmul(k_rotated, rotation)
+        q = q_base.view(1, 1, sq, d_head).expand(batch, hq, -1, -1).clone()
+        k = k_base.view(1, 1, sk, d_head).expand(batch, hk, -1, -1).clone()
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
     if distribution != "transformer":
         raise ValueError(f"Unsupported input distribution: {distribution}")
 
@@ -2279,11 +2355,13 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=str,
         default="transformer",
-        choices=["normal", "transformer", "sink", "underflow", "latesink"],
+        choices=["normal", "transformer", "sink", "underflow", "latesink", "maxstair"],
         help=(
             "Distribution used for generated Q/K/V tensors. 'sink' is a realistic "
             "StreamingLLM attention sink pattern; 'underflow'/'latesink' are "
-            "adversarial fp8 tile-skip / frozen-max rollback regression tripwires."
+            "adversarial fp8 tile-skip / frozen-max rollback regression tripwires; "
+            "'maxstair' raises the max every KV tile and triggers rollback for alternating "
+            "query-row groups."
         ),
     )
     parser.add_argument(

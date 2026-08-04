@@ -405,7 +405,7 @@ void rotate_activation_mxfp6_quant(aiter_tensor_t& out,
                 reinterpret_cast<uint8_t*>(scale.data_ptr()),
                 reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
                 m,
-                input.stride(-2),
+                dim,
                 multiplier);
     });
 }
@@ -528,7 +528,7 @@ void rotate_activation_mxfp4_quant(aiter_tensor_t& out,
                 reinterpret_cast<uint8_t*>(scale.data_ptr()),
                 reinterpret_cast<DTYPE_I const*>(input.data_ptr()),
                 m,
-                input.stride(-2),
+                dim,
                 multiplier);
     });
 }
