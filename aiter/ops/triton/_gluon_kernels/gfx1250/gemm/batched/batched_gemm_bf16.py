@@ -494,7 +494,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
     num_k_tiles = gl.cdiv(k_span, BLOCK_K)
 
     # TDM prologue: fill the pipeline
-    for _ in gl.static_range(NUM_BUFFERS):
+    for _ in gl.static_range(NUM_BUFFERS - 1):
         gl.amd.gfx1250.tdm.async_load(
             a_desc, [0, 0], a_buffer.index(load_idx % NUM_BUFFERS)
         )
@@ -523,7 +523,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
         load_idx += 1
 
     # Register pre-load prologue
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     if LAYOUT[0] == "T":
         cur_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -573,7 +573,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
             b_desc, add_offsets=[0, BLOCK_K]
         )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     load_idx += 1
 
@@ -602,7 +602,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
     compute_idx += 1
 
     # Remaining main-loop iterations
-    for _ in range(num_k_tiles - NUM_BUFFERS - 2):
+    for _ in range(num_k_tiles - NUM_BUFFERS - 1):
         accumulator = gl.amd.gfx1250.wmma(cur_a, cur_b, accumulator)
 
         gl.amd.gfx1250.tdm.async_load(
@@ -630,7 +630,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
                 b_desc, add_offsets=[0, BLOCK_K]
             )
 
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
         load_idx += 1
 
@@ -687,7 +687,7 @@ def _batched_gemm_bf16_compute_bound_kernel(
         b_desc, [0, 0], b_buffer.index(load_idx % NUM_BUFFERS)
     )
 
-    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * 2)
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
     load_idx += 1
 
@@ -716,8 +716,8 @@ def _batched_gemm_bf16_compute_bound_kernel(
     compute_idx += 1
 
     # Epilogue: drain remaining tiles
-    for i in gl.static_range(NUM_BUFFERS - 1):
-        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2 - i) * 2)
+    for i in gl.static_range(NUM_BUFFERS - 2):
+        gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
 
         if LAYOUT[0] == "T":
             next_a = gl.amd.cdna4.async_copy.load_shared_relaxed(
