@@ -165,6 +165,13 @@ def _select_mxfp4_a4w4_kernels(*, token: int, expert: int, topk: int) -> dict:
     return {**selected, "kernelName2": g2}
 
 
+_FLYDSL_V2_GEMM2_RE = re.compile(
+    r"^flydsl_moe2_layout_a(?P<a>\w+?)_w(?P<b>\w+?)_(?P<out>\w+?)_"
+    r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
+    r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
+)
+
+
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
     kname = (kname or "").replace("_FLYDSL", "")
     mode = {}
@@ -272,3 +279,48 @@ def _is_mxfp4_kname(kname) -> bool:
     # CSV tune files leave kernelName empty for 1-stage configs; pandas loads
     # those cells as float('nan'), and bool(nan) is True, so guard on str type.
     return isinstance(kname, str) and kname.startswith("flydsl_mxmoe_g")
+
+
+def parse_flydsl_v2_gemm2_kernel(name):
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
+    if not m:
+        return None
+    return {
+        "a_dtype": m.group("a"),
+        "b_dtype": m.group("b"),
+        "out_dtype": m.group("out"),
+        "tile_m": int(m.group("tm")),
+        "tile_n": int(m.group("tn")),
+        "tile_k": int(m.group("tk")),
+        "epilog": m.group("epilog"),
+        "persist": bool(m.group("persist")),
+        "use_nt": bool(m.group("nt")),
+        "sort_block_m": int(m.group("sbm")) if m.group("sbm") else 0,
+    }
+
+
+def parse_g2_kname_any(kname) -> dict:
+    """Parse either gemm2 name family into the fields the stage2 dispatch needs.
+
+    ``v2`` tells path B (flydsl_moe2_layout gemm2 behind the mxmoe front-end)
+    apart from the native mxmoe gemm2; the other keys mean the same for both.
+    """
+    v2 = parse_flydsl_v2_gemm2_kernel(kname)
+    if v2 is not None:
+        return {
+            "v2": True,
+            "BM": v2["tile_m"],
+            "atomic": v2["epilog"] == "atomic",
+            "use_nt": v2["use_nt"],
+            "mxfp4out": False,
+            "cshuffle": False,
+        }
+    p2 = _parse_mxfp4_g2_kname(kname)
+    return {
+        "v2": False,
+        "BM": p2["BM"],
+        "atomic": p2["atomic"],
+        "use_nt": p2["use_nt"],
+        "mxfp4out": p2["mxfp4out"],
+        "cshuffle": p2["cshuffle"],
+    }

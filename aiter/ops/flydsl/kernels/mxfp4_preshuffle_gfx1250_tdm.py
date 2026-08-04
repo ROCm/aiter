@@ -16,13 +16,12 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
+    batched_situv2,
     fused_silu_swiglu_elem,
-    lds_load_b32_raw,
-    lds_load_b128_raw,
-    lds_store_b32_raw,
-    lds_store_b64_raw,
-    lds_store_b128_raw,
+    fused_situv2_elem,
+    make_lds_copy_ops,
     pipeline_fence,
+    situv2_consts,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -62,6 +61,8 @@ def launch_gemm_a8w4_tdm(
     stage1_quant_out: Constexpr[int] = 0,
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
+    f32_situ_beta: fx.Float32 = 1.0,
+    f32_situ_linear_beta: fx.Float32 = 1.0,
 ):
     cache_tag = (
         K,
@@ -153,6 +154,8 @@ def launch_gemm_a8w4_tdm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
     ):
         # rocdl.disable_xdl_arb_stall()
 
@@ -226,6 +229,10 @@ def launch_gemm_a8w4_tdm(
 
         def lds_view(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
+
+        lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
+        _, lds_store_b64 = make_lds_copy_ops(64)
+        lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
 
         def make_tdm_store(gt, outer, stride):
             return fx.rocdl.make_tdm_atom(
@@ -383,10 +390,10 @@ def launch_gemm_a8w4_tdm(
             row = wmb + wm * 16 + lane16
             b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                    Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8))
+                return Vec(lds_load_b128(buf, b0)).shuffle(
+                    Vec(lds_load_b128(buf, b0 + 32)), list(range(8))
                 )
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
             return (
                 v[0]
                 .shuffle(v[1], list(range(8)))
@@ -401,8 +408,8 @@ def launch_gemm_a8w4_tdm(
                 + kgrp * 256
                 + lane16 * 16
             )
-            return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8))
+            return Vec(lds_load_b128(buf, b0)).shuffle(
+                Vec(lds_load_b128(buf, b0 + 512)), list(range(8))
             )
 
         def load_sa(buf, wm, ksl):
@@ -410,14 +417,14 @@ def launch_gemm_a8w4_tdm(
             byte = (
                 warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
             )
-            return lds_load_b32_raw(buf, SA_OFF + byte)
+            return lds_load_b32(buf, SA_OFF + byte)[0]
 
         def load_sb(buf, wn, ksl):
             col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32_raw(
+            return lds_load_b32(
                 buf,
                 SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4,
-            )
+            )[0]
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMAScale(
@@ -547,6 +554,14 @@ def launch_gemm_a8w4_tdm(
             STORE_N = (tile_n // 2) if stage1_act else tile_n
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
+            is_situv2 = stage1_act == 3
+            # Uniform across the tile, so fold the betas once here rather than
+            # per element. Only materialised on the SiTUv2 path.
+            situ_c = (
+                situv2_consts(f32_situ_beta, f32_situ_linear_beta)
+                if const_expr(is_situv2)
+                else None
+            )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             # -- Activate + stage to LDS --
@@ -586,13 +601,20 @@ def launch_gemm_a8w4_tdm(
                             for p in range_constexpr(4):
                                 pairs.append((acc[2 * p], acc[2 * p + 1]))
 
-                        all_vals = batched_silu_swiglu(
-                            pairs,
-                            swiglu=is_swiglu,
-                            limit_f32=f32_swiglu_limit,
-                            neg_limit_f32=neg_limit,
-                            range_constexpr=range_constexpr,
-                        )
+                        if const_expr(is_situv2):
+                            all_vals = batched_situv2(
+                                pairs,
+                                consts=situ_c,
+                                range_constexpr=range_constexpr,
+                            )
+                        else:
+                            all_vals = batched_silu_swiglu(
+                                pairs,
+                                swiglu=is_swiglu,
+                                limit_f32=f32_swiglu_limit,
+                                neg_limit_f32=neg_limit,
+                                range_constexpr=range_constexpr,
+                            )
 
                         scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                             all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
@@ -620,8 +642,10 @@ def launch_gemm_a8w4_tdm(
                                     dynamic_position=[],
                                 )
                                 col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                lds_store_b32_raw(
-                                    stC_idx, row_rel * STORE_N + col_fp8, packed_i32
+                                lds_store_b32(
+                                    stC_idx,
+                                    row_rel * STORE_N + col_fp8,
+                                    Vec.from_elements([packed_i32], fx.Int32),
                                 )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
@@ -655,8 +679,17 @@ def launch_gemm_a8w4_tdm(
                                 )
                             ).to(fx.Float32)
                         if const_expr(stage1_act):
-                            hv = Vec.from_elements(
-                                [
+                            if const_expr(is_situv2):
+                                act_vals = [
+                                    fused_situv2_elem(
+                                        acc[2 * p],
+                                        acc[2 * p + 1],
+                                        consts=situ_c,
+                                    )
+                                    for p in range_constexpr(4)
+                                ]
+                            else:
+                                act_vals = [
                                     fused_silu_swiglu_elem(
                                         acc[2 * p],
                                         acc[2 * p + 1],
@@ -665,10 +698,9 @@ def launch_gemm_a8w4_tdm(
                                         neg_limit_f32=neg_limit,
                                     )
                                     for p in range_constexpr(4)
-                                ],
-                                fx.Float32,
-                            ).to(oc)
-                            lds_store_b64_raw(
+                                ]
+                            hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
+                            lds_store_b64(
                                 stC_idx,
                                 (row_rel * STORE_N + col_rel // 2) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
@@ -677,7 +709,7 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
-                            lds_store_b128_raw(
+                            lds_store_b128(
                                 stC_idx,
                                 (row_rel * STORE_N + col_rel) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
@@ -723,6 +755,8 @@ def launch_gemm_a8w4_tdm(
         i32_m,
         N,
         f32_swiglu_limit,
+        f32_situ_beta,
+        f32_situ_linear_beta,
     ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
 

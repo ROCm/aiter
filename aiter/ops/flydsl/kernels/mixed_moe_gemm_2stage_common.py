@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Shared MXFP4/FP8 MoE and heterogeneous MoE kernel builders.
-
-MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
+"""MoE GEMM stage1/stage2 kernel implementations (FlyDSL MFMA FP8/FP16/FP4).
 
 This module contains the **kernel builder code** for:
 - `moe_gemm1` (stage1, with silu/swiglu activation)
@@ -49,6 +47,7 @@ from flydsl.expr.typing import T
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
 from .layout_utils import crd2idx, idx2crd
@@ -157,6 +156,7 @@ def compile_mixed_moe_gemm1_common(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     shared_expert_id: int | None = None,
+    v2_output_layout: bool = False,
 ):
     """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
     heterogeneous_b = shared_expert_id is not None
@@ -185,7 +185,7 @@ def compile_mixed_moe_gemm1_common(
     if heterogeneous_b and not is_f4_b:
         raise ValueError("Heterogeneous B requires MXFP4 routed weights")
 
-    sort_block_m = max(32, tile_m)
+    sort_block_m = tile_m
     num_waves = min(4, tile_n // 32)
     # accumulators are reduced in LDS before the epilogue. k_wave=1 keeps the
     num_n_waves = num_waves
@@ -217,13 +217,13 @@ def compile_mixed_moe_gemm1_common(
 
     def x_elem_type():
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f8
+            return default_f8_type() if is_f8_a else T.i8
+        return default_f8_type()
 
     def w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f8
+        return default_f8_type()
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -288,6 +288,7 @@ def compile_mixed_moe_gemm1_common(
     gui_tag = "_gui" if gate_up_interleave else ""
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
+    v2out_tag = "_v2out" if v2_output_layout else ""
     # Keep the historical name for silu (no cache churn); swiglu/situv2 get a
     # distinct symbol so they can't alias the silu kernel on disk. beta is
     # compile-time for situv2 (folded via arith.constant), so two different betas
@@ -305,7 +306,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 33 if heterogeneous_b else 32
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -343,7 +344,7 @@ def compile_mixed_moe_gemm1_common(
         ping_buffer_bytes = x_region_bytes
 
     def x_lds_elem():
-        return T.f8
+        return default_f8_type()
 
     lds_pong_offset = allocator_pong._align(allocator_pong.ptr, 16)
     allocator_pong.ptr = lds_pong_offset + pong_buffer_bytes
@@ -489,7 +490,7 @@ def compile_mixed_moe_gemm1_common(
             # the kernel uses only the wrapped maximumf/negation ops.
             swiglu_neg_limit = -f32_swiglu_limit
 
-            x_elem = T.f8
+            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -658,7 +659,12 @@ def compile_mixed_moe_gemm1_common(
             if const_expr(not a_scale_one):
                 c32 = arith.constant(32, index=True)
                 kblk = k_in // c32
-                sx_nbytes_idx = sorted_m * kblk
+                scale_rows = (
+                    (sorted_m + arith.constant(31, index=True))
+                    // arith.constant(32, index=True)
+                    * arith.constant(32, index=True)
+                )
+                sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
 
@@ -1016,13 +1022,13 @@ def compile_mixed_moe_gemm1_common(
                         s0, s1 = load_cell(
                             shared_w_rsrc,
                             shared_layout_b,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base,
                         )
                         s2, s3 = load_cell(
                             shared_w_rsrc,
                             shared_layout_b,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base + c1,
                         )
                         return s0, s1, s2, s3
@@ -2467,7 +2473,11 @@ def compile_mixed_moe_gemm1_common(
                     t_idx = arith.index_cast(ir.IndexType.get(), t)
                     s_idx = arith.index_cast(ir.IndexType.get(), s)
                     ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
-                    row_byte_base = out_base_idx + ts_idx * arith.constant(
+                    if const_expr(v2_output_layout):
+                        payload_row_idx = row
+                    else:
+                        payload_row_idx = ts_idx
+                    row_byte_base = out_base_idx + payload_row_idx * arith.constant(
                         out_row_stride, index=True
                     )
                     return ((fused2, row_byte_base), row_valid)
@@ -3176,6 +3186,7 @@ def compile_mixed_moe_gemm1_common(
         gate_mode,
         a_scale_one,
         xcd_swizzle,
+        v2_output_layout,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -3487,16 +3498,32 @@ def compile_mixed_moe_gemm2_common(
 
     out_s = str(out_dtype).strip().lower()
     if const_expr(
-        out_s not in ("f16", "fp16", "half", "bf16", "bfloat16", "f32", "fp32", "float")
+        out_s
+        not in (
+            "f16",
+            "fp16",
+            "half",
+            "bf16",
+            "bfloat16",
+            "f32",
+            "fp32",
+            "float",
+            "fp8",
+        )
     ):
         raise ValueError(
-            f"out_dtype must be 'f16', 'bf16', or 'f32', got {out_dtype!r}"
+            f"out_dtype must be 'f16', 'bf16', 'f32', or 'fp8', got {out_dtype!r}"
         )
     out_is_f32 = out_s in ("f32", "fp32", "float")
-    out_is_bf16 = out_s in ("bf16", "bfloat16")
+    need_fp8_out = out_s == "fp8"
+    out_is_bf16 = out_s in ("bf16", "bfloat16") or need_fp8_out
+    if const_expr(need_fp8_out and bool(accumulate)):
+        raise ValueError(
+            "compile_mixed_moe_gemm2 fp8 output requires accumulate=False (reduce path)"
+        )
     if const_expr((not bool(accumulate)) and out_is_f32):
         raise ValueError(
-            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16'}"
+            "compile_moe_gemm2(accumulate=False) only supports out_dtype in {'f16','bf16','fp8'}"
         )
     w_elem_bytes = 1
     w_elem_pack = 2 if is_f4_b else 1
@@ -3510,13 +3537,13 @@ def compile_mixed_moe_gemm2_common(
 
     def x_elem_type():
         if const_expr(is_f4_b):
-            return T.f8 if is_f8_a else T.i8
-        return T.f8
+            return default_f8_type() if is_f8_a else T.i8
+        return default_f8_type()
 
     def w_elem_type():
         if const_expr(is_f4_b):
             return T.i8
-        return T.f8
+        return default_f8_type()
 
     def scale_elem_type():
         return T.i32
@@ -3591,7 +3618,7 @@ def compile_mixed_moe_gemm2_common(
     lds_total_elems = lds_total_bytes if a_elem_bytes == 1 else (lds_total_bytes // 2)
 
     def x_lds_elem():
-        return T.f8
+        return default_f8_type()
 
     lds_alloc_bytes = int(lds_total_elems) * int(a_elem_bytes)
     lds_alloc_offset = allocator._align(allocator.ptr, 16)
@@ -3622,7 +3649,7 @@ def compile_mixed_moe_gemm2_common(
             n_in = arith.index_cast(ir.IndexType.get(), i32_n_in.ir_value())
             k_in = arith.index_cast(ir.IndexType.get(), i32_k_in.ir_value())
             size_expert_ids_in = arith.index_cast(T.index, i32_size_expert_ids_in)
-            x_elem = T.f8
+            x_elem = default_f8_type()
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
@@ -3768,7 +3795,12 @@ def compile_mixed_moe_gemm2_common(
             w_rsrc = ptr_buffer_resource(arg_w, w_nbytes)
             shared_w_rsrc = ptr_buffer_resource(arg_shared_w, shared_w_nbytes)
 
-            out_elem_bytes = 4 if out_is_f32 else 2
+            out_elem_bytes = 1 if need_fp8_out else (4 if out_is_f32 else 2)
+            # fp8 route-out row = [N fp8 value bytes | N/8 e8m0 scale bytes].
+            scale_bytes_per_row = (int(model_dim) // 8) if need_fp8_out else 0
+            out_row_bytes_const = int(model_dim) * int(out_elem_bytes) + int(
+                scale_bytes_per_row
+            )
             out_nbytes_idx = (
                 tokens_in * n_in * arith.constant(out_elem_bytes, index=True)
             )
@@ -3778,6 +3810,12 @@ def compile_mixed_moe_gemm2_common(
                     * arith.index(topk)
                     * n_in
                     * arith.constant(out_elem_bytes, index=True)
+                )
+            if const_expr(need_fp8_out):
+                out_nbytes_idx = (
+                    tokens_in
+                    * arith.index(topk)
+                    * arith.constant(out_row_bytes_const, index=True)
                 )
             out_nbytes_i32 = arith.index_cast(T.i32, out_nbytes_idx)
             out_rsrc = ptr_buffer_resource(arg_out, out_nbytes_i32)
@@ -3794,7 +3832,12 @@ def compile_mixed_moe_gemm2_common(
             if const_expr(is_f4_a or is_f8_a):
                 # #3476: use 256-padded K/32 to match host scale padding.
                 kblk = arith.constant(scale_kblk_padded, index=True)
-                sx_nbytes_idx = num_valid_idx * kblk
+                scale_rows = (
+                    (num_valid_idx + arith.constant(31, index=True))
+                    // arith.constant(32, index=True)
+                    * arith.constant(32, index=True)
+                )
+                sx_nbytes_idx = scale_rows * kblk
                 sx_nbytes_i32 = arith.index_cast(T.i32, sx_nbytes_idx)
                 sx_rsrc = ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
             else:
@@ -4205,14 +4248,14 @@ def compile_mixed_moe_gemm2_common(
                             shared_w_rsrc,
                             arith.index(0),
                             shared_b_stride_n0,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base,
                         )
                         s2, s3 = load_cell(
                             shared_w_rsrc,
                             arith.index(0),
                             shared_b_stride_n0,
-                            T.f8,
+                            default_f8_type(),
                             shared_k0_base + arith.index(1),
                         )
                         return s0, s1, s2, s3
@@ -5161,6 +5204,10 @@ def compile_mixed_moe_gemm2_common(
                         row_byte_base = out_base_idx + t_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
                         )
+                    elif const_expr(need_fp8_out):
+                        row_byte_base = out_base_idx + ts_idx * arith.constant(
+                            out_row_bytes_const, index=True
+                        )
                     else:
                         row_byte_base = out_base_idx + ts_idx * arith.constant(
                             model_dim * out_elem_bytes, index=True
@@ -5176,61 +5223,150 @@ def compile_mixed_moe_gemm2_common(
                     ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
                     return llvm.inttoptr(ptr_ty, i64_raw)
 
-                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
+                def _store_pair_unmasked(
+                    *, row_local, row, row_ctx, col_pair0, col_g0, frag
+                ):
                     _fused, row_byte_base, row_byte_off_i32 = row_ctx
-
-                    def emit_store():
-                        if const_expr(not bool(accumulate)):
-                            col_idx = col_g0
-                            byte_off_col = col_idx * arith.constant(
-                                out_elem_bytes, index=True
+                    if const_expr(need_fp8_out):
+                        # frag is vector<e_vec x f32>; e_vec==8 == one opus
+                        # 8-col MXFP8 group. Quantize to e4m3 + one e8m0 byte.
+                        c0_i32_q = fx.Int32(0)
+                        c1_i32_q = fx.Int32(1)
+                        c7_i32_q = fx.Int32(7)
+                        c23_i32_q = fx.Int32(23)
+                        c254_i32_q = fx.Int32(254)
+                        c255_i32_q = fx.Int32(0xFF)
+                        c0_f32_q = fx.Float32(0.0)
+                        frag_vec = fx.Vector(frag)
+                        frag_vals = []
+                        for i in range_constexpr(e_vec):
+                            frag_vals.append(frag_vec[i].to(fx.Float32))
+                        local_max = c0_f32_q
+                        for i in range_constexpr(e_vec):
+                            abs_v = fx.Float32(
+                                llvm.call_intrinsic(
+                                    f32,
+                                    "llvm.fabs.f32",
+                                    [frag_vals[i].ir_value()],
+                                    [],
+                                    [],
+                                )
                             )
-                            ptr_addr_idx = row_byte_base + byte_off_col
-                            out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
-                            frag_v = frag._value if hasattr(frag, "_value") else frag
+                            local_max = local_max.maximumf(abs_v)
+                        # opus: E = bf16/f32 biased exp(amax) - 7, clamp E>=1,
+                        # E=0 when amax==0. scale byte = E; dequant = fp8*2^(E-127).
+                        amax_bits = local_max.bitcast(fx.Int32)
+                        ax_e = (amax_bits >> c23_i32_q) & c255_i32_q
+                        E = ax_e - c7_i32_q
+                        E = (E > c1_i32_q).select(E, c1_i32_q)
+                        E = (amax_bits == c0_i32_q).select(c0_i32_q, E)
+                        quant_scale = ((c254_i32_q - E) << c23_i32_q).bitcast(
+                            fx.Float32
+                        )
+                        scaled_vals = []
+                        for i in range_constexpr(e_vec):
+                            scaled_vals.append(frag_vals[i] * quant_scale)
+                        ptr_addr_idx = row_byte_base + col_g0
+                        for wg in range_constexpr(e_vec // 4):
+                            b = wg * 4
+                            packed_w = c0_i32_q
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32, scaled_vals[b], scaled_vals[b + 1], packed_w, 0
+                            )
+                            packed_w = rocdl.cvt_pk_fp8_f32(
+                                T.i32,
+                                scaled_vals[b + 2],
+                                scaled_vals[b + 3],
+                                packed_w,
+                                1,
+                            )
+                            word_ptr = ptr_addr_idx + arith.constant(wg * 4, index=True)
+                            out_ptr_v = idx_to_llvm_ptr(word_ptr)
+                            packed_raw = (
+                                packed_w._value
+                                if hasattr(packed_w, "_value")
+                                else packed_w
+                            )
                             llvm.StoreOp(
-                                frag_v,
-                                out_ptr_v,
-                                alignment=e_vec * out_elem_bytes,
-                                nontemporal=True,
+                                packed_raw, out_ptr_v, alignment=4, nontemporal=True
                             )
-                        elif const_expr(use_buf_atomic):
-                            col_i32 = arith.index_cast(T.i32, col_g0)
-                            col_byte_off_i32 = col_i32 * out_elem_bytes_i32
-                            byte_off_i32 = row_byte_off_i32 + col_byte_off_i32
-                            rocdl.raw_ptr_buffer_atomic_fadd(
-                                frag,
-                                out_rsrc,
-                                byte_off_i32,
-                                zero_i32,
-                                zero_i32,
-                            )
-                        else:
-                            col_idx = col_g0
-                            byte_off_col = col_idx * arith.constant(
-                                out_elem_bytes, index=True
-                            )
-                            ptr_addr_idx = row_byte_base + byte_off_col
-                            out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
-                            frag_v = frag._value if hasattr(frag, "_value") else frag
-                            llvm.AtomicRMWOp(
-                                llvm.AtomicBinOp.fadd,
-                                out_ptr_v,
-                                frag_v,
-                                llvm.AtomicOrdering.monotonic,
-                                syncscope="agent",
-                                alignment=e_vec * out_elem_bytes,
-                            )
+                        # e8m0 scale byte at [model_dim + col_g0/8].
+                        scale_byte_idx = (
+                            row_byte_base
+                            + arith.constant(model_dim, index=True)
+                            + (col_g0 // arith.constant(8, index=True))
+                        )
+                        scale_ptr_v = idx_to_llvm_ptr(scale_byte_idx)
+                        e8m0_raw = fx.Int8(E).ir_value()
+                        llvm.StoreOp(
+                            e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
+                        )
+                    elif const_expr(not bool(accumulate)):
+                        col_idx = col_g0
+                        byte_off_col = col_idx * arith.constant(
+                            out_elem_bytes, index=True
+                        )
+                        ptr_addr_idx = row_byte_base + byte_off_col
+                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        frag_v = frag._value if hasattr(frag, "_value") else frag
+                        llvm.StoreOp(
+                            frag_v,
+                            out_ptr_v,
+                            alignment=e_vec * out_elem_bytes,
+                            nontemporal=True,
+                        )
+                    elif const_expr(use_buf_atomic):
+                        col_i32 = arith.index_cast(T.i32, col_g0)
+                        col_byte_off_i32 = col_i32 * out_elem_bytes_i32
+                        byte_off_i32 = row_byte_off_i32 + col_byte_off_i32
+                        rocdl.raw_ptr_buffer_atomic_fadd(
+                            frag,
+                            out_rsrc,
+                            byte_off_i32,
+                            zero_i32,
+                            zero_i32,
+                        )
+                    else:
+                        col_idx = col_g0
+                        byte_off_col = col_idx * arith.constant(
+                            out_elem_bytes, index=True
+                        )
+                        ptr_addr_idx = row_byte_base + byte_off_col
+                        out_ptr_v = idx_to_llvm_ptr(ptr_addr_idx)
+                        frag_v = frag._value if hasattr(frag, "_value") else frag
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.fadd,
+                            out_ptr_v,
+                            frag_v,
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=e_vec * out_elem_bytes,
+                        )
 
+                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                     if const_expr(model_dim_pad > 0):
                         valid_n = arith.constant(model_dim - model_dim_pad, index=True)
                         pair_valid = col_g0 < valid_n
-                        _if_pair = scf.IfOp(pair_valid)
-                        with ir.InsertionPoint(_if_pair.then_block):
-                            emit_store()
+                        if_pair = scf.IfOp(pair_valid)
+                        with ir.InsertionPoint(if_pair.then_block):
+                            _store_pair_unmasked(
+                                row_local=row_local,
+                                row=row,
+                                row_ctx=row_ctx,
+                                col_pair0=col_pair0,
+                                col_g0=col_g0,
+                                frag=frag,
+                            )
                             scf.YieldOp([])
                     else:
-                        emit_store()
+                        _store_pair_unmasked(
+                            row_local=row_local,
+                            row=row,
+                            row_ctx=row_ctx,
+                            col_pair0=col_pair0,
+                            col_g0=col_g0,
+                            frag=frag,
+                        )
 
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
                 rocdl.s_setprio(3)
@@ -5643,7 +5779,7 @@ def compile_mixed_moe_gemm1_a16w4(
     # gated by `if is_a16w4_stage1:` and generic-only blocks by
     # `if not is_a16w4_stage1:`.  This mirrors the stage2 design.
 
-    # A16W4 alias used throughout the body: gate_only ? mock_gate_only
+    # A16W4 alias used throughout the body: gate_only = mock_gate_only.
     gate_only = mock_gate_only
     if gate_only and gate_up_interleave:
         raise ValueError(
@@ -5710,13 +5846,13 @@ def compile_mixed_moe_gemm1_a16w4(
         if is_a16w4_stage1:
             return T.bf16
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            return default_f8_type() if is_f8_a else T.i8
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     def _w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_b else (T.i8 if is_int8 else default_f8_type())
 
     def out_elem():
         return T.f32 if out_is_f32 else (T.bf16 if out_is_bf16 else T.f16)
@@ -5724,7 +5860,7 @@ def compile_mixed_moe_gemm1_a16w4(
     def x_lds_elem():
         if is_a16w4_stage1:
             return T.bf16
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     # ---- K dimension & split-K validation ----
     if is_a16w4_stage1:
@@ -7946,13 +8082,13 @@ def compile_mixed_moe_gemm2_a16w4(
         if is_a16w4:
             return T.bf16
         if is_f4_b:
-            return T.f8 if is_f8_a else T.i8
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+            return default_f8_type() if is_f8_a else T.i8
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     def _w_elem_type():
         if is_f4_b:
             return T.i8
-        return T.f16 if is_f16_b else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_b else (T.i8 if is_int8 else default_f8_type())
 
     total_threads = 256
     bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
@@ -8015,7 +8151,7 @@ def compile_mixed_moe_gemm2_a16w4(
     def x_lds_elem():
         if is_a16w4:
             return T.bf16
-        return T.f16 if is_f16_a else (T.i8 if is_int8 else T.f8)
+        return T.f16 if is_f16_a else (T.i8 if is_int8 else default_f8_type())
 
     _w_elem_pack_py = 2 if is_f4_b else 1
     w_nbytes = (experts * model_dim * inter_dim) // _w_elem_pack_py

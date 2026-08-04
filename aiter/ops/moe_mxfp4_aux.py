@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # mxfp4_moe -- HIP aux kernels (sort / quant / sort_scales / scatter_reduce) for
-# the MXFP4 (a4w4) MoE. The gemm1/gemm2 themselves run on the FlyDSL port
+# the MXFP4 A4W4/A8W4 MoE paths. The gemm1/gemm2 themselves run on the FlyDSL port
 # (aiter/ops/flydsl/mxfp4_gemm{1,2}*.py); only these shared aux ops stay in HIP.
 #
 # Each function is a thin @compile_ops binding to a C++ host entry in
@@ -16,12 +16,11 @@
 #   D_INTER  = per-shard MLP intermediate size = moe_intermediate_size / TP
 #              (mirrors D_HIDDEN naming; the "INTER" matches aiter's main
 #              `inter_dim` convention. Not the expert count.)
-#   MB       = block_m (sort/gemm block size, ? {16, 32, 64, 128})
+#   MB       = block_m (sort/gemm block size, one of {16, 32, 64, 128})
 
 from torch import Tensor
 
 from ..jit.core import compile_ops
-
 
 # Keep synchronized with moe_aux/codegen/gen_instances.py::SHAPES. The
 # replacement-dispatch test compares the two definitions.
