@@ -34,7 +34,7 @@ torch.set_printoptions(sci_mode=False)
 def check_support(dtype, kv_dtype, nhead):
     if dtype == dtypes.fp8 and kv_dtype == dtypes.bf16:
         return False
-    return get_gfx() != "gfx942"
+    return get_gfx() == "gfx950"
 
 
 def cal_diff(
