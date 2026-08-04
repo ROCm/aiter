@@ -1493,6 +1493,12 @@ namespace py = pybind11;
           py::arg("scale"),                                                             \
           py::arg("input"),                                                             \
           py::arg("multiplier"));                                                       \
+    m.def("rotate_activation_mxfp4_quant",                                              \
+          &aiter::rotate_activation_mxfp4_quant,                                        \
+          py::arg("out"),                                                               \
+          py::arg("scale"),                                                             \
+          py::arg("input"),                                                             \
+          py::arg("multiplier"));                                                       \
     m.def("rope_rotate_activation_fp4quant_inplace",                                         \
           &aiter::rope_rotate_activation_fp4quant_inplace,                                   \
           py::arg("out"),                                                                    \
