@@ -77,6 +77,12 @@ AITER_MOE_NUM_EXPERT_ACTIVATED = parse_num_expert_activated()
 
 SCALE_BLOCK = 32
 DEFAULT_SCALE_BYTE = 127  # e8m0 byte for 2^0 = 1.0
+_ACT_BY_NAME = {
+    "silu": ActivationType.Silu,
+    "swiglu": ActivationType.Swiglu,
+    "situv2": ActivationType.Situv2,
+}
+
 VERIFY_TOL_A4W4 = 0.02
 VERIFY_TOL_A8W4 = 0.02
 # Production MoE accuracy gate (matches op_tests/test_moe_2stage.py calc_diff):
@@ -670,11 +676,6 @@ def test_situv2_activation_matches_torch():
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.skip(
-    reason="SiTUv2 has no grouped kernel since the fused stage1 epilogue was "
-    "removed; the TDM path runs it as silu. See TODO(situv2) in "
-    "grouped_moe_gfx1250."
-)
 def test_grouped_a4w4_situv2_matches_torch_ref():
     run_moe(
         "a4w4",
@@ -684,9 +685,114 @@ def test_grouped_a4w4_situv2_matches_torch_ref():
     )
 
 
+def test_grouped_a8w4_situv2_matches_torch_ref():
+    # a8w4 takes the fused stage1 quant epilogue (batched activation), which is
+    # a separate code path from a4w4's bf16 intermediate (element-wise).
+    run_moe(
+        "a8w4",
+        activation=ActivationType.Situv2,
+        model_dim=512,
+        inter_dim=512,
+        tol=VERIFY_TOL_A8W4,
+    )
+
+
 @pytest.mark.parametrize("activation", [ActivationType.Silu, ActivationType.Swiglu])
 def test_grouped_a4w4_swiglu_limit_clamps(activation):
     run_moe("a4w4", activation=activation, swiglu_limit=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Contiguous-M prefix scan
+#
+# The scan sits in front of every grouped MoE launch: it turns the per-expert
+# row counts into the tile-aligned starts/psum the GEMM schedules on, and
+# rewrites the route rows in place. It is also the one piece whose width is set
+# by the expert count rather than the token count, so it gets its own coverage
+# above and below the block size -- a wrong row here does not produce a bad
+# number, it produces an out-of-bounds write in whichever kernel consumes the
+# row next.
+# ---------------------------------------------------------------------------
+def _psum_ref(masked_m: torch.Tensor, tile_m: int):
+    """starts / psum / contiguous_m from a tile-aligned cumulative sum."""
+    aligned = ((masked_m + tile_m - 1) // tile_m) * tile_m
+    inclusive = torch.cumsum(aligned.to(torch.int64), 0)
+    starts = inclusive - aligned
+    return (
+        starts.to(torch.int32),
+        (starts + masked_m).to(torch.int32),
+        max(int(inclusive[-1]), tile_m),
+    )
+
+
+def _random_route_counts(experts: int, topk: int, tokens: int, seed: int = 0):
+    """Per-expert counts from a real (unbalanced) random routing."""
+    torch.manual_seed(seed)
+    topk = min(topk, experts)
+    topk_ids = torch.stack([torch.randperm(experts)[:topk] for _ in range(tokens)]).to(
+        torch.int32
+    )
+    counts = torch.bincount(topk_ids.reshape(-1).long(), minlength=experts)
+    return topk_ids, counts.to(torch.int32)
+
+
+# 512 is MAX_EXPERTS_PER_BLOCK: one thread per expert covers E up to that in a
+# single pass, and everything above it needs the chunked sweep. Kimi-K3 is 896.
+@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+def test_contiguous_psum_matches_cumsum(experts):
+    _require_gfx1250()
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum
+
+    tile_m = 64
+    _topk_ids, masked_m = _random_route_counts(experts, topk=16, tokens=128)
+    ref_starts, ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+    starts, psum, contiguous_m = contiguous_psum(masked_m, experts, tile_m)
+    torch.cuda.synchronize()
+
+    bad = int((starts != ref_starts).sum())
+    assert bad == 0, (
+        f"E={experts}: {bad} experts have a wrong start, first at "
+        f"{int((starts != ref_starts).nonzero()[0][0])}"
+    )
+    assert torch.equal(psum, ref_psum), f"E={experts}: psum mismatch"
+    assert (
+        int(contiguous_m[0]) == ref_total
+    ), f"E={experts}: contiguous_m {int(contiguous_m[0])} != {ref_total}"
+
+
+@pytest.mark.parametrize("experts", [8, 256, 512, 513, 896, 1024])
+def test_contiguous_psum_remap_rows_stay_in_bounds(experts):
+    """The remap is what the MoE actually calls; an unscanned expert lands here
+    as a row index pointing outside the contiguous buffer."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.grouped_moe_gfx1250 import contiguous_psum_remap
+
+    tile_m, topk, tokens = 64, 16, 128
+    topk_ids, masked_m = _random_route_counts(experts, topk, tokens)
+    ref_starts, _ref_psum, ref_total = _psum_ref(masked_m, tile_m)
+
+    # Masked layout: row = expert * max_m + slot, which is what
+    # flydsl_moe_topids_to_rows produces and the remap folds down.
+    flat = topk_ids.reshape(-1)
+    max_m = max(tile_m, ((flat.numel() + tile_m - 1) // tile_m) * tile_m)
+    slot = torch.zeros(experts, dtype=torch.int64)
+    rows = torch.empty(flat.numel(), dtype=torch.int32)
+    for i, e in enumerate(flat.tolist()):
+        rows[i] = e * max_m + int(slot[e])
+        slot[e] += 1
+
+    remapped = rows.clone()
+    contiguous_psum_remap(masked_m, remapped, experts, max_m, tile_m)
+    torch.cuda.synchronize()
+
+    expected = ref_starts[flat.long()].long() + (rows.long() - flat.long() * max_m)
+    assert torch.equal(remapped.long(), expected), f"E={experts}: row remap mismatch"
+    oob = int((remapped >= ref_total).sum())
+    assert oob == 0, (
+        f"E={experts}: {oob} remapped rows land outside the contiguous buffer "
+        f"(bound {ref_total}, max row {int(remapped.max())})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -819,9 +925,7 @@ def run_csv_scenario(args) -> None:
 
     activation_override = None
     if args.act is not None:
-        activation_override = (
-            ActivationType.Swiglu if args.act == "swiglu" else ActivationType.Silu
-        )
+        activation_override = _ACT_BY_NAME[args.act]
 
     rows = []
     for idx, rec in enumerate(csv_rows):
@@ -981,14 +1085,28 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=101)
     parser.add_argument(
         "--act",
-        choices=("silu", "swiglu"),
+        choices=("silu", "swiglu", "situv2"),
         default=None,
         help="stage1 activation: silu => silu(gate)*up; "
-        "swiglu => gpt-oss swiglu with clamp/alpha/residual. Default: swiglu "
+        "swiglu => gpt-oss swiglu with clamp/alpha/residual; "
+        "situv2 => Kimi-K3 SiTUv2 (see --situ-beta / --situ-linear-beta). "
+        "Default: swiglu "
         "for bench/verify/kernel; for --scenario csv, unset means use each "
         "row's act_type (pass --act to force one activation for all rows).",
     )
     parser.add_argument("--swiglu-limit", type=float, default=7.0)
+    parser.add_argument(
+        "--situ-beta",
+        type=float,
+        default=4.0,
+        help="SiTUv2 gate beta (Kimi-K3 activation_situ_beta).",
+    )
+    parser.add_argument(
+        "--situ-linear-beta",
+        type=float,
+        default=25.0,
+        help="SiTUv2 up beta (Kimi-K3 activation_situ_linear_beta).",
+    )
     parser.add_argument(
         "--no-bias",
         action="store_true",
@@ -1046,7 +1164,7 @@ def main() -> None:
     # sets args.tokens to a single int so run_moe reads it unchanged.
     token_list = args.tokens if isinstance(args.tokens, list) else [args.tokens]
     # None (unset) defaults to swiglu for the single-shape scenarios.
-    activation = ActivationType.Silu if args.act == "silu" else ActivationType.Swiglu
+    activation = _ACT_BY_NAME.get(args.act, ActivationType.Swiglu)
     rows = []
     for _tok in token_list:
         args.tokens = _tok
@@ -1066,6 +1184,8 @@ def main() -> None:
             tol=tol,
             activation=activation,
             swiglu_limit=args.swiglu_limit,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
             use_bias=not args.no_bias,
             check_aot_cache=not args.no_check_aot_cache,
             raise_on_fail=False,

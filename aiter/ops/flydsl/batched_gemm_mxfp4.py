@@ -51,6 +51,8 @@ def flydsl_grouped_gemm_a8w4_masked(
     stage1_quant_out=0,
     quant_scale=None,
     quant_wmma_rep=1,
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -65,16 +67,28 @@ def flydsl_grouped_gemm_a8w4_masked(
       m_tile_map   (n_experts,) int32 psum (per-expert exclusive end-row)
     contiguous_m must be a multiple of tile_m (holds by construction).
 
-    When ``stage1_quant_out=1`` (fp8), the epilogue fuses silu/swiglu + MX fp8
-    quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives the
-    fp8 payload (uint8, 1 byte/elem) and ``quant_scale`` receives the preshuffled
-    e8m0 scale (uint8).  ``quant_wmma_rep`` is gemm2's ``warp_tile_m // 16``,
-    controlling the scale preshuffle tile geometry.
+    ``stage1_act`` selects the stage1 epilogue: 0 none, 1 silu, 2 swiglu,
+    3 SiTUv2 (``situ_beta`` / ``situ_linear_beta``, the Kimi-K3 activation).
+    The betas are runtime kernel arguments, so all SiTUv2 shapes share one
+    compiled kernel.
+
+    When ``stage1_quant_out=1`` (fp8), the epilogue fuses the activation + MX
+    fp8 quantization + e8m0 scale preshuffle into the kernel.  ``out`` receives
+    the fp8 payload (uint8, 1 byte/elem) and ``quant_scale`` receives the
+    preshuffled e8m0 scale (uint8).  ``quant_wmma_rep`` is gemm2's
+    ``warp_tile_m // 16``, controlling the scale preshuffle tile geometry.
     """
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
     if stream is None:
         stream = torch.cuda.current_stream()
+    # Only meaningful for SiTUv2; the betas are ignored by every other epilogue,
+    # so do not let them reject a silu/swiglu launch.
+    if stage1_act == 3:
+        if float(situ_beta) <= 0.0:
+            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
+        if float(situ_linear_beta) <= 0.0:
+            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
     nb = min(num_buffers, max(1, K // tile_k))
     has_bias = 1 if bias is not None else 0
     bias_ptr = ptr_arg(bias) if bias is not None else ptr_arg(a)
@@ -110,6 +124,8 @@ def flydsl_grouped_gemm_a8w4_masked(
         stage1_quant_out,
         quant_wmma_rep,
         quant_scale_tensor,
+        float(situ_beta),
+        float(situ_linear_beta),
     )
     return out
 
