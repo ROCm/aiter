@@ -253,10 +253,14 @@ def fused_clamp_act_mul(
         _LOGGER.info(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
+        # Gluon runs a 2D [BLOCK_SIZE_M, BLOCK_SIZE_N] tile: grid = cdiv(M, BLOCK_SIZE_M).
+        # block_size_m is a tunable (1 = one row per program).
+        block_size_m = 1
         # ".cg" matches the Triton reference's hardcoded cache hint.
-        _fused_clamp_silu_mul_gluon_kernel[(M,)](
+        _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, block_size_m),)](
             *kernel_args,
             **kernel_constexprs,
+            BLOCK_SIZE_M=block_size_m,
             cache_modifier=".cg",
         )
     else:
