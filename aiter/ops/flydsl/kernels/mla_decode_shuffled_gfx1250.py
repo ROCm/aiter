@@ -205,7 +205,7 @@ def compile_mla_decode_main(
         raise ValueError(
             f"KV_COMPUTE_BLOCK_SIZE must be multiple of WMMA_K={WMMA_K}, got {KV_COMPUTE_BLOCK_SIZE}"
         )
-    # A compute tile may span whole pages, or cover part of one page.
+        
     if KV_COMPUTE_BLOCK_SIZE % KV_BLOCK_SIZE and KV_BLOCK_SIZE % KV_COMPUTE_BLOCK_SIZE:
         raise ValueError(
             f"KV_COMPUTE_BLOCK_SIZE {KV_COMPUTE_BLOCK_SIZE} and KV_BLOCK_SIZE "
@@ -284,7 +284,7 @@ def compile_mla_decode_main(
 
     lora_compute_block_elems = TOKENS_PER_LOAD * KV_LORA_RANK
     rope_compute_block_elems = TOKENS_PER_LOAD * QK_ROPE_HEAD_DIM
-    # A page's rope blob starts after its whole lora blob, however finely we slice the page.
+    # lora part of a page starts after rope part
     page_lora_elems = KV_BLOCK_SIZE * KV_LORA_RANK
 
     # KV LDS slabs
@@ -336,7 +336,7 @@ def compile_mla_decode_main(
         # Lane decomposition
         lane_kgrp = lane_id / fx.Index(WMMA_M)
         lane16 = lane_id % fx.Index(WMMA_M)
-        # Under a head split each warp owns NQGSP_LOCAL consecutive head tiles.
+        # with head split each warp owns NQGSP_LOCAL consecutive head tiles.
         head_row_off = (wave_id * fx.Index(NQGSP_LOCAL * WMMA_M) if WARP_HEAD_SPLIT
                         else fx.Index(0))
 
@@ -475,8 +475,12 @@ def compile_mla_decode_main(
             return out
 
         BLOCK_STRIDE = KV_BLOCK_SIZE * QK_HEAD_DIM
+        
+        # for cases where KVC < KVB sub_tok tells the start token of the subtile we are loading from the page/block
+        def _sub_tok(tile_global_idx):
+            return ((tile_global_idx % fx.Index(TILES_PER_BLOCK)) * fx.Index(TOKENS_PER_LOAD)
+                    if TILES_PER_BLOCK > 1 else fx.Index(0))
 
-        # sub_tok = first token of this load within its page (0 unless KVC < KVB).
         def _issue_kv_load_single_block(phys_blk, lora_byte_off, rope_byte_off, sub_tok):
             lora_desc = tdm_ops.make_tensor_descriptor_2d(
                 global_ptr=arg_kv_cache,
@@ -504,7 +508,7 @@ def compile_mla_decode_main(
             )
             tdm_ops.tensor_load_2d(rope_desc)
 
-        # Issue loads for a whole compute tile: each of the BLOCKS_PER_COMPUTE
+        # Issue loads for a whole compute tile
         def _issue_kv_tile_loads(phys_blks_list, lora_stage_off, rope_stage_off, sub_tok):
             lora_block_bytes = lora_compute_block_elems * elem_bytes
             rope_block_bytes = rope_compute_block_elems * elem_bytes
@@ -515,10 +519,6 @@ def compile_mla_decode_main(
                     rope_stage_off + fx.Index(b * rope_block_bytes),
                     sub_tok,
                 )
-
-        def _sub_tok(tile_global_idx):
-            return ((tile_global_idx % fx.Index(TILES_PER_BLOCK)) * fx.Index(TOKENS_PER_LOAD)
-                    if TILES_PER_BLOCK > 1 else fx.Index(0))
 
         def _issue_q_load():
             q_outer_off = seq_idx * num_q_heads_idx
@@ -691,7 +691,7 @@ def compile_mla_decode_main(
                     qk_accs[qt][n_tile] = fx.Vector.from_elements(new_vals, fx.Float32)
 
                 # row mask when NUM_Q_HEADS isn't a multiple of 16:
-                if QGSP_PADDED != NUM_Q_HEADS or WARP_HEAD_SPLIT:
+                if QGSP_PADDED != NUM_Q_HEADS:
                     is_row_valid = (head_row_off + fx.Index(qt * WMMA_M)
                                     + lane16) < num_q_heads_idx
                     for n_tile in range_constexpr(NQK_LOCAL):
