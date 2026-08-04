@@ -96,12 +96,29 @@ Status legend: [ ] todo · [~] in progress · [x] done
   `aiter/ops/flydsl/kernels/warp_decode_moe.py`; test
   `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` (`python …` or `pytest`, 4 pass).
 
-### Phase 2 — `gate_up` FP8  [ ]
-- [ ] Grid `B*TOPK*INTER` waves; HIDDEN tiled in `64*kVector`.
-- [ ] Per-K-block scale application (`x_scale * w_scale`).
-- [ ] `silu(gate·x) * (up·x)`; lane-0 writes BF16 `inter[B,TOPK,INTER]`.
-- [ ] Correctness vs torch/CPU reference.
-- [ ] Perf pass on gfx950.
+### Phase 2 — `gate_up` FP8  [x] (correctness baseline; perf optimization pending)
+- [x] Grid `B*TOPK*INTER` waves; HIDDEN tiled in `64*kVector` (kVector 16, →8 fallback).
+- [x] Scale application: BF16 activation ⇒ `xs=1`; fold constant `gs`/`us` (PerTensor `p[0]`
+      / PerToken `p[e*INTER+j]`) into the accumulator **after** the K reduce (exact since the
+      scale is constant over K). Block2D deferred to Phase 4.
+- [x] `silu(gate_acc)·up_acc`, `silu(z)=z/(1+e^-z)` in f32; writes BF16 `inter[B,TOPK,INTER]`.
+      (Baseline writes from **all lanes** — every lane holds the identical reduced result;
+      lane-0-only store is a perf refinement, see below.)
+- [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
+      PerTensor + PerToken and kVector 16 (`HIDDEN=1024`) / kVector 8 (`HIDDEN=512`).
+- [~] Perf pass on gfx950: **baseline ~1.3–1.5 TB/s** effective weight-read BW
+      (~20–25% of HBM peak; reference targets ~90%). Known levers, all deferred:
+      (1) lane-0-only store (kills 64× redundant BF16 stores);
+      (2) **vectorized loads** — load x/w as 128-bit `vec4` i32 instead of per-word scalar
+          `buffer_load` (biggest win); (3) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
+      (4) B=1 software-pipelined weight prefetch.
+- **Where:** kernel `build_gate_up_fp8_module` + `pick_kvector` in
+  `aiter/ops/flydsl/kernels/warp_decode_moe.py`; entry `flydsl_warp_decode_gate_up` in
+  `aiter/ops/flydsl/warp_decode_moe.py`; tests `GATE_UP_CASES` /`test_gate_up_fp8` in
+  `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` (7 pass total).
+- **Scope choices (confirmed):** BF16 activation + FP8 weights first; PerTensor+PerToken
+  scales; full aiter Python entry point added now. FP8/BF16 activation-variant and Block2D
+  are later.
 
 ### Phase 3 — `down_reduce` FP8  [ ]
 - [ ] Grid `B*ceil(HIDDEN/HPerWarp)`; sum over TOPK then INTER.
@@ -109,12 +126,13 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [ ] Start `kHPerWarp=1`; then add H2 (2 outputs/wave) variant.
 - [ ] Correctness + perf vs reference.
 
-### Phase 4 — Scale layouts + integration  [ ]
-- [ ] Support PerTensor / PerToken / Block2D scale layouts.
-- [ ] Python entry point in `aiter/ops/flydsl/`.
-- [ ] op_test at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`, conforming to §8
-      (CONTRIBUTE + `aiter-op-test` skill; reuse existing MoE oracle/harness helpers).
-- [ ] Benchmark on gfx950 vs reference numbers in the ticket.
+### Phase 4 — Scale layouts + integration  [~]
+- [~] Scale layouts: PerTensor + PerToken done (Phase 2, gate_up); **Block2D pending**.
+- [x] Python entry point in `aiter/ops/flydsl/warp_decode_moe.py` (added in Phase 2;
+      extend with `down_reduce` + Block2D).
+- [x] op_test scaffolding at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`
+      (Phase 1 primitives + Phase 2 gate_up; conforms to §8). Extend for down/Block2D.
+- [ ] Benchmark on gfx950 vs reference numbers in the ticket (+ perf optimization pass).
 
 ### Follow-on (out of first baseline scope)
 - [ ] MXFP4 `down` fast path + H2 layout (beats best FP8 `down` at B≥2).
@@ -317,3 +335,9 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   `kernels/warp_decode_moe.py` + test `test_flydsl_warp_decode_moe.py` (4 pass, `pytest` + CLI).
   Resolved the inline-asm form and the **exponent-only (E8M0) scale semantics** of the fp8
   convert (§9) — drives the PerTensor/PerToken scale-fold decision for Phases 2–4.
+- _phase 2_ — `gate_up` FP8 correctness baseline (BF16 act, FP8 e4m3 weights, PerTensor +
+  PerToken): kernel `build_gate_up_fp8_module`/`pick_kvector` + entry
+  `flydsl_warp_decode_gate_up` + 3 op_test cases. **Exact** vs torch (cos 1.0, max_delta 0.0)
+  for kVector 16/8. Perf baseline ~1.3–1.5 TB/s weight-read BW (~20–25% peak); optimization
+  levers recorded in §5 Phase 2 (lane-0 store, vectorized loads, ILP dot2, prefetch).
+  Confirmed scope: BF16 act + PerTensor/PerToken first; full Python entry point now.
