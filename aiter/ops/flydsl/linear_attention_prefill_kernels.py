@@ -36,6 +36,7 @@ import triton
 from flydsl.runtime.device import get_rocm_arch
 
 from ..triton._triton_kernels.gated_delta_rule.utils import (
+    GatedDeltaRulePrefillMetadata,
     prepare_chunk_offsets,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
@@ -315,6 +316,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """FlyDSL K5 host wrapper.
 
@@ -400,6 +402,24 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None
         kernel_cu_seqlens = None
+    elif prefill_metadata is not None:
+        prefill_metadata.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            total_prefill_tokens=T,
+            num_sequences=len(cu_seqlens) - 1,
+        )
+        schedule = prefill_metadata.get_chunk_schedule(
+            BT,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+        chunk_offsets = schedule.chunk_offsets
+        NT = schedule.total_chunks
+        kernel_cu_seqlens = schedule.kernel_cu_seqlens
+        N = schedule.n_prefill
     else:
         # Pass the ORIGINAL (cache-stable) cu_seqlens + the decode ints into
         # the cached prologue helpers. They all key on the original tensor's

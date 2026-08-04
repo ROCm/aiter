@@ -20,7 +20,11 @@ from ..gated_delta_rule_utils import (
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 from ..utils.solve_tril import FLA_TRIL_PRECISION, solve_tril
 
@@ -81,7 +85,8 @@ def fused_solve_tril_recompute_w_u_kernel(
     w,
     u,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -91,6 +96,7 @@ def fused_solve_tril_recompute_w_u_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
     LOWP_DTYPE_IS_BF16: tl.constexpr = False,
@@ -112,8 +118,8 @@ def fused_solve_tril_recompute_w_u_kernel(
 
     if IS_VARLEN:
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -441,7 +447,8 @@ def recompute_w_u_head_major_kernel(
     w,
     u,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -451,6 +458,7 @@ def recompute_w_u_head_major_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     """
@@ -468,8 +476,8 @@ def recompute_w_u_head_major_kernel(
 
     if IS_VARLEN:
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -549,7 +557,9 @@ def _run_split_path(
     beta: torch.Tensor,
     g_cumsum: torch.Tensor,
     cu_seqlens: torch.LongTensor | None,
-    chunk_indices: torch.LongTensor | None,
+    sequence_ids: torch.LongTensor | None,
+    chunk_ids: torch.LongTensor | None,
+    index_stride: int,
     NT: int,
     B: int,
     T: int,
@@ -568,7 +578,9 @@ def _run_split_path(
     Ai = solve_tril(
         A_raw,
         cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        sequence_ids=sequence_ids,
+        chunk_ids=chunk_ids,
+        index_stride=index_stride,
         output_dtype=k.dtype,
     )
     u_out = v.new_empty(B, H, T, V)
@@ -582,13 +594,15 @@ def _run_split_path(
         w_out,
         u_out,
         cu_seqlens,
-        chunk_indices,
+        sequence_ids,
+        chunk_ids,
         T=T,
         H=H,
         Hg=Hg,
         K=K,
         V=V,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         USE_EXP2=use_exp2,
     )
     return w_out, u_out
@@ -604,6 +618,7 @@ def fused_solve_tril_recompute_w_u(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused triangular solve + recompute w, u in a single kernel.
@@ -629,16 +644,41 @@ def fused_solve_tril_recompute_w_u(
     # decode ints (cached, no per-forward D2H); the kernels walk the
     # pre-sliced prefill data via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
-        NT = len(chunk_indices)
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            sequence_ids = schedule.sequence_ids
+            chunk_ids = schedule.chunk_ids
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            index_stride = 1
+        else:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            flat_chunk_indices = chunk_indices.reshape(-1)
+            sequence_ids = flat_chunk_indices
+            chunk_ids = flat_chunk_indices[1:]
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            index_stride = 2
+        NT = len(sequence_ids) // index_stride
     else:
-        chunk_indices = None
+        sequence_ids = None
+        chunk_ids = None
         kernel_cu_seqlens = None
+        index_stride = 1
         NT = triton.cdiv(T, BT)
 
     # Decide fused vs split.
@@ -666,7 +706,9 @@ def fused_solve_tril_recompute_w_u(
             beta,
             g_cumsum,
             kernel_cu_seqlens,
-            chunk_indices,
+            sequence_ids,
+            chunk_ids,
+            index_stride,
             NT,
             B,
             T,
@@ -690,13 +732,15 @@ def fused_solve_tril_recompute_w_u(
         w_out,
         u_out,
         kernel_cu_seqlens,
-        chunk_indices,
+        sequence_ids,
+        chunk_ids,
         T=T,
         H=H,
         Hg=Hg,
         K=K,
         V=V,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         DOT_PRECISION=FLA_TRIL_PRECISION,
         USE_EXP2=use_exp2,
         LOWP_DTYPE_IS_BF16=k.dtype == torch.bfloat16,
