@@ -427,17 +427,23 @@ def launch_gemm_a8w4_tdm(
             # 5. Retire everything except KSL1's B b128 loads, which are the only
             #    ops issued after the last thing KSL0 needs.
             rocdl.s_wait_dscnt(B_DS_PHYS)
-            a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1)) for wm in range_constexpr(wmma_m_rep)]
             # load_b_and_scales gives (wt, sb_k, sa_k); mma_rows wants sa 4th and
             # sb 5th, hence [2] then [1] -- same swap k_step performs.
             all_wm = list(range(wmma_m_rep))
-            mma_rows(all_wm, a0, b0[0], b0[2], b0[1])   # 7. KSL0
+            a1 = [to_rmem(ACT_NDW, load_a(buf, wm, 1)) for wm in range_constexpr(wmma_m_rep)]
+            mma_rows(all_wm, a0, b0[0], b0[2], b0[1])   # 7. KSL0 consumes A0
             rocdl.s_wait_dscnt(0)                       # 8.
-            mma_rows(all_wm, a1, wt1, sa1, sb1)         # 9. KSL1
+            mma_rows(all_wm, a1, wt1, sa1, sb1)         # 9. KSL1 consumes A1
             all_mma = wmma_m_rep * wmma_n_rep
-            rocdl.sched_dsrd(BS_DS + A_DS + BS_DS)   # B0+SB0+SA0, A0, B1+SB1+SA1
-            rocdl.sched_dsrd(A_DS)                   # A1
-            rocdl.sched_mfma(all_mma)                # KSL0
+            # The sched_group sequence must describe the order actually wanted.
+            # Emitting "all DS, then all MFMA" lets the scheduler hoist A1's loads
+            # above KSL0's WMMAs; the allocator then reuses A0's registers for
+            # them and A0 is clobbered before it is read (NaN). Interleave the
+            # groups so A1's loads are scheduled against KSL0's MFMAs instead.
+            rocdl.sched_dsrd(BS_DS + A_DS + BS_DS)   # B0/SB0/SA0, A0, SB1/SA1/B1
+            for _i in range_constexpr(wmma_m_rep):
+                rocdl.sched_mfma(wmma_n_rep)         # one wm's worth of KSL0
+                rocdl.sched_dsrd(DS_A)               # ... overlapped with one A1 load
             rocdl.sched_mfma(all_mma)                # KSL1
             rocdl.sched_barrier(0)
 
