@@ -10,6 +10,11 @@ from typing import Any, ClassVar
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from aiter.ops.flydsl.activation import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from einops import rearrange
 
 import aiter
@@ -46,11 +51,6 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
-from aiter.ops.flydsl.activation import (
-    DEFAULT_SITUV2_BETA,
-    DEFAULT_SITUV2_LINEAR_BETA,
-    get_flydsl_activation_name,
-)
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,

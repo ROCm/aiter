@@ -60,8 +60,7 @@ def _buffer_rsrc(addr_i64, num_records_bytes):
 
 
 def _lds_swizzle_mask(row, row_bytes=128):
-    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns.
-    """
+    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns."""
     assert row_bytes in (64, 128), f"unsupported FP4 LDS row width {row_bytes}"
     return (row & fx.Int32(2 * (row_bytes // 16) - 2)) << fx.Int32(3)
 
