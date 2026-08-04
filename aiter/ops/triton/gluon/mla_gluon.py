@@ -757,6 +757,7 @@ def _mla_softmax_reducev_kernel(
     HEAD_DIM_CKV: tl.constexpr,
     HAS_FINAL_LSE: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
+    BLOCK_S: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -774,27 +775,38 @@ def _mla_softmax_reducev_kernel(
     kv_len_per_split = cur_batch_seq_len // NUM_KV_SPLITS
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
-    offs_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h + offs_d_ckv
-    offs_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
+    offs_s = tl.arange(0, BLOCK_S)
+    base_l = cur_batch * stride_l_b + q_pos * stride_l_qs + cur_head * stride_l_h
+    base_ml = cur_batch * stride_ml_b + q_pos * stride_ml_qs + cur_head * stride_ml_h
 
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
+    # The split-KV LSE merge is associative, so instead of a serial dependent loop
+    # over NUM_KV_SPLITS (latency-bound on ~batch*nhead workgroups), reduce BLOCK_S
+    # splits at a time as a vectorized [BLOCK_S, HEAD_DIM] tile. This overlaps the
+    # per-split loads and shortens the dependent chain to NUM_KV_SPLITS/BLOCK_S.
     LOOP_START = NUM_KV_SPLITS - 1 if kv_len_per_split == 0 else 0
-    for split_kv_id in range(LOOP_START, NUM_KV_SPLITS):
-        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-        logits_1 = tl.load(Mid_lse + offs_ml + split_kv_id * stride_ml_s)
+    for start in range(LOOP_START, NUM_KV_SPLITS, BLOCK_S):
+        s_ids = start + offs_s  # [BLOCK_S]
+        s_mask = s_ids < NUM_KV_SPLITS
+        lse = tl.load(
+            Mid_lse + base_ml + s_ids * stride_ml_s, mask=s_mask, other=-float("inf")
+        )  # [BLOCK_S]
+        logits = tl.load(
+            Logits + base_l + s_ids[:, None] * stride_l_s + offs_d_ckv[None, :],
+            mask=s_mask[:, None],
+            other=0.0,
+        )  # [BLOCK_S, HEAD_DIM_CKV]
 
-        n_e_max = tl.maximum(logits_1, e_max)
+        tile_max = tl.max(lse, axis=0)  # scalar; masked/empty splits are -inf
+        n_e_max = tl.maximum(e_max, tile_max)
         old_scale = tl.where(e_max == -float("inf"), 0.0, tl.exp(e_max - n_e_max))
-        acc *= old_scale
-        exp_logic = tl.where(logits_1 == -float("inf"), 0.0, tl.exp(logits_1 - n_e_max))
-        # MTP: a fully causal-masked split stores NaN logits with lse=-inf; guard
-        # the accumulate so NaN*0 doesn't poison acc (no-op for plain decode).
-        acc += tl.where(logits_1 == -float("inf"), 0.0, exp_logic * logits)
-
-        e_sum = e_sum * old_scale + exp_logic
+        # w=0 for empty/causal-masked splits (lse=-inf) so NaN logits never poison acc.
+        w = tl.where(lse == -float("inf"), 0.0, tl.exp(lse - n_e_max))  # [BLOCK_S]
+        acc = acc * old_scale + tl.sum(w[:, None] * logits, axis=0)
+        e_sum = e_sum * old_scale + tl.sum(w, axis=0)
         e_max = n_e_max
 
     out = acc / e_sum if e_sum > 0.0 else tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
@@ -1139,6 +1151,7 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
+        BLOCK_S=64,
         num_warps=8,
     )
 
