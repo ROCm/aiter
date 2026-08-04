@@ -11,13 +11,12 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     range_constexpr,
     rocdl,
     tdm_ops,
-    vector,
 )
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import scf
 from flydsl.expr.typing import Constexpr, T
@@ -41,7 +40,7 @@ from .quant_utils import (
 # low-level TDM intrinsics) so this kernel needs no FlyDSL-side patch. Once the
 # gather/scatter wrappers land upstream, import them from
 # flydsl.expr.rocdl.tdm_ops instead and delete tdm_gather_shim.py.
-from .tdm_gather_shim import tdm_scatter
+from .tdm_gather_shim import make_tensor_gather_descriptor, tensor_store_gather
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 from .tensor_shim import AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE
 
@@ -882,16 +881,26 @@ def launch_gemm_a8w4_tdm(
                                 row_indices.append(keep.select(idxv, _oob))
                             else:
                                 row_indices.append(_oob)
-                        # row_width / tensor_dim0 / tensor_dim1 / stride /
-                        # elem_bytes are derived from the _comb_view / _lds_c
-                        # layouts by tdm_scatter.
-                        tdm_scatter(
+                        # Pass compile-time geometry explicitly: inside kernel
+                        # tracing the view layout leaves are dynamic IR, so
+                        # deriving row_width/tensor_dim0/stride from the views
+                        # cannot yield the Python ints the descriptor needs
+                        # (row_width << 16, etc.). tensor_dim1 is the runtime OOB
+                        # bound (_oob) as a raw i32.
+                        desc = make_tensor_gather_descriptor(
                             _comb_view,
                             _lds_c,
                             row_indices,
+                            row_width=LDS_STORE_N,
+                            tensor_dim0=STORE_N,
+                            tensor_dim1=_oob.ir_value(),
+                            stride=_stride_elems,
+                            elem_bytes=elem_bytes,
+                            index_size=32,
                             lds_byte_offset=base_row * LDS_STORE_N * elem_bytes,
                             global_byte_offset=_gboff,
                         )
+                        tensor_store_gather(desc)
                 tdm_ops.tensor_wait(0)
             else:
                 # -- Shared LDS -> TDM store to global --
