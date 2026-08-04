@@ -6,6 +6,8 @@ import functools
 
 import torch
 
+from ..prefill_batch_metadata import CausalConvPrefillMetadata
+
 try:
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -498,7 +500,17 @@ def causal_conv1d_split_qkv_flydsl_fn(
         )
 
     # Reuse precomputed chunk schedule metadata when provided.
-    if (
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=cu_seqlen,
+            num_sequences=query_start_loc.numel() - 1,
+        )
+        grid = metadata.get_chunk_grid(block_m)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        chunk_off_ptr = grid.chunk_ids
+    elif (
         metadata is not None
         and hasattr(metadata, "nums_dict")
         and block_m in metadata.nums_dict
