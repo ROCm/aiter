@@ -45,13 +45,14 @@ def deserialize_str(s: str) -> dict:
 
 
 def strip_annotate(cls):
-    """Neutralize ``__annotate__`` so Triton's aggregate hash walker skips it.
+    """Neutralize '__annotate__' so Triton's aggregate hash walker skips it.
 
-    Triton's ``@aggregate`` builds ``hash_attrs`` from ``inspect.getmembers``.
+    Triton's '@aggregate' builds 'hash_attrs' from 'inspect.getmembers'.
     On Python 3.14 (PEP 649) that yields the compiler-generated annotate
-    function, and the JIT's ``record_reference`` rejects it with
-    "Unsupported function referenced". Apply *below* ``@aggregate`` so it runs
-    first (decorators apply bottom-up)::
+    function, and the JIT's 'record_reference' rejects it with
+    "Unsupported function referenced".
+
+    This annotation can be used like below to remove the problematic attribute:
 
         @aggregate
         @strip_annotate
@@ -61,7 +62,7 @@ def strip_annotate(cls):
     No-op on Python < 3.14.
 
     Fixed upstream in triton-lang/triton main (PR #9529 excludes
-    ``__annotate__``; a follow-up excludes ``__annotate_func__``), but NOT in
+    ``__annotate__``, a follow-up excludes ``__annotate_func__``), but NOT in
     any 3.7.x release.
     """
     _ = cls.__annotations__
