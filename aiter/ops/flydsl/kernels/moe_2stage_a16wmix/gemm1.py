@@ -198,6 +198,7 @@ def _gemm1_body_a16w4(
     f32_situ_beta_rcp,
     f32_situ_linbeta,
     f32_situ_linbeta_rcp,
+    f32_swiglu_limit,
     *,
     BM,
     TILE_N,
@@ -853,6 +854,7 @@ def _gemm1_body_a16w4(
                         fx.Float32(f32_situ_beta_rcp),
                         fx.Float32(f32_situ_linbeta),
                         fx.Float32(f32_situ_linbeta_rcp),
+                        -fx.Float32(f32_swiglu_limit),
                     )[0]
                 else:
                     y = _silu_mul_batch([g], [u])[0]
@@ -987,6 +989,7 @@ def compile_gemm1_a16w4_port(
         f32_situ_beta_rcp: fx.Float32,
         f32_situ_linbeta: fx.Float32,
         f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
@@ -1045,6 +1048,7 @@ def compile_gemm1_a16w4_port(
                 f32_situ_beta_rcp,
                 f32_situ_linbeta,
                 f32_situ_linbeta_rcp,
+                f32_swiglu_limit,
                 BM=BM,
                 TILE_N=TILE_N,
                 TILE_K=TILE_K,
@@ -1074,6 +1078,7 @@ def compile_gemm1_a16w4_port(
         f32_situ_beta_rcp: fx.Float32,
         f32_situ_linbeta: fx.Float32,
         f32_situ_linbeta_rcp: fx.Float32,
+        f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
         stream: fx.Stream,
     ):
@@ -1090,6 +1095,7 @@ def compile_gemm1_a16w4_port(
             f32_situ_beta_rcp,
             f32_situ_linbeta,
             f32_situ_linbeta_rcp,
+            f32_swiglu_limit,
             arg_out,
             value_attrs={"rocdl.waves_per_eu": waves_per_eu} if waves_per_eu else None,
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)

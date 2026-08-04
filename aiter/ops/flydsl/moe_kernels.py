@@ -1401,6 +1401,7 @@ def _flydsl_moe_stage1_impl(
             act=_act,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
             w_layout="guinterleave",
         )
         return inter_sorted

@@ -134,6 +134,7 @@ def flydsl_a16w4_gemm1(
     act="silu",
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    swiglu_limit=float("inf"),
     w_dtype="fp4",
     w_layout="standard",
     stream=None,
@@ -205,7 +206,9 @@ def flydsl_a16w4_gemm1(
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
-    # SiTUv2 beta/linear_beta -> runtime f32 scalars; host precomputes reciprocals (no device rcp).
+    # SiTUv2 beta/linear_beta + swiglu_limit -> runtime f32 scalars (host precomputes
+    # reciprocals; no device rcp). swiglu_limit is the SiTUv2 clamp bound (+inf =
+    # no clamp), matching the a8w4/mixed_moe situv2 clamp so a16w4 == a8w4.
     _beta = float(situ_beta)
     _lbeta = float(situ_linear_beta)
     if _beta <= 0.0 or _lbeta <= 0.0:
@@ -226,6 +229,7 @@ def flydsl_a16w4_gemm1(
         1.0 / _beta,
         _lbeta,
         1.0 / _lbeta,
+        float(swiglu_limit),
         inter_sorted_bf16.data_ptr(),
         torch.cuda.current_stream() if stream is None else stream,
     )
