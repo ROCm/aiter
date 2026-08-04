@@ -201,6 +201,81 @@ def _heuristic_bv(
     return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
 
 
+# -- HIP-equivalent BV selector (frozen, self-contained copy) --------------
+# The mfma16_hip fork below picks BV to match the hand-tuned HIP K5 kernel
+# (``aiter.ops.chunk_gated_delta_rule_fwd_h``) point-for-point. Rather than
+# importing that module's private ``_select_bv`` -- whose name/signature drift
+# with mainline HIP retunes and have already broken this fork once -- we keep a
+# frozen copy of its LDS/CU-threshold algorithm here. This intentionally does
+# NOT track future mainline HIP changes; re-sync deliberately if the HIP
+# heuristic is retuned and parity is still desired.
+_HIPEQ_BV_FIXED_LDS_BYTES = 32 * 1024
+_HIPEQ_BV_LDS_BYTES_PER_BV = 512
+_HIPEQ_BV_RESIDENT_WGS_CAP = 2
+_HIPEQ_BV_CANDIDATES = (64, 32, 16)
+_HIPEQ_BV_CACHE: dict[tuple[int, int, int, int], int] = {}
+
+
+def _hipeq_device_idx(device: torch.device) -> int:
+    if device.index is not None:
+        return int(device.index)
+    return int(torch.cuda.current_device())
+
+
+def _hipeq_shared_memory_per_cu(props: object) -> int:
+    """Per-CU shared memory with architecture-based fallback."""
+    shared_per_cu = getattr(props, "shared_memory_per_multiprocessor", None)
+    if shared_per_cu is not None:
+        return int(shared_per_cu)
+    arch = getattr(props, "gcnArchName", "")
+    if arch:
+        arch = arch.split(":")[0]
+    _arch_lds = {"gfx95": 128 * 1024, "gfx94": 64 * 1024}
+    for prefix, size in _arch_lds.items():
+        if arch.startswith(prefix):
+            return size
+    shared_per_block = getattr(props, "shared_memory_per_block", None)
+    if shared_per_block is not None:
+        return int(shared_per_block)
+    raise RuntimeError("Unable to determine shared memory per CU.")
+
+
+def _hipeq_compute_bv(
+    device: torch.device, total_chunks: int, max_seq_chunks: int, num_heads: int
+) -> int:
+    props = torch.cuda.get_device_properties(device)
+    num_cus = props.multi_processor_count
+    lds_per_cu = _hipeq_shared_memory_per_cu(props)
+    for bv in _HIPEQ_BV_CANDIDATES:
+        lds_per_wg = _HIPEQ_BV_FIXED_LDS_BYTES + _HIPEQ_BV_LDS_BYTES_PER_BV * bv
+        resident = min(max(1, lds_per_cu // lds_per_wg), _HIPEQ_BV_RESIDENT_WGS_CAP)
+        total_wgs = (128 // bv) * num_heads * total_chunks
+        threshold = max(1, (num_cus * resident) // 2) * max_seq_chunks
+        if total_wgs >= threshold:
+            return bv
+    return 16
+
+
+def _hipeq_select_bv(
+    device: torch.device, num_heads: int, total_chunks: int, max_seq_chunks: int
+) -> int:
+    key = (_hipeq_device_idx(device), num_heads, total_chunks, max_seq_chunks)
+    cached = _HIPEQ_BV_CACHE.get(key)
+    if cached is not None:
+        return cached
+    bv = _hipeq_compute_bv(device, total_chunks, max_seq_chunks, num_heads)
+    _HIPEQ_BV_CACHE[key] = bv
+    return bv
+
+
+def _hipeq_varlen_host_metadata(chunk_offsets: torch.Tensor) -> tuple[int, int]:
+    """Total and maximum per-sequence chunk counts (one D2H transfer)."""
+    offsets = chunk_offsets.tolist()
+    total_chunks = offsets[-1]
+    max_seq_chunks = max(offsets[i + 1] - offsets[i] for i in range(len(offsets) - 1))
+    return total_chunks, max_seq_chunks
+
+
 def _get_or_compile(
     K,
     V,
@@ -799,10 +874,10 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     contract via ``initial_state_indices`` / ``inplace_final_state``, matching
     ``chunk_gated_delta_rule_fwd_h_hip_fn``).
 
-    Unlike the baseline wrapper, BV is chosen by the hip K5 selector
-    (``_select_bv_for_varlen`` / ``_select_bv_for_dense``) so it matches
-    ``chunk_gated_delta_rule_fwd_h_hip_fn`` exactly; ``FLYDSL_K5_MFMA16HIP_BV``
-    (in {16,32,64}) overrides it for A/B sweeps.
+    Unlike the baseline wrapper, BV is chosen by a frozen, self-contained copy
+    of the hip K5 LDS/CU selector (``_hipeq_select_bv``) so it matches the
+    hand-tuned HIP kernel today without importing its private API;
+    ``FLYDSL_K5_MFMA16HIP_BV`` (in {16,32,64}) overrides it for A/B sweeps.
     """
     use_g = g is not None
     use_gk = gk is not None
@@ -1043,20 +1118,16 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     else:
         si_i32 = None
 
-    # BV selection: reuse the hip K5 analytic selector so the fork picks the
-    # same BV as ``chunk_gated_delta_rule_fwd_h_hip_fn`` (lazy import avoids a
-    # potential circular import; both sides key on the same chunk_offsets).
-    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
-        _select_bv_for_dense as _hip_select_bv_for_dense,
-    )
-    from aiter.ops.chunk_gated_delta_rule_fwd_h import (
-        _select_bv_for_varlen as _hip_select_bv_for_varlen,
-    )
-
+    # BV selection: use the frozen, self-contained copy of the hip K5 LDS/CU
+    # selector (``_hipeq_select_bv`` above) so this fork picks the same BV as
+    # the hand-tuned HIP kernel today, without importing its private API.
+    # dense: total_chunks = B*NT, max_seq_chunks = NT (NT = cdiv(T, BT));
+    # varlen: both come from chunk_offsets (one D2H transfer, like hip).
     if is_varlen:
-        BV = _hip_select_bv_for_varlen(chunk_offsets, H)
+        _total_chunks, _max_seq_chunks = _hipeq_varlen_host_metadata(chunk_offsets)
     else:
-        BV = _hip_select_bv_for_dense(B, T_flat, chunk_size, H, k.device)
+        _total_chunks, _max_seq_chunks = B * NT, NT
+    BV = _hipeq_select_bv(k.device, H, _total_chunks, _max_seq_chunks)
 
     # Env override for A/B BV sweeps; the hand-tuned HIP K5 reference is fixed
     # at BV=16 (FLYDSL_K5_MFMA16HIP_BV=16 reproduces it).
