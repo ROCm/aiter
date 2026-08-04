@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import contextlib
 import itertools
 
 import pandas as pd
@@ -46,6 +47,45 @@ except ImportError:
     flydsl_fp8_mqa_logits = None
 
 
+@contextlib.contextmanager
+def _fill_output_with_nan(s_q, s_k):
+    """NaN-fill the output buffer a launcher allocates inside this block.
+
+    Why this is needed: `clean_logits=True` is satisfied by the kernel
+    itself writing -inf to the out-of-window positions -- so the `-inf` mask
+    assert below is the only thing checking the fill.
+    On its own that assert is vacuous: the launcher
+    allocates with `torch.empty`, and PyTorch's caching allocator hands the same
+    block back on every iteration, still holding the previous iteration's
+    correct -inf. An under-fill (a missed grid.y chunk, an off-by-one at a range
+    boundary) would pass every time.
+
+    Nan-initialization turns every position the kernel fails to write into a NaN, which
+    fails the mask assert directly. It also hardens `clean_logits=False` by
+    proving the epilogue writes every in-window position.
+    """
+    real_empty = torch.empty
+    nan_filled = []
+
+    def _empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if (
+            t.dtype == torch.float32
+            and t.dim() == 2
+            and t.shape[0] >= s_q
+            and t.shape[1] >= s_k
+        ):
+            t.fill_(float("nan"))
+            nan_filled.append(tuple(t.shape))
+        return t
+
+    torch.empty = _empty
+    try:
+        yield nan_filled
+    finally:
+        torch.empty = real_empty
+
+
 def _make_windows(s_q, s_k, mode):
     if mode == "causal":
         ks = torch.zeros(s_q, dtype=torch.int, device="cuda")
@@ -79,6 +119,20 @@ def _make_windows(s_q, s_k, mode):
             -1 - (rows % 7),
             torch.where(rows % 3 == 1, 0, torch.minimum(rows + 1, ks + s_k)),
         )
+        return ks.to(torch.int32), ke.to(torch.int32)
+    if mode == "past_end":
+        # cu_starts beyond seq_len_kv, interleaved with ordinary rows. A window
+        # that starts past the end of KV is legal input and simply empty, but it
+        # is the one case where the kernel's -inf fill must clamp cu_starts:
+        # the fill's first range is [0, cu_starts), the per-row output view is a
+        # buffer descriptor covering 4 GiB from the row base (no hardware OOB
+        # net), and seq_len_kv is often the row stride exactly.
+        # An unclamped fill would run straight into the next row's live columns.
+        # The reference masks with an unclamped `col >= cu_starts`, so it agrees:
+        # these rows are entirely -inf.
+        rows = torch.arange(s_q, device="cuda")
+        ks = torch.where(rows % 2 == 0, s_k + 17, 0)
+        ke = torch.where(rows % 2 == 0, s_k + 64, torch.minimum(rows + 1, ks + s_k))
         return ks.to(torch.int32), ke.to(torch.int32)
     raise ValueError(f"unknown window mode: {mode}")
 
@@ -157,7 +211,23 @@ def test_fp8_mqa_logits(
     ret = {"gfx": get_gfx()}
     for name, fn in candidates.items():
         with torch.inference_mode():
-            out, us = run_perftest(fn)
+            _, us = run_perftest(fn)
+            # Correctness is graded on a separate, NaN-initialized call -- not on
+            # run_perftest's result.
+            #
+            # This construction intercepts the regular torch.empty call the launcher 
+            # makes to allocate the output buffer, and fills it with NaN. 
+            # The kernel then writes into that buffer, and any unwritten positions remain NaN. 
+            # The correctness check below asserts that the -inf mask matches the reference, 
+            # so any unwritten positions (which should be -inf) will fail the assert if they are still NaN.
+            #
+            # Applied to triton too where it essentially does nothing since its launcher still
+            # pre-fills with torch.full when clean_logits=True.
+            with _fill_output_with_nan(s_q, s_k) as nan_filled:
+                out = fn()
+        if name == "flydsl":
+            # Ensure that then the logits buffer was NaN filled, i.e., sanity check for the FlyDSL kernel test.
+            assert nan_filled, "flydsl: the output buffer was not intercepted."
         out = _rehydrate(out, ks, ke, s_q, s_k, clean_logits)
 
         out_mask = out == float("-inf")
@@ -266,8 +336,8 @@ def main():
         "--window",
         type=str,
         nargs="*",
-        default=["causal", "cp", "misaligned", "empty"],
-        choices=["causal", "cp", "misaligned", "empty"],
+        default=["causal", "cp", "misaligned", "empty", "past_end"],
+        choices=["causal", "cp", "misaligned", "empty", "past_end"],
     )
     args = parser.parse_args()
 

@@ -80,6 +80,99 @@ def _load_pack_i32x8(i32_view, byte_off_i32):
     return Vec(v4_lo).shuffle(v4_hi, list(range(8))).ir_value()
 
 
+def _emit_neg_inf_range(out_row_t, neg_inf, lo_i32, hi_i32, tid_i32, nthreads):
+    """Thread-strided ``out_row_t[c] = -inf`` over columns ``[lo, hi)``.
+
+    ``nthreads`` threads cooperate, with ``tid_i32`` in ``[0, nthreads)``; thread
+    ``t`` writes ``lo+t, lo+t+nthreads, ...``. Consecutive lanes cover
+    consecutive dwords, so one wave iteration coalesces into a single 256-byte
+    store. Zero-trip on an empty range (``scf.for`` with ``lb >= ub``).
+
+    Plain dwords on purpose: the fill is bandwidth-bound rather than store-issue-bound. 
+    So dwordx4 doesn't improve performance.
+    """
+    lo = _to_raw(fx.Index(_i32_add(lo_i32, tid_i32)))
+    hi = _to_raw(fx.Index(hi_i32))
+    step = _to_raw(fx.Index(fx.Int32(nthreads)))
+    loop = scf.ForOp(lo, hi, step, [])
+    with ir.InsertionPoint(loop.body):
+        col = fx.Int32(arith.index_cast(T.i32, loop.induction_variable))
+        out_row_t[col] = fx.Float32(neg_inf)
+        scf.YieldOp([])
+
+
+def _emit_row_neg_inf_fill(
+    *,
+    logits,  # the output kernel arg
+    stride_i64,  # i64 row stride in elements (the builders' _stride_i64)
+    rows,  # list[fx.Int32]: absolute query rows this thread group owns
+    starts,  # list[fx.Int32]: max(cu_starts, 0),        parallel to rows
+    ends,  # list[fx.Int32]: min(cu_ends, seq_len_kv), parallel to rows
+    seq_len_kv,  # fx.Int32
+    tid_i32,  # fx.Int32 in [0, nthreads): id within the cooperating group
+    nthreads,  # int: 64 (one wave) or MR_BLOCK_THREADS (the whole block)
+    by_i32,  # fx.Int32: block_idx.y
+    num_splits,  # fx.Int32: grid.y (>= 1)
+    clean_logits,  # fx.Int32: 0/1
+):
+    """``clean_logits`` prefill, fused into the compute kernel.
+
+    The epilogue writes column ``c`` of row ``rows[j]`` only for
+    ``c in [starts[j], ends[j])``, so the complement inside ``[0, seq_len_kv)``
+    is never written by anybody. This emits -inf over exactly that complement,
+    which is the two contiguous ranges ``[0, s)`` and ``[e, seq_len_kv)`` with::
+
+        s = min(starts[j], seq_len_kv)
+        e = max(ends[j], s)
+
+    ``e``'s max collapses an empty or inverted window (``cu_ends <= cu_starts``,
+    or the negative ``cu_ends`` a causal mask yields when s_kv < s_q) to
+    "fill the whole row", and keeps the two ranges from overlapping. ``s``'s min
+    is load-bearing: ``starts`` is clamped only from below, and the per-row
+    output descriptor is built with ``num_records`` = 4 GiB, so an unclamped
+    ``cu_starts`` past the end would run off the row and corrupt the next ones
+    with no hardware OOB net.
+
+    Rows are already partitioned across grid.x (and across waves in the LDS
+    builder), but ``num_splits`` blocks share every row. Since nobody computes
+    the complement, it can be partitioned freely: block ``by`` takes its ``by``-th
+    equal chunk of each range -- disjoint, gap-free, and balanced across grid.y.
+    That is deliberately independent of the tile loop's
+    ``tile_start``/``split_cols`` arithmetic and is emitted unconditionally, so a
+    block whose ``by`` lands past the union window (zero tile iterations) still
+    fills its share.
+
+    MUST be emitted AFTER the tile loop. ``_build_kernel_mfma_lds_pipe`` waits on
+    an exact ``s_waitcnt vmcnt(N)`` for its in-flight global->LDS DMAs, and on
+    gfx9 vmcnt counts vector STORES too -- a fill store in flight inside the loop
+    would inflate the count and let the kernel read a half-written LDS tile.
+    Fill and compute addresses are disjoint, so no barrier or ordering is needed.
+    """
+    i32_0 = fx.Int32(0)
+    slk = fx.Int32(seq_len_kv)
+    # Scalar-uniform branch: the flag is a kernarg, so this is s_cmp/s_cbranch.
+    cond = arith.cmpi(arith.CmpIPredicate.ne, _to_raw(clean_logits), _to_raw(i32_0))
+    with ir.InsertionPoint(scf.IfOp(cond).then_block):
+        neg_inf = arith.constant(float("-inf"), type=T.f32)
+
+        def _split(lo_i32, hi_i32):
+            """This block's chunk of ``[lo, hi)``: the ``by``-th of num_splits."""
+            lo, hi = _to_raw(lo_i32), _to_raw(hi_i32)
+            chunk = arith.ceildivui(arith.subi(hi, lo), _to_raw(num_splits))
+            b_lo = arith.minsi(arith.addi(lo, arith.muli(_to_raw(by_i32), chunk)), hi)
+            b_hi = arith.minsi(arith.addi(b_lo, chunk), hi)
+            return fx.Int32(b_lo), fx.Int32(b_hi)
+
+        for j in range_constexpr(len(rows)):
+            out_row_t = _make_out_row_t(logits, stride_i64, rows[j])
+            s = fx.Int32(arith.minsi(_to_raw(starts[j]), _to_raw(slk)))
+            e = fx.Int32(arith.maxsi(_to_raw(ends[j]), _to_raw(s)))
+            for lo_i32, hi_i32 in ((i32_0, s), (e, slk)):
+                b_lo, b_hi = _split(lo_i32, hi_i32)
+                _emit_neg_inf_range(out_row_t, neg_inf, b_lo, b_hi, tid_i32, nthreads)
+        scf.YieldOp([])
+
+
 # Default KV tile width (columns processed per inner-loop iteration).
 _BLOCK_KV = 128
 
@@ -453,6 +546,7 @@ def _build_kernel_mfma_r_w(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,  # grid.y KV-column splits (1 == no split)
+        clean_logits: fx.Int32,  # 0/1: also write -inf outside every row's window
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         mfma_res_ty = Vec.make_type(ACC_ELEMS, fx.Float32)
@@ -712,8 +806,8 @@ def _build_kernel_mfma_r_w(
 
                     # Only lane_div_N==0 lanes hold the MFMA_N distinct columns.
                     # `col >= start` is required: the tile loop is BKV-aligned
-                    # below `start`, so it guards the pre-filled -inf in
-                    # [aligned_start, start).
+                    # below `start`, so it guards the -inf that the fused fill
+                    # below writes into [aligned_start, start).
                     in_window = arith.andi(
                         _to_raw(
                             arith.cmpi(
@@ -746,6 +840,21 @@ def _build_kernel_mfma_r_w(
 
             scf.YieldOp([])
 
+        # ---- Fused clean_logits prefill (must come after the tile loop) ----
+        _emit_row_neg_inf_fill(
+            logits=logits,
+            stride_i64=_stride_i64,
+            rows=[_i32_add(r0, fx.Int32(j)) for j in range_constexpr(RPB)],
+            starts=starts,
+            ends=ends,
+            seq_len_kv=seq_len_kv,
+            tid_i32=tid,  # every thread in the block cooperates
+            nthreads=MR_BLOCK_THREADS,
+            by_i32=by,
+            num_splits=num_splits,
+            clean_logits=clean_logits,
+        )
+
     @flyc.jit
     def launch_fp8_mqa_logits_mfma_r_w(
         Q: fx.Tensor,
@@ -759,6 +868,7 @@ def _build_kernel_mfma_r_w(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
+        clean_logits: fx.Int32,
         stream: fx.Stream,
     ):
         n_blocks = arith.ceildivui(_to_raw(seq_len), _to_raw(fx.Int32(RPB)))
@@ -777,6 +887,7 @@ def _build_kernel_mfma_r_w(
             seq_len_kv,
             stride_logits_s,
             num_splits,
+            clean_logits,
         ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_r_w
@@ -913,6 +1024,7 @@ def _build_kernel_mfma_lds_pipe(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
+        clean_logits: fx.Int32,  # 0/1: also write -inf outside every row's window
     ):
         f32_0 = arith.constant(0.0, type=T.f32)
         i32_64 = arith.constant(64, type=T.i32)
@@ -1272,6 +1384,27 @@ def _build_kernel_mfma_lds_pipe(
 
             scf.YieldOp([])
 
+        # ---- Fused clean_logits prefill: per-wave, over this wave's own rows.
+        # A wave holds starts[]/ends[] only for its RPW rows; making all waves
+        # cooperate would need extra cu_starts/cu_ends loads for no gain.
+        # Emitting this after the tile loop is mandatory -- the loop's
+        # s_waitcnt(vmcnt=_WAIT_VMCNT) counts vector stores too on gfx9, so a
+        # fill store in flight inside it would let a half-written LDS tile
+        # through. ----
+        _emit_row_neg_inf_fill(
+            logits=logits,
+            stride_i64=_stride_i64,
+            rows=[_i32_add(wave_row0, fx.Int32(j)) for j in range_constexpr(RPW)],
+            starts=starts,
+            ends=ends,
+            seq_len_kv=seq_len_kv,
+            tid_i32=lane,  # the 64 lanes of THIS wave
+            nthreads=64,
+            by_i32=block_y,
+            num_splits=num_splits,
+            clean_logits=clean_logits,
+        )
+
     @flyc.jit
     def launch_fp8_mqa_logits_mfma_lds_pipe(
         Q: fx.Tensor,
@@ -1285,6 +1418,7 @@ def _build_kernel_mfma_lds_pipe(
         seq_len_kv: fx.Int32,
         stride_logits_s: fx.Int32,
         num_splits: fx.Int32,
+        clean_logits: fx.Int32,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -1308,6 +1442,7 @@ def _build_kernel_mfma_lds_pipe(
             seq_len_kv,
             stride_logits_s,
             num_splits,
+            clean_logits,
         ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_lds_pipe
@@ -1563,8 +1698,10 @@ def flydsl_fp8_mqa_logits(
     cu_starts:    [seq_len], dtype int32, per-row window start (inclusive)
     cu_ends:      [seq_len], dtype int32, per-row window end (exclusive)
     clean_logits: bool. If True, positions outside [cu_starts[i], cu_ends[i])
-                  in row i are written as -inf. If False, the kernel skips
-                  those positions and the caller owns whatever is left there.
+                  in row i are written as -inf -- by the kernel itself, as part
+                  of the same launch; the output is never pre-filled. If False,
+                  the kernel skips those positions and the caller owns whatever
+                  is left there.
     stream:       optional HIP stream; defaults to the current stream.
     variant:      optional kernel-variant tag (see ``KERNEL_VARIANTS``). If None,
                   taken from ``FLYDSL_FP8_MQA_LOGITS_VARIANT`` or, failing that,
@@ -1636,26 +1773,25 @@ def flydsl_fp8_mqa_logits(
         cu_starts = torch.cat([cu_starts, cu_starts.new_zeros(pad)], dim=0)
         cu_ends = torch.cat([cu_ends, cu_ends.new_zeros(pad)], dim=0)
 
-    # Match the Triton launcher's -inf-prefill / padding behavior so the two
-    # produce identically-shaped, identically-masked outputs. The kernel writes
-    # the output through a per-row i64 byte-offset view, so the row*stride*4
-    # element offset no longer has to fit in i32 (the prior ~46k-square ceiling
-    # is gone); only the per-row column offset stays in i32.
+    # Column padding matches the Triton launcher, so the two produce
+    # identically-shaped, identically-strided outputs. It also keeps every row
+    # base 1 KiB-aligned (the stride is a multiple of 256 f32), which the
+    # per-row stores want. The kernel writes the output through a per-row i64
+    # byte-offset view, so the row*stride*4 element offset no longer has to fit
+    # in i32 (the prior ~46k-square ceiling is gone); only the per-row column
+    # offset stays in i32.
+    #
+    # No torch.full even when clean_logits: the kernel now writes -inf itself,
+    # at exactly the out-of-window positions it would otherwise skip. That drops
+    # a whole extra kernel launch and about a third of the output write traffic
+    # (a full-tensor prefill, half of which the epilogue immediately overwrote).
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if clean_logits:
-        logits = torch.full(
-            (seq_len_padded, seq_len_kv_aligned),
-            fill_value=-float("inf"),
-            dtype=torch.float32,
-            device=Q.device,
-        )[:, :seq_len_kv]
-    else:
-        logits = torch.empty(
-            (seq_len_padded, seq_len_kv_aligned),
-            dtype=torch.float32,
-            device=Q.device,
-        )[:, :seq_len_kv]
+    logits = torch.empty(
+        (seq_len_padded, seq_len_kv_aligned),
+        dtype=torch.float32,
+        device=Q.device,
+    )[:, :seq_len_kv]
 
     num_splits = _auto_num_splits(
         seq_len_padded, seq_len_kv, _ROWS_PER_BLOCK, _BKV, Q.device.index
@@ -1678,6 +1814,7 @@ def flydsl_fp8_mqa_logits(
             int(seq_len_kv),
             int(logits.stride(0)),
             int(num_splits),
+            int(bool(clean_logits)),
             stream,
         )
 
