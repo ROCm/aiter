@@ -129,31 +129,15 @@ def _e8m0_byte_to_f32(packed_i32, byte_pos):
     return (b << fx.Int32(23)).bitcast(fx.Float32)
 
 
-def _cvt_pk_bf16_f32_se(src_a_f32, src_b_f32):
-    # Side-effecting v_cvt_pk_bf16_f32 (pack 2 f32 -> 2xbf16 in i32). LOAD-BEARING:
-    # the stateless rocdl.cvt_pk_bf16_f32 gets CSE-merged/reordered across K steps in
-    # the a16wi4 gemm1 hot loop (garbage output); side_effects pins each call.
-    return llvm.inline_asm(
-        ir.IntegerType.get_signless(32),
-        [_raw(src_a_f32), _raw(src_b_f32)],
-        "v_cvt_pk_bf16_f32 $0, $1, $2",
-        "=v,v,v",
-        has_side_effects=True,
-    )
-
-
 def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
     """int4 (signed) -> bf16 upconvert for one MFMA K32 step (8 nibbles -> v8bf16).
 
-    ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the
-    mxfp4 sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8,
-    and scales the mantissa by 16, so the x16 is folded into eff = scale*16.
-    bf16 conversion uses the scalar ``.to(BFloat16)`` truncation (arith.truncf), NOT
-    the side-effecting ``v_cvt_pk_bf16_f32``: truncf is a plain schedulable op so the
-    compiler packs the per-nibble ``* eff`` scale (v_pk_mul_f32) instead of emitting 8
-    scalar v_mul_f32/K32, and it sidesteps the stateless-cvt_pk mis-CSE that forced the
-    side-effecting pin. This is the original a16wi4 dequant (pre-"unify" regression),
-    which beat main. ``use_k16`` (gfx942) already used this path.
+    ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the mxfp4
+    sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8, and
+    x16-scales the mantissa, so x16 folds into eff = scale*16. WHY scalar ``.to(BFloat16)``
+    (arith.truncf) and NOT side-effecting ``v_cvt_pk_bf16_f32``: truncf is schedulable so
+    the compiler packs the per-nibble ``* eff`` (v_pk_mul_f32), and it sidesteps the
+    stateless-cvt_pk mis-CSE that forced the side-effecting pin.
     """
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)

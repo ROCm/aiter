@@ -151,9 +151,7 @@ def _gemm2_body_a16w4(
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
     """
     _is_int4 = w_dtype == "int4"
-    _is_bf16 = (
-        w_dtype == "bf16"
-    )  # a16w16: raw bf16 W (unpacked, no scale, no upconvert)
+    _is_bf16 = w_dtype == "bf16"  # a16w16: raw bf16 W (no scale, no upconvert)
     elem_bytes = 2
     KH_TILE_BYTES = TILE_K * elem_bytes
     LDS_STRIDE = TILE_K
@@ -209,9 +207,8 @@ def _gemm2_body_a16w4(
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
 
-    # bf16 W overflows the 32-bit num_records / i32 byte-offset at large E; fold the
-    # per-expert base into the i64 resource addr and index within the expert. mxfp4/int4
-    # keep the whole-tensor path.
+    # bf16 W overflows the 32-bit num_records/i32 byte-offset at large E; fold the per-
+    # expert base into the i64 resource addr and index within the expert (see gemm1).
     if const_expr(_is_bf16):
         _w_per_expert_bytes = N_OUT * (K * 2)
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
@@ -262,10 +259,9 @@ def _gemm2_body_a16w4(
 
     x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFFFFF))
     x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
-    # gfx950 (K=32): BufferCopyLDS128b direct-to-LDS async copy. gfx942 (use_k16): CDNA3
-    # direct-to-LDS is 4 B/lane only (the 16 B form fails LLVM ISA lowering), so stage via
-    # VGPRs like the legacy kernel: buffer_load 16 B gmem->regs then ds_write 16 B regs->
-    # LDS (both b128, valid on CDNA3), preserving the same swizzled-src / linear-LDS layout.
+    # gfx950 (K=32): BufferCopyLDS128b direct-to-LDS async copy. gfx942 (use_k16): the 16 B
+    # direct-to-LDS form fails LLVM ISA lowering, so stage via VGPRs: buffer_load 16 B
+    # gmem->regs then ds_write 16 B regs->LDS, preserving the swizzled-src/linear-LDS layout.
     if const_expr(use_k16):
         x_dma_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32
@@ -538,8 +534,8 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
-    # region (offset 0) is reused for the epilog's f32 acc staging.
+    # ---- epilogue: atomic bf16 scatter (routing-weighted). A-LDS region (offset 0) is
+    # reused for the epilog's f32 acc staging.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
     accm_v = [
@@ -710,10 +706,9 @@ def compile_gemm2_a16w4_port(
             )
 
         if const_expr(persist):
-            # Persistent CU-limited grid (~NUM_CU CTAs): each CTA does tile bx_i32 then
-            # strides by grid size over [0, bound); _xcd_np maps every visited index, so
-            # each tile runs once (same mapping as non-persistent). Loop-top barrier
-            # separates the prev tile's epilog LDS from the next tile's A-DMA.
+            # Persistent CU-limited grid (~NUM_CU CTAs): each CTA strides by grid size over
+            # [0, bound); _xcd_np maps every visited index so each tile runs once. Loop-top
+            # barrier separates the prev tile's epilog LDS from the next tile's A-DMA.
             grid_nb = fx.Int32(gpu.grid_dim.x)
             if bx_i32 < bound:
                 _run_tile(_xcd_np(bx_i32))

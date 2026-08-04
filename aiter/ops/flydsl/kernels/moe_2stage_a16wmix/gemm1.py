@@ -20,7 +20,6 @@ from .utils import (  # noqa: F401
     A16WI4_GROUP_SIZE,
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
-    _cvt_pk_bf16_f32_se,
     _e8m0_byte_to_f32,
     _gep,
     _global_base_ptr1,
@@ -77,9 +76,7 @@ def _gemm1_body_a16w4(
     -> bf16 intermediate ``[sorted_size, inter_dim]`` stored by SORTED POSITION.
     """
     _is_int4 = w_dtype == "int4"
-    _is_bf16 = (
-        w_dtype == "bf16"
-    )  # a16w16: raw bf16 W (unpacked, no scale, no upconvert)
+    _is_bf16 = w_dtype == "bf16"  # a16w16: raw bf16 W (no scale, no upconvert)
     N_OUT = 2 * INTER
     elem_bytes = 2  # bf16
     a_elem_bytes = 2
@@ -88,9 +85,8 @@ def _gemm1_body_a16w4(
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64  # bf16 8-per-lane K micro-steps per K-tile
     _k0_count = TILE_K // 128
-    # Wave partition num_n_waves x k_wave. k_wave=1: 4 waves split TILE_N (TILE_N/4 each).
-    # k_wave>1 (aiter intra-block slice-K): each wave does a K-slice (klen=K/k_wave) of a
-    # wider N-slice; partials LDS-reduced across k-group peers before epilogue.
+    # k_wave=1: 4 waves split TILE_N. k_wave>1 (intra-block slice-K): each wave does a
+    # K-slice (klen=K/k_wave) of a wider N-slice; partials LDS-reduced before epilogue.
     _NUM_WAVES = 4
     num_n_waves = _NUM_WAVES // k_wave
     if const_expr(k_wave > 1):
@@ -106,9 +102,9 @@ def _gemm1_body_a16w4(
     # A load is group-local: num_n_waves*64 threads load each k-group's BM x TILE_K tile.
     a_load_threads = num_n_waves * 64
     k_blocks16 = KH_TILE_BYTES // 16
-    # Software pipeline (aiter-aligned): A-LDS double-buffered (tile K+1 DMA -> pong while
-    # K reads ping); B + B-scale for K+1 issued before K's MFMA to stay in flight. A-DMA
-    # completes on lgkmcnt, so only s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
+    # Software pipeline: A-LDS double-buffered (K+1 DMA -> pong while K reads ping); B +
+    # B-scale for K+1 issued before K's MFMA. A-DMA completes on lgkmcnt, so only
+    # s_waitcnt(lgkmcnt=0) + one barrier gate the ds_read.
     _PIPE = K_TILES_TOTAL > 1
     A_LDS_STAGES = 2 if _PIPE else 1
     A_SLOT_BYTES = BM * KH_TILE_BYTES
@@ -163,9 +159,9 @@ def _gemm1_body_a16w4(
     inter_i32 = fx.Int32(INTER)
 
     # ---- buffer resources -----------------------------------------------------
-    # bf16 W [E, N_OUT, K] whole-tensor extent overflows the 32-bit num_records/i32
-    # byte-offset at large E (E896: 6.6GB): fold the per-expert base into the i64
-    # resource addr and index within the expert. mxfp4/int4 keep the whole-tensor path.
+    # bf16 W whole-tensor extent overflows the 32-bit num_records/i32 byte-offset at large
+    # E (E896: 6.6GB): fold the per-expert base into the i64 resource addr and index within
+    # the expert. mxfp4/int4 keep the whole-tensor path.
     if const_expr(_is_bf16):
         _w_per_expert_bytes = N_OUT * (K * 2)
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
@@ -182,20 +178,18 @@ def _gemm1_body_a16w4(
         _sw_bytes = NE * N_OUT * _g_half * 4
     else:
         _sw_bytes = NE * N_OUT * (scale_k_padded // 32)
-    # bf16 W has no scale buffer; sw_tiles unused (arg_bscale is a dummy pointer). Scale
-    # is a per-lane scalar e8m0/bf16-pair gather: a make_buffer_tensor 1-dword tiles view
-    # + BufferCopy32b scalar read (buffer_load_dword, OOB-clamped) replaces the raw
-    # create_buffer_resource_from_addr + buffer_load.
+    # bf16 W has no scale buffer (arg_bscale is a dummy pointer). Scale is a per-lane scalar
+    # e8m0/bf16-pair gather: make_buffer_tensor 1-dword tiles view + BufferCopy32b scalar
+    # read (buffer_load_dword, OOB-clamped).
     sw_tiles = (
         None
         if _is_bf16
         else _global_i32_buffer_tiles(arg_bscale, min(_sw_bytes, 0xFFFFFFFF), 1)
     )
     sw_read_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
-    # Intermediate [sorted_size, inter] bf16: num_records = cumsum0*inter*2, so masked
-    # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
-    # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
-    # API does not express the masked scalar scatter this epilogue relies on.
+    # Intermediate [sorted_size, inter] bf16. KEPT RAW: the masked buffer_store epilogue
+    # needs a dynamic (runtime cumsum0) num_records + per-store predication that the fx.copy
+    # layout API cannot express.
     _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
@@ -234,16 +228,12 @@ def _gemm1_body_a16w4(
         x_row_base_div4.append(t_i32 * fx.Int32(c_k_div4))
 
     # A global->LDS staging. gfx950 (K=32): one BufferCopyLDS128b direct-to-LDS async copy
-    # (16 B / 8 bf16, VGPR-bypassing). gfx942 (use_k16): CDNA3 direct-to-LDS moves only
-    # 4 B/lane; the 16 B dwordx4-to-LDS form does not exist and LLVM cannot legalize the
-    # s128 LDS store (ISA-lowering crash). A narrow 4x4 B direct-to-LDS split is also wrong
-    # because buffer_load_dword...lds writes lane L to M0+L*width -- four 4 B copies cannot
-    # reproduce the 16 B/lane layout the 128b copy (and the ds_read_b128 A-read) expect.
-    # So on gfx942 stage via VGPRs like the legacy kernel: buffer_load 16 B gmem->regs then
-    # ds_write 16 B regs->LDS (both b128, valid on CDNA3), preserving the same LDS layout.
+    # (16 B/lane, VGPR-bypassing). gfx942 (use_k16): CDNA3 has no 16 B dwordx4-to-LDS form
+    # (LLVM cannot legalize the s128 LDS store), so stage via VGPRs: buffer_load 16 B
+    # gmem->regs then ds_write 16 B regs->LDS (both b128), preserving the same LDS layout.
     # LOAD-BEARING OOB clamp: size the resource to the REAL [n_tokens, K] bf16 alloc so
-    # padding-row loads (sentinel token id >= n_tokens) get HW-clamped to 0 (epilogue is
-    # token<i32_ntok guarded). A ~4GB resource would instead fault on unmapped memory.
+    # padding-row loads (token >= n_tokens) get HW-clamped to 0 (epilogue is token<i32_ntok
+    # guarded); a ~4GB resource would instead fault on unmapped memory.
     x_buf = _global_i32_buffer_view(
         arg_x, fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4)
     )
@@ -455,11 +445,9 @@ def _gemm1_body_a16w4(
         col_g = by_n + n_tile_base + fx.Int32(ni * 16) + lane_mod_16
         col_g_list.append(col_g)
         if const_expr(_guint):
-            # GUGU (aiter guinterleave, shuffle_weight/shuffle_scale is_guinterleave=True):
-            # gate/up rows are interleaved. The weight 16-row block index within an expert
-            # is n0*2 (gate) / n0*2+1 (up); the scale packs gate/up into the N_Pack byte of
-            # a SHARED dword (np = 0 gate / 1 up). K indexing is unchanged vs standard
-            # (verified byte-identical; only the N term differs). mxfp4 only.
+            # GUGU (guinterleave): gate/up rows interleaved. Weight 16-row block index is
+            # n0*2 (gate) / n0*2+1 (up); scale packs gate/up into the N_Pack byte of a SHARED
+            # dword (np=0 gate / 1 up). K indexing unchanged vs standard. mxfp4 only.
             n0_local = (by_n + n_tile_base + fx.Int32(ni * 16)) // fx.Int32(16)
             blk_gate = e * fx.Int32(N_OUT // 16) + n0_local * fx.Int32(2)
             n_blk_gate.append(blk_gate)
@@ -645,10 +633,10 @@ def _gemm1_body_a16w4(
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
 
-    # ---- k_wave slice-K reduce (aiter mixed_moe LDS-reduce): each wave stores its
-    # nm = num_acc_n*m_repeat vec4-f32 acc-slots to a per-wave LDS region, then sums its
-    # peers' (peer = g*num_n_waves + wave_n_id) partials. Gate/up reduced in SEPARATE
-    # rounds to halve peak LDS scratch (kw4@tile_n=256 else overruns 160KB).
+    # ---- k_wave slice-K LDS-reduce: each wave stores its nm=num_acc_n*m_repeat vec4-f32
+    # acc-slots to a per-wave LDS region, then sums its peers' (peer=g*num_n_waves+
+    # wave_n_id) partials. Gate/up reduced in SEPARATE rounds to halve peak LDS scratch
+    # (kw4@tile_n=256 else overruns 160KB).
     if const_expr(k_wave > 1):
         nm = num_acc_n * m_repeat
         grp_stride = 64 * nm * 4  # f32 elems per wave (vec4 per lane per acc-slot)
@@ -686,8 +674,8 @@ def _gemm1_body_a16w4(
         _reduce_round(acc_up)
 
     # ---- epilogue: SiLU(gate)*up -> bf16 intermediate [sorted_size, inter] -----
-    # Stored by SORTED POSITION (row = bx_m + row_in_tile). Padding rows (token >=
-    # tokens) masked out; for k_wave>1 only the primary k-group (wave_k_id==0) writes.
+    # Stored by SORTED POSITION. Padding rows (token >= tokens) masked out; for k_wave>1
+    # only the primary k-group (wave_k_id==0) writes.
     if const_expr(k_wave > 1):
         _is_primary = wave_k_id == fx.Int32(0)
     for mi in range_constexpr(m_repeat):
