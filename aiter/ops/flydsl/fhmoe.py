@@ -42,6 +42,7 @@ def compile_flydsl_fhmoe_stage1(
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage1 kernel."""
@@ -77,6 +78,7 @@ def compile_flydsl_fhmoe_stage1(
         a_scale_one=a_scale_one,
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
         shared_expert_id=shared_expert_id,
     )
 
@@ -274,6 +276,7 @@ def flydsl_fhmoe_stage1(
     xcd_swizzle: int = 0,
     swiglu_limit: float | None = None,
     k_wave: int = 1,
+    v2_output_layout: bool = False,
     shared_w1: torch.Tensor,
     shared_w1_scale: torch.Tensor,
     shared_expert_id: int,
@@ -320,6 +323,7 @@ def flydsl_fhmoe_stage1(
         xcd_swizzle=xcd_swizzle,
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
+        v2_output_layout=v2_output_layout,
         _compile_kernel=compile_kernel,
         _build_mx_args=build_mx_args,
     )

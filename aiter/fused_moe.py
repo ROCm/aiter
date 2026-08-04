@@ -49,6 +49,8 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _is_mxfp4_kname,
     _parse_mxfp4_g1_kname,
     _parse_mxfp4_g2_kname,
+    parse_flydsl_v2_gemm2_kernel,
+    parse_g2_kname_any,
 )
 from aiter.ops.opus import moe_stage2_a8w4_fused_adapter as _opus_a8w4
 
@@ -423,6 +425,9 @@ def stage2_uses_route_reduce(stage2: Callable) -> bool:
         return parsed is not None and parsed.get("mode", "atomic") == "reduce"
     if func is _opus_a8w4.opus_a8w4_stage2_wrapper:
         return _opus_a8w4.stage2_uses_route_reduce(stage2)
+    if func is _flydsl_v2_stage2_wrapper:
+        cfg = parse_flydsl_v2_gemm2_kernel(kernel_name)
+        return cfg is not None and cfg.get("epilog") == "reduce"
     return False
 
 
@@ -848,7 +853,7 @@ def _fused_moe_impl(
                 "(expert_mask is dropped by the output_aux sort path)."
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
-        _atomic = _parse_mxfp4_g2_kname(_kn2)["atomic"]
+        _atomic = parse_g2_kname_any(_kn2)["atomic"]
         (
             sorted_ids,
             sorted_weights,
@@ -1351,6 +1356,8 @@ def _flydsl_stage1_wrapper(
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     zero_out=None,
+    out_dtype: str | None = None,
+    v2_output_layout: bool = False,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1359,6 +1366,8 @@ def _flydsl_stage1_wrapper(
     parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernelName)
     if parsed is None:
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
+    if out_dtype is not None:
+        parsed = {**parsed, "out_dtype": out_dtype}
     if activation == ActivationType.Swiglu:
         act = "swiglu"
     elif activation == ActivationType.Situv2:
@@ -1400,6 +1409,7 @@ def _flydsl_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         k_wave=parsed.get("k_wave", 1),
         zero_out=zero_out,
+        v2_output_layout=v2_output_layout,
     )
 
 
@@ -1805,10 +1815,9 @@ def _mxfp4_a4w4_stage2_fw(
 ):
 
     device = inter_states.device
-    p2 = _parse_mxfp4_g2_kname(kernelName2)
-    BM = p2["BM"]
-    atomic = p2["atomic"]
-    mxfp4out = p2.get("mxfp4out", False)
+    # kernelName2's format selects the gemm2 family: a flydsl_moe2_layout name
+    # means path B (v2 gemm2 behind the mxmoe front-end), else native mxmoe.
+    cfg = parse_g2_kname_any(kernelName2)
     # Read inter_real BEFORE any w2.view() drops the attr. The flydsl port reads
     # D_INTER directly (D_INTER_REAL handles the unpadded shard); no K-pad needed.
     inter_real = getattr(w2, "inter_real", None)
@@ -1818,6 +1827,38 @@ def _mxfp4_a4w4_stage2_fw(
     D_HIDDEN = w2.shape[1]
     D_INTER = w1.shape[1] // 2
     M = moe_out.shape[0]
+    if cfg["v2"]:
+        # The mxmoe intermediate (inter_states + a2_scale) is byte-compatible
+        # with gemm2_body_v2's native-BM scale-chunk layout at SBM=BM (verified
+        # for BM in {16,32,64,128} x epilog {atomic,reduce}).
+        if inter_real is not None and inter_real != D_INTER:
+            # This path does not thread the v2 gemm2's K-pad skip (has_pad +
+            # i32_kpad), so the pad columns would be accumulated instead of
+            # skipped. v2 needs K aligned only to its BK, so an unpadded shard
+            # is the intended input here.
+            raise NotImplementedError(
+                f"FlyDSL v2 stage2 requires an unpadded inter_dim shard, got "
+                f"w2.inter_real={inter_real} with D_INTER={D_INTER}. Use a "
+                f"native flydsl_mxmoe_g2 kernelName2 for pre-padded weights."
+            )
+        return _flydsl_v2_stage2_wrapper(
+            inter_states=inter_states,
+            w1=None,
+            w2=w2,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            num_valid_ids=num_valid_ids,
+            out=moe_out,
+            topk=topk,
+            kernelName=kernelName2,
+            model_dim=D_HIDDEN,
+            inter_dim=D_INTER,
+            num_experts=NE,
+            w2_scale=w2_scale,
+            a2_scale=a2_scale,
+            sorted_weights=sorted_weights,
+            block_m=block_m,
+        )
     out = _mxfp4_a4w4_stage2(
         inter_states,
         a2_scale,
@@ -1829,8 +1870,8 @@ def _mxfp4_a4w4_stage2_fw(
         sorted_weights,
         reverse_sorted,
         moe_out,
-        atomic=atomic,
-        mxfp4out=mxfp4out,
+        atomic=cfg["atomic"],
+        mxfp4out=cfg["mxfp4out"],
         kernelName2=kernelName2,
         M=M,
         max_sorted=sorted_token_ids.shape[0],
@@ -1838,10 +1879,10 @@ def _mxfp4_a4w4_stage2_fw(
         topk=topk,
         D_HIDDEN=D_HIDDEN,
         D_INTER=D_INTER,
-        BM=BM,
+        BM=cfg["BM"],
         device=device,
-        use_nt=p2["use_nt"],
-        cshuffle=p2.get("cshuffle", False),
+        use_nt=cfg["use_nt"],
+        cshuffle=cfg["cshuffle"],
         inter_real=inter_real,
     )
 
@@ -1858,6 +1899,115 @@ def _mxfp4_scale_u8(scale):
     if scale is not None and scale.element_size() == 1 and scale.dtype != torch.uint8:
         return scale.view(torch.uint8)
     return scale
+
+
+def _flydsl_v2_stage2_wrapper(
+    inter_states,
+    w1,
+    w2,
+    sorted_token_ids,
+    sorted_expert_ids,
+    num_valid_ids,
+    out,
+    topk,
+    kernelName="",
+    model_dim=0,
+    inter_dim=0,
+    num_experts=0,
+    w2_scale=None,
+    a2_scale=None,
+    sorted_weights=None,
+    bias2=None,
+    inter_dim_pad: int = 0,
+    model_dim_pad: int = 0,
+    block_m=None,
+    expert_mask=None,
+    topk_ids=None,
+    **_kwargs,
+):
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    cfg = parse_flydsl_v2_gemm2_kernel(kernelName)
+    if cfg is None:
+        raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName}")
+
+    bm = cfg["tile_m"]
+    bn = cfg["tile_n"]
+    bk = cfg["tile_k"]
+    sbm = cfg["sort_block_m"] or (int(block_m) if block_m else bm)
+    epilog = cfg["epilog"]
+    max_sorted = inter_states.shape[0]
+
+    token_num = out.shape[0]
+    model_dim_runtime = out.shape[1]
+    target = out
+    _s2_fp8_inter = (
+        epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
+    if epilog == "reduce":
+        if _s2_fp8_inter:
+            if model_dim_runtime % 8 != 0:
+                raise ValueError(
+                    "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
+                )
+            target = torch.empty(
+                (token_num * topk, model_dim_runtime + model_dim_runtime // 8),
+                dtype=torch.uint8,
+                device=out.device,
+            )
+        else:
+            target = torch.empty(
+                (token_num, topk, model_dim_runtime),
+                dtype=out.dtype,
+                device=out.device,
+            )
+        if expert_mask is not None:
+            # EP sorting omits remote and fake routes, so GEMM2 intentionally
+            # leaves their per-route slots unwritten. Zero them before the
+            # masked reduction to prevent speculative loads of stale NaN data.
+            target.zero_()
+    mxfp4_moe_gemm2(
+        inter_sorted_quant=_mxfp4_scale_u8(inter_states),
+        inter_sorted_shuffled_scale=_mxfp4_scale_u8(a2_scale),
+        w2_u8=_mxfp4_scale_u8(w2),
+        w2_scale_u8=_mxfp4_scale_u8(w2_scale),
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        sorted_token_ids=sorted_token_ids,
+        sorted_weights=sorted_weights,
+        out=target,
+        M_logical=token_num,
+        max_sorted=max_sorted,
+        NE=num_experts,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        BM=bm,
+        BN=bn,
+        BK=bk,
+        use_nt=cfg["use_nt"],
+        a_dtype=cfg["a_dtype"],
+        epilog=epilog,
+        SBM=sbm,
+        persist=cfg["persist"],
+        inter_dim_pad=inter_dim_pad,
+        model_dim_pad=model_dim_pad,
+        out_dtype="fp8" if _s2_fp8_inter else "bf16",
+    )
+    if epilog == "reduce":
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        _run_moe_reduction(
+            target,
+            out,
+            token_num,
+            topk,
+            model_dim_runtime,
+            expert_mask=expert_mask,
+            topk_ids=topk_ids,
+            is_fp8=_s2_fp8_inter,
+        )
+    return out
 
 
 @functools.lru_cache(maxsize=2048)
@@ -2071,7 +2221,6 @@ def get_2stage_cfgs(
                     f"[fused_moe] Opus stage2 config unsupported ({opus_reason}); "
                     "using default heuristics"
                 )
-
     use_non_temporal_load = False
     if cfg is None or int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")):
         ksplit = 0
@@ -2212,6 +2361,9 @@ def get_2stage_cfgs(
         )
     is_flydsl1 = isinstance(kernelName1, str) and kernelName1.startswith("flydsl_")
     is_flydsl2 = isinstance(kernelName2, str) and kernelName2.startswith("flydsl_")
+    is_flydsl2_layout = isinstance(kernelName2, str) and kernelName2.startswith(
+        "flydsl_moe2_layout_"
+    )
     is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith("opus_moe1_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
@@ -2246,7 +2398,21 @@ def get_2stage_cfgs(
                 use_non_temporal_load=use_non_temporal_load,
             )
 
-        if is_flydsl2:
+        flydsl_v2_stage2_cfg = None
+        if is_flydsl2_layout:
+            flydsl_v2_stage2_cfg = parse_flydsl_v2_gemm2_kernel(kernelName2)
+            if flydsl_v2_stage2_cfg is None:
+                raise ValueError(f"Invalid FlyDSL v2 GEMM2 kernel name: {kernelName2}")
+            stage2_func = functools.partial(
+                _flydsl_v2_stage2_wrapper,
+                kernelName=kernelName2,
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                num_experts=expert,
+                inter_dim_pad=intermediate_pad,
+                model_dim_pad=hidden_pad,
+            )
+        elif is_flydsl2:
             stage2_func = functools.partial(
                 _flydsl_stage2_wrapper,
                 kernelName=kernelName2,
@@ -2278,6 +2444,9 @@ def get_2stage_cfgs(
             )
         _s1_fp8q = is_opus1 or (is_flydsl1 and "_fp8" in kernelName1.split("_t")[-1])
         _fuse_quant = "fp8" if _s1_fp8q else ("fp4" if _s1_fp4q else "")
+        if flydsl_v2_stage2_cfg is not None:
+            stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
+            _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -2286,7 +2455,9 @@ def get_2stage_cfgs(
             run_1stage,
             has_bias=enable_bias and (is_opus1 or is_flydsl1),
             fuse_quant=_fuse_quant,
-            stage2_has_bias=enable_bias and (is_flydsl2 or is_cktile2),
+            stage2_has_bias=enable_bias
+            and ((is_flydsl2 and not is_flydsl2_layout) or is_cktile2),
+            skip_inter_quant=is_flydsl2_layout,
             **route_bucket_metadata,
         )
     if (
@@ -2867,6 +3038,8 @@ def fused_moe_2stages(
         if fuse_stage2_zero:
             extra_stage1_args["zero_out"] = moe_out
     if stage1_func is _flydsl_stage1_wrapper:
+        if stage2_func is _flydsl_v2_stage2_wrapper:
+            extra_stage1_args["v2_output_layout"] = True
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
         # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
@@ -2876,7 +3049,14 @@ def fused_moe_2stages(
         )
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
-    if stage2_func is _flydsl_stage2_wrapper and expert_mask is not None:
+    if (
+        stage2_func
+        in (
+            _flydsl_stage2_wrapper,
+            _flydsl_v2_stage2_wrapper,
+        )
+        and expert_mask is not None
+    ):
         extra_stage2_args["expert_mask"] = expert_mask
         extra_stage2_args["topk_ids"] = topk_ids
     if m_indices is not None:
@@ -2914,7 +3094,12 @@ def fused_moe_2stages(
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(("stage1", _stage1_call))
     a2 = _stage1_call()
-    if m_indices is not None and isinstance(a2, tuple):
+    if (
+        metadata.skip_inter_quant
+        and isinstance(a2, tuple)
+        or m_indices is not None
+        and isinstance(a2, tuple)
+    ):
         a2, a2_scale = a2[0], a2[1]
     elif metadata.fuse_quant == "fp4" and isinstance(a2, tuple):
         a2_raw, a2_scale = a2[0], a2[1]

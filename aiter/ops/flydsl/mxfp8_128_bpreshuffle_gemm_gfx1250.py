@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""gfx1250 FlyDSL backend for a8w8 blockscale bpreshuffle GEMM."""
+"""gfx1250 FlyDSL backend for mxfp8_128 bpreshuffle GEMM.
+
+mxfp8_128: fp8 e4m3 activations/weights with fp8_e8m0 block scales over a
+128-element block (distinct from the 32-element-block MXFP8 and from the
+fp32-scale blockscale GEMM).
+"""
 
 from __future__ import annotations
 
@@ -10,7 +15,7 @@ import re
 import torch
 from torch import Tensor
 
-_launch_gemm_a8w8_bsc_col = None
+_launch_gemm_a8w8 = None
 _ptr_arg = None
 _fx = None
 
@@ -22,15 +27,15 @@ _MAX_SPLIT_K = 1
 
 
 def _lazy_import():
-    global _launch_gemm_a8w8_bsc_col, _ptr_arg, _fx
-    if _launch_gemm_a8w8_bsc_col is not None:
+    global _launch_gemm_a8w8, _ptr_arg, _fx
+    if _launch_gemm_a8w8 is not None:
         return
     import flydsl.expr as fx_mod
 
-    from .kernels.gemm_a8w8_blockscale_gfx1250 import launch_gemm_a8w8_bsc_col
+    from .kernels.gemm_a8w8_gfx1250 import launch_gemm_a8w8
     from .kernels.tensor_shim import ptr_arg
 
-    _launch_gemm_a8w8_bsc_col = launch_gemm_a8w8_bsc_col
+    _launch_gemm_a8w8 = launch_gemm_a8w8
     _ptr_arg = ptr_arg
     _fx = fx_mod
 
@@ -41,18 +46,17 @@ def _require_e8m0_scale(scale: Tensor, shape: tuple[int, int], name: str) -> Ten
 
     if tuple(scale.shape) != shape:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] {name} must have shape {shape}, "
+            f"[FlyDSL gfx1250 mxfp8_128] {name} must have shape {shape}, "
             f"got {tuple(scale.shape)}"
         )
     if scale.dtype != dtypes.fp8_e8m0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] {name} must be fp8_e8m0, "
-            f"got {scale.dtype}"
+            f"[FlyDSL gfx1250 mxfp8_128] {name} must be fp8_e8m0, got {scale.dtype}"
         )
     return scale
 
 
-def run_blockscale_preshuffle_gemm_a8_gfx1250(
+def run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -70,7 +74,7 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
     split_k: int = 1,
     x_scale_transposed: bool = True,
 ) -> Tensor:
-    """Run the gfx1250 WMMA a8w8 blockscale bpreshuffle GEMM.
+    """Run the gfx1250 WMMA mxfp8_128 bpreshuffle GEMM.
 
     XQ: ``(M, K)`` FP8 E4M3. WQ: ``(N, K)`` FP8 E4M3, already 16x16
     preshuffled. x_scale: ``(M, K//128)`` fp8_e8m0; when
@@ -82,36 +86,36 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
 
     if XQ.dim() != 2 or WQ.dim() != 2:
         raise RuntimeError(
-            "[FlyDSL gfx1250 blockscale] A/B must be 2-D, got "
+            "[FlyDSL gfx1250 mxfp8_128] A/B must be 2-D, got "
             f"{tuple(XQ.shape)}, {tuple(WQ.shape)}"
         )
     if XQ.element_size() != 1 or WQ.element_size() != 1:
-        raise RuntimeError("[FlyDSL gfx1250 blockscale] A/B must be 1-byte fp8 storage")
+        raise RuntimeError("[FlyDSL gfx1250 mxfp8_128] A/B must be 1-byte fp8 storage")
 
     M, K = XQ.shape
     N = WQ.shape[0]
     if K != WQ.shape[1]:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] K mismatch: A.K={K} vs B.K={WQ.shape[1]}"
+            f"[FlyDSL gfx1250 mxfp8_128] K mismatch: A.K={K} vs B.K={WQ.shape[1]}"
         )
     if N % _BLOCK_N != 0 or K % _BLOCK_K != 0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] N/K must be multiples of "
+            f"[FlyDSL gfx1250 mxfp8_128] N/K must be multiples of "
             f"{_BLOCK_N}/{_BLOCK_K}, got N={N}, K={K}"
         )
     if N % tile_n != 0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] N={N} not a multiple of tile_n={tile_n}"
+            f"[FlyDSL gfx1250 mxfp8_128] N={N} not a multiple of tile_n={tile_n}"
         )
     if K % tile_k != 0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] K={K} not a multiple of tile_k={tile_k}"
+            f"[FlyDSL gfx1250 mxfp8_128] K={K} not a multiple of tile_k={tile_k}"
         )
 
     out_dtype = _OUT_DTYPE_NAME.get(Out.dtype)
     if out_dtype is None:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] unsupported out dtype {Out.dtype}; "
+            f"[FlyDSL gfx1250 mxfp8_128] unsupported out dtype {Out.dtype}; "
             "expected bf16/fp16"
         )
 
@@ -121,32 +125,32 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
 
     if split_k > _MAX_SPLIT_K:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] split_k={split_k} exceeds the "
+            f"[FlyDSL gfx1250 mxfp8_128] split_k={split_k} exceeds the "
             f"bf16/f16 atomic-add precision cap of {_MAX_SPLIT_K}"
         )
 
     nb = int(num_buffers)
     if nb not in _SUPPORTED_NUM_BUFFERS:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] num_buffers must be one of "
+            f"[FlyDSL gfx1250 mxfp8_128] num_buffers must be one of "
             f"{_SUPPORTED_NUM_BUFFERS}, got {nb}"
         )
     if K % (split_k * tile_k) != 0:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] K={K} must be divisible by "
+            f"[FlyDSL gfx1250 mxfp8_128] K={K} must be divisible by "
             f"split_k*tile_k={split_k}*{tile_k}={split_k * tile_k}"
         )
     num_k_tiles = (K // split_k) // tile_k
     if num_k_tiles < nb:
         raise RuntimeError(
-            f"[FlyDSL gfx1250 blockscale] {nb}-buffer pipeline needs >= {nb} "
+            f"[FlyDSL gfx1250 mxfp8_128] {nb}-buffer pipeline needs >= {nb} "
             f"K-tiles per split-k chunk, got {num_k_tiles}"
         )
 
     if not x_scale_transposed:
         raise RuntimeError(
-            "[FlyDSL gfx1250 blockscale] x_scale_transposed=False is not supported "
-            "by the dedicated blockscale kernel (A-scale must be M-contiguous)"
+            "[FlyDSL gfx1250 mxfp8_128] x_scale_transposed=False is not supported "
+            "by the dedicated mxfp8_128 kernel (A-scale must be M-contiguous)"
         )
 
     k_blocks = K // _BLOCK_K
@@ -161,7 +165,7 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
     out_is_f16 = 1 if out_dtype == "f16" else 0
 
     stream = _fx.Stream(torch.cuda.current_stream(device=XQ.device))
-    _launch_gemm_a8w8_bsc_col(
+    _launch_gemm_a8w8(
         _ptr_arg(Out),
         _ptr_arg(XQ),
         _ptr_arg(WQ),
@@ -183,12 +187,13 @@ def run_blockscale_preshuffle_gemm_a8_gfx1250(
         nb,
         cluster_m,
         cluster_n,
+        True,
     )
     return Out
 
 
 _KERNEL_NAME_RE = re.compile(
-    r"^flydsl_blockscale_bpreshuffle_wmma_"
+    r"^flydsl_mxfp8_128_bpreshuffle_wmma_"
     r"t(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"mw(?P<m_warp>\d+)_nw(?P<n_warp>\d+)_"
     r"nb(?P<num_buffers>\d+)_sk(?P<split_k>\d+)_"
@@ -197,12 +202,12 @@ _KERNEL_NAME_RE = re.compile(
 
 
 def parse_wmma_kernel_name(name: str):
-    """Parse a flydsl_blockscale_bpreshuffle_wmma_ kernelName, or return None."""
+    """Parse a flydsl_mxfp8_128_bpreshuffle_wmma_ kernelName, or return None."""
     m = _KERNEL_NAME_RE.fullmatch(name)
     return {k: int(v) for k, v in m.groupdict().items()} if m else None
 
 
-def run_gemm_a8w8_blockscale_bpreshuffle_gfx1250(
+def run_gemm_a8w8_mxfp8_128_bpreshuffle_gfx1250(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -214,9 +219,9 @@ def run_gemm_a8w8_blockscale_bpreshuffle_gfx1250(
     cfg = parse_wmma_kernel_name(kernel_name)
     if cfg is None:
         raise ValueError(
-            f"[FlyDSL gfx1250 blockscale] unrecognised kernelName: {kernel_name!r}"
+            f"[FlyDSL gfx1250 mxfp8_128] unrecognised kernelName: {kernel_name!r}"
         )
-    return run_blockscale_preshuffle_gemm_a8_gfx1250(
+    return run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
         XQ,
         WQ,
         x_scale,
