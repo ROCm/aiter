@@ -24,6 +24,7 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 try:
@@ -49,9 +50,13 @@ def _hstu_attn_fwd_one_block(
     seq_len,
     offs_m,
     offs_n,
+    mask_m,
+    mask_n,
     q,
-    K_block_ptr,
-    V_block_ptr,
+    K_base,
+    V_base,
+    stride_kn,
+    stride_vn,
     n_targets,
     alpha,
     MAX_SEQ_LEN,
@@ -63,10 +68,19 @@ def _hstu_attn_fwd_one_block(
     HAS_MAX_ATTN_LEN: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
 ):
     start_n = tl.multiple_of(start_n, BLOCK_N)
+    
     # -- compute qk ----
-    k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+    offs_d_q = tl.arange(0, BLOCK_D_Q)
+    offs_d_v = tl.arange(0, BLOCK_D_V)
+    k_ptrs = K_base + offs_d_q[:, None] + offs_n[None, :] * stride_kn
+    v_ptrs = V_base + offs_n[:, None] * stride_vn + offs_d_v[None, :]
+    
+    # -- compute qk ----
+    k = tl.load(k_ptrs, mask=mask_n[None, :], other=0.0)
     qk = tl.dot(q, k, allow_tf32=ALLOW_TF32) * alpha
     invalid_mask = offs_m[:, None] == offs_n[None, :]
     max_ids = seq_len
@@ -109,7 +123,7 @@ def _hstu_attn_fwd_one_block(
     # pyre-fixme[16]: Module `math` has no attribute `fast_dividef`.
     silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * (1.0 / MAX_SEQ_LEN)
     silu = tl.where(invalid_mask, silu, 0)
-    v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+    v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
     silu = silu.to(v.dtype)
     return tl.dot(silu, v, allow_tf32=ALLOW_TF32)
 
@@ -149,6 +163,16 @@ def _hstu_attn_fwd_compute(
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
 ):
+    # add assumption to use buffer load and store
+    tl.assume(stride_qm > 0)
+    tl.assume(stride_qh > 0)
+    tl.assume(stride_kn > 0)
+    tl.assume(stride_kh > 0)
+    tl.assume(stride_vn > 0)
+    tl.assume(stride_vh > 0)
+    tl.assume(stride_om > 0)
+    tl.assume(stride_oh > 0)
+    
     seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
     off_h = off_h.to(tl.int64)
     off_z = off_z.to(tl.int64)
@@ -169,42 +193,55 @@ def _hstu_attn_fwd_compute(
         # initialize offsets
         offs_m = start_m + tl.arange(0, BLOCK_M)
         offs_n = tl.arange(0, BLOCK_N)
+        offs_d_q = tl.arange(0, BLOCK_D_Q)
+        K_base=K + off_h * stride_kh + seq_start * stride_kn,
+        V_base=V + off_h * stride_vh + seq_start * stride_vn,
+        mask_m = offs_m < seq_len
         if IS_DELTA_Q:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + off_z * DeltaSize * stride_qm,
-                shape=(DeltaSize, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m_delta, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
-                order=(1, 0),
-            )
+            Q_base = Q + off_h * stride_qh + off_z * DeltaSize * stride_qm
+            q_ptrs = Q_base + (start_m_delta + tl.arange(0, BLOCK_M))[:, None] * stride_qm + offs_d_q[None, :]
+            q = tl.load(q_ptrs, mask=((start_m_delta + tl.arange(0, BLOCK_M)) < DeltaSize)[:, None], other=0.0)
         else:
-            Q_block_ptr = tl.make_block_ptr(
-                base=Q + off_h * stride_qh + seq_start * stride_qm,
-                shape=(seq_len, BLOCK_D_Q),
-                strides=(stride_qm, 1),
-                offsets=(start_m, 0),
-                block_shape=(BLOCK_M, BLOCK_D_Q),
-                order=(1, 0),
-            )
-        K_block_ptr = tl.make_block_ptr(
-            base=K + off_h * stride_kh + seq_start * stride_kn,
-            shape=(BLOCK_D_Q, seq_len),
-            strides=(1, stride_kn),
-            offsets=(0, 0),
-            block_shape=(BLOCK_D_Q, BLOCK_N),
-            order=(0, 1),
-        )
-        V_block_ptr = tl.make_block_ptr(
-            base=V + off_h * stride_vh + seq_start * stride_vn,
-            shape=(seq_len, BLOCK_D_V),
-            strides=(stride_vn, 1),
-            offsets=(0, 0),
-            block_shape=(BLOCK_N, BLOCK_D_V),
-            order=(1, 0),
-        )
+            Q_base = Q + off_h * stride_qh + seq_start * stride_qm
+            q_ptrs = Q_base + offs_m[:, None] * stride_qm + offs_d_q[None, :]
+            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
 
-        q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+        # if IS_DELTA_Q:
+        #     Q_block_ptr = tl.make_block_ptr(
+        #         base=Q + off_h * stride_qh + off_z * DeltaSize * stride_qm,
+        #         shape=(DeltaSize, BLOCK_D_Q),
+        #         strides=(stride_qm, 1),
+        #         offsets=(start_m_delta, 0),
+        #         block_shape=(BLOCK_M, BLOCK_D_Q),
+        #         order=(1, 0),
+        #     )
+        # else:
+        #     Q_block_ptr = tl.make_block_ptr(
+        #         base=Q + off_h * stride_qh + seq_start * stride_qm,
+        #         shape=(seq_len, BLOCK_D_Q),
+        #         strides=(stride_qm, 1),
+        #         offsets=(start_m, 0),
+        #         block_shape=(BLOCK_M, BLOCK_D_Q),
+        #         order=(1, 0),
+        #     )
+        # K_block_ptr = tl.make_block_ptr(
+        #     base=K + off_h * stride_kh + seq_start * stride_kn,
+        #     shape=(BLOCK_D_Q, seq_len),
+        #     strides=(1, stride_kn),
+        #     offsets=(0, 0),
+        #     block_shape=(BLOCK_D_Q, BLOCK_N),
+        #     order=(0, 1),
+        # )
+        # V_block_ptr = tl.make_block_ptr(
+        #     base=V + off_h * stride_vh + seq_start * stride_vn,
+        #     shape=(seq_len, BLOCK_D_V),
+        #     strides=(stride_vn, 1),
+        #     offsets=(0, 0),
+        #     block_shape=(BLOCK_N, BLOCK_D_V),
+        #     order=(1, 0),
+        # )
+
+        # q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
         if CAUSAL:
             if HAS_MULTIPLE_TARGETS:
@@ -235,19 +272,25 @@ def _hstu_attn_fwd_compute(
             low = 0
             high = seq_len
 
-        if low > 0:
-            K_block_ptr = tl.advance(K_block_ptr, (0, low))
-            V_block_ptr = tl.advance(V_block_ptr, (low, 0))
-        end_n = low
+        # if low > 0:
+        #     K_block_ptr = tl.advance(K_block_ptr, (0, low))
+        #     V_block_ptr = tl.advance(V_block_ptr, (low, 0))
+        # end_n = low
         for start_n in range(low, high, BLOCK_N):
+            cur_offs_n = offs_n + start_n
+            mask_n = cur_offs_n < seq_len
             acc += _hstu_attn_fwd_one_block(
                 start_n=start_n,
                 seq_len=seq_len,
                 offs_m=offs_m,
-                offs_n=offs_n + start_n,
+                offs_n=cur_offs_n,
+                mask_m=mask_m,
+                mask_n=mask_n,
                 q=q,
-                K_block_ptr=K_block_ptr,
-                V_block_ptr=V_block_ptr,
+                K_base=K_base,
+                V_base=V_base,
+                stride_kn=stride_kn,
+                stride_vn=stride_vn,
                 n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
                 alpha=alpha,
                 MAX_SEQ_LEN=MAX_SEQ_LEN,
@@ -259,10 +302,12 @@ def _hstu_attn_fwd_compute(
                 HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                 ALLOW_TF32=ALLOW_TF32,
                 BLOCK_N=BLOCK_N,
+                BLOCK_D_Q=BLOCK_D_Q,
+                BLOCK_D_V=BLOCK_D_V,
             )
             K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
             V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-            end_n += BLOCK_N
+            # end_n += BLOCK_N
 
         # Not merged: the `# pyre-ignore[61]` between the two ifs applies to the inner one; merging would silently drop that suppression.
         if HAS_MULTIPLE_TARGETS and CAUSAL:  # noqa: SIM102
@@ -270,20 +315,26 @@ def _hstu_attn_fwd_compute(
             if uih_end < start_m:
                 low_delta = start_m
                 high_delta = start_m + BLOCK_M
-                offset = (low_delta - end_n).to(tl.int32)
-                K_block_ptr = tl.advance(K_block_ptr, (0, offset))
-                V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
+                # offset = (low_delta - end_n).to(tl.int32)
+                # K_block_ptr = tl.advance(K_block_ptr, (0, offset))
+                # V_block_ptr = tl.advance(V_block_ptr, (offset, 0))
                 for start_delta in tl.range(
                     low_delta, high_delta, BLOCK_N, num_stages=0
                 ):
+                    cur_offs_n = offs_n + start_delta
+                    mask_n = cur_offs_n < seq_len
                     acc += _hstu_attn_fwd_one_block(
                         start_n=start_delta,
                         seq_len=seq_len,
                         offs_m=offs_m,
-                        offs_n=offs_n + start_delta,
+                        offs_n=cur_offs_n,
+                        mask_m=mask_m,
+                        mask_n=mask_n,
                         q=q,
-                        K_block_ptr=K_block_ptr,
-                        V_block_ptr=V_block_ptr,
+                        K_base=K_base,
+                        V_base=V_base,
+                        stride_kn=stride_kn,
+                        stride_vn=stride_vn,
                         n_targets=n_targets if HAS_MULTIPLE_TARGETS else None,
                         alpha=alpha,
                         MAX_SEQ_LEN=MAX_SEQ_LEN,
@@ -295,9 +346,9 @@ def _hstu_attn_fwd_compute(
                         HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
                         ALLOW_TF32=ALLOW_TF32,
                         BLOCK_N=BLOCK_N,
+                        BLOCK_D_Q=BLOCK_D_Q,
+                        BLOCK_D_V=BLOCK_D_V,
                     )
-                    K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
-                    V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
         if IS_DELTA_Q:
             start_m_delta = pid * BLOCK_M
@@ -352,6 +403,7 @@ def _hstu_attn_fwd(
     stride_om,
     stride_oh,
     alpha,
+    Z,
     H,
     MAX_SEQ_LEN,
     DeltaSize,
@@ -369,12 +421,19 @@ def _hstu_attn_fwd(
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
 ):
-    off_hz = tl.program_id(1)
-    off_z = off_hz // H
+    tpid = tl.program_id(0)
+
+    num_tiles = tl.cdiv(MAX_SEQ_LEN, BLOCK_M)
+    tpid = remap_xcd(tpid, num_tiles * Z * H, 8)
+
+    off_h = tpid % H
+    off_nz = tpid // H
+    pid = off_nz % num_tiles
+    off_z = off_nz // num_tiles
+
     if HAS_SORT_BY_LENGTH_INDICES:
         off_z = tl.load(sort_by_length_indices + off_z)
-    off_h = off_hz % H
-    pid = tl.program_id(0)
+
     _hstu_attn_fwd_compute(
         Q=Q,
         K=K,
