@@ -99,10 +99,10 @@ def _fused_clamp_silu_mul_kernel(
     colN: gl.constexpr = gl.SliceLayout(0, gLayout2D)   # [BN] col-index vector
     rowS: gl.constexpr = gl.SliceLayout(1, sLayout2D)   # [BM] row-index vector (scale tile)
     colS: gl.constexpr = gl.SliceLayout(0, sLayout2D)   # [G]  group-index vector
-    # Identity (unpadded) LDS staging — same as rmsnorm and the other elementwise
-    # TDM kernels (padded layouts only lower when a matrix-core layout is on the
-    # register side, which this elementwise BlockedLayout tile has none of).
-    shared2D: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    # Padded LDS staging (bank-conflict avoidance, mirrors the gemm C-store).
+    shared2D: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[BLOCK_SIZE_N, 8]], [BLOCK_SIZE_M, BLOCK_SIZE_N], [1, 0]
+    )
 
     pid = gl.program_id(0)
     m_start = pid * BLOCK_SIZE_M
@@ -223,8 +223,13 @@ def _fused_clamp_silu_mul_kernel(
                 gl.reshape(scale_out, [BLOCK_SIZE_M, NUM_N_Q_GROUPS]), sLayout2D
             )
 
-        # 2D TDM store of the quantized output tile.
-        out_smem.store(out_q.to(out_ptr.dtype.element_ty))
+        # Accumulate the output into `acc` (zero-init, so functionally identical),
+        # then 2D TDM store the accumulated tile.
+        acc = gl.zeros(
+            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=gLayout2D
+        )
+        acc = acc + out_q
+        out_smem.store(acc.to(out_ptr.dtype.element_ty))
         if num_warps > 1:
             gl.barrier()
         gl.amd.gfx1250.tdm.async_store(out_desc, [m_start, 0], out_smem)
@@ -271,8 +276,13 @@ def _fused_clamp_silu_mul_kernel(
             )
         gl.amd.gfx1250.tdm.async_wait(0)
     else:
-        # no quant: 2D TDM store of the native-dtype tile.
-        out_smem.store(gl.convert_layout(out, gLayout2D).to(out_ptr.dtype.element_ty))
+        # no quant: accumulate into `acc` (zero-init, functionally identical),
+        # then 2D TDM store the native-dtype tile.
+        acc = gl.zeros(
+            [BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=gl.float32, layout=gLayout2D
+        )
+        acc = acc + gl.convert_layout(out, gLayout2D)
+        out_smem.store(acc.to(out_ptr.dtype.element_ty))
         if num_warps > 1:
             gl.barrier()
         gl.amd.gfx1250.tdm.async_store(out_desc, [m_start, 0], out_smem)
