@@ -55,8 +55,8 @@ if is_flydsl_available():
     from .kernels.pa_mqa_logits_fp4_prefill import (
         compute_varqlen_row_info,
         compute_varqlen_windows,
-        flydsl_pa_mqa_logits_fp4_prefill_packed,
         flydsl_pa_mqa_logits_fp4_prefill,
+        flydsl_pa_mqa_logits_fp4_prefill_packed,
         flydsl_pa_mqa_logits_fp4_varqlen,
         pack_prefill_row_info,
         prepare_pa_mqa_logits_fp4_prefill_packed,

@@ -12,10 +12,10 @@ import argparse
 import itertools
 import random
 
-import aiter
 import pandas as pd
 import torch
 
+import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest

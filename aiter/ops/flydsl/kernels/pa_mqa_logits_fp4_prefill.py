@@ -761,7 +761,7 @@ def compile_pa_mqa_logits_fp4_prefill(
 class _PreparedPackedPrefillLauncher:
     """Shape-specialized packed prefill launch with compiled fast dispatch."""
 
-    __slots__ = ("_launcher", "split_kv", "n_ctas")
+    __slots__ = ("_launcher", "n_ctas", "split_kv")
 
     def __init__(self, launcher, split_kv, n_ctas):
         self._launcher = launcher
