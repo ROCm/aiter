@@ -236,7 +236,7 @@ except Exception as e:  # noqa: BLE001
     logger.warning(f"Custom allreduce is disabled: {e}")
 
 
-def is_full_xgmi(physical_device_ids: List[int]) -> bool:
+def is_full_xgmi(physical_device_ids: list[int]) -> bool:
     # Custom IPC all-reduce requires every GPU pair to share a single-hop XGMI
     # (Infinity Fabric) link; otherwise the caller falls back to RCCL.
     try:
@@ -246,7 +246,7 @@ def is_full_xgmi(physical_device_ids: List[int]) -> bool:
             amdsmi_get_processor_handles,
             amdsmi_topo_get_link_type,
         )
-    except: 
+    except ImportError:
         return False
 
     amdsmi_init()
