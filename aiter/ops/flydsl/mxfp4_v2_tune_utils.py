@@ -20,6 +20,11 @@ import torch
 import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_topk, moe_sorting, torch_moe_stage1, torch_moe_stage2
+from aiter.ops.flydsl.activation import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+    get_flydsl_activation_name,
+)
 from aiter.ops.flydsl.kernels.moe_sorting_kernel import moe_sorting_flydsl
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
