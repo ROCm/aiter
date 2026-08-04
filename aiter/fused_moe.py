@@ -293,7 +293,7 @@ def _flydsl_moe_sorting(
     num_local_tokens,
     accumulate=True,
 ):
-    """FlyDSL sorting dispatch — called outside torch_compile_guard."""
+    """FlyDSL sorting dispatch -- called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
 
     device = topk_ids.device
@@ -310,7 +310,7 @@ def _flydsl_moe_sorting(
     # accumulates (or EP w/ expert_mask), else a (0,0) placeholder for FlyDSL
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
-    # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
+    # buffer entirely -- the caller owns the [M, topk, model_dim] intermediate.
     if (expert_mask is not None) or accumulate:
         moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
     else:
@@ -438,6 +438,35 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _resolve_is_shuffled(w1, w2, is_shuffled: bool | None) -> bool:
+    """Whether w1/w2 are in the preshuffled MFMA layout.
+
+    shuffle_weight() marks its result by setting an `is_shuffled` attribute on
+    the returned tensor. That attribute is not part of the tensor metadata, so
+    clone(), contiguous(), to(), detach() and nn.Parameter() all drop it and the
+    weights are then read back with the wrong layout. Callers that copy or wrap
+    their weights must pass `is_shuffled` explicitly.
+    """
+    if is_shuffled is not None:
+        return bool(is_shuffled)
+    return getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+
+
+def _tag_is_shuffled(w, is_shuffled: bool):
+    """Alias of `w` carrying `is_shuffled`, so downstream lookups see the tag.
+
+    The stage kernels read the layout off the weight tensor they are handed, so
+    an explicit `is_shuffled` has to be attached to the tensor rather than only
+    passed alongside it. detach() shares storage, so this stays free of copies,
+    and the caller's tensor is left untouched.
+    """
+    if bool(getattr(w, "is_shuffled", False)) == is_shuffled:
+        return w
+    tagged = w.detach()
+    tagged.is_shuffled = is_shuffled
+    return tagged
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -473,6 +502,10 @@ def fused_moe(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
+    # Layout of w1/w2. None infers it from the `is_shuffled` attribute that
+    # shuffle_weight() leaves on its result -- pass it explicitly if the weights
+    # went through clone() / to() / contiguous() / nn.Parameter(), which drop it.
+    is_shuffled: bool | None = None,
 ):
     if (
         any(
@@ -512,6 +545,7 @@ def fused_moe(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            is_shuffled=is_shuffled,
         )
     if not block_size_M:
         block_size_M = -1
@@ -541,6 +575,7 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        is_shuffled=is_shuffled,
     )
 
 
@@ -570,6 +605,7 @@ def fused_moe_fake(
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    is_shuffled: bool | None = None,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -608,6 +644,7 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    is_shuffled: bool | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
         hidden_states=hidden_states,
@@ -635,6 +672,7 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        is_shuffled=is_shuffled,
     )
 
 
@@ -664,6 +702,7 @@ def _fused_moe_impl(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
+    is_shuffled: bool | None = None,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -685,7 +724,7 @@ def _fused_moe_impl(
         inter_dim * 2,
     ], f"Invalid MoE weight: {w1.shape=} {w2.shape=}"
     isG1U1 = inter_dim != w1.shape[1]
-    isShuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    isShuffled = _resolve_is_shuffled(w1, w2, is_shuffled)
 
     global_E = E
     if expert_mask is not None:
@@ -960,6 +999,7 @@ def _fused_moe_impl(
             beta=beta,
             linear_beta=linear_beta,
             gate_mode=gate_mode,
+            is_shuffled=is_shuffled,
             expert_mask=expert_mask,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
@@ -2676,6 +2716,7 @@ def fused_moe_2stages(
     beta=None,
     linear_beta=None,
     gate_mode=GateMode.SEPARATED.value,
+    is_shuffled: bool | None = None,
     expert_mask=None,
     m_indices=None,
     reverse_sorted=None,
@@ -2692,7 +2733,12 @@ def fused_moe_2stages(
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
         moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
-    is_shuffled = getattr(w1, "is_shuffled", False) or getattr(w2, "is_shuffled", False)
+    if is_shuffled is not None:
+        # The stage kernels pick their preshuffle_on / preshuffle_off variant from
+        # the tag on w1 / w2, so an explicit layout has to reach them there.
+        w1 = _tag_is_shuffled(w1, bool(is_shuffled))
+        w2 = _tag_is_shuffled(w2, bool(is_shuffled))
+    is_shuffled = _resolve_is_shuffled(w1, w2, is_shuffled)
     metadata = get_2stage_cfgs(
         get_padded_M(token_num),  # consider token_num > 1024 as prefill
         model_dim,

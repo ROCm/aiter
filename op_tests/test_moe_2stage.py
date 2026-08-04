@@ -283,10 +283,15 @@ def test_fmoe(
         exp_bias1_aiter = exp_bias1 = None
         exp_bias2_aiter = exp_bias2 = None
 
-    # pre-shuffle
+    # pre-shuffle. shuffle_weight() marks its result with an `is_shuffled`
+    # attribute, but that is not tensor metadata: the packing/view chains below
+    # and run_perftest's deepcopy-based arg rotation both drop it. Track the
+    # layout here and hand it to fused_moe explicitly.
     w1_scale_aiter = w1_scale
     w2_scale_aiter = w2_scale
+    is_shuffled_aiter = False
     if qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2:  # a16wi4
+        is_shuffled_aiter = True
         w1_qt_aiter = pack_int8_to_packed_int4(
             shuffle_weight(w1_qt_aiter.view(dtypes.i8), (16, 16))
         )
@@ -307,6 +312,7 @@ def test_fmoe(
             shuffle_scale_for_int4(w2_scale, group_size=32).view(-1).contiguous()
         )
     elif WQDType == torch.int4:  # int4 w quant (a8w4)
+        is_shuffled_aiter = True
         w1_qt_aiter = rearrange_4bit_elements(
             convert_int8_to_uint32_int4(
                 shuffle_weight(w1_qt_aiter, (16, 16), use_int4=True)
@@ -324,16 +330,19 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
+        is_shuffled_aiter = True
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
+        is_shuffled_aiter = True
         w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
         w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
     elif WQDType != dtypes.fp4x2 or preshuffle:
+        is_shuffled_aiter = True
         w1_qt_aiter = shuffle_weight(w1_qt_aiter, layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2_qt_aiter, layout=(16, 16))
         w1_scale_aiter = fp4_utils.e8m0_shuffle(w1_scale)
@@ -368,8 +377,7 @@ def test_fmoe(
                 doweight_stage1,
                 hidden_pad,
                 intermediate_pad,
-                getattr(w1_qt_aiter, "is_shuffled", False)
-                or getattr(w2_qt_aiter, "is_shuffled", False),
+                is_shuffled_aiter,
                 gateMode,
             )
             if metadata.fuse_quant == "fp4":
@@ -463,6 +471,7 @@ def test_fmoe(
 
     # ######################## stage 2 end ###########
     _fused_moe_kwargs = {
+        "is_shuffled": is_shuffled_aiter,
         "w1_scale": w1_scale_aiter,
         "w2_scale": w2_scale_aiter,
         "quant_type": qType,
