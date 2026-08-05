@@ -347,3 +347,128 @@ def build_gate_up_fp8_module(
         )
 
     return _launch
+
+
+# -------------------------------------------------------------------------
+# Phase 3 -- down_reduce FP8 fast path (BF16 intermediate, FP8 e4m3 weights)
+# -------------------------------------------------------------------------
+def build_down_reduce_fp8_module(
+    inter: int,
+    hidden: int,
+    top_k: int,
+    *,
+    kvector: int | None = None,
+    w_scale_mode: str = "pertensor",
+    serialize_dot2: bool = True,
+):
+    """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
+
+    One wave (64 lanes) computes one ``y[b, out_j]`` scalar; grid ``B*HIDDEN``
+    blocks of 64 lanes.  For each of the token's TOPK experts, lane ``l`` owns
+    INTER K-range ``[l*kVector, (l+1)*kVector)``, accumulates the dot in f32 via
+    ``v_dot2_f32_bf16`` over FP8->BF16-converted weights, and folds the
+    (lane-uniform) ``router_wt * ds`` into a per-lane partial.  A single butterfly
+    reduce over the fused partial gives ``y``; every lane writes the BF16 result.
+
+    Shapes / layout (row-major, contiguous):
+      * inter        [B, TOPK, INTER]    bf16       (row = b*TOPK + k)
+      * w_down       [E, HIDDEN, INTER]  fp8_e4m3   (row = e*HIDDEN + out_j)
+      * w_down_scale f32; PerTensor -> [1], PerToken -> [E*HIDDEN] (per weight row)
+      * router_ids   [B, TOPK]           int32
+      * router_wts   [B, TOPK]           float32    (normalized to sum 1 per token)
+      * y            [B, HIDDEN]         bf16
+    """
+    if kvector is None:
+        kvector = pick_kvector(inter)
+    if kvector % 2 != 0:
+        raise ValueError(f"kVector must be even for dot2, got {kvector}")
+    ktile_n = WARP_SIZE * kvector
+    if inter % ktile_n != 0:
+        raise ValueError(f"INTER={inter} not divisible by 64*kVector={ktile_n}")
+    num_iter = inter // ktile_n
+    n_pairs = kvector // 2
+    per_token_scale = const_expr(w_scale_mode == "pertoken")
+
+    @flyc.kernel
+    def _kernel(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+    ):
+        bid = fx.block_idx.x
+        lane = fx.thread_idx.x
+
+        out_j = bid % hidden
+        token_b = bid // hidden
+
+        inter_rsrc = _ptr_rsrc(inter_ptr)
+        wd_rsrc = _ptr_rsrc(wd_ptr)
+        wds_rsrc = _ptr_rsrc(wds_ptr)
+        rid_rsrc = _ptr_rsrc(rid_ptr)
+        rwt_rsrc = _ptr_rsrc(rwt_ptr)
+
+        one_f32 = fx.Float32(1.0).ir_value()
+        acc_lane = fx.Float32(0.0)
+
+        for k in range_constexpr(top_k):
+            ridx = token_b * top_k + k
+            e = fx.Int32(
+                buffer_ops.buffer_load(rid_rsrc, ridx, vec_width=1, dtype=T.i32())
+            )
+            rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
+            w_row = e * hidden + out_j
+
+            if const_expr(per_token_scale):
+                scale_off = w_row
+            else:
+                scale_off = fx.Int32(0)
+            ds = buffer_ops.buffer_load(wds_rsrc, scale_off, vec_width=1, dtype=T.f32())
+
+            dot_k = fx.Float32(0.0).ir_value()
+            for i in range_constexpr(num_iter):
+                k_base = i * ktile_n + lane * kvector
+                inter_row = token_b * top_k + k
+                a_word0 = (inter_row * inter + k_base) // 2
+                wd_word0 = (w_row * inter + k_base) // 4
+                for ipair in range_constexpr(n_pairs):
+                    w_word = ipair // 2
+                    w_hi = (ipair % 2) == 1
+                    a_i32 = buffer_ops.buffer_load(
+                        inter_rsrc, a_word0 + ipair, vec_width=1, dtype=T.i32()
+                    )
+                    dword = buffer_ops.buffer_load(
+                        wd_rsrc, wd_word0 + w_word, vec_width=1, dtype=T.i32()
+                    )
+                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dword, one_f32, hi=w_hi))
+                    dot_k = dot2_f32_bf16(a_i32, d_i32, dot_k, serialize=serialize_dot2)
+
+            # router_wt * ds is lane-uniform, so fold it into the per-lane partial
+            # before the single cross-lane reduce (exact; avoids a reduce per k).
+            acc_lane = acc_lane + fx.Float32(dot_k) * (fx.Float32(rw) * fx.Float32(ds))
+
+        y_sum = wave_reduce_add_f32(acc_lane.ir_value())
+        out_off = token_b * hidden + out_j
+        y_rsrc = _ptr_rsrc(y_ptr)
+        buffer_ops.buffer_store(BFloat16(fx.Float32(y_sum)).ir_value(), y_rsrc, out_off)
+
+    @flyc.jit
+    def _launch(
+        inter_ptr: fx.Pointer,
+        wd_ptr: fx.Pointer,
+        wds_ptr: fx.Pointer,
+        rid_ptr: fx.Pointer,
+        rwt_ptr: fx.Pointer,
+        y_ptr: fx.Pointer,
+        grid_x: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _kernel(inter_ptr, wd_ptr, wds_ptr, rid_ptr, rwt_ptr, y_ptr).launch(
+            grid=(grid_x, 1, 1),
+            block=(WARP_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return _launch

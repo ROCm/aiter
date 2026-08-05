@@ -165,6 +165,7 @@ def test_butterfly_reduce():
 # Phase 2 -- gate_up FP8 fast path (BF16 activation, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
 from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
+    flydsl_warp_decode_down_reduce,
     flydsl_warp_decode_gate_up,
 )
 
@@ -264,6 +265,91 @@ def test_gate_up_fp8(case):
     assert passed
 
 
+# -------------------------------------------------------------------------
+# Phase 3 -- down_reduce FP8 fast path (BF16 intermediate, FP8 e4m3 weights)
+# -------------------------------------------------------------------------
+# name, B, INTER, HIDDEN, E, TOPK, w_scale_mode
+DOWN_CASES = [
+    ("down_i1024_h64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor"),
+    ("down_i1024_h128_e8_tk2_pertoken", 1, 1024, 128, 8, 2, "pertoken"),
+    ("down_i512_h32_e2_tk1_kv8_pertensor", 1, 512, 32, 2, 1, "pertensor"),
+]
+
+
+def _gen_down(B, INTER, HIDDEN, E, TOPK, w_scale_mode):
+    device = torch.device("cuda")
+    gen = torch.Generator(device="cuda").manual_seed(20260405)
+    inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
+        torch.bfloat16
+    )
+    w_down = (
+        (torch.rand((E, HIDDEN, INTER), generator=gen, device=device) - 0.5) * 0.5
+    ).to(torch.float8_e4m3fn)
+    router_ids = torch.randint(
+        0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
+    )
+    router_wts = torch.rand((B, TOPK), generator=gen, device=device).float()
+    router_wts = router_wts / router_wts.sum(dim=1, keepdim=True)
+    n_scale = 1 if w_scale_mode == "pertensor" else E * HIDDEN
+    w_down_scale = (
+        torch.rand(n_scale, generator=gen, device=device) * 1.5 + 0.5
+    ).float()
+    return inter, w_down, router_ids, router_wts, w_down_scale
+
+
+def _ref_down(inter, w_down, router_ids, router_wts, w_down_scale, w_scale_mode):
+    B, TOPK, INTER = inter.shape
+    E, HIDDEN, _ = w_down.shape
+    interf = inter.float()
+    wdf = w_down.float()
+    y = torch.zeros(B, HIDDEN, device=inter.device)
+    idx = torch.arange(HIDDEN, device=inter.device)
+    for b in range(B):
+        for k in range(TOPK):
+            e = int(router_ids[b, k])
+            rw = router_wts[b, k]
+            dot = interf[b, k] @ wdf[e].T
+            if w_scale_mode == "pertensor":
+                ds = w_down_scale[0]
+            else:
+                ds = w_down_scale[e * HIDDEN + idx]
+            y[b] += dot * (rw * ds)
+    return y.to(torch.bfloat16)
+
+
+def _run_down_case(case, *, cos_thresh=0.999):
+    name, B, INTER, HIDDEN, E, TOPK, mode = case
+    print("=" * 78)
+    print(f"[flydsl] warp-decode down_reduce  case={name}")
+    inter, w_down, router_ids, router_wts, wds = _gen_down(
+        B, INTER, HIDDEN, E, TOPK, mode
+    )
+    out = flydsl_warp_decode_down_reduce(
+        inter, w_down, router_ids, router_wts, wds, w_scale_mode=mode
+    )
+    torch.cuda.synchronize()
+    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode)
+    cos = _cosine(ref, out)
+    max_delta = (ref.float() - out.float()).abs().max().item()
+    denom = ref.float().abs().max().item() + 1e-6
+    passed = cos >= cos_thresh
+    print(
+        f"  cos_sim={cos:.6f} (thresh {cos_thresh}), "
+        f"max_delta={max_delta:.4f} ({100*max_delta/denom:.2f}% of max)"
+    )
+    print(f"    ref  sample: {ref.float().reshape(-1)[:6].tolist()}")
+    print(f"    test sample: {out.float().reshape(-1)[:6].tolist()}")
+    print(f"    --> {'PASS' if passed else 'FAIL'}")
+    return passed, cos
+
+
+@pytest.mark.skipif(not _HAS_FP8, reason="torch build lacks float8_e4m3fn")
+@pytest.mark.parametrize("case", [pytest.param(c, id=c[0]) for c in DOWN_CASES])
+def test_down_reduce_fp8(case):
+    passed, _ = _run_down_case(case)
+    assert passed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -297,7 +383,18 @@ def main() -> int:
     else:
         print("  skipped (torch build lacks float8_e4m3fn)")
 
-    all_ok = (n_pass == len(results)) and gate_up_ok
+    print("\n" + "=" * 78)
+    print("[flydsl] warp-decode MoE down_reduce FP8 (Phase 3)")
+    print("=" * 78)
+    down_ok = True
+    if _HAS_FP8:
+        for case in DOWN_CASES:
+            passed, _ = _run_down_case(case)
+            down_ok = down_ok and passed
+    else:
+        print("  skipped (torch build lacks float8_e4m3fn)")
+
+    all_ok = (n_pass == len(results)) and gate_up_ok and down_ok
     return 0 if all_ok else 1
 
 

@@ -120,11 +120,21 @@ Status legend: [ ] todo · [~] in progress · [x] done
   scales; full aiter Python entry point added now. FP8/BF16 activation-variant and Block2D
   are later.
 
-### Phase 3 — `down_reduce` FP8  [ ]
-- [ ] Grid `B*ceil(HIDDEN/HPerWarp)`; sum over TOPK then INTER.
-- [ ] Fold `router_wt * scale` into accumulator; butterfly reduce; lane-0 write `y[B,HIDDEN]`.
-- [ ] Start `kHPerWarp=1`; then add H2 (2 outputs/wave) variant.
-- [ ] Correctness + perf vs reference.
+### Phase 3 — `down_reduce` FP8  [x] (1-output baseline; H2 + perf pending)
+- [x] Grid `B*HIDDEN` waves (`kHPerWarp=1`); `out_j=bid%HIDDEN`, `token_b=bid//HIDDEN`;
+      INTER tiled in `64*kVector` (kVector from INTER: 16, →8 fallback).
+- [x] Fold `router_wt * ds` (both lane-uniform) into each expert's **per-lane** partial, then
+      a **single** butterfly reduce over Σ_k — exact and avoids a reduce per k. PerTensor
+      `p[0]` / PerToken `p[e*HIDDEN+out_j]`. (Baseline writes BF16 `y[B,HIDDEN]` from all lanes.)
+- [x] `kHPerWarp=1` shipped. **H2 (2 outputs/wave)** — the reference FP8 best — pending.
+- [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
+      PerTensor + PerToken, kVector 16 (`INTER=1024`) / 8 (`INTER=512`). End-to-end
+      gate_up→down_reduce vs full torch MoE: cos 0.9999998, max_delta 1.5e-5 (stages compose).
+- [~] Perf baseline ~0.4 TB/s (small grid + no H2; same load/store/dot2 levers as gate_up,
+      plus H2 activation-reuse). Optimization deferred.
+- **Where:** kernel `build_down_reduce_fp8_module` in `kernels/warp_decode_moe.py`; entry
+  `flydsl_warp_decode_down_reduce` in `ops/flydsl/warp_decode_moe.py`; tests `DOWN_CASES` /
+  `test_down_reduce_fp8` in the op_test (10 pass total).
 
 ### Phase 4 — Scale layouts + integration  [~]
 - [~] Scale layouts: PerTensor + PerToken done (Phase 2, gate_up); **Block2D pending**.
@@ -341,3 +351,9 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   for kVector 16/8. Perf baseline ~1.3–1.5 TB/s weight-read BW (~20–25% peak); optimization
   levers recorded in §5 Phase 2 (lane-0 store, vectorized loads, ILP dot2, prefetch).
   Confirmed scope: BF16 act + PerTensor/PerToken first; full Python entry point now.
+- _phase 3_ — `down_reduce` FP8 1-output/wave baseline (BF16 intermediate, FP8 e4m3 weights,
+  PerTensor + PerToken): kernel `build_down_reduce_fp8_module` + entry
+  `flydsl_warp_decode_down_reduce` + 3 op_test cases (10 pass total). **Exact** vs torch
+  (cos 1.0, max_delta 0.0); end-to-end gate_up→down composes (cos 0.9999998). Folds
+  `router_wt*ds` per expert into the per-lane partial → single reduce. Perf baseline ~0.4 TB/s;
+  **H2 (2 outputs/wave)** and shared load/store/dot2 optimizations deferred.
