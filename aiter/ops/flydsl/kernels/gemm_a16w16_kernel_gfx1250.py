@@ -17,7 +17,7 @@ WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
 KERNARG_PRELOAD_COUNT = 8
-SCOPE_DEV = 16  
+SCOPE_DEV = 16
 
 
 def _byte_off_i32(elem_off, elem_bytes):
