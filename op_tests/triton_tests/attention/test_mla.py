@@ -256,7 +256,6 @@ def torch_mla_extend(
         (torch.bfloat16, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, torch.bfloat16, 64, False),
         (e4m3_dtype, e4m3_dtype, e4m3_dtype, 64, True),
-        # skip NVFP4 KV cache for now as ds_load_tr4 is not yet supported
         (e4m3_dtype, torch.uint8, torch.bfloat16, 128, False),
         (torch.uint8, torch.uint8, torch.bfloat16, 128, False),
     ],
