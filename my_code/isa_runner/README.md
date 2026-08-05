@@ -32,6 +32,11 @@ python isa_runner.py inspect \
 Exit codes: `0` ok, `1` build/load error, `2` instruction order changed,
 `3` smoke result mismatch.
 
+`bash selftest.sh` runs all of the above end to end. Verified on c9-3 /
+`hyg_fyd1` / gfx1250: smoke order 13/13, 256/256 elements correct,
+~8.4 us per launch, and the 2871-instruction production kernel reassembles in
+exact order, loads and resolves its symbol.
+
 ## Assembly format
 
 A file must be self-contained — the three blocks below are what make a code
@@ -65,6 +70,22 @@ so they can be fed in unmodified.
 3. **Metadata** (`.amdgpu_metadata` … `.end_amdgpu_metadata`) — YAML describing
    args, `.symbol: <name>.kd`, `.max_flat_workgroup_size` and `.wavefront_size`.
    The loader reads this, not the descriptor, when resolving the kernel symbol.
+
+## Gotchas found the hard way
+
+- **`workgroup_id_x` lives in `ttmp9`, not `s2`.** With
+  `.amdhsa_system_sgpr_workgroup_id_x 1` you might expect `s2`; on gfx1250 it
+  arrives through the trap temporaries. The compiler's own output reads `ttmp9`
+  and uses `s2` as scratch. Reading `s2` gave a garbage block offset and a
+  page fault (`Memory access fault ... Reason: Page not present`).
+- **Guard your stores.** A bad index faults the GPU. The smoke kernel takes an
+  `n_elems` argument and masks `exec` before storing; do the same in new
+  kernels rather than trusting the launch geometry.
+- **`vcc` must be declared.** Using `vcc_lo` requires
+  `.amdhsa_reserve_vcc 1`.
+- **Trailing `s_code_end` is expected.** `.p2alignl`/`.fill 96, 4, 0xBF9F0000`
+  in the source becomes 99 padding instructions; `verify_order` reports them as
+  `trailing_s_code_end_ignored` rather than a mismatch.
 
 ## Kernel symbol
 
