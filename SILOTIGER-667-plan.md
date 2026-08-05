@@ -130,12 +130,18 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `inter[B,TOPK,INTER]` (`if lane == 0:`; reduce still runs on all lanes).
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken and kVector 16 (`HIDDEN=1024`) / kVector 8 (`HIDDEN=512`).
-- [x] Perf pass on gfx950: after lane-0-store **and vectorized 128-bit loads**, a realistic
-      shape (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~6.9 TB/s (~86% HBM peak)**, up from the
-      ~1.4–1.6 TB/s scalar-load baseline. Vectorization loads x/w via widest `vec4`/`vec2` i32
-      `buffer_load`s (`load_i32_words` helper) and also drops the old duplicate weight-dword
-      reloads. Remaining levers, deferred: (1) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
-      (2) B=1 software-pipelined weight prefetch. [done] lane-0-only store; vectorized loads.
+- [x] Perf pass on gfx950 (harness device time, cold reads): gate_up is **memory-BW-bound at
+      ~8 TB/s (~99% HBM peak)** on the realistic shape (B1 HIDDEN7168 INTER2048 E8 TOPK8).
+      **Correction:** the vectorized 128-bit loads change is **not** a win here — a rigorous
+      interleaved A/B (BEFORE=git `d0aa8c445` scalar+redundant-reload vs AFTER=vec4/vec2, 12
+      trials each, bit-identical output) shows gate_up **−2.5%** (pertensor, separable) to
+      **0%** (pertoken) — i.e. neutral-to-slightly-*worse*. The earlier "~1.4–1.6 → ~6.9 TB/s
+      jump" was a **measurement artifact** (under-warmed, warm-cache `time.perf_counter` probe);
+      the scalar kernel already ran at ~8 TB/s. Root cause: BW-bound on *unique* weight bytes,
+      so coalescing doesn't help and the "redundant" reloads were same-address cache hits (no
+      extra DRAM traffic). Vectorized code kept (correct, near-peak, cleaner). Real remaining
+      levers, deferred: (1) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase); (2) B=1
+      software-pipelined weight prefetch. [done] lane-0-only store.
 - **Where:** kernel `build_gate_up_fp8_module` + `pick_kvector` in
   `aiter/ops/flydsl/kernels/warp_decode_moe.py`; entry `flydsl_warp_decode_gate_up` in
   `aiter/ops/flydsl/warp_decode_moe.py`; tests `GATE_UP_CASES` /`test_gate_up_fp8` in
@@ -154,10 +160,11 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken, kVector 16 (`INTER=1024`) / 8 (`INTER=512`). End-to-end
       gate_up→down_reduce vs full torch MoE: cos 0.9999998, max_delta 1.5e-5 (stages compose).
-- [x] Perf: after vectorized 128-bit loads, the realistic DeepSeek-ish shape
-      (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~5.7 TB/s (~71% HBM peak)** (was ~6.2 TB/s
-      before vectorization on the lane-0-store baseline; the vec-load win is smaller here since
-      `down` was already coalescing well). Remaining lever: H2 (2 outputs/wave) activation-reuse.
+- [x] Perf (harness device time, cold reads): down is BW-bound at **~6.5 TB/s (~80% HBM peak)**
+      on the realistic shape (B1 INTER2048 HIDDEN7168 E8 TOPK8). Vectorized loads give a small,
+      *real* win here — interleaved A/B (12 trials, bit-identical output): **+1.3%** (pertensor,
+      separable) to **0%** (pertoken) — much smaller than earlier throwaway numbers implied.
+      Remaining lever: H2 (2 outputs/wave) activation-reuse.
 - **Where:** kernel `build_down_reduce_fp8_module` in `kernels/warp_decode_moe.py`; entry
   `flydsl_warp_decode_down_reduce` in `ops/flydsl/warp_decode_moe.py`; tests `DOWN_CASES` /
   `test_down_reduce_fp8` in the op_test (10 pass total).
@@ -408,3 +415,12 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   perf sweep with per-stage markdown tables + `--timing`. Harness numbers (gfx950, device
   time, cold reads): **gate_up B1 H7168/I2048 = 7.95 TB/s (~99% peak)**, **down B1 I2048/H7168
   = 6.28 TB/s (~79% peak)**; `cuda_event` reveals a ~19 us/launch host-dispatch floor.
+- _perf: vectorized-loads A/B (retest)_ — with the workspace's `aiter` git history, ran a
+  rigorous interleaved before/after via the locked harness: BEFORE = git `d0aa8c445` (scalar +
+  redundant reloads) vs AFTER = HEAD (vec4/vec2), one-file kernel swap (entry point + harness
+  unchanged), 12 interleaved trials each, device time, cold reads, bit-identical output.
+  **Result: the vectorization is essentially a wash, not the earlier "big win".**
+  gate_up **−2.5%** pertensor (8.44→8.23 TB/s, separable) / **0%** pertoken;
+  down **+1.3%** pertensor (6.95→7.04, separable) / **0%** pertoken. The original
+  ~1.4–1.6→~6.9 gate_up "jump" was a bad-baseline artifact; both kernels were already
+  BW-bound near peak. Kept the vectorized code (correct, cleaner); corrected §5 Phase 2/3.
