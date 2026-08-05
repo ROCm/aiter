@@ -2,8 +2,9 @@
 ; gemm1 hot loop -- BASELINE ISA with the observed pipeline inlined as comments
 ;
 ; kernel : gemm_a8w4_tdm_t64x256x256_w1x4_b3_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1
-; build  : AITER_TDM_WIDE_KSL=0 (the shipping FRONT/BACK split), gfx1250,
-;          waves-per-eu=1,1
+; build  : AITER_TDM_WIDE_KSL=0 (FRONT/BACK split), gfx1250, waves-per-eu=1,1.
+;          NOT gemm1's default -- with the knob unset gemm1 takes the wide loop
+;          in the companion file. Both are correct; this one is the fallback.
 ; source : 21_final_isa.s lines 815..1071 (steady-state K256 tile), verbatim
 ; state  : vgpr_count=281  vgpr_spill_count=0  sgpr_count=90
 ;          rel_l2 = 2.8725e-03 (correct)
@@ -13,7 +14,7 @@
 ; against 168 cyc of WMMA issue -- i.e. LDS waits and compute are about equal,
 ; which caps what any pure latency-hiding rewrite can win here.
 ;
-; Companion file: gemm1_hotloop_annotated.s (the AITER_TDM_WIDE_KSL=1 variant).
+; Companion file: gemm1_hotloop_annotated.s (the wide variant, gemm1's default).
 ; ============================================================================
 
 

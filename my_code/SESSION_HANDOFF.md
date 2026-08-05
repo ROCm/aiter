@@ -72,7 +72,9 @@ Metric = the torch-profiler table's `device_time_avg` per kernel (NOT the CUDA
 Event number, NOT e2e alone). Correctness gate = `rel_l2`, must be
 **2.8725e-03**; `nan` means the run aborted on `logits_diff gate 0.01`.
 **Always check `rel_l2` before reporting any timing** — I once reported a 2.9%
-regression from runs that were producing NaN.
+regression from runs that were producing NaN. Also read **both** kernels'
+columns: when one env knob feeds gemm1 and gemm2, the kernel that moved tells
+you which one the knob actually hit (see section 5).
 
 ---
 
@@ -140,7 +142,7 @@ It has no performance value (its tile_n=128 line tops out at 496 us vs 378 for
 
 ---
 
-## 5. Current open task: the "wide-KSL" hot-loop rewrite (FAILING)
+## 5. The "wide-KSL" hot-loop rewrite (correct; underperforming)
 
 ### Goal the user specified
 Restructure the gemm1 K256 hot loop to:
@@ -169,57 +171,90 @@ Restructure the gemm1 K256 hot loop to:
 
 ### Implementation
 `compute_ktile_wide` in `aiter/ops/flydsl/kernels/mxfp4_preshuffle_gfx1250_tdm.py`
-(~line 403), selected by `USE_WIDE` (auto: `KWS==2 and _wide_vgpr<=512`;
-override with `AITER_TDM_WIDE_KSL=0/1`). A leftover probe
-`AITER_TDM_WIDE_WAIT` also exists.
+(~line 413), selected by `USE_WIDE`. Two independent gates (`:447-457`):
+`_wide_ok = KWS==2 and not stage1_quant_out` is **structural**, `_wide_want =
+_wide_vgpr<=512` is the budget heuristic, and `AITER_TDM_WIDE_KSL=0/1` may only
+override `_wide_want`. A leftover probe `AITER_TDM_WIDE_WAIT` also exists.
 
-### Status: **generates the right ISA but computes `rel_l2 = nan`**
+### Status: **gemm1 wide is CORRECT and already on by default**
 
-The emitted ISA matches all 9 steps — verified line by line, both files are in
-the repo:
-- `my_code/gemm1_hotloop_annotated.s` — WIDE=1, 346 VGPR, **nan**
-- `my_code/gemm1_hotloop_baseline_annotated.s` — WIDE=0, 281 VGPR, correct
+With no env set, gemm1 (`64x256x256`, KWS=2) runs wide and gives
+`rel_l2 = 2.8725e-03`; gemm2 (`64x512x128`, **KWS=1**) runs split. Confirmed on
+c9-3 by the two `[sched]` lines in `my_code/sweep_tdm/verify_unset.log`.
+
+The emitted ISA matches all 9 steps — verified line by line:
+- `my_code/gemm1_hotloop_annotated.s` — WIDE, 346 VGPR
+- `my_code/gemm1_hotloop_baseline_annotated.s` — split, 281 VGPR
 
 Physical DS per K256 tile is 56 in both. `s_wait_dscnt 0xc` (=12) is emitted as
 planned. Activation split confirms the two K-slices (WMMA 1–16 read v0..v63,
 17–32 read v64..v127).
 
-**Static checks that all came back CLEAN (so none of them is the bug):**
-no VGPR/SGPR spill; 346 < the 1024 wave32 limit (:2250); A1's destinations are
-read by WMMA 17–32 (not dead, not clobbered); no WMMA reads a register a later
-load overwrites; accumulators overlap no load destination; wait immediates are
-exactly 12 and 0.
+**Deviation — the one real open problem here:** LLVM hoists `s_wait_dscnt 0` to
+after the *first* WMMA and inserts an extra `s_wait_dscnt 0x13`, so the hiding
+window collapses from 16 WMMA wide to 1. The schedule is correct but buys
+nothing yet.
 
-**Deviation found (explains slowness, NOT the NaN):** LLVM hoists
-`s_wait_dscnt 0` to after the *first* WMMA and inserts an extra
-`s_wait_dscnt 0x13`, so the hiding window collapses from 16 WMMA wide to 1.
+### RETRACTED: the "wide-KSL computes nan" finding
 
-### Measured (b8-2, alternating runs)
-| | gemm1 | gemm2 | e2e | rel_l2 |
+An earlier version of this document reported that wide generated the right ISA
+but produced `rel_l2 = nan`, and listed four disproven hypotheses about gemm1's
+register allocation and wait semantics. **That diagnosis was wrong — gemm1 was
+never broken.** All four hypotheses were tested against a kernel that had no bug,
+which is why every static check came back clean.
+
+The NaN came from the env override, which used to be unconditional and so
+discarded the `KWS==2` precondition:
+
+```python
+USE_WIDE = KWS == 2 and _wide_vgpr <= 512 and not stage1_quant_out
+if _wide_env is not None:
+    USE_WIDE = _wide_env not in ("0", "false", "False")   # KWS dropped
+```
+
+`AITER_TDM_WIDE_KSL=1` therefore forced **gemm2** into `compute_ktile_wide`.
+gemm2 has `tile_k2=128` → `KWS=1` → there is no ksl=1, and every `ksl=1` LDS read
+lands exactly one row past its region, returning neighbouring live data rather
+than a hole:
+
+| read | ksl=1 delta | region size | lands on |
+|---|---:|---:|---|
+| `load_b` | `ksl*1024` | `B_LDS_ROW = PACK_TK*16 = 1024` | next wn's row; last wn crosses into SA |
+| `load_a` | `ksl*A_KSTEP = 128` | `A_ROW_B = 128` (pitch 144) | 16B pad + 112B of next row |
+| `load_sb` | `ksl*32` | `SC_INNER = tile_k//4 = 32` | next super's scale |
+| `load_sa` | `ksl*wmma_m_rep*4` | `AS_INNER*4` | a whole row down |
+
+`mma_rows` then ran 32 WMMA instead of 16, accumulating garbage into the same
+`c_frags`; a bad e8m0 scale yields NaN. Note the VGPR gate did not stop it —
+gemm2's `_wide_vgpr` is exactly 512, and `<= 512` holds. Only `KWS==2` did.
+
+Fixed in `ad2d3ebab` by splitting the structural gate from the heuristic one.
+**Measured on c9-3, same batch:**
+
+| run | gemm1 | gemm2 | e2e | rel_l2 |
 |---|---:|---:|---:|---|
-| WIDE=0 | 204.3 / 203.1 | 190.4 / 190.7 | 993.7 / 996.3 | 2.8725e-03 |
-| WIDE=1 | 208.9 / 208.7 | 207.1 / 209.2 | 1020.5 / 1024.8 | **nan** |
+| pre-fix `WIDE=1` | 354.3 | **398.3** | 1033.3 | FAIL(rc=1) |
+| post-fix `WIDE=1` | 353.0 | **344.6** | 977.3 | 2.8725e-03 |
+| post-fix unset | 349.7 | 345.4 | 972.6 | 2.8725e-03 |
 
-WIDE timings come from wrong-result runs — they bound the schedule's cost, not
-its value.
+gemm1 never moved (noise); only gemm2 did. `WIDE=1` and unset are now identical,
+as they should be. The old b8-2 table that showed `WIDE=1 → nan` is deleted: its
+gemm2 column (190.4 → 207.1) was the tell that the *other* kernel had changed,
+and it went unread at the time.
 
-### Hypotheses I proposed and that were DISPROVEN — do not repeat these
-1. "`mma_rows` scale args swapped" — they were already correct; my "fix" broke
-   it and was reverted.
-2. "mixed DS types make the partial wait unsafe" — separating them still NaN.
-3. "sched_group order lets A1 clobber A0" — interleaving still NaN.
-4. "accumulators overlap A1 registers" — **my analysis script dropped the
-   VGPR-MSB comment.** In this ISA `v[66:73] /*v[322:329]*/` really means
-   v322–329 (v256+ goes through VGPR-MSB indexing, doc §3.3.2.3 :2249). Any
-   register analysis MUST parse the comment, not the 8-bit encoding.
+**Lessons worth keeping:**
+- When one env knob feeds two kernels, check the per-kernel `[sched]` line before
+  attributing a regression to either. Both kernels' numbers are in the table.
+- Any register analysis on this ISA MUST parse the VGPR-MSB comment:
+  `v[66:73] /*v[322:329]*/` really means v322–329 (doc §3.3.2.3 :2249). An
+  earlier script dropped it and manufactured a false overlap.
+- When a hypothesis dies, revert its code. `s_wait_dscnt(8)` was left behind
+  after one such death and the user caught it.
 
-I also left `s_wait_dscnt(8)` in the code for a while after hypothesis 2 was
-disproven — the user caught it. When a hypothesis dies, revert its code.
-
-### Suggested next step (not yet run)
-Bisect rather than hypothesise: set both waits to `s_wait_dscnt(0)`. If accuracy
-returns, the bug is in the partial-wait semantics; if not, it is in the reordered
-loads. One run, binary answer.
+### Suggested next step
+The remaining problem is the collapsed hiding window (DEVIATION above), not
+correctness. Stopping LLVM from hoisting `s_wait_dscnt 0` past the WMMA block is
+the whole remaining value of this rewrite.
 
 **Worth knowing before investing more:** the ceiling here is small. The two
 baseline waits cost 92.9 + 73.1 = 166 cyc/K-tile against 168 cyc of WMMA issue;
@@ -295,8 +330,9 @@ Committed under `my_code/`:
 | `sweep_tdm.sh` | tile/buffer sweep driver, all tags |
 | `run_vdi_dump_att.sh` | ATT capture, host-side |
 | `compile_only_timing.py` | cold-compile timing / `--child` compile of one config |
-| `gemm1_hotloop_annotated.s` | WIDE=1 hot loop verbatim + plan as comments |
-| `gemm1_hotloop_baseline_annotated.s` | WIDE=0 hot loop verbatim + plan as comments |
+| `gemm1_hotloop_annotated.s` | wide hot loop verbatim + plan as comments |
+| `gemm1_hotloop_baseline_annotated.s` | split hot loop verbatim + plan as comments |
+| `verify_wide_fix.sh` | re-runs g2_m64_nb3 with WIDE=1 and unset, dumps both `[sched]` lines |
 | `grouped_gemm_a8w4_gfx1250.md` | workload/layout/preshuffle reference (575 lines) |
 | `gemm1_a8w4_tdm_silu_gfx1250_deep_dive.md` | GEMM1 deep dive (1778 lines) |
 | `gemm2_a8w4_tdm_noact_gfx1250_deep_dive.md` | GEMM2 deep dive (1381 lines) |
@@ -307,7 +343,7 @@ Wrapper: `aiter/ops/flydsl/batched_gemm_mxfp4.py`
 Preshuffle: `aiter/ops/shuffle.py`
 Tuned CSV: `aiter/configs/tuned_grouped_fmoe.csv`
 
-HEAD at handoff: `764b78ad9`.
+HEAD at handoff: `ad2d3ebab`.
 
 ---
 

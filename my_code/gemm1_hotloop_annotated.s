@@ -6,9 +6,11 @@
 ; source : 21_final_isa.s lines 828..1092 (the steady-state K256 tile), verbatim
 ; state  : vgpr_count=346  vgpr_spill_count=0  sgpr_count=90
 ;
-; STATUS: this build computes rel_l2 = nan. With AITER_TDM_WIDE_KSL=0 the same
-;         tiles give rel_l2 = 2.8725e-03. Root cause NOT yet identified -- the
-;         static checks listed at the bottom all come back clean.
+; STATUS: CORRECT (rel_l2 = 2.8725e-03) and on by default for gemm1. An earlier
+;         version of this header blamed it for rel_l2 = nan; that was wrong. The
+;         NaN came from the env knob forcing GEMM2 (KWS=1) into the wide path --
+;         see SESSION_HANDOFF.md section 5, fixed in ad2d3ebab. This loop's only
+;         open problem is DEVIATION 1 below (collapsed hiding window).
 ; ============================================================================
 
 
@@ -390,22 +392,25 @@
 ;
 ; DEVIATION 1 (scheduling): s_wait_dscnt(0) is hoisted to after the FIRST WMMA,
 ;   so the hiding window is 1 WMMA wide instead of 16. LLVM also inserted an
-;   extra s_wait_dscnt 0x13 that the frontend never emitted. This explains why
-;   the wide schedule is not faster; it does not explain the NaN.
+;   extra s_wait_dscnt 0x13 that the frontend never emitted. This is why the
+;   wide schedule is not faster, and it is the only thing left to fix here.
 ;
 ; DEVIATION 2 (code size): one logical TDM issue becomes 5 predicated
 ;   tensor_load_to_lds with ~100 lines of scalar branching before the back-edge.
 ;
-; STATIC CHECKS THAT CAME BACK CLEAN (i.e. do NOT explain the NaN):
+; STATIC CHECKS, all clean -- consistent with this loop being correct:
 ;   - no VGPR/SGPR spill; 346 VGPRs is inside the 1024 wave32 limit (doc :2250)
 ;   - A1 destinations v64..v127 are read by WMMA 17..32 -- not dead, not clobbered
 ;   - no WMMA reads a register that a later load in the same iteration overwrites
 ;   - accumulators (v128..v255, v322..v337) overlap no load destination
 ;   - s_wait_dscnt immediates are exactly 12 and 0 as the plan requires
+;   Reading VGPR numbers here requires parsing the /*vNNN*/ comment: v256+ goes
+;   through VGPR-MSB indexing (doc sec 3.3.2.3 :2249), so the bare 8-bit encoding
+;   lies. A script that dropped the comment once invented a false overlap.
 ;
-; MEASURED (b8-2, g2_m64_nb3 tiles, alternating runs)
-;   WIDE=0 : gemm1 204.3 / 203.1 us   gemm2 190.4 / 190.7   rel_l2 2.8725e-03
-;   WIDE=1 : gemm1 208.9 / 208.7 us   gemm2 207.1 / 209.2   rel_l2 nan
-;   The WIDE timings come from runs producing wrong results, so they bound the
-;   schedule's cost, not its value.
+; MEASURED (c9-3, g2_m64_nb3 tiles, same batch, post-fix ad2d3ebab)
+;   unset  : gemm1 349.7 us  gemm2 345.4  e2e 972.6   rel_l2 2.8725e-03
+;   WIDE=1 : gemm1 353.0 us  gemm2 344.6  e2e 977.3   rel_l2 2.8725e-03
+;   Identical, as expected: gemm1 runs this loop either way. Absolute numbers are
+;   not comparable to the b8-2 figures elsewhere -- always re-measure a baseline.
 ; ============================================================================
