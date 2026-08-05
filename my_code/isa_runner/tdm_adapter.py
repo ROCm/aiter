@@ -116,6 +116,7 @@ class Capture:
     lds_bytes: int = 0
     tiles: dict[str, int] = field(default_factory=dict)
     reference: Any = field(default=None, repr=False)  # torch tensor clone
+    reference_isa: Any = field(default=None, repr=False)  # unmodified .s
 
     def to_json(self) -> dict:
         return {
@@ -313,25 +314,40 @@ def _run_reference_moe(tokens, experts, topk, model_dim, inter_dim):
     )
 
 
-def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
-           device: int = 0, lds_bytes: int | None = None,
-           iters: int = 0, warmup: int = 20, check: bool = True) -> dict:
-    """Launch *isa_source* with the captured arguments."""
+def _launch_into(cap: Capture, isa_source, name_hint, spec, device, live):
+    """Poison-fill the output, launch one ISA, return (module_kept, name)."""
     import torch
-
     res = build(isa_source)
-    name = kernel or (res.kernels[0] if len(res.kernels) == 1 else cap.kernel)
-
-    out_t = cap.reference
-    if check and out_t is None:
-        raise IsaRunnerError("no reference captured; rerun capture in-process")
-
-    # Poison the output so a kernel that fails to write cannot masquerade as a
-    # pass. Not zero: zero is a plausible kernel result.
-    live = getattr(cap, "_out_tensor", None)
-    if check and live is not None:
+    name = name_hint or (res.kernels[0] if len(res.kernels) == 1 else cap.kernel)
+    if live is not None:
         live.fill_(_POISON)
         torch.cuda.synchronize()
+    mod = IsaModule(res.code_object, device=device, source=res.source)
+    mod.function(name)
+    mod.launch(name, cap.pack_kernargs(), spec)
+    mod.synchronize()
+    torch.cuda.synchronize()
+    return mod, name, res
+
+
+def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
+           device: int = 0, lds_bytes: int | None = None,
+           iters: int = 0, warmup: int = 20, check: bool = True,
+           reference_isa: str | Path | None = None) -> dict:
+    """Launch *isa_source* with the captured arguments.
+
+    The reference is produced by launching *reference_isa* (the unmodified dump)
+    through this same path first. That makes the comparison self-consistent:
+    the padded rows the kernel skips keep the poison value in both runs and
+    compare equal, so no heuristic mask is needed. Comparing against the tensor
+    left by the torch run instead does not work -- its skipped rows hold
+    uninitialised garbage near FLT_MAX, and both norms overflow to inf.
+    """
+    import torch
+
+    live = getattr(cap, "_out_tensor", None)
+    if check and live is None:
+        raise IsaRunnerError("no output tensor captured; rerun capture in-process")
 
     spec = KernelLaunchSpec(
         grid=cap.grid, block=cap.block,
@@ -339,7 +355,6 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         device=device,
     )
     report: dict[str, Any] = {
-        "isa": str(res.source), "kernel": name,
         "grid": list(spec.grid), "block": list(spec.block),
         "shared_mem_bytes": spec.shared_mem_bytes,
         "capture": cap.to_json(),
@@ -349,39 +364,46 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         # Reading recycled memory yields NaN rather than an error, so surface it.
         report["args_not_pinned"] = unpinned
 
-    with IsaModule(res.code_object, device=device, source=res.source) as mod:
-        mod.function(name)
-        args = cap.pack_kernargs()
-        mod.launch(name, args, spec)
-        mod.synchronize()
+    ref_t = None
+    if check:
+        ref_isa = reference_isa or cap.reference_isa
+        if ref_isa is None:
+            raise IsaRunnerError("--reference-isa is required for --check")
+        rmod, rname, rres = _launch_into(cap, ref_isa, None, spec, device, live)
+        ref_t = live.detach().clone()
+        rmod.close()
+        report["reference_isa"] = str(rres.source)
+        report["reference_kernel"] = rname
+        report["reference_wrote_elems"] = int(
+            (ref_t != _POISON).sum().item())
 
-        if check and live is not None:
-            torch.cuda.synchronize()
-            got, ref = live.float(), out_t.float()
+    mod, name, res = _launch_into(cap, isa_source, kernel, spec, device, live)
+    report["isa"], report["kernel"] = str(res.source), name
+    try:
+        if check:
+            got = live.float()
+            ref = ref_t.float()
+            same_poison = (got == _POISON) & (ref == _POISON)
+            report["skipped_padding_elems"] = int(same_poison.sum().item())
+            report["compared_elems"] = int((~same_poison).sum().item())
 
-            # i32_m is the align_m-padded row count; tiles whose expert id is
-            # n_experts are skipped by the kernel, so those rows keep whatever
-            # was in the buffer (torch.empty -> possibly NaN). Comparing them
-            # would make every run NaN. Score only the rows the kernel writes:
-            # where the reference itself is finite and not still poisoned.
-            valid = torch.isfinite(ref) & (ref != _POISON)
-            report["valid_elems"] = int(valid.sum().item())
-            report["total_elems"] = int(ref.numel())
-
-            unwritten = int((valid & (got == _POISON)).sum().item())
-            report["unwritten_valid_elems"] = unwritten
-
-            d = torch.where(valid, got - ref, torch.zeros_like(ref))
-            denom = torch.where(valid, ref, torch.zeros_like(ref)).norm().item() or 1.0
+            d = torch.where(same_poison, torch.zeros_like(ref), got - ref)
+            base = torch.where(same_poison, torch.zeros_like(ref), ref)
+            denom = base.norm().item() or 1.0
             rel_l2 = d.norm().item() / denom
             report["rel_l2"] = rel_l2
             report["max_abs_diff"] = d.abs().max().item()
-            report["passed"] = bool(rel_l2 < 1e-6 and unwritten == 0
-                                    and report["valid_elems"] > 0)
+            report["still_poisoned"] = int(
+                ((got == _POISON) & (ref != _POISON)).sum().item())
+            report["passed"] = bool(rel_l2 < 1e-6
+                                    and report["still_poisoned"] == 0
+                                    and report["compared_elems"] > 0)
 
         if iters:
             report["benchmark"] = mod.benchmark(
-                name, args, spec, iters=iters, warmup=warmup)
+                name, cap.pack_kernargs(), spec, iters=iters, warmup=warmup)
+    finally:
+        mod.close()
 
     return report
 
@@ -397,6 +419,9 @@ def main(argv=None) -> int:
                                      " per-process and cannot be reused)")
     p.add_argument("--out", help="write the report JSON here")
     p.add_argument("--lds-bytes", type=int)
+    p.add_argument("--reference-isa",
+                   help="unmodified .s used to produce the reference output; "
+                        "required with --check")
     p.add_argument("--iters", type=int, default=0)
     p.add_argument("--warmup", type=int, default=20)
     p.add_argument("--check", action="store_true", default=True)
@@ -420,7 +445,8 @@ def main(argv=None) -> int:
             return 1
         report = replay(cap, args.isa, kernel=args.kernel,
                         lds_bytes=args.lds_bytes, iters=args.iters,
-                        warmup=args.warmup, check=args.check)
+                        warmup=args.warmup, check=args.check,
+                        reference_isa=args.reference_isa)
 
     text = json.dumps(report, indent=2)
     print(text)
