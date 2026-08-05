@@ -1,18 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Unit tests for the FlyDSL warp-decode MoE primitives (SILOTIGER-667, Phase 1).
+"""Correctness + perf tests for the FlyDSL warp-decode MoE kernels (SILOTIGER-667).
 
-Validates the three low-level primitives the warp-decode gate_up / down_reduce
-kernels are built from, each in isolation on real gfx950 hardware:
+Two layers, both in this one file (per the ticket's locked testing standard, ?2):
 
-    1. ``v_dot2_f32_bf16``      local inline-asm dot helper (2 bf16 MACs/lane).
-    2. ``cvt_scalef32_pk_bf16_fp8``  scaled FP8(e4m3) -> BF16 pair convert.
-    3. 64-lane ``shuffle_xor`` butterfly reduce.
+  * **Correctness (pytest gate):** the three low-level primitives in isolation
+    (``v_dot2_f32_bf16``, ``cvt_scalef32_pk_bf16_fp8``, 64-lane butterfly reduce)
+    plus the ``gate_up`` / ``down_reduce`` FP8 fast paths vs a torch reference.
+  * **Perf sweep (``__main__``):** ``@benchmark`` + ``run_perftest`` +
+    ``checkAllclose`` over realistic decode shapes, emitting a markdown table with
+    ``us`` / ``TFLOPS`` / ``TB/s`` / ``%peak`` / ``err`` per stage. Timing uses the
+    shared harness (device time by default), adequate warmup/iters, and a
+    cold-HBM-read rotation policy (see ``_rotate_for``). Never hand-rolled timers.
 
 Usage:
-    python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py
+    # correctness (fast):
     pytest -q op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py
+    # correctness + perf sweep with markdown tables:
+    python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py
+    python op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py --timing cuda_event
 """
 
 from __future__ import annotations
@@ -33,16 +40,30 @@ if not is_flydsl_available():
     )
 
 import flydsl.compiler as flyc  # noqa: E402
+import pandas as pd  # noqa: E402
 
+import aiter  # noqa: E402
+from aiter import dtypes  # noqa: E402
+from aiter.jit.utils.chip_info import get_gfx  # noqa: E402
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg  # noqa: E402
 from aiter.ops.flydsl.kernels.warp_decode_moe import (  # noqa: E402
     WARP_SIZE,
     build_warp_decode_primitives_module,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest  # noqa: E402
 
 torch.set_default_device("cuda")
 
 _HAS_FP8 = hasattr(torch, "float8_e4m3fn")
+
+# Approximate gfx950 (MI355X, HBM3E) peak DRAM bandwidth, for the %peak column
+# only. Perf figures are streamed-weight TB/s; %peak is illustrative, not a gate.
+_HBM_PEAK_TBS = 8.0
+
+# Perf-sweep default timing knobs (SILOTIGER-667 ?2: >=5 warmup, >=100 iters for
+# these tiny B=1 decode kernels; small 2/1 is reserved for correctness-only).
+_PERF_NUM_ITERS = 100
+_PERF_NUM_WARMUP = 5
 
 
 def _run_primitives(serialize_dot2: bool = True):
@@ -350,6 +371,183 @@ def test_down_reduce_fp8(case):
     assert passed
 
 
+# -------------------------------------------------------------------------
+# Perf sweep -- combined correctness + benchmark (SILOTIGER-667 ?2 standard)
+# -------------------------------------------------------------------------
+# Realistic decode shapes (weights >> last-level cache). name, B, HIDDEN, INTER,
+# E, TOPK, mode.  DeepSeek-V3-ish (H7168/I2048/TOPK8) is the headline case.
+GATE_UP_PERF_SHAPES = [
+    (1, 7168, 2048, 8, 8, "pertensor"),
+    (4, 7168, 2048, 8, 8, "pertensor"),
+    (1, 7168, 2048, 8, 8, "pertoken"),
+    (1, 4096, 1024, 8, 8, "pertensor"),
+]
+# name, B, INTER, HIDDEN, E, TOPK, mode.
+DOWN_PERF_SHAPES = [
+    (1, 2048, 7168, 8, 8, "pertensor"),
+    (4, 2048, 7168, 8, 8, "pertensor"),
+    (1, 2048, 7168, 8, 8, "pertoken"),
+    (1, 1024, 4096, 8, 8, "pertensor"),
+]
+
+
+def _timing_kwargs(timing: str) -> dict:
+    """Map a --timing choice to run_perftest kwargs (see SILOTIGER-667 ?2).
+
+    device     : torch-profiler *device* time only (pure kernel), IQR-trimmed
+                 when num_iters > 30. The reported headline BW.
+    cuda_event : wall-clock mean per launch -- includes host dispatch (the
+                 entry-point's per-call ptr_arg + current_stream cost, real at
+                 B=1, ~20 us kernels).
+    graph      : CUDA-graph replay + device time (lowest host overhead).
+    """
+    if timing == "cuda_event":
+        return {"use_cuda_event": True}
+    if timing == "graph":
+        return {"testGraph": True}
+    return {}  # device (default)
+
+
+def _rotate_for(*tensors) -> int:
+    """Pick ``num_rotate_args`` for a cold-HBM-read measurement without OOM.
+
+    SILOTIGER-667 ?2 wants each timed iter to stream weights from HBM (not reuse
+    cache). ``run_perftest``'s default auto-rotation deep-copies enough input
+    sets to fill cache -- fine for tiny tensors, but it OOMs on 100 MB+ FP8
+    weight tensors. When the weight set already dwarfs the last-level cache (any
+    realistic decode shape) reads are cold with no rotation at all, so we return
+    a tiny fixed count; only genuinely small working sets fall back to auto (0).
+    """
+    nbytes = sum(
+        t.numel() * t.element_size() for t in tensors if isinstance(t, torch.Tensor)
+    )
+    llc = 256 * 1024 * 1024  # ~MI350 MALL; above this, reads are cold w/o copies
+    if nbytes >= llc:
+        return 2  # cold already; 1 deep-copy keeps the profiler's rotation happy
+    return 0  # small: let run_perftest auto-fill cache to force cold reads
+
+
+@benchmark()
+def bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, timing, num_iters, num_warmup):
+    x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
+        B, HIDDEN, INTER, E, TOPK, mode
+    )
+    # Faithful to the real call: pre-allocate and pass the output buffer.
+    out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode)  # not timed
+
+    outputs = B * TOPK * INTER
+    flops = 4 * HIDDEN * outputs  # 2 dots (gate+up) x 2 (mul+add) x HIDDEN
+    wbytes = 2 * outputs * HIDDEN  # gate+up FP8 rows streamed (1 B each)
+
+    fn = lambda: flydsl_warp_decode_gate_up(  # noqa: E731
+        x, w_gate, w_up, router_ids, wgs, wus, w_scale_mode=mode, out=out
+    )
+    got, us = run_perftest(
+        fn,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=_rotate_for(x, w_gate, w_up),
+        **_timing_kwargs(timing),
+    )
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        tol_err_ratio=0.05,
+        msg=f"gate_up {mode}",
+        printLog=False,
+    )
+    assert _cosine(ref, got) >= 0.999, f"gate_up {mode}: correctness regression"
+    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    return {
+        "gfx": get_gfx(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
+        "TB/s": tbs,
+        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "err": err,
+    }
+
+
+@benchmark()
+def bench_down(B, INTER, HIDDEN, E, TOPK, mode, timing, num_iters, num_warmup):
+    inter, w_down, router_ids, router_wts, wds = _gen_down(
+        B, INTER, HIDDEN, E, TOPK, mode
+    )
+    out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=inter.device)
+    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode)  # not timed
+
+    outputs = B * HIDDEN
+    flops = 2 * INTER * TOPK * outputs  # TOPK dots of length INTER x 2 (mul+add)
+    wbytes = outputs * TOPK * INTER  # FP8 down rows streamed (1 B each)
+
+    fn = lambda: flydsl_warp_decode_down_reduce(  # noqa: E731
+        inter, w_down, router_ids, router_wts, wds, w_scale_mode=mode, out=out
+    )
+    got, us = run_perftest(
+        fn,
+        num_iters=num_iters,
+        num_warmup=num_warmup,
+        num_rotate_args=_rotate_for(inter, w_down),
+        **_timing_kwargs(timing),
+    )
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        got.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        tol_err_ratio=0.05,
+        msg=f"down {mode}",
+        printLog=False,
+    )
+    assert _cosine(ref, got) >= 0.999, f"down {mode}: correctness regression"
+    tbs = wbytes / us / 1e6 if us > 0 else 0.0
+    return {
+        "gfx": get_gfx(),
+        "us": us,
+        "TFLOPS": flops / us / 1e6 if us > 0 else 0.0,
+        "TB/s": tbs,
+        "%peak": 100.0 * tbs / _HBM_PEAK_TBS,
+        "err": err,
+    }
+
+
+def _fmt_table(rows) -> str:
+    """Markdown table when ``tabulate`` is available; plain text otherwise."""
+    df = pd.DataFrame(rows)
+    try:
+        return df.to_markdown(index=False)
+    except ImportError:
+        return df.to_string(index=False)
+
+
+def _run_perf_sweeps(args) -> None:
+    """Correctness+perf sweeps -> one markdown table per stage."""
+    timing_kw = dict(
+        timing=args.timing, num_iters=args.num_iters, num_warmup=args.num_warmup
+    )
+
+    gate_rows = [
+        bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, **timing_kw)
+        for (B, HIDDEN, INTER, E, TOPK, mode) in args.gate_up_shapes
+    ]
+    aiter.logger.info(
+        "warp-decode gate_up perf (%s timing):\n%s", args.timing, _fmt_table(gate_rows)
+    )
+
+    down_rows = [
+        bench_down(B, INTER, HIDDEN, E, TOPK, mode, **timing_kw)
+        for (B, INTER, HIDDEN, E, TOPK, mode) in args.down_shapes
+    ]
+    aiter.logger.info(
+        "warp-decode down_reduce perf (%s timing):\n%s",
+        args.timing,
+        _fmt_table(down_rows),
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -357,7 +555,23 @@ def main() -> int:
         action="store_true",
         help="disable the s_nop 2 dot2 hazard guard",
     )
+    parser.add_argument(
+        "--skip-perf",
+        action="store_true",
+        help="run only the correctness checks (no perf sweep / tables)",
+    )
+    parser.add_argument(
+        "--timing",
+        choices=["device", "cuda_event", "graph"],
+        default="device",
+        help="run_perftest timing mode for the perf sweep (default: device)",
+    )
+    parser.add_argument("--num-iters", type=int, default=_PERF_NUM_ITERS)
+    parser.add_argument("--num-warmup", type=int, default=_PERF_NUM_WARMUP)
     args = parser.parse_args()
+    # Fixed realistic shapes (weights >> LLC); not swept via CLI for now.
+    args.gate_up_shapes = GATE_UP_PERF_SHAPES
+    args.down_shapes = DOWN_PERF_SHAPES
 
     print("=" * 78)
     print("[flydsl] warp-decode MoE primitives (Phase 1)")
@@ -395,6 +609,15 @@ def main() -> int:
         print("  skipped (torch build lacks float8_e4m3fn)")
 
     all_ok = (n_pass == len(results)) and gate_up_ok and down_ok
+
+    if not args.skip_perf and _HAS_FP8:
+        print("\n" + "=" * 78)
+        print(f"[flydsl] warp-decode MoE perf sweep (timing={args.timing})")
+        print("=" * 78)
+        _run_perf_sweeps(args)
+    elif not _HAS_FP8:
+        print("\n  perf sweep skipped (torch build lacks float8_e4m3fn)")
+
     return 0 if all_ok else 1
 
 
