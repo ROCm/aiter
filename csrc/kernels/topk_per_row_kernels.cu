@@ -2691,21 +2691,7 @@ enum class Phase
 // Workspace size = max(mb, ob) so the dispatcher can switch freely.
 namespace {
 
-// TOPK_STABLE=1 (or t/T/y/Y) enables deterministic, ascending-index ordered
-// top-k with smallest-index tie-breaking, so every tensor-parallel rank selects
-// AND orders an identical KV set for identical inputs (required for DSA + TP
-// all-reduce correctness). Process-wide switch, read once and cached; keeps the
-// Python/pybind API unchanged. When on, the prefill/decode entries force the
-// one-block path (the multi-block persistent kernel's cross-block atomic emit
-// is inherently order-dependent and cannot be made stable cheaply).
-inline bool topk_stable_enabled()
-{
-    static const bool v = []() {
-        const char* e = std::getenv("TOPK_STABLE");
-        return e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y');
-    }();
-    return v;
-}
+
 
 template <aiter::Phase phase>
 inline size_t query_mb_workspace(int32_t numRows, int32_t stride0, int kTopK = 2048)
@@ -2840,7 +2826,8 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
                            int64_t stride0,
                            int64_t /*stride1*/,
                            int64_t k = 2048,
-                           std::optional<torch::Tensor> workspace = std::nullopt)
+                           std::optional<torch::Tensor> workspace = std::nullopt,
+                           bool stable = false)
 {
     if (numRows <= 0) return;
 
@@ -2859,12 +2846,12 @@ void top_k_per_row_prefill(const torch::Tensor& logits,
     float* values_ptr      = values.has_value() ? values->data_ptr<float>() : nullptr;
     const bool write_vals  = values.has_value();
 
-    // TOPK_STABLE=1: force the one-block path with the deterministic, ascending-
+    // stable=true: force the one-block path with the deterministic, ascending-
     // ordered, smallest-index tie-break emit (STABLE=true). This guarantees a
     // scheduling-independent top-k so every tensor-parallel rank selects and
     // orders an identical KV set. The multi-block persistent path is bypassed
     // (its cross-block atomic emit is inherently order-dependent).
-    if (topk_stable_enabled()) {
+    if (stable) {
         constexpr bool select_min = !is_largest;
         const size_t ob_ws      = query_ob_workspace<aiter::Phase::Prefill>(batch, stride0, kTopK);
         torch::Tensor ws        = torch::empty({static_cast<int64_t>(ob_ws)}, options);
@@ -2955,7 +2942,8 @@ void top_k_per_row_decode(const torch::Tensor& logits,
                           int64_t stride0,
                           int64_t /*stride1*/,
                           int64_t k = 2048,
-                          std::optional<torch::Tensor> workspace = std::nullopt)
+                          std::optional<torch::Tensor> workspace = std::nullopt,
+                          bool stable = false)
 {
     if (numRows <= 0) return;
 
@@ -2976,9 +2964,9 @@ void top_k_per_row_decode(const torch::Tensor& logits,
     const size_t ob_ws         = query_ob_workspace<aiter::Phase::Decode>(batch, stride0, kTopK);
     torch::Tensor ob_workspace = torch::empty({static_cast<int64_t>(ob_ws)}, options);
     void* ws_ptr               = static_cast<void*>(ob_workspace.data_ptr<uint8_t>());
-    // TOPK_STABLE=1: deterministic ascending-ordered, smallest-index tie-break
+    // stable=true: deterministic ascending-ordered, smallest-index tie-break
     // emit so every TP rank selects and orders an identical KV set.
-    if (topk_stable_enabled()) {
+    if (stable) {
         aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Decode, /*STABLE=*/true>(
             ws_ptr, buf_size, logits_ptr, static_cast<int*>(nullptr),
             batch, stride0,

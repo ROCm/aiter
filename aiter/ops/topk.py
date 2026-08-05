@@ -298,6 +298,7 @@ def _top_k_per_row_prefill(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -352,12 +353,17 @@ def top_k_per_row_prefill(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (prefill). The multi-block path runs on a persistent,
     zero-initialized workspace (memset-free; see get_topk_mb_workspace); the
-    one-block path allocates its own scratch internally."""
+    one-block path allocates its own scratch internally.
+
+    When stable=True, the one-block path is forced with deterministic,
+    ascending-index ordered, smallest-index tie-breaking emit so every
+    tensor-parallel rank selects and orders an identical KV set."""
     workspace = None
-    if topk_use_mulblocks(numRows, stride0):
+    if not stable and topk_use_mulblocks(numRows, stride0):
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_prefill(
@@ -371,6 +377,7 @@ def top_k_per_row_prefill(
         stride1,
         k,
         workspace,
+        stable,
     )
 
 
@@ -398,6 +405,7 @@ def _top_k_per_row_decode(
     stride1: int,
     k: int = 2048,
     workspace: torch.Tensor | None = None,
+    stable: bool = False,
 ) -> None: ...
 
 
@@ -410,17 +418,17 @@ def top_k_per_row_decode(
     stride0: int,
     stride1: int,
     k: int = 2048,
+    stable: bool = False,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel — the C++
-    side ignores the workspace argument for decode."""
+    side ignores the workspace argument for decode.
+
+    When stable=True, the deterministic ascending-ordered, smallest-index
+    tie-break emit is used so every TP rank selects and orders an identical
+    KV set."""
     # Decode always takes the ob path (see topk_per_row_kernels.cu).
-    # The original mb dispatch is commented out below for reference:
-    #   workspace = None
-    #   if topk_use_mulblocks(numRows, stride0):
-    #       size = topk_mb_workspace_size(numRows, stride0, k, True)
-    #       workspace = get_topk_mb_workspace(logits.device, size)
     return _top_k_per_row_decode(
-        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None
+        logits, next_n, seqLens, indices, numRows, stride0, stride1, k, None, stable
     )
 
 
