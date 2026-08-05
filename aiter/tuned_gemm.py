@@ -284,7 +284,9 @@ def get_GEMM_A16W16_config(
                 assert (
                     False
                 ), f"no solution for {M=} {N=} {K=} {dtype=} {bias=}, {scaleAB=}, {bpreshuffle=}"
-        elif is_skinny_default_shape(M, N, K, dtype, cu_num):
+        elif gfx in ["gfx942", "gfx950"] and is_skinny_default_shape(
+            M, N, K, dtype, cu_num
+        ):
             # soltype, solution_idx = 3, 2
             default_config["libtype"] = "skinny"
             default_config["solidx"] = 2
