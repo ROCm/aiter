@@ -41,100 +41,22 @@ from torch import Tensor
 from aiter.ops.gemm_op_common import get_padded_m
 
 try:
-    from aiter.ops.opus.gemm_op_a16w16 import is_splitk_kid as _opus_is_splitk_kid
     from aiter.ops.opus.gemm_op_a16w16 import opus_gemm_a16w16_tune as _opus_tune
-    from aiter.ops.opus.gemm_op_a16w16 import (
-        opus_gemm_workspace_init as _opus_workspace_init,
-    )
 except Exception:  # noqa: BLE001  blanket catch is intentional here
     _opus_tune = None
-    _opus_workspace_init = None
-    _opus_is_splitk_kid = None
 
-# Every opus split-K arch (gfx950 / gfx942 / gfx1250) owns a per-stream fp32
-# workspace (process-global `opus_splitk_ws_get` registry, backed by raw
-# hipMalloc) that must be registered AND grown to the shape's size *eagerly*
-# before HIP graph capture -- hipMalloc/hipFree are stream-capture-illegal, so a
-# grow inside capture aborts the capture, leaving an empty graph whose replay
-# silently writes zeros (garbage logits). torch.cuda.graph captures on a
-# process-global stream (`torch.cuda.graphs.graph.default_capture_stream`) when
-# no explicit stream is passed (the vLLM/ATOM CUDAGraphWrapper case); we warm
-# that stream here during the eager pass so a later capture of the same shape
-# finds a ready workspace. (The opus launcher reads a stable device-resident
-# handle, so the captured graph stays valid across replays / post-capture grows
-# -- which is exactly why opus keeps a persistent workspace instead of a
-# per-call hipMallocAsync that would not survive capture; the only cost is this
-# one-time warm.)
-_OPUS_WS_ARCHS = {"gfx950", "gfx942", "gfx1250"}
-_opus_ws_warmed_sigs = set()
-
-
-@functools.lru_cache(maxsize=1)
-def _opus_needs_ws_prewarm() -> bool:
-    if _opus_tune is None or _opus_workspace_init is None:
-        return False
-    try:
-        return get_gfx() in _OPUS_WS_ARCHS
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _opus_graph_capture_stream():
-    """The stream torch.cuda.graph captures on when called without `stream=`.
-
-    Mirrors torch's own lazy-init so we register the opus workspace on the exact
-    stream a later `with torch.cuda.graph(g):` will use.
-    """
-    g = torch.cuda.graphs.graph
-    if getattr(g, "default_capture_stream", None) is None:
-        g.default_capture_stream = torch.cuda.Stream()
-    return g.default_capture_stream
-
-
-def _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype):
-    """Eagerly size the opus split-K workspace on the graph capture stream.
-
-    No-op when already capturing (too late to allocate), on non-registry archs,
-    for a non-split-K kid (never touches the workspace), or when this
-    (shape, kid, splitK, bias) was already warmed.
-    """
-    if not _opus_needs_ws_prewarm():
-        return
-    # Only split-K kids allocate/read the fp32 workspace; every other kid family
-    # (flatmm / persistent / mono_tile / nosplit) launches straight to its kernel
-    # and never touches the registry, so warming it for them is pure waste.
-    if _opus_is_splitk_kid is not None and not _opus_is_splitk_kid(solidx):
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    m, k = inp.shape
-    n = weights.shape[0]
-    sig = (int(solidx), m, n, k, int(splitK), bias is not None, str(otype))
-    if sig in _opus_ws_warmed_sigs:
-        return
-    try:
-        s = _opus_graph_capture_stream()
-        with torch.cuda.stream(s):
-            _opus_workspace_init()
-            Yw = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
-            _opus_tune(
-                inp.unsqueeze(0),
-                weights.unsqueeze(0),
-                Yw.unsqueeze(0),
-                bias=bias,
-                kernelId=int(solidx),
-                splitK=int(splitK),
-            )
-        s.synchronize()
-        _opus_ws_warmed_sigs.add(sig)
-    # Don't break eager callers; capture would re-surface it.
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            f"opus split-K workspace prewarm on the graph capture stream failed "
-            f"({type(e).__name__}: {e}); HIP graph capture of this opus shape may "
-            f"produce zeros. Call aiter.opus_gemm_workspace_init() on the capture "
-            f"stream manually if you capture with a custom stream."
-        )
+# NOTE: gfx1250 split-K kids allocate their partial-sum workspace as a plain
+# torch.empty tensor (see aiter.ops.opus.gemm_op_a16w16._get_opus_workspace)
+# passed explicitly to the launcher. torch's caching allocator is HIP graph-
+# capture aware, so that single torch.empty path serves both eager and capture
+# (a buffer first touched inside capture comes from the graph mempool with a
+# replay-stable address) and no eager pre-warm of the shape is required. (The
+# old per-stream hipMalloc registry -- opus_gemm_workspace_init /
+# opus_splitk_ws_get -- used by the gfx942/gfx950 a16w16 split-K path still needs
+# an eager warm before capture; if that path is ever exercised under cudagraphs,
+# warm it via aiter.opus_gemm_workspace_init() on the capture stream. It fails
+# loudly ("splitk workspace not initialized") rather than silently corrupting,
+# so its absence here is safe to detect.)
 
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -626,11 +548,8 @@ def opus_gemm(
     splitK = int(config.get("splitK", 0)) if config is not None else 0
     m, _k = inp.shape
     n = weights.shape[0]
-    # Eagerly size the per-stream split-K workspace on torch's graph capture
-    # stream so a later HIP graph capture of this shape doesn't abort (which
-    # would leave the captured graph empty -> replay writes zeros). No-op when
-    # already capturing, on gfx950, or for an already-warmed shape.
-    _opus_prewarm_capture_workspace(inp, weights, solidx, splitK, bias, otype)
+    # The split-K workspace (if any) is allocated capture-safely inside
+    # opus_gemm_a16w16_tune -> _get_opus_workspace; no eager pre-warm needed.
     Y = torch.empty(m, n, dtype=otype or inp.dtype, device=inp.device)
     _opus_tune(
         inp.unsqueeze(0),
