@@ -584,23 +584,19 @@ class EpDispatchCombineOp:
                 _b, _w = (int(x) for x in _bw.split(","))
                 combine_specs = [(_b, _w)]
             elif cfg.is_fused:
-                # The fused combine is an xdb cross-device barrier + a light
-                # per-(token,k) topk sum. That sum is *tiny* (tens of MB) so the
-                # kernel is dominated by the cross-BLOCK grid barrier (block 0 signals
-                # every block via comb_bar, then waits for all of them to report). That
-                # handshake serializes with block_num, so once block_num exceeds what
-                # co-resides on the 256-CU GPU the kernel falls off a cliff: at bs512 a
-                # 512-block grid ran ~1255 us/call vs ~94 us/call for a 16-block grid
-                # (~13x). The reduce is not big enough to be HBM bound here, so the
-                # right geometry is the FEWEST blocks that still saturate HBM --
-                # empirically 8-32 blocks across bs128..bs2048 (best per_layer, and
-                # scatter_fused then beats gather). Token-adaptive tiers
-                # (count_upper_bound, (block, warp)); block count grows very gently
-                # with tokens and stays small. Override via SCATTER_COMB_BW to retune.
+                # The fused combine is an xdb barrier + a light topk sum. Only the
+                # first npes lanes now touch the system-scope xdb flag, so additional
+                # waves are useful bandwidth workers instead of multiplying barrier
+                # traffic. Re-tuned after that change: keep 8 blocks through 32
+                # tokens (16 regresses at bs8), then 16/32/64 blocks win through
+                # 256/1024/larger counts. The next doubling is flat at 128 and
+                # regresses at 512/2048 because comb_bar starts dominating again.
+                # Override via SCATTER_COMB_BW for other token/hidden shapes.
                 self._fused_comb_tiers = [
-                    (256, (8, 16)),
-                    (1024, (16, 16)),
-                    (None, (32, 16)),
+                    (32, (8, 16)),
+                    (256, (16, 16)),
+                    (1024, (32, 16)),
+                    (None, (64, 16)),
                 ]
                 combine_specs = [s for _, s in self._fused_comb_tiers]
             else:
@@ -1080,9 +1076,11 @@ class EpDispatchCombineOp:
                     break
         else:
             _, comb_spec = self._pick(count)
-        self.combine_out.zero_()
+        # The kernel overwrites every element of each active token's hidden row.
+        # Unlike comb_inp, there are no dropped slots that require a zero sentinel.
         self._combine_variants[comb_spec](
             self.arena.handle,
+            self.arena.local_ptr("comb_inp"),
             self.combine_barrier.data_ptr(),
             self.cross_device_flag.data_ptr(),
             self.combine_out.data_ptr(),
