@@ -26,6 +26,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
 )
 
 MAX_EXPERTS_PER_BLOCK = 512
+REMAP_BLOCK_THREADS = 256
 
 
 @fx.struct
@@ -196,11 +197,15 @@ def build_moe_contiguous_psum_module():
     return launch_psum
 
 
-def build_moe_contiguous_psum_remap_module():
+def build_moe_contiguous_psum_remap_module(split_remap: bool = False):
     """JIT launcher: contiguous psum + in-place masked-to-contiguous row remap."""
 
     @flyc.kernel(
-        name="moe_contiguous_psum_remap",
+        name=(
+            "moe_contiguous_psum_scan"
+            if split_remap
+            else "moe_contiguous_psum_remap"
+        ),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_remap_kernel(
@@ -302,30 +307,78 @@ def build_moe_contiguous_psum_remap_module():
 
         gpu.barrier()
 
-        # Only remap valid routes ([0, valid_route_count)); dead-tail routes
-        # hold unwritten/garbage rows from the route kernel and must NOT be used
-        # as a row index (would OOB-read starts[expert]). They are never read
-        # downstream. When truncation is disabled the caller passes a null pointer
-        # instead of a (1,) tensor, so the load must not run unconditionally.
-        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        if const_expr(not split_remap):
+            # Only remap valid routes ([0, valid_route_count)); dead-tail routes
+            # hold unwritten/garbage rows from the route kernel and must NOT be used
+            # as a row index (would OOB-read starts[expert]). They are never read
+            # downstream. When truncation is disabled the caller passes a null pointer
+            # instead of a (1,) tensor, so the load must not run unconditionally.
+            num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
+            valid_route_count = fx.Uint32(numel)
+            if num_valid_routes_is_set:
+                valid_route_count = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        ptr_rsrc(num_valid_routes),
+                        fx.Uint32(0),
+                        vec_width=1,
+                        dtype=i32,
+                    )
+                )
+            for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
+                row = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        rows_rsrc, route_i32, vec_width=1, dtype=i32
+                    )
+                )
+                m = fx.Uint32(route_max_m)
+                expert = row // m
+                slot = row - expert * m
+                start = fx.Uint32(
+                    buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+                )
+                buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+
+    @flyc.kernel(
+        name="moe_contiguous_remap",
+        known_block_size=[REMAP_BLOCK_THREADS, 1, 1],
+    )
+    def remap_kernel(
+        topids_to_rows: fx.Pointer,
+        starts: fx.Pointer,
+        numel: Int32,
+        route_max_m: Int32,
+        num_valid_routes: fx.Pointer,
+    ):
+        i32 = T.i32
+        route = (
+            fx.Uint32(fx.block_idx.x) * REMAP_BLOCK_THREADS
+            + fx.Uint32(fx.thread_idx.x)
+        )
         valid_route_count = fx.Uint32(numel)
+        num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
         if num_valid_routes_is_set:
             valid_route_count = fx.Uint32(
                 buffer_ops.buffer_load(
-                    ptr_rsrc(num_valid_routes), fx.Uint32(0), vec_width=1, dtype=i32
+                    ptr_rsrc(num_valid_routes),
+                    fx.Uint32(0),
+                    vec_width=1,
+                    dtype=i32,
                 )
             )
-        for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
+        if route < valid_route_count:
+            rows_rsrc = ptr_rsrc(topids_to_rows)
             row = fx.Uint32(
-                buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
+                buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, dtype=i32)
             )
             m = fx.Uint32(route_max_m)
             expert = row // m
             slot = row - expert * m
             start = fx.Uint32(
-                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+                buffer_ops.buffer_load(
+                    ptr_rsrc(starts), expert, vec_width=1, dtype=i32
+                )
             )
-            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+            buffer_ops.buffer_store(start + slot, rows_rsrc, route)
 
     @flyc.jit
     def launch_psum_remap(
@@ -357,6 +410,21 @@ def build_moe_contiguous_psum_remap_module():
             block=(MAX_EXPERTS_PER_BLOCK, 1, 1),
             stream=stream,
         )
+        if const_expr(split_remap):
+            remap_grid = (
+                fx.Uint32(numel) + REMAP_BLOCK_THREADS - 1
+            ) // REMAP_BLOCK_THREADS
+            remap_kernel(
+                topids_to_rows,
+                starts,
+                numel,
+                route_max_m,
+                num_valid_routes,
+            ).launch(
+                grid=(arith.index_cast(T.index, remap_grid), 1, 1),
+                block=(REMAP_BLOCK_THREADS, 1, 1),
+                stream=stream,
+            )
 
     launch_psum_remap.compile_hints = {
         "llvm_options": {

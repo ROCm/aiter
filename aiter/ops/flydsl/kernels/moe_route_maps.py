@@ -210,6 +210,227 @@ def build_moe_topids_to_rows_module():
     return launch_topids_to_rows
 
 
+def build_moe_route_unified_module():
+    """Single route kernel for plain, EP/g2l, LDS and global-atomic modes.
+
+    Optional pointers select g2l remapping and weight cast/mask at runtime.
+    ``use_lds`` selects the two-level atomic path when the local bucket count
+    fits the fixed LDS table; otherwise the same kernel performs direct device
+    atomics. Four routes per thread provide one launch geometry for all modes.
+    """
+    routes_per_thread = 4
+    routes_per_block = BLOCK_THREADS * routes_per_thread
+
+    @flyc.kernel(
+        name="moe_route_unified",
+        known_block_size=[BLOCK_THREADS, 1, 1],
+    )
+    def route_kernel(
+        topk_ids: fx.Pointer,
+        g2l_lut: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        weight_in: fx.Pointer,
+        gather_w: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        numel: Int32,
+        max_m: Int32,
+        n_buckets: Int32,
+        use_lds: Int32,
+        weight_is_f16: Int32,
+    ):
+        i32 = T.i32
+        c0 = arith.constant(0, type=i32)
+        c1 = arith.constant(1, type=i32)
+        tid = fx.Uint32(fx.thread_idx.x)
+        route0 = fx.Uint32(fx.block_idx.x) * routes_per_block + tid
+        numel_i32 = fx.Uint32(numel)
+        n_buckets_i32 = fx.Uint32(n_buckets)
+        use_lds_flag = fx.Int32(use_lds) != 0
+        use_g2l = fx.Int64(ptrtoint(g2l_lut)) != 0
+        write_weight = fx.Int64(ptrtoint(gather_w)) != 0
+        is_f16 = fx.Int32(weight_is_f16) != 0
+
+        valid_route_count = numel_i32
+        has_valid_bound = fx.Int64(ptrtoint(num_valid_routes)) != 0
+        if has_valid_bound:
+            valid_route_count = fx.Uint32(
+                buffer_ops.buffer_load(
+                    ptr_rsrc(num_valid_routes), c0, vec_width=1, dtype=i32
+                )
+            )
+
+        lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
+        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+        topk_rsrc = ptr_rsrc(topk_ids)
+        out_rsrc = ptr_rsrc(topids_to_rows)
+
+        if use_lds_flag:
+            for bucket in range(tid, n_buckets_i32, BLOCK_THREADS):
+                _lds_store(lds_cnt, fx.Int32(0), bucket)
+            gpu.barrier()
+
+        route_regs = []
+        expert_regs = []
+        rank_regs = []
+        valid_regs = []
+        for route_it in range_constexpr(routes_per_thread):
+            route = route0 + route_it * BLOCK_THREADS
+            valid = route < valid_route_count
+            expert = fx.Uint32(0)
+            rank = fx.Uint32(0)
+            if valid:
+                global_expert = fx.Uint32(
+                    buffer_ops.buffer_load(
+                        topk_rsrc, route, vec_width=1, dtype=i32
+                    )
+                )
+                dropped = fx.Int32(0) != 0
+                if use_g2l:
+                    local_expert = fx.Uint32(
+                        buffer_ops.buffer_load(
+                            ptr_rsrc(g2l_lut),
+                            global_expert,
+                            vec_width=1,
+                            dtype=i32,
+                        )
+                    )
+                    dropped = local_expert == n_buckets_i32
+                    expert = dropped.select(fx.Uint32(0), local_expert)
+                else:
+                    expert = global_expert
+
+                if write_weight:
+                    w_f32 = fx.Float32(
+                        buffer_ops.buffer_load(
+                            ptr_rsrc(weight_in),
+                            route,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    w_out = dropped.select(fx.Float32(0.0), w_f32)
+                    w_bf16 = arith.bitcast(
+                        T.i16, arith.trunc_f(T.bf16, _raw(w_out))
+                    )
+                    w_f16 = arith.bitcast(
+                        T.i16, arith.trunc_f(T.f16, _raw(w_out))
+                    )
+                    buffer_ops.buffer_store(
+                        is_f16.select(w_f16, w_bf16),
+                        ptr_rsrc(gather_w),
+                        route,
+                    )
+
+                if use_lds_flag:
+                    rank = fx.Uint32(
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.add,
+                            _slot_ptr(cnt_base_i64, expert, address_space=3),
+                            c1,
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="workgroup",
+                            alignment=4,
+                        ).result
+                    )
+                else:
+                    rank = fx.Uint32(
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.add,
+                            _slot_ptr(
+                                fx.Int64(ptrtoint(atomic_buffer)), expert
+                            ),
+                            c1,
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        ).result
+                    )
+
+            route_regs.append(route)
+            expert_regs.append(expert)
+            rank_regs.append(rank)
+            valid_regs.append(valid)
+
+        if use_lds_flag:
+            gpu.barrier()
+            for bucket in range(tid, n_buckets_i32, BLOCK_THREADS):
+                count = _lds_load(lds_cnt, bucket)
+                nonempty = count != c0
+                base = fx.Int32(0)
+                if nonempty:
+                    base = fx.Int32(
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.add,
+                            _slot_ptr(
+                                fx.Int64(ptrtoint(atomic_buffer)), bucket
+                            ),
+                            _raw(count),
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
+                        ).result
+                    )
+                _lds_store(lds_cnt, base, bucket)
+            gpu.barrier()
+
+        for route_it in range_constexpr(routes_per_thread):
+            if valid_regs[route_it]:
+                expert = expert_regs[route_it]
+                rank = rank_regs[route_it]
+                if use_lds_flag:
+                    rank = (
+                        fx.Uint32(_lds_load(lds_cnt, expert))
+                        + rank
+                    )
+                row = rank + expert * fx.Uint32(max_m)
+                buffer_ops.buffer_store(row, out_rsrc, route_regs[route_it])
+
+    @flyc.jit
+    def launch_route_unified(
+        topk_ids: fx.Pointer,
+        g2l_lut: fx.Pointer,
+        atomic_buffer: fx.Pointer,
+        topids_to_rows: fx.Pointer,
+        weight_in: fx.Pointer,
+        gather_w: fx.Pointer,
+        num_valid_routes: fx.Pointer,
+        numel: fx.Int32,
+        max_m: fx.Int32,
+        n_buckets: fx.Int32,
+        use_lds: fx.Int32,
+        weight_is_f16: fx.Int32,
+        grid_blocks: fx.Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        route_kernel(
+            topk_ids,
+            g2l_lut,
+            atomic_buffer,
+            topids_to_rows,
+            weight_in,
+            gather_w,
+            num_valid_routes,
+            numel,
+            max_m,
+            n_buckets,
+            use_lds,
+            weight_is_f16,
+        ).launch(
+            grid=(arith.index_cast(T.index, grid_blocks), 1, 1),
+            block=(BLOCK_THREADS, 1, 1),
+            stream=stream,
+        )
+
+    launch_route_unified.compile_hints = {
+        "llvm_options": {
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+        },
+    }
+    return launch_route_unified
+
+
 def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
     """topids_to_rows with a fused EP global->local expert remap.
 
