@@ -19,9 +19,9 @@
 #                        (batch, split, head_block*qlen) grid. Full decode
 #                        (stage-1 + stage-2 reduce into the final O). A partial
 #                        last head block (nhead % BLOCK_H != 0) masks OOB heads.
-#                        Low-head decode (nhead <= 16) uses a context-bucketed
-#                        16-112 way KV split policy measured with scattered
-#                        physical pages. The MFMA tile remains 16x16.
+#                        Low-head decode (nhead <= 16) computes the original
+#                        block-bound split policy from runtime sequence metadata
+#                        so CUDA Graph capture cannot freeze it at one split.
 #
 # The bh16 regimes support num_iter in {1, 2, ...} (no gl.assume(num_iter>=3));
 # only bh64 assumes >= 3. See epilogue-1 handling below.
@@ -92,23 +92,11 @@ def _mla_split_policy_kernel(
             tl.load(B_seq_len + cur_batch + 1) - tl.load(B_seq_len + cur_batch)
         )
 
-    active_kv_splits = tl.where(
-        cur_batch_seq_len <= 4096,
-        16,
-        tl.where(
-            cur_batch_seq_len <= 16384,
-            48,
-            tl.where(
-                cur_batch_seq_len <= 65536,
-                64,
-                tl.where(cur_batch_seq_len <= 131072, 96, 112),
-            ),
-        ),
+    # Preserve the original host policy:
+    # min(workgroup budget, cdiv(runtime sequence length, BLOCK_N)).
+    active_kv_splits = tl.maximum(
+        1, tl.minimum(tl.cdiv(cur_batch_seq_len, BLOCK_N), NUM_KV_SPLITS)
     )
-    active_kv_splits = tl.minimum(
-        active_kv_splits, tl.cdiv(cur_batch_seq_len, BLOCK_N)
-    )
-    active_kv_splits = tl.maximum(1, tl.minimum(active_kv_splits, NUM_KV_SPLITS))
     tl.store(Active_kv_splits + cur_batch, active_kv_splits)
 # fmt: on
 
@@ -1059,17 +1047,13 @@ def mla_gluon(
                 ),
             )
             if nhead <= BLOCK_H:
-                # Launch and allocate for the largest bucket. Stage-1 and
-                # stage-2 derive the active 16/48/64/96/112 split count from
-                # device-side sequence metadata, so CUDA Graph capture cannot
-                # freeze low-head decode at the caller's default min_kv_seq_len=1.
-                # Keep the upstream MTP/head-block workgroup budget intact.
+                # Launch and allocate for the graph-stable workgroup budget.
+                # A device-side policy derives the original block-bound split
+                # count from runtime sequence metadata, so CUDA Graph capture
+                # cannot freeze the caller's default min_kv_seq_len=1.
                 NUM_KV_SPLITS = max(
                     1,
-                    min(
-                        112,
-                        256 // (batch_size * qlen * NUM_M_BLOCKS),
-                    ),
+                    256 // (batch_size * qlen * NUM_M_BLOCKS),
                 )
                 DYNAMIC_KV_SPLITS = True
         NUM_KV_SPLITS = _resolve_num_kv_splits(NUM_KV_SPLITS, num_kv_splits)
