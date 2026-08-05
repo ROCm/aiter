@@ -32,6 +32,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
+  # Keep on upstream (Dao-AILab) main; do not re-point at a personal fork/branch.
   FA_BRANCH: main
   FA_REPOSITORY_URL: https://github.com/Dao-AILab/flash-attention.git
   BASE_IMAGE: rocm/pytorch:latest@sha256:683765a52c61341e1674fe730ab3be861a444a45a36c0a8caae7653a08a0e208
@@ -175,6 +176,21 @@ jobs:
       - name: Build Docker image (v2)
         run: docker build -t fa_triton_test:ci -f Dockerfile.triton .
 
+      # Persist the Triton JIT cache across runs via the GH cache backend (node-
+      # independent; nothing left on the runners). Kernel compilation dominates these
+      # GPU test steps, so a warm cache keeps them under their step timeouts. Keyed per
+      # arch + commit SHA (restore-keys warm-starts from the previous commit; only
+      # changed kernels recompile). Pure speed layer: Triton keys each kernel by its own
+      # content hash, so a cache hit never serves a stale kernel. Mounted below at
+      # /root/.triton.
+      - name: Triton JIT cache
+        uses: actions/cache@v4
+        with:
+          path: .triton-cache
+          key: triton-${{ matrix.label }}-${{ github.sha }}
+          restore-keys: |
+            triton-${{ matrix.label }}-
+
       - name: Start CI container (v2)
         run: |
           docker ps -aq -f name=fa_triton_test | xargs -r docker stop | xargs -r docker rm || true
@@ -185,17 +201,21 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_test \
             fa_triton_test:ci
 
-      - name: Run benchmarks (v2)
+      - name: Run FA benchmark (v2)
         if: ${{ github.event_name != 'push' }}
         timeout-minutes: 60
         run: |
@@ -205,6 +225,14 @@ jobs:
             FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
             python benchmarks/benchmark_flash_attention.py
           " |& tee benchmark_fa_triton_${{ matrix.label }}.log
+
+      # MHA bench -> wide CSV (metric=throughput/TFLOPS, higher=faster). Runs on PRs
+      # (all arches) and on push-to-main for MI35X, where the baseline is published.
+      - name: Run MHA bench (v2)
+        if: ${{ github.event_name != 'push' || matrix.label == 'MI35X' }}
+        timeout-minutes: 60
+        run: |
+          set -o pipefail
           docker exec fa_triton_test bash -c "
             cd /aiter
             python op_tests/op_benchmarks/triton/bench_mha.py \
@@ -212,8 +240,10 @@ jobs:
           " |& tee benchmark_mha_daoai_${{ matrix.label }}.log
           docker cp fa_triton_test:/tmp/bench_dao_ai/ bench_dao_ai_${{ matrix.label }}/ 2>/dev/null || true
 
+      # Full correctness suite (output + varlen + kvcache) — runs on MI35X (and any
+      # non-RDNA arch). RDNA3 has its own reduced version below.
       - name: PR correctness tests (v2)
-        if: ${{ github.event_name != 'push' }}
+        if: ${{ github.event_name != 'push' && matrix.label != 'RDNA3' }}
         timeout-minutes: 90
         run: |
           docker exec fa_triton_test bash -c "
@@ -229,6 +259,21 @@ jobs:
             pytest -v --reruns 2 --timeout=120 \
               tests/test_flash_attn_triton_amd.py::test_flash_attn_kvcache \
               -k '16-20000'
+          "
+
+      # RDNA3 is much slower (and optional), so the full varlen + kvcache sweep blows
+      # the 90-min cap. It runs only the output test.
+      - name: PR correctness tests (v2) [RDNA3]
+        if: ${{ github.event_name != 'push' && matrix.label == 'RDNA3' }}
+        timeout-minutes: 90
+        run: |
+          docker exec fa_triton_test bash -c "
+            cd /flash-attention
+            export FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE
+            export FLASH_ATTENTION_TRITON_AMD_AUTOTUNE=0
+            pytest -v --reruns 2 --timeout=120 \
+              tests/test_flash_attn_triton_amd.py::test_flash_attn_output \
+              -k '2048-2048'
           "
 
       - name: Post-merge correctness tests (v2)
@@ -292,12 +337,16 @@ jobs:
             DEVICE_FLAG="--device /dev/dri"
           fi
 
+          # Mount the restored Triton JIT cache (see the "Triton JIT cache" step).
+          mkdir -p "$GITHUB_WORKSPACE/.triton-cache"
+
           docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
             --ipc=host --group-add video \
             --network=host \
             --shm-size 32g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
+            -v "$GITHUB_WORKSPACE/.triton-cache:/root/.triton" \
             -w /flash-attention \
             --name fa_triton_v3_test \
             fa_triton_v3_test:ci
@@ -345,8 +394,17 @@ jobs:
       # ===========================================
       # Artifacts
       # ===========================================
+      # The single home for the MHA bench CSV: the current-run source for the PR
+      # perf compare (fa_mha_bench job) AND, on push-to-main, the baseline it diffs
+      # against (fetched by commit). One artifact, 90-day retention so a baseline
+      # outlives the raw run. Uploaded on PRs (all arches) and push-to-main (MI35X,
+      # for the baseline). push only fires on main, so no ref guard is needed.
       - name: Upload benchmark results
-        if: ${{ success() && github.event_name != 'push' }}
+        if: ${{ success() && (github.event_name != 'push' || matrix.label == 'MI35X') }}
+        # Best-effort: the bench already ran, and GitHub's artifact backend times out
+        # transiently (CreateArtifact), so an upload flake must not fail the whole bench
+        # job. A missing artifact just means the PR compare warns "no baseline" (warn-only).
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: flash-attention-triton-benchmark-${{ matrix.label }}
@@ -354,7 +412,97 @@ jobs:
             benchmark_fa_triton_${{ matrix.label }}.log
             benchmark_mha_daoai_${{ matrix.label }}.log
             bench_dao_ai_${{ matrix.label }}/
-          retention-days: 7
+          retention-days: 90
+
+  # =============================================================================
+  # FA MHA Bench (main-vs-branch perf compare)
+  # =============================================================================
+  # On a PR: diff the PR's MHA bench CSV against the last main baseline with
+  # compare_mha.py (throughput, higher=faster) and write the table to the job
+  # summary. Warn-only. CPU-only (compare_mha.py is stdlib, no GPU), so it runs
+  # off the GPU runner. Mirrors the tuned_op_bench job in aiter-test.yaml.
+  # CSVs come from the MI35X leg only (single arch, no cross-arch noise).
+  fa_mha_bench:
+    name: FA MHA Bench
+    if: >-
+      always() && !cancelled() &&
+      !github.event.pull_request.draft &&
+      github.event_name == 'pull_request'
+    needs: [flash_attention_triton]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download current MHA bench CSV (MI35X)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/current/
+
+      - name: Locate current CSV
+        id: current
+        run: |
+          csv=$(find /tmp/current -name bench_mha.csv 2>/dev/null | head -1)
+          if [[ -z "$csv" ]]; then
+            echo "::warning::No current MHA bench CSV found (MI35X leg may have failed); skipping perf compare."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cp "$csv" /tmp/current.csv
+          echo "Current CSV: $csv ($(wc -l < /tmp/current.csv) lines)"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch baseline from PR base.sha
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          commit: ${{ github.event.pull_request.base.sha }}
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/baseline_pinned/
+          if_no_artifact_found: warn
+
+      - name: Fallback baseline from latest main
+        if: steps.current.outputs.found == 'true'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        timeout-minutes: 10
+        with:
+          workflow: flash_attention_integration.yaml
+          branch: main
+          name: flash-attention-triton-benchmark-MI35X
+          path: /tmp/baseline_main/
+          if_no_artifact_found: warn
+
+      - name: Compare
+        if: steps.current.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          # The download steps may not create these dirs when no artifact is found;
+          # mkdir + `|| true` keep the no-baseline path from aborting under pipefail.
+          mkdir -p /tmp/baseline_pinned /tmp/baseline_main
+          baseline_csv=$(find /tmp/baseline_pinned -name bench_mha.csv 2>/dev/null | head -1 || true)
+          if [[ -z "$baseline_csv" ]]; then
+            baseline_csv=$(find /tmp/baseline_main -name bench_mha.csv 2>/dev/null | head -1 || true)
+          fi
+          if [[ -z "$baseline_csv" ]]; then
+            echo "::warning::No MHA bench baseline found; skipping perf compare."
+            {
+              echo "## FA MHA Bench"
+              echo
+              echo "_No baseline available. First run, or main has not published a baseline yet._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## FA MHA Bench (vs main baseline, MI35X)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 op_tests/op_benchmarks/triton/compare_mha.py \
+            "$baseline_csv" /tmp/current.csv | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # =============================================================================
   # Windows Smoke Test
