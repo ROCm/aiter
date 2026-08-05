@@ -57,11 +57,20 @@ def _run_compiled(exe, *args):
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
     """
     cf = getattr(exe, "_cf", None)
-    if cf is None:
+    if cf is not None:
+        cf(*args)
+        return
+    try:
         cf = flyc.compile(exe, *args)
         exe._cf = cf
-    else:
-        cf(*args)
+    except Exception:
+        # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
+        try:
+            while ir.Context.current is not None:
+                ir.Context.current.__exit__(None, None, None)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        raise
 
 
 def _to_raw(v):
@@ -349,6 +358,7 @@ class GTensor(TensorBase):
         )
 
     def get_llvm_ptr(self, ptr, bytes_offset_i64, ptr_type="!llvm.ptr<1>"):
+        # fx.Int64 coerces index / i32 / i64 byte offsets to i64.
         bytes_offset_i64 = _to_raw(fx.Int64(bytes_offset_i64))
         _ptr_type = ir.Type.parse(ptr_type)
         raw = extract_to_ir_values(ptr)[0]
