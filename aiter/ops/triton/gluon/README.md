@@ -52,6 +52,12 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~4.31<br>TB/s</td><td>—</td><td>—</td>
 </tr>
 <tr>
+  <td><code>mla_gluon_gfx942</code></td><td>MLA</td><td>CDNA3</td>
+  <td nowrap>Q/KV/Out: bf16<br>QLEN in {1, 4}<br>nhead = 12<br>latent dim = 512<br>RoPE dim = 64<br>PAGE_SIZE=1</td>
+  <td>python -m pytest op_tests/triton_tests/<br>test_mla_gluon_gfx942.py</td>
+  <td>—</td><td>—</td><td>—</td>
+</tr>
+<tr>
   <td><code>pa_decode_gluon</code></td><td>Paged Attn<br>Decode</td><td>CDNA3<br>CDNA4</td>
   <td nowrap>Q: fp8/bf16/fp16<br>KV: fp8/bf16/fp16<br>Out: bf16 or match<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256</td>
   <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
@@ -246,6 +252,16 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | 100K     | 1     | 256           | 7                | 63.78  | 1.81 |
 | 100K     | 3     | 85            | 19               | 88.77  | 3.89 |
 | 100K     | 4     | 64            | 25               | 106.96 | 4.31 |
+
+### `mla_gluon_gfx942.py` — CDNA3 MLA Decode
+
+**Functions:** `mla_gluon_gfx942(...)`, `mla_gluon_gfx942_graph(...)`
+
+**Description:** Synchronous-LDS bf16 MLA decode for gfx942 with 12 query
+heads, 512 latent dimensions, 64 RoPE dimensions, PAGE_SIZE=1, and QLEN 1 or 4.
+The graph adapter accepts a combined `[N, 576]` physical cache and ragged
+token-index/indptr metadata. It supports split reduction, causal QLEN masking,
+optional QLEN-head fusion, and a 64-bit-address load path for caches over 2 GiB.
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 
