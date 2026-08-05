@@ -71,6 +71,10 @@ KERNARG_LAYOUT = [
 ]
 KERNARG_SIZE = 104
 
+# Written into the output before replay: a value the kernel would never
+# produce, so "never written" is distinguishable from "wrote zero".
+_POISON = -12345.0
+
 
 def arena_bytes(tile_m, tile_n, tile_k, num_buffers, m_warp=1, n_warp=4,
                 a_is_fp4=0) -> int:
@@ -298,10 +302,11 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
     if check and out_t is None:
         raise IsaRunnerError("no reference captured; rerun capture in-process")
 
-    # Zero the output so a kernel that fails to write is not mistaken for a pass.
+    # Poison the output so a kernel that fails to write cannot masquerade as a
+    # pass. Not zero: zero is a plausible kernel result.
     live = getattr(cap, "_out_tensor", None)
     if check and live is not None:
-        live.zero_()
+        live.fill_(_POISON)
         torch.cuda.synchronize()
 
     spec = KernelLaunchSpec(
@@ -325,12 +330,26 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         if check and live is not None:
             torch.cuda.synchronize()
             got, ref = live.float(), out_t.float()
-            denom = ref.norm().item() or 1.0
-            rel_l2 = ((got - ref).norm().item()) / denom
+
+            # i32_m is the align_m-padded row count; tiles whose expert id is
+            # n_experts are skipped by the kernel, so those rows keep whatever
+            # was in the buffer (torch.empty -> possibly NaN). Comparing them
+            # would make every run NaN. Score only the rows the kernel writes:
+            # where the reference itself is finite and not still poisoned.
+            valid = torch.isfinite(ref) & (ref != _POISON)
+            report["valid_elems"] = int(valid.sum().item())
+            report["total_elems"] = int(ref.numel())
+
+            unwritten = int((valid & (got == _POISON)).sum().item())
+            report["unwritten_valid_elems"] = unwritten
+
+            d = torch.where(valid, got - ref, torch.zeros_like(ref))
+            denom = torch.where(valid, ref, torch.zeros_like(ref)).norm().item() or 1.0
+            rel_l2 = d.norm().item() / denom
             report["rel_l2"] = rel_l2
-            report["max_abs_diff"] = (got - ref).abs().max().item()
-            report["passed"] = rel_l2 < 1e-6
-            report["all_zero"] = bool(got.abs().max().item() == 0.0)
+            report["max_abs_diff"] = d.abs().max().item()
+            report["passed"] = bool(rel_l2 < 1e-6 and unwritten == 0
+                                    and report["valid_elems"] > 0)
 
         if iters:
             report["benchmark"] = mod.benchmark(
