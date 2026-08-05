@@ -44,7 +44,7 @@ def get_x_vals():
         (128, 4096), # small M, med N
         (8192, 4096), # med-large M, med N
         (16384, 4096), # large M, med N
-        (4096, 2048), # med M, small N
+        (4096, 512), # med M, small N
         (8192, 8192), # equal M=N, both med-large
         (16384, 16384), # both large
     ]
