@@ -70,10 +70,10 @@ def _global_i32_buffer_view(addr_i64, num_bytes):
     )
 
 
-def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
+def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_layout):
     return fx.logical_divide(
         _global_i32_buffer_view(addr_i64, num_bytes),
-        fx.make_layout(tile_elems, 1),
+        tile_layout,
     )
 
 

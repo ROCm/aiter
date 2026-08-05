@@ -42,6 +42,8 @@ from .mxfp4_gemm_common import (
     num_n_blocks_for,
 )
 
+ACC_LDS_PAD_DW = 4
+
 
 def n_out_for(inter):
     return 2 * inter
@@ -128,6 +130,10 @@ def _gemm1_body(
     M_REPS = BM // 16
     N_REPS = BN // 64
 
+    mem_1x1 = fx.make_layout(1, 1)
+    mem_4x1 = fx.make_layout(4, 1)
+    mem_8x1 = fx.make_layout(8, 1)
+
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
     e = rocdl.readfirstlane(T.i32, as_ir_value(_global_i32_at(arg_eids, m_block_idx)))
@@ -142,32 +148,28 @@ def _gemm1_body(
     _asc_per_mb = max(BM // 32, 1) * kAS_per_chunk_dw * 4
     ascale_num = fx.Int64(i32_total_m_blocks) * fx.Int64(_asc_per_mb)
 
-    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, 4)
+    bq_tiles = _global_i32_buffer_tiles(arg_bq, BQ_BYTES, mem_4x1)
     bq_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_aux), fx.Int32)
-    bq_reg_lay = fx.make_layout(4, 1)
 
-    bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, 1)
+    bscale_tiles = _global_i32_buffer_tiles(arg_bscale, BSCALE_BYTES, mem_1x1)
     bscale_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
-    bscale_reg_lay = fx.make_layout(1, 1)
 
     # aq/ascale: global->LDS async DMA (no register fragment), via BufferCopyLDS.
     aq_buf = _global_i32_buffer_view(arg_aq, aq_num_records)
-    aq_dma_tiles4 = fx.logical_divide(aq_buf, fx.make_layout(4, 1))
+    aq_dma_tiles4 = fx.logical_divide(aq_buf, mem_4x1)
     aq_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
     aq_reg_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-    aq_reg_lay = fx.make_layout(4, 1)
 
     ascale_buf = _global_i32_buffer_view(arg_ascale, ascale_num)
-    ascale_dma_tiles4 = fx.logical_divide(ascale_buf, fx.make_layout(4, 1))
-    ascale_dma_tiles1 = fx.logical_divide(ascale_buf, fx.make_layout(1, 1))
+    ascale_dma_tiles4 = fx.logical_divide(ascale_buf, mem_4x1)
+    ascale_dma_tiles1 = fx.logical_divide(ascale_buf, mem_1x1)
     ascale_dma_atom16 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), fx.Int32)
     ascale_dma_atom4 = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), fx.Int32)
 
     if const_expr(inline_quant):
         hidden_num = fx.Int64(i32_ntok * fx.Int32(K * 2))
-        hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, 4)
+        hidden_tiles = _global_i32_buffer_tiles(arg_hidden, hidden_num, mem_4x1)
         hidden_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-        hidden_reg_lay = fx.make_layout(4, 1)
 
     # Union LDS region [s_aq | s_asc], reused as lds_acc (f32 accumulator) in the
     # epilogue. s_aq/lds_acc start at lds_raw_ptr; s_asc follows at
@@ -239,7 +241,7 @@ def _gemm1_body(
     # so the first K-iter's fx.gemm computes A*B+0 (matches the raw init path).
     scale_atoms = _scale_mma_atoms(a_dtype)
     accm = [
-        [fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32) for _ in range(N_REPS)]
+        [fx.make_rmem_tensor(mem_4x1, fx.Float32) for _ in range(N_REPS)]
         for _ in range(kMChunks)
     ]
     for i in range_constexpr(kMChunks):
@@ -253,10 +255,9 @@ def _gemm1_body(
         fx.recast_iter(fx.Int32, lds_raw_ptr),
         fx.make_layout(kAStages * BM * KH_TILE // 4, 1),
     )
-    s_aq_i32x4_tiles = fx.logical_divide(s_aq_i32_flat, fx.make_layout(4, 1))
-    s_aq_i32x1_tiles = fx.logical_divide(s_aq_i32_flat, fx.make_layout(1, 1))
+    s_aq_i32x4_tiles = fx.logical_divide(s_aq_i32_flat, mem_4x1)
+    s_aq_i32x1_tiles = fx.logical_divide(s_aq_i32_flat, mem_1x1)
     i32x4_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
-    i32x4_reg_lay = fx.make_layout(4, 1)
 
     def issue_a_load_lds(slot, kt):
         # A wave-wide BufferCopyLDS128b writes 1024 contiguous bytes. That is
@@ -297,7 +298,7 @@ def _gemm1_body(
                         + half_off
                         + ((lane_mod_8 * fx.Int32(16)) ^ mask)
                     )
-                    r = fx.make_rmem_tensor(aq_reg_lay, fx.Int32)
+                    r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
                     fx.copy(
                         aq_reg_atom,
                         fx.slice(aq_dma_tiles4, (None, src_off // fx.Int32(16))),
@@ -325,7 +326,7 @@ def _gemm1_body(
     def _lds_i32x4_frag(tile_idx):
         # ds_read_b128 straight into an i32[4] register fragment (kept as a tensor
         # so it can feed fx.gemm directly).
-        r = fx.make_rmem_tensor(i32x4_reg_lay, fx.Int32)
+        r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
         fx.copy_atom_call(
             i32x4_copy_atom, fx.slice(s_aq_i32x4_tiles, (None, tile_idx)), r
         )
@@ -354,7 +355,7 @@ def _gemm1_body(
                             _lds_i32x4_frag((boff + hi_col) // fx.Int32(16))
                         )
                     )
-                    t = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Int32)
+                    t = fx.make_rmem_tensor(mem_8x1, fx.Int32)
                     t.store(lo.shuffle(hi, list(range(8))))
                     a[i][k] = t
             else:
@@ -437,8 +438,8 @@ def _gemm1_body(
         fx.recast_iter(fx.Int32, fx.add_offset(lds_raw_ptr, kAStages * BM * KH_TILE)),
         fx.make_layout(kSubBlocks * K_TILES_TOTAL * 64, 1),
     )
-    asc_i32_tiles = fx.logical_divide(s_asc_i32_flat, fx.make_layout(1, 1))
-    asc_i32x4_tiles = fx.logical_divide(s_asc_i32_flat, fx.make_layout(4, 1))
+    asc_i32_tiles = fx.logical_divide(s_asc_i32_flat, mem_1x1)
+    asc_i32x4_tiles = fx.logical_divide(s_asc_i32_flat, mem_4x1)
 
     def issue_a_scale_ds_read(kt):
         out = []
@@ -463,7 +464,7 @@ def _gemm1_body(
             + lib * fx.Int32(16)
         )
         s_soff = rocdl.readfirstlane(T.i32, fx.Int32(kt * (BK * 2) + B128_IDX * 256))
-        r = fx.make_rmem_tensor(hidden_reg_lay, fx.Int32)
+        r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
         fx.copy(
             hidden_copy_atom,
             fx.slice(hidden_tiles, (None, v_voff // fx.Int32(16))),
@@ -605,7 +606,7 @@ def _gemm1_body(
         )
         for half in range_constexpr(2):
             tile_idx = (v + fx.Int32(half * 1024)) // fx.Int32(16)
-            r = fx.make_rmem_tensor(bq_reg_lay, fx.Int32)
+            r = fx.make_rmem_tensor(mem_4x1, fx.Int32)
             fx.copy(
                 bq_copy_atom,
                 fx.slice(bq_tiles, (None, tile_idx)),
@@ -621,7 +622,7 @@ def _gemm1_body(
         for mw in range_constexpr(2):
             s_off = b_scale_s_base[mw] if K_C_HI == 0 else b_scale_s_base_hi[mw]
             idx = (v + fx.Int32(imm)) // fx.Int32(4)
-            r = fx.make_rmem_tensor(bscale_reg_lay, fx.Int32)
+            r = fx.make_rmem_tensor(mem_1x1, fx.Int32)
             fx.copy(
                 bscale_copy_atom,
                 fx.slice(bscale_tiles, (None, idx)),
@@ -763,27 +764,38 @@ def _gemm1_body(
     gpu.barrier()
 
     # lds_acc reuses the s_aq region (offset 0) as an f32 accumulator.
-    acc_layout = fx.make_layout((BM, BN), (BN, 1))
+    # Four dwords of row padding rotate each four-row store group by 16 banks
+    # on gfx950, avoiding the 4-way conflict from a BN-aligned row stride.
+    ACC_LDS_STRIDE = BN + ACC_LDS_PAD_DW
+    acc_layout = fx.make_layout((BM, BN), (ACC_LDS_STRIDE, 1))
 
     def acc_idx(row, col):
         return _layout_idx(acc_layout, row, col)
 
     acc_copy_atom = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
-    acc_reg_lay = fx.make_layout(1, 1)
     acc_flat_view = fx.make_view(
-        fx.recast_iter(fx.Float32, lds_raw_ptr), fx.make_layout(BM * BN, 1)
+        fx.recast_iter(fx.Float32, lds_raw_ptr),
+        fx.make_layout(BM * ACC_LDS_STRIDE, 1),
     )
-    acc_flat_tiles = fx.logical_divide(acc_flat_view, fx.make_layout(1, 1))
+    acc_flat_tiles = fx.logical_divide(acc_flat_view, mem_1x1)
 
     def acc_store(idx, value):
-        r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
+        r = fx.make_rmem_tensor(mem_1x1, fx.Float32)
         r.store(fx.Vector.from_elements([fx.Float32(value)], fx.Float32))
         fx.copy_atom_call(acc_copy_atom, r, fx.slice(acc_flat_tiles, (None, idx)))
 
     def acc_load(idx):
-        r = fx.make_rmem_tensor(acc_reg_lay, fx.Float32)
+        r = fx.make_rmem_tensor(mem_1x1, fx.Float32)
         fx.copy_atom_call(acc_copy_atom, fx.slice(acc_flat_tiles, (None, idx)), r)
         return r.load()[0]
+
+    # Expose independent epilogue address arithmetic before the accumulator
+    # stores so LLVM can schedule it in the final MFMA's VALU shadow.
+    tx_i32 = fx.Int32(gpu.thread_id("x"))
+    m_lane = tx_i32 // fx.Int32(16)
+    n_lane = tx_i32 % fx.Int32(16)
+    wave_grp = n_lane // fx.Int32(4)
+    kk = n_lane % fx.Int32(4)
 
     for i in range_constexpr(kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -798,12 +810,6 @@ def _gemm1_body(
                 acc_store(idx, vec[v])
 
     gpu.barrier()
-
-    tx_i32 = fx.Int32(gpu.thread_id("x"))
-    m_lane = tx_i32 // fx.Int32(16)
-    n_lane = tx_i32 % fx.Int32(16)
-    wave_grp = n_lane // fx.Int32(4)
-    kk = n_lane % fx.Int32(4)
 
     def run_epilogue():
         aqout_layout = fx.make_layout((BM, OUT_ROW_BYTES), (OUT_ROW_BYTES, 1))
@@ -936,9 +942,13 @@ def _gemm1_body(
                     fx.Int32,
                 )
 
-        # (chunk, ku, wave_grp, m_lane) -> dword index; shape is a placeholder.
+        # One scale chunk covers 32 sorted rows. Derive the runtime chunk extent
+        # from the active M blocks instead of using an oversized placeholder.
+        num_scale_chunks = (
+            i32_total_m_blocks * fx.Int32(BM) + fx.Int32(31)
+        ) // fx.Int32(32)
         ascaleout_layout = fx.make_layout(
-            (1 << 20, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
+            (num_scale_chunks, 2, 4, 16), (OUT_AS_PER_CHUNK_DW, 64, 16, 1)
         )
         ascaleout_i16_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int16, 1 << 25)
         ascaleout_i32_tiles = _global_scalar_tiles(arg_ascaleout, fx.Int32, 1 << 24)
@@ -946,10 +956,9 @@ def _gemm1_body(
             fx.UniversalAtomicAdd(fx.Int32, syncscope=fx.rocdl.SyncScope.Agent),
             fx.Int32,
         )
-        atomic_reg_lay = fx.make_layout(1, 1)
 
         def atomic_add_scale(idx, value):
-            r = fx.make_rmem_tensor(atomic_reg_lay, fx.Int32)
+            r = fx.make_rmem_tensor(mem_1x1, fx.Int32)
             r.store(fx.Vector.from_elements([value], fx.Int32))
             fx.copy_atom_call(
                 atomic_add_atom,
@@ -996,14 +1005,9 @@ def _gemm1_body(
                     )
 
     if const_expr(BN == 128):
-
-        @flyc.jit
-        def run_bn128_epilogue():
-            # BN128 produces 64 post-activation columns: two 32-column scale groups.
-            if wave_grp < fx.Int32(2):
-                run_epilogue()
-
-        run_bn128_epilogue()
+        # BN128 produces 64 post-activation columns: two 32-column scale groups.
+        if wave_grp < fx.Int32(2):
+            run_epilogue()
     else:
         run_epilogue()
 
@@ -1014,7 +1018,7 @@ def _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL):
     kMChunks = kmchunks_for(BM)
     s_aq_bytes = kAStages * BM * KH_TILE
     s_asc_bytes = kSubBlocks * K_TILES_TOTAL * 256
-    lds_acc_bytes = lds_acc_bytes_for(BM, BN)
+    lds_acc_bytes = lds_acc_bytes_for(BM, BN + ACC_LDS_PAD_DW)
     lds_bytes = max(s_aq_bytes + s_asc_bytes, lds_acc_bytes)
     return kAStages, kSubBlocks, kMChunks, lds_bytes
 
