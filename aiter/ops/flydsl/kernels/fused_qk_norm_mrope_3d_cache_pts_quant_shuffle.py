@@ -53,6 +53,7 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
+from aiter.ops.flydsl.utils import get_shared_memory_per_block
 from aiter.utility import dtypes as aiter_dtypes
 
 from .kernels_common import get_warp_size
@@ -76,11 +77,6 @@ KV_THREADS = 512
 
 # A cache run is always 16 B: 16 FP8 elements or 8 bf16 elements.
 _RUN_BYTES = 16
-
-# Typical LDS budget per CU on gfx942/gfx950 (64 KB); used only as a sanity
-# check on (head_size, block_size) so oversized configs fail fast with a
-# clear message instead of an opaque compiler/allocator error.
-_MAX_LDS_BYTES = 65536
 
 # HIP exposes gridDim.y as a 16-bit dimension.
 _MAX_GRID_Y = 65535
@@ -968,11 +964,12 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             "multiple of 16 (dwordx4 K-cache run size)"
         )
     lds_bytes = _align_up(2 * head_size * block_size * k_cache.element_size() + 4, 16)
-    if lds_bytes > _MAX_LDS_BYTES:
+    lds_limit = get_shared_memory_per_block(qkv.device)
+    if lds_bytes > lds_limit:
         raise ValueError(
             f"head_size={head_size} x block_size={block_size} needs "
-            f"{lds_bytes} B of LDS staging (K + V tiles), "
-            f"exceeding the {_MAX_LDS_BYTES} B budget assumed here."
+            f"{lds_bytes} B of LDS staging, "
+            f"exceeding the {lds_limit} B hardware limit."
         )
     if qkv.dtype != aiter_dtypes.bf16:
         raise TypeError(f"qkv must be bf16, got {qkv.dtype}")
