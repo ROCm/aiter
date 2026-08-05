@@ -854,6 +854,10 @@ void mla_decode_stage1_asm_fwd(
     int ps = persistent ? 1 : 0;
     int prefill = 0; // decode stage
     int config_causal = causal;
+    // A single query token makes the causal mask a no-op, so both causal modes
+    // share the masked kernel instead of requiring an msk0 duplicate.
+    if(max_seqlen_q == 1)
+        config_causal = 1;
     int config_max_seqlen_q = max_seqlen_q;
     int config_gqa_ratio = gqa_ratio;
     int sub_Q = 128; // default value
@@ -891,11 +895,15 @@ void mla_decode_stage1_asm_fwd(
         }else if (q_type == "fp8"){
             if(max_seqlen_q == 1){
                 config_max_seqlen_q = 1;
-            }else if(max_seqlen_q == 2){
+            }else if(max_seqlen_q == 2 && !(persistent && arch_id == "gfx950")){
                 config_max_seqlen_q = 2;
             }else if(max_seqlen_q <= 4){
                 sub_Q = 64;
                 config_max_seqlen_q = 4;
+                if(persistent && arch_id == "gfx950" && max_seqlen_q >= 2)
+                {
+                    args.s_MQA = static_cast<unsigned int>(gqa_ratio);
+                }
             }else if (max_seqlen_q > 4 && persistent && arch_id == "gfx950"){
                 config_max_seqlen_q = 4;
                 config_gqa_ratio = 32;
