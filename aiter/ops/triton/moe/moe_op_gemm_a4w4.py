@@ -204,6 +204,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "xcd_swizzle": num_xcds,
         "num_buffers": num_buffers,
         "waves_per_eu": 0,
+        "num_ctas": 1,
     }
     return ret
 
@@ -460,6 +461,7 @@ def moe_gemm_a4w4(
             BLOCK_N=config["block_n"],
             BLOCK_K=config["block_k"],
             num_warps=config["num_warps"],
+            num_ctas=config["num_ctas"],
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
@@ -518,6 +520,7 @@ def moe_gemm_a4w4(
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
             **layouts,
+            num_ctas=config["num_ctas"],
             num_warps=config["num_warps"],
         )
     else:
