@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -94,15 +93,16 @@ def test_preshuffle_does_not_write_past_max_model_len(use_varctx: bool) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires a ROCm GPU")
 
-    from aiter import dtypes
     from aiter.ops.triton.pa_mqa_logits import (
         deepgemm_fp8_paged_mqa_logits,
     )
 
+    from aiter import dtypes
+
     context_len = 2300
     block_size = 64
     chunk_k = 256
-    guard_size = block_size
+    guard_size = chunk_k
     hidden_dim = 128
     heads = 128
     sentinel = 12345.0
