@@ -23,14 +23,10 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl, vector
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
-from .tensor_shim import GTensor, STensor, _to_raw
+from .tensor_shim import GTensor, _to_raw
 
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
@@ -56,29 +52,28 @@ def _mfma_bf16_16x16x16(a_bf16x4, b_bf16x4, acc_f32x4):
     """
     a_i16x4 = a_bf16x4.bitcast(fx.Int16)
     b_i16x4 = b_bf16x4.bitcast(fx.Int16)
-    return rocdl.mfma_f32_16x16x16bf16_1k(
+    raw = rocdl.mfma_f32_16x16x16bf16_1k(
         T.f32x4, [a_i16x4, b_i16x4, acc_f32x4, 0, 0, 0]
     )
+    # Wrap the intrinsic result so accumulators stay on the fx.Vector method
+    # API (arithmetic operators, .to(), .bitcast()) all the way to the epilogue.
+    return fx.Vector(raw, (4,), fx.Float32)
 
 
 def _f32x4_to_bf16x4_rne(vec_f32x4):
-    """Round-to-nearest-even f32x4 -> bf16x4 via ``arith.truncf``. LLVM lowers
-    this to the native ``v_cvt_pk_bf16_f32`` on gfx950 and to a software RNE
-    sequence (bias + NaN->qNaN fix-up) on gfx942, both matching torch/HIP
+    """Round-to-nearest-even f32x4 -> bf16x4. LLVM lowers this to the native
+    ``v_cvt_pk_bf16_f32`` on gfx950 and to a software RNE sequence (bias +
+    NaN->qNaN fix-up) on gfx942, both matching torch/HIP
     ``__float2bfloat16_rn`` (verified bit-exact on gfx942)."""
-    return arith.truncf(T.vec(4, T.bf16), vec_f32x4)
+    return vec_f32x4.to(fx.BFloat16)
 
 
 def _f32x4_to_bf16x4_trunc(vec_f32x4):
     """Truncating f32x4 -> bf16x4 (keep high 16 bits, no rounding bias). Bit-
     identical to HIP ``float_to_bf16`` (``bit_cast<u32>(x) >> 16``); arch-neutral.
     """
-    i32x4 = T.vec(4, T.i32)
-    x = vector.bitcast(i32x4, vec_f32x4)
-    c16 = arith.constant_vector(16, i32x4)
-    hi = arith.shrui(x, c16)
-    hi16 = arith.trunci(T.vec(4, T.i16), hi)
-    return vector.bitcast(T.vec(4, T.bf16), hi16)
+    hi = vec_f32x4.bitcast(fx.Uint32) >> fx.Vector.filled(4, 16, fx.Uint32)
+    return hi.to(fx.Uint16).bitcast(fx.BFloat16)
 
 
 # Default fp32->bf16 output-conversion mode. When True, use bit-truncation to
@@ -93,8 +88,7 @@ _BF16_CONVERT_TRUNC_DEFAULT = True
 def _make_bf16_converter(trunc: bool):
     """Return the fp32x4 -> bf16x4 output converter for this compile:
     bit-truncation to match HIP ``float_to_bf16`` (``trunc=True``, default), or
-    RNE via ``arith.truncf`` (arch-optimal: native cvt on gfx950, software RNE
-    on gfx942)."""
+    RNE (arch-optimal: native cvt on gfx950, software RNE on gfx942)."""
     return _f32x4_to_bf16x4_trunc if trunc else _f32x4_to_bf16x4_rne
 
 
@@ -173,20 +167,19 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     NUM_H_ACCS = NUM_K_BLOCKS * N_REPEAT
 
-    # HIP-ALIGNED (non-VWARP / split-M only): this fork uses ONLY the "wid owns
+    # Warp partition (split-M only): this fork uses ONLY the "wid owns
     # 16 BT rows, all V" split-M warp partition -- the SAME warp scheme as the
     # hand-tuned HIP/C++ K5 kernel (BT split-M in GEMM1, K split across waves in
     # GEMM2, V not split across warps) with the SAME 16x16x16 bf16 MFMA. The
     # alternative OPT-VWARP layout has been removed entirely from this fork.
 
-    # HIP-ALIGN 2a: w panels (w_panel0/1), one [BT][64] panel per 64-K block,
+    # w panels (w_panel0/1), one [BT][64] panel per 64-K block,
     # written with HIP's ``w_panel_swizzle`` (bank-conflict-free) and read by
     # GEMM1 via ``load_a_w_fragment_swizzled`` (plain b64, contiguous 16-K).
     LDS_WP_PANEL_ELEMS = BT * 64
     LDS_WP_ELEMS = NUM_K_BLOCKS * LDS_WP_PANEL_ELEMS
-    LDS_WP_BYTES = LDS_WP_ELEMS * 2
 
-    # HIP-ALIGN 2b: k in rotating-pair swizzled panels (one per 64-K block).
+    # k in rotating-pair swizzled panels (one per 64-K block).
     # Mirrors HIP's k_panel0[64*BT] + k_panel_rotating_pair_addr_bytes layout
     # exactly: global load reads b128 (8 bf16) for adjacent token pairs (t0,t1),
     # then scatters b16x2 packed writes to swizzled LDS addresses; GEMM2 reads
@@ -195,22 +188,22 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # = 64*BT bf16 elements per panel.
     LDS_KP_PANEL_ELEMS = 64 * BT
     LDS_KP_ELEMS = NUM_K_BLOCKS * LDS_KP_PANEL_ELEMS
-    LDS_KP_BYTES = LDS_KP_ELEMS * 2
 
-    # HIP-ALIGN 3: gated v_new in a shared2 panel (like h / HIP gated_v_panel);
+    # gated v_new in a shared2 panel (like h / HIP gated_v_panel);
     # GEMM2 B read via load_shared2 (contiguous BT, matches the k A frag).
     LDS_GV_ELEMS = (BT // 4) * BV * 4  # 16 bt_groups x BV cols x 4 BT
 
-    # HIP-ALIGN phase 1b: h_state panels (shared2 layout) for the GEMM1 B
+    # h_state panels (shared2 layout) for the GEMM1 B
     # operand. One [row_block][V] panel per 64-K block (like HIP's
     # h_state_panel0/1); GEMM1 reads the MFMA B fragment with a plain b64 load
     # (load_b_shared2) instead of the hardware-transpose ds_read_tr16. Each
     # cell holds 4 K (a k_group): 64/4=16 row_blocks x BV cols x 4 K.
     LDS_HP_PANEL_ELEMS = (64 // 4) * BV * 4  # = 64 * BV per 64-K block
     LDS_HP_ELEMS = NUM_K_BLOCKS * LDS_HP_PANEL_ELEMS
-    LDS_HP_BYTES = LDS_HP_ELEMS * 2
+    # gated_v aliases h_state panel 1, so it must fit that panel exactly.
+    assert LDS_GV_ELEMS == LDS_HP_PANEL_ELEMS
 
-    # HIP-ALIGN phase 1a: [V][K] transpose buffer for the h snapshot HBM store.
+    # [V][K] transpose buffer for the h snapshot HBM store.
     # h_accs (f32) is written here in V-major / K-innermost order so 8 adjacent
     # K land contiguously -> a single b128 (ds_read_b128 + buffer_store b128),
     # matching HIP's ``h_transpose_buf`` + ``coalesced_vk_store_from_transpose``
@@ -218,38 +211,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # (no pad) so the 8-wide vec load/store stays 16 B aligned.
     LDS_HT_STRIDE = K
     LDS_HT_ELEMS = BV * LDS_HT_STRIDE
-    LDS_HT_BYTES = LDS_HT_ELEMS * 2
 
-    # Bump revision so the FlyDSL JIT disk cache (~/.flydsl/cache/) invalidates
-    # on revision change (port of FlyDSL commit d4643e0e).
-    # fp32->bf16 output conversion is a compile option (BF16_CONVERT_TRUNC):
-    # truncate to match hip float_to_bf16, or RNE.
-    # rev124: global-memory address arithmetic widened to i64.
-    _K5_KERNEL_REVISION = 124
-
-    GPU_ARCH = get_rocm_arch()
-    allocator = SmemAllocator(
-        None,
-        arch=GPU_ARCH,
-        global_sym_name=f"gdn_h_mfma16_hip_smem_v{_K5_KERNEL_REVISION}",
-    )
-    lds_wp_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_wp_offset + LDS_WP_BYTES
-    lds_kp_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_kp_offset + LDS_KP_BYTES
-    # HIP-ALIGN 1b: h_state panels (GEMM1 B operand, shared2 layout).
-    lds_hp_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_hp_offset + LDS_HP_BYTES
-    # HIP-ALIGN 3: gated_v ALIASES h_state_panel1 (the kb=1 h_state panel), like
-    # HIP's ``gated_v_panel = h_state_panel1``. LDS_GV_ELEMS == LDS_HP_PANEL_ELEMS
-    # (both 64*BV) so it fits exactly, and no separate buffer is allocated
-    # (saves LDS_GV_BYTES). Correct because gated_v is written only AFTER GEMM1
-    # has finished reading the h_state panels -- a WAR barrier is inserted right
-    # before the gated_v store to enforce that ordering across warps.
-    lds_gv_offset = lds_hp_offset + LDS_HP_PANEL_ELEMS * 2  # panel 1 (byte offset)
-    # HIP-ALIGN phase 1a: [V][K] transpose buffer for the b128 h store.
-    lds_ht_offset = allocator._align(allocator.ptr, 16)
-    allocator.ptr = lds_ht_offset + LDS_HT_BYTES
+    # ``hp`` must stay a single Array: GEMM1 indexes across both 64-K panels as
+    # ``kb * LDS_HP_PANEL_ELEMS + ...``, which requires the two panels to be
+    # contiguous. Separate struct fields are independent static LDS symbols with
+    # no guaranteed adjacency.
+    @fx.struct
+    class SharedStorage:
+        wp: fx.Array[fx.BFloat16, LDS_WP_ELEMS, 16]
+        kp: fx.Array[fx.BFloat16, LDS_KP_ELEMS, 16]
+        hp: fx.Array[fx.BFloat16, LDS_HP_ELEMS, 16]
+        ht: fx.Array[fx.BFloat16, LDS_HT_ELEMS, 16]
 
     # Cooperative load parameters
     LOAD_VEC_WIDTH = 8  # 8 bf16 = 16 bytes = buffer_load_dwordx4
@@ -280,8 +252,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         T_flat: fx.Int32,
         N_val: fx.Int32,
     ):
-        i_v = fx.block_idx.x
-        i_nh = fx.block_idx.y
+        i_v = fx.Int32(gpu.block_id("x"))
+        i_nh = fx.Int32(gpu.block_id("y"))
         i_n = i_nh // fx.Int32(H)
         i_h = i_nh % fx.Int32(H)
 
@@ -292,12 +264,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # slot; the per-chunk h snapshot stays dense (i_n-indexed).
         if const_expr(USE_STATE_INDICES):
             si_ = GTensor(state_indices_tensor, dtype=T.i32, shape=(-1,))
-            state_n = si_[fx.Index(i_n)]
+            state_n = si_[fx.Int64(i_n)]
         else:
             state_n = i_n
         state_nh = state_n * fx.Int32(H) + i_h
 
-        tid = fx.thread_idx.x
+        tid = fx.Int32(gpu.thread_id("x"))
         wid = tid // fx.Int32(WARP_SIZE)
         lane = tid % fx.Int32(WARP_SIZE)
 
@@ -324,49 +296,33 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
             co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
 
-        # -- LDS views --
-        lds_base_ptr = allocator.get_base()
+        # -- LDS --
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
+        lds_wp_ptr = lds.wp.ptr  # w panels (HIP w_panel swizzle)
+        lds_kp_ptr = lds.kp.ptr  # k panels (rotating-pair swizzle)
+        lds_hp_ptr = lds.hp.ptr  # h_state panels (shared2, GEMM1 B operand)
+        lds_ht_ptr = lds.ht.ptr  # [V][K] transpose buffer for the b128 h store
+        # gated_v ALIASES h_state panel 1 (like HIP's ``gated_v_panel =
+        # h_state_panel1``): gated_v is written only AFTER GEMM1 has finished
+        # reading the h_state panels, and a WAR barrier before the gated_v store
+        # enforces that ordering across warps. Aliasing avoids a separate
+        # LDS_GV buffer, which would cost an occupancy step.
+        lds_gv_ptr = lds_hp_ptr + fx.Int32(LDS_HP_PANEL_ELEMS)
 
-        # w panels (bf16, HIP w_panel swizzle) -- separate from k
-        lds_wp_ptr = SmemPtr(lds_base_ptr, lds_wp_offset, T.bf16, shape=(LDS_WP_ELEMS,))
-        lds_wp = STensor(lds_wp_ptr, dtype=T.bf16, shape=(LDS_WP_ELEMS,))
-        lds_wp_memref = lds_wp_ptr.get()
+        v4bf16 = T.vec(4, T.bf16)
 
-        # k panels (bf16, rotating-pair swizzle) -- separate from w
-        lds_kp_ptr = SmemPtr(lds_base_ptr, lds_kp_offset, T.bf16, shape=(LDS_KP_ELEMS,))
-        lds_kp = STensor(lds_kp_ptr, dtype=T.bf16, shape=(LDS_KP_ELEMS,))
-        lds_kp_memref = lds_kp_ptr.get()
-
-        # gated v_new (bf16, shared2)
-        lds_gv_ptr = SmemPtr(lds_base_ptr, lds_gv_offset, T.bf16, shape=(LDS_GV_ELEMS,))
-        lds_gv = STensor(lds_gv_ptr, dtype=T.bf16, shape=(LDS_GV_ELEMS,))
-        lds_gv_memref = lds_gv_ptr.get()
-
-        # h_state panels (shared2 layout) for the GEMM1 B operand
-        lds_hp_ptr = SmemPtr(lds_base_ptr, lds_hp_offset, T.bf16, shape=(LDS_HP_ELEMS,))
-        lds_hp = STensor(lds_hp_ptr, dtype=T.bf16, shape=(LDS_HP_ELEMS,))
-        lds_hp_memref = lds_hp_ptr.get()
-
-        # h snapshot transpose buffer [V][K] (bf16) for the b128 HBM store
-        lds_ht_ptr = SmemPtr(lds_base_ptr, lds_ht_offset, T.bf16, shape=(LDS_HT_ELEMS,))
-        lds_ht = STensor(lds_ht_ptr, dtype=T.bf16, shape=(LDS_HT_ELEMS,))
-        lds_ht_memref = lds_ht_ptr.get()
-
-        # HIP-ALIGN 1b: plain b64 read of a shared2 panel cell (GEMM1 B frag).
-        v4bf16_hp_type = T.vec(4, T.bf16)
-
+        # Plain b64 read of a shared2 panel cell (GEMM1 / GEMM2 B frag).
         def _lds_read_hp_bf16x4(elem_idx):
-            return vector.load_op(v4bf16_hp_type, lds_hp_memref, [fx.Index(elem_idx)])
+            return fx.ptr_load(lds_hp_ptr + fx.Int32(elem_idx), result_type=v4bf16)
 
-        # GEMM2 B operand: plain b64 read of the gated_v shared2 panel.
         def _lds_read_gv_bf16x4(elem_idx):
-            return vector.load_op(v4bf16_hp_type, lds_gv_memref, [fx.Index(elem_idx)])
+            return fx.ptr_load(lds_gv_ptr + fx.Int32(elem_idx), result_type=v4bf16)
 
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // fx.Int32(THREADS_PER_ROW_64)
         load_col_base = (tid % fx.Int32(THREADS_PER_ROW_64)) * fx.Int32(LOAD_VEC_WIDTH)
 
-        # HIP-ALIGN 2a: w_panel swizzle (returns ELEMENT offset within a panel).
+        # w_panel swizzle (returns ELEMENT offset within a panel).
         # Port of w_panel_swizzle_base_bytes >> 1 (all bf16 = 2 B).
         #   row_in_half = row & 31; col_group = col_base >> 3
         #   tid = row_in_half*8 + col_group
@@ -381,24 +337,20 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             base = base | ((row & fx.Int32(32)) << fx.Int32(7))  # 32<<7 = 4096
             return base >> fx.Int32(1)  # bytes -> bf16 elements
 
-        v4bf16_w_type = T.vec(4, T.bf16)
-
-        # HIP-ALIGN 2a: load_a_w_fragment_swizzled (contiguous 16-K A frag).
+        # load_a_w_fragment_swizzled (contiguous 16-K A frag).
         # Caller passes row = row_base + lane&15 and k0 = k_base + (lane>>4)*4;
         # the ^4-elem (^8-byte) toggle picks the low/high 4 within an 8-group.
         def _load_a_w_swizzled(panel_base_elems, row, k0):
             col_base = k0 & fx.Int32(~7)
             elem = _w_panel_swz_elems(row, col_base) ^ (k0 & fx.Int32(4))
-            return vector.load_op(
-                v4bf16_w_type,
-                lds_wp_memref,
-                [fx.Index(panel_base_elems + elem)],
+            return fx.ptr_load(
+                lds_wp_ptr + fx.Int32(panel_base_elems + elem), result_type=v4bf16
             )
 
-        # HIP-ALIGN 2b: k_panel rotating-pair swizzle address computation.
+        # k_panel rotating-pair swizzle address computation.
         # Port of HIP's k_panel_rotating_pair_base_bytes / _addr_bytes.
         # Returns a BYTE offset within a panel; caller converts to element
-        # offset (>> 1) before indexing the bf16 memref.
+        # offset (>> 1) before indexing the bf16 LDS pointer.
         def _k_panel_rotating_pair_addr_bytes(row, pair_col):
             row_block = row >> fx.Int32(3)
             row_in_block = row & fx.Int32(7)
@@ -416,7 +368,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 row_in_block << fx.Int32(7)
             )
 
-        # HIP-ALIGN 2b: load_a_k_fragment_rotating -- GEMM2 A operand read.
+        # load_a_k_fragment_rotating -- GEMM2 A operand read.
         # Mirrors HIP's load_a_k_fragment_rotating(base, row_base, t_base, lane).
         def _load_a_k_rotating(panel_base_elems, row_base, t_base):
             row = row_base + lane_n
@@ -424,19 +376,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             pair_col = t0 >> fx.Int32(1)
             byte_off = _k_panel_rotating_pair_addr_bytes(row, pair_col)
             elem_off = byte_off >> fx.Int32(1)
-            return vector.load_op(
-                v4bf16_w_type,
-                lds_kp_memref,
-                [fx.Index(panel_base_elems + elem_off)],
+            return fx.ptr_load(
+                lds_kp_ptr + fx.Int32(panel_base_elems + elem_off), result_type=v4bf16
             )
 
         # -- Prologue: compute bos, T_local, NT, boh --
         if const_expr(IS_VARLEN):
-            bos = cu_[fx.Index(i_n)]
-            eos = cu_[fx.Index(i_n) + fx.Index(1)]
+            bos = cu_[fx.Int64(i_n)]
+            eos = cu_[fx.Int64(i_n) + fx.Int64(1)]
             T_local = eos - bos
             NT = (T_local + fx.Int32(BT - 1)) // fx.Int32(BT)
-            boh = co_[fx.Index(i_n)]
+            boh = co_[fx.Int64(i_n)]
         else:
             bos = i_n * T_val
             T_local = T_val
@@ -541,7 +491,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     h0_off_base = (
                         h0_base + fx.Int64(h0_col) * fx.Int64(K) + fx.Int64(h0_row_base)
                     )
-                    loaded_vec = h0_.vec_load((fx.Index(h0_off_base),), 4)
+                    loaded_vec = h0_.vec_load((h0_off_base,), 4)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.extf(T.f32x4)
                     acc_idx = kb * N_REPEAT + slot
@@ -558,9 +508,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         k_t1_pf = k_t0_pf + fx.Int32(1)
 
         init_state = [_to_raw(v) for v in h_accs]
-        c_zero = fx.Index(0)
-        c_one = fx.Index(1)
-        nt_idx = fx.Index(NT)
+        c_zero = fx.Int64(0)
+        c_one = fx.Int64(1)
+        nt_idx = fx.Int64(NT)
 
         # -- PROLOGUE: load w/k for chunk 0 to LDS (HIP .cu:1125-1141) --
         # Empty varlen sequences (T_local==0 -> NT==0) need no prefetch; if not
@@ -572,13 +522,11 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # through, and the epilogue writes h0 back to ht -- state passes through
         # correctly.
         #
-        # The whole body is wrapped in the closure _load_chunk0_to_lds: the
-        # GTensor (w_/k_) and STensor (lds_wp/lds_kp) are captured as free
-        # variables so the if body only contains "call closure + barrier". This
-        # keeps the FlyDSL AST rewriter from treating these non-MLIR-Value
-        # tensor objects as scf.if carried state (otherwise it errors with
-        # "GTensor is not an MLIR Value") -- same trick as the has_next block
-        # below.
+        # The body lives in the _load_chunk0_to_lds closure so the ``if`` body
+        # is just "call closure + barrier": the GTensor wrappers (w_/k_) are
+        # captured as free variables rather than appearing inside the if, which
+        # would make the FlyDSL AST rewriter try to carry them as scf.if state
+        # and fail with "GTensor is not an MLIR Value".
         def _load_chunk0_to_lds():
             _prol_it = fx.Int32(0)
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -593,15 +541,14 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + fx.Int64(kb * 64)
                         + fx.Int64(load_col_base)
                     )
-                    wvec = w_.vec_load((fx.Index(w_g_off),), LOAD_VEC_WIDTH)
+                    wvec = w_.vec_load((w_g_off,), LOAD_VEC_WIDTH)
                     swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
-                    lds_wp.vec_store(
-                        (fx.Index(swz),), wvec.shuffle(wvec, [0, 1, 2, 3]), 4
+                    fx.ptr_store(
+                        wvec.shuffle(wvec, [0, 1, 2, 3]), lds_wp_ptr + fx.Int32(swz)
                     )
-                    lds_wp.vec_store(
-                        (fx.Index(swz ^ fx.Int32(4)),),
+                    fx.ptr_store(
                         wvec.shuffle(wvec, [4, 5, 6, 7]),
-                        4,
+                        lds_wp_ptr + fx.Int32(swz ^ fx.Int32(4)),
                     )
             k_abs_t0_prol = _prol_it * fx.Int32(BT) + k_t0_pf
             k_abs_t1_prol = _prol_it * fx.Int32(BT) + k_t1_pf
@@ -620,25 +567,29 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 k_g_off_t1 = (
                     k_base + fx.Int64(k_safe_t1_prol) * stride_k + fx.Int64(k_col_off)
                 )
-                kvec_t0 = k_.vec_load((fx.Index(k_g_off_t0),), LOAD_VEC_WIDTH)
-                kvec_t1 = k_.vec_load((fx.Index(k_g_off_t1),), LOAD_VEC_WIDTH)
+                kvec_t0 = k_.vec_load((k_g_off_t0,), LOAD_VEC_WIDTH)
+                kvec_t1 = k_.vec_load((k_g_off_t1,), LOAD_VEC_WIDTH)
                 for i in range_constexpr(LOAD_VEC_WIDTH):
                     row_i = k_row_base_pf + fx.Int32(i)
                     byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
                     elem_off = byte_off >> fx.Int32(1)
-                    lds_kp[fx.Index(kp_pbase + elem_off)] = kvec_t0[i]
-                    lds_kp[fx.Index(kp_pbase + elem_off + fx.Int32(1))] = kvec_t1[i]
+                    fx.ptr_store(kvec_t0[i], lds_kp_ptr + fx.Int32(kp_pbase + elem_off))
+                    fx.ptr_store(
+                        kvec_t1[i],
+                        lds_kp_ptr + fx.Int32(kp_pbase + elem_off + fx.Int32(1)),
+                    )
 
-        # NT comes from integer division and is a raw ArithValue (no
-        # .ir_value); wrap it in fx.Int32 before comparing to get an fx boolean
-        # usable by scf.if (same as the has_next block below).
+        # NT comes from integer division and is a raw ArithValue; wrap it in
+        # fx.Int32 before comparing so the result is an fx boolean.
         has_work = fx.Int32(NT) > fx.Int32(0)
-        if has_work.ir_value():
+        if has_work:
             _load_chunk0_to_lds()
             gpu.barrier()
 
         for i_t, state in range(c_zero, nt_idx, c_one, init=init_state):
-            h_accs_in = list(state[:NUM_H_ACCS])
+            # scf.for hands back its iter_args as raw ir.Values; re-type them so
+            # the loop body stays on the fx.Vector method API.
+            h_accs_in = [fx.Vector(v, (4,), fx.Float32) for v in state[:NUM_H_ACCS]]
             i_t_i32 = fx.Int32(i_t)
 
             # Stage h_accs into (a) the h_state panels [row_block][V] for the
@@ -652,20 +603,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     # acc_j == nr (V-tile); K sub-tile = wid*16.
                     hp_col = fx.Int32(acc_j * 16) + lane_n
 
-                    # HIP-ALIGN 1b: write the h_state panel cell (shared2). This
+                    # Write the h_state panel cell (shared2). This
                     # lane owns k_group (row_block = wid*4+lane_m_base) at V-col
                     # = nr*16+lane_n; 4 warps together fill all 16 row_blocks.
                     hp_row_block = wid * fx.Int32(4) + lane_m_base
                     hp_cell = fx.Int32(kb * LDS_HP_PANEL_ELEMS) + (
                         hp_row_block * fx.Int32(BV) + hp_col
                     ) * fx.Int32(4)
-                    lds_hp.vec_store(
-                        (fx.Index(hp_cell),),
-                        _f32x4_to_bf16x4(acc_val),
-                        4,
+                    fx.ptr_store(
+                        _f32x4_to_bf16x4(acc_val), lds_hp_ptr + fx.Int32(hp_cell)
                     )
 
-                    # HIP-ALIGN 1a: [V][K/4-group] transpose buffer, XOR-swizzled
+                    # [V][K/4-group] transpose buffer, XOR-swizzled
                     # (k_group ^ (v & 0xF)) to break bank conflicts on the
                     # scatter write -- mirrors HIP ``h_transpose_buf_offset``.
                     # The 4 elem_i are one k_group (4 contiguous K) -> one b64.
@@ -673,10 +622,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     ht_idx = (
                         hp_col * fx.Int32(K // 4) + (ht_kg ^ (hp_col & fx.Int32(0xF)))
                     ) * fx.Int32(4)
-                    lds_ht.vec_store(
-                        (fx.Index(ht_idx),),
-                        _f32x4_to_bf16x4(acc_val),
-                        4,
+                    fx.ptr_store(
+                        _f32x4_to_bf16x4(acc_val), lds_ht_ptr + fx.Int32(ht_idx)
                     )
 
             # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
@@ -709,10 +656,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     u_off = (
                         v_base + fx.Int64(safe_u_row) * stride_v + fx.Int64(u_col_pf)
                     )
-                    u_prefetch.append(v_[fx.Index(u_off)])
+                    u_prefetch.append(v_[u_off])
 
             if const_expr(USE_G):
-                g_last = g_[fx.Index(g_sh_base + fx.Int64(last_idx_raw) * g_stride_t)]
+                g_last = g_[g_sh_base + fx.Int64(last_idx_raw) * g_stride_t]
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
                     abs_row = (
@@ -725,7 +672,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     safe_row = in_bounds.select(abs_row, fx.Int32(0))
                     g_row_pf.append(
                         (
-                            g_[fx.Index(g_sh_base + fx.Int64(safe_row) * g_stride_t)],
+                            g_[g_sh_base + fx.Int64(safe_row) * g_stride_t],
                             in_bounds,
                         )
                     )
@@ -798,9 +745,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + fx.Int64(kb * 64)
                         + fx.Int64(load_col_base)
                     )
-                    w_next_vecs.append(
-                        w_.vec_load((fx.Index(w_g_off_next),), LOAD_VEC_WIDTH)
-                    )
+                    w_next_vecs.append(w_.vec_load((w_g_off_next,), LOAD_VEC_WIDTH))
                     w_next_swz.append(
                         wp_pb_next + _w_panel_swz_elems(row, load_col_base)
                     )
@@ -856,7 +801,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     g_row_val, in_bounds = g_row_pf[elem_i]
                     gate = _fast_exp(g_last - g_row_val)
                     gate_elems.append(in_bounds.select(gate, fx.Float32(0.0)))
-                gate_vec = vector.from_elements(T.f32x4, gate_elems)
+                gate_vec = fx.Vector.from_elements(gate_elems, dtype=fx.Float32)
             else:
                 # Even without g we must mask the last chunk's padding rows
                 # (abs_row >= T_local). Otherwise these invalid tokens' v_new
@@ -875,12 +820,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     mask_elems.append(
                         in_bounds.select(fx.Float32(1.0), fx.Float32(0.0))
                     )
-                gate_vec = vector.from_elements(T.f32x4, mask_elems)
+                gate_vec = fx.Vector.from_elements(mask_elems, dtype=fx.Float32)
 
             if const_expr(SAVE_NEW_VALUE):
-
+                # Wrapping the store in a bare function call hides it from the
+                # ``ReplaceIfWithDispatch`` AST rewriter, which scans subscript
+                # stores and ``obj.method()`` calls inside dynamic ``if`` bodies
+                # and demands MLIR-Value state for any name written to. ``vn_``
+                # is a GTensor (HBM tensor wrapper), not an MLIR Value; an
+                # ast.Name call makes the analyzer skip it.
                 def _emit_vn_store(off, value):
-                    vn_[fx.Index(off)] = value
+                    vn_[off] = value
 
             for idx in range_constexpr(N_REPEAT):
                 bv_val = bv_accs[idx]
@@ -890,7 +840,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     u_raw = u_prefetch[idx * 4 + elem_i]
                     u_bf16 = fx.BFloat16(u_raw)
                     u_f32_elems.append(u_bf16.to(fx.Float32))
-                u_f32 = vector.from_elements(T.f32x4, u_f32_elems)
+                u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
                 vn_val = u_f32 - bv_val
 
                 if const_expr(SAVE_NEW_VALUE):
@@ -903,7 +853,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        if (vn_bt_row < T_local).ir_value():
+                        if vn_bt_row < T_local:
                             bf16_v = vn_bf16[elem_i]
                             vn_off = (
                                 vn_base
@@ -919,10 +869,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 gv_col = fx.Int32(idx * 16) + lane_n
                 gv_row_block = wid * fx.Int32(4) + lane_m_base
                 gv_cell = (gv_row_block * fx.Int32(BV) + gv_col) * fx.Int32(4)
-                lds_gv.vec_store(
-                    (fx.Index(gv_cell),),
-                    _f32x4_to_bf16x4(gated_val),
-                    4,
+                fx.ptr_store(
+                    _f32x4_to_bf16x4(gated_val), lds_gv_ptr + fx.Int32(gv_cell)
                 )
 
             # >>> PREFETCH k_next: HBM loads for next chunk (HIP .cu:727-731).
@@ -942,11 +890,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 k_next_vecs_t0.append(
                     k_.vec_load(
                         (
-                            fx.Index(
-                                k_base
-                                + fx.Int64(k_safe_t0_next) * stride_k
-                                + fx.Int64(k_col_off_pf)
-                            ),
+                            k_base
+                            + fx.Int64(k_safe_t0_next) * stride_k
+                            + fx.Int64(k_col_off_pf),
                         ),
                         LOAD_VEC_WIDTH,
                     )
@@ -954,11 +900,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 k_next_vecs_t1.append(
                     k_.vec_load(
                         (
-                            fx.Index(
-                                k_base
-                                + fx.Int64(k_safe_t1_next) * stride_k
-                                + fx.Int64(k_col_off_pf)
-                            ),
+                            k_base
+                            + fx.Int64(k_safe_t1_next) * stride_k
+                            + fx.Int64(k_col_off_pf),
                         ),
                         LOAD_VEC_WIDTH,
                     )
@@ -986,9 +930,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             + lane_m_base * fx.Int32(4)
                             + fx.Int32(elem_i)
                         )
-                        gk_raw = gk_[fx.Index(gk_chunk_base + fx.Int64(global_k))]
+                        gk_raw = gk_[gk_chunk_base + fx.Int64(global_k)]
                         gk_elems.append(_fast_exp(gk_raw))
-                    gk_vec = vector.from_elements(T.f32x4, gk_elems)
+                    gk_vec = fx.Vector.from_elements(gk_elems, dtype=fx.Float32)
                     for nr in range_constexpr(N_REPEAT):
                         acc_idx = kb * N_REPEAT + nr
                         h_accs_in[acc_idx] = h_accs_in[acc_idx] * gk_vec
@@ -1014,12 +958,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 off_lo = (v_loc * fx.Int32(K // 4) + (kg_lo ^ v_xor)) * fx.Int32(4)
                 off_hi = (v_loc * fx.Int32(K // 4) + (kg_hi ^ v_xor)) * fx.Int32(4)
                 val_lo = fx.Vector(
-                    vector.load_op(v4bf16_w_type, lds_ht_memref, [fx.Index(off_lo)]),
+                    fx.ptr_load(lds_ht_ptr + fx.Int32(off_lo), result_type=v4bf16),
                     (4,),
                     fx.BFloat16,
                 )
                 val_hi = fx.Vector(
-                    vector.load_op(v4bf16_w_type, lds_ht_memref, [fx.Index(off_hi)]),
+                    fx.ptr_load(lds_ht_ptr + fx.Int32(off_hi), result_type=v4bf16),
                     (4,),
                     fx.BFloat16,
                 )
@@ -1031,13 +975,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     + fx.Int64(v_global) * fx.Int64(K)
                     + fx.Int64(k8)
                 )
-                h_.vec_store((fx.Index(h_off),), vec8, LOAD_VEC_WIDTH)
+                h_.vec_store((h_off,), vec8, LOAD_VEC_WIDTH)
 
             # -- 6. GEMM2: h += k^T @ v_new_gated (no w prefetch/interleave).
             BT_STEPS = BT // WMMA_K
             for kb in range_constexpr(NUM_K_BLOCKS):
                 for bt_s in range_constexpr(BT_STEPS):
-                    # HIP-ALIGN 2b: A = k load_a_k_fragment_rotating.
+                    # A = k load_a_k_fragment_rotating.
                     # row_base = wid*16 within the panel; t_base lo/hi split.
                     kp_pbase = fx.Int32(kb * LDS_KP_PANEL_ELEMS)
                     k_a_lo = _load_a_k_rotating(
@@ -1069,31 +1013,21 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
             # >>> WRITE prefetched w_next/k_next to LDS for next iteration.
             # Barrier ensures GEMM2 done reading old panels (HIP .cu:794-798).
-            # Closures hide lds_wp/lds_kp (STensor) from the FlyDSL AST
-            # rewriter which otherwise tries to yield them through scf.if.
-            def _emit_wp_vec_store(idx_tuple, val, width):
-                lds_wp.vec_store(idx_tuple, val, width)
-
-            def _emit_kp_scalar_store(idx, val):
-                lds_kp[fx.Index(idx)] = val
-
             has_next = next_i_t * fx.Int32(BT) < T_local
-            if has_next.ir_value():
+            if has_next:
                 gpu.barrier()
                 _pf_idx = 0
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                         wvec_pf = w_next_vecs[_pf_idx]
                         swz_pf = w_next_swz[_pf_idx]
-                        _emit_wp_vec_store(
-                            (fx.Index(swz_pf),),
+                        fx.ptr_store(
                             wvec_pf.shuffle(wvec_pf, [0, 1, 2, 3]),
-                            4,
+                            lds_wp_ptr + fx.Int32(swz_pf),
                         )
-                        _emit_wp_vec_store(
-                            (fx.Index(swz_pf ^ fx.Int32(4)),),
+                        fx.ptr_store(
                             wvec_pf.shuffle(wvec_pf, [4, 5, 6, 7]),
-                            4,
+                            lds_wp_ptr + fx.Int32(swz_pf ^ fx.Int32(4)),
                         )
                         _pf_idx += 1
                 for kb in range_constexpr(NUM_K_BLOCKS):
@@ -1106,14 +1040,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                             row_i, k_pair_col_pf
                         )
                         elem_off = byte_off >> fx.Int32(1)
-                        _emit_kp_scalar_store(kp_pbase + elem_off, kvec_t0_pf[i])
-                        _emit_kp_scalar_store(
-                            kp_pbase + elem_off + fx.Int32(1), kvec_t1_pf[i]
+                        fx.ptr_store(
+                            kvec_t0_pf[i], lds_kp_ptr + fx.Int32(kp_pbase + elem_off)
+                        )
+                        fx.ptr_store(
+                            kvec_t1_pf[i],
+                            lds_kp_ptr + fx.Int32(kp_pbase + elem_off + fx.Int32(1)),
                         )
 
             results = yield [_to_raw(v) for v in h_accs_in]
 
-        h_accs_final = list(results[:NUM_H_ACCS])
+        h_accs_final = [fx.Vector(v, (4,), fx.Float32) for v in results[:NUM_H_ACCS]]
 
         # -- Epilogue: store final state --
         # OPT-7: 4 x scalar f32 store -> 1 x buffer_store_dwordx4 (16 B).
@@ -1138,7 +1075,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         out_vec = _f32x4_to_bf16x4(acc_val)
                     else:
                         out_vec = acc_val
-                    ht_.vec_store((fx.Index(ht_off_base),), out_vec, 4)
+                    ht_.vec_store((ht_off_base,), out_vec, 4)
 
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
@@ -1162,11 +1099,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         grid_nh: fx.Int32,
         stream: fx.Stream,
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
-
         launcher = gdn_h_kernel(
             k_tensor,
             v_tensor,
