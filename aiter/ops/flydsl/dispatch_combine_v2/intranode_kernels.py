@@ -1389,6 +1389,7 @@ def make_combine_fused_reduce(
     @flyc.kernel(known_block_size=[warp_num_per_block * WAVE, 1, 1])
     def ep_combine_fused(
         arena: Int64,
+        addr_comb_inp: Int64,
         addr_comb_bar: Int64,
         addr_xdb_flag: Int64,
         addr_out: Int64,
@@ -1406,21 +1407,20 @@ def make_combine_fused_reduce(
         window = cco.Window(arena)
         rsrc_out = create_buffer_resource_from_addr(addr_out)
         rsrc_comb_bar = create_buffer_resource_from_addr(addr_comb_bar)
-        xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
 
         # ── Stage A: cross-device barrier — wait until all peers' gemm2 P2P writes
         # into our comb_inp are globally visible. Block-0-only xdb handshake, then
         # signal other blocks via comb_bar (same as make_combine Stage 1; #487). ──
         if grid_thread_id < npes:
+            xdb_cur_flag = P.load_i64_acquire(fx.Int64(addr_xdb_flag))
             xdb_remote = fx.Int64(
                 window.lsa_ptr(grid_thread_id, off_xdb_mem)
             ) + fx.Int64(rank) * fx.Int64(8)
             P.store_i64_system(xdb_remote, arith.constant(0), xdb_cur_flag)
-        if grid_thread_id == 0:
-            P.atomic_add_global(
-                fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64)
-            )
-        if grid_thread_id < npes:
+            if grid_thread_id == 0:
+                P.atomic_add_global(
+                    fx.Int64(addr_xdb_flag), arith.constant(1, type=T.i64)
+                )
             xdb_peer_slot = fx.Int64(
                 window.lsa_ptr(my_lsa_rank, off_xdb_mem)
             ) + fx.Int64(grid_thread_id) * fx.Int64(8)
@@ -1439,7 +1439,7 @@ def make_combine_fused_reduce(
                 P.atomic_add_global(fx.Int64(addr_comb_bar), arith.constant(1))
 
         # ── Stage B: local read of comb_inp[tok*topk + k] + unweighted topk sum ──
-        comb_inp_base = fx.Int64(window.lsa_ptr(my_lsa_rank, off_comb_inp))
+        comb_inp_base = fx.Int64(addr_comb_inp)
         safe_tok = arith.select(
             cur_rank_num_token == arith.constant(0),
             arith.constant(1),
@@ -1501,21 +1501,38 @@ def make_combine_fused_reduce(
                     )
                 for _r in range_constexpr(_UNROLL):
                     _off = base + _r * STEP_CHUNK
-                    _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
-                    for k_slot in range_constexpr(topk):
-                        for _j in range_constexpr(VEC):
-                            _accs[_j] = _accs[_j] + to_acc(
-                                vector.extract(_pre[_r][k_slot], static_position=[_j])
-                            )
-                    _res = vector.from_elements(
-                        T.vec(4, T.i32),
-                        [
-                            from_acc(_accs[0]),
-                            from_acc(_accs[1]),
-                            from_acc(_accs[2]),
-                            from_acc(_accs[3]),
-                        ],
-                    )
+                    if const_expr(hidden_elem_size == 2):
+                        # Preserve all eight packed bf16 values as one vector through
+                        # conversion and accumulation. This avoids scalar extract /
+                        # rebuild moves while retaining f32 accumulation.
+                        _v8bf = T.vec(8, T.bf16)
+                        _v8f = T.vec(8, T.f32)
+                        _vacc = arith.constant_vector(0.0, _v8f)
+                        for k_slot in range_constexpr(topk):
+                            _vacc = _vacc + vector.bitcast(
+                                _v8bf, _pre[_r][k_slot]
+                            ).extf(_v8f)
+                        _res = vector.bitcast(
+                            T.vec(4, T.i32), _vacc.truncf(_v8bf)
+                        )
+                    else:
+                        _accs = [zero_acc(), zero_acc(), zero_acc(), zero_acc()]
+                        for k_slot in range_constexpr(topk):
+                            for _j in range_constexpr(VEC):
+                                _accs[_j] = _accs[_j] + to_acc(
+                                    vector.extract(
+                                        _pre[_r][k_slot], static_position=[_j]
+                                    )
+                                )
+                        _res = vector.from_elements(
+                            T.vec(4, T.i32),
+                            [
+                                from_acc(_accs[0]),
+                                from_acc(_accs[1]),
+                                from_acc(_accs[2]),
+                                from_acc(_accs[3]),
+                            ],
+                        )
                     buffer_store(_res, rsrc_out, out_base + _off)
             for u in range(main_end + lane, eff, WAVE):
                 _one(unit_base + u)
@@ -1530,6 +1547,7 @@ def make_combine_fused_reduce(
     @flyc.jit
     def run(
         arena: Int64,
+        addr_comb_inp: Int64,
         addr_comb_bar: Int64,
         addr_xdb_flag: Int64,
         addr_out: Int64,
@@ -1539,6 +1557,7 @@ def make_combine_fused_reduce(
     ):
         ep_combine_fused(
             arena,
+            addr_comb_inp,
             addr_comb_bar,
             addr_xdb_flag,
             addr_out,
