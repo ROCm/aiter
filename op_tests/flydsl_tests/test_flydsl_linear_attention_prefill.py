@@ -331,6 +331,61 @@ STATE_BF16_PARAMS = [
 STATE_BF16_TEST_IDS = [repr(p) for p in STATE_BF16_PARAMS]
 
 
+# -- KDA (Kimi-K3) per-channel gate shapes ----------------
+# These exercise the USE_GK code path with ``gk`` instead of ``g``.
+KDA_PARAMS = [
+    PrefillArgs(
+        K=128, V=128, Hk=96, Hv=96, tp=8,
+        full_prompt_len=8192,
+        model_name="KDA-kimi-k3-tp8-T8k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=8192,
+    ),
+    PrefillArgs(
+        K=128, V=128, Hk=96, Hv=96, tp=8,
+        full_prompt_len=32768,
+        model_name="KDA-kimi-k3-tp8-T32k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=32768,
+    ),
+    PrefillArgs(
+        K=128, V=128, Hk=96, Hv=96, tp=4,
+        full_prompt_len=8192,
+        model_name="KDA-kimi-k3-tp4-T8k",
+        is_varlen=True,
+        output_final_state=True,
+        max_num_batched_tokens=8192,
+    ),
+]
+KDA_TEST_IDS = [repr(p) for p in KDA_PARAMS]
+
+
+def _make_inputs_kda(args: PrefillArgs):
+    """Build K5 inputs for the KDA (per-channel gate) path.
+
+    Returns the same tuple as ``_make_inputs`` but replaces ``g`` (scalar
+    cumsum gate) with ``gk`` ([T_total, H, K] per-channel cumsum gate).
+    ``w`` and ``u`` are returned in both token-major and head-major layouts.
+    """
+    context_lens = args.resolve_context_lens()
+    k, w_orig, u_orig, w_c, u_c, _g, h0, cu, scheduled_q_lens = _make_inputs(
+        context_lens, args=args
+    )
+    H = args.Hv // args.tp
+    T_total = k.shape[1]
+    # Per-channel cumulative gate [T_total, H, K], non-positive (decay).
+    gk = (
+        torch.randn(T_total, H, args.K, dtype=torch.float32, device=k.device)
+        .abs()
+        .mul(-0.1)
+        .cumsum(dim=0)
+        .contiguous()
+    )
+    return k, w_orig, u_orig, w_c, u_c, gk, h0, cu, scheduled_q_lens
+
+
 # -- Helper functions ---------------------------------------------------
 
 
@@ -426,13 +481,30 @@ def ref_chunk_gated_delta_rule_fwd_h(
     k,
     w,
     u,
-    g,
+    g=None,
+    gk=None,
     initial_state=None,
     output_final_state=False,
     chunk_size=64,
     cu_seqlens=None,
 ):
-    """Reference in FP32 for correctness checking."""
+    """Reference in FP32 for correctness checking.
+
+    Supports both gate variants:
+      * Scalar gate (``g`` is not None, USE_G path, GDN/Qwen3-Next):
+          b_v[t] = u[t] - w[t] @ h^T
+          gate[t] = exp(g_last - g_cumsum[t])   # scalar, broadcast over V
+          h = h * exp(g_last) + (b_v * gate)^T @ k[t]
+
+      * Per-channel gate (``gk`` is not None, USE_GK path, KDA/Kimi-K3):
+          b_v[t] = u[t] - w[t] @ h^T            # same delta correction
+          h[:, k] *= exp(gk_last[k])             # per-K decay; no v_new gating
+          h = h + b_v^T @ k[t]
+          (k is pre-gated by the pipeline; v_new is not gated here)
+
+    ``w`` and ``u`` are expected in token-major layout ``[B, T, H, *]``.
+    """
+    assert (g is None) != (gk is None), "exactly one of g, gk must be provided"
     B, T, Hg_dim, K_dim = k.shape
     H_dim, V_dim = u.shape[-2], u.shape[-1]
     BT_dim = chunk_size
@@ -486,23 +558,31 @@ def ref_chunk_gated_delta_rule_fwd_h(
                     b_v = u_chunk - w_chunk @ h_state.T
                     v_new_out[b_idx, bos + t_start : bos + t_end, i_h] = b_v
 
-                    last_idx = bos + t_end - 1
-                    g_last = g[i_h, last_idx].float()
-                    g_chunk = g[i_h, bos + t_start : bos + t_end].float()
-
-                    mask = torch.zeros(BT_dim, device=k.device)
-                    mask[:actual_bt] = 1.0
-                    gate = torch.where(
-                        mask[:actual_bt].bool(),
-                        torch.exp(g_last - g_chunk),
-                        torch.zeros_like(g_chunk),
-                    )
-                    b_v_gated = b_v * gate.unsqueeze(-1)
-
-                    h_state = h_state * torch.exp(g_last)
                     k_chunk = k[b_idx, bos + t_start : bos + t_end, i_hg].float()
-                    b_v_gated_cast = b_v_gated.to(k.dtype).float()
-                    h_state = h_state + b_v_gated_cast.T @ k_chunk
+
+                    if gk is not None:
+                        # USE_GK: per-K-dim h decay, no v_new gating
+                        last_idx = bos + t_end - 1
+                        gk_last = gk[last_idx, i_h].float()  # [K]
+                        h_state = h_state * torch.exp(gk_last).unsqueeze(0)
+                        h_state = h_state + b_v.T @ k_chunk
+                    else:
+                        # USE_G: scalar h decay + v_new gating
+                        last_idx = bos + t_end - 1
+                        g_last = g[i_h, last_idx].float()
+                        g_chunk = g[i_h, bos + t_start : bos + t_end].float()
+
+                        mask = torch.zeros(BT_dim, device=k.device)
+                        mask[:actual_bt] = 1.0
+                        gate = torch.where(
+                            mask[:actual_bt].bool(),
+                            torch.exp(g_last - g_chunk),
+                            torch.zeros_like(g_chunk),
+                        )
+                        b_v_gated = b_v * gate.unsqueeze(-1)
+                        h_state = h_state * torch.exp(g_last)
+                        b_v_gated_cast = b_v_gated.to(k.dtype).float()
+                        h_state = h_state + b_v_gated_cast.T @ k_chunk
 
                 if output_final_state:
                     final_state[seq_idx, i_h] = h_state
@@ -855,6 +935,82 @@ class TestCorrectness:
                 rtol=rtol,
                 msg="triton_origin_opt: final_state mismatch",
             )
+
+    @pytest.mark.parametrize("args", KDA_PARAMS, ids=KDA_TEST_IDS)
+    def test_correctness_flydsl_kda(self, args: PrefillArgs):
+        """FlyDSL K5 with per-channel gate (USE_GK, KDA/Kimi-K3 path).
+        """
+        k, w_orig, u_orig, w_c, u_c, gk, h0, cu, _ = _make_inputs_kda(args)
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k,
+            w_c,
+            u_c,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k,
+            w_orig,
+            u_orig,
+            gk=gk,
+            initial_state=h0,
+            output_final_state=args.output_final_state,
+            cu_seqlens=cu,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly,
+            vn_fly,
+            fs_fly,
+            h_ref,
+            vn_ref,
+            fs_ref,
+            output_final_state=args.output_final_state,
+            label="flydsl_kda",
+        )
+
+    def test_non_multiple_of_64(self):
+        """FlyDSL K5 with sequence length not a multiple of BT=64.
+
+        Regression guard: tail-chunk final_state corruption
+        when the sequence length is not a multiple of the chunk size.
+        Uses the KDA (gk) path.
+        """
+        H, Hg, K, V, BT = 12, 12, 128, 128, 64
+        seq_len = 8192 + 37  # not a multiple of 64
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device="cuda")
+        k = torch.randn(1, seq_len, Hg, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_orig = torch.randn(1, seq_len, H, K, dtype=torch.bfloat16, device="cuda") * 0.1
+        u_orig = torch.randn(1, seq_len, H, V, dtype=torch.bfloat16, device="cuda") * 0.1
+        w_c = w_orig.permute(0, 2, 1, 3).contiguous()
+        u_c = u_orig.permute(0, 2, 1, 3).contiguous()
+        gk = (
+            torch.randn(seq_len, H, K, dtype=torch.float32, device="cuda")
+            .abs()
+            .mul(-0.1)
+            .cumsum(dim=0)
+            .contiguous()
+        )
+        h0 = torch.randn(1, H, V, K, dtype=torch.float32, device="cuda") * 0.01
+
+        h_fly, vn_fly, fs_fly = chunk_gated_delta_rule_fwd_h_flydsl(
+            k, w_c, u_c, gk=gk, initial_state=h0,
+            output_final_state=True, cu_seqlens=cu_seqlens,
+        )
+        h_ref, vn_ref, fs_ref = ref_chunk_gated_delta_rule_fwd_h(
+            k, w_orig, u_orig, gk=gk, initial_state=h0,
+            output_final_state=True, cu_seqlens=cu_seqlens,
+        )
+
+        _assert_k5_outputs_match_ref(
+            h_fly, vn_fly, fs_fly,
+            h_ref, vn_ref, fs_ref,
+            output_final_state=True,
+            label="flydsl_non_mul64",
+        )
 
 
 _perf_results: list[dict] = []

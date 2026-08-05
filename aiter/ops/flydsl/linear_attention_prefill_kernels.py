@@ -29,8 +29,16 @@ from ..triton._triton_kernels.gated_delta_rule.utils import (
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
+from flydsl.runtime.device import get_rocm_arch as _get_rocm_arch
+
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
+from .kernels.chunk_gated_delta_h_gfx942 import compile_chunk_gated_delta_h_gfx942
+
 from .kernels.tensor_shim import _run_compiled
+
+# Arch detected once at import time; used by _get_or_compile to select the
+# right compile backend.
+_ARCH: str = _get_rocm_arch()
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
 # place of exp(g) (matches the Triton VK / HIP K5 convention).
@@ -223,7 +231,7 @@ def _get_or_compile(
         g_log2_scaled,
     )
     if cache_key not in _compiled_kernels:
-        _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
+        _compile_kwargs = dict(
             K=K,
             V=V,
             BT=BT,
@@ -240,6 +248,19 @@ def _get_or_compile(
             STATE_DTYPE_BF16=state_bf16,
             G_IS_LOG2_SCALED=g_log2_scaled,
         )
+        if _ARCH == "gfx950":
+            _compiled_kernels[cache_key] = compile_chunk_gated_delta_h(
+                **_compile_kwargs
+            )
+        elif _ARCH == "gfx942":
+            _compiled_kernels[cache_key] = compile_chunk_gated_delta_h_gfx942(
+                **_compile_kwargs
+            )
+        else:
+            raise ValueError(
+                f"FlyDSL GDN K5 is not supported on arch '{_ARCH}'. "
+                f"Supported arches: gfx942, gfx950."
+            )
     return _compiled_kernels[cache_key]
 
 
