@@ -36,9 +36,8 @@ def apply_gate_up(
 ) -> torch.Tensor:
     """Torch reference for the stage1 gate/up activation.
 
-    ``situv2`` has no kernel on the grouped path right now -- see TODO(situv2)
-    in ``grouped_moe_gfx1250`` -- but the reference is kept here so the
-    restored kernel has something to be checked against.
+    ``situv2`` (Kimi-K3 ``hidden_act="situ"``) is the grouped TDM stage1
+    epilogue's ``stage1_act=3``; this is what that kernel is checked against.
     """
     lim = 7.0 if swiglu_limit is None else float(swiglu_limit)
     if act == "swiglu":
