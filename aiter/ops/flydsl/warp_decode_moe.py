@@ -21,6 +21,7 @@ import torch
 
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 from aiter.ops.flydsl.kernels.warp_decode_moe import (
+    build_down_reduce_fp8_module,
     build_gate_up_fp8_module,
     pick_kvector,
 )
@@ -31,6 +32,18 @@ def _get_gate_up(hidden, inter, top_k, kvector, w_scale_mode, serialize_dot2):
     return build_gate_up_fp8_module(
         hidden,
         inter,
+        top_k,
+        kvector=kvector,
+        w_scale_mode=w_scale_mode,
+        serialize_dot2=serialize_dot2,
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _get_down_reduce(inter, hidden, top_k, kvector, w_scale_mode, serialize_dot2):
+    return build_down_reduce_fp8_module(
+        inter,
+        hidden,
         top_k,
         kvector=kvector,
         w_scale_mode=w_scale_mode,
@@ -107,6 +120,74 @@ def flydsl_warp_decode_gate_up(
             ptr_arg(w_gate_scale),
             ptr_arg(w_up_scale),
             ptr_arg(router_ids),
+            ptr_arg(out),
+            grid_x,
+            torch.cuda.current_stream(),
+        ),
+    )
+    return out
+
+
+def flydsl_warp_decode_down_reduce(
+    intermediate: torch.Tensor,
+    w_down: torch.Tensor,
+    router_ids: torch.Tensor,
+    router_wts: torch.Tensor,
+    w_down_scale: torch.Tensor,
+    *,
+    w_scale_mode: str = "pertensor",
+    serialize_dot2: bool = True,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
+
+    Computes, per token ``b`` and output ``out_j``::
+
+        y[b,out_j] = ?_k router_wts[b,k] . ds_k . (?_i inter[b,k,i].w_down[e,out_j,i])
+
+    where ``e = router_ids[b,k]`` and ``ds_k`` is the (PerTensor/PerToken) weight
+    scale for row ``e*HIDDEN + out_j``.
+
+    Args:
+        intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k, contiguous).
+        w_down:       [E, HIDDEN, INTER] float8_e4m3fn (row = e*HIDDEN + out_j).
+        router_ids:   [B, TOPK] int32.
+        router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
+        w_down_scale: float32 weight scales.  ``pertensor`` -> [1];
+            ``pertoken`` -> [E*HIDDEN] (one per weight row).
+        w_scale_mode: "pertensor" or "pertoken".
+        out:          optional [B, HIDDEN] bfloat16 output buffer.
+
+    Returns:
+        [B, HIDDEN] bfloat16 output.
+    """
+    if w_scale_mode not in ("pertensor", "pertoken"):
+        raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
+    assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
+    assert intermediate.is_contiguous() and w_down.is_contiguous()
+    assert router_wts.dtype == torch.float32, "router_wts must be float32"
+
+    B, TOPK, INTER = intermediate.shape
+    E, HIDDEN, Ik = w_down.shape
+    assert Ik == INTER, f"w_down INTER {Ik} != intermediate INTER {INTER}"
+    assert router_ids.shape == (B, TOPK), "router_ids must be [B, TOPK]"
+
+    kvector = pick_kvector(INTER)
+    if out is None:
+        out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
+
+    launcher = _get_down_reduce(
+        INTER, HIDDEN, TOPK, kvector, w_scale_mode, serialize_dot2
+    )
+    grid_x = B * HIDDEN
+    _run(
+        launcher,
+        (
+            ptr_arg(intermediate),
+            ptr_arg(w_down),
+            ptr_arg(w_down_scale),
+            ptr_arg(router_ids),
+            ptr_arg(router_wts),
             ptr_arg(out),
             grid_x,
             torch.cuda.current_stream(),
