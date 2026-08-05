@@ -820,6 +820,10 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
         "shared_expert_id" in inspect.signature(api).parameters
         for api in (compile_mixed_fhmoe_gemm1, compile_mixed_fhmoe_gemm2)
     )
+    assert all(
+        "v2_output_layout" in inspect.signature(api).parameters
+        for api in (flydsl_fhmoe_stage1, compile_mixed_fhmoe_gemm1)
+    )
     fhmoe_apis = (
         flydsl_fhmoe_stage1,
         flydsl_fhmoe_stage2,
@@ -836,7 +840,10 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
     compile_calls = []
 
     def invoke_compiler(**kwargs):
-        return kwargs["_compile_kernel"](xcd_swizzle=kwargs["xcd_swizzle"])
+        compile_kwargs = {"xcd_swizzle": kwargs["xcd_swizzle"]}
+        if "v2_output_layout" in kwargs:
+            compile_kwargs["v2_output_layout"] = kwargs["v2_output_layout"]
+        return kwargs["_compile_kernel"](**compile_kwargs)
 
     def compile_stage1(**kwargs):
         compile_calls.append((1, kwargs))
@@ -862,6 +869,7 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
             shared_w1_scale=tensor,
             shared_expert_id=8,
             xcd_swizzle=4,
+            v2_output_layout=True,
         )
         == 1
     )
@@ -880,7 +888,14 @@ def test_fhmoe_runtime_compile_bridge_forwards_xcd(monkeypatch: pytest.MonkeyPat
         == 2
     )
     assert compile_calls == [
-        (1, {"shared_expert_id": 8, "xcd_swizzle": 4}),
+        (
+            1,
+            {
+                "shared_expert_id": 8,
+                "xcd_swizzle": 4,
+                "v2_output_layout": True,
+            },
+        ),
         (2, {"shared_expert_id": 8, "xcd_swizzle": 4}),
     ]
 
