@@ -472,7 +472,7 @@ def run_smoke(module: IsaModule, kernel: str = "isa_smoke", *,
         hip.check(hip.lib.hipMemset(buf, 0, nbytes))
         spec = KernelLaunchSpec(grid=(blocks, 1, 1), block=(block_size, 1, 1))
         args = [ctypes.c_uint64(buf.value), ctypes.c_uint32(sentinel),
-                ctypes.c_uint32(block_size)]
+                ctypes.c_uint32(block_size), ctypes.c_uint32(n)]
 
         module.launch(kernel, args, spec)
         module.synchronize()
