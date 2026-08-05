@@ -135,32 +135,64 @@ def get_kernel_config_triton(m, n, k, routing_data):
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
+    num_warps = 4
 
     if block_m == 16:
-        # decode kernel: keep the LDS footprint small enough for real occupancy.
-        # block_n must stay a multiple of 32 * num_warps (the 32x16x128 wmma is
-        # transposed, so one warp round covers 32 columns per warp).
         block_k = 512
-        num_warps = 4
-        if n <= 1536:
-            block_n = 128
-            num_buffers = 3
-        elif n <= 3072:
-            block_n = 128
+        if n <= 512:
+            block_n = 512
             num_buffers = 2
-        else:
+        elif n <= 1024:
+            block_n = 128
+            num_buffers = 1
+        elif n <= 4096:
             block_n = 256
             num_buffers = 1
-    elif block_m == 32 or block_m == 64:
-        block_n = 512
-        block_k = 512
-        num_buffers = 2
-        num_warps = 4
+        elif k <= 256:
+            block_n = 512
+            num_buffers = 1
+        else:
+            block_n = 128
+            num_buffers = 1
+    elif block_m == 32:
+        if n <= 512:
+            block_n = 256
+            block_k = 256
+            num_buffers = 2
+        elif n <= 1024:
+            block_n = 128
+            block_k = 512
+            num_buffers = 2
+        elif n <= 4096:
+            block_n = 256
+            block_k = 256
+            num_buffers = 2
+        elif k <= 1024:
+            block_n = 512
+            block_k = 512
+            num_buffers = 2
+        else:
+            block_n = 128
+            block_k = 512
+            num_buffers = 2
+    elif block_m == 64:
+        block_k = 256
+        if n <= 1024:
+            block_n = 512
+            num_buffers = 2
+        elif n <= 2048:
+            block_n = 256
+            num_buffers = 2
+        else:
+            block_n = 512
+            num_buffers = 1
     else:
-        block_n = 256
-        block_k = 512
-        num_buffers = 2
-        num_warps = 4
+        block_n = 512
+        block_k = 256
+        if n > 4096:
+            num_buffers = 1
+        else:
+            num_buffers = 2
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
 
