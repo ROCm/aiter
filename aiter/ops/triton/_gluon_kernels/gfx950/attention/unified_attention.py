@@ -7,6 +7,7 @@ import pytest
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton._triton_kernels.attention.unified_attention import reduce_segments
+from aiter.ops.triton.utils.common_utils import strip_annotate
 import os
 from aiter.ops.triton.utils.types import e4m3_dtype
 import triton.language as tl
@@ -190,6 +191,7 @@ def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SI
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Layouts and derived constants for the unified attention kernel."""
 
@@ -372,6 +374,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class AsyncKVLoaderConfig:
     """Derived blocked / shared-memory layouts for the async KV load path.
     Only tuned for CDNA4. 2D (HEAD_SIZE, TILE_SIZE) / (TILE_SIZE, HEAD_SIZE)
@@ -397,6 +400,7 @@ class AsyncKVLoaderConfig:
 
 
 @aggregate
+@strip_annotate
 class AsyncKVLoader:
     cfg: AttentionConfig
     kv_cfg: AsyncKVLoaderConfig
@@ -562,6 +566,7 @@ class AsyncKVLoader:
 
 
 @aggregate
+@strip_annotate
 class AsyncGatherKVLoader:
     """Async CDNA4 KV loader supporting TILE_SIZE != BLOCK_SIZE.
 
@@ -755,6 +760,7 @@ class AsyncGatherKVLoader:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     cfg: AttentionConfig
 
@@ -1606,7 +1612,7 @@ def unified_attention(
             num_buffers = 1 if HEAD_SIZE >= 256 else 2
         else:
             mfma_dim = 16
-            num_buffers = 1 if HEAD_SIZE >= 128 else 2
+            num_buffers = 1 if HEAD_SIZE >= 256 else 2
         # BLOCK_M must hold a whole query group: BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
         # has to be >= 1
         min_warps = 2 if (HEAD_SIZE >= 256 and not Q_FP8) else 1
