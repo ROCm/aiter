@@ -1,6 +1,5 @@
 import torch
 import triton.experimental.gluon.language as gl
-from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
@@ -69,7 +68,6 @@ def get_moe_a4w4_layouts_prefill(
     BLOCK_N,
     BLOCK_K,
     num_warps,
-    num_ctas,
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
@@ -103,19 +101,6 @@ def get_moe_a4w4_layouts_prefill(
         SHUFFLED_BLOCK_K_WS = MX_SCALE_BLOCK_K
         SHUFFLED_BLOCK_N_WS = PACKED_BLOCK_N_W
 
-    # cga layout
-    if num_ctas == 4:
-        ctas_per_cga = [2, 2]
-    elif num_ctas == 8:
-        ctas_per_cga = [2, 4]
-    elif num_ctas == 16:
-        ctas_per_cga = [4, 4]
-    else:
-        ctas_per_cga = [1, num_ctas]
-    cga_layout_c = make_cga_layout(
-        ctas_per_cga, [ctas_per_cga[0], ctas_per_cga[1]], [0, 1]
-    )
-
     # wmma layouts
     if num_warps == 4:
         if BLOCK_M == 16:
@@ -133,7 +118,6 @@ def get_moe_a4w4_layouts_prefill(
         warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[32, 16, 128],
-        cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
         version=3,
@@ -141,7 +125,6 @@ def get_moe_a4w4_layouts_prefill(
         warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[32, 16, 64],
-        cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
         operand_index=0,
@@ -154,35 +137,12 @@ def get_moe_a4w4_layouts_prefill(
         k_width=16,
     )
 
-    CGA_A = DOT_LAYOUT_X.cga_layout
-    CGA_B = DOT_LAYOUT_W.cga_layout
-    CGA_B_NMAJOR = [[basis[1], basis[0]] for basis in CGA_B]
-    CGA_A_T = [[basis[1], basis[0]] for basis in CGA_A]
-
     # wmma layouts for scales
-    WMMA_X_SCALES = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
-        cga_layout=CGA_A,
-    )
-    WMMA_W_SCALES = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
-        cga_layout=CGA_B_NMAJOR,
-    )
     DOT_LAYOUT_X_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(operand_index=0, parent=WMMA_X_SCALES, k_width=16),
-        [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
+        DOT_LAYOUT_X, [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K]
     )
     DOT_LAYOUT_W_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(operand_index=1, parent=WMMA_W_SCALES, k_width=16),
-        [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K],
+        DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K]
     )
 
     GATHER_IDX_LAYOUT = None
@@ -196,7 +156,6 @@ def get_moe_a4w4_layouts_prefill(
                 threads_per_warp=[32, 1],
                 warps_per_cta=[1, num_warps],
                 order=[0, 1],
-                cga_layout=CGA_A_T,
             ),
         )
 
@@ -205,7 +164,6 @@ def get_moe_a4w4_layouts_prefill(
         threads_per_warp=[32, 1],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
-        cga_layout=CGA_A,
     )
 
     # shared layouts
@@ -213,7 +171,6 @@ def get_moe_a4w4_layouts_prefill(
         interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
         shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
         order=[1, 0],
-        cga_layout=CGA_A,
     )
     if PRESHUFFLE_WEIGHTS:
         SHARED_LAYOUT_W = gl.SwizzledSharedLayout(
@@ -221,35 +178,30 @@ def get_moe_a4w4_layouts_prefill(
             per_phase=1,
             max_phase=1,
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     elif BLOCK_K <= 256:
         SHARED_LAYOUT_W = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_W, SHUFFLED_BLOCK_K_W],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     else:
         SHARED_LAYOUT_W = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[SHUFFLED_BLOCK_K_W, 16]],
             shape=[SHUFFLED_BLOCK_N_W, SHUFFLED_BLOCK_K_W],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     if X_SCALES_TDM:
         SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
             shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
             order=[1, 0],
-            cga_layout=CGA_A,
         )
     else:
         SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
             order=[1, 0],
-            cga_layout=CGA_A,
         )
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         SHARED_LAYOUT_W_SCALES = gl.SwizzledSharedLayout(
@@ -257,37 +209,24 @@ def get_moe_a4w4_layouts_prefill(
             per_phase=1,
             max_phase=1,
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     elif MX_SCALE_BLOCK_K <= 256:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     else:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[SHUFFLED_BLOCK_K_WS, 16]],
             shape=[SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
-    if ctas_per_cga[1] > 1:
-        SHARED_LAYOUT_Y = gl.SwizzledSharedLayout(
-            vec=1,
-            per_phase=1,
-            max_phase=1,
-            order=[1, 0],
-            cga_layout=cga_layout_c,
-        )
-    else:
-        SHARED_LAYOUT_Y = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[OUT_BLOCK_N, 8]],
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            order=[1, 0],
-            cga_layout=cga_layout_c,
-        )
+    SHARED_LAYOUT_Y = gl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[OUT_BLOCK_N, 8]],
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        order=[1, 0],
+    )
 
     layouts = {
         "WMMA_LAYOUT": WMMA_LAYOUT,
@@ -312,7 +251,6 @@ def get_moe_a4w4_layouts_decode(
     BLOCK_N,
     BLOCK_K,
     num_warps,
-    num_ctas,
     ACTIVATION_REDUCTION_N,
     PRESHUFFLE_WEIGHTS,
     SWIZZLE_MX_SCALE,
@@ -324,14 +262,6 @@ def get_moe_a4w4_layouts_decode(
     PACKED_BLOCK_K_X = BLOCK_K // 2
     PACKED_BLOCK_K_W = BLOCK_K // 2
     PACKED_BLOCK_N_W = BLOCK_N
-
-    # the 32x16x128 wmma is transposed, so its tile is M=16 x N=32. With warps
-    # tiling N only, one warp round covers 32 * num_warps columns of the
-    # per-CTA tile.
-    assert (BLOCK_N // num_ctas) % (32 * num_warps) == 0, (
-        f"BLOCK_N // num_ctas ({BLOCK_N // num_ctas}) must be a multiple of "
-        f"32 * num_warps ({32 * num_warps})"
-    )
 
     # weight preshuffling
     if PRESHUFFLE_WEIGHTS:
@@ -354,14 +284,6 @@ def get_moe_a4w4_layouts_decode(
         SHUFFLED_BLOCK_K_WS = MX_SCALE_BLOCK_K
         SHUFFLED_BLOCK_N_WS = PACKED_BLOCK_N_W
 
-    # cga layout: the cluster may only split N. BLOCK_M is 16, which is exactly
-    # one wmma tile in M, so splitting M across CTAs leaves each CTA with less
-    # than a full tile and the dot fails to legalize.
-    ctas_per_cga = [1, num_ctas]
-    cga_layout_c = make_cga_layout(
-        ctas_per_cga, [ctas_per_cga[0], ctas_per_cga[1]], [0, 1]
-    )
-
     # wmma layouts
     if num_warps == 4:
         warp_bases = [[0, 1], [0, 2]]
@@ -373,7 +295,6 @@ def get_moe_a4w4_layouts_decode(
         warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[32, 16, 128],
-        cga_layout=cga_layout_c,
     )
     WMMA_LAYOUT_PACKED = gl.amd.AMDWMMALayout(
         version=3,
@@ -381,7 +302,6 @@ def get_moe_a4w4_layouts_decode(
         warp_bases=warp_bases,
         reg_bases=[],
         instr_shape=[32, 16, 64],
-        cga_layout=cga_layout_c,
     )
     DOT_LAYOUT_X = gl.DotOperandLayout(
         operand_index=0,
@@ -394,35 +314,12 @@ def get_moe_a4w4_layouts_decode(
         k_width=16,
     )
 
-    CGA_A = DOT_LAYOUT_X.cga_layout
-    CGA_B = DOT_LAYOUT_W.cga_layout
-    CGA_B_NMAJOR = [[basis[1], basis[0]] for basis in CGA_B]
-    CGA_A_T = [[basis[1], basis[0]] for basis in CGA_A]
-
     # wmma layouts for scales
-    WMMA_X_SCALES = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
-        cga_layout=CGA_A,
-    )
-    WMMA_W_SCALES = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=warp_bases,
-        reg_bases=[],
-        instr_shape=WMMA_LAYOUT_PACKED.instr_shape,
-        cga_layout=CGA_B_NMAJOR,
-    )
     DOT_LAYOUT_X_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(operand_index=0, parent=WMMA_X_SCALES, k_width=16),
-        [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
+        DOT_LAYOUT_X, [PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K]
     )
     DOT_LAYOUT_W_SCALES = gl.amd.gfx1250.get_wmma_scale_layout(
-        gl.DotOperandLayout(operand_index=1, parent=WMMA_W_SCALES, k_width=16),
-        [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K],
+        DOT_LAYOUT_W, [PACKED_BLOCK_N_W, MX_SCALE_BLOCK_K]
     )
 
     GATHER_IDX_LAYOUT = None
@@ -436,7 +333,6 @@ def get_moe_a4w4_layouts_decode(
                 threads_per_warp=[32, 1],
                 warps_per_cta=[1, num_warps],
                 order=[0, 1],
-                cga_layout=CGA_A_T,
             ),
         )
 
@@ -445,17 +341,13 @@ def get_moe_a4w4_layouts_decode(
         threads_per_warp=[32, 1],
         warps_per_cta=[num_warps, 1],
         order=[1, 0],
-        cga_layout=CGA_A,
     )
 
     # shared layouts
-    # x is a TDM gather destination, and the gather lowering requires the pad
-    # interval to divide the innermost block dim. Pad once per row.
     SHARED_LAYOUT_X = gl.PaddedSharedLayout.with_identity_for(
         interval_padding_pairs=[[PACKED_BLOCK_K_X, 16]],
         shape=[PACKED_BLOCK_M_X, PACKED_BLOCK_K_X],
         order=[1, 0],
-        cga_layout=CGA_A,
     )
     if PRESHUFFLE_WEIGHTS:
         SHARED_LAYOUT_W = gl.SwizzledSharedLayout(
@@ -463,74 +355,49 @@ def get_moe_a4w4_layouts_decode(
             per_phase=1,
             max_phase=1,
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     elif SHUFFLED_BLOCK_K_W <= 256:
         SHARED_LAYOUT_W = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_W, SHUFFLED_BLOCK_K_W],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     else:
         SHARED_LAYOUT_W = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[SHUFFLED_BLOCK_K_W, 16]],
             shape=[SHUFFLED_BLOCK_N_W, SHUFFLED_BLOCK_K_W],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
-    if X_SCALES_TDM:
-        SHARED_LAYOUT_X_SCALES = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[MX_SCALE_BLOCK_K, 16]],
-            shape=[PACKED_BLOCK_M_X, MX_SCALE_BLOCK_K],
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
-    else:
-        SHARED_LAYOUT_X_SCALES = gl.SwizzledSharedLayout(
-            vec=1,
-            per_phase=1,
-            max_phase=1,
-            order=[1, 0],
-            cga_layout=CGA_A,
-        )
+    SHARED_LAYOUT_X_SCALES = gl.SwizzledSharedLayout(
+        vec=1,
+        per_phase=1,
+        max_phase=1,
+        order=[1, 0],
+    )
     if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
         SHARED_LAYOUT_W_SCALES = gl.SwizzledSharedLayout(
             vec=1,
             per_phase=1,
             max_phase=1,
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     elif SHUFFLED_BLOCK_K_WS <= 256:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[256, 16]],
             shape=[SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
     else:
         SHARED_LAYOUT_W_SCALES = gl.PaddedSharedLayout.with_identity_for(
             interval_padding_pairs=[[SHUFFLED_BLOCK_K_WS, 16]],
             shape=[SHUFFLED_BLOCK_N_WS, SHUFFLED_BLOCK_K_WS],
             order=[1, 0],
-            cga_layout=CGA_B_NMAJOR,
         )
-    if ctas_per_cga[1] > 1:
-        SHARED_LAYOUT_Y = gl.SwizzledSharedLayout(
-            vec=1,
-            per_phase=1,
-            max_phase=1,
-            order=[1, 0],
-            cga_layout=cga_layout_c,
-        )
-    else:
-        SHARED_LAYOUT_Y = gl.PaddedSharedLayout.with_identity_for(
-            interval_padding_pairs=[[OUT_BLOCK_N, 8]],
-            shape=[BLOCK_M, OUT_BLOCK_N],
-            order=[1, 0],
-            cga_layout=cga_layout_c,
-        )
+    SHARED_LAYOUT_Y = gl.PaddedSharedLayout.with_identity_for(
+        interval_padding_pairs=[[OUT_BLOCK_N, 8]],
+        shape=[BLOCK_M, OUT_BLOCK_N],
+        order=[1, 0],
+    )
 
     layouts = {
         "WMMA_LAYOUT": WMMA_LAYOUT,
@@ -593,7 +460,6 @@ def unshuffle_weights_gfx1250(
 @gluon.jit(launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a4w4_prefill(
     Y,
-    stride_y_k,
     stride_y_m,
     stride_y_n,
     X,
@@ -640,7 +506,6 @@ def _moe_gemm_a4w4_prefill(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
-    SPLIT_K: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,  # "GFX1250_SCALE" | None
     PRESHUFFLE_WEIGHTS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -662,7 +527,6 @@ def _moe_gemm_a4w4_prefill(
     SHARED_LAYOUT_Y: gl.constexpr,
     # metaparameters
     num_warps: gl.constexpr,
-    num_ctas: gl.constexpr,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -976,13 +840,9 @@ def _moe_gemm_a4w4_prefill(
     # main loop: perform wmma and fill LDS with next tile
     acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=WMMA_LAYOUT)
     for _ in range(num_k_iter - NUM_BUFFERS):
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
 
         # fill next tile to LDS
         if GatherIndx is None:
@@ -1124,13 +984,9 @@ def _moe_gemm_a4w4_prefill(
 
     # epilogue: drain remaining tiles
     for k_ep in gl.static_range(NUM_BUFFERS - 1):
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
 
         # wait for next tile to be filled
         gl.amd.gfx1250.tdm.async_wait(
@@ -1198,7 +1054,7 @@ def _moe_gemm_a4w4_prefill(
         acc = acc + bias[None, :]
 
     # apply activation function
-    if APPLY_SWIGLU and SPLIT_K == 1:
+    if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL)
         out = gl.convert_layout(out, WMMA_LAYOUT)
         gl.static_assert(
@@ -1249,7 +1105,6 @@ def _moe_gemm_a4w4_prefill(
 )
 def _moe_gemm_a4w4_decode(
     Y,
-    stride_y_k,
     stride_y_m,
     stride_y_n,
     X,
@@ -1296,7 +1151,6 @@ def _moe_gemm_a4w4_decode(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     XCD_SWIZZLE: gl.constexpr,
-    SPLIT_K: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,  # "GFX1250_SCALE" | None
     PRESHUFFLE_WEIGHTS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
@@ -1318,7 +1172,6 @@ def _moe_gemm_a4w4_decode(
     SHARED_LAYOUT_Y: gl.constexpr,
     # metaparameters
     num_warps: gl.constexpr,
-    num_ctas: gl.constexpr,
 ):
     MX_PACK_DIVISOR: gl.constexpr = 32
     gl.static_assert(
@@ -1700,13 +1553,9 @@ def _moe_gemm_a4w4_decode(
             )
         wmma_idx += 1
 
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
 
     # load bias into LDS while the pipeline drains
     if B is not None:
@@ -1782,13 +1631,9 @@ def _moe_gemm_a4w4_decode(
             )
         wmma_idx += 1
 
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.arrive()
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_x, cur_x_scales, "e2m1", cur_w, cur_w_scales, "e2m1", acc
         )
-        if num_ctas > 1:
-            gl.amd.gfx1250.cluster.wait()
 
     # bias
     if B is not None:
@@ -1799,7 +1644,7 @@ def _moe_gemm_a4w4_decode(
         acc = acc + bias[None, :]
 
     # apply activation function
-    if APPLY_SWIGLU and SPLIT_K == 1:
+    if APPLY_SWIGLU:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL)
         out = gl.convert_layout(out, WMMA_LAYOUT)
         gl.static_assert(

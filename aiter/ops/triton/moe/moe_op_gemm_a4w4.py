@@ -203,9 +203,7 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         "num_warps": num_warps,
         "xcd_swizzle": num_xcds,
         "num_buffers": num_buffers,
-        "split_k": 1,
         "waves_per_eu": 0,
-        "num_ctas": 1,
     }
     return ret
 
@@ -331,18 +329,22 @@ def moe_gemm_a4w4(
     # compute optimization flags
     if use_gluon:
         config = get_kernel_config_gluon(M, N, K, routing_data)
+        split_k = 1
     else:
         config = get_kernel_config_triton(M, N, K, routing_data)
+        split_k = config["split_k"]
 
     x_scales_tdm = False
     if use_gluon:
         mx_scale_block_k = config["block_k"] // MXFP4_QUANT_BLOCK_SIZE
         ASYNC_COPY_MIN_SCALE_WIDTH = 4
         x_scales_tdm = (
-            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH or K % config["block_k"] != 0
+            mx_scale_block_k < ASYNC_COPY_MIN_SCALE_WIDTH
+            or K % config["block_k"] != 0
+            or x_scales.stride(0) % 16 != 0
         )
 
-    if apply_swiglu and config["split_k"] > 1:
+    if apply_swiglu and split_k > 1:
         apply_swiglu_matmul = False
         reduction_n_matmul = 1
         apply_swiglu_reduction = True
@@ -369,7 +371,7 @@ def moe_gemm_a4w4(
         gather_indx,
         scatter_indx,
         config["block_m"],
-        config["split_k"],
+        split_k,
         preshuffle_weights,
     )
 
@@ -385,20 +387,15 @@ def moe_gemm_a4w4(
     # spmd grid
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
-    grid = grid_m * grid_n * config["split_k"]
+    grid = grid_m * grid_n * split_k
 
     # launch kernel
     if use_gluon and get_arch() == "gfx1250" and block_m == 16:
-        assert (
-            config["split_k"] == 1
-        ), "Split-k is not supported for Gluon backend on gfx1250"
-        num_ctas = 1 if gather_indx is not None else config["num_ctas"]
         layouts = get_moe_a4w4_layouts_decode(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
             BLOCK_K=config["block_k"],
             num_warps=config["num_warps"],
-            num_ctas=num_ctas,
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
@@ -408,7 +405,6 @@ def moe_gemm_a4w4(
         # launch gluon kernel
         _moe_gemm_a4w4_decode[(grid,)](
             y,
-            y.stride(0),
             y.stride(1),
             y.stride(2),
             x,
@@ -447,7 +443,6 @@ def moe_gemm_a4w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            SPLIT_K=config["split_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
@@ -456,20 +451,15 @@ def moe_gemm_a4w4(
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=K % config["block_k"] != 0,
             **layouts,
-            num_ctas=num_ctas,
             num_warps=config["num_warps"],
         )
     elif use_gluon and get_arch() == "gfx1250":
-        assert (
-            config["split_k"] == 1
-        ), "Split-k is not supported for Gluon backend on gfx1250"
         # layouts
         layouts = get_moe_a4w4_layouts_prefill(
             BLOCK_M=config["block_m"],
             BLOCK_N=config["block_n"],
             BLOCK_K=config["block_k"],
             num_warps=config["num_warps"],
-            num_ctas=config["num_ctas"],
             ACTIVATION_REDUCTION_N=reduction_n_matmul,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
@@ -482,7 +472,6 @@ def moe_gemm_a4w4(
         # launch gluon kernel
         _moe_gemm_a4w4_prefill[(grid,)](
             y,
-            y.stride(0),
             y.stride(1),
             y.stride(2),
             x,
@@ -521,7 +510,6 @@ def moe_gemm_a4w4(
             config["block_m"],
             config["block_n"],
             config["block_k"],
-            SPLIT_K=config["split_k"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
             PRESHUFFLE_WEIGHTS=preshuffle_weights,
@@ -530,7 +518,6 @@ def moe_gemm_a4w4(
             X_SCALES_TDM=x_scales_tdm,
             CLAMP_BOUNDS=clamp_bounds,
             **layouts,
-            num_ctas=1 if gather_indx is not None else config["num_ctas"],
             num_warps=config["num_warps"],
         )
     else:
@@ -580,7 +567,7 @@ def moe_gemm_a4w4(
             config["group_m"],
             XCD_SWIZZLE=config["xcd_swizzle"],
             SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            SPLIT_K=config["split_k"],
+            SPLIT_K=split_k,
             EVEN_K=K % config["block_k"] == 0,
             MASK_K_LIMIT=K % config["block_k"],
             W_CACHE_MODIFIER=config["w_cache_modifier"],
