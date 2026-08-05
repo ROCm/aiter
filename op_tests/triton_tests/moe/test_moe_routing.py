@@ -166,6 +166,9 @@ def test_routing(n_tokens, n_expts_tot, n_expts_act, sm_first):
 def _score_transform_torch(logits, score_mode):
     if score_mode == "sqrtsoftplus":
         return torch.sqrt(F.softplus(logits.to(torch.float32))).to(logits.dtype)
+    if score_mode == "sigmoid":
+        # kept in fp32: the kernel selects in fp32 for this mode
+        return torch.sigmoid(logits.to(torch.float32))
     # "softmax" mode in the kernel means "no pre-transform" (identity)
     return logits
 
@@ -375,12 +378,16 @@ def _check_routing_data_bucket(
     ],
 )
 @pytest.mark.parametrize(
-    "score_mode, has_bias, renorm, routed_scaling_factor",
+    "score_mode, has_bias, renorm, routed_scaling_factor, dtype",
     [
-        ("sqrtsoftplus", True, True, 2.5),  # full V4 noaux_tc path
-        ("sqrtsoftplus", True, False, 1.0),  # bias, no renorm
-        ("sqrtsoftplus", False, True, 1.0),  # no bias
-        ("softmax", False, False, 1.0),  # identity transform, no renorm
+        ("sqrtsoftplus", True, True, 2.5, torch.float32),  # full V4 noaux_tc path
+        ("sqrtsoftplus", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sqrtsoftplus", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.float32),  # full GLM-5.2 / DSv3 path
+        ("sigmoid", True, False, 1.0, torch.float32),  # bias, no renorm
+        ("sigmoid", False, True, 1.0, torch.float32),  # no bias
+        ("sigmoid", True, True, 2.5, torch.bfloat16),  # selection must stay fp32
+        ("softmax", False, False, 1.0, torch.float32),  # identity, no renorm
     ],
 )
 def test_routing_score_mode(
@@ -391,13 +398,14 @@ def test_routing_score_mode(
     has_bias,
     renorm,
     routed_scaling_factor,
+    dtype,
 ):
     if get_arch() not in ["gfx950", "gfx1250"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
 
     device = "cuda"
     torch.manual_seed(2)
-    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=torch.float32)
+    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=dtype)
     bias = (
         torch.randn(n_expts_tot, dtype=torch.float32, device=device) * 0.05
         if has_bias
