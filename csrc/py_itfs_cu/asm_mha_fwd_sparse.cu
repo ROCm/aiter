@@ -1691,6 +1691,11 @@ fmha_v3_fwd_f4f4(at::Tensor& q,
     const int head_size_v = v.sizes()[3];
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
+    // The mxfp4 V packer emits whole kTileKV-token tiles, so V's seqlen dim (and its E8M0
+    // block-scale image) is rounded up while K stays at the true length. The kernel is told the
+    // true seqlen_k and derives V's per-(b,h) scale stride from this same round-up.
+    const int seqlen_k_padded =
+        ((seqlen_k + ASM_SPARSE_BLOCK_N - 1) / ASM_SPARSE_BLOCK_N) * ASM_SPARSE_BLOCK_N;
 
     TORCH_CHECK(head_size_q_logical == ASM_SPARSE_HEAD_DIM &&
                     head_size_v == ASM_SPARSE_HEAD_DIM,
@@ -1704,10 +1709,29 @@ fmha_v3_fwd_f4f4(at::Tensor& q,
     TORCH_CHECK((gqa_ratio & (gqa_ratio - 1)) == 0,
                 "fmha_v3_fwd_f4f4: GQA ratio (HQ/HK) must be a power of 2 (got ",
                 gqa_ratio, ").");
+    // Ragged KV (seqlen_k % ASM_SPARSE_BLOCK_N != 0) is supported: the kernel masks the partial last
+    // tile and clamps the V buffer to the TILE-PADDED length, which the col-major fp4 V pack requires
+    // (see mi350_fmha_hd128_f4f4.py init_buffer_addresses). v is passed at seqlen_k_padded because
+    // that pack always materialises whole tiles.
 
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads,   head_size_q_packed);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size_q_packed);
-    CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+    CHECK_SHAPE(v, batch_size, seqlen_k_padded, num_heads_k, head_size_v);
+
+    // v_descale is the E8M0 block-scale image: one 512 B block per kTileKV tokens per (b, kv_head),
+    // and the kernel DERIVES the per-(b,h) slice stride from seqlen_k (no stride is passed for it).
+    // A tensor that is short or laid out differently therefore reads into a neighbouring slice and
+    // silently produces wrong exponents, so pin the total size here. Only the element count is
+    // constrained, since callers may present it as [b, h_kv, nT*512] or already flattened.
+    TORCH_CHECK(v_descale.is_contiguous(),
+                "fmha_v3_fwd_f4f4: v_descale must be contiguous.");
+    TORCH_CHECK(v_descale.numel() ==
+                    static_cast<int64_t>(batch_size) * num_heads_k * seqlen_k_padded * 4,
+                "fmha_v3_fwd_f4f4: v_descale must hold ",
+                static_cast<int64_t>(batch_size) * num_heads_k * seqlen_k_padded * 4,
+                " E8M0 bytes (batch=", batch_size, " HK=", num_heads_k,
+                " padded seqlen_k=", seqlen_k_padded, " x 4 B/token); got ",
+                v_descale.numel(), ".");
 
     auto opts = q.options();
     at::Tensor out;
