@@ -493,7 +493,7 @@ __device__ inline void global_load(const D* g_base, void* smem_base,
     const auto s_os = opus::layout_to_offsets<VEC>(u_smem);
     auto* s_ptr = reinterpret_cast<OPUS_LDS_ADDR char*>(reinterpret_cast<__UINTPTR_TYPE__>(smem_base));
     const char* src = reinterpret_cast<const char*>(g_base)
-                    + static_cast<long>(g_os[0]) * static_cast<long>(sizeof(D));
+                    + static_cast<int64_t>(g_os[0]) * static_cast<int64_t>(sizeof(D));
     const unsigned int m0_base = __builtin_amdgcn_readfirstlane(static_cast<unsigned int>(
         reinterpret_cast<__UINTPTR_TYPE__>(s_ptr + s_os[0] * static_cast<int>(sizeof(D)))));
 
@@ -532,7 +532,7 @@ __device__ inline auto global_load(const D* g_base, const Layout& u) {
     opus::static_for<N>([&](auto i) {
         opus::set_slice(r, *reinterpret_cast<const opus::vector_t<D, VEC>*>(
                                reinterpret_cast<const char*>(g_base)
-                               + static_cast<long>(os[i.value]) * static_cast<long>(sizeof(D))),
+                               + static_cast<int64_t>(os[i.value]) * static_cast<int64_t>(sizeof(D))),
                         opus::number<i.value * VEC>{}, opus::number<(i.value + 1) * VEC>{});
     });
     return r;
@@ -542,7 +542,7 @@ __device__ inline auto global_load(const D* g_base, const Layout& u) {
 template<opus::index_t VEC, class D>
 __device__ inline auto global_load(const D* g_base, opus::index_t os) {
     return *reinterpret_cast<const opus::vector_t<D, VEC>*>(
-        reinterpret_cast<const char*>(g_base) + static_cast<long>(os) * static_cast<long>(sizeof(D)));
+        reinterpret_cast<const char*>(g_base) + static_cast<int64_t>(os) * static_cast<int64_t>(sizeof(D)));
 }
 
 // =============================================================================
