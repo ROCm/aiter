@@ -112,6 +112,8 @@ def get_shapes():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_gemm_afp8wfp8(M: int, N: int, K: int, dtype: torch.dtype):
     torch.manual_seed(0)
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("MXFP8 GEMM has no gfx1250 Triton config")
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     torch.cuda.empty_cache()
@@ -128,6 +130,8 @@ def test_gemm_afp8wfp8(M: int, N: int, K: int, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_gemm_afp8wfp8_preshuffle(M: int, N: int, K: int, dtype: torch.dtype):
     torch.manual_seed(0)
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("MXFP8 GEMM has no gfx1250 Triton config")
     if not arch_info.is_fp8_avail():
         pytest.skip("MXFP8 GEMM requires FP8-capable arch")
     if N % 16 != 0 or K % 32 != 0:

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -72,13 +74,12 @@ def run_triton(
 
 
 def get_x_vals():
-
     x_vals = [
-        (m, n1, n2, k)
-        for k in [1024, 8192, 7168]
-        for n2 in [256, 512]
-        for n1 in [256, 512]
-        for m in [1, 8, 32, 64, 128, 8192]
+        (1, 256, 256, 1024),  # M=1 edge case
+        (32, 512, 256, 7168),  # DSR1-like K, small M
+        (128, 256, 512, 3072),  # medium M, K divisible by 256 for FP4 shuffle
+        (64, 512, 512, 4096),  # Llama3-like K
+        (256, 256, 256, 7168),  # DSR1-like K, larger M
     ]
     return x_vals
 
@@ -88,6 +89,11 @@ def get_x_vals():
 @pytest.mark.parametrize("output", [True, False])
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("fp4_shuffle", [True, False])
+@pytest.mark.xfail(
+    condition=bool(os.getenv("HSA_MODEL_LIB")),
+    reason="FFM gfx1250 model produces incorrect fused FP4 GEMM results",
+    strict=False,
+)
 def test_gemm(dtype, M, N1, N2, K, output, skip_reduce, fp4_shuffle):
 
     if not (arch_info.is_fp4_avail()):

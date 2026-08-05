@@ -2529,6 +2529,8 @@ def sliding_window_performance_test():
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("pa_decode_gluon does not support gfx1250")
     if case_set_name == "normal_accuracy":
         normal_accuracy_test()
     elif case_set_name == "normal_accuracy_aot":

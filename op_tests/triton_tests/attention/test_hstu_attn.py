@@ -4,6 +4,7 @@ import torch
 from aiter.ops.triton.attention.hstu_attention import (
     _AttentionFunction,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.hstu_attention_ref import (
     torch_hstu_attention,
 )
@@ -149,6 +150,9 @@ def test_hstu_attention(
     max_seq_len: int,  # for repro
     sparsity: float,  # for repro
 ):
+    if arch_info.get_arch() == "gfx1250":
+        pytest.skip("HSTU attention has no gfx1250 Triton config")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     dropout_pr = 0.0

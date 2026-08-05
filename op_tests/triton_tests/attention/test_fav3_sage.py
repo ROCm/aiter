@@ -846,8 +846,8 @@ def test_sage_mxfp4(
     layout = "bhsd"
     hadamard_rotate = True  # hadamard expected to be on
 
-    if not (arch_info.is_fp4_avail()):
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)
@@ -922,8 +922,8 @@ def test_sage_mxfp4_block_sparse_none(
     dtype=torch.bfloat16,
 ):
     """With block_lut=None, MXFP4 output must match non-sparse path."""
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
     q, k, v = input_helper(
@@ -969,8 +969,8 @@ def test_sage_mxfp4_block_sparse_vs_reference(
     dtype=torch.bfloat16,
 ):
     """Block-sparse MXFP4 output matches reference that applies the same block mask."""
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -1039,8 +1039,8 @@ def test_sage_mxfp4_block_sparse_vs_reference(
 @pytest.mark.parametrize("layout", ["bhsd"])
 def test_sage_mxfp4_block_sparse_empty_kv_blocks(layout: str, dtype=torch.bfloat16):
     """When a Q block has no KV blocks allowed, that block's output is zero."""
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
     torch.cuda.empty_cache()
     torch.manual_seed(20)
 
@@ -1304,8 +1304,8 @@ def test_sage_mxfp4_return_lse_matches_reference(
     an un-smoothed K would produce (within mxfp4 quant noise). This is the
     property that FA-style ring-attention merging relies on.
     """
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
 
     HEAD_SZ = 128
     torch.cuda.empty_cache()
@@ -1383,8 +1383,8 @@ def test_sage_mxfp4_ring_merge_matches_single_call(
     (within mxfp4 quant noise). Pre-fix this diverges with RING_DEGREE because
     each shard uses a different K mean; post-fix it stays bounded.
     """
-    if not arch_info.is_fp4_avail():
-        pytest.skip("MXFP4 not supported on this architecture")
+    if arch_info.get_arch() != "gfx950":
+        pytest.skip("SAGE MXFP4 is only supported on gfx950")
 
     HEAD_SZ = 128
     assert SEQLEN % RING_DEGREE == 0

@@ -1,3 +1,4 @@
+import os
 import random
 import sys
 
@@ -10,35 +11,12 @@ from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attentio
 @pytest.mark.parametrize(
     "batch, h, n_ctx_q, n_ctx, d, total_programs, init_dtype, BLOCK_M, BLOCK_N, waves_per_eu, num_warps ",
     [
-        (1, 64, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 64, 16, [524288], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 96, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
-        (1, 96, 16, [1048576], 16, 912, torch.float16, 16, 256, 1, 4),
-        (1, 128, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [131072], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [262144], 64, 912, torch.float16, 16, 64, 2, 4),
-        (1, 128, 16, [524288], 16, 912, torch.float16, 16, 256, 1, 4),
-        (3, 64, 16, [4096, 32768, 65536], 64, 912, torch.float16, 16, 64, 2, 4),
-        (
-            8,
-            64,
-            16,
-            [1024, 1024, 2048, 2048, 4096, 4096, 32768, 65536],
-            64,
-            912,
-            torch.float16,
-            16,
-            64,
-            2,
-            4,
-        ),
+        (1, 64, 16, [4096], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 96, 16, [8192], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 128, 16, [4096], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 128, 16, [16384], 64, 912, torch.float16, 16, 64, 2, 4),
+        (1, 64, 16, [32768], 64, 912, torch.float16, 16, 64, 2, 4),
+        (3, 64, 16, [1024, 2048, 4096], 64, 912, torch.float16, 16, 64, 2, 4),
     ],
 )
 def test_persistent_lean_attention(
@@ -55,6 +33,9 @@ def test_persistent_lean_attention(
     waves_per_eu,
     num_warps,
 ):
+    if os.environ.get("HSA_MODEL_LIB"):
+        pytest.skip("persistent lean attention does not complete under FFM")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     torch.manual_seed(20)

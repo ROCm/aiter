@@ -26,6 +26,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post, mhc_post_pre
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.mhc_config_utils import (
     hip_post_dispatch_block as _hip_post_dispatch_block,
 )
@@ -49,6 +50,12 @@ except ImportError:
     _aiter = None
     _HAS_AITER_MHC_PRE = False
     _HAS_AITER_MHC_POST = False
+
+
+requires_mhc_post_config = pytest.mark.skipif(
+    arch_info.get_arch() == "gfx1250",
+    reason="MHC_POST has no gfx1250 config",
+)
 
 
 # =============================================================================
@@ -719,6 +726,7 @@ def test_triton_mhc_matches_hip(M, n, C):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@requires_mhc_post_config
 def test_mhc_post_correctness(M, n, C, dtype):
     """Test mhc_post against PyTorch reference."""
     layer_input, residual, post_mix, comb_mix = generate_mhc_post_inputs(M, n, C, dtype)
@@ -734,6 +742,7 @@ def test_mhc_post_correctness(M, n, C, dtype):
     )
 
 
+@requires_mhc_post_config
 def test_mhc_post_preallocated_output():
     """Verify in-place path: result is out and matches reference."""
     from aiter.ops.triton.fusions.mhc import mhc_post
@@ -763,6 +772,7 @@ def test_mhc_post_preallocated_output():
     )
 
 
+@requires_mhc_post_config
 def test_mhc_post_squeeze_post_mix():
     """Pass post_mix as (M, n, 1) — as mhc() emits it."""
     from aiter.ops.triton.fusions.mhc import mhc_post
@@ -812,6 +822,7 @@ def test_mhc_post_squeeze_post_mix():
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@requires_mhc_post_config
 def test_triton_mhc_post_matches_hip(M, n, C, dtype):
     """Triton ``mhc_post()`` matches HIP ``aiter.mhc_post()``.
 
@@ -876,6 +887,7 @@ def test_triton_mhc_post_matches_hip(M, n, C, dtype):
 @pytest.mark.parametrize("C", [1024, 4096, 7168])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_asymmetric_exp_domain", [False, True])
+@requires_mhc_post_config
 def test_triton_mhc_pre_post(M, n, C, dtype, use_asymmetric_exp_domain):
     """Fused ``mhc_post_pre()`` matches the unfused reference chain.
 
@@ -1050,6 +1062,7 @@ def mhc_e2e_triton(
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@requires_mhc_post_config
 def test_mhc_e2e_correctness(M, n, C, dtype):
     """
     Test correctness of Triton mhc → mhc_post pipeline

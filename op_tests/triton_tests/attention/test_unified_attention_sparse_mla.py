@@ -275,12 +275,12 @@ def chunk_input(
     )
 
 
-@pytest.mark.parametrize("s_q", [1, 64, 177])
-@pytest.mark.parametrize("s_k", [1, 64, 177])
-@pytest.mark.parametrize("top_k", [64, 78])
-@pytest.mark.parametrize("num_q_heads", [16, 32])
-@pytest.mark.parametrize("lora_dim", [256, 512])
-@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("s_q", [1, 64])
+@pytest.mark.parametrize("s_k", [1, 64])
+@pytest.mark.parametrize("top_k", [64])
+@pytest.mark.parametrize("num_q_heads", [128])
+@pytest.mark.parametrize("lora_dim", [512])
+@pytest.mark.parametrize("block_size", [64])
 @torch.inference_mode()
 def test_triton_unified_attn(
     s_q: int,

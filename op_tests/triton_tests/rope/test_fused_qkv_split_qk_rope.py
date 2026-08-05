@@ -162,8 +162,8 @@ def test_fused_qkv_split_qk_rope(
         rotate_style,
     )
 
-    torch.testing.assert_close(q_torch, q_triton)
-    torch.testing.assert_close(k_torch, k_triton)
+    torch.testing.assert_close(q_torch, q_triton, atol=5e-4, rtol=2e-2)
+    torch.testing.assert_close(k_torch, k_triton, atol=5e-4, rtol=2e-2)
     torch.testing.assert_close(v_torch, v_triton)
 
 

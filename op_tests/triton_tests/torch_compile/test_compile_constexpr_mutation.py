@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import pytest
 import torch
 import triton
@@ -49,6 +51,10 @@ def torch_rmsnorm(x, weight, eps):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("M, N", [(32, 64), (64, 128), (128, 256)])
+@pytest.mark.skipif(
+    bool(os.environ.get("HSA_MODEL_LIB")),
+    reason="torch.compile mutation tracking is not reliable under FFM",
+)
 def test_compile_constexpr_mutation(M, N, dtype):
     """Triton kernel with tl.constexpr + shared-storage views under torch.compile."""
     torch.manual_seed(42)

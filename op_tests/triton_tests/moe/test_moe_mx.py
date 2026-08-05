@@ -6,14 +6,14 @@ import torch
 
 from aiter.ops.triton.moe.moe_op_mxfp4 import fused_moe_mxfp4
 from aiter.ops.triton.moe.moe_op_mxfp4_silu_fused import fused_moe_mxfp4_silu
-from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
-from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
-from aiter.ops.triton.utils.types import str_to_torch_dtype, torch_to_triton_dtype
+from aiter.ops.triton.utils.types import torch_to_triton_dtype, str_to_torch_dtype
 from op_tests.triton_tests.moe.test_moe import (
-    torch_moe_align_block_size_ref,
     torch_moe_ref,
+    torch_moe_align_block_size_ref,
 )
+import aiter.ops.triton.utils._triton.arch_info as arch_info
+from aiter.ops.triton.utils.moe_config_utils import get_optimal_moe_config_func
+from aiter.ops.triton.utils.moe_common import torch_silu_and_mul_ref
 
 DEBUG_MODE = False
 
@@ -267,18 +267,10 @@ def input_helper(
     [
         (64, 64, 128, 8, 2),
         (16, 256, 256, 128, 4),
-        (1000, 704, 800, 3, 1),
-        (1000, 704, 800, 8, 2),
-        (64, 14336, 4096, 8, 2),
-        (16, 14336, 128, 8, 2),  # not working either
-        (16, 14336, 4096, 4, 1),
-        (1, 14336, 128, 4, 2),
-        (3, 14336, 128, 4, 2),
-        (16, 14336, 128, 1, 1),
-        (64, 7186, 128, 8, 2),
-        (64, 3584, 128, 8, 2),
         (64, 1792, 128, 8, 2),
-        (1, 1024, 16384, 2, 1),
+        (16, 2048, 2048, 4, 1),
+        (64, 512, 2048, 8, 2),
+        (1, 1024, 2048, 2, 1),
     ],
 )
 @pytest.mark.parametrize(

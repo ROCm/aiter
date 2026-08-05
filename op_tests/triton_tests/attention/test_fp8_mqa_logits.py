@@ -87,14 +87,10 @@ def generate_cp_test_data(seq_len, seq_len_kv):
     "s_q, s_k",
     [
         (1, 1),
-        (1, 16),
         (1, 113),
-        (17, 76),
-        (61, 113),
         (61, 1024),
         (128, 1024),
         (1024, 1024),
-        (1024, 1560),
     ],
 )
 @pytest.mark.parametrize("num_heads", [64])

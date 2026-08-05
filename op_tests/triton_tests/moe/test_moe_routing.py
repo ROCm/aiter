@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -394,6 +396,8 @@ def test_routing_score_mode(
 ):
     if get_arch() not in ["gfx950", "gfx1250"]:
         pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+    if os.environ.get("HSA_MODEL_LIB") and score_mode == "sqrtsoftplus":
+        pytest.skip("sqrtsoftplus routing does not compile with the FFM Triton pin")
 
     device = "cuda"
     torch.manual_seed(2)

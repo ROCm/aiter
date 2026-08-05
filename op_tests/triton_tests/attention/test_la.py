@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import math
+import os
 import sys
 
 import pytest
@@ -346,6 +347,9 @@ def test_persistent_lean_attention(
     waves_per_eu,
     num_warps,
 ):
+    if os.environ.get("HSA_MODEL_LIB"):
+        pytest.skip("persistent lean attention does not complete under FFM")
+
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
 
     torch.manual_seed(20)

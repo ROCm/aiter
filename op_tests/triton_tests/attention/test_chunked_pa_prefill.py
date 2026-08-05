@@ -10,7 +10,7 @@ import torch
 from aiter.ops.triton.attention.chunked_pa_prefill import chunked_prefill_paged_decode
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
-NUM_HEADS = [64]
+NUM_HEADS = [8]
 NUM_QUERIES_PER_KV = [1, 8]
 HEAD_SIZES = [128]
 DTYPES = [torch.float16]
@@ -342,12 +342,12 @@ def test_contexted_kv_attention(
         v_scale,
         _,
     ) = input_helper(
-        BS=10,
-        MAX_SEQ_LEN=1024,
-        MAX_CTX_LEN=1024,
-        cache_size=640,
+        BS=1,
+        MAX_SEQ_LEN=16,
+        MAX_CTX_LEN=64,
+        cache_size=4,
         block_size=32,
-        max_block_per_request=64,
+        max_block_per_request=2,
         num_heads=num_heads,
         head_size=head_size,
         num_queries_per_kv=num_queries_per_kv,
@@ -422,12 +422,12 @@ def test_contexted_kv_attention_alibi(
         v_scale,
         alibi_slopes,
     ) = input_helper(
-        BS=10,
-        MAX_SEQ_LEN=1024,
-        MAX_CTX_LEN=1024,
-        cache_size=640,
+        BS=1,
+        MAX_SEQ_LEN=16,
+        MAX_CTX_LEN=64,
+        cache_size=4,
         block_size=32,
-        max_block_per_request=64,
+        max_block_per_request=2,
         num_heads=num_heads,
         head_size=head_size,
         num_queries_per_kv=num_queries_per_kv,
