@@ -10,6 +10,7 @@ from .cumsum import (
 from .index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
+    prepare_max_seq_chunks,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "l2norm_fwd",
     "prepare_chunk_indices",
     "prepare_chunk_offsets",
+    "prepare_max_seq_chunks",
     "prepare_num_chunks",
     "prepare_rebased_cu_seqlens",
     "recompute_w_u_fwd",

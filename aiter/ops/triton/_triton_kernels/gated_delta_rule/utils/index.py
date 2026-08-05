@@ -216,6 +216,33 @@ def prepare_num_chunks(
 
 
 @tensor_cache
+def prepare_max_seq_chunks(
+    cu_seqlens: torch.LongTensor,
+    chunk_size: int,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+) -> int:
+    """Largest per-sequence chunk count across the prefill sequences (host int).
+
+    Equals ``max_i cdiv(prefill_seqlen_i, chunk_size)``, which is the chunk-column
+    count a rectangular ``(chunk, sequence x head)`` launch grid needs in order to
+    cover the longest sequence -- as opposed to ``prepare_num_chunks``, which gives
+    the flattened block count. Reuses the cached ``prepare_chunk_offsets``; the
+    single ``int()`` D2H is memoized per ``(cu_seqlens identity, chunk_size,
+    num_decodes, num_decode_tokens)``, so it runs once per shape rather than once
+    per forward call.
+
+    See ``prepare_chunk_indices`` for the decode-prefix slicing semantics.
+    """
+    offsets = prepare_chunk_offsets(
+        cu_seqlens, chunk_size, num_decodes, num_decode_tokens
+    )
+    if offsets.numel() <= 1:
+        return 0
+    return int((offsets[1:] - offsets[:-1]).max())
+
+
+@tensor_cache
 def get_max_num_splits(cu_seqlens: torch.LongTensor, chunk_size: int) -> int:
     """Get maximum number of splits (chunks) across all sequences."""
     return triton.cdiv(int(max(prepare_lens(cu_seqlens))), chunk_size)
