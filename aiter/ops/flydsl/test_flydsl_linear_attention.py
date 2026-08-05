@@ -47,6 +47,9 @@ class Args:
     head_k_dim: int
     head_v_dim: int
     use_qk_l2norm: bool = True
+    # KDA supplies an f32 bias alongside a lower-precision query. None keeps the
+    # bias tied to dtype, which is what every pre-847 caller does.
+    dt_bias_dtype: torch.dtype | None = None
 
 
 def create_inputs(args):
@@ -71,7 +74,11 @@ def create_inputs(args):
     b = torch.randn(
         (args.b, args.sq, args.num_v_heads), dtype=args.dtype, device="cuda"
     )
-    dt_bias = torch.randn((args.num_v_heads), dtype=args.dtype, device="cuda")
+    dt_bias = torch.randn(
+        (args.num_v_heads),
+        dtype=args.dt_bias_dtype or args.dtype,
+        device="cuda",
+    )
     dt_bias.uniform_(1, 2)
     A_log = torch.randn((args.num_v_heads), dtype=torch.float32, device="cuda")
     A_log.uniform_(0, 16)
@@ -431,9 +438,41 @@ def ref_func(args, query, key, value, a, b, dt_bias, A_log, indices, state, out)
             head_v_dim=128,
             use_qk_l2norm=True,
         ),
+        # f32 bias against a lower-precision query: the decoupling added for KDA.
+        Args(
+            dtype=torch.bfloat16,
+            b=1,
+            sq=1,
+            num_k_heads=2,
+            num_v_heads=8,
+            head_k_dim=128,
+            head_v_dim=128,
+            use_qk_l2norm=True,
+            dt_bias_dtype=torch.float32,
+        ),
+        Args(
+            dtype=torch.float16,
+            b=2,
+            sq=2,
+            num_k_heads=16,
+            num_v_heads=32,
+            head_k_dim=128,
+            head_v_dim=128,
+            use_qk_l2norm=True,
+            dt_bias_dtype=torch.float32,
+        ),
     ],
 )
 def test_flydsl_gdr_decode(args):
+    check_gdr_decode(args)
+
+
+def check_gdr_decode(args):
+    """Compare the FlyDSL decode against the Triton reference for one config.
+
+    Shared with ``op_tests`` so the CI-visible test reuses this oracle instead of
+    carrying a second copy of the reference kernel.
+    """
     inputs = create_inputs(args)
     outputs = create_outputs(args)
     ref_outputs = create_outputs(args)
