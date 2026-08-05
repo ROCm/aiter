@@ -272,8 +272,11 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         elif n <= 3072:
             block_n = 128
             num_buffers = 2
-        else:
+        elif n <= 4096:
             block_n = 256
+            num_buffers = 1
+        else:
+            block_n = 512
             num_buffers = 1
 
     elif block_m == 32:
