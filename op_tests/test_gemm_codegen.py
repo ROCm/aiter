@@ -465,27 +465,64 @@ def test_write_name_keyed_lookup_header():
                 pass
 
 
+def test_dsr1_m32_gluon_csv_registration():
+    _section("DeepSeek-R1 M=32 Gluon production CSV registration")
+
+    tuned_file = os.path.join(
+        _REPO_ROOT,
+        "aiter",
+        "configs",
+        "model_configs",
+        "a8w8_blockscale_tuned_gemm_ds_v3.csv",
+    )
+    frame = pd.read_csv(tuned_file)
+    expected = {
+        "gluon_dsr1_m32_n2112_k7168": (32, 2112, 7168),
+        "gluon_dsr1_m32_n3072_k1536": (32, 3072, 1536),
+        "gluon_dsr1_m32_n4608_k7168": (32, 4608, 7168),
+        "gluon_dsr1_m32_n7168_k2048": (32, 7168, 2048),
+        "gluon_dsr1_m32_n7168_k2304": (32, 7168, 2304),
+    }
+    for selector, (m, n, k) in expected.items():
+        rows = frame[
+            (frame["gfx"] == "gfx950")
+            & (frame["cu_num"] == 256)
+            & (frame["M"] == m)
+            & (frame["N"] == n)
+            & (frame["K"] == k)
+        ]
+        _check(
+            f"DSv3 CSV: exact key {(m, n, k)} has one row",
+            len(rows) == 1,
+            f"rows={rows.to_dict('records')}",
+        )
+        if len(rows) != 1:
+            continue
+        row = rows.iloc[0]
+        _check(
+            f"DSv3 CSV: exact key {(m, n, k)} selects {selector}",
+            row["libtype"] == "gluon"
+            and row["kernelName"] == selector
+            and int(row["kernelId"]) == 0
+            and int(row["splitK"]) == 0,
+            f"row={row.to_dict()}",
+        )
+
+
 def test_blockscale_kernel_name_forwarding():
     _section("6. Python -> C++ kernelName forwarding for blockscale GEMM")
 
     try:
         import aiter.ops.gemm_op_a8w8 as a8w8_mod
+        import aiter.ops.triton.gluon.gemm_a8w8_blockscale_dsr1_m32 as gluon_dispatch
         from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config
     except Exception as e:  # noqa: BLE001
         print(f"  SKIP  could not import gemm_op_a8w8 ({e})")
         return
 
-    try:
-        from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
-
-        gfx = get_gfx_runtime()
-        cu_num = get_cu_num()
-    except Exception as e:  # noqa: BLE001
-        print(f"  SKIP  forwarding tests require a live GPU for gfx detection ({e})")
-        return
-
-    # Stub torch.empty so we don't allocate device memory; the recorded calls
-    # below short-circuit before any kernel actually runs.
+    # Pin runtime detection to a supported target so every dispatch check runs
+    # with CPU tensors and mocked kernels; no live GPU or kernel launch is needed.
+    gfx, cu_num = TARGET_B
     try:
         import torch
     except Exception as e:  # noqa: BLE001
@@ -496,10 +533,14 @@ def test_blockscale_kernel_name_forwarding():
     saved = {
         "ck": a8w8_mod.gemm_a8w8_blockscale_ck,
         "cktile": a8w8_mod.gemm_a8w8_blockscale_cktile,
+        "gluon": gluon_dispatch.try_gemm_a8w8_blockscale_dsr1_m32,
+        "get_gfx": a8w8_mod.get_gfx,
+        "get_cu_num": a8w8_mod.get_cu_num,
         "cache": dict(a8w8_mod._CKGEMM_CONFIG_CACHE),
         "has_gfx": dict(a8w8_mod._CKGEMM_HAS_GFX),
     }
     record = {}
+    gluon_contract = {"matches": True}
 
     def fake_ck(*args, **kwargs):
         record["libtype"] = "ck"
@@ -510,6 +551,22 @@ def test_blockscale_kernel_name_forwarding():
         record["libtype"] = "cktile"
         record["kwargs"] = dict(kwargs)
         return args[4]  # Y
+
+    def fake_gluon(*args, kernel_name, gfx):
+        record["gluon_called"] = True
+        record["gluon_kernel_name"] = kernel_name
+        record["gluon_gfx"] = gfx
+        record["gluon_out"] = args[4]
+        if gluon_contract["matches"]:
+            record["libtype"] = "gluon"
+            return args[4]  # Y
+        return None
+
+    def fake_get_gfx():
+        return gfx
+
+    def fake_get_cu_num():
+        return cu_num
 
     AITER_CONFIGS = a8w8_mod.AITER_CONFIGS
 
@@ -531,8 +588,11 @@ def test_blockscale_kernel_name_forwarding():
             cls.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE = saved
 
     try:
+        a8w8_mod.get_gfx = fake_get_gfx
+        a8w8_mod.get_cu_num = fake_get_cu_num
         a8w8_mod.gemm_a8w8_blockscale_ck = fake_ck
         a8w8_mod.gemm_a8w8_blockscale_cktile = fake_cktile
+        gluon_dispatch.try_gemm_a8w8_blockscale_dsr1_m32 = fake_gluon
 
         m, n, k = 32, 128, 256
 
@@ -668,9 +728,100 @@ def test_blockscale_kernel_name_forwarding():
                 f"recorded kwargs={record.get('kwargs')}",
             )
 
+        # 6.5 A known Gluon selector is forwarded to the exact-shape helper.
+        _check(
+            "gluon dispatch: every selector has a frozen CK fallback",
+            gluon_dispatch.DSR1_M32_CK_FALLBACK_CONFIGS.keys()
+            == gluon_dispatch.DSR1_M32_KERNEL_SHAPES.keys(),
+            "selector/fallback key sets differ",
+        )
+        # Use the one prior CK winner with non-zero splitK so this test proves
+        # that contract rejection preserves both parts of its tuned config.
+        known_selector = "gluon_dsr1_m32_n4608_k7168"
+        csv_gluon = _make_temp_csv(f"""
+            gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
+            {gfx},{cu_num},{m},{n},{k},0,gluon,0,10.0,{known_selector},100.0,500.0,0.0
+        """)
+        csv_paths.append(csv_gluon)
+        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+        a8w8_mod._CKGEMM_HAS_GFX = {}
+        get_CKGEMM_config.cache_clear()
+        with _override_blockscale_csv(csv_gluon):
+            gluon_contract["matches"] = True
+            record.clear()
+            result = a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+            _check(
+                "gluon CSV: known selector routes to the M=32 Gluon helper",
+                record.get("libtype") == "gluon" and record.get("gluon_called") is True,
+                f"record={record}",
+            )
+            _check(
+                "gluon CSV: selector and preallocated output are forwarded",
+                record.get("gluon_kernel_name") == known_selector
+                and result is record.get("gluon_out"),
+                f"record={record}",
+            )
+
+            # 6.6 A padded-M or otherwise ineligible runtime contract must use
+            # the existing CK fallback even though the CSV row selects Gluon.
+            gluon_contract["matches"] = False
+            record.clear()
+            a8w8_mod.gemm_a8w8_blockscale(
+                XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+            )
+            _check(
+                "gluon CSV: helper returning None falls back to CK",
+                record.get("gluon_called") is True and record.get("libtype") == "ck",
+                f"record={record}",
+            )
+            _check(
+                "gluon CSV: contract fallback preserves the prior tuned CK path",
+                record.get("kwargs", {}).get("kernelName")
+                == gluon_dispatch.DSR1_M32_CK_FALLBACK_CONFIGS[known_selector][1]
+                and record.get("kwargs", {}).get("splitK")
+                == gluon_dispatch.DSR1_M32_CK_FALLBACK_CONFIGS[known_selector][0],
+                f"recorded kwargs={record.get('kwargs')}",
+            )
+
+        # 6.7 Unknown Gluon selectors are configuration errors, not CK fallbacks.
+        unknown_selector = "gluon_dsr1_m32_unknown"
+        csv_gluon_unknown = _make_temp_csv(f"""
+            gfx,cu_num,M,N,K,kernelId,libtype,splitK,us,kernelName,tflops,bw,errRatio
+            {gfx},{cu_num},{m},{n},{k},0,gluon,0,10.0,{unknown_selector},100.0,500.0,0.0
+        """)
+        csv_paths.append(csv_gluon_unknown)
+        a8w8_mod._CKGEMM_CONFIG_CACHE = {}
+        a8w8_mod._CKGEMM_HAS_GFX = {}
+        get_CKGEMM_config.cache_clear()
+        gluon_dispatch.try_gemm_a8w8_blockscale_dsr1_m32 = saved["gluon"]
+        with _override_blockscale_csv(csv_gluon_unknown):
+            record.clear()
+            raised = None
+            try:
+                a8w8_mod.gemm_a8w8_blockscale(
+                    XQ, WQ, x_scale, w_scale, dtype=torch.bfloat16
+                )
+            except RuntimeError as e:
+                raised = e
+            _check(
+                "gluon CSV: unknown selector raises RuntimeError",
+                raised is not None and unknown_selector in str(raised),
+                f"err={raised}",
+            )
+            _check(
+                "gluon CSV: unknown selector does not silently call CK",
+                record.get("libtype") != "ck",
+                f"record={record}",
+            )
+
     finally:
+        a8w8_mod.get_gfx = saved["get_gfx"]
+        a8w8_mod.get_cu_num = saved["get_cu_num"]
         a8w8_mod.gemm_a8w8_blockscale_ck = saved["ck"]
         a8w8_mod.gemm_a8w8_blockscale_cktile = saved["cktile"]
+        gluon_dispatch.try_gemm_a8w8_blockscale_dsr1_m32 = saved["gluon"]
         a8w8_mod._CKGEMM_CONFIG_CACHE = saved["cache"]
         a8w8_mod._CKGEMM_HAS_GFX = saved["has_gfx"]
         get_CKGEMM_config.cache_clear()
@@ -938,6 +1089,7 @@ if __name__ == "__main__":
     test_write_lookup_header()
     test_write_name_keyed_lookup_header()
     test_runtime_dispatch_key()
+    test_dsr1_m32_gluon_csv_registration()
     test_blockscale_kernel_name_forwarding()
     test_build_tune_dict_strict_unknown_kernel()
 

@@ -834,7 +834,36 @@ def gemm_a8w8_blockscale(
             libtype = config["libtype"]
             splitK = int(config.get("splitK", 0))
             kernelName = str(config.get("kernelName", ""))
-            if libtype == "ck":
+            if libtype == "gluon":
+                from .triton.gluon.gemm_a8w8_blockscale_dsr1_m32 import (
+                    DSR1_M32_CK_FALLBACK_CONFIGS,
+                    try_gemm_a8w8_blockscale_dsr1_m32,
+                )
+
+                gluon_out = try_gemm_a8w8_blockscale_dsr1_m32(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    kernel_name=kernelName,
+                    gfx=get_gfx(),
+                )
+                if gluon_out is not None:
+                    return gluon_out
+                fallback_split_k, fallback_kernel_name = DSR1_M32_CK_FALLBACK_CONFIGS[
+                    kernelName
+                ]
+                return gemm_a8w8_blockscale_ck(
+                    XQ,
+                    WQ,
+                    x_scale,
+                    w_scale,
+                    Y,
+                    splitK=fallback_split_k,
+                    kernelName=fallback_kernel_name,
+                )
+            elif libtype == "ck":
                 return gemm_a8w8_blockscale_ck(
                     XQ,
                     WQ,
