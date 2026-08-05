@@ -724,6 +724,7 @@ class FmoeTuner(TunerCommon):
         kparams,
         blockM,
         act_type,
+        sorted_output=False,
     ):
         from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
@@ -741,8 +742,57 @@ class FmoeTuner(TunerCommon):
             activation=act_type,
             inter_dim_pad=0,
             bias=bias,
+            sorted_output=sorted_output,
         )
         return out
+
+    @staticmethod
+    def run_opus_stage1_sorted_ref(
+        a1_qt,
+        w1_qt,
+        w2_qt,
+        topk_weights,
+        topk_ids,
+        a1_scale,
+        w1_scale,
+        sorted_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        bias,
+        dtype,
+        act_type,
+        q_type,
+        doweight_stage1,
+        topk,
+        blockM,
+    ):
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            a1_qt,
+            w1_qt,
+            w2_qt,
+            topk_weights,
+            topk_ids,
+            a1_scale,
+            w1_scale,
+            w1_bias=bias,
+            dtype=dtype,
+            activation=act_type,
+            quant_type=q_type,
+            doweight_stage1=doweight_stage1,
+            topk=topk,
+            blockM=blockM,
+        )
+        return _v2_stage1_ref(
+            ref1,
+            topk_ids,
+            sorted_ids,
+            sorted_expert_ids,
+            int(num_valid_ids[0].item()),
+            token=int(a1_qt.shape[0]),
+            inter_dim=int(ref1.shape[-1]),
+            bm_s1=int(blockM),
+            max_sorted=int(sorted_ids.numel()),
+        )
 
     @staticmethod
     def run_flydsl_stage2_out(
@@ -869,7 +919,11 @@ class FmoeTuner(TunerCommon):
     ):
         # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
         # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         out, _scale = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_shuf,
@@ -885,6 +939,8 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
             act=act,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
             w1_scale=w1_scale_shuf,
             a1_scale=a1_scale_sort,
             sorted_weights=None,
@@ -936,6 +992,49 @@ class FmoeTuner(TunerCommon):
             "n": v["n"],
             "max_sorted": v["max_sorted"],
             "ref2": d["ref2"],
+        }
+
+    @staticmethod
+    def generate_opus_sorted_stage2_data(
+        token,
+        model_dim,
+        inter_dim,
+        expert,
+        topk,
+        blockM,
+        act_type,
+        device="cuda",
+    ):
+        v2 = FmoeTuner.generate_v2_stage2_data(
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            blockM,
+            "fp8",
+            act_type,
+            device=device,
+        )
+        scale_cols = ((inter_dim // 32 + 7) // 8) * 8
+        return {
+            "a2_qt": v2["isq"].view(dtypes.fp8).view(-1, inter_dim),
+            "w2_qt_shffle_ck": v2["w2u8"]
+            .view(dtypes.fp4x2)
+            .view(expert, model_dim, inter_dim // 2),
+            "sorted_ids": v2["sti"],
+            "sorted_expert_ids": v2["sei"],
+            "sorted_weights": v2["swt"],
+            "num_valid_ids": v2["cumsum"],
+            "w2_scale_aiter": v2["w2sc"]
+            .view(dtypes.fp8_e8m0)
+            .view(expert * model_dim, -1),
+            "a2_scale_mxfp4_sort": v2["iss"].view(dtypes.fp8_e8m0).view(-1, scale_cols),
+            "moe_buf": torch.empty(
+                (token, model_dim), dtype=dtypes.bf16, device=v2["isq"].device
+            ),
+            "bias": None,
+            "ref2": v2["ref2"],
         }
 
     @staticmethod
@@ -1081,6 +1180,8 @@ class FmoeTuner(TunerCommon):
                 kernel_id=kid,
                 inter_dim_pad=0,
                 return_per_slot=True,
+                token_num=int(moe_buf.shape[0]),
+                topk=int(topk),
             )
             if route_out.dtype == torch.uint8:  # MXFP8 route_out
                 return opus_moe_stage2_reduce_token_slot_route_output_fwd(
@@ -1106,6 +1207,8 @@ class FmoeTuner(TunerCommon):
             block_m=blockM,
             kernel_id=kid,
             inter_dim_pad=0,
+            token_num=int(moe_buf.shape[0]),
+            topk=int(topk),
         )
 
     @staticmethod
@@ -3728,6 +3831,7 @@ class FmoeTuner(TunerCommon):
         from aiter.ops.opus.moe_stage2_a8w4_meta import (
             OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
             get_opus_a8w4_stage2_kernels,
+            opus_a8w4_layout_name,
         )
 
         sys.path.insert(0, f"{AITER_CSRC_DIR}/opus_moe/")
@@ -3787,6 +3891,37 @@ class FmoeTuner(TunerCommon):
             False,
             True,
         )
+        sorted_s1_ref_args = (
+            [
+                "a1_qt",
+                "w1_qt",
+                "w2_qt",
+                "topk_weights",
+                "topk_ids",
+                "a1_scale",
+                "w1_scale",
+                "sorted_ids",
+                "sorted_expert_ids",
+                "num_valid_ids",
+                "bias",
+            ],
+            dtype,
+            act_type,
+            q_type,
+            doweight_stage1,
+            topk,
+        )
+        sorted_s1_compare = None
+        if stage1_supported and is_flydsl_available():
+            from aiter.ops.flydsl.mxfp4_v2_tune_utils import (
+                v2_stage1_dequant_cosine_err,
+            )
+
+            sorted_s1_compare = functools.partial(
+                v2_stage1_dequant_cosine_err,
+                inter_dim=inter_dim,
+                adtype="fp8",
+            )
 
         # fp8-activation stage2 ref (shape-level, shared by all opus kids): torch
         # stage2 on the bf16 stage1 output, sliced by opus_eff to match runtime effective-K.
@@ -3876,6 +4011,59 @@ class FmoeTuner(TunerCommon):
                             cosine_diff_compare,
                         )
                     )
+                    if sorted_s1_compare is not None:
+                        # Internal v2=1 marks the sorted-route intermediate ABI.
+                        # It is stripped before CSV output; kernelName2's
+                        # *_moe2_layout_* prefix remains the persistent marker.
+                        tasks_opus.append(
+                            (
+                                (info, "stage1", inst.profile_name, blockM, 0, 1),
+                                FmoeTuner.generate_data_2stages,
+                                (
+                                    token,
+                                    model_dim,
+                                    inter_dim,
+                                    expert,
+                                    topk,
+                                    act_type,
+                                    dtype,
+                                    q_dtype_a,
+                                    q_dtype_w,
+                                    q_type,
+                                    use_g1u1,
+                                    doweight_stage1,
+                                    blockM,
+                                    1,
+                                    True,
+                                ),
+                                FmoeTuner.run_opus_stage1_out,
+                                (
+                                    [
+                                        "a1_qt_fp8_cast",
+                                        "w1_qt_shffle_ck",
+                                        "sorted_ids",
+                                        "sorted_expert_ids",
+                                        "num_valid_ids",
+                                        "w1_scale_aiter",
+                                        "a1_scale_e8m0_one_sort",
+                                        "bias",
+                                    ],
+                                    topk,
+                                    s1_params,
+                                    blockM,
+                                    act_type,
+                                    True,
+                                ),
+                                {},
+                                FmoeTuner.run_opus_stage1_sorted_ref,
+                                sorted_s1_ref_args + (blockM,),
+                                {},
+                                None,
+                                0.1,
+                                0.1,
+                                sorted_s1_compare,
+                            )
+                        )
             for kname, kparams in get_opus_a8w4_stage2_kernels(token=token).items():
                 # tuner blockM is the moe_sorting block_m; valid only when it
                 # equals the kid's SORT_BLOCK_M.
@@ -3920,6 +4108,39 @@ class FmoeTuner(TunerCommon):
                         cosine_diff_compare,
                     )
                 )
+                if is_flydsl_available():
+                    tasks_opus.append(
+                        (
+                            (
+                                info,
+                                "stage2",
+                                opus_a8w4_layout_name(kname),
+                                blockM,
+                                0,
+                                1,
+                            ),
+                            FmoeTuner.generate_opus_sorted_stage2_data,
+                            (
+                                token,
+                                model_dim,
+                                inter_dim,
+                                expert,
+                                topk,
+                                blockM,
+                                act_type,
+                            ),
+                            FmoeTuner.run_opus_stage2_out,
+                            run_args,
+                            {},
+                            FmoeTuner.run_v2_stage2_ref,
+                            (["ref2"],),
+                            {},
+                            None,
+                            0.1,
+                            0.1,
+                            cosine_diff_compare,
+                        )
+                    )
 
         return tasks_opus
 
@@ -4600,6 +4821,15 @@ class FmoeTuner(TunerCommon):
                 tasks_ck.extend(self.gen_flydsl_2stages_task(info, blockMs))
             if _want("flydslv2"):
                 tasks_ck.extend(self.gen_flydsl_v2_2stages_task(info, blockMs))
+            elif _opus_only and not _tune_only:
+                # OPUS_ONLY still needs the sorted-layout consumer so Opus
+                # stage1 v2=1 tasks can compete with sorted-layout consumers.
+                # Keep FlyDSL v2 stage1 out of this mode.
+                tasks_ck.extend(
+                    task
+                    for task in self.gen_flydsl_v2_2stages_task(info, blockMs)
+                    if task[0][1] == "stage2"
+                )
             if _want("flydsli4"):
                 tasks_ck.extend(self.gen_flydsl_i4_2stages_task(info, blockMs))
             if _want("opus"):
@@ -5319,8 +5549,8 @@ class FmoeTuner(TunerCommon):
                     )
 
             # v2 is a transient tuning-time pairing marker; the persistent v2
-            # marker is kernelName2's ``flydsl_moe2_layout_`` prefix. Drop it before the
-            # best-row selection so it never reaches the tuned CSV. (It still
+            # marker is kernelName2's ``*_moe2_layout_*`` prefix. Drop it before
+            # the best-row selection so it never reaches the tuned CSV. (It still
             # appears in the profile_fmoe.csv debug dump, since prorfiles
             # captured the pre-strip DataFrame by reference; that is fine -- the
             # dump already carries internal columns like stage/flat/ksplit.)

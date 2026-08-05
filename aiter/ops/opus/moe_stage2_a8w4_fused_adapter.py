@@ -61,6 +61,12 @@ def is_opus_a8w4_stage2_kernel(kernel_name) -> bool:
     return name == OPUS_A8W4_STAGE2_KERNEL or opus_a8w4_kid_from_name(name) is not None
 
 
+def is_opus_a8w4_stage2_layout_kernel(kernel_name) -> bool:
+    from .moe_stage2_a8w4_meta import opus_a8w4_is_layout_name
+
+    return opus_a8w4_is_layout_name(_cfg_str(kernel_name))
+
+
 def route_bucket_metadata(cfg: dict) -> dict[str, object]:
     return {
         "route_bucket": _cfg_str(
@@ -257,11 +263,7 @@ def opus_a8w4_stage2_wrapper(
         raise ValueError("Opus A8W4 stage2 does not support EP expert_mask/topk_ids")
     if a2_scale is None or w2_scale is None:
         raise ValueError("Opus A8W4 stage2 requires a2_scale and w2_scale")
-    if inter_states.dim() != 3:
-        raise ValueError(
-            "Opus A8W4 stage2 expects inter_states=[token, topk, inter_dim], "
-            f"got {tuple(inter_states.shape)}"
-        )
+    token_num = int(out.shape[0])
     from .moe_stage2_a8w4_meta import (
         OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     )
@@ -271,13 +273,13 @@ def opus_a8w4_stage2_wrapper(
     expected_w2 = (
         w2.shape[0],
         w2.shape[1],
-        inter_states.shape[2] // kernel_contract.fp4_values_per_byte,
+        inter_states.shape[-1] // kernel_contract.fp4_values_per_byte,
     )
     if tuple(w2.shape) != expected_w2:
         raise ValueError(
             f"Opus A8W4 stage2 expects w2={list(expected_w2)}, got {tuple(w2.shape)}"
         )
-    expected_out = (inter_states.shape[0], w2.shape[1])
+    expected_out = (token_num, w2.shape[1])
     if tuple(out.shape) != expected_out:
         raise ValueError(
             f"Opus A8W4 stage2 expects out={list(expected_out)}, "
@@ -303,6 +305,8 @@ def opus_a8w4_stage2_wrapper(
             kernel_id=int(kernel_id),
             inter_dim_pad=actual_inter_dim_pad,
             return_per_slot=True,
+            token_num=token_num,
+            topk=int(topk),
         )
         if route_out.dtype == torch.uint8:  # MXFP8 route_out
             return opus_moe_stage2_reduce_token_slot_route_output_fwd(
@@ -328,6 +332,8 @@ def opus_a8w4_stage2_wrapper(
         block_m=sort_block_m,
         kernel_id=int(kernel_id),
         inter_dim_pad=actual_inter_dim_pad,
+        token_num=token_num,
+        topk=int(topk),
     )
 
 
@@ -336,6 +342,7 @@ __all__ = [
     "cfg_is_supported",
     "check_route_bucket_metadata",
     "is_opus_a8w4_stage2_kernel",
+    "is_opus_a8w4_stage2_layout_kernel",
     "opus_a8w4_stage2_wrapper",
     "route_bucket_metadata",
     "stage2_cfg_values",

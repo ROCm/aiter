@@ -96,7 +96,9 @@ struct opus_moe_stage2_a8w4_kargs
     int num_experts;
     int model_dim;
     int sorted_blocks;
+    int a_rows;
     int a_scale_rows;
+    int sorted_intermediate;
     int route_out_fp8;          // Runtime guard for the MXFP8 route-out path.
     int64_t route_out_row_bytes;  // fp8 route_out row stride bytes (= model_dim + model_dim/8).
 };

@@ -111,7 +111,7 @@ def parse_csv(csv_path: str):
                 else None
             )
             stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
-            stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
+            stage1_v2_output_layout = "_moe2_layout_" in stage2_name
             stage2_v2_params = (
                 parse_flydsl_v2_gemm2_kernel(stage2_name)
                 if stage1_v2_output_layout

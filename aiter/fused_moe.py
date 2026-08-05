@@ -1262,6 +1262,7 @@ class MOEMetadata:
     expected_sorted_blocks: int | None = None
     min_sorted_blocks: int | None = None
     max_sorted_blocks: int | None = None
+    sorted_intermediate: bool = False
 
 
 def _needs_swiglu_bias_support(dtype, quant_type):
@@ -1298,6 +1299,7 @@ def _opus_a8w4_stage1_wrapper(
     situ_beta: float = 4.0,
     situ_linear_beta: float = 25.0,
     inter_dim_pad: int = 0,
+    sorted_output: bool = False,
     **_kwargs,
 ):
     if sorted_weights is not None:
@@ -1324,6 +1326,7 @@ def _opus_a8w4_stage1_wrapper(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        sorted_output=sorted_output,
     )
 
 
@@ -2390,6 +2393,7 @@ def get_2stage_cfgs(
     is_opus1 = isinstance(kernelName1, str) and kernelName1.startswith("opus_moe1_")
     is_cktile2 = isinstance(kernelName2, str) and kernelName2.startswith("cktile_")
     is_opus2 = _opus_a8w4.is_opus_a8w4_stage2_kernel(kernelName2)
+    is_opus2_layout = _opus_a8w4.is_opus_a8w4_stage2_layout_kernel(kernelName2)
     if is_opus1 or ((is_flydsl1 or is_flydsl2) and is_flydsl_available()):
         enable_bias = (
             _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == dtypes.fp4x2
@@ -2471,6 +2475,9 @@ def get_2stage_cfgs(
         if flydsl_v2_stage2_cfg is not None:
             stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
             _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
+        # The stage2 name is the persistent ABI marker. Existing Opus stage2
+        # rows remain token-major; *_moe2_layout_* aliases require sorted-route.
+        sorted_intermediate = is_flydsl2_layout or is_opus2_layout
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -2481,7 +2488,8 @@ def get_2stage_cfgs(
             fuse_quant=_fuse_quant,
             stage2_has_bias=enable_bias
             and ((is_flydsl2 and not is_flydsl2_layout) or is_cktile2),
-            skip_inter_quant=is_flydsl2_layout,
+            skip_inter_quant=sorted_intermediate,
+            sorted_intermediate=sorted_intermediate,
             **route_bucket_metadata,
         )
     if (
@@ -3037,7 +3045,7 @@ def fused_moe_2stages(
     if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     if stage1_func is _flydsl_stage1_wrapper:
-        if stage2_func is _flydsl_v2_stage2_wrapper:
+        if metadata.sorted_intermediate:
             extra_stage1_args["v2_output_layout"] = True
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
@@ -3047,6 +3055,8 @@ def fused_moe_2stages(
             1.0 if linear_beta is None else float(linear_beta)
         )
     elif stage1_func is _opus_a8w4_stage1_wrapper:
+        if metadata.sorted_intermediate:
+            extra_stage1_args["sorted_output"] = True
         extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)

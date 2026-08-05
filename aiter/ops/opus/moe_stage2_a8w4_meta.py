@@ -34,6 +34,8 @@ OPUS_A8W4_KID_ATOMIC_BM16_BN128_B3_WS2_BT256 = 2011
 OPUS_A8W4_KID_ATOMIC_BM32_BN128_OCC1_B2_WS2 = 2012
 
 _OPUS_A8W4_REDUCE_BLOCK_N_RE = re.compile(r"_rbn(\d+)$")
+_OPUS_A8W4_STAGE2_PREFIX = "opus_moe2_"
+OPUS_A8W4_STAGE2_LAYOUT_PREFIX = "opus_moe2_layout_"
 
 
 @dataclass(frozen=True)
@@ -496,6 +498,22 @@ def _opus_a8w4_stage2_instance(kid: int) -> OpusA8W4Stage2Instance | None:
     return OPUS_A8W4_STAGE2_BY_KID.get(int(kid))
 
 
+def opus_a8w4_is_layout_name(name) -> bool:
+    return str(name).strip().startswith(OPUS_A8W4_STAGE2_LAYOUT_PREFIX)
+
+
+def opus_a8w4_layout_name(name: str) -> str:
+    name = str(name).strip()
+    return OPUS_A8W4_STAGE2_LAYOUT_PREFIX + name[len(_OPUS_A8W4_STAGE2_PREFIX) :]
+
+
+def opus_a8w4_canonical_name(name: str) -> str:
+    name = str(name).strip()
+    if opus_a8w4_is_layout_name(name):
+        return _OPUS_A8W4_STAGE2_PREFIX + name[len(OPUS_A8W4_STAGE2_LAYOUT_PREFIX) :]
+    return name
+
+
 def opus_a8w4_base_name(name: str) -> str:
     return _OPUS_A8W4_REDUCE_BLOCK_N_RE.sub("", str(name).strip())
 
@@ -509,7 +527,7 @@ def opus_a8w4_reduce_block_n_from_name(name) -> int | None:
 
 
 def opus_a8w4_kid_from_name(name) -> int | None:
-    name = str(name).strip()
+    name = opus_a8w4_canonical_name(name)
     inst = OPUS_A8W4_STAGE2_BY_NAME.get(name)
     if inst is None:
         inst = OPUS_A8W4_STAGE2_BY_NAME.get(opus_a8w4_base_name(name))

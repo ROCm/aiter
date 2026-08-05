@@ -124,6 +124,8 @@ def _opus_moe_stage2_a8w4_decode_fwd_raw(
     sorted_expert_ids: Tensor,
     num_valid_ids: Tensor,
     out: Tensor,
+    token_num: int,
+    topk: int,
     block_m: int,
     kernel_id: int,
     inter_dim_pad: int,
@@ -160,9 +162,17 @@ def opus_moe_stage2_a8w4_decode_fwd(
     kernel_id: int = -1,
     return_per_slot: bool = False,
     route_out_dtype: str | None = None,
+    token_num: int | None = None,
+    topk: int | None = None,
 ) -> Tensor:
+    if inter_states.dim() == 2:
+        token_num = int(token_num)
+        topk = int(topk)
+    else:
+        token_num = int(inter_states.shape[0])
+        topk = int(inter_states.shape[1])
     effective_inter_dim = opus_a8w4_effective_inter_dim(
-        inter_states.shape[2], inter_dim_pad
+        inter_states.shape[-1], inter_dim_pad
     )
     if effective_inter_dim is None:
         raise ValueError(
@@ -178,7 +188,7 @@ def opus_moe_stage2_a8w4_decode_fwd(
         )
     elif not return_per_slot and kernel_id == -1 and block_m == 32:
         kernel_id = opus_a8w4_best_atomic_kid(
-            inter_states.shape[0],
+            token_num,
         )
         block_m = opus_a8w4_kid_block_m(kernel_id)
     route_out = bool(return_per_slot)
@@ -206,13 +216,13 @@ def opus_moe_stage2_a8w4_decode_fwd(
     if out is None:
         if route_out_fp8:
             # MXFP8 route_out: uint8 [rows, md fp8 | md/8 e8m0 scale].
-            rows = inter_states.shape[0] * inter_states.shape[1]
+            rows = token_num * topk
             out = torch.empty((rows, md + md // 8), dtype=torch.uint8, device=w2.device)
         else:
             shape = (
-                (inter_states.shape[0], inter_states.shape[1], w2.shape[1])
+                (token_num, topk, w2.shape[1])
                 if route_out
-                else (inter_states.shape[0], w2.shape[1])
+                else (token_num, w2.shape[1])
             )
             alloc = torch.empty if route_out else torch.zeros
             out = alloc(shape, dtype=torch.bfloat16, device=w2.device)
@@ -231,6 +241,8 @@ def opus_moe_stage2_a8w4_decode_fwd(
         _contiguous(sorted_expert_ids),
         _contiguous(num_valid_ids),
         kernel_out,
+        token_num,
+        topk,
         int(block_m),
         int(kernel_id),
         int(inter_dim_pad),

@@ -741,9 +741,15 @@ inline __device__ void epilogue_quantize_row_pass(
         return;
 
     constexpr int kValuesPerWord = static_cast<int>(sizeof(uint32_t));
-    const int output_word_route_base =
-        route.token * static_cast<int>(kargs.stride_out_t / kValuesPerWord) +
-        route.slot * static_cast<int>(kargs.stride_out_k / kValuesPerWord) +
+    int output_word_route_base;
+    if(kargs.sorted_intermediate)
+        output_word_route_base =
+            route_row * static_cast<int>(kargs.stride_out_t / kValuesPerWord);
+    else
+        output_word_route_base =
+            route.token * static_cast<int>(kargs.stride_out_t / kValuesPerWord) +
+            route.slot * static_cast<int>(kargs.stride_out_k / kValuesPerWord);
+    output_word_route_base +=
         (tile.out_col_base + local_col_base) / kValuesPerWord;
 
     const int group_base =

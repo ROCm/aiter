@@ -40,6 +40,7 @@ struct OpusMoeStage1A8W4Kargs
     int inter_dim;
     int hidden_scale_cols;
     int k_steps;
+    int sorted_intermediate;
     ActivationType activation;
     float swiglu_limit;
     float situ_beta;

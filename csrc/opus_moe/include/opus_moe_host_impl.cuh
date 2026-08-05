@@ -400,14 +400,18 @@ void opus_moe_stage2_a8w4_decode_fwd(
     aiter_tensor_t& sorted_expert_ids,
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
+    int token_num,
+    int actual_topk,
     int block_m,
     int kernel_id,
     int inter_dim_pad)
 {
+    const bool sorted_intermediate = inter_states.dim() == 2;
     check_tensor(inter_states,
                  "inter_states",
-                 3,
-                 "[token, topk, packed_inter_dim]",
+                 sorted_intermediate ? 2 : 3,
+                 sorted_intermediate ? "[sorted_route, inter_dim]"
+                                     : "[token, topk, packed_inter_dim]",
                  AITER_DTYPE_fp8,
                  "fp8");
     check_tensor(
@@ -434,9 +438,8 @@ void opus_moe_stage2_a8w4_decode_fwd(
     if(sorted_weights.has_value())
         check_same_device(inter_states, "inter_states", *sorted_weights, "sorted_weights");
 
-    const int token_num = static_cast<int>(inter_states.size(0));
-    const int actual_topk = static_cast<int>(inter_states.size(1));
-    const int logical_inter_dim = static_cast<int>(inter_states.size(2));
+    const int logical_inter_dim =
+        static_cast<int>(inter_states.size(sorted_intermediate ? 1 : 2));
     const int effective_inter_dim = logical_inter_dim - inter_dim_pad;
     const int num_experts = static_cast<int>(w2.size(0));
     const int model_dim = static_cast<int>(w2.size(1));
@@ -529,7 +532,7 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.num_valid_ids = reinterpret_cast<const int32_t*>(num_valid_ids.data_ptr());
     kargs.out_bf16 = reinterpret_cast<hip_bfloat16*>(out.data_ptr());
     kargs.stride_a_t = inter_states.stride(0);
-    kargs.stride_a_k = inter_states.stride(1);
+    kargs.stride_a_k = sorted_intermediate ? 0 : inter_states.stride(1);
     kargs.stride_w_e = w2.stride(0);
     kargs.stride_w_h = w2.stride(1);
     kargs.stride_a_scale_route = a2_scale.stride(0);
@@ -540,7 +543,9 @@ void opus_moe_stage2_a8w4_decode_fwd(
     kargs.num_experts = num_experts;
     kargs.model_dim = model_dim;
     kargs.sorted_blocks = sorted_blocks;
+    kargs.a_rows = static_cast<int>(inter_states.size(0));
     kargs.a_scale_rows = static_cast<int>(a2_scale.size(0));
+    kargs.sorted_intermediate = sorted_intermediate ? 1 : 0;
     // Keep a runtime route-out guard: the MXFP8 path codegen is measurably more
     // stable than making route-out a pure compile-time else branch.
     kargs.route_out_fp8 = route_out_fp8 ? 1 : 0;
@@ -642,6 +647,7 @@ void opus_moe_stage1_a8w4_fwd(
     aiter_tensor_t& num_valid_ids,
     aiter_tensor_t& out,
     aiter_tensor_t& out_scale,
+    int topk,
     int block_m,
     const std::string& kernelName,
     int inter_dim_pad,
@@ -650,6 +656,7 @@ void opus_moe_stage1_a8w4_fwd(
     float situ_beta,
     float situ_linear_beta)
 {
+    const bool sorted_intermediate = out.dim() == 2;
     check_tensor(hidden_states,
                  "hidden_states",
                  2,
@@ -672,7 +679,13 @@ void opus_moe_stage1_a8w4_fwd(
                  "fp8_e8m0");
     if(bias.has_value())
         check_tensor(*bias, "bias", 2, "[expert, 2 * inter_dim]", AITER_DTYPE_fp32, "fp32");
-    check_tensor(out, "out", 3, "[token, topk, inter_dim]", AITER_DTYPE_fp8, "fp8");
+    check_tensor(out,
+                 "out",
+                 sorted_intermediate ? 2 : 3,
+                 sorted_intermediate ? "[sorted_route, inter_dim]"
+                                     : "[token, topk, inter_dim]",
+                 AITER_DTYPE_fp8,
+                 "fp8");
     check_tensor(out_scale,
                  "out_scale",
                  2,
@@ -690,8 +703,7 @@ void opus_moe_stage1_a8w4_fwd(
     const int num_experts = static_cast<int>(w1.size(0));
     const int gate_up_dim = static_cast<int>(w1.size(1));
     const int packed_model_dim = static_cast<int>(w1.size(2));
-    const int topk = static_cast<int>(out.size(1));
-    const int inter_dim = static_cast<int>(out.size(2));
+    const int inter_dim = static_cast<int>(out.size(sorted_intermediate ? 1 : 2));
     const int sorted_blocks =
         active_sorted_block_upper_bound(sorted_expert_ids, token_num, topk);
     const int effective_inter_dim = inter_dim - inter_dim_pad;
@@ -752,8 +764,9 @@ void opus_moe_stage1_a8w4_fwd(
                 model_dim / opus_moe::stage1_a8w4::kFp4ValuesPerByte,
                 ", got ",
                 packed_model_dim);
-    AITER_CHECK(out.size(0) == token_num,
-                "out token dimension must match hidden_states token dimension");
+    if(!sorted_intermediate)
+        AITER_CHECK(out.size(0) == token_num,
+                    "out token dimension must match hidden_states token dimension");
     AITER_CHECK(hidden_scale.size(1) >= hidden_scale_cols,
                 "hidden_scale second dimension must cover model_dim / ",
                 scale_group);
@@ -790,7 +803,7 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.stride_w1_e = w1.stride(0);
     kargs.stride_w1_bias_e = bias.has_value() ? bias->stride(0) : 0;
     kargs.stride_out_t = out.stride(0);
-    kargs.stride_out_k = out.stride(1);
+    kargs.stride_out_k = sorted_intermediate ? 0 : out.stride(1);
     kargs.stride_out_scale_route = out_scale.stride(0);
     kargs.token_num = token_num;
     kargs.topk = topk;
@@ -798,6 +811,7 @@ void opus_moe_stage1_a8w4_fwd(
     kargs.inter_dim = inter_dim;
     kargs.hidden_scale_cols = hidden_scale_cols;
     kargs.k_steps = k_steps;
+    kargs.sorted_intermediate = sorted_intermediate ? 1 : 0;
     kargs.activation = activation_type;
     kargs.swiglu_limit = swiglu_limit;
     kargs.situ_beta = situ_beta;
