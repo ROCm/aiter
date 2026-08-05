@@ -98,7 +98,7 @@ def test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype):
         bs = name == "blockscale"
         out, us = run_perftest(
             lambda a_scale=a_scale, b_scale=b_scale, bs=bs: (
-                aiter.gemm_a8w8_mxscale_preshuffle(
+                aiter.gemm_a8w8_mxscale_preshuffle_flydsl(
                     a_codes, b_shuf, a_scale, b_scale, dtype, blockscale=bs
                 )
             )
@@ -122,7 +122,7 @@ def main():
     # Whole-op gate: the kernel is gfx950-only and needs the flydsl toolchain.
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
-            "gemm_a8w8_mxscale_preshuffle unsupported on %s; skipping", get_gfx()
+            "gemm_a8w8_mxscale_preshuffle_flydsl unsupported on %s; skipping", get_gfx()
         )
         return
     from aiter.ops.flydsl.utils import is_flydsl_available
@@ -178,7 +178,7 @@ def main():
             df.append(test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype))
         df = pd.DataFrame(df)
         aiter.logger.info(
-            "gemm_a8w8_mxscale_preshuffle summary (markdown):\n%s",
+            "gemm_a8w8_mxscale_preshuffle_flydsl summary (markdown):\n%s",
             df.to_markdown(index=False),
         )
 

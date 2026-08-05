@@ -452,22 +452,6 @@ def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
 
 
 def shuffle_scale_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
-    """Coarse A blockscale ``(rows, K//128)`` E8M0 -> compact per-lane words.
-
-    The `shuffle_scale_a16w4` layout for a scale that is *constant inside each
-    128-K block*: the byte a lane reads is ``[n1][k1][nl][kp][np]`` with
-    ``row = n1*32 + np*16 + nl`` and ``kblk = k1*2 + kp``. K_Lane drops out (the
-    consumer broadcasts it in the load address), so this is 4x smaller than the
-    per-1x32 form.
-
-    Equivalent to expanding to per-1x32, running `shuffle_scale_a16w4` and keeping
-    only K_Lane 0 (the other three slices are byte-identical copies) -- but with no
-    expansion and no full-shuffle temporary, so it is cheap enough to call per
-    iteration on device. ``rows`` must be a multiple of 32.
-
-    Consumed by the gfx950 mxscale preshuffle GEMM in blockscale mode
-    (`aiter.gemm_a8w8_mxscale_preshuffle`); pair with `shuffle_scale_blockscale_b`.
-    """
     s = a_scale.view(torch.uint8)
     rows = s.shape[0]
     if s.shape[-1] != K // 128:
@@ -485,15 +469,6 @@ def shuffle_scale_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
 
 
 def shuffle_scale_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
-    """Coarse B blockscale ``(N//128, K//128)`` E8M0 -> one word per (128-N block, chunk).
-
-    B is constant over N as well, so N_Lane and 3/4 of the 32-N super-rows drop out
-    too -- 256x smaller than the per-1x32 form. The word keeps ``[kp, np]`` with np
-    duplicated: the consumer's opsel picks the N half by byte index, and both halves
-    share the value. Static per weight, so do this once at weight-prep time.
-
-    See `shuffle_scale_blockscale_a` for the shared derivation.
-    """
     s = b_scale.view(torch.uint8)
     if s.shape != (N // 128, K // 128):
         raise ValueError(

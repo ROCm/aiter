@@ -227,7 +227,7 @@ def gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
 # 1x128), so it gets its own entry rather than a libtype branch there.
 
 
-def gemm_a8w8_mxscale_preshuffle(
+def gemm_a8w8_mxscale_preshuffle_flydsl(
     XQ: Tensor,
     WQ: Tensor,
     x_scale: Tensor,
@@ -260,14 +260,17 @@ def gemm_a8w8_mxscale_preshuffle(
     """
     if get_gfx() != "gfx950":
         raise RuntimeError(
-            f"gemm_a8w8_mxscale_preshuffle requires gfx950, got {get_gfx()}"
+            f"gemm_a8w8_mxscale_preshuffle_flydsl requires gfx950, got {get_gfx()}"
         )
     if not is_flydsl_available():
-        raise RuntimeError("gemm_a8w8_mxscale_preshuffle requires flydsl")
+        raise RuntimeError("gemm_a8w8_mxscale_preshuffle_flydsl requires flydsl")
     assert dtype in (
         dtypes.bf16,
         dtypes.fp16,
-    ), f"Output {dtype=} is currently not supported in gemm_a8w8_mxscale_preshuffle"
+    ), (
+        f"Output {dtype=} is currently not supported in "
+        "gemm_a8w8_mxscale_preshuffle_flydsl"
+    )
 
     from .flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
 
