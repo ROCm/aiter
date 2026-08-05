@@ -23,12 +23,13 @@ Usage:
 """
 
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 
 import flydsl.compiler as flyc
-from aiter import pertoken_quant
+from aiter import ActivationType, QuantType, pertoken_quant
 from aiter.fused_moe import moe_sorting
 from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
     _stage1_activation_module_tag,
@@ -400,6 +401,74 @@ def _run_stage1_bridge(
     return g, out, ref
 
 
+def _run_stage1_tuner(
+    tokens,
+    model_dim,
+    inter_dim,
+    experts,
+    topk,
+    tile_m,
+    tile_n,
+    tile_k,
+    k_batch,
+    group_size=32,
+):
+    """Exercise the autotuner's FlyDSL stage1 launcher for SiTUv2."""
+    tuner_dir = (
+        Path(__file__).resolve().parents[1]
+        / "csrc"
+        / "ck_gemm_moe_2stages_codegen"
+    )
+    sys.path.insert(0, str(tuner_dir))
+    from gemm_moe_tune import FmoeTuner
+
+    g = _gen_common(tokens, model_dim, inter_dim, experts, topk, tile_m)
+    w1_codes, scale_w1_groups, w1_kernel, scale_w1_1d = _gen_w1(
+        g["dev"], experts, inter_dim, model_dim, group_size
+    )
+    w1 = w1_kernel.view(experts, 2 * inter_dim, model_dim // 2)
+    kparams = {
+        "in_dtype": "fp4_bf16",
+        "a_dtype": "bf16",
+        "b_dtype": "fp4",
+        "out_dtype": "bf16",
+        "tile_m": tile_m,
+        "tile_n": tile_n,
+        "tile_k": tile_k,
+        "k_batch": k_batch,
+    }
+    out = FmoeTuner.run_flydsl_stage1_out(
+        g["x"],
+        w1,
+        g["sorted_ids"],
+        g["sorted_expert_ids"],
+        None,
+        g["num_valid_ids"],
+        scale_w1_1d,
+        None,
+        None,
+        torch.bfloat16,
+        topk,
+        kparams,
+        tile_m,
+        torch.bfloat16,
+        QuantType.per_1x32,
+        ActivationType.Situv2,
+    )
+    torch.cuda.synchronize()
+    ref = _ref_stage1(
+        g,
+        w1_codes,
+        scale_w1_groups,
+        inter_dim,
+        group_size,
+        act="situv2",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    return out, ref
+
+
 def _run_stage2_bridge(g, a2, tokens, model_dim, inter_dim, experts, topk,
                        tile_m, tile_n, tile_k, group_size=32):
     dev = g["dev"]
@@ -470,6 +539,14 @@ def test_a16w4_stage1_situv2_splitk_gfx942(k_batch):
         k_batch=k_batch,
     )
     assert _check(ref, out.reshape(ref.shape), f"stage1_a16w4_situv2_kb{k_batch}")
+
+
+@pytest.mark.parametrize("k_batch", [1, 2, 4])
+@pytest.mark.skipif(not _is_gfx942(), reason="gfx942-only decode path")
+def test_a16w4_stage1_situv2_tuner_gfx942(k_batch):
+    shape = _SHAPE if k_batch == 1 else _SPLITK_SHAPE
+    out, ref = _run_stage1_tuner(**shape, k_batch=k_batch)
+    assert _check(ref, out.reshape(ref.shape), f"tuner_a16w4_situv2_kb{k_batch}")
 
 
 def test_stage1_module_name_distinguishes_situv2_betas():

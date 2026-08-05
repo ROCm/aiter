@@ -81,6 +81,11 @@ TUNE_MOE_EXPERT_BALANCE = (
 
 COS_DIFF_THRESHOLD = 1e-1
 
+# Kimi-K3 SiTUv2 parameters. Keep the FlyDSL candidate and torch reference on
+# the same constants so correctness gating measures the requested activation.
+_TUNER_SITU_BETA = 4.0
+_TUNER_SITU_LINEAR_BETA = 25.0
+
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
@@ -510,7 +515,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
-        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -535,6 +544,8 @@ class FmoeTuner(TunerCommon):
             b_dtype=kparams["b_dtype"],
             out_dtype=_out_dtype,
             act=act,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
@@ -1455,6 +1466,8 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        situ_beta=_TUNER_SITU_BETA,
+        situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1478,6 +1491,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -1756,6 +1771,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
