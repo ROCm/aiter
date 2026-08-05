@@ -168,6 +168,7 @@ def _batched_gemm_a16wfp4_kernel(
         offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
             0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
         )
+        offs_ks_local = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
             b_scales_ptr
@@ -179,7 +180,16 @@ def _batched_gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
+            if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
+            else:
+                b_scales = tl.load(
+                    b_scale_ptrs,
+                    mask=offs_ks_local[None, :]
+                    < ((2 * K) // SCALE_GROUP_SIZE)
+                    - k * (BLOCK_SIZE_K // SCALE_GROUP_SIZE),
+                    other=0,
+                )
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
@@ -189,7 +199,9 @@ def _batched_gemm_a16wfp4_kernel(
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs,
+                    mask=offs_k_bf16[None, :] < 2 * K - k * BLOCK_SIZE_K,
+                    other=0,
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0

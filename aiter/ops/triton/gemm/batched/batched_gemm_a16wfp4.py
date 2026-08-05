@@ -105,6 +105,9 @@ def batched_gemm_a16wfp4_(
     Bx, M, K = x.shape
     Bw, N, K = w.shape
     assert Bx == Bw
+    assert (
+        2 * K % 32 == 0
+    ), f"unpacked K must be a multiple of 32 for mxfp4 scales, got {2 * K}"
     B = Bx
 
     if config is None:
