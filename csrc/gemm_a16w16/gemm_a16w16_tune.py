@@ -461,6 +461,11 @@ class GemmA16W16Tuner(GemmCommonTuner):
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
         )
+        self.parser.add_argument(
+            "--exclude-splitk",
+            action="store_true",
+            help="Exclude all split-K kernel families.",
+        )
 
     def _clear_op_caches(self):
         from aiter.tuned_gemm import get_GEMM_A16W16_config, get_GEMM_A16W16_config_
@@ -986,6 +991,14 @@ class GemmA16W16Tuner(GemmCommonTuner):
                         )
                 task.extend(opus_tasks)
 
+            if args.exclude_splitk:
+                task[prev_count:] = [
+                    candidate
+                    for candidate in task[prev_count:]
+                    if int(candidate[0][2]) <= 1
+                    and "splitk" not in str(candidate[0][3]).lower()
+                    and "split_k" not in str(candidate[0][3]).lower()
+                ]
             shape_kernel_nums = len(task) - prev_count
             tasks_data.append((shape_kernel_nums, ()))
 
