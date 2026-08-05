@@ -94,6 +94,8 @@ torch::Tensor gemm_a8w8_blockscale(torch::Tensor& XQ,
                 "splitK must be in the range [0, 30], got ",
                 splitK);
 
+    // Four or more partials use order-dependent atomic accumulation.
+    splitK     = splitK > 1 ? 1 : splitK;
     int KBatch = 1 << splitK;
 
     if(x_scale.dtype() == at::ScalarType::Float && Y.dtype() == at::ScalarType::Half)
