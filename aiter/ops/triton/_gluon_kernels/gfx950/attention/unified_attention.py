@@ -220,8 +220,6 @@ class AttentionConfig:
     v_layout: gl.constexpr
     p_layout: gl.constexpr
 
-    blocked_q: gl.constexpr
-
     Q_CACHE_MODIFIER: gl.constexpr
     KV_CACHE_MODIFIER: gl.constexpr
     USE_LOAD_BUFFER_OP: gl.constexpr
@@ -237,9 +235,7 @@ class AttentionConfig:
     NUM_MASKED_TILES: gl.constexpr
     NUM_BUFFERS: gl.constexpr
     MFMA_DIM: gl.constexpr
-    # KV-cache / block-table strides: constexpr so the fixed (allocated-once) vLLM
-    # cache strides get baked in (constant-folded addressing). Routed via the config
-    # like gfx1250; the loaders read self.cfg.stride_*.
+    # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
     stride_k_cache_0: gl.constexpr
     stride_k_cache_1: gl.constexpr
     stride_k_cache_2: gl.constexpr
@@ -306,11 +302,7 @@ class AttentionConfig:
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.DOT_FP8 = gl.constexpr(self.Q_FP8)
         self.MFMA_DIM = gl.constexpr(MFMA_DIM)
-        # MFMA M/N size. 32x32 packs 32 rows/warp (=> BLOCK_M = 32*num_warps);
-        # 16x16 allows the smaller BLOCK_M = 16*num_warps, which halves the wasted
-        # rows in GQA decode (only NUM_QUERIES_PER_KV rows/query are ever valid).
-        # K per instruction follows the CDNA4 shapes: bf16 32x32x16 / 16x16x32,
-        # fp8 32x32x64 / 16x16x128.  kWidth matches the known-good dot operands.
+        # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
         if MFMA_DIM == 32:
             mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
             self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
@@ -348,18 +340,6 @@ class AttentionConfig:
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, self.K_WIDTH_PV))
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH_PV))
 
-        ELEMENT_SIZE = 8 if Q_FP8 else 16
-        MAX_LOAD = 128
-        SIZE_PER_THREAD = MAX_LOAD // ELEMENT_SIZE
-        HEAD_SIZE_DIV = HEAD_SIZE // SIZE_PER_THREAD
-        self.blocked_q = gl.constexpr(
-            gl.BlockedLayout(
-                size_per_thread=[1, SIZE_PER_THREAD],
-                threads_per_warp=[self.WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
-                warps_per_cta=[NUM_WARPS, 1],
-                order=[1, 0],
-            )
-        )
         self.Q_CACHE_MODIFIER = gl.constexpr(".cg")
         self.KV_CACHE_MODIFIER = gl.constexpr(".cg") if ALL_DECODE else gl.constexpr("")
         self.stride_k_cache_0 = gl.constexpr(stride_k_cache_0)
