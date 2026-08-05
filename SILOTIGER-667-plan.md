@@ -38,6 +38,31 @@ progresses. Ticket description is in `SILOTIGER-667.md`.
 - **dot2 inner-loop form for the FP8 baseline:** use the **serialized `s_nop 2`** dot2
   (`dot2_bf16_packed_raw`) for correctness-first Phases 2/3. The s_nop-free + `dot2_drain4`
   ILP scheme (multiple independent accumulators) is introduced **only** with the MXFP4 work.
+- **Benchmarking & testing methodology (production-representative):** we target production
+  use-cases, so all perf numbers must come from the shared harness — never ad-hoc
+  `time.perf_counter` loops (those are under-warmed / warm-cache and misreport BW):
+  - **One combined op_test, not separate scripts.** Correctness *and* perf live in the same
+    `test_flydsl_warp_decode_moe.py`, per the `aiter-op-test` skill: `@benchmark()` fn +
+    `run_perftest` candidate loop + `checkAllclose(ref.to(fp32), out.to(fp32), ...)` +
+    a final markdown table with `us` / `TFLOPS` / `TB/s` / `err` per candidate. The torch
+    reference is computed and compared but **never timed / never in the table**.
+  - **Always time via `run_perftest`** (`aiter.test_common`). It does the warmup+repeat and
+    reports IQR-trimmed torch-profiler **device** time (pure kernel). Any published TB/s for
+    this ticket must be a `run_perftest` number.
+  - **Warmup + iters for these tiny B=1 decode kernels:** use at least **`num_warmup=5`,
+    `num_iters>=100`** (the noise floor at 200 iters is std ~0.03 TB/s; 1-warmup/50-iter
+    wall-clock is not acceptable). Pure-correctness-only checks may use the small
+    `num_iters=2, num_warmup=1` convention since perf is not being measured there.
+  - **Cache handling = cold HBM reads.** Keep `num_rotate_args` at its **default (auto
+    L2-fill)** so each timed iter streams weights cold from HBM — this is the representative
+    number for a decode kernel. Do **not** force `num_rotate_args=1` (warm-cache) except to
+    dodge OOM on very large inputs, and if so, label the number as warm-cache.
+  - **Timing modes:** report the default **device** time as the headline BW; additionally use
+    **`use_cuda_event=True`** (wall-clock, includes host dispatch) when characterizing the
+    Python entry point's per-call `ptr_arg(...)` + `current_stream()` overhead (real at B=1,
+    ~20 us kernels), and `testGraph=True` for the low-host-overhead graph-replay figure.
+  - **Roofline:** compute `TB/s` from the FP8 weight bytes actually streamed (dominant term)
+    and quote it against gfx950 HBM peak, matching the reference's %-of-peak claims.
 
 ## 3. Feasibility (verified)
 
