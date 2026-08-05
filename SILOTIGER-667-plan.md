@@ -166,9 +166,16 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [~] Scale layouts: PerTensor + PerToken done (Phase 2, gate_up); **Block2D pending**.
 - [x] Python entry point in `aiter/ops/flydsl/warp_decode_moe.py` (added in Phase 2;
       extend with `down_reduce` + Block2D).
-- [x] op_test scaffolding at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py`
-      (Phase 1 primitives + Phase 2 gate_up; conforms to §8). Extend for down/Block2D.
-- [ ] Benchmark on gfx950 vs reference numbers in the ticket (+ perf optimization pass).
+- [x] op_test at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` now meets the locked
+      §2 benchmarking standard: pytest correctness gate (primitives + gate_up + down, 10 pass)
+      **plus** a `@benchmark` + `run_perftest` + `checkAllclose` perf sweep (`python <file>`)
+      emitting a markdown table per stage (`us`/`TFLOPS`/`TB/s`/`%peak`/`err`), with
+      `--timing {device,cuda_event,graph}`, >=5 warmup / >=100 iters, and LLC-aware cold-read
+      rotation (`_rotate_for`). Extend for Block2D later.
+- [~] Benchmark on gfx950 (device time, cold reads): **gate_up B1 H7168/I2048 = 7.95 TB/s
+      (~99% peak), down B1 I2048/H7168 = 6.28 TB/s (~79% peak)**; `cuda_event` shows a ~19 us
+      host-dispatch floor per launch (entry-point `ptr_arg` + `current_stream`). Still TODO:
+      side-by-side vs the ticket's CK-Tile reference numbers.
 
 ### Follow-on (out of first baseline scope)
 - [ ] MXFP4 `down` fast path + H2 layout (beats best FP8 `down` at B≥2).
@@ -392,3 +399,12 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   weight-dword reloads); rewrote both kernels' inner loops to use it. Correctness unchanged
   (10 pass). On the DeepSeek-ish shape (B1 INTER2048 HIDDEN7168 E8 TOPK8): **gate_up ~6.9 TB/s
   (~86% HBM peak)** (big jump from ~1.4–1.6), **down ~5.7 TB/s (~71%)**. Next lever: H2 for down.
+  (Numbers superseded by the harness figures below — the throwaway wall-clock probe was
+  under-warmed/warm-cache.)
+- _testing standard_ — amended §2 with the production benchmarking methodology (combined
+  correctness+perf op_test, always `run_perftest`, >=5 warmup / >=100 iters, cold-HBM-read
+  `num_rotate_args`, device-time headline + `cuda_event`/`graph` modes, streamed-weight TB/s).
+  Rewrote the op_test to conform: kept the pytest correctness gate and added a `@benchmark`
+  perf sweep with per-stage markdown tables + `--timing`. Harness numbers (gfx950, device
+  time, cold reads): **gate_up B1 H7168/I2048 = 7.95 TB/s (~99% peak)**, **down B1 I2048/H7168
+  = 6.28 TB/s (~79% peak)**; `cuda_event` reveals a ~19 us/launch host-dispatch floor.
