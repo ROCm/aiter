@@ -5,6 +5,7 @@ from aiter.ops.triton.gemm.batched.batched_gemm_a16wfp4 import (
     batched_gemm_a16wfp4,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
@@ -190,6 +191,57 @@ def test_batched_gemm_a16wfp4(B: int, M: int, N: int, K: int, layout, dtype):
     torch_out = run_torch(x, w, w_scales, dtype).to(dtype)
 
     batched_gemm_a16wfp4(x, w, w_scales, dtype, out, transpose_bm=False, prequant=True)
+
+    torch.testing.assert_close(torch_out, out)
+
+
+@pytest.mark.parametrize(
+    "B, M, N, K, BLOCK_SIZE_K",
+    [(2, 7, 512, 192, 128), (3, 16, 128, 192, 128), (2, 7, 512, 1152, 256)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_batched_gemm_a16wfp4_odd_k_tail_masks(
+    B: int, M: int, N: int, K: int, BLOCK_SIZE_K: int, dtype
+):
+    """Regression for the two EVEN_K == False bugs fixed in #4181. K here is
+    unpacked, the kernel's counts packed pairs: A's mask compared unpacked
+    offsets to packed K, too tight, silently dropping valid activations;
+    w_scales was unmasked and read off its end, where the 0xFF poisoned
+    below is e8m0 NaN. Only the latter was an out-of-bounds read."""
+    if not (arch_info.is_fp4_avail()):
+        pytest.skip("MXFP4 not supported on this architecture")
+
+    # Configs are keyed by the unpacked K, which is what this test's K already is.
+    config, _ = get_gemm_config("BATCHED_GEMM-A16WFP4", M, N, K)
+    config = dict(config)
+    config["BLOCK_SIZE_K"] = BLOCK_SIZE_K
+    # Pin split-K off rather than asserting on it: the path under test is the
+    # NUM_KSPLIT == 1 tail, and reading that from tuning data would let a
+    # re-tune of these shapes silently move the test off it.
+    config["NUM_KSPLIT"] = 1
+    # Both of these follow from the parametrization alone, not from tuning.
+    assert BLOCK_SIZE_K < K, "wrapper would clamp BLOCK_SIZE_K to next_pow2(K)"
+    assert K % BLOCK_SIZE_K != 0, "EVEN_K would be true; nothing to pin"
+
+    x, w, _x_scales, w_scales, out = generate_batched_gemm_a16wfp4_inputs(
+        B, M, N, K, dtype, layout="TN", output=True
+    )
+
+    num_groups = K // SCALE_GROUP_SIZE
+    numel = B * num_groups * N
+    poisoned = torch.full(
+        (2 * numel + 2 * N,), 0xFF, dtype=torch.uint8, device=w_scales.device
+    )
+    w_scales_oob = poisoned[:numel].view(B, num_groups, N).transpose(1, 2)
+    w_scales_oob.copy_(w_scales)
+    assert w_scales_oob.shape == w_scales.shape
+    assert w_scales_oob.stride() == w_scales.stride()
+
+    torch_out = run_torch(x, w, w_scales_oob, dtype).to(dtype)
+
+    batched_gemm_a16wfp4(
+        x, w, w_scales_oob, dtype, out, config=config, transpose_bm=False, prequant=True
+    )
 
     torch.testing.assert_close(torch_out, out)
 
