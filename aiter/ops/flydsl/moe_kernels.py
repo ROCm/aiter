@@ -2257,30 +2257,12 @@ def _get_compiled_topids_to_rows():
 
 
 @functools.cache
-def _get_compiled_topids_to_rows_g2l(weight_dtype: str):
+def _get_compiled_route_unified():
     from aiter.ops.flydsl.kernels.moe_route_maps import (
-        build_moe_topids_to_rows_g2l_module,
+        build_moe_route_unified_module,
     )
 
-    return build_moe_topids_to_rows_g2l_module(weight_dtype)
-
-
-@functools.cache
-def _get_compiled_route_g2l_fused(weight_dtype: str):
-    from aiter.ops.flydsl.kernels.moe_route_maps import (
-        build_moe_route_g2l_fused_module,
-    )
-
-    return build_moe_route_g2l_fused_module(weight_dtype)
-
-
-@functools.cache
-def _get_compiled_route_g2l_lds(weight_dtype: str):
-    from aiter.ops.flydsl.kernels.moe_route_maps import (
-        build_moe_route_g2l_lds_module,
-    )
-
-    return build_moe_route_g2l_lds_module(weight_dtype)
+    return build_moe_route_unified_module()
 
 
 def flydsl_moe_topids_to_rows(
@@ -2305,13 +2287,14 @@ def flydsl_moe_topids_to_rows(
     (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
     folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
 
-    ``counter`` is the ``(E,)`` per-expert atomic slot counter; when a pre-zeroed
-    buffer is passed (the g2l-LUT kernel zeroes it as a side output) the host
-    ``torch.zeros(E)`` launch is skipped, otherwise it is allocated here.
+    All route modes use one runtime-configured kernel/ABI. Empty optional pointers
+    select plain routing; a g2l LUT enables EP remapping and weight cast/mask.
+    E<=512 may use a two-level LDS atomic reduction, while arbitrary larger E uses
+    the same kernel's direct global-atomic branch. ``counter`` may be supplied
+    pre-zeroed; otherwise it is allocated here.
 
-    When ``expert_mask`` is given (instead of ``g2l_lut``), the single-block fused
-    kernel builds the LUT in LDS and zeros the counter itself -- collapsing the
-    ``moe_g2l_lut`` + ``moe_route_g2l`` pair into one launch (no global LUT buffer).
+    When ``expert_mask`` is given instead of ``g2l_lut``, this wrapper materializes
+    the equivalent LUT on-device and then calls the same unified route kernel.
     """
     device = topk_ids.device
     token_num, topk = topk_ids.shape
@@ -2342,75 +2325,62 @@ def flydsl_moe_topids_to_rows(
         num_valid_routes = torch.empty(0, dtype=torch.int32, device=device)
 
     if expert_mask is not None:
-        # Fused single-block path: build LUT + zero counter + route in one kernel.
-        assert gather_w is not None, "expert_mask fused path requires gather_w (out)"
-        assert weight_in is not None, "expert_mask fused path requires weight_in (f32)"
-        wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
-        counter = torch.empty(E, dtype=torch.int32, device=device)
-        mask_i32 = expert_mask.to(torch.int32).reshape(-1)
-        _get_compiled_route_g2l_fused(wdt)(
-            ptr_arg(mask_i32),
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            ptr_arg(gather_w.reshape(-1)),
-            ptr_arg(num_valid_routes),
-            int(mask_i32.numel()),
-            numel,
-            int(max_m),
-            int(E),
-            stream=torch.cuda.current_stream(),
+        assert gather_w is not None, "expert_mask requires gather_w (out)"
+        assert weight_in is not None, "expert_mask requires weight_in (f32)"
+        mask_i32 = expert_mask.to(device=device, dtype=torch.int32).reshape(-1)
+        prefix = torch.cumsum(mask_i32, dim=0, dtype=torch.int32)
+        g2l_lut = torch.where(
+            mask_i32 != 0,
+            prefix - 1,
+            torch.full_like(mask_i32, int(E)),
         )
-        return counter, topids_to_rows.view(token_num, topk)
+
+    use_g2l = g2l_lut is not None
+    if use_g2l:
+        assert gather_w is not None, "g2l route requires gather_w (out)"
+        assert weight_in is not None, "g2l route requires weight_in (f32)"
 
     if counter is None or counter.numel() != E:
         counter = torch.zeros(E, dtype=torch.int32, device=device)
 
-    route_grid = (numel + 255) // 256
-    if g2l_lut is not None:
-        assert gather_w is not None, "g2l_lut requires gather_w (out)"
-        assert weight_in is not None, "g2l_lut requires weight_in (f32 route weights)"
-        wdt = "f16" if gather_w.dtype == torch.float16 else "bf16"
-        # Two-level (LDS -> global) atomic reduction when the bucket count fits
-        # the LDS counter: collapses the per-route device atomics (which serialize
-        # on bucket 0 under EP drops) into one device atomic per non-empty bucket
-        # per block. Falls back to the plain device-atomic kernel for large E.
-        from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
+    topk_ids_i32 = topk_ids.to(torch.int32).reshape(-1)
+    null_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    null_f32 = torch.empty(0, dtype=torch.float32, device=device)
+    null_u8 = torch.empty(0, dtype=torch.uint8, device=device)
+    g2l_arg = g2l_lut.reshape(-1) if use_g2l else null_i32
+    weight_arg = (
+        weight_in.to(torch.float32).reshape(-1) if use_g2l else null_f32
+    )
+    gather_arg = gather_w.reshape(-1) if use_g2l else null_u8
 
-        _use_lds_reduce = (
-            os.environ.get("AITER_FLYDSL_ROUTE_G2L_LDS", "1") in ("1", "true", "True")
-            and int(E) <= MAX_ROUTE_BUCKETS
-        )
-        if _use_lds_reduce:
-            topids_to_rows_kernel = _get_compiled_route_g2l_lds(wdt)
-        else:
-            topids_to_rows_kernel = _get_compiled_topids_to_rows_g2l(wdt)
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(g2l_lut),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            ptr_arg(weight_in.to(torch.float32).reshape(-1)),
-            ptr_arg(gather_w.reshape(-1)),
-            ptr_arg(num_valid_routes),
-            numel,
-            int(max_m),
-            int(E),
-            route_grid,
-            stream=torch.cuda.current_stream(),
-        )
-    else:
-        topids_to_rows_kernel = _get_compiled_topids_to_rows()
-        topids_to_rows_kernel(
-            ptr_arg(topk_ids.to(torch.int32).reshape(-1)),
-            ptr_arg(counter),
-            ptr_arg(topids_to_rows),
-            numel,
-            int(max_m),
-            route_grid,
-            stream=torch.cuda.current_stream(),
-        )
+    from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
+
+    route_lds_min_numel = int(
+        os.environ.get("AITER_MOE_ROUTE_LDS_MIN_NUMEL", "81920")
+    )
+    use_lds = int(E) <= MAX_ROUTE_BUCKETS and (
+        use_g2l or numel >= max(0, route_lds_min_numel)
+    )
+    routes_per_thread = 4
+    route_grid = (
+        numel + 256 * routes_per_thread - 1
+    ) // (256 * routes_per_thread)
+    _get_compiled_route_unified()(
+        ptr_arg(topk_ids_i32),
+        ptr_arg(g2l_arg),
+        ptr_arg(counter),
+        ptr_arg(topids_to_rows),
+        ptr_arg(weight_arg),
+        ptr_arg(gather_arg),
+        ptr_arg(num_valid_routes),
+        numel,
+        int(max_m),
+        int(E),
+        int(use_lds),
+        int(gather_w is not None and gather_w.dtype == torch.float16),
+        route_grid,
+        stream=torch.cuda.current_stream(),
+    )
     return counter, topids_to_rows.view(token_num, topk)
 
 
@@ -2533,7 +2503,7 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
-        use_ksplit_s1 = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        use_ksplit_s1 = grid_blocks < _routeks_ksplit_grid_threshold()
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
@@ -2775,6 +2745,43 @@ def _get_compiled_fused_quant_preshuffle(
 
 
 _ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
+_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD = 8192
+
+
+def _routeks_ksplit_grid_threshold() -> int:
+    """Return the route-grid crossover; allow profiling overrides."""
+    return max(
+        0,
+        int(
+            os.environ.get(
+                "AITER_MOE_ROUTEKS_KSPLIT_GRID_THRESHOLD",
+                str(_ROUTEKS_KSPLIT_GRID_THRESHOLD),
+            )
+        ),
+    )
+
+
+def _routeks_multi_route_enabled() -> bool:
+    """Whether no-K-split may quantize once and scatter to every route."""
+    return os.environ.get("AITER_MOE_ROUTEKS_MULTI_ROUTE", "1") not in (
+        "",
+        "0",
+        "false",
+        "False",
+    )
+
+
+def _routeks_multi_route_grid_threshold() -> int:
+    """Route-grid size at which the fd7168/topk6 rpw6 kernel pays off."""
+    return max(
+        0,
+        int(
+            os.environ.get(
+                "AITER_MOE_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD",
+                str(_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD),
+            )
+        ),
+    )
 
 
 @functools.cache
@@ -2785,6 +2792,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     source_topk: int = 0,
     remap_rows: bool = False,
     ksplit: bool = True,
+    routes_per_warp: int = 1,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2797,6 +2805,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         source_topk=source_topk,
         remap_rows=remap_rows,
         ksplit=ksplit,
+        routes_per_warp=routes_per_warp,
     )
 
 
@@ -2876,7 +2885,22 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
-        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        use_ksplit = grid_blocks < _routeks_ksplit_grid_threshold()
+        use_multi_route = (
+            not use_ksplit
+            and feat_dim == 7168
+            and wmma_rep == 8
+            and quant_mode == "fp8"
+            and source_topk == 6
+            and numel % source_topk == 0
+            and grid_blocks >= _routeks_multi_route_grid_threshold()
+            and _routeks_multi_route_enabled()
+        )
+        routes_per_warp = source_topk if use_multi_route else 1
+        launch_grid_blocks = grid_blocks
+        if use_multi_route:
+            source_rows = numel // routes_per_warp
+            launch_grid_blocks = (source_rows + warps_per_block - 1) // warps_per_block
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -2884,6 +2908,7 @@ def flydsl_moe_fused_quant_preshuffle(
             source_topk=source_topk,
             remap_rows=remap_rows,
             ksplit=use_ksplit,
+            routes_per_warp=routes_per_warp,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
@@ -2904,7 +2929,7 @@ def flydsl_moe_fused_quant_preshuffle(
             route_max_m_arg,
             numel,
             ptr_arg(num_valid_routes_i32),
-            grid_blocks,
+            launch_grid_blocks,
             stream=torch.cuda.current_stream(),
         )
         return out_payload, out_scale
