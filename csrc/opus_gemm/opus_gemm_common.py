@@ -145,6 +145,14 @@ class OpusGemmInstance:
                 parts.append("scaleprefetch")
             if self.preload_sf:
                 parts.append("sfpreload")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_<geom>_wgpcu{N}
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_bdirect":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_bdirect_<geom>_wgpcu{N}
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_bdirect")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_minterleave":
             # opus_bmm_a8w8_mxscale_flatmm_minterleave_<geom>_wgpcu{N}[_skip_scale_wait]
             parts.insert(tag_at, "a8w8_mxscale_flatmm_minterleave")
@@ -255,6 +263,8 @@ class OpusGemmInstance:
 # the two agree, so a guard edit that forgets this table fails the build.
 _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_flatmm_splitk": 0,
+    "a8w8_mxscale_bmm_bpreshuffle": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": 0,
     "a8w8_mxscale_bmm_pipeline": 0,
     "a8w8_mxscale_bmm_fused": 0,
     "a8w8_mxscale_bmm_minterleave": 2,  # MI=2 M tiles per WG, baked in
@@ -492,6 +502,115 @@ a8w8_mxscale_bmm_flatmm_splitk_kernels_list.update({
 })
 
 
+def _a8w8_mxscale_bmm_bpreshuffle(bm, bn, bk, wg_per_cu):
+    """fp8 e8m0 mxscale BMM tile reading a 16x16-preshuffled weight buffer.
+
+    Same kernel, launcher and tile geometry as the plain flatmm split-K family
+    (BLOCK_SIZE=256, T_M=2/T_N=1, MFMA 16x16x128, VEC=(16,16,4),
+    GROUP=(1,128,128)); the traits alias is the bpreshuffle sibling, which flips
+    two compile-time axes: B comes from shuffle_weight(w, layout=(16, 16)) and
+    the per-subtile e8m0 scales are picked with the MFMA scale_op_sel byte
+    select instead of a broadcast pack. Callers must pass the preshuffled wo_a
+    (same [batch, N, K] shape/strides, permuted contents).
+    """
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        2, 1,           # T_M, T_N (tileM 4-wave warp-spec; name only)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a8w8_mxscale_bmm_bpreshuffle",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    return inst
+
+
+# B-preshuffle + op_sel tiles. kid 170 mirrors kid320's 64x32x256 geometry,
+# which is the smallest tile whose per-wave register tile is 32x32x256
+# (COM_REP_M/N/K = 2/2/2) -- i.e. the A scale spans 2 M subtiles x 2 K groups
+# and the B scale 2 K groups, so every MFMA in the tile picks its e8m0 byte with
+# scale_op_sel.
+_BMM_MXSCALE_BPRESHUFFLE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    170: (64, 32, 256, 2),
+}
+a8w8_mxscale_bmm_bpreshuffle_kernels_list = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_TILES.items()
+}
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=False):
+    """kid170's tile with B bypassing LDS.
+
+    Identical to _a8w8_mxscale_bmm_bpreshuffle except for the traits alias: the
+    16x16 preshuffle order already IS the mfma_16x16x128 B fragment order, so the
+    consumer waves buffer_load B straight into their MFMA registers and the
+    producer waves stage A only. Same preshuffled wo_a as kid170.
+    """
+    # Same tileN/tileM naming rule as the plain flatmm split-K family: the real
+    # T_M/T_N comes from B_M in the traits, these only drive the symbol name.
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        t_m, t_n,       # T_M, T_N (4-wave warp-spec; tileN=1,2 / tileM=2,1)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, 128, 128,    # GROUP_M=1 (per-token), GROUP_N=GROUP_K=128
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.prefetch_scale = prefetch_scale
+    return inst
+
+
+# kid 171: kid170's geometry, B read straight from global into registers.
+# Dropping B from LDS frees ~25 KiB per WG. Spending it on pipeline depth or
+# occupancy did not pay off (4 prefetch slots and WG_PER_CU=3 both measured ~25%
+# slower -- occupancy is VGPR-bound at 2 waves/SIMD, not LDS-bound), but it does
+# let the fatter tiles below keep 3 prefetch slots at WG_PER_CU=2.
+#
+# 173-176 target large M, where kid171 streams all of B once per 64-row block and
+# turns bandwidth-bound: each raises MFMA work per B byte a different way.
+# Each kid mirrors the geometry of whichever row-major kid the tuner ships in
+# that M band, so the only variable is where B's bytes come from:
+#
+#   M <= ~64    179 vs kid311  -5..-38%   (best shape: g1 N2048 K8192 M64)
+#   M ~128      no win; kid321 stays ahead
+#   M ~256-1500 171 vs kid321/kid653  -8..-10%
+#   M >= ~2048  no win; kid325 (128x128x128) and kid158 (BMM pipeline + SF
+#               preload) are 1.4-2.3x ahead of anything here. Half the waves in
+#               this family are producers, so a compute-bound tile only gets two
+#               MFMA waves; 178 is kept as the best of the family, not a win.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU[, prefetch_scale])
+    171: (64, 32, 256, 2),
+    # Largest tile the family can hold: 4x kid171's MFMA work per B byte. Only
+    # scaling one dimension does nothing (128x32x256 wg1, 128x32x128 wg2 and
+    # 64x64x256 wg2 all measured slower than kid171 at every M). At WG_PER_CU=2
+    # this tile spills 142 VGPRs against the 256-VGPR cap; WG_PER_CU=1 trades
+    # half the waves for a 512-VGPR budget and double-buffers A and B clean.
+    178: (128, 64, 256, 1),
+    # tileN (B_M=16): a 64-row tile computes 4x the rows a decode shape needs.
+    # Each consumer wave owns its own 16 columns, which the direct-B layout
+    # absorbs as a base offset. Spending the LDS this frees on occupancy loses
+    # badly again (wg4 measured 20 us vs 8 us at wg2), and the scale prefetch
+    # kid311 ships is worth nothing here -- the direct-B vmcnt wait already
+    # retires the scale loads. B_K=512 beats 256, and B_N=64 loses to 32.
+    179: (16, 32, 512, 2),
+}
+a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(*cfg)
+    for kid, cfg in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES.items()
+}
+
+
 def _a8w8_mxscale_bmm_minterleave(bm, bn, bk, wg_per_cu, skip_scale_wait=False):
     """fp8 e8m0 mxscale BATCHED matmul M-tile-interleaved tile.
 
@@ -628,6 +747,8 @@ a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = {
 # kdict merge and the BMM int-kid tune-lookup emitter.
 a8w8_mxscale_bmm_kernel_lists = (
     a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list,
     a8w8_mxscale_bmm_fused_kernels_list,
     a8w8_mxscale_bmm_minterleave_kernels_list,
     a8w8_mxscale_bmm_mouter_kernels_list,

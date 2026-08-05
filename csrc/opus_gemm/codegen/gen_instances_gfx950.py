@@ -29,6 +29,8 @@ PIPELINE_HEADER_MAP = {
     "a16w16_persistent": "gfx950/opus_gemm_pipeline_a16w16_persistent_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_pipeline_a16w16_mono_tile_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_bmm_pipeline_a8w8_mxscale_gfx950.cuh",
@@ -57,6 +59,8 @@ TRAITS_HEADER_MAP = {
     "a16w16_persistent": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a16w16_mono_tile": "gfx950/opus_gemm_traits_a16w16_gfx950.cuh",
     "a8w8_mxscale_bmm_flatmm_splitk": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_minterleave": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_fused": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
     "a8w8_mxscale_bmm_pipeline": "gfx950/opus_gemm_traits_a8w8_scale_gfx950.cuh",
@@ -76,6 +80,8 @@ KERNEL_FUNC_MAP = {
     "a16w16_persistent": "gemm_a16w16_persistent_kernel",
     "a16w16_mono_tile": "gemm_a16w16_mono_tile_kernel_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     "a8w8_mxscale_bmm_minterleave": "gemm_a8w8_mxscale_flatmm_minterleave_kernel",
     "a8w8_mxscale_bmm_fused": "gemm_a8w8_mxscale_flatmm_splitk_kernel",
     # pipeline: default; the emit fn selects the real kernel per-kid from flags.
@@ -102,6 +108,8 @@ TRAITS_NAME_MAP = {
     "a16w16_persistent": "opus_gemm_a16w16_persistent_traits_gfx950",
     "a16w16_mono_tile": "opus_gemm_a16w16_mono_tile_traits_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_a8w8_scale_traits_gfx950",
@@ -121,6 +129,8 @@ KARGS_NAME_MAP = {
     "a16w16_persistent": "opus_gemm_persistent_kargs_gfx950",
     "a16w16_mono_tile": "opus_gemm_mono_tile_kargs_gfx950",
     "a8w8_mxscale_bmm_flatmm_splitk": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_minterleave": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_fused": "opus_gemm_scale_splitk_kargs_gfx950",
     "a8w8_mxscale_bmm_pipeline": "opus_gemm_scale_kargs_gfx950",
@@ -2851,6 +2861,16 @@ def _register_bmm_emit(kernel_tag, fn, launcher_tile_mult):
 # guards MI(=2)*B_M, wave4m2 guards LOGICAL_B_M(=2*B_M), the rest guard B_M.
 _register_bmm_emit(
     "a8w8_mxscale_bmm_flatmm_splitk", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# bpreshuffle: same launcher body / kernel / emit as the plain split-K family;
+# only the traits alias differs (B_PRESHUFFLE + SCALE_OPSEL).
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle", gen_bmm_mxscale_flatmm_splitk_instance, 0
+)
+# bdirect: bpreshuffle with B skipping LDS (consumers buffer_load their own MFMA
+# B fragments); again only the traits alias differs.
+_register_bmm_emit(
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect", gen_bmm_mxscale_flatmm_splitk_instance, 0
 )
 _register_bmm_emit(
     "a8w8_mxscale_bmm_minterleave", gen_bmm_mxscale_minterleave_instance, 2

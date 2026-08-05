@@ -146,7 +146,11 @@ template<int BLOCK_SIZE_,
         typename DTYPE_,
         typename VEC_,
         typename GROUP_,
-        int WG_PER_CU_>
+        int WG_PER_CU_,
+        // Consumers fetch B into registers themselves (see the bdirect traits).
+        // A template parameter rather than a plain member because it resizes the
+        // per-K-tile LDS footprint that prefetch_k_iter is derived from below.
+        bool B_DIRECT_REG_ = false>
 struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     using BLOCK = opus::remove_cvref_t<BLOCK_>;
     using DTYPE = opus::remove_cvref_t<DTYPE_>;
@@ -254,10 +258,16 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int WG_PER_CU = WG_PER_CU_;
     static constexpr int LDS_SIZE_TOTAL = 163840;
     static constexpr int max_lds_size_per_wg = LDS_SIZE_TOTAL / WG_PER_CU_;
+    // B_DIRECT_REG stages no B, so only the A groups are budgeted. That headroom
+    // is what lets the wider/taller direct-B tiles keep 3 prefetch slots at
+    // WG_PER_CU=2; it is deliberately not spent on more slots, since 4 measured
+    // ~25% slower than 3 (occupancy here is VGPR-bound, not LDS-bound).
     static constexpr int per_block_iter_lds_size =
-        (NUM_LOAD_GROUPS_PER_BM + NUM_LOAD_GROUPS_PER_BN)
+        (NUM_LOAD_GROUPS_PER_BM + (B_DIRECT_REG_ ? 0 : NUM_LOAD_GROUPS_PER_BN))
         * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
-    static constexpr int prefetch_k_iter = max_lds_size_per_wg / per_block_iter_lds_size;
+    static constexpr int prefetch_k_iter_budget = max_lds_size_per_wg / per_block_iter_lds_size;
+    static constexpr int prefetch_k_iter =
+        (B_DIRECT_REG_ && prefetch_k_iter_budget > 3) ? 3 : prefetch_k_iter_budget;
     static_assert(prefetch_k_iter >= 3,
                   "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
 
@@ -266,4 +276,88 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int a_ds_read_insts = (COM_REP_M * COM_REP_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (COM_REP_N * COM_REP_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
     static constexpr int mma_insts = COM_REP_M * COM_REP_N * COM_REP_K;
+
+    // B source layout: row-major [N, K] (false) vs the 16x16-tiled preshuffle
+    // produced by shuffle_weight(w, layout=(16, 16)) (true). Only the B global
+    // address math changes; LDS content and every consumer-side layout are
+    // identical, so the flag flips one layout helper in the producer.
+    static constexpr bool B_PRESHUFFLE = false;
+    // Scale packing for the multi-scale-group MFMA path: false keeps the tuned
+    // broadcast pack (MXSCALE_ACCUM_MODE), true forces the hardware
+    // scale_op_sel byte-select over the COM_REP_K K groups.
+    static constexpr bool SCALE_OPSEL = false;
+    // Consumer waves read their MFMA B fragments straight from global memory
+    // instead of going through the producer/LDS staging. Only meaningful with
+    // B_PRESHUFFLE (see the bdirect traits below for why the two are tied).
+    static constexpr bool B_DIRECT_REG = B_DIRECT_REG_;
+};
+
+// B-preshuffle + scale-op_sel sibling of the flatmm split-K traits.
+//
+// Same tile geometry / LDS / pipeline as the base traits (so a bpreshuffle kid
+// is just its plain kid with a preshuffled weight buffer), with two axes
+// flipped: B comes from shuffle_weight(w, layout=(16, 16)) and the per-subtile
+// scales are selected with the MFMA scale_op_sel immediate instead of a
+// broadcast pack. The 16x16 preshuffle tile requires the B tile and the per-WG
+// B load group to be whole 16-column blocks.
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename GROUP_,
+        int WG_PER_CU_,
+        bool B_DIRECT_REG_ = false>
+struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_> {
+    using base = opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950<
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, B_DIRECT_REG_>;
+
+    static constexpr bool B_PRESHUFFLE = true;
+    static constexpr bool SCALE_OPSEL  = true;
+
+    static_assert(base::B_N % 16 == 0,
+                  "B preshuffle tiles N in blocks of 16");
+    static_assert(base::LOAD_GROUP_N % 16 == 0,
+                  "each B load group must cover whole 16-column preshuffle blocks");
+    static_assert(base::LOAD_GROUP_K % 32 == 0,
+                  "each B load group must cover whole 32-element preshuffle K blocks");
+    static_assert(base::VEC_B == 16,
+                  "a preshuffle block stores 16 contiguous K bytes per (n, k-half)");
+};
+
+// B-preshuffle sibling that skips LDS for B entirely.
+//
+// The 16x16 preshuffle order IS the mfma_16x16x128 B fragment order: a 16-column
+// block stores byte (n, k) at (k/16)*256 + n*16 + k%16, and the MFMA wants lane l
+// to hold n = l%16 over k = rept*64 + (l/16)*16 + 0..15, i.e. block offset
+// rept*1024 + (l/16)*256 + (l%16)*16 == rept*1024 + l*16. So one wave's B operand
+// for a 16x16x128 tile is 2048 contiguous bytes and every lane's half is a
+// naturally aligned dwordx4 -- there is nothing for an LDS round trip to fix up.
+// Consumers therefore buffer_load B into the MFMA registers themselves, which
+// drops the B half of the producer waves' async copies, the B ds_reads, and the
+// B LDS buffers. The cost is that both consumer waves fetch the same B tile (in
+// tileM they share one N range), so B is read twice per WG from L1/L2.
+template<int BLOCK_SIZE_,
+        typename BLOCK_,
+        typename DTYPE_,
+        typename VEC_,
+        typename GROUP_,
+        int WG_PER_CU_>
+struct opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_bdirect_traits_gfx950
+    : opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true> {
+    using base = opus_gemm_a8w8_mxscale_flatmm_splitk_bpreshuffle_traits_gfx950<
+        BLOCK_SIZE_, BLOCK_, DTYPE_, VEC_, GROUP_, WG_PER_CU_, true>;
+
+    // buffer_loads per consumer per K tile: one dwordx4 per (n-rep, k-rep, half).
+    static constexpr int b_direct_load_insts = base::COM_REP_N * base::COM_REP_K * 2;
+    static_assert(b_direct_load_insts == base::b_ds_read_insts,
+                  "direct B must fetch exactly what the LDS path used to ds_read");
+
+    // tileN is fine: T_N partitions N across the consumer waves, which the
+    // direct-B layout absorbs as a base-offset of the wave's first 16-column
+    // block (nbc), the same way the LDS path offsets smem_b_at.
+    static_assert(base::T_K == 1,
+                  "direct B layout folds away the tile_k mma p-dim");
+    static_assert(base::W_N == 16 && base::W_K == 128,
+                  "direct B addressing is derived from the 16x16x128 fragment order");
 };

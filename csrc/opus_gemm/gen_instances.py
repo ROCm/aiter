@@ -141,6 +141,8 @@ INPUT_DTYPE_MAP = {
     "a8w8_scale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_flatmm_splitk": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle": ("fp8_t", "fp8_t"),
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_fused": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_minterleave": ("fp8_t", "fp8_t"),
     "a8w8_mxscale_bmm_mouter": ("fp8_t", "fp8_t"),
@@ -190,6 +192,8 @@ def _kargs_template_vars(kernel_tag, kargs_name):
     if kernel_tag in (
         "a8w8_mxscale_bmm_flatmm_splitk",
         "a8w8_mxscale_bmm_fused",
+        "a8w8_mxscale_bmm_bpreshuffle",
+        "a8w8_mxscale_bmm_bpreshuffle_bdirect",
     ):
         return (
             "",
@@ -801,6 +805,8 @@ void
             for k in kernels_dict.values():
                 if k.kernel_tag in (
                     "a8w8_mxscale_bmm_flatmm_splitk",
+                    "a8w8_mxscale_bmm_bpreshuffle",
+                    "a8w8_mxscale_bmm_bpreshuffle_bdirect",
                     "a8w8_mxscale_bmm_fused",
                     "a8w8_mxscale_bmm_minterleave",
                     "a8w8_mxscale_bmm_mouter",
