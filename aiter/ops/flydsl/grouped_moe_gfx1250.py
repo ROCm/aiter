@@ -477,23 +477,11 @@ def _grouped_a8w4_tdm_moe(
         )
     else:
         _masked_m, topids_to_rows = flydsl_moe_topids_to_rows(topk_ids, E, max_m)
-    fuse_remap_requested = os.environ.get(
-        "AITER_MOE_FUSE_REMAP_QUANT", "1"
-    ) not in (
-        "",
-        "0",
-        "false",
-        "False",
+    from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+        routeks_uses_ksplit,
     )
-    # In-place remap is safe only on noKS (single grid.y).
-    route_grid_blocks = (token_num * topk + 7) // 8
-    ksplit_grid_threshold = max(
-        0, int(os.environ.get("AITER_MOE_ROUTEKS_KSPLIT_GRID_THRESHOLD", "512"))
-    )
-    fuse_remap_quant = (
-        fuse_remap_requested
-        and route_grid_blocks >= ksplit_grid_threshold
-    )
+
+    fuse_remap_quant = not routeks_uses_ksplit(token_num * topk, 8)
     if fuse_remap_quant:
         _starts, psum, _ = contiguous_psum(_masked_m, E, tile_m)
     else:
@@ -1101,17 +1089,14 @@ def _get_compiled_contiguous_psum():
     return build_moe_contiguous_psum_module()
 
 
-_SPLIT_PSUM_REMAP_MIN_NUMEL = 81920
-
-
 @functools.cache
-def _get_compiled_contiguous_psum_remap(split_remap: bool = False):
+def _get_compiled_contiguous_psum_remap():
     """Compile and cache the contiguous prefix-sum + row-remap kernel."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_contiguous_psum_remap_module,
     )
 
-    return build_moe_contiguous_psum_remap_module(split_remap=split_remap)
+    return build_moe_contiguous_psum_remap_module()
 
 
 @functools.cache
@@ -1217,7 +1202,6 @@ def contiguous_psum_remap(
     topids_flat = topids_to_rows.reshape(-1)
     # Only remap the valid routes; dead-tail rows are unwritten and must not be
     # used as a row index. Default (no truncation) covers every route.
-    has_dynamic_valid_routes = num_valid_routes is not None
     if num_valid_routes is None:
         # A 0-element tensor has data_ptr() == 0; the kernel reads that null
         # pointer as "no truncation".
@@ -1228,18 +1212,7 @@ def contiguous_psum_remap(
             .to(device=device, dtype=torch.int32)
             .contiguous()
         )
-    split_min_numel = int(
-        os.environ.get(
-            "AITER_MOE_SPLIT_PSUM_REMAP_MIN_NUMEL",
-            str(_SPLIT_PSUM_REMAP_MIN_NUMEL),
-        )
-    )
-    launch = _get_compiled_contiguous_psum_remap(
-        split_remap=(
-            not has_dynamic_valid_routes
-            and int(topids_flat.numel()) >= max(0, split_min_numel)
-        )
-    )
+    launch = _get_compiled_contiguous_psum_remap()
     launch(
         ptr_arg(masked_m_i32),
         ptr_arg(topids_flat),

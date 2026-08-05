@@ -2355,12 +2355,7 @@ def flydsl_moe_topids_to_rows(
 
     from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
 
-    route_lds_min_numel = int(
-        os.environ.get("AITER_MOE_ROUTE_LDS_MIN_NUMEL", "81920")
-    )
-    use_lds = int(E) <= MAX_ROUTE_BUCKETS and (
-        use_g2l or numel >= max(0, route_lds_min_numel)
-    )
+    use_lds = int(E) <= MAX_ROUTE_BUCKETS
     routes_per_thread = 4
     route_grid = (
         numel + 256 * routes_per_thread - 1
@@ -2503,7 +2498,11 @@ def flydsl_moe_fused_route_quant_scatter(
             route_grid,
             stream=torch.cuda.current_stream(),
         )
-        use_ksplit_s1 = grid_blocks < _routeks_ksplit_grid_threshold()
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            routeks_uses_ksplit,
+        )
+
+        use_ksplit_s1 = routeks_uses_ksplit(numel, warps_per_block)
         launch_routeks = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=model_dim,
             wmma_rep=wmma_rep,
@@ -2744,46 +2743,6 @@ def _get_compiled_fused_quant_preshuffle(
     )
 
 
-_ROUTEKS_KSPLIT_GRID_THRESHOLD = 512
-_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD = 8192
-
-
-def _routeks_ksplit_grid_threshold() -> int:
-    """Return the route-grid crossover; allow profiling overrides."""
-    return max(
-        0,
-        int(
-            os.environ.get(
-                "AITER_MOE_ROUTEKS_KSPLIT_GRID_THRESHOLD",
-                str(_ROUTEKS_KSPLIT_GRID_THRESHOLD),
-            )
-        ),
-    )
-
-
-def _routeks_multi_route_enabled() -> bool:
-    """Whether no-K-split may quantize once and scatter to every route."""
-    return os.environ.get("AITER_MOE_ROUTEKS_MULTI_ROUTE", "1") not in (
-        "",
-        "0",
-        "false",
-        "False",
-    )
-
-
-def _routeks_multi_route_grid_threshold() -> int:
-    """Route-grid size at which the fd7168/topk6 rpw6 kernel pays off."""
-    return max(
-        0,
-        int(
-            os.environ.get(
-                "AITER_MOE_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD",
-                str(_ROUTEKS_MULTI_ROUTE_GRID_THRESHOLD),
-            )
-        ),
-    )
-
-
 @functools.cache
 def _get_compiled_fused_quant_preshuffle_route_ksplit(
     feat_dim: int,
@@ -2885,18 +2844,23 @@ def flydsl_moe_fused_quant_preshuffle(
         else:
             row_starts_i32 = masked_m
             route_max_m_arg = 1
-        use_ksplit = grid_blocks < _routeks_ksplit_grid_threshold()
+        from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
+            routeks_uses_ksplit,
+            select_routeks_routes_per_warp,
+        )
+
+        use_ksplit = routeks_uses_ksplit(numel, warps_per_block)
+        selected_routes_per_warp = select_routeks_routes_per_warp(
+            source_topk
+        )
         use_multi_route = (
             not use_ksplit
-            and feat_dim == 7168
-            and wmma_rep == 8
-            and quant_mode == "fp8"
-            and source_topk == 6
+            and selected_routes_per_warp > 1
             and numel % source_topk == 0
-            and grid_blocks >= _routeks_multi_route_grid_threshold()
-            and _routeks_multi_route_enabled()
         )
-        routes_per_warp = source_topk if use_multi_route else 1
+        routes_per_warp = (
+            selected_routes_per_warp if use_multi_route else 1
+        )
         launch_grid_blocks = grid_blocks
         if use_multi_route:
             source_rows = numel // routes_per_warp

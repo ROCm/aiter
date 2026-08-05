@@ -1251,6 +1251,46 @@ def build_moe_fused_quant_preshuffle_module(
     return launch_fused
 
 
+ROUTEKS_KSPLIT_MIN_GRID_BLOCKS = 512
+
+
+def routeks_uses_ksplit(numel: int, warps_per_block: int) -> bool:
+    grid_blocks = (int(numel) + int(warps_per_block) - 1) // int(
+        warps_per_block
+    )
+    return grid_blocks < ROUTEKS_KSPLIT_MIN_GRID_BLOCKS
+
+
+def select_routeks_routes_per_warp(
+    source_topk: int, max_routes_per_warp: int = 0
+) -> int:
+    if source_topk <= 1:
+        return 1
+    limit = (
+        source_topk
+        if max_routes_per_warp <= 0
+        else min(source_topk, max_routes_per_warp)
+    )
+    for candidate in range(limit, 1, -1):
+        if source_topk % candidate == 0:
+            return candidate
+    return 1
+
+
+def routeks_compile_variants(
+    source_topk: int,
+    remap_rows: bool,
+    max_routes_per_warp: int = 0,
+):
+    variants = [(False, 1)] if remap_rows else [(True, 1), (False, 1)]
+    routes_per_warp = select_routeks_routes_per_warp(
+        source_topk, max_routes_per_warp
+    )
+    if routes_per_warp > 1:
+        variants.append((False, routes_per_warp))
+    return tuple(variants)
+
+
 def build_moe_fused_quant_preshuffle_route_ksplit_module(
     feat_dim: int,
     wmma_rep: int,
