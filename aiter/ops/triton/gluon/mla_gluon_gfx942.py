@@ -428,24 +428,24 @@ def mla_gluon_gfx942(
         if mid_lse is not None and mid_lse.dim() == 3:
             mid_lse = mid_lse.unsqueeze(1)
 
-    assert arch_info.get_arch() == "gfx942", (
-        f"mla_gluon_gfx942 requires gfx942, got {arch_info.get_arch()}"
-    )
-    assert q_nope.dim() == 4, (
-        f"q_nope must be 4-D [B, QLEN, H, D], got {q_nope.dim()}-D"
-    )
+    assert (
+        arch_info.get_arch() == "gfx942"
+    ), f"mla_gluon_gfx942 requires gfx942, got {arch_info.get_arch()}"
+    assert (
+        q_nope.dim() == 4
+    ), f"q_nope must be 4-D [B, QLEN, H, D], got {q_nope.dim()}-D"
     batch_size, qlen, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
-    assert head_dim_ckv == 512, (
-        f"mla_gluon_gfx942 requires head_dim_ckv=512, got {head_dim_ckv}"
-    )
+    assert (
+        head_dim_ckv == 512
+    ), f"mla_gluon_gfx942 requires head_dim_ckv=512, got {head_dim_ckv}"
     assert head_dim_kpe == 64, f"expected head_dim_kpe=64, got {head_dim_kpe}"
     assert page_size == 1, "mla_gluon_gfx942 requires page_size=1"
 
     block_h = 16
-    assert nhead <= block_h, (
-        f"mla_gluon_gfx942 handles at most {block_h} heads, got {nhead}"
-    )
+    assert (
+        nhead <= block_h
+    ), f"mla_gluon_gfx942 handles at most {block_h} heads, got {nhead}"
 
     has_pe = q_pe is not None
 
