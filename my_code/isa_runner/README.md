@@ -144,6 +144,65 @@ Builds are cached in `~/.isa_runner_cache` keyed by source hash + arch; use
 `--force` to rebuild. Binary `.text` patching is only a fallback for same-size
 replacement and is not implemented here — editing the `.s` is the main path.
 
+## Running a real kernel: `tdm_adapter.py`
+
+The smoke kernel proves the mechanism; the adapter feeds a hand-edited ISA the
+**real** gemm1/gemm2 inputs. Those inputs (preshuffled MXFP8 A, preshuffled
+MXFP4 W, n32k4-folded scales, per-expert psum `m_tile_map`) are not practical to
+construct by hand — a subtly wrong construction yields a plausible wrong answer.
+So the adapter **captures** instead: it patches the FlyDSL launch, runs the
+production path once, and records the device pointers the kernel really got.
+
+```bash
+cd /data/yanguahe/code/wk_sp1/aiter        # repo root: shadows /app/aiter
+K=my_code/isa_cmp/w1/<kernel>/21_final_isa.s
+
+# sanity: identical ISA on both sides must be bit-exact
+python my_code/isa_runner/tdm_adapter.py replay --which gemm1 \
+    --isa $K --reference-isa $K --out r.json
+
+# edit, then compare against the unmodified dump
+python my_code/isa_runner/make_variant.py $K edited.s --wait-after-wmma
+python my_code/isa_runner/tdm_adapter.py replay --which gemm1 \
+    --isa edited.s --reference-isa $K --iters 100 --out r.json
+python my_code/isa_runner/show_report.py r.json
+```
+
+Capture and replay must be in the **same process** — the pointers are device
+addresses, so a saved JSON is metadata only.
+
+### Why the reference is another ISA run
+
+`--reference-isa` is launched through the identical path first, and its output
+is the reference. Comparing against the tensor left behind by the torch run does
+not work: `i32_m` is the `align_m`-padded row count (49152 for 24576 real
+routes), the kernel skips padding tiles, and those rows hold uninitialised
+values near `FLT_MAX`. Both norms then overflow to `inf` and `rel_l2` is `NaN`.
+With an ISA-vs-ISA reference the skipped rows hold the same poison value on both
+sides and cancel exactly.
+
+Validated on c9-3: same ISA both sides → `rel_l2 = 0.0`, `passed: true`, with
+`reference_wrote_elems` exactly half the buffer. Negative control (drop one of
+96 WMMA) → `rel_l2 = 7.4e-4`, `max_abs_diff = 98.0`, `passed: false`.
+
+### Gotchas the adapter handles
+
+- **Pin the inputs.** `ptr_arg` keeps only a raw pointer, so once the
+  production call returns, torch's caching allocator reuses those buffers and
+  the replay silently reads freed memory (NaN, not an error). The adapter holds
+  references to every captured tensor.
+- **Dynamic LDS is computed, not guessed.** `arena_bytes()` mirrors the
+  frontend's arena math; it reproduces both the kernel's own `ARENA=158208` log
+  and the `dynamic_shared_memory_size 159744` in the MLIR (the same arena after
+  the `tile_m<=64` zero-fill rounding). The descriptor says
+  `group_segment_fixed_size 0`, so the launch must supply this.
+- **Capture the tuned tiles.** The adapter defaults `AITER_TDM_TILE_*` to the
+  `g2_m64_nb3` config so the captured kernel matches the dumped
+  `t64x256x256_b3` ISA; the CSV default would capture `16x256x256_b2`, which no
+  dump matches.
+- **Run from the repo root.** The container also has an older `/app/aiter`
+  without the TDM kernel.
+
 ## Timing
 
 `bench` uses HIP events around a loop of launches, so the number is
