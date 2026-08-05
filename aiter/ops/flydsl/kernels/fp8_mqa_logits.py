@@ -937,9 +937,15 @@ def _build_kernel_mfma_lds_pipe(
         "_build_kernel_mfma_lds_pipe currently supports only the CDNA4 scaled "
         "atoms (frag_bytes=32)."
     )
-    assert H % mfma.MFMA_M == 0, f"Number of heads must be a multiple of MFMA_M ({mfma.MFMA_M})"
-    assert BKV % mfma.MFMA_N == 0, f"Block KV size must be a multiple of MFMA_N ({mfma.MFMA_N})"
-    assert D % mfma.MFMA_K == 0, f"Head size must be a multiple of MFMA_K ({mfma.MFMA_K})"
+    assert (
+        H % mfma.MFMA_M == 0
+    ), f"Number of heads must be a multiple of MFMA_M ({mfma.MFMA_M})"
+    assert (
+        BKV % mfma.MFMA_N == 0
+    ), f"Block KV size must be a multiple of MFMA_N ({mfma.MFMA_N})"
+    assert (
+        D % mfma.MFMA_K == 0
+    ), f"Head size must be a multiple of MFMA_K ({mfma.MFMA_K})"
     assert RPW >= 1 and WPB >= 1, "Rows per wave and waves per block must be >= 1"
 
     N_TILES = BKV // mfma.MFMA_N
@@ -979,7 +985,7 @@ def _build_kernel_mfma_lds_pipe(
         "lower prefetch_depth or block_kv, or raise waves_per_block"
     )
 
-    # XOR swizzle (bank-conflict avoidance).  
+    # XOR swizzle (bank-conflict avoidance).
     # The slot stores [BKV, D] fp8 HEAD_SIZE-
     # contiguous, so per column the D bytes are DW_PER_COL i32 dwords.
     # Single B-frag read gathers a fixed CHUNK_DW-dword slice of the head dim across the 32/16
@@ -1051,7 +1057,7 @@ def _build_kernel_mfma_lds_pipe(
         lane_div_N = lane // fx.Int32(mfma.MFMA_N)
         lane_mod_N = lane % fx.Int32(mfma.MFMA_N)
         lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
-        
+
         # First row owned by this wave.
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
 
@@ -1083,7 +1089,7 @@ def _build_kernel_mfma_lds_pipe(
             OOB columns are clamped to ``seq_len_kv-1`` (harmless -- masked out in
             the epilogue by the per-row window predicate).
             """
-            wave_slot_i32 = slot_byte_i32 + wave * fx.Int32(64 * DMA_BYTES) 
+            wave_slot_i32 = slot_byte_i32 + wave * fx.Int32(64 * DMA_BYTES)
             wave_slot_scalar = rocdl.readfirstlane(
                 fx.Int64.ir_type, arith.extui(T.i64, _to_raw(wave_slot_i32))
             )
@@ -1138,9 +1144,9 @@ def _build_kernel_mfma_lds_pipe(
             starts[j] = fx.Int32(arith.maxsi(_to_raw(s), _to_raw(fx.Int32(0))))
             ends[j] = fx.Int32(arith.minsi(_to_raw(e), _to_raw(fx.Int32(seq_len_kv))))
 
-            # Load A-frags: 
+            # Load A-frags:
             # Q[
-            #   row, 
+            #   row,
             #   h = mi*MFMA_M + lane%MFMA_N,
             #   d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7
             #  ]
@@ -1159,7 +1165,7 @@ def _build_kernel_mfma_lds_pipe(
             a_packs[j] = row_a_frag
 
             # Load weights: weights[row, h] per (mi, ii).
-            # The head this accumulator element belongs to is 
+            # The head this accumulator element belongs to is
             # mi*MFMA_M + acc_head_static_offsets[ii] + lane_div_N*acc_head_group_stride.
             row_w = [[None] * mfma.ACC_ELEMS for _ in range_constexpr(M_TILES)]
             h_w_static_offset = lane_div_N * fx.Int32(mfma.acc_head_group_stride)
