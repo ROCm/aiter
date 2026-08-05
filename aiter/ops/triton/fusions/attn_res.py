@@ -229,8 +229,10 @@ def _run_packed(
     device = packed.device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    need_opre = save_opre or has_onorm
-    o_pre = torch.empty((N, D), device=device, dtype=dtype) if need_opre else None
+    # One pass keeps the pre-norm mix in registers, so unlike the discrete path
+    # the output RMSNorm needs no scratch buffer here: allocate o_pre only when
+    # the caller actually wants it back.
+    o_pre = torch.empty((N, D), device=device, dtype=dtype) if save_opre else None
     lse = torch.empty((N,), device=device, dtype=torch.float32)
     rstd = torch.empty((L, N), device=device, dtype=torch.float32)
     logit = torch.empty_like(rstd)
@@ -270,7 +272,7 @@ def _run_packed(
         EXP2=use_exp2,
     )
     o = o.view(output_shape)
-    o_pre_out = o_pre.view(output_shape) if (save_opre and o_pre is not None) else None
+    o_pre_out = o_pre.view(output_shape) if o_pre is not None else None
     rstd = rstd.view(L, *output_shape[:-1])
     logit = logit.view(L, *output_shape[:-1])
     lse = lse.view(output_shape[:-1])
