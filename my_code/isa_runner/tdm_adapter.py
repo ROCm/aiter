@@ -36,7 +36,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]          # <repo>/my_code/isa_runner -> <repo>
+# The container also ships an older aiter at /app/aiter that lacks the TDM
+# kernel; the repo checkout must win, which is why sweep_tdm.sh cds to the repo
+# root. Put it ahead of everything before any aiter import happens.
+sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_REPO / "op_tests"))
+sys.path.insert(0, str(_REPO))
+
 from isa_runner import IsaModule, IsaRunnerError, KernelLaunchSpec, build  # noqa: E402
 
 # The 15 kernargs, in order, as they are packed into the 104-byte kernarg
@@ -217,11 +225,7 @@ def _run_reference_moe(tokens, experts, topk, model_dim, inter_dim):
     Reuses the op_test's data prep (preshuffle, scales, routing) rather than
     reimplementing it -- that construction is the part most likely to be wrong.
     """
-    repo = Path(__file__).resolve().parents[2]
-    sys.path.insert(0, str(repo / "op_tests"))
-    sys.path.insert(0, str(repo))
     import test_flydsl_grouped_gemm_gfx1250 as t
-    from aiter.jit.utils.chip_info import get_gfx  # noqa: F401
 
     t.set_data_format("a8w4")
     return t.run_moe(
