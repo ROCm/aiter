@@ -270,7 +270,7 @@ def get_gluon_a8w4_ctas_per_cga(m):
         return [1, 1]
     # Decode: shard the cluster along N only.
     if m < 1024:
-        return [1, num_ctas]
+        return [1, 1]
     # Prefill: shard along both M and N.
     if num_ctas == 4:
         return [2, 2]
@@ -556,21 +556,6 @@ def moe_gemm_a8w4(
             waves_per_eu=config["waves_per_eu"],
         )
     elif use_gluon and block_m == 16:
-        layouts = get_moe_a8w4_layouts(
-            num_warps=config["num_warps"],
-            BLOCK_M=config["block_m"],
-            BLOCK_N=config["block_n"],
-            BLOCK_K=config["block_k"],
-            ctas_per_cga=config["ctas_per_cga"],
-            ACTIVATION_REDUCTION_N=reduction_n_matmul,
-            PRESHUFFLED=preshuffled,
-            SWIZZLE_MX_SCALE=swizzle_mx_scale,
-            is_x_microscaled=x_scales is not None,
-            has_quant_static_scale=quant_static_scale is not None,
-            apply_swiglu=apply_swiglu_matmul,
-            GatherIndx=gather_indx,
-            X_SCALE_TDM=X_SCALE_TDM,
-        )
         _moe_gemm_a8w4_decode_gluon[(grid,)](
             y,
             y.stride(1),
@@ -620,10 +605,8 @@ def moe_gemm_a8w4(
             PRESHUFFLED=preshuffled,
             CLAMP_BOUNDS=clamp_bounds,
             num_warps=config["num_warps"],
-            num_ctas=config["num_ctas"],
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             waves_per_eu=config["waves_per_eu"],
-            **layouts,
         )
     elif use_gluon:
         layouts = get_moe_a8w4_layouts(
