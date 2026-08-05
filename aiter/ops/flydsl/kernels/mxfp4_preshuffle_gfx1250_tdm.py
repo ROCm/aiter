@@ -63,6 +63,7 @@ def launch_gemm_a8w4_tdm(
     quant_wmma_rep: Constexpr[int] = 1,
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
+    xt_prefetch: Constexpr[int] = 1,
 ):
     # cluster_n > 1 launches (cluster_n, 1, 1) workgroup clusters whose peers all
     # share one m_tile (and therefore one expert) and differ only in n_tile, so one
@@ -89,6 +90,11 @@ def launch_gemm_a8w4_tdm(
     #      value, so a Python ``if`` on it becomes a traced branch instead of a
     #      host-side check -- so the callers that choose cluster_n enforce it
     #      (batched_gemm_mxfp4._pick_cluster_n and its assert).
+    # Effective cross-tile B/scale prefetch: the env knob plus a buffer to
+    # spare after the rotated wait (both schedules below need num_buffers>=3).
+    # Derived here so the cache tag and the kernel symbol say what the kernel
+    # actually does, not what was requested.
+    xt_on = 1 if (xt_prefetch and num_buffers >= 3) else 0
     cache_tag = (
         K,
         tile_m,
@@ -106,6 +112,7 @@ def launch_gemm_a8w4_tdm(
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
+        xt_on,
     )
     _ = cache_tag
     WMMA_M = WMMA_N = 16
@@ -161,11 +168,13 @@ def launch_gemm_a8w4_tdm(
     _bias = "_bias" if has_bias else ""
     _grouped = f"_e{n_experts}" if n_experts > 0 else ""
     _cl = f"_cn{cluster_n}" if cluster_n > 1 else ""
+    # Marked when on, so the baseline keeps its original symbol.
+    _xt = "_xt" if xt_on else ""
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
-        f"{_grouped}{_act}{_bias}{_qout}{_cl}"
+        f"{_grouped}{_act}{_bias}{_qout}{_cl}{_xt}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -530,41 +539,73 @@ def launch_gemm_a8w4_tdm(
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
             return wt, sb_k, sa_k
 
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl):
+        # Cross-tile carry for one k128 of B/scales. The k-tile loop is a runtime
+        # scf.for, so this cannot ride a Python value across iterations: it lives
+        # in fixed rmem that persists across the loop, exactly like c_frags. One
+        # set is enough -- a tile reads it for subtile 0 and overwrites it on its
+        # last subtile, so the read always precedes the write. Scales are packed
+        # into one tensor because rmem SSA promotion wants a vector store/load and
+        # a width-1 vector leaves a poison lane.
+        xt_wt = [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
+        xt_sc = fx.make_rmem_tensor(wmma_m_rep + wmma_n_rep, fx.Int32)
+
+        def xt_store(buf):
+            """Load subtile 0 of ``buf`` into the carry slots."""
+            sa_v = [load_sa(buf, wm, 0) for wm in range_constexpr(wmma_m_rep)]
+            sb_v = [load_sb(buf, wn, 0) for wn in range_constexpr(wmma_n_rep)]
+            for wn in range_constexpr(wmma_n_rep):
+                xt_wt[wn].store(load_b(buf, wn, 0))
+            xt_sc.store(Vec.from_elements(sa_v + sb_v))
+
+        def xt_read():
+            sc = xt_sc.load()
+            return (
+                xt_wt,
+                [sc[wmma_m_rep + wn] for wn in range_constexpr(wmma_n_rep)],
+                [sc[wm] for wm in range_constexpr(wmma_m_rep)],
+            )
+
+        # ``nxt_ksl`` is the next subtile inside this tile, ``xt_buf`` the next
+        # tile's buffer: either way this step issues the following k128's B/scale
+        # ds_reads under its own MFMAs. Only one of the two is ever set.
+        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, xt_buf=None):
             act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
             if const_expr(len(BACK) > 0):
                 act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
-                rocdl.s_wait_dscnt(len(BACK) * DS_A)
+                # rocdl.s_wait_dscnt(len(BACK) * DS_A)
             else:
-                rocdl.s_wait_dscnt(0)
+                pass
             mma_rows(FRONT, act_f, wt, sa_k, sb_k)
+            prefetch = load_b_and_scales(buf, nxt_ksl)
             if const_expr(len(BACK) > 0):
-                rocdl.s_wait_dscnt(0)
+                # rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
+            if const_expr(xt_buf is not None):
+                xt_store(xt_buf)
             return (
-                load_b_and_scales(buf, nxt_ksl)
+                prefetch
                 if const_expr(nxt_ksl is not None)
                 else None
             )
 
-        def compute_ktile(buf, prefetch_kt):
+        def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None):
+            """Compute one k-tile, carrying one k128 of B/scales across tiles.
+
+            ``from_xt`` takes this tile's subtile-0 B/scales from the carry slots,
+            where the previous tile's last k128 put them. ``nxt_buf`` is the next
+            tile's LDS buffer, whose subtile 0 is loaded during this tile's last
+            k128 -- so the tile boundary no longer exposes those ds_reads. The
+            caller must have waited for ``nxt_buf``'s TDM to land.
+            """
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt)
                 rocdl.sched_barrier(0)
-            prev = load_b_and_scales(buf, 0)
+            prev = xt_read() if const_expr(from_xt) else load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
-                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl)
-            fr, bk = front_wm * wmma_n_rep, len(BACK) * wmma_n_rep
-            for ks in range_constexpr(KWS):
-                rocdl.sched_dsrd((BS_DS if ks == 0 else 0) + front_wm * DS_A)
-                rocdl.sched_mfma(fr)
-                rocdl.sched_dsrd(len(BACK) * DS_A)
-                rocdl.sched_mfma(bk)
-                if const_expr(ks < KWS - 1):
-                    rocdl.sched_dsrd(BS_DS)
-            rocdl.sched_barrier(0)
+                xt_buf = nxt_buf if const_expr(ksl + 1 == KWS) else None
+                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, xt_buf)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
@@ -573,39 +614,90 @@ def launch_gemm_a8w4_tdm(
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
             # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
+            # Reading the next tile's B/scales during this tile's last k128 means
+            # that tile must already be in LDS, so both schedules rotate their wait
+            # one tile earlier. num_buffers >= 3 is what that costs: it trades one
+            # tile of global-load latency hiding for the tile-boundary ds_read
+            # stall, which is why it stays off at num_buffers == 2 (there the wait
+            # would leave nothing in flight at all).
             if const_expr(tile_m <= 64 or num_buffers <= 2):
                 # Post-compute issue: better for decode (small tile_m).
+                XT = xt_on
+                XT_W = 1 if XT else 0
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
                 n_steady = K_TILES - num_buffers
+                if const_expr(XT):
+                    # Every iteration of the rolled loop reads the carry slots, so
+                    # tile 0's k128 has to be in them before the loop starts.
+                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                    workgroup_barrier()
+                    xt_store(ptr_to_idx(buf_ptr(0)))
                 for kt in range(n_steady):
                     s = kt % num_buffers
                     buf = ptr_to_idx(buf_ptr(s))
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - XT_W))
                     workgroup_barrier()
-                    compute_ktile(buf, None)
+                    nxt_buf = (
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        if const_expr(XT)
+                        else None
+                    )
+                    compute_ktile(buf, None, XT, nxt_buf)
                     workgroup_barrier()
                     issue(s, kt + num_buffers)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 1 - j))
-                    compute_ktile(buf, None)
+                    has_next = XT and j + 1 < num_buffers
+                    pipeline_fence(
+                        outstanding=TDM_PER
+                        * max(0, num_buffers - 1 - j - (1 if has_next else 0))
+                    )
+                    nxt_buf = (
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        if const_expr(has_next)
+                        else None
+                    )
+                    compute_ktile(buf, None, XT, nxt_buf)
             else:
-                # Mid-compute prefetch: better for prefill (large tile_m).
+                # Mid-compute prefetch: better for prefill (large tile_m). This
+                # branch is only reached with num_buffers >= 3, and its fence then
+                # goes to num_buffers-3 == 0: the next tile's TDM is issued at the
+                # top of this tile's compute, so one tile of overlap survives even
+                # though nothing is in flight at the fence itself.
+                XT = xt_on
+                XT_W = 1 if XT else 0
                 for i in range_constexpr(num_buffers - 1):
                     issue(i, i)
                 n_steady = K_TILES - (num_buffers - 1)
+                if const_expr(XT):
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                    xt_store(ptr_to_idx(buf_ptr(0)))
                 for kt in range(n_steady):
                     s = kt % num_buffers
                     buf = ptr_to_idx(buf_ptr(s))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-                    compute_ktile(buf, kt + (num_buffers - 1))
+                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - XT_W))
+                    nxt_buf = (
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        if const_expr(XT)
+                        else None
+                    )
+                    compute_ktile(buf, kt + (num_buffers - 1), XT, nxt_buf)
                 for j in range_constexpr(num_buffers - 1):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - j))
-                    compute_ktile(buf, None)
+                    has_next = XT and j + 1 < num_buffers - 1
+                    pipeline_fence(
+                        outstanding=TDM_PER
+                        * max(0, num_buffers - 2 - j - (1 if has_next else 0))
+                    )
+                    nxt_buf = (
+                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                        if const_expr(has_next)
+                        else None
+                    )
+                    compute_ktile(buf, None, XT, nxt_buf)
 
             accs = [c_frags[idx].load().ir_value() for idx in range_constexpr(n_acc)]
             # The epilogue below reuses this LDS arena to stage C. Draining this
