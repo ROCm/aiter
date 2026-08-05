@@ -39,7 +39,7 @@ def _flydsl_mla_reduce_supported(
     max_seqlen_q: int,
     num_kv_splits: int,
 ) -> bool:
-    """Whether this production call is within the FlyDSL dispatch scope."""
+    """Whether a single-token decode reduction is within FlyDSL's scope."""
     if (
         get_gfx() not in _FLYDSL_MLA_REDUCE_TARGET_GFX
         or isinstance(max_seqlen_q, bool)
@@ -59,26 +59,18 @@ def _flydsl_mla_reduce_supported(
         or partial_lse.device != final_output.device
     ):
         return False
-    if partial_output.ndim == 4:
-        if (
-            partial_output.size(1) != 1
-            or partial_lse.ndim != 4
-            or tuple(partial_lse.shape)
-            != (
-                partial_output.size(0),
-                1,
-                partial_output.size(-2),
-                1,
-            )
-        ):
-            return False
-    elif partial_output.ndim == 3:
-        if partial_lse.ndim != 2 or tuple(partial_lse.shape) != (
+    if (
+        partial_output.ndim != 4
+        or partial_output.size(1) != 1
+        or partial_lse.ndim != 4
+        or tuple(partial_lse.shape)
+        != (
             partial_output.size(0),
+            1,
             partial_output.size(-2),
-        ):
-            return False
-    else:
+            1,
+        )
+    ):
         return False
     if final_output.ndim != 3:
         return False
@@ -103,8 +95,10 @@ def _flydsl_mla_reduce_enabled() -> bool:
 
     Default behavior is unchanged: production calls the HIP ``aiter.mla_reduce_v1``.
     Set ``AITER_MLA_REDUCE_FLYDSL=1`` to route through the FlyDSL port instead.
-    The validated scope is gfx942 H=16, Dv=512 single-token decode. Calls outside the
-    permitted ABI and shape scope use the HIP path.
+    The opt-in scope is H=16, Dv=512 single-token decode. MTP decode and prefill
+    use the HIP path; the latter is routed directly by its caller rather than
+    inferred from ``max_seqlen_q``. Calls outside the permitted ABI and shape scope
+    use the HIP path.
     Not memoized, so the env var can be toggled at runtime; only the optional
     package availability probe above is cached.
     """
@@ -121,7 +115,7 @@ def _flydsl_mla_reduce_enabled() -> bool:
         return False
 
 
-def _mla_reduce_v1_dispatch(
+def _mla_decode_reduce_v1_dispatch(
     partial_output,
     partial_lse,
     reduce_indptr,
@@ -132,7 +126,7 @@ def _mla_reduce_v1_dispatch(
     final_output,
     final_lse,
 ):
-    """Dispatch MLA reduce to HIP (default) or FlyDSL (opt-in).
+    """Dispatch a decode MLA reduction to HIP (default) or FlyDSL (opt-in).
 
     Signature mirrors ``aiter.mla_reduce_v1`` (num_kv_splits at slot 7, between
     max_seqlen_q and final_output) so it is a drop-in swap. The HIP kernel uses
@@ -843,7 +837,7 @@ def mla_decode_fwd(
                 0,
             )
 
-        _mla_reduce_v1_dispatch(
+        _mla_decode_reduce_v1_dispatch(
             logits,
             attn_lse,
             reduce_indptr,
@@ -1134,7 +1128,7 @@ def mla_prefill_ps_fwd(
         v_scale,
     )
 
-    _mla_reduce_v1_dispatch(
+    aiter.mla_reduce_v1(
         logits,
         attn_lse,
         reduce_indptr,

@@ -680,7 +680,6 @@ _IRREGULAR_SCENARIOS = [
     ("empty_middle", [8, 0, 16, 8], 1, 1),
     ("mlds_boundary", [300], 1, 1),
     ("mlds_max", [304], 1, 1),
-    ("mtp_irregular", [8, 32, 16], 2, 4),
     ("pool_oversize", [8, 304], 8, 1),
 ]
 
@@ -720,7 +719,6 @@ _GRAPH_CASES = [
     ("gapped_pmap", _HIP_SHAPE, "hip", [8, 8, 8, 8], 4, 1),
     ("empty_middle", _TORCH_REF_SHAPE, "torch", [8, 0, 16, 8], 1, 1),
     ("mlds_max", _TORCH_REF_SHAPE, "torch", [304], 1, 1),
-    ("mtp_irregular", _TORCH_REF_SHAPE, "torch", [8, 32, 16], 2, 4),
     ("small_split", _TORCH_REF_SHAPE, "torch", [32] * 4, 1, 1),
 ]
 
@@ -986,7 +984,7 @@ _PLAN_SPLITK_CASES = [
     (
         {"active_tiles": 1, "max_splits": 128, "max_seqlen_q": 2},
         (False, 1, 0),
-    ),  # prefill
+    ),  # non-single-token query width is outside the split-K scope
 ]
 _PLAN_CAPTURE_SAFE_CASES = [
     ({"num_final_rows": 32, "num_kv_splits": 128}, (False, 1, 0)),  # saturated grid
@@ -1216,13 +1214,19 @@ def test_degenerate_empty_tile(num_tiles):
     assert torch.equal(x.flse, expected_lse)
 
 
-def _decode_fwd_reduce_tensors(Dv=512, split_len=1):
-    """Build host placeholders matching decode-reduce layout."""
+def _decode_fwd_reduce_tensors(Dv=512, split_len=1, flat=False):
+    """Build host placeholders for decode or the old flat prefill layout."""
     rows, H = SERVING_PARTIAL_POOL, _SERVING_SHAPE[0]
     final_rows = 8
+    if flat:
+        po = torch.empty(rows, H, Dv, dtype=torch.float32)
+        pl = torch.empty(rows, H, dtype=torch.float32)
+    else:
+        po = torch.empty(rows, split_len, H, Dv, dtype=torch.float32)
+        pl = torch.empty(rows, split_len, H, 1, dtype=torch.float32)
     return Inputs(
-        torch.empty(rows, split_len, H, Dv, dtype=torch.float32),
-        torch.empty(rows, split_len, H, 1, dtype=torch.float32),
+        po,
+        pl,
         torch.empty(SERVING_NUM_REDUCE_TILE + 1, dtype=torch.int32),
         torch.empty(SERVING_NUM_REDUCE_TILE, 2, dtype=torch.int32),
         torch.empty(1, dtype=torch.int32),
@@ -1238,7 +1242,7 @@ def test_dispatch_scope_and_decode_fwd_layout():
     from aiter import mla
     from aiter.ops import flydsl
 
-    for fn in (mla._mla_reduce_v1_dispatch, mla.mla_decode_fwd):
+    for fn in (mla._mla_decode_reduce_v1_dispatch, mla.mla_decode_fwd):
         assert "actual_max_splits" not in inspect.signature(fn).parameters
 
     x = _decode_fwd_reduce_tensors()
@@ -1252,7 +1256,14 @@ def test_dispatch_scope_and_decode_fwd_layout():
         ("gfx950", "gfx950", x, 1, True),
         ("unsupported architecture", "gfx90a", _decode_fwd_reduce_tensors(), 1, False),
         ("Dv=128", "gfx942", _decode_fwd_reduce_tensors(128), 1, False),
-        ("prefill", "gfx942", _decode_fwd_reduce_tensors(), 2, False),
+        ("multi-token decode", "gfx942", _decode_fwd_reduce_tensors(), 2, False),
+        (
+            "flat partial layout",
+            "gfx942",
+            _decode_fwd_reduce_tensors(flat=True),
+            1,
+            False,
+        ),
         (
             "noncontiguous partial output",
             "gfx942",
@@ -1277,7 +1288,7 @@ def test_dispatch_scope_and_decode_fwd_layout():
                 mock.patch.object(flydsl, "flydsl_mla_reduce_v1") as flydsl_reduce,
                 mock.patch.object(mla.aiter, "mla_reduce_v1") as hip_reduce,
             ):
-                mla._mla_reduce_v1_dispatch(*args)
+                mla._mla_decode_reduce_v1_dispatch(*args)
 
             if expect_flydsl:
                 assert flydsl_reduce.call_count == 1, name
