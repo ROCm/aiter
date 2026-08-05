@@ -153,8 +153,6 @@ def mrope_cos_sin(col, tok, positions_t, cos_sin_t, mrope_section, is_interleave
 
 @lru_cache(maxsize=1)
 def _fp8_range():
-    from aiter.utility import dtypes as aiter_dtypes
-
     fp8_dtype = aiter_dtypes.fp8
     fp8_max = float(torch.finfo(fp8_dtype).max)
     fp8_min = float(torch.finfo(fp8_dtype).min)
