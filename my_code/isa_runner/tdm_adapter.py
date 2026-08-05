@@ -72,6 +72,34 @@ KERNARG_LAYOUT = [
 KERNARG_SIZE = 104
 
 
+def arena_bytes(tile_m, tile_n, tile_k, num_buffers, m_warp=1, n_warp=4,
+                a_is_fp4=0) -> int:
+    """Dynamic LDS the kernel allocates, mirroring the frontend's arena math.
+
+    The descriptor's group_segment_fixed_size is 0 because the arena is a
+    dynamic SharedAllocator, so the launch must supply this. Validated against
+    both the kernel's own ``ARENA=`` log line (158208 for 64x256x256_b3) and the
+    dynamic_shared_memory_size in 19_gpu_module_to_binary.mlir (159744 -- the
+    same arena rounded up by the tile_m<=64 zero-fill loop).
+    """
+    a_pack = 2 if a_is_fp4 else 1
+    a_row_b = tile_k // a_pack
+    stage_a = ((tile_m * (a_row_b + 16) + 15) // 16) * 16
+    stage_b = (((tile_n // 16) * ((tile_k // 2) * 16) + 15) // 16) * 16
+    wmma_m_rep = (tile_m // m_warp) // 16
+    as_supers = tile_m // wmma_m_rep
+    as_inner = (tile_k // 128) * wmma_m_rep
+    stage_sa = ((as_supers * as_inner * 4 + 15) // 16) * 16
+    stage_sb = (((tile_n // 32) * (tile_k // 4) * 4 + 15) // 16) * 16
+    pitch = ((stage_a + stage_b + stage_sa + stage_sb + 511) // 512) * 512
+    c_store = ((tile_m * tile_n * 2 + 127) // 128) * 128
+    arena = max(num_buffers * pitch, c_store)
+    if tile_m <= 64:  # zero-fill loop rounds the arena to 16 B * block
+        zblk = 16 * (m_warp * n_warp * 32)
+        arena = ((arena + zblk - 1) // zblk) * zblk
+    return arena
+
+
 @dataclass
 class Capture:
     """One recorded kernel invocation."""
@@ -81,6 +109,8 @@ class Capture:
     args: dict[str, int | float]
     out_ptr: int
     out_nbytes: int
+    lds_bytes: int = 0
+    tiles: dict[str, int] = field(default_factory=dict)
     reference: Any = field(default=None, repr=False)  # torch tensor clone
 
     def to_json(self) -> dict:
@@ -92,6 +122,8 @@ class Capture:
                      for k, v in self.args.items()},
             "out_ptr": self.out_ptr,
             "out_nbytes": self.out_nbytes,
+            "lds_bytes": self.lds_bytes,
+            "tiles": self.tiles,
         }
 
     def pack_kernargs(self) -> list:
@@ -141,6 +173,14 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
     os.environ.setdefault("ENABLE_CK", "0")
     os.environ.setdefault("AITER_FORCE_GFX1250", "1")
     os.environ.setdefault("AITER_MOE_EXPERT_BALANCE", "true")
+    # Default to the tuned g2_m64_nb3 tiles so the captured kernel is the same
+    # one 21_final_isa.s was dumped from; without this the CSV default
+    # (16x256x256_b2) is captured and no dumped ISA matches it.
+    for k, v in (("AITER_TDM_TILE_M", "64"), ("AITER_TDM_TILE_N", "256"),
+                 ("AITER_TDM_TILE_K", "256"), ("AITER_TDM_NUM_BUFFERS", "3"),
+                 ("AITER_TDM_TILE_M2", "64"), ("AITER_TDM_TILE_N2", "512"),
+                 ("AITER_TDM_TILE_K2", "128"), ("AITER_TDM_NUM_BUFFERS2", "3")):
+        os.environ.setdefault(k, v)
 
     import flydsl.compiler as flyc
 
@@ -191,6 +231,11 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
                 },
                 out_ptr=_ptr_of(arg_c),
                 out_nbytes=0,
+                lds_bytes=arena_bytes(tile_m, tile_n, tile_k, num_buffers,
+                                      m_warp, n_warp, a_is_fp4),
+                tiles={"tile_m": tile_m, "tile_n": tile_n, "tile_k": tile_k,
+                       "num_buffers": num_buffers, "m_warp": m_warp,
+                       "n_warp": n_warp},
             ))
             records[-1]._out_tensor = arg_c  # keep alive; sized after the run
         return real_launch(
@@ -261,8 +306,7 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
 
     spec = KernelLaunchSpec(
         grid=cap.grid, block=cap.block,
-        shared_mem_bytes=(lds_bytes if lds_bytes is not None
-                          else _infer_lds(isa_source)),
+        shared_mem_bytes=(lds_bytes if lds_bytes is not None else cap.lds_bytes),
         device=device,
     )
     report: dict[str, Any] = {
@@ -293,18 +337,6 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
                 name, args, spec, iters=iters, warmup=warmup)
 
     return report
-
-
-def _infer_lds(isa_source: str | Path) -> int:
-    """Dynamic LDS the kernel needs, from the ARENA the frontend would allocate.
-
-    The descriptor's group_segment_fixed_size is 0 for these kernels because the
-    arena is allocated dynamically, so the launch must supply it. Falls back to
-    the recorded gemm1 profile.
-    """
-    from isa_runner import TDM_GEMM1_LDS_BYTES
-    env = os.environ.get("AITER_ISA_LDS_BYTES")
-    return int(env) if env else TDM_GEMM1_LDS_BYTES
 
 
 def main(argv=None) -> int:
