@@ -191,9 +191,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     grid = max(1, (numel + 255) // 256)
 
     def _route_ksplit(feat_dim, source_topk, remap_rows=False):
-        for ks, routes_per_warp in routeks_compile_variants(
-            source_topk, remap_rows
-        ):
+        for ks, routes_per_warp in routeks_compile_variants(source_topk, remap_rows):
             launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
@@ -240,8 +238,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         launch = build_moe_route_unified_module()
         route_grid = max(
             1,
-            (numel + 256 * routes_per_thread - 1)
-            // (256 * routes_per_thread),
+            (numel + 256 * routes_per_thread - 1) // (256 * routes_per_thread),
         )
         launch(
             ptr_arg(torch.empty(0, dtype=i32, device=dev)),

@@ -202,9 +202,7 @@ def build_moe_contiguous_psum_remap_module(split_remap: bool = False):
 
     @flyc.kernel(
         name=(
-            "moe_contiguous_psum_scan"
-            if split_remap
-            else "moe_contiguous_psum_remap"
+            "moe_contiguous_psum_scan" if split_remap else "moe_contiguous_psum_remap"
         ),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
@@ -326,9 +324,7 @@ def build_moe_contiguous_psum_remap_module(split_remap: bool = False):
                 )
             for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
                 row = fx.Uint32(
-                    buffer_ops.buffer_load(
-                        rows_rsrc, route_i32, vec_width=1, dtype=i32
-                    )
+                    buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
                 )
                 m = fx.Uint32(route_max_m)
                 expert = row // m
@@ -350,9 +346,8 @@ def build_moe_contiguous_psum_remap_module(split_remap: bool = False):
         num_valid_routes: fx.Pointer,
     ):
         i32 = T.i32
-        route = (
-            fx.Uint32(fx.block_idx.x) * REMAP_BLOCK_THREADS
-            + fx.Uint32(fx.thread_idx.x)
+        route = fx.Uint32(fx.block_idx.x) * REMAP_BLOCK_THREADS + fx.Uint32(
+            fx.thread_idx.x
         )
         valid_route_count = fx.Uint32(numel)
         num_valid_routes_is_set = fx.Int64(ptrtoint(num_valid_routes)) != 0
@@ -374,9 +369,7 @@ def build_moe_contiguous_psum_remap_module(split_remap: bool = False):
             expert = row // m
             slot = row - expert * m
             start = fx.Uint32(
-                buffer_ops.buffer_load(
-                    ptr_rsrc(starts), expert, vec_width=1, dtype=i32
-                )
+                buffer_ops.buffer_load(ptr_rsrc(starts), expert, vec_width=1, dtype=i32)
             )
             buffer_ops.buffer_store(start + slot, rows_rsrc, route)
 

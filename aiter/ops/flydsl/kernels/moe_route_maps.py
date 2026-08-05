@@ -281,9 +281,7 @@ def build_moe_route_unified_module():
             rank = fx.Uint32(0)
             if valid:
                 global_expert = fx.Uint32(
-                    buffer_ops.buffer_load(
-                        topk_rsrc, route, vec_width=1, dtype=i32
-                    )
+                    buffer_ops.buffer_load(topk_rsrc, route, vec_width=1, dtype=i32)
                 )
                 dropped = fx.Int32(0) != 0
                 if use_g2l:
@@ -310,12 +308,8 @@ def build_moe_route_unified_module():
                         )
                     )
                     w_out = dropped.select(fx.Float32(0.0), w_f32)
-                    w_bf16 = arith.bitcast(
-                        T.i16, arith.trunc_f(T.bf16, _raw(w_out))
-                    )
-                    w_f16 = arith.bitcast(
-                        T.i16, arith.trunc_f(T.f16, _raw(w_out))
-                    )
+                    w_bf16 = arith.bitcast(T.i16, arith.trunc_f(T.bf16, _raw(w_out)))
+                    w_f16 = arith.bitcast(T.i16, arith.trunc_f(T.f16, _raw(w_out)))
                     buffer_ops.buffer_store(
                         is_f16.select(w_f16, w_bf16),
                         ptr_rsrc(gather_w),
@@ -337,9 +331,7 @@ def build_moe_route_unified_module():
                     rank = fx.Uint32(
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.add,
-                            _slot_ptr(
-                                fx.Int64(ptrtoint(atomic_buffer)), expert
-                            ),
+                            _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), expert),
                             c1,
                             llvm.AtomicOrdering.monotonic,
                             syncscope="agent",
@@ -362,9 +354,7 @@ def build_moe_route_unified_module():
                     base = fx.Int32(
                         llvm.AtomicRMWOp(
                             llvm.AtomicBinOp.add,
-                            _slot_ptr(
-                                fx.Int64(ptrtoint(atomic_buffer)), bucket
-                            ),
+                            _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), bucket),
                             _raw(count),
                             llvm.AtomicOrdering.monotonic,
                             syncscope="agent",
@@ -379,10 +369,7 @@ def build_moe_route_unified_module():
                 expert = expert_regs[route_it]
                 rank = rank_regs[route_it]
                 if use_lds_flag:
-                    rank = (
-                        fx.Uint32(_lds_load(lds_cnt, expert))
-                        + rank
-                    )
+                    rank = fx.Uint32(_lds_load(lds_cnt, expert)) + rank
                 row = rank + expert * fx.Uint32(max_m)
                 buffer_ops.buffer_store(row, out_rsrc, route_regs[route_it])
 

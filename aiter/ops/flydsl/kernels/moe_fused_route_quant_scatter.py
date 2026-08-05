@@ -1255,9 +1255,7 @@ ROUTEKS_KSPLIT_MIN_GRID_BLOCKS = 512
 
 
 def routeks_uses_ksplit(numel: int, warps_per_block: int) -> bool:
-    grid_blocks = (int(numel) + int(warps_per_block) - 1) // int(
-        warps_per_block
-    )
+    grid_blocks = (int(numel) + int(warps_per_block) - 1) // int(warps_per_block)
     return grid_blocks < ROUTEKS_KSPLIT_MIN_GRID_BLOCKS
 
 
@@ -1283,9 +1281,7 @@ def routeks_compile_variants(
     max_routes_per_warp: int = 0,
 ):
     variants = [(False, 1)] if remap_rows else [(True, 1), (False, 1)]
-    routes_per_warp = select_routeks_routes_per_warp(
-        source_topk, max_routes_per_warp
-    )
+    routes_per_warp = select_routeks_routes_per_warp(source_topk, max_routes_per_warp)
     if routes_per_warp > 1:
         variants.append((False, routes_per_warp))
     return tuple(variants)
@@ -1487,9 +1483,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                         )
                         row = start + slot
                         if lane == c0_i32:
-                            buffer_ops.buffer_store(
-                                row, rows_rsrc, route_i
-                            )
+                            buffer_ops.buffer_store(row, rows_rsrc, route_i)
                     scale_tile = fx.Uint32(row) // fx.Uint32(c_rows_per_tile)
                     row_in_tile = row - scale_tile * c_rows_per_tile
                     wmma_row = fx.Uint32(row_in_tile) // fx.Uint32(c16_i32)

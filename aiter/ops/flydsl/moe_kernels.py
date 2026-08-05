@@ -2348,18 +2348,14 @@ def flydsl_moe_topids_to_rows(
     null_f32 = torch.empty(0, dtype=torch.float32, device=device)
     null_u8 = torch.empty(0, dtype=torch.uint8, device=device)
     g2l_arg = g2l_lut.reshape(-1) if use_g2l else null_i32
-    weight_arg = (
-        weight_in.to(torch.float32).reshape(-1) if use_g2l else null_f32
-    )
+    weight_arg = weight_in.to(torch.float32).reshape(-1) if use_g2l else null_f32
     gather_arg = gather_w.reshape(-1) if use_g2l else null_u8
 
     from aiter.ops.flydsl.kernels.moe_route_maps import MAX_ROUTE_BUCKETS
 
     use_lds = int(E) <= MAX_ROUTE_BUCKETS
     routes_per_thread = 4
-    route_grid = (
-        numel + 256 * routes_per_thread - 1
-    ) // (256 * routes_per_thread)
+    route_grid = (numel + 256 * routes_per_thread - 1) // (256 * routes_per_thread)
     _get_compiled_route_unified()(
         ptr_arg(topk_ids_i32),
         ptr_arg(g2l_arg),
@@ -2850,17 +2846,11 @@ def flydsl_moe_fused_quant_preshuffle(
         )
 
         use_ksplit = routeks_uses_ksplit(numel, warps_per_block)
-        selected_routes_per_warp = select_routeks_routes_per_warp(
-            source_topk
-        )
+        selected_routes_per_warp = select_routeks_routes_per_warp(source_topk)
         use_multi_route = (
-            not use_ksplit
-            and selected_routes_per_warp > 1
-            and numel % source_topk == 0
+            not use_ksplit and selected_routes_per_warp > 1 and numel % source_topk == 0
         )
-        routes_per_warp = (
-            selected_routes_per_warp if use_multi_route else 1
-        )
+        routes_per_warp = selected_routes_per_warp if use_multi_route else 1
         launch_grid_blocks = grid_blocks
         if use_multi_route:
             source_rows = numel // routes_per_warp
