@@ -219,8 +219,19 @@ def verify_order(source: str | Path, code_object: str | Path,
         return [re.sub(r"_e(32|64)$", "", s) for s in seq]
 
     nsrc, ndis = norm(src), norm(dis)
+
+    # Trailing s_code_end comes from the source's own .p2alignl/.fill padding
+    # (0xBF9F0000). It sits after the last real instruction and is required
+    # encoding padding, not a scheduling change -- drop it before comparing.
+    padding = 0
+    while ndis and ndis[-1] == "s_code_end" and len(ndis) > len(nsrc):
+        ndis.pop()
+        padding += 1
+
     ok = nsrc == ndis
     result = {"ok": ok, "source_count": len(nsrc), "disasm_count": len(ndis)}
+    if padding:
+        result["trailing_s_code_end_ignored"] = padding
     if not ok:
         first = next((i for i, (a, b) in enumerate(zip(nsrc, ndis)) if a != b),
                      min(len(nsrc), len(ndis)))
