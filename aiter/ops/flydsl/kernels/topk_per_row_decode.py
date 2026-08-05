@@ -111,10 +111,18 @@ def _create_topk_per_row_decode_radix_unordered(top_k: int):
         s_hist2 = lds.s_hist2.view(fx.make_layout(RADIX_BINS, 1))
         s_meta = lds.s_meta.view(fx.make_layout(8, 1))
 
-        logits_t = GTensor(logits, dtype=T.f32, shape=(-1,))
-        logits_rsrc = logits_t.rsrc
+        # GTensor always builds a max-size descriptor, so bound these two by hand;
+        # see the comment in topk_per_row_decode_tiered.py for why the vec4 tail
+        # needs the real size. num_rows is a kernel argument here.
+        logits_bytes = fx.Int64(num_rows) * fx.Int64(stride0) * fx.Int64(4)
+        logits_rsrc = buffer_ops.create_buffer_resource(
+            logits, max_size=False, num_records_bytes=logits_bytes
+        )
         seq_lens_t = GTensor(seq_lens, dtype=T.i32, shape=(-1,))
-        indices_rsrc = GTensor(indices, dtype=T.i32, shape=(-1,)).rsrc
+        indices_bytes = fx.Int64(num_rows) * fx.Int64(top_k) * fx.Int64(4)
+        indices_rsrc = buffer_ops.create_buffer_resource(
+            indices, max_size=False, num_records_bytes=indices_bytes
+        )
 
         c_zero = arith.constant(0, type=T.i32)
         c_one = arith.constant(1, type=T.i32)

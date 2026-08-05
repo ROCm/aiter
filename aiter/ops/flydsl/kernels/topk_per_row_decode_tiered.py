@@ -279,9 +279,23 @@ def create_topk_per_row_decode_tiered_kernel(
         s_scan = lds.s_scan.view(fx.make_layout(red_slots * 2, 1))
         s_meta = lds.s_meta.view(fx.make_layout(8, 1))
 
-        logits_rsrc = buffer_ops.create_buffer_resource(logits, max_size=True)
+        # Bound this descriptor to the real allocation instead of 4 GiB. The vec4
+        # tail loads a whole group even when the row has 1-3 elements left, and the
+        # lanes are predicated only after the load, so the last row of an unpadded
+        # buffer fetches an address past the tensor. max_size switches off the
+        # hardware range check that would otherwise return zero for it; the true
+        # size restores it, and the tail mask discards that zero exactly as it
+        # discarded the garbage before. num_rows is the grid's y extent -- see the
+        # launcher.
+        logits_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(stride0) * fx.Int64(4)
+        logits_rsrc = buffer_ops.create_buffer_resource(
+            logits, max_size=False, num_records_bytes=logits_bytes
+        )
         seq_lens_rsrc = buffer_ops.create_buffer_resource(seq_lens, max_size=True)
-        indices_rsrc = buffer_ops.create_buffer_resource(indices, max_size=True)
+        indices_bytes = fx.Int64(gpu.grid_dim.y) * fx.Int64(top_k) * fx.Int64(4)
+        indices_rsrc = buffer_ops.create_buffer_resource(
+            indices, max_size=False, num_records_bytes=indices_bytes
+        )
         workspace_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
         workspace_base_idx = buffer_ops.extract_base_index(workspace, address_space=1)
 
