@@ -4,6 +4,8 @@ from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton.utils.common_utils import strip_annotate
+
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 
@@ -139,6 +141,7 @@ def _make_kv_load_layouts_cdna4(
 
 
 @aggregate
+@strip_annotate
 class MQAAsyncKVLoaderConfig:
     BLOCK_KV: gl.constexpr
     HEAD_SIZE: gl.constexpr
@@ -175,6 +178,7 @@ class MQAAsyncKVLoaderConfig:
 
 
 @aggregate
+@strip_annotate
 class MQAAsyncKVLoader:
     """CDNA4 async-copy loader. Shared holds K as [HEAD_SIZE, BLOCK_KV]."""
 
