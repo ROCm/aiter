@@ -104,10 +104,11 @@ def flydsl_gdr_decode(
     for input in [query, key, value, a, b, dt_bias, A_log, indices, out]:
         assert input.device == device
     assert state.data_ptr() % 16 == 0
-    for input in [key, value, a, b, dt_bias, out]:
+    for input in [key, value, a, b, out]:
         assert input.dtype == dtype
     assert state.dtype in [torch.float, torch.bfloat16]
     assert A_log.dtype in [torch.float, torch.bfloat16]
+    assert dt_bias.dtype in [torch.float, torch.bfloat16, torch.half]
     assert indices.dtype == torch.int32
 
     if need_shuffle_state:
@@ -130,6 +131,7 @@ def flydsl_gdr_decode(
     exe = create_vk_gdr_decode_kernel(
         get_dtype_str(query.dtype),
         get_dtype_str(A_log.dtype),
+        get_dtype_str(dt_bias.dtype),
         get_dtype_str(state_.dtype),
         seq_length,
         num_k_heads,

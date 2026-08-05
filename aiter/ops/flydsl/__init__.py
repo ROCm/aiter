@@ -59,7 +59,7 @@ if is_flydsl_available():
     from .kernels.qk_norm_rope_quant import flydsl_qk_norm_rope_quant
     from .moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
-    # from .linear_attention_kernels import flydsl_gdr_decode
+    from .linear_attention_kernels import flydsl_gdr_decode
 
     __all__ += [
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
@@ -75,5 +75,5 @@ if is_flydsl_available():
         "flydsl_pa_mqa_logits_fp4_varqlen",
         "flydsl_preshuffle_gemm_a8",
         "flydsl_qk_norm_rope_quant",
-        # "flydsl_gdr_decode",
+        "flydsl_gdr_decode",
     ]

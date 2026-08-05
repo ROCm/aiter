@@ -27,6 +27,7 @@ fm_fast = arith.FastMathFlags.fast
 def create_vk_gdr_decode_kernel(
     dtype: str,
     A_log_dtype: str,
+    dt_bias_dtype: str,
     state_dtype: str,
     seq_length: int,
     num_k_heads: int,
@@ -105,6 +106,7 @@ def create_vk_gdr_decode_kernel(
         dtype_ = get_dtype_in_kernel(dtype)
         fx_dtype_ = fx.BFloat16 if dtype == "bf16" else fx.Float16
         A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
+        dt_bias_dtype_ = get_dtype_in_kernel(dt_bias_dtype)
         state_dtype_ = get_dtype_in_kernel(state_dtype)
         # i32_0 = arith.constant(0, type=T.i32)
         f32_0 = arith.constant(0.0, type=T.f32)
@@ -152,7 +154,7 @@ def create_vk_gdr_decode_kernel(
             stride=(b_strides[0], b_strides[1], b_strides[2]),
             shape=(-1, seq_length, num_v_heads),
         )
-        dt_bias_tensor = GTensor(dt_bias, dtype=dtype_, shape=(num_v_heads,))
+        dt_bias_tensor = GTensor(dt_bias, dtype=dt_bias_dtype_, shape=(num_v_heads,))
         A_log_tensor = GTensor(A_log, dtype=A_log_dtype_, shape=(num_v_heads,))
         out_tensor = GTensor(
             out, dtype=dtype_, shape=(-1, seq_length, num_v_heads, head_v_dim)
@@ -185,7 +187,10 @@ def create_vk_gdr_decode_kernel(
                 r_A_log = A_log_tensor[hv_i]
             else:
                 r_A_log = A_log_tensor[hv_i].extf(T.f32)
-            r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
+            if const_expr("f32" in dt_bias_dtype):
+                r_dt_bias = dt_bias_tensor[hv_i]
+            else:
+                r_dt_bias = dt_bias_tensor[hv_i].extf(T.f32)
 
             state_vecs = [0] * (WARP_TILE_V_ITERS * WARP_TILE_K_ITERS)
             for vi in range_constexpr(WARP_TILE_V_ITERS):
