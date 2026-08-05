@@ -105,11 +105,12 @@ Status legend: [ ] todo · [~] in progress · [x] done
       `inter[B,TOPK,INTER]` (`if lane == 0:`; reduce still runs on all lanes).
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken and kVector 16 (`HIDDEN=1024`) / kVector 8 (`HIDDEN=512`).
-- [~] Perf pass on gfx950: **~1.4–1.6 TB/s** weight-read BW after the lane-0-store fix
-      (~20–25% of HBM peak; reference targets ~90%). Remaining levers, deferred:
-      (1) **vectorized loads** — load x/w as 128-bit `vec4` i32 instead of per-word scalar
-          `buffer_load` (biggest win); (2) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
-      (3) B=1 software-pipelined weight prefetch. [done] lane-0-only store.
+- [x] Perf pass on gfx950: after lane-0-store **and vectorized 128-bit loads**, a realistic
+      shape (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~6.9 TB/s (~86% HBM peak)**, up from the
+      ~1.4–1.6 TB/s scalar-load baseline. Vectorization loads x/w via widest `vec4`/`vec2` i32
+      `buffer_load`s (`load_i32_words` helper) and also drops the old duplicate weight-dword
+      reloads. Remaining levers, deferred: (1) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
+      (2) B=1 software-pipelined weight prefetch. [done] lane-0-only store; vectorized loads.
 - **Where:** kernel `build_gate_up_fp8_module` + `pick_kvector` in
   `aiter/ops/flydsl/kernels/warp_decode_moe.py`; entry `flydsl_warp_decode_gate_up` in
   `aiter/ops/flydsl/warp_decode_moe.py`; tests `GATE_UP_CASES` /`test_gate_up_fp8` in
@@ -128,9 +129,10 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken, kVector 16 (`INTER=1024`) / 8 (`INTER=512`). End-to-end
       gate_up→down_reduce vs full torch MoE: cos 0.9999998, max_delta 1.5e-5 (stages compose).
-- [~] Perf: grid-starved small shapes ~0.45 TB/s, but a realistic DeepSeek-ish shape
-      (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~6.2 TB/s (~78% HBM peak)** — on par with the
-      reference's ~74–79% down claim. Levers: H2 activation-reuse + vectorized loads.
+- [x] Perf: after vectorized 128-bit loads, the realistic DeepSeek-ish shape
+      (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~5.7 TB/s (~71% HBM peak)** (was ~6.2 TB/s
+      before vectorization on the lane-0-store baseline; the vec-load win is smaller here since
+      `down` was already coalescing well). Remaining lever: H2 (2 outputs/wave) activation-reuse.
 - **Where:** kernel `build_down_reduce_fp8_module` in `kernels/warp_decode_moe.py`; entry
   `flydsl_warp_decode_down_reduce` in `ops/flydsl/warp_decode_moe.py`; tests `DOWN_CASES` /
   `test_down_reduce_fp8` in the op_test (10 pass total).
@@ -360,3 +362,8 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   `if lane == 0:` guarded store (reduce still on all lanes). Correctness unchanged (10 pass).
   gate_up ~1.4–1.6 TB/s; down_reduce hits **~6.2 TB/s (~78% HBM peak)** on a DeepSeek-ish
   shape. Next lever: vectorized 128-bit loads.
+- _perf: vectorized loads_ — added `load_i32_words` helper coalescing the inner-loop scalar
+  `buffer_load`s into widest `vec4`/`vec2` i32 transactions (and dropping the duplicate
+  weight-dword reloads); rewrote both kernels' inner loops to use it. Correctness unchanged
+  (10 pass). On the DeepSeek-ish shape (B1 INTER2048 HIDDEN7168 E8 TOPK8): **gate_up ~6.9 TB/s
+  (~86% HBM peak)** (big jump from ~1.4–1.6), **down ~5.7 TB/s (~71%)**. Next lever: H2 for down.

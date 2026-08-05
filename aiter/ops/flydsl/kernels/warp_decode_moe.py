@@ -37,7 +37,7 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import math as fxmath
 from flydsl.expr.typing import BFloat16
 
-from aiter.ops.flydsl.kernels import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 WARP_SIZE = 64
 # Butterfly-reduce shifts for a full 64-lane wave (low -> high).
@@ -86,6 +86,33 @@ def fp8x2_to_bf16x2(src_i32, scale_f32, *, hi: bool):
 def bf16x2_to_i32(pair_vec):
     """Reinterpret a ``vector<2xbf16>`` as an i32 (dot2 packs 2 bf16 per VGPR)."""
     return llvm.bitcast(T.i32(), pair_vec)
+
+
+def load_i32_words(rsrc, word0, n):
+    """Load ``n`` consecutive i32 dwords starting at element offset ``word0`` using
+    the widest 128-bit/64-bit buffer loads possible, returning a Python list of
+    ``n`` scalar i32 ir.Values.  ``n`` is a compile-time constant (loop unrolled).
+
+    Coalescing the per-word scalar loads into ``vec4``/``vec2`` buffer transactions
+    is the main memory-throughput win for the warp-decode inner loop.
+    """
+    out = []
+    i = 0
+    while i < n:
+        if n - i >= 4:
+            w = 4
+        elif n - i >= 2:
+            w = 2
+        else:
+            w = 1
+        vec = buffer_ops.buffer_load(rsrc, word0 + i, vec_width=w, dtype=T.i32())
+        if w == 1:
+            out.append(vec)
+        else:
+            for j in range(w):
+                out.append(vector.extract(vec, static_position=[j]))
+        i += w
+    return out
 
 
 def _i32_const(value: int):
@@ -240,6 +267,7 @@ def build_gate_up_fp8_module(
         raise ValueError(f"HIDDEN={hidden} not divisible by 64*kVector={ktile_n}")
     num_iter = hidden // ktile_n
     n_pairs = kvector // 2  # x uint32 words / weight pairs per lane per iter
+    n_wwords = kvector // 4  # fp8 weight dwords/lane/iter (4 fp8 each)
     per_token_scale = const_expr(w_scale_mode == "pertoken")
 
     @flyc.kernel
@@ -280,22 +308,17 @@ def build_gate_up_fp8_module(
             k_base = i * ktile_n + lane * kvector
             # element bases -> word (i32) offsets: x is 2 bf16/word, w is 4 fp8/word.
             x_word0 = (token_b * hidden + k_base) // 2
-            wg_word0 = (w_row * hidden + k_base) // 4
-            wu_word0 = (w_row * hidden + k_base) // 4
+            w_word0 = (w_row * hidden + k_base) // 4
+            # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
+            xw = load_i32_words(x_rsrc, x_word0, n_pairs)
+            gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
+            uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
             for ipair in range_constexpr(n_pairs):
                 w_word = ipair // 2
                 w_hi = (ipair % 2) == 1
-                x_i32 = buffer_ops.buffer_load(
-                    x_rsrc, x_word0 + ipair, vec_width=1, dtype=T.i32()
-                )
-                gword = buffer_ops.buffer_load(
-                    wg_rsrc, wg_word0 + w_word, vec_width=1, dtype=T.i32()
-                )
-                uword = buffer_ops.buffer_load(
-                    wu_rsrc, wu_word0 + w_word, vec_width=1, dtype=T.i32()
-                )
-                g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gword, one_f32, hi=w_hi))
-                u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uword, one_f32, hi=w_hi))
+                x_i32 = xw[ipair]
+                g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
+                u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
                 gate_dot = dot2_f32_bf16(
                     x_i32, g_i32, gate_dot, serialize=serialize_dot2
                 )
@@ -388,6 +411,7 @@ def build_down_reduce_fp8_module(
         raise ValueError(f"INTER={inter} not divisible by 64*kVector={ktile_n}")
     num_iter = inter // ktile_n
     n_pairs = kvector // 2
+    n_wwords = kvector // 4  # fp8 weight dwords/lane/iter (4 fp8 each)
     per_token_scale = const_expr(w_scale_mode == "pertoken")
 
     @flyc.kernel
@@ -434,17 +458,16 @@ def build_down_reduce_fp8_module(
                 inter_row = token_b * top_k + k
                 a_word0 = (inter_row * inter + k_base) // 2
                 wd_word0 = (w_row * inter + k_base) // 4
+                # Coalesced 128-bit loads: n_pairs inter dwords, n_wwords w dwords.
+                aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                dw = load_i32_words(wd_rsrc, wd_word0, n_wwords)
                 for ipair in range_constexpr(n_pairs):
                     w_word = ipair // 2
                     w_hi = (ipair % 2) == 1
-                    a_i32 = buffer_ops.buffer_load(
-                        inter_rsrc, a_word0 + ipair, vec_width=1, dtype=T.i32()
+                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi))
+                    dot_k = dot2_f32_bf16(
+                        aw[ipair], d_i32, dot_k, serialize=serialize_dot2
                     )
-                    dword = buffer_ops.buffer_load(
-                        wd_rsrc, wd_word0 + w_word, vec_width=1, dtype=T.i32()
-                    )
-                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dword, one_f32, hi=w_hi))
-                    dot_k = dot2_f32_bf16(a_i32, d_i32, dot_k, serialize=serialize_dot2)
 
             # router_wt * ds is lane-uniform, so fold it into the per-lane partial
             # before the single cross-lane reduce (exact; avoids a reduce per k).
