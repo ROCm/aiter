@@ -164,11 +164,13 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
         build_moe_fused_quant_preshuffle_route_ksplit_module,
         build_moe_fused_route_quant_scatter_module,
         build_moe_fused_route_quant_scatter_st_ksplit_module,
+        routeks_compile_variants,
     )
     from aiter.ops.flydsl.kernels.moe_gather_reduce import (
         build_moe_gather_reduce_module,
     )
     from aiter.ops.flydsl.kernels.moe_route_maps import (
+        MAX_ROUTE_BUCKETS,
         build_moe_route_unified_module,
     )
 
@@ -189,15 +191,9 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
     grid = max(1, (numel + 255) // 256)
 
     def _route_ksplit(feat_dim, source_topk, remap_rows=False):
-        variants = [(False, 1)] if remap_rows else [(True, 1), (False, 1)]
-        if (
-            feat_dim == 7168
-            and wmma_rep == 8
-            and quant_mode == "fp8"
-            and source_topk == 6
+        for ks, routes_per_warp in routeks_compile_variants(
+            source_topk, remap_rows
         ):
-            variants.append((False, 6))
-        for ks, routes_per_warp in variants:
             launch = build_moe_fused_quant_preshuffle_route_ksplit_module(
                 feat_dim=feat_dim,
                 wmma_rep=wmma_rep,
@@ -258,7 +254,7 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             numel,
             max_m,
             E,
-            int(E <= 512 and numel >= 81920),
+            int(E <= MAX_ROUTE_BUCKETS),
             0,
             route_grid,
             stream=0,
@@ -282,24 +278,20 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             stream=0,
         )
 
-        split_variants = (False, True) if numel >= 81920 else (False,)
-        for split_remap in split_variants:
-            psum_remap = build_moe_contiguous_psum_remap_module(
-                split_remap=split_remap
-            )
-            psum_remap(
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                numel,
-                E,
-                max_m,
-                tile_m,
-                ptr_arg(torch.empty(0, dtype=i32, device=dev)),
-                stream=0,
-            )
+        psum_remap = build_moe_contiguous_psum_remap_module()
+        psum_remap(
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            numel,
+            E,
+            max_m,
+            tile_m,
+            ptr_arg(torch.empty(0, dtype=i32, device=dev)),
+            stream=0,
+        )
 
         _route_ksplit(
             feat_dim=model_dim,
