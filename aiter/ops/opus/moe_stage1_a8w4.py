@@ -12,6 +12,20 @@ from ..enum import ActivationType
 _OPUS_MOE_STAGE1_A8W4_SCALE_GROUP = 32
 
 
+def _opus_runtime_swiglu_limit(
+    swiglu_limit: float | None,
+    activation: int,
+) -> float:
+    """Normalize the clamp bound passed to Opus stage1 kernels.
+
+    ``None`` and ``0.0`` mean no configured clamp. SwiGLU retains its 7.0
+    default; Silu and Situv2 encode no clamp as positive infinity.
+    """
+    if activation == ActivationType.Swiglu.value:
+        return float(swiglu_limit) if swiglu_limit else 7.0
+    return float(swiglu_limit) if swiglu_limit else float("inf")
+
+
 def _contiguous(tensor: Tensor) -> Tensor:
     return tensor if tensor.is_contiguous() else tensor.contiguous()
 
@@ -103,10 +117,7 @@ def opus_moe_stage1_a8w4_fwd(
     block_m = int(block_m)
     kernelName = str(kernelName)
     activation = int(getattr(activation, "value", activation))
-    if swiglu_limit is None:
-        swiglu_limit = (
-            7.0 if activation == ActivationType.Swiglu.value else float("inf")
-        )
+    swiglu_limit = _opus_runtime_swiglu_limit(swiglu_limit, activation)
     inter_dim = int(w1.shape[1]) // 2
     if out is None:
         out = torch.empty(

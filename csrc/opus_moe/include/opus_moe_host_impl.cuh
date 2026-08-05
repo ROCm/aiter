@@ -703,19 +703,11 @@ void opus_moe_stage1_a8w4_fwd(
                 "Opus A8W4 stage1 activation must be Silu (0), Swiglu (2), or "
                 "Situv2 (3), got ",
                 activation);
+    AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     if(activation_type == ActivationType::Situv2)
     {
-        // Situv2 must not be SwiGLU-clamped; the non-sparse stage1 kernel clamps
-        // every activation, so pass +inf (no-op) if a stray non-positive limit
-        // reaches this path from warmup (Python passes +inf).
-        if(!(swiglu_limit > 0.0f))
-            swiglu_limit = std::numeric_limits<float>::infinity();
         AITER_CHECK(situ_beta > 0.0f, "situ_beta must be positive");
         AITER_CHECK(situ_linear_beta > 0.0f, "situ_linear_beta must be positive");
-    }
-    else
-    {
-        AITER_CHECK(swiglu_limit > 0.0f, "swiglu_limit must be positive");
     }
     AITER_CHECK(kernel_id != opus_moe::kStage1A8W4KidInvalid,
                 "Invalid Opus A8W4 stage1 kernel name: ",
