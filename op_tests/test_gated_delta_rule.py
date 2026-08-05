@@ -31,6 +31,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd,
     fused_solve_tril_recompute_w_u,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
+    fused_solve_tril_recompute as fused_solve_module,
+)
 from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
@@ -69,6 +72,42 @@ def test_chunk_opt_vk_unsupported_gfx12_runtime_allowlist(
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: props)
 
     assert chunk_module._is_unsupported_gfx12_runtime(torch.device("cuda")) is expected
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "process_mode", "expected"),
+    [("fused", "split", False), ("split", "fused", True)],
+)
+def test_solve_tril_recompute_explicit_dispatch_overrides_auto_threshold(
+    execution_mode: str,
+    process_mode: str,
+    expected: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", process_mode)
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert (
+        fused_solve_module._should_use_split_path(
+            execution_mode=execution_mode,
+            nt=128,
+            is_varlen=False,
+        )
+        is expected
+    )
+
+
+def test_solve_tril_recompute_auto_dispatch_is_backward_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FORCE", "")
+    monkeypatch.setattr(fused_solve_module, "_SOLVE_TRIL_RECOMPUTE_FUSE_NT_MAX", 32)
+    assert not fused_solve_module._should_use_split_path("auto", 32, False)
+    assert fused_solve_module._should_use_split_path("auto", 33, False)
+
+
+def test_solve_tril_recompute_rejects_unknown_execution_mode() -> None:
+    with pytest.raises(ValueError, match="execution_mode"):
+        fused_solve_module._should_use_split_path("invalid", 128, False)
 
 
 def recurrent_gated_delta_rule_ref(
