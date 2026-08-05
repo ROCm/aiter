@@ -1,28 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon (gfx1250) port of ``_fused_clamp_silu_mul_kernel``.
-
-Semantics mirror the Triton reference in
-``aiter/ops/triton/_triton_kernels/fusions/fused_clamp_act_mul.py``: per token row
-of an ``[M, 2*N]`` input (gate = first ``N`` cols, up = second ``N``):
-optional SwiGLU clamp -> ``act(gate) * up`` -> optional weights -> optional
-per-``QUANT_BLOCK_SIZE`` FP8 group quant, with an optional shuffled scale store.
-
-Each program processes ``BLOCK_M`` consecutive rows in a ``gl.static_range``
-loop, ONE row per iteration (grid = cdiv(M, BLOCK_M)). Processing one row at a
-time keeps the per-iteration register/LDS footprint at a single row (unlike
-widening the register-distributed tile, which scales VGPRs linearly with the row
-count); BLOCK_M just amortizes more rows onto each workgroup. Requires
-``M % BLOCK_M == 0`` (asserted host-side) so no iteration addresses a row >= M.
-With ``BLOCK_M == 1`` this is exactly the per-row version.
-
-Gluon differences from the Triton reference: tensors carry explicit
-``BlockedLayout``s (``row_layout`` for the data vector, ``row_scale_layout`` for
-the scale vector), ``tl.ravel`` becomes ``gl.reshape`` back to 1D +
-``gl.convert_layout`` onto the store layout, ``tl.abs`` becomes
-``gl.maximum(x, -x)``, and the ue8m0 group reduction uses a 2D
-``[NUM_N_Q_GROUPS, QUANT_BLOCK_SIZE]`` reshape reduced over ``axis=1``.
+"""Gluon (gfx1250) port of triton _fused_clamp_silu_mul_kernel for GFX1250
 """
 
 from triton.experimental import gluon
@@ -34,7 +13,7 @@ from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 # Human-readable repr for the compiled kernel: lists the constexpr keys that
 # identify a unique specialization (shown in traces / cache keys).
 _GLUON_REPR_KEYS = [
-    "BLOCK_M",
+    "ROWS_PER_PROG",
     "BLOCK_SIZE_N",
     "QUANT_BLOCK_SIZE",
     "SCALE_FMT",
@@ -68,7 +47,7 @@ def _fused_clamp_silu_mul_kernel(
     weights_stride_m,    # weights row stride
     weights_stride_n,    # weights col stride
     swiglu_limit,        # clamp bound (used only when HAVE_SWIGLU_CLAMP)
-    BLOCK_M: gl.constexpr,        # rows processed per program (loop trip count)
+    ROWS_PER_PROG: gl.constexpr,    # ring buffers = rows per program = loop trips
     BLOCK_SIZE_N: gl.constexpr,
     QUANT_BLOCK_SIZE: gl.constexpr,
     SCALE_FMT: gl.constexpr,
@@ -99,32 +78,30 @@ def _fused_clamp_silu_mul_kernel(
         warps_per_cta=[num_warps],
         order=[0],
     )
-    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])       # 1D input buffers
+    shared_out_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])    # 2D output ACC
 
-    pid = gl.program_id(0)                                  # pid = row-block
-    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64)  # offsets
-    mask = offs < n_half                                    # mask
-    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)              # valid scale groups
-    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  # scale-group indices
+    # setup
+    pid = gl.program_id(0)                 
+    m_start = pid * ROWS_PER_PROG
+    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
+    mask = offs < n_half                        
+    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        
+    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  
 
-    out_smem = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, [BLOCK_SIZE_N], shared_tdm_layout
-    )
     gate_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [BLOCK_SIZE_N], shared_tdm_layout
+        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
     )
     up_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [BLOCK_SIZE_N], shared_tdm_layout
+        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
+    )
+    out_acc = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_out_layout
     )
 
-    # loop through rows, 
-    for r in gl.static_range(BLOCK_M):
-        row = pid * BLOCK_M + r
-        row_base = row * inp_stride_m
-
-        if num_warps > 1:
-            gl.barrier()
-
+    # prologue + setup TDM
+    for i in gl.static_range(ROWS_PER_PROG):
+        row_base = (m_start + i) * inp_stride_m
         gate_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=inp_ptr + row_base,
             shape=[n_half],
@@ -139,15 +116,16 @@ def _fused_clamp_silu_mul_kernel(
             block_shape=[BLOCK_SIZE_N],
             layout=shared_tdm_layout,
         )
-        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=out_ptr + row * out_stride_m,
-            shape=[n_half],
-            strides=[out_stride_n],
-            block_shape=[BLOCK_SIZE_N],
-            layout=shared_tdm_layout,
-        )
-        gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem)
-        gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem)
+        gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem.index(i))
+        gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem.index(i))
+
+    # main loop
+    for i in gl.static_range(ROWS_PER_PROG):
+        row = m_start + i
+
+        gl.amd.gfx1250.tdm.async_wait(2 * (ROWS_PER_PROG - i - 1))
+        gate = gate_smem.index(i).load(row_layout).to(gl.float32)
+        up = up_smem.index(i).load(row_layout).to(gl.float32)
 
         # weights
         if HAVE_WEIGHTS:
@@ -159,11 +137,6 @@ def _fused_clamp_silu_mul_kernel(
                     mask=mask, other=0.0, cache_modifier=cache_modifier,
                 ).to(gl.float32)
 
-        gl.amd.gfx1250.tdm.async_wait(1)
-        gate = gate_smem.load(row_layout).to(gl.float32)
-        gl.amd.gfx1250.tdm.async_wait(0)
-        up = up_smem.load(row_layout).to(gl.float32)
-
         # clamp
         if HAVE_SWIGLU_CLAMP:
             up = gl.clamp(up, -swiglu_limit, swiglu_limit)   # clamp up to [-lim, lim]
@@ -171,7 +144,7 @@ def _fused_clamp_silu_mul_kernel(
 
         # act(gate) * up
         out = _apply_activation_from_str(gate, ACTIVATION) * up
-        
+
         # apply weights
         if HAVE_WEIGHTS:
             out = out * w
@@ -210,8 +183,10 @@ def _fused_clamp_silu_mul_kernel(
                     gl.reshape(scale_out, [NUM_N_Q_GROUPS]), row_scale_layout
                 )
 
-            out_smem.store(out_q.to(out_ptr.dtype.element_ty))  # stage for TDM store
+            # accumulate
+            out_acc.index(i).store(out_q.to(out_ptr.dtype.element_ty))
 
+            # scale store (per row, keyed on absolute row/group)
             if SHUFFLE:
                 # Preshuffled scale store: same tiled index math as the Triton
                 # reference (rows padded to 256, block-cols to 8, tiled layout).
@@ -244,10 +219,17 @@ def _fused_clamp_silu_mul_kernel(
                 )
         else:
             # no quant
-            out_smem.store(out.to(out_ptr.dtype.element_ty))  # stage for TDM store
+            out_acc.index(i).store(out.to(out_ptr.dtype.element_ty))
 
-        # TDM store (barrier so all warps finished writing out_smem first).
-        if num_warps > 1:
-            gl.barrier()
-        gl.amd.gfx1250.tdm.async_store(out_desc, [0], out_smem)
-        gl.amd.gfx1250.tdm.async_wait(0)
+    # store
+    if num_warps > 1:
+        gl.barrier()
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=out_ptr,
+        shape=[M, n_half],
+        strides=[out_stride_m, out_stride_n],
+        block_shape=[ROWS_PER_PROG, BLOCK_SIZE_N],
+        layout=shared_out_layout,
+    )
+    gl.amd.gfx1250.tdm.async_store(out_desc, [m_start, 0], out_acc)
+    gl.amd.gfx1250.tdm.async_wait(0)

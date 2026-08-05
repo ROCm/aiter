@@ -41,6 +41,7 @@ def fused_clamp_act_mul(
     quant_block_size: int = 128,
     scale_dtype_fmt: Literal["fp32", "ue8m0"] = "fp32",
     shuffle_scale: bool = False,
+    num_buffers: int = 1,
     backend: Optional[str] = None,
 ):
     """
@@ -215,10 +216,11 @@ def fused_clamp_act_mul(
             f"quant_block_size ({quant_block_size})"
         )
 
-        # Tuneable
-        block_m = 1
-        assert M % block_m == 0, (
-            f"M ({M}) must be a multiple of block_m ({block_m})"
+        # Rows per program = TDM prefetch ring buffers (the `num_buffers` arg). M
+        # must divide evenly so the pipeline's fixed async_wait counts match the
+        # in-flight loads. num_buffers = 1 is the per-row version.
+        assert M % num_buffers == 0, (
+            f"M ({M}) must be a multiple of num_buffers ({num_buffers})"
         )
 
 
@@ -269,12 +271,10 @@ def fused_clamp_act_mul(
         _LOGGER.info(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
-        # Each program owns block_m rows (grid = cdiv(M, block_m)); BLOCK_SIZE_N
-        # spans the whole row. ".cg" matches the Triton reference's cache hint.
-        _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, block_m),)](
+        _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, num_buffers),)](
             *kernel_args,
             **kernel_constexprs,
-            BLOCK_M=block_m,
+            ROWS_PER_PROG=num_buffers,
             cache_modifier=".cg",
         )
     else:
