@@ -38,10 +38,12 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.expr import arith, buffer_ops, gpu, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 from ..tensor_shim import _run_compiled
@@ -77,6 +79,9 @@ DEFAULT_N_BLOCK = 64
 
 # Ping-pong K LDS buffers the main loop rotates through (double-buffered prefetch).
 N_KV_PP = 2
+
+# log2(e): exp(x) = exp2(x * LOG2E). Softmax uses the native ISA exp2 intrinsic.
+LOG2E = 1.4426950408889634
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
 # granularity) live inside mha_buffer_managers.py — they are intrinsic to the
@@ -217,14 +222,93 @@ def _qk_gemm(*, k_mgr, k_lds, q_frags, n_block, lane_idx, n_inflight=3):
     return s_acc
 
 
-def _softmax(**kw):
-    """Online softmax over S^T, with optional causal masking.
+def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
+            is_causal=False, kv_pos0=None, q_max=None):
+    """Online-softmax update for one KV tile. ``s`` already includes softmax_scale
+    (folded into Q), so exp uses plain LOG2E.
 
-    Updates the running (row_max, row_sum), rescales the O accumulator, and
-    converts the masked/normalised P^T to bf16 for PV. Cross-lane max/sum only
-    needs the lane<->lane+16 partner (two 16-row halves per wave). Empty for now.
+    Layout (from ``_qk_gemm``): ``s`` is a list of ``NKV = n_block//WMMA_N`` v8-f32
+    accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``,
+    the kv rows ``kvt*16 + (l//16)*8 + [0..8)`` (its half). The peer lane ``l^16``
+    holds the other 8-row half of the same q, so the row max/sum reduce locally over
+    (kvt, si) then across the ``shuffle_xor(16)`` partner.
+
+    Args:
+      m_prev, d_prev: running max / denom (fx.Float32, shared by the l<->l^16 pair).
+      is_causal: when True, mask element with sequence-relative kv position
+        ``kv_pos0 + (l//16)*8 + kvt*16 + si`` greater than ``q_max`` (= q_seq +
+        (kv_len - q_len)); both ``kv_pos0`` and ``q_max`` are fx.Int32.
+
+    Returns ``(p, m_new, d_new, corr)``:
+      p:     list of NKV v8 **bf16** — P^T = exp(S^T - m_new) (PV B-operand).
+      m_new: updated running max (fx.Float32).
+      d_new: updated running denom = corr*d_prev + rowsum(p) (fx.Float32).
+      corr:  exp(m_prev - m_new), the O-accumulator rescale factor (fx.Float32).
     """
-    raise NotImplementedError("Softmax not implemented yet")
+    NKV = n_block // WMMA_N
+    f32 = ir.F32Type.get()
+    fast = arith.FastMathFlags.fast
+    neg_inf = fx.Float32(float("-inf"))
+    zero = fx.Float32(0.0)
+    log2e = fx.Float32(LOG2E)
+
+    def fmax(a, b):
+        return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
+
+    def fadd(a, b):
+        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
+
+    def fsub(a, b):
+        return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
+
+    def fmul(a, b):
+        return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+
+    def exp2(x):
+        return fx.Float32(rocdl.exp2(f32, _raw(x)))
+
+    def peer(v):  # cross-lane reduce partner: lane l <-> l^16 (the other kv half)
+        return fx.Float32(v).shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
+
+    khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
+
+    # ---- Pass 1: masked S values + running row max ----
+    s_masked = []  # flattened (kvt, si) order
+    for kvt in range(NKV):
+        svec = fx.Vector(s[kvt])
+        for si in range(8):
+            sval = fx.Float32(svec[si])
+            if is_causal:
+                kpos = kv_pos0 + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + si)
+                sval = (kpos > q_max).select(neg_inf, sval)
+            s_masked.append(sval)
+
+    local_max = s_masked[0]
+    for v in s_masked[1:]:
+        local_max = fmax(local_max, v)
+    row_max = fmax(local_max, peer(local_max))
+    m_new = fmax(m_prev, row_max)
+
+    # corr = exp(m_prev - m_new); neg_m = -(m_new * log2e) for the fused p exp.
+    corr = exp2(fmul(fsub(m_prev, m_new), log2e))
+    neg_m = fsub(zero, fmul(m_new, log2e))
+
+    # ---- Pass 2: p = exp(S - m_new) (bf16, per tile) + running row sum ----
+    p = []
+    local_sum = zero
+    idx = 0
+    for kvt in range(NKV):
+        pe = []
+        for si in range(8):
+            # exp2(s*log2e - m_new*log2e) via one fma.
+            pj = exp2(fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m))))
+            local_sum = fadd(local_sum, pj)
+            pe.append(pj)
+            idx += 1
+        p.append(fx.Vector.from_elements(pe, fx.Float32).to(fx.BFloat16))
+
+    d_new = fadd(fmul(corr, d_prev), fadd(local_sum, peer(local_sum)))
+    return p, m_new, d_new, corr
 
 
 def _pv_gemm(**kw):
@@ -414,7 +498,9 @@ def _core_attention(
         cur_pp = t % fx.Int32(N_KV_PP)
         k_cur = _k_lds_buf(cur_pp)
 
-        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T). ----
+        n_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
+
+        # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). ----
         s = _qk_gemm(
             k_mgr=k_mgr,
             k_lds=k_cur,
@@ -423,17 +509,32 @@ def _core_attention(
             lane_idx=lane_idx,
         )
 
-        # ---- TODO(compute, still UNWIRED): softmax + PV consume ``s``. ----
-        # v_cur = _v_lds_buf(cur_pp); n_start = t * fx.Int32(n_block)
-        # Per-wave causal bound (runtime): with wave_max_seq =
-        #   min(q_len-1, (block_x*BLOCK_M + warp_idx*WMMA_M + WMMA_M-1)//gqa_ratio)
-        #   kv_end_eff  = min(kv_len_wg, wave_max_seq + causal_off + 1)
-        #   skip_compute = n_start >= kv_end_eff
-        #   need_mask    = (n_start < kv_end_eff) & (n_start + n_block > kv_end_eff)
+        # ---- Softmax: online update over this KV tile's kv axis. ----
+        # v1 tests the SINGLE-tile path (m_prev=-inf, d_prev=0); the running
+        # (m,d,O_acc) become scf.for_ iter_args once PV + epilogue land. Causal
+        # masks element kv position n_start+(l//16)*8+kvt*16+si > seq_idx+causal_off
+        # (causal_off = kv_len - q_len); q's sequence index is the GQA-aware seq_idx.
+        if is_causal:
+            q_max = seq_idx + (kv_len - q_len)
+        else:
+            q_max = None
+        p, m_new, d_new, corr = _softmax(
+            s=s,
+            m_prev=fx.Float32(float("-inf")),
+            d_prev=fx.Float32(0.0),
+            lane_idx=lane_idx,
+            n_block=n_block,
+            is_causal=is_causal,
+            kv_pos0=n_start,
+            q_max=q_max,
+        )
+
+        # ---- TODO(PV/epilogue, still UNWIRED): _pv_gemm consumes (p, V) into an
+        # O accumulator rescaled by corr; m_new/d_new become loop-carried state.
+        # v_cur = _v_lds_buf(cur_pp)
         # Prefetch tile t+1 into (t+1)%N_KV_PP via async_load_vram_to_lds_wr_tile,
         # interleaved between QK/softmax/PV (order tuned by thread trace).
-        # _softmax(s, ...); _pv_gemm(s, v_cur, ...)  # wired one by one later
-        del s  # not consumed until softmax lands (keeps the tracer from complaining)
+        del s, p, m_new, d_new, corr  # unused until PV lands (DCE'd for now)
         scf.yield_([])
 
     # TODO(epilogue): once PV lands, normalise O by row_sum and write via
