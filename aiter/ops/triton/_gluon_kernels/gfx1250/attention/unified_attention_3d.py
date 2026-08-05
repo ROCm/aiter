@@ -11,6 +11,7 @@ from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 # from triton._C.libtriton.gluon_ir import make_cga_layout
@@ -35,6 +36,7 @@ def apply_softcap(S, x):
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -556,6 +558,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     """Program state and core operations for the unified attention kernel."""
 

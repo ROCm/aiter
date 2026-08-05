@@ -723,6 +723,7 @@ class FmoeTuner(TunerCommon):
         topk,
         kparams,
         blockM,
+        act_type,
     ):
         from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
@@ -737,6 +738,7 @@ class FmoeTuner(TunerCommon):
             topk=topk,
             block_m=blockM,
             kernelName=str(kparams["kernelName"]),
+            activation=act_type,
             inter_dim_pad=0,
             bias=bias,
         )
@@ -1953,6 +1955,8 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
+        situ_beta=_TUNER_SITU_BETA,
+        situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1976,8 +1980,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
-            situ_beta=_TUNER_SITU_BETA,
-            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -3747,24 +3751,18 @@ class FmoeTuner(TunerCommon):
         ):
             return tasks_opus
 
-        stage1_activation = {
-            ActivationType.Silu: "silu",
-            ActivationType.Swiglu: "swiglu",
-        }.get(act_type)
-
-        stage1_insts = (
-            opus_a8w4_stage1_instances_for_shape(
-                model_dim=model_dim,
-                logical_inter_dim=inter_dim,
-                inter_dim_pad=0,
-                activation=stage1_activation,
-            )
-            if stage1_activation is not None
-            else ()
+        stage1_insts = opus_a8w4_stage1_instances_for_shape(
+            model_dim=model_dim,
+            logical_inter_dim=inter_dim,
+            inter_dim_pad=0,
         )
 
         stage1_supported = (
-            dtype == dtypes.bf16 and not doweight_stage1 and bool(stage1_insts)
+            dtype == dtypes.bf16
+            and act_type
+            in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+            and not doweight_stage1
+            and bool(stage1_insts)
         )
 
         s1_ref_args = (
@@ -3866,6 +3864,7 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 s1_params,
                                 blockM,
+                                act_type,
                             ),
                             {},
                             FmoeTuner.run_torch_moe_stage1,
