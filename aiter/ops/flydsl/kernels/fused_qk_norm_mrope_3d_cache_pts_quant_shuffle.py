@@ -91,24 +91,20 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 # ============================================================================
-# Shuffle-layout byte-offset helpers (pure Python -- compile-time constants
-# given (head_size, block_size, x, num_kv_heads); mirror
-# ``set_kv_cache_shuffle_kernel`` / ``rope_common.h``).
+# Cache-layout helpers.
 # ============================================================================
-def _k_head_stride(head_size, block_size):
-    return head_size * block_size
+def _is_contiguous_from_dim1(t: torch.Tensor) -> bool:
+    """Whether every cache block is internally contiguous.
 
-
-def _k_per_block(head_size, block_size, num_kv_heads):
-    return num_kv_heads * _k_head_stride(head_size, block_size)
-
-
-def _v_head_stride(head_size, block_size, x):
-    return (block_size // x) * head_size * x
-
-
-def _v_per_block(head_size, block_size, x, num_kv_heads):
-    return num_kv_heads * _v_head_stride(head_size, block_size, x)
+    Dim 0 may have padding/interleaving, as with a
+    ``[num_blocks, 2, ...]`` allocation sliced along dim 1.
+    """
+    expected = 1
+    for dim in range(t.dim() - 1, 0, -1):
+        if t.shape[dim] != 1 and t.stride(dim) != expected:
+            return False
+        expected *= t.shape[dim]
+    return True
 
 
 # Other helpers
@@ -342,6 +338,8 @@ def _build_kv_kernel(
     is_interleaved: bool,
     gemma_norm: bool,
     cache_is_fp8: bool,
+    k_cache_block_stride: int,
+    v_cache_block_stride: int,
 ):
     H_Q, H_KV, D = num_heads_q, num_heads_kv, head_size
     HALF = D // 2
@@ -651,8 +649,11 @@ def _build_kv_kernel(
         if can_coalesce:
             # ---------------- Phase 2a: K coalesced write ----------------
             block_id = fx.Int64(slot_mapping[tok0]) // fx.Int64(block_size)
-            k_block_base = block_id * fx.Int64(_k_per_block(D, block_size, H_KV))
-            v_block_base = block_id * fx.Int64(_v_per_block(D, block_size, x, H_KV))
+            # The block strides are compile-time-specialized. This supports
+            # views such as kv[:, 0] / kv[:, 1], whose blocks are internally
+            # packed but separated by the other cache plane.
+            k_block_base = block_id * fx.Int64(k_cache_block_stride)
+            v_block_base = block_id * fx.Int64(v_cache_block_stride)
             k_cache_block = fx.Tensor(
                 fx.make_view(fx.get_iter(k_cache) + k_block_base, layout_k_cache)
             )
@@ -703,12 +704,8 @@ def _build_kv_kernel(
                         if slot >= fx.Int64(0):
                             block_id = slot // fx.Int64(block_size)
                             block_off = slot % fx.Int64(block_size)
-                            k_block_base = block_id * fx.Int64(
-                                _k_per_block(D, block_size, H_KV)
-                            )
-                            v_block_base = block_id * fx.Int64(
-                                _v_per_block(D, block_size, x, H_KV)
-                            )
+                            k_block_base = block_id * fx.Int64(k_cache_block_stride)
+                            v_block_base = block_id * fx.Int64(v_cache_block_stride)
                             k_cache_block = fx.Tensor(
                                 fx.make_view(
                                     fx.get_iter(k_cache) + k_block_base, layout_k_cache
@@ -813,6 +810,8 @@ def _compile_kv(
     is_interleaved,
     gemma_norm,
     cache_is_fp8,
+    k_cache_block_stride,
+    v_cache_block_stride,
 ):
     return _build_kv_kernel(
         num_heads_q=num_heads_q,
@@ -826,6 +825,8 @@ def _compile_kv(
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
         cache_is_fp8=cache_is_fp8,
+        k_cache_block_stride=k_cache_block_stride,
+        v_cache_block_stride=v_cache_block_stride,
     )
 
 
@@ -897,8 +898,9 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         k_cache, v_cache: shuffle-layout FP8 or bf16 paged KV cache buffers.
             Addressed via ``block_size``/``x``/
             ``head_size``/``num_heads_k`` regardless of the tensor's
-            declared torch shape, exactly like the HIP kernel with
-            ``use_shuffle_layout=True``).
+            declared torch shape. The dimensions inside each block must be
+            contiguous, but dim 0 may be strided (for example views produced
+            by slicing a ``[num_blocks, 2, ...]`` K/V allocation).
         slot_mapping: ``[T]`` int64 physical cache slot per token. Complete,
             page-aligned contiguous groups use the coalesced page-write path;
             arbitrary, decode-style, negative-slot, and ragged-tail groups
@@ -1046,8 +1048,10 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         raise ValueError(f"q_out must be bf16 with {num_tokens * H_Q * D} elements")
     if not q_out.is_contiguous():
         raise ValueError("q_out must be contiguous")
-    if not k_cache.is_contiguous() or not v_cache.is_contiguous():
-        raise ValueError("k_cache/v_cache must be contiguous")
+    if not _is_contiguous_from_dim1(k_cache) or not _is_contiguous_from_dim1(v_cache):
+        raise ValueError(
+            "k_cache/v_cache must be contiguous within each block (dims >= 1)"
+        )
     if not positions.is_cuda or not slot_mapping.is_cuda:
         raise ValueError("positions and slot_mapping must be device tensors")
     tensors = [
@@ -1117,6 +1121,31 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             stream,
         )
 
+    packed_block_elems = H_K * D * block_size
+    # Preserve the historical shape-agnostic behavior for contiguous flat
+    # buffers. For non-contiguous cache views, dim 0 denotes the physical
+    # cache block and its stride includes any interleaved plane/padding.
+    k_cache_block_stride = (
+        packed_block_elems if k_cache.is_contiguous() else k_cache.stride(0)
+    )
+    v_cache_block_stride = (
+        packed_block_elems if v_cache.is_contiguous() else v_cache.stride(0)
+    )
+    for name, stride in (
+        ("k_cache", k_cache_block_stride),
+        ("v_cache", v_cache_block_stride),
+    ):
+        if stride < packed_block_elems:
+            raise ValueError(
+                f"{name} block stride ({stride}) is smaller than one packed "
+                f"shuffle-layout block ({packed_block_elems} elements)"
+            )
+        if (stride * k_cache.element_size()) % _RUN_BYTES != 0:
+            raise ValueError(
+                f"{name} block stride ({stride} elements) must preserve "
+                f"{_RUN_BYTES}-byte cache-run alignment"
+            )
+
     kv_launch = _compile_kv(
         num_heads_q=H_Q,
         num_heads_kv=H_K,
@@ -1129,6 +1158,8 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
         is_interleaved=is_interleaved,
         gemma_norm=gemma_norm,
         cache_is_fp8=cache_is_fp8,
+        k_cache_block_stride=k_cache_block_stride,
+        v_cache_block_stride=v_cache_block_stride,
     )
     # Include a final partial page; the kernel handles it with guarded staging
     # and scatter writes.

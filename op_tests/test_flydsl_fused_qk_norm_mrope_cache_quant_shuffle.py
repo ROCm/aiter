@@ -39,6 +39,7 @@ def run_case(
     interleaved: bool,
     slot_pattern: str,
     strided_positions: bool,
+    strided_caches: bool,
     gemma_norm: bool,
     return_kv: bool,
     seed: int,
@@ -117,14 +118,28 @@ def run_case(
     q_fly = torch.empty(
         num_tokens, num_q_heads, head_size, dtype=torch.bfloat16, device=device
     )
-    k_fly = initial_k_cache.clone()
-    v_fly = initial_v_cache.clone()
+
+    def allocate_caches():
+        if not strided_caches:
+            return initial_k_cache.clone(), initial_v_cache.clone()
+
+        # Model the common vLLM cache allocation [num_blocks, 2, ...].
+        # Slicing out K/V doubles dim-0's stride while preserving packed blocks.
+        kv_storage = torch.empty(
+            (num_blocks, 2, *cache_shape[1:]), dtype=cache_dtype, device=device
+        )
+        k_cache = kv_storage[:, 0]
+        v_cache = kv_storage[:, 1]
+        k_cache.copy_(initial_k_cache)
+        v_cache.copy_(initial_v_cache)
+        return k_cache, v_cache
+
+    k_fly, v_fly = allocate_caches()
     k_out_fly = initial_k_out.clone() if return_kv else None
     v_out_fly = initial_v_out.clone() if return_kv else None
 
     q_hip = torch.empty_like(q_fly)
-    k_hip = initial_k_cache.clone()
-    v_hip = initial_v_cache.clone()
+    k_hip, v_hip = allocate_caches()
     k_out_hip = initial_k_out.clone() if return_kv else None
     v_out_hip = initial_v_out.clone() if return_kv else None
 
@@ -191,14 +206,15 @@ def run_case(
         f"T={num_tokens} Hq={num_q_heads} Hkv={num_kv_heads} D={head_size} "
         f"cache={cache_dtype} page={page_size} interleaved={interleaved} "
         f"slots={slot_pattern} strided_pos={strided_positions} "
+        f"strided_cache={strided_caches} "
         f"gemma={gemma_norm} return_kv={return_kv}"
     )
     print(f"[case] {label}")
 
     outputs = [
         ("q_out", q_fly, q_hip),
-        ("k_cache", k_fly.view(-1), k_hip.view(-1)),
-        ("v_cache", v_fly.view(-1), v_hip.view(-1)),
+        ("k_cache", k_fly.reshape(-1), k_hip.reshape(-1)),
+        ("v_cache", v_fly.reshape(-1), v_hip.reshape(-1)),
     ]
     if return_kv:
         outputs.extend(
@@ -265,6 +281,10 @@ def main() -> None:
     parser.add_argument(
         "--strided-positions", type=_str_to_bool, nargs="+", default=[False]
     )
+    # TODO: Strided caches are not supported by the HIP kernel, suppress until then
+    parser.add_argument(
+        "--strided-caches", type=_str_to_bool, nargs="+", default=[False], help=argparse.SUPPRESS
+    )
     parser.add_argument("--gemma-norm", type=_str_to_bool, nargs="+", default=[False])
     parser.add_argument("--return-kv", type=_str_to_bool, nargs="+", default=[False])
     parser.add_argument("--seed", type=int, default=0)
@@ -283,6 +303,7 @@ def main() -> None:
         args.interleaved,
         args.slot_patterns,
         args.strided_positions,
+        args.strided_caches,
         args.gemma_norm,
         args.return_kv,
     )
@@ -298,6 +319,7 @@ def main() -> None:
             interleaved,
             slot_pattern,
             strided_positions,
+            strided_caches,
             gemma_norm,
             return_kv,
         ) = case
@@ -311,6 +333,7 @@ def main() -> None:
             interleaved=interleaved,
             slot_pattern=slot_pattern,
             strided_positions=strided_positions,
+            strided_caches=strided_caches,
             gemma_norm=gemma_norm,
             return_kv=return_kv,
             seed=args.seed,
