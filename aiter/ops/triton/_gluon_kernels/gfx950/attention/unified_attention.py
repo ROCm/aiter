@@ -311,6 +311,13 @@ class AttentionConfig:
             mfma_instr = [16, 16, 32] if not self.DOT_FP8 else [16, 16, 128]
             self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
             self.K_WIDTH_PV = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
+        # The PV dot reduces over TILE_SIZE, so the tile has to supply at least the
+        # instruction's K
+        assert TILE_SIZE >= mfma_instr[2], (
+            f"TILE_SIZE={TILE_SIZE} is below the MFMA K={mfma_instr[2]} of "
+            f"{mfma_instr[0]}x{mfma_instr[1]}x{mfma_instr[2]} (MFMA_DIM={MFMA_DIM}): the PV "
+            f"dot reduces over TILE_SIZE"
+        )
         self.CAUSAL = gl.constexpr(CAUSAL)
         self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
         self.USE_SINKS = gl.constexpr(USE_SINKS)
@@ -1537,8 +1544,6 @@ def unified_attention(
     v_descale,
     sinks,
     output_scale=None,
-    num_kv_blocks=1,
-    num_splits=None,
 ):
     """
     Run the unified attention kernel with a paged KV cache.
@@ -1573,7 +1578,6 @@ def unified_attention(
     ARCH_NAME = arch_info.get_arch()
     assert ARCH_NAME == "gfx950", "unified_attention_2d_gfx950 only supports gfx950"
     assert softcap == 0, "Softcap is not supported"
-    # num_kv_blocks > 1 => TILE_SIZE > page_size, handled by AsyncGatherKVLoader.
     BLOCK_SIZE = k.shape[1]
     NUM_KV_HEADS = k.shape[2]
     ALL_DECODE = max_seqlen_q == 1
@@ -1603,26 +1607,24 @@ def unified_attention(
         num_warps, block_m, mfma_dim = 4, 128, 32
         num_buffers = 1 if (HEAD_SIZE >= 256 and not Q_FP8) else 2
 
-    TILE_SIZE = BLOCK_SIZE * num_kv_blocks
+    # A page bigger or smaller than the tile is assembled by AsyncGatherKVLoader
+    TILE_SIZE = 64
     BLOCK_M = block_m
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     if ALL_DECODE:
         total_query_blocks = NUM_SEQS
     else:
         total_query_blocks = q.shape[0] // BLOCK_Q + NUM_SEQS
-    assert num_kv_blocks & (num_kv_blocks - 1) == 0, "num_kv_blocks must be a power of 2"
     NUM_WARPS = num_warps
     kv_size = k.nelement() * k.element_size()
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
     num_tiles = max(1, triton.cdiv(max_seqlen_k, TILE_SIZE))
-    if not ALL_DECODE:
-        num_splits = 1
-    elif num_splits is None:
+    if ALL_DECODE:
         num_splits = _select_num_splits(NUM_SEQS, NUM_KV_HEADS, num_tiles, NUM_WARPS)
     else:
-        num_splits = max(1, min(num_tiles, num_splits))
+        num_splits = 1
     if num_splits > 1:
         partial_acc = torch.empty(
             (q.shape[0], NUM_Q_HEADS, num_splits, HEAD_SIZE), dtype=torch.float32, device=q.device
