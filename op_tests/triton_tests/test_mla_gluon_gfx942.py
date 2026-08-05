@@ -173,6 +173,7 @@ def _assert_matches_reference(case: MlaCase) -> None:
 @pytest.mark.parametrize(
     ("batch_size", "qlen", "seq_lens"),
     [
+        pytest.param(1, 1, [25], id="qlen1-short-sequence"),
         pytest.param(4, 1, [145, 163, 181, 199], id="qlen1"),
         # The graph launch uses 24 non-empty splits. For the earliest query,
         # the final two splits are entirely beyond its causal boundary.
