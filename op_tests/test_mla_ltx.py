@@ -111,7 +111,7 @@ class Harness:
             "Gqa": self.nhead,
             "qSeqLen": self.decode_qlen,
             "prefill": 0,
-            "causal": 0,
+            "causal": 1,
         }
 
     def summary(self) -> str:
@@ -136,7 +136,8 @@ class Harness:
 
 
 # (q_dtype, kv_dtype, nhead/Gqa, decode_qlen/qSeqLen)
-# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=0, cprr=0).
+# Decode absorb rows from hsa/gfx950/mla/mla_asm.csv (prefill=0, causal=1, cprr=0).
+# causal=0 rows are the msk0 non-masked builds, which this harness does not cover.
 PresetConfig = tuple[torch.dtype, torch.dtype, int, int]
 
 PRESETS: dict[str, PresetConfig] = {
@@ -175,11 +176,11 @@ def _csv_name_to_dtype(name: str) -> torch.dtype:
 def decode_presets_from_csv(
     aiter_root: Path | None = None,
 ) -> dict[str, PresetConfig]:
-    """Unique decode configs in mla_asm.csv (prefill=0, causal=0, qSeqLen>=1)."""
+    """Unique decode configs in mla_asm.csv (prefill=0, causal=1, qSeqLen>=1)."""
     seen: set[tuple[str, str, int, int]] = set()
     out: dict[str, PresetConfig] = {}
     for row in _load_asm_csv(aiter_root):
-        if row["prefill"] != 0 or row["causal"] != 0:
+        if row["prefill"] != 0 or row["causal"] != 1:
             continue
         q_seq = int(row["qSeqLen"])
         if q_seq < 1:
