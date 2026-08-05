@@ -56,8 +56,8 @@ echo "##################################################################"
 pip uninstall -y triton triton-kernels pytorch-triton pytorch-triton-rocm triton-rocm amd-triton || true
 
 # Pin triton to a known commit so the build is reproducible.
-# Commit from August 4th, 2026 - [Examples][gluon] Cleanup attention example (#10255)
-TRITON_COMMIT='478af922627ad13318ed5a1fc329fd8140bac2b6'
+# Commit from August 5th, 2026 - [AMD] Support warp-based split-k for mxfp fa on gfx1250 (#11178)
+TRITON_COMMIT='511b0f9e33c1320a2e64f49eb6ad5bf90a03adad'
 echo "[experiment] Target TRITON_COMMIT=${TRITON_COMMIT}"
 
 # Network in CI is flaky and a full clone of triton routinely times out
