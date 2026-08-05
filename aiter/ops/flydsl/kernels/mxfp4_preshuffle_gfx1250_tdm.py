@@ -267,7 +267,16 @@ def launch_gemm_a8w4_tdm(
             waves, nw = [(None,)] * 4, num_waves
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
+        # The waves listed in one ``wv`` load disjoint halves of the same tile, so
+        # they agree on every compile-time field of the atom (tile shape, padding,
+        # num_warps) and differ only in global offset, LDS offset and OOB extent --
+        # all runtime atom state. Folding the half index into those three collapses
+        # the pair to one atom, which makes a wave *group* (which tensor it feeds),
+        # not a single wave, the smallest unit that needs its own code.
+        wave_half = wave % 2
+        wave_grp = wave // 2
+
+        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv grp")
         jobs = []
 
         def add_tdm_loads(
@@ -286,31 +295,34 @@ def launch_gemm_a8w4_tdm(
             pad=None,
         ):
             seg = outer // len(wv)
-            for i in range_constexpr(len(wv)):
-                gt = global_view(
-                    g_base,
-                    g_off + fx.Int64(i * seg) * g_stride,
-                    (seg, inner),
-                    (inner, 1),
+            # Rows this wave skips inside the tile: runtime when a wave pair splits
+            # the tile, a compile-time 0 when one wave owns the whole thing. The LDS
+            # term carries lds_row's unit (bytes for A/B, dwords for the scales).
+            hseg = wave_half * seg if const_expr(len(wv) > 1) else 0
+            gt = global_view(
+                g_base,
+                g_off + fx.Int64(hseg) * g_stride,
+                (seg, inner),
+                (inner, 1),
+            )
+            ext = None if oob is None else oob - hseg
+            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+            atom = fx.rocdl.make_tdm_atom(
+                gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw
+            )
+            jobs.append(
+                Job(
+                    atom,
+                    gt,
+                    on_i32,
+                    lds_off + hseg * lds_row,
+                    lds_row,
+                    inner,
+                    seg,
+                    k_adv,
+                    None if wv[0] is None else wv[0] // 2,
                 )
-                ext = None if oob is None else oob - i * seg
-                pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
-                atom = fx.rocdl.make_tdm_atom(
-                    gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw
-                )
-                jobs.append(
-                    Job(
-                        atom,
-                        gt,
-                        on_i32,
-                        lds_off + i * seg * lds_row,
-                        lds_row,
-                        inner,
-                        seg,
-                        k_adv,
-                        wv[i],
-                    )
-                )
+            )
 
         add_tdm_loads(
             gA_base,
@@ -366,22 +378,54 @@ def launch_gemm_a8w4_tdm(
             wv=waves[3],
         )
 
-        def issue(s, kt):
+        # Wave ids are runtime values, so ownership cannot be resolved while tracing
+        # -- one instruction stream serves every wave. Branching once per group is
+        # the floor here: within a group the halves are already runtime offsets, so
+        # its jobs share one test and one block. Callers that have already selected
+        # a group (the unswitched k-loop) pass ``my_jobs`` and get no test at all.
+        job_grps = sorted({j.grp for j in jobs}) if jobs[0].grp is not None else []
+
+        def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
             so4 = s * (PITCH // 4)
-            for j in jobs:
+
+            def emit(j):
                 base = base_i32 if j.on_i32 else pa
                 dst = lds_view(
                     base + j.lds_off + (so4 if j.on_i32 else 0),
                     (j.outer, j.inner),
                     (j.lds_row, 1),
                 )
-                off = fx.Int64(kt * j.k_adv)
-                if const_expr(j.wave is None):
-                    fx.copy(j.atom, j.gt, dst, imm_offset=off)
-                else:
-                    if wave == j.wave:
-                        fx.copy(j.atom, j.gt, dst, imm_offset=off)
+                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+
+            if const_expr(my_jobs is not None):
+                for j in my_jobs:
+                    emit(j)
+            elif const_expr(not job_grps):
+                for j in jobs:
+                    emit(j)
+            else:
+                for g in range_constexpr(len(job_grps)):
+                    if wave_grp == job_grps[g]:
+                        for j in jobs:
+                            if const_expr(j.grp == job_grps[g]):
+                                emit(j)
+
+        def unswitch(body):
+            """Run ``body`` once per wave group, with that group's jobs bound.
+
+            Hoisting the group test out of the k-loop leaves the loop body free of
+            any wave comparison: each copy issues its own two TDMs unconditionally.
+            The copies are identical apart from those two descriptors, and every
+            wave executes exactly one of them, so the barrier and tensorcnt counts
+            per iteration are the same as before the split.
+            """
+            if const_expr(not job_grps):
+                body(None)
+            else:
+                for g in range_constexpr(len(job_grps)):
+                    if wave_grp == job_grps[g]:
+                        body([j for j in jobs if j.grp == job_grps[g]])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -489,10 +533,10 @@ def launch_gemm_a8w4_tdm(
                 else None
             )
 
-        def compute_ktile(buf, prefetch_kt):
+        def compute_ktile(buf, prefetch_kt, my_jobs=None):
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
-                issue(prefetch_kt % num_buffers, prefetch_kt)
+                issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
                 rocdl.sched_barrier(0)
             prev = load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
@@ -520,14 +564,18 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(num_buffers):
                     issue(i, i)
                 n_steady = K_TILES - num_buffers
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
-                    workgroup_barrier()
-                    compute_ktile(buf, None)
-                    workgroup_barrier()
-                    issue(s, kt + num_buffers)
+
+                def steady_post(my_jobs):
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                        workgroup_barrier()
+                        compute_ktile(buf, None)
+                        workgroup_barrier()
+                        issue(s, kt + num_buffers, my_jobs)
+
+                unswitch(steady_post)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
@@ -538,11 +586,15 @@ def launch_gemm_a8w4_tdm(
                 for i in range_constexpr(num_buffers - 1):
                     issue(i, i)
                 n_steady = K_TILES - (num_buffers - 1)
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
-                    compute_ktile(buf, kt + (num_buffers - 1))
+
+                def steady_mid(my_jobs):
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
+                        compute_ktile(buf, kt + (num_buffers - 1), my_jobs)
+
+                unswitch(steady_mid)
                 for j in range_constexpr(num_buffers - 1):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
