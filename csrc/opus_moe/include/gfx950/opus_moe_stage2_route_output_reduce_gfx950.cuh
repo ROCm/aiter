@@ -3,14 +3,16 @@
 #pragma once
 
 #include "../opus_moe_common.cuh"
+#ifdef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 #include "opus_moe_stage2_utils_gfx950.cuh"
-
-#include "aiter_hip_common.h"
-
 #include <cstdint>
 #include <hip/hip_bfloat16.h>
+#else
+#include "aiter_hip_common.h"
 #include <hip/hip_runtime.h>
+#endif
 
+#ifndef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 constexpr int kOpusMoeStage2RouteOutputReduceAutoBlockN = -1;
 constexpr int kOpusMoeStage2RouteOutputReduceBf16BlockN = 2048;
 constexpr int kOpusMoeStage2RouteOutputReduceDefaultBlockN = 4096;
@@ -25,7 +27,9 @@ inline int opus_moe_stage2_reduce_token_slot_route_output_select_block_n(
     const int auto_block_n = opus_moe::stage2_a8w4_route_reduce_auto_block_n(model_dim);
     return auto_block_n > 0 ? auto_block_n : kOpusMoeStage2RouteOutputReduceDefaultBlockN;
 }
+#endif
 
+#ifdef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 #ifdef __HIP_DEVICE_COMPILE__
 static __device__ __forceinline__ void
 opus_moe_stage2_route_reduce_accum_bf16x4(float* acc, int base, uint64_t packed)
@@ -267,7 +271,14 @@ opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(opus_moe_stage2_rou
 #endif
 #endif
 }
+#else
+template<int BLOCK_N, int BLOCK_THREADS, int TOPK = 0, bool ROUTE_FP8 = false>
+__global__ __launch_bounds__(BLOCK_THREADS, ROUTE_FP8 ? 2 : 4) void
+opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950(
+    opus_moe_stage2_route_reduce_kargs kargs);
+#endif
 
+#ifndef OPUS_MOE_ROUTE_REDUCE_DEVICE_TU
 template<int BLOCK_N, int BLOCK_THREADS, int TOPK, bool ROUTE_FP8>
 inline void opus_moe_stage2_reduce_token_slot_route_output_launch_variant_gfx950(
     const opus_moe_stage2_route_reduce_kargs& kargs,
@@ -366,3 +377,4 @@ inline void opus_moe_stage2_reduce_token_slot_route_output_launch_gfx950(
         break;
     }
 }
+#endif

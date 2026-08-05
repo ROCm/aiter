@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Generate Opus MoE dispatch headers.
+"""Generate Opus MoE dispatch headers and device-instantiation shards.
 
 This is intentionally smaller than ``csrc/opus_gemm/gen_instances.py`` today:
 several kernels still live in hand-written headers, but the generated
@@ -13,6 +13,7 @@ import argparse
 import csv
 import glob
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -34,7 +35,7 @@ from opus_moe_common import (
     opus_a8w4_stage1_shape_requirements,
 )
 
-MANIFEST_HEADER = """#pragma once
+BF16_MANIFEST_HEADER = """#pragma once
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 //
@@ -105,22 +106,18 @@ STAGE1_A8W4_MANIFEST_HEADER = """#pragma once
 
 
 def _emit_bf16_manifest_header() -> str:
-    lines = [MANIFEST_HEADER]
+    lines = [BF16_MANIFEST_HEADER]
     bf16_kernels = [STAGE2_BF16_KERNELS[kid] for kid in sorted(STAGE2_BF16_KERNELS)]
 
-    lines.append(f"#define OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP_SIZE {len(bf16_kernels)}\n")
     if not bf16_kernels:
-        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP\n\n")
+        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_DISPATCH_CASES\n\n")
     else:
-        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_TUNE_LOOKUP \\\n")
+        lines.append("#define GENERATE_OPUS_MOE_STAGE2_BF16_DISPATCH_CASES \\\n")
         for idx, inst in enumerate(bf16_kernels):
             suffix = " \\\n" if idx != len(bf16_kernels) - 1 else "\n"
             lines.append(
-                "    {"
-                f"{inst.kid}, "
-                f"&{inst.launcher}<"
-                f"{inst.trait}>"
-                "}," + suffix
+                f"    case {inst.kid}: return &{inst.launcher}<{inst.trait}>;"
+                + suffix
             )
     lines.append("\n")
 
@@ -148,6 +145,33 @@ def _cpp_name_suffix(name: str) -> str:
 
 def _cpp_effective_contract_alias(effective_inter_dim: int) -> str:
     return f"OpusMoeStage2A8W4Eff{effective_inter_dim}Contract"
+
+
+def _stage2_a8w4_traits_alias(kid: int, effective_inter_dim: int) -> str:
+    return (
+        f"OpusMoeStage2A8W4DecodeKid{int(kid)}" f"Eff{int(effective_inter_dim)}Traits"
+    )
+
+
+def _stage2_a8w4_traits_type(inst, effective_inter_dim: int) -> str:
+    return (
+        "OpusMoeStage2A8W4DecodeShape<"
+        f"opus_moe::{_cpp_effective_contract_alias(effective_inter_dim)}, "
+        f"{inst.block_m}, "
+        f"{inst.block_n}, "
+        f"{inst.sort_block_m}, "
+        f"{_cpp_bool(inst.direct_atomic)}, "
+        f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
+        f"{inst.block_threads}, "
+        f"{inst.min_blocks_per_cu}, "
+        f"{inst.cachectl_b}, "
+        f"{inst.cachectl_wscale}"
+        ">"
+    )
+
+
+def _stage1_a8w4_traits_alias(kid: int) -> str:
+    return f"OpusMoeStage1A8W4Kid{int(kid)}Traits"
 
 
 def _expand_tune_paths(spec: str | None) -> list[Path]:
@@ -413,9 +437,6 @@ def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> 
     lines = [A8W4_MANIFEST_HEADER]
     a8w4_kernels = [STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)]
 
-    lines.append(
-        f"#define OPUS_MOE_STAGE2_A8W4_DECODE_LOOKUP_SIZE {len(a8w4_kernels)}\n"
-    )
     if not a8w4_kernels:
         lines.append("#define GENERATE_OPUS_MOE_STAGE2_A8W4_DECODE_DISPATCH_CASES\n")
         return "".join(lines)
@@ -428,18 +449,8 @@ def _emit_stage2_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> 
             contract_cases.append(
                 f"case {effective_dim}: "
                 "return opus_moe_stage2_a8w4_decode_launch_gfx950<"
-                "OpusMoeStage2A8W4DecodeShape<"
-                f"opus_moe::{_cpp_effective_contract_alias(effective_dim)}, "
-                f"{inst.block_m}, "
-                f"{inst.block_n}, "
-                f"{inst.sort_block_m}, "
-                f"{_cpp_bool(inst.direct_atomic)}, "
-                f"{_cpp_bool(inst.pace_route_blocks_to_pow2)}, "
-                f"{inst.block_threads}, "
-                f"{inst.min_blocks_per_cu}, "
-                f"{inst.cachectl_b}, "
-                f"{inst.cachectl_wscale}"
-                ">>(kargs, stream);"
+                f"{_stage2_a8w4_traits_type(inst, effective_dim)}>"
+                "(kargs, stream);"
             )
         lines.append(
             f"    case {inst.kid}: switch(effective_inter_dim) {{ "
@@ -586,18 +597,174 @@ def _emit_stage1_a8w4_manifest_header() -> str:
         suffix = " \\\n" if idx != len(kernels) - 1 else "\n"
         lines.append(
             f"    case {inst.kid}: "
-            f"return launch<{_stage1_cpp_shape(inst)}>("
+            f"return launch_gfx950<{_stage1_cpp_shape(inst)}>("
             "effective_inter_dim, sorted_blocks, kargs, stream);" + suffix
         )
     lines.append("\n")
     return "".join(lines)
 
 
+# ---- Device translation-unit generation -----------------------------------
+
+
+def _route_reduce_instantiation_rows() -> list[tuple[int, int]]:
+    rows = [
+        (2048, 256),
+        (4096, 256),
+        *(
+            (int(inst.block_n), int(inst.threads))
+            for inst in OPUS_A8W4_ROUTE_REDUCE_INSTANCES
+        ),
+    ]
+    return list(dict.fromkeys(rows))
+
+
+class OpusMoeDeviceCodegen:
+    """Emit independently compilable device-instantiation shards."""
+
+    def __init__(self, working_path: Path, effective_inter_dims: tuple[int, ...]):
+        self.instances_path = working_path / "instances"
+        self.effective_inter_dims = effective_inter_dims
+
+    def _prepare_dirs(self) -> None:
+        if self.instances_path.exists():
+            shutil.rmtree(self.instances_path)
+        self.instances_path.mkdir(parents=True, exist_ok=True)
+
+    def _emit_stage2_device_tus(self) -> None:
+        for effective_dim in self.effective_inter_dims:
+            lines = [
+                "// SPDX-License-Identifier: MIT\n",
+                "// Auto-generated A8W4 stage2 device shard; do not edit.\n",
+                '#include "gfx950/a8w4/opus_moe_pipeline_stage2_a8w4_decode_main_gfx950.cuh"\n',
+            ]
+            seen_traits: set[str] = set()
+            for inst in (
+                STAGE2_A8W4_KERNELS[kid] for kid in sorted(STAGE2_A8W4_KERNELS)
+            ):
+                traits_type = _stage2_a8w4_traits_type(inst, effective_dim)
+                if traits_type in seen_traits:
+                    continue
+                seen_traits.add(traits_type)
+                alias = _stage2_a8w4_traits_alias(inst.kid, effective_dim)
+                lines.extend(
+                    [
+                        f"using {alias} = {traits_type};\n",
+                        "template __global__ void opus_moe_stage2_a8w4_decode_kernel_gfx950<",
+                        f"{alias}>(opus_moe_stage2_a8w4_kargs);\n",
+                    ]
+                )
+            path = (
+                self.instances_path
+                / f"opus_moe_stage2_a8w4_k_{effective_dim}.device.cu"
+            )
+            path.write_text("".join(lines), encoding="utf-8")
+
+    def _emit_stage1_device_tus(self) -> None:
+        families = (
+            (
+                True,
+                "group_split",
+                "opus_moe_stage1_a8w4_pipeline_group_split_gfx950.cuh",
+                "opus_moe_stage1_a8w4_kernel_group_split_gfx950",
+            ),
+            (
+                False,
+                "pair_kwave",
+                "opus_moe_stage1_a8w4_pipeline_pair_kwave_gfx950.cuh",
+                "opus_moe_stage1_a8w4_kernel_pair_kwave_gfx950",
+            ),
+        )
+        for group_split, namespace, header, kernel in families:
+            instances = [
+                STAGE1_A8W4_KERNELS[kid]
+                for kid in sorted(STAGE1_A8W4_KERNELS)
+                if bool(STAGE1_A8W4_KERNELS[kid].gate_up_group_split) == group_split
+            ]
+            if not instances:
+                continue
+            lines = [
+                "// SPDX-License-Identifier: MIT\n",
+                "// Auto-generated A8W4 stage1 device shard; do not edit.\n",
+                f'#include "gfx950/a8w4/stage1/{header}"\n',
+                "namespace opus_moe\n{\nnamespace stage1_a8w4\n{\n",
+            ]
+            for inst in instances:
+                lines.append(
+                    f"using {_stage1_a8w4_traits_alias(inst.kid)} = {_stage1_cpp_shape(inst)};\n"
+                )
+            lines.append(f"namespace pipeline_{namespace}\n{{\n")
+            for inst in instances:
+                alias = _stage1_a8w4_traits_alias(inst.kid)
+                lines.extend(
+                    [
+                        f"template __global__ void {kernel}<",
+                        f"{alias}>(OpusMoeStage1A8W4Kargs);\n",
+                    ]
+                )
+            lines.extend(
+                [
+                    f"}} // namespace pipeline_{namespace}\n",
+                    "} // namespace stage1_a8w4\n",
+                    "} // namespace opus_moe\n",
+                ]
+            )
+            path = self.instances_path / f"opus_moe_stage1_a8w4_{namespace}.device.cu"
+            path.write_text("".join(lines), encoding="utf-8")
+
+    def _emit_route_reduce_device_tus(self) -> None:
+        for topk in (0, 4, 6, 8):
+            lines = [
+                "// SPDX-License-Identifier: MIT\n",
+                "// Auto-generated route-reduce device shard; do not edit.\n",
+                "#define OPUS_MOE_ROUTE_REDUCE_DEVICE_TU 1\n",
+                '#include "gfx950/opus_moe_stage2_route_output_reduce_gfx950.cuh"\n',
+            ]
+            for block_n, threads in _route_reduce_instantiation_rows():
+                for route_fp8 in (False, True):
+                    lines.extend(
+                        [
+                            "template __global__ void ",
+                            "opus_moe_stage2_reduce_token_slot_route_output_kernel_gfx950<",
+                            f"{block_n}, {threads}, {topk}, {_cpp_bool(route_fp8)}>(",
+                            "opus_moe_stage2_route_reduce_kargs);\n",
+                        ]
+                    )
+            path = self.instances_path / f"opus_moe_route_reduce_topk_{topk}.device.cu"
+            path.write_text("".join(lines), encoding="utf-8")
+
+    def _emit_bf16_device_tu(self) -> None:
+        lines = [
+            "// SPDX-License-Identifier: MIT\n",
+            "// Auto-generated BF16 stage2 device shard; do not edit.\n",
+            '#include "gfx950/a16w16/opus_moe_pipeline_stage2_gemmstyle_gfx950.cuh"\n',
+        ]
+        for inst in (STAGE2_BF16_KERNELS[kid] for kid in sorted(STAGE2_BF16_KERNELS)):
+            lines.extend(
+                [
+                    "template __global__ void opus_moe_stage2_gemmstyle_kernel_gfx950<",
+                    f"{inst.trait}>(opus_moe_stage2_bf16_kargs);\n",
+                ]
+            )
+        (self.instances_path / "opus_moe_stage2_bf16.device.cu").write_text(
+            "".join(lines), encoding="utf-8"
+        )
+
+    def gen_instances(self) -> None:
+        self._prepare_dirs()
+        self._emit_stage2_device_tus()
+        self._emit_stage1_device_tus()
+        self._emit_route_reduce_device_tus()
+        self._emit_bf16_device_tu()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Opus MoE dispatch headers")
     parser.add_argument("--working_path", required=True)
     parser.add_argument(
-        "--tune_files", default="", help="Accepted for JIT compatibility."
+        "--tune_files",
+        default="",
+        help="Colon-separated tuned FMoE CSV paths/globs used to collect shapes.",
     )
     parser.add_argument(
         "--tune_file", default=None, help="Deprecated alias for --tune_files."
@@ -632,6 +799,7 @@ def main() -> None:
     stage1_a8w4_manifest_path.write_text(
         _emit_stage1_a8w4_manifest_header(), encoding="utf-8"
     )
+    OpusMoeDeviceCodegen(out_dir, effective_inter_dims).gen_instances()
 
     print(
         f"[opus_moe gen_instances] wrote {bf16_manifest_path} with "
@@ -648,6 +816,10 @@ def main() -> None:
         f"{len(STAGE1_A8W4_KERNELS)} A8W4 stage1 kid(s)"
     )
     print(f"[opus_moe gen_instances] wrote {stage1_a8w4_meta_path}")
+    print(
+        f"[opus_moe gen_instances] wrote {len(effective_inter_dims)} stage2 device shard(s), "
+        "2 stage1 shard(s), 4 route-reduce shard(s), and 1 BF16 shard"
+    )
 
 
 if __name__ == "__main__":
