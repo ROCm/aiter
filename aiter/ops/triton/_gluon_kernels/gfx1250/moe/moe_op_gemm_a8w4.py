@@ -1079,8 +1079,16 @@ def _moe_gemm_a8w4_decode(
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_gather(
+            # This Triton build's async_gather positions the column via the
+            # descriptor (no column-offset arg); reposition then gather.
+            _gather_x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_desc,
+                add_offsets=[0, write_idx * BLOCK_K],
+                pred=True,
+                clamp_bounds=True,
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                _gather_x_desc,
                 offs_x_m,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
@@ -1097,8 +1105,14 @@ def _moe_gemm_a8w4_decode(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
             else:
-                gl.amd.gfx1250.tdm.async_gather(
+                _gather_xs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
+                    add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                    pred=True,
+                    clamp_bounds=True,
+                )
+                gl.amd.gfx1250.tdm.async_gather(
+                    _gather_xs_desc,
                     offs_x_m,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
@@ -1136,8 +1150,16 @@ def _moe_gemm_a8w4_decode(
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_gather(
+            # This Triton build's async_gather positions the column via the
+            # descriptor (no column-offset arg); reposition then gather.
+            _gather_x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_desc,
+                add_offsets=[0, write_idx * BLOCK_K],
+                pred=True,
+                clamp_bounds=True,
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                _gather_x_desc,
                 offs_x_m,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
@@ -1154,8 +1176,14 @@ def _moe_gemm_a8w4_decode(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
             else:
-                gl.amd.gfx1250.tdm.async_gather(
+                _gather_xs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
+                    add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                    pred=True,
+                    clamp_bounds=True,
+                )
+                gl.amd.gfx1250.tdm.async_gather(
+                    _gather_xs_desc,
                     offs_x_m,
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
                 )
@@ -1668,8 +1696,16 @@ def _moe_gemm_a8w4_prefill(
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_gather(
+            # This Triton build's async_gather positions the column via the
+            # descriptor (no column-offset arg); reposition then gather.
+            _gather_x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_desc,
+                add_offsets=[0, write_idx * BLOCK_K],
+                pred=True,
+                clamp_bounds=True,
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                _gather_x_desc,
                 offs_x_m,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
@@ -1692,8 +1728,14 @@ def _moe_gemm_a8w4_prefill(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
                 else:
-                    gl.amd.gfx1250.tdm.async_gather(
+                    _gather_xs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                         x_scales_desc,
+                        add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                        pred=True,
+                        clamp_bounds=True,
+                    )
+                    gl.amd.gfx1250.tdm.async_gather(
+                        _gather_xs_desc,
                         offs_x_m,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
@@ -1773,8 +1815,16 @@ def _moe_gemm_a8w4_prefill(
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
         else:
-            gl.amd.gfx1250.tdm.async_gather(
+            # This Triton build's async_gather positions the column via the
+            # descriptor (no column-offset arg); reposition then gather.
+            _gather_x_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_desc,
+                add_offsets=[0, write_idx * BLOCK_K],
+                pred=True,
+                clamp_bounds=True,
+            )
+            gl.amd.gfx1250.tdm.async_gather(
+                _gather_x_desc,
                 offs_x_m,
                 x_buffer.index(write_idx % NUM_BUFFERS),
             )
@@ -1797,8 +1847,14 @@ def _moe_gemm_a8w4_prefill(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
                 else:
-                    gl.amd.gfx1250.tdm.async_gather(
+                    _gather_xs_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                         x_scales_desc,
+                        add_offsets=[0, write_idx * MX_SCALE_BLOCK_K],
+                        pred=True,
+                        clamp_bounds=True,
+                    )
+                    gl.amd.gfx1250.tdm.async_gather(
+                        _gather_xs_desc,
                         offs_x_m,
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
                     )
