@@ -2,4 +2,4 @@ dtype,hdim_q,hdim_v,mask,mode,bf16_cvt,ts_qo,ts_kv,ps,page,qseq_min,qseq_max,bdx
 fp8,128,128,2,1,0,256,128,1,16,0,0,512,1,_ZN5aiter36fmha_fwd_hd128_fp8_causal_qkptph_vphE,fmha_fwd_hd128_fp8_causal_qkptph_vph_ps.co
 fp8,128,128,2,1,0,64,64,1,64,0,896,256,3,_ZN5aiter60fmha_fwd_hd128_fp8_causal_qkptph_vph_qt64_4w_16x16_kv64_1bufE,fmha_fwd_hd128_fp8_causal_qkptph_vph_qt64_4w_16x16_kv64_1buf.co
 fp8,128,128,2,1,0,128,128,1,64,897,2048,512,1,_ZN5aiter42fmha_fwd_hd128_fp8_causal_qkptph_vph_qt128E,fmha_fwd_hd128_fp8_causal_qkptph_vph_qt128.co
-fp8,128,128,2,1,0,256,128,1,64,2049,0,512,1,_ZN5aiter41fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64E,fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64.co
+fp8,128,128,2,1,0,256,128,1,64,2049,0,512,1,_ZN5aiter41fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64E,fmha_fwd_hd128_fp8_causal_qkptph_vph_ps64_ptl.co
