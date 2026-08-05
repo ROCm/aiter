@@ -10,8 +10,15 @@ This file puts both properties under CI.
 
 The export checks matter on their own: reaching into ``linear_attention_kernels``
 keeps working if the export drops back out of ``__init__.py``, so no other test
-would notice that regression. The numeric checks reuse the in-package harness
-rather than carrying a second copy of its Triton reference.
+would notice that regression. The scalar numeric checks reuse the in-package
+harness rather than carrying a second copy of its Triton reference.
+
+The KDA cases trust the torch reference and put the *kernel* on trial.
+``op_tests/test_kda_torch_ref.py`` runs that arrow backwards -- it trusts the
+shipping scalar kernel and puts the *reference* on trial. The two therefore look
+alike without either subsuming the other, and which one fails says where the
+fault is: here alone means the per-channel kernel, there alone means the
+reference, both at once means the gate formula they share.
 
 Keep it thin -- shapes belong here, the reference kernel belongs in-package.
 """
@@ -91,3 +98,184 @@ def test_package_export_is_the_kernel_wrapper_itself():
 )
 def test_flydsl_gdr_decode_matches_reference(args):
     check_gdr_decode(args)
+
+
+G_MIN = -5.0
+K = V = 128
+
+
+def assert_close_rmse(name, ref, tri, ratio=1e-3, err_atol=1e-3):
+    """The reference implementation's own bar, from vLLM ``test_kda.py:92``.
+
+    RMSE-relative with an absolute escape hatch, used at the packed-vs-dense
+    decode pair (1e-3, 1e-3). The ratio alone is not the bar.
+    """
+    ref, tri = ref.detach().float(), tri.detach().float()
+    abs_err = (ref - tri).abs().max().item()
+    if abs_err <= err_atol:
+        return abs_err
+    assert not torch.isnan(ref).any(), f"{name}: NaN in ref"
+    assert not torch.isnan(tri).any(), f"{name}: NaN in tri"
+    rmse_diff = (ref - tri).square().mean().sqrt().item()
+    rmse_base = ref.square().mean().sqrt().item()
+    rel_err = rmse_diff / (rmse_base + 1e-8)
+    assert (
+        rel_err < ratio
+    ), f"{name}: max abs err {abs_err:.6f}, rmse ratio {rel_err:.6f} >= {ratio}"
+    return abs_err
+
+
+def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0):
+    """Build one KDA decode case.
+
+    ``need_shuffle_state`` decides which state layout the caller holds: False
+    means it is already (D_v, D_k), True means (D_k, D_v) and the wrapper
+    transposes. With K == V the two are shape-identical and differ only in
+    meaning, so feeding the wrong one measures the harness, not the kernel.
+    """
+    torch.manual_seed(seed)
+    dev = "cuda"
+    T = 1
+    args = {
+        "q": torch.randn(B, T, H, K, dtype=dt, device=dev),
+        "k": torch.randn(B, T, H, K, dtype=dt, device=dev),
+        "v": torch.randn(B, T, H, V, dtype=dt, device=dev),
+        "a": torch.randn(B, T, H, K, dtype=dt, device=dev),
+        "b": torch.randn(B, T, H, dtype=dt, device=dev),
+        "dt_bias": (
+            torch.randn(H, K, dtype=torch.float32, device=dev) * 0.1
+        ).contiguous(),
+        "A_log": (torch.randn(H, dtype=torch.float32, device=dev) * 0.5).contiguous(),
+        "out": torch.zeros(B, T, H, V, dtype=dt, device=dev),
+    }
+
+    d0, d1 = (K, V) if shuffle else (V, K)
+    n_slots = B + first_index
+    if padded:
+        # vLLM's setup: rows are padded, so the state is deliberately
+        # non-contiguous and the kernel has to honour the strides it is given.
+        storage = torch.randn(n_slots, H * K * V + 17, dtype=torch.float32, device=dev)
+        pool = storage[:, : H * K * V].view(n_slots, H, d0, d1)
+        assert not pool.is_contiguous()
+    else:
+        pool = torch.randn(n_slots, H, d0, d1, dtype=torch.float32, device=dev)
+
+    indices = torch.arange(first_index, first_index + B, dtype=torch.int32, device=dev)
+    return args, pool, indices
+
+
+def _kda_reference(args, initial_state):
+    from aiter.ops.torch_ref.kda import kda_gate, l2norm, naive_recurrent_kda
+
+    return naive_recurrent_kda(
+        l2norm(args["q"]),
+        l2norm(args["k"]),
+        args["v"],
+        kda_gate(args["a"], args["A_log"], args["dt_bias"], g_min=G_MIN),
+        args["b"].float().sigmoid(),
+        scale=K**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("B", "H", "dt", "shuffle", "padded", "first_index"),
+    [
+        (1, 8, torch.bfloat16, True, False, 0),
+        (4, 12, torch.bfloat16, True, False, 0),
+        (2, 12, torch.float16, True, False, 0),
+        # K3 as deployed: state already (D_v, D_k), padded storage, and slots
+        # numbered from 1 because the serving stack treats 0 as invalid.
+        (4, 12, torch.bfloat16, False, True, 1),
+        (4, 12, torch.bfloat16, False, False, 1),
+        (4, 12, torch.bfloat16, True, True, 1),
+    ],
+    ids=[
+        "b1_h8_bf16",
+        "b4_h12_bf16",
+        "b2_h12_fp16",
+        "k3_deployed",
+        "no_shuffle",
+        "padded_state",
+    ],
+)
+def test_kda_per_channel_gate_matches_torch_reference(
+    B, H, dt, shuffle, padded, first_index
+):
+    """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x).
+
+    H is 1:1 with the k heads, which is K3's ratio and a case the scalar path
+    never exercised.
+    """
+    args, pool, indices = _kda_inputs(B, H, dt, first_index, padded, shuffle)
+
+    initial_state = pool[indices.long()].clone()
+    if not shuffle:
+        initial_state = initial_state.transpose(-1, -2)
+
+    kernel_pool = pool.clone()
+    flydsl_ops.flydsl_gdr_decode(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["a"],
+        args["b"],
+        args["dt_bias"],
+        args["A_log"],
+        indices,
+        kernel_pool,
+        args["out"],
+        use_qk_l2norm=True,
+        need_shuffle_state=shuffle,
+    )
+
+    ref_out, ref_state = _kda_reference(args, initial_state)
+    got_state = kernel_pool[indices.long()]
+    if not shuffle:
+        got_state = got_state.transpose(-1, -2)
+
+    out_err = assert_close_rmse("o", ref_out, args["out"])
+    state_err = assert_close_rmse("ht", ref_state, got_state)
+
+    # Tripwire under the acceptance bar above: agreement is ~1e-4 in practice,
+    # so a drift to just inside 1e-3 would pass the bar while signalling that
+    # something in the gate or the recurrence changed.
+    assert out_err < 5e-4 and state_err < 5e-4, (out_err, state_err)
+
+
+def test_negative_slot_is_skipped_and_zero_is_not():
+    """Pins this kernel's invalid-slot contract, which is not the reference's.
+
+    aiter skips ``pool_idx < 0`` and writes nothing -- leaving the caller's
+    output buffer untouched. The KDA reference instead treats ``state_idx <= 0``
+    as invalid and zero-fills. They differ on both the boundary and the
+    behaviour, so slot 0 being *processed* here is the point of the test.
+    """
+    B, H, dt = 4, 12, torch.bfloat16
+    args, pool, _ = _kda_inputs(B, H, dt, first_index=0, padded=False, shuffle=True)
+
+    indices = torch.tensor([-1, 0, 1, 2], dtype=torch.int32, device="cuda")
+    args["out"].fill_(7.0)
+    kernel_pool = pool.clone()
+
+    flydsl_ops.flydsl_gdr_decode(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["a"],
+        args["b"],
+        args["dt_bias"],
+        args["A_log"],
+        indices,
+        kernel_pool,
+        args["out"],
+        use_qk_l2norm=True,
+        need_shuffle_state=True,
+    )
+
+    # Row 0 asked for slot -1: untouched, not zeroed.
+    assert (args["out"][0] == 7.0).all()
+    # Slot 0 is valid here even though the reference would call it invalid.
+    assert not (args["out"][1] == 7.0).all()
+    assert not torch.equal(kernel_pool[0], pool[0])

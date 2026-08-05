@@ -111,6 +111,27 @@ def flydsl_gdr_decode(
     assert dt_bias.dtype in [torch.float, torch.bfloat16, torch.half]
     assert indices.dtype == torch.int32
 
+    # KDA decays per channel, so `a` carries a D_k axis and dt_bias is (H_v, D_k).
+    # The rank of `a` selects the gate; the two must agree or the gate would read
+    # one layout while the kernel indexes the other.
+    gate_mode = "kda" if a.dim() == 4 else "gdr"
+    if gate_mode == "kda":
+        assert (
+            dt_bias.dim() == 2
+        ), f"per-channel `a` needs a 2D (H_v, D_k) dt_bias, got {tuple(dt_bias.shape)}"
+        assert (
+            a.shape[-1] == query.shape[-1]
+        ), f"`a` last dim must be D_k={query.shape[-1]}, got {a.shape[-1]}"
+        assert dt_bias.shape == (a.shape[2], a.shape[3]), (
+            f"dt_bias {tuple(dt_bias.shape)} does not match `a` heads/channels "
+            f"{(a.shape[2], a.shape[3])}"
+        )
+        assert dt_bias.is_contiguous(), "dt_bias must be contiguous"
+    else:
+        assert (
+            dt_bias.dim() == 1
+        ), f"per-head `a` needs a 1D (H_v,) dt_bias, got {tuple(dt_bias.shape)}"
+
     if need_shuffle_state:
         state_ = state.permute(0, 1, 3, 2).contiguous()
     else:
@@ -142,6 +163,7 @@ def flydsl_gdr_decode(
         a.stride(),
         b.stride(),
         use_qk_l2norm,
+        gate_mode,
         **kwargs_,
     )
     with torch.cuda.device(query.device.index):
