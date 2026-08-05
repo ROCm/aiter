@@ -47,9 +47,11 @@ def _compile_to_cache(
     import torch
 
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
-        _compact_blockscale_a,
-        _compact_blockscale_b,
         flydsl_mxscale_preshuffle_gemm,
+    )
+    from aiter.ops.shuffle import (
+        shuffle_scale_blockscale_a,
+        shuffle_scale_blockscale_b,
     )
 
     a_bytes = K // 2 if a_dtype == "fp4" else K
@@ -62,13 +64,13 @@ def _compile_to_cache(
         if blockscale:
             # caller-prepared compact-shuffled scales (op no longer repacks); build
             # from coarse A 1x128 (rows,K//128) / B 128x128 (N//128,K//128).
-            a_scale = _compact_blockscale_a(
+            a_scale = shuffle_scale_blockscale_a(
                 torch.zeros(
                     (M + 31) // 32 * 32, K // 128, dtype=torch.uint8, device=dev
                 ),
                 K,
             )
-            b_scale = _compact_blockscale_b(
+            b_scale = shuffle_scale_blockscale_b(
                 torch.zeros(N // 128, K // 128, dtype=torch.uint8, device=dev), N, K
             )
         else:
@@ -102,7 +104,7 @@ def parse_csv(csv_path: str) -> list[dict]:
         return list(_csv.DictReader(f))
 
 
-def compile_one_config(row: dict, blockscale: bool = False) -> bool:
+def compile_one_config(row: dict, both_modes: bool = False) -> bool:
     name = (row.get("kernelName") or "").strip()
     parsed = parse_kernel_name(name)
     if parsed is None:
@@ -122,17 +124,12 @@ def compile_one_config(row: dict, blockscale: bool = False) -> bool:
         "xcd_swizzle": parsed["xcd_swizzle"],
         "split_k": parsed["split_k"],
     }
-    # MX per-1x32 path (default, always).
-    _compile_to_cache(**cfg)
-    # blockscale path (a8w8 only, N%128==0) is a distinct Constexpr -> separate
-    # binary; precompile it too so runtime doesn't JIT on first call.
-    if (
-        blockscale
-        and parsed["a_dtype"] == "fp8"
-        and parsed["b_dtype"] == "fp8"
-        and N % 128 == 0
-    ):
-        _compile_to_cache(**cfg, blockscale=True)
+    # blockscale is the op's default, so that is the binary runtime will look for.
+    _compile_to_cache(**cfg, blockscale=True)
+    # --both also warms the MX per-1x32 binary (a distinct Constexpr -> distinct
+    # binary) for callers that pass blockscale=False.
+    if both_modes:
+        _compile_to_cache(**cfg, blockscale=False)
     return True
 
 
@@ -144,10 +141,10 @@ def main():
         "--csv", nargs="+", default=_default_csvs(), help="tuned CSV(s) to precompile"
     )
     ap.add_argument(
-        "--blockscale",
+        "--both",
         action="store_true",
-        help="also precompile the a8w8 blockscale variant (A 1x128, B 128x128) "
-        "for each fp8/fp8, N%%128==0 config",
+        help="also precompile the MX per-1x32 binary for each config, for callers "
+        "that pass blockscale=False",
     )
     args = ap.parse_args()
 
@@ -160,7 +157,7 @@ def main():
         for row in parse_csv(csv_path):
             total += 1
             try:
-                if compile_one_config(row, blockscale=args.blockscale):
+                if compile_one_config(row, both_modes=args.both):
                     done += 1
                     print(
                         f"[aot.mxscale_preshuffle] compiled {row.get('kernelName')} "

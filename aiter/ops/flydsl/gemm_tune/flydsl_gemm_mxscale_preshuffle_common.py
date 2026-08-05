@@ -42,6 +42,37 @@ def _a_row_bytes(a_dtype: str, tile_k: int) -> int:
     return tile_k // 2 if a_dtype == "fp4" else tile_k
 
 
+def make_kernel_name(
+    tile_m: int,
+    tile_n: int,
+    tile_k: int,
+    a_dtype: str,
+    b_dtype: str,
+    out_dtype: str,
+    waves_per_eu: int,
+    xcd_swizzle: int = 0,
+    split_k: int = 1,
+    blockscale: str = "none",
+) -> str:
+    """The one place the mxpsh kernelName is spelled.
+
+    Shared by the tune catalog (`kernelInstance.name` -> the tuned CSV) and by the
+    kernel itself (`@flyc.kernel(name=...)` -> the GPU symbol), so a profile line
+    can be matched back to its CSV row. `blockscale != "none"` is a distinct
+    Constexpr -> distinct binary, so the GPU symbol gets a suffix to keep profiles
+    apart. The suffix is deliberately NOT part of the CSV grammar
+    (`parse_kernel_name` returns None for it) and never reaches `kernelInstance.name`:
+    the CSV keeps one spelling per launch config, so CSVs tuned before the suffix
+    existed keep working unchanged.
+    """
+    a, b, o = _DTYPE_SHORT[a_dtype], _DTYPE_SHORT[b_dtype], _DTYPE_SHORT[out_dtype]
+    name = (
+        f"flydsl_mxpsh_{tile_m}x{tile_n}x{tile_k}"
+        f"_{a}_{b}_{o}_w{waves_per_eu}_x{xcd_swizzle}_sk{split_k}"
+    )
+    return name if blockscale == "none" else f"{name}_bs{blockscale}"
+
+
 @dataclass
 class kernelInstance:
     tile_m: int
@@ -56,12 +87,16 @@ class kernelInstance:
 
     @property
     def name(self) -> str:
-        a = _DTYPE_SHORT[self.a_dtype]
-        b = _DTYPE_SHORT[self.b_dtype]
-        o = _DTYPE_SHORT[self.out_dtype]
-        return (
-            f"flydsl_mxpsh_{self.tile_m}x{self.tile_n}x{self.tile_k}"
-            f"_{a}_{b}_{o}_w{self.waves_per_eu}_x{self.xcd_swizzle}_sk{self.split_k}"
+        return make_kernel_name(
+            self.tile_m,
+            self.tile_n,
+            self.tile_k,
+            self.a_dtype,
+            self.b_dtype,
+            self.out_dtype,
+            self.waves_per_eu,
+            self.xcd_swizzle,
+            self.split_k,
         )
 
 

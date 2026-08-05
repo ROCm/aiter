@@ -12,8 +12,10 @@ tensors to raw pointers via ``tensor_shim.ptr_arg`` and forwards the config.
 Operand convention (matches the kernel's host preshuffle):
     A       : [M, K]   row-major, NOT preshuffled  (fp8/fp6 = 1 byte/code, fp4 = 2 codes/byte)
     B       : preshuffled via aiter.ops.shuffle.shuffle_weight(., (16, 16))  (fp4 or fp8 weight)
-    a_scale : per-1x32 E8M0, shuffle_scale_a16w4'd
-    b_scale : per-1x32 E8M0, shuffle_scale_a16w4'd
+    a_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_a(a_1x128, K)
+              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
+    b_scale : blockscale -> aiter.ops.shuffle.shuffle_scale_blockscale_b(b_128x128, N, K)
+              MX         -> per-1x32 E8M0, shuffle_scale_a16w4'd
     Out     : [M, N]   bf16 / fp16
 """
 
@@ -24,65 +26,6 @@ import torch
 from aiter.ops.flydsl.utils import is_flydsl_available
 
 _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-
-
-def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
-    """Pad the 128-K block axis up to the shuffle's 256-K chunking (2 blocks per
-    chunk), filling with 0x7F (E8M0 1.0). K1 = (K+255)//256 mirrors shuffle_scale
-    rounding k_scale up to 8, so K%256!=0 (e.g. K=384) matches the kernel's chunks.
-    """
-    K1 = (K + 255) // 256
-    if s.shape[-1] < 2 * K1:
-        s = torch.nn.functional.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
-    return s, K1
-
-
-def _compact_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
-    """Coarse A blockscale (rows, K//128) -> the kernel's compact per-lane words.
-
-    Emits the layout directly as a reshape+permute: the byte a lane reads is
-    ``[n1][k1][nl][kp][np]`` with ``row = n1*32 + np*16 + nl`` and
-    ``kblk = k1*2 + kp`` (K_Lane dropped -- blockscale is constant inside a
-    128-K block, so the kernel broadcasts it via ``sc_lane_a = lane_mod_16``).
-
-    Equivalent to expanding the coarse scale to per-1x32, running the real
-    `shuffle_scale_a16w4` and keeping only K_Lane 0 (the other three slices are
-    byte-identical copies) -- but with no expansion and no full-shuffle
-    temporary, so it is cheap to call per-iteration on device (a per-call host
-    round-trip would stall the pipeline).
-    """
-    s = a_scale.view(torch.uint8)
-    rows = s.shape[0]
-    if s.shape[-1] != K // 128:
-        raise ValueError(
-            f"blockscale a_scale must be (rows, K//128)=(*, {K // 128}); "
-            f"got {tuple(a_scale.shape)}"
-        )
-    if rows % 32:
-        raise ValueError(
-            f"blockscale a_scale rows must be a multiple of 32, got {rows}"
-        )
-    s, K1 = _pad_kblocks(s, K)
-    # (rows, 2*K1) -> [n1, np, nl, k1, kp] -> [n1, k1, nl, kp, np]
-    return s.view(rows // 32, 2, 16, K1, 2).permute(0, 3, 2, 4, 1).contiguous().view(-1)
-
-
-def _compact_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
-    """Coarse B blockscale (N//128, K//128) -> one word per (128-N block, chunk).
-
-    B is constant over N as well, so N_Lane and 3/4 of the 32-N super-rows drop
-    out too (kernel: ``sc_lane_b = 0``, super-row ``nsb // 4``). The word keeps
-    ``[kp, np]`` with np duplicated, to stay dword-aligned. Same direct emit as
-    `_compact_blockscale_a`; see there for the shared reasoning.
-    """
-    s = b_scale.view(torch.uint8)
-    if s.shape != (N // 128, K // 128):
-        raise ValueError(
-            f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
-            f"got {tuple(b_scale.shape)}"
-        )
-    s, K1 = _pad_kblocks(s, K)
-    return s.view(N // 128, K1, 2, 1).expand(N // 128, K1, 2, 2).contiguous().view(-1)
 
 
 def flydsl_mxscale_preshuffle_gemm(
@@ -100,7 +43,7 @@ def flydsl_mxscale_preshuffle_gemm(
     waves_per_eu: int = 0,
     xcd_swizzle: int = 0,
     split_k: int = 1,
-    blockscale: bool = False,
+    blockscale: bool = True,
     stream=None,
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
@@ -111,12 +54,19 @@ def flydsl_mxscale_preshuffle_gemm(
     partial slab to a scratch tmp[split_k, M, N], then a reduce kernel sums the
     slabs into Out (bf16/fp16). Helps small-M / large-K (low-occupancy) shapes.
 
-    blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
-    the caller built via _compact_blockscale_a/_b from the coarse E8M0 (A 1x128
-    [rows, K//128], B 128x128 [N//128, K//128]). The op does NOT repack here —
-    symmetric with MX mode where the caller pre-shuffles. The kernel broadcasts
-    them to the 1x32 scaled-MFMA via the scale load address. Prepare the static
-    B-scale at weight-prep time to keep it off the per-call path; the per-token
+    blockscale selects the scale format and **defaults to True** -- the coarse
+    blockscale path is the one this op is tuned for. It is a8w8-only and needs
+    N%128==0; fp4/fp6 operands (a4w4 / a6w4) must pass blockscale=False.
+
+    * blockscale=True: a_scale/b_scale are the *compact-shuffled* blockscale buffers
+      the caller built via aiter.ops.shuffle.shuffle_scale_blockscale_a/_b from the
+      coarse E8M0 (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]).
+    * blockscale=False: a_scale/b_scale are per-1x32 E8M0 run through
+      `shuffle_scale_a16w4`.
+
+    Either way the op does NOT repack -- the caller pre-shuffles. For blockscale the
+    kernel broadcasts to the 1x32 scaled-MFMA via the scale load address. Prepare the
+    static B-scale at weight-prep time to keep it off the per-call path; the per-token
     A-scale is a plain reshape+permute, so build it on device (a host round-trip
     costs more than this GEMM).
     """
@@ -153,13 +103,18 @@ def flydsl_mxscale_preshuffle_gemm(
             f"unsupported Out dtype {Out.dtype}; expected bfloat16 or float16"
         )
 
-    bs_mode = "none"
+    # blockscale is the default path; an unsupported shape is an error rather than
+    # a silent downgrade, so a4w4/a6w4 callers have to opt out explicitly.
     if blockscale:
+        if a_dtype != "fp8" or b_dtype != "fp8":
+            raise ValueError(
+                f"blockscale is a8w8-only; got a_dtype={a_dtype!r} b_dtype={b_dtype!r}"
+            )
         if N % 128 != 0:
             raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
-        # a_scale/b_scale are already compact-shuffled by the caller
-        # (_compact_blockscale_a/_b, built once on host). No per-call repack here.
-        bs_mode = "ab"
+    # a_scale/b_scale are already compact-shuffled by the caller
+    # (shuffle_scale_blockscale_a/_b). No per-call repack here.
+    bs_mode = "ab" if blockscale else "none"
 
     st = stream if stream is not None else torch.cuda.current_stream()
 
@@ -314,7 +269,7 @@ def gemm_mxscale_preshuffle(
     waves_per_eu=None,
     xcd_swizzle=None,
     split_k=None,
-    blockscale=False,
+    blockscale=True,
     config=None,
     stream=None,
 ):
@@ -322,6 +277,9 @@ def gemm_mxscale_preshuffle(
 
     Tile selection precedence: explicit tile_m/n/k args > tuned CSV
     (config or lookup by (gfx,cu_num,M,N,K,a_dtype,b_dtype)) > heuristic default.
+
+    blockscale defaults to True, matching how the tuned CSV is tuned; a4w4 / a6w4
+    callers must pass blockscale=False.
     """
     M = int(A.shape[0])
     N = int(Out.shape[-1])

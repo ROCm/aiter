@@ -222,6 +222,70 @@ def gemm_a8w8_blockscale_bpreshuffle_flydsl(
     )
 
 
+# ── MX-microscale preshuffle GEMM (gfx950, FlyDSL) ───────────────────────────
+# A separate quant scheme from a8w8_blockscale above (E8M0 microscale, not fp32
+# 1x128), so it gets its own entry rather than a libtype branch there.
+
+
+def gemm_a8w8_mxscale_preshuffle(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+    *,
+    a_dtype: str = "fp8",
+    b_dtype: str = "fp8",
+    blockscale: bool = True,
+    config: dict | None = None,
+) -> Tensor:
+    """MX-microscale preshuffle GEMM on gfx950 (FlyDSL). a8w8 / a4w4 / a6w4.
+
+    Operands (the op does no repacking -- prepare them once, caller-side):
+        XQ       [M, K] codes, row-major, NOT preshuffled
+                 (fp8/fp6: 1 byte/code; fp4: 2 codes/byte, so last dim is K//2)
+        WQ       ``shuffle_weight(w_codes, layout=(16, 16))``
+        x_scale  blockscale=True : ``shuffle_scale_blockscale_a(a_1x128, K)``
+                 blockscale=False: ``shuffle_scale_a16w4(a_1x32, 1, False)``
+        w_scale  blockscale=True : ``shuffle_scale_blockscale_b(b_128x128, N, K)``
+                 blockscale=False: ``shuffle_scale_a16w4(b_1x32, 1, False)``
+    all from ``aiter.ops.shuffle``.
+
+    ``blockscale`` defaults to True (the tuned path). It is a8w8-only and needs
+    N%128==0; a4w4 / a6w4 callers must pass blockscale=False.
+
+    The launch config comes from the tuned CSV keyed on
+    (gfx, cu_num, M, N, K, a_dtype, b_dtype), or a heuristic tile when untuned;
+    pass ``config`` to override the lookup.
+    """
+    if get_gfx() != "gfx950":
+        raise RuntimeError(
+            f"gemm_a8w8_mxscale_preshuffle requires gfx950, got {get_gfx()}"
+        )
+    if not is_flydsl_available():
+        raise RuntimeError("gemm_a8w8_mxscale_preshuffle requires flydsl")
+    assert dtype in (
+        dtypes.bf16,
+        dtypes.fp16,
+    ), f"Output {dtype=} is currently not supported in gemm_a8w8_mxscale_preshuffle"
+
+    from .flydsl.mxscale_preshuffle_kernels import gemm_mxscale_preshuffle
+
+    m, n = XQ.shape[0], WQ.shape[0]
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return gemm_mxscale_preshuffle(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Y,
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        blockscale=blockscale,
+        config=config,
+    )
+
+
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",

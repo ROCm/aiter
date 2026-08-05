@@ -7,6 +7,11 @@ Mechanism mirrors csrc/ck_gemm_a8w8_bpreshuffle/gemm_a8w8_bpreshuffle_tune.py:
 a GemmCommonTuner subclass driving mp_tuner (multiprocess compile + bench +
 checkAllclose). Only the FlyDSL libtype is tuned (this is a standalone FlyDSL op).
 
+Tuning runs the **blockscale** path (A 1x128 / B 128x128), which is the op's
+default. It is a8w8-only, so non-fp8/fp8 shapes in the untuned list are skipped.
+kernelName keeps the plain grammar (no blockscale marker), so CSVs tuned before
+this change stay valid and `parse_kernel_name` is unchanged.
+
 Usage:
     HIP_VISIBLE_DEVICES=0 python -m aiter.ops.flydsl.gemm_tune.tune_mxscale_preshuffle \
         --untune_file aiter/configs/mxscale_preshuffle_untuned_gemm.csv
@@ -23,7 +28,12 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.ops.quant import per_1x32_f4_quant, per_1x32_f8_scale_f8_quant
-from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_scale_a16w4,
+    shuffle_scale_blockscale_a,
+    shuffle_scale_blockscale_b,
+    shuffle_weight,
+)
 from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -68,11 +78,6 @@ def generate_data(
     a_codes, b_codes = a_q[:m], b_q[:n]
     b_shuf = shuffle_weight(b_codes, layout=(16, 16))
     if blockscale:
-        from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
-            _compact_blockscale_a,
-            _compact_blockscale_b,
-        )
-
         if a_dtype != "fp8" or b_dtype != "fp8":
             raise ValueError("blockscale tune supports fp8/fp8 (a8w8) only")
         if n % 128 != 0 or k % 128 != 0:
@@ -82,8 +87,8 @@ def generate_data(
         sau, sbu = sa.view(torch.uint8), sb.view(torch.uint8)
         sa_128 = sau.view(ma, k // 128, 4).amax(dim=2).contiguous()
         sb_128 = sbu[:n].view(n // 128, 128, k // 128, 4).amax(dim=(1, 3)).contiguous()
-        a_scale = _compact_blockscale_a(sa_128, k)
-        b_scale = _compact_blockscale_b(sb_128, n, k)
+        a_scale = shuffle_scale_blockscale_a(sa_128, k)
+        b_scale = shuffle_scale_blockscale_b(sb_128, n, k)
         a_deq = a_codes.float() * fp4_utils.e8m0_to_f32(
             sa_128[:m].repeat_interleave(128, dim=1)
         )
@@ -147,13 +152,6 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
 
         _op._TUNED_CACHE.clear()
 
-    def _setup_specific_arguments(self):
-        self.parser.add_argument(
-            "--blockscale",
-            action="store_true",
-            help="tune/validate the a8w8 blockscale path (A 1x128, B 128x128)",
-        )
-
     def calculate(self, results, bpes=(1, 1, 2)):
         # (inbpe, w_bpe, outbpe); fp8=1 byte/code, bf16 out=2
         return super().calculate(results, bpes=bpes)
@@ -171,7 +169,8 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
             return []
         gemm_keys = ["A", "B", "a_scale", "b_scale", "out"]
         ref_keys = ["a_deq", "b_deq"]
-        blockscale = bool(getattr(args, "blockscale", False))
+        # Blockscale only: it is the op's default and the only mode we tune.
+        # Non-a8w8 shapes are filtered out by tune() before reaching here.
         tasks = []
         for kid, ki in candidates_for(a_dtype, b_dtype, M, N, K):
             info = (info_keys, kid, ki.split_k, ki.name, "flydsl")
@@ -179,9 +178,9 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                 (
                     info,
                     generate_data,
-                    (M, N, K, seed, a_dtype, b_dtype, blockscale),
+                    (M, N, K, seed, a_dtype, b_dtype, True),
                     run_gemm_flydsl,
-                    (gemm_keys, kid, a_dtype, b_dtype, blockscale),
+                    (gemm_keys, kid, a_dtype, b_dtype, True),
                     {"num_warmup": args.warmup, "num_iters": args.iters},
                     run_torch,
                     (ref_keys, dtypes.bf16),
@@ -212,6 +211,14 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
             a_dtype = untunedf.loc[i, "a_dtype"]
             b_dtype = untunedf.loc[i, "b_dtype"]
             seed += 1
+            # Tuning is blockscale-only (a8w8, N%128==0). Skip anything the path
+            # cannot run instead of letting generate_data raise mid-sweep.
+            if a_dtype != "fp8" or b_dtype != "fp8" or N % 128 != 0 or K % 128 != 0:
+                print(
+                    f"[mxscale] skip untuned shape M={M} N={N} K={K} {a_dtype}/{b_dtype}: "
+                    "blockscale tuning needs fp8/fp8 with N%128==0 and K%128==0"
+                )
+                continue
             info_keys = (gfx, cu_num, M, N, K, a_dtype, b_dtype)
             shape_tasks = self.get_flydsl_mxscale_tune_task(info_keys, seed, args)
             if not shape_tasks:
@@ -282,7 +289,6 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
-        blockscale = bool(getattr(args, "blockscale", False))
         results = []
         for i in range(len(untunedf)):
             row = untunedf.iloc[i]
@@ -293,7 +299,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                 self._get_run_config_err_ratio_limit(row, args)
             )
             try:
-                gd = generate_data(M, N, K, 0, a_dtype, b_dtype, blockscale=blockscale)
+                gd = generate_data(M, N, K, 0, a_dtype, b_dtype, blockscale=True)
 
                 def _dispatch(A, B, a_scale, b_scale, out):
                     return gemm_mxscale_preshuffle(
@@ -304,7 +310,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                         out,
                         a_dtype=a_dtype,  # noqa: B023
                         b_dtype=b_dtype,  # noqa: B023
-                        blockscale=blockscale,
+                        blockscale=True,
                     )
 
                 out, us = run_perftest(

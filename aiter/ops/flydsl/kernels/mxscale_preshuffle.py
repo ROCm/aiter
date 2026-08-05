@@ -35,6 +35,10 @@ from flydsl.expr.typing import (
 )
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+    _DTYPE_SHORT,
+    make_kernel_name,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_rsrc
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
@@ -185,7 +189,23 @@ def launch_gemm(
         a0: fx.Array[Int8, A_LDS_B, 16]
         a1: fx.Array[Int8, A_LDS_B, 16]
 
-    @flyc.kernel
+    # Name the GPU symbol after the tuned-CSV kernelName instead of letting FlyDSL
+    # fall back to "kernel_gemm_<id>" -- otherwise every config profiles under the
+    # same symbol and rocprof/att traces can't tell them apart.
+    _kname = make_kernel_name(
+        BM,
+        BN,
+        BK,
+        a_dtype,
+        b_dtype,
+        out_dtype,
+        waves_per_eu,
+        xcd_swizzle,
+        k_batch,
+        blockscale,
+    )
+
+    @flyc.kernel(name=_kname)
     def kernel_gemm(
         arg_c: fx.Int64,
         arg_a: fx.Int64,
@@ -691,7 +711,11 @@ def launch_splitk_reduce(
     dword (= 2 out elems = 2 fp32 inputs per slab) per thread; grid.x covers all.
     """
 
-    @flyc.kernel
+    # Same reason as the GEMM kernel: keep the split-K reduce distinguishable per
+    # config in a profile instead of a bare "reduce_kernel_<id>".
+    _kname = f"flydsl_mxpsh_skreduce_sk{split_k}_{_DTYPE_SHORT[out_dtype]}"
+
+    @flyc.kernel(name=_kname)
     def reduce_kernel(
         tmp: fx.Pointer,
         out: fx.Pointer,
