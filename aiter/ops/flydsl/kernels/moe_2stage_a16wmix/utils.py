@@ -3,10 +3,8 @@
 
 """Shared low-level helpers for the a16w4/a16wi4/a16w16 fused MoE kernels.
 
-Leaf utilities used by BOTH stage1 (:mod:`gemm1`) and stage2 (:mod:`gemm2`):
-pointer/buffer construction, the s_waitcnt shim, the arch gate, LDS swizzle, and the
-int4/e8m0 dequant primitives. Kept dependency-free of the kernel bodies so either stage
-can import from here without a stage1<->stage2 import cycle.
+Leaf utilities used by both stage1 (:mod:`gemm1`) and stage2 (:mod:`gemm2`).
+Dependency-free of the kernel bodies to avoid a stage1<->stage2 import cycle.
 """
 
 import flydsl.expr as fx
@@ -20,8 +18,8 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 
 _PTR3 = "!llvm.ptr<3>"
 
-# a16wi4 (int4 W) groupwise scale: group_size = 32 == one MFMA K32 step (one ku per
-# K-group). Scale packed bf16 pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
+# a16wi4 int4 groupwise scale: group_size = 32 == one MFMA K32 step. Scale is bf16
+# pairs (E, N, G//2, 2); even/odd ku selects lo/hi half.
 A16WI4_GROUP_SIZE = 32
 
 
@@ -37,9 +35,8 @@ def s_waitcnt(vmcnt=None, lgkmcnt=None, expcnt=None):
 def a16wmix_use_k16(arch):
     """True for the gfx942 (CDNA3) codepath: K=16 MFMA + scalar int4 dequant.
 
-    Arch-gate: gfx950 (CDNA4) has K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32;
-    gfx942 has neither and falls back to K=16 MFMA + scalar-trunc dequant. The caller
-    passes the target arch (e.g. ``get_rocm_arch()``).
+    gfx950 (CDNA4) has K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32; gfx942 has
+    neither and falls back to K=16 MFMA + scalar-trunc dequant.
     """
     return "gfx95" not in str(arch)
 
@@ -66,8 +63,8 @@ def _global_i32_at(addr_i64, idx):
 
 
 def _global_i32_buffer_view(addr_i64, num_bytes):
-    # fx.copy BufferCopy atoms take soffset as an element count (not bytes); the
-    # make_layout dynamic-shape leaf must be i32/i64, not fx.Index.
+    # BufferCopy soffset is an element count (not bytes); make_layout dynamic-shape
+    # leaf must be i32/i64, not fx.Index.
     num_bytes_i64 = fx.Int64(num_bytes)
     view = fx.Tensor(
         fx.make_view(
@@ -86,9 +83,8 @@ def _global_i32_buffer_tiles(addr_i64, num_bytes, tile_elems):
 
 
 def _buffer_i32_scalar_read(tiles1, idx, atom):
-    """Read one i32 dword at element ``idx`` from a ``_global_i32_buffer_tiles(..., 1)``
-    view via the layout-API BufferCopy atom (buffer_load_dword; OOB-clamped by the
-    buffer resource). ``tiles1`` is 1-dword tiles so the tile index == ``idx``.
+    """Read one i32 dword at element ``idx`` via a BufferCopy atom (buffer_load_dword,
+    OOB-clamped). ``tiles1`` is 1-dword tiles so the tile index == ``idx``.
     """
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
@@ -112,10 +108,10 @@ def _gep(base_ptr, byte_off_i32):
 
 
 def _a16w4_swizzle_xor16(row, col_bytes, k_blocks16, *, enable=False):
-    """A-LDS bank-conflict XOR swizzle (aiter swizzle_xor16: col ^ ((row&(kb16-1))*16)).
+    """A-LDS bank-conflict XOR swizzle (col ^ ((row&(kb16-1))*16)).
 
-    Both the DMA write and the LDS read go through this helper so the physical layout
-    stays consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
+    Both the DMA write and the LDS read use this so the physical layout stays
+    consistent. gemm1 keeps linear (enable=False); gemm2 enables it.
     """
     if not enable:
         return col_bytes
@@ -134,15 +130,14 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
 
     ``raw_i32`` holds 8 signed-int4 nibbles in bits[4n+3:4n] (same K order as the mxfp4
     sel 0..3 path). ``v_cvt_off_f32_i4`` reads the nibble unsigned, subtracts 8, and
-    x16-scales the mantissa, so x16 folds into eff = scale*16. WHY scalar ``.to(BFloat16)``
-    (arith.truncf) and NOT side-effecting ``v_cvt_pk_bf16_f32``: truncf is schedulable so
-    the compiler packs the per-nibble ``* eff`` (v_pk_mul_f32), and it sidesteps the
-    stateless-cvt_pk mis-CSE that forced the side-effecting pin.
+    x16-scales the mantissa, so x16 folds into eff = scale*16. Scalar ``.to(BFloat16)``
+    (arith.truncf), NOT side-effecting ``v_cvt_pk_bf16_f32``: truncf is schedulable so
+    the compiler packs the per-nibble ``* eff``, and it sidesteps the stateless-cvt_pk
+    mis-CSE that forced the side-effecting pin.
     """
     eff = scale_f32 * fx.Float32(16.0)
     raw_even = fx.Int32(raw_i32)
     raw_odd = raw_even.shrui(fx.Int32(4))
-    # byte_sel loads (1 shift total); scalar f32 -> bf16 truncation.
     bf16s = []
     for j in range_constexpr(4):
         f_lo = fx.Float32(rocdl.cvt_off_f32_i4(_raw(raw_even), byte_sel=j)) * eff
@@ -150,11 +145,3 @@ def _int4_nibble_to_bf16x8(raw_i32, scale_f32, *, use_k16=False):
         bf16s.append(f_lo.to(fx.BFloat16))
         bf16s.append(f_hi.to(fx.BFloat16))
     return fx.Vector.from_elements([_raw(x) for x in bf16s], fx.BFloat16)  # v8bf16
-
-
-def kmchunks_for(BM):
-    return BM // 16
-
-
-def lds_acc_bytes_for(rows, BN):
-    return rows * BN * 4

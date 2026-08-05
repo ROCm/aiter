@@ -7,19 +7,12 @@ CDNA MFMA pipeline. bf16 A (no A-scale), W1/W2 upconverted to bf16 in-kernel,
 non-scaled ``MFMA(16,16,32,bf16)``:
 
   - stage1 (:mod:`gemm1`): fused gate+up GEMM + SiLU/SiTUv2 -> bf16 intermediate
-    ``[sorted_size, inter_dim]`` by sorted position (no requant/scale).
+    ``[sorted_size, inter_dim]`` by sorted position.
   - stage2 (:mod:`gemm2`): down-proj GEMM + routing-weighted atomic bf16 scatter
     to ``[tokens, model_dim]``.
 
-Reuses the standard sorting/cumsum/m_indices contract and the
-shuffle_weight+e8m0_shuffle W layout. Shared low-level helpers live in
-:mod:`gemm1` (imported by :mod:`gemm2`); host-side launch glue is defined below.
-
-Launch args are raw device pointers (``fx.Int64``); tensors passed as
-``.data_ptr()``.
+Launch args are raw device pointers (``fx.Int64``); tensors passed as ``.data_ptr()``.
 """
-
-import functools
 
 import torch
 from flydsl.runtime.device import get_rocm_arch
@@ -38,74 +31,8 @@ __all__ = [
     "gemm2_a16w4_grid",
 ]
 
-
-@functools.cache
-def _get_compiled_gemm1_a16w4(
-    BM,
-    D_HIDDEN,
-    D_INTER,
-    NE,
-    topk,
-    TILE_N,
-    TILE_K,
-    act,
-    b_cache_mod,
-    xcd_swizzle,
-    waves_per_eu,
-    w_dtype="fp4",
-    w_layout="standard",
-    k_wave=1,
-):
-    # _get_compiled_* is @functools.cache'd, so this builder runs once; the
-    # returned @flyc.jit launcher is then dispatched via _run_compiled.
-    return compile_gemm1_a16w4_port(
-        BM=BM,
-        D_HIDDEN=D_HIDDEN,
-        D_INTER=D_INTER,
-        NE=NE,
-        TOPK=topk,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        act=act,
-        b_cache_mod=b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        w_layout=w_layout,
-        k_wave=k_wave,
-        use_k16=a16wmix_use_k16(get_rocm_arch()),
-    )
-
-
-@functools.cache
-def _get_compiled_gemm2_a16w4(
-    BM,
-    NE,
-    N_OUT,
-    D_INTER,
-    TILE_N,
-    TILE_K,
-    b_cache_mod=2,
-    xcd_swizzle=1,
-    waves_per_eu=None,
-    w_dtype="fp4",
-    persist=False,
-    topk=1,
-):
-    return compile_gemm2_a16w4_port(
-        BM=BM,
-        NE=NE,
-        N_OUT=N_OUT,
-        D_INTER=D_INTER,
-        TILE_N=TILE_N,
-        TILE_K=TILE_K,
-        b_cache_mod=b_cache_mod,
-        xcd_swizzle=xcd_swizzle,
-        waves_per_eu=waves_per_eu,
-        w_dtype=w_dtype,
-        persist=persist,
-        use_k16=a16wmix_use_k16(get_rocm_arch()),
-    )
+# compile_gemm{1,2}_a16w4_port are @functools.cache'd: each config builds its @flyc.jit
+# launcher once; _run_compiled then caches the compiled function on the exe.
 
 
 def flydsl_a16w4_gemm1(
@@ -138,24 +65,22 @@ def flydsl_a16w4_gemm1(
 ):
     """a16w4/a16wi4/a16w16 fused stage1: gate+up GEMM + SiLU -> bf16 intermediate.
 
-    ``w_dtype="fp4"`` (default): W1 mxfp4, ``w1_scale_u8`` = shuffled e8m0. ``"int4"``:
-    W1 packed signed int4 (same preshuffle as mxfp4), ``w1_scale_u8`` groupwise bf16 in
-    the ``(E, N_OUT, G//2, 2)`` bf16-pair layout (dword = n*(G//2)+group//2).
-    ``"bf16"``: RAW bf16 W1 preshuffled ``shuffle_weight (16,16)``; ``w1_scale_u8`` unused.
+    ``w_dtype``: "fp4" (default) mxfp4 W1 + shuffled e8m0 ``w1_scale_u8``; "int4" packed
+    signed int4 (same preshuffle as mxfp4) + groupwise bf16 scale in the
+    ``(E, N_OUT, G//2, 2)`` layout; "bf16" raw bf16 W1 ``shuffle_weight (16,16)``, scale
+    unused.
 
-    ``w_layout="standard"`` (default) consumes the N-major GGUU preshuffle. ``"guinterleave"``
-    (mxfp4 only) consumes aiter's native GUGU stage1 W1+scale layout
-    (``shuffle_weight_a16w4``/``shuffle_scale_a16w4``) directly, with no host relayout.
+    ``w_layout``: "standard" (default) N-major GGUU preshuffle; "guinterleave" (mxfp4
+    only) consumes aiter's native GUGU stage1 W1+scale layout directly, no host relayout.
 
-    ``a_bf16`` is bf16 ``[n_tokens, D_HIDDEN]``. Writes the bf16 intermediate
-    ``[sorted_size, D_INTER]`` (by sorted position) into ``inter_sorted_bf16``.
+    ``a_bf16`` is ``[n_tokens, D_HIDDEN]``; writes ``[sorted_size, D_INTER]`` (by sorted
+    position) into ``inter_sorted_bf16``.
 
-    Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
-    rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier (0=cached, 2=nt),
-    ``xcd_swizzle`` -> XCD/HBM grid remap, ``k_wave`` -> intra-block slice-K ({1,2,4}).
-    ``k_batch``/``gate_mode`` accepted for parity (only k_batch=1/separated supported).
-    Tiles are CSV/registry-driven and always supplied by the caller; ``b_nt=None``
-    falls back to the per-M U-shape (nt mid-band, cached at ends).
+    Tile config (CSV/registry-driven, always supplied by caller): ``tile_m/n/k`` ->
+    BM/TILE_N/TILE_K, ``waves_per_eu`` -> rocdl.waves_per_eu, ``b_nt`` -> W-load cache
+    modifier (0=cached, 2=nt), ``xcd_swizzle`` -> XCD/HBM grid remap, ``k_wave`` ->
+    intra-block slice-K ({1,2,4}). ``k_batch``/``gate_mode`` for parity only (k_batch=1/
+    separated). ``b_nt=None`` falls back to the per-M U-shape (nt mid-band, cached ends).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm1 only supports k_batch=1, got {k_batch}")
@@ -167,8 +92,6 @@ def flydsl_a16w4_gemm1(
     BM = tile_m
     TILE_K = tile_k
     TILE_N = tile_n
-    # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
-    # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
     b_cache_mod = (2 if (16 <= int(n_tokens) <= 1024) else 0) if b_nt is None else b_nt
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
@@ -183,21 +106,22 @@ def flydsl_a16w4_gemm1(
             f"a16w4 gemm1 requires D_INTER % TILE_N({TILE_N}) == 0, got D_INTER={D_INTER}"
         )
 
-    launch = _get_compiled_gemm1_a16w4(
-        BM,
-        D_HIDDEN,
-        D_INTER,
-        NE,
-        topk,
-        TILE_N,
-        TILE_K,
-        act,
-        b_cache_mod,
-        xcd_swizzle,
-        waves_per_eu,
-        w_dtype,
-        w_layout,
-        k_wave,
+    launch = compile_gemm1_a16w4_port(
+        BM=BM,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
+        NE=NE,
+        TOPK=topk,
+        TILE_N=TILE_N,
+        TILE_K=TILE_K,
+        act=act,
+        b_cache_mod=b_cache_mod,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        w_dtype=w_dtype,
+        w_layout=w_layout,
+        k_wave=k_wave,
+        use_k16=a16wmix_use_k16(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
     grid = gemm1_a16w4_grid(BM, INTER=D_INTER, TILE_N=TILE_N, max_m_blocks=max_m_blocks)
@@ -250,7 +174,7 @@ def flydsl_a16w4_gemm2(
     Tile config: ``tile_m/n/k`` -> BM/TILE_N/TILE_K, ``waves_per_eu`` ->
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt=None`` keeps the per-M
-    U-shape (cached at ends, nt mid-band).
+    U-shape (cached ends, nt mid-band).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -259,8 +183,6 @@ def flydsl_a16w4_gemm2(
     TILE_N = tile_n
     TILE_K = tile_k
     _m = int(M_logical)
-    # Tile config is CSV/registry-driven: the caller resolves tile_n/tile_k/b_nt/
-    # xcd_swizzle from the tuned kernelName2 and always passes them.
     if D_INTER % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm2 requires D_INTER (K) % {TILE_K} == 0, got D_INTER={D_INTER}"
@@ -270,27 +192,24 @@ def flydsl_a16w4_gemm2(
             f"a16w4 gemm2 requires D_HIDDEN (model_dim) % {TILE_N} == 0, got H={D_HIDDEN}"
         )
 
-    # B cache modifier per-token U-shape: cached (0) at both ends (small M reuse / large
-    # M L2 residency), nt (2) mid-band (32..1024). Caller may override via b_nt.
+    # B cache modifier per-token U-shape: cached (0) at both ends, nt (2) mid-band.
     _b_cache_mod = (0 if (_m <= 16 or _m >= 2048) else 2) if b_nt is None else b_nt
     max_m_blocks = int(sorted_expert_ids.numel())
-    # Persistent CU-limited grid (opt-in, default OFF; byte-identical when off): does NOT
-    # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
-    # opt-in building block.
+    # Persistent CU-limited grid: opt-in, default OFF, byte-identical when off.
     _persist = False if persist is None else bool(persist)
-    launch = _get_compiled_gemm2_a16w4(
-        BM,
-        NE,
-        D_HIDDEN,
-        D_INTER,
-        TILE_N,
-        TILE_K,
-        _b_cache_mod,
-        xcd_swizzle,
-        waves_per_eu,
-        w_dtype,
-        _persist,
-        topk,
+    launch = compile_gemm2_a16w4_port(
+        BM=BM,
+        NE=NE,
+        N_OUT=D_HIDDEN,
+        D_INTER=D_INTER,
+        TILE_N=TILE_N,
+        TILE_K=TILE_K,
+        b_cache_mod=_b_cache_mod,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        w_dtype=w_dtype,
+        persist=_persist,
+        use_k16=a16wmix_use_k16(get_rocm_arch()),
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist

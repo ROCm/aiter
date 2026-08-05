@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -26,18 +28,16 @@ from .utils import (
     _lds_ptr3,
     _udiv,
     _umod,
-    kmchunks_for,
-    lds_acc_bytes_for,
 )
 
-# gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do
-# not over-launch ~max_m_blocks empty CTAs.
+# gfx950 CU count; caps the persistent gemm2 grid so high-expert launches (E896) do not
+# over-launch empty CTAs.
 NUM_CU = 256
 
 
 # @flyc.jit is LOAD-BEARING: it AST-rewrites ``if token_id < i32_M`` into an scf.if.
 # Without it the guard runs as a plain Python if (dropped at trace), so the atomic-fadd
-# scatter fires on padded/OOB rows -- ~13x s2 regression (39us -> ~490us at E896).
+# scatter fires on padded/OOB rows -- ~13x s2 regression at E896.
 @flyc.jit
 def _atomic_bf16_epilog(
     lds_acc_base_i32,
@@ -54,9 +54,9 @@ def _atomic_bf16_epilog(
     N_OUT,
     BN,
 ):
-    _kMChunks = kmchunks_for(BM)
+    _kMChunks = BM // 16
     M_REPS = BM // 8
-    # 4 waves split the BN(=TILE_N) tile (generic over BN, e.g. int4 tile_n=128).
+    # 4 waves split the BN(=TILE_N) tile.
     _n_per_wave = BN // 4
     num_acc_n = _n_per_wave // 16
     _s_count = BN // 64  # each s-iter covers 64 cols (32 lanes x vec2)
@@ -147,7 +147,7 @@ def _gemm2_body_a16w4(
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
-    A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
+    A = bf16 stage1 intermediate by sorted position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
     """
     _is_int4 = w_dtype == "int4"
@@ -207,8 +207,8 @@ def _gemm2_body_a16w4(
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
 
-    # bf16 W overflows the 32-bit num_records/i32 byte-offset at large E; fold the per-
-    # expert base into the i64 resource addr and index within the expert (see gemm1).
+    # bf16 W overflows the 32-bit num_records at large E; fold the per-expert base into
+    # the i64 resource addr and index within the expert (see gemm1).
     if const_expr(_is_bf16):
         _w_per_expert_bytes = N_OUT * (K * 2)
         w_base_i64 = fx.Int64(arg_bq) + fx.Int64(e) * fx.Int64(_w_per_expert_bytes)
@@ -225,8 +225,7 @@ def _gemm2_body_a16w4(
         _sw_bytes = NE * N_OUT * _g_half * 4
     else:
         _sw_bytes = NE * N_OUT * (scale_k_padded // 32)
-    # Per-lane scalar scale gather via make_buffer_tensor 1-dword tiles + BufferCopy32b
-    # scalar read (see gemm1._buffer_i32_scalar_read), replacing raw buffer_ops.
+    # Per-lane scalar scale gather via BufferCopy32b (see _buffer_i32_scalar_read).
     sw_tiles = (
         None
         if _is_bf16
@@ -260,8 +259,8 @@ def _gemm2_body_a16w4(
     x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFFFFF))
     x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
     # gfx950 (K=32): BufferCopyLDS128b direct-to-LDS async copy. gfx942 (use_k16): the 16 B
-    # direct-to-LDS form fails LLVM ISA lowering, so stage via VGPRs: buffer_load 16 B
-    # gmem->regs then ds_write 16 B regs->LDS, preserving the swizzled-src/linear-LDS layout.
+    # direct-to-LDS form fails LLVM ISA lowering, so stage via VGPRs (buffer_load gmem->regs
+    # then ds_write regs->LDS), preserving the swizzled-src/linear-LDS layout.
     if const_expr(use_k16):
         x_dma_atom = fx.make_copy_atom(
             fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32
@@ -534,7 +533,7 @@ def _gemm2_body_a16w4(
                     _mma(accm[mi][ni], a8, bb)
         gpu.barrier()
 
-    # ---- epilogue: atomic bf16 scatter (routing-weighted). A-LDS region (offset 0) is
+    # ---- epilogue: atomic bf16 scatter (routing-weighted). A-LDS region (offset 0)
     # reused for the epilog's f32 acc staging.
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -564,7 +563,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
 
     Non-persistent (default): one CTA per (m-block x n-block) tile over padded
     ``max_m_blocks``. Persistent: cap to ``min(total_work, NUM_CU)`` CTAs (only when
-    padded work > ``NUM_CU*4``); each CTA loops over its real work-tiles.
+    padded work > ``NUM_CU*4``), each CTA loops over its real work-tiles.
     """
     total_work = int(max_m_blocks) * (N_OUT // TILE_N)
     if persist and total_work > NUM_CU * 4:
@@ -572,6 +571,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
     return total_work
 
 
+@functools.cache
 def compile_gemm2_a16w4_port(
     BM=32,
     *,
@@ -593,8 +593,7 @@ def compile_gemm2_a16w4_port(
     bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
 
     ``xcd_swizzle`` (>0) bijectively round-robins the launch index across the 8 XCDs to
-    balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group swizzle for
-    per-XCD L2 locality (group = xcd_swizzle m-blocks).
+    balance per-XCD/HBM traffic (gemm2 is HBM-bound), + optional M-group L2-locality swizzle.
     """
     assert w_dtype in (
         "fp4",
@@ -612,9 +611,9 @@ def compile_gemm2_a16w4_port(
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
 
-    # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N f32).
+    # LDS: A tile (BM x TILE_K bf16) then f32 accumulator region (BM x TILE_N).
     _a_bytes = BM * KH_TILE_BYTES
-    _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
+    _acc_bytes = BM * TILE_N * 4
     _lds_bytes = _a_bytes + _acc_bytes
 
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
@@ -655,7 +654,7 @@ def compile_gemm2_a16w4_port(
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
-        # traffic; xcd_swizzle>0 also M-group-swizzles for per-XCD L2 locality.
+        # traffic; xcd_swizzle>0 also M-group-swizzles for L2 locality.
         _NXCD = 8
         _xq = _udiv(bound, _NXCD)
         _xr = _umod(bound, _NXCD)
@@ -706,9 +705,9 @@ def compile_gemm2_a16w4_port(
             )
 
         if const_expr(persist):
-            # Persistent CU-limited grid (~NUM_CU CTAs): each CTA strides by grid size over
-            # [0, bound); _xcd_np maps every visited index so each tile runs once. Loop-top
-            # barrier separates the prev tile's epilog LDS from the next tile's A-DMA.
+            # Persistent CU-limited grid: each CTA strides by grid size over [0, bound);
+            # _xcd_np maps every visited index so each tile runs once. Loop-top barrier
+            # separates the prev tile's epilog LDS from the next tile's A-DMA.
             grid_nb = fx.Int32(gpu.grid_dim.x)
             if bx_i32 < bound:
                 _run_tile(_xcd_np(bx_i32))
