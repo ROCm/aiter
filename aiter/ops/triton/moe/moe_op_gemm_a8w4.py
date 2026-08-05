@@ -268,13 +268,15 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     num_warps = 4
     num_buffers = 3
     split_k = 1
-    use_persistent = False
-    persistent_iters = 0
+
+    if block_m == 16 and k <= 768:
+        use_persistent = True
+        persistent_iters = 3
+    else:
+        use_persistent = False
+        persistent_iters = 0
 
     if block_m == 16:
-        if k <= 768:
-            use_persistent = True
-            persistent_iters = 3
         bucket = m2bucket(m)
         tuned = _get_a8w4_dispatch(get_arch())
         key = f"bm{block_m}_n{n}_k{k}_{bucket}"

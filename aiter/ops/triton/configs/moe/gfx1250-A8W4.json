@@ -99,16 +99,6 @@
         "block_k": 512,
         "num_buffers": 2
     },
-    "bm16_n4096_k2048_large": {
-        "block_n": 512,
-        "block_k": 512,
-        "num_buffers": 1
-    },
-    "bm16_n4096_k2048_xlarge": {
-        "block_n": 512,
-        "block_k": 256,
-        "num_buffers": 3
-    },
     "bm16_n4096_k4096_tiny": {
         "block_n": 64,
         "block_k": 512,
@@ -128,16 +118,6 @@
         "block_n": 128,
         "block_k": 512,
         "num_buffers": 2
-    },
-    "bm16_n4096_k4096_large": {
-        "block_n": 512,
-        "block_k": 512,
-        "num_buffers": 1
-    },
-    "bm16_n4096_k4096_xlarge": {
-        "block_n": 512,
-        "block_k": 256,
-        "num_buffers": 3
     },
     "bm16_n768_k7168_tiny": {
         "block_n": 64,
