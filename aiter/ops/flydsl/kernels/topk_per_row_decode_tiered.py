@@ -117,11 +117,15 @@ def needs_workspace_zero(
     top_k: int,
     short_max: int,
     tier_mode: str = "auto",
+    bits_per_pass: int = 11,
 ) -> bool:
     """Return whether any row can enter the persistent multi-block path."""
     if tier_mode == "short":
         return False
     if tier_mode in ("mid", "long"):
+        return True
+    # No short tier below 11 bits, so every row is persistent regardless of length.
+    if bits_per_pass != 11:
         return True
     return max_row_len > max(short_max, top_k)
 

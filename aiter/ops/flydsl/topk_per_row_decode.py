@@ -396,6 +396,7 @@ def _build_launcher(
         top_k,
         kernel_config["tiered_short_max"],
         tier_mode=kernel_config["tier_mode"],
+        bits_per_pass=kernel_config["bits_per_pass"],
     )
     launcher = create_topk_per_row_decode_tiered_kernel(
         top_k=top_k,

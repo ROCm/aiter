@@ -95,7 +95,7 @@ def _build_case(num_rows, width, next_n, seq_len, dist, poison, stride_pad=0):
     return logits, seq_lens, row_ends
 
 
-def _run(logits, seq_lens, num_rows, next_n, k):
+def _run(logits, seq_lens, num_rows, next_n, k, workspace=None):
     indices = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
     flydsl_top_k_per_row_decode(
         logits,
@@ -107,6 +107,7 @@ def _run(logits, seq_lens, num_rows, next_n, k):
         logits.stride(1),
         k=k,
         ordered=False,
+        workspace=workspace,
     )
     torch.cuda.synchronize()
     return indices
@@ -295,29 +296,33 @@ def test_non_finite_never_selected(k, L):
 
 
 @contextlib.contextmanager
-def _tier_override(mode):
-    """Set FLYDSL_TOPK_TIERED_OVERRIDE and clear the config/launcher caches so the
-    override actually takes effect (both are cached and otherwise ignore env)."""
+def _env_override(**overrides):
+    """Set FLYDSL_TOPK_* vars and clear the config/launcher caches so the override
+    actually takes effect (both are cached and otherwise ignore env)."""
     import os
 
     import aiter.ops.flydsl.topk_per_row_decode as m
 
-    prev = os.environ.get("FLYDSL_TOPK_TIERED_OVERRIDE")
-    if mode is None:
-        os.environ.pop("FLYDSL_TOPK_TIERED_OVERRIDE", None)
-    else:
-        os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = mode
-    m._environ_kernel_config.cache_clear()
-    m._build_launcher.cache_clear()
+    prev = {name: os.environ.get(name) for name in overrides}
+
+    def _apply(values):
+        for name, value in values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        m._environ_kernel_config.cache_clear()
+        m._build_launcher.cache_clear()
+
+    _apply(overrides)
     try:
         yield m
     finally:
-        if prev is None:
-            os.environ.pop("FLYDSL_TOPK_TIERED_OVERRIDE", None)
-        else:
-            os.environ["FLYDSL_TOPK_TIERED_OVERRIDE"] = prev
-        m._environ_kernel_config.cache_clear()
-        m._build_launcher.cache_clear()
+        _apply(prev)
+
+
+def _tier_override(mode):
+    return _env_override(FLYDSL_TOPK_TIERED_OVERRIDE=mode)
 
 
 @pytest.mark.parametrize("mode", ["short", "mid", "long"])
@@ -391,6 +396,30 @@ def test_repeated_calls_reuse_workspace():
             workspace=ws,
         )
         torch.cuda.synchronize()
+        _assert_batch(logits, indices, row_ends, k)
+
+
+@pytest.mark.parametrize("dist", DISTRIBUTIONS)
+@pytest.mark.parametrize("k", [256, 512])
+def test_bpp10_short_row_zeroes_workspace(k, dist):
+    """The LDS-only short tier is compiled in only at bits_per_pass 11. At 10 a row
+    short enough for that tier still runs the persistent path, so it hands out
+    output slots from the workspace counters and the host has to zero them. Width
+    <= short_max here, which is exactly the case a length-only test reads as
+    "short tier, no zero needed". The workspace is poisoned rather than merely
+    reused so the stale counters do not depend on what the allocator recycles."""
+    from aiter.ops.flydsl import flydsl_top_k_per_row_decode_workspace_size
+
+    L = 16384
+    with _env_override(FLYDSL_TOPK_TIERED_BPP="10") as m:
+        cfg = m._kernel_config(1, L)
+        assert cfg["bits_per_pass"] == 10
+        assert L <= max(cfg["tiered_short_max"], k), "L must be short-tier sized"
+
+        logits, sl, row_ends = _build_case(1, L, 1, L, dist, None)
+        size = flydsl_top_k_per_row_decode_workspace_size(1, L)
+        ws = torch.full((size,), 0x7F000000, dtype=torch.int32, device="cuda")
+        indices = _run(logits, sl, 1, 1, k, workspace=ws)
         _assert_batch(logits, indices, row_ends, k)
 
 
