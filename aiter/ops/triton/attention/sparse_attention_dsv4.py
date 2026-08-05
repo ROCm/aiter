@@ -28,7 +28,7 @@ _arch = arch_info.get_arch()
 _gluon_sparse_attn_prefill = None
 if _TRITON_GE_36 and _arch == "gfx950":
     try:
-        from aiter.ops.triton._gluon_kernels.gfx950.attention.mla import (
+        from aiter.ops.triton.gluon.mla_gluon import (
             mla_gluon as _gluon_sparse_attn_prefill,
         )
     except ImportError:
