@@ -357,7 +357,10 @@ namespace py = pybind11;
           py::arg("block_m"),                                                        \
           py::arg("kernelName"),                                                     \
           py::arg("inter_dim_pad"),                                                  \
-          py::arg("swiglu_limit"))
+          py::arg("activation"),                                                     \
+          py::arg("swiglu_limit"),                                                   \
+          py::arg("situ_beta"),                                                      \
+          py::arg("situ_linear_beta"))
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \

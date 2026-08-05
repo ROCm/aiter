@@ -65,9 +65,10 @@ class OpusA8W4Stage1Instance:
     k_wave: int = 1
     min_blocks_per_cu_override: int = 0
     quant_group_blocks: int = 1
-    activation: str = "silu"
     block_threads: int = 256
     weight_load_stream: bool = False
+    weight_load_reverse: bool = False
+    sparse_epilogue: bool = False
     k_loop_swizzle_colors: int = 0
     route_affinity_window: int = 0
     route_affinity_phase_period: int = 1
@@ -131,15 +132,6 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         k_wave=4,
         min_blocks_per_cu_override=1,
     ),
-    OpusA8W4Stage1Instance(
-        kid=1006,
-        name="opus_moe1_afp8_wfp4_bf16_t16x384_pair_kw2_m2_swiglu",
-        block_m=16,
-        block_n=384,
-        k_wave=2,
-        min_blocks_per_cu_override=2,
-        activation="swiglu",
-    ),
     # --- gate-up group-split (k_wave=1) ---
     OpusA8W4Stage1Instance(
         kid=1007,
@@ -184,16 +176,8 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         block_n=256,
         gate_up_group_split=True,
         quant_group_blocks=2,
-    ),
-    OpusA8W4Stage1Instance(
-        kid=1012,
-        name="opus_moe1_afp8_wfp4_bf16_t32x256_gs_qgb4_bt512_swiglu",
-        block_m=32,
-        block_n=256,
-        gate_up_group_split=True,
-        quant_group_blocks=4,
-        activation="swiglu",
-        block_threads=512,
+        weight_load_stream=True,
+        weight_load_reverse=True,
     ),
     OpusA8W4Stage1Instance(
         kid=1013,
@@ -293,6 +277,18 @@ OPUS_A8W4_STAGE1_INSTANCES = (
         route_affinity_window=64,
         b_k1_lead=True,
     ),
+    # Decode-oriented paired variant.  block_m=16 avoids forcing Stage2 to use
+    # a wider sorting tile when only a handful of routes are active.
+    OpusA8W4Stage1Instance(
+        kid=1022,
+        name="opus_moe1_afp8_wfp4_bf16_t16x384_pair_kw7_m1_stream",
+        block_m=16,
+        block_n=384,
+        k_wave=7,
+        min_blocks_per_cu_override=1,
+        weight_load_stream=True,
+        sparse_epilogue=True,
+    ),
 )
 
 OPUS_A8W4_STAGE1_BY_KID = {inst.kid: inst for inst in OPUS_A8W4_STAGE1_INSTANCES}
@@ -381,16 +377,13 @@ def opus_a8w4_stage1_instances_for_shape(
     model_dim: int,
     logical_inter_dim: int,
     inter_dim_pad: int,
-    activation: str | None = None,
     block_m: int | None = None,
 ) -> tuple[OpusA8W4Stage1Instance, ...]:
-    act = None if activation is None else str(activation).strip().lower()
     bm = None if block_m is None else int(block_m)
     return tuple(
         inst
         for inst in OPUS_A8W4_STAGE1_INSTANCES
-        if (act is None or str(inst.activation).lower() == act)
-        and (bm is None or int(inst.block_m) == bm)
+        if (bm is None or int(inst.block_m) == bm)
         and opus_a8w4_stage1_instance_supports_shape(
             inst,
             model_dim=model_dim,
@@ -398,12 +391,6 @@ def opus_a8w4_stage1_instances_for_shape(
             inter_dim_pad=inter_dim_pad,
         )
     )
-
-
-def opus_a8w4_stage1_instance_requires_bias(
-    inst: OpusA8W4Stage1Instance,
-) -> bool:
-    return str(inst.activation).lower() == "swiglu"
 
 
 @dataclass(frozen=True)
