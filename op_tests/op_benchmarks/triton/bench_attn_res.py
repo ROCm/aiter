@@ -16,7 +16,7 @@ Usage (from the repository root):
 
 Bandwidth uses the MINIMUM required traffic (read each residual once + write
 the output once) for every layout, so a faster configuration always reports a
-higher number. The discrete layout runs a two-pass kernel and therefore reads
+higher number. The sequence layout runs a two-pass kernel and therefore reads
 the residual twice; its real HBM throughput is about 2x the reported value.
 """
 
@@ -42,7 +42,7 @@ arg_to_torch_dtype = {
     "fp32": torch.float32,
 }
 
-_LAYOUTS = ("discrete", "packed")
+_LAYOUTS = ("sequence", "packed")
 
 
 # Prefill-sized token counts, plus the decode range where the grid is small
@@ -182,7 +182,7 @@ def parse_args():
         type=str,
         default="all",
         choices=[*_LAYOUTS, "all"],
-        help="Residual layout: discrete (2-pass), packed (1-pass), or all",
+        help="Residual layout: sequence (2-pass), packed (1-pass), or all",
     )
     parser.add_argument(
         "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)

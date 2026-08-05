@@ -16,7 +16,7 @@ _LOG2E = tl.constexpr(1.4426950408889634)
     key=["L2", "D", "HAS_ONORM", "SAVE_OPRE", "LOAD_CACHE", "STORE_CACHE", "EXP2"],
 )
 @triton.jit(do_not_specialize=["L"])
-def _attn_res_fwd_discrete_2pass_kernel(
+def _attn_res_fwd_sequence_2pass_kernel(
     q,
     res,
     w,
@@ -40,7 +40,7 @@ def _attn_res_fwd_discrete_2pass_kernel(
     STORE_CACHE: tl.constexpr,
     EXP2: tl.constexpr,
 ):
-    """Discrete layout (L independent [N, D] tensors), two-pass over D.
+    """Sequence layout (L independent [N, D] tensors), two-pass over D.
 
     Only the per-source scalars stay resident (~100 VGPR), so occupancy is high
     and the kernel saturates HBM at large N. The residual is read twice: once

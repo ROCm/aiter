@@ -41,7 +41,7 @@ def run_torch(query, residuals, rms_weight, output_rms_weight, rms_eps, scale):
     return o, o_pre, rstd, logit, probs
 
 
-@pytest.mark.parametrize("layout", ["discrete", "packed"])
+@pytest.mark.parametrize("layout", ["sequence", "packed"])
 @pytest.mark.parametrize("shape", [(64, 256), (128, 512), (37, 1024)])
 @pytest.mark.parametrize("L", [1, 2, 3, 4, 8])
 @pytest.mark.parametrize("with_onorm", [False, True])
@@ -74,7 +74,7 @@ def test_attn_res(layout, shape, L, with_onorm, dtype):
     assert o_pre is None
 
 
-@pytest.mark.parametrize("layout", ["discrete", "packed"])
+@pytest.mark.parametrize("layout", ["sequence", "packed"])
 @pytest.mark.parametrize("use_exp2", [False, True])
 @pytest.mark.parametrize("use_cache_modifier", [False, True])
 def test_attn_res_toggles(layout, use_exp2, use_cache_modifier):
@@ -103,7 +103,7 @@ def test_attn_res_toggles(layout, use_exp2, use_cache_modifier):
     torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("layout", ["discrete", "packed"])
+@pytest.mark.parametrize("layout", ["sequence", "packed"])
 def test_attn_res_checkpoint_level_0(layout):
     """checkpoint_level=0 also returns the pre-norm mix used by backward."""
     N, D, L = 64, 256, 4
@@ -152,7 +152,7 @@ def test_attn_res_packed_tensor_input():
     torch.testing.assert_close(o_packed, o_list, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("layout", ["discrete", "packed"])
+@pytest.mark.parametrize("layout", ["sequence", "packed"])
 def test_attn_res_return_weights(layout):
     """attn_res(return_weights=True) reproduces the softmax gate."""
     N, D, L = 64, 256, 4
@@ -331,10 +331,10 @@ def test_attn_res_gate_matches_attn_res_fwd(B):
     torch.testing.assert_close(y_gate, y_fwd, atol=1e-5, rtol=1e-5)
 
 
-def test_attn_res_discrete_requires_d_multiple_of_16():
-    """The discrete gather hints 16-element alignment, so D must be a multiple of 16."""
+def test_attn_res_sequence_requires_d_multiple_of_16():
+    """The sequence gather hints 16-element alignment, so D must be a multiple of 16."""
     query, residuals, rms_weight, _ = generate_attn_res_inputs(
         16, 40, 2, torch.float32, with_onorm=False
     )
     with pytest.raises(AssertionError, match="multiple of 16"):
-        attn_res_fwd(query, residuals, rms_weight, layout="discrete")
+        attn_res_fwd(query, residuals, rms_weight, layout="sequence")

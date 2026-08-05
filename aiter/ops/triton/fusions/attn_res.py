@@ -14,14 +14,17 @@ candidate axis, and mixes the raw residuals with that gate::
 Two residual layouts are supported, each paired with the pass structure that
 won for it in benchmarking:
 
-* ``layout="discrete"``: L independent ``[.., D]`` tensors, served by a
-  two-pass D-tiled kernel. Only per-source scalars stay resident (~100 VGPR),
-  so occupancy is high and it saturates HBM at large N; the residual is read
-  twice.
+* ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors,
+  which is the native form of the fla ``fused_attnres`` API. Served by a
+  two-pass D-tiled kernel: only per-source scalars stay resident (~100 VGPR),
+  so occupancy is high and it saturates HBM at large N, but the residual is
+  read twice and the gather costs O(L^2) traffic.
 * ``layout="packed"``: one contiguous ``[.., L, D]`` tensor, served by a
   one-pass whole-row kernel that loads ``v[L, D]`` once into registers and
   reuses it for both the reduction and the output, reading the residual from
-  HBM exactly once.
+  HBM exactly once. Faster whenever the caller can hand over a packed tensor;
+  a ``Sequence`` is accepted too but has to be stacked first, which costs an
+  extra ``L * N * D`` copy.
 
 :func:`attn_res_gate` exposes the same math under the inference contract used
 by serving stacks: the candidate set is a packed ``[.., B, D]`` block plus a
@@ -35,8 +38,8 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
-    _attn_res_fwd_discrete_2pass_kernel,
     _attn_res_fwd_packed_1pass_kernel,
+    _attn_res_fwd_sequence_2pass_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -70,7 +73,7 @@ def attn_res_fwd(
     scale: float = 1.0,
     checkpoint_level: int = 1,
     *,
-    layout: str = "discrete",
+    layout: str = "sequence",
     use_exp2: bool = True,
     use_cache_modifier: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -78,7 +81,7 @@ def attn_res_fwd(
 
     Key parameters:
     - query: ``[.., D]`` scoring query, flattened internally.
-    - residuals: discrete layout -> Sequence of L tensors each ``[.., D]``;
+    - residuals: sequence layout -> Sequence of L tensors each ``[.., D]``;
       packed layout -> a single ``[.., L, D]`` tensor, or a Sequence that will
       be stacked into one.
     - rms_weight: ``[D]`` per-channel weight folded into the score.
@@ -86,7 +89,7 @@ def attn_res_fwd(
     - rms_eps: epsilon of both the per-candidate and the output RMSNorm.
     - scale: multiplies the logits before the softmax.
     - checkpoint_level: 0 also returns the pre-norm mix ``o_pre`` for backward.
-    - layout: "discrete" (two-pass) or "packed" (one-pass).
+    - layout: "sequence" (two-pass) or "packed" (one-pass).
     - use_exp2: softmax via the hardware exp2 instead of exp.
     - use_cache_modifier: residual ``.cg`` load / output ``.cs`` store instead
       of default caching.
@@ -95,8 +98,8 @@ def attn_res_fwd(
     - (o, o_pre, rstd, logit, lse); ``o_pre`` is None unless
       ``checkpoint_level == 0``.
     """
-    if layout not in ("discrete", "packed"):
-        raise ValueError(f"layout must be 'discrete' or 'packed', got {layout!r}")
+    if layout not in ("sequence", "packed"):
+        raise ValueError(f"layout must be 'sequence' or 'packed', got {layout!r}")
 
     _LOGGER.info(
         f"ATTN_RES: query={tuple(query.shape)} rms_weight={tuple(rms_weight.shape)} "
@@ -110,7 +113,7 @@ def attn_res_fwd(
     w_flat = rms_weight.flatten().contiguous()
     ow_flat = output_rms_weight.flatten().contiguous() if has_onorm else None
 
-    runner = _run_packed if layout == "packed" else _run_discrete
+    runner = _run_packed if layout == "packed" else _run_sequence
     return runner(
         q_flat,
         residuals,
@@ -126,7 +129,7 @@ def attn_res_fwd(
     )
 
 
-def _run_discrete(
+def _run_sequence(
     q_flat,
     residuals,
     w_flat,
@@ -147,7 +150,7 @@ def _run_discrete(
     # row base, which only holds when the row stride D is a multiple of 16.
     assert (
         D % 16 == 0
-    ), f"attn_res discrete layout requires D to be a multiple of 16, got D={D}"
+    ), f"attn_res sequence layout requires D to be a multiple of 16, got D={D}"
     flat_residuals = tuple(r.reshape(-1, D).contiguous() for r in residuals)
     res = _build_ptr_table(flat_residuals)
     L = len(flat_residuals)
@@ -164,7 +167,7 @@ def _run_discrete(
     logit = torch.empty_like(rstd)
     L2 = max(1, triton.next_power_of_2(L))
 
-    _attn_res_fwd_discrete_2pass_kernel[(N,)](
+    _attn_res_fwd_sequence_2pass_kernel[(N,)](
         q=q_flat,
         res=res,
         w=w_flat,
@@ -229,7 +232,7 @@ def _run_packed(
     device = packed.device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    # One pass keeps the pre-norm mix in registers, so unlike the discrete path
+    # One pass keeps the pre-norm mix in registers, so unlike the sequence path
     # the output RMSNorm needs no scratch buffer here: allocate o_pre only when
     # the caller actually wants it back.
     o_pre = torch.empty((N, D), device=device, dtype=dtype) if save_opre else None
@@ -289,7 +292,7 @@ def attn_res(
     return_weights: bool = False,
     checkpoint_level: int = 1,
     *,
-    layout: str = "discrete",
+    layout: str = "sequence",
     use_exp2: bool = True,
     use_cache_modifier: bool = True,
 ):

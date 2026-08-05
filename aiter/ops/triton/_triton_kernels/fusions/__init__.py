@@ -2,8 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 from aiter.ops.triton._triton_kernels.fusions.attn_res import (
-    _attn_res_fwd_discrete_2pass_kernel,
     _attn_res_fwd_packed_1pass_kernel,
+    _attn_res_fwd_sequence_2pass_kernel,
 )
 from aiter.ops.triton._triton_kernels.fusions.mhc import (
     _mhc_fused_kernel,
@@ -15,8 +15,8 @@ from aiter.ops.triton._triton_kernels.fusions.mhc import (
 )
 
 __all__ = [
-    "_attn_res_fwd_discrete_2pass_kernel",
     "_attn_res_fwd_packed_1pass_kernel",
+    "_attn_res_fwd_sequence_2pass_kernel",
     "_mhc_fused_kernel",
     "_mhc_fused_split_kernel",
     "_mhc_post_kernel",
