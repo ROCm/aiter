@@ -3,8 +3,10 @@
 
 import math
 import random
+
 import pytest
 import torch
+
 from aiter.ops.triton.attention.chunked_pa_prefill import chunked_prefill_paged_decode
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
@@ -136,7 +138,6 @@ def context_attention_fwd_torch(
             # Output
             acc_total = acc + acc_self
             output[q_start:q_end, h] = acc_total.to(output.dtype)
-    return
 
 
 def _get_alibi_slopes(total_num_heads: int, device: torch.device) -> torch.Tensor:

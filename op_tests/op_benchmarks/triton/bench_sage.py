@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import argparse
 import csv
 import glob
@@ -12,15 +10,15 @@ import re
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import torch
 import triton
 
 import aiter
-from aiter.ops.mha import flash_attn_func, flash_attn_fp8_pertensor_func
-
+from aiter.ops.mha import flash_attn_fp8_pertensor_func, flash_attn_func
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3
-from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.fav3_sage import (
     fav3_sage_func,
     fav3_sage_wrapper_func,
@@ -31,6 +29,7 @@ from aiter.ops.triton.attention.fav3_sage_attention_mxfp4_wrapper import (
     fav3_sage_mxfp4_wrapper,
     get_sage_fwd_configs_mxfp4,
 )
+from aiter.ops.triton.attention.mha_v3 import _quantize_bshd
 from aiter.ops.triton.attention.utils import block_attn_mask_to_ragged_lut
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     create_hadamard_matrix,
@@ -38,7 +37,6 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
-
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -66,7 +64,7 @@ KernelName = Literal[
     "aiter_bf16",
 ]
 
-ALL_KERNELS: List[str] = [
+ALL_KERNELS: list[str] = [
     "sage_fp8",
     "sage_mxfp4",
     "fav3_fp8",
@@ -100,7 +98,7 @@ def layout_preprocess(
     v: torch.Tensor,
     layout: Literal["bshd", "bhsd"],
     target_layout: Literal["bshd", "bhsd"] = "bshd",
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if layout != target_layout:
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
@@ -147,7 +145,7 @@ def _array_ndim(arr: Any) -> int:
 
 
 def _mask_array_to_tensor(
-    mask_arr: List[Any],
+    mask_arr: list[Any],
     device: torch.device,
 ) -> LoadedMask:
     if not mask_arr:
@@ -169,9 +167,9 @@ def _mask_array_to_tensor(
 
 
 def load_block_mask_from_json(
-    path: Optional[str],
+    path: str | None,
     device: torch.device,
-) -> Optional[Union[LoadedMask, List[LoadedMask]]]:
+) -> LoadedMask | list[LoadedMask] | None:
     if not path or not path.strip():
         return None
 
@@ -217,7 +215,7 @@ def load_block_mask_from_json(
     return None
 
 
-def kernel_block_sizes(kernel: KernelName) -> Tuple[int, int]:
+def kernel_block_sizes(kernel: KernelName) -> tuple[int, int]:
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
@@ -248,8 +246,8 @@ def build_block_mask(
     args: argparse.Namespace,
     shape: ShapeSpec,
     device: torch.device,
-    loaded_single_mask: Optional[LoadedMask],
-) -> Optional[torch.Tensor]:
+    loaded_single_mask: LoadedMask | None,
+) -> torch.Tensor | None:
     if loaded_single_mask is not None:
         block_m, block_n = kernel_block_sizes(args.kernel)
         expected_q_blocks = (shape.n_ctx_q + block_m - 1) // block_m
@@ -287,9 +285,9 @@ def build_block_mask(
 
 def sparse_flops_from_lut(
     kernel: KernelName,
-    block_lut: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     shape: ShapeSpec,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     _, _, lut_count = block_lut
     num_sparse_pairs = lut_count.sum().item()
 
@@ -318,8 +316,8 @@ def fp8_quantize(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-) -> Tuple[
+    scale: torch.Tensor | None = None,
+) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
     quant_dtype = aiter.dtypes.fp8
@@ -345,10 +343,8 @@ def fp8_quantize(
 
 
 def _unpack_block_lut(
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-) -> Tuple[
-    Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], bool
-]:
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, bool]:
     """Unpack block LUT into (kv_block_indices, lut_start, lut_count, use_block_sparse)."""
     if block_lut is not None:
         kv_block_indices, lut_start, lut_count = block_lut
@@ -409,7 +405,7 @@ def make_fav3_fp8_runner(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    softmax_scale: Optional[float],
+    softmax_scale: float | None,
     causal: bool,
     e2e: bool = False,
 ) -> Any:
@@ -465,7 +461,7 @@ def make_kernel_runner(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_lut: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    block_lut: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
 ) -> Any:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -474,6 +470,21 @@ def make_kernel_runner(
     softmax_scale = head_dim**-0.5
 
     if args.kernel == "sage_fp8":
+        block_r = args.block_r
+        r = None
+        if args.hadamard_rotate:
+            if block_r > head_dim:
+                raise ValueError(
+                    f"block_r ({block_r}) must be <= head dim ({head_dim})"
+                )
+            if head_dim % block_r != 0:
+                raise ValueError(
+                    f"head dim ({head_dim}) must be divisible by block_r ({block_r})"
+                )
+            r = create_hadamard_matrix(block_r, device=q.device, dtype=q.dtype) / (
+                block_r**0.5
+            )
+
         if args.e2e:
             return lambda: fav3_sage_wrapper_func(
                 q,
@@ -484,6 +495,9 @@ def make_kernel_runner(
                 return_lse=False,
                 layout=args.layout,
                 block_lut=block_lut,
+                hadamard_rotation=args.hadamard_rotate,
+                R=r,
+                BLOCK_R=block_r if args.hadamard_rotate else None,
             )
 
         cfg = get_sage_fwd_configs()
@@ -500,6 +514,9 @@ def make_kernel_runner(
             BLKK=cfg["BLOCK_N"],
             sm_scale=softmax_scale,
             layout=args.layout,
+            hadamard_rotation=args.hadamard_rotate,
+            R=r,
+            BLOCK_R=block_r if args.hadamard_rotate else None,
         )
 
         kv_idx, lut_s, lut_c, sparse = _unpack_block_lut(block_lut)
@@ -652,7 +669,7 @@ def make_reference_output(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    block_attn_mask: Optional[torch.Tensor],
+    block_attn_mask: torch.Tensor | None,
 ) -> torch.Tensor:
     q_bshd, k_bshd, v_bshd = layout_preprocess(
         q, k, v, layout=args.layout, target_layout="bshd"
@@ -715,8 +732,8 @@ def benchmark_single_case(
     k: torch.Tensor,
     v: torch.Tensor,
     provider: str,
-    loaded_single_mask: Optional[LoadedMask],
-    explicit_block_attn_mask: Optional[torch.Tensor] = None,
+    loaded_single_mask: LoadedMask | None,
+    explicit_block_attn_mask: torch.Tensor | None = None,
 ) -> float:
     shape = infer_shape_spec(q, v, args.layout)
     block_attn_mask = (
@@ -783,7 +800,7 @@ def benchmark_single_case(
     return ms
 
 
-def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[str]:
+def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> list[str]:
     metric_map = {
         "time": "time(ms)",
         "throughput": "throughput(TFLOPS)",
@@ -813,12 +830,12 @@ def metric_lines(args: argparse.Namespace, include_sparse_metric: bool) -> List[
     return [metric_map[args.metric]]
 
 
-def make_styles(num_lines: int) -> List[Tuple[str, str]]:
+def make_styles(num_lines: int) -> list[tuple[str, str]]:
     palette = ["red", "green", "yellow", "blue", "cyan", "magenta"]
     return [(palette[i % len(palette)], "-") for i in range(num_lines)]
 
 
-def create_single_shape_config(args: argparse.Namespace) -> List[Any]:
+def create_single_shape_config(args: argparse.Namespace) -> list[Any]:
     hk = args.hk if args.hk else args.hq
     sk = args.sk if args.sk else args.sq
     d_head = args.d if args.d else 128
@@ -852,8 +869,8 @@ def create_single_shape_config(args: argparse.Namespace) -> List[Any]:
 
 def create_captured_config(
     args: argparse.Namespace,
-    inputs: List[Dict[str, Any]],
-) -> List[Any]:
+    inputs: list[dict[str, Any]],
+) -> list[Any]:
     include_sparse_metric = (
         args.block_sparsity is not None or args.block_mask_file is not None
     )
@@ -876,8 +893,8 @@ def create_captured_config(
 
 def create_mask_list_config(
     args: argparse.Namespace,
-    masks: List[LoadedMask],
-) -> List[Any]:
+    masks: list[LoadedMask],
+) -> list[Any]:
     lines = metric_lines(args, include_sparse_metric=True)
     hk = args.hk if args.hk else args.hq
 
@@ -906,7 +923,7 @@ def create_mask_list_config(
     ]
 
 
-def load_captured_inputs(input_dir: str) -> List[Dict[str, Any]]:
+def load_captured_inputs(input_dir: str) -> list[dict[str, Any]]:
     input_files = sorted(glob.glob(os.path.join(input_dir, "*_input_*.pt")))
     if not input_files:
         raise FileNotFoundError(f"No captured input files found in {input_dir}")
@@ -956,15 +973,19 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.e2e and args.kernel not in _quantized_kernels and args.kernel != "all":
         logger.warning("--e2e has no effect for kernel %s", args.kernel)
 
-    if args.kernel not in ("sage_mxfp4", "all") and (
+    _hadamard_kernels = ("sage_fp8", "sage_mxfp4", "all")
+
+    if args.kernel not in _hadamard_kernels and (
         args.qsmooth or args.hadamard_rotate is False
     ):
-        logger.warning("MXFP4-specific flags are ignored unless --kernel=sage_mxfp4")
+        logger.warning(
+            "Hadamard/qsmooth flags are ignored unless --kernel is sage_fp8, sage_mxfp4, or all"
+        )
 
 
 def run_benchmark_generated(
     args: argparse.Namespace,
-    loaded_single_mask: Optional[LoadedMask],
+    loaded_single_mask: LoadedMask | None,
 ) -> None:
     @triton.testing.perf_report(create_single_shape_config(args))
     def bench_mha(
@@ -1005,7 +1026,7 @@ def run_benchmark_generated(
 
 def run_benchmark_captured(
     args: argparse.Namespace,
-    loaded_single_mask: Optional[LoadedMask],
+    loaded_single_mask: LoadedMask | None,
 ) -> None:
     inputs = load_captured_inputs(args.captured_dir)
 
@@ -1028,7 +1049,7 @@ def run_benchmark_captured(
     bench_mha_captured.run(save_path="." if args.o else None, print_data=True)
 
 
-def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -> None:
+def run_benchmark_mask_list(args: argparse.Namespace, masks: list[LoadedMask]) -> None:
     block_m, block_n = kernel_block_sizes(args.kernel)
 
     @triton.testing.perf_report(create_mask_list_config(args, masks))
@@ -1077,7 +1098,7 @@ def run_benchmark_mask_list(args: argparse.Namespace, masks: List[LoadedMask]) -
 
 def run_block_sparse_repetitions(
     args: argparse.Namespace,
-    loaded_single_mask: Optional[LoadedMask],
+    loaded_single_mask: LoadedMask | None,
 ) -> None:
     if loaded_single_mask is not None:
         raise ValueError(
@@ -1122,9 +1143,9 @@ def run_block_sparse_repetitions(
         * (shape.d_head + shape.d_head_v)
     )
 
-    latencies_ms: List[float] = []
-    tflops_dense: List[float] = []
-    tflops_effective: List[float] = []
+    latencies_ms: list[float] = []
+    tflops_dense: list[float] = []
+    tflops_effective: list[float] = []
 
     for _ in range(args.n_repetitions):
         mask = (
@@ -1146,7 +1167,7 @@ def run_block_sparse_repetitions(
         effective_tflops = (sparse_flops / (ms * 1e-3)) / 1e12
         tflops_effective.append(effective_tflops)
 
-    def stats(x: List[float]) -> Dict[str, float]:
+    def stats(x: list[float]) -> dict[str, float]:
         t = torch.tensor(x)
         return {
             "median": torch.quantile(t, 0.5).item(),
@@ -1342,18 +1363,18 @@ def parse_args() -> argparse.Namespace:
         "--hadamard-rotate",
         type=lambda v: bool(int(v)),
         default=True,
-        help="(MXFP4 only) Apply Hadamard rotation: 1/0",
+        help="Apply Hadamard rotation before Q/K quant: 1/0 (sage_fp8, sage_mxfp4)",
     )
     parser.add_argument(
         "--block-r",
         type=int,
         default=128,
-        help="(MXFP4 only) Hadamard block size, must be <= head dim",
+        help="Hadamard block size; must divide head dim (sage_fp8, sage_mxfp4)",
     )
     parser.add_argument(
         "--qsmooth",
         action="store_true",
-        help="(MXFP4 only) Enable Q smoothing",
+        help="(sage_mxfp4 only) Enable Q smoothing",
     )
 
     parser.add_argument(
@@ -1418,7 +1439,7 @@ def print_vgpr_from_bench(runner: Any) -> None:
     finally:
         os.unlink(output_file)
 
-    vgpr_info: List[str] = []
+    vgpr_info: list[str] = []
     for line in lines:
         if re.search(r"Autotuning kernel", line):
             vgpr_info.append(line.strip())
@@ -1463,7 +1484,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     )
 
     saved_kernel = args.kernel
-    rows: List[Tuple[str, float, float]] = []
+    rows: list[tuple[str, float, float]] = []
 
     for kernel_name in ALL_KERNELS:
         args.kernel = kernel_name
@@ -1472,7 +1493,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
             ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
             tflops = total_flops / ms * 1e-9
             rows.append((kernel_name, ms, tflops))
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("Skipping %s: %s", kernel_name, e)
             rows.append((kernel_name, float("nan"), float("nan")))
 
@@ -1484,7 +1505,7 @@ def run_all_kernels(args: argparse.Namespace) -> None:
     print(f"{'kernel':<16} {'time(ms)':>10} {'TFLOPS':>10}")
     print("-" * 38)
     for name, ms, tflops in rows:
-        if ms != ms:  # nan
+        if ms != ms:  # nan  # noqa: PLR0124
             print(f"{name:<16} {'SKIP':>10} {'SKIP':>10}")
         else:
             print(f"{name:<16} {ms:>10.4f} {tflops:>10.2f}")
@@ -1503,7 +1524,7 @@ def main() -> int:
     validate_args(args)
 
     loaded_masks = load_block_mask_from_json(args.block_mask_file, torch.device("cuda"))
-    loaded_single_mask: Optional[LoadedMask] = None
+    loaded_single_mask: LoadedMask | None = None
 
     if isinstance(loaded_masks, list):
         if args.load_captured:

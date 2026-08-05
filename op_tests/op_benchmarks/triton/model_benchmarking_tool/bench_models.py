@@ -1,38 +1,48 @@
-from abc import ABC, abstractmethod
-from contextlib import redirect_stdout, redirect_stderr
-from typing import Callable, TypeAlias, Optional
-import io
-import logging
-import shlex
-import os
-import pandas as pd
-import json
-import re
-import matplotlib.pyplot as plt
 import argparse
-from triton.runtime.errors import OutOfResources
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+import io
+import json
+import logging
+import os
+import re
+import shlex
+from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
+from typing import TypeAlias
 
-from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
-    main as bench_gemm_a16w16_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
-    main as bench_gemm_a8w8_per_token_scale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
-    main as bench_gemm_a8w8_blockscale_main,
-)
-from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
-    main as bench_gemm_afp4wfp4_main,
-)
+import matplotlib.pyplot as plt
+import pandas as pd
+from triton.runtime.errors import OutOfResources
+
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.op_benchmarks.triton.bench_batched_gemm_a8w8 import (
     main as bench_batched_gemm_a8w8_main,
+)
+from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
+    main as bench_batched_gemm_a16wfp4_main,
 )
 from op_tests.op_benchmarks.triton.bench_batched_gemm_afp4wfp4 import (
     main as bench_batched_gemm_afp4wfp4_main,
 )
-from op_tests.op_benchmarks.triton.bench_batched_gemm_a16wfp4 import (
-    main as bench_batched_gemm_a16wfp4_main,
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_blockscale import (
+    main as bench_gemm_a8w8_blockscale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a8w8_per_token_scale import (
+    main as bench_gemm_a8w8_per_token_scale_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_a16w16 import (
+    main as bench_gemm_a16w16_main,
+)
+from op_tests.op_benchmarks.triton.bench_gemm_afp4wfp4 import (
+    main as bench_gemm_afp4wfp4_main,
+)
+from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
+from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
+    main as bench_moe_gemm_a4w4_main,
+)
+from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
+    main as bench_moe_gemm_a8w4_main,
 )
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
     main as bench_moe_gemm_a8w8_main,
@@ -40,16 +50,8 @@ from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8 import (
 from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w8_blockscale import (
     main as bench_moe_gemm_a8w8_blockscale_main,
 )
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a8w4 import (
-    main as bench_moe_gemm_a8w4_main,
-)
-from op_tests.op_benchmarks.triton.bench_moe_gemm_a4w4 import (
-    main as bench_moe_gemm_a4w4_main,
-)
 from op_tests.op_benchmarks.triton.bench_rmsnorm import main as bench_rmsnorm_main
 from op_tests.op_benchmarks.triton.bench_rope import main as bench_rope_main
-from op_tests.op_benchmarks.triton.bench_mha import main as bench_mha_main
-from op_tests.op_benchmarks.triton.bench_mla_decode import main as bench_mla_main
 from op_tests.op_benchmarks.triton.bench_unified_attention import (
     main as bench_unified_attention_main,
 )
@@ -220,7 +222,7 @@ class GemmKernelHandler(KernelHandler):
             "Kernel": self._kernel,
             "batch_size": None,
             "seq_len": None,
-            "B": shape["B"] if "B" in shape else None,
+            "B": shape.get("B", None),
             "M": self._M,
             "N": shape["N"],
             "K": shape["K"],
@@ -575,10 +577,10 @@ def read_json(json_path: str) -> ModelShapesData:
 
 def call_function(
     bench_fn: Callable[[list[str]], None], handler: KernelHandler
-) -> Optional[str]:
+) -> str | None:
     stdout = io.StringIO()
     stderr = io.StringIO()
-    raw_result: Optional[str] = None
+    raw_result: str | None = None
 
     try:
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -596,25 +598,15 @@ def call_function(
             hw_limit = int(match.group(2))
             ratio: float = required / hw_limit
             print(
-                "Out of LDS on %s: %d / %d (%.1fx)"
-                % (
-                    handler.to_str(),
-                    required,
-                    hw_limit,
-                    ratio,
-                )
+                f"Out of LDS on {handler.to_str()}: {required} / {hw_limit} "
+                f"({ratio:.1f}x)"
             )
         else:
-            print("Out of resources while benchmarking %s. %s" % (handler.to_str(), e))
+            print(f"Out of resources while benchmarking {handler.to_str()}. {e}")
 
-    except (Exception, SystemExit) as e:
+    except (Exception, SystemExit) as e:  # noqa: BLE001
         print(
-            "Unexpected error while benchmarking %s. %s: %s"
-            % (
-                handler.to_str(),
-                type(e).__name__,
-                e,
-            )
+            f"Unexpected error while benchmarking {handler.to_str()}. {type(e).__name__}: {e}"
         )
 
     # Close matplotlib figures to silence errors and avoid memory leaks.
@@ -888,7 +880,7 @@ def filter_models_and_kernels(
         filtered: ModelShapesData = {}
         for m, kernels in data.items():
             matched_kernels = _filter_by_regex(
-                kernel_pattern, "kernel", sorted(list(kernels.keys()))
+                kernel_pattern, "kernel", sorted(kernels.keys())
             )
             kept = {k: kernels[k] for k in matched_kernels}
             if kept:
@@ -903,8 +895,8 @@ def filter_models_and_kernels(
 
 def main() -> None:
     data = read_json("model_shapes.json")
-    available_models = sorted(list(data.keys()))
-    available_kernels = sorted(list(KERNEL_DICT.keys()))
+    available_models = sorted(data.keys())
+    available_kernels = sorted(KERNEL_DICT.keys())
     args = parse_args(available_models, available_kernels)
 
     models = args.model

@@ -20,10 +20,9 @@
 #      to triton JIT kernel
 # ========================================================================
 
-import os
 import math
-from functools import lru_cache
-from typing import Optional
+import os
+from functools import cache
 
 import torch
 import triton
@@ -31,11 +30,10 @@ from packaging.version import Version
 from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
-
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
 
 enable_aot_gluon_pa_mqa_logits = os.environ.get(
     "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS", "0"
@@ -47,10 +45,10 @@ if triton_version >= Version("3.5.0"):
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
     )
     from aiter.ops.triton.gluon.pa_decode_gluon import get_cdna_version
     from aiter.ops.triton.gluon.pa_mqa_logits import (
@@ -66,10 +64,10 @@ else:
 
     from aiter.ops.triton._triton_kernels.attention.pa_mqa_logits import (
         _deepgemm_fp8_paged_mqa_logits,
-        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _deepgemm_fp8_paged_mqa_logits_ragged_k,
         _deepgemm_fp8_paged_mqa_logits_stage1,
         _deepgemm_fp8_paged_mqa_logits_stage1_ragged_k,
+        _deepgemm_fp8_paged_mqa_logits_varctx_schedule,
         _gluon_deepgemm_fp8_paged_mqa_logits,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle,
         _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle_varctx,
@@ -191,7 +189,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     max_model_len: int,
     ChunkQ: int = 64,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
 ):
     if TotalCuCount is None:
@@ -245,7 +243,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _compile_deepgemm_fp8_paged_mqa_logits(
     ChunkQ,
     ChunkK,
@@ -297,7 +295,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "weights": "*fp32",
         "stride_w_batch": "i32",
         "OutLogits_buffer": "*fp32",
-        "stride_out_batch": "i32",
+        "stride_out_batch": "i64",
         "max_model_len": "i32",
         "max_block_len": "i32",
         "num_block": "i32",
@@ -380,7 +378,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
                 ["tt.pointer_range", 32],
             ],  # weights
             (14,): [["tt.divisibility", 16]],  # stride_w_batch
-            (15,): [["tt.pointer_range", 32]],  # OutLogits_buffer
+            # OutLogits_buffer: NO tt.pointer_range 32 -- the output row base
+            # offset (row * stride_out_batch) can exceed a 32-bit byte offset
+            # for wide dense logits (e.g. max_model_len=1<<20). stride_out_batch
+            # is i64 and the gluon kernel advances the base pointer in 64 bit
+            # (buffer_store voffset stays int32) to avoid the 2**31 overflow.
         },
     )
 
@@ -414,7 +416,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     context_lens: torch.Tensor,
     max_model_len: int,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
 ):
     if TotalCuCount is None:
@@ -456,7 +458,7 @@ def deepgemm_fp8_paged_mqa_logits(
     Preshuffle: bool = False,
     KVBlockSize: int = 1,
     ChunkK: int = 256,
-    TotalCuCount: Optional[int] = None,
+    TotalCuCount: int | None = None,
     WavePerEU: int = 2,
     VarCtxSchedule: torch.Tensor = None,
 ):

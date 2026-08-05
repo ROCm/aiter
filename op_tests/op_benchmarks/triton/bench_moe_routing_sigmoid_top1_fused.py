@@ -11,8 +11,8 @@ from op_tests.op_benchmarks.triton.utils.argparse import (
     get_parser,
 )
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_model_configs,
     get_caller_name_no_ext,
+    get_model_configs,
 )
 from op_tests.triton_tests.moe.test_moe_routing_sigmoid_top1_fused import (
     torch_routing_sigmoid_top1,
@@ -191,7 +191,7 @@ def main():
         config_file = args.model_configs
         configs = get_model_configs(config_path=config_file, models=args.model)
         x_vals = []
-        for _, config in configs.items():
+        for config in configs.values():
             # layer takes (M, K) as input and produces (M, N) -> N is the number of experts
             assert (
                 "n_routed_experts" in config

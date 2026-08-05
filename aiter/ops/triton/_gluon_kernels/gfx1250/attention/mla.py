@@ -1,19 +1,23 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
 
-import triton.language as tl
-import torch
-from triton.experimental import gluon
-import triton.experimental.gluon.language as gl
-from aiter.ops.triton.utils.types import e4m3_dtype
-from triton.language.core import _aggregate as aggregate
-from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 import math
+
+import torch
+import triton.experimental.gluon.language as gl
+import triton.language as tl
+from triton.experimental import gluon
+from triton.language.core import _aggregate as aggregate
+
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
+from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
 
 @aggregate
+@strip_annotate
 class MLAConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -38,7 +42,6 @@ class MLAConfig:
     QK_WMMA_LAYOUT: gl.constexpr
     PV_WMMA_LAYOUT: gl.constexpr
     QK_WMMA_UNPACKED_LAYOUT: gl.constexpr
-    PV_WMMA_LAYOUT: gl.constexpr
 
     # Dot operand layouts
     Q_DOT_LAYOUT: gl.constexpr
@@ -472,6 +475,7 @@ class MLAConfig:
 
 
 @aggregate
+@strip_annotate
 class MLAProgram:
     """Program state and core operations for the unified attention kernel."""
 
@@ -1032,7 +1036,7 @@ class MLAProgram:
 
     @gluon.jit
     def get_kv_buffer_row_offsets(self, block_idx):
-        return ((block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx)).to(gl.int32)
+        return (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32)
 
     @gluon.jit
     def tdm_load_global_to_shared_kv_lora(self, row_offsets, buffer_id):

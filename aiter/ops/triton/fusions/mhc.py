@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Optional, Tuple
 import torch
 import triton
 
@@ -9,16 +8,16 @@ from aiter.ops.triton._triton_kernels.fusions import (
     _mhc_fused_kernel,
     _mhc_fused_split_kernel,
     _mhc_post_kernel,
+    _mhc_post_pre_reduce_apply_kernel,
     _mhc_post_pre_split_kernel,
     _mhc_reduce_apply_kernel,
-    _mhc_post_pre_reduce_apply_kernel,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.mhc_config_utils import (
     get_mhc_config,
     get_mhc_post_config,
 )
-import aiter.ops.triton.utils._triton.arch_info as arch_info
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -37,8 +36,8 @@ def mhc(
     hc_pre_eps: float = 0.0,
     hc_post_mult_value: float = 2.0,
     sinkhorn_iters: int = 20,
-    config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mHC layer in one Triton launch (or a split-K + reduce-apply
     launch pair when ``NUM_KSPLIT > 1``).
 
@@ -302,12 +301,12 @@ def mhc(
 
 
 def mhc_post(
-    out: Optional[torch.Tensor],
+    out: torch.Tensor | None,
     layer_input: torch.Tensor,  # (M, C)  bf16 / fp16
     residual: torch.Tensor,  # (M, n, C)  bf16 / fp16
     post_mix: torch.Tensor,  # (M, n) or (M, n, 1)  fp32
     comb_mix: torch.Tensor,  # (M, n, n)  fp32 [src, dst]
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> torch.Tensor:
     """Fused mHC post step in one Triton launch.
 
@@ -447,14 +446,14 @@ def mhc_post_pre(
     sinkhorn_iters: int = 20,
     asymmetric_exp_domain: bool = False,
     hc_sinkhorn_eps: float = 1e-6,
-    residual_out: Optional[torch.Tensor] = None,
-    h_post: Optional[torch.Tensor] = None,
-    h_res: Optional[torch.Tensor] = None,
-    layer_input_out: Optional[torch.Tensor] = None,
-    acc_partial: Optional[torch.Tensor] = None,
-    acc_sq_partial: Optional[torch.Tensor] = None,
-    config: Optional[dict] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_out: torch.Tensor | None = None,
+    h_post: torch.Tensor | None = None,
+    h_res: torch.Tensor | None = None,
+    layer_input_out: torch.Tensor | None = None,
+    acc_partial: torch.Tensor | None = None,
+    acc_sq_partial: torch.Tensor | None = None,
+    config: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused mhc_post + (next) mhc_pre across two Triton launches.
 
     Launch 1 (``_mhc_post_pre_split_kernel``): per (M-tile, C-tile), one CTA

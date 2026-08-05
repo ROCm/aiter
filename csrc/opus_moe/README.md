@@ -11,13 +11,13 @@ case-gated through tuned A8W4 stage2 configs.
 
 There is one active fused MoE path:
 
-- A8W4 decode stage2 kernels for the `a8w4_decode_k3` family:
-  `logical_inter_dim=512`, `inter_dim_pad=128`, and runtime `topk`,
-  `hidden`, and `experts`.
+- A8W4 decode stage2 kernels selected by public algorithm ids plus generated
+  effective inter-dim specializations. Runtime `logical_inter_dim` and
+  `inter_dim_pad` select the effective-K specialization; `topk`, `hidden`, and
+  `experts` remain runtime values.
 
-The `a8w4_decode_k5` metadata family is retained only as a small bring-up
-coverage set for the generalized codegen path; it is not part of the tuned DSV4
-production target set.
+The same public A8W4 algorithm ids dispatch the matching specialization by
+effective inter dim; K is not encoded into separate public kid ranges.
 
 Private BF16 route-reduce kernel source is retained for future bring-up, but it
 is not exposed through `fused_moe` or a Python user API in this PR.
@@ -65,35 +65,20 @@ Supported A8W4 kernel ids:
 
 Numbering convention:
 
-- `2000-2099`: K3 decode candidates, assigned contiguously.
-- `2100-2109`: K5 direct atomic bring-up candidates.
-- `2110-2119`: K5 route-output bring-up candidates.
+- `2000-2099`: A8W4 decode algorithm candidates, assigned contiguously. K is
+  selected by generated shape contract dispatch for supported kids, not encoded
+  into the kid.
 
-The current K3 active ids are contiguous. Synthetic balanced / round-robin and
-full-tile experiments were retired because they are not valid for general MoE
-routing.
+Synthetic balanced / round-robin and full-tile experiments were retired because
+they are not valid for general MoE routing.
 
-| kid | name | block shape | output contract |
-|---:|---|---|---|
-| `-1` | auto | selected by host shape/block rules | direct-atomic only |
-| `2000` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2` | `BM16 x BN64`, `sort_block_m=16` | direct atomic; tuner candidate only for `token <= 1024` |
-| `2001` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn2560` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2002` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3008` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2003` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2004` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3136` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2005` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3200` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2006` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3264` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2007` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3328` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2008` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3456` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2009` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3584` | `BM64 x BN256`, `sort_block_m=64` | MXFP8 route output, reduce width sweep |
-| `2010` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64` | `BM64 x BN256`, `sort_block_m=64` | BF16 route output, then reduce; source retained for explicit use, disabled from tuner because it is not competitive for K3 targets |
-| `2100` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_occ6_cache_b2_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
-| `2101` | `opus_moe2_afp8_wfp4_atomic_t16x64x256_sbm16_cache_b3_ws2_k5` | `BM16 x BN64`, `sort_block_m=16` | K5 direct atomic bring-up |
-| `2110` | `opus_moe2_afp8_wfp4_bf16_t64x256x256_sbm64_k5` | `BM64 x BN256`, `sort_block_m=64` | K5 BF16 route output, then reduce |
-| `2111` | `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_k5_rbn2816` | `BM64 x BN256`, `sort_block_m=64` | K5 MXFP8 route output, then reduce |
+The source of truth for public ids, names, block shapes, output mode, and
+route-reduce tile width is
+`aiter/ops/opus/moe_stage2_a8w4_meta.py`. `-1` remains the direct-atomic auto
+selector.
 
 In fused MoE tuned configs, the preferred A8W4 stage2 selection is a per-kid
-`kernelName2` value from the table above. The generic wrapper name
+`kernelName2` value from metadata. The generic wrapper name
 `opus_moe_stage2_a8w4_decode` is still accepted for rows that carry explicit
 numeric columns:
 
@@ -104,7 +89,7 @@ numeric columns:
   route-output reduce, otherwise `0`.
 - `stage2_reduce_block_n`: optional route-output reduce tile width. Per-kid
   kernel names can also carry this as an `_rbn<N>` suffix, for example
-  `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn2816`.
+  `opus_moe2_afp8_wfp4_fp8_t64x256x256_sbm64_rbn3072`.
 
 Optional tuned CSV metadata columns `route_bucket`, `expected_sorted_blocks`,
 `min_sorted_blocks`, and `max_sorted_blocks` are carried to runtime and checked
@@ -175,11 +160,12 @@ dumps should stay outside the repository.
 - gfx950 only.
 - Private BF16 source assumes no padded/OOB route rows if it is re-enabled in a
   future change.
-- A8W4 production tuning currently targets the `a8w4_decode_k3` family:
-  `logical_inter_dim=512`, `inter_dim_pad=128`, effective inter dim `384`,
-  and runtime `topk`, `hidden`, and `experts`.
-- A small `a8w4_decode_k5` bring-up family is generated to keep the generalized
-  metadata/codegen path exercised, but it is not production tuned.
+- A8W4 production tuning should use tuned CSV entries for the runtime logical
+  inter dim; runtime `inter_dim_pad` selects the compiled effective-K
+  specialization.
+- A8W4 codegen derives compiled logical/effective inter dims from tuned CSV
+  Opus rows. Because the public CSV schema does not encode `inter_dim_pad`,
+  the current DSV4 `512-128 -> 384` path is kept by a small codegen seed.
 - A8W4 direct-output kernels do not support EP `expert_mask/topk_ids` or
   `bias2`.
 - A8W4 route-out kids include a BF16 precision fallback and the MXFP8 path used

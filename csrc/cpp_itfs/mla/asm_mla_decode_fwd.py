@@ -1,16 +1,18 @@
+import functools
+
+import triton
 from jinja2 import Template
+from triton.tools.compile import CompileArgs, compile_kernel
+
 from csrc.cpp_itfs.utils import (
-    compile_template_op,
-    transfer_hsaco,
     AITER_CORE_DIR,
     GPU_ARCH,
+    compile_template_op,
     get_default_func_name,
     not_built,
     run_lib,
+    transfer_hsaco,
 )
-from triton.tools.compile import compile_kernel, CompileArgs
-import triton
-import functools
 
 MD_NAME = "asm_mla_decode_fwd"
 warpSize = 64
@@ -20,7 +22,7 @@ with open(f"{AITER_CORE_DIR}/csrc/cpp_itfs/mla/asm_mla_decode_fwd.cpp.jinja", "r
 mgcs = {16: 64, 128: 16}
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_meta_param(num_kv_splits, device, bs):
     import torch
 
@@ -39,7 +41,7 @@ def compile(
     kv_dtype: str,
     num_kv_splits: int,
     v_head_dim: int,
-    func_name: str = None,
+    func_name: str | None = None,
 ):
     if func_name is None:
         func_name = get_default_func_name(
@@ -110,6 +112,7 @@ def asm_mla_decode_fwd(
     attn_lse=None,
 ):
     import torch
+
     from csrc.cpp_itfs.torch_utils import torch_to_c_types
 
     if q.dtype != torch.bfloat16:
