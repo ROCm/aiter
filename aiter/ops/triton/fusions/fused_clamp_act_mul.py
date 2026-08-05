@@ -206,6 +206,15 @@ def fused_clamp_act_mul(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
+    if (backend == "gluon"):
+        BLOCK_SIZE_N = triton.next_power_of_2(n_half)
+        assert BLOCK_SIZE_N % quant_block_size == 0, (
+            f"BLOCK_SIZE_N ({BLOCK_SIZE_N}) must be a multiple of "
+            f"quant_block_size ({quant_block_size})"
+            )
+        N_CHUNKS = triton.cdiv(n_half, BLOCK_SIZE_N)
+
+
     # Args are identical for both kernels; the Gluon kernel takes one extra
     # `cache_modifier` constexpr (threaded into every gl.load).
     kernel_args = (
@@ -253,16 +262,14 @@ def fused_clamp_act_mul(
         _LOGGER.info(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
-        # Gluon runs a 2D [BLOCK_SIZE_M, BLOCK_SIZE_N] tile: grid = cdiv(M, BLOCK_SIZE_M).
-        # block_size_m must be >= 16: the output tile is staged through a WMMA
-        # (matrix-core) accumulator layout whose M dimension is the 16-row WMMA
-        # instruction, so the padded-LDS TDM store lowers like the gemm C-store.
+        # Tuneable BLOCK_M
         block_size_m = 16
         # ".cg" matches the Triton reference's hardcoded cache hint.
         _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, block_size_m),)](
             *kernel_args,
             **kernel_constexprs,
             BLOCK_SIZE_M=block_size_m,
+            N_CHUNKS=N_CHUNKS,
             cache_modifier=".cg",
         )
     else:
