@@ -446,11 +446,18 @@ def launch_gemm_a8w4_tdm(
         # at 512 to keep 2 waves/SIMD reachable.
         _wide_vgpr = wmma_m_rep * wmma_n_rep * 8 + 2 * (wmma_m_rep * ACT_NDW + wmma_n_rep * 8)
         _wide_env = os.environ.get("AITER_TDM_WIDE_KSL")
-        USE_WIDE = KWS == 2 and _wide_vgpr <= 512 and not stage1_quant_out
+        # KWS==2 is structural: compute_ktile_wide hardcodes two K-slices, so at
+        # KWS==1 every ksl=1 LDS read runs exactly one row past its region and
+        # silently returns neighbouring data. The env knob may only override the
+        # VGPR-budget heuristic, never this.
+        _wide_ok = KWS == 2 and not stage1_quant_out
+        _wide_want = _wide_vgpr <= 512
         if _wide_env is not None:
-            USE_WIDE = _wide_env not in ("0", "false", "False")
+            _wide_want = _wide_env not in ("0", "false", "False")
+        USE_WIDE = _wide_ok and _wide_want
         print(f"[sched] {module_name}: KWS={KWS} wide_operand_vgpr~{_wide_vgpr} -> "
-              f"{'WIDE (both K-slices in flight)' if USE_WIDE else 'split FRONT/BACK'}", flush=True)
+              + ("WIDE (both K-slices in flight)" if USE_WIDE else
+                 "split FRONT/BACK" + ("" if _wide_ok else " (wide not applicable)")), flush=True)
         if const_expr(USE_WIDE):
             compute_ktile = compute_ktile_wide
 
