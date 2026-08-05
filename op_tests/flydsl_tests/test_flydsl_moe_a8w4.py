@@ -33,6 +33,7 @@ from aiter.ops.quant import (
 )
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight, shuffle_weight_a16w4
 from aiter.test_common import checkAllclose
+from aiter.utility import fp4_utils
 from aiter.utility.fp4_utils import e8m0_shuffle
 
 Q_TYPE = QuantType.per_1x32
@@ -236,6 +237,121 @@ def test_flydsl_stage2_a8w4_gui(inter_dim, seed):
     )
     torch.cuda.synchronize()
     _check_close(data["ref_stage2"], out, f"stage2_a8w4_gui_i{inter_dim}")
+
+
+@pytest.mark.parametrize("block_m", [16, 32, 64, 128])
+@pytest.mark.parametrize(
+    ("inter_dim", "tile_k"),
+    [
+        pytest.param(384, 128, id="bk128"),
+        pytest.param(512, 256, id="bk256"),
+    ],
+)
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_v2_stage2_a8w4_full_tile(block_m, inter_dim, tile_k):
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    token, model_dim, E, topk = block_m, 128, 1, 1
+    a2 = torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+    w1 = torch.zeros((E, inter_dim * 2, model_dim), dtype=torch.bfloat16, device="cuda")
+    w2 = torch.randn((E, model_dim, inter_dim), dtype=torch.bfloat16, device="cuda") / 4
+    topk_ids = torch.zeros((token, topk), dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones((token, topk), dtype=torch.float32, device="cuda")
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weights, E, model_dim, torch.bfloat16, block_m
+    )
+
+    a2_q, a2_scale = per_1x32_f8_scale_f8_quant(
+        a2, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+    )
+    w1_q, _ = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2)
+    w1_q = w1_q.view(E, inter_dim * 2, model_dim // 2)
+    w2_q = w2_q.view(E, model_dim, inter_dim // 2)
+
+    a2_dequant = (
+        a2_q.float().view(token, topk, inter_dim // 32, 32)
+        * fp4_utils.e8m0_to_f32(a2_scale).view(token, topk, inter_dim // 32, 1)
+    ).view(token, topk, inter_dim)
+    ref = torch_moe_stage2(
+        a2_dequant,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        dtype=torch.bfloat16,
+        quant_type=Q_TYPE,
+        w2_scale=w2_scale,
+        a2_scale=None,
+        doweight=True,
+    )
+
+    a2_sorted = a2_q.reshape(token * topk, inter_dim)
+    a2_scale_sorted = mxfp4_moe_sort_fwd(
+        a2_scale,
+        sorted_ids=sorted_ids,
+        num_valid_ids=num_valid_ids,
+        token_num=token,
+        cols=inter_dim,
+    )
+    w2_shuffled = shuffle_weight_a16w4(w2_q, 16, False)
+    w2_scale_shuffled = shuffle_scale_a16w4(w2_scale, E, False)
+    out = torch.zeros((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+    mxfp4_moe_gemm2(
+        inter_sorted_quant=a2_sorted,
+        inter_sorted_shuffled_scale=a2_scale_sorted,
+        w2_u8=w2_shuffled,
+        w2_scale_u8=w2_scale_shuffled,
+        sorted_expert_ids=sorted_expert_ids,
+        cumsum_tensor=num_valid_ids,
+        sorted_token_ids=sorted_ids,
+        sorted_weights=sorted_weights,
+        out=out,
+        M_logical=token,
+        max_sorted=a2_sorted.shape[0],
+        NE=E,
+        D_HIDDEN=model_dim,
+        D_INTER=inter_dim,
+        topk=topk,
+        BM=block_m,
+        BN=128,
+        BK=tile_k,
+        use_nt=True,
+        a_dtype="fp8",
+        epilog="atomic",
+        SBM=block_m,
+        persist=False,
+    )
+    torch.cuda.synchronize()
+    _check_close(
+        ref.float(),
+        out.float(),
+        f"v2_stage2_a8w4_bm{block_m}_bk{tile_k}",
+    )
+
+
+@_SKIP_GFX950_FLYDSL
+def test_flydsl_stage2_fp8_ep_reduction():
+    from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+    token, topk, model_dim = 2, 4, 128
+    values = torch.tensor([1, 7, 2, 9], dtype=dtypes.fp8, device="cuda")
+    target = torch.empty(
+        (token * topk, model_dim + model_dim // 8), dtype=torch.uint8, device="cuda"
+    )
+    target[:, :model_dim] = values.repeat(token).view(torch.uint8)[:, None]
+    target[:, model_dim:] = 127  # E8M0 scale 1.0
+    expert_mask = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device="cuda")
+    topk_ids = torch.arange(topk, dtype=torch.int32, device="cuda").repeat(token, 1)
+    out = torch.empty((token, model_dim), dtype=torch.bfloat16, device="cuda")
+
+    _run_moe_reduction(
+        target, out, token, topk, model_dim, expert_mask, topk_ids, is_fp8=True
+    )
+    torch.testing.assert_close(out, torch.full_like(out, 3.0))
 
 
 @pytest.mark.parametrize("inter_dim", [256, 384, 640])
