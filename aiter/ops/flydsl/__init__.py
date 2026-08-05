@@ -48,6 +48,7 @@ if is_flydsl_available():
     from .kernels.fp8_mqa_logits import (
         flydsl_fp8_mqa_logits,
     )
+    from .kernels.attn_res import flydsl_attn_res
     from .kernels.pa_mqa_logits_fp4 import (
         flydsl_pa_mqa_logits_fp4,
     )
@@ -65,6 +66,7 @@ if is_flydsl_available():
         "FP8_MQA_LOGITS_DEFAULT_VARIANT",
         "FP8_MQA_LOGITS_VARIANTS",
         "compute_varqlen_windows",
+        "flydsl_attn_res",
         "flydsl_flash_attn_func",
         "flydsl_fp8_mqa_logits",
         "flydsl_hgemm",
