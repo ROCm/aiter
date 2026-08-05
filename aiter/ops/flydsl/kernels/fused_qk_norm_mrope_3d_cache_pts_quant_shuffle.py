@@ -117,7 +117,15 @@ def rms_reduce_add(x, lane, broadcast_half=True):
         return (lane < RMS_GROUP).select(v, other_half)
     return v
 
-def mrope_cos_sin(col, tok, positions_t, cos_sin_t, mrope_section, is_interleaved, HALF):
+def mrope_cos_sin(
+    col,
+    tok,
+    positions_t,
+    cos_t,
+    sin_t,
+    mrope_section,
+    is_interleaved,
+):
     """Interleaved 3D-mrope cos/sin gather for column ``col`` in
     [0, HALF). Mirrors ``apply_interleaved_rope``: column ``col``
     takes its position from section ``col % 3`` if that section
@@ -143,8 +151,8 @@ def mrope_cos_sin(col, tok, positions_t, cos_sin_t, mrope_section, is_interleave
 
     pos_i64 = fx.Int64(positions_t[sect_idx, tok])
     pos = pos_i64.to(fx.Int32)
-    cos_v = fx.Float32(cos_sin_t[pos, col])
-    sin_v = fx.Float32(cos_sin_t[pos, col + HALF])
+    cos_v = fx.Float32(cos_t[pos, col])
+    sin_v = fx.Float32(sin_t[pos, col])
     return cos_v, sin_v
 
 @lru_cache(maxsize=1)
@@ -187,6 +195,18 @@ def _build_q_kernel(
         token_offset: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
+        cos_t = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(cos_sin),
+                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
+            )
+        )
+        sin_t = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(cos_sin) + HALF,
+                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
+            )
+        )
 
         bid_x = fx.block_idx.x
         bid_t = fx.block_idx.y  # token id within this launch chunk
@@ -223,10 +243,10 @@ def _build_q_kernel(
                     logical_lane,
                     tok,
                     positions,
-                    cos_sin,
+                    cos_t,
+                    sin_t,
                     mrope_section,
                     is_interleaved,
-                    HALF,
                 )
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
@@ -264,7 +284,15 @@ def _build_q_kernel(
                 # kernel before the fp32 RoPE arithmetic.
                 xn0 = (x0s[k] * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                 xn1 = (x1s[k] * rstd * w1).to(fx.BFloat16).to(fx.Float32)
-                cos_v, sin_v = mrope_cos_sin(col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF)
+                cos_v, sin_v = mrope_cos_sin(
+                    col,
+                    tok,
+                    positions,
+                    cos_t,
+                    sin_t,
+                    mrope_section,
+                    is_interleaved,
+                )
                 o0 = xn0 * cos_v - xn1 * sin_v
                 o1 = xn1 * cos_v + xn0 * sin_v
                 q_out[tok, head, col] = o0.to(fx.BFloat16)
@@ -390,6 +418,18 @@ def _build_kv_kernel(
         page_block_offset: fx.Int32,
     ):
         fm_fast = arith.FastMathFlags.fast
+        cos_t = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(cos_sin),
+                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
+            )
+        )
+        sin_t = fx.Tensor(
+            fx.make_view(
+                fx.get_iter(cos_sin) + HALF,
+                fx.make_layout((cos_sin.shape[0], HALF), cos_sin.stride),
+            )
+        )
         layout_tx_wave_lane = fx.make_layout((WAVES_PER_BLOCK, WAVE), stride=(WAVE, 1))
         # Two different logical ownership maps are used by each wave:
         #  * RMSNorm: 32 lanes own contiguous D/32-element vectors.
@@ -584,7 +624,13 @@ def _build_kv_kernel(
                             xn0 = (k0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                             xn1 = (k1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
                             cos_v, sin_v = mrope_cos_sin(
-                                col, tok, positions, cos_sin, mrope_section, is_interleaved, HALF
+                                col,
+                                tok,
+                                positions,
+                                cos_t,
+                                sin_t,
+                                mrope_section,
+                                is_interleaved,
                             )
                             o0 = xn0 * cos_v - xn1 * sin_v
                             o1 = xn1 * cos_v + xn0 * sin_v
