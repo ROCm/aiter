@@ -324,9 +324,15 @@ def _mla_decode_gfx942_kernel(
         else:
             qk = gl.where(offs_n_score[None, :] < split_kv_end, qk, float("-inf"))
 
-        n_e_max = gl.maximum(gl.max(qk, 1), e_max)
-        re_scale = gl.exp2((e_max - n_e_max) * LOG2E)
-        p = gl.exp2((qk - n_e_max[:, None]) * LOG2E)
+        tile_max = gl.max(qk, 1)
+        tile_has_values = tile_max != float("-inf")
+        n_e_max = gl.where(tile_has_values, gl.maximum(tile_max, e_max), e_max)
+        re_scale = gl.where(tile_has_values, gl.exp2((e_max - n_e_max) * LOG2E), 1.0)
+        p = gl.where(
+            tile_has_values[:, None],
+            gl.exp2((qk - n_e_max[:, None]) * LOG2E),
+            0.0,
+        )
         e_sum = e_sum * re_scale + gl.sum(p, 1)
         acc = acc * re_scale[:, None]
         e_max = n_e_max
@@ -338,7 +344,11 @@ def _mla_decode_gfx942_kernel(
         acc = gl.amd.cdna3.mfma(p_operand, v_c.to(dtype), acc)
 
     offs_d_out = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, mfma_layout))
-    out = acc / e_sum[:, None]
+    out = gl.where(
+        e_sum[:, None] > 0.0,
+        acc / e_sum[:, None],
+        gl.zeros([BLOCK_H, HEAD_DIM_CKV], dtype=gl.float32, layout=mfma_layout),
+    )
 
     if FUSE_QH:
         cur_qh_out = cur_q_tile * BLOCK_H + gl.arange(
@@ -369,7 +379,7 @@ def _mla_decode_gfx942_kernel(
     )
 
     if NUM_KV_SPLITS > 1:
-        lse = e_max + gl.log(e_sum)
+        lse = gl.where(e_sum > 0.0, e_max + gl.log(e_sum), float("-inf"))
         if FUSE_QH:
             offs_lse = (
                 cur_batch * stride_mid_lse_b
@@ -417,6 +427,12 @@ def mla_gluon_gfx942(
     ``[B, QLEN, H, D]``. With ``use_2d_view=False``, ``req_to_tokens`` is a
     ragged token-index array and ``b_seq_len`` is its ``[B + 1]`` indptr.
     """
+    assert q_pe is not None, "q_pe must not be None"
+    assert q_pe.dim() == q_nope.dim(), (
+        f"q_pe and q_nope must have the same rank, got "
+        f"{q_pe.dim()}-D and {q_nope.dim()}-D"
+    )
+
     original_o = o
     if q_nope.dim() == 3:
         q_nope = q_nope.unsqueeze(1)
@@ -434,6 +450,10 @@ def mla_gluon_gfx942(
     assert (
         q_nope.dim() == 4
     ), f"q_nope must be 4-D [B, QLEN, H, D], got {q_nope.dim()}-D"
+    assert q_pe.shape[:-1] == q_nope.shape[:-1], (
+        "q_pe leading dimensions must match q_nope after normalization, got "
+        f"{q_pe.shape[:-1]} and {q_nope.shape[:-1]}"
+    )
     batch_size, qlen, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
     assert (
@@ -591,6 +611,7 @@ def mla_gluon_gfx942_graph(
     within_2gb_override=None,
 ):
     """Run the graph-capturable combined-cache adapter with ragged metadata."""
+    assert q_pe is not None, "q_pe must not be None"
     if q_nope.dim() == 3:
         batch_size, nhead, _ = q_nope.shape
         qlen = 1

@@ -14,33 +14,47 @@ from aiter.ops.triton._triton_kernels.attention.mla import (
 from aiter.ops.triton._triton_kernels.attention.mla import (
     _mla_prefill_fwd_kernel as triton_mla_prefill_fwd_kernel,
 )
-from aiter.ops.triton.utils.device_info import get_num_sms
-
-try:
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
-        _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
-    )
-except:  # noqa: E722
-    gluon_mla_prefill_fwd_kernel_non_pipelined = None
-    gluon_mla_decode_fwd_kernel_non_pipelined = None
-    gluon_mla_decode_fwd_kernel = None
-    gluon_mla_decode_fwd_reduce_kernel = None
-
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
 WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
+
+gluon_mla_prefill_fwd_kernel_non_pipelined = None
+gluon_mla_decode_fwd_kernel_non_pipelined = None
+gluon_mla_decode_fwd_kernel = None
+gluon_mla_decode_fwd_reduce_kernel = None
+_mla_gluon_gfx942_impl = None
+_mla_gluon_gfx942_graph_impl = None
+
+if DEVICE_ARCH == "gfx1250":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_kernel as gluon_mla_decode_fwd_kernel,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_kernel_non_pipelined as gluon_mla_decode_fwd_kernel_non_pipelined,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_decode_fwd_reduce_kernel as gluon_mla_decode_fwd_reduce_kernel,  # noqa: F401
+        )
+        from aiter.ops.triton._gluon_kernels.gfx1250.attention.mla import (
+            _mla_prefill_fwd_kernel_non_pipelined as gluon_mla_prefill_fwd_kernel_non_pipelined,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
+elif DEVICE_ARCH == "gfx942":
+    try:
+        from aiter.ops.triton._gluon_kernels.gfx942.attention.mla import (
+            mla_gluon_gfx942 as _mla_gluon_gfx942_impl,
+        )
+        from aiter.ops.triton._gluon_kernels.gfx942.attention.mla import (
+            mla_gluon_gfx942_graph as _mla_gluon_gfx942_graph_impl,
+        )
+    except Exception:  # noqa: BLE001, S110
+        pass
 
 
 def select_2d_config(
@@ -524,3 +538,83 @@ def mla_decode_fwd(
         **reduce_config,
     )
     return out
+
+
+def mla_gluon_gfx942(
+    q_nope,
+    q_pe,
+    kv_c_cache,
+    k_pe_cache,
+    req_to_tokens,
+    b_seq_len,
+    o,
+    sm_scale,
+    kv_scale=1.0,
+    num_kv_splits=8,
+    page_size=1,
+    kv_pe_offset=0,
+    block_n=32,
+    num_warps=4,
+    waves_per_eu=0,
+    mid_o=None,
+    mid_lse=None,
+    use_2d_view=True,
+    within_2gb_override=None,
+    causal=True,
+    reduce_num_warps=8,
+    fuse_qlen_heads=False,
+):
+    """Run the gfx942 Gluon MLA decode kernel."""
+    assert (
+        _mla_gluon_gfx942_impl is not None
+    ), f"mla_gluon_gfx942 requires gfx942, got {DEVICE_ARCH}"
+    return _mla_gluon_gfx942_impl(
+        q_nope,
+        q_pe,
+        kv_c_cache,
+        k_pe_cache,
+        req_to_tokens,
+        b_seq_len,
+        o,
+        sm_scale,
+        kv_scale=kv_scale,
+        num_kv_splits=num_kv_splits,
+        page_size=page_size,
+        kv_pe_offset=kv_pe_offset,
+        block_n=block_n,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
+        mid_o=mid_o,
+        mid_lse=mid_lse,
+        use_2d_view=use_2d_view,
+        within_2gb_override=within_2gb_override,
+        causal=causal,
+        reduce_num_warps=reduce_num_warps,
+        fuse_qlen_heads=fuse_qlen_heads,
+    )
+
+
+def mla_gluon_gfx942_graph(
+    q_nope,
+    q_pe,
+    kv_buffer,
+    o,
+    page_table,
+    seq_info,
+    sm_scale,
+    within_2gb_override=None,
+):
+    """Run the gfx942 graph-capturable adapter with ragged metadata."""
+    assert (
+        _mla_gluon_gfx942_graph_impl is not None
+    ), f"mla_gluon_gfx942_graph requires gfx942, got {DEVICE_ARCH}"
+    return _mla_gluon_gfx942_graph_impl(
+        q_nope,
+        q_pe,
+        kv_buffer,
+        o,
+        page_table,
+        seq_info,
+        sm_scale,
+        within_2gb_override=within_2gb_override,
+    )

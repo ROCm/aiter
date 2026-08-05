@@ -26,11 +26,7 @@ from aiter.ops.triton.utils._triton import arch_info
 if arch_info.get_arch() != "gfx942":
     pytest.skip("the gfx942 MLA kernel requires gfx942", allow_module_level=True)
 
-from aiter.ops.triton.gluon.mla_gluon_gfx942 import (
-    _graph_launch_config,
-    mla_gluon_gfx942,
-    mla_gluon_gfx942_graph,
-)
+from aiter.ops.triton.attention.mla import mla_gluon_gfx942, mla_gluon_gfx942_graph
 
 BLOCK_SIZE = 768
 HEAD_DIM_CKV = 512
@@ -165,6 +161,7 @@ def _reference(case: MlaCase) -> torch.Tensor:
 
 
 def _assert_matches_reference(case: MlaCase) -> None:
+    assert torch.isfinite(case.output).all().item()
     torch.testing.assert_close(
         case.output,
         _reference(case),
@@ -173,17 +170,18 @@ def _assert_matches_reference(case: MlaCase) -> None:
     )
 
 
-def test_graph_launch_configs() -> None:
-    assert _graph_launch_config(1, 4) == (24, 32, 2)
-    assert _graph_launch_config(4, 4) == (16, 32, 2)
-    assert _graph_launch_config(8, 4) == (10, 32, 2)
-    assert _graph_launch_config(16, 4) == (6, 32, 2)
-
-
 @pytest.mark.parametrize(
     ("batch_size", "qlen", "seq_lens"),
     [
         pytest.param(4, 1, [145, 163, 181, 199], id="qlen1"),
+        # The graph launch uses 24 non-empty splits. For the earliest query,
+        # the final two splits are entirely beyond its causal boundary.
+        pytest.param(
+            1,
+            4,
+            [25],
+            id="qlen4-fully-masked-future-splits",
+        ),
         pytest.param(1, 4, [801], id="qlen4-b1"),
         pytest.param(4, 4, [129, 145, 161, 177], id="qlen4-b4"),
         pytest.param(
@@ -191,6 +189,29 @@ def test_graph_launch_configs() -> None:
             4,
             [129, 137, 145, 153, 161, 169, 177, 185],
             id="qlen4-b8-fused-qh",
+        ),
+        pytest.param(
+            16,
+            4,
+            [
+                129,
+                133,
+                137,
+                141,
+                145,
+                149,
+                153,
+                157,
+                161,
+                165,
+                169,
+                173,
+                177,
+                181,
+                185,
+                189,
+            ],
+            id="qlen4-b16-fused-qh",
         ),
     ],
 )
@@ -235,6 +256,33 @@ def test_low_level_split_reduction_forced_64bit_load() -> None:
     )
 
     _assert_matches_reference(case)
+
+
+@pytest.mark.parametrize("invalid_q_pe", ["none", "rank", "leading_shape"])
+def test_q_pe_validation(invalid_q_pe: str) -> None:
+    case = _make_case(1, 4, [25], seed=47)
+    if invalid_q_pe == "none":
+        q_pe = None
+        match = "must not be None"
+    elif invalid_q_pe == "rank":
+        q_pe = case.q_pe[0]
+        match = "same rank"
+    else:
+        q_pe = case.q_pe[:, :, :-1, :]
+        match = "leading dimensions"
+
+    with pytest.raises(AssertionError, match=match):
+        mla_gluon_gfx942(
+            case.q_nope,
+            q_pe,
+            case.kv_buffer[:, :HEAD_DIM_CKV],
+            case.kv_buffer[:, HEAD_DIM_CKV:],
+            case.kv_indices,
+            case.kv_indptr,
+            case.output,
+            SM_SCALE,
+            use_2d_view=False,
+        )
 
 
 def test_cuda_graph_replay_with_metadata_mutation() -> None:

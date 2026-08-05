@@ -54,7 +54,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 <tr>
   <td><code>mla_gluon_gfx942</code></td><td>MLA</td><td>CDNA3</td>
   <td nowrap>Q/KV/Out: bf16<br>QLEN in {1, 4}<br>nhead = 12<br>latent dim = 512<br>RoPE dim = 64<br>PAGE_SIZE=1</td>
-  <td>python -m pytest op_tests/triton_tests/<br>test_mla_gluon_gfx942.py</td>
+  <td><code>python -m pytest -q op_tests/triton_tests/test_mla_gluon_gfx942.py</code></td>
   <td>—</td><td>—</td><td>—</td>
 </tr>
 <tr>
@@ -253,9 +253,16 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 | 100K     | 3     | 85            | 19               | 88.77  | 3.89 |
 | 100K     | 4     | 64            | 25               | 106.96 | 4.31 |
 
-### `mla_gluon_gfx942.py` — CDNA3 MLA Decode
+### `aiter/ops/triton/_gluon_kernels/gfx942/attention/mla.py` — CDNA3 MLA Decode
 
-**Functions:** `mla_gluon_gfx942(...)`, `mla_gluon_gfx942_graph(...)`
+**Public API:** `aiter.ops.triton.attention.mla.mla_gluon_gfx942(...)` and
+`aiter.ops.triton.attention.mla.mla_gluon_gfx942_graph(...)`
+
+**Test:**
+
+```
+python -m pytest -q op_tests/triton_tests/test_mla_gluon_gfx942.py
+```
 
 **Description:** Synchronous-LDS bf16 MLA decode for gfx942 with 12 query
 heads, 512 latent dimensions, 64 RoPE dimensions, PAGE_SIZE=1, and QLEN 1 or 4.
