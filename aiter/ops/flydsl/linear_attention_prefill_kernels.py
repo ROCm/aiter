@@ -1266,7 +1266,8 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
         si_i32 = dummy.to(torch.int32)
     tensor_args = tensor_args + (_as_ptr(si_i32),)
 
-    launch_fn(
+    _run_compiled(
+        launch_fn,
         *tensor_args,
         T,
         T_flat,
