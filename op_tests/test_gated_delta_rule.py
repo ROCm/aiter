@@ -1271,5 +1271,259 @@ def test_chunk_opt_vk_varlen(
     assert_close("ht", ref_ht, tri_ht.transpose(-1, -2), 0.005)
 
 
+# --- Fused FlyDSL K1..K4 prepare (use_prepare_flydsl) ---------------------
+#
+# The fused kernel replaces the Triton K1+K2 pair and reproduces its output
+# layouts ([B, H, T, K/V] head-major w/u, [B, H, T] g_cumsum) and exponent
+# domain exactly, so the tests below hold K5/K6 fixed and compare the flag on
+# vs off. Checking against recurrent_gated_delta_rule_ref instead would bury
+# the swap under the pipeline's own, much larger, algebraic error.
+
+try:
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        gdn_prepare_flydsl_supported,
+    )
+    from aiter.ops.flydsl.utils import is_flydsl_available
+    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        build_gated_delta_rule_prefill_metadata,
+    )
+
+    _HAS_FLYDSL_PREPARE = is_flydsl_available()
+except ImportError:  # pragma: no cover - import guard
+    _HAS_FLYDSL_PREPARE = False
+
+requires_flydsl_prepare = pytest.mark.skipif(
+    not _HAS_FLYDSL_PREPARE,
+    reason="flydsl is not installed, so use_prepare_flydsl cannot be exercised",
+)
+
+# The swap only perturbs the last bits of the bf16 w/u handed to K5, but K5
+# accumulates them across chunks and K6 mixes them into o, so the end-to-end gap
+# is a few bf16 ULPs on values of order 1. Asserted on absolute error rather
+# than via assert_close: the whole claim is bit-level agreement between two
+# paths, and assert_close's relative ratio downgrades to a warning under
+# FLA_CI_ENV, which would let a real divergence through.
+_PREPARE_ATOL_O = 6e-3
+_PREPARE_ATOL_HT = 1e-2
+
+# The fused prepare emits one set of w/u/g_cumsum regardless of which K5 reads
+# them, and each K5 backend's own correctness is covered by the tests above, so
+# the backend sweep rides on the varlen case only -- the harder address path.
+_PREPARE_K5_BACKENDS = [
+    pytest.param({}, id="k5_triton_vk"),
+    pytest.param({"use_chunk_flydsl": True}, id="k5_flydsl"),
+    pytest.param(
+        {"use_chunk_hip": True},
+        id="k5_hip",
+        marks=pytest.mark.skipif(
+            not IS_AMD or _is_gfx12_runtime(),
+            reason="HIP K5 kernel requires a non-gfx12 AMD device",
+        ),
+    ),
+]
+
+
+def _prepare_make_inputs(B, T, Hg, H, D, *, n_state, seed, dtype=torch.bfloat16):
+    gen = torch.Generator(device=device).manual_seed(seed)
+    kw = {"dtype": dtype, "device": device, "generator": gen}
+    beta = torch.rand(B, T, H, dtype=torch.float32, device=device, generator=gen)
+    # Decay gates are negative, as produced by the GDN gating stage.
+    g = -(
+        torch.rand(B, T, H, dtype=torch.float32, device=device, generator=gen) * 0.5
+        + 0.2
+    )
+    return {
+        "q": torch.randn(B, T, Hg, D, **kw) * 0.2,
+        "k": torch.randn(B, T, Hg, D, **kw) * 0.2,
+        "v": torch.randn(B, T, H, D, **kw) * 0.2,
+        "beta": beta.sigmoid(),
+        "g": g,
+        "initial_state": torch.randn(
+            n_state, H, D, D, dtype=torch.float32, device=device, generator=gen
+        )
+        * 0.1,
+    }
+
+
+def _run_prepare_pipeline(inputs, *, cu_seqlens, use_prepare_flydsl, **kwargs):
+    return chunk_gated_delta_rule_opt_vk(
+        **{name: t.clone() for name, t in inputs.items()},
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+        use_prepare_flydsl=use_prepare_flydsl,
+        **kwargs,
+    )
+
+
+def _assert_prepare_swap_is_transparent(inputs, *, cu_seqlens, **kwargs):
+    o_fused, ht_fused = _run_prepare_pipeline(
+        inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True, **kwargs
+    )
+    o_triton, ht_triton = _run_prepare_pipeline(
+        inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=False, **kwargs
+    )
+
+    assert o_fused.shape == o_triton.shape
+    assert ht_fused.shape == ht_triton.shape
+    err_o = (o_fused.float() - o_triton.float()).abs().max().item()
+    err_ht = (ht_fused.float() - ht_triton.float()).abs().max().item()
+    assert err_o < _PREPARE_ATOL_O, f"o diff {err_o:.3e}"
+    assert err_ht < _PREPARE_ATOL_HT, f"ht diff {err_ht:.3e}"
+
+
+@requires_flydsl_prepare
+@pytest.mark.parametrize(
+    ("B", "T", "Hg", "H", "seed"),
+    [
+        # B > 1 takes the dense head-major output base ((i_b*H + i_h)*T), a
+        # different branch from varlen's (i_h*T + bos).
+        pytest.param(2, 192, 4, 4, 1, id="dense_b2"),
+        # Hg != H exercises the i_h // (H//Hg) key/value broadcast.
+        pytest.param(1, 256, 4, 16, 2, id="dense_gqa"),
+        # T % 64 != 0 exercises the ragged-tail store clamp, which is
+        # per-(sequence, head) under the head-major epilogue: a sequence-level
+        # limit would spill the tail rows into the NEXT head's slab instead of
+        # out of the tensor.
+        pytest.param(1, 300, 4, 8, 3, id="dense_ragged"),
+    ],
+)
+def test_chunk_opt_vk_prepare_flydsl(B: int, T: int, Hg: int, H: int, seed: int):
+    inputs = _prepare_make_inputs(B, T, Hg, H, 128, n_state=B, seed=seed)
+    _assert_prepare_swap_is_transparent(inputs, cu_seqlens=None)
+
+
+@requires_flydsl_prepare
+@pytest.mark.parametrize("k5_kwargs", _PREPARE_K5_BACKENDS)
+@pytest.mark.parametrize("with_metadata", [False, True], ids=["cached", "metadata"])
+@pytest.mark.skipif(
+    os.getenv("SKIP_TEST_CHUNK_VARLEN") == "1",
+    reason="Skipping varlen test because SKIP_TEST_CHUNK_VARLEN is set",
+)
+def test_chunk_opt_vk_prepare_flydsl_varlen(with_metadata: bool, k5_kwargs: dict):
+    """Skewed, GQA, ragged varlen batch against every K5 backend.
+
+    The fused prepare launches a rectangular (chunk column, sequence x head)
+    grid, so it needs the LONGEST sequence's chunk count -- not the flattened
+    total the other stages use. Mixing one long sequence with short ragged ones
+    is what catches that, and ``with_metadata`` covers both ways the count is
+    derived: off the prebuilt schedule, or off the identity-keyed caches.
+    """
+    seq_lens = [1024, 15, 100, 300]
+    cu_list = [0]
+    for length in seq_lens:
+        cu_list.append(cu_list[-1] + length)
+    cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
+    inputs = _prepare_make_inputs(
+        1, cu_list[-1], 4, 16, 128, n_state=len(seq_lens), seed=4
+    )
+
+    kwargs = dict(k5_kwargs)
+    if with_metadata:
+        kwargs["prefill_metadata"] = build_gated_delta_rule_prefill_metadata(
+            seq_lens, cu_seqlens=cu_seqlens, chunk_size=64
+        )
+
+    _assert_prepare_swap_is_transparent(inputs, cu_seqlens=cu_seqlens, **kwargs)
+
+
+@requires_flydsl_prepare
+@pytest.mark.parametrize("with_metadata", [False, True], ids=["cached", "metadata"])
+def test_chunk_opt_vk_prepare_flydsl_decode_prefix(with_metadata: bool):
+    """Leading decode-only sequences must be rebased away, as Triton does.
+
+    ``cu_seqlens`` keeps the decode prefix while the data tensors are pre-sliced
+    past it, so the fused kernel has to rebase the offsets itself. Getting this
+    wrong reads the wrong tokens without raising, and no other test in this file
+    exercises the decode prefix.
+    """
+    seq_lens = [1, 1, 128, 300]
+    num_decodes = 2
+    cu_list = [0]
+    for length in seq_lens:
+        cu_list.append(cu_list[-1] + length)
+    cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
+    num_decode_tokens = sum(seq_lens[:num_decodes])
+    n_prefill = len(seq_lens) - num_decodes
+
+    inputs = _prepare_make_inputs(
+        1, cu_list[-1] - num_decode_tokens, 4, 8, 128, n_state=n_prefill, seed=5
+    )
+
+    kwargs = {
+        "num_decodes": num_decodes,
+        "num_decode_tokens": num_decode_tokens,
+    }
+    if with_metadata:
+        kwargs["prefill_metadata"] = build_gated_delta_rule_prefill_metadata(
+            seq_lens,
+            cu_seqlens=cu_seqlens,
+            chunk_size=64,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+
+    _assert_prepare_swap_is_transparent(inputs, cu_seqlens=cu_seqlens, **kwargs)
+
+
+@requires_flydsl_prepare
+@pytest.mark.parametrize(
+    ("dtype", "D"),
+    [
+        # fp16 is the dangerous one: the fused kernel emits bf16 w/u, and K5
+        # takes h from k.dtype but v_new from u.dtype, so accepting fp16 would
+        # feed K6 mixed precision instead of raising.
+        pytest.param(torch.float16, 128, id="fp16"),
+        # D != 128 would trip compile_gdn_prepare's hard assert.
+        pytest.param(torch.bfloat16, 64, id="head_dim_64"),
+    ],
+)
+def test_chunk_opt_vk_prepare_flydsl_falls_back(dtype: torch.dtype, D: int):
+    """Outside the fused kernel's support the flag must be refused, not asserted."""
+    inputs = _prepare_make_inputs(1, 192, 4, 4, D, n_state=1, seed=6, dtype=dtype)
+    assert not gdn_prepare_flydsl_supported(inputs["k"], inputs["v"])
+
+    o_flag, ht_flag = _run_prepare_pipeline(
+        inputs, cu_seqlens=None, use_prepare_flydsl=True
+    )
+    o_ref, ht_ref = _run_prepare_pipeline(
+        inputs, cu_seqlens=None, use_prepare_flydsl=False
+    )
+
+    # The flag was refused, so this has to be the very same Triton computation.
+    assert torch.equal(o_flag, o_ref)
+    assert torch.equal(ht_flag, ht_ref)
+
+
+@requires_flydsl_prepare
+def test_chunk_opt_vk_prepare_flydsl_does_not_sync():
+    """A warmed-up varlen forward must not read anything back to the host.
+
+    The wrapper originally derived its grid with ``.tolist()`` on the device
+    offsets, which blocks once per layer per forward; the identity-keyed caches
+    exist to remove exactly that. Only the cached path is pinned here -- with a
+    prebuilt schedule every host value is host-resident by construction.
+    """
+    if not hasattr(torch.cuda, "set_sync_debug_mode"):
+        pytest.skip("torch.cuda.set_sync_debug_mode is unavailable")
+
+    cu_list = [0, 128, 300, 600]
+    cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
+    inputs = _prepare_make_inputs(
+        1, cu_list[-1], 4, 8, 128, n_state=len(cu_list) - 1, seed=7
+    )
+
+    # Warm up: JIT compilation and the one-shot memoized offset reads may
+    # synchronize; steady-state forwards may not.
+    for _ in range(2):
+        _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1,23 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL Linear Attention Prefill K5 host wrapper (gated delta rule).
+"""FlyDSL Linear Attention Prefill host wrappers (gated delta rule).
 
-This module hosts ``chunk_gated_delta_rule_fwd_h_flydsl`` -- the host
-wrapper around the K5 hidden-state recurrence FlyDSL kernel
-(``compile_chunk_gated_delta_h``). It performs PyTorch tensor
-preparation, chooses ``BV`` with a rule-based grid/CU heuristic, manages
-the compiled kernel cache, and handles the launch stream. The kernel-
-compile module ``kernels.chunk_gated_delta_h`` is kept ``torch``-free,
-mirroring the layering used by ``kernels.gdr_decode``.
+This module hosts the ``torch``-facing wrappers for the FlyDSL GDN prefill
+kernels, keeping their kernel-compile modules under ``kernels.`` free of any
+``torch`` dependency (mirroring the layering used by ``kernels.gdr_decode``):
 
-For an end-to-end GDN forward that uses this K5 wrapper, call
+* ``chunk_gated_delta_rule_fwd_h_flydsl`` -- K5 hidden-state recurrence
+  (``compile_chunk_gated_delta_h``). Prepares tensors, chooses ``BV`` with a
+  rule-based grid/CU heuristic, manages the compiled kernel cache and stream.
+* ``gdn_prepare_fwd_flydsl`` -- K1..K4 chunk prepare fused into one kernel
+  (``compile_gdn_prepare``). Allocates the outputs and applies the
+  anti-camping ``grid_x`` padding.
+
+For an end-to-end GDN forward, call
 ``aiter.ops.triton.gated_delta_net.chunk_gated_delta_rule_opt_vk`` with
-``use_chunk_flydsl=True``.
+``use_chunk_flydsl=True`` (K5) and/or ``use_prepare_flydsl=True`` (K1..K4).
+The two are independent: the prepare wrapper matches the layout and
+exponent-domain contract of the Triton K1+K2 pair it replaces, so it composes
+with any of the three K5 backends. Use ``gdn_prepare_flydsl_supported`` to
+check a problem shape before selecting it.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 
 import torch
@@ -26,10 +34,12 @@ import triton
 from ..triton._triton_kernels.gated_delta_rule.utils import (
     GatedDeltaRulePrefillMetadata,
     prepare_chunk_offsets,
+    prepare_max_seq_chunks,
     prepare_num_chunks,
     prepare_rebased_cu_seqlens,
 )
 from .kernels.chunk_gated_delta_h import compile_chunk_gated_delta_h
+from .kernels.gdn_prepare import compile_gdn_prepare
 from .kernels.tensor_shim import _run_compiled
 
 # log2(e); g pre-scaled by this constant lets the kernel use exp2(g) in
@@ -39,6 +49,8 @@ _RCP_LN2 = math.log2(math.e)
 
 __all__ = [
     "chunk_gated_delta_rule_fwd_h_flydsl",
+    "gdn_prepare_flydsl_supported",
+    "gdn_prepare_fwd_flydsl",
 ]
 
 
@@ -552,3 +564,268 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
     )
 
     return h, v_new, final_state
+
+
+# -- K1..K4 prepare host wrapper (single fused FlyDSL kernel) --------------
+
+
+@functools.cache
+def _num_xcd() -> int:
+    """XCD (Accelerator Complex Die) count on the visible device.
+
+    The HW workgroup->XCD dispatch is the dominant partition behind the grid_x
+    camping (see the anti-camping padding in the wrapper).  On CDNA each XCD
+    holds a fixed number of active CUs, so we recover the XCD count from the
+    visible CU count (also correct under CPX/partitioned modes, which expose
+    fewer CUs):
+        gfx942  MI300X/MI325X = 304 CU, MI300A = 228 CU  @ 38 CU/XCD -> 8 or 6
+        gfx950  MI350/MI355   = 256 CU                    @ 32 CU/XCD -> 8
+    """
+    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    arch = getattr(p, "gcnArchName", "").split(":")[0]
+    cu_per_xcd = {"gfx942": 38, "gfx950": 32}.get(arch)
+    if cu_per_xcd:
+        return max(1, round(p.multi_processor_count / cu_per_xcd))
+    return 8  # sane CDNA default
+
+
+def _pad_grid_x_coprime(grid_x: int, num_xcd: int) -> int:
+    """Smallest grid_x' >= grid_x that is coprime with num_xcd (>= NT columns
+    are required to cover the longest sequence, so we only pad upward)."""
+    while num_xcd > 1 and math.gcd(grid_x, num_xcd) != 1:
+        grid_x += 1
+    return grid_x
+
+
+@functools.cache
+def _is_cdna_mfma_arch(device_index: int) -> bool:
+    """Whether the device runs the CDNA bf16 MFMA path the prepare kernel needs."""
+    try:
+        arch = getattr(
+            torch.cuda.get_device_properties(device_index), "gcnArchName", ""
+        )
+    except Exception:  # noqa: BLE001 -- absent/unreadable properties => unsupported
+        return False
+    return arch.split(":")[0].startswith(("gfx94", "gfx95"))
+
+
+def gdn_prepare_flydsl_supported(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    BT: int = 64,
+) -> bool:
+    """Whether ``gdn_prepare_fwd_flydsl`` can serve this problem shape.
+
+    The fused kernel covers a deliberately narrow slice of what the Triton
+    K1+K2 pair accepts -- ``compile_gdn_prepare`` hard-asserts ``BT=64``,
+    ``K=128`` and ``V=128``, the epilogue emits bf16, and the GEMMs are CDNA
+    bf16 MFMA. Callers use this to pick the fused path only where it applies and
+    fall back to Triton everywhere else, instead of tripping an assert.
+    """
+    return (
+        BT == 64
+        and k.shape[-1] == 128
+        and v.shape[-1] == 128
+        and k.dtype is torch.bfloat16
+        and v.dtype is torch.bfloat16
+        and k.is_cuda
+        and _is_cdna_mfma_arch(k.device.index if k.device.index is not None else 0)
+    )
+
+
+def gdn_prepare_fwd_flydsl(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    BT: int = 64,
+    Hg: int | None = None,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
+    stream=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlyDSL GDN prepare (K1..K4 fused) host wrapper.
+
+    Drop-in for the Triton ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` +
+    ``fused_solve_tril_recompute_w_u`` pair: same inputs, same output layouts
+    and exponent domain, one kernel instead of three dispatches. The
+    ``A_raw [B, T, H, BT]`` fp32 intermediate those two exchange never
+    materializes here (256 MiB at T=32768, H=32).
+
+    Args:
+        k: [B, T, Hg, K] bf16.
+        v: [B, T, H, V] bf16.
+        g: [B, T, H] f32 raw forget-gate increments (natural-log space).
+        beta: [B, T, H] f32, post-sigmoid.
+        cu_seqlens: [N+1] for variable-length batching, or None for dense.
+            When given, ``B`` must be 1 and ``T`` is the packed token count.
+        BT: chunk size (must be 64).
+        Hg: number of K/V heads; defaults to ``k.shape[2]``. ``H % Hg == 0``.
+        use_exp2: when True, publish ``g_cumsum`` in log2 space (pre-scaled by
+            ``log2(e)``) so the downstream K5/K6 kernels can use ``exp2``.
+            Matches the Triton K1 ``use_exp2`` convention, including its
+            default. ``w_bar``/``u_bar`` are unaffected.
+        num_decodes / num_decode_tokens: skip a leading decode-only prefix in
+            the ORIGINAL ``cu_seqlens`` (the data tensors are expected
+            pre-sliced to the prefill region). Offsets are rebased internally
+            via the cached prologue helpers, which key on the original
+            tensor's identity, so the grid metadata stays cache-warm across
+            forward calls and no per-forward device-to-host read happens.
+        prefill_metadata: prebuilt reusable K1--K6 schedule. Preferred over the
+            cached helpers when several GDR layers share one batch: the grid
+            shape then comes straight off the host-resident schedule.
+        stream: launch stream; defaults to the current stream.
+
+    Returns:
+        (w_bar [B, H, T, K] bf16, u_bar [B, H, T, V] bf16,
+        g_cumsum [B, H, T] f32) -- all head-major contiguous, i.e. stride 1
+        along T within a head, as K5 and K6 require.
+
+    All three outputs are shaped on the caller's ``T``; ``T`` need not be a
+    multiple of ``BT`` (the ragged last chunk is handled by the kernel's
+    ``seqlen`` guards, so no input padding is done).
+
+    KKT, the triangular inverse, and the WY GEMMs all run on MFMA bf16
+    16x16x16; see ``kernels.gdn_prepare.compile_gdn_prepare`` for the LDS
+    layout and the fixed ``s_vT`` bank-swizzle.
+    """
+    B, T0, Hg_in, K = k.shape
+    H = v.shape[2]
+    V = v.shape[3]
+    if Hg is None:
+        Hg = Hg_in
+    assert H % Hg == 0
+
+    # ``w_bar``/``u_bar`` are emitted as bf16, so silently up/down-casting a
+    # non-bf16 ``k``/``v`` here would hand the downstream K5 a ``w``/``u`` whose
+    # dtype disagrees with ``k`` -- and K5 derives ``h`` from ``k.dtype`` but
+    # ``v_new`` from ``u.dtype``, so the mismatch surfaces as mixed-precision
+    # garbage in K6 rather than as an error. Reject it here instead. Callers who
+    # need fp16 should stay on the Triton K1+K2 pair, which follows the input
+    # dtype.
+    if k.dtype is not torch.bfloat16 or v.dtype is not torch.bfloat16:
+        raise TypeError(
+            "gdn_prepare_fwd_flydsl emits bf16 `w_bar`/`u_bar` and therefore "
+            f"requires bf16 `k` and `v`; got k={k.dtype}, v={v.dtype}."
+        )
+    if cu_seqlens is None and (num_decodes or num_decode_tokens):
+        raise ValueError(
+            "`num_decodes` / `num_decode_tokens` describe a packed varlen batch "
+            "and require `cu_seqlens`."
+        )
+
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous().float()
+    beta = beta.contiguous().float()
+
+    is_varlen = cu_seqlens is not None
+    if is_varlen:
+        assert B == 1
+        # The launch grid is rectangular -- ``NT`` chunk columns by
+        # ``num_seqs * H`` rows -- so it needs the LONGEST sequence's chunk
+        # count, not the flattened total. Both host ints come from the shared
+        # schedule (or the identity-keyed caches), so no per-forward D2H.
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T0,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            num_seqs = schedule.n_prefill
+            NT = schedule.max_seq_chunks
+        else:
+            # Pass the ORIGINAL (cache-stable) cu_seqlens plus the decode ints
+            # into the cached helpers; handing them a freshly-rebased tensor
+            # would key the caches on an unstable identity and re-fire the D2H
+            # every call.
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            num_seqs = len(kernel_cu_seqlens) - 1
+            NT = prepare_max_seq_chunks(cu_seqlens, BT, num_decodes, num_decode_tokens)
+        # Device-to-device narrowing cast; the result feeds only the launch, so
+        # its identity does not matter to the caches above.
+        cu = kernel_cu_seqlens.to(device=k.device, dtype=torch.int32).contiguous()
+        T = T0
+    else:
+        cu = torch.empty(0, device=k.device, dtype=torch.int32)
+        num_seqs = B
+        # No input padding for a ragged last chunk: every global access in the
+        # kernel is already bounded by ``seqlen`` -- the buffer descriptors are
+        # clamped to the sequence's last row, so out-of-range loads return zero
+        # and out-of-range stores are dropped, in hardware.  A dense tail
+        # therefore behaves exactly like varlen's ragged last chunk.  Padding
+        # instead cost four input copies plus an oversized output allocation,
+        # and forced a trailing ``[:, :T0]`` slice that returned non-contiguous
+        # tensors for B > 1.
+        T = T0
+        NT = (T0 + BT - 1) // BT
+
+    # The kernel writes every output position (dense: row r is written by chunk
+    # r // BT; varlen: each packed token is written by exactly one block), so
+    # empty is safe and avoids two ~5us fill kernels.
+    w_bar = torch.empty(B, H, T, K, dtype=torch.bfloat16, device=k.device)
+    u_bar = torch.empty(B, H, T, V, dtype=torch.bfloat16, device=k.device)
+    g_cumsum = torch.empty(B, H, T, dtype=torch.float32, device=k.device)
+
+    grid_x = NT
+    grid_y = num_seqs * H
+
+    # Anti partition-camping: the HW dispatches workgroups to the GPU's XCDs
+    # (8 on MI300X/MI325X/MI350, 6 on MI300A; each XCD = 4 shader engines).
+    # When varlen work is skewed (one long sequence among many short ones) and
+    # grid_x (== NT) shares a factor with the XCD count, the long sequence's
+    # chunk blocks pile onto a few XCDs/SEs while the rest idle -> up to ~8x
+    # slower.  Measured (grid_x=16 on 8 XCDs): all heavy work landed on 1 XCD,
+    # SQ_BUSY per-SE CV 1.73 / max-mean 7.5x; camping strength tracks
+    # gcd(grid_x, num_xcd).  Padding grid_x up to the nearest value coprime
+    # with num_xcd stripes the blocks across every XCD (coprime with an even
+    # num_xcd => odd => also clears the 4-SE tier).  The extra chunk column(s)
+    # are >= every seqlen so they early-exit and the output is bit-identical.
+    # Only varlen skews (dense = uniform full chunks).
+    if is_varlen and NT >= 2:
+        grid_x = _pad_grid_x_coprime(NT, _num_xcd())
+
+    if stream is None:
+        stream = torch.cuda.current_stream()
+
+    exe = compile_gdn_prepare(
+        BT=BT,
+        K=K,
+        V=V,
+        is_varlen=is_varlen,
+        g_scale=_RCP_LN2 if use_exp2 else 1.0,
+    )
+    _run_compiled(
+        exe,
+        k.view(-1),
+        v.view(-1),
+        g.view(-1),
+        beta.view(-1),
+        (cu if is_varlen else k).view(-1),
+        w_bar.view(-1),
+        u_bar.view(-1),
+        g_cumsum.view(-1),
+        T,
+        H,
+        Hg,
+        grid_x,
+        grid_y,
+        stream,
+    )
+
+    return w_bar, u_bar, g_cumsum

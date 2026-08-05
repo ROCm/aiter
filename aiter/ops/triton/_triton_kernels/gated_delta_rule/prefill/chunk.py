@@ -226,6 +226,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_prepare_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     o: torch.Tensor | None = None,
@@ -244,6 +245,13 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     instead of Triton. When use_chunk_flydsl=True, hidden state computation
     uses the FlyDSL kernel. The two flags are mutually exclusive.
 
+    When use_prepare_flydsl=True, the K1+K2 pair (cumsum+KKT, then solve and
+    recompute w/u) is replaced by a single fused FlyDSL kernel, which also
+    avoids materializing their `A_raw [B, T, H, BT]` fp32 intermediate. This
+    flag is independent of the K5 choice above: the fused kernel reproduces the
+    Triton pair's output layouts and exponent domain exactly, so it composes
+    with all three hidden-state backends.
+
     Args:
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
@@ -256,6 +264,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         cu_seqlens: [N+1] optional
         use_chunk_hip: bool — use HIP kernel for hidden state (K5)
         use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
+        use_prepare_flydsl: bool — use the fused FlyDSL kernel for K1..K4
+            (cumsum + KKT + triangular solve + w/u) in place of the Triton
+            pair. Silently falls back to Triton when the shape/dtype/arch is
+            outside the fused kernel's support (bf16, K=V=128, CDNA).
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
         use_exp2: bool — use exp2 instead of exp for gate computation
@@ -303,29 +315,56 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     ):
         use_chunk_hip = False
 
-    g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        use_exp2=use_exp2,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-        prefill_metadata=prefill_metadata,
-    )
+    fused_prepare = None
+    if use_prepare_flydsl:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            gdn_prepare_flydsl_supported,
+            gdn_prepare_fwd_flydsl,
+        )
 
-    w, u = fused_solve_tril_recompute_w_u(
-        A_raw=A_raw,
-        k=k,
-        v=v,
-        beta=beta,
-        g_cumsum=g_cumsum,
-        cu_seqlens=cu_seqlens,
-        use_exp2=use_exp2,
-        num_decodes=num_decodes,
-        num_decode_tokens=num_decode_tokens,
-        prefill_metadata=prefill_metadata,
-    )
+        # Outside the fused kernel's bf16 / K=V=128 / CDNA slice, keep Triton.
+        if gdn_prepare_flydsl_supported(k, v):
+            fused_prepare = gdn_prepare_fwd_flydsl
+
+    if fused_prepare is not None:
+        # One kernel for K1..K4. Emits w/u head-major [B, H, T, K/V] and
+        # g_cumsum head-major [B, H, T] in the same exponent domain as the
+        # Triton pair, so everything downstream is unchanged.
+        w, u, g_cumsum = fused_prepare(
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
+    else:
+        g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
+
+        w, u = fused_solve_tril_recompute_w_u(
+            A_raw=A_raw,
+            k=k,
+            v=v,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            cu_seqlens=cu_seqlens,
+            use_exp2=use_exp2,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
+        )
 
     if use_chunk_hip:
         from aiter.ops.chunk_gated_delta_rule_fwd_h import (

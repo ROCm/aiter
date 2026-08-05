@@ -457,6 +457,7 @@ def chunk_gated_delta_rule_opt_vk(
     cu_seqlens: torch.LongTensor | None = None,
     use_chunk_hip: bool = False,
     use_chunk_flydsl: bool = False,
+    use_prepare_flydsl: bool = False,
     state_dtype: torch.dtype | None = None,
     use_exp2: bool = True,
     num_decodes: int = 0,
@@ -493,6 +494,11 @@ def chunk_gated_delta_rule_opt_vk(
         use_chunk_hip (bool): Use HIP kernel for hidden state (K5).
         use_chunk_flydsl (bool): Use FlyDSL kernel for hidden state (K5).
             Mutually exclusive with ``use_chunk_hip``.
+        use_prepare_flydsl (bool): Use the fused FlyDSL kernel for K1..K4
+            (cumsum + KKT + triangular solve + w/u) in place of the Triton
+            pair, which also drops their `A_raw` fp32 intermediate.
+            Independent of the two K5 flags; falls back to Triton when the
+            shape/dtype/arch is outside the fused kernel's support.
         state_dtype (torch.dtype, optional): Initial/final state dtype
             (`fp32` or `bf16`), supported by both the HIP and Triton paths.
         use_exp2 (bool): Use exp2 instead of exp for gate computation.
@@ -555,6 +561,7 @@ def chunk_gated_delta_rule_opt_vk(
         cu_seqlens=cu_seqlens,
         use_chunk_hip=use_chunk_hip,
         use_chunk_flydsl=use_chunk_flydsl,
+        use_prepare_flydsl=use_prepare_flydsl,
         state_dtype=state_dtype,
         use_exp2=use_exp2,
         o=o,
