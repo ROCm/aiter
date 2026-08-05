@@ -215,6 +215,12 @@ def fused_clamp_act_mul(
             f"quant_block_size ({quant_block_size})"
         )
 
+        # Tuneable
+        block_m = 1
+        assert M % block_m == 0, (
+            f"M ({M}) must be a multiple of block_m ({block_m})"
+        )
+
 
     # Args are identical for both kernels; the Gluon kernel takes one extra
     # `cache_modifier` constexpr (threaded into every gl.load).
@@ -255,7 +261,7 @@ def fused_clamp_act_mul(
         assert (
             _is_gluon_available()
         ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
-        # Lazy import so non-gfx1250 environments never import the Gluon module.
+
         from aiter.ops.triton._gluon_kernels.gfx1250.fusions.fused_clamp_act_mul import (
             _fused_clamp_silu_mul_kernel as _fused_clamp_silu_mul_gluon_kernel,
         )
@@ -263,11 +269,12 @@ def fused_clamp_act_mul(
         _LOGGER.info(
             f"FUSED_CLAMP_ACT_MUL [gluon/gfx1250]: M={M} n_half={n_half}"
         )
-        # One program per token row (grid = M); BLOCK_SIZE_N spans the whole row.
-        # ".cg" matches the Triton reference's hardcoded cache hint.
-        _fused_clamp_silu_mul_gluon_kernel[(M,)](
+        # Each program owns block_m rows (grid = cdiv(M, block_m)); BLOCK_SIZE_N
+        # spans the whole row. ".cg" matches the Triton reference's cache hint.
+        _fused_clamp_silu_mul_gluon_kernel[(triton.cdiv(M, block_m),)](
             *kernel_args,
             **kernel_constexprs,
+            BLOCK_M=block_m,
             cache_modifier=".cg",
         )
     else:
