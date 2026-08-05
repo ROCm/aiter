@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FP8 MQA logits (DeepSeek lightning indexer) -- FlyDSL gfx942 kernel.
+"""FP8 MQA logits (DeepSeek lightning indexer) -- FlyDSL gfx942/gfx950 kernel.
 
 Compute for each query row ``m`` and KV position ``n``
 inside that row's window ``[cu_starts[m], cu_ends[m])``::
@@ -180,7 +180,21 @@ _DEFAULT_COMPILE_HINTS = {
     "fast_fp_math": True,
 }
 
-_ARCH = get_gfx()
+# Resolved once at import so the variant registry below can be built statically.
+# The guard keeps the module importable on a host with no GPU (CI collecting
+# tests, doc builds), where ``get_gfx()`` raises.
+#
+# The sentinel is deliberately not a real arch.
+# Here the arch selects the kernel registry, so naming a real arch
+# would register variants that cannot run and defer the failure to a compile or
+# launch error. Returning ``"unknown"`` instead leaves ``_VARIANT_BUILDERS`` empty and lets
+# ``_auto_variant`` raise NotImplementedError naming the arch. Hence, the import succeeds,
+# and the first actual use fails with a clear message. ``_split_policy`` already
+# treats an unrecognised arch as gfx942, so it needs no separate handling.
+try:
+    _ARCH = get_gfx()
+except Exception:  # noqa: BLE001
+    _ARCH = "unknown"
 
 
 @dataclass(frozen=True)
@@ -1573,7 +1587,14 @@ if _ARCH == "gfx950":
     )
 
 KERNEL_VARIANTS = tuple(_VARIANT_BUILDERS.keys())
-DEFAULT_VARIANT = "mfma_r2_w4" if _ARCH == "gfx942" else "mfma32x32x64_bkv64_r1_w2_lds3"
+# None on an unsupported/undetected arch: there is no variant to name when
+# _VARIANT_BUILDERS is empty, and compile_fp8_mqa_logits' membership check then
+# rejects it with the available-variants list rather than a confusing KeyError.
+DEFAULT_VARIANT = (
+    "mfma_r2_w4"
+    if _ARCH == "gfx942"
+    else ("mfma32x32x64_bkv64_r1_w2_lds3" if _ARCH == "gfx950" else None)
+)
 
 # Parses both tag schemes; group 1 is the shape (None for the gfx942 tags),
 # then block_kv (None -> _BLOCK_KV), RPB, WPB, and the LDS buffer count.
@@ -1648,7 +1669,9 @@ def compile_fp8_mqa_logits(
     head_size: int,
     block_kv: int = _BLOCK_KV,
     paged: bool = False,
-    variant: str = DEFAULT_VARIANT,
+    # None only on an unsupported/undetected arch, where DEFAULT_VARIANT is None
+    # and no variant exists; the membership check below rejects it.
+    variant: str | None = DEFAULT_VARIANT,
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
     clean_logits: bool = True,
