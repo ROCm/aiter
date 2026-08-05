@@ -351,9 +351,6 @@ def _build_kv_kernel(
     COMPUTE_GROUPS_PER_BLOCK = KV_THREADS // COMPUTE_GROUP
     PHASE1_ITERS = _ceil_div(block_size, COMPUTE_GROUPS_PER_BLOCK)
     CACHE_FX_TYPE = fx.Int8 if cache_is_fp8 else fx.BFloat16
-    CACHE_IS_FNUZ = cache_is_fp8 and aiter_dtypes.fp8 == getattr(
-        torch, "float8_e4m3fnuz", None
-    )
 
     STAGE_ELEMS = block_size * D
     K_TOTAL_RUNS = (D // x) * block_size
@@ -494,17 +491,6 @@ def _build_kv_kernel(
             s0 = _fp8_clamp(v0 * inv_s)
             s1 = _fp8_clamp(v1 * inv_s)
 
-            if const_expr(CACHE_IS_FNUZ):
-                # On gfx942, v_cvt_pk_fp8_f32 encodes values that round to
-                # negative zero as 0x80. In e4m3fnuz that byte is NaN, so
-                # match the established qk_norm_rope_quant conversion path
-                # by mapping tiny negative inputs to +0 before conversion.
-                zero = fx.Float32(0.0)
-                neg_underflow = fx.Float32(-(2.0**-8))
-                s0_tiny_neg = (s0 < zero) and (s0 > neg_underflow)
-                s1_tiny_neg = (s1 < zero) and (s1 > neg_underflow)
-                s0 = s0_tiny_neg.select(zero, s0)
-                s1 = s1_tiny_neg.select(zero, s1)
             packed = fx.Int32(fx.rocdl.cvt_pk_fp8_f32(T.i32, s0, s1, fx.Int32(0), 0))
             byte0 = packed.to(fx.Int8)
             byte1 = (packed >> fx.Int32(8)).to(fx.Int8)
