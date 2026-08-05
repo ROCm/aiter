@@ -40,7 +40,10 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    block_base_bytes_i64,
+    emit_group_fp8_nm_asm_scatter,
+)
 from .tensor_shim import _run_compiled, _to_raw
 
 # --- shape constants --------------------------------------------------------
@@ -909,9 +912,10 @@ def _build_kernel(
                     # BF16 paged write. kv_cache layout: [NB, k_per_block, D].
                     # cache_addr = physical_block * block_stride + slot_in_block * token_stride + tid*VEC
                     # (strides are in bf16 elements; caller passes elements.)
+                    # The block term rides on the descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
-                        + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                        ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
                         + tid_x_vec
                     )
                     # Build a per-block GTensor and store VEC bf16 via dword path.
@@ -920,7 +924,11 @@ def _build_kernel(
                     raw_vec = vector.from_elements(vecVf32, out_lane)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 2
+                        ),
                     )
                     # cache_off is in bf16 elements; convert to dword for the i32-vec store.
                     cache_off_dw = ArithValue(cache_off) >> arith.constant(1, type=i32)
@@ -958,12 +966,14 @@ def _build_kernel(
                 elif const_expr(nm_asm):
                     # -- group_fp8 (V4 nm-asm) via shared emitter (wave32; same layout
                     # as wave64 -- single source of truth). --
-                    _nm_cache_base = ArithValue(physical_block) * ArithValue(
-                        kv_cache_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-                    _nm_krope_base = ArithValue(physical_block) * ArithValue(
-                        krope_block_stride
-                    ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                    # The block term rides on each descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
+                    _nm_cache_base = ArithValue(slot_in_block) * ArithValue(
+                        kv_cache_token_stride
+                    )
+                    _nm_krope_base = ArithValue(slot_in_block) * ArithValue(
+                        krope_token_stride
+                    )
                     emit_group_fp8_nm_asm_scatter(
                         normed_lane=normed_lane,
                         rotated_lane=rotated_lane,
@@ -971,11 +981,19 @@ def _build_kernel(
                         is_rope_t=is_rope_t,
                         cache_base=_to_raw(_nm_cache_base),
                         out_rsrc=buffer_ops.create_buffer_resource(
-                            kv_cache, max_size=True
+                            kv_cache,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, kv_cache_block_stride, 1
+                            ),
                         ),
                         krope_base=_to_raw(_nm_krope_base),
                         krope_rsrc=buffer_ops.create_buffer_resource(
-                            k_rope_buff, max_size=True
+                            k_rope_buff,
+                            max_size=True,
+                            base_byte_offset=block_base_bytes_i64(
+                                physical_block, krope_block_stride, 2
+                            ),
                         ),
                         VEC=VEC,
                         NOPE=NOPE,
@@ -1873,16 +1891,21 @@ def _build_kernel_ksplit(
                 )
 
                 if const_expr(not quant):
+                    # The block term rides on the descriptor's base, not on
+                    # the 32-bit offset -- see `block_base_bytes_i64`.
                     cache_off = (
-                        ArithValue(physical_block) * ArithValue(kv_cache_block_stride)
-                        + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+                        ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
                         + lid_x_vec
                     )
                     out_vec_t = T.vec(VEC, T.bf16)
                     raw_vec = vector.from_elements(vecVf32, out_lane)
                     bf16_vec = raw_vec.truncf(out_vec_t)
                     out_rsrc = buffer_ops.create_buffer_resource(
-                        kv_cache, max_size=True
+                        kv_cache,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, kv_cache_block_stride, 2
+                        ),
                     )
                     cache_off_dw = ArithValue(cache_off) >> c_one_i32
                     dwords = (VEC + 1) // 2

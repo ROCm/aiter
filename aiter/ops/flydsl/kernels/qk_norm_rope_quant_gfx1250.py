@@ -374,7 +374,7 @@ def _build_kernel(
         kv_scale: fx.Pointer,  # [T, NG]           f32 or uint8 (e8m0)
         kv_in_row_stride: Int32,  # KV row stride in bf16 elements
         swa_kv: fx.Pointer,  # [num_slots, cache_size, D] bf16 (dummy if not kv_write)
-        state_slot_mapping: fx.Pointer,  # [bs] i32 (dummy if not kv_write)
+        swa_index: fx.Pointer,  # paged: block_tables; direct: [T] dest rows
         batch_id_per_token: fx.Pointer,  # [T] i32, -1 sentinel (dummy if not kv_write)
         swa_slot_stride: Int32,  # bf16 elements (= cache_size * D)
         swa_pos_stride: Int32,  # bf16 elements (= D)
@@ -823,7 +823,7 @@ def _build_kernel(
                         bt_off = ArithValue(bid_safe) * ArithValue(
                             swa_slot_stride
                         ) + ArithValue(blk)
-                        bt_rsrc = _ptr_buffer_resource(state_slot_mapping)
+                        bt_rsrc = _ptr_buffer_resource(swa_index)
                         phys = buffer_ops.buffer_load(
                             bt_rsrc, _to_raw(bt_off), vec_width=1, dtype=i32
                         )
@@ -831,19 +831,35 @@ def _build_kernel(
                         row = ArithValue(phys) * ArithValue(
                             swa_cache_size
                         ) + ArithValue(in_blk)
-                        swa_off_elems = ArithValue(row) * ArithValue(swa_pos_stride)
+                        row_safe = _to_raw(row)
                     else:
-                        slot_rsrc = _ptr_buffer_resource(state_slot_mapping)
-                        slot = buffer_ops.buffer_load(
-                            slot_rsrc, bid_safe, vec_width=1, dtype=i32
+                        # Direct: the caller already resolved this token's row.
+                        # A `-1` row means "skip", same as a `-1` batch id --
+                        # a caller whose window is not expressible here needs a
+                        # way to say so per token, not just per request.
+                        row_rsrc = _ptr_buffer_resource(swa_index)
+                        row = buffer_ops.buffer_load(
+                            row_rsrc, bid_t, vec_width=1, dtype=i32
                         )
-                        ring = arith.remsi(pos_i32, _to_raw(swa_cache_size))
-                        swa_off_elems = ArithValue(slot) * ArithValue(
-                            swa_slot_stride
-                        ) + ArithValue(ring) * ArithValue(swa_pos_stride)
+                        do_swa = arith.andi(do_swa, ArithValue(row) >= 0)
+                        row_safe = arith.maxsi(row, arith.constant(0, type=i32))
+                    # The row index fits 32 bits; `row * D * 2` does not. A
+                    # unified V4 pool runs to ~150M rows, so a 32-bit byte
+                    # offset wraps 3% of the way in, and the sliding windows
+                    # this writes live at the far end. Widen before either
+                    # multiply, and let it reach the descriptor through the
+                    # base address (`static_bytes_offset_i64`) rather than
+                    # through the 32-bit offset field, whose window is 4 GiB.
                     swa_off_bytes = arith.index_cast(
-                        T.index, _to_raw(swa_off_elems)
-                    ) * arith.constant(2, type=T.index)
+                        T.index,
+                        arith.muli(
+                            arith.muli(
+                                arith.extsi(T.i64, row_safe),
+                                arith.extsi(T.i64, _to_raw(swa_pos_stride)),
+                            ),
+                            arith.constant(2, type=T.i64),
+                        ),
+                    )
                     swa_g_tmp = GTensor(
                         swa_kv,
                         dtype=T.bf16,
@@ -882,7 +898,7 @@ def _build_kernel(
         kv_scale: fx.Pointer,
         kv_in_row_stride: fx.Int32,
         swa_kv: fx.Pointer,
-        state_slot_mapping: fx.Pointer,
+        swa_index: fx.Pointer,
         batch_id_per_token: fx.Pointer,
         swa_slot_stride: fx.Int32,
         swa_pos_stride: fx.Int32,
@@ -912,7 +928,7 @@ def _build_kernel(
             kv_scale,
             kv_in_row_stride,
             swa_kv,
-            state_slot_mapping,
+            swa_index,
             batch_id_per_token,
             swa_slot_stride,
             swa_pos_stride,
@@ -990,7 +1006,7 @@ def flydsl_qk_norm_rope_quant_gfx1250(
     q_scale: torch.Tensor | None = None,
     kv_scale: torch.Tensor | None = None,
     swa_kv: torch.Tensor | None = None,
-    state_slot_mapping: torch.Tensor | None = None,
+    swa_dest_rows: torch.Tensor | None = None,
     batch_id_per_token: torch.Tensor | None = None,
     swa_block_tables: torch.Tensor | None = None,
     swa_block_size: int | None = None,
@@ -1120,17 +1136,25 @@ def flydsl_qk_norm_rope_quant_gfx1250(
         ssm_arg = swa_block_tables
         bid_arg = batch_id_per_token
     elif kv_write:
-        if state_slot_mapping is None:
-            raise ValueError("ring kv_write requires state_slot_mapping")
-        if swa_kv.dim() != 3 or swa_kv.shape[2] != D:
-            raise ValueError(f"swa_kv must be [S, C, D={D}], got {tuple(swa_kv.shape)}")
-        if state_slot_mapping.dim() != 1 or state_slot_mapping.dtype != torch.int32:
-            raise TypeError("state_slot_mapping must be 1-D int32")
-        swa_slot_stride = swa_kv.stride(0)
-        swa_pos_stride = swa_kv.stride(1)
-        swa_cache_size = swa_kv.shape[1]
+        if swa_dest_rows is None:
+            raise ValueError("direct kv_write requires swa_dest_rows")
+        if swa_kv.dim() != 2 or swa_kv.shape[1] != D:
+            raise ValueError(
+                f"direct swa_kv must be flat [num_rows, D={D}], "
+                f"got {tuple(swa_kv.shape)}"
+            )
+        if swa_dest_rows.dim() != 1 or swa_dest_rows.dtype != torch.int32:
+            raise TypeError("swa_dest_rows must be 1-D int32")
+        if swa_dest_rows.shape[0] < T_tok:
+            raise ValueError(
+                f"swa_dest_rows len {swa_dest_rows.shape[0]} < T={T_tok}; it is "
+                "indexed by token, not by request"
+            )
+        swa_slot_stride = 0
+        swa_pos_stride = swa_kv.stride(0)
+        swa_cache_size = 1
         swa_kv_arg = swa_kv
-        ssm_arg = state_slot_mapping
+        ssm_arg = swa_dest_rows
         bid_arg = batch_id_per_token
     else:
         swa_slot_stride = 0
@@ -1197,8 +1221,11 @@ def flydsl_qk_norm_rope_quant_gfx1250(
             _ptr_arg(q_scale_arg[start:end] if quant else q_scale_arg),
             _ptr_arg(kv_scale_arg[start:end] if quant else kv_scale_arg),
             kv.stride(0),
+            # `swa_index` is sliced iff it is indexed by token: block tables
+            # are per request and stay whole, destination rows are per token
+            # and must follow the chunk exactly as positions do.
             _ptr_arg(swa_kv_arg),
-            _ptr_arg(ssm_arg),
+            _ptr_arg(ssm_arg[start:end] if (kv_write and not paged) else ssm_arg),
             _ptr_arg(bid_arg[start:end] if kv_write else bid_arg),
             swa_slot_stride,
             swa_pos_stride,
