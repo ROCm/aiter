@@ -28,7 +28,7 @@ pytestmark = pytest.mark.skipif(
 
 # Skips itself at import when flydsl or a GPU is missing, which skips this module
 # with it.
-from aiter.ops.flydsl.test_flydsl_linear_attention import (  # noqa: E402
+from aiter.ops.flydsl.test_flydsl_linear_attention import (
     Args,
     check_gdr_decode,
 )
