@@ -7,7 +7,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.compiler.protocol import dsl_size_of
 from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.typing import T
@@ -17,6 +16,8 @@ from flydsl.utils.smem_allocator import check_smem_capacity
 WMMA_M, WMMA_N, WMMA_K = 16, 16, 32
 WAVE_SIZE, LDS_PAD_A, LDS_PAD_B = 32, 8, 8
 _SCHED_ALLOW_SALU = 1 << 2
+KERNARG_PRELOAD_COUNT = 8
+SCOPE_DEV = 16  
 
 
 def _byte_off_i32(elem_off, elem_bytes):
@@ -147,10 +148,22 @@ def compile_gemm_a16w16(
         b_imm_bytes, lds_b_stride = tile_k * elem_bytes, tile_k + LDS_PAD_B
         lds_b_elems = tile_n * lds_b_stride + LDS_PAD_B
 
-    @fx.struct
-    class SharedStorage:
-        a: fx.Array[_fx_elem, num_buffers * lds_a_elems, 16]
-        b: fx.Array[_fx_elem, num_buffers * lds_b_elems, 16]
+    _USE_XT = split_k > 1 and out_dtype == "f32"
+
+    if _USE_XT:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[_fx_elem, num_buffers * lds_a_elems, 16]
+            b: fx.Array[_fx_elem, num_buffers * lds_b_elems, 16]
+            xt: fx.Array[fx.Float32, num_warps * WMMA_M * WMMA_N, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[_fx_elem, num_buffers * lds_a_elems, 16]
+            b: fx.Array[_fx_elem, num_buffers * lds_b_elems, 16]
 
     check_smem_capacity(dsl_size_of(SharedStorage), gpu_arch)
 
@@ -158,10 +171,10 @@ def compile_gemm_a16w16(
 
     @flyc.kernel
     def kernel_gemm_a16w16(
-        arg_y: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_y: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
@@ -189,14 +202,8 @@ def compile_gemm_a16w16(
         warp_m_base, warp_n_base = wave_m_idx * warp_tile_m, wave_n_idx * warp_tile_n
         m_idx, n_stride = fx.Uint64(i32_m), fx.Uint64(i32_n)
         y_rsrc = fx.rocdl.get_buffer_rsrc(
-            fx.rocdl.make_buffer_ptr(
-                fx.get_iter(arg_y), m_idx * n_stride * elem_bytes_d
-            )
+            fx.rocdl.make_buffer_ptr(arg_y, m_idx * n_stride * elem_bytes_d)
         )
-        if const_expr(add_bias):
-            bias_rsrc = fx.rocdl.get_buffer_rsrc(
-                fx.rocdl.make_buffer_ptr(fx.get_iter(arg_bias))
-            )
 
         lds = fx.SharedAllocator(static=True).allocate(SharedStorage).peek()
         big_a_mem, big_b_mem = lds.a.ptr, lds.b.ptr
@@ -205,35 +212,54 @@ def compile_gemm_a16w16(
         blk_m64, blk_n64 = fx.Int64(blk_m), fx.Int64(blk_n)
         split_k_base64 = fx.Int64(split_k_base)
 
-        def _mk_side(tensor, base_off, shape, outer_stride, pad_interval, pad_amount):
+        def _mk_side(
+            ptr, base_off, shape, outer_stride, pad_interval, pad_amount, extents
+        ):
             gt = fx.Tensor(
                 fx.make_view(
-                    fx.add_offset(fx.get_iter(tensor), base_off),
+                    fx.add_offset(ptr, base_off),
                     fx.make_layout(shape, (outer_stride, 1)),
                 )
             )
             return gt, fx.rocdl.make_tdm_atom(
                 gt,
-                [None, None],
+                extents,
                 strides=[outer_stride, None],
                 num_warps=num_warps,
                 pad_interval=pad_interval,
                 pad_amount=pad_amount,
             )
 
+        m_oob = fx.Int32(m_idx - blk_m)
+        n_oob = fx.Int32(fx.Uint64(N) - blk_n) if const_expr(N > 0) else None
+        a_extents = [m_oob, None] if const_expr(physical_mk) else [None, m_oob]
+        b_extents = [None, n_oob] if const_expr(physical_kn) else [n_oob, None]
+
         if const_expr(physical_mk):
             a_base_off = blk_m64 * K + split_k_base64
         else:
             a_base_off = split_k_base64 * M + blk_m64
         gA, atom_a = _mk_side(
-            arg_x, a_base_off, a_tile_shape, a_outer_stride, a_pad_interval, LDS_PAD_A
+            arg_x,
+            a_base_off,
+            a_tile_shape,
+            a_outer_stride,
+            a_pad_interval,
+            LDS_PAD_A,
+            a_extents,
         )
         if const_expr(physical_kn):
             b_base_off = split_k_base64 * N + blk_n64
         else:
             b_base_off = blk_n64 * K + split_k_base64
         gB, atom_b = _mk_side(
-            arg_w, b_base_off, b_tile_shape, b_outer_stride, b_pad_interval, LDS_PAD_B
+            arg_w,
+            b_base_off,
+            b_tile_shape,
+            b_outer_stride,
+            b_pad_interval,
+            LDS_PAD_B,
+            b_extents,
         )
 
         def _imm64(k_tile, mul):
@@ -380,25 +406,42 @@ def compile_gemm_a16w16(
             fx.Float16 if out_dtype == "f16" else fx.BFloat16 if _half_out else None
         )
 
+        if const_expr(add_bias):
+            bias_lay = fx.make_layout(4, 1)
+            bias_tiles = fx.logical_divide(
+                fx.rocdl.make_buffer_tensor(
+                    fx.make_view(arg_bias, fx.make_layout(N, 1)),
+                    max_size=False,
+                    num_records_bytes=N * elem_bytes,
+                ),
+                bias_lay,
+            )
+            bias_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), _fx_elem)
+
+            def load_bias4(tile_idx):
+                r = fx.make_rmem_tensor(bias_lay, _fx_elem)
+                fx.copy_atom_call(bias_atom, fx.slice(bias_tiles, (None, tile_idx)), r)
+                return r.load()
+
         def epilogue_stores(final_accs):
             zero_off = fx.Int32(0).ir_value()
             if const_expr(split_k > 1):
                 zero_i32 = zero_off
+                dev_scope = fx.Int32(SCOPE_DEV).ir_value()
+            if const_expr(_USE_XT):
+                xt = fx.add_offset(
+                    lds.xt.ptr,
+                    (wave_m_idx * n_warp + wave_n_idx) * (WMMA_M * WMMA_N),
+                )
             if const_expr(add_bias):
                 bias_vecs = []
                 for wn in range_constexpr(wmma_n_rep):
-                    col_i32 = blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8
+                    col_tile = (blk_n + warp_n_base + wn * WMMA_N + lane_kgrp * 8) // 4
                     elems = []
                     for half in range_constexpr(2):
-                        bv = rocdl.raw_ptr_buffer_load(
-                            T.vec(4, elem_ty),
-                            bias_rsrc,
-                            _byte_off_i32(col_i32 + half * 4, elem_bytes),
-                            zero_off,
-                            zero_off,
-                        )
+                        bv = load_bias4(col_tile + half)
                         for i in range_constexpr(4):
-                            elems.append(fx.Vector(bv)[i].to(fx.Float32))
+                            elems.append(bv[i].to(fx.Float32))
                     bias_vecs.append(
                         fx.Vector.from_elements(elems, fx.Float32).ir_value()
                     )
@@ -438,7 +481,7 @@ def compile_gemm_a16w16(
                                     y_rsrc,
                                     fx.Int32(c_off_bytes + pair * 4).ir_value(),
                                     zero_i32,
-                                    zero_i32,
+                                    dev_scope,
                                 )
                         else:
                             rocdl.raw_ptr_buffer_store(
@@ -450,13 +493,28 @@ def compile_gemm_a16w16(
                             )
                     elif const_expr(split_k > 1):
                         for e in range_constexpr(8):
-                            rocdl.raw_ptr_buffer_atomic_fadd(
-                                fx.Vector(acc)[e].ir_value(),
-                                y_rsrc,
-                                _byte_off_i32(row * n_stride + col_base + e, 4),
-                                zero_i32,
-                                zero_i32,
+                            fx.ptr_store(
+                                fx.Vector(acc)[e],
+                                fx.add_offset(xt, lane16 * WMMA_N + lane_kgrp * 8 + e),
                             )
+                        t_base = blk_m + warp_m_base + wm * WMMA_M
+                        t_col = blk_n + warp_n_base + wn * WMMA_N + lane16
+                        for e in range_constexpr(8):
+                            if t_base + 2 * e < m_idx:
+                                rocdl.raw_ptr_buffer_atomic_fadd(
+                                    fx.ptr_load(
+                                        fx.add_offset(
+                                            xt, (lane_kgrp + 2 * e) * WMMA_N + lane16
+                                        )
+                                    ).ir_value(),
+                                    y_rsrc,
+                                    _byte_off_i32(
+                                        (t_base + lane_kgrp + 2 * e) * n_stride + t_col,
+                                        4,
+                                    ),
+                                    zero_i32,
+                                    dev_scope,
+                                )
                     else:
                         for half in range_constexpr(2):
                             vec4 = fx.Vector.from_elements(
@@ -573,41 +631,41 @@ def compile_gemm_a16w16(
 
     @flyc.jit
     def launch_gemm_a16w16(
-        arg_y: fx.Tensor,
-        arg_x: fx.Tensor,
-        arg_w: fx.Tensor,
-        arg_bias: fx.Tensor,
+        arg_y: fx.Pointer,
+        arg_x: fx.Pointer,
+        arg_w: fx.Pointer,
+        arg_bias: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         stream: fx.Stream,
     ):
-        ctx = CompilationContext.get_current()
-
         gx = (fx.Uint64(i32_m) + (tile_m - 1)) // tile_m
         gy = (fx.Uint64(i32_n) + (tile_n - 1)) // tile_n
 
-        launcher = kernel_gemm_a16w16(arg_y, arg_x, arg_w, arg_bias, i32_m, i32_n)
-
-        flat_wg_attr = ir.StringAttr.get(f"{block_threads},{block_threads}")
-        wpe = int(waves_per_eu or 0)
-
-        for op in ctx.gpu_module_body.operations:
-            if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                op.attributes["rocdl.flat_work_group_size"] = flat_wg_attr
-                if wpe >= 1:
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(
-                        ir.IntegerType.get_signless(32), wpe
-                    )
-                if kernarg_preload:
-                    inreg = ir.DictAttr.get({"llvm.inreg": ir.UnitAttr.get()})
-                    n_args = len(op.regions[0].blocks[0].arguments)
-                    op.attributes["arg_attrs"] = ir.ArrayAttr.get([inreg] * n_args)
+        wpe = int(waves_per_eu) if waves_per_eu is not None else 0
+        launcher = kernel_gemm_a16w16(
+            arg_y,
+            arg_x,
+            arg_w,
+            arg_bias,
+            i32_m,
+            i32_n,
+            value_attrs={
+                "rocdl.flat_work_group_size": f"{block_threads},{block_threads}",
+                "rocdl.waves_per_eu": wpe if wpe >= 1 else None,
+            },
+        )
 
         launcher.launch(
             grid=(gx, gy, split_k), block=(block_threads, 1, 1), stream=stream
         )
 
-    _llvm_opts = {"amdgpu-expert-scheduling-mode": True, "unroll-threshold": 0}
+    _llvm_opts = {
+        "amdgpu-expert-scheduling-mode": True,
+        "unroll-threshold": 0,
+        "amdgpu-kernarg-preload": kernarg_preload,
+        "amdgpu-kernarg-preload-count": KERNARG_PRELOAD_COUNT,
+    }
     if sched_strategy is not None:
         _llvm_opts["amdgpu-sched-strategy"] = sched_strategy
     launch_gemm_a16w16.compile_hints["llvm_options"] = _llvm_opts

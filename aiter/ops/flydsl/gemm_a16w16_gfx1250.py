@@ -11,14 +11,15 @@ import torch
 
 _compile_gemm_a16w16 = None
 _run_compiled = None
+_flyc = None
 _fx = None
 
 
 def _lazy_import():
-    global _compile_gemm_a16w16, _run_compiled, _fx
+    global _compile_gemm_a16w16, _run_compiled, _flyc, _fx
     if _compile_gemm_a16w16 is not None:
         return
-    # Absolute (not relative) so this module also works when loaded by file path.
+    import flydsl.compiler as flyc
     import flydsl.expr as fx
 
     from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
@@ -28,7 +29,23 @@ def _lazy_import():
 
     _compile_gemm_a16w16 = compile_gemm_a16w16
     _run_compiled = run_compiled
+    _flyc = flyc
     _fx = fx
+
+
+_FX_DTYPE = {}
+
+
+def _p(t):
+    if not _FX_DTYPE:
+        _FX_DTYPE.update(
+            {
+                torch.bfloat16: _fx.BFloat16,
+                torch.float16: _fx.Float16,
+                torch.float32: _fx.Float32,
+            }
+        )
+    return _flyc.from_c_void_p(_FX_DTYPE[t.dtype], t.data_ptr())
 
 
 _CFG_KEYS = (
@@ -161,7 +178,16 @@ def gemm_a16w16(
     )
 
     stream = torch.cuda.current_stream(device=x.device).cuda_stream
-    _run_compiled(launch_fn, y_buf, x, w, bias, M, N_stride, _fx.Stream(stream))
+    _run_compiled(
+        launch_fn,
+        _p(y_buf),
+        _p(x),
+        _p(w),
+        _p(bias),
+        M,
+        N_stride,
+        _fx.Stream(stream),
+    )
 
     result = y_buf[:, :N] if N_stride != N else y_buf
     if _splitk_f32_accum:
