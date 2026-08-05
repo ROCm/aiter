@@ -13,6 +13,7 @@ It is extracted from `tests/kernels/test_moe_gemm.py` so that:
 """
 
 import functools
+import math
 import os
 from contextlib import contextmanager
 
@@ -101,6 +102,20 @@ def _stage1_activation_module_tag(
     return f"_situv2_sb{float_tag(situ_beta)}_slb{float_tag(situ_linear_beta)}"
 
 
+def _validate_stage1_activation_parameters(
+    act: str, situ_beta: float, situ_linear_beta: float
+) -> None:
+    if act not in ("silu", "situv2"):
+        raise ValueError(f"act must be 'silu' or 'situv2', got {act!r}")
+    if act == "situv2":
+        for name, value in (
+            ("situ_beta", situ_beta),
+            ("situ_linear_beta", situ_linear_beta),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and > 0, got {value!r}")
+
+
 @functools.lru_cache(maxsize=1024)
 def compile_moe_gemm1(
     *,
@@ -157,13 +172,7 @@ def compile_moe_gemm1(
     elem_bytes = 2 if is_f16_or_bf16 else 1
     if out_dtype not in ("f16", "bf16"):
         raise ValueError(f"out_dtype must be 'f16' or 'bf16', got {out_dtype!r}")
-    if act not in ("silu", "situv2"):
-        raise ValueError(f"act must be 'silu' or 'situv2', got {act!r}")
-    if act == "situv2":
-        if situ_beta <= 0.0:
-            raise ValueError(f"situ_beta must be > 0, got {situ_beta!r}")
-        if situ_linear_beta <= 0.0:
-            raise ValueError(f"situ_linear_beta must be > 0, got {situ_linear_beta!r}")
+    _validate_stage1_activation_parameters(act, situ_beta, situ_linear_beta)
 
     # NOTE: don't materialize MLIR types outside an active MLIR Context.
     def out_mlir():

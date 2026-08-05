@@ -4,6 +4,7 @@
 """Dependency-free cache-key regression tests for the FlyDSL MoE builder."""
 
 import ast
+import math
 import re
 from pathlib import Path
 
@@ -35,6 +36,22 @@ def _activation_module_tag():
         namespace,
     )
     return namespace["_stage1_activation_module_tag"]
+
+
+def _activation_parameter_validator():
+    tree = ast.parse(_SOURCE.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_validate_stage1_activation_parameters"
+    )
+    namespace = {"math": math}
+    exec(  # noqa: S102
+        compile(ast.Module(body=[function], type_ignores=[]), str(_SOURCE), "exec"),
+        namespace,
+    )
+    return namespace["_validate_stage1_activation_parameters"]
 
 
 def _stage1_kernel_uses_module_name():
@@ -79,3 +96,33 @@ def test_stage1_module_name_distinguishes_activation_and_betas():
         for value in (silu, situ_default, situ_beta, situ_linear_beta)
     )
     assert _stage1_kernel_uses_module_name()
+
+
+def test_stage1_situv2_betas_must_be_finite_and_positive():
+    validate = _activation_parameter_validator()
+    invalid_values = (math.nan, math.inf, -math.inf, 0.0, -1.0)
+
+    for parameter in ("situ_beta", "situ_linear_beta"):
+        for value in invalid_values:
+            kwargs = {"situ_beta": 1.0, "situ_linear_beta": 1.0}
+            kwargs[parameter] = value
+            try:
+                validate("situv2", **kwargs)
+            except ValueError as error:
+                assert str(error) == (
+                    f"{parameter} must be finite and > 0, got {value!r}"
+                )
+            else:
+                raise AssertionError(f"{parameter}={value!r} was accepted")
+
+        for value in (1e-300, 0.5, 1.0, 1e300):
+            kwargs = {"situ_beta": 1.0, "situ_linear_beta": 1.0}
+            kwargs[parameter] = value
+            validate("situv2", **kwargs)
+
+
+def test_stage1_silu_ignores_situv2_betas():
+    validate = _activation_parameter_validator()
+
+    for value in (math.nan, math.inf, -math.inf, 0.0, -1.0):
+        validate("silu", situ_beta=value, situ_linear_beta=value)
