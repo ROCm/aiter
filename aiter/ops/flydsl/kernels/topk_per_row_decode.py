@@ -17,15 +17,17 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
+
+# buffer_ops and vector come from aiter's own shims, not flydsl.expr: the flydsl
+# cleanup in #4501 dropped those from the stable interface.
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .tensor_shim import GTensor
 
