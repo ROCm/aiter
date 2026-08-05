@@ -2062,6 +2062,7 @@ namespace py = pybind11;
     m.def("moe_smoothquant_fwd", &moe_smoothquant_fwd);
 
 #define SAMPLE_PYBIND                                                                \
+    AITER_SET_STREAM_PYBIND;                                                         \
     m.def("greedy_sample", &aiter::greedy_sample, py::arg("out"), py::arg("input")); \
     m.def("random_sample_outer_exponential",                                         \
           &aiter::random_sample_outer_exponential,                                   \
@@ -2075,9 +2076,10 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("input"),                                                          \
           py::arg("temperature"),                                                    \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
     m.def("mixed_sample_outer_exponential",                                          \
           &aiter::mixed_sample_outer_exponential,                                    \
           py::arg("out"),                                                            \
@@ -2090,15 +2092,17 @@ namespace py = pybind11;
           py::arg("out"),                                                            \
           py::arg("input"),                                                          \
           py::arg("temperature"),                                                    \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);                                                   \
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);                                         \
     m.def("exponential",                                                             \
           &aiter::exponential,                                                       \
           py::arg("out"),                                                            \
-          py::arg("lambd")     = 1.0,                                                \
-          py::arg("generator") = std::nullopt,                                       \
-          py::arg("eps")       = 1e-10);
+          py::arg("lambd")         = 1.0,                                            \
+          py::arg("philox_seed")   = 0,                                              \
+          py::arg("philox_offset") = 0,                                              \
+          py::arg("eps")           = 1e-10);
 
 #define HIPBSOLGEMM_PYBIND                                                         \
     m.def("hipb_create_extension", &hipb_create_extension, "create_extension");    \
