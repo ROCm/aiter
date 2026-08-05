@@ -27,8 +27,8 @@ from aiter.ops.flydsl.kernels.gemm_decode_persistent import (
 )
 
 pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950",
-    reason="persistent BF16 decode requires gfx950",
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="persistent BF16 decode requires gfx942 or gfx950",
 )
 
 ATOL = 0.125
@@ -43,7 +43,13 @@ CORRECTNESS_CASES = (
     (1, 7168, 896),
     (4, 7168, 896),
 )
-PROVIDERS = ("persistent", "direct", "reference")
+PROVIDERS = (
+    "persistent",
+    "direct",
+    "aiter_wvsplitk",
+    "hipblaslt",
+    "reference",
+)
 
 
 def _make_tensors(m: int, n: int, k: int, seed: int = 0):
@@ -107,7 +113,7 @@ def test_persistent_wrapper_validates_tensor_contract():
         )
 
 
-@pytest.mark.parametrize("cache_modifier", [0, 0x2000])
+@pytest.mark.parametrize("cache_modifier", [0, 0x2])
 def test_persistent_b_cache_modifier(cache_modifier):
     m, n, k = 1, 33, 128
     a, b, c, reference = _make_tensors(m, n, k)
@@ -127,6 +133,49 @@ def test_persistent_b_cache_modifier(cache_modifier):
     _assert_correct(c, reference)
 
 
+def test_persistent_rejects_unsupported_cache_policy():
+    with pytest.raises(ValueError, match="unsupported cache policy"):
+        PersistentDecodeConfig(b_cache_modifier=0x2000).validate(m=1, k=128)
+
+
+def test_gfx942_long_k_selector():
+    if get_gfx() != "gfx942":
+        pytest.skip("gfx942-specific measured selector")
+
+    assert select_persistent_decode_config(1, 6288, 7168, 304) == (
+        PersistentDecodeConfig(
+            waves_per_workgroup=16,
+            columns_per_wave=4,
+            preload_b_tile=True,
+        )
+    )
+    assert select_persistent_decode_config(1, 20480, 7168, 304) == (
+        PersistentDecodeConfig(
+            waves_per_workgroup=12,
+            columns_per_wave=2,
+            preload_b_tile=True,
+        )
+    )
+    assert select_persistent_decode_config(1, 16384, 4096, 304) == (
+        PersistentDecodeConfig(
+            waves_per_workgroup=12,
+            columns_per_wave=2,
+        )
+    )
+    assert select_persistent_decode_config(4, 6288, 7168, 304) == (
+        PersistentDecodeConfig(
+            waves_per_workgroup=4,
+            columns_per_wave=1,
+        )
+    )
+    assert select_persistent_decode_config(4, 8448, 7168, 304) == (
+        PersistentDecodeConfig(
+            waves_per_workgroup=12,
+            columns_per_wave=4,
+        )
+    )
+
+
 def test_persistent_geometry_graph_stream_and_ir_contracts():
     m, n, k = 1, 33, 256
     a, b, c, reference = _make_tensors(m, n, k)
@@ -136,7 +185,7 @@ def test_persistent_geometry_graph_stream_and_ir_contracts():
         columns_per_wave=2,
         workgroups_per_cu=4,
         waves_per_eu=1,
-        b_cache_modifier=0x2000,
+        b_cache_modifier=0x2,
     )
     launcher = compile_gemm_decode_persistent_bf16(
         m,
@@ -176,7 +225,7 @@ def test_persistent_geometry_graph_stream_and_ir_contracts():
         attr_offset,
     )
     assert re.search(
-        r"rocdl\.raw\.ptr\.buffer\.load[^\n]*%c8192",
+        r"rocdl\.raw\.ptr\.buffer\.load[^\n]*%c2",
         source_ir,
     )
 
@@ -209,7 +258,34 @@ def _prepare_provider(provider, a, b, c, m, n, k, config, reference_library):
             return c
 
         return run, None
+    if provider == "aiter_wvsplitk":
+        if k % 8 != 0:
+            return None, "requires K divisible by 8"
+        if m > 4:
+            return None, "supports M in [1, 4]"
+        from aiter.ops.custom import wvSpltK
+
+        num_cus = torch.cuda.get_device_properties(0).multi_processor_count
+
+        def run(_stream=None):
+            wvSpltK(b, a, c, m, num_cus)
+            return c
+
+        return run, None
+    if provider == "hipblaslt":
+        torch.backends.cuda.preferred_blas_library("hipblaslt")
+        b_transposed = b.T
+
+        def run(_stream=None):
+            torch.mm(a, b_transposed, out=c)
+            return c
+
+        return run, None
     if provider == "reference":
+        if k % 8 != 0:
+            return None, "requires K divisible by 8"
+        if m > 5:
+            return None, "supports M in [1, 5]"
         op = _load_reference_op(reference_library)
         num_cus = torch.cuda.get_device_properties(0).multi_processor_count
 
@@ -273,8 +349,9 @@ def _format_samples(samples):
 def _benchmark(args):
     for n, k in args.shape:
         for m in args.m:
+            num_cus = torch.cuda.get_device_properties(0).multi_processor_count
             config = (
-                select_persistent_decode_config(m, n, k)
+                select_persistent_decode_config(m, n, k, num_cus)
                 if args.auto_config
                 else PersistentDecodeConfig(
                     waves_per_workgroup=args.waves,
@@ -282,10 +359,11 @@ def _benchmark(args):
                     workgroups_per_cu=args.workgroups_per_cu,
                     waves_per_eu=args.waves_per_eu,
                     b_cache_modifier=(
-                        0x2000
+                        0
                         if args.b_cache_modifier is None
                         else args.b_cache_modifier
                     ),
+                    preload_b_tile=args.preload_b_tile,
                 )
             )
             if args.auto_config and args.b_cache_modifier is not None:
@@ -307,6 +385,12 @@ def _benchmark(args):
                     config,
                     args.reference_library,
                 )
+                if run is None:
+                    print(
+                        f"m={m} n={n} k={k} provider={provider} "
+                        f"SKIP {launcher}"
+                    )
+                    continue
                 output = run()
                 torch.cuda.synchronize()
                 _assert_correct(output, reference)
@@ -345,7 +429,7 @@ def main():
         choices=PROVIDERS,
         default=list(PROVIDERS),
     )
-    parser.add_argument("--waves", type=int, choices=(4, 8, 16), default=16)
+    parser.add_argument("--waves", type=int, choices=range(4, 17), default=16)
     parser.add_argument("--columns", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument(
         "--auto-config",
@@ -359,6 +443,7 @@ def main():
         default=1,
     )
     parser.add_argument("--waves-per-eu", type=int, default=0)
+    parser.add_argument("--preload-b-tile", action="store_true")
     parser.add_argument(
         "--b-cache-modifier",
         type=lambda value: int(value, 0),

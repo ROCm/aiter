@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from flydsl.runtime.device import get_rocm_arch
+
+CACHE_POLICY_DEFAULT = 0
+CACHE_POLICY_NON_TEMPORAL = 0x2
+_CACHE_POLICY_MASK = 0x13
 
 
 def _storage_range(tensor: torch.Tensor) -> tuple[int, int]:
@@ -18,6 +22,14 @@ def _overlaps(lhs: torch.Tensor, rhs: torch.Tensor) -> bool:
     lhs_begin, lhs_end = _storage_range(lhs)
     rhs_begin, rhs_end = _storage_range(rhs)
     return lhs_begin < rhs_end and rhs_begin < lhs_end
+
+
+def validate_cache_policy(cache_policy: int) -> None:
+    """Reject cache-policy bits that gfx942 lowering would silently discard."""
+    if not isinstance(cache_policy, int):
+        raise TypeError("cache policy must be an integer")
+    if cache_policy < 0 or cache_policy & ~_CACHE_POLICY_MASK:
+        raise ValueError(f"unsupported cache policy: {cache_policy:#x}")
 
 
 def validate_gemm_decode_tensors(
@@ -60,5 +72,6 @@ def validate_gemm_decode_tensors(
 
     if _overlaps(C, A) or _overlaps(C, B):
         raise ValueError("C must not overlap A or B")
-    if get_gfx() != "gfx950":
-        raise ValueError(f"decode GEMM requires gfx950, got {get_gfx()}")
+    gfx = get_rocm_arch()
+    if gfx not in ("gfx942", "gfx950"):
+        raise ValueError(f"decode GEMM requires gfx942 or gfx950, got {gfx}")

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: MIT
 
-"""Persistent multi-wave BF16 decode GEMM for gfx950.
+"""Persistent multi-wave BF16 decode GEMM for gfx942 and gfx950.
 
 The kernel computes ``C[M, N] = A[M, K] @ B[N, K].T`` for ``M <= 4``.
 One workgroup stages the complete activation matrix in right-sized LDS, then
-its waves persistently traverse output columns. Each wave uses the gfx950
+its waves persistently traverse output columns. Each wave uses the shared
 4x4x4 BF16 MFMA atom and a DPP-only reduction before deterministic BF16 stores.
 """
 
@@ -21,17 +21,23 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as _arith_dialect
 from flydsl._mlir.dialects import scf
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, vector
+from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
 from flydsl.expr.arith import ArithValue
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, Int32
 from flydsl.runtime.device import get_rocm_arch
 from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP, SmemAllocator, SmemPtr
 
-from .gemm_decode_common import validate_gemm_decode_tensors
+from .gemm_decode_common import (
+    CACHE_POLICY_DEFAULT,
+    validate_cache_policy,
+    validate_gemm_decode_tensors,
+)
 from .tensor_shim import GTensor, STensor
 
 WAVE_SIZE = 64
 MFMA_K = 4
+K_CHUNK = 8
+K_UNROLL = 2
 STAGE_VECTOR = 8
 DTYPE_BYTES = 2
 
@@ -44,21 +50,29 @@ class PersistentDecodeConfig:
     columns_per_wave: int = 1
     workgroups_per_cu: int = 1
     waves_per_eu: int = 0
-    b_cache_modifier: int = 0x2000
+    b_cache_modifier: int = CACHE_POLICY_DEFAULT
+    preload_b_tile: bool = False
 
-    def validate(self, *, m: int, k: int) -> None:
-        if self.waves_per_workgroup not in (4, 8, 16):
-            raise ValueError("waves_per_workgroup must be one of 4, 8, or 16")
+    def validate(self, *, m: int, k: int, gpu_arch: str | None = None) -> None:
+        if not 4 <= self.waves_per_workgroup <= 16:
+            raise ValueError("waves_per_workgroup must be in [4, 16]")
         if self.columns_per_wave not in (1, 2, 4):
             raise ValueError("columns_per_wave must be one of 1, 2, or 4")
         if self.workgroups_per_cu not in (1, 2, 4):
             raise ValueError("workgroups_per_cu must be one of 1, 2, or 4")
         if self.waves_per_eu < 0:
             raise ValueError("waves_per_eu must be non-negative")
-        lds_bytes = _align_up(m * _staged_k(k) * DTYPE_BYTES, 128)
-        if lds_bytes * self.workgroups_per_cu > SMEM_CAPACITY_MAP["gfx950"]:
+        validate_cache_policy(self.b_cache_modifier)
+        if gpu_arch is None:
+            gpu_arch = get_rocm_arch()
+        if gpu_arch not in ("gfx942", "gfx950"):
             raise ValueError(
-                "requested workgroups_per_cu exceeds the gfx950 LDS capacity"
+                f"persistent BF16 decode requires gfx942 or gfx950, got {gpu_arch}"
+            )
+        lds_bytes = _align_up(m * _staged_k(k) * DTYPE_BYTES, 128)
+        if lds_bytes * self.workgroups_per_cu > SMEM_CAPACITY_MAP[gpu_arch]:
+            raise ValueError(
+                f"requested workgroups_per_cu exceeds the {gpu_arch} LDS capacity"
             )
 
 
@@ -82,15 +96,54 @@ def select_persistent_decode_config(
     m: int,
     n: int,
     k: int,
+    num_cus: int = 304,
 ) -> PersistentDecodeConfig:
-    """Return the conservative winner from the bounded gfx950 sweep."""
-    del n
+    """Return a conservative config from the bounded cross-arch sweep."""
     if k <= 1024:
         if m == 1:
             return PersistentDecodeConfig(waves_per_workgroup=8)
         return PersistentDecodeConfig(
             waves_per_workgroup=16,
             workgroups_per_cu=2,
+        )
+    if get_rocm_arch() == "gfx942":
+        if n < 4096:
+            return PersistentDecodeConfig(
+                waves_per_workgroup=16,
+                columns_per_wave=1,
+            )
+        if (m, n, k) == (4, 6288, 7168):
+            return PersistentDecodeConfig(
+                waves_per_workgroup=4,
+                columns_per_wave=1,
+            )
+        if (m, n, k) == (4, 8448, 7168):
+            return PersistentDecodeConfig(
+                waves_per_workgroup=12,
+                columns_per_wave=4,
+            )
+        if m == 1:
+            columns = 2 if n >= 16384 else 4
+        elif m == 4 and n < 8192:
+            columns = 2
+        else:
+            columns = 4
+        if m == 1 and k >= 4096 and columns == 2:
+            active_waves = 12
+        else:
+            active_waves = (
+                min(16, max(4, _ceil_div(n, num_cus * columns)))
+                if columns == 2
+                else 16
+            )
+        return PersistentDecodeConfig(
+            waves_per_workgroup=active_waves,
+            columns_per_wave=columns,
+            preload_b_tile=(
+                m == 1
+                and k == 7168
+                and n in (6288, 20480)
+            ),
         )
     return PersistentDecodeConfig(
         waves_per_workgroup=16,
@@ -127,7 +180,7 @@ def _dpp_move_f32(value, control: int):
 def _mfma_4x4x4_bf16(a_fragment, b_fragment, accumulator):
     a_i16 = vector.bitcast(T.vec(4, T.i16), a_fragment)
     b_i16 = vector.bitcast(T.vec(4, T.i16), b_fragment)
-    # FlyDSL has no matching high-level MMA atom for this gfx950 instruction.
+    # FlyDSL has no matching high-level MMA atom for this shared instruction.
     return fx.rocdl.mfma_f32_4x4x4bf16_1k_(
         T.vec(4, T.f32),
         _raw(a_i16),
@@ -156,47 +209,73 @@ def _reduce_mfma_scalar(accumulator):
     return _add_f32(result, _dpp_move_f32(result, 0x143))
 
 
-def _masked_bf16x4(
+def _masked_bf16x8(
     resource,
     row_base,
     column_base,
+    valid,
     row_size: int,
     cache_modifier: int,
 ):
-    zero = arith.constant(0.0, type=T.bf16)
-    values = []
-    for i in range_constexpr(MFMA_K):
-        column = column_base + fx.Int32(i)
-        valid = column < fx.Int32(row_size)
-        safe_column = ArithValue(_raw(valid)).select(column, fx.Int32(0))
-        loaded = buffer_ops.buffer_load(
-            resource,
-            row_base + safe_column,
-            vec_width=1,
-            dtype=T.bf16,
-            cache_modifier=cache_modifier,
-        )
-        values.append(ArithValue(_raw(valid)).select(loaded, zero))
-    return vector.from_elements(T.vec(MFMA_K, T.bf16), values)
+    if row_size % K_CHUNK:
+        zero = arith.constant(0.0, type=T.bf16)
+        values = []
+        for i in range_constexpr(K_CHUNK):
+            column = column_base + fx.Int32(i)
+            element_valid = valid & (column < fx.Int32(row_size))
+            safe_column = ArithValue(_raw(element_valid)).select(
+                column,
+                fx.Int32(0),
+            )
+            loaded = buffer_ops.buffer_load(
+                resource,
+                row_base + safe_column,
+                vec_width=1,
+                dtype=T.bf16,
+                cache_modifier=cache_modifier,
+            )
+            values.append(
+                ArithValue(_raw(element_valid)).select(loaded, zero)
+            )
+        return vector.from_elements(T.vec(K_CHUNK, T.bf16), values)
+
+    safe_column = ArithValue(_raw(valid)).select(column_base, fx.Int32(0))
+    loaded = buffer_ops.buffer_load(
+        resource,
+        row_base + safe_column,
+        vec_width=K_CHUNK,
+        dtype=T.bf16,
+        cache_modifier=cache_modifier,
+    )
+    zero = arith.constant_vector(0.0, T.vec(K_CHUNK, T.bf16))
+    return ArithValue(_raw(valid)).select(loaded, zero)
+
+
+def _bf16x4_fragment(chunk, offset: int):
+    return vector.extract_strided_slice(
+        T.vec(MFMA_K, T.bf16),
+        chunk,
+        offsets=[offset],
+        sizes=[MFMA_K],
+        strides=[1],
+    )
 
 
 @functools.lru_cache(maxsize=512)
-def compile_gemm_decode_persistent_bf16(
+def _compile_gemm_decode_persistent_bf16(
     m: int,
     n: int,
     k: int,
     num_cus: int,
-    config: PersistentDecodeConfig = DEFAULT_CONFIG,
+    config: PersistentDecodeConfig,
+    gpu_arch: str,
 ):
     """Compile one shape/configuration of the persistent decode kernel."""
     if not (1 <= m <= 4):
         raise ValueError("persistent BF16 decode supports m in [1, 4]")
     if n <= 0 or k <= 0 or num_cus <= 0:
         raise ValueError("n, k, and num_cus must be positive")
-    config.validate(m=m, k=k)
-    gpu_arch = get_rocm_arch()
-    if gpu_arch != "gfx950":
-        raise ValueError(f"persistent BF16 decode requires gfx950, got {gpu_arch}")
+    config.validate(m=m, k=k, gpu_arch=gpu_arch)
 
     waves = config.waves_per_workgroup
     columns = config.columns_per_wave
@@ -205,8 +284,10 @@ def compile_gemm_decode_persistent_bf16(
     logical_workgroups = _ceil_div(n, columns_per_workgroup)
     grid_workgroups = min(logical_workgroups, num_cus * config.workgroups_per_cu)
     persistent_turns = _ceil_div(logical_workgroups, grid_workgroups)
-    has_k_tail = k % (WAVE_SIZE * MFMA_K) != 0
-    full_k_tiles = k // (WAVE_SIZE * MFMA_K)
+    has_k_tail = k % (WAVE_SIZE * K_CHUNK) != 0
+    full_k_chunks = k // (WAVE_SIZE * K_CHUNK)
+    k_unroll = K_UNROLL if columns == 2 or m == 1 else 1
+    full_k_groups = _ceil_div(full_k_chunks, k_unroll)
     staged_k = _staged_k(k)
     activation_elements = m * staged_k
     activation_vectors_per_row = k // STAGE_VECTOR
@@ -238,6 +319,7 @@ def compile_gemm_decode_persistent_bf16(
         A: fx.Tensor,
         B: fx.Tensor,
         C: fx.Tensor,
+        full_k_groups_runtime: Int32,
     ):
         tid = fx.Int32(gpu.thread_idx.x)
         wave_id = tid // fx.Int32(WAVE_SIZE)
@@ -308,6 +390,93 @@ def compile_gemm_decode_persistent_bf16(
         column_stride = fx.Int32(grid_workgroups * columns_per_workgroup)
         acc_zero = arith.constant_vector(0.0, T.vec(4, T.f32))
 
+        def compute_full_k_group(
+            k_group_base,
+            accumulators,
+            safe_columns,
+            group_chunks,
+        ):
+            k_bases = [
+                k_group_base
+                + fx.Int32(unroll_i * WAVE_SIZE * K_CHUNK)
+                + lane * fx.Int32(K_CHUNK)
+                for unroll_i in range_constexpr(group_chunks)
+            ]
+            a_chunks = [
+                [
+                    a_smem.vec_load(
+                        (
+                            fx.Index(
+                                fx.Int32(row * staged_k)
+                                + k_bases[unroll_i]
+                            ),
+                        ),
+                        K_CHUNK,
+                    )
+                    for row in range_constexpr(m)
+                ]
+                for unroll_i in range_constexpr(group_chunks)
+            ]
+            preload_columns = 2 if config.preload_b_tile else 1
+            column_groups = _ceil_div(columns, preload_columns)
+            for column_group in range_constexpr(column_groups):
+                first_group_column = column_group * preload_columns
+                group_columns = min(
+                    preload_columns,
+                    columns - first_group_column,
+                )
+                # The c2 long-K path mirrors the native UNRL-major schedule,
+                # which lowers to progressive vmcnt waits. Keep the proven
+                # column-major c4 schedule unchanged.
+                fragment_order = (
+                    tuple(
+                        (unroll_i, group_col)
+                        for unroll_i in range_constexpr(group_chunks)
+                        for group_col in range_constexpr(group_columns)
+                    )
+                    if config.preload_b_tile and columns == 2
+                    else tuple(
+                        (unroll_i, group_col)
+                        for group_col in range_constexpr(group_columns)
+                        for unroll_i in range_constexpr(group_chunks)
+                    )
+                )
+                b_tile = {
+                    (unroll_i, group_col): b_global.vec_load(
+                        (
+                            safe_columns[first_group_column + group_col],
+                            k_bases[unroll_i],
+                        ),
+                        K_CHUNK,
+                    )
+                    for unroll_i, group_col in fragment_order
+                }
+                for unroll_i, group_col in fragment_order:
+                    column_i = first_group_column + group_col
+                    b_chunk = b_tile[(unroll_i, group_col)]
+                    for fragment_i in range_constexpr(
+                        K_CHUNK // MFMA_K
+                    ):
+                        fragment_offset = fragment_i * MFMA_K
+                        b_fragment = _bf16x4_fragment(
+                            b_chunk,
+                            fragment_offset,
+                        )
+                        for row in range_constexpr(m):
+                            acc_index = row * columns + column_i
+                            a_fragment = _bf16x4_fragment(
+                                a_chunks[unroll_i][row],
+                                fragment_offset,
+                            )
+                            accumulators[acc_index] = (
+                                _mfma_4x4x4_bf16(
+                                    a_fragment,
+                                    b_fragment,
+                                    accumulators[acc_index],
+                                )
+                            )
+            return accumulators
+
         for turn in range_constexpr(persistent_turns):
             column_base = first_column + fx.Int32(turn) * column_stride
             safe_columns = []
@@ -319,88 +488,136 @@ def compile_gemm_decode_persistent_bf16(
                 safe_columns.append(safe)
                 column_valid.append(valid)
 
-            accumulators = [acc_zero] * (m * columns)
-            for k_tile in range_constexpr(full_k_tiles):
-                k_base = fx.Int32(k_tile * WAVE_SIZE * MFMA_K) + lane * fx.Int32(
-                    MFMA_K
-                )
-                a_fragments = [
-                    a_smem.vec_load(
-                        (fx.Index(fx.Int32(row * staged_k) + k_base),),
-                        MFMA_K,
-                    )
-                    for row in range_constexpr(m)
-                ]
-                for column_i in range_constexpr(columns):
-                    b_fragment = b_global.vec_load(
-                        (safe_columns[column_i], k_base), MFMA_K
-                    )
-                    for row in range_constexpr(m):
-                        acc_index = row * columns + column_i
-                        accumulators[acc_index] = _mfma_4x4x4_bf16(
-                            a_fragments[row],
-                            b_fragment,
-                            accumulators[acc_index],
+            logical_workgroup = (
+                gpu.block_idx.x + fx.Int32(turn * grid_workgroups)
+            )
+            active_turn = scf.IfOp(
+                _raw(logical_workgroup < fx.Int32(logical_workgroups)),
+                results_=[],
+                has_else=False,
+            )
+            with ir.InsertionPoint(active_turn.then_block):
+                accumulators = [acc_zero] * (m * columns)
+                if const_expr(
+                    config.preload_b_tile
+                    and columns == 2
+                    and full_k_chunks % k_unroll == 0
+                ):
+                    init_state = [fx.Int32(0)] + accumulators
+                    for _, state in range(
+                        0,
+                        full_k_groups_runtime,
+                        1,
+                        init=init_state,
+                    ):
+                        k_group_base = state[0]
+                        accumulators = compute_full_k_group(
+                            k_group_base,
+                            list(state[1:]),
+                            safe_columns,
+                            k_unroll,
+                        )
+                        next_k_group_base = (
+                            k_group_base
+                            + fx.Int32(
+                                k_unroll * WAVE_SIZE * K_CHUNK
+                            )
+                        )
+                        loop_results = yield [
+                            next_k_group_base,
+                            *accumulators,
+                        ]
+                    accumulators = list(loop_results[1:])
+                else:
+                    for k_group in range_constexpr(full_k_groups):
+                        group_chunks = min(
+                            k_unroll,
+                            full_k_chunks - k_group * k_unroll,
+                        )
+                        accumulators = compute_full_k_group(
+                            fx.Int32(
+                                k_group
+                                * k_unroll
+                                * WAVE_SIZE
+                                * K_CHUNK
+                            ),
+                            accumulators,
+                            safe_columns,
+                            group_chunks,
                         )
 
-            if has_k_tail:
-                k_base = fx.Int32(full_k_tiles * WAVE_SIZE * MFMA_K) + lane * fx.Int32(
-                    MFMA_K
-                )
-                a_fragments = []
-                for row in range_constexpr(m):
+                if has_k_tail:
+                    k_base = fx.Int32(
+                        full_k_chunks * WAVE_SIZE * K_CHUNK
+                    ) + lane * fx.Int32(K_CHUNK)
                     valid_base = k_base < fx.Int32(k)
                     safe_k_base = ArithValue(_raw(valid_base)).select(
                         k_base,
-                        fx.Int32(k),
+                        fx.Int32(0),
                     )
-                    a_fragments.append(
-                        a_smem.vec_load(
-                            (
-                                fx.Index(
-                                    fx.Int32(row * staged_k) + safe_k_base
-                                ),
-                            ),
-                            MFMA_K,
-                        )
-                    )
-                for column_i in range_constexpr(columns):
-                    b_row_base = safe_columns[column_i] * fx.Int32(k)
-                    b_fragment = _masked_bf16x4(
-                        b_global.rsrc,
-                        b_row_base,
-                        k_base,
-                        k,
-                        config.b_cache_modifier,
-                    )
+                    a_chunks = []
                     for row in range_constexpr(m):
-                        acc_index = row * columns + column_i
-                        accumulators[acc_index] = _mfma_4x4x4_bf16(
-                            a_fragments[row],
-                            b_fragment,
-                            accumulators[acc_index],
+                        a_chunks.append(
+                            a_smem.vec_load(
+                                (
+                                    fx.Index(
+                                        fx.Int32(row * staged_k) + safe_k_base
+                                    ),
+                                ),
+                                K_CHUNK,
+                            )
                         )
+                    for column_i in range_constexpr(columns):
+                        b_row_base = safe_columns[column_i] * fx.Int32(k)
+                        b_chunk = _masked_bf16x8(
+                            b_global.rsrc,
+                            b_row_base,
+                            k_base,
+                            valid_base,
+                            k,
+                            config.b_cache_modifier,
+                        )
+                        for fragment_i in range_constexpr(K_CHUNK // MFMA_K):
+                            fragment_offset = fragment_i * MFMA_K
+                            b_fragment = _bf16x4_fragment(
+                                b_chunk, fragment_offset
+                            )
+                            for row in range_constexpr(m):
+                                acc_index = row * columns + column_i
+                                a_fragment = _bf16x4_fragment(
+                                    a_chunks[row], fragment_offset
+                                )
+                                accumulators[acc_index] = _mfma_4x4x4_bf16(
+                                    a_fragment,
+                                    b_fragment,
+                                    accumulators[acc_index],
+                                )
 
-            reduced = [
-                _reduce_mfma_scalar(accumulator) for accumulator in accumulators
-            ]
-            for row in range_constexpr(m):
-                for column_i in range_constexpr(columns):
-                    store_valid = (lane == fx.Int32(WAVE_SIZE - 1)) & column_valid[
-                        column_i
-                    ]
-                    store_if = scf.IfOp(
-                        _raw(store_valid),
-                        results_=[],
-                        has_else=False,
-                    )
-                    with ir.InsertionPoint(store_if.then_block):
-                        output = _arith_dialect.TruncFOp(
-                            T.bf16,
-                            reduced[row * columns + column_i],
-                        ).result
-                        c_global[row, column_base + fx.Int32(column_i)] = output
-                        scf.YieldOp([])
+                reduced = [
+                    _reduce_mfma_scalar(accumulator)
+                    for accumulator in accumulators
+                ]
+                for row in range_constexpr(m):
+                    for column_i in range_constexpr(columns):
+                        store_valid = (
+                            lane == fx.Int32(WAVE_SIZE - 1)
+                        ) & column_valid[column_i]
+                        store_if = scf.IfOp(
+                            _raw(store_valid),
+                            results_=[],
+                            has_else=False,
+                        )
+                        with ir.InsertionPoint(store_if.then_block):
+                            output = _arith_dialect.TruncFOp(
+                                T.bf16,
+                                reduced[row * columns + column_i],
+                            ).result
+                            c_global[
+                                row,
+                                column_base + fx.Int32(column_i),
+                            ] = output
+                            scf.YieldOp([])
+                scf.YieldOp([])
 
     @flyc.jit
     def launch(
@@ -421,6 +638,7 @@ def compile_gemm_decode_persistent_bf16(
             A,
             B,
             C,
+            fx.Int32(full_k_groups),
             value_attrs=attrs,
         ).launch(
             grid=(grid_workgroups, 1, 1),
@@ -432,6 +650,24 @@ def compile_gemm_decode_persistent_bf16(
     launch.lds_bytes = _align_up(activation_elements * DTYPE_BYTES, 128)
     launch.grid_workgroups = grid_workgroups
     return launch
+
+
+def compile_gemm_decode_persistent_bf16(
+    m: int,
+    n: int,
+    k: int,
+    num_cus: int,
+    config: PersistentDecodeConfig = DEFAULT_CONFIG,
+):
+    """Compile one shape/config with the target architecture in the cache key."""
+    return _compile_gemm_decode_persistent_bf16(
+        m,
+        n,
+        k,
+        num_cus,
+        config,
+        get_rocm_arch(),
+    )
 
 
 def gemm_decode_persistent_bf16(
@@ -449,7 +685,7 @@ def gemm_decode_persistent_bf16(
     """Launch a cached persistent BF16 decode kernel."""
     validate_gemm_decode_tensors(A, B, C, m, n, k)
     if config is None:
-        config = select_persistent_decode_config(m, n, k)
+        config = select_persistent_decode_config(m, n, k, num_cus)
     launcher = compile_gemm_decode_persistent_bf16(m, n, k, num_cus, config)
     launcher(A, B, C, stream=stream)
     return C

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Correctness and benchmark coverage for the gfx950 BF16 decode GEMM."""
+"""Correctness and benchmark coverage for gfx942/gfx950 BF16 decode GEMM."""
 
 import argparse
 import statistics
@@ -20,6 +20,7 @@ from flydsl.expr.typing import T
 import aiter.ops.flydsl.kernels.gemm_decode_common as gemm_decode_common
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.gemm_decode import (
+    ContractionMode,
     GemmDecodeConfig,
     OutputRounding,
     ReductionMode,
@@ -27,12 +28,14 @@ from aiter.ops.flydsl.kernels.gemm_decode import (
     _launch_gemm_decode_bf16,
     gemm_decode_bf16,
     gemm_decode_bf16_configured,
+    pack_bf16x2,
     select_gemm_decode_config,
+    unpack_bf16x2_f32,
 )
 
 pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950",
-    reason="gemm_decode_bf16 requires gfx950",
+    get_gfx() not in ("gfx942", "gfx950"),
+    reason="gemm_decode_bf16 requires gfx942 or gfx950",
 )
 
 ATOL = 0.125
@@ -140,8 +143,8 @@ def test_gemm_decode_validates_tensor_contract(monkeypatch):
     with pytest.raises(ValueError, match="C must not overlap"):
         gemm_decode_bf16(A, B, A, M, N, K)
 
-    monkeypatch.setattr(gemm_decode_common, "get_gfx", lambda: "gfx942")
-    with pytest.raises(ValueError, match="requires gfx950"):
+    monkeypatch.setattr(gemm_decode_common, "get_rocm_arch", lambda: "gfx90a")
+    with pytest.raises(ValueError, match="requires gfx942 or gfx950"):
         gemm_decode_bf16(A, B, C, M, N, K)
 
 
@@ -158,6 +161,12 @@ def test_gemm_decode_validates_tensor_contract(monkeypatch):
             waves_per_eu=1,
             b_cache_modifier=0,
             reduction=ReductionMode.BPERMUTE_REFERENCE,
+        ),
+        GemmDecodeConfig(
+            kvec=8,
+            m_per_wave=1,
+            n_per_wave=1,
+            contraction=ContractionMode.PACKED_F32,
         ),
     ],
 )
@@ -181,9 +190,37 @@ def test_gemm_decode_compile_time_axes(config):
     ref = (A.float() @ B.float().T).bfloat16()
     assert torch.isfinite(C).all()
     torch.testing.assert_close(C, ref, atol=ATOL, rtol=RTOL)
+    if config.contraction == ContractionMode.PACKED_F32:
+        source_ir = _launch_gemm_decode_bf16._last_compiled[1].source_ir
+        assert "v_pk_fma_f32" in source_ir
 
 
 def test_gemm_decode_config_selection():
+    if get_gfx() == "gfx942":
+        assert select_gemm_decode_config(1, 7168, 896) == GemmDecodeConfig(
+            kvec=8,
+            m_per_wave=1,
+            n_per_wave=1,
+            waves_per_eu=4,
+            contraction=ContractionMode.SCALAR_F32,
+        )
+        assert select_gemm_decode_config(4, 16384, 7168) == GemmDecodeConfig(
+            kvec=8,
+            m_per_wave=4,
+            n_per_wave=2,
+            waves_per_eu=4,
+            contraction=ContractionMode.PACKED_F32,
+        )
+        assert select_gemm_decode_config(4, 65, 128).n_per_wave == 1
+        assert (
+            select_gemm_decode_config(1, 16384, 4096).b_cache_modifier
+            == 0x2
+        )
+        assert (
+            select_gemm_decode_config(4, 16384, 7168).b_cache_modifier
+            == 0
+        )
+        return
     assert select_gemm_decode_config(1, 7168, 896) == GemmDecodeConfig(
         kvec=2,
         m_per_wave=1,
@@ -196,6 +233,86 @@ def test_gemm_decode_config_selection():
         reduction=ReductionMode.BPERMUTE_REFERENCE,
     )
     assert select_gemm_decode_config(4, 65, 128).n_per_wave == 1
+
+
+def test_gemm_decode_rejects_unsupported_cache_policy():
+    with pytest.raises(ValueError, match="unsupported cache policy"):
+        GemmDecodeConfig(b_cache_modifier=0x2000).validate()
+
+
+def test_gfx942_rejects_bf16_dot2():
+    if get_gfx() != "gfx942":
+        pytest.skip("gfx942-specific instruction guard")
+    M, N, K = 1, 64, 128
+    A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
+    C = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    config = GemmDecodeConfig(
+        kvec=2,
+        m_per_wave=1,
+        n_per_wave=1,
+        contraction=ContractionMode.DOT2_BF16,
+    )
+    with pytest.raises(ValueError, match="dot2_bf16 contraction requires gfx950"):
+        gemm_decode_bf16_configured(A, B, C, M, N, K, config)
+
+
+def test_bf16_pair_expansion_is_bit_exact():
+    @flyc.kernel
+    def expand_kernel(
+        src: fx.Tensor,
+        dst: fx.Tensor,
+        pairs: fx.Constexpr[int],
+    ):
+        pair = gpu.thread_idx.x
+        if pair < fx.Int32(pairs):
+            src_rsrc = buffer_ops.create_buffer_resource(src)
+            dst_rsrc = buffer_ops.create_buffer_resource(dst)
+            lo = buffer_ops.buffer_load(
+                src_rsrc,
+                pair * fx.Int32(2),
+                vec_width=1,
+                dtype=T.bf16,
+            )
+            hi = buffer_ops.buffer_load(
+                src_rsrc,
+                pair * fx.Int32(2) + fx.Int32(1),
+                vec_width=1,
+                dtype=T.bf16,
+            )
+            expanded = unpack_bf16x2_f32(pack_bf16x2(lo, hi))
+            buffer_ops.buffer_store(
+                expanded[0],
+                dst_rsrc,
+                pair * fx.Int32(2),
+            )
+            buffer_ops.buffer_store(
+                expanded[1],
+                dst_rsrc,
+                pair * fx.Int32(2) + fx.Int32(1),
+            )
+
+    @flyc.jit
+    def expand(
+        src: fx.Tensor,
+        dst: fx.Tensor,
+        pairs: fx.Constexpr[int],
+    ):
+        expand_kernel(src, dst, pairs).launch(
+            grid=(1, 1, 1),
+            block=(64, 1, 1),
+        )
+
+    bits = torch.tensor(
+        [0x0000, 0x8000, 0x0001, 0x8001, 0x3F80, 0x7F80, 0xFF80, 0x7FC1],
+        dtype=torch.uint16,
+    )
+    src = bits.view(torch.bfloat16).cuda()
+    dst = torch.empty(bits.numel(), dtype=torch.float32, device="cuda")
+    expand(src, dst, bits.numel() // 2)
+    torch.cuda.synchronize()
+    expected_bits = (bits.to(torch.int32) << 16).view(torch.float32)
+    assert torch.equal(dst.cpu().view(torch.int32), expected_bits.view(torch.int32))
 
 
 def test_waves_per_eu_is_attached_to_direct_gpu_func():
@@ -220,6 +337,9 @@ def test_waves_per_eu_is_attached_to_direct_gpu_func():
         0,
         attr_offset,
     )
+    if get_gfx() == "gfx942":
+        assert "llvm.intr.fma" in source_ir
+        assert "v_dot2_f32_bf16" not in source_ir
 
 
 def test_gemm_decode_graph_replay_on_non_default_stream():
@@ -335,6 +455,8 @@ def test_truncation_conversion_finite_values():
 
 
 def test_stochastic_conversion_is_repeatable_and_bounded():
+    if get_gfx() != "gfx950":
+        pytest.skip("stochastic BF16 conversion requires gfx950")
     midpoint = 1.00390625
     values = torch.full((64,), midpoint, dtype=torch.float32)
     first = _convert_values(values, OutputRounding.STOCHASTIC)

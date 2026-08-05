@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 #
-# gfx950-only BF16 warp-per-scalar GEMM for autoregressive decode.
+# gfx942/gfx950 BF16 warp-per-scalar GEMM for autoregressive decode.
 #
 # C[M, N] = A[M, K] @ B[N, K]^T   (B row-major weight matrix)
 #
 # One wavefront computes a compile-time MxN register tile:
 #   - 64 lanes split K, each owns KVEC adjacent BF16 elements per full iteration
-#   - Accumulate via v_dot2_f32_bf16 (2 BF16 MACs -> FP32)
+#   - gfx950 accumulates with v_dot2_f32_bf16 (2 BF16 MACs -> FP32)
+#   - gfx942 expands BF16 exactly and accumulates with scalar FP32 FMA
 #   - A and B vectors are reused across the register tile
 #   - K tails use wide loads plus an in-kernel masked BF16-pair remainder
 #   - Partial output-column tiles select an exact NP=1 instance
@@ -26,12 +27,18 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as _arith_dialect
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects import scf as _scf
-from flydsl.expr import buffer_ops, gpu, range_constexpr
+from flydsl.expr import arith, buffer_ops, gpu, range_constexpr, vector
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
+from flydsl.runtime.device import get_rocm_arch
 
-from .gemm_decode_common import validate_gemm_decode_tensors
+from .gemm_decode_common import (
+    CACHE_POLICY_DEFAULT,
+    CACHE_POLICY_NON_TEMPORAL,
+    validate_cache_policy,
+    validate_gemm_decode_tensors,
+)
 
 
 class OutputRounding(str, Enum):
@@ -50,6 +57,15 @@ class ReductionMode(str, Enum):
     BPERMUTE_REFERENCE = "bpermute_reference"
 
 
+class ContractionMode(str, Enum):
+    """Compile-time architecture-specific contraction choices."""
+
+    AUTO = "auto"
+    DOT2_BF16 = "dot2_bf16"
+    SCALAR_F32 = "scalar_f32"
+    PACKED_F32 = "packed_f32"
+
+
 @dataclass(frozen=True)
 class GemmDecodeConfig:
     """Compile-time axes for one direct-kernel instance."""
@@ -58,9 +74,10 @@ class GemmDecodeConfig:
     n_per_wave: int = 2
     m_per_wave: int = 4
     waves_per_eu: int = 2
-    b_cache_modifier: int = 0x2000
+    b_cache_modifier: int = CACHE_POLICY_DEFAULT
     reduction: ReductionMode = ReductionMode.DPP
     output_rounding: OutputRounding = OutputRounding.RNE
+    contraction: ContractionMode = ContractionMode.AUTO
 
     def validate(self) -> None:
         if self.kvec not in (2, 4, 8):
@@ -71,6 +88,9 @@ class GemmDecodeConfig:
             raise ValueError("m_per_wave must be one of 1, 2, or 4")
         if self.waves_per_eu <= 0:
             raise ValueError("waves_per_eu must be positive")
+        validate_cache_policy(self.b_cache_modifier)
+        if not isinstance(self.contraction, ContractionMode):
+            raise ValueError("contraction must be a ContractionMode")
 
 
 DEFAULT_CONFIG = GemmDecodeConfig()
@@ -133,6 +153,39 @@ def dot2_f32_bf16(acc: ir.Value, a_i32: ir.Value, b_i32: ir.Value) -> ir.Value:
         ir.F32Type.get(),
         [_to_ir(acc), _to_ir(a_i32), _to_ir(b_i32)],
         "v_dot2_f32_bf16 $0, $2, $3, $1",
+        "=v,0,v,v",
+        has_side_effects=False,
+    )
+
+
+def unpack_bf16x2_f32(packed) -> tuple[ir.Value, ir.Value]:
+    """Expand two packed BF16 values exactly into two FP32 values."""
+    packed = ArithValue(_to_ir(packed))
+    lo_bits = (packed & fx.Int32(0xFFFF)) << fx.Int32(16)
+    hi_bits = packed & fx.Int32(0xFFFF0000)
+    return (
+        _to_ir(ArithValue(lo_bits).bitcast(T.f32)),
+        _to_ir(ArithValue(hi_bits).bitcast(T.f32)),
+    )
+
+
+def scalar_fma_bf16x2(
+    acc: ir.Value,
+    a_pair: tuple[ir.Value, ir.Value],
+    b_pair: tuple[ir.Value, ir.Value],
+) -> ir.Value:
+    """Accumulate one exactly expanded BF16 pair with scalar FP32 FMAs."""
+    acc = _llvm.intr_fma(a_pair[0], b_pair[0], _to_ir(acc))
+    return _llvm.intr_fma(a_pair[1], b_pair[1], acc)
+
+
+def packed_fma_bf16x2(acc, a_pair, b_pair) -> ir.Value:
+    """Accumulate two expanded BF16 products with one packed FP32 FMA."""
+    packed_type = ir.VectorType.get([2], ir.F32Type.get())
+    return _llvm.inline_asm(
+        packed_type,
+        [_to_ir(acc), _to_ir(a_pair), _to_ir(b_pair)],
+        "v_pk_fma_f32 $0, $2, $3, $1",
         "=v,0,v,v",
         has_side_effects=False,
     )
@@ -298,8 +351,40 @@ def _make_kernel(config: GemmDecodeConfig):
     cache_modifier = config.b_cache_modifier
     reduction = config.reduction
     rounding = config.output_rounding
+    gfx = get_rocm_arch()
+    contraction = config.contraction
+    if contraction == ContractionMode.AUTO:
+        contraction = (
+            ContractionMode.DOT2_BF16
+            if gfx == "gfx950"
+            else ContractionMode.SCALAR_F32
+        )
+    if contraction == ContractionMode.DOT2_BF16 and gfx != "gfx950":
+        raise ValueError(f"dot2_bf16 contraction requires gfx950, got {gfx}")
+    use_packed = contraction == ContractionMode.PACKED_F32
+    acc_type = T.vec(2, T.f32) if use_packed else T.f32
     use_dpp = reduction == ReductionMode.DPP
     store_lane = 63 if use_dpp else 0
+
+    def zero_accumulator():
+        if use_packed:
+            return arith.constant_vector(0.0, T.vec(2, T.f32))
+        return _const_f32(0.0)
+
+    def prepare_pair(packed):
+        if contraction == ContractionMode.DOT2_BF16:
+            return packed
+        expanded = unpack_bf16x2_f32(packed)
+        if contraction == ContractionMode.PACKED_F32:
+            return vector.from_elements(T.vec(2, T.f32), list(expanded))
+        return expanded
+
+    def contract_pair(acc, a_pair, b_pair):
+        if contraction == ContractionMode.DOT2_BF16:
+            return dot2_f32_bf16(acc, a_pair, b_pair)
+        if contraction == ContractionMode.PACKED_F32:
+            return packed_fma_bf16x2(acc, a_pair, b_pair)
+        return scalar_fma_bf16x2(acc, a_pair, b_pair)
 
     @flyc.kernel
     def kernel(
@@ -324,7 +409,10 @@ def _make_kernel(config: GemmDecodeConfig):
             n_cols.append(n_col)
         n_load = n_cols
 
-        accs = [_const_f32(0.0) for _ in range_constexpr(mp * np)]
+        accs = [
+            zero_accumulator()
+            for _ in range_constexpr(mp * np)
+        ]
         k_tile = 64 * kvec
         npairs = kvec // 2
         for i in range_constexpr(K // k_tile):
@@ -344,17 +432,17 @@ def _make_kernel(config: GemmDecodeConfig):
             ]
             for pair in range_constexpr(npairs):
                 ap = [
-                    pack_bf16x2(av[2 * pair], av[2 * pair + 1])
+                    prepare_pair(pack_bf16x2(av[2 * pair], av[2 * pair + 1]))
                     for av in avs
                 ]
                 bp = [
-                    pack_bf16x2(bv[2 * pair], bv[2 * pair + 1])
+                    prepare_pair(pack_bf16x2(bv[2 * pair], bv[2 * pair + 1]))
                     for bv in bvs
                 ]
                 for row in range_constexpr(mp):
                     for col in range_constexpr(np):
                         idx = row * np + col
-                        accs[idx] = dot2_f32_bf16(
+                        accs[idx] = contract_pair(
                             accs[idx],
                             ap[row],
                             bp[col],
@@ -368,7 +456,7 @@ def _make_kernel(config: GemmDecodeConfig):
                 incoming_accs = tuple(accs)
                 vector_tail = _scf.IfOp(
                     _to_ir(lane < fx.Int32(tail_full_lanes)),
-                    results_=[T.f32] * len(accs),
+                    results_=[acc_type] * len(accs),
                     has_else=True,
                 )
                 with ir.InsertionPoint(vector_tail.then_block):
@@ -392,23 +480,27 @@ def _make_kernel(config: GemmDecodeConfig):
                     ]
                     for pair in range_constexpr(npairs):
                         ap = [
-                            pack_bf16x2(
-                                av[2 * pair],
-                                av[2 * pair + 1],
+                            prepare_pair(
+                                pack_bf16x2(
+                                    av[2 * pair],
+                                    av[2 * pair + 1],
+                                )
                             )
                             for av in avs
                         ]
                         bp = [
-                            pack_bf16x2(
-                                bv[2 * pair],
-                                bv[2 * pair + 1],
+                            prepare_pair(
+                                pack_bf16x2(
+                                    bv[2 * pair],
+                                    bv[2 * pair + 1],
+                                )
                             )
                             for bv in bvs
                         ]
                         for row in range_constexpr(mp):
                             for col in range_constexpr(np):
                                 idx = row * np + col
-                                accs[idx] = dot2_f32_bf16(
+                                accs[idx] = contract_pair(
                                     accs[idx],
                                     ap[row],
                                     bp[col],
@@ -425,36 +517,61 @@ def _make_kernel(config: GemmDecodeConfig):
                 )
                 for pair in range_constexpr(npairs):
                     ap = [
-                        _load_tail_pair(
-                            rsrc_a,
-                            row,
-                            K,
-                            tail_lane_base,
-                            pair,
+                        prepare_pair(
+                            _load_tail_pair(
+                                rsrc_a,
+                                row,
+                                K,
+                                tail_lane_base,
+                                pair,
+                            )
                         )
                         for row in m_rows
                     ]
                     bp = [
-                        _load_tail_pair(
-                            rsrc_b,
-                            col,
-                            K,
-                            tail_lane_base,
-                            pair,
-                            cache_modifier=cache_modifier,
+                        prepare_pair(
+                            _load_tail_pair(
+                                rsrc_b,
+                                col,
+                                K,
+                                tail_lane_base,
+                                pair,
+                                cache_modifier=cache_modifier,
+                            )
                         )
                         for col in n_cols
                     ]
                     for row in range_constexpr(mp):
                         for col in range_constexpr(np):
                             idx = row * np + col
-                            accs[idx] = dot2_f32_bf16(
+                            accs[idx] = contract_pair(
                                 accs[idx],
                                 ap[row],
                                 bp[col],
                             )
 
-        if use_dpp and K % kvec == 0:
+        if contraction == ContractionMode.PACKED_F32:
+            packed_accs = accs
+            accs = []
+            for packed_acc in packed_accs:
+                lo = vector.extract(
+                    packed_acc,
+                    static_position=[0],
+                    dynamic_position=[],
+                )
+                hi = vector.extract(
+                    packed_acc,
+                    static_position=[1],
+                    dynamic_position=[],
+                )
+                if use_dpp and K % kvec == 0:
+                    lo = wavefront_reduce_sum_f32(lo)
+                    hi = wavefront_reduce_sum_f32(hi)
+                else:
+                    lo = _bpermute_reduce_sum_f32(lo, lane)
+                    hi = _bpermute_reduce_sum_f32(hi, lane)
+                accs.append(_add_f32(lo, hi))
+        elif use_dpp and K % kvec == 0:
             accs = [wavefront_reduce_sum_f32(acc) for acc in accs]
         else:
             accs = [
@@ -480,6 +597,7 @@ def _make_kernel(config: GemmDecodeConfig):
 def get_gemm_decode_bf16(config: GemmDecodeConfig = DEFAULT_CONFIG):
     """Return a stable launch callable for ``config``."""
     config.validate()
+
     def launch(A, B, C, M, N, K, stream=fx.Stream(None)):
         return gemm_decode_bf16_configured(
             A,
@@ -510,6 +628,7 @@ def _launch_gemm_decode_bf16(
     cache_modifier: fx.Constexpr[int],
     reduction_code: fx.Constexpr[int],
     rounding_code: fx.Constexpr[int],
+    contraction_code: fx.Constexpr[int],
     stream: fx.Stream = fx.Stream(None),
 ):
     reduction = (
@@ -526,6 +645,15 @@ def _launch_gemm_decode_bf16(
         if rounding_code == 2
         else OutputRounding.STOCHASTIC
     )
+    contraction = (
+        ContractionMode.AUTO
+        if contraction_code == 0
+        else ContractionMode.DOT2_BF16
+        if contraction_code == 1
+        else ContractionMode.SCALAR_F32
+        if contraction_code == 2
+        else ContractionMode.PACKED_F32
+    )
     config = GemmDecodeConfig(
         kvec=kvec,
         n_per_wave=np,
@@ -534,6 +662,7 @@ def _launch_gemm_decode_bf16(
         b_cache_modifier=cache_modifier,
         reduction=reduction,
         output_rounding=rounding,
+        contraction=contraction,
     )
     kernel = _make_kernel(config)
     kernel(
@@ -562,6 +691,12 @@ def gemm_decode_bf16_configured(
 ):
     """Launch one explicit compile-time configuration."""
     validate_gemm_decode_tensors(A, B, C, M, N, K)
+    config.validate()
+    if (
+        config.output_rounding == OutputRounding.STOCHASTIC
+        and get_rocm_arch() != "gfx950"
+    ):
+        raise ValueError("stochastic BF16 conversion requires gfx950")
     if N % config.n_per_wave != 0:
         raise ValueError("N must be divisible by config.n_per_wave")
     if M % config.m_per_wave != 0:
@@ -573,6 +708,12 @@ def gemm_decode_bf16_configured(
         OutputRounding.TRUNCATE: 2,
         OutputRounding.STOCHASTIC: 3,
     }[config.output_rounding]
+    contraction_code = {
+        ContractionMode.AUTO: 0,
+        ContractionMode.DOT2_BF16: 1,
+        ContractionMode.SCALAR_F32: 2,
+        ContractionMode.PACKED_F32: 3,
+    }[config.contraction]
     return _launch_gemm_decode_bf16(
         A,
         B,
@@ -587,6 +728,7 @@ def gemm_decode_bf16_configured(
         config.b_cache_modifier,
         reduction_code,
         rounding_code,
+        contraction_code,
         stream=stream,
     )
 
@@ -692,9 +834,35 @@ def _launch_m4_high_k(
 
 
 def select_gemm_decode_config(M: int, N: int, K: int) -> GemmDecodeConfig:
-    """Select a measured direct-family config for an even-K shape."""
+    """Select a target-specific starting config for the direct family."""
     if M < 1 or M > 4:
         raise ValueError("gemm_decode_bf16 supports M in [1, 4]")
+    if get_rocm_arch() == "gfx942":
+        if K <= 256:
+            kvec = 2
+        elif K == 768:
+            kvec = 4
+        else:
+            kvec = 8
+        use_m4_d2 = M == 4 and K > 1536 and N >= 16384 and N % 2 == 0
+        cache_policy = (
+            CACHE_POLICY_NON_TEMPORAL
+            if M == 1 and K >= 4096
+            else CACHE_POLICY_DEFAULT
+        )
+        return GemmDecodeConfig(
+            kvec=kvec,
+            n_per_wave=2 if use_m4_d2 else 1,
+            m_per_wave=M if M in (1, 2, 4) else 1,
+            waves_per_eu=4,
+            b_cache_modifier=cache_policy,
+            reduction=ReductionMode.DPP,
+            contraction=(
+                ContractionMode.PACKED_F32
+                if use_m4_d2
+                else ContractionMode.SCALAR_F32
+            ),
+        )
     if M == 1:
         config = _M1_LOW_K_CONFIG if K <= 1536 else _M1_HIGH_K_CONFIG
     elif M == 4:
@@ -727,14 +895,15 @@ def gemm_decode_bf16(
 ):
     """Launch the default direct-kernel configuration for ``M``."""
     validate_gemm_decode_tensors(A, B, C, M, N, K)
-    if M == 1 and K <= 1536 and N % 4 == 0:
-        return _launch_m1_low_k(A, B, C, M, N, K, stream=stream)
-    if M == 1 and K > 1536:
-        return _launch_m1_high_k(A, B, C, M, N, K, stream=stream)
-    if M == 4 and K <= 1536 and N % 2 == 0:
-        return _launch_m4_low_k(A, B, C, M, N, K, stream=stream)
-    if M == 4 and K > 1536 and N % 4 == 0:
-        return _launch_m4_high_k(A, B, C, M, N, K, stream=stream)
+    if get_rocm_arch() == "gfx950":
+        if M == 1 and K <= 1536 and N % 4 == 0:
+            return _launch_m1_low_k(A, B, C, M, N, K, stream=stream)
+        if M == 1 and K > 1536:
+            return _launch_m1_high_k(A, B, C, M, N, K, stream=stream)
+        if M == 4 and K <= 1536 and N % 2 == 0:
+            return _launch_m4_low_k(A, B, C, M, N, K, stream=stream)
+        if M == 4 and K > 1536 and N % 4 == 0:
+            return _launch_m4_high_k(A, B, C, M, N, K, stream=stream)
     config = select_gemm_decode_config(M, N, K)
     return gemm_decode_bf16_configured(
         A,
