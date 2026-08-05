@@ -183,16 +183,23 @@ def _pa_decode_sparse(
         else:
             valid = in_range
 
+        # 64-bit before the multiply: a slot index fits 32 bits (the index
+        # buffer is int32 by ABI) but `slot * kv_stride_n` does not. A unified
+        # V4 pool runs to ~150M rows, so at a 512-element row the product
+        # passes 2^31 only 2.8% of the way in and every row above that is read
+        # from a wrapped address -- silently, since the wrapped offset still
+        # lands inside the same allocation.
+        slot_off = slot.to(tl.int64)
         kv_raw = tl.load(
             unified_kv_ptr
-            + slot[:, None] * kv_stride_n
+            + slot_off[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
         if QUANT_KV:
             scales_full = tl.load(
-                kv_scales_ptr + slot[:, None] * ks_stride_n + g_idx_per_d[None, :],
+                kv_scales_ptr + slot_off[:, None] * ks_stride_n + g_idx_per_d[None, :],
                 mask=valid[:, None] & d_mask[None, :],
                 other=0.0,
             )

@@ -340,11 +340,14 @@ def _fused_qk_norm_rope_group_quant_kernel(
     q_rope_buff: Tensor | None = None,
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, pe_dim],
-    # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
     # batch_id_per_token maps token->seq (-1 = CG-pad, skipped).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,
     swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
     swa_block_size: int = 0,
     batch_id_per_token: Tensor | None = None,
 ) -> None: ...
@@ -379,11 +382,14 @@ def fused_qk_norm_rope_group_quant(
     scale_dtype: str = "e8m0",
     # --- Optional fused SWA write (decode-only) ---
     # swa_nope_scale_buff [num_rows, entry] / swa_rope_buff [num_rows, rot_dim],
-    # addressed by swa_block_tables[bid, positions[t] // swa_block_size].
+    # addressed either by swa_block_tables[bid, positions[t] // swa_block_size]
+    # (paged) or by swa_dest_row[t] (rows the caller computed itself, for a
+    # window whose layout this kernel need not know). Pass exactly one.
     # batch_id_per_token maps token->seq (-1 = skip).
     swa_nope_scale_buff: Tensor | None = None,
     swa_rope_buff: Tensor | None = None,
     swa_block_tables: Tensor | None = None,
+    swa_dest_row: Tensor | None = None,
     swa_block_size: int | None = None,
     batch_id_per_token: Tensor | None = None,
 ):
@@ -488,6 +494,7 @@ def fused_qk_norm_rope_group_quant(
         swa_nope_scale_buff=swa_nope_scale_buff,
         swa_rope_buff=swa_rope_buff,
         swa_block_tables=swa_block_tables,
+        swa_dest_row=swa_dest_row,
         swa_block_size=0 if swa_block_size is None else swa_block_size,
         batch_id_per_token=batch_id_per_token,
     )

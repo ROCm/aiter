@@ -71,6 +71,32 @@ def state_slot_byte_offset(slot, slot_stride_f32_elems):
     )
 
 
+def block_base_bytes_i64(physical_block, block_stride, elem_bytes: int = 1):
+    """Byte offset of one physical block, computed in 64 bits.
+
+    A buffer descriptor addresses through a 32-bit offset inside a 32-bit
+    ``num_records`` window, so one fixed base cannot reach past 4 GiB: the
+    offset wraps at 2 GiB and the hardware drops the access at 4 GiB, both
+    silently. Shifting the descriptor's BASE per block instead leaves the
+    32-bit field holding one block's worth of offset, which no layout makes big.
+
+    How soon that mattered scales with how many layers a block spans.
+    DeepSeek-V4's envelope layout puts every layer's rows for one block
+    together, so consecutive blocks sit 708 KB apart and block 3,031 wraps; the
+    layer-major predecessor still wrapped at block 65,536 for a CSA layer, well
+    inside a pool that routinely holds 150,000.
+
+    ``block_stride`` is in elements of the cache's own dtype; ``elem_bytes``
+    converts (1 for the fp8 entry cache, 2 for a bf16 one).
+    """
+    blk_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(physical_block))
+    stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(block_stride))
+    base = arith.muli(blk_i64, stride_i64)
+    if elem_bytes == 1:
+        return base
+    return arith.muli(base, arith.constant(elem_bytes, type=T.i64))
+
+
 def emit_group_fp8_nm_asm_scatter(
     *,
     normed_lane,  # list[VEC] f32: post-norm nope values (this lane's slice)

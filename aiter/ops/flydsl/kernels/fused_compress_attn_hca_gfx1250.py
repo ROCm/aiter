@@ -30,7 +30,10 @@ from flydsl.expr.typing import Int32, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 
-from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
+from .fused_compress_attn_common import (
+    block_base_bytes_i64,
+    emit_group_fp8_nm_asm_scatter,
+)
 from .tensor_shim import _run_compiled, _to_raw
 
 BLOCK_THREADS = 32  # 1 wave32 (RDNA4 / gfx1250)
@@ -900,17 +903,23 @@ def _build_norm_rope_scatter_kernel(
             physical_block = buffer_ops.buffer_load(
                 bt_rsrc, bt_off, vec_width=1, dtype=i32
             )
-            cache_base = ArithValue(physical_block) * ArithValue(
-                kv_cache_block_stride
-            ) + ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
-            out_rsrc = buffer_ops.create_buffer_resource(kv_cache, max_size=True)
+            # The block term rides on the descriptor's base, not on the
+            # 32-bit offset -- see `block_base_bytes_i64`.
+            cache_base = ArithValue(slot_in_block) * ArithValue(kv_cache_token_stride)
+            out_rsrc = buffer_ops.create_buffer_resource(
+                kv_cache,
+                max_size=True,
+                base_byte_offset=block_base_bytes_i64(
+                    physical_block, kv_cache_block_stride, 1 if quant else 2
+                ),
+            )
 
             if const_expr(quant):
                 # -- group_fp8 (V4 nm-asm) via shared emitter (wave32; same layout
                 # as wave64 CSA/HCA -- single source of truth). --
-                _krope_base = ArithValue(physical_block) * ArithValue(
-                    krope_block_stride
-                ) + ArithValue(slot_in_block) * ArithValue(krope_token_stride)
+                _krope_base = ArithValue(slot_in_block) * ArithValue(
+                    krope_token_stride
+                )
                 emit_group_fp8_nm_asm_scatter(
                     normed_lane=normed_lane,
                     rotated_lane=rotated_lane,
@@ -920,7 +929,11 @@ def _build_norm_rope_scatter_kernel(
                     out_rsrc=out_rsrc,
                     krope_base=_to_raw(_krope_base),
                     krope_rsrc=buffer_ops.create_buffer_resource(
-                        k_rope_buff, max_size=True
+                        k_rope_buff,
+                        max_size=True,
+                        base_byte_offset=block_base_bytes_i64(
+                            physical_block, krope_block_stride, 2
+                        ),
                     ),
                     VEC=VEC,
                     NOPE=NOPE,
@@ -1217,8 +1230,8 @@ def flydsl_hca_compress_attn_gfx1250(
             raise ValueError(
                 f"k_rope_cache shape {tuple(k_rope_cache.shape)} != [NB, k_per_block, {rope_head_dim}]"
             )
-        if not k_rope_cache.is_contiguous():
-            raise ValueError("k_rope_cache must be contiguous")
+        if k_rope_cache.stride(2) != 1:
+            raise ValueError("k_rope_cache must be dense in the last dim")
     else:
         if kv_cache.dtype != torch.bfloat16:
             raise TypeError(f"HCA 2-kernel kv_cache must be bf16; got {kv_cache.dtype}")

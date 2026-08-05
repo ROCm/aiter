@@ -1995,6 +1995,7 @@ namespace py = pybind11;
           py::arg("swa_nope_scale_buff") = std::nullopt,               \
           py::arg("swa_rope_buff")       = std::nullopt,               \
           py::arg("swa_block_tables")    = std::nullopt,               \
+          py::arg("swa_dest_row")        = std::nullopt,               \
           py::arg("swa_block_size")      = 0,                          \
           py::arg("batch_id_per_token")  = std::nullopt);               \
     m.def("fused_kv_norm_rope_group_quant",                            \
