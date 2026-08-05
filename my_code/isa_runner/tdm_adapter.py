@@ -189,8 +189,21 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
     import flydsl.compiler as flyc
 
     records: list[Capture] = []
-    original = flyc.CompiledFunction.__call__ if hasattr(
-        flyc, "CompiledFunction") else None
+
+    # Everything the kernel reads must outlive run_moe: the kernel-level args
+    # are raw pointers (ptr_arg), so without a reference torch's caching
+    # allocator reuses those buffers and the replay reads freed memory --
+    # which shows up as a NaN result, not as an error. Hold the tensors from
+    # the wrapper, which still has them as tensors.
+    keepalive: list[Any] = []
+    from aiter.ops.flydsl import batched_gemm_mxfp4 as bgm
+
+    real_grouped = bgm.flydsl_grouped_gemm_a8w4_masked
+
+    def grouped_spy(out, a, w, a_scales, w_scales, m_tile_map, **kw):
+        keepalive.extend([out, a, w, a_scales, w_scales, m_tile_map,
+                          kw.get("bias"), kw.get("quant_scale")])
+        return real_grouped(out, a, w, a_scales, w_scales, m_tile_map, **kw)
 
     # The launch goes through the kernel object's .launch(); wrap the module's
     # dispatch entry so we see the final grid/block and the raw arg tuple.
@@ -250,21 +263,32 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
             **kw)
 
     tdm_mod.launch_gemm_a8w4_tdm = spy
-    # batched_gemm_mxfp4 imports the symbol inside the function body, so the
-    # module-level patch above is picked up on the next call.
+    bgm.flydsl_grouped_gemm_a8w4_masked = grouped_spy
+    # batched_gemm_mxfp4 imports launch_gemm_a8w4_tdm inside the function body,
+    # so the module-level patch above is picked up on the next call.
     try:
         _run_reference_moe(tokens, experts, topk, model_dim, inter_dim)
     finally:
         tdm_mod.launch_gemm_a8w4_tdm = real_launch
+        bgm.flydsl_grouped_gemm_a8w4_masked = real_grouped
 
     if not records:
         raise IsaRunnerError(f"no {which} launch captured")
 
     cap = records[0]
+    cap._keepalive = keepalive  # inputs must stay allocated for the replay
     t = getattr(cap, "_out_tensor", None)
     if t is not None and hasattr(t, "numel"):
         cap.out_nbytes = t.numel() * t.element_size()
         cap.reference = t.detach().clone()
+
+    # Fail loudly if a captured pointer no longer belongs to a live tensor.
+    live_ptrs = {int(x.data_ptr()) for x in keepalive
+                 if x is not None and hasattr(x, "data_ptr")}
+    missing = [n for n, v in cap.args.items()
+               if n.startswith("arg_") and int(v) and int(v) not in live_ptrs]
+    if missing:
+        cap.args_not_pinned = missing
     return cap
 
 
@@ -320,6 +344,10 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         "shared_mem_bytes": spec.shared_mem_bytes,
         "capture": cap.to_json(),
     }
+    unpinned = getattr(cap, "args_not_pinned", None)
+    if unpinned:
+        # Reading recycled memory yields NaN rather than an error, so surface it.
+        report["args_not_pinned"] = unpinned
 
     with IsaModule(res.code_object, device=device, source=res.source) as mod:
         mod.function(name)
