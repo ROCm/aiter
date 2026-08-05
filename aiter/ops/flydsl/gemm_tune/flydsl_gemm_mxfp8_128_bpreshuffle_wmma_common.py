@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Full-style gfx1250 WMMA candidates for a8w8 blockscale bpreshuffle GEMM."""
+"""Full-style gfx1250 WMMA candidates for mxfp8_128 bpreshuffle GEMM."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 from aiter.ops.flydsl.utils import get_shared_memory_per_block
 
-NAME_PREFIX = "flydsl_blockscale_bpreshuffle_wmma"
+NAME_PREFIX = "flydsl_mxfp8_128_bpreshuffle_wmma"
 
 WMMA = 16  # WMMA M/N tile granularity
 LDS_BYTES = get_shared_memory_per_block(fallback_gfx="gfx1250")
@@ -24,14 +24,14 @@ _ELEM_BYTES_D = 2  # bf16 / f16 output
 
 _BLOCK_N = 128
 _BLOCK_K = 128
-_SCALE_BYTES = 1  # gfx1250 blockscale scales are fp8/e8m0 storage
+_SCALE_BYTES = 1  # gfx1250 mxfp8_128 scales are fp8/e8m0 storage
 _SCALE_GUARD_BYTES = 16
 
 _TILE_M_OPTS = (16, 32, 64, 128, 256)
 _TILE_N_OPTS = (32, 64, 128, 256, 512, 1024)
 _TILE_K_OPTS = (128, 256, 512, 1024)
 _NUM_BUFFERS_OPTS = (2, 3, 4)
-_WARP_OPTS = ((1, 2), (1, 4), (2, 1), (2, 2), (4, 1))
+_WARP_OPTS = ((1, 4), (2, 2), (4, 1))
 _CLUSTER_OPTS = ((1, 1),)
 _SPLIT_K = (1,)
 
@@ -100,7 +100,7 @@ def _cluster_valid(cm: int, cn: int) -> bool:
     return cm >= 1 and cn >= 1 and cm * cn <= 16
 
 
-def _blockscale_stage_scale_bytes(ki: WmmaKernelInstance) -> tuple[int, int]:
+def _mxfp8_128_stage_scale_bytes(ki: WmmaKernelInstance) -> tuple[int, int]:
     k_blocks = _ceil_div(ki.tile_k, _BLOCK_K)
     a_scale_bytes = ki.tile_m * k_blocks * _SCALE_BYTES + _SCALE_GUARD_BYTES
     n_blocks = _ceil_div(ki.tile_n, _BLOCK_N) + 1
@@ -109,9 +109,9 @@ def _blockscale_stage_scale_bytes(ki: WmmaKernelInstance) -> tuple[int, int]:
 
 
 def kernel_instance_estimated_lds_bytes(ki: WmmaKernelInstance) -> int:
-    """Conservative LDS upper bound for blockscale FP8 WMMA candidates."""
+    """Conservative LDS upper bound for mxfp8_128 FP8 WMMA candidates."""
 
-    a_scale_bytes, b_scale_bytes = _blockscale_stage_scale_bytes(ki)
+    a_scale_bytes, b_scale_bytes = _mxfp8_128_stage_scale_bytes(ki)
 
     lds_a_data = ki.tile_m * (ki.tile_k + _LDS_PAD_A_BYTES)
     lds_b_data = ki.tile_n * ki.tile_k
@@ -175,8 +175,8 @@ def kernel_fits_shape(ki: WmmaKernelInstance, M: int, N: int, K: int) -> bool:
         return False
     if (K // ki.split_k) // ki.tile_k < ki.num_buffers:
         return False
-    if ki.tile_m > M:
-        return False
+    # M may be ragged; the kernel handles partial M tiles via OOB clamping,
+    # so tile_m > M is legal (and needed for small-M decode shapes).
 
     m_blocks = _ceil_div(M, ki.tile_m)
     n_blocks = N // ki.tile_n

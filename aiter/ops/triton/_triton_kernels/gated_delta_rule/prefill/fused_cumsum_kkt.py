@@ -8,7 +8,11 @@ from ..gated_delta_rule_utils import (
     autotune_cache_kwargs,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 
 
@@ -179,7 +183,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     g_cumsum_out,
     A_out,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -187,6 +192,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
     G_SCALE: tl.constexpr = 1.0,
 ):
@@ -195,8 +201,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     T_flat = T
     if IS_VARLEN:
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -276,6 +282,7 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused cumsum + scaled dot KKT (optimized, with autotuning).
@@ -305,16 +312,41 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     # D2H across forward calls. The kernel walks the pre-sliced prefill data
     # via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
-        NT = len(chunk_indices)
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            sequence_ids = schedule.sequence_ids
+            chunk_ids = schedule.chunk_ids
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            index_stride = 1
+        else:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            flat_chunk_indices = chunk_indices.reshape(-1)
+            sequence_ids = flat_chunk_indices
+            chunk_ids = flat_chunk_indices[1:]
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            index_stride = 2
+        NT = len(sequence_ids) // index_stride
     else:
-        chunk_indices = None
+        sequence_ids = None
+        chunk_ids = None
         kernel_cu_seqlens = None
+        index_stride = 1
         NT = triton.cdiv(T, BT)
 
     g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
@@ -327,12 +359,14 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         g_cumsum_out,
         A_out,
         kernel_cu_seqlens,
-        chunk_indices,
+        sequence_ids,
+        chunk_ids,
         T=T,
         H=H,
         Hg=Hg,
         K=K,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         USE_EXP2=use_exp2,
         G_SCALE=RCP_LN2 if use_exp2 else 1.0,
     )
