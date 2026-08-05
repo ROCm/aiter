@@ -101,17 +101,15 @@ Status legend: [ ] todo · [~] in progress · [x] done
 - [x] Scale application: BF16 activation ⇒ `xs=1`; fold constant `gs`/`us` (PerTensor `p[0]`
       / PerToken `p[e*INTER+j]`) into the accumulator **after** the K reduce (exact since the
       scale is constant over K). Block2D deferred to Phase 4.
-- [x] `silu(gate_acc)·up_acc`, `silu(z)=z/(1+e^-z)` in f32; writes BF16 `inter[B,TOPK,INTER]`.
-      (Baseline writes from **all lanes** — every lane holds the identical reduced result;
-      lane-0-only store is a perf refinement, see below.)
+- [x] `silu(gate_acc)·up_acc`, `silu(z)=z/(1+e^-z)` in f32; **lane-0-only** BF16 store to
+      `inter[B,TOPK,INTER]` (`if lane == 0:`; reduce still runs on all lanes).
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken and kVector 16 (`HIDDEN=1024`) / kVector 8 (`HIDDEN=512`).
-- [~] Perf pass on gfx950: **baseline ~1.3–1.5 TB/s** effective weight-read BW
-      (~20–25% of HBM peak; reference targets ~90%). Known levers, all deferred:
-      (1) lane-0-only store (kills 64× redundant BF16 stores);
-      (2) **vectorized loads** — load x/w as 128-bit `vec4` i32 instead of per-word scalar
-          `buffer_load` (biggest win); (3) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
-      (4) B=1 software-pipelined weight prefetch.
+- [~] Perf pass on gfx950: **~1.4–1.6 TB/s** weight-read BW after the lane-0-store fix
+      (~20–25% of HBM peak; reference targets ~90%). Remaining levers, deferred:
+      (1) **vectorized loads** — load x/w as 128-bit `vec4` i32 instead of per-word scalar
+          `buffer_load` (biggest win); (2) s_nop-free dot2 + `dot2_drain4` ILP (MXFP4 phase);
+      (3) B=1 software-pipelined weight prefetch. [done] lane-0-only store.
 - **Where:** kernel `build_gate_up_fp8_module` + `pick_kvector` in
   `aiter/ops/flydsl/kernels/warp_decode_moe.py`; entry `flydsl_warp_decode_gate_up` in
   `aiter/ops/flydsl/warp_decode_moe.py`; tests `GATE_UP_CASES` /`test_gate_up_fp8` in
@@ -125,13 +123,14 @@ Status legend: [ ] todo · [~] in progress · [x] done
       INTER tiled in `64*kVector` (kVector from INTER: 16, →8 fallback).
 - [x] Fold `router_wt * ds` (both lane-uniform) into each expert's **per-lane** partial, then
       a **single** butterfly reduce over Σ_k — exact and avoids a reduce per k. PerTensor
-      `p[0]` / PerToken `p[e*HIDDEN+out_j]`. (Baseline writes BF16 `y[B,HIDDEN]` from all lanes.)
+      `p[0]` / PerToken `p[e*HIDDEN+out_j]`. **lane-0-only** BF16 store to `y[B,HIDDEN]`.
 - [x] `kHPerWarp=1` shipped. **H2 (2 outputs/wave)** — the reference FP8 best — pending.
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken, kVector 16 (`INTER=1024`) / 8 (`INTER=512`). End-to-end
       gate_up→down_reduce vs full torch MoE: cos 0.9999998, max_delta 1.5e-5 (stages compose).
-- [~] Perf baseline ~0.4 TB/s (small grid + no H2; same load/store/dot2 levers as gate_up,
-      plus H2 activation-reuse). Optimization deferred.
+- [~] Perf: grid-starved small shapes ~0.45 TB/s, but a realistic DeepSeek-ish shape
+      (B1 INTER2048 HIDDEN7168 E8 TOPK8) hits **~6.2 TB/s (~78% HBM peak)** — on par with the
+      reference's ~74–79% down claim. Levers: H2 activation-reuse + vectorized loads.
 - **Where:** kernel `build_down_reduce_fp8_module` in `kernels/warp_decode_moe.py`; entry
   `flydsl_warp_decode_down_reduce` in `ops/flydsl/warp_decode_moe.py`; tests `DOWN_CASES` /
   `test_down_reduce_fp8` in the op_test (10 pass total).
@@ -357,3 +356,7 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   (cos 1.0, max_delta 0.0); end-to-end gate_up→down composes (cos 0.9999998). Folds
   `router_wt*ds` per expert into the per-lane partial → single reduce. Perf baseline ~0.4 TB/s;
   **H2 (2 outputs/wave)** and shared load/store/dot2 optimizations deferred.
+- _perf: lane-0 store_ — replaced the all-lane redundant BF16 store in both kernels with an
+  `if lane == 0:` guarded store (reduce still on all lanes). Correctness unchanged (10 pass).
+  gate_up ~1.4–1.6 TB/s; down_reduce hits **~6.2 TB/s (~78% HBM peak)** on a DeepSeek-ish
+  shape. Next lever: vectorized 128-bit loads.

@@ -321,12 +321,13 @@ def build_gate_up_fp8_module(
         )
         out_val = gate_acc * sig * up_acc
 
-        # Every lane holds the identical reduced result; all write the same
-        # scalar to the same address (store cost is negligible vs the weight
-        # reads). A lane-0 guard is a later perf refinement.
+        # Every lane holds the identical reduced result; only lane 0 writes the
+        # single BF16 scalar (avoids 64x redundant global stores). The reduce
+        # above must run on all lanes (cross-lane shuffles), so it stays outside.
         out_off = (token_b * top_k + expert_k) * inter + neuron_j
         out_rsrc = _ptr_rsrc(out_ptr)
-        buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
+        if lane == 0:
+            buffer_ops.buffer_store(BFloat16(out_val).ir_value(), out_rsrc, out_off)
 
     @flyc.jit
     def _launch(
@@ -449,10 +450,14 @@ def build_down_reduce_fp8_module(
             # before the single cross-lane reduce (exact; avoids a reduce per k).
             acc_lane = acc_lane + fx.Float32(dot_k) * (fx.Float32(rw) * fx.Float32(ds))
 
+        # Reduce runs on all lanes (cross-lane shuffles); only lane 0 stores.
         y_sum = wave_reduce_add_f32(acc_lane.ir_value())
         out_off = token_b * hidden + out_j
         y_rsrc = _ptr_rsrc(y_ptr)
-        buffer_ops.buffer_store(BFloat16(fx.Float32(y_sum)).ir_value(), y_rsrc, out_off)
+        if lane == 0:
+            buffer_ops.buffer_store(
+                BFloat16(fx.Float32(y_sum)).ir_value(), y_rsrc, out_off
+            )
 
     @flyc.jit
     def _launch(
