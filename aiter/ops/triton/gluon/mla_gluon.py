@@ -1151,7 +1151,7 @@ def mla_gluon(
         HEAD_DIM_CKV=head_dim_ckv,
         HAS_FINAL_LSE=return_lse,
         USE_2D_VIEW=use_2d_view,
-        BLOCK_S=64,
+        BLOCK_S=min(64, triton.next_power_of_2(NUM_KV_SPLITS)),
         num_warps=8,
     )
 
