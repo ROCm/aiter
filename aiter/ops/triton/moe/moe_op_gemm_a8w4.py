@@ -265,8 +265,6 @@ def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
     w_cache_modifier = ".cg" if block_m <= 32 else None
-    num_warps = 4
-    num_buffers = 3
     split_k = 1
 
     if block_m == 16 and k <= 768:
@@ -276,46 +274,18 @@ def get_kernel_config_gluon(m, n, k, routing_data):
         use_persistent = False
         persistent_iters = 0
 
-    if block_m == 16:
-        bucket = m2bucket(m)
-        tuned = _get_a8w4_dispatch(get_arch())
-        key = f"bm{block_m}_n{n}_k{k}_{bucket}"
-        if key in tuned:
-            cfg = tuned[key]
-            block_n, block_k, num_buffers = (
-                cfg["block_n"],
-                cfg["block_k"],
-                cfg["num_buffers"],
-            )
-        else:
-            block_k = 512
-            if k <= 768:
-                block_n = 128
-                block_k = 256
-                num_buffers = 2
-            elif n <= 1536:
-                block_n = 128
-                num_buffers = 3
-            elif n <= 3072:
-                block_n = 128
-                num_buffers = 2
-            elif n <= 4096:
-                block_n = 256
-                num_buffers = 1
-            else:
-                block_n = 512
-                num_buffers = 1
-
-    elif block_m == 32:
-        block_k = 512
-        if n <= 1024:
-            block_n = 128
-        else:
-            block_n = 256
-
-    else:
-        block_n = 256
-        block_k = 256
+    bucket = m2bucket(m)
+    tuned = _get_a8w4_dispatch(get_arch())
+    key = f"bm{block_m}_n{n}_k{k}_{bucket}"
+    if key not in tuned:
+        key = f"bm{block_m}_any"
+    cfg = tuned[key]
+    block_n, block_k, num_buffers, num_warps = (
+        cfg["block_n"],
+        cfg["block_k"],
+        cfg["num_buffers"],
+        cfg["num_warps"],
+    )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
 
@@ -393,11 +363,6 @@ def moe_gemm_a8w4(
     num_tokens = x.shape[-2]
     M = num_tokens if gather_indx is None else gather_indx.shape[0]
     K, N = x.shape[-1], w.shape[-1]
-    # Temporary: TDM async_gather over mxfp8 activations and prefill is broken on gfx1250
-    if use_gluon and gather_indx is not None and M > 1024 and x_has_mx:
-        warnings.warn(
-            "do_gather (TDM async_gather) is not supported on gfx1250 for M > 1024 with mxfp8 activations."
-        )
     if preshuffled:
         # preshuffle layout is (E, K_packed*16, N//16); w.shape[-1] = N//16
         N = w.shape[-1] * 16
