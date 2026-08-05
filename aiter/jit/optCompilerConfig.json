@@ -567,7 +567,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-mfma-vgpr-form'"
+            "'-mllvm --amdgpu-mfma-vgpr-form'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "md_name": "'module_moe_opus'",
         "extra_ldflags": "None",
@@ -1210,6 +1211,22 @@
         "verbose": "False",
         "blob_gen_cmd": "''"
     },
+    "module_inverse_rope_group_quant": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/inverse_rope_group_quant_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/inverse_rope_group_quant.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-DENABLE_FP8'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{AITER_CSRC_DIR}/include/opus'"
+        ],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
+    },
     "module_fmha_fwd_with_sink_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_fmha_fwd_with_sink.cu'"
@@ -1287,6 +1304,29 @@
         "verbose": "False",
         "blob_gen_cmd": [
             "f'{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_fwd --output_dir {{}}'"
+        ]
+    },
+    "module_vsa_sparse_attention": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_ck/vsa_sparse_attention_kernels.cu'",
+            "f'{AITER_CSRC_DIR}/pybind/vsa_sparse_attention_pybind.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-fbracket-depth=1024'",
+            "'-DCK_TILE_FMHA_FWD_FAST_EXP2=1'",
+            "f'-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get(\"CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\", 2)}'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [
+            "f'{CK_DIR}/example/ck_tile'",
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn'",
+            "f'{CK_DIR}/include/ck_tile/ops/sparse_attn'"
+        ],
+        "verbose": "False",
+        "hip_clang_path": "os.environ.get('MHA_HIP_CLANG_PATH')",
+        "blob_gen_cmd": [
+            "f'{CK_DIR}/example/ck_tile/50_sparse_attn/generate.py -d fwd_vsa --receipt 600 --output_dir {{}}'"
         ]
     },
     "module_mha_fwd": {
@@ -1634,6 +1674,22 @@
             "'ComposableKernel'"
         ],
         "is_experimental": "True"
+    },
+    "module_ds32_mla": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mla_ds32_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32_decode_fwd.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/dsa_v32_splitkv.hpp'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/ds32/defs.h'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffast-math'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "blob_gen_cmd": "''"
     },
     "module_topk_plain": {
         "srcs": [

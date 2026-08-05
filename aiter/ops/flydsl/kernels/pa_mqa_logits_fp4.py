@@ -12,9 +12,11 @@ import torch
 import triton
 import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, buffer_ops, gpu, rocdl
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
+
+from aiter.ops.flydsl.kernels import buffer_ops
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -275,13 +277,10 @@ def build_pa_mqa_logits_fp4_module(
         chunk_count = cta_info_vec[2]
         context_len = cta_info_vec[3]
 
-        _row_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(batch_packed))
-        _stride_i64 = arith.extsi(T.i64, buffer_ops._unwrap_value(stride_out_batch))
-        _row_elems_i64 = arith.muli(_row_i64, _stride_i64)
-        _row_bytes_i64 = arith.muli(
-            _row_elems_i64,
-            arith.constant(4, type=T.i64),  # sizeof(f32)
-        )
+        # sizeof(f32) = 4; compute the per-batch base byte offset in i64.
+        _row_bytes_i64 = (
+            fx.Int64(batch_packed) * fx.Int64(stride_out_batch) * 4
+        ).ir_value()
         out_rsrc = buffer_ops.create_buffer_resource(
             out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
         )
@@ -421,8 +420,8 @@ def build_pa_mqa_logits_fp4_module(
             for k_tile in range_constexpr(k_tiles):
                 packed = kvs_packed_list_in[k_tile]
                 for nt in range_constexpr(N_TILES_PER_WARP):
-                    shifted = arith.ArithValue(packed) >> fx.Int32(8 * nt)
-                    scales[nt][k_tile] = shifted & fx.Int32(0xFF)
+                    shifted = fx.Int32(packed) >> (8 * nt)
+                    scales[nt][k_tile] = shifted & 0xFF
             return scales
 
         def _issue_nt_mfmas(kv_list_in, kvs_scales_per_nt, nt):
@@ -542,7 +541,7 @@ def build_pa_mqa_logits_fp4_module(
         # === Main loop: chunk_count - 1 iterations ===
         N_KVS = k_tiles  # one packed i32 per k_tile (NTPW=4 nts packed in)
         chunk_count_minus_1_i32 = chunk_count - fx.Int32(1)
-        chunk_count_minus_1_idx = fx.Index(chunk_count_minus_1_i32)
+        chunk_count_minus_1_idx = fx.Int64(chunk_count_minus_1_i32)
         init_args = (
             list(kv_pre) + list(kvs_pre) + list(phys_next_pre) + nt0_init_scalars
         )
@@ -652,7 +651,7 @@ def compile_pa_mqa_logits_fp4(
         gx: fx.Int32,
         stream: fx.Stream,
     ):
-        gxi = arith.index_cast(T.index, gx.ir_value())
+        gxi = fx.Int64(gx)
         kfn(out, q, qs, kv, kvs, bt, w, cta_info_, stride_out, weight_scale).launch(
             grid=(gxi,), block=(block_threads, 1, 1), stream=stream
         )

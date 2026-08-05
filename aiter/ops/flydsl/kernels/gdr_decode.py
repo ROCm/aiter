@@ -5,19 +5,13 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import (
     gpu as mlir_gpu,
 )
-from flydsl._mlir.dialects import (
-    math as mlir_math,
-)
-from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects import (
-    vector as mlir_vector,
-)
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, vector
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
+
+from aiter.ops.flydsl.kernels import vector
 
 from .tensor_shim import (
     GTensor,
@@ -109,6 +103,7 @@ def create_vk_gdr_decode_kernel(
         softplus_threshold_ = arith.constant(softplus_threshold, type=T.f32)
 
         dtype_ = get_dtype_in_kernel(dtype)
+        fx_dtype_ = fx.BFloat16 if dtype == "bf16" else fx.Float16
         A_log_dtype_ = get_dtype_in_kernel(A_log_dtype)
         state_dtype_ = get_dtype_in_kernel(state_dtype)
         # i32_0 = arith.constant(0, type=T.i32)
@@ -167,8 +162,8 @@ def create_vk_gdr_decode_kernel(
             dtype=state_dtype_,
             shape=(num_v_heads, head_v_dim, head_k_dim),
             stride=(state_strides[1], state_strides[2], state_strides[3]),
-            static_bytes_offset_i64=fx.Index(pool_idx)
-            * fx.Index(state_strides[0])
+            static_bytes_offset_i64=fx.Int64(pool_idx)
+            * fx.Int64(state_strides[0])
             * get_dtype_bytes(state_dtype),
         )
 
@@ -177,15 +172,15 @@ def create_vk_gdr_decode_kernel(
                 log2e = 1.4426950408889634
                 out = rocdl.exp2(T.f32, x * log2e)
                 return out
-            return mlir_math.exp(x, fastmath=fm_fast)
+            return fx.math.exp(x, fastmath=fm_fast)
 
         def fast_log1p(x):
-            return mlir_math.log1p(x, fastmath=fm_fast)
+            return fx.math.log1p(x, fastmath=fm_fast)
 
-        cond_valid = arith.cmpi(arith.CmpIPredicate.sge, pool_idx, fx.Int32(0))
-        cond_valid_if = scf.IfOp(cond_valid, results_=[], has_else=False)
-        with ir.InsertionPoint(cond_valid_if.then_block):
-
+        # Skip CG-pad slots (indices sentinel < 0). The guarded body is a
+        # closure so the runtime `if` sees an opaque call (no GTensor "state"
+        # to thread through an scf.if yield) -- lowers to scf.if, no raw region.
+        def _do_decode():
             if const_expr("f32" in A_log_dtype):
                 r_A_log = A_log_tensor[hv_i]
             else:
@@ -208,25 +203,18 @@ def create_vk_gdr_decode_kernel(
                         ].extf(acc_vec_t)
 
             for sq_i in range_constexpr(seq_length):
-
                 r_a = a_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 r_b = b_tensor[b_i, sq_i, hv_i].extf(T.f32)
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta_ * x
 
-                cond_sp = arith.cmpf(
-                    arith.CmpFPredicate.OLE, beta_x, fx.Float32(softplus_threshold_)
-                )
-                cond_sp_if = scf.IfOp(cond_sp, results_=[T.f32], has_else=True)
-                with ir.InsertionPoint(cond_sp_if.then_block):
-                    softplus_x_ = (f32_1 / softplus_beta_) * fast_log1p(
-                        fast_exp(beta_x)
-                    )
-                    scf.YieldOp([softplus_x_])
-                with ir.InsertionPoint(cond_sp_if.else_block):
-                    softplus_x_ = x
-                    scf.YieldOp([softplus_x_])
-                softplus_x = cond_sp_if.results[0]
+                # softplus with the large-x identity: for beta_x > threshold,
+                # softplus(x) == x. select computes both arms (the overflow arm
+                # is discarded) -> bit-identical to the old branch.
+                softplus_big = (f32_1 / softplus_beta_) * fast_log1p(fast_exp(beta_x))
+                softplus_x = (
+                    fx.Float32(beta_x) <= fx.Float32(softplus_threshold_)
+                ).select(softplus_big, x)
 
                 r_g_value = -fast_exp(r_A_log) * softplus_x
                 r_beta = f32_1 / (f32_1 + fast_exp(-r_b))
@@ -264,47 +252,39 @@ def create_vk_gdr_decode_kernel(
                         sum_k_partial_vec = (
                             sum_k_partial_vec + sk_vecs[ki] * sk_vecs[ki]
                         )
-                    sum_q_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_q_partial_vec
-                    ).dest
-                    sum_k_partial = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_k_partial_vec
-                    ).dest
+                    sum_q_partial = fx.Vector(sum_q_partial_vec).reduce(
+                        fx.ReductionOp.ADD
+                    )
+                    sum_k_partial = fx.Vector(sum_k_partial_vec).reduce(
+                        fx.ReductionOp.ADD
+                    )
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_q_partial = (
-                            sum_q_partial
-                            + mlir_gpu.ShuffleOp(
-                                sum_q_partial,
-                                _to_raw(arith.constant(offset, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_q_partial = sum_q_partial + sum_q_partial.shuffle_xor(
+                            offset, WARP_SIZE
                         )
-                        sum_k_partial = (
-                            sum_k_partial
-                            + mlir_gpu.ShuffleOp(
-                                sum_k_partial,
-                                _to_raw(arith.constant(offset, type=T.i32)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_k_partial = sum_k_partial + sum_k_partial.shuffle_xor(
+                            offset, WARP_SIZE
                         )
                     local_sum_q = mlir_gpu.ShuffleOp(
-                        sum_q_partial,
+                        _to_raw(sum_q_partial),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
                     ).shuffleResult
                     local_sum_k = mlir_gpu.ShuffleOp(
-                        sum_k_partial,
+                        _to_raw(sum_k_partial),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
                     ).shuffleResult
-                    inv_norm_q = mlir_math.rsqrt(local_sum_q + 1e-6)
-                    inv_norm_k = mlir_math.rsqrt(local_sum_k + 1e-6)
-                    inv_norm_q_vec = vector.BroadcastOp(acc_vec_t, inv_norm_q).vector
-                    inv_norm_k_vec = vector.BroadcastOp(acc_vec_t, inv_norm_k).vector
+                    inv_norm_q = fx.math.rsqrt(local_sum_q + 1e-6)
+                    inv_norm_k = fx.math.rsqrt(local_sum_k + 1e-6)
+                    inv_norm_q_vec = vector.BroadcastOp(
+                        acc_vec_t, _to_raw(inv_norm_q)
+                    ).vector
+                    inv_norm_k_vec = vector.BroadcastOp(
+                        acc_vec_t, _to_raw(inv_norm_k)
+                    ).vector
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         sq_vecs[ki] = sq_vecs[ki] * inv_norm_q_vec * scale_vec
                         sk_vecs[ki] = sk_vecs[ki] * inv_norm_k_vec
@@ -319,19 +299,11 @@ def create_vk_gdr_decode_kernel(
                     dot_kq_vec = vector.FMAOp(
                         sk_vecs[ki], sq_vecs[ki], dot_kq_vec
                     ).result
-                dot_kq = mlir_vector.ReductionOp(
-                    T.f32, vector.CombiningKind.ADD, dot_kq_vec
-                ).dest
+                dot_kq = fx.Vector(dot_kq_vec).reduce(fx.ReductionOp.ADD)
                 for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                    dot_kq = (
-                        dot_kq
-                        + mlir_gpu.ShuffleOp(
-                            dot_kq, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
-                        ).shuffleResult
-                    )
+                    dot_kq = dot_kq + dot_kq.shuffle_xor(offset, WARP_SIZE)
 
                 for vi in range_constexpr(WARP_TILE_V_ITERS):
-
                     global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
                     r_v = v_tensor[b_i, sq_i, hv_i, global_v_i].extf(T.f32)
 
@@ -348,33 +320,18 @@ def create_vk_gdr_decode_kernel(
                         sum_hk = vector.FMAOp(h_cur, sk_vecs[ki], sum_hk).result
                         sum_hq_old = vector.FMAOp(h_cur, sq_vecs[ki], sum_hq_old).result
 
-                    sum_hk = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hk
-                    ).dest
-                    sum_hq_old = mlir_vector.ReductionOp(
-                        T.f32, vector.CombiningKind.ADD, sum_hq_old
-                    ).dest
+                    sum_hk = fx.Vector(sum_hk).reduce(fx.ReductionOp.ADD)
+                    sum_hq_old = fx.Vector(sum_hq_old).reduce(fx.ReductionOp.ADD)
 
                     for offset in WARP_THREADS_K_SHFL_OFFSETS:
-                        sum_hk = (
-                            sum_hk
-                            + mlir_gpu.ShuffleOp(
-                                sum_hk, _to_raw(fx.Int32(offset)), width_i32, mode="xor"
-                            ).shuffleResult
-                        )
-                        sum_hq_old = (
-                            sum_hq_old
-                            + mlir_gpu.ShuffleOp(
-                                sum_hq_old,
-                                _to_raw(fx.Int32(offset)),
-                                width_i32,
-                                mode="xor",
-                            ).shuffleResult
+                        sum_hk = sum_hk + sum_hk.shuffle_xor(offset, WARP_SIZE)
+                        sum_hq_old = sum_hq_old + sum_hq_old.shuffle_xor(
+                            offset, WARP_SIZE
                         )
 
                     v_new = (r_v - sum_hk) * r_beta
                     v_new = mlir_gpu.ShuffleOp(
-                        v_new,
+                        _to_raw(v_new),
                         _to_raw(fx.Int32(w_tid // WARP_THREADS_K * WARP_THREADS_K)),
                         width_i32,
                         mode="idx",
@@ -390,14 +347,15 @@ def create_vk_gdr_decode_kernel(
                         ).result
                         state_vecs[vi * WARP_TILE_K_ITERS + ki] = h_new
 
-                    sum_hq = sum_hq.truncf(dtype_)
-                    write_cond = arith.cmpi(
-                        arith.CmpIPredicate.eq, fx.Index(warp_k_vec_start), fx.Index(0)
-                    )
-                    write_cond_if = scf.IfOp(write_cond, results_=[], has_else=False)
-                    with ir.InsertionPoint(write_cond_if.then_block):
-                        out_tensor[b_i, sq_i, hv_i, global_v_i] = sum_hq
-                        scf.YieldOp([])
+                    sum_hq = sum_hq.to(fx_dtype_)
+
+                    # Only k-vec lane 0 writes the q output; closure keeps the
+                    # GTensor store opaque to the runtime-if state analysis.
+                    def _write_q(_sum_hq=sum_hq, _gv=global_v_i, _sq=sq_i):
+                        out_tensor[b_i, _sq, hv_i, _gv] = _sum_hq
+
+                    if warp_k_vec_start == 0:
+                        _write_q()
 
             for vi in range_constexpr(WARP_TILE_V_ITERS):
                 global_v_i = global_v_start + vi * WARP_GROUP_TILE_V
@@ -410,7 +368,9 @@ def create_vk_gdr_decode_kernel(
                     state_tensor.vec_store(
                         (hv_i, global_v_i, warp_k_vec_i), out_vec, VALUES_PER_THREAD_K
                     )
-            scf.YieldOp([])
+
+        if pool_idx >= 0:
+            _do_decode()
 
     @flyc.jit
     def launch_gdr_decode_kernel(

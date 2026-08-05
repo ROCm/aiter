@@ -23,10 +23,12 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm, scf
-from flydsl.expr import arith, buffer_ops, const_expr, gpu, range_constexpr, vector
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
 from flydsl.expr.typing import Int32, Stream, T
+
+from aiter.ops.flydsl.kernels import buffer_ops, vector
 
 from .fused_compress_attn_common import emit_group_fp8_nm_asm_scatter
 from .tensor_shim import _run_compiled, _to_raw
