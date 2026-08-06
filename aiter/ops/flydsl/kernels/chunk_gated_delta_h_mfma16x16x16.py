@@ -243,10 +243,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     LDS_HT_STRIDE = K
     LDS_HT_ELEMS = BV * LDS_HT_STRIDE
 
-    # ``hp`` must stay a single Array: GEMM1 indexes across both 64-K panels as
-    # ``kb * LDS_HP_PANEL_ELEMS + ...``, which requires the two panels to be
+    # ``hp`` must stay a single Array: its view spans both 64-K panels with a
+    # panel stride of LDS_HP_PANEL_ELEMS, which requires the two panels to be
     # contiguous. Separate struct fields are independent static LDS symbols with
-    # no guaranteed adjacency.
+    # no guaranteed adjacency. Same for ``wp``.
     @fx.struct
     class SharedStorage:
         wp: fx.Array[fx.BFloat16, LDS_WP_ELEMS, 16]
@@ -348,24 +348,71 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             co_ = _flat_buffer(chunk_offsets_tensor, fx.Int32, 4)
 
         # -- LDS --
-        # Accessed as raw base pointers + computed element offsets rather than
-        # ``lds.<field>.view(make_layout(...))``: the three panel layouts are
-        # HIP-derived swizzles (w_panel, k rotating-pair, transpose-buffer XOR)
-        # whose addresses come out of runtime bit math, not layout algebra.
-        # The view form was measured on gfx942 -- byte-identical ISA, but it
-        # needs a logical_divide + slice per read and silently assumes the
-        # offset is 4-element aligned, so it buys nothing here.
+        # Every panel is addressed through a layout view. The trailing mode of
+        # each view is 4 elements: one k_group, i.e. exactly one b64 access, and
+        # the swizzles use base=2 (elements -> 8 B granularity) so those 4
+        # elements always stay contiguous.
+        # The k panel is the one exception and keeps hand-written bit math: its
+        # rotating-pair address needs three overlapping XOR terms, while a layout
+        # carries a single swizzle.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        lds_wp_ptr = lds.wp.ptr  # w panels (HIP w_panel swizzle)
         lds_kp_ptr = lds.kp.ptr  # k panels (rotating-pair swizzle)
-        lds_hp_ptr = lds.hp.ptr  # h_state panels (shared2, GEMM1 B operand)
-        lds_ht_ptr = lds.ht.ptr  # [V][K] transpose buffer for the b128 h store
+
+        # w panels: per-panel [BT][64] row-major + S<4,2,4>. This is the layout
+        # form of HIP's ``w_panel_swizzle`` -- verified bit-exact on all BT*64
+        # addresses. The panel stride is far above the swizzled bits, so the two
+        # panels can share one view.
+        sW = fx.make_view(
+            lds.wp.ptr,
+            fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(4, 2, 4)),
+                fx.make_layout(
+                    (NUM_K_BLOCKS, BT, 64 // 4, 4),
+                    (LDS_WP_PANEL_ELEMS, 64, 4, 1),
+                ),
+            ),
+        )
+        # h_state panels, shared2: (panel, row_block, col) -> 4 K. No swizzle.
+        sH = fx.make_view(
+            lds.hp.ptr,
+            fx.make_layout(
+                (NUM_K_BLOCKS, 64 // 4, BV, 4),
+                (LDS_HP_PANEL_ELEMS, BV * 4, 4, 1),
+            ),
+        )
         # gated_v ALIASES h_state panel 1 (like HIP's ``gated_v_panel =
         # h_state_panel1``): gated_v is written only AFTER GEMM1 has finished
         # reading the h_state panels, and a WAR barrier before the gated_v store
         # enforces that ordering across warps. Aliasing avoids a separate
         # LDS_GV buffer, which would cost an occupancy step.
-        lds_gv_ptr = lds_hp_ptr + LDS_HP_PANEL_ELEMS
+        sGV = fx.make_view(
+            lds.hp.ptr + LDS_HP_PANEL_ELEMS,
+            fx.make_layout((64 // 4, BV, 4), (BV * 4, 4, 1)),
+        )
+        # [V][K] transpose buffer: [BV][K] row-major + S<4,2,5>, the layout form
+        # of the hand-written ``k_group ^ (v & 0xF)`` scatter.
+        sHT = fx.make_view(
+            lds.ht.ptr,
+            fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(4, 2, 5)),
+                fx.make_layout((BV, K // 4, 4), (K, 4, 1)),
+            ),
+        )
+
+        # LDS <-> register moves go through the same copy-atom form as the global
+        # accesses above; the rmem staging tensor is folded away by
+        # fly-promote-regmem-to-vectorssa.
+        cp_lds_x4 = fx.make_copy_atom(fx.UniversalCopy64b(), fx.BFloat16)
+
+        def _lds_read_x4(view, coord):
+            frag = fx.make_rmem_tensor(4, fx.BFloat16)
+            fx.copy(cp_lds_x4, fx.slice(view, coord), frag)
+            return fx.Vector(frag.load())
+
+        def _lds_write_x4(view, coord, vec4):
+            frag = fx.make_rmem_tensor(4, fx.BFloat16)
+            frag.store(vec4)
+            fx.copy(cp_lds_x4, frag, fx.slice(view, coord))
 
         v4bf16 = T.vec(4, T.bf16)
 
@@ -397,39 +444,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             fx.mma_atom_call(mma_atom, rd, ra, rb, rc)
             return fx.memref_load_vec(rd)
 
-        # Plain b64 read of a shared2 panel cell (GEMM1 / GEMM2 B frag).
-        def _lds_read_hp_bf16x4(elem_idx):
-            return fx.ptr_load(lds_hp_ptr + elem_idx, result_type=v4bf16)
-
-        def _lds_read_gv_bf16x4(elem_idx):
-            return fx.ptr_load(lds_gv_ptr + elem_idx, result_type=v4bf16)
-
         # -- Cooperative load decomposition --
         load_row_in_batch = tid // THREADS_PER_ROW_64
         load_col_base = (tid % THREADS_PER_ROW_64) * LOAD_VEC_WIDTH
+        load_col_group = (tid % THREADS_PER_ROW_64) * (LOAD_VEC_WIDTH // 4)
 
-        # w_panel swizzle (returns ELEMENT offset within a panel).
-        # Port of w_panel_swizzle_base_bytes >> 1 (all bf16 = 2 B).
-        #   row_in_half = row & 31; col_group = col_base >> 3
-        #   tid = row_in_half*8 + col_group
-        #   base_bytes = ((tid<<4)&4080) ^ (tid&120); if row&32: base|=4096
-        def _w_panel_swz_elems(row, col_base):
-            row_in_half = row & 31
-            col_group = col_base >> 3
-            tid_like = row_in_half * 8 + col_group
-            base = ((tid_like << 4) & 4080) ^ (tid_like & 120)
-            base = base | ((row & 32) << 7)  # 32<<7 = 4096
-            return base >> 1  # bytes -> bf16 elements
-
-        # load_a_w_fragment_swizzled (contiguous 16-K A frag).
-        # Caller passes row = row_base + lane&15 and k0 = k_base + (lane>>4)*4;
-        # the ^4-elem (^8-byte) toggle picks the low/high 4 within an 8-group.
-        def _load_a_w_swizzled(panel_base_elems, row, k0):
-            col_base = k0 & ~7
-            elem = _w_panel_swz_elems(row, col_base) ^ (k0 & 4)
-            return fx.ptr_load(
-                lds_wp_ptr + (panel_base_elems + elem), result_type=v4bf16
-            )
+        # GEMM1 A fragment: the k_group at (row, kg), one b64.
+        # Caller passes row = row_base + lane&15 and kg = k_base/4 + lane>>4.
+        def _load_a_w(kb, row, kg):
+            return _lds_read_x4(sW, (kb, row, kg, None))
 
         # k_panel rotating-pair swizzle address computation.
         # Port of HIP's k_panel_rotating_pair_base_bytes / _addr_bytes.
@@ -607,7 +630,6 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         def _load_chunk0_to_lds():
             # Chunk 0, so the absolute row is just the in-chunk row.
             for kb in range_constexpr(NUM_K_BLOCKS):
-                wp_panel_base = kb * LDS_WP_PANEL_ELEMS
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                     row = batch * ROWS_PER_BATCH_64 + load_row_in_batch
                     safe_row = (row < T_local).select(row, 0)
@@ -618,11 +640,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + fx.Int64(load_col_base)
                     )
                     wvec = _gload(cp_bf16x8, w_, w_g_off, LOAD_VEC_WIDTH, fx.BFloat16)
-                    swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
-                    fx.ptr_store(wvec.shuffle(wvec, [0, 1, 2, 3]), lds_wp_ptr + swz)
-                    fx.ptr_store(
+                    _lds_write_x4(
+                        sW,
+                        (kb, row, load_col_group, None),
+                        wvec.shuffle(wvec, [0, 1, 2, 3]),
+                    )
+                    _lds_write_x4(
+                        sW,
+                        (kb, row, load_col_group + 1, None),
                         wvec.shuffle(wvec, [4, 5, 6, 7]),
-                        lds_wp_ptr + (swz ^ 4),
                     )
             k_safe_t0_prol = (k_t0_pf < T_local).select(k_t0_pf, 0)
             k_safe_t1_prol = (k_t1_pf < T_local).select(k_t1_pf, 0)
@@ -673,16 +699,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     # lane owns k_group (row_block = wid*4+lane_m_base) at V-col
                     # = nr*16+lane_n; 4 warps together fill all 16 row_blocks.
                     hp_row_block = wid * 4 + lane_m_base
-                    hp_cell = kb * LDS_HP_PANEL_ELEMS + (hp_row_block * BV + hp_col) * 4
-                    fx.ptr_store(_f32x4_to_bf16x4(acc_val), lds_hp_ptr + hp_cell)
+                    _lds_write_x4(
+                        sH, (kb, hp_row_block, hp_col, None), _f32x4_to_bf16x4(acc_val)
+                    )
 
-                    # [V][K/4-group] transpose buffer, XOR-swizzled
-                    # (k_group ^ (v & 0xF)) to break bank conflicts on the
-                    # scatter write -- mirrors HIP ``h_transpose_buf_offset``.
-                    # The 4 elem_i are one k_group (4 contiguous K) -> one b64.
+                    # [V][K/4-group] transpose buffer. The swizzle in sHT breaks
+                    # bank conflicts on this scatter write; the 4 elements of a
+                    # k_group stay contiguous, so it is one b64.
                     ht_kg = kb * 16 + wid * 4 + lane_m_base
-                    ht_idx = (hp_col * (K // 4) + (ht_kg ^ (hp_col & 0xF))) * 4
-                    fx.ptr_store(_f32x4_to_bf16x4(acc_val), lds_ht_ptr + ht_idx)
+                    _lds_write_x4(sHT, (hp_col, ht_kg, None), _f32x4_to_bf16x4(acc_val))
 
             # w/k for this chunk already in LDS (prologue or prev GEMM2 end).
             gpu.barrier()
@@ -745,27 +770,15 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # the remaining MFMA chain hides that prefetch's HBM latency.
             def _gemm1_kblock(kb, bv_accs=bv_accs):
                 for ks in range_constexpr(K_STEPS_PER_BLOCK):
-                    wp_pbase = kb * LDS_WP_PANEL_ELEMS
                     a_row = wid * 16 + lane_n
-                    a_frag_lo = _load_a_w_swizzled(
-                        wp_pbase,
-                        a_row,
-                        ks * K_STEP + lane_m_base * 4,
-                    )
-                    a_frag_hi = _load_a_w_swizzled(
-                        wp_pbase,
-                        a_row,
-                        (ks * K_STEP + 16) + lane_m_base * 4,
-                    )
+                    kg_lo = (ks * K_STEP) // 4 + lane_m_base
+                    kg_hi = (ks * K_STEP + 16) // 4 + lane_m_base
+                    a_frag_lo = _load_a_w(kb, a_row, kg_lo)
+                    a_frag_hi = _load_a_w(kb, a_row, kg_hi)
                     for nr in range_constexpr(N_REPEAT):
-                        hp_base = kb * LDS_HP_PANEL_ELEMS
                         hp_col_b = nr * 16 + lane_n
-                        rb_lo = ((ks * K_STEP) >> 2) + lane_m_base
-                        rb_hi = (((ks * K_STEP) + 16) >> 2) + lane_m_base
-                        idx_lo = hp_base + (rb_lo * BV + hp_col_b) * 4
-                        idx_hi = hp_base + (rb_hi * BV + hp_col_b) * 4
-                        b_frag_lo = _lds_read_hp_bf16x4(idx_lo)
-                        b_frag_hi = _lds_read_hp_bf16x4(idx_hi)
+                        b_frag_lo = _lds_read_x4(sH, (kb, kg_lo, hp_col_b, None))
+                        b_frag_hi = _lds_read_x4(sH, (kb, kg_hi, hp_col_b, None))
                         bv_accs[nr] = _mfma_bf16_16x16x16(
                             a_frag_lo, b_frag_lo, bv_accs[nr]
                         )
@@ -790,9 +803,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             # load_w_panels_from_global_full inside run_gemm1_fulltile_bvp).
             next_i_t = i_t_i32 + 1
             w_next_vecs = []
-            w_next_swz = []
+            w_next_coord = []
             for kb in range_constexpr(NUM_K_BLOCKS):
-                wp_pb_next = kb * LDS_WP_PANEL_ELEMS
                 for batch in range_constexpr(NUM_LOAD_BATCHES_64):
                     row = batch * ROWS_PER_BATCH_64 + load_row_in_batch
                     abs_row_next = next_i_t * BT + row
@@ -806,9 +818,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     w_next_vecs.append(
                         _gload(cp_bf16x8, w_, w_g_off_next, LOAD_VEC_WIDTH, fx.BFloat16)
                     )
-                    w_next_swz.append(
-                        wp_pb_next + _w_panel_swz_elems(row, load_col_base)
-                    )
+                    w_next_coord.append((kb, row))
 
             # GEMM1 remaining K-blocks -- MFMA hides u/g/w_next HBM latency.
             for kb in range_constexpr(GEMM1_PF_SPLIT, NUM_K_BLOCKS):
@@ -874,8 +884,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 gated_val = vn_val * gate_vec
                 gv_col = idx * 16 + lane_n
                 gv_row_block = wid * 4 + lane_m_base
-                gv_cell = (gv_row_block * BV + gv_col) * 4
-                fx.ptr_store(_f32x4_to_bf16x4(gated_val), lds_gv_ptr + gv_cell)
+                _lds_write_x4(
+                    sGV, (gv_row_block, gv_col, None), _f32x4_to_bf16x4(gated_val)
+                )
 
             # >>> PREFETCH k_next: HBM loads for next chunk (HIP
             # load_k_panels_from_global_full at the run_gemm1 tail).
@@ -955,13 +966,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 kv = vec_idx % K_VECS
                 v_loc = vec_idx // K_VECS
                 k8 = kv * LOAD_VEC_WIDTH
-                v_xor = v_loc & 0xF
                 kg_lo = kv * 2
-                kg_hi = kg_lo + 1
-                off_lo = (v_loc * (K // 4) + (kg_lo ^ v_xor)) * 4
-                off_hi = (v_loc * (K // 4) + (kg_hi ^ v_xor)) * 4
-                val_lo = fx.ptr_load(lds_ht_ptr + off_lo, result_type=v4bf16)
-                val_hi = fx.ptr_load(lds_ht_ptr + off_hi, result_type=v4bf16)
+                val_lo = _lds_read_x4(sHT, (v_loc, kg_lo, None))
+                val_hi = _lds_read_x4(sHT, (v_loc, kg_lo + 1, None))
                 vec8 = val_lo.shuffle(val_hi, [0, 1, 2, 3, 4, 5, 6, 7])
                 v_global = i_v * BV + v_loc
                 h_off = (
@@ -984,13 +991,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         kp_pbase, wid * 16, (bt_s * K_STEP + 16)
                     )
 
-                    # gated_v B: shared2 layout (unchanged).
-                    gv_rb_lo = ((bt_s * K_STEP) >> 2) + lane_m_base
-                    gv_rb_hi = (((bt_s * K_STEP) + 16) >> 2) + lane_m_base
+                    # gated_v B: shared2 layout, one b64 per row_block.
+                    gv_rb_lo = (bt_s * K_STEP) // 4 + lane_m_base
+                    gv_rb_hi = (bt_s * K_STEP + 16) // 4 + lane_m_base
                     for nr in range_constexpr(N_REPEAT):
                         gv_col = nr * 16 + lane_n
-                        vn_b_lo = _lds_read_gv_bf16x4((gv_rb_lo * BV + gv_col) * 4)
-                        vn_b_hi = _lds_read_gv_bf16x4((gv_rb_hi * BV + gv_col) * 4)
+                        vn_b_lo = _lds_read_x4(sGV, (gv_rb_lo, gv_col, None))
+                        vn_b_hi = _lds_read_x4(sGV, (gv_rb_hi, gv_col, None))
 
                         acc_idx = kb * N_REPEAT + nr
                         h_accs_in[acc_idx] = _mfma_bf16_16x16x16(
@@ -1008,14 +1015,16 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 gpu.barrier()
                 for pf_idx in range_constexpr(NUM_K_BLOCKS * NUM_LOAD_BATCHES_64):
                     wvec_pf = w_next_vecs[pf_idx]
-                    swz_pf = w_next_swz[pf_idx]
-                    fx.ptr_store(
+                    kb_pf, row_pf = w_next_coord[pf_idx]
+                    _lds_write_x4(
+                        sW,
+                        (kb_pf, row_pf, load_col_group, None),
                         wvec_pf.shuffle(wvec_pf, [0, 1, 2, 3]),
-                        lds_wp_ptr + swz_pf,
                     )
-                    fx.ptr_store(
+                    _lds_write_x4(
+                        sW,
+                        (kb_pf, row_pf, load_col_group + 1, None),
                         wvec_pf.shuffle(wvec_pf, [4, 5, 6, 7]),
-                        lds_wp_ptr + (swz_pf ^ 4),
                     )
                 for kb in range_constexpr(NUM_K_BLOCKS):
                     kp_pbase = kb * LDS_KP_PANEL_ELEMS
