@@ -322,6 +322,17 @@ PRESET_SHAPES = [
     (1, 64, 2048, 64, 128),
     (1, 64, 4096, 64, 128),
     (1, 64, 8192, 64, 128),
+    # H = 32, D = 128 (GLM-5.2 sparse indexer: index_n_heads=32, index_head_dim=128).
+    # GLM-5.2 is a 753B MoE that uses an IndexShare mechanism: the indexer runs
+    # 32 query heads against 1 KV head (MQA) over the full 1M-token context to
+    # select which positions to retrieve in the main attention.
+    # With the mfma32x32x64 atom, H=32 gives M_TILES=1 (half the compute
+    # intensity of H=64), making this more memory-bandwidth bound than the DS4
+    # shapes -- the auto-variant picks r=2 for all these shapes to compensate.
+    (1, 4096, 4096, 32, 128),
+    (1, 8192, 8192, 32, 128),
+    (1, 128, 32768, 32, 128),
+    (1, 671, 131072, 32, 128),
 ]
 
 FLYDSL_PREFIX = "flydsl:"
