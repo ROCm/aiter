@@ -554,7 +554,10 @@ class DeviceMoEPipeline:
             # gemm2-fused scatter: zero the per-(token,k) comb_inp before gemm2's
             # P2P writes (dropped/unwritten slots must read 0 in the combine sum),
             # then hand gemm2 the arena handles + this rank's tis (recv->origin).
-            self.op.zero_fused_staging()
+            # EXPERIMENT: dropless + full-topk means every (token,k) slot is written
+            # by gemm2 each layer, so the per-layer zero is unnecessary here (arena is
+            # already zeroed once at setup). Skip it to measure the ~110us fill saving.
+            # self.op.zero_fused_staging()
             ep_kwargs = dict(self.op.ep_scatter_params())
             ep_tis = handle.disp_tok_id_to_src_tok_id_local
             ep_kwargs = dict(
