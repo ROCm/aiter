@@ -180,5 +180,17 @@ fmha_v3_fwd_f4f4(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
                  float softmax_scale,
                  std::optional<at::Tensor> out_ = std::nullopt); // [b, sq, hq, d_v], bf16
 
+// Dedicated persistent one-wave f4f4 entry. Tensor ABI and constraints match
+// fmha_v3_fwd_f4f4; only the code object/symbol and fixed solo launch differ.
+std::vector<at::Tensor>
+fmha_v3_fwd_f4f4_solo(at::Tensor& q,                  // [b, sq, hq, d/2], int8/uint8
+                      const at::Tensor& k,             // [b, sk, hk, d/2], int8/uint8
+                      const at::Tensor& v,             // [b, sk, hk, d_v], int8/uint8 (fp4)
+                      const at::Tensor& q_descale,     // E8M0 bytes, [b, sq, hq, d/32]
+                      const at::Tensor& k_descale,     // E8M0 bytes, [b, sk, hk, d/32]
+                      const at::Tensor& v_descale,     // uint8 E8M0 block-scale image
+                      float softmax_scale,
+                      std::optional<at::Tensor> out_ = std::nullopt); // bf16
+
 } // namespace torch_itfs
 } // namespace aiter

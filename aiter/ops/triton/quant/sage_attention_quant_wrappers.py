@@ -1,5 +1,4 @@
 import functools
-import os
 import torch
 import triton
 import aiter
@@ -18,6 +17,10 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
 )
 
 from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
+from aiter.ops.triton.quant.f4f4_solo import (
+    quantize_f4f4_solo_k,
+    quantize_f4f4_solo_v,
+)
 
 
 def fused_sage_quant_mxfp4(
@@ -317,6 +320,86 @@ def sage_quant_f4f4(
     # kernel's scaled PV MFMA reads the E8M0 image appended to the v_descale buffer tail.
     v_fp4_view, v_descale = _pack_v_mxfp4_colmajor(v_bshd)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
+
+
+def sage_quant_f4f4_solo(
+    q,
+    k,
+    v,
+    FP8_TYPE,
+    FP8_MAX,
+    BLKQ,
+    BLKK,
+    sm_scale=None,
+    q_smoothing=False,
+    layout="bshd",
+    USE_RNE=False,
+    R=None,
+    BLOCK_R=32,
+):
+    """Quantize Q/K/V for the dedicated coalesced f4f4-solo kernel.
+
+    Q uses the same rotation, smoothing, and MXFP4 downcast as
+    :func:`sage_quant_f4f4`. K and V use the solo kernel's compact LDS-order
+    tile images. Outputs always use bshd logical descriptors:
+
+      * Q: uint8 ``[b, sq, hq, 64]``; Q scale: uint8 ``[b, sq, hq, 4]``.
+      * K: uint8 ``[b, sk, hk, 64]``, seq stride 64 and head stride
+        ``nT*8192``; K scale: uint8 ``[b, sk, hk, 4]``.
+      * V: uint8 ``[b, sk, hk, 128]``, seq stride 64 and head stride
+        ``nT*8192``; V scale image: uint8 ``[b, hk, nT*512]``.
+
+    K/V are overlapping strided descriptors over tile images. Consumers must
+    pass them through unchanged; making either view contiguous destroys the
+    kernel ABI. ``FP8_TYPE``, ``FP8_MAX``, ``BLKK``, and ``USE_RNE`` remain in
+    the signature for parity with the other Sage quantizers.
+    """
+    if layout == "bshd":
+        b, sq, hq, head_dim = q.shape
+        bk, sk, h_kv, kd = k.shape
+        bv, sv, hv, vd = v.shape
+    elif layout == "bhsd":
+        b, hq, sq, head_dim = q.shape
+        bk, h_kv, sk, kd = k.shape
+        bv, hv, sv, vd = v.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {layout}")
+
+    if head_dim != 128 or kd != 128 or vd != 128:
+        raise ValueError(
+            f"f4f4-solo requires Q/K/V head_dim=128, got {head_dim}/{kd}/{vd}"
+        )
+    if (bk, bv) != (b, b) or sv != sk or hv != h_kv:
+        raise ValueError(
+            "Q/K/V batch, K/V sequence, or K/V head dimensions do not match"
+        )
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("Q, K, and V must be on the same device")
+
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+
+    q_rot, k_rot, delta_s = rotation_smooth_qk(
+        q,
+        k,
+        BLKQ,
+        R=R,
+        BLOCK_R=BLOCK_R,
+        q_smoothing=q_smoothing,
+        layout=layout,
+        sm_scale=(sm_scale * 1.4426950408889634),
+    )
+    if layout == "bhsd":
+        q_rot = q_rot.permute(0, 2, 1, 3)
+        k_rot = k_rot.permute(0, 2, 1, 3)
+        v_bshd = v.permute(0, 2, 1, 3)
+    else:
+        v_bshd = v
+
+    q_fp4, q_scale = downcast_to_mxfp(q_rot, torch.uint8, axis=-1)
+    k_fp4, k_scale = quantize_f4f4_solo_k(k_rot)
+    v_fp4, v_scale = quantize_f4f4_solo_v(v_bshd)
+    return q_fp4, q_scale, k_fp4, k_scale, v_fp4, v_scale, delta_s
 
 
 def sage_quant(

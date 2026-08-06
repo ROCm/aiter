@@ -25,6 +25,13 @@ from .fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
 )
 
+from .f4f4_solo import (
+    quantize_f4f4_solo_k,
+    quantize_f4f4_solo_v,
+)
+
+from .sage_attention_quant_wrappers import sage_quant_f4f4_solo
+
 __all__ = [
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
@@ -47,4 +54,8 @@ __all__ = [
     "fused_reduce_act_mul_and_mxfp4_quant",
     "fused_reduce_rms_mxfp4_quant",
     "fused_dynamic_mxfp4_quant_moe_sort",
+    # f4f4-solo exports
+    "quantize_f4f4_solo_k",
+    "quantize_f4f4_solo_v",
+    "sage_quant_f4f4_solo",
 ]

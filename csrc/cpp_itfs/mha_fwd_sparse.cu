@@ -11,8 +11,11 @@
 
 #include "mha_fwd_sparse.h"
 #include "aiter_hip_common.h"
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 
 namespace aiter {
 
@@ -50,6 +53,34 @@ static constexpr const char* kDenseF4f4KernelName =
     "_ZN5aiter26fmha_fwd_hd128_f4f4_gfx950E";
 static constexpr const char* kDenseF4f4CoName =
     "fmha_v3_fwd/fwd_hd128_f4f4.co";
+// Dedicated one-wave, two-Q-pipeline f4f4 kernel. Unlike the cooperative
+// sibling above, this launch contract is always bdx=64 and persistent over
+// 64-row Q tiles.
+static constexpr int kDenseF4f4SoloTileQ = 64;
+static constexpr int kDenseF4f4SoloBdx = 64;
+static constexpr const char* kDenseF4f4SoloKernelName =
+    "_ZN5aiter31fmha_fwd_hd128_f4f4_solo_gfx950E";
+static constexpr const char* kDenseF4f4SoloCoName =
+    "fmha_v3_fwd/fwd_hd128_f4f4_solo.co";
+
+static uint32_t* get_dense_f4f4_solo_counter(int device, hipStream_t stream)
+{
+    using StreamCounterMap = std::unordered_map<hipStream_t, uint32_t*>;
+    static std::mutex counter_pool_mutex;
+    static std::unordered_map<int, StreamCounterMap> counter_pool;
+
+    std::lock_guard<std::mutex> lock(counter_pool_mutex);
+    auto& stream_counters = counter_pool[device];
+    const auto it = stream_counters.find(stream);
+    if(it != stream_counters.end())
+        return it->second;
+
+    uint32_t* counter = nullptr;
+    HIP_CALL(hipMalloc(reinterpret_cast<void**>(&counter), sizeof(uint32_t)));
+    stream_counters.emplace(stream, counter);
+    return counter;
+}
+
 // fp8-quantized sibling (E4M3 Q/K/V). Same 704-byte kernarg layout and
 // same in_bpe=1 byte stride as the i8fp8 path, so init_sparse_v3_args is
 // reused unchanged; only the kernel symbol + .co name differ.
@@ -437,6 +468,82 @@ float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
         size_t* arg_size_ptr = &arg_size;
         impl_ptr->launch_kernel({args_ptr, arg_size_ptr, gdx, gdy, gdz,
                                  bdx, 1, 1, s_.stream_id_});
+    });
+}
+
+// Dedicated one-wave f4f4 solo launch. The kernel owns two 32-row Q contexts
+// per workgroup and persistently grid-strides over the flattened
+// (ceil(seqlen_q/64), nhead_q, batch) tile space. The standard dense 656-byte
+// kernarg is retained: ptr_lse @0x40 carries the atomic counter and s_lse
+// @0x100 carries the flattened tile count.
+float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config& s)
+{
+    if(!a.use_asm_v3)
+        return -1;
+
+    const std::string arch_id = get_gpu_arch();
+    if(arch_id != "gfx950")
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_f4f4_solo: only gfx950 is supported "
+                          "(detected arch: " << arch_id << ")");
+        return -1;
+    }
+    if(a.is_group_mode || a.mask_type != 0 || a.has_lse || a.p_drop > 0.f ||
+       a.bias_type != 0)
+    {
+        AITER_LOG_WARNING("fmha_fwd_v3_f4f4_solo: unsupported feature combination "
+                          "(group/mask/lse/dropout/bias must all be off)");
+        return -1;
+    }
+
+    if(a.v3_api_check)
+    {
+        return 1;
+    }
+
+    const long long num_q_tiles =
+        (static_cast<long long>(a.seqlen_q) + kDenseF4f4SoloTileQ - 1) /
+        kDenseF4f4SoloTileQ;
+    const long long total =
+        num_q_tiles * static_cast<long long>(a.nhead_q) * static_cast<long long>(a.batch);
+    if(total == 0)
+        return 0;
+
+    static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
+    AiterAsmKernel* impl_ptr = &impl_ptr_map.get_or_create(
+        kDenseF4f4SoloCoName,
+        [&]() { return AiterAsmKernel(kDenseF4f4SoloKernelName, kDenseF4f4SoloCoName); });
+
+    fmha_fwd_v3_sparse_args args{};
+    size_t arg_size = sizeof(fmha_fwd_v3_args);
+    init_sparse_v3_args(args, a);
+
+    int device = 0;
+    hipDeviceProp_t props{};
+    HIP_CALL(hipGetDevice(&device));
+    HIP_CALL(hipGetDeviceProperties(&props, device));
+
+    const char* wgs_env = std::getenv("AITER_F4F4_SOLO_WGS");
+    const long long override_wgs = wgs_env != nullptr ? std::atoll(wgs_env) : 0;
+    const long long default_wgs = static_cast<long long>(props.multiProcessorCount) * 4;
+    const long long wanted_wgs = override_wgs > 0 ? override_wgs : default_wgs;
+    const int launch_wgs = static_cast<int>(wanted_wgs < total ? wanted_wgs : total);
+
+    // WG i starts with flattened tile i, so the counter must begin at the
+    // first tile not pre-assigned to the launch grid.
+    uint32_t* counter = get_dense_f4f4_solo_counter(device, s.stream_id_);
+    HIP_CALL(hipMemsetD32Async(reinterpret_cast<hipDeviceptr_t>(counter),
+                              static_cast<unsigned int>(launch_wgs),
+                              1,
+                              s.stream_id_));
+    args.ptr_lse = counter;
+    args.s_lse = static_cast<unsigned int>(total);
+
+    return ck_tile::launch_kernel(s, [=](const ck_tile::stream_config& s_) mutable {
+        void* args_ptr = &args;
+        size_t* arg_size_ptr = &arg_size;
+        impl_ptr->launch_kernel({args_ptr, arg_size_ptr, launch_wgs, 1, 1,
+                                 kDenseF4f4SoloBdx, 1, 1, s_.stream_id_});
     });
 }
 

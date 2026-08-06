@@ -26,6 +26,7 @@ from aiter.ops.mha import (
     flash_attn_mxfp4_sparse_pertensor_func,
     flash_attn_mxfp4_pertensor_func,
     flash_attn_f4f4_pertensor_func,
+    flash_attn_f4f4_solo_pertensor_func,
     flash_attn_fp8_sparse_pertensor_func,
     flash_attn_fp8_sparse_vfa_pertensor_func,
 )
@@ -49,6 +50,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant,
     sage_quant_mxfp4,
     sage_quant_f4f4,
+    sage_quant_f4f4_solo,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
 
@@ -79,6 +81,7 @@ KernelName = Literal[
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_f4f4",
+    "aiter_f4f4_solo",
     "aiter_bf16",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
@@ -93,6 +96,7 @@ ALL_KERNELS: List[str] = [
     "aiter_fp8",
     "aiter_i8fp8",
     "aiter_mxfp4",
+    "aiter_f4f4_solo",
     "aiter_bf16",
 ]
 
@@ -104,6 +108,7 @@ FP8_CHECK_KERNELS = {
     "aiter_i8fp8",
     "aiter_mxfp4",
     "aiter_f4f4",
+    "aiter_f4f4_solo",
     "aiter_asm_sparse",
     "aiter_asm_sparse_mxfp4",
     "aiter_asm_sparse_fp8",
@@ -668,6 +673,90 @@ def make_f4f4_runner(
     return _run
 
 
+def make_f4f4_solo_runner(
+    args: argparse.Namespace,
+    q_bshd: torch.Tensor,
+    k_bshd: torch.Tensor,
+    v_bshd: torch.Tensor,
+) -> Any:
+    """Runner for the dedicated persistent one-wave f4f4 kernel.
+
+    Q uses the current f4f4 MXFP4 path. K and V are compact, coalesced
+    LDS-order tile images and must remain strided views through launch.
+    """
+    if args.causal:
+        raise NotImplementedError(
+            "aiter_f4f4_solo does not support causal masking yet."
+        )
+    if args.layout != "bshd":
+        raise ValueError("aiter_f4f4_solo expects --layout=bshd inputs.")
+    if (
+        q_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+        or v_bshd.shape[-1] != ASM_SPARSE_HEAD_DIM
+    ):
+        raise ValueError(
+            f"aiter_f4f4_solo is hard-coded to hd={ASM_SPARSE_HEAD_DIM} "
+            f"(got Qd={q_bshd.shape[-1]}, Vd={v_bshd.shape[-1]})."
+        )
+
+    cfg = get_sage_fwd_configs_mxfp4()
+    fp8_type = aiter.dtypes.fp8
+    fp8_max = torch.finfo(fp8_type).max
+
+    block_r = args.block_r
+    if block_r > q_bshd.shape[-1]:
+        raise ValueError(
+            f"block_r ({block_r}) must be <= head dim ({q_bshd.shape[-1]})"
+        )
+    r = create_hadamard_matrix(
+        block_r, device=q_bshd.device, dtype=q_bshd.dtype
+    ) / (block_r**0.5)
+
+    (
+        q_quant,
+        q_descale,
+        k_quant,
+        k_descale,
+        v_quant,
+        v_descale,
+        _delta_s,
+    ) = sage_quant_f4f4_solo(
+        q_bshd,
+        k_bshd,
+        v_bshd,
+        fp8_type,
+        fp8_max,
+        BLKQ=cfg["BLOCK_M"],
+        BLKK=64,
+        layout=args.layout,
+        R=r,
+        BLOCK_R=block_r,
+        q_smoothing=False,
+    )
+
+    q_quant = q_quant.contiguous()
+    q_descale = q_descale.contiguous()
+    k_descale = k_descale.contiguous()
+    # Never make k_quant/v_quant contiguous: their strides describe the solo
+    # LDS-order tile images. Preserve V E8M0 bytes without a numeric cast.
+    v_descale = v_descale.contiguous()
+
+    softmax_scale = ASM_SPARSE_HEAD_DIM ** -0.5
+
+    def _run() -> torch.Tensor:
+        return flash_attn_f4f4_solo_pertensor_func(
+            q_quant,
+            k_quant,
+            v_quant,
+            q_descale,
+            k_descale,
+            v_descale,
+            softmax_scale=softmax_scale,
+        )
+
+    return _run
+
+
 def make_dense_mxfp4_runner(
     args: argparse.Namespace,
     q_bshd: torch.Tensor,
@@ -833,6 +922,73 @@ def generate_test_tensors(
         k = torch.randn((batch, hk, sk, d_head), device=device, dtype=dtype)
         v = torch.randn((batch, hk, sk, d_head_v), device=device, dtype=dtype)
         return q, k, v
+
+    if distribution == "sink":
+        q, k, v = generate_test_tensors(
+            batch,
+            hq,
+            hk,
+            sq,
+            sk,
+            d_head,
+            d_head_v,
+            dtype,
+            device,
+            "transformer",
+        )
+        direction = torch.nn.functional.normalize(
+            torch.randn(
+                (batch, 1, 1, d_head), device=device, dtype=torch.float32
+            ),
+            dim=-1,
+        )
+        k[:, :, : min(sk, 4), :] += 12.0 * direction
+        q += 3.0 * direction
+        return q.to(dtype), k.to(dtype), v.to(dtype)
+
+    if distribution in ("underflow", "latesink"):
+        gap_name = (
+            "AITER_UNDERFLOW_GAP"
+            if distribution == "underflow"
+            else "AITER_LATESINK_GAP"
+        )
+        gap = float(
+            os.environ.get(
+                gap_name, "16.0" if distribution == "underflow" else "40.0"
+            )
+        )
+        scale = float(d_head) ** -0.5
+        hot_keys = min(128, sk)
+        direction = torch.randn(
+            (1, 1, 1, d_head), device=device, dtype=torch.float32
+        )
+        direction /= direction.pow(2).sum(dim=-1, keepdim=True).add(1e-12).sqrt()
+        amplitude = (gap / scale) ** 0.5
+
+        if distribution == "underflow":
+            jitter = float(os.environ.get("AITER_UNDERFLOW_JITTER", "0.4"))
+            jitter = min(max(jitter, 0.0), 1.0)
+            row_factor = jitter + (1.0 - jitter) * torch.rand(
+                (batch, hq, sq, 1), device=device, dtype=torch.float32
+            )
+            q_base = amplitude * row_factor * direction
+            hot_slice = slice(0, hot_keys)
+        else:
+            q_base = amplitude * direction
+            hot_slice = slice(sk - hot_keys, sk)
+        q = q_base + 0.35 * torch.randn(
+            (batch, hq, sq, d_head), device=device, dtype=torch.float32
+        )
+        k = 0.30 * torch.randn(
+            (batch, hk, sk, d_head), device=device, dtype=torch.float32
+        )
+        k[:, :, hot_slice, :] = amplitude * direction + 0.10 * torch.randn(
+            (batch, hk, hot_keys, d_head), device=device, dtype=torch.float32
+        )
+        v = 0.5 * torch.randn(
+            (batch, hk, sk, d_head_v), device=device, dtype=torch.float32
+        )
+        return q.to(dtype), k.to(dtype), v.to(dtype)
 
     if distribution != "transformer":
         raise ValueError(f"Unsupported input distribution: {distribution}")
@@ -1522,6 +1678,9 @@ def make_kernel_runner(
     if args.kernel == "aiter_f4f4":
         return make_f4f4_runner(args, q_bshd, k_bshd, v_bshd)
 
+    if args.kernel == "aiter_f4f4_solo":
+        return make_f4f4_solo_runner(args, q_bshd, k_bshd, v_bshd)
+
     if args.kernel == "fav3_fp8":
         return make_fav3_fp8_runner(
             q_bshd,
@@ -1583,7 +1742,7 @@ def compute_accuracy_metrics(
 
 
 def fp8_max_diff_percentage(args: argparse.Namespace) -> float:
-    if args.input_distribution == "transformer":
+    if args.input_distribution in ("transformer", "sink"):
         return 2.0
     return 0.5
 
@@ -1744,6 +1903,7 @@ def benchmark_single_case(
         "aiter_i8fp8",
         "aiter_mxfp4",
         "aiter_f4f4",
+        "aiter_f4f4_solo",
         "sage_fp8",
         "sage_mxfp4",
         "aiter_asm_sparse",
@@ -1772,6 +1932,7 @@ def benchmark_single_case(
             "aiter_i8fp8",
             "aiter_mxfp4",
             "aiter_f4f4",
+            "aiter_f4f4_solo",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
             "aiter_asm_sparse_fp8",
@@ -2348,6 +2509,7 @@ def parse_args() -> argparse.Namespace:
             "aiter_i8fp8",
             "aiter_mxfp4",
             "aiter_f4f4",
+            "aiter_f4f4_solo",
             "aiter_bf16",
             "aiter_asm_sparse",
             "aiter_asm_sparse_mxfp4",
@@ -2384,8 +2546,11 @@ def parse_args() -> argparse.Namespace:
         "--input-distribution",
         type=str,
         default="transformer",
-        choices=["normal", "transformer"],
-        help="Distribution used for generated Q/K/V tensors",
+        choices=["normal", "transformer", "sink", "underflow", "latesink"],
+        help=(
+            "Distribution used for generated Q/K/V tensors; underflow and "
+            "latesink exercise skip and frozen-max rollback."
+        ),
     )
     parser.add_argument(
         "--qk-clip",

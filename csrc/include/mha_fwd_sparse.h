@@ -130,6 +130,12 @@ float fmha_fwd_v3_mxfp4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 // .co name so it coexists with mxfp4 (distinct symbol + .co) in one process.
 float fmha_fwd_v3_f4f4(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
 
+// Dedicated one-wave f4f4 sibling. Loads fwd_hd128_f4f4_solo.co and
+// _ZN5aiter31fmha_fwd_hd128_f4f4_solo_gfx950E, then persistently dispatches
+// flattened 64-row Q tiles with bdx=64. The atomic counter and total tile count
+// reuse fmha_fwd_v3_args::ptr_lse and ::s_lse.
+float fmha_fwd_v3_f4f4_solo(mha_fwd_sparse_args a, const ck_tile::stream_config& s);
+
 // Sparse fp8 sibling. Same kernarg layout, different .co
 // (fwd_hd128_fp8_sparse.co) generated from
 // /workspace/mi350_fmha_hd128_fp8_sparse.py. Q/K/V are all fp8 (E4M3)

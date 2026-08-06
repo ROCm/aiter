@@ -472,7 +472,8 @@ def _gen_fmha_v3_fwd_f4f4_fake_tensors(
     if out is not None:
         return (out,)
     b, sq, hq, _ = q.shape
-    # V is a col-major fp4 view whose logical last dim is the full head_dim (128).
+    # Packed f4f4 V views retain the full logical head dimension (128);
+    # cooperative and solo entry points use different backing layouts/strides.
     head_dim_v = v.shape[-1]
     return (q.new_empty((b, sq, hq, head_dim_v), dtype=dtypes.bf16),)
 
@@ -490,6 +491,24 @@ def fmha_v3_fwd_f4f4(
     q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
     k_descale: Tensor,            # E8M0 per-block bytes
     v_descale: Tensor,            # uint8 E8M0 block-scale image, [b, hk, nT*512]
+    softmax_scale: float,
+    out: Optional[Tensor] = None,
+) -> Tuple[Tensor]: ...
+
+
+@compile_ops(
+    "module_fmha_v3_fwd",
+    fc_name="fmha_v3_fwd_f4f4_solo",
+    gen_fake=_gen_fmha_v3_fwd_f4f4_fake_tensors,
+    mutates_args=[],
+)
+def fmha_v3_fwd_f4f4_solo(
+    q: Tensor,                    # [b, sq, hq, hd/2 = 64], int8/uint8 (fp4-packed)
+    k: Tensor,                    # [b, sk, hk, 64], uint8 solo C0 LDS-order; seq stride 64
+    v: Tensor,                    # [b, sk, hk, 128], uint8 solo pre-transposed LDS-order; seq stride 64
+    q_descale: Tensor,            # E8M0 per-block bytes, [b, sq, hq, hd/32 = 4]
+    k_descale: Tensor,            # E8M0 per-block bytes, [b, sk, hk, 4]
+    v_descale: Tensor,            # uint8 E8M0 image, [b, hk, ceil(sk/128)*512]
     softmax_scale: float,
     out: Optional[Tensor] = None,
 ) -> Tuple[Tensor]: ...
@@ -4029,6 +4048,57 @@ def flash_attn_f4f4_pertensor_func(
         head_dim_logical = q.shape[-1] * 2
         softmax_scale = head_dim_logical ** (-0.5)
     outs = fmha_v3_fwd_f4f4(
+        q,
+        k,
+        v,
+        q_descale,
+        k_descale,
+        v_descale,
+        float(softmax_scale),
+        None,
+    )
+    return outs[0]
+
+
+def flash_attn_f4f4_solo_pertensor_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
+    v_descale: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+):
+    """Dedicated persistent one-wave f4f4 FMHA forward (hd=128, gfx950).
+
+    Q and all scale arithmetic match ``flash_attn_f4f4_pertensor_func``. K/V
+    use the solo kernel's compact coalesced LDS-order images; their logical
+    tensors are overlapping strided descriptors and must not be made
+    contiguous. This entry always loads ``fwd_hd128_f4f4_solo.co`` and
+    launches the dedicated solo symbol with bdx=64 over flattened 64-row Q
+    tiles. It does not depend on ``AITER_FMHA_SOLO``;
+    ``AITER_F4F4_SOLO_WGS`` is only a test override for the persistent
+    workgroup count.
+
+    Args:
+        q: int8/uint8 tensor [b, sq, hq, 64], fp4-packed (bshd).
+        k: uint8 [b, sk, hk, 64] C0-only LDS-order view; sequence stride is
+            64 bytes and head stride is ceil(sk/128)*8192 bytes.
+        v: uint8 [b, sk, hk, 128] pre-transposed LDS-order view; sequence
+            stride is 64 bytes and head stride is ceil(sk/128)*8192 bytes.
+        q_descale: uint8 E8M0 scales [b, sq, hq, 4].
+        k_descale: uint8 E8M0 scales [b, sk, hk, 4].
+        v_descale: uint8 E8M0 image [b, hk, ceil(sk/128)*512], with one
+            scale per (output channel, 32-token block) in kernel gather order.
+        softmax_scale: defaults to the logical Q/K head dimension**-0.5.
+
+    Returns:
+        bf16 tensor [b, sq, hq, 128], bshd.
+    """
+    if softmax_scale is None:
+        head_dim_logical = q.shape[-1] * 2
+        softmax_scale = head_dim_logical ** (-0.5)
+    outs = fmha_v3_fwd_f4f4_solo(
         q,
         k,
         v,

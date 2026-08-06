@@ -1026,6 +1026,16 @@ namespace py = pybind11;
           py::arg("v_descale"),                                                   \
           py::arg("softmax_scale"),                                               \
           py::arg("out") = std::nullopt);                                         \
+    m.def("fmha_v3_fwd_f4f4_solo",                                                \
+          &aiter::torch_itfs::fmha_v3_fwd_f4f4_solo,                              \
+          py::arg("q"),                                                           \
+          py::arg("k"),                                                           \
+          py::arg("v"),                                                           \
+          py::arg("q_descale"),                                                   \
+          py::arg("k_descale"),                                                   \
+          py::arg("v_descale"),                                                   \
+          py::arg("softmax_scale"),                                               \
+          py::arg("out") = std::nullopt);                                         \
     m.def("fmha_v3_fwd_fp8_sparse_persistent",                                    \
           &aiter::torch_itfs::fmha_v3_fwd_fp8_sparse_persistent,                  \
           py::arg("q"),                                                           \
