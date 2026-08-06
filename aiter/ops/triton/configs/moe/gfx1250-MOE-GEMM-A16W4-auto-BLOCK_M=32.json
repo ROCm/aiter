@@ -1,0 +1,16 @@
+{
+    "N_LEQ_6144": {
+        "K_LEQ_3072": {
+            "backend": "gluon",
+            "num_buffers": 1
+        },
+        "K_LEQ_6144": {
+            "backend": "gluon",
+            "num_buffers": 1
+        },
+        "default": {
+            "backend": "gluon",
+            "num_buffers": 1
+        }
+    }
+}

@@ -36,11 +36,16 @@ def _apply_score_mode(x, SCORE_MODE: tl.constexpr):
       - "sqrtsoftplus": x → sqrt(softplus(x)) using numerically stable
         softplus(x) = max(x, 0) + log(1 + exp(-|x|)). Matches
         torch.nn.functional.softplus for the DeepSeek-V4 sqrtsoftplus router.
+      - "sigmoid": x → 1 / (1 + exp(-x)). Per-expert sigmoid gate used by the
+        DeepSeek sigmoid router (optionally with an additive selection bias).
     """
     if SCORE_MODE == "sqrtsoftplus":
         x_f = x.to(tl.float32)
         softplus_x = tl.maximum(x_f, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x_f)))
         return tl.sqrt(softplus_x).to(x.dtype)
+    if SCORE_MODE == "sigmoid":
+        x_f = x.to(tl.float32)
+        return (1.0 / (1.0 + tl.exp(-x_f))).to(x.dtype)
     # "softmax" (and default): identity
     return x
 
@@ -230,11 +235,12 @@ def _topk(
         y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
     )
 
-    # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
-    # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for
-    # selection. We want the unbiased sqrt(softplus(x)) values as the gathered
-    # weights (the "noaux_tc" pattern from V4). Subtract bias[y_indices].
-    if SCORE_MODE == "sqrtsoftplus" and HAS_BIAS:
+    # For a pre-transform SCORE_MODE (sqrtsoftplus / sigmoid) with HAS_BIAS, the
+    # y_values returned by streaming_topk are biased scores (transform(x) + bias)
+    # — used for selection only. We want the unbiased transform(x) values as the
+    # gathered weights (the "noaux_tc" pattern from V4 / the DeepSeek sigmoid
+    # router). Subtract bias[y_indices].
+    if SCORE_MODE != "softmax" and HAS_BIAS:
         safe_idx = tl.where(real_mask, y_indices, 0).to(tl.int32)
         b_at_idx = tl.load(Bias + safe_idx)
         y_unbiased = y_values.to(tl.float32) - b_at_idx
