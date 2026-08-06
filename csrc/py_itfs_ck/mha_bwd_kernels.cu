@@ -32,7 +32,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
         std::optional<const at::Tensor> alibi_slopes_, // [hq] or [b, hq]
         std::optional<const at::Tensor> rng_state_,
         std::optional<at::Generator> gen_,
-        std::optional<const at::Tensor> sink_,         // [b, hq] log-space sink scores (float)
+        std::optional<const at::Tensor> sink_,         // [hq] log-space sink scores (float)
         std::optional<at::Tensor> d_sink_)             // [hq] sink gradient output (float)
 {
     if (is_causal) { window_size_right = 0; }
@@ -298,8 +298,8 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                 CHECK_DEVICE(sink);
                 TORCH_CHECK(sink.dtype() == torch::kFloat32, "sink must be float32");
                 TORCH_CHECK(sink.is_contiguous(), "sink must be contiguous");
-                TORCH_CHECK(sink.dim() == 2 && sink.size(0) == batch_size && sink.size(1) == num_heads,
-                            "sink must have shape [batch_size, num_heads]");
+                TORCH_CHECK(sink.dim() == 1 && sink.size(0) == num_heads,
+                            "sink must have shape [num_heads]");
                 sink_data_ptr = sink.data_ptr();
             }
             if (d_sink_.has_value() && d_sink_.value().defined()) {
@@ -343,7 +343,7 @@ mha_bwd(const at::Tensor &dout,         // [b, sq, hq, d_v]
                                 dk_expanded.data_ptr(),
                                 dv_expanded.data_ptr(),
                                 dbias_ptr,
-                                sink_data_ptr,   // sink_ptr [b, hq]
+                                sink_data_ptr,   // sink_ptr [hq]
                                 d_sink_data_ptr, // d_sink_ptr [hq]
                                 nullptr, // seqstart_q_ptr
                                 nullptr, // seqstart_k_ptr
