@@ -943,6 +943,28 @@ def get_2stage_cfgs(
         return MOEMetadata(None, None, block_m, ksplit, run_1stage,
                            stage0=functools.partial(fused_moe_asmjit_aot, config_string = kernelName1.split("__")[1]))
 
+    if kernelName1 and kernelName1.startswith("fused_moe_gfx942"):
+        kernel_name1_parts = kernelName1.split("__", 1)
+        if len(kernel_name1_parts) == 2:
+            if not is_flydsl_available():
+                logger.warning(
+                    "[fused_moe] tuned config requests FlyDSL gfx942 kernels but "
+                    "flydsl is not available; falling back to default dispatch."
+                )
+            else:
+                from aiter.fused_moe_gfx942 import fused_moe_gfx942
+
+                return MOEMetadata(
+                    None,
+                    None,
+                    block_m,
+                    ksplit,
+                    run_1stage,
+                    stage0=functools.partial(
+                        fused_moe_gfx942, config_string=kernel_name1_parts[1]
+                    ),
+                )
+
     def get_block_m() -> int:
         if q_dtype_a == dtypes.fp8:
             return 32
