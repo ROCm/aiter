@@ -6101,9 +6101,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 m_indices=m_indices,
                 moe_buf=moe_buf,
                 interleave=p1["interleave"],
-                situ_beta=_TUNER_SITU_BETA if p1["act"] == "situv2" else 1.0,
+                situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
                 situ_linear_beta=(
-                    _TUNER_SITU_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+                    DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
                 ),
             )
             return _flydsl_stage2_wrapper(
@@ -6155,9 +6155,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
             interleave=p1["interleave"],
             bias1=data["bias1"],
             swiglu_limit=7.0,
-            situ_beta=_TUNER_SITU_BETA if p1["act"] == "situv2" else 1.0,
+            situ_beta=DEFAULT_SITUV2_BETA if p1["act"] == "situv2" else 1.0,
             situ_linear_beta=(
-                _TUNER_SITU_LINEAR_BETA if p1["act"] == "situv2" else 1.0
+                DEFAULT_SITUV2_LINEAR_BETA if p1["act"] == "situv2" else 1.0
             ),
         )
         return _mxfp4_a4w4_stage2_fw(

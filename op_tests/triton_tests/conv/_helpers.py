@@ -210,7 +210,7 @@ class TestSuite:
         res = TestResult(name, passed, max_abs, rel, msg)
         self.results.append(res)
         if self.verbose:
-            mark = "?" if passed else "?"
+            mark = "PASS" if passed else "FAIL"
             print(f"  {mark} {name:<40} | max_abs={max_abs:.3e} rel={rel:.3e}")
         return res
 
