@@ -81,9 +81,6 @@ def is_gfx950_gluon_available(
     use_gluon_2d = (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_gluon_kernel is not None
-        # Past 256 the gather loader cannot fit LDS: it stages two buffers whatever
-        # NUM_BUFFERS says, so a 64-wide tile of 512 needs 256 KB of the CU's 160 KB.
-        # Untuned above 256 in any case.
         and head_size <= 256
         and not softcap
         and not use_qq_bias
