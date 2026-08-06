@@ -91,7 +91,7 @@ def launch_gemm_a8w4_tdm(
     #      value, so a Python ``if`` on it becomes a traced branch instead of a
     #      host-side check -- so the callers that choose cluster_n enforce it
     #      (batched_gemm_mxfp4._pick_cluster_n and its assert).
-    # Effective cross-tile B/scale prefetch: the env knob plus a buffer to
+    # Effective cross-tile A/B/scale prefetch: the env knob plus a buffer to
     # spare after the rotated wait (both schedules below need num_buffers>=3).
     # Derived here so the cache tag and the kernel symbol say what the kernel
     # actually does, not what was requested.
@@ -592,22 +592,31 @@ def launch_gemm_a8w4_tdm(
         DS_A = 2 if a_is_fp4 else 4
         DS_B = 2
         BS_DS = wmma_n_rep * DS_B + wmma_n_rep + wmma_m_rep
+        STATE_DS = wmma_m_rep * DS_A + BS_DS
 
-        def load_b_and_scales(buf, ksl):
+        def load_state(buf, ksl):
+            act = [
+                to_rmem(ACT_NDW, load_a(buf, wm, ksl))
+                for wm in range_constexpr(wmma_m_rep)
+            ]
             wt = [
                 to_rmem(8, load_b(buf, wn, ksl)) for wn in range_constexpr(wmma_n_rep)
             ]
             sb_k = [load_sb(buf, wn, ksl) for wn in range_constexpr(wmma_n_rep)]
             sa_k = [load_sa(buf, wm, ksl) for wm in range_constexpr(wmma_m_rep)]
-            return wt, sb_k, sa_k
+            return act, wt, sb_k, sa_k
 
-        # Cross-tile carry for one k128 of B/scales. The k-tile loop is a runtime
+        # Cross-tile carry for one k128 of A/B/scales. The k-tile loop is a runtime
         # scf.for, so this cannot ride a Python value across iterations: it lives
         # in fixed rmem that persists across the loop, exactly like c_frags. One
         # set is enough -- a tile reads it for subtile 0 and overwrites it on its
         # last subtile, so the read always precedes the write. Scales are packed
         # into one tensor because rmem SSA promotion wants a vector store/load and
         # a width-1 vector leaves a poison lane.
+        xt_act = [
+            fx.make_rmem_tensor(ACT_NDW, fx.Int32)
+            for _ in range_constexpr(wmma_m_rep)
+        ]
         xt_wt = [fx.make_rmem_tensor(8, fx.Int32) for _ in range_constexpr(wmma_n_rep)]
         xt_sc = fx.make_rmem_tensor(wmma_m_rep + wmma_n_rep, fx.Int32)
 
@@ -615,6 +624,8 @@ def launch_gemm_a8w4_tdm(
             """Load subtile 0 of ``buf`` into the carry slots."""
             sa_v = [load_sa(buf, wm, 0) for wm in range_constexpr(wmma_m_rep)]
             sb_v = [load_sb(buf, wn, 0) for wn in range_constexpr(wmma_n_rep)]
+            for wm in range_constexpr(wmma_m_rep):
+                xt_act[wm].store(load_a(buf, wm, 0))
             for wn in range_constexpr(wmma_n_rep):
                 xt_wt[wn].store(load_b(buf, wn, 0))
             xt_sc.store(Vec.from_elements(sa_v + sb_v))
@@ -622,35 +633,36 @@ def launch_gemm_a8w4_tdm(
         def xt_read():
             sc = xt_sc.load()
             return (
-                xt_wt,
+                [
+                    to_rmem(ACT_NDW, xt_act[wm].load())
+                    for wm in range_constexpr(wmma_m_rep)
+                ],
+                [
+                    to_rmem(8, xt_wt[wn].load())
+                    for wn in range_constexpr(wmma_n_rep)
+                ],
                 [sc[wmma_m_rep + wn] for wn in range_constexpr(wmma_n_rep)],
                 [sc[wm] for wm in range_constexpr(wmma_m_rep)],
             )
 
         # ``nxt_ksl`` is the next subtile inside this tile, ``xt_buf`` the next
-        # tile's buffer: either way this step issues the following k128's B/scale
-        # ds_reads under its own MFMAs. Only one of the two is ever set.
-        def k_step(buf, ksl, wt, sb_k, sa_k, nxt_ksl, xt_buf=None):
-            act_f = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in FRONT]
-            if const_expr(len(BACK) > 0):
-                act_b = [to_rmem(ACT_NDW, load_a(buf, wm, ksl)) for wm in BACK]
-                # rocdl.s_wait_dscnt(len(BACK) * DS_A)
-            else:
-                pass
+        # tile's buffer. Both paths prefetch a complete A/B/scale state.
+        def k_step(buf, act, wt, sb_k, sa_k, nxt_ksl, xt_buf=None):
             if const_expr(nxt_ksl is not None):
-                prefetch = load_b_and_scales(buf, nxt_ksl)
+                prefetch = load_state(buf, nxt_ksl)
             else:
                 prefetch = None
-            mma_rows(FRONT, act_f, wt, sa_k, sb_k)
+            if const_expr(xt_buf is not None):
+                xt_store(xt_buf)
+            mma_rows(FRONT, act[:front_wm], wt, sa_k, sb_k)
             if const_expr(len(BACK) > 0):
-                # rocdl.s_wait_dscnt(0)
-                mma_rows(BACK, act_b, wt, sa_k, sb_k)
+                mma_rows(BACK, act[front_wm:], wt, sa_k, sb_k)
             return prefetch
 
         def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None, my_jobs=None):
-            """Compute one k-tile, carrying one k128 of B/scales across tiles.
+            """Compute one k-tile, carrying one k128 of A/B/scales across tiles.
 
-            ``from_xt`` takes this tile's subtile-0 B/scales from the carry slots,
+            ``from_xt`` takes this tile's subtile-0 A/B/scales from the carry slots,
             where the previous tile's last k128 put them. ``nxt_buf`` is the next
             tile's LDS buffer, whose subtile 0 is loaded during this tile's last
             k128 -- so the tile boundary no longer exposes those ds_reads. The
@@ -663,11 +675,19 @@ def launch_gemm_a8w4_tdm(
                 rocdl.sched_barrier(0)
                 issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
                 rocdl.sched_barrier(0)
-            prev = xt_read() if const_expr(from_xt) else load_b_and_scales(buf, 0)
+            prev = xt_read() if const_expr(from_xt) else load_state(buf, 0)
             for ksl in range_constexpr(KWS):
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
                 xt_buf = nxt_buf if const_expr(ksl + 1 == KWS) else None
-                prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, xt_buf)
+                prev = k_step(
+                    buf,
+                    prev[0],
+                    prev[1],
+                    prev[2],
+                    prev[3],
+                    nxt_ksl,
+                    xt_buf,
+                )
             front_mma = front_wm * wmma_n_rep
             back_mma = len(BACK) * wmma_n_rep
 
@@ -685,18 +705,11 @@ def launch_gemm_a8w4_tdm(
                     ksl + 1 == KWS and nxt_buf is not None
                 )
                 if const_expr(ksl == 0):
-                    initial_b = BS_DS if not from_xt else 0
-                    rocdl.sched_dsrd(initial_b + front_wm * DS_A)
-                back_loads = spread(len(BACK) * DS_A, front_mma)
-                for i in range_constexpr(front_mma):
-                    rocdl.sched_mfma(1)
-                    if const_expr(back_loads[i] > 0):
-                        rocdl.sched_dsrd(back_loads[i])
-                future_loads = BS_DS if has_next else 0
-                if const_expr(ksl + 1 < KWS):
-                    future_loads += front_wm * DS_A
-                future_schedule = spread(future_loads, back_mma)
-                for i in range_constexpr(back_mma):
+                    rocdl.sched_dsrd(STATE_DS if not from_xt else 0)
+                future_schedule = spread(
+                    STATE_DS if has_next else 0, front_mma + back_mma
+                )
+                for i in range_constexpr(front_mma + back_mma):
                     rocdl.sched_mfma(1)
                     if const_expr(future_schedule[i] > 0):
                         rocdl.sched_dsrd(future_schedule[i])
@@ -709,7 +722,7 @@ def launch_gemm_a8w4_tdm(
             # AND for shallow pipelines: at num_buffers<=2 the mid-compute branch
             # prefetches only num_buffers-1==1 tile and under-overlaps, so it
             # loses to post even for large tile_m (fixes gemm2 tile_m=128/nb=2).
-            # Reading the next tile's B/scales during this tile's last k128 means
+            # Reading the next tile's A/B/scales during this tile's last k128 means
             # that tile must already be in LDS, so both schedules rotate their wait
             # one tile earlier. num_buffers >= 3 is what that costs: it trades one
             # tile of global-load latency hiding for the tile-boundary ds_read
