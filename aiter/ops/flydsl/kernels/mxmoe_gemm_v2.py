@@ -171,7 +171,7 @@ def issue_a_load_lds_dt(
         mask = (
             lds_swizzle_mask_f8(lds_row + a_lane_row, KH_TILE_A)
             if const_expr(is_f8)
-            else lds_swizzle_mask(lds_row + a_lane_row)
+            else lds_swizzle_mask(lds_row + a_lane_row, KH_TILE_A)
         )
         car = m_row + lds_row + a_lane_row  # direct sorted row
         voffset = (lane_col ^ mask) + car * K_BYTES
@@ -336,7 +336,7 @@ def gemm2_body_v2(
                     a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
                     a_frags[i][k].store(a64.bitcast(fx.Int32))
                 else:
-                    mask = lds_swizzle_mask(lane_mod_16)
+                    mask = lds_swizzle_mask(lane_mod_16, KH_TILE_A)
                     lds_col = (lane_div_16 * 16 + k * 64) ^ mask
                     vec = lds_vec_load(
                         s_aq_base,
