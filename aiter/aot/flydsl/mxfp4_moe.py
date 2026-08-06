@@ -3,12 +3,12 @@
 
 """AOT pre-compile for the FlyDSL mxmoe a4w4 MoE port (gemm1 / gemm2).
 
-Parses the flydsl_mxmoe_* port rows from the fp4 tuned CSVs and warms the FlyDSL
-disk cache via the same runtime entry points, keyed identically so inference
-hits the cache.
+Parses the flydsl_mxmoe_* port rows from the fp4/a4w4 tuned CSVs and warms the
+FlyDSL disk cache via the same runtime entry points, keyed identically so
+inference hits the cache.
 
 Standalone:
-    python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_fp4_tuned_fmoe.csv]
+    python -m aiter.aot.flydsl.mxfp4_moe [--csv /path/to/foo_a4w4_tuned_fmoe.csv]
 """
 
 import argparse
@@ -20,15 +20,33 @@ import time
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_ROOT_DIR
+from aiter.ops.flydsl.moe_common import (
+    DEFAULT_SITUV2_BETA,
+    DEFAULT_SITUV2_LINEAR_BETA,
+)
 
 _MODEL_CONFIG_DIR = f"{AITER_ROOT_DIR}/aiter/configs/model_configs"
-DEFAULT_CSVS = sorted(glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv"))
+DEFAULT_CSVS = sorted(
+    set(
+        glob.glob(f"{_MODEL_CONFIG_DIR}/*_fp4_tuned_fmoe.csv")
+        + glob.glob(f"{_MODEL_CONFIG_DIR}/*_a4w4_tuned_fmoe.csv")
+    )
+)
 
 # Mirror the runtime gate so the default build skips the opt-in mxfp4-out path.
 _MXFP4_INTERMEDIATE = os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") not in ("0", "")
 # V2 GEMM2 enables fp8 route-out by default; the legacy MoE AOT path keeps its
 # own default behavior in moe.py.
 _STAGE2_FP8_ROUTE_OUT = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+
+
+def _act_of(row: dict) -> str:
+    act_type = row.get("act_type", "")
+    if "Situv2" in act_type:
+        return "situv2"
+    if "Swiglu" in act_type:
+        return "swiglu"
+    return "silu"
 
 
 def _job_key(job: dict) -> tuple:
@@ -62,6 +80,9 @@ def _job_key(job: dict) -> tuple:
             job["NE"],
             job["topk"],
             job["xcd_swizzle"],
+            job["act"],
+            job["situ_beta"],
+            job["situ_linear_beta"],
         )
     return (
         2,
@@ -130,6 +151,11 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
+                        # Activation comes from the act_type key column, not the
+                        # kernel name; betas mirror fused_moe's None default.
+                        "act": _act_of(row),
+                        "situ_beta": DEFAULT_SITUV2_BETA,
+                        "situ_linear_beta": DEFAULT_SITUV2_LINEAR_BETA,
                     }
                 )
             if v2_g2 is not None:
@@ -223,6 +249,9 @@ def _compile_stage1(job):
         D_INTER=job["D_INTER"],
         topk=job["topk"],
         xcd_swizzle=job["xcd_swizzle"],
+        act=job["act"],
+        situ_beta=job["situ_beta"],
+        situ_linear_beta=job["situ_linear_beta"],
         stream=0,
     )
 

@@ -30,6 +30,9 @@ def _get_compiled_mxfp4_gemm1_port(
     BK,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     from .kernels.mxfp4_gemm1 import compile_gemm1_a4w4_port
 
@@ -45,11 +48,26 @@ def _get_compiled_mxfp4_gemm1_port(
         BK=BK,
         interleave=interleave,
         xcd_swizzle=xcd_swizzle,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
 
 def _assert_supported(
-    *, NE, D_HIDDEN, D_INTER, topk, BM, use_nt, inline_quant, BN=256, BK=256
+    *,
+    NE,
+    D_HIDDEN,
+    D_INTER,
+    topk,
+    BM,
+    use_nt,
+    inline_quant,
+    BN=256,
+    BK=256,
+    act="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     if D_HIDDEN % BK != 0:
         raise NotImplementedError(
@@ -64,6 +82,14 @@ def _assert_supported(
         raise NotImplementedError(
             f"flydsl mxfp4 gemm1 unsupported variant "
             f"(BM={BM}, use_nt={use_nt}, inline_quant={inline_quant})"
+        )
+    if act not in ("silu", "situv2"):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm1 requires act in ('silu', 'situv2'), got {act!r}"
+        )
+    if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
+        raise NotImplementedError(
+            "flydsl mxfp4 gemm1 requires positive SiTUv2 beta values"
         )
 
 
@@ -91,6 +117,9 @@ def flydsl_mxfp4_gemm1(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
+    act="silu",
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
     stream=None,
 ):
     _assert_supported(
@@ -103,6 +132,9 @@ def flydsl_mxfp4_gemm1(
         inline_quant=inline_quant,
         BN=BN,
         BK=BK,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     from .kernels.mxfp4_gemm1 import gemm1_grid
 
@@ -118,6 +150,9 @@ def flydsl_mxfp4_gemm1(
         BK,
         interleave,
         xcd_swizzle,
+        act,
+        situ_beta,
+        situ_linear_beta,
     )
     grid = gemm1_grid(n_tokens, BM, NE=NE, TOPK=topk, INTER=D_INTER, BN=BN)
     _moe_kernels._run_compiled(
