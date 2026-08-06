@@ -1,6 +1,26 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
+// ============================================================================
+// gfx1250 F4GEMM ASM Support Matrix
+// ----------------------------------------------------------------------------
+//  OUTTYPE | A_PRESHUFFLE | B_PRESHUFFLE | INTYPE |   M    |   N    |   K
+// ---------+--------------+--------------+--------+--------+--------+--------
+//  BF16    |      0       |      1       | MXFP4  | %1==0  | %16==0 | %32==0
+//  BF16    |      0       |      1       | NVFP4  | %1==0  | %16==0 | %32==0
+//  BF16    |      1       |      1       | MXFP4  | %16==0 | %16==0 | %32==0
+//  BF16    |      1       |      1       | NVFP4  | %16==0 | %16==0 | %32==0
+//  FP8     |      0       |      1       | MXFP4  | %1==0  | %16==0 | %32==0
+//  FP8     |      0       |      1       | NVFP4  | %1==0  | %16==0 | %32==0
+//  FP8     |      1       |      1       | MXFP4  | %16==0 | %16==0 | %32==0
+//  FP8     |      1       |      1       | NVFP4  | %16==0 | %16==0 | %32==0
+// ----------------------------------------------------------------------------
+// Notes:
+//  - B_PRESHUFFLE is always 1 (B is always pre-shuffled).
+//  - A_PRESHUFFLE=1 tightens the M constraint from %1==0 to %16==0.
+//  - K is always a multiple of 32.
+// ============================================================================
+//
 // gfx1250 F4GEMM ASM dispatch (preload SGPR mode).
 // Two entrypoints:
 //   - mxfp4_gemm_asm: D = A[M,K/2] mxfp4 * B[N,K/2] mxfp4 (e8m0 scales)
@@ -31,20 +51,23 @@
 constexpr int MXFP4_SCALE_BLOCK = 32;
 constexpr int NVFP4_SCALE_BLOCK = 16;
 
+constexpr int F4GEMM_N_ALIGN = 16;
+constexpr int F4GEMM_K_ALIGN = 32;
+
 // Preload-mode KernelArgs (4B-tight, MEM-first). Offsets in comments are the
 // kernarg byte offsets the preload-aware shader s_load's from.
 struct __attribute__((packed)) KernelArgs
 {
     void*        ptr_D;            // dw 0..1   (off 0x00)
-    void*        ptr_A;           // dw 2..3   (off 0x08)
-    void*        ptr_B;           // dw 4..5   (off 0x10)
+    void*        ptr_A;            // dw 2..3   (off 0x08)
+    void*        ptr_B;            // dw 4..5   (off 0x10)
     void*        ptr_ScaleA;       // dw 6..7   (off 0x18)
     void*        ptr_ScaleB;       // dw 8..9   (off 0x20)
     unsigned int strideD0;         // dw 10     (off 0x28)
     unsigned int strideA0;         // dw 11     (off 0x2C)
-    unsigned int strideB0;        // dw 12     (off 0x30)
+    unsigned int strideB0;         // dw 12     (off 0x30)
     unsigned int ScaleA_stride0;   // dw 13     (off 0x34)
-    unsigned int ScaleB_stride0;  // dw 14     (off 0x38)
+    unsigned int ScaleB_stride0;   // dw 14     (off 0x38)
     unsigned int M;                // dw 15     (off 0x3C)
     unsigned int N;                // dw 16     (off 0x40)
     unsigned int K;                // dw 17     (off 0x44)
@@ -84,20 +107,13 @@ static std::tuple<std::string, int> get_heuristic_kernel(
         // scale mode is baked into that variant (fp4 output is a noscale .co).
         if(cfg.outtype != outtype)
             continue;
-        // Persistent/cluster shaders don't mask partial tiles, so the problem
-        // must tile both dims exactly.
-        if((N % cfg.tile_n) != 0 || (M % cfg.tile_m) != 0)
+
+        const int m_align = a_preshuffle ? 16 : 1;
+        if((M % m_align) != 0 || (N % F4GEMM_N_ALIGN) != 0 || (K % F4GEMM_K_ALIGN) != 0)
             continue;
 
         int tg_num_M         = (M + cfg.tile_m - 1) / cfg.tile_m;  // tiles in M (gdy)
         int tg_num_N         = (N + cfg.tile_n - 1) / cfg.tile_n;  // tiles in N (gdx)
-
-        // Cluster dims (compile-time per .co, declared in the CSV) must evenly
-        // divide the tile grid; otherwise this variant can't run this shape.
-        int cl_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
-        int cl_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
-        if((cl_x > 1 && (tg_num_N % cl_x) != 0) || (cl_y > 1 && (tg_num_M % cl_y) != 0))
-            continue;
 
         tg_num               = tg_num_M * tg_num_N;
         uint32_t local_round = (tg_num + num_cu - 1) / num_cu;
@@ -192,8 +208,12 @@ static void f4gemm_launch(aiter_tensor_t* A,
         out_is_fp4 ? static_cast<unsigned int>(Ndim / 2)
                    : (out_is_fp8 ? static_cast<unsigned int>(Ndim)
                                  : static_cast<unsigned int>(Ndim) * 2);
-    unsigned int stride_sa = static_cast<unsigned int>(Kdim / scale_block);
-    unsigned int stride_sb = static_cast<unsigned int>(Kdim / scale_block);
+    // Scale row stride: the shader loads scales in 128-K super-columns, so the
+    // per-row scale count is padded up to a multiple of 128/scale_block. Equals
+    // Kdim/scale_block when K%128==0.
+    unsigned int stride_sa =
+        static_cast<unsigned int>(((Kdim + 127) / 128) * (128 / scale_block));
+    unsigned int stride_sb = stride_sa;
 
     KernelArgs args{};                       // zero-init; log2_grid_x/y set below if persistent
     args.ptr_D           = out->ptr;
@@ -308,21 +328,8 @@ static void f4gemm_launch(aiter_tensor_t* A,
     constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
     constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
 
-    const int tiles_x = Ndim / SUBN;   // N-direction output tiles (exact: see heuristic)
-    const int tiles_y = Mdim / SUBM;   // M-direction output tiles (exact: see heuristic)
-
-    // Cluster dims must evenly tile the work grid (cluster is compile-time per .co).
-    if(cluster_x > 1 || cluster_y > 1)
-    {
-        AITER_CHECK(tiles_x >= cluster_x && (tiles_x % cluster_x) == 0,
-                    __func__, " cluster_x=", cluster_x, " requires N tiles (", tiles_x,
-                    ") to be a multiple of it; N=", Ndim, " must be a multiple of ",
-                    SUBN * cluster_x);
-        AITER_CHECK(tiles_y >= cluster_y && (tiles_y % cluster_y) == 0,
-                    __func__, " cluster_y=", cluster_y, " requires M tiles (", tiles_y,
-                    ") to be a multiple of it; M=", Mdim, " must be a multiple of ",
-                    SUBM * cluster_y);
-    }
+    const int tiles_x = (Ndim + SUBN - 1) / SUBN;   // N-direction output tiles
+    const int tiles_y = (Mdim + SUBM - 1) / SUBM;   // M-direction output tiles
 
     int          gdx         = tiles_x;
     int          gdy         = tiles_y;
