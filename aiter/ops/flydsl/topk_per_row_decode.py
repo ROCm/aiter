@@ -91,8 +91,9 @@ def _environ_kernel_config() -> dict:
 def _default_kernel_config(
     num_rows: int,
     max_model_len: int,
+    arch: str | None = None,
 ) -> dict:
-    arch = get_rocm_arch()
+    arch = arch or get_rocm_arch()
 
     # Grid width per row: enough workgroups to cover the row at LOAD_VEC elements
     # per thread, clamped to [2, 32] (32 = the wg cap the mid/long tiers can use;
@@ -255,8 +256,8 @@ def _default_kernel_config(
     }
 
 
-def _kernel_config(num_rows: int, max_model_len: int) -> dict:
-    default_config = _default_kernel_config(num_rows, max_model_len)
+def _kernel_config(num_rows: int, max_model_len: int, arch: str | None = None) -> dict:
+    default_config = _default_kernel_config(num_rows, max_model_len, arch)
     environ_config = _environ_kernel_config()
 
     kernel_config = {
@@ -275,7 +276,7 @@ def _kernel_config(num_rows: int, max_model_len: int) -> dict:
             f"got {tier_mode!r}"
         )
 
-    kernel_config = _apply_deadlock_guard(kernel_config, num_rows, max_model_len)
+    kernel_config = _apply_deadlock_guard(kernel_config, num_rows, max_model_len, arch)
     return kernel_config
 
 
@@ -283,6 +284,7 @@ def _apply_deadlock_guard(
     kernel_config: dict,
     num_rows: int,
     max_model_len: int,
+    arch: str | None = None,
 ) -> dict:
     """Clamp the tiered config so the mid/long-tier inter-workgroup barrier cannot
     deadlock. The possibility of deadlock requires both a wide batch (num_rows > ~80-90)
@@ -335,7 +337,7 @@ def _apply_deadlock_guard(
     # the 1024-thread block is wave-limited (32 waves/CU / 16), with VGPR/LDS
     # headroom (measured gfx942: VGPR=40, LDS=8.7KB). Re-check if scan_stages or
     # the histogram grows enough to push VGPR>64 / LDS>32KB (would drop occ to 1).
-    max_coresident_workgroups = _multi_processor_count(get_rocm_arch()) * 2
+    max_coresident_workgroups = _multi_processor_count(arch or get_rocm_arch()) * 2
     is_deadlock_free = (
         num_rows * (max_active_workgroups_per_row - 1) < max_coresident_workgroups
     )
@@ -372,20 +374,36 @@ def flydsl_top_k_per_row_decode_workspace_size(
     return workspace_slots
 
 
+@functools.lru_cache(maxsize=1)
+def _current_arch() -> str:
+    """Arch of the device this process runs on.
+
+    Cached because _build_launcher needs it on every decode step and it cannot
+    change within a process. AOT compiles for other archs and passes them
+    explicitly instead of going through here.
+    """
+    return get_rocm_arch()
+
+
 @functools.lru_cache(maxsize=16384)
 def _build_launcher(
     top_k: int,
     num_rows: int,
     max_model_len: int,
+    arch: str,
 ):
     """Build (and lru-cache) the launcher + workspace metadata for this shape.
 
     Returns the flyc.jit launcher object, does not compile. The first
     _run_compiled() call triggers flyc.compile.
 
-    Cached per unique (top_k, num_rows, max_model_len).
+    Cached per unique (top_k, num_rows, max_model_len, arch). The arch belongs in
+    the key: it decides several config fields (short_max, and the gfx950-only
+    row_proportional_parts / early_stop), and the JitFunction freezes its compile
+    target on first use. Without it, an AOT process compiling several archs hands
+    the first arch's launcher to the rest and their kernels never reach the cache.
     """
-    kernel_config = _kernel_config(num_rows, max_model_len)
+    kernel_config = _kernel_config(num_rows, max_model_len, arch)
 
     workspace_slots = topk_workspace_slots(
         num_rows,
@@ -540,6 +558,7 @@ def flydsl_top_k_per_row_decode(
         k,
         numRows,
         logits.shape[1],
+        _current_arch(),
     )
 
     if workspace is None:

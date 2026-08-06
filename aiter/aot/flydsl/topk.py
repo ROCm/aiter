@@ -139,7 +139,12 @@ def compile_one_config(
             override_env("FLYDSL_GPU_ARCH", aot_arch),
             FakeTensorMode(),
         ):
-            launcher, ws_slots, _ = _build_launcher(k, num_rows, max_model_len)
+            # Pass the target arch explicitly: it is part of the launcher cache
+            # key, so jobs for different archs cannot share one launcher even
+            # though this process compiles them all back to back.
+            launcher, ws_slots, _ = _build_launcher(
+                k, num_rows, max_model_len, aot_arch
+            )
 
             dev = torch.device("cpu")
             next_n = 1
