@@ -625,17 +625,14 @@ def launch_gemm_a8w4_tdm(
                             )
 
                         if const_expr(quant_fp4):
-                            # Match the previous bf16-intermediate + standalone
-                            # FP4 quant path: round the activated result to bf16
-                            # before computing its MX scale and packed payload.
-                            rounded_vec = (
-                                Vec.from_elements(all_vals, fx.Float32)
-                                .to(fx.BFloat16)
-                                .to(fx.Float32)
+                            # Compute the MX scale directly from the f32 activation.
+                            # gfx1250's native FP4 pack consumes bf16, so keep one
+                            # rounded view for that instruction without widening it
+                            # back to f32.
+                            pack_bf16 = Vec.from_elements(all_vals, fx.Float32).to(
+                                fx.BFloat16
                             )
-                            quant_vals = [
-                                rounded_vec[i] for i in range_constexpr(len(all_vals))
-                            ]
+                            quant_vals = all_vals
                             quant_dtype = MxDtype.FP4_E2M1
                         else:
                             quant_vals = all_vals
@@ -652,23 +649,36 @@ def launch_gemm_a8w4_tdm(
 
                         if const_expr(quant_fp4):
                             # kgrp0 owns activated columns [0:4] of each wn and
-                            # kgrp1 owns [4:8]. Exchange the peer values so
-                            # kgrp0 can issue one native pk8 conversion and one
-                            # aligned b32 LDS store for all eight FP4 values.
-                            peer_vals = [
-                                v.shuffle_xor(fx.Int32(16), fx.Int32(WAVE))
-                                for v in quant_vals
-                            ]
+                            # kgrp1 owns [4:8]. Pack each lane's four bf16 values
+                            # into two dwords before exchanging them, halving the
+                            # cross-kgrp shuffles.
+                            packed_bf16 = pack_bf16.bitcast(fx.Int32)
+                            local_bf16_words = []
+                            peer_bf16_words = []
+                            for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
+                                begin = sub_wn * 2
+                                local_words = [
+                                    packed_bf16[begin + i]
+                                    for i in range_constexpr(2)
+                                ]
+                                local_bf16_words.append(local_words)
+                                peer_bf16_words.append(
+                                    [
+                                        word.shuffle_xor(
+                                            fx.Int32(16), fx.Int32(WAVE)
+                                        )
+                                        for word in local_words
+                                    ]
+                                )
                             if row_rel < mn_oob and is_kgrp0:
                                 for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
-                                    begin = sub_wn * 4
                                     src_bf16 = (
                                         Vec.from_elements(
-                                            quant_vals[begin : begin + 4]
-                                            + peer_vals[begin : begin + 4],
-                                            fx.Float32,
+                                            local_bf16_words[sub_wn]
+                                            + peer_bf16_words[sub_wn],
+                                            fx.Int32,
                                         )
-                                        .to(fx.BFloat16)
+                                        .bitcast(fx.BFloat16)
                                         .ir_value()
                                     )
                                     packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
