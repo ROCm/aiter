@@ -236,10 +236,9 @@ def _lookup_tuned(M, N, K, a_dtype, b_dtype, tuned_file=None):
 
 
 def _heuristic_tile(a_dtype, b_dtype, M, N, K):
-    """Pick a legal tile from the catalog when no tune/explicit config is given."""
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
 
-    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K)]
+    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, "gfx950")]
     if not cands:
         return None
     target_m = min(max((M + 31) // 32 * 32, 32), 128)
@@ -281,6 +280,15 @@ def gemm_mxscale_preshuffle(
     blockscale defaults to True, matching how the tuned CSV is tuned; a4w4 / a6w4
     callers must pass blockscale=False.
     """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    if get_gfx_runtime() != "gfx950":
+        raise RuntimeError(
+            f"gemm_mxscale_preshuffle is the gfx950 MFMA path, got "
+            f"{get_gfx_runtime()}; call aiter.gemm_a8w8_mxscale_preshuffle_flydsl, "
+            f"which dispatches per arch"
+        )
+
     M = int(A.shape[0])
     N = int(Out.shape[-1])
     K = int(A.shape[-1]) * (2 if a_dtype == "fp4" else 1)

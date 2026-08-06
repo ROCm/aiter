@@ -81,14 +81,13 @@ def test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype):
             shuffle_scale_blockscale_b(sb_128, n, k),
             (sa_128, sb_128.repeat_interleave(128, dim=0), 128),
         ),
-        "mx1x32": (
+    }
+    if get_gfx() not in BLOCKSCALE_ONLY_GFX:
+        scales["mx1x32"] = (
             shuffle_scale_a16w4(sa, 1, False),
             shuffle_scale_a16w4(sb, 1, False),
             (sa[:m], sb[:n], 32),
-        ),
-    }
-    if get_gfx() in BLOCKSCALE_ONLY_GFX:
-        del scales["mx1x32"]
+        )
 
     # A x B^T with fp8 codes: FLOPs = 2*M*N*K; bytes = codes + out + this mode's
     # scale traffic (blockscale reads 4x less A-scale and 256x less B-scale, which
