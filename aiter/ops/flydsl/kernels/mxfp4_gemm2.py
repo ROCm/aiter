@@ -611,7 +611,11 @@ def _gemm2_body(
             write_slot = next_kt % _aStages
             _kloop_fence()
             a = issue_a_ds_read(slot)
-            issue_a_load_lds(write_slot, next_kt)
+            if const_expr(_n_load_waves < 4):
+                if wave < fx.Int32(_n_load_waves):
+                    issue_a_load_lds(write_slot, next_kt)
+            else:
+                issue_a_load_lds(write_slot, next_kt)
             a_scale_sub = [
                 a_scale_v[kt][sub] for sub in range_constexpr(_kScaleSubBlocks)
             ]

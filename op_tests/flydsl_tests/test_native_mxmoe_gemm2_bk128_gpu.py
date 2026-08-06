@@ -25,8 +25,23 @@ _SKIP_GFX950_FLYDSL = pytest.mark.skipif(
 
 def _check_close(ref, out, label):
     assert torch.isfinite(out).all(), f"{label}: output contains NaN or Inf"
-    err = checkAllclose(ref, out, msg=label, atol=1.0, rtol=0.05)
+    ref_f32 = ref.float().reshape(1, -1)
+    out_f32 = out.float().reshape(1, -1)
+    cosine = torch.nn.functional.cosine_similarity(
+        ref_f32, out_f32, dim=1, eps=1e-12
+    ).item()
+    assert cosine >= 0.999, (
+        f"{label}: cosine similarity {cosine:.6f} is below 0.999"
+    )
+    err = checkAllclose(ref, out, msg=label, atol=0.01, rtol=0.05)
     assert err == 0 or err <= 0.05, f"{label}: error ratio {err} exceeds 0.05"
+
+
+def test_check_close_rejects_all_zero_output():
+    ref = torch.tensor((0.6, -0.4, 0.2), dtype=torch.float32)
+    out = torch.zeros_like(ref)
+    with pytest.raises(AssertionError, match="cosine similarity"):
+        _check_close(ref, out, "all_zero")
 
 
 def _dequant_fp4(value, scale, cols):
@@ -35,8 +50,8 @@ def _dequant_fp4(value, scale, cols):
     return (values * scales).view(*value.shape[:-1], cols)
 
 
-def prepare_direct_stage2_case(inter_dim, bk, seed=123):
-    token, model_dim, expert, topk, bm = 33, 256, 2, 2, 32
+def prepare_direct_stage2_case(inter_dim, bk, *, bm=32, seed=123):
+    token, model_dim, expert, topk = 33, 256, 2, 2
     device = torch.device("cuda")
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -173,4 +188,20 @@ def test_native_atomic_bm32_direct_stage2(inter_dim, bk):
     out = run_direct_stage2(case)
     _check_close(
         case["ref"].float(), out.float(), f"native_bm32_k{inter_dim}_bk{bk}"
+    )
+
+
+@pytest.mark.parametrize(
+    "inter_dim",
+    [
+        pytest.param(512, id="k512-4tiles"),
+        pytest.param(1024, id="k1024-8tiles"),
+    ],
+)
+@_SKIP_GFX950_FLYDSL
+def test_native_atomic_bm16_bk128_deep_k(inter_dim):
+    case = prepare_direct_stage2_case(inter_dim, 128, bm=16)
+    out = run_direct_stage2(case)
+    _check_close(
+        case["ref"].float(), out.float(), f"native_bm16_k{inter_dim}_bk128"
     )
