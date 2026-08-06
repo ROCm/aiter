@@ -164,6 +164,7 @@ def build_pa_mqa_logits_fp4_module(
         chunk_start_raw = split_idx * chunks_per_split + extra_before
         chunk_count_raw = chunks_per_split + (split_idx < remainder).to(fx.Int32)
         valid_split = valid_row & (chunk_count_raw > fx.Int32(0))
+        bt_batch_id = valid_split.select(pid_b, fx.Int32(0))
         chunk_start = valid_split.select(chunk_start_raw, fx.Int32(0))
         chunk_count = valid_split.select(chunk_count_raw, fx.Int32(1))
         local_end = valid_split.select(local_end, fx.Int32(0))
@@ -253,7 +254,10 @@ def build_pa_mqa_logits_fp4_module(
             )
             bi_base = token_global_base // kv_block_size
             phys_vec = buffer_ops.buffer_load(
-                bt_rsrc, pid_b * _stride_bt + bi_base, vec_width=N_PHYS, dtype=T.i32
+                bt_rsrc,
+                bt_batch_id * _stride_bt + bi_base,
+                vec_width=N_PHYS,
+                dtype=T.i32,
             )
             return _phys_to_list(phys_vec)
 
@@ -596,23 +600,25 @@ def flydsl_pa_mqa_logits_fp4_decode(
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int | None = None,
     out: torch.Tensor | None = None,
-    cta_info: torch.Tensor | None = None,
-    n_ctas: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Bounded-split FP4 paged MQA decode for fixed or variable query lengths.
+    """Canonical bounded-split FP4 paged MQA decode API.
 
-    Q, Q scales, weights, and output use packed row-major query layout. The fixed
-    case omits ``cu_seq_q`` and has ``batch * next_n_max`` rows. The variable
-    case passes an int32 contiguous ``cu_seq_q`` and uses ``next_n_max`` as the
-    static padded grid bound. ``parallel_unit_num`` is a target, not an exact CTA
-    count; the host derives one bounded ``split_kv`` scalar from static sizes.
+    ``q_fp4`` uses packed row-major ``[total_q, heads, head_dim / 2]`` layout;
+    Q scales, weights, and output use the same leading ``total_q`` row order.
+    Fixed decode omits ``cu_seq_q`` and requires
+    ``total_q == batch * next_n_max``. Ragged decode passes a contiguous int32
+    ``cu_seq_q`` and uses ``next_n_max`` as the static per-batch grid bound.
+    ``parallel_unit_num`` is a target, not an exact CTA count; the host derives
+    one bounded ``split_kv`` scalar from static sizes.
 
-    Reused ``out`` must already contain ``-inf`` outside windows. ``cta_info`` and
-    ``n_ctas`` are temporarily accepted for source compatibility but ignored.
-    For graph capture, provide stable int32 contiguous metadata buffers. The
-    caller must ensure device qlens do not exceed ``next_n_max`` and ``cu_seq_q``
-    does not index past allocated Q rows; checking either would require a sync.
+    The kernel writes every element inside each valid row's window and leaves
+    cells outside it untouched. Pre-fill a reused ``out`` with ``-inf`` only
+    when its consumer can observe those cells; bounded top-k consumers may use
+    uninitialized scratch. For graph capture, provide stable int32 contiguous
+    metadata buffers. The caller must ensure device qlens do not exceed
+    ``next_n_max`` and ``cu_seq_q`` does not index past allocated Q rows;
+    checking either would require a sync.
     """
     if q_fp4.ndim != 3:
         raise ValueError(
@@ -646,7 +652,6 @@ def flydsl_pa_mqa_logits_fp4_decode(
         # The fixed specialization does not read this argument.
         cu_seq_q_arg = context_lens_arg
 
-    del cta_info, n_ctas
     split_ctx_len = max_seq_len if split_ctx_len is None else int(split_ctx_len)
     split_kv = _bounded_split_kv(total_q, split_ctx_len, block_k, parallel_unit_num)
     if out is None:
@@ -688,59 +693,3 @@ def flydsl_pa_mqa_logits_fp4_decode(
         stream,
     )
     return out
-
-
-def flydsl_pa_mqa_logits_fp4(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_scale: torch.Tensor,
-    block_tables: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    max_seq_len: int,
-    *,
-    weight_scale: float = 1.0,
-    next_n: int = 1,
-    block_k: int = 256,
-    kv_block_size: int = 64,
-    num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: int | None = None,
-    split_ctx_len: int | None = None,
-    out: torch.Tensor | None = None,
-    cta_info: torch.Tensor | None = None,
-    total_ctas: int | None = None,
-    stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """Fixed-width compatibility wrapper for bounded-split FP4 decode."""
-    if q_fp4.ndim != 4:
-        raise ValueError(
-            "flydsl_pa_mqa_logits_fp4 expects q_fp4 "
-            f"[batch, next_n, heads, head_dim/2], got shape {tuple(q_fp4.shape)}."
-        )
-    batch_size, q_next_n, heads, head_dim_packed = q_fp4.shape
-    if q_next_n != next_n:
-        raise ValueError(f"q_fp4 next_n dim ({q_next_n}) != next_n arg ({next_n}).")
-    q_packed = q_fp4.view(batch_size * next_n, heads, head_dim_packed)
-    q_scale_packed = q_scale.view(batch_size * next_n, *q_scale.shape[2:])
-    return flydsl_pa_mqa_logits_fp4_decode(
-        q_packed,
-        q_scale_packed,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        context_lens,
-        max_seq_len,
-        next_n_max=next_n,
-        split_ctx_len=split_ctx_len,
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        num_warps=num_warps,
-        parallel_unit_num=parallel_unit_num,
-        out=out,
-        cta_info=cta_info,
-        n_ctas=total_ctas,
-        stream=stream,
-    )

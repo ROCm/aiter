@@ -27,15 +27,7 @@ MFMA_N = 16
 WARP_SIZE = 64
 DEFAULT_BLOCK_THREADS = DEFAULT_NUM_WARPS * WARP_SIZE  # 256
 
-# cta_info packed fields per CTA.
-CTA_INFO_WIDTH = 6
 ROW_INFO_WIDTH = 4
-
-
-def _resolve_prefill_block_k(block_k: int, max_seq_len: int) -> int:
-    if block_k == 256 and max_seq_len <= 256:
-        return 64
-    return block_k
 
 
 def _pack_i32_pair_to_i64(a_i32, b_i32):
@@ -112,147 +104,6 @@ def pack_prefill_row_info(row_to_batch, local_starts, local_ends, *, out=None):
             ROW_WIDTH=ROW_INFO_WIDTH,
         )
     return out
-
-
-def compute_prefill_schedule(
-    row_to_batch,
-    local_starts,
-    local_ends,
-    block_k,
-    parallel_unit_num,
-    max_seq_len,
-    cta_info_out=None,
-):
-    """Compute the persistent-grid schedule for ragged-prefill MQA logits.
-
-    Pass `cta_info_out` (a fixed [parallel_unit_num, CTA_INFO_WIDTH] int32 buffer)
-    to write the schedule into a stable address (CUDAGraph decode: the captured
-    kernel replays from this pointer while `build()` refreshes its contents).
-    """
-    block_k = _resolve_prefill_block_k(block_k, max_seq_len)
-    device = local_ends.device
-    P = parallel_unit_num
-    T = local_ends.shape[0]  # fixed total_tokens (rows)
-
-    assert P >= T, (
-        f"compute_prefill_schedule: parallel_unit_num={P} < rows={T} would "
-        f"silently drop rows past slot {P} (logits stay at the caller's "
-        f"pre-fill -> wrong top-k). Pass parallel_unit_num >= number of rows."
-    )
-
-    rb = row_to_batch.to(torch.int32)
-    ls = local_starts.to(torch.int32)
-    le = local_ends.to(torch.int32)
-
-    # chunk count per row = ceil(le / block_k); le<=0 → 0 chunks.
-    chunks_per_row = torch.clamp((le + (block_k - 1)) // block_k, min=0)  # [T]
-
-    s_max = max(1, (max_seq_len + block_k - 1) // block_k)
-    s_cand = torch.arange(1, s_max + 1, device=device, dtype=torch.int32)  # [s_max]
-    ctas_per_r_s = (chunks_per_row[None, :] + (s_cand[:, None] - 1)) // s_cand[
-        :, None
-    ]  # [s_max, T]
-    total_ctas_s = ctas_per_r_s.sum(dim=1)  # [s_max]
-    feasible = total_ctas_s <= P  # [s_max] bool, monotonic False..True
-    max_chunks = torch.clamp(chunks_per_row.max(), min=1).to(torch.int32)
-    # smallest feasible s, via arithmetic (no tensor gather → no capture sync).
-    first_feasible_s = torch.clamp((~feasible).to(torch.int32).sum() + 1, max=s_max)
-    safe = torch.where(feasible.any(), first_feasible_s, max_chunks).to(torch.int32)
-
-    # ── per-row number of CTAs (chunk-splits); 0 for empty rows ──
-    ctas_r = (chunks_per_row + (safe - 1)) // safe  # [T]
-    incl = torch.cumsum(ctas_r, dim=0, dtype=torch.int32)  # [T] inclusive prefix sum
-    excl = incl - ctas_r  # exclusive prefix sum
-    total_splits = incl[-1]  # 0-dim; total valid (row, split) slots
-
-    # ── map each fixed slot → (row, split) + emit cta_info in ONE kernel ──
-    # (the ~25 per-slot torch ops below were the bulk of the ~50-launch cost).
-    if cta_info_out is None:
-        cta_info = torch.empty(P, CTA_INFO_WIDTH, dtype=torch.int32, device=device)
-    else:
-        cta_info = cta_info_out
-    safe_i32 = safe.reshape(1).to(torch.int32)
-    total_splits_i32 = total_splits.reshape(1).to(torch.int32)
-    BLOCK_P = 256
-    grid = (triton.cdiv(P, BLOCK_P),)
-    _prefill_cta_info_kernel[grid](
-        incl,
-        excl,
-        chunks_per_row.to(torch.int32),
-        rb,
-        ls,
-        le,
-        safe_i32,
-        total_splits_i32,
-        cta_info,
-        T,
-        P,
-        BLOCK_P=BLOCK_P,
-    )
-    return safe, cta_info, P
-
-
-@triton.jit
-def _prefill_cta_info_kernel(
-    incl_ptr,  # [T] int32 inclusive prefix sum of per-row CTA counts
-    excl_ptr,  # [T] int32 exclusive prefix sum
-    chunks_ptr,  # [T] int32 chunks_per_row
-    rb_ptr,  # [T] int32 row_to_batch
-    ls_ptr,  # [T] int32 local_starts
-    le_ptr,  # [T] int32 local_ends
-    safe_ptr,  # [1] int32
-    total_splits_ptr,  # [1] int32
-    cta_info_ptr,  # [P, 6] int32
-    T,
-    P,
-    BLOCK_P: tl.constexpr,
-):
-    """Single-kernel slot->row mapping + cta_info emit for ragged prefill."""
-    pid = tl.program_id(0)
-    safe = tl.load(safe_ptr)
-    total_splits = tl.load(total_splits_ptr)
-    slot = pid * BLOCK_P + tl.arange(0, BLOCK_P)  # [BLOCK_P]
-    smask = slot < P
-    valid = slot < total_splits
-
-    # searchsorted(incl, slot, right=True) = count(incl <= slot): per-slot
-    # binary search over incl[T] in global memory (~log2(T) iters).
-    lo = tl.zeros([BLOCK_P], tl.int32)
-    hi = tl.full([BLOCK_P], T, tl.int32)
-    for _ in tl.static_range(32):
-        mid = (lo + hi) // 2
-        incl_mid = tl.load(
-            incl_ptr + tl.minimum(mid, T - 1), mask=(mid < T), other=2147483647
-        )
-        go_right = incl_mid <= slot
-        lo = tl.where(go_right, mid + 1, lo)
-        hi = tl.where(go_right, hi, mid)
-    safe_row = tl.minimum(lo, T - 1)  # clamp for gather
-
-    excl_r = tl.load(excl_ptr + safe_row, mask=smask, other=0)
-    chunks_r = tl.load(chunks_ptr + safe_row, mask=smask, other=0)
-    rb_r = tl.load(rb_ptr + safe_row, mask=smask, other=0)
-    ls_r = tl.load(ls_ptr + safe_row, mask=smask, other=0)
-    le_r = tl.load(le_ptr + safe_row, mask=smask, other=0)
-
-    vi = valid.to(tl.int32)
-    split_within = slot - excl_r
-    start = split_within * safe  # pre-mask (count uses this)
-    count = tl.maximum(tl.minimum(safe, chunks_r - start), 0)
-    row_id = safe_row * vi
-    batch_id = rb_r * vi
-    start = start * vi
-    count = tl.where(valid, count, 1)
-    ls_out = ls_r * vi
-    le_out = le_r * vi
-
-    base = slot * 6
-    tl.store(cta_info_ptr + base + 0, row_id, mask=smask)
-    tl.store(cta_info_ptr + base + 1, batch_id, mask=smask)
-    tl.store(cta_info_ptr + base + 2, start, mask=smask)
-    tl.store(cta_info_ptr + base + 3, count, mask=smask)
-    tl.store(cta_info_ptr + base + 4, ls_out, mask=smask)
-    tl.store(cta_info_ptr + base + 5, le_out, mask=smask)
 
 
 def build_pa_mqa_logits_fp4_prefill_module(
@@ -758,93 +609,7 @@ def compile_pa_mqa_logits_fp4_prefill(
     return launch_pa_mqa_logits_fp4_prefill, block_threads
 
 
-class _PreparedPackedPrefillLauncher:
-    """Shape-specialized packed prefill launch with compiled fast dispatch."""
-
-    __slots__ = ("_launcher", "n_ctas", "split_kv")
-
-    def __init__(self, launcher, split_kv, n_ctas):
-        self._launcher = launcher
-        self.split_kv = split_kv
-        self.n_ctas = n_ctas
-
-    def __call__(
-        self,
-        out,
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        row_info,
-        *,
-        weight_scale=1.0,
-        stream=None,
-    ):
-        if stream is None:
-            stream = torch.cuda.current_stream()
-        args = (
-            out,
-            q_fp4,
-            q_scale,
-            kv_cache,
-            kv_scale,
-            block_tables,
-            weights,
-            row_info,
-            out.stride(0),
-            float(weight_scale),
-            self.split_kv,
-            self.n_ctas,
-            stream,
-        )
-        device_index = q_fp4.device.index
-        if device_index is None or device_index == torch.cuda.current_device():
-            _run_compiled(self._launcher, *args)
-        else:
-            with torch.cuda.device(device_index):
-                _run_compiled(self._launcher, *args)
-
-
-@lru_cache(maxsize=128)
-def prepare_pa_mqa_logits_fp4_prefill_packed(
-    *,
-    total_tokens: int,
-    heads: int,
-    head_dim: int,
-    max_blocks_per_seq: int,
-    max_seq_len: int,
-    block_k: int = 256,
-    kv_block_size: int = 64,
-    num_warps: int = DEFAULT_NUM_WARPS,
-    parallel_unit_num: int = 512,
-):
-    """Return a cached shape-specialized packed prefill launcher.
-
-    The first call with runtime tensors compiles and executes the launcher;
-    subsequent calls invoke the cached ``CompiledFunction`` directly. Warm the
-    returned launcher once before CUDAGraph capture.
-    """
-    max_chunks = max(1, (max_seq_len + block_k - 1) // block_k)
-    target_ctas = max(parallel_unit_num, total_tokens)
-    split_kv = min(
-        max_chunks,
-        max(1, (target_ctas + total_tokens - 1) // total_tokens),
-    )
-    n_ctas = total_tokens * split_kv
-    launcher, _ = compile_pa_mqa_logits_fp4_prefill(
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        max_blocks_per_seq=max_blocks_per_seq,
-        num_warps=num_warps,
-        heads=heads,
-        head_dim=head_dim,
-    )
-    return _PreparedPackedPrefillLauncher(launcher, split_kv, n_ctas)
-
-
-def flydsl_pa_mqa_logits_fp4_prefill_packed(
+def flydsl_pa_mqa_logits_fp4_prefill(
     q_fp4: torch.Tensor,
     q_scale: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -860,8 +625,6 @@ def flydsl_pa_mqa_logits_fp4_prefill_packed(
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int = 512,
     out: torch.Tensor | None = None,
-    cta_info: torch.Tensor | None = None,
-    n_ctas: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Bounded-split prefill using packed ``[row, 4]`` int32 row metadata."""
@@ -879,10 +642,6 @@ def flydsl_pa_mqa_logits_fp4_prefill_packed(
             f"row_info must be contiguous int32 [>= {total_tokens}, {ROW_INFO_WIDTH}]"
         )
 
-    # Retained temporarily for ATOM/source compatibility; bounded-split prefill
-    # derives its CTA assignment in-kernel and does not consume cta_info.
-    del cta_info, n_ctas
-
     if out is None:
         out = torch.full(
             (total_tokens, max_seq_len),
@@ -891,18 +650,24 @@ def flydsl_pa_mqa_logits_fp4_prefill_packed(
             device=q_fp4.device,
         )
 
-    prepared = prepare_pa_mqa_logits_fp4_prefill_packed(
-        total_tokens=total_tokens,
-        heads=heads,
-        head_dim=head_dim,
-        max_blocks_per_seq=max_blocks_per_seq,
-        max_seq_len=max_seq_len,
+    max_chunks = max(1, (max_seq_len + block_k - 1) // block_k)
+    target_ctas = max(parallel_unit_num, total_tokens)
+    split_kv = min(
+        max_chunks,
+        max(1, (target_ctas + total_tokens - 1) // total_tokens),
+    )
+    n_ctas = total_tokens * split_kv
+    launcher, _ = compile_pa_mqa_logits_fp4_prefill(
         block_k=block_k,
         kv_block_size=kv_block_size,
+        max_blocks_per_seq=max_blocks_per_seq,
         num_warps=num_warps,
-        parallel_unit_num=parallel_unit_num,
+        heads=heads,
+        head_dim=head_dim,
     )
-    prepared(
+    if stream is None:
+        stream = torch.cuda.current_stream()
+    args = (
         out,
         q_fp4,
         q_scale,
@@ -911,71 +676,19 @@ def flydsl_pa_mqa_logits_fp4_prefill_packed(
         block_tables,
         weights,
         row_info,
-        weight_scale=weight_scale,
-        stream=stream,
+        out.stride(0),
+        float(weight_scale),
+        split_kv,
+        n_ctas,
+        stream,
     )
+    device_index = q_fp4.device.index
+    if device_index is None or device_index == torch.cuda.current_device():
+        _run_compiled(launcher, *args)
+    else:
+        with torch.cuda.device(device_index):
+            _run_compiled(launcher, *args)
     return out
-
-
-def flydsl_pa_mqa_logits_fp4_prefill(
-    q_fp4: torch.Tensor,
-    q_scale: torch.Tensor,
-    kv_cache: torch.Tensor,
-    kv_scale: torch.Tensor,
-    block_tables: torch.Tensor,
-    weights: torch.Tensor,
-    row_to_batch: torch.Tensor,
-    local_starts: torch.Tensor,
-    local_ends: torch.Tensor,
-    max_seq_len: int,
-    *,
-    weight_scale: float = 1.0,
-    block_k: int = 256,
-    kv_block_size: int = 64,
-    num_warps: int | None = None,
-    parallel_unit_num: int = 512,
-    out: torch.Tensor | None = None,
-    row_info_out: torch.Tensor | None = None,
-    cta_info: torch.Tensor | None = None,
-    n_ctas: int | None = None,
-    stream: torch.cuda.Stream | None = None,
-) -> torch.Tensor:
-    """Compatibility wrapper for callers with three row metadata tensors.
-
-    This launches one fused metadata-pack kernel. Performance-sensitive or
-    CUDAGraph callers should build/reuse row info and call
-    :func:`flydsl_pa_mqa_logits_fp4_prefill_packed` directly.
-    """
-    requested_block_k = block_k
-    block_k = _resolve_prefill_block_k(block_k, max_seq_len)
-    if num_warps is None or block_k != requested_block_k:
-        num_warps = block_k // 64
-
-    row_info = pack_prefill_row_info(
-        row_to_batch,
-        local_starts,
-        local_ends,
-        out=row_info_out,
-    )
-    return flydsl_pa_mqa_logits_fp4_prefill_packed(
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        row_info,
-        max_seq_len,
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        num_warps=num_warps,
-        parallel_unit_num=parallel_unit_num,
-        out=out,
-        cta_info=cta_info,
-        n_ctas=n_ctas,
-        stream=stream,
-    )
 
 
 @triton.jit
@@ -1154,7 +867,6 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
     context_lens: torch.Tensor | None = None,
     next_n_max: int | None = None,
     split_ctx_len: int | None = None,
-    windows: tuple | None = None,
     row_info: torch.Tensor | None = None,
     weight_scale: float = 1.0,
     block_k: int = 256,
@@ -1162,16 +874,14 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
     num_warps: int = DEFAULT_NUM_WARPS,
     parallel_unit_num: int | None = None,
     out: torch.Tensor | None = None,
-    cta_info: torch.Tensor | None = None,
-    n_ctas: int | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Variable-qlen FP4 decode through the unified bounded-split kernel.
 
     ``next_n_max`` is the static per-batch qlen bound used for the grid. Pass it
     explicitly in CUDAGraph/ATOM integrations. Unified decode derives metadata
-    inline and does not consume row info; ``row_info`` and ``windows`` are
-    compatibility routes through bounded-split prefill.
+    inline and does not consume row info; ``row_info`` routes directly through
+    bounded-split packed prefill.
     """
     total_q = q_fp4.shape[0]
     if cu_seq_q is not None and context_lens is not None:
@@ -1200,15 +910,13 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
             num_warps=num_warps,
             parallel_unit_num=parallel_unit_num,
             out=out,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
             stream=stream,
         )
 
     if parallel_unit_num is None:
         parallel_unit_num = total_q * max(1, (max_seq_len + block_k - 1) // block_k)
     if row_info is not None:
-        return flydsl_pa_mqa_logits_fp4_prefill_packed(
+        return flydsl_pa_mqa_logits_fp4_prefill(
             q_fp4,
             q_scale,
             kv_cache,
@@ -1223,35 +931,9 @@ def flydsl_pa_mqa_logits_fp4_varqlen(
             num_warps=num_warps,
             parallel_unit_num=parallel_unit_num,
             out=out,
-            cta_info=cta_info,
-            n_ctas=n_ctas,
             stream=stream,
         )
-    if windows is None:
-        raise ValueError(
-            "flydsl_pa_mqa_logits_fp4_varqlen requires both cu_seq_q and "
-            "context_lens for unified decode, packed row_info, or "
-            "windows=(row_to_batch, local_starts, local_ends)."
-        )
-    row_to_batch, local_starts, local_ends = windows
-    return flydsl_pa_mqa_logits_fp4_prefill(
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        row_to_batch,
-        local_starts,
-        local_ends,
-        max_seq_len,
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        num_warps=num_warps,
-        parallel_unit_num=parallel_unit_num,
-        out=out,
-        cta_info=cta_info,
-        n_ctas=n_ctas,
-        stream=stream,
+    raise ValueError(
+        "flydsl_pa_mqa_logits_fp4_varqlen requires both cu_seq_q and "
+        "context_lens for unified decode, or packed row_info for prefill."
     )

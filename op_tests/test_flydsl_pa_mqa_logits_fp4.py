@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""aiter op-test + benchmark for ``flydsl_pa_mqa_logits_fp4`` (decode / varctx).
+"""Op-test and benchmark for canonical ``flydsl_pa_mqa_logits_fp4_decode``.
 Usage:
     python op_tests/test_flydsl_pa_mqa_logits_fp4.py
     python op_tests/test_flydsl_pa_mqa_logits_fp4.py --batch 8 --ctx 8192 --next-n 1
@@ -17,7 +17,7 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, is_flydsl_available
+from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_decode, is_flydsl_available
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 dev = "cuda"
@@ -462,6 +462,12 @@ def run_fixed_decode_case(
         .contiguous()
     )  # [B, NN, K_TILES, 4, 16, m_tiles]
     qe = torch.nn.functional.pad(qe_real, (0, qs_pad - m_tiles)).contiguous()
+    q_decode = q_packed.reshape(
+        batch_size * next_n, heads, head_dim_packed
+    ).contiguous()
+    q_scale_decode = qe.reshape(
+        batch_size * next_n, k_tiles, 4, 16, qs_pad
+    ).contiguous()
 
     target_ctas = 1024 if parallel_unit_num is None else parallel_unit_num
     max_chunks = max(1, (t_max + block_k - 1) // block_k)
@@ -480,17 +486,18 @@ def run_fixed_decode_case(
     )
 
     def launch_flydsl():
-        flydsl_pa_mqa_logits_fp4(
-            q_packed,
-            qe,
+        flydsl_pa_mqa_logits_fp4_decode(
+            q_decode,
+            q_scale_decode,
             kv_cache,
             kv_scale,
             block_tables,
             weights,
             context_lens,
             t_max,
+            next_n_max=next_n,
+            cu_seq_q=None,
             weight_scale=weight_scale,
-            next_n=next_n,
             block_k=block_k,
             kv_block_size=kv_block_size,
             num_warps=num_warps,
@@ -554,7 +561,7 @@ def run_fixed_decode_case(
             fn,
             num_iters=num_iters,
             num_warmup=num_warmup,
-            use_cuda_event=True,
+            use_cuda_event=False,
         )
         err = checkAllclose(
             ref_logits[mask].to(torch.float32),
@@ -602,7 +609,7 @@ def test_decode(
 def main():
     if get_gfx() != "gfx950":
         aiter.logger.warning(
-            "flydsl_pa_mqa_logits_fp4 unsupported on %s; skipping", get_gfx()
+            "flydsl_pa_mqa_logits_fp4_decode unsupported on %s; skipping", get_gfx()
         )
         return
     if not is_flydsl_available():

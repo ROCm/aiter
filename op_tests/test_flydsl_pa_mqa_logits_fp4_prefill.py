@@ -2,17 +2,17 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""aiter op-test for ``flydsl_pa_mqa_logits_fp4_prefill`` and
-``flydsl_pa_mqa_logits_fp4_varqlen``.
+"""Op-tests for FP4 paged MQA canonical decode and ragged prefill APIs.
 
 Validates the ragged-prefill FP4 paged MQA logits kernel (gfx950) against a
 pure-torch reference. Each query row owns a seq-local window
 ``[local_start, local_end)`` into its sequence's paged FP4 KV cache, read
 straight from ``block_tables`` (no cp_gather staging).
 
-The variable-qlen path (``flydsl_pa_mqa_logits_fp4_varqlen``) is the same kernel
-driven by a ``cu_seq_q`` (per-batch qlen prefix-sum) adapter with MTP tail-causal
-windows ``[0, ctx_b - qlen_b + n]``; those cases also report TFLOPS / GB/s.
+Variable-qlen decode calls ``flydsl_pa_mqa_logits_fp4_decode`` directly with a
+``cu_seq_q`` per-batch qlen prefix-sum and MTP tail-causal windows
+``[0, ctx_b - qlen_b + n]``. Compatibility row-info and prefill routes remain
+covered separately; these cases also report TFLOPS / GB/s.
 
 Accuracy (torch ref):
   - vs exact FP4-dequant ref  -> kernel correctness (cos ~ 1.0)
@@ -193,9 +193,7 @@ def run_case(
 ):
     from aiter.ops.flydsl import (
         flydsl_pa_mqa_logits_fp4_prefill,
-        flydsl_pa_mqa_logits_fp4_prefill_packed,
         pack_prefill_row_info,
-        prepare_pa_mqa_logits_fp4_prefill_packed,
     )
 
     torch.manual_seed(seed)
@@ -277,21 +275,9 @@ def run_case(
     out = torch.full(
         (total_tokens, max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
-    out_compat = torch.full_like(out, float("-inf"))
-    out_prepared = torch.full_like(out, float("-inf"))
-    prepared = prepare_pa_mqa_logits_fp4_prefill_packed(
-        total_tokens=total_tokens,
-        heads=heads,
-        head_dim=head_dim,
-        max_blocks_per_seq=max_blocks_per_seq,
-        max_seq_len=max_seq_len,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-        parallel_unit_num=parallel_unit_num,
-    )
 
     def run_fp4():
-        flydsl_pa_mqa_logits_fp4_prefill_packed(
+        flydsl_pa_mqa_logits_fp4_prefill(
             q_fp4,
             q_scale,
             kv_cache,
@@ -308,47 +294,8 @@ def run_case(
         )
         return out
 
-    def run_compat():
-        flydsl_pa_mqa_logits_fp4_prefill(
-            q_fp4,
-            q_scale,
-            kv_cache,
-            kv_scale,
-            block_tables,
-            weights,
-            row_to_batch,
-            local_starts,
-            local_ends,
-            max_seq_len,
-            weight_scale=weight_scale,
-            block_k=block_k,
-            kv_block_size=kv_block_size,
-            parallel_unit_num=parallel_unit_num,
-            out=out_compat,
-            row_info_out=row_info,
-        )
-        return out_compat
-
-    def run_prepared():
-        prepared(
-            out_prepared,
-            q_fp4,
-            q_scale,
-            kv_cache,
-            kv_scale,
-            block_tables,
-            weights,
-            row_info,
-            weight_scale=weight_scale,
-        )
-        return out_prepared
-
     run_fp4()
-    run_compat()
-    run_prepared()
     torch.cuda.synchronize()
-    assert torch.equal(out, out_compat), "three-tensor compatibility path differs"
-    assert torch.equal(out, out_prepared), "prepared packed launcher differs"
 
     m = ~torch.isneginf(ref_fp4)
     cos_exact = _cos(out[m], ref_fp4[m]).item()
@@ -384,7 +331,7 @@ def run_case(
             fn,
             num_iters=iters,
             num_warmup=warmup,
-            use_cuda_event=True,
+            use_cuda_event=False,
         )
         err = checkAllclose(
             ref_fp4[m].to(torch.float32),
@@ -568,7 +515,8 @@ def run_varqlen_case(
 ):
     from aiter.ops.flydsl import (
         compute_varqlen_row_info,
-        flydsl_pa_mqa_logits_fp4_prefill_packed,
+        flydsl_pa_mqa_logits_fp4_decode,
+        flydsl_pa_mqa_logits_fp4_prefill,
         flydsl_pa_mqa_logits_fp4_varqlen,
     )
     from aiter.ops.flydsl.kernels.pa_mqa_logits_fp4_prefill import (
@@ -662,23 +610,23 @@ def run_varqlen_case(
         q_bf16, kv_bf16, weights, rb_ref, ls_ref, le_ref, max_seq_len, weight_scale
     )
 
-    out = flydsl_pa_mqa_logits_fp4_varqlen(
+    out = flydsl_pa_mqa_logits_fp4_decode(
         q_fp4,
         q_scale,
         kv_cache,
         kv_scale,
         block_tables,
         weights,
+        context_lens,
         max_seq_len,
-        cu_seq_q=cu_seq_q,
-        context_lens=context_lens,
         next_n_max=max(max(qlens), 1),
+        cu_seq_q=cu_seq_q,
         weight_scale=weight_scale,
         block_k=block_k,
         kv_block_size=kv_block_size,
     )
     torch.cuda.synchronize()
-    out_packed = flydsl_pa_mqa_logits_fp4_prefill_packed(
+    out_packed = flydsl_pa_mqa_logits_fp4_prefill(
         q_fp4,
         q_scale,
         kv_cache,
@@ -712,27 +660,6 @@ def run_varqlen_case(
         out_packed, out_row_info_route
     ), "row_info varqlen route differs from packed prefill"
 
-    # Passing compatibility windows alongside cu_seq_q must still select the
-    # unified decode path and match bit-for-bit.
-    out_reuse = flydsl_pa_mqa_logits_fp4_varqlen(
-        q_fp4,
-        q_scale,
-        kv_cache,
-        kv_scale,
-        block_tables,
-        weights,
-        max_seq_len,
-        cu_seq_q=cu_seq_q,
-        context_lens=context_lens,
-        next_n_max=max(max(qlens), 1),
-        windows=(rb_k, ls_k, le_k),
-        weight_scale=weight_scale,
-        block_k=block_k,
-        kv_block_size=kv_block_size,
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(out, out_reuse), "windows= reuse path differs from cu_seq_q path"
-
     m = ~torch.isneginf(ref_fp4)
     cos_exact = _cos(out[m], ref_fp4[m]).item()
     cos_bf16 = _cos(out[m], ref_bf16[m]).item()
@@ -758,17 +685,17 @@ def run_varqlen_case(
 
         def graph_launch():
             graph_out.fill_(float("-inf"))
-            flydsl_pa_mqa_logits_fp4_varqlen(
+            flydsl_pa_mqa_logits_fp4_decode(
                 q_fp4,
                 q_scale,
                 kv_cache,
                 kv_scale,
                 block_tables,
                 weights,
+                context_lens,
                 max_seq_len,
-                cu_seq_q=cu_seq_q,
-                context_lens=context_lens,
                 next_n_max=max(max(qlens), 1),
+                cu_seq_q=cu_seq_q,
                 weight_scale=weight_scale,
                 block_k=block_k,
                 kv_block_size=kv_block_size,
@@ -795,7 +722,7 @@ def run_varqlen_case(
 
         def packed_graph_launch():
             packed_graph_out.fill_(float("-inf"))
-            flydsl_pa_mqa_logits_fp4_prefill_packed(
+            flydsl_pa_mqa_logits_fp4_prefill(
                 q_fp4,
                 q_scale,
                 kv_cache,
@@ -838,17 +765,17 @@ def run_varqlen_case(
     )
 
     def run_fp4():
-        flydsl_pa_mqa_logits_fp4_varqlen(
+        flydsl_pa_mqa_logits_fp4_decode(
             q_fp4,
             q_scale,
             kv_cache,
             kv_scale,
             block_tables,
             weights,
+            context_lens,
             max_seq_len,
-            cu_seq_q=cu_seq_q,
-            context_lens=context_lens,
             next_n_max=max(max(qlens), 1),
+            cu_seq_q=cu_seq_q,
             weight_scale=weight_scale,
             block_k=block_k,
             kv_block_size=kv_block_size,
@@ -881,7 +808,7 @@ def run_varqlen_case(
             fn,
             num_iters=iters,
             num_warmup=warmup,
-            use_cuda_event=True,
+            use_cuda_event=False,
         )
         err = checkAllclose(
             ref_fp4[m].to(torch.float32),
