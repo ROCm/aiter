@@ -267,8 +267,13 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     def exp2(x):
         return fx.Float32(rocdl.exp2(f32, _raw(x)))
 
+    # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
+    sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
+
     def peer(v):  # cross-lane reduce partner: lane l <-> l^16 (the other kv half)
-        return fx.Float32(v).shuffle_xor(fx.Int32(16), fx.Int32(WAVE_SIZE))
+        return fx.Float32(rocdl_dialect.permlanex16(
+            f32, _raw(v), _raw(v), sel_lo, sel_hi, fi=False, bound_control=False,
+        ))
 
     khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
 
@@ -498,7 +503,7 @@ def _core_attention(
         cur_pp = t % fx.Int32(N_KV_PP)
         k_cur = _k_lds_buf(cur_pp)
 
-        n_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
+        kv_tile_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
 
         # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). ----
         s = _qk_gemm(
@@ -512,8 +517,13 @@ def _core_attention(
         # ---- Softmax: online update over this KV tile's kv axis. ----
         # v1 tests the SINGLE-tile path (m_prev=-inf, d_prev=0); the running
         # (m,d,O_acc) become scf.for_ iter_args once PV + epilogue land. Causal
-        # masks element kv position n_start+(l//16)*8+kvt*16+si > seq_idx+causal_off
+        # masks element kv position kv_tile_start+(l//16)*8+kvt*16+si > seq_idx+causal_off
         # (causal_off = kv_len - q_len); q's sequence index is the GQA-aware seq_idx.
+        #
+        # TODO(perf): the per-element `.select` lowers to one v_cmp + v_cndmask_b32
+        # per masked score (64 pairs for n_block=128). Split the KV loop into a
+        # fully-below-diagonal prefix (no mask) + a boundary region (only diagonal
+        # tiles masked) so the mask select is gone from the loop's steady state.
         if is_causal:
             q_max = seq_idx + (kv_len - q_len)
         else:
@@ -525,7 +535,7 @@ def _core_attention(
             lane_idx=lane_idx,
             n_block=n_block,
             is_causal=is_causal,
-            kv_pos0=n_start,
+            kv_pos0=kv_tile_start,
             q_max=q_max,
         )
 
