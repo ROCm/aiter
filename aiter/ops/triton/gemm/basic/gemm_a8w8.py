@@ -91,6 +91,22 @@ def gemm_a8w8(
         else:
             config, _ = _get_config(M, N, K)
 
+    # gfx1250 workaround: the 8-bit tl.dot in the triton kernel miscompiles at
+    # BLOCK_SIZE_K=128 for fp8 operands, producing garbage (~1e20) that
+    # overflows the bf16 output to inf/NaN. It is fp8-specific (int8 at BK=128 is
+    # exact) and data-independent (all-ones fp8 fails). Cap the K tile at 64 for
+    # fp8 on this arch; int8, the gluon backend and other architectures are
+    # unaffected. Mirrors the BLOCK_SIZE_K=64 clamp in gemm_a8w8_blockscale.py.
+    # See test_gemm_fp8_default_config_no_nan.
+    if (
+        backend == "triton"
+        and x.dtype.is_floating_point
+        and x.dtype.itemsize == 1
+        and config.get("BLOCK_SIZE_K", 0) > 64
+        and get_arch() == "gfx1250"
+    ):
+        config["BLOCK_SIZE_K"] = 64
+
     if y is None and (config.get("NUM_KSPLIT", 1) == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
 
