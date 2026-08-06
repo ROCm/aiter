@@ -223,7 +223,7 @@ def _qk_gemm(*, k_mgr, k_lds, q_frags, n_block, lane_idx, n_inflight=3):
 
 
 def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
-            is_causal=False, kv_pos0=None, q_max=None):
+            is_causal=False, kv_pos_base=None, q_max=None, kv_len=None):
     """Online-softmax update for one KV tile. ``s`` already includes softmax_scale
     (folded into Q), so exp uses plain LOG2E.
 
@@ -231,13 +231,17 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``,
     the kv rows ``kvt*16 + (l//16)*8 + [0..8)`` (its half). The peer lane ``l^16``
     holds the other 8-row half of the same q, so the row max/sum reduce locally over
-    (kvt, si) then across the ``shuffle_xor(16)`` partner.
+    (kvt, i) then across the ``shuffle_xor(16)`` partner.
 
     Args:
       m_prev, d_prev: running max / denom (fx.Float32, shared by the l<->l^16 pair).
       is_causal: when True, mask element with sequence-relative kv position
-        ``kv_pos0 + (l//16)*8 + kvt*16 + si`` greater than ``q_max`` (= q_seq +
-        (kv_len - q_len)); both ``kv_pos0`` and ``q_max`` are fx.Int32.
+        ``kv_pos_base + (l//16)*8 + kvt*16 + i`` greater than ``q_max`` (= q_seq +
+        (kv_len - q_len)); both ``kv_pos_base`` and ``q_max`` are fx.Int32.
+      kv_len: when set (non-causal), mask the same kv position when it is
+        ``>= kv_len`` — the last tile's tail rows past the KV length (which the
+        clamped OOB load left holding duplicate data). Redundant under causal
+        (``q_max <= kv_len-1``), so pass None there to keep that path unchanged.
 
     Returns ``(p, m_new, d_new, corr)``:
       p:     list of NKV v8 **bf16** — P^T = exp(S^T - m_new) (PV B-operand).
@@ -278,14 +282,17 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
 
     # ---- Pass 1: masked S values + running row max ----
-    s_masked = []  # flattened (kvt, si) order
+    s_masked = []  # flattened (kvt, i) order
     for kvt in range(NKV):
         svec = fx.Vector(s[kvt])
-        for si in range(8):
-            sval = fx.Float32(svec[si])
-            if is_causal:
-                kpos = kv_pos0 + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + si)
-                sval = (kpos > q_max).select(neg_inf, sval)
+        for i in range(8):
+            sval = fx.Float32(svec[i])
+            if is_causal or kv_len is not None:
+                kv_pos = kv_pos_base + khalf * fx.Int32(8) + fx.Int32(kvt * WMMA_N + i)
+                if is_causal:
+                    sval = (kv_pos > q_max).select(neg_inf, sval)
+                if kv_len is not None:
+                    sval = (kv_pos >= kv_len).select(neg_inf, sval)
             s_masked.append(sval)
 
     local_max = s_masked[0]
@@ -304,7 +311,7 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     idx = 0
     for kvt in range(NKV):
         pe = []
-        for si in range(8):
+        for i in range(8):
             # exp2(s*log2e - m_new*log2e) via one fma.
             pj = exp2(fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m))))
             local_sum = fadd(local_sum, pj)
@@ -382,6 +389,12 @@ def _core_attention(
     stride_k_head,
     stride_v_head,
     stride_o_head,
+    # LSE addressing (element strides + per-batch bound), resolved by the caller.
+    # Only consumed when return_lse; the caller may pass anything otherwise.
+    stride_lse_seq,
+    stride_lse_head,
+    lse_base_elems,  # first element offset of this batch's LSE slab
+    lse_num_records_bytes,  # buffer-resource bound (below the 0x7FFFFFFF drop)
     # Per-batch token ranges (fx.Int32), resolved by the caller:
     q_start,  # first Q token index of this batch in the global tensor
     q_len,  # valid Q tokens in this batch
@@ -504,24 +517,32 @@ def _core_attention(
     # v1 shape (raw scf.for_, per [[fdsl-ast-rewriter-scope]]): a single UNIFORM
     # loop, no first/last peel. Each iter opens by draining outstanding async and
     # barriering, after which the current tile's KV is GUARANTEED resident in LDS
-    # (tile 0 from the prologue; every later tile from the previous iter's
-    # interleaved wr_tile prefetch). The body then just computes on buffer
-    # t % N_KV_PP. Prefetch of tile t+1 (into (t+1)%N_KV_PP) is issued INSIDE the
-    # compute stages via async_load_vram_to_lds_wr_tile (order tuned by thread
-    # trace), NOT as a bulk load here.
+    # (tile 0 from the prologue; every later tile from THIS loop's end-of-body
+    # bulk prefetch into the other ping-pong buffer). The body computes on buffer
+    # t % N_KV_PP, then prefetches tile t+1 into (t+1) % N_KV_PP.
     #
-    # Compute is UNWIRED for now: QkGemm/Softmax/PvGemm land + are tested one at a
-    # time. When they do, (O_accu, row_max, row_sum) become scf.for_ iter_args
-    # (init before the loop, normalise after) and the per-wave causal predicates
-    # below gate them.
+    # Loop-carried state (scf.for_ iter_args): the online-softmax running max
+    # ``m`` and denom ``d`` (per-lane f32), followed by the ``d_tiles`` fp32 O
+    # accumulators. Seed m=-inf, d=0, O=0: tile 0's corr=exp2(m_prev-m_new)=0
+    # zeroes the (already-zero) O before its PV adds in — the standard flash seed.
+    #
+    # TODO(perf): replace the end-of-body bulk async_load with per-write-tile
+    # async_load_vram_to_lds_wr_tile interleaved between QK/softmax/PV (order
+    # tuned by thread trace) so the tile t+1 fetch overlaps tile t's compute.
     # ========================================================================
+    d_tiles = v_hdim // WMMA_M
+    _init = [
+        _raw(fx.Float32(float("-inf"))),
+        _raw(fx.Float32(0.0)),
+    ] + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
+
     n_tiles = arith.ceildivui(
         arith.unwrap(kv_len_wg), arith.constant(n_block, type=T.i32)
     )
     _lo = arith.index(0)
     _hi = arith.index_cast(T.index, n_tiles)
     _step = arith.index(1)
-    for _tile_iv in scf.for_(_lo, _hi, _step):
+    for _tile_iv, _iargs, _loop_res in scf.for_(_lo, _hi, _step, iter_args=_init):
         t = fx.Int32(arith.index_cast(T.i32, _tile_iv))
 
         # Current tile's KV is already in LDS. Drain the async that filled it, then
@@ -532,8 +553,14 @@ def _core_attention(
         # Current tile lives in ping-pong buffer t % N_KV_PP.
         cur_pp = t % fx.Int32(N_KV_PP)
         k_cur = _k_lds_buf(cur_pp)
+        v_cur = _v_lds_buf(cur_pp)
 
         kv_tile_start = t * fx.Int32(n_block)  # this tile's first (batch-relative) kv row
+
+        # Unpack loop-carried state.
+        m_prev = fx.Float32(_iargs[0])
+        d_prev = fx.Float32(_iargs[1])
+        o_acc = [fx.Vector(_iargs[2 + dt]) for dt in range(d_tiles)]
 
         # ---- GEMM1: S^T = K @ Q^T for this KV tile (== P^T pre-softmax). ----
         s = _qk_gemm(
@@ -545,9 +572,8 @@ def _core_attention(
         )
 
         # ---- Softmax: online update over this KV tile's kv axis. ----
-        # v1 tests the SINGLE-tile path (m_prev=-inf, d_prev=0); the running
-        # (m,d,O_acc) become scf.for_ iter_args once PV + epilogue land. Causal
-        # masks element kv position kv_tile_start+(l//16)*8+kvt*16+si > seq_idx+causal_off
+        # Causal masks element kv position
+        # kv_tile_start+(l//16)*8+kvt*16+i > seq_idx+causal_off
         # (causal_off = kv_len - q_len); q's sequence index is the GQA-aware seq_idx.
         #
         # TODO(perf): the per-element `.select` lowers to one v_cmp + v_cndmask_b32
@@ -560,26 +586,139 @@ def _core_attention(
             q_max = None
         p, m_new, d_new, corr = _softmax(
             s=s,
-            m_prev=fx.Float32(float("-inf")),
-            d_prev=fx.Float32(0.0),
+            m_prev=m_prev,
+            d_prev=d_prev,
             lane_idx=lane_idx,
             n_block=n_block,
             is_causal=is_causal,
-            kv_pos0=kv_tile_start,
+            kv_pos_base=kv_tile_start,
             q_max=q_max,
+            # Non-causal needs an explicit KV-length mask for the last tile's tail;
+            # causal's q_max already excludes kv >= kv_len, so leave it None there.
+            kv_len=(None if is_causal else kv_len),
         )
 
-        # ---- TODO(PV/epilogue, still UNWIRED): _pv_gemm consumes (p, V) into an
-        # O accumulator rescaled by corr; m_new/d_new become loop-carried state.
-        # v_cur = _v_lds_buf(cur_pp)
-        # Prefetch tile t+1 into (t+1)%N_KV_PP via async_load_vram_to_lds_wr_tile,
-        # interleaved between QK/softmax/PV (order tuned by thread trace).
-        del s, p, m_new, d_new, corr  # unused until PV lands (DCE'd for now)
-        scf.yield_([])
+        # ---- Rescale the running O by corr, then GEMM2 accumulates this tile. ----
+        corr_vec = fx.Vector.from_elements([corr], fx.Float32).broadcast_to(8)
+        o_resc = [o_acc[dt] * corr_vec for dt in range(d_tiles)]
+        o_new = _pv_gemm(
+            v_mgr=v_mgr,
+            v_lds=v_cur,
+            p=p,
+            v_hdim=v_hdim,
+            n_block=n_block,
+            lane_idx=lane_idx,
+            o_acc=o_resc,
+        )
 
-    # TODO(epilogue): once PV lands, normalise O by row_sum and write via
-    # OManager16b.store_o_to_vram using (q_head_idx, seq_idx); mask seq_idx>=q_len.
-    del q_head_idx, seq_idx  # unused until the epilogue lands
+        # ---- Prefetch tile t+1 into (t+1) % N_KV_PP. The final (past-the-end)
+        # prefetch has kv_valid=0, so check_oob clamps every row in-bounds to a
+        # harmless load the loop never consumes. No runtime guard needed. ----
+        nxt = t + fx.Int32(1)
+        nxt_pp = nxt % fx.Int32(N_KV_PP)
+        nxt_row0 = nxt * fx.Int32(n_block)
+        nxt_valid = _kv_valid(nxt_row0)
+        k_mgr.async_load_vram_to_lds(
+            ptr_lds=_k_lds_buf(nxt_pp),
+            ptr_K=ptr_K,
+            stride_k_seq=stride_k_seq,
+            stride_k_head=stride_k_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + nxt_row0,
+            kv_valid=nxt_valid,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+        )
+        v_mgr.async_load_vram_to_lds(
+            ptr_lds=_v_lds_buf(nxt_pp),
+            ptr_V=ptr_V,
+            stride_v_seq=stride_v_seq,
+            stride_v_head=stride_v_head,
+            kv_head=kv_head,
+            kv_row0=kv_start + nxt_row0,
+            kv_valid=nxt_valid,
+            warp_idx=warp_idx,
+            lane_idx=lane_idx,
+        )
+
+        scf.yield_([_raw(m_new), _raw(d_new)] + [_raw(o) for o in o_new])
+
+    # ========================================================================
+    # Epilogue: normalize O by the running denom d, then reshape+store to VRAM.
+    # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
+    # (unnormalized); divide by the per-query denom d (peer-consistent across the
+    # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
+    # ========================================================================
+    d_final = fx.Float32(_loop_res[1])
+    o_final = [fx.Vector(_loop_res[2 + dt]) for dt in range(d_tiles)]
+
+    inv_vec = (
+        fx.Vector.from_elements([fx.Float32(1.0) / d_final], fx.Float32)
+        .broadcast_to(8)
+    )
+    o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
+
+    # O staging reuses the (now-dead) K LDS region; barrier so all waves finished
+    # the last tile's K reads before the accumulator overwrites it.
+    o_mgr = OManager16b(v_hdim=v_hdim, gqa_ratio=gqa_ratio, num_waves=NUM_WAVES)
+    rocdl.s_wait_asynccnt(0)  # drain the last (dead) tile prefetch before LDS reuse
+    gpu.barrier()
+    # Stride convention (matches host wrappers + gfx1250 fmha family): Q/K/V strides
+    # are in BYTES (load managers add token*stride straight to a byte pointer), but
+    # O strides are in ELEMENTS — exactly what OManager wants (it multiplies
+    # off_elems by _BF16_BYTES itself), so pass stride_o_* straight through.
+    # OManager redirects mask-dropped rows to byte offset 0x7FFFFFFF, so o_rsrc MUST
+    # bound below that (max_size=True would make the drop land in-bounds and fault).
+    # This WG only writes tokens in [q_start, q_start+q_len); every valid byte offset
+    # is < (q_start+q_len)*stride_o_seq*_BF16_BYTES, and 0x7FFFFFFF sits far past it.
+    o_num_records_bytes = (q_start + q_len) * stride_o_seq * fx.Int32(2)
+    o_rsrc = buffer_ops.create_buffer_resource(
+        ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+    )
+    o_mgr.store_o_to_vram(
+        o_rsrc=o_rsrc,
+        o_base_elems=fx.Int32(0),
+        stride_o_seq=stride_o_seq,
+        stride_o_head=stride_o_head,
+        q_start=q_start,
+        q_len=q_len,
+        kv_head=kv_head,
+        block_x=block_x,
+        warp_idx=warp_idx,
+        lane_idx=lane_idx,
+        ptr_lds=k_lds_base,
+        o_frags=o_norm,
+    )
+
+    # ---- LSE store (optional). LSE = m_final + ln(d_final) in the scaled-score
+    # domain (softmax_scale is folded into Q, so S already carries it) — matches
+    # torch.logsumexp(scale * Q @ K^T, dim=kv). Each query q = warp*16 + l%16 is
+    # held identically by the lane pair (l, l^16); store once from the khalf==0
+    # lanes (0-15 per warp = the BLOCK_M packed rows), masked by seq < q_len.
+    # buffer_store redirects mask-drops to byte 0x7FFFFFFF, so lse_rsrc is bounded.
+    if return_lse:
+        m_final = fx.Float32(_loop_res[0])
+        # fx.log2 lowers to the HW v_log_f32 (base-2), so scale by ln2 (= 1/LOG2E)
+        # to get the natural log for LSE = m + ln(d).
+        ln_d = fx.log2(d_final) * fx.Float32(1.0 / LOG2E)
+        lse_val = m_final + ln_d
+        khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)
+        lse_mask = khalf0 & (seq_idx < q_len)
+        lse_off_el = (
+            lse_base_elems + seq_idx * stride_lse_seq + q_head_idx * stride_lse_head
+        )
+        lse_rsrc = buffer_ops.create_buffer_resource(
+            ptr_LSE, num_records_bytes=lse_num_records_bytes
+        )
+        buffer_ops.buffer_store(
+            lse_val,
+            lse_rsrc,
+            lse_off_el * fx.Int32(4),
+            mask=lse_mask,
+            offset_is_bytes=True,
+        )
+
+    del q_head_idx, seq_idx
 
 
 # ============================================================================
@@ -642,6 +781,8 @@ def build_fmha_fwd_prefill_m16x8(
             stride_k_head: fx.Int32,
             stride_v_head: fx.Int32,
             stride_o_head: fx.Int32,
+            stride_lse_seq: fx.Int32,
+            stride_lse_head: fx.Int32,
             max_seqlen_q: fx.Int32,
             max_seqlen_k: fx.Int32,
         ):
@@ -654,6 +795,11 @@ def build_fmha_fwd_prefill_m16x8(
             kv_start, kv_end = _load_seqlen_pair(ptr_cu_seqlens_k, batch)
             q_len = q_end - q_start
             kv_len = kv_end - kv_start
+
+            # LSE is [total_q, nheads_q]: base = q_start*stride_lse_seq; every valid
+            # element offset is < (q_start+q_len)*stride_lse_seq (< the 0x7FFFFFFF drop).
+            lse_base_elems = q_start * stride_lse_seq
+            lse_num_records_bytes = (q_start + q_len) * stride_lse_seq * fx.Int32(4)
 
             _core_attention(
                 qk_hdim=QK_HDIM,
@@ -676,6 +822,10 @@ def build_fmha_fwd_prefill_m16x8(
                 stride_k_head=stride_k_head,
                 stride_v_head=stride_v_head,
                 stride_o_head=stride_o_head,
+                stride_lse_seq=stride_lse_seq,
+                stride_lse_head=stride_lse_head,
+                lse_base_elems=lse_base_elems,
+                lse_num_records_bytes=lse_num_records_bytes,
                 q_start=q_start,
                 q_len=q_len,
                 kv_start=kv_start,
@@ -700,6 +850,9 @@ def build_fmha_fwd_prefill_m16x8(
         stride_k_head: fx.Int32,
         stride_v_head: fx.Int32,
         stride_o_head: fx.Int32,
+        stride_lse_seq: fx.Int32,
+        stride_lse_head: fx.Int32,
+        stride_lse_batch: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
     ):
@@ -710,6 +863,11 @@ def build_fmha_fwd_prefill_m16x8(
         Token base is batch_idx * seq_len (batch = grid.z).
         """
         batch = fx.Int32(gpu.block_id("z"))
+
+        # LSE is [B, nheads_q, seq_q]: base = batch*stride_lse_batch; every valid
+        # element offset is < base + stride_lse_batch (< the 0x7FFFFFFF drop).
+        lse_base_elems = batch * stride_lse_batch
+        lse_num_records_bytes = (lse_base_elems + stride_lse_batch) * fx.Int32(4)
 
         _core_attention(
             qk_hdim=QK_HDIM,
@@ -732,6 +890,10 @@ def build_fmha_fwd_prefill_m16x8(
             stride_k_head=stride_k_head,
             stride_v_head=stride_v_head,
             stride_o_head=stride_o_head,
+            stride_lse_seq=stride_lse_seq,
+            stride_lse_head=stride_lse_head,
+            lse_base_elems=lse_base_elems,
+            lse_num_records_bytes=lse_num_records_bytes,
             q_start=batch * seq_len_q,
             q_len=seq_len_q,
             kv_start=batch * seq_len_k,
@@ -777,6 +939,8 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
         stride_k_head: fx.Int32,
         stride_v_head: fx.Int32,
         stride_o_head: fx.Int32,
+        stride_lse_seq: fx.Int32,
+        stride_lse_head: fx.Int32,
         max_seqlen_q: fx.Int32,
         max_seqlen_k: fx.Int32,
         num_heads_kv: fx.Int32,
@@ -812,6 +976,8 @@ def _ensure_thd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
             stride_k_head,
             stride_v_head,
             stride_o_head,
+            stride_lse_seq,
+            stride_lse_head,
             max_seqlen_q,
             max_seqlen_k,
         )
@@ -848,6 +1014,9 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
         stride_k_head: fx.Int32,
         stride_v_head: fx.Int32,
         stride_o_head: fx.Int32,
+        stride_lse_seq: fx.Int32,
+        stride_lse_head: fx.Int32,
+        stride_lse_batch: fx.Int32,
         seq_len_q: fx.Int32,
         seq_len_k: fx.Int32,
         num_heads_kv: fx.Int32,
@@ -881,6 +1050,9 @@ def _ensure_bshd_kernel(is_causal: bool, return_lse: bool, gqa_ratio: int):
             stride_k_head,
             stride_v_head,
             stride_o_head,
+            stride_lse_seq,
+            stride_lse_head,
+            stride_lse_batch,
             seq_len_q,
             seq_len_k,
         )
@@ -948,6 +1120,14 @@ def flash_attn_varlen_m16x8(
     stride_k_head = k.stride(1) * bpp
     stride_v_head = v.stride(1) * bpp
     stride_o_head = out.stride(1)
+    # LSE (element strides). When return_lse it is [total_q, nheads_q]; otherwise a
+    # scratch tensor that the kernel never writes, so 0 strides are harmless.
+    if return_lse:
+        stride_lse_seq = lse.stride(0)
+        stride_lse_head = lse.stride(1)
+    else:
+        stride_lse_seq = 0
+        stride_lse_head = 0
 
     _ensure_thd_kernel(bool(causal), bool(return_lse), gqa)
 
@@ -969,6 +1149,8 @@ def flash_attn_varlen_m16x8(
         stride_k_head,
         stride_v_head,
         stride_o_head,
+        stride_lse_seq,
+        stride_lse_head,
         max_seqlen_q,
         max_seqlen_k,
         nheads_k,
@@ -1031,6 +1213,10 @@ def flash_attn_batch_m16x8(
     stride_k_head = k.stride(2) * bpp
     stride_v_head = v.stride(2) * bpp
     stride_o_head = out.stride(2)
+    # LSE is [B, nheads_q, seq_q] (element strides; batch stride bounds the resource).
+    stride_lse_seq = lse.stride(2)
+    stride_lse_head = lse.stride(1)
+    stride_lse_batch = lse.stride(0)
 
     _ensure_bshd_kernel(bool(causal), bool(return_lse), gqa)
 
@@ -1050,6 +1236,9 @@ def flash_attn_batch_m16x8(
         stride_k_head,
         stride_v_head,
         stride_o_head,
+        stride_lse_seq,
+        stride_lse_head,
+        stride_lse_batch,
         seq_len_q,
         seq_len_k,
         nheads_k,
