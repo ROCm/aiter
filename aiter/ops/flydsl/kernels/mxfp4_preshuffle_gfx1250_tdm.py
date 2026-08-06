@@ -16,13 +16,12 @@ from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
+    batched_situv2,
     fused_silu_swiglu_elem,
-    lds_load_b32_raw,
-    lds_load_b128_raw,
-    lds_store_b32_raw,
-    lds_store_b64_raw,
-    lds_store_b128_raw,
+    fused_situv2_elem,
+    make_lds_copy_ops,
     pipeline_fence,
+    situv2_consts,
     workgroup_barrier,
 )
 from .quant_utils import (
@@ -64,6 +63,8 @@ def launch_gemm_a8w4_tdm(
     arg_quant_scale: fx.Tensor = None,
     cluster_n: Constexpr[int] = 1,
     xt_prefetch: Constexpr[int] = 1,
+    f32_situ_beta: fx.Float32 = 1.0,
+    f32_situ_linear_beta: fx.Float32 = 1.0,
 ):
     # cluster_n > 1 launches (cluster_n, 1, 1) workgroup clusters whose peers all
     # share one m_tile (and therefore one expert) and differ only in n_tile, so one
@@ -190,6 +191,8 @@ def launch_gemm_a8w4_tdm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
+        f32_situ_beta: fx.Float32,
+        f32_situ_linear_beta: fx.Float32,
     ):
         # rocdl.disable_xdl_arb_stall()
 
@@ -284,6 +287,10 @@ def launch_gemm_a8w4_tdm(
         def lds_view(ptr, shape, stride):
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
+        lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
+        _, lds_store_b64 = make_lds_copy_ops(64)
+        lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
+
         def make_tdm_store(gt, outer, stride):
             return fx.rocdl.make_tdm_atom(
                 gt, [outer, None], strides=[stride, None], num_warps=num_waves
@@ -317,7 +324,15 @@ def launch_gemm_a8w4_tdm(
             waves, nw = [(None,)] * 4, num_waves
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv wave")
+        # The waves listed in one ``wv`` load disjoint slices of the same tile, so
+        # they agree on every compile-time field of the atom (tile shape, padding,
+        # num_warps) and differ only in global offset, LDS offset and OOB extent --
+        # all runtime atom state. Folding the slice index into those three collapses
+        # the whole list to one atom, so ``wv`` itself -- not a single wave -- is the
+        # smallest unit that needs its own code.
+        Job = namedtuple(
+            "Job", "atom gt on_i32 lds_off lds_row inner outer k_adv waves"
+        )
         jobs = []
 
         def add_tdm_loads(
@@ -337,46 +352,50 @@ def launch_gemm_a8w4_tdm(
             wg_mask=0,
         ):
             seg = outer // len(wv)
-            for i in range_constexpr(len(wv)):
-                gt = global_view(
-                    g_base,
-                    g_off + fx.Int64(i * seg) * g_stride,
-                    (seg, inner),
-                    (inner, 1),
-                )
-                ext = None if oob is None else oob - i * seg
-                pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
-                atom = fx.rocdl.make_tdm_atom(
+            # Where this wave's slice starts along the outer dim: ``wave - wv[0]`` is
+            # 0 on the first owner and steps by one down the list, so the offset is a
+            # runtime value; a compile-time 0 when the list is cooperative. The LDS
+            # term carries lds_row's unit (bytes for A/B, dwords for the scales).
+            wave_outer_off = (wave - wv[0]) * seg if const_expr(len(wv) > 1) else 0
+            gt = global_view(
+                g_base,
+                g_off + fx.Int64(wave_outer_off) * g_stride,
+                (seg, inner),
+                (inner, 1),
+            )
+            ext = None if oob is None else oob - wave_outer_off
+            pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
+            atom = fx.rocdl.make_tdm_atom(
+                gt,
+                [ext, None],
+                strides=[g_stride, None],
+                num_warps=nw,
+                # Descriptor bit 21: GL1 returns to the peers present when the
+                # GL2 data lands and re-broadcasts to latecomers, instead of
+                # holding early arrivals for a wider merge. Cluster peers work
+                # on different n_tiles, so they reach this load at noticeably
+                # different times and the wider merge would stall the early
+                # ones. Only meaningful with multicast on.
+                early_timeout=bool(wg_mask),
+                **pad_kw,
+            )
+            if wg_mask:
+                # Non-zero mask switches the TDM from GLOBAL_LOAD_ASYNC to
+                # CLUSTER_LOAD_ASYNC, fanning one load out to every peer's LDS.
+                atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
+            jobs.append(
+                Job(
+                    atom,
                     gt,
-                    [ext, None],
-                    strides=[g_stride, None],
-                    num_warps=nw,
-                    # Descriptor bit 21: GL1 returns to the peers present when the
-                    # GL2 data lands and re-broadcasts to latecomers, instead of
-                    # holding early arrivals for a wider merge. Cluster peers work
-                    # on different n_tiles, so they reach this load at noticeably
-                    # different times and the wider merge would stall the early
-                    # ones. Only meaningful with multicast on.
-                    early_timeout=bool(wg_mask),
-                    **pad_kw,
+                    on_i32,
+                    lds_off + wave_outer_off * lds_row,
+                    lds_row,
+                    inner,
+                    seg,
+                    k_adv,
+                    wv,
                 )
-                if wg_mask:
-                    # Non-zero mask switches the TDM from GLOBAL_LOAD_ASYNC to
-                    # CLUSTER_LOAD_ASYNC, fanning one load out to every peer's LDS.
-                    atom = fx.atom_set_value(atom, "workgroup_mask", fx.Int32(wg_mask))
-                jobs.append(
-                    Job(
-                        atom,
-                        gt,
-                        on_i32,
-                        lds_off + i * seg * lds_row,
-                        lds_row,
-                        inner,
-                        seg,
-                        k_adv,
-                        wv[i],
-                    )
-                )
+            )
 
         add_tdm_loads(
             gA_base,
@@ -433,22 +452,65 @@ def launch_gemm_a8w4_tdm(
             wv=waves[3],
         )
 
-        def issue(s, kt):
+        # Wave ids are runtime values, so ownership cannot be resolved while tracing
+        # -- one instruction stream serves every wave. One test per owner list is the
+        # floor here: the slice index inside a list is already a runtime offset, so
+        # every job with the same owners shares one test and one block. Callers that
+        # have already selected a list (the unswitched k-loop) pass ``my_jobs`` and
+        # get no test at all.
+        job_waves = (
+            sorted({j.waves for j in jobs}) if jobs[0].waves[0] is not None else []
+        )
+
+        def owns(wv):
+            """Runtime predicate: is this wave one of ``wv``?"""
+            pred = wave == wv[0]
+            for w in wv[1:]:
+                pred = pred | (wave == w)
+            return pred
+
+        def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
             so4 = s * (PITCH // 4)
-            for j in jobs:
+
+            def emit(j):
                 base = base_i32 if j.on_i32 else pa
                 dst = lds_view(
                     base + j.lds_off + (so4 if j.on_i32 else 0),
                     (j.outer, j.inner),
                     (j.lds_row, 1),
                 )
-                off = fx.Int64(kt * j.k_adv)
-                if const_expr(j.wave is None):
-                    fx.copy(j.atom, j.gt, dst, imm_offset=off)
-                else:
-                    if wave == j.wave:
-                        fx.copy(j.atom, j.gt, dst, imm_offset=off)
+                fx.copy(j.atom, j.gt, dst, imm_offset=fx.Int64(kt * j.k_adv))
+
+            if const_expr(my_jobs is not None):
+                for j in my_jobs:
+                    emit(j)
+            elif const_expr(not job_waves):
+                for j in jobs:
+                    emit(j)
+            else:
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
+                        for j in jobs:
+                            if const_expr(j.waves == job_waves[g]):
+                                emit(j)
+
+        def unswitch(body):
+            """Run ``body`` once per owner list, with that list's jobs bound.
+
+            Hoisting the ownership test out of the k-loop leaves the loop body free
+            of any wave comparison: each copy issues its list's TDMs unconditionally.
+            The copies are identical apart from those descriptors, and every wave
+            appears in exactly one list, so it runs exactly one copy and the barrier
+            and tensorcnt counts per iteration are the same as before the split. A
+            wave in no list would skip the barriers and hang the workgroup.
+            """
+            if const_expr(not job_waves):
+                body(None)
+            else:
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
+                        body([j for j in jobs if j.waves == job_waves[g]])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
@@ -457,10 +519,10 @@ def launch_gemm_a8w4_tdm(
             row = wmb + wm * 16 + lane16
             b0 = row * A_LDS_ROW + ksl * A_KSTEP + kgrp * 16
             if const_expr(a_is_fp4):
-                return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                    Vec(lds_load_b128_raw(buf, b0 + 32)), list(range(8))
+                return Vec(lds_load_b128(buf, b0)).shuffle(
+                    Vec(lds_load_b128(buf, b0 + 32)), list(range(8))
                 )
-            v = [Vec(lds_load_b128_raw(buf, b0 + 32 * j)) for j in range_constexpr(4)]
+            v = [Vec(lds_load_b128(buf, b0 + 32 * j)) for j in range_constexpr(4)]
             return (
                 v[0]
                 .shuffle(v[1], list(range(8)))
@@ -475,8 +537,8 @@ def launch_gemm_a8w4_tdm(
                 + kgrp * 256
                 + lane16 * 16
             )
-            return Vec(lds_load_b128_raw(buf, b0)).shuffle(
-                Vec(lds_load_b128_raw(buf, b0 + 512)), list(range(8))
+            return Vec(lds_load_b128(buf, b0)).shuffle(
+                Vec(lds_load_b128(buf, b0 + 512)), list(range(8))
             )
 
         def load_sa(buf, wm, ksl):
@@ -484,14 +546,14 @@ def launch_gemm_a8w4_tdm(
             byte = (
                 warp_lds_row * (AS_INNER * 4) + kgrp * 4 + ksl * wmma_m_rep * 4 + wm * 4
             )
-            return lds_load_b32_raw(buf, SA_OFF + byte)
+            return lds_load_b32(buf, SA_OFF + byte)[0]
 
         def load_sb(buf, wn, ksl):
             col_rel = wnb + wn * 16 + lane16
-            return lds_load_b32_raw(
+            return lds_load_b32(
                 buf,
                 SB_OFF + ((col_rel // 32) * SC_INNER + ksl * 32 + (col_rel % 32)) * 4,
-            )
+            )[0]
 
         wmma_atom = fx.make_mma_atom(
             fx.rocdl.WMMAScale(
@@ -582,13 +644,9 @@ def launch_gemm_a8w4_tdm(
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
             if const_expr(xt_buf is not None):
                 xt_store(xt_buf)
-            return (
-                prefetch
-                if const_expr(nxt_ksl is not None)
-                else None
-            )
+            return prefetch if const_expr(nxt_ksl is not None) else None
 
-        def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None):
+        def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None, my_jobs=None):
             """Compute one k-tile, carrying one k128 of B/scales across tiles.
 
             ``from_xt`` takes this tile's subtile-0 B/scales from the carry slots,
@@ -596,10 +654,13 @@ def launch_gemm_a8w4_tdm(
             tile's LDS buffer, whose subtile 0 is loaded during this tile's last
             k128 -- so the tile boundary no longer exposes those ds_reads. The
             caller must have waited for ``nxt_buf``'s TDM to land.
+
+            ``my_jobs`` is the owner list already selected by ``unswitch``; it only
+            reaches ``issue`` and is unused when ``prefetch_kt`` is None.
             """
             if const_expr(prefetch_kt is not None):
                 rocdl.sched_barrier(0)
-                issue(prefetch_kt % num_buffers, prefetch_kt)
+                issue(prefetch_kt % num_buffers, prefetch_kt, my_jobs)
                 rocdl.sched_barrier(0)
             prev = xt_read() if const_expr(from_xt) else load_b_and_scales(buf, 0)
             for ksl in range_constexpr(KWS):
@@ -629,23 +690,29 @@ def launch_gemm_a8w4_tdm(
                 n_steady = K_TILES - num_buffers
                 if const_expr(XT):
                     # Every iteration of the rolled loop reads the carry slots, so
-                    # tile 0's k128 has to be in them before the loop starts.
+                    # tile 0's k128 has to be in them before the loop starts. This
+                    # stays outside ``unswitch``: it is one-shot and every wave runs
+                    # it, unlike the per-owner-list loop below.
                     tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
                     workgroup_barrier()
                     xt_store(ptr_to_idx(buf_ptr(0)))
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - XT_W))
-                    workgroup_barrier()
-                    nxt_buf = (
-                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                        if const_expr(XT)
-                        else None
-                    )
-                    compute_ktile(buf, None, XT, nxt_buf)
-                    workgroup_barrier()
-                    issue(s, kt + num_buffers)
+
+                def steady_post(my_jobs):
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1 - XT_W))
+                        workgroup_barrier()
+                        nxt_buf = (
+                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                            if const_expr(XT)
+                            else None
+                        )
+                        compute_ktile(buf, None, XT, nxt_buf)
+                        workgroup_barrier()
+                        issue(s, kt + num_buffers, my_jobs)
+
+                unswitch(steady_post)
                 for j in range_constexpr(num_buffers):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
@@ -674,16 +741,20 @@ def launch_gemm_a8w4_tdm(
                 if const_expr(XT):
                     pipeline_fence(outstanding=TDM_PER * (num_buffers - 2))
                     xt_store(ptr_to_idx(buf_ptr(0)))
-                for kt in range(n_steady):
-                    s = kt % num_buffers
-                    buf = ptr_to_idx(buf_ptr(s))
-                    pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - XT_W))
-                    nxt_buf = (
-                        ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
-                        if const_expr(XT)
-                        else None
-                    )
-                    compute_ktile(buf, kt + (num_buffers - 1), XT, nxt_buf)
+
+                def steady_mid(my_jobs):
+                    for kt in range(n_steady):
+                        s = kt % num_buffers
+                        buf = ptr_to_idx(buf_ptr(s))
+                        pipeline_fence(outstanding=TDM_PER * (num_buffers - 2 - XT_W))
+                        nxt_buf = (
+                            ptr_to_idx(buf_ptr((kt + 1) % num_buffers))
+                            if const_expr(XT)
+                            else None
+                        )
+                        compute_ktile(buf, kt + (num_buffers - 1), XT, nxt_buf, my_jobs)
+
+                unswitch(steady_mid)
                 for j in range_constexpr(num_buffers - 1):
                     kt = n_steady + j
                     buf = ptr_to_idx(buf_ptr(kt % num_buffers))
@@ -708,6 +779,14 @@ def launch_gemm_a8w4_tdm(
             STORE_N = (tile_n // 2) if stage1_act else tile_n
             neg_limit = fx.Float32(0.0) - f32_swiglu_limit
             is_swiglu = stage1_act == 2
+            is_situv2 = stage1_act == 3
+            # Uniform across the tile, so fold the betas once here rather than
+            # per element. Only materialised on the SiTUv2 path.
+            situ_c = (
+                situv2_consts(f32_situ_beta, f32_situ_linear_beta)
+                if const_expr(is_situv2)
+                else None
+            )
             oc = fx.Float16 if out_is_f16 else fx.BFloat16
 
             # -- Activate + stage to LDS --
@@ -747,13 +826,20 @@ def launch_gemm_a8w4_tdm(
                             for p in range_constexpr(4):
                                 pairs.append((acc[2 * p], acc[2 * p + 1]))
 
-                        all_vals = batched_silu_swiglu(
-                            pairs,
-                            swiglu=is_swiglu,
-                            limit_f32=f32_swiglu_limit,
-                            neg_limit_f32=neg_limit,
-                            range_constexpr=range_constexpr,
-                        )
+                        if const_expr(is_situv2):
+                            all_vals = batched_situv2(
+                                pairs,
+                                consts=situ_c,
+                                range_constexpr=range_constexpr,
+                            )
+                        else:
+                            all_vals = batched_silu_swiglu(
+                                pairs,
+                                swiglu=is_swiglu,
+                                limit_f32=f32_swiglu_limit,
+                                neg_limit_f32=neg_limit,
+                                range_constexpr=range_constexpr,
+                            )
 
                         scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
                             all_vals, wave_size=WAVE, dtype=MxDtype.FP8_E4M3
@@ -781,8 +867,10 @@ def launch_gemm_a8w4_tdm(
                                     dynamic_position=[],
                                 )
                                 col_fp8 = (wnb + wn * 16 + kgrp * 8) // 2
-                                lds_store_b32_raw(
-                                    stC_idx, row_rel * STORE_N + col_fp8, packed_i32
+                                lds_store_b32(
+                                    stC_idx,
+                                    row_rel * STORE_N + col_fp8,
+                                    Vec.from_elements([packed_i32], fx.Int32),
                                 )
 
                     # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
@@ -816,8 +904,17 @@ def launch_gemm_a8w4_tdm(
                                 )
                             ).to(fx.Float32)
                         if const_expr(stage1_act):
-                            hv = Vec.from_elements(
-                                [
+                            if const_expr(is_situv2):
+                                act_vals = [
+                                    fused_situv2_elem(
+                                        acc[2 * p],
+                                        acc[2 * p + 1],
+                                        consts=situ_c,
+                                    )
+                                    for p in range_constexpr(4)
+                                ]
+                            else:
+                                act_vals = [
                                     fused_silu_swiglu_elem(
                                         acc[2 * p],
                                         acc[2 * p + 1],
@@ -826,10 +923,9 @@ def launch_gemm_a8w4_tdm(
                                         neg_limit_f32=neg_limit,
                                     )
                                     for p in range_constexpr(4)
-                                ],
-                                fx.Float32,
-                            ).to(oc)
-                            lds_store_b64_raw(
+                                ]
+                            hv = Vec.from_elements(act_vals, fx.Float32).to(oc)
+                            lds_store_b64(
                                 stC_idx,
                                 (row_rel * STORE_N + col_rel // 2) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
@@ -838,7 +934,7 @@ def launch_gemm_a8w4_tdm(
                             hv = Vec.from_elements(
                                 [acc[i] for i in range_constexpr(8)], fx.Float32
                             ).to(oc)
-                            lds_store_b128_raw(
+                            lds_store_b128(
                                 stC_idx,
                                 (row_rel * STORE_N + col_rel) * 2,
                                 hv.bitcast(fx.Int32).ir_value(),
@@ -884,6 +980,8 @@ def launch_gemm_a8w4_tdm(
         i32_m,
         N,
         f32_swiglu_limit,
+        f32_situ_beta,
+        f32_situ_linear_beta,
     )
     grid = (m_tiles * n_tiles, 1, 1)
     if cluster_n > 1:

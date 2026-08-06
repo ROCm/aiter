@@ -567,7 +567,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-mllvm --amdgpu-mfma-vgpr-form'"
+            "'-mllvm --amdgpu-mfma-vgpr-form'",
+            "'-mllvm -enable-post-misched=1'"
         ],
         "md_name": "'module_moe_opus'",
         "extra_ldflags": "None",
