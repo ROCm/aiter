@@ -27,7 +27,6 @@ import math
 import os
 import random
 from pathlib import Path
-from typing import Tuple, Union
 
 import pandas as pd
 import torch
@@ -79,7 +78,7 @@ V4_PACK_OFF_PAD = V4_DIM_NOPE + V4_DIM_SCALE_DUP  # 462
 # so the same DUMP_MLA_METADATA env switch works here too).
 # ---------------------------------------------------------------------------
 def dump_mla_metadata_v1_txt(
-    filepath: Union[str, Path],
+    filepath: str | Path,
     *,
     batch: int,
     q_seq_len: int,
@@ -115,8 +114,10 @@ def dump_mla_metadata_v1_txt(
 
     work_ind_line = " ".join(f"{int(v):>{w}}" for v in wi)
     lines = [
-        f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
-        f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n",
+        (
+            f"batch:{batch}, q_seq_len:{q_seq_len}, max_num_blocks:{max_num_blocks}, "
+            f"work_q:{work_q}, work_kv:{work_kv}, total_tgs:{total_tgs}\n"
+        ),
         line_for("bs_indptr", lambda r: int(r[0].item())),
         line_for("partial_indptr", lambda r: int(r[1].item())),
         line_for("w_q_start", lambda r: int(r[2].item())),
@@ -170,7 +171,7 @@ def cast_scale_inv_to_ue8m0_pow2(scales_inv: torch.Tensor) -> torch.Tensor:
 
 def quantize_v4_nope_bpad8(
     nope_fp32: torch.Tensor,  # [..., V4_DIM_NOPE]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Per-tile (64 elt) E8M0 quantization. Returns (nope_fp8, scale_e8m0,
     nope_dq_bf16):
@@ -208,7 +209,7 @@ def quantize_v4_nope_bpad8(
 
 def quantize_v4_q(
     q: torch.Tensor,  # [total_q, nhead, V4_DIM_QK]  bf16
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Quantize Q the same way the ASM kernel sees it: nope FP8 + bpad8 E8M0
     scales, rope kept BF16. Returns (q_nope_fp8, q_nope_scale_e8m0,
@@ -263,7 +264,7 @@ def pack_v4_nope_scale(
 
 def unpack_v4_nope_scale(
     packed: torch.Tensor,  # [..., 512]   FP8
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Inverse of pack_v4_nope_scale; recovers (nope_fp8, scale_e8m0).
     Reads the *first* of each duplicated scale byte pair."""
     pb = packed.view(torch.uint8)
@@ -280,7 +281,7 @@ def unpack_v4_nope_scale(
 def init_v4_kv_cache(
     num_page: int,
     page_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Build a paged KV cache from a single fp32 source. Returns both the
     "golden" pure-bf16 buffer (no fp8 anywhere) and the kernel-shaped
@@ -335,9 +336,9 @@ def ref_masked_attention_v4(
     scale: float,
     out_dtype: torch.dtype,
     is_causal: bool = True,
-    causal_diagonal: int = None,
+    causal_diagonal: int | None = None,
     attn_sink: torch.Tensor = None,  # optional [h_q] fp32 per-head sink logit
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     attn = torch.einsum("qhd,khd->hqk", query.float(), key.float()) * scale
     if is_causal:
         s_q, s_k = query.shape[0], key.shape[0]
@@ -359,12 +360,12 @@ def ref_masked_attention_v4(
         m = attn_aug.max(dim=-1).values
         attn_exp = torch.exp(attn - m.unsqueeze(-1))  # NOTE: only over real K
         sink_exp = torch.exp(sink - m.unsqueeze(-1))  # [h, q, 1]
-        l = attn_exp.sum(-1) + sink_exp.squeeze(-1)  # noqa: E741
+        l = attn_exp.sum(-1) + sink_exp.squeeze(-1)
     else:
         lse = attn.logsumexp(dim=-1)
         m = attn.max(dim=-1).values
         attn_exp = torch.exp(attn - m.unsqueeze(-1))
-        l = attn_exp.sum(-1)  # noqa: E741
+        l = attn_exp.sum(-1)
     out = torch.einsum("hqk,khd->qhd", attn_exp, value.float())
     out = out / l.transpose(0, 1).unsqueeze(-1)
     return out.to(out_dtype), lse
@@ -492,7 +493,7 @@ def torch_mla_v4_split_kv(
     is_causal=True,
     attn_sink: torch.Tensor = None,  # only applied on first split of each batch
 ):
-    num_page, page_size, _, d_qk = kv_silver_bf16.shape
+    _num_page, page_size, _, d_qk = kv_silver_bf16.shape
     total_q, nheads, _ = q_silver_bf16.shape
     dev = kv_silver_bf16.device
 
@@ -706,7 +707,7 @@ def test_mla_v4(
         attn_sink = torch.randn(nhead, dtype=torch.float32) * 0.5
 
     # ---- silver reference (kernel-shaped inputs: 512-byte packed FP8 + BF16 rope) ----
-    out_silver, lse_silver = torch_mla_extend_v4_silver(
+    out_silver, _lse_silver = torch_mla_extend_v4_silver(
         q_packed,
         q_rope_bf16,
         kv_packed,
@@ -883,7 +884,7 @@ def test_mla_v4(
         kv_nope_bf16 = _v4_dequant_nope_bpad8(kv_nope_fp8, kv_nope_scale_e8m0)
         kv_silver_bf16 = torch.cat([kv_nope_bf16, kv_rope_bf16], dim=-1)
 
-        partial_out_ref, partial_lse_ref, _, _ = torch_mla_v4_split_kv(
+        partial_out_ref, _partial_lse_ref, _, _ = torch_mla_v4_split_kv(
             q_silver_bf16,
             kv_silver_bf16,
             qo_indptr,

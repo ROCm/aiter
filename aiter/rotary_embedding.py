@@ -1,5 +1,4 @@
 # Copyright (C) Advanced Micro Devices, Inc. All rights reserved.
-# coding=utf-8
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.33.2/src/transformers/models/llama/modeling_llama.py
 # Copyright (C) 2023-2026 The vLLM team.
@@ -24,24 +23,24 @@
 """Rotary Positional Embeddings."""
 
 import math
-from typing import Any, Dict, List, Optional, Tuple, Union
+
+# from custom_op import CustomOp
+import os
+from dataclasses import dataclass
+from typing import Any
 
 import torch
-import torch.nn as nn
-from dataclasses import dataclass
+from torch import nn
+
 from aiter import (
     dtypes,
     fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
     fused_qk_norm_rope_cache_pts_quant_shuffle,
 )
 
-# from custom_op import CustomOp
-
-import os
-
-AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", 0)) == 1
-AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", 0)) == 1
-AITER_ROPE_FUSED_QKNORM = int(os.environ.get("AITER_ROPE_FUSED_QKNORM", 0)) == 1
+AITER_ROPE_TRITON_BACKEND = int(os.environ.get("AITER_ROPE_TRITON_BACKEND", "0")) == 1
+AITER_ROPE_NATIVE_BACKEND = int(os.environ.get("AITER_ROPE_NATIVE_BACKEND", "0")) == 1
+AITER_ROPE_FUSED_QKNORM = int(os.environ.get("AITER_ROPE_FUSED_QKNORM", "0")) == 1
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -115,7 +114,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cache", cos, persistent=False)
         self.register_buffer("sin_cache", sin, persistent=False)
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -151,10 +150,10 @@ class RotaryEmbedding(nn.Module):
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
         is_nope_first=False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         if offsets is not None:
             positions = positions + offsets.view_as(positions)
@@ -217,9 +216,9 @@ class RotaryEmbedding(nn.Module):
         # [num_tokens, num_heads, rope_size+nope_size],
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
+        offsets: torch.Tensor | None = None,
         is_nope_first=False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # from vllm import _custom_ops as ops
         import aiter as ops
 
@@ -261,10 +260,10 @@ class RotaryEmbedding(nn.Module):
         # if NOT is_nope_first
         # [[batch_size, seq_len, num_heads, rope_size+nope_size],
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
         is_nope_first=False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         import aiter as ops
 
         assert (
@@ -350,10 +349,10 @@ class RotaryEmbedding(nn.Module):
         # if NOT is_nope_first
         # [[batch_size, seq_len, num_heads, rope_size+nope_size],
         query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        offsets: Optional[torch.Tensor] = None,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
         is_nope_first=False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         import aiter.ops.triton.rope.rope as ops
 
         self.cos_cache = self.cos_cache.to(query.device, dtype=query.dtype)
@@ -474,24 +473,24 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         max_position_embeddings: int,
         base: int,
         is_neox_style: bool,
-        scaling_factors: Union[List[float], float],
+        scaling_factors: list[float] | float,
         dtype: torch.dtype,
     ) -> None:
         if isinstance(scaling_factors, float):
             scaling_factors = [scaling_factors]
-        self.scaling_factors: List[float] = scaling_factors  # noqa
+        self.scaling_factors: list[float] = scaling_factors
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         # Lazy initialized.
-        self._scaling_factor_to_offset: Dict[float, int]
+        self._scaling_factor_to_offset: dict[float, int]
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.base)
-        cache_list: List[torch.Tensor] = []
+        cache_list: list[torch.Tensor] = []
         # offsets to the next cache in a tensor.
         # Each offset corresponds to the same index in scaling_factors.
-        offsets: List[int] = []
+        offsets: list[int] = []
         for scaling_factor in self.scaling_factors:
             # NOTE(woosuk): self.max_position_embeddings is the original
             # maximum length before applying the rope scaling.
@@ -521,7 +520,7 @@ class LinearScalingRotaryEmbedding(RotaryEmbedding):
         return torch.cat(cache_list, dim=0)
 
     @property
-    def scaling_factor_to_offset(self) -> Dict[float, int]:
+    def scaling_factor_to_offset(self) -> dict[float, int]:
         return self._scaling_factor_to_offset
 
 
@@ -585,7 +584,7 @@ def _yarn_find_correction_range(
     dim: int,
     base: float = 10000,
     max_position_embeddings: int = 2048,
-) -> Tuple[int, int]:
+) -> tuple[int, int]:
     low = math.floor(
         _yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings)
     )
@@ -696,10 +695,10 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        short_factor: List[float],
-        long_factor: List[float],
-        short_mscale: Optional[float] = None,
-        long_mscale: Optional[float] = None,
+        short_factor: list[float],
+        long_factor: list[float],
+        short_mscale: float | None = None,
+        long_mscale: float | None = None,
     ):
         super().__init__()
 
@@ -752,7 +751,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
             "long_short_cos_sin_cache", long_short_cache, persistent=False
         )
 
-    def _compute_inv_freq(self, rescale_factors: List[float]) -> torch.Tensor:
+    def _compute_inv_freq(self, rescale_factors: list[float]) -> torch.Tensor:
         rescale_factors = torch.tensor(rescale_factors, dtype=dtypes.fp32)
         inv_freq = 1.0 / (
             rescale_factors
@@ -769,7 +768,7 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
     def _compute_cos_sin_cache(
         self,
         max_position_embeddings: int,
-        rescale_factors: List[float],
+        rescale_factors: list[float],
         mscale: float,
     ) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(rescale_factors)
@@ -785,8 +784,8 @@ class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         query = query.view(*query.shape[:-1], -1, self.head_size)
         key = key.view(*key.shape[:-1], -1, self.head_size)
 
@@ -904,8 +903,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         query, key = super().forward(positions, query, key, offsets)
         if positions.numel() == 1:
             key = key.clone()
@@ -935,7 +934,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         inv_freqs = super()._compute_inv_freq(base)
         low_freq_wavelen = self.orig_max_position / self.low_freq_factor
         high_freq_wavelen = self.orig_max_position / self.high_freq_factor
@@ -981,7 +980,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        mrope_section: Optional[List[int]] = None,
+        mrope_section: list[int] | None = None,
         mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
@@ -998,7 +997,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
         Args:
@@ -1048,16 +1047,16 @@ class MRotaryEmbedding(RotaryEmbedding):
 
     @staticmethod
     def get_input_positions(
-        input_tokens: List[int],
-        image_grid_thw: Union[List[List[int]], torch.Tensor],
-        video_grid_thw: Union[List[List[int]], torch.Tensor],
+        input_tokens: list[int],
+        image_grid_thw: list[list[int]] | torch.Tensor,
+        video_grid_thw: list[list[int]] | torch.Tensor,
         image_token_id: int,
         video_token_id: int,
         vision_start_token_id: int,
         vision_end_token_id: int,
         spatial_merge_size: int,
         context_len: int = 0,
-    ) -> Tuple[List[List[int]], int]:
+    ) -> tuple[list[list[int]], int]:
         """Get mrope input positions and delta value."""
 
         if isinstance(image_grid_thw, torch.Tensor):
@@ -1158,7 +1157,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         mrope_position_delta: int,
         context_len: int,
         seq_len: int,
-    ) -> List[List[int]]:
+    ) -> list[list[int]]:
         return [
             list(
                 range(
@@ -1211,7 +1210,7 @@ class ProportionalRotaryEmbedding(RotaryEmbedding):
 
 @dataclass
 class AiterFusedSetKVBufferArg:
-    kv_cache: Tuple[torch.Tensor, torch.Tensor]
+    kv_cache: tuple[torch.Tensor, torch.Tensor]
     cache_loc: torch.Tensor
     k_scale: torch.Tensor
     v_scale: torch.Tensor
@@ -1224,7 +1223,7 @@ class AiterFusedSetKVBufferArg:
 class RotaryEmbeddingFusedQKNorm(nn.Module):
     """Rotary Embedding with QKNorm fused"""
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
@@ -1282,8 +1281,8 @@ class RotaryEmbeddingFusedQKNorm(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         eps: float,
-        fused_set_kv_buffer_arg: Optional[AiterFusedSetKVBufferArg] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused_set_kv_buffer_arg: AiterFusedSetKVBufferArg | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1
         num_tokens = positions.shape[0]
         num_heads_q = num_heads
@@ -1389,7 +1388,7 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        mrope_section: Optional[List[int]] = None,
+        mrope_section: list[int] | None = None,
         mrope_interleaved: bool = False,
     ) -> None:
         super().__init__(
@@ -1439,16 +1438,14 @@ class MRotaryEmbeddingQKNormFused(RotaryEmbeddingFusedQKNorm):
         num_heads: int,
         num_kv_heads: int,
         eps: float,
-        fused_set_kv_buffer_arg: Optional[AiterFusedSetKVBufferArg] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fused_set_kv_buffer_arg: AiterFusedSetKVBufferArg | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert positions.ndim == 2
         num_tokens = positions.shape[-1]
         num_heads_q = num_heads
         num_heads_k = num_kv_heads
         num_heads_v = num_kv_heads
-        is_interleaved = (
-            True if positions.ndim == 2 and self.mrope_section is not None else False
-        )
+        is_interleaved = bool(positions.ndim == 2 and self.mrope_section is not None)
         assert is_interleaved == self.mrope_interleaved
         if fused_set_kv_buffer_arg is not None:
             q_out = torch.empty(
@@ -1579,7 +1576,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         )
         self.register_buffer("cos_sin_q_inter_cache", q_inter_cache, persistent=False)
 
-    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): The HF implementation uses `torch.arange(...).float()`.
         # However, we use `torch.arange(..., dtype=torch.float)` instead to
@@ -1653,8 +1650,8 @@ class DualChunkRotaryEmbedding(nn.Module):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        offsets: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         query = query.view(*query.shape[:-1], -1, self.head_size)
         key = key.view(*key.shape[:-1], -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
@@ -1739,7 +1736,7 @@ class DualChunkRotaryEmbedding(nn.Module):
         return s
 
 
-_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
+_ROPE_DICT: dict[tuple, RotaryEmbedding] = {}
 
 
 def get_rope(
@@ -1748,10 +1745,10 @@ def get_rope(
     max_position: int,
     base: int,
     is_neox_style: bool = True,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[torch.dtype] = None,
+    rope_scaling: dict[str, Any] | None = None,
+    dtype: torch.dtype | None = None,
     partial_rotary_factor: float = 1.0,
-    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+    dual_chunk_attention_config: dict[str, Any] | None = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -1862,11 +1859,7 @@ def get_rope(
                     is_neox_style,
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
-                    mrope_interleaved=(
-                        rope_scaling["mrope_interleaved"]
-                        if "mrope_interleaved" in rope_scaling
-                        else False
-                    ),
+                    mrope_interleaved=(rope_scaling.get("mrope_interleaved", False)),
                 )
             else:
                 rotary_emb = RotaryEmbedding(
@@ -1995,10 +1988,10 @@ def get_rope_wrapper(
     max_position: int,
     base: int,
     is_neox_style: bool = True,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[torch.dtype] = None,
+    rope_scaling: dict[str, Any] | None = None,
+    dtype: torch.dtype | None = None,
     partial_rotary_factor: float = 1.0,
-    device: Optional[str] = None,
+    device: str | None = None,
 ):
     if device != "cpu":
         return get_rope(
