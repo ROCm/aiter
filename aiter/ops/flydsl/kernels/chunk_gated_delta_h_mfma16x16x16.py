@@ -26,9 +26,47 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .tensor_shim import GTensor
-
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
+
+
+def _flat_buffer(ptr, numeric, align):
+    """Flat buffer-resource view over a raw global pointer slot.
+
+    The tensor slots come in through the ``fx.Pointer`` ABI, so the element type
+    is re-established here and the view keeps a trivial 1-element layout: every
+    access in this kernel is a hand-computed element offset (see ``_gtile``),
+    not a layout coordinate. ``align`` is the alignment guaranteed by the widest
+    access on that slot, so the vector copies stay single instructions.
+    """
+    ptr_ty = fx.PointerType.get(
+        numeric.ir_type, address_space=fx.AddressSpace.Global, alignment=align
+    )
+    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(ptr)))
+    return fx.rocdl.make_buffer_tensor(
+        fx.make_view(base, fx.make_layout(1, 1)), max_size=True
+    )
+
+
+def _gtile(buf, elem_off, width):
+    """``width``-element tile of ``buf`` at ELEMENT offset ``elem_off``."""
+    return fx.make_view(
+        fx.add_offset(fx.get_iter(buf), elem_off), fx.make_layout(width, 1)
+    )
+
+
+def _gload(atom, buf, elem_off, width, numeric):
+    """buffer_load ``width`` elements of ``buf`` at ELEMENT offset ``elem_off``."""
+    frag = fx.make_rmem_tensor(width, numeric)
+    fx.copy(atom, _gtile(buf, elem_off, width), frag)
+    vec = fx.Vector(frag.load())
+    return vec[0] if width == 1 else vec
+
+
+def _gstore(atom, buf, elem_off, value, width, numeric):
+    """buffer_store ``value`` into ``buf`` at ELEMENT offset ``elem_off``."""
+    frag = fx.make_rmem_tensor(width, numeric)
+    frag.store(fx.Vector.from_elements([value], dtype=numeric) if width == 1 else value)
+    fx.copy(atom, frag, _gtile(buf, elem_off, width))
 
 
 def _make_fast_exp(g_is_log2_scaled: bool):
@@ -43,12 +81,13 @@ def _make_fast_exp(g_is_log2_scaled: bool):
     i.e. 819 -> 849 instructions and 146 -> 148 VGPRs, for a fix-up this
     kernel does not need (the gates underflow to 0 either way).
 
-    The result is wrapped once here so callers stay on the typed fx API
-    instead of re-wrapping the raw intrinsic value at each use site.
+    The raw intrinsic takes / returns an untyped SSA value, so ``x`` is
+    unwrapped and the result re-wrapped here, keeping callers on the typed
+    fx API.
     """
     if g_is_log2_scaled:
-        return lambda x: fx.Float32(rocdl.exp2(T.f32, x))
-    return lambda x: fx.Float32(rocdl.exp2(T.f32, x * _LOG2E))
+        return lambda x: fx.Float32(rocdl.exp2(T.f32, x.ir_value()))
+    return lambda x: fx.Float32(rocdl.exp2(T.f32, (x * _LOG2E).ir_value()))
 
 
 def _f32x4_to_bf16x4_rne(vec_f32x4):
@@ -136,7 +175,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     NUM_K_BLOCKS = K // 64
 
     # Tensor slots use the ``fx.Pointer`` ABI (raw data pointer). The kernel
-    # body wraps every slot as ``GTensor(..., shape=(-1,))`` and never reads
+    # body wraps every slot as a flat ``_flat_buffer`` view and never reads
     # the FlyDSL-injected memref shape/stride, so passing a bare pointer
     # produces identical device code while skipping the per-launch DLPack
     # export + layout-buffer packing that the default layout-dynamic
@@ -256,9 +295,17 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # ``[pool_size, H, V, K]``) rather than ``i_n`` itself (dense
         # ``[N, H, V, K]``). Only h0 (read) and ht (in-place write-back) use this
         # slot; the per-chunk h snapshot stays dense (i_n-indexed).
+        # Buffer-copy atoms shared by every global access below. The 128b/64b
+        # ones carry the cooperative vector loads (8 bf16 / 4 state elements);
+        # the 32b/16b ones the per-lane scalars.
+        cp_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        cp_f32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        cp_bf16 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        cp_bf16x8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+
         if const_expr(USE_STATE_INDICES):
-            si_ = GTensor(state_indices_tensor, dtype=T.i32, shape=(-1,))
-            state_n = si_[fx.Int64(i_n)]
+            si_ = _flat_buffer(state_indices_tensor, fx.Int32, 4)
+            state_n = _gload(cp_i32, si_, fx.Int64(i_n), 1, fx.Int32)
         else:
             state_n = i_n
         state_nh = state_n * H + i_h
@@ -267,35 +314,38 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
 
-        # Flat 1-D GTensors with hand-computed i64 element offsets rather than
-        # ``make_buffer_tensor`` + a shaped view: every access here is a runtime
-        # scalar offset that is already clamped (safe_row / in_bounds selects),
-        # so the buffer descriptor's OOB check would be redundant. Measured on
-        # gfx942 -- the buffer_tensor form emits the same 819 instructions but
-        # needs the offset truncated to i32 for the view index, which is unsafe
-        # for the long-context shapes this kernel targets.
-        k_ = GTensor(k_tensor, dtype=T.bf16, shape=(-1,))
-        v_ = GTensor(v_tensor, dtype=T.bf16, shape=(-1,))
-        w_ = GTensor(w_tensor, dtype=T.bf16, shape=(-1,))
-        h_ = GTensor(h_tensor, dtype=T.bf16, shape=(-1,))
-        g_ = GTensor(g_tensor, dtype=T.f32, shape=(-1,))
+        # Flat 1-D buffer views with hand-computed i64 element offsets rather
+        # than a shaped view + layout coordinates: every access here is a
+        # runtime scalar offset that is already clamped (safe_row / in_bounds
+        # selects), so there is no tile structure for the layout algebra to
+        # exploit. ``align`` is the widest access on that slot -- 16 B for the
+        # 8-element cooperative loads, element size for the scalar ones.
+        k_ = _flat_buffer(k_tensor, fx.BFloat16, 16)
+        v_ = _flat_buffer(v_tensor, fx.BFloat16, 2)
+        w_ = _flat_buffer(w_tensor, fx.BFloat16, 16)
+        h_ = _flat_buffer(h_tensor, fx.BFloat16, 16)
+        g_ = _flat_buffer(g_tensor, fx.Float32, 4)
         if const_expr(USE_GK):
-            gk_ = GTensor(gk_tensor, dtype=T.f32, shape=(-1,))
+            gk_ = _flat_buffer(gk_tensor, fx.Float32, 4)
 
-        vn_ = GTensor(v_new_tensor, dtype=T.bf16, shape=(-1,))
-        # SSM-state dtype is selected by the compile-time flag; ``T.f32`` /
-        # ``T.bf16`` must be evaluated *inside* the kernel body where an MLIR
-        # context is active (mirrors how ``gdr_decode.py`` resolves
-        # ``state_dtype_`` from inside its kernel function).
-        state_t = T.bf16 if STATE_DTYPE_BF16 else T.f32
+        vn_ = _flat_buffer(v_new_tensor, fx.BFloat16, 2)
+        # SSM-state dtype is selected by the compile-time flag. The h0/ht
+        # accesses are 4 contiguous K, so the state buffers are 16 B aligned in
+        # f32 and 8 B in bf16, and the copy atom is sized to match.
+        state_num = fx.BFloat16 if STATE_DTYPE_BF16 else fx.Float32
+        state_bytes = 2 if STATE_DTYPE_BF16 else 4
+        cp_state_x4 = fx.make_copy_atom(
+            fx.rocdl.BufferCopy64b() if STATE_DTYPE_BF16 else fx.rocdl.BufferCopy128b(),
+            state_num,
+        )
         if const_expr(USE_INITIAL_STATE):
-            h0_ = GTensor(h0_tensor, dtype=state_t, shape=(-1,))
+            h0_ = _flat_buffer(h0_tensor, state_num, 4 * state_bytes)
         if const_expr(STORE_FINAL_STATE):
-            ht_ = GTensor(ht_tensor, dtype=state_t, shape=(-1,))
+            ht_ = _flat_buffer(ht_tensor, state_num, 4 * state_bytes)
 
         if const_expr(IS_VARLEN):
-            cu_ = GTensor(cu_seqlens_tensor, dtype=T.i32, shape=(-1,))
-            co_ = GTensor(chunk_offsets_tensor, dtype=T.i32, shape=(-1,))
+            cu_ = _flat_buffer(cu_seqlens_tensor, fx.Int32, 4)
+            co_ = _flat_buffer(chunk_offsets_tensor, fx.Int32, 4)
 
         # -- LDS --
         # Accessed as raw base pointers + computed element offsets rather than
@@ -411,14 +461,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             )
 
         # -- Prologue: compute bos, T_local, NT, boh --
-        # cu_/co_ reads come back as untyped SSA values; wrap them once here so
-        # every downstream use stays on the typed fx API.
         if const_expr(IS_VARLEN):
-            bos = fx.Int32(cu_[fx.Int64(i_n)])
-            eos = fx.Int32(cu_[fx.Int64(i_n) + fx.Int64(1)])
+            bos = _gload(cp_i32, cu_, fx.Int64(i_n), 1, fx.Int32)
+            eos = _gload(cp_i32, cu_, fx.Int64(i_n) + fx.Int64(1), 1, fx.Int32)
             T_local = eos - bos
             NT = (T_local + (BT - 1)) // BT
-            boh = fx.Int32(co_[fx.Int64(i_n)])
+            boh = _gload(cp_i32, co_, fx.Int64(i_n), 1, fx.Int32)
         else:
             bos = i_n * T_val
             T_local = T_val
@@ -517,7 +565,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     h0_off_base = (
                         h0_base + fx.Int64(h0_col) * fx.Int64(K) + fx.Int64(h0_row_base)
                     )
-                    loaded_vec = h0_.vec_load((h0_off_base,), 4)
+                    loaded_vec = _gload(cp_state_x4, h0_, h0_off_base, 4, state_num)
                     if const_expr(STATE_DTYPE_BF16):
                         loaded_vec = loaded_vec.to(fx.Float32)
                     acc_idx = kb * N_REPEAT + slot
@@ -552,10 +600,10 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         # correctly.
         #
         # The body lives in the _load_chunk0_to_lds closure so the ``if`` body
-        # is just "call closure + barrier": the GTensor wrappers (w_/k_) are
-        # captured as free variables rather than appearing inside the if, which
-        # would make the FlyDSL AST rewriter try to carry them as scf.if state
-        # and fail with "GTensor is not an MLIR Value".
+        # is just "call closure + barrier": the buffer views (w_/k_) and copy
+        # atoms are captured as free variables rather than appearing inside the
+        # if, which would make the FlyDSL AST rewriter try to carry them as
+        # scf.if state.
         def _load_chunk0_to_lds():
             # Chunk 0, so the absolute row is just the in-chunk row.
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -569,7 +617,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + fx.Int64(kb * 64)
                         + fx.Int64(load_col_base)
                     )
-                    wvec = w_.vec_load((w_g_off,), LOAD_VEC_WIDTH)
+                    wvec = _gload(cp_bf16x8, w_, w_g_off, LOAD_VEC_WIDTH, fx.BFloat16)
                     swz = wp_panel_base + _w_panel_swz_elems(row, load_col_base)
                     fx.ptr_store(wvec.shuffle(wvec, [0, 1, 2, 3]), lds_wp_ptr + swz)
                     fx.ptr_store(
@@ -587,8 +635,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                 k_g_off_t1 = (
                     k_base + fx.Int64(k_safe_t1_prol) * stride_k + fx.Int64(k_col_off)
                 )
-                kvec_t0 = k_.vec_load((k_g_off_t0,), LOAD_VEC_WIDTH)
-                kvec_t1 = k_.vec_load((k_g_off_t1,), LOAD_VEC_WIDTH)
+                kvec_t0 = _gload(cp_bf16x8, k_, k_g_off_t0, LOAD_VEC_WIDTH, fx.BFloat16)
+                kvec_t1 = _gload(cp_bf16x8, k_, k_g_off_t1, LOAD_VEC_WIDTH, fx.BFloat16)
                 for i in range_constexpr(LOAD_VEC_WIDTH):
                     row_i = k_row_base_pf + i
                     byte_off = _k_panel_rotating_pair_addr_bytes(row_i, k_pair_col_pf)
@@ -659,10 +707,16 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     u_off = (
                         v_base + fx.Int64(safe_u_row) * stride_v + fx.Int64(u_col_pf)
                     )
-                    u_prefetch.append(v_[u_off])
+                    u_prefetch.append(_gload(cp_bf16, v_, u_off, 1, fx.BFloat16))
 
             if const_expr(USE_G):
-                g_last = g_[g_sh_base + fx.Int64(last_idx_raw) * g_stride_t]
+                g_last = _gload(
+                    cp_f32,
+                    g_,
+                    g_sh_base + fx.Int64(last_idx_raw) * g_stride_t,
+                    1,
+                    fx.Float32,
+                )
                 g_row_pf = []
                 for elem_i in range_constexpr(4):
                     abs_row = i_t_i32 * BT + wid * 16 + lane_m_base * 4 + elem_i
@@ -670,7 +724,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     safe_row = in_bounds.select(abs_row, 0)
                     g_row_pf.append(
                         (
-                            g_[g_sh_base + fx.Int64(safe_row) * g_stride_t],
+                            _gload(
+                                cp_f32,
+                                g_,
+                                g_sh_base + fx.Int64(safe_row) * g_stride_t,
+                                1,
+                                fx.Float32,
+                            ),
                             in_bounds,
                         )
                     )
@@ -743,7 +803,9 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         + fx.Int64(kb * 64)
                         + fx.Int64(load_col_base)
                     )
-                    w_next_vecs.append(w_.vec_load((w_g_off_next,), LOAD_VEC_WIDTH))
+                    w_next_vecs.append(
+                        _gload(cp_bf16x8, w_, w_g_off_next, LOAD_VEC_WIDTH, fx.BFloat16)
+                    )
                     w_next_swz.append(
                         wp_pb_next + _w_panel_swz_elems(row, load_col_base)
                     )
@@ -781,24 +843,12 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     )
                 gate_vec = fx.Vector.from_elements(mask_elems, dtype=fx.Float32)
 
-            if const_expr(SAVE_NEW_VALUE):
-                # Wrapping the store in a bare function call hides it from the
-                # ``ReplaceIfWithDispatch`` AST rewriter, which scans subscript
-                # stores and ``obj.method()`` calls inside dynamic ``if`` bodies
-                # and demands MLIR-Value state for any name written to. ``vn_``
-                # is a GTensor (HBM tensor wrapper), not an MLIR Value; an
-                # ast.Name call makes the analyzer skip it.
-                def _emit_vn_store(off, value):
-                    vn_[off] = value
-
             for idx in range_constexpr(N_REPEAT):
                 bv_val = bv_accs[idx]
                 u_col = i_v * BV + (idx * 16) + lane_n
                 u_f32_elems = []
                 for elem_i in range_constexpr(4):
-                    u_raw = u_prefetch[idx * 4 + elem_i]
-                    u_bf16 = fx.BFloat16(u_raw)
-                    u_f32_elems.append(u_bf16.to(fx.Float32))
+                    u_f32_elems.append(u_prefetch[idx * 4 + elem_i].to(fx.Float32))
                 u_f32 = fx.Vector.from_elements(u_f32_elems, dtype=fx.Float32)
                 vn_val = u_f32 - bv_val
 
@@ -816,7 +866,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                                 + fx.Int64(vn_bt_row) * fx.Int64(V)
                                 + fx.Int64(u_col)
                             )
-                            _emit_vn_store(vn_off, bf16_v)
+                            _gstore(cp_bf16, vn_, vn_off, bf16_v, 1, fx.BFloat16)
 
                 # gate_vec: with USE_G it is the decay gate (with the OOB mask
                 # already folded in); otherwise it is a pure 0/1 padding mask.
@@ -839,23 +889,25 @@ def compile_chunk_gated_delta_h_mfma16_hip(
             for kb in range_constexpr(NUM_K_BLOCKS):
                 k_col_off_pf = kb * 64 + k_row_base_pf
                 k_next_vecs_t0.append(
-                    k_.vec_load(
-                        (
-                            k_base
-                            + fx.Int64(k_safe_t0_next) * stride_k
-                            + fx.Int64(k_col_off_pf),
-                        ),
+                    _gload(
+                        cp_bf16x8,
+                        k_,
+                        k_base
+                        + fx.Int64(k_safe_t0_next) * stride_k
+                        + fx.Int64(k_col_off_pf),
                         LOAD_VEC_WIDTH,
+                        fx.BFloat16,
                     )
                 )
                 k_next_vecs_t1.append(
-                    k_.vec_load(
-                        (
-                            k_base
-                            + fx.Int64(k_safe_t1_next) * stride_k
-                            + fx.Int64(k_col_off_pf),
-                        ),
+                    _gload(
+                        cp_bf16x8,
+                        k_,
+                        k_base
+                        + fx.Int64(k_safe_t1_next) * stride_k
+                        + fx.Int64(k_col_off_pf),
                         LOAD_VEC_WIDTH,
+                        fx.BFloat16,
                     )
                 )
 
@@ -875,7 +927,13 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     gk_elems = []
                     for elem_i in range_constexpr(4):
                         global_k = kb * 64 + wid * 16 + lane_m_base * 4 + elem_i
-                        gk_raw = gk_[gk_chunk_base + fx.Int64(global_k)]
+                        gk_raw = _gload(
+                            cp_f32,
+                            gk_,
+                            gk_chunk_base + fx.Int64(global_k),
+                            1,
+                            fx.Float32,
+                        )
                         gk_elems.append(_fast_exp(gk_raw))
                     gk_vec = fx.Vector.from_elements(gk_elems, dtype=fx.Float32)
                     for nr in range_constexpr(N_REPEAT):
@@ -912,7 +970,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                     + fx.Int64(v_global) * fx.Int64(K)
                     + fx.Int64(k8)
                 )
-                h_.vec_store((h_off,), vec8, LOAD_VEC_WIDTH)
+                _gstore(cp_bf16x8, h_, h_off, vec8, LOAD_VEC_WIDTH, fx.BFloat16)
 
             # -- GEMM2: h += k^T @ v_new_gated (no w prefetch/interleave).
             BT_STEPS = BT // K_STEP
@@ -980,8 +1038,8 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         h_accs_final = [fx.Vector(v, (4,), fx.Float32) for v in results[:NUM_H_ACCS]]
 
         # -- Epilogue: store final state --
-        # acc_val is already f32x4 with element i at K offset i -> vec_store
-        # directly (no extract + from_elements needed), giving one
+        # acc_val is already f32x4 with element i at K offset i -> store the
+        # vector directly (no extract + from_elements needed), giving one
         # buffer_store_dwordx4 instead of 4 scalar f32 stores.
         if const_expr(STORE_FINAL_STATE):
             for kb in range_constexpr(NUM_K_BLOCKS):
@@ -998,7 +1056,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
                         out_vec = _f32x4_to_bf16x4(acc_val)
                     else:
                         out_vec = acc_val
-                    ht_.vec_store((ht_off_base,), out_vec, 4)
+                    _gstore(cp_state_x4, ht_, ht_off_base, out_vec, 4, state_num)
 
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
