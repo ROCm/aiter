@@ -1070,16 +1070,10 @@ def flydsl_preshuffle_gemm_a8(
 
 # ---------------------------------------------------------------------------
 # Expose flydsl_hgemm to the PyTorch dispatcher (torch.ops.aiter.flydsl_hgemm)
-#
-# FlyDSL kernels are JIT-compiled via `flyc.compile` and bypass the dispatcher,
-# so they carry no `Input Dims` in profiler traces and are opaque to
-# torch.compile. Registering a real `torch.ops.aiter.flydsl_hgemm` op gives both
-# profiler shape metadata and torch.compile compatibility (via `fake_impl`).
-#
+
 # We copy the original signature and drop only `stream` (fx.Stream /
 # torch.cuda.Stream is not a legal torch schema type; it is never passed on the
-# runtime path — see aiter/tuned_gemm.py). `infer_schema` resolves the module's
-# stringized annotations, so no explicit annotation table is needed.
+# runtime path — see aiter/tuned_gemm.py).
 # ---------------------------------------------------------------------------
 import functools as _ft
 import inspect as _insp
