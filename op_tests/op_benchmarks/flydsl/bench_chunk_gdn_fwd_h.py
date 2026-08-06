@@ -198,11 +198,102 @@ def _load_impls(which: str) -> dict:
             from aiter.ops.chunk_gated_delta_rule_fwd_h import (
                 chunk_gated_delta_rule_fwd_h_hip_fn,
             )
-            impls["hip"] = chunk_gated_delta_rule_fwd_h_hip_fn
+            impls["hip"] = _adapt_hip(chunk_gated_delta_rule_fwd_h_hip_fn)
         except ImportError as e:
             warnings.warn(f"HIP K5 not available: {e}")
 
     return impls
+
+
+def _adapt_hip(hip_fn):
+    """Wrap the HIP K5 wrapper so it accepts the same call shape as flydsl/triton.
+
+    The bench closures call every impl uniformly as
+    ``fn(k=, w=, u=, g=, gk=, initial_state=, output_final_state=,
+        save_new_value=, cu_seqlens=, use_exp2=)`` with ``g`` in the FlyDSL/Triton
+    2-D head-major ``[H, T_flat]`` layout. The production HIP wrapper
+    (``chunk_gated_delta_rule_fwd_h_hip_fn``) instead requires a **3-D** ``g``
+    (``[B, H, T]`` head-major or ``[B, T, H]`` token-major) and a ``g_head_major``
+    flag. This adapter reshapes ``g`` to ``[1, H, T_flat]`` and sets
+    ``g_head_major=True`` so the HIP kernel can be benchmarked without editing any
+    production code. ``gk`` (``[T_flat, H, K]``) already matches HIP's expected
+    layout and is forwarded unchanged.
+
+    Graph capture: the HIP wrapper otherwise (a) does a device-to-host read of the
+    chunk schedule during launch and (b) *builds* the prefill metadata inside the
+    call -- both illegal under CUDA-graph capture ("operation not permitted when
+    stream is capturing" / "GDR metadata cannot be built during ... capture"). The
+    fix is to build a reusable ``GatedDeltaRulePrefillMetadata`` ONCE before capture
+    (in ``_run_one``) and pass it as ``prefill_metadata=``; the captured call then
+    only reuses it. The metadata is looked up here by ``cu_seqlens`` tensor identity
+    (no device sync). With no ``cu_seqlens`` (single sequence) there is no schedule
+    to build, so nothing extra is needed.
+    """
+    import functools
+
+    @functools.wraps(hip_fn)
+    def _wrapped(*, k, w, u, g=None, gk=None, cu_seqlens=None, **kwargs):
+        g_hip = g
+        if g is not None:
+            # [H, T_flat] -> [1, H, T_flat] (batch=1, head-major).
+            g_hip = g.unsqueeze(0) if g.dim() == 2 else g
+        prefill_metadata = _hip_meta_cache.get(
+            id(cu_seqlens) if cu_seqlens is not None else None
+        )
+        return hip_fn(
+            k=k,
+            w=w,
+            u=u,
+            g=g_hip,
+            gk=gk,
+            cu_seqlens=cu_seqlens,
+            g_head_major=True,
+            prefill_metadata=prefill_metadata,
+            **kwargs,
+        )
+
+    return _wrapped
+
+
+# Maps id(cu_seqlens tensor) -> reusable GatedDeltaRulePrefillMetadata, built once
+# per shape in _run_one BEFORE warmup/capture so the HIP adapter never builds
+# metadata (or does a device-to-host read) inside the timed / graph-captured
+# closure.
+_hip_meta_cache: dict = {}
+
+
+class _CaptureSafeMeta:
+    """Thin proxy over ``GatedDeltaRulePrefillMetadata`` that no-ops ``validate``.
+
+    The production metadata's ``validate()`` raises unconditionally while a HIP/
+    CUDA graph is capturing ("Typed prefill metadata cannot be used during ...
+    capture"). Everything else the HIP wrapper touches on the metadata
+    (``get_chunk_schedule`` -> returns precomputed on-device tensors) is
+    capture-safe. The bench validates the metadata ONCE before capture (below),
+    so skipping the redundant in-capture ``validate`` is sound and lets the HIP
+    kernel be graph-captured. This is a benchmark-only shim; it does not alter any
+    production code path (the real wrapper still runs identically outside capture).
+    """
+
+    def __init__(self, meta, cu_seqlens, *, chunk_size, total_prefill_tokens,
+                 num_sequences):
+        self._meta = meta
+        # One-time, pre-capture validation using the real implementation
+        # (keyword-only signature; see GatedDeltaRulePrefillMetadata.validate).
+        meta.validate(
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            num_decodes=0,
+            num_decode_tokens=0,
+            total_prefill_tokens=total_prefill_tokens,
+            num_sequences=num_sequences,
+        )
+
+    def validate(self, *args, **kwargs):
+        return None  # already validated pre-capture
+
+    def __getattr__(self, name):
+        return getattr(self._meta, name)
 
 
 # --------------------------------------------------------------------------- #
@@ -316,6 +407,29 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
         k, w_hm, u_hm, w_tm, g, gk, h0, cu = _make_inputs(shape)
     except Exception as e:
         return {"label": label, "error": str(e)}
+
+    # Build reusable HIP prefill metadata ONCE (before any warmup/capture) so the
+    # HIP adapter never builds metadata or does a device-to-host read inside the
+    # timed / graph-captured closure. Only needed for the varlen (N>1) path and
+    # only when HIP is among the impls.
+    if cu is not None and "hip" in impls:
+        try:
+            from aiter.ops.prefill_batch_metadata import (
+                build_gated_delta_rule_prefill_metadata,
+            )
+            _bounds = cu.detach().to("cpu", torch.int64)
+            _seq_lens = (_bounds[1:] - _bounds[:-1]).tolist()
+            _meta = build_gated_delta_rule_prefill_metadata(
+                _seq_lens, cu_seqlens=cu, chunk_size=BT,
+            )
+            _hip_meta_cache[id(cu)] = _CaptureSafeMeta(
+                _meta, cu,
+                chunk_size=BT,
+                total_prefill_tokens=int(T_flat),
+                num_sequences=len(_seq_lens),
+            )
+        except Exception as e:
+            warnings.warn(f"HIP prefill metadata build failed: {e}")
 
     modes = ["eager", "graph"] if args.mode == "all" else [args.mode]
     baseline_name = args.baseline
