@@ -257,42 +257,59 @@ def test_all_identical_values(k):
     _assert_batch(logits, indices, row_ends, k)
 
 
-@pytest.mark.parametrize("L", [8192, 120003], ids=["short", "long"])
-@pytest.mark.parametrize("k", [256, 2048])
-def test_non_finite_never_selected(k, L):
-    """+inf / -inf / NaN in the valid region must never be selected"""
-    device = torch.device("cuda")
+def _non_finite_row(L, device):
+    """A row with +inf / NaN scattered through it, plus one -inf.
+
+    Returns (logits, seq_lens, top_positions, bottom_positions).
+    """
     torch.manual_seed(_SEED)
     logits = torch.randn((1, L), dtype=torch.float32, device=device)
-    # Scatter non-finite through the valid region. +inf/NaN are the ones a raw-bit
-    # radix-select wrongly ranks at the very top; -inf should sort out naturally.
-    bad = {
-        10: float("inf"),
-        100: float("nan"),
-        L // 3: float("inf"),
-        L // 2: float("-inf"),
-        L - 5: float("nan"),
-    }
-    for pos, val in bad.items():
+    top = {10: float("inf"), 100: float("nan"), L // 3: float("inf")}
+    top[L - 5] = float("nan")
+    bottom = {L // 2: float("-inf")}
+    for pos, val in {**top, **bottom}.items():
         logits[0, pos] = val
     sl = torch.tensor([L], dtype=torch.int32, device=device)
+    return logits, sl, set(top), set(bottom)
 
-    indices = _run(logits, sl, 1, 1, k)
-    got = indices[0].to(device).long()
 
-    # (a) no selected index points to a non-finite value
-    sel_vals = logits[0, got]
-    assert torch.isfinite(sel_vals).all(), (
-        f"selected non-finite values: "
-        f"{sel_vals[~torch.isfinite(sel_vals)][:8].tolist()}"
-    )
-    # (b) the selected set is the top-k of the finite values (non-finite -> -inf)
-    sanitized = torch.where(
-        torch.isfinite(logits[0]),
-        logits[0],
-        torch.full_like(logits[0], float("-inf")),
-    )
-    _assert_row_topk_set(sanitized.cpu(), indices[0].cpu(), k, L)
+@pytest.mark.parametrize("L", [8192, 120003], ids=["short", "long"])
+@pytest.mark.parametrize("k", [256, 2048])
+def test_non_finite_ranks_like_torch(k, L):
+    """+inf and NaN rank at the very top and -inf below every finite value, which
+    is what torch.topk does and what the HIP kernel a gated call can fall back to
+    does. Clamping them instead would make the answer depend on which kernel the
+    gate happened to pick for that batch."""
+    device = torch.device("cuda")
+    logits, sl, top, bottom = _non_finite_row(L, device)
+
+    got = set(_run(logits, sl, 1, 1, k)[0].tolist())
+    assert top <= got, f"non-finite positions not selected: {sorted(top - got)}"
+    assert not (bottom & got), "-inf must never be selected"
+
+    # The remaining slots are the plain top-(k - len(top)) of the finite values.
+    finite = logits[0].clone()
+    for pos in top | bottom:
+        finite[pos] = float("-inf")
+    expected = torch.topk(finite, k - len(top)).values.sort().values
+    rest = torch.tensor(sorted(got - top), device=device)
+    torch.testing.assert_close(finite[rest].sort().values, expected, rtol=0, atol=0)
+
+
+def test_non_finite_mask_override_excludes_them():
+    """FLYDSL_TOPK_TIERED_MASK_NONFINITE=1 restores the clamp-to--inf behaviour
+    for a caller that would rather drop them than propagate them."""
+    k, L = 256, 8192
+    device = torch.device("cuda")
+    logits, sl, top, bottom = _non_finite_row(L, device)
+
+    with _env_override(FLYDSL_TOPK_TIERED_MASK_NONFINITE="1") as m:
+        assert m._kernel_config(1, L)["mask_non_finite"]
+        got = set(_run(logits, sl, 1, 1, k)[0].tolist())
+
+    assert not (
+        got & (top | bottom)
+    ), f"masked run still selected non-finite: {sorted(got & (top | bottom))}"
 
 
 @contextlib.contextmanager

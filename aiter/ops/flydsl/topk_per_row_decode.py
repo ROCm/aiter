@@ -241,6 +241,12 @@ def _default_kernel_config(
     # Env FLYDSL_TOPK_TIERED_ES (0/1) overrides; gfx942 frozen (0).
     es_on = _env_int("FLYDSL_TOPK_TIERED_ES", 1 if arch == "gfx950" else 0)
 
+    # mask_non_finite off: the HIP kernel a gated call can fall back to ranks
+    # +inf/NaN by their raw twiddled bits, which puts them at the top, and so does
+    # torch.topk. Masking them to -inf here would make the answer depend on which
+    # kernel the gate picked for that batch. It would also bury an upstream
+    # numerical failure rather than surface it. Env
+    # FLYDSL_TOPK_TIERED_MASK_NONFINITE=1 restores the masking.
     return {
         "blocks_per_row": blocks_per_row,
         "bits_per_pass": bits_per_pass,
@@ -249,7 +255,7 @@ def _default_kernel_config(
         "tiered_mid_cap": tiered_mid_cap_default,
         "tiered_mid_max": tiered_mid_max,
         "tiered_long_cap": tiered_long_cap_default,
-        "mask_non_finite": True,
+        "mask_non_finite": False,
         "tier_mode": "auto",
         "row_proportional_parts": bool(rpp_on),
         "early_stop": bool(es_on) and num_rows <= 1,
