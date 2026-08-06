@@ -1515,11 +1515,12 @@ def test_chunk_opt_vk_prepare_flydsl_does_not_sync():
         _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
     torch.cuda.synchronize()
 
+    prev_sync_debug_mode = torch.cuda.get_sync_debug_mode()
     torch.cuda.set_sync_debug_mode("error")
     try:
         _run_prepare_pipeline(inputs, cu_seqlens=cu_seqlens, use_prepare_flydsl=True)
     finally:
-        torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.set_sync_debug_mode(prev_sync_debug_mode)
 
 
 if __name__ == "__main__":

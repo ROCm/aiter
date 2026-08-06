@@ -631,9 +631,10 @@ def gdn_prepare_flydsl_supported(
     The fused kernel covers a deliberately narrow slice of what the Triton
     K1+K2 pair accepts -- ``compile_gdn_prepare`` hard-asserts ``BT=64``,
     ``K=128`` and ``V=128``, the epilogue emits bf16, the GEMMs are CDNA bf16
-    MFMA, and the launch ABI caps a flattened view at ``2**31`` elements.
-    Callers use this to pick the fused path only where it applies and fall back
-    to Triton everywhere else, instead of tripping an assert.
+    MFMA, the single launch needs ``k`` and ``v`` co-resident on one device,
+    and the launch ABI caps a flattened view at ``2**31`` elements. Callers use
+    this to pick the fused path only where it applies and fall back to Triton
+    everywhere else, instead of tripping an assert.
     """
     return (
         BT == 64
@@ -642,6 +643,8 @@ def gdn_prepare_flydsl_supported(
         and k.dtype is torch.bfloat16
         and v.dtype is torch.bfloat16
         and k.is_cuda
+        and v.is_cuda
+        and _device_index(k) == _device_index(v)
         and v.numel() < _MAX_FLAT_ELEMS
         and _is_cdna_mfma_arch(_device_index(k))
     )
@@ -729,6 +732,18 @@ def gdn_prepare_fwd_flydsl(
         raise ValueError(
             "`num_decodes` / `num_decode_tokens` describe a packed varlen batch "
             "and require `cu_seqlens`."
+        )
+    # Everything past this point assumes the supported slice: an unsupported
+    # arch or head dim would otherwise surface as a compile-time assert, and a
+    # host-side or cross-device tensor as a segfault inside the launch.
+    if not gdn_prepare_flydsl_supported(k, v, BT=BT):
+        raise ValueError(
+            "gdn_prepare_fwd_flydsl serves bf16 `k`/`v` with K=V=128 and BT=64, "
+            "co-resident on one CDNA device, under 2**31 flattened elements; "
+            f"got k={tuple(k.shape)} {k.dtype} on {k.device}, "
+            f"v={tuple(v.shape)} {v.dtype} on {v.device}, BT={BT}. Gate on "
+            "`gdn_prepare_flydsl_supported` and use the Triton K1+K2 pair "
+            "wherever it returns False."
         )
 
     k = k.contiguous()
