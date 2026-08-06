@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import ctypes
 import functools
 import importlib
+import importlib.util
 import json
 import logging
 import multiprocessing
@@ -603,13 +605,35 @@ def check_numa():
 __mds = {}
 
 
+_RTLD_DEEPBIND = (
+    0 if os.getenv("AITER_DISABLE_DEEPBIND") == "1" else getattr(os, "RTLD_DEEPBIND", 0)
+)
+_deep_handles = {}
+
+
+def _deep_import(mod_path: str) -> types.ModuleType:
+    """Import an extension deep-bound.
+
+    importlib takes no dlopen flags, so open the extension here first; glibc
+    dedupes by (st_dev, st_ino), so the import reuses this already-bound
+    handle. sys.setdlopenflags() is avoided on purpose: it is process-wide, so
+    a concurrent unrelated dlopen would inherit the flag. Handles are kept
+    because dropping a CDLL can dlclose the module out from under us.
+    """
+    spec = importlib.util.find_spec(mod_path)
+    origin = getattr(spec, "origin", None) or ""
+    if _RTLD_DEEPBIND and origin.endswith(".so") and origin not in _deep_handles:
+        _deep_handles[origin] = ctypes.CDLL(origin, mode=os.RTLD_NOW | _RTLD_DEEPBIND)
+    return importlib.import_module(mod_path)
+
+
 @torch_compile_guard()
 def get_module_custom_op(md_name: str) -> None:
     if md_name not in __mds:
         if "AITER_JIT_DIR" in os.environ:
-            __mds[md_name] = importlib.import_module(md_name)
+            __mds[md_name] = _deep_import(md_name)
         else:
-            __mds[md_name] = importlib.import_module(f"{__package__}.{md_name}")
+            __mds[md_name] = _deep_import(f"{__package__}.{md_name}")
         logger.info(f"import [{md_name}] under {__mds[md_name].__file__}")
 
 
@@ -1302,7 +1326,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args.get("third_party", []),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
             )
-        lib = ctypes.CDLL(so_path)
+        lib = ctypes.CDLL(so_path, mode=os.RTLD_NOW | _RTLD_DEEPBIND)
         c_func = getattr(lib, fc_name)
 
         def _opt_sym(name, argtypes=(), restype=None):

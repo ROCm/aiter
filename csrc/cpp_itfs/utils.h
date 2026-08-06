@@ -20,6 +20,18 @@ namespace aiter{
 
 #define DIVIDE_ROUND_UP(a, b) (((a) + (b)-1) / (b))
 
+__inline__ int aiter_dlopen_mode(int resolution_mode)
+{
+#ifdef RTLD_DEEPBIND
+    const char* disable_deepbind = std::getenv("AITER_DISABLE_DEEPBIND");
+    if(disable_deepbind == nullptr || std::string(disable_deepbind) != "1")
+    {
+        return resolution_mode | RTLD_DEEPBIND;
+    }
+#endif
+    return resolution_mode;
+}
+
 static std::once_flag init_libs_lru_cache, init_func_names_lru_cache, init_root_dir_flag;
 
 template<typename K, typename V>
@@ -92,7 +104,7 @@ private:
 
 public:
     SharedLibrary(std::string& path) {
-        handle = dlopen(path.c_str(), RTLD_LAZY);
+        handle = dlopen(path.c_str(), aiter_dlopen_mode(RTLD_LAZY));
         if (!handle) {
             throw std::runtime_error(dlerror());
         }
