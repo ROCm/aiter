@@ -125,7 +125,7 @@ def assert_close_rmse(name, ref, tri, ratio=1e-3, err_atol=1e-3):
     return abs_err
 
 
-def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0):
+def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1):
     """Build one KDA decode case.
 
     ``need_shuffle_state`` decides which state layout the caller holds: False
@@ -156,11 +156,27 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0):
         # non-contiguous and the kernel has to honour the strides it is given.
         storage = torch.randn(n_slots, H * K * V + 17, dtype=torch.float32, device=dev)
         pool = storage[:, : H * K * V].view(n_slots, H, d0, d1)
+        # Both assertions are vLLM's (test_kda.py:321-322). The second is the
+        # one that bites: a slot must still be internally contiguous, so only
+        # the outer stride is padded. Assert it rather than assume .view() gave
+        # us that, or a future change to the storage shape could silently start
+        # testing a layout the kernel never sees.
         assert not pool.is_contiguous()
+        assert pool.stride()[1:] == (d0 * d1, d1, 1)
     else:
         pool = torch.randn(n_slots, H, d0, d1, dtype=torch.float32, device=dev)
 
-    indices = torch.arange(first_index, first_index + B, dtype=torch.int32, device=dev)
+    if indices_stride > 1:
+        # vLLM parametrizes this (state_indices_stride): the serving stack hands
+        # over a strided column of a wider table, not a fresh contiguous array.
+        storage = torch.zeros(B, indices_stride, dtype=torch.int32, device=dev)
+        indices = storage[:, 0]
+        assert indices.stride(0) == indices_stride
+    else:
+        indices = torch.empty(B, dtype=torch.int32, device=dev)
+    indices.copy_(
+        torch.arange(first_index, first_index + B, dtype=torch.int32, device=dev)
+    )
     return args, pool, indices
 
 
@@ -180,16 +196,18 @@ def _kda_reference(args, initial_state):
 
 
 @pytest.mark.parametrize(
-    ("B", "H", "dt", "shuffle", "padded", "first_index"),
+    ("B", "H", "dt", "shuffle", "padded", "first_index", "indices_stride"),
     [
-        (1, 8, torch.bfloat16, True, False, 0),
-        (4, 12, torch.bfloat16, True, False, 0),
-        (2, 12, torch.float16, True, False, 0),
-        # K3 as deployed: state already (D_v, D_k), padded storage, and slots
-        # numbered from 1 because the serving stack treats 0 as invalid.
-        (4, 12, torch.bfloat16, False, True, 1),
-        (4, 12, torch.bfloat16, False, False, 1),
-        (4, 12, torch.bfloat16, True, True, 1),
+        (1, 8, torch.bfloat16, True, False, 0, 1),
+        (4, 12, torch.bfloat16, True, False, 0, 1),
+        (2, 12, torch.float16, True, False, 0, 1),
+        # K3 as deployed: state already (D_v, D_k), padded storage, slots
+        # numbered from 1 because the serving stack treats 0 as invalid, and a
+        # strided index column -- every landmine in vLLM's setup at once.
+        (4, 12, torch.bfloat16, False, True, 1, 8),
+        (4, 12, torch.bfloat16, False, False, 1, 1),
+        (4, 12, torch.bfloat16, True, True, 1, 1),
+        (4, 12, torch.bfloat16, True, False, 1, 8),
     ],
     ids=[
         "b1_h8_bf16",
@@ -198,17 +216,20 @@ def _kda_reference(args, initial_state):
         "k3_deployed",
         "no_shuffle",
         "padded_state",
+        "strided_indices",
     ],
 )
 def test_kda_per_channel_gate_matches_torch_reference(
-    B, H, dt, shuffle, padded, first_index
+    B, H, dt, shuffle, padded, first_index, indices_stride
 ):
     """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x).
 
     H is 1:1 with the k heads, which is K3's ratio and a case the scalar path
     never exercised.
     """
-    args, pool, indices = _kda_inputs(B, H, dt, first_index, padded, shuffle)
+    args, pool, indices = _kda_inputs(
+        B, H, dt, first_index, padded, shuffle, indices_stride=indices_stride
+    )
 
     initial_state = pool[indices.long()].clone()
     if not shuffle:

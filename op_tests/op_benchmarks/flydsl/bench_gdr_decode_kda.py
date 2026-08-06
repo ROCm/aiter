@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tuning sweep and A/B benchmark for the KDA (per-channel) FlyDSL GDR decode.
+
+Kimi-K3 decodes at a 1:1 head ratio, which matches no row in
+``gdr_decode_tuned.csv`` -- every row there is GQA at ratio 2 or 4. An untuned
+call therefore falls back to NUM_BLOCKS_PER_V_DIM=1, NUM_WARPS=4,
+WARP_THREADS_K=8, so any timing taken before the sweep measures the fallback
+rather than the kernel. ``--sweep`` produces the missing rows; ``--bench``
+compares the tuned kernel against the deployed Triton kernel.
+
+Usage:
+    # Tuning sweep, emits rows in gdr_decode_tuned.csv format
+    python bench_gdr_decode_kda.py --sweep -o rows.csv
+
+    # A/B against vLLM's fused_recurrent_kda_packed_decode
+    python bench_gdr_decode_kda.py --bench
+
+    # Both, at the ticket's batch sizes
+    python bench_gdr_decode_kda.py --sweep --bench
+
+The comparator lives on vLLM's kimi-k3 branch. Point --vllm at that checkout, or
+set PYTHONPATH; without it --bench reports the FlyDSL column alone rather than
+failing, since the sweep half needs no vLLM.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import math
+import os
+import statistics
+import sys
+from pathlib import Path
+
+import torch
+import triton
+from flydsl.runtime.device import get_rocm_arch
+
+from aiter.ops.flydsl.kernels.gdr_decode import create_vk_gdr_decode_kernel
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, get_dtype_str
+from aiter.ops.torch_ref.kda import kda_gate, l2norm, naive_recurrent_kda
+
+# K3 @ TP8: 12 heads 1:1, 128-wide, bf16 activations over an f32 paged state.
+H, K, V = 12, 128, 128
+DTYPE = torch.bfloat16
+STATE_DTYPE = torch.float32
+G_MIN = -5.0
+BATCHES = (1, 4, 64, 256)
+
+# The search space the existing table was built over.
+NUM_BLOCKS_PER_V_DIM_CHOICES = (1, 2, 4, 8)
+NUM_WARPS_CHOICES = (1, 2, 4)
+WARP_THREADS_K_CHOICES = (4, 8, 16, 32)
+
+# What get_default_kwargs falls back to when no row matches the shape.
+FALLBACK_CONFIG = (1, 4, 8)
+
+# How many of the sweep's leaders get re-timed, and over how many trials.
+TOP_N = 5
+TRIALS = 5
+
+CSV_HEADER = (
+    "arch,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,"
+    "NUM_BLOCKS_PER_V_DIM,NUM_WARPS,WARP_THREADS_K,duration"
+)
+
+
+def valid_configs():
+    """Mirror the kernel's own shape asserts instead of catching failures.
+
+    A config that violates them raises inside ``create_vk_gdr_decode_kernel``;
+    enumerating up front keeps a real compile error distinguishable from a
+    geometry that was never legal.
+    """
+    values_per_thread_k = 4 if STATE_DTYPE is torch.float32 else 8
+    out = []
+    for nbpv, nw, wtk in itertools.product(
+        NUM_BLOCKS_PER_V_DIM_CHOICES, NUM_WARPS_CHOICES, WARP_THREADS_K_CHOICES
+    ):
+        warp_threads_v = 64 // wtk
+        if warp_threads_v * wtk != 64:
+            continue
+        warp_tile_k = wtk * values_per_thread_k
+        if K % warp_tile_k or K // warp_tile_k < 1:
+            continue
+        if V % nbpv:
+            continue
+        tile_v = V // nbpv
+        warp_group_tile_v = nw * warp_threads_v
+        if tile_v % warp_group_tile_v or tile_v // warp_group_tile_v < 1:
+            continue
+        out.append((nbpv, nw, wtk))
+    return out
+
+
+def make_inputs(B, device="cuda", seed=0):
+    """One KDA decode case, in both APIs' layouts over identical values.
+
+    The Triton kernel reads q/k/v from a packed ``[B, 2*H*K + H*V]`` buffer and
+    FlyDSL takes three tensors, so "the same inputs" means the same numbers, not
+    the same object. q/k/v for FlyDSL are views into the packed buffer, which is
+    what the serving stack would hand it (Sq = 1, so the split is zero-copy).
+
+    Slots are numbered from 1: the Triton kernel treats ``state_idx <= 0`` as
+    invalid and returns zeros, so a 0 slot would time an early return.
+    """
+    torch.manual_seed(seed)
+    mixed_qkv = torch.randn(B, 2 * H * K + H * V, dtype=DTYPE, device=device)
+    q = mixed_qkv[:, : H * K].view(B, 1, H, K)
+    k = mixed_qkv[:, H * K : 2 * H * K].view(B, 1, H, K)
+    v = mixed_qkv[:, 2 * H * K :].view(B, 1, H, V)
+
+    raw_g = torch.randn(1, B, H, K, dtype=DTYPE, device=device)
+    raw_beta = torch.randn(1, B, H, dtype=DTYPE, device=device)
+    A_log = (torch.randn(H, dtype=torch.float32, device=device) * 0.5).contiguous()
+    dt_bias = (torch.randn(H, K, dtype=torch.float32, device=device) * 0.1).contiguous()
+
+    n_slots = B + 1
+    pool = torch.randn(n_slots, H, V, K, dtype=STATE_DTYPE, device=device)
+    indices = torch.arange(1, 1 + B, dtype=torch.int32, device=device)
+
+    return {
+        "mixed_qkv": mixed_qkv,
+        "q": q,
+        "k": k,
+        "v": v,
+        "a": raw_g[0].unsqueeze(1),  # (B, 1, H, K), a view of raw_g
+        "b": raw_beta[0].unsqueeze(1),  # (B, 1, H)
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "pool": pool,
+        "indices": indices,
+        "B": B,
+    }
+
+
+def flydsl_runner(inp, config):
+    """Bind one explicit config, bypassing the CSV lookup in the wrapper.
+
+    ``flydsl_gdr_decode`` resolves its config from ``gdr_decode_tuned.csv``, so
+    a sweep has to build the kernel directly; this mirrors what the wrapper does
+    around that lookup, at need_shuffle_state=False (K3's layout).
+    """
+    nbpv, nw, wtk = config
+    state = inp["pool"]
+    out = torch.zeros(inp["B"], 1, H, V, dtype=DTYPE, device=state.device)
+    exe = create_vk_gdr_decode_kernel(
+        get_dtype_str(DTYPE),
+        get_dtype_str(inp["A_log"].dtype),
+        get_dtype_str(inp["dt_bias"].dtype),
+        get_dtype_str(state.dtype),
+        1,
+        H,
+        H,
+        K,
+        V,
+        state.stride(),
+        inp["a"].stride(),
+        inp["b"].stride(),
+        True,
+        "kda",
+        NUM_BLOCKS_PER_V_DIM=nbpv,
+        NUM_WARPS=nw,
+        WARP_THREADS_K=wtk,
+    )
+    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
+    a, b = inp["a"], inp["b"]
+    A_log, dt_bias = inp["A_log"], inp["dt_bias"]
+    indices = inp["indices"]
+    stream = torch.cuda.current_stream()
+
+    def run():
+        _run_compiled(
+            exe, q, k, v, a, b, dt_bias, A_log, indices, state, out, inp["B"], stream
+        )
+
+    return run, out
+
+
+def torch_reference(inp, pool_before):
+    """``pool_before`` must be the state as it was *before* the kernel ran.
+
+    Both kernels update the paged state in place, so reading ``inp["pool"]``
+    here would feed the reference the already-decayed state and compare two
+    different problems.
+    """
+    initial_state = pool_before[inp["indices"].long()].clone().transpose(-1, -2)
+    return naive_recurrent_kda(
+        l2norm(inp["q"]),
+        l2norm(inp["k"]),
+        inp["v"],
+        kda_gate(inp["a"], inp["A_log"], inp["dt_bias"], g_min=G_MIN),
+        inp["b"].float().sigmoid(),
+        scale=K**-0.5,
+        initial_state=initial_state,
+        output_final_state=True,
+    )
+
+
+def rmse_ratio(ref, got):
+    """vLLM's bar (test_kda.py:92): RMSE-relative, absolute-error escape hatch."""
+    ref, got = ref.detach().float(), got.detach().float()
+    abs_err = (ref - got).abs().max().item()
+    rmse = (ref - got).square().mean().sqrt().item()
+    base = ref.square().mean().sqrt().item()
+    return abs_err, rmse / (base + 1e-8)
+
+
+def check(inp, out, state_after, pool_before):
+    ref_out, ref_state = torch_reference(inp, pool_before)
+    got_state = state_after[inp["indices"].long()].transpose(-1, -2)
+    o_abs, o_rel = rmse_ratio(ref_out, out)
+    s_abs, s_rel = rmse_ratio(ref_state, got_state)
+    ok = (o_abs <= 1e-3 or o_rel < 1e-3) and (s_abs <= 1e-3 or s_rel < 1e-3)
+    return ok, max(o_abs, s_abs)
+
+
+def time_us(fn):
+    return triton.testing.do_bench(fn, warmup=25, rep=100) * 1e3
+
+
+def confirm(B, candidates):
+    """Re-time the sweep's leaders over independent trials and rank on median.
+
+    Also times the untuned fallback, so the sweep reports what it bought rather
+    than only what it picked. Candidates are whatever the sweep just found on
+    *this* GPU -- nothing here is specific to an architecture, which matters
+    because the winning set differs between gfx942 and gfx950.
+    """
+    print(f"    re-timing the top {len(candidates)} over {TRIALS} trials:")
+    rows = []
+    for cfg in list(candidates) + [FALLBACK_CONFIG]:
+        times, err = [], math.nan
+        for t in range(TRIALS):
+            inp = make_inputs(B, seed=t)
+            pool0 = inp["pool"].clone()
+            run, out = flydsl_runner(inp, cfg)
+            run()
+            torch.cuda.synchronize()
+            if t == 0:
+                _, err = check(inp, out, inp["pool"], pool0)
+            inp["pool"].copy_(pool0)
+            times.append(time_us(run))
+        rows.append((statistics.median(times), min(times), max(times), cfg, err))
+
+    fallback = next(r[0] for r in rows if r[3] == FALLBACK_CONFIG)
+    rows.sort()
+    for med, lo, hi, cfg, _ in rows:
+        tag = "   <-- untuned fallback" if cfg == FALLBACK_CONFIG else ""
+        print(
+            f"      {cfg!s:<12} median {med:8.2f}  min {lo:8.2f}  max {hi:8.2f}"
+            f"  spread {(hi - lo) / med * 100:4.1f}%"
+            f"  vs fallback {fallback / med:.2f}x{tag}"
+        )
+    best_med, _, _, best_cfg, best_err = rows[0]
+    print(
+        f"    winner {best_cfg} at {best_med:.2f} us"
+        f" ({fallback / best_med:.2f}x the fallback, err {best_err:.1e})\n"
+    )
+    return best_med, best_cfg, best_err
+
+
+def sweep(args):
+    arch = get_rocm_arch()
+    configs = valid_configs()
+    print(f"arch {arch} · {len(configs)} valid configs · batches {list(BATCHES)}\n")
+
+    rows = []
+    for B in BATCHES:
+        results = []
+        for cfg in configs:
+            inp = make_inputs(B)
+            baseline_pool = inp["pool"].clone()
+            try:
+                run, out = flydsl_runner(inp, cfg)
+                run()
+                torch.cuda.synchronize()
+            except Exception as exc:  # noqa: BLE001 - any failure is a lost config
+                print(f"  B={B:<4} {cfg}  COMPILE/RUN FAIL: {type(exc).__name__}")
+                continue
+
+            ok, err = check(inp, out, inp["pool"], baseline_pool)
+            if not ok:
+                # Parity at every config, not just the winner: a config that is
+                # fast because it is wrong must not win the sweep.
+                print(f"  B={B:<4} {cfg}  PARITY FAIL err={err:.2e}")
+                continue
+
+            inp["pool"].copy_(baseline_pool)
+            run, _ = flydsl_runner(inp, cfg)
+            us = time_us(run)
+            results.append((us, cfg, err))
+
+        results.sort()
+        worst = results[-1][0]
+        print(f"B={B}: {len(results)} configs passed parity")
+        print(
+            f"    spread: slowest valid config is {worst / results[0][0]:.1f}x the best"
+        )
+
+        # The single-shot argmin is not trustworthy on its own: the top configs
+        # routinely land within a few percent, which is the same order as
+        # run-to-run variation, so re-time the leaders and rank on the median.
+        best_us, best_cfg, _ = confirm(B, [c for _, c, _ in results[:TOP_N]])
+
+        nbpv, nw, wtk = best_cfg
+        rows.append(
+            f"{arch},{DTYPE},{STATE_DTYPE},{B},1,{H},{H},{K},{V},"
+            f"{nbpv},{nw},{wtk},{best_us}"
+        )
+
+    print(CSV_HEADER)
+    for r in rows:
+        print(r)
+    if args.output:
+        Path(args.output).write_text(
+            CSV_HEADER + "\n" + "\n".join(rows) + "\n", encoding="utf-8"
+        )
+        print(f"\nwrote {args.output}")
+    return rows
+
+
+def load_triton(vllm_path):
+    """Load the comparator from a vLLM checkout without importing vLLM itself.
+
+    ``import vllm`` drags in the config stack (pydantic, and onward), none of
+    which the kernel needs -- so the file is loaded directly and its three vLLM
+    imports are satisfied by stubs. The stubs are not stand-ins: under the
+    default ``FLA_USE_FAST_OPS=0`` vLLM's ``exp``/``log`` *are* ``tl.exp``/
+    ``tl.log``, and ``triton_utils`` re-exports plain triton, so the Triton
+    source compiled here is byte-for-byte what vLLM compiles. Guarded below.
+    """
+    import importlib.util
+    import types
+
+    if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
+        # Then vLLM would bind fast_expf/fast_logf and the stub would silently
+        # benchmark different math.
+        raise RuntimeError("unset FLA_USE_FAST_OPS to compare like for like")
+
+    path = Path(vllm_path or "/workspace/vllm")
+    target = path / "vllm/models/kimi_k3/amd/ops/third_party/kda/fused_recurrent.py"
+    if not target.exists():
+        print(f"note: comparator not found at {target}; skipping the Triton column")
+        return None
+
+    import triton as _triton
+    import triton.language as _tl
+
+    def _mod(name, **attrs):
+        m = types.ModuleType(name)
+        m.__dict__.update(attrs)
+        sys.modules[name] = m
+        return m
+
+    _mod("vllm")
+    _mod("vllm.third_party")
+    _mod("vllm.third_party.flash_linear_attention")
+    _mod("vllm.third_party.flash_linear_attention.ops")
+    _mod("vllm.third_party.flash_linear_attention.ops.op", exp=_tl.exp, log=_tl.log)
+    _mod("vllm.triton_utils", tl=_tl, triton=_triton)
+    _mod("vllm.utils")
+    _mod(
+        "vllm.utils.math_utils",
+        cdiv=lambda a, b: -(a // -b),
+        next_power_of_2=lambda n: 1 if n < 1 else 1 << (n - 1).bit_length(),
+    )
+
+    spec = importlib.util.spec_from_file_location("_kda_fused_recurrent", target)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001 - degrade to the FlyDSL column alone
+        print(f"note: vLLM comparator unavailable ({type(exc).__name__}: {exc})")
+        return None
+    return mod.fused_recurrent_kda_packed_decode
+
+
+def bench_one(B, flydsl_gdr_decode, triton_fn):
+    """One row of the A/B table.
+
+    Its own function so the timed closures bind parameters rather than a loop
+    variable, and so every timing starts from the same pre-run state -- both
+    kernels update the paged state in place.
+    """
+    inp = make_inputs(B)
+    pool0 = inp["pool"].clone()
+    out = torch.zeros(B, 1, H, V, dtype=DTYPE, device="cuda")
+
+    # Hoisted deliberately. q/k/v are views into the packed buffer, and the
+    # wrapper calls .contiguous() on them, so leaving this inside the timed
+    # region would charge FlyDSL for unpacking QKV on every call. Reading at
+    # packed offsets is explicitly a separate ticket, so the kernel is timed on
+    # the layout it is specified to take; the unpack is reported as its own
+    # column rather than hidden inside either kernel's number.
+    q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
+
+    def fly():
+        flydsl_gdr_decode(
+            q,
+            k,
+            v,
+            inp["a"],
+            inp["b"],
+            inp["dt_bias"],
+            inp["A_log"],
+            inp["indices"],
+            inp["pool"],
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=False,
+        )
+
+    fly()
+    torch.cuda.synchronize()
+    fly_ok, fly_err = check(inp, out, inp["pool"], pool0)
+    inp["pool"].copy_(pool0)
+    fly_us = time_us(fly)
+
+    def tri():
+        return triton_fn(
+            inp["mixed_qkv"],
+            inp["raw_g"],
+            inp["raw_beta"],
+            inp["A_log"],
+            inp["dt_bias"].view(-1),
+            G_MIN,
+            inp["pool"],
+            inp["indices"],
+        )
+
+    tri_us, tri_ok, tri_err = math.nan, None, math.nan
+    if triton_fn is not None:
+        inp["pool"].copy_(pool0)
+        tri_out, _ = tri()
+        torch.cuda.synchronize()
+        tri_ok, tri_err = check(inp, tri_out[0].unsqueeze(1), inp["pool"], pool0)
+        inp["pool"].copy_(pool0)
+        tri_us = time_us(tri)
+
+    # What a caller got before the sweep: with no 12x12 row the wrapper falls
+    # back to (1, 4, 8). Bound directly, since the wrapper now finds a row.
+    inp["pool"].copy_(pool0)
+    untuned_run, _ = flydsl_runner(inp, FALLBACK_CONFIG)
+    untuned_run()
+    torch.cuda.synchronize()
+    inp["pool"].copy_(pool0)
+    untuned_us = time_us(untuned_run)
+
+    unpack_us = time_us(
+        lambda: (
+            inp["q"].contiguous(),
+            inp["k"].contiguous(),
+            inp["v"].contiguous(),
+        )
+    )
+    return {
+        "B": B,
+        "tri_us": tri_us,
+        "untuned_us": untuned_us,
+        "fly_us": fly_us,
+        "speedup": math.nan if math.isnan(tri_us) else tri_us / fly_us,
+        "unpack_us": unpack_us,
+        "fly_ok": fly_ok,
+        "fly_err": fly_err,
+        "tri_ok": tri_ok,
+        "tri_err": tri_err,
+    }
+
+
+def bench(args):
+    """A/B at the ticket's batch sizes, both kernels on identical values.
+
+    FlyDSL is run through the public wrapper so the number reflects what a
+    consumer gets, tuning table included -- not a hand-picked config.
+    """
+    from aiter.ops.flydsl import flydsl_gdr_decode
+
+    arch = get_rocm_arch()
+    triton_fn = load_triton(args.vllm)
+    print(f"\narch {arch} · H={H} K=V={K} bf16 · f32 state · per-call us\n")
+    header = (
+        f"{'B':>5} {'Triton (baseline)':>18} {'FlyDSL (untuned)':>17}"
+        f" {'FlyDSL (tuned)':>16} {'speedup':>9} {'QKV unpack':>13}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    table = []
+    for B in BATCHES:
+        row = bench_one(B, flydsl_gdr_decode, triton_fn)
+        print(
+            f"{row['B']:>5} {row['tri_us']:>18.2f} {row['untuned_us']:>17.2f}"
+            f" {row['fly_us']:>16.2f} {row['speedup']:>8.2f}x"
+            f" {row['unpack_us']:>13.2f}"
+        )
+        table.append(row)
+
+    print("\nparity vs the torch reference (both must hold, or the timing is noise):")
+    for r in table:
+        tri_ok, tri_err = r["tri_ok"], r["tri_err"]
+        t = "n/a" if tri_ok is None else f"{'ok' if tri_ok else 'FAIL'} {tri_err:.1e}"
+        fly = f"{'ok' if r['fly_ok'] else 'FAIL'} {r['fly_err']:.1e}"
+        print(f"  B={r['B']:<4} FlyDSL {fly}   Triton {t}")
+    return table
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--sweep", action="store_true", help="tune for the 1:1 head ratio")
+    p.add_argument("--bench", action="store_true", help="A/B against Triton")
+    p.add_argument("-o", "--output", help="write the winning CSV rows here")
+    p.add_argument("--vllm", help="path to a vLLM kimi-k3 checkout")
+    args = p.parse_args()
+    if not args.sweep and not args.bench:
+        args.sweep = args.bench = True
+    if args.sweep:
+        sweep(args)
+    if args.bench:
+        bench(args)
+
+
+if __name__ == "__main__":
+    main()
