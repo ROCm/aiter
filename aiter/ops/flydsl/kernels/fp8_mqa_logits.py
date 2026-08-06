@@ -1372,11 +1372,16 @@ def _build_kernel_mfma_lds_pipe(
 # --------------------------------------------------------------------------- #
 
 
-def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True):
+def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True, prefetch_depth=2):
     """Registry entry factory.
 
-    ``lds`` is None for the direct-load builder, else the LDS buffer count
-    (prefetch depth is fixed at 2, the only configuration in use).
+    ``lds`` is None for the direct-load builder, else the LDS slot count.
+    ``prefetch_depth`` controls the software-pipeline depth for LDS variants:
+    tiles 0..PD-1 are prefetched into flight before the steady-state loop, and
+    each iteration issues one new DMA while waiting for the oldest in-flight tile.
+    Defaults to 2. Variants with PD != 2 append ``_pd{PD}``
+    to their tag so the cache and registry can hold both simultaneously.
+    Constraint: ``(PD-1) * NUM_ASYNC_LOADS ≤ 63`` (gfx9 vmcnt encoding limit).
     """
     extra = {} if bkv is None else {"block_kv": bkv}
     if lds is None:
@@ -1390,7 +1395,7 @@ def _mk_builder(rpb, wpb, *, mfma=_MFMA16, bkv=None, lds=None, swizzle=True):
         mfma=mfma,
         swizzle=swizzle,
         num_buffers=lds,
-        prefetch_depth=2,
+        prefetch_depth=prefetch_depth,
     )
 
 
@@ -1474,6 +1479,28 @@ if _ARCH == "gfx950":
             "mfma32x32x64_bkv128_r2_w4_lds3": _mk_builder(
                 2, 4, mfma=_K64, bkv=128, lds=3
             ),
+            # -- K128/bkv64 triple-buffered (complement the _lds2 entry above).
+            #
+            # At H=32, mfma16x16x128 gives M_TILES=2 and N_TILES=4 per BKV-64
+            # tile (8 MFMAs/wave), vs mfma32x32x64's M_TILES=1 N_TILES=2
+            # (4 MFMAs/wave).  Despite the 2x MFMA advantage, K128 measured
+            # *slower* for H=32 square shapes: MFMA_N=16 (vs 32) doubles the
+            # scatter-write count per BKV tile and adds an extra shuffle in the
+            # head-reduce butterfly, erasing the MFMA gain.  K64 + WPB=4 is
+            # the preferred auto-selection for H<=32; these variants are kept
+            # as exploration coverage and may perform better for higher H. --
+            "mfma16x16x128_bkv64_r1_w2_lds3": _mk_builder(
+                1, 2, mfma=_K128, bkv=64, lds=3
+            ),
+            "mfma16x16x128_bkv64_r2_w2_lds3": _mk_builder(
+                2, 2, mfma=_K128, bkv=64, lds=3
+            ),
+            "mfma16x16x128_bkv128_r4_w4_lds3": _mk_builder(
+                4, 4, mfma=_K128, bkv=128, lds=3
+            ),
+            "mfma16x16x128_bkv128_r2_w2_lds3": _mk_builder(
+                2, 2, mfma=_K128, bkv=128, lds=3
+            ),
         }
     )
 
@@ -1516,12 +1543,19 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
     when M and N are both large, else WPB=4 for more wavefronts on small-M /
     short-window shapes.
 
-    gfx950: the LDS 3-buffer 32x32x64 atom at bkv=64, WPB=2. Rows-per-wave r
-    sets the KV reuse per block (reuse = r*WPB). r=1 gives more blocks and
-    better utilisation on small/square shapes; r=2 amortises the barrier cost
-    when KV streaming pressure is high (long KV) or the problem is large and
-    square. At H>=128 the compute-to-bandwidth ratio is already 2x that of
-    H64, so r=1 always suffices.
+    gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
+
+    gfx950 H<=32: mfma32x32x64 with WPB=4 for small/square shapes, 
+        WPB=2 r=2 for streaming / large-square.
+        K64 gives M_TILES=1 at H=32 -- half the compute of H=64 -- so the
+        smaller tile grid benefits from extra wavefronts per block (WPB=4)
+        rather than more blocks (WPB=2), which keeps the SIMD units busier
+        when the row grid alone under-saturates the device.  For large or
+        streaming shapes the row grid is already sufficient to fill the device,
+        so WPB=2 with r=2 (more row reuse per KV load) is preferred.
+
+    gfx950 H in (32, 128): mfma32x32x64 with r=2 for streaming / large-square
+        shapes (KV pressure high), r=1 otherwise.
     """
     if _ARCH == "gfx942":
         wpb = 2 if (seq_len >= 2048 and seq_len_kv >= 8192) else 4
@@ -1531,7 +1565,12 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
             return "mfma32x32x64_bkv64_r1_w2_lds3"
         streaming = seq_len_kv > 2 * seq_len
         large_square = seq_len >= 8192 and seq_len_kv >= seq_len
-        return f"mfma32x32x64_bkv64_r{2 if streaming or large_square else 1}_w2_lds3"
+        if num_heads <= 32:
+            if streaming or large_square:
+                return "mfma32x32x64_bkv64_r2_w2_lds3"
+            return "mfma32x32x64_bkv64_r2_w4_lds3"
+        r = 2 if streaming or large_square else 1
+        return f"mfma32x32x64_bkv64_r{r}_w2_lds3"
     raise NotImplementedError(
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
         "supported: gfx942, gfx950"
