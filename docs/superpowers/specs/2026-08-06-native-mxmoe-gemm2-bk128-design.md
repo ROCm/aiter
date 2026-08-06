@@ -35,8 +35,9 @@ kernel, layouts, epilogues, and tuning path independent.
 4. Propagate the explicitly encoded BK through runtime, AOT, cache keys,
    generated symbols, and tuner candidates.
 5. Preserve explicit dispatch: the configured kernel name determines BK.
-6. Keep BK256 computation and performance unchanged apart from its newly
-   explicit generated-symbol suffix.
+6. Keep BK256 computation and performance equivalent for BM>=32. For BM16,
+   intentionally remove the pre-existing inactive-wave A-loads that could
+   compete with writes to adjacent LDS slots.
 
 ## Non-goals
 
@@ -45,6 +46,8 @@ kernel, layouts, epilogues, and tuning path independent.
 - Changing the tuned CSV schema or shape key.
 - Automatically changing BK at runtime.
 - Adding BK128 padding or `inter_real` behavior to the acceptance contract.
+- Removing the pre-existing externally requested BK256 `D_INTER_REAL` padding
+  capability from the runtime wrapper.
 - Refactoring native and v2 GEMM2 into a shared implementation.
 - Retuning or adding model config rows as part of the kernel capability change.
 
@@ -70,6 +73,9 @@ The legal native tile set is `BN=256, BK in {128, 256}`.
 
 `inter_dim` continues to come from the actual `w1` and `w2` tensor shapes.
 Configuration lookup and tuner shapes do not inspect `w2.inter_real`.
+For native AOT rows, the CSV `inter_dim` is the actual, unpadded contraction K;
+BK128 does not introduce a native `inter_real` contract. This does not remove
+the existing runtime wrapper's externally supplied BK256 padding capability.
 
 Examples:
 
@@ -78,16 +84,21 @@ Examples:
 
 ### Generated GPU symbols
 
-Both BK variants receive an explicit suffix:
+Both BK variants receive an epoch and BK suffix:
 
 ```text
-..._bk128
-..._bk256
+..._core<epoch>_bk<BK>
 ```
 
-This intentionally invalidates old BK256 binary-cache entries once. It avoids
-symbol collisions when one process or AOT module compiles the same shape with
-both BK values. CSV kernel names are unaffected.
+For example, epoch 2 produces `..._core2_bk128` and `..._core2_bk256`.
+This intentionally invalidates old BK256 binary-cache entries when the epoch is
+bumped and avoids symbol collisions when one process or AOT module compiles the
+same shape with both BK values. CSV kernel names are unaffected.
+
+The launcher directly references the module-level `_gemm2_body` JitFunction, so
+FlyDSL records `jit:_gemm2_body:<manager_key>` and body changes automatically
+alter the launcher key. The epoch remains only an explicit forced
+cache/generated-symbol invalidation mechanism.
 
 ## Architecture and Parameter Flow
 
@@ -176,6 +187,12 @@ The LDS swizzle receives `KH_TILE` explicitly. This selects the existing
 64-byte swizzle for BK128 and the current 128-byte swizzle for BK256. A-copy
 load groups are independent of the 32-row scale/MFMA groups.
 
+Only the first `nLoadWaves` issue both initial and rotating-pipeline A loads.
+For BM16/BK256 this is two waves. The old rotating refill path let all four
+waves issue the refill: waves 2 and 3 addressed rows beyond the BM16 slot and
+could write adjacent rotating LDS slots. Guarding those inactive waves is an
+intentional correctness fix, not a no-op preservation claim.
+
 ### A LDS-to-register and B weight loads
 
 A and B fragments use `kHalves` instead of a fixed length of two.
@@ -227,11 +244,12 @@ change.
 
 ### BK256 stability
 
-All generalized quantities are compile-time constants. BK256 should fold back
-to the existing loads, addresses, MFMA sequence, and pipeline. Normalized
-IR/ISA comparison ignores the intentional symbol-name suffix. If generalized
-source changes the substantive BK256 code, sensitive load or MFMA blocks retain
-a compile-time BK256 branch.
+All generalized quantities are compile-time constants. For BM>=32, BK256 keeps
+the prior load/address/MFMA/pipeline semantics. Textual or byte-identical ISA is
+not required: instruction scheduling may differ after source generalization.
+For BM16, the inactive-wave rotating A-load guard above is an intentional
+semantic correction. Static ISA/resource comparison must therefore report the
+actual differences rather than normalize them away as symbol-only changes.
 
 ## AOT Design
 
@@ -337,12 +355,39 @@ native `x256x128` kernel name to verify the complete dispatch chain.
   keys and GPU symbols.
 - Run representative correctness cases with cold and warm caches.
 - Run representative cases from AOT artifacts.
-- Compare old and new BK256 normalized IR/ISA while ignoring only the symbol
-  suffix.
+- Compare old and new BK256 normalized IR/ISA while ignoring only generated
+  symbol spelling; classify and report every remaining difference.
 - Investigate any BK256 median benchmark regression above 3%; a single noisy
   measurement is not a hard CI failure.
 - Record BK128 K384 and K512 performance without an absolute threshold. The
   tuner decides adoption by measured `us`.
+
+### Final-review BM16/BK256 evidence
+
+The production BM16/BN256/BK256 atomic K512 specialization was compiled in
+separate before/after processes from the base source at
+`375c47524f86c91f03c12227fed27e39170088b8` and the final working source, then
+benchmarked in one alternating process on gfx950 with identical inputs.
+
+- Correctness: both versions passed the quantized stage2 reference and their
+  outputs were bitwise equal.
+- K512 static ISA: normalized ISA was not identical. The remaining diff is an
+  ordering change between two independent A-address instructions. Both versions
+  have two static global-to-LDS A-load sites, one guarded group/four dynamic
+  wave-load executions, 90 VGPR, 29 SGPR, 20,480 LDS bytes, and 16 static MFMA
+  instructions.
+- K512 performance: 12 alternating samples, 1,000 launches per sample including
+  the same output zero, produced medians of 8.50897 us before and 8.50521 us
+  after (-0.044%).
+- Long-pipeline guard proof (K1024/BK256): both versions remained correct, but
+  guarded A-load groups changed from 1 to 3 and derived dynamic wave-load
+  executions from 12 to 8. Static A-load sites remained 4; resources changed
+  from 164 to 160 VGPR while SGPR=75, LDS=22,528 bytes, and MFMA=32 stayed
+  constant.
+
+Reproducible sources, raw ISA, normalized diffs, summaries, and performance
+samples are under `/tmp/native_mxmoe_bm16_bk256_ab/` and are indexed by
+`static_isa_summary.json` and `bm16_bk256_k512_alternating_perf.json`.
 
 ## Risks and Mitigations
 
@@ -361,8 +406,8 @@ native `x256x128` kernel name to verify the complete dispatch chain.
    - Mitigation: include BK in AOT/runtime keys and suffix every generated
      symbol.
 6. **BK256 performance drift**
-   - Mitigation: compile-time folding, normalized IR/ISA comparison, and
-     targeted benchmarking.
+   - Mitigation: BM>=32 semantic comparison, explicit BM16 guard accounting,
+     normalized IR/ISA diff reporting, and targeted alternating benchmarking.
 
 ## Rollout
 

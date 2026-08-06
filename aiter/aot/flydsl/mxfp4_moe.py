@@ -130,18 +130,13 @@ def parse_csv(csv_path: str):
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             native_g2 = (
                 _parse_mxfp4_g2_kname(kn2)
-                if isinstance(kn2, str)
-                and kn2.startswith("flydsl_mxmoe_g2_a4w4_")
+                if isinstance(kn2, str) and kn2.startswith("flydsl_mxmoe_g2_a4w4_")
                 else None
             )
             if v2_g2 is not None:
                 stage2_bk = v2_g2["tile_k"]
-                stage2_d_inter = (
-                    (inter_dim + stage2_bk - 1) // stage2_bk
-                ) * stage2_bk
-                stage2_d_inter_real = (
-                    inter_dim if inter_dim != stage2_d_inter else None
-                )
+                stage2_d_inter = ((inter_dim + stage2_bk - 1) // stage2_bk) * stage2_bk
+                stage2_d_inter_real = inter_dim if inter_dim != stage2_d_inter else None
             elif native_g2 is not None:
                 stage2_bk = native_g2["BK"]
                 if inter_dim % stage2_bk != 0:
@@ -154,9 +149,7 @@ def parse_csv(csv_path: str):
                 stage2_d_inter_real = None
             else:
                 stage2_d_inter = ((inter_dim + 255) // 256) * 256
-                stage2_d_inter_real = (
-                    inter_dim if inter_dim != stage2_d_inter else None
-                )
+                stage2_d_inter_real = inter_dim if inter_dim != stage2_d_inter else None
 
             kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):

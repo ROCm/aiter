@@ -14,10 +14,16 @@
 - 新合法集合是 `BK in {128, 256}`；不增加 BN128。
 - `kernelName2` 中的 BK 是精确选择，不允许 runtime 自动改写。
 - 配置继续按 `w1/w2` 实际 shape 查找，不改变 CSV schema 或 shape key。
-- 本计划不实现 BK128 padding/`inter_real` 验收，不改 GEMM1，不合并 native/v2 实现。
+- native CSV 的 `inter_dim` 是实际、未 padding 的 K；本计划不实现 BK128
+  padding/`inter_real` 验收，也不移除 runtime wrapper 既有的外部 BK256
+  `D_INTER_REAL` padding 能力。
+- 不改 GEMM1，不合并 native/v2 实现。
 - 现有 11 个 native BM/NT/epilogue 组合必须全部保留。
-- 内部 GPU symbol 对 BK128 和 BK256 都显式追加 `_bk128`/`_bk256`。
-- BK256 除 symbol 名外，normalized IR/ISA 与性能不得发生实质回退。
+- 内部 GPU symbol 对 BK128 和 BK256 都显式追加
+  `_core<epoch>_bk<BK>`。
+- BK256 的 BM>=32 保持内存访问与计算语义等价；BM16 有意修复 inactive
+  wave 在长流水 refill 中写入相邻 LDS slot 的既有问题。不得声称
+  normalized IR/ISA 仅有 symbol 差异。
 - 实现依据：`docs/superpowers/specs/2026-08-06-native-mxmoe-gemm2-bk128-design.md`。
 
 ## File Structure
@@ -1634,7 +1640,11 @@ diff -u /tmp/before_20_llvm_ir.ll /tmp/after_20_llvm_ir.ll
 diff -u /tmp/before_21_final_isa.s /tmp/after_21_final_isa.s
 ```
 
-Expected: 两个 `diff` 均无输出。若有实质差异，在 BK-sensitive load/MFMA 代码处加入 `const_expr(BK == 256)` 编译期分支恢复旧 BK256 codegen，然后重新执行 Tasks 3-5 的测试。
+Expected: 不假设两个 `diff` 无输出。BM>=32 必须保持 load/address/MFMA
+语义等价；BM16 必须保留 inactive-wave A-load guard。记录 normalized ISA
+的全部剩余差异、A-load/guard 数量和 VGPR/SGPR/LDS/MFMA，而不是把差异
+描述为仅 symbol 变化。只有出现未设计的语义或性能回退时才增加
+BK-sensitive 编译期分支，并重新执行 Tasks 3-5 的测试。
 
 - [ ] **Step 6: 运行两组 shape 的 tuner smoke 与 benchmark**
 
@@ -1768,4 +1778,53 @@ git log --oneline -5
 ```
 
 Expected: 只有用户原先存在的未跟踪文件；本计划涉及的源代码和测试均已提交，最近历史包含四个独立提交。
+
+---
+
+### Final-review corrections and implementation deviations
+
+These corrections supersede conflicting preservation wording above:
+
+1. **BM16 wave guard**
+   - Both initial and rotating-pipeline A loads are issued only by
+     `n_load_waves`.
+   - For BM16/BK256, the old long-pipeline refill let waves 2/3 write rows
+     beyond the BM16 slot into adjacent rotating LDS slots. The guard is an
+     intentional fix; BM>=32 BK256 remains semantically equivalent.
+   - K512/BK256 still has only its already-guarded two initial static A-load
+     sites. The guard's semantic delta is visible in a long pipeline:
+     K1024 changes guarded groups `1 -> 3` and derived dynamic wave-load
+     executions `12 -> 8`.
+
+2. **Direct-stage2 test deviation**
+   - The final 33-case matrix uses a deterministic direct-stage2 fixture built
+     from exact quantized operands instead of routing every matrix case through
+     native stage1 as originally sketched in Task 4.
+   - This isolates GEMM2 variants and makes expert/scale/output writes
+     discriminative. The separate K384/BK128 high-level smoke retains complete
+     fused dispatch coverage, so the deviation does not remove end-to-end
+     validation.
+
+3. **Cache dependency and symbol**
+   - `launch_gemm2` directly references the module-level `_gemm2_body`
+     JitFunction. FlyDSL therefore records
+     `jit:_gemm2_body:<manager_key>` automatically.
+   - `NATIVE_GEMM2_CORE_CACHE_EPOCH` remains only for explicit forced
+     cache/symbol invalidation; the symbol contract is
+     `_core<epoch>_bk<BK>`.
+
+4. **Final BM16/BK256 K512 evidence**
+   - Base source: commit
+     `375c47524f86c91f03c12227fed27e39170088b8`, extracted without a worktree.
+   - Correctness: before/after passed and produced bitwise-equal outputs.
+   - Normalized ISA is not identical: the K512 diff contains an independent
+     A-address instruction reorder. Both versions use 2 static A-load sites,
+     1 guarded group/4 dynamic wave-load executions, 90 VGPR, 29 SGPR,
+     20,480 LDS bytes, and 16 static MFMA instructions.
+   - Same-process 12-round alternating medians were 8.50897 us before and
+     8.50521 us after (-0.044%).
+   - Reproducible artifacts:
+     `/tmp/native_mxmoe_bm16_bk256_ab/static_isa_summary.json`,
+     `/tmp/native_mxmoe_bm16_bk256_ab/k512_normalized_isa.diff`, and
+     `/tmp/native_mxmoe_bm16_bk256_ab/bm16_bk256_k512_alternating_perf.json`.
 

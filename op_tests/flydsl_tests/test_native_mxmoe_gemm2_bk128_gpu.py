@@ -42,9 +42,7 @@ def _check_close(ref, out, label):
     cosine = torch.nn.functional.cosine_similarity(
         ref_f32, out_f32, dim=1, eps=1e-12
     ).item()
-    assert cosine >= 0.999, (
-        f"{label}: cosine similarity {cosine:.6f} is below 0.999"
-    )
+    assert cosine >= 0.999, f"{label}: cosine similarity {cosine:.6f} is below 0.999"
     err = checkAllclose(ref, out, msg=label, atol=0.01, rtol=0.05)
     assert err == 0 or err <= 0.05, f"{label}: error ratio {err} exceeds 0.05"
 
@@ -91,9 +89,9 @@ def _route_stage2_ref(
             quant_dtype=dtypes.fp4x2,
             shuffle=False,
         )
-        routes_for_reduce = _dequant_fp4(
-            route_q, route_scale, model_dim
-        ).view(token, topk, model_dim)
+        routes_for_reduce = _dequant_fp4(route_q, route_scale, model_dim).view(
+            token, topk, model_dim
+        )
     out = (routes_for_reduce * topk_weights[:, :, None]).sum(dim=1)
     return out, routes, route_q, route_scale
 
@@ -133,9 +131,9 @@ def _high_level_ref(
         quant_dtype=dtypes.fp4x2,
         shuffle=False,
     )
-    inter_dequant = _dequant_fp4(
-        inter_q, inter_scale, inter_dim
-    ).view(token, topk, inter_dim)
+    inter_dequant = _dequant_fp4(inter_q, inter_scale, inter_dim).view(
+        token, topk, inter_dim
+    )
     w2_dequant = _dequant_fp4(
         w2_qt,
         w2_scale.view(expert, model_dim, inter_dim // 32),
@@ -168,9 +166,9 @@ def prepare_direct_stage2_case(
     token_idx = torch.arange(token, dtype=torch.int32, device=device)
     slot_idx = torch.arange(topk, dtype=torch.int32, device=device)
     topk_ids = (token_idx[:, None] + slot_idx[None, :]) % expert
-    topk_weights = torch.arange(
-        topk, 0, -1, dtype=torch.float32, device=device
-    ).repeat(token, 1)
+    topk_weights = torch.arange(topk, 0, -1, dtype=torch.float32, device=device).repeat(
+        token, 1
+    )
     topk_weights /= topk_weights.sum(dim=1, keepdim=True)
 
     max_padded = token * topk + expert * bm - topk
@@ -196,26 +194,17 @@ def prepare_direct_stage2_case(
     sorted_row = torch.arange(max_sorted, dtype=torch.int32, device=device)
     packed_token = sorted_ids & 0x00FFFFFF
     packed_slot = (sorted_ids >> 24) & 0xFF
-    valid_row = (
-        (sorted_row < n_sorted) & (packed_token < token) & (packed_slot < topk)
-    )
-    reverse_sorted = torch.full(
-        (token * topk,), -1, dtype=torch.int32, device=device
-    )
+    valid_row = (sorted_row < n_sorted) & (packed_token < token) & (packed_slot < topk)
+    reverse_sorted = torch.full((token * topk,), -1, dtype=torch.int32, device=device)
     route = packed_token[valid_row] * topk + packed_slot[valid_row]
     reverse_sorted[route.long()] = sorted_row[valid_row]
     assert (reverse_sorted >= 0).all(), "not every routed slot was sorted"
 
     inter = (
-        torch.randn(
-            (token, topk, inter_dim), dtype=torch.bfloat16, device=device
-        )
-        / 10
+        torch.randn((token, topk, inter_dim), dtype=torch.bfloat16, device=device) / 10
     )
     w2 = (
-        torch.randn(
-            (expert, model_dim, inter_dim), dtype=torch.bfloat16, device=device
-        )
+        torch.randn((expert, model_dim, inter_dim), dtype=torch.bfloat16, device=device)
         / 10
     )
     if epilog == "nonatomic_mxfp4":
@@ -226,9 +215,7 @@ def prepare_direct_stage2_case(
         ).to(torch.bfloat16)
         route_scale = torch.pow(
             2.0,
-            (
-                (token_idx[:, None] + slot_idx[None, :]) % 3 - 1
-            ).float(),
+            ((token_idx[:, None] + slot_idx[None, :]) % 3 - 1).float(),
         ).to(torch.bfloat16)
         inter.view(token, topk, k_groups, 32).mul_(
             route_scale[:, :, None, None] * group_scale[None, None, :, None]
@@ -238,8 +225,7 @@ def prepare_direct_stage2_case(
             (torch.arange(expert, device=device) % 4 - 2).float(),
         ).to(torch.bfloat16)
         w2.view(expert, model_dim, k_groups, 32).mul_(
-            expert_scale[:, None, None, None]
-            * group_scale[None, None, :, None]
+            expert_scale[:, None, None, None] * group_scale[None, None, :, None]
         )
 
     inter_q, inter_scale = per_1x32_f4_quant(
@@ -247,9 +233,7 @@ def prepare_direct_stage2_case(
         quant_dtype=dtypes.fp4x2,
         shuffle=False,
     )
-    w2_q, w2_scale = per_1x32_f4_quant(
-        w2, quant_dtype=dtypes.fp4x2, shuffle=False
-    )
+    w2_q, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2, shuffle=False)
 
     layout = {
         "sti": sorted_ids,
@@ -316,9 +300,7 @@ def prepare_direct_stage2_case(
     launch_kwargs = {
         "inter_sorted_quant": layout["isq"],
         "inter_sorted_shuffled_scale": layout["iss"],
-        "w2_u8": shuffle_weight(
-            w2_q, (16, 16), is_guinterleave=False, gate_up=False
-        ),
+        "w2_u8": shuffle_weight(w2_q, (16, 16), is_guinterleave=False, gate_up=False),
         "w2_scale_u8": shuffle_scale(
             w2_scale.view(expert * model_dim, inter_dim // 32),
             expert,
@@ -372,15 +354,10 @@ def run_direct_stage2(case):
         valid_rows = case["reverse_sorted"].long()
         assert (
             case["flat_out"][valid_rows] != case["flat_out_sentinel"]
-        ).all(), (
-            "f4out payload did not overwrite every valid byte"
-        )
+        ).all(), "f4out payload did not overwrite every valid byte"
         assert (
-            case["flat_out_scale"][valid_rows]
-            != case["flat_out_scale_sentinel"]
-        ).all(), (
-            "f4out scale did not overwrite every valid byte"
-        )
+            case["flat_out_scale"][valid_rows] != case["flat_out_scale_sentinel"]
+        ).all(), "f4out scale did not overwrite every valid byte"
         aiter.mxfp4_moe_scatter_reduce_q(
             flat_out_q=case["flat_out"],
             flat_out_scale=case["flat_out_scale"],
@@ -448,9 +425,7 @@ def test_native_full_variant_matrix(bm, use_nt, epilog, inter_dim, bk):
             case["topk_weights"],
             quantize_routes=True,
         )
-        experts_differ = not torch.equal(
-            case["w2_dequant"][0], case["w2_dequant"][1]
-        )
+        experts_differ = not torch.equal(case["w2_dequant"][0], case["w2_dequant"][1])
         weight_scale_values = int(
             torch.unique(case["w2_scale"].view(torch.uint8)).numel()
         )
@@ -489,21 +464,15 @@ def test_native_k384_bk128_high_level_smoke(monkeypatch):
     token, model_dim, inter_dim, expert, topk, bm = 2, 7168, 384, 48, 6, 32
     activation = ActivationType.Silu
     device = torch.device("cuda")
-    hidden = torch.ones(
-        (token, model_dim), dtype=torch.bfloat16, device=device
-    )
+    hidden = torch.ones((token, model_dim), dtype=torch.bfloat16, device=device)
     hidden_groups = hidden.view(token, model_dim // 32, 32)
     hidden_groups[1].mul_(
         torch.pow(
             2.0,
-            (
-                torch.arange(model_dim // 32, device=device) % 3 - 1
-            ).float(),
+            (torch.arange(model_dim // 32, device=device) % 3 - 1).float(),
         ).to(torch.bfloat16)[:, None]
     )
-    a1_qt, a1_scale = per_1x32_f4_quant(
-        hidden, quant_dtype=dtypes.fp4x2, shuffle=False
-    )
+    a1_qt, a1_scale = per_1x32_f4_quant(hidden, quant_dtype=dtypes.fp4x2, shuffle=False)
     w1 = torch.zeros(
         (expert, inter_dim * 2, model_dim),
         dtype=torch.bfloat16,
@@ -523,15 +492,9 @@ def test_native_k384_bk128_high_level_smoke(monkeypatch):
     ).to(torch.bfloat16)
     w1[expert_idx, inter_idx, hidden_idx] = gate_values
     w1[expert_idx, inter_dim + inter_idx, hidden_idx + 1] = up_values
-    w1_qt, w1_scale = per_1x32_f4_quant(
-        w1, quant_dtype=dtypes.fp4x2, shuffle=False
-    )
-    w1_a16 = shuffle_weight(
-        w1_qt, (16, 16), is_guinterleave=False, gate_up=True
-    )
-    w1s_a16 = shuffle_scale(
-        w1_scale, expert, is_guinterleave=False, gate_up=True
-    )
+    w1_qt, w1_scale = per_1x32_f4_quant(w1, quant_dtype=dtypes.fp4x2, shuffle=False)
+    w1_a16 = shuffle_weight(w1_qt, (16, 16), is_guinterleave=False, gate_up=True)
+    w1s_a16 = shuffle_scale(w1_scale, expert, is_guinterleave=False, gate_up=True)
     del w1
 
     w2 = torch.zeros(
@@ -559,21 +522,15 @@ def test_native_k384_bk128_high_level_smoke(monkeypatch):
         * (hidden_factor * hidden_sign)[None, :, None]
         * k_factor[None, None, :]
     ).to(torch.bfloat16)
-    w2_qt, w2_scale = per_1x32_f4_quant(
-        w2, quant_dtype=dtypes.fp4x2, shuffle=False
-    )
-    w2_a16 = shuffle_weight(
-        w2_qt, (16, 16), is_guinterleave=False, gate_up=False
-    )
-    w2s_a16 = shuffle_scale(
-        w2_scale, expert, is_guinterleave=False, gate_up=False
-    )
+    w2_qt, w2_scale = per_1x32_f4_quant(w2, quant_dtype=dtypes.fp4x2, shuffle=False)
+    w2_a16 = shuffle_weight(w2_qt, (16, 16), is_guinterleave=False, gate_up=False)
+    w2s_a16 = shuffle_scale(w2_scale, expert, is_guinterleave=False, gate_up=False)
     del w2
 
     ref_experts = token * topk
-    topk_ids = torch.arange(
-        ref_experts, dtype=torch.int32, device=device
-    ).view(token, topk)
+    topk_ids = torch.arange(ref_experts, dtype=torch.int32, device=device).view(
+        token, topk
+    )
     route_weights = torch.stack(
         (
             torch.arange(topk, 0, -1, dtype=torch.float32, device=device),
@@ -688,27 +645,17 @@ def test_native_k384_bk128_high_level_smoke(monkeypatch):
     ref_w1_scale_by_expert = ref_w1_scale.view(
         ref_experts, inter_dim * 2, model_dim // 32
     )
-    ref_w2_scale_by_expert = ref_w2_scale.view(
-        ref_experts, model_dim, inter_dim // 32
-    )
+    ref_w2_scale_by_expert = ref_w2_scale.view(ref_experts, model_dim, inter_dim // 32)
     w1_experts_differ = not (
         torch.equal(ref_w1_qt[0], ref_w1_qt[1])
-        and torch.equal(
-            ref_w1_scale_by_expert[0], ref_w1_scale_by_expert[1]
-        )
+        and torch.equal(ref_w1_scale_by_expert[0], ref_w1_scale_by_expert[1])
     )
     w2_experts_differ = not (
         torch.equal(ref_w2_qt[0], ref_w2_qt[1])
-        and torch.equal(
-            ref_w2_scale_by_expert[0], ref_w2_scale_by_expert[1]
-        )
+        and torch.equal(ref_w2_scale_by_expert[0], ref_w2_scale_by_expert[1])
     )
-    w1_scale_values = int(
-        torch.unique(ref_w1_scale.view(torch.uint8)).numel()
-    )
-    w2_scale_values = int(
-        torch.unique(ref_w2_scale.view(torch.uint8)).numel()
-    )
+    w1_scale_values = int(torch.unique(ref_w1_scale.view(torch.uint8)).numel())
+    w2_scale_values = int(torch.unique(ref_w2_scale.view(torch.uint8)).numel())
     wrong_expert_changes_ref = not torch.allclose(
         ref.to(torch.bfloat16).float(),
         wrong_ref.to(torch.bfloat16).float(),
@@ -746,9 +693,7 @@ def test_native_k384_bk128_high_level_smoke(monkeypatch):
 def test_native_atomic_bm32_direct_stage2(inter_dim, bk):
     case = prepare_direct_stage2_case(inter_dim, bk)
     out = run_direct_stage2(case)
-    _check_close(
-        case["ref"].float(), out.float(), f"native_bm32_k{inter_dim}_bk{bk}"
-    )
+    _check_close(case["ref"].float(), out.float(), f"native_bm32_k{inter_dim}_bk{bk}")
 
 
 @pytest.mark.parametrize(
@@ -762,6 +707,4 @@ def test_native_atomic_bm32_direct_stage2(inter_dim, bk):
 def test_native_atomic_bm16_bk128_deep_k(inter_dim):
     case = prepare_direct_stage2_case(inter_dim, 128, bm=16)
     out = run_direct_stage2(case)
-    _check_close(
-        case["ref"].float(), out.float(), f"native_bm16_k{inter_dim}_bk128"
-    )
+    _check_close(case["ref"].float(), out.float(), f"native_bm16_k{inter_dim}_bk128")

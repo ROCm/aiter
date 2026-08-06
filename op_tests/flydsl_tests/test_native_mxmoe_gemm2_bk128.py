@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import csv
+import inspect
 
 import pytest
 import torch
@@ -273,9 +274,7 @@ def test_native_tuner_candidate_bks(monkeypatch, inter_dim, expected_bks):
         "get_flydsl_stage2_v2_kernels",
         lambda *args, **kwargs: {},
     )
-    tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
-        gemm_moe_tune.Mxfp4FlydslTuner
-    )
+    tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(gemm_moe_tune.Mxfp4FlydslTuner)
     tuner.keys = _TUNER_KEYS
     candidates = tuner._candidate_rows(_tuner_row(inter_dim))
     native_names = [
@@ -285,6 +284,51 @@ def test_native_tuner_candidate_bks(monkeypatch, inter_dim, expected_bks):
     ]
     bks = {_parse_mxfp4_g2_kname(name)["BK"] for name in native_names}
     assert bks == expected_bks
+
+
+def test_native_compile_rejects_unsupported_bm():
+    from aiter.ops.flydsl.kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
+
+    with pytest.raises(AssertionError, match=r"BM must be one of .*got BM=8"):
+        compile_gemm2_a4w4_port(
+            BM=8,
+            use_nt=False,
+            NE=2,
+            N_OUT=256,
+            epilog="atomic",
+            D_INTER=512,
+            BN=256,
+            BK=256,
+        )
+
+
+def test_native_launcher_tracks_gemm2_body_dependency():
+    from flydsl.compiler.jit_function import _collect_dependency_sources
+
+    from aiter.ops.flydsl.kernels import mxfp4_gemm2
+
+    launch = mxfp4_gemm2.compile_gemm2_a4w4_port(
+        BM=32,
+        use_nt=False,
+        NE=2,
+        N_OUT=256,
+        epilog="atomic",
+        D_INTER=512,
+        BN=256,
+        BK=256,
+    )
+    dependencies = _collect_dependency_sources(
+        launch.func, inspect.getfile(launch.func)
+    )
+    body_dependencies = [
+        dependency
+        for dependency in dependencies
+        if dependency.startswith("jit:_gemm2_body:")
+    ]
+
+    assert body_dependencies == [
+        f"jit:_gemm2_body:{mxfp4_gemm2._gemm2_body.manager_key}"
+    ]
 
 
 def test_native_core_cache_epoch_changes_launcher_key(monkeypatch):

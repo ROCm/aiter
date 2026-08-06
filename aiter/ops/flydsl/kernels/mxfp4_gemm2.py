@@ -38,9 +38,8 @@ from .mxfp4_gemm_common import (
 )
 
 NUM_CU = 256
-# FlyDSL keys scalar closure values referenced by a launcher, but it does not
-# transitively collect the module-level `_gemm2_body` source. The factory below
-# captures this epoch in `launch_gemm2`; bump it whenever core semantics change.
+# `launch_gemm2` directly references `_gemm2_body`, so FlyDSL tracks body changes
+# automatically. Bump this epoch only when an explicit cache/symbol reset is needed.
 NATIVE_GEMM2_CORE_CACHE_EPOCH = 2
 
 
@@ -104,6 +103,7 @@ def compile_gemm2_a4w4_port(
     BK=256,
     xcd_swizzle=0,
 ):
+    assert BM in (16, 32, 64, 128), f"BM must be one of (16, 32, 64, 128), got BM={BM}"
     assert BN == 256, f"only BN==256 supported, got BN={BN}"
     assert BK in (128, 256), f"BK must be one of (128, 256), got BK={BK}"
     KH_TILE = BK // 2
@@ -186,13 +186,10 @@ def compile_gemm2_a4w4_port(
             rows_per_call = 64 // lanes_per_row
             for slot in range_constexpr(kStages):
                 for group in range_constexpr(_load_groups):
-                    lds_row = (
-                        wave * fx.Int32(_rows_per_wave)
-                        + fx.Int32(group * rows_per_call)
+                    lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(
+                        group * rows_per_call
                     )
-                    car = m_row0 + lds_row + (
-                        lane // fx.Int32(lanes_per_row)
-                    )
+                    car = m_row0 + lds_row + (lane // fx.Int32(lanes_per_row))
                     _issue_a_load_lds(
                         aq_rsrc,
                         saq_base_i32,
@@ -322,6 +319,7 @@ def compile_gemm2_a4w4_port(
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
     ):
+        _ = _gemm2_body
         _ = _core_cache_epoch
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
@@ -460,10 +458,11 @@ def _gemm2_body(
         return kt // _tilesPerScaleChunk
 
     def shift_scale_word(scale, kt):
+        scale_i32 = fx.Int32(scale)
         if const_expr(_tilesPerScaleChunk == 1):
-            return scale
+            return scale_i32
         shift = fx.Int32((kt % _tilesPerScaleChunk) * 16)
-        return arith.shrui(scale, _raw(shift))
+        return scale_i32.shrui(shift)
 
     def load_a_scale_tile(kt):
         chunk_kt = scale_chunk_tile(kt)
@@ -516,13 +515,8 @@ def _gemm2_body(
 
     def issue_a_load_lds(slot, kt):
         for group in range_constexpr(_load_groups):
-            lds_row = (
-                wave * fx.Int32(_rows_per_wave)
-                + fx.Int32(group * _rows_per_call)
-            )
-            car = m_row + lds_row + (
-                lane // fx.Int32(_lanes_per_row)
-            )
+            lds_row = wave * fx.Int32(_rows_per_wave) + fx.Int32(group * _rows_per_call)
+            car = m_row + lds_row + (lane // fx.Int32(_lanes_per_row))
             _issue_a_load_lds(
                 aq_rsrc,
                 saq_base_i32,
@@ -578,26 +572,20 @@ def _gemm2_body(
                         i = i0 + row_group
                         if const_expr(i >= _kMChunks):
                             continue
-                        acc_in = (
-                            zero4
-                            if const_expr(init and half == 0)
-                            else accm[i][J]
-                        )
-                        accm[i][J] = (
-                            rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                                mfma_res_ty,
-                                [
-                                    a[i][half],
-                                    b_tile[J][half],
-                                    acc_in,
-                                    4,
-                                    4,
-                                    2 * half + row_group,
-                                    sa,
-                                    2 * half + in_b,
-                                    sb,
-                                ],
-                            )
+                        acc_in = zero4 if const_expr(init and half == 0) else accm[i][J]
+                        accm[i][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                            mfma_res_ty,
+                            [
+                                a[i][half],
+                                b_tile[J][half],
+                                acc_in,
+                                4,
+                                4,
+                                2 * half + row_group,
+                                sa,
+                                2 * half + in_b,
+                                sb,
+                            ],
                         )
 
     def _kloop_fence():
@@ -653,9 +641,7 @@ def _gemm2_body(
             a_scale_sub = [
                 a_scale_v[kt][sub] for sub in range_constexpr(_kScaleSubBlocks)
             ]
-            mfma_cluster(
-                b[kt], a, a_scale_sub, b_scale_v[kt], init=False, kt=kt
-            )
+            mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False, kt=kt)
 
     if epilog == "nonatomic":
         out_base = _global_base_ptr1(arg_out)
