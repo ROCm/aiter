@@ -48,8 +48,7 @@ def create_vk_gdr_decode_kernel(
 ):
     # "gdr": per-head decay, -exp(A_log) * softplus(a + dt_bias).
     # "kda": per-channel decay, g_min * sigmoid(exp(A_log) * (a + dt_bias)).
-    # The mode reaches the lru_cache key and KERNEL_NAME, so the two compile to
-    # separate binaries and "gdr" keeps rendering exactly what it did pre-847.
+    # Separate binaries, so "gdr" stays bit-identical to pre-847.
     assert gate_mode in ("gdr", "kda"), gate_mode
     PER_CHANNEL = gate_mode == "kda"
 
@@ -206,10 +205,9 @@ def create_vk_gdr_decode_kernel(
             return fx.math.log1p(x, fastmath=fm_fast)
 
         def fast_exp_vec(x_vec, mult=1.0):
-            """exp(x * mult) per lane, folding mult into the log2(e) factor.
+            """exp(x * mult) per lane, mult folded into the log2(e) factor.
 
-            rocdl.exp2 takes a scalar, so map it over the lanes -- they lower to
-            the same v_exp_f32 the scalar gate emits.
+            rocdl.exp2 is scalar-only; the per-lane map still emits v_exp_f32.
             """
             c = arith.constant(mult * 1.4426950408889634, type=T.f32)
             scaled = x_vec * vector.BroadcastOp(acc_vec_t, c).vector
@@ -259,10 +257,8 @@ def create_vk_gdr_decode_kernel(
                     ).vector
                     one_vec = vector.BroadcastOp(acc_vec_t, f32_1).vector
 
-                    # Decay is per channel, so g is a vector per ki rather than a
-                    # broadcast scalar. It does not depend on vi -- the state is
-                    # [V, K] and decay acts along K -- so it is hoisted here and
-                    # reused across the v loop.
+                    # Decay varies along K, not V, so hoist it above the v loop:
+                    # one vector per ki, reused for every vi.
                     r_g_vecs = [0] * WARP_TILE_K_ITERS
                     for ki in range_constexpr(WARP_TILE_K_ITERS):
                         warp_k_vec_i = warp_k_vec_start + ki * WARP_TILE_K
@@ -274,8 +270,8 @@ def create_vk_gdr_decode_kernel(
                         )
                         if const_expr("f32" not in dt_bias_dtype):
                             dt_bias_vec = dt_bias_vec.extf(acc_vec_t)
-                        # g = g_min * sigmoid(exp(A_log) * (a + dt_bias)), and the
-                        # state decays by exp(g) exactly as on the scalar path.
+                        # g = g_min * sigmoid(exp(A_log) * (a + dt_bias)), stored
+                        # as exp(g) -- the decay factor, like r_g on the scalar path.
                         y_vec = r_A_vec * (a_vec + dt_bias_vec)
                         sigmoid_vec = one_vec / (one_vec + fast_exp_vec(y_vec, -1.0))
                         r_g_vecs[ki] = fast_exp_vec(g_min_vec * sigmoid_vec)

@@ -4,21 +4,17 @@
 """CI-visible tests for the FlyDSL GDR decode op: its export, and its numerics.
 
 CI collects only ``op_tests/test_*.py`` at depth 1 (see
-``.github/scripts/split_tests.sh``), so the kernel's in-package suite at
+``.github/scripts/split_tests.sh``), so the in-package suite at
 ``aiter/ops/flydsl/test_flydsl_linear_attention.py`` never runs automatically.
-This file puts both properties under CI.
 
-The export checks matter on their own: reaching into ``linear_attention_kernels``
-keeps working if the export drops back out of ``__init__.py``, so no other test
-would notice that regression. The scalar numeric checks reuse the in-package
-harness rather than carrying a second copy of its Triton reference.
+The export checks matter on their own: importing from
+``linear_attention_kernels`` keeps working if the export drops back out of
+``__init__.py``, so nothing else would catch that.
 
-The KDA cases trust the torch reference and put the *kernel* on trial.
-``op_tests/test_kda_torch_ref.py`` runs that arrow backwards -- it trusts the
-shipping scalar kernel and puts the *reference* on trial. The two therefore look
-alike without either subsuming the other, and which one fails says where the
-fault is: here alone means the per-channel kernel, there alone means the
-reference, both at once means the gate formula they share.
+These cases trust the torch reference and put the *kernel* on trial;
+``op_tests/test_kda_torch_ref.py`` runs the arrow backwards. Which one fails
+localises the fault: here alone, the per-channel kernel; there alone, the
+reference; both, the gate formula they share.
 
 Keep it thin -- shapes belong here, the reference kernel belongs in-package.
 """
@@ -33,8 +29,7 @@ pytestmark = pytest.mark.skipif(
     not is_flydsl_available(), reason="flydsl is not installed"
 )
 
-# Skips itself at import when flydsl or a GPU is missing, which skips this module
-# with it.
+# Skips at import when flydsl or a GPU is missing, taking this module with it.
 from aiter.ops.flydsl.test_flydsl_linear_attention import (
     Args,
     check_gdr_decode,
@@ -105,10 +100,9 @@ K = V = 128
 
 
 def assert_close_rmse(name, ref, tri, ratio=1e-3, err_atol=1e-3):
-    """The reference implementation's own bar, from vLLM ``test_kda.py:92``.
-
-    RMSE-relative with an absolute escape hatch, used at the packed-vs-dense
-    decode pair (1e-3, 1e-3). The ratio alone is not the bar.
+    """vLLM's own bar (``test_kda.py:92``): RMSE-relative with an absolute
+    escape hatch, at the packed-vs-dense decode pair's (1e-3, 1e-3). The ratio
+    alone is not the bar.
     """
     ref, tri = ref.detach().float(), tri.detach().float()
     abs_err = (ref - tri).abs().max().item()
@@ -128,10 +122,9 @@ def assert_close_rmse(name, ref, tri, ratio=1e-3, err_atol=1e-3):
 def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1):
     """Build one KDA decode case.
 
-    ``need_shuffle_state`` decides which state layout the caller holds: False
-    means it is already (D_v, D_k), True means (D_k, D_v) and the wrapper
-    transposes. With K == V the two are shape-identical and differ only in
-    meaning, so feeding the wrong one measures the harness, not the kernel.
+    ``shuffle`` picks the state layout the caller holds: False is already
+    (D_v, D_k), True is (D_k, D_v) and the wrapper transposes. With K == V the
+    two are shape-identical, so feeding the wrong one tests the harness.
     """
     torch.manual_seed(seed)
     dev = "cuda"
@@ -152,15 +145,12 @@ def _kda_inputs(B, H, dt, first_index, padded, shuffle, seed=0, indices_stride=1
     d0, d1 = (K, V) if shuffle else (V, K)
     n_slots = B + first_index
     if padded:
-        # vLLM's setup: rows are padded, so the state is deliberately
-        # non-contiguous and the kernel has to honour the strides it is given.
+        # vLLM's setup: padded rows, so the kernel must honour the strides.
         storage = torch.randn(n_slots, H * K * V + 17, dtype=torch.float32, device=dev)
         pool = storage[:, : H * K * V].view(n_slots, H, d0, d1)
-        # Both assertions are vLLM's (test_kda.py:321-322). The second is the
-        # one that bites: a slot must still be internally contiguous, so only
-        # the outer stride is padded. Assert it rather than assume .view() gave
-        # us that, or a future change to the storage shape could silently start
-        # testing a layout the kernel never sees.
+        # vLLM's own assertions (test_kda.py:321-322). The second bites: only
+        # the outer stride is padded, each slot still internally contiguous.
+        # Asserted, so a storage-shape change cannot silently test another layout.
         assert not pool.is_contiguous()
         assert pool.stride()[1:] == (d0 * d1, d1, 1)
     else:
@@ -201,9 +191,8 @@ def _kda_reference(args, initial_state):
         (1, 8, torch.bfloat16, True, False, 0, 1),
         (4, 12, torch.bfloat16, True, False, 0, 1),
         (2, 12, torch.float16, True, False, 0, 1),
-        # K3 as deployed: state already (D_v, D_k), padded storage, slots
-        # numbered from 1 because the serving stack treats 0 as invalid, and a
-        # strided index column -- every landmine in vLLM's setup at once.
+        # K3 as deployed, every landmine at once: (D_v, D_k) state, padded
+        # storage, slots numbered from 1, strided index column.
         (4, 12, torch.bfloat16, False, True, 1, 8),
         (4, 12, torch.bfloat16, False, False, 1, 1),
         (4, 12, torch.bfloat16, True, True, 1, 1),
@@ -224,8 +213,7 @@ def test_kda_per_channel_gate_matches_torch_reference(
 ):
     """The KDA gate: 4D `a`, 2D f32 dt_bias, g_min * sigmoid(exp(A_log) * x).
 
-    H is 1:1 with the k heads, which is K3's ratio and a case the scalar path
-    never exercised.
+    H is 1:1 with the k heads -- K3's ratio, which the scalar path never saw.
     """
     args, pool, indices = _kda_inputs(
         B, H, dt, first_index, padded, shuffle, indices_stride=indices_stride
@@ -259,19 +247,18 @@ def test_kda_per_channel_gate_matches_torch_reference(
     out_err = assert_close_rmse("o", ref_out, args["out"])
     state_err = assert_close_rmse("ht", ref_state, got_state)
 
-    # Tripwire under the acceptance bar above: agreement is ~1e-4 in practice,
-    # so a drift to just inside 1e-3 would pass the bar while signalling that
-    # something in the gate or the recurrence changed.
+    # Tripwire under the bar above: agreement is ~1e-4, so drift to just inside
+    # 1e-3 would pass while signalling that something changed.
     assert out_err < 5e-4 and state_err < 5e-4, (out_err, state_err)
 
 
 def test_negative_slot_is_skipped_and_zero_is_not():
     """Pins this kernel's invalid-slot contract, which is not the reference's.
 
-    aiter skips ``pool_idx < 0`` and writes nothing -- leaving the caller's
-    output buffer untouched. The KDA reference instead treats ``state_idx <= 0``
-    as invalid and zero-fills. They differ on both the boundary and the
-    behaviour, so slot 0 being *processed* here is the point of the test.
+    aiter skips ``pool_idx < 0`` and writes nothing, leaving the caller's buffer
+    untouched; the reference treats ``state_idx <= 0`` as invalid and zero-fills.
+    They differ on both boundary and behaviour, so slot 0 being *processed* is
+    the point.
     """
     B, H, dt = 4, 12, torch.bfloat16
     args, pool, _ = _kda_inputs(B, H, dt, first_index=0, padded=False, shuffle=True)

@@ -3,19 +3,12 @@
 
 """Pure-PyTorch reference for the Kimi Delta Attention (KDA) recurrence.
 
-Oracle for the per-channel decay work on ``flydsl_gdr_decode``. The in-repo
-Triton references compute the scalar gate only -- their ``IS_KDA`` branches
-change the pointer layout but keep ``-exp(A_log) * softplus(a + dt_bias)`` -- so
-there is nothing in aiter to check per-channel gate math against.
+Oracle for the per-channel decay work on ``flydsl_gdr_decode``. Nothing in aiter
+could serve: the Triton references' ``IS_KDA`` branches change the pointer layout
+but still compute the scalar gate.
 
-``kda_gate`` covers both gate modes the kernel has to support:
-
-* ``g_min`` set (KDA): ``g_min * sigmoid(exp(A_log) * (a + dt_bias))``
-* ``g_min`` None (GDR): ``-exp(A_log) * softplus(a + dt_bias)``, today's scalar
-  path, which per-channel inputs may also use.
-
-Ported from ``naive_recurrent_kda`` in vLLM
-(``tests/models/kimi_k3/test_kda.py``), itself from FLA's ``naive.py``.
+Ported from ``naive_recurrent_kda`` in vLLM (``tests/models/kimi_k3/test_kda.py``),
+itself from FLA's ``naive.py``.
 """
 
 from __future__ import annotations
@@ -46,11 +39,10 @@ def kda_gate(
         a: ``(B, T, H, K)`` per-channel, or ``(B, T, H)`` scalar per head.
         A_log: ``(H,)``, always f32, broadcast across channels.
         dt_bias: ``(H, K)`` per-channel, or ``(H,)`` scalar per head.
-        g_min: KDA's lower bound (the ticket uses -5). None selects the GDR
-            softplus gate.
+        g_min: KDA's lower bound, -5. None selects the GDR softplus gate.
 
     Returns:
-        Decay with the shape of ``a``, in log space -- callers apply ``exp``.
+        Decay in log space, shaped like ``a`` -- callers apply ``exp``.
     """
     x = a.float() + dt_bias.float()
     A = A_log.float().exp()
@@ -81,11 +73,10 @@ def naive_recurrent_kda(
     """Delta-rule recurrence in f32.
 
     Args:
-        q, k, v: ``(B, T, H, K)`` / ``(B, T, H, V)``. Apply :func:`l2norm`
-            first if the kernel under test normalizes internally -- this does
-            not, matching the vLLM reference.
-        g: log-space decay, ``(B, T, H, K)`` per-channel or ``(B, T, H)``
-            scalar. Scalar decay is broadcast across ``K``.
+        q, k, v: ``(B, T, H, K)`` / ``(B, T, H, V)``. Apply :func:`l2norm` first
+            if the kernel under test normalizes internally -- this does not,
+            matching the vLLM reference.
+        g: log-space decay, ``(B, T, H, K)`` or ``(B, T, H)``.
         beta: ``(B, T, H)``, already through sigmoid.
         initial_state: ``(B, H, K, V)``.
 

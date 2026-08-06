@@ -111,9 +111,8 @@ def flydsl_gdr_decode(
     assert dt_bias.dtype in [torch.float, torch.bfloat16, torch.half]
     assert indices.dtype == torch.int32
 
-    # KDA decays per channel, so `a` carries a D_k axis and dt_bias is (H_v, D_k).
-    # The rank of `a` selects the gate; the two must agree or the gate would read
-    # one layout while the kernel indexes the other.
+    # `a`'s rank selects the gate; dt_bias must match it, or the kernel would
+    # index a layout the caller did not pass.
     gate_mode = "kda" if a.dim() == 4 else "gdr"
     if gate_mode == "kda":
         assert (

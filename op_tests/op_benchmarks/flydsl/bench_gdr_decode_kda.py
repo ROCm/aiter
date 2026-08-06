@@ -5,17 +5,14 @@
 """Tuning sweep and A/B benchmark for the KDA (per-channel) FlyDSL GDR decode.
 
 Kimi-K3 decodes at a 1:1 head ratio, which matches no row in
-``gdr_decode_tuned.csv`` -- every row there is GQA at ratio 2 or 4. An untuned
-call therefore falls back to NUM_BLOCKS_PER_V_DIM=1, NUM_WARPS=4,
-WARP_THREADS_K=8, so any timing taken before the sweep measures the fallback
-rather than the kernel. ``--sweep`` produces the missing rows; ``--bench``
-compares the tuned kernel against the deployed Triton kernel.
+``gdr_decode_tuned.csv`` -- all of them are GQA at ratio 2 or 4 -- so an untuned
+call falls back to (1, 4, 8) and any timing taken before the sweep measures the
+fallback. ``--sweep`` produces the missing rows; ``--bench`` compares against the
+deployed Triton kernel.
 
-``--bench`` reports two things, because at decode batch sizes they differ by
-about 2x and quoting the wrong one is the easy mistake: how fast a decode *loop*
-runs (``call_us``, host cost included -- below B=64 both kernels are host-bound,
-so this is set by the host and not the kernel) and how fast the *kernels* are
-(``kernel_us``, host cost excluded -- what the sweep ranks on).
+``--bench`` reports two numbers because they differ by ~2x at decode batch sizes
+and quoting the wrong one is the easy mistake: ``call_us`` (host cost included,
+what a decode loop runs at) and ``kernel_us`` (excluded, what the sweep ranks on).
 
 Usage:
     # Tuning sweep, emits rows in gdr_decode_tuned.csv format
@@ -27,9 +24,8 @@ Usage:
     # Both, at the ticket's batch sizes
     python bench_gdr_decode_kda.py --sweep --bench
 
-The comparator lives on vLLM's kimi-k3 branch. Point --vllm at that checkout, or
-set PYTHONPATH; without it --bench reports the FlyDSL column alone rather than
-failing, since the sweep half needs no vLLM.
+The comparator lives on vLLM's kimi-k3 branch: point --vllm at a checkout. Without
+it --bench drops the Triton column rather than failing, since --sweep needs no vLLM.
 """
 
 from __future__ import annotations
@@ -58,10 +54,8 @@ STATE_DTYPE = torch.float32
 G_MIN = -5.0
 BATCHES = (1, 4, 64, 256)
 
-# Wider than the space the existing table was built over, which stopped at
-# NUM_BLOCKS_PER_V_DIM=8 / NUM_WARPS=4. That was sized for GQA shapes with 32-64
-# value heads; K3 has 12, so the grid (B * H_v * NUM_BLOCKS_PER_V_DIM) is far
-# smaller and splitting V harder is the only way to fill the GPU at low batch.
+# Wider than the original space (NUM_BLOCKS_PER_V_DIM<=8, NUM_WARPS<=4, sized for
+# GQA's 32-64 value heads). K3 has 12, so only splitting V harder fills the grid.
 NUM_BLOCKS_PER_V_DIM_CHOICES = (1, 2, 4, 8, 16, 32, 64)
 NUM_WARPS_CHOICES = (1, 2, 4, 8, 16)
 WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
@@ -73,9 +67,8 @@ FALLBACK_CONFIG = (1, 4, 8)
 TOP_N = 5
 TRIALS = 5
 
-# Calls per call_us measurement. Long enough that the trailing sync -- the last
-# call's device time, the only part not overlapped by the next enqueue -- is lost
-# in the average, short enough that B=256 still costs ~30 ms.
+# Calls per call_us measurement: enough to bury the trailing sync (the last
+# call's device time, the only part not overlapped), few enough that B=256 is 30 ms.
 LOOP_ITERS = 500
 
 CSV_HEADER = (
@@ -85,12 +78,8 @@ CSV_HEADER = (
 
 
 def valid_configs():
-    """Mirror the kernel's own shape asserts instead of catching failures.
-
-    A config that violates them raises inside ``create_vk_gdr_decode_kernel``;
-    enumerating up front keeps a real compile error distinguishable from a
-    geometry that was never legal.
-    """
+    """Mirror the kernel's shape asserts, so a real compile error stays
+    distinguishable from a geometry that was never legal."""
     values_per_thread_k = 4 if STATE_DTYPE is torch.float32 else 8
     out = []
     for nbpv, nw, wtk in itertools.product(
@@ -115,13 +104,10 @@ def valid_configs():
 def make_inputs(B, device="cuda", seed=0):
     """One KDA decode case, in both APIs' layouts over identical values.
 
-    The Triton kernel reads q/k/v from a packed ``[B, 2*H*K + H*V]`` buffer and
-    FlyDSL takes three tensors, so "the same inputs" means the same numbers, not
-    the same object. q/k/v for FlyDSL are views into the packed buffer, which is
-    what the serving stack would hand it (Sq = 1, so the split is zero-copy).
-
-    Slots are numbered from 1: the Triton kernel treats ``state_idx <= 0`` as
-    invalid and returns zeros, so a 0 slot would time an early return.
+    Triton reads q/k/v packed as ``[B, 2*H*K + H*V]``, FlyDSL takes three
+    tensors, so "same inputs" means same numbers -- FlyDSL's are zero-copy views
+    at Sq = 1. Slots start at 1: Triton returns zeros for ``state_idx <= 0``, so
+    slot 0 would time an early return.
     """
     torch.manual_seed(seed)
     mixed_qkv = torch.randn(B, 2 * H * K + H * V, dtype=DTYPE, device=device)
@@ -156,11 +142,10 @@ def make_inputs(B, device="cuda", seed=0):
 
 
 def flydsl_runner(inp, config):
-    """Bind one explicit config, bypassing the CSV lookup in the wrapper.
+    """Bind one explicit config, bypassing the wrapper's CSV lookup.
 
-    ``flydsl_gdr_decode`` resolves its config from ``gdr_decode_tuned.csv``, so
-    a sweep has to build the kernel directly; this mirrors what the wrapper does
-    around that lookup, at need_shuffle_state=False (K3's layout).
+    ``flydsl_gdr_decode`` resolves its config from ``gdr_decode_tuned.csv``, so a
+    sweep must build the kernel directly. need_shuffle_state=False, K3's layout.
     """
     nbpv, nw, wtk = config
     state = inp["pool"]
@@ -199,12 +184,9 @@ def flydsl_runner(inp, config):
 
 
 def torch_reference(inp, pool_before):
-    """``pool_before`` must be the state as it was *before* the kernel ran.
-
-    Both kernels update the paged state in place, so reading ``inp["pool"]``
-    here would feed the reference the already-decayed state and compare two
-    different problems.
-    """
+    """``pool_before`` must be the state from *before* the kernel ran: both
+    kernels decay the pool in place, so ``inp["pool"]`` would feed the reference
+    already-decayed state and compare two different problems."""
     initial_state = pool_before[inp["indices"].long()].clone().transpose(-1, -2)
     return naive_recurrent_kda(
         l2norm(inp["q"]),
@@ -237,27 +219,20 @@ def check(inp, out, state_after, pool_before):
 
 
 def kernel_us(fn):
-    """Time the *kernel*: device time for one call, via CUDA events, L2 flushed.
-
-    Host cost is invisible here -- the events sit on the device timeline, so
-    whatever Python took to enqueue the call is not in the number.
-    """
+    """Time the *kernel*: device time for one call, CUDA events, L2 flushed.
+    The events sit on the device timeline, so host cost is not in the number."""
     return triton.testing.do_bench(fn, warmup=25, rep=100) * 1e3
 
 
 def call_us(fn):
-    """Time the *call*: wall clock per call with calls issued back to back.
+    """Time the *call*: wall clock per call, calls issued back to back.
 
-    Host cost is included, so this is the larger of the two whenever the host
-    cannot keep the GPU fed -- which at these shapes is every batch below 64.
-    A decode loop is thousands of these back to back, and it runs at whichever
-    of host or device is slower, so this is the one that answers "how fast does
-    decode go". That the host cost survives to production is not an assumption:
-    vLLM marks this op ``@eager_break_during_capture``, so it is re-run eagerly
-    on every decode step rather than replayed from a captured graph.
+    Host cost included, so this exceeds ``kernel_us`` whenever the host cannot
+    keep the GPU fed -- here, every batch below 64. A decode loop is thousands of
+    these, and vLLM marks this op ``@eager_break_during_capture``, so the host
+    cost is paid per step in production rather than captured away.
 
-    One sync, at the end. Syncing per call would serialise host and device and
-    measure neither.
+    One sync, at the end: syncing per call would serialise host and device.
     """
     for _ in range(25):
         fn()
@@ -270,12 +245,11 @@ def call_us(fn):
 
 
 def confirm(B, candidates):
-    """Re-time the sweep's leaders over independent trials and rank on median.
+    """Re-time the sweep's leaders over independent trials, rank on median.
 
-    Also times the untuned fallback, so the sweep reports what it bought rather
-    than only what it picked. Candidates are whatever the sweep just found on
-    *this* GPU -- nothing here is specific to an architecture, which matters
-    because the winning set differs between gfx942 and gfx950.
+    Also times the untuned fallback, so the sweep reports what it bought and not
+    just what it picked. Candidates come from this GPU's sweep -- the winning set
+    differs between gfx942 and gfx950.
     """
     print(f"    re-timing the top {len(candidates)} over {TRIALS} trials:")
     rows = []
@@ -331,8 +305,7 @@ def sweep(args):
 
             ok, err = check(inp, out, inp["pool"], baseline_pool)
             if not ok:
-                # Parity at every config, not just the winner: a config that is
-                # fast because it is wrong must not win the sweep.
+                # Parity at every config: fast-because-wrong must not win.
                 print(f"  B={B:<4} {cfg}  PARITY FAIL err={err:.2e}")
                 continue
 
@@ -348,9 +321,8 @@ def sweep(args):
             f"    spread: slowest valid config is {worst / results[0][0]:.1f}x the best"
         )
 
-        # The single-shot argmin is not trustworthy on its own: the top configs
-        # routinely land within a few percent, which is the same order as
-        # run-to-run variation, so re-time the leaders and rank on the median.
+        # The single-shot argmin is not trustworthy: the leaders land within a
+        # few percent, the same order as run-to-run drift. Rank on the median.
         best_us, best_cfg, _ = confirm(B, [c for _, c, _ in results[:TOP_N]])
 
         nbpv, nw, wtk = best_cfg
@@ -373,19 +345,16 @@ def sweep(args):
 def load_triton(vllm_path):
     """Load the comparator from a vLLM checkout without importing vLLM itself.
 
-    ``import vllm`` drags in the config stack (pydantic, and onward), none of
-    which the kernel needs -- so the file is loaded directly and its three vLLM
-    imports are satisfied by stubs. The stubs are not stand-ins: under the
+    ``import vllm`` drags in pydantic and the config stack, so the file is loaded
+    directly with its three vLLM imports stubbed. The stubs are faithful: at the
     default ``FLA_USE_FAST_OPS=0`` vLLM's ``exp``/``log`` *are* ``tl.exp``/
-    ``tl.log``, and ``triton_utils`` re-exports plain triton, so the Triton
-    source compiled here is byte-for-byte what vLLM compiles. Guarded below.
+    ``tl.log``, and the rest is plain triton and integer math. Guarded below.
     """
     import importlib.util
     import types
 
     if os.environ.get("FLA_USE_FAST_OPS", "0") == "1":
-        # Then vLLM would bind fast_expf/fast_logf and the stub would silently
-        # benchmark different math.
+        # Otherwise vLLM binds fast_expf/fast_logf and the stub changes the math.
         raise RuntimeError("unset FLA_USE_FAST_OPS to compare like for like")
 
     path = Path(vllm_path or "/workspace/vllm")
@@ -429,21 +398,17 @@ def load_triton(vllm_path):
 def bench_one(B, flydsl_gdr_decode, triton_fn):
     """One row of both A/B tables: every measurement at one batch size.
 
-    Its own function so the timed closures bind parameters rather than a loop
-    variable, and so every timing starts from the same pre-run state -- both
-    kernels update the paged state in place, hence the ``copy_(pool0)`` before
-    each one.
+    Its own function so the timed closures bind parameters, not a loop variable.
+    Both kernels decay the pool in place, hence the ``copy_(pool0)`` before each
+    measurement.
     """
     inp = make_inputs(B)
     pool0 = inp["pool"].clone()
     out = torch.zeros(B, 1, H, V, dtype=DTYPE, device="cuda")
 
-    # Hoisted deliberately. q/k/v are views into the packed buffer, and the
-    # wrapper calls .contiguous() on them, so leaving this inside the timed
-    # region would charge FlyDSL for unpacking QKV on every call. Reading at
-    # packed offsets is explicitly a separate ticket, so the kernel is timed on
-    # the layout it is specified to take; the unpack is reported as its own
-    # column rather than hidden inside either kernel's number.
+    # Hoisted deliberately: q/k/v are packed-buffer views and the wrapper calls
+    # .contiguous(), so timing this would charge FlyDSL for unpacking per call.
+    # Packed reads are a separate ticket, so the unpack gets its own column.
     q, k, v = inp["q"].contiguous(), inp["k"].contiguous(), inp["v"].contiguous()
 
     def fly():
@@ -523,9 +488,7 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
         "tri_kernel": tri_kernel,
         "fly_kernel": fly_kernel,
         "kernel_speedup": ratio(tri_kernel, fly_kernel),
-        # Two asides that only make sense on the kernel axis: what the sweep
-        # bought over the untuned fallback, and what a packed-QKV caller would
-        # pay to unpack (a deferred ticket, reported rather than hidden).
+        # Kernel-axis asides: what tuning bought, what a packed caller would pay.
         "untuned_kernel": untuned_kernel,
         "unpack_kernel": unpack_kernel,
         "fly_ok": fly_ok,
@@ -556,16 +519,11 @@ def print_table(caption, columns, table):
 def bench(args):
     """A/B at the ticket's batch sizes, both kernels on identical values.
 
-    Two tables, because "how fast is it" has two answers here and quoting the
-    wrong one is the easy mistake. The first times the *call* and is the ticket's
-    number: below B=64 both kernels are host-bound, so a decode loop runs at the
-    rate the host can drive it and the kernel is not the constraint. The second
-    times the *kernel* with host cost excluded, which is what the sweep ranks on
-    and where the tuning shows up. They disagree by about 2x at B=1, and both are
-    true -- see ``kernel_us`` and ``call_us``.
-
-    FlyDSL is run through the public wrapper so the number reflects what a
-    consumer gets, tuning table included -- not a hand-picked config.
+    Two tables, because "how fast is it" has two answers that disagree by ~2x at
+    B=1 and are both true. The call table is the ticket's number: below B=64 both
+    kernels are host-bound, so the kernel is not the constraint. The kernel table
+    is what the sweep ranks on. FlyDSL goes through the public wrapper either
+    way, so the numbers are what a consumer gets, tuning table included.
     """
     from aiter.ops.flydsl import flydsl_gdr_decode
 

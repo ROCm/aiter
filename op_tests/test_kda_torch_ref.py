@@ -1,20 +1,15 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Pins the KDA torch reference, which is the oracle for the per-channel work.
+"""Pins the KDA torch reference, which is the oracle everything else trusts.
 
-Changes 1-3 have nothing else to check them against, so an error here would be
-invisible and would propagate into every later test. Two independent anchors:
+An error here would be invisible and would propagate into every test that uses
+it. Two independent anchors: the gate against the formula vLLM asserts on, and
+the recurrence against today's ``flydsl_gdr_decode``.
 
-* the gate against the formula vLLM asserts on, expressed in vLLM's flattened
-  layout so the head/channel broadcast is checked rather than restated;
-* the recurrence against today's ``flydsl_gdr_decode``, which is the strong
-  check -- it runs the whole reference against a kernel already known good.
-
-Only the *scalar* path may be used for that second anchor. This file is what
-earns the reference the right to judge the per-channel kernel in
-``op_tests/test_flydsl_gdr_decode.py``; checking it against that same kernel
-would close the loop and pin nothing.
+That second anchor must use the *scalar* path only. Checking the reference
+against the per-channel kernel it exists to judge would close the loop and pin
+nothing.
 """
 
 import pytest
@@ -33,9 +28,8 @@ DEVICE = "cuda"
 def test_kda_gate_matches_vllm_formula():
     """Compare against vLLM's expected_gate (tests/models/kimi_k3/test_kda.py).
 
-    vLLM keeps ``a`` as ``(T, H*D)`` and ``dt_bias`` as ``(H*D,)``; this takes
-    ``(B, T, H, D)`` and ``(H, D)``. Writing both sides pins the broadcast --
-    A_log is per head and has to spread across channels.
+    vLLM flattens to ``(T, H*D)``; this takes ``(B, T, H, D)``. Writing both
+    pins the broadcast: A_log is per head and must spread across channels.
     """
     torch.manual_seed(0)
     T, H, D, g_min = 4, 6, 16, -5.0
@@ -75,13 +69,10 @@ def test_scalar_gate_is_the_gdr_softplus_form():
 def test_reference_reproduces_flydsl_scalar_decode(B, H, dt):
     """The reference must reproduce the shipping kernel on the scalar path.
 
-    Identity shuffle indices, so this isolates the gate and the recurrence from
-    the state-gather behaviour.
-
-    The tolerance is deliberately tight. Agreement here is near-exact (worst
-    seen over a 36-run sweep: 4e-6 on the output, 5e-7 on the state), so a loose
-    bound would wave through a wrong gate -- swapping in KDA's g_min form only
-    moves the output by 2.6e-2.
+    Identity shuffle indices, isolating the gate and recurrence from the state
+    gather. The tight tolerance is deliberate: agreement is near-exact (worst
+    over a 36-run sweep, 4e-6 output / 5e-7 state), while swapping in KDA's
+    g_min form moves the output only 2.6e-2 -- a loose bound would pass it.
     """
     from aiter.ops.flydsl import flydsl_gdr_decode
 

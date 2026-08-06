@@ -47,8 +47,7 @@ class Args:
     head_k_dim: int
     head_v_dim: int
     use_qk_l2norm: bool = True
-    # KDA supplies an f32 bias alongside a lower-precision query. None keeps the
-    # bias tied to dtype, which is what every pre-847 caller does.
+    # KDA pairs an f32 bias with a lower-precision query; None is pre-847 behaviour.
     dt_bias_dtype: torch.dtype | None = None
 
 
@@ -468,10 +467,9 @@ def test_flydsl_gdr_decode(args):
 
 
 def check_gdr_decode(args):
-    """Compare the FlyDSL decode against the Triton reference for one config.
+    """FlyDSL decode vs the Triton reference for one config.
 
-    Shared with ``op_tests`` so the CI-visible test reuses this oracle instead of
-    carrying a second copy of the reference kernel.
+    Imported by ``op_tests``, which is the suite CI runs.
     """
     inputs = create_inputs(args)
     outputs = create_outputs(args)
