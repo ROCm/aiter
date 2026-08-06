@@ -1326,7 +1326,7 @@ def _ctypes_call(func, fc_name, md_name):
                 d_args.get("third_party", []),
                 flags_extra_hip_per_source=d_args.get("flags_extra_hip_per_source", {}),
             )
-        lib = ctypes.CDLL(so_path, mode=os.RTLD_NOW | _RTLD_DEEPBIND)
+        lib = ctypes.CDLL(so_path, mode=os.RTLD_LAZY | _RTLD_DEEPBIND)
         c_func = getattr(lib, fc_name)
 
         def _opt_sym(name, argtypes=(), restype=None):
