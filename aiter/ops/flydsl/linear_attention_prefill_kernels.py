@@ -65,6 +65,36 @@ def _grid_ctas(*, H: int, V: int, N: int, BV: int) -> int:
     return max(1, N) * H * ((V + BV - 1) // BV)
 
 
+_cu_count_cache: int | None = None
+
+
+def _device_cu_count() -> int:
+    """Number of CUs on the current device (cached). Falls back to 304 (MI300X/
+    MI325X gfx942) if the query fails."""
+    global _cu_count_cache
+    if _cu_count_cache is None:
+        try:
+            import torch
+
+            _cu_count_cache = int(
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            )
+        except Exception:
+            _cu_count_cache = 304
+    return _cu_count_cache
+
+
+# gfx942: minimum grid fill (CTAs / CU_count) at BV=64 for BV=64 to beat the
+# small-BV heuristic. Measured on MI325X (17-shape sweep): BV=64 wins for every
+# shape with fill >= 0.32 and loses for every shape with fill <= 0.21; 0.30 sits
+# safely in that gap. Below it, the BV=64 grid leaves too many CUs idle and the
+# fatter tile cannot compensate; at/above it, BV=64 right-sizes an otherwise
+# wildly over-subscribed BV=16 grid (up to -34%, matching the HIP kernel's grid).
+_GFX942_BV64_MIN_FILL = 0.30
+
+
 def _select_bv_for_grid(*, H: int, V: int, N: int, target_ctas: int) -> int:
     """Choose the largest legal BV whose grid still covers target_ctas."""
     legal = sorted(_legal_bv_candidates(V), reverse=True)
@@ -187,6 +217,17 @@ def _heuristic_bv(
         V (rare: V<16 or V not divisible by 16), falls back to the
         largest legal candidate, then finally to ``_DEFAULT_BV``.
     """
+    # gfx942 BV=64 rule (profile-driven): after the lds_vnt reclaim, BV=64 fits in
+    # ~58 KiB (< 64 KiB/CU) and matches the HIP kernel's grid. BV=64 uses fatter
+    # tiles / fewer CTAs, which beats the small-BV heuristic ONLY when the BV=64
+    # grid still fills the CUs (measured cutoff: fill >= ~0.30). Below that the
+    # grid starves; the small-BV heuristic (more CTAs) wins. Prefer BV=64 when it
+    # is legal for this V and clears the fill bar; otherwise fall through.
+    if _ARCH == "gfx942" and 64 in _legal_bv_candidates(V):
+        fill64 = _grid_ctas(H=H, V=V, N=N, BV=64) / max(_device_cu_count(), 1)
+        if fill64 >= _GFX942_BV64_MIN_FILL:
+            return 64
+
     target_bv = _target_bv_for_shape(
         H=H, Hg=Hg, T_flat=T_flat, N=N, is_varlen=is_varlen
     )
@@ -194,11 +235,9 @@ def _heuristic_bv(
         _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
     )
     bv = _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
-    # gfx942 LDS budget caps BV at 32 (BV=64 needs 73.5 KiB > 64 KiB/CU at
-    # K=128, BT=64). The gfx942 kernel asserts this; clamp here so the CTA-target
-    # rule can never select an allocation that fails at launch.
+    # Safety: the gfx942 kernel asserts BV <= 64.
     if _ARCH == "gfx942":
-        bv = min(bv, 32)
+        bv = min(bv, 64)
     return bv
 
 

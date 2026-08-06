@@ -79,10 +79,12 @@ def compile_chunk_gated_delta_h_gfx942(
     assert K <= 256
     assert K % 64 == 0
     assert BV % 16 == 0
-    # gfx942 LDS budget: BV=64 needs 73.5 KiB > 64 KiB/CU. Cap at 32.
-    assert BV <= 32, (
-        f"gfx942 LDS budget caps BV at 32 (got BV={BV}); "
-        "BV=64 overflows the 64 KiB/CU LDS limit at K=128, BT=64."
+    # gfx942 LDS budget: after the lds_vnt reclaim (Gap 4, sized to BV not V), the
+    # 4 LDS buffers total ~58 KiB at BV=64 (< 64 KiB/CU), so BV=64 now fits. The
+    # previous cap of 32 was due to the old V-sized lds_vnt (66.5 KiB at BV=64).
+    assert BV <= 64, (
+        f"gfx942 LDS budget caps BV at 64 (got BV={BV}); "
+        "BV>64 overflows the 64 KiB/CU LDS limit at K=128, BT=64."
     )
     NUM_K_BLOCKS = K // 64
 
@@ -109,11 +111,16 @@ def compile_chunk_gated_delta_h_gfx942(
     LDS_KT_STRIDE = BT + LDS_KT_PAD
     LDS_KT_ELEMS = K * LDS_KT_STRIDE
 
-    # lds_vn: v_new stored TRANSPOSED as [BT, V] -> we need GEMM2 B-frag = run over
-    # BT (contraction) at fixed V. Store as [V, BT] so the BT run is contiguous.
+    # lds_vn: v_new stored TRANSPOSED as [BV, BT] -> GEMM2 B-frag = run over BT
+    # (contraction) at fixed V. Store as [v_local, BT] so the BT run is contiguous.
+    # Gap 4 (LDS reclaim): each CTA only handles a BV-wide V-slice, and every vnt
+    # access uses v_local = nr*16 + lane_n in [0, BV) -- NOT the full V. The old
+    # ``V * STRIDE`` sizing over-allocated by V/BV (4x at BV=32 = 12.75 KiB wasted).
+    # Sizing to BV rows is a pure allocation shrink (indexing already uses v_local
+    # < BV) and is what lets BV=64 fit in the 64 KiB/CU LDS budget.
     LDS_VNT_PAD = 4
     LDS_VNT_STRIDE = BT + LDS_VNT_PAD
-    LDS_VNT_ELEMS = V * LDS_VNT_STRIDE  # V rows (full V, tiled by BV per CTA in cols)
+    LDS_VNT_ELEMS = BV * LDS_VNT_STRIDE
 
     # lds_h: h snapshot [V, K] used as GEMM1 B-frag = run over K (contraction) at
     # fixed V. Store as [V, K] so the K run is contiguous (already the natural VK
