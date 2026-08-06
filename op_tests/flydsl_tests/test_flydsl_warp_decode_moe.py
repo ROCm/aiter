@@ -190,15 +190,21 @@ from aiter.ops.flydsl.warp_decode_moe import (  # noqa: E402
     flydsl_warp_decode_gate_up,
 )
 
-# name, B, HIDDEN, INTER, E, TOPK, w_scale_mode
+# name, B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
 GATE_UP_CASES = [
-    ("h1024_i64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor"),
-    ("h1024_i128_e8_tk2_pertoken", 1, 1024, 128, 8, 2, "pertoken"),
-    ("h512_i32_e2_tk1_kv8_pertensor", 1, 512, 32, 2, 1, "pertensor"),
+    ("h1024_i64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor", None),
+    ("h1024_i128_e8_tk2_pertoken", 1, 1024, 128, 8, 2, "pertoken", None),
+    ("h512_i32_e2_tk1_kv8_pertensor", 1, 512, 32, 2, 1, "pertensor", None),
+    ("h1024_i64_e4_tk2_block2d", 2, 1024, 64, 4, 2, "block2d", (128, 128)),
+    ("h512_i32_e2_tk1_kv8_block2d", 1, 512, 32, 2, 1, "block2d", (64, 128)),
 ]
 
 
-def _gen_gate_up(B, HIDDEN, INTER, E, TOPK, w_scale_mode):
+def _n_block2d_scales(rows, cols, bn, bk):
+    return (rows // bn) * (cols // bk)
+
+
+def _gen_gate_up(B, HIDDEN, INTER, E, TOPK, w_scale_mode, scale_block=None):
     device = torch.device("cuda")
     gen = torch.Generator(device="cuda").manual_seed(20260404)
     x = ((torch.rand((B, HIDDEN), generator=gen, device=device) * 2 - 1)).to(
@@ -213,7 +219,13 @@ def _gen_gate_up(B, HIDDEN, INTER, E, TOPK, w_scale_mode):
     router_ids = torch.randint(
         0, E, (B, TOPK), generator=gen, device=device, dtype=torch.int32
     )
-    n_scale = 1 if w_scale_mode == "pertensor" else E * INTER
+    if w_scale_mode == "pertensor":
+        n_scale = 1
+    elif w_scale_mode == "pertoken":
+        n_scale = E * INTER
+    else:  # block2d
+        bn, bk = scale_block
+        n_scale = _n_block2d_scales(E * INTER, HIDDEN, bn, bk)
     w_gate_scale = (
         torch.rand(n_scale, generator=gen, device=device) * 1.5 + 0.5
     ).float()
@@ -221,7 +233,25 @@ def _gen_gate_up(B, HIDDEN, INTER, E, TOPK, w_scale_mode):
     return x, w_gate, w_up, router_ids, w_gate_scale, w_up_scale
 
 
-def _ref_gate_up(x, w_gate, w_up, router_ids, w_gate_scale, w_up_scale, w_scale_mode):
+def _block2d_scale_matrix(p, e, rows_per_e, cols, bn, bk):
+    """[rows_per_e, cols] scale matrix for expert ``e`` from flat Block2D scales."""
+    device = p.device
+    row_idx = e * rows_per_e + torch.arange(rows_per_e, device=device)
+    col_blk = torch.arange(cols, device=device) // bk
+    sidx = (row_idx // bn)[:, None] * (cols // bk) + col_blk[None, :]
+    return p[sidx]
+
+
+def _ref_gate_up(
+    x,
+    w_gate,
+    w_up,
+    router_ids,
+    w_gate_scale,
+    w_up_scale,
+    w_scale_mode,
+    scale_block=None,
+):
     B, HIDDEN = x.shape
     E, INTER, _ = w_gate.shape
     TOPK = router_ids.shape[1]
@@ -233,15 +263,22 @@ def _ref_gate_up(x, w_gate, w_up, router_ids, w_gate_scale, w_up_scale, w_scale_
     for b in range(B):
         for k in range(TOPK):
             e = int(router_ids[b, k])
-            gate = xf[b] @ wgf[e].T
-            up = xf[b] @ wuf[e].T
-            if w_scale_mode == "pertensor":
-                gate = gate * w_gate_scale[0]
-                up = up * w_up_scale[0]
+            if w_scale_mode == "block2d":
+                bn, bk = scale_block
+                sg = _block2d_scale_matrix(w_gate_scale, e, INTER, HIDDEN, bn, bk)
+                su = _block2d_scale_matrix(w_up_scale, e, INTER, HIDDEN, bn, bk)
+                gate = (wgf[e] * sg) @ xf[b]
+                up = (wuf[e] * su) @ xf[b]
             else:
-                rows = e * INTER + idx
-                gate = gate * w_gate_scale[rows]
-                up = up * w_up_scale[rows]
+                gate = xf[b] @ wgf[e].T
+                up = xf[b] @ wuf[e].T
+                if w_scale_mode == "pertensor":
+                    gate = gate * w_gate_scale[0]
+                    up = up * w_up_scale[0]
+                else:
+                    rows = e * INTER + idx
+                    gate = gate * w_gate_scale[rows]
+                    up = up * w_up_scale[rows]
             silu = gate / (1.0 + torch.exp(-gate))
             out[b, k] = (silu * up).to(torch.bfloat16)
     return out
@@ -254,17 +291,24 @@ def _cosine(a, b):
 
 
 def _run_gate_up_case(case, *, cos_thresh=0.999):
-    name, B, HIDDEN, INTER, E, TOPK, mode = case
+    name, B, HIDDEN, INTER, E, TOPK, mode, scale_block = case
     print("=" * 78)
     print(f"[flydsl] warp-decode gate_up  case={name}")
     x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
-        B, HIDDEN, INTER, E, TOPK, mode
+        B, HIDDEN, INTER, E, TOPK, mode, scale_block
     )
     out = flydsl_warp_decode_gate_up(
-        x, w_gate, w_up, router_ids, wgs, wus, w_scale_mode=mode
+        x,
+        w_gate,
+        w_up,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode=mode,
+        scale_block=scale_block,
     )
     torch.cuda.synchronize()
-    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode)
+    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block)
     cos = _cosine(ref, out)
     max_delta = (ref.float() - out.float()).abs().max().item()
     denom = ref.float().abs().max().item() + 1e-6
@@ -289,15 +333,17 @@ def test_gate_up_fp8(case):
 # -------------------------------------------------------------------------
 # Phase 3 -- down_reduce FP8 fast path (BF16 intermediate, FP8 e4m3 weights)
 # -------------------------------------------------------------------------
-# name, B, INTER, HIDDEN, E, TOPK, w_scale_mode
+# name, B, INTER, HIDDEN, E, TOPK, w_scale_mode, scale_block (None | (BN, BK))
 DOWN_CASES = [
-    ("down_i1024_h64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor"),
-    ("down_i1024_h128_e8_tk2_pertoken", 1, 1024, 128, 8, 2, "pertoken"),
-    ("down_i512_h32_e2_tk1_kv8_pertensor", 1, 512, 32, 2, 1, "pertensor"),
+    ("down_i1024_h64_e4_tk2_pertensor", 2, 1024, 64, 4, 2, "pertensor", None),
+    ("down_i1024_h128_e8_tk2_pertoken", 1, 1024, 128, 8, 2, "pertoken", None),
+    ("down_i512_h32_e2_tk1_kv8_pertensor", 1, 512, 32, 2, 1, "pertensor", None),
+    ("down_i1024_h64_e4_tk2_block2d", 2, 1024, 64, 4, 2, "block2d", (128, 128)),
+    ("down_i512_h32_e2_tk1_kv8_block2d", 1, 512, 32, 2, 1, "block2d", (64, 128)),
 ]
 
 
-def _gen_down(B, INTER, HIDDEN, E, TOPK, w_scale_mode):
+def _gen_down(B, INTER, HIDDEN, E, TOPK, w_scale_mode, scale_block=None):
     device = torch.device("cuda")
     gen = torch.Generator(device="cuda").manual_seed(20260405)
     inter = ((torch.rand((B, TOPK, INTER), generator=gen, device=device) * 2 - 1)).to(
@@ -311,14 +357,22 @@ def _gen_down(B, INTER, HIDDEN, E, TOPK, w_scale_mode):
     )
     router_wts = torch.rand((B, TOPK), generator=gen, device=device).float()
     router_wts = router_wts / router_wts.sum(dim=1, keepdim=True)
-    n_scale = 1 if w_scale_mode == "pertensor" else E * HIDDEN
+    if w_scale_mode == "pertensor":
+        n_scale = 1
+    elif w_scale_mode == "pertoken":
+        n_scale = E * HIDDEN
+    else:  # block2d
+        bn, bk = scale_block
+        n_scale = _n_block2d_scales(E * HIDDEN, INTER, bn, bk)
     w_down_scale = (
         torch.rand(n_scale, generator=gen, device=device) * 1.5 + 0.5
     ).float()
     return inter, w_down, router_ids, router_wts, w_down_scale
 
 
-def _ref_down(inter, w_down, router_ids, router_wts, w_down_scale, w_scale_mode):
+def _ref_down(
+    inter, w_down, router_ids, router_wts, w_down_scale, w_scale_mode, scale_block=None
+):
     B, TOPK, INTER = inter.shape
     E, HIDDEN, _ = w_down.shape
     interf = inter.float()
@@ -329,27 +383,39 @@ def _ref_down(inter, w_down, router_ids, router_wts, w_down_scale, w_scale_mode)
         for k in range(TOPK):
             e = int(router_ids[b, k])
             rw = router_wts[b, k]
-            dot = interf[b, k] @ wdf[e].T
-            if w_scale_mode == "pertensor":
-                ds = w_down_scale[0]
+            if w_scale_mode == "block2d":
+                bn, bk = scale_block
+                sd = _block2d_scale_matrix(w_down_scale, e, HIDDEN, INTER, bn, bk)
+                dot = (wdf[e] * sd) @ interf[b, k]
+                y[b] += rw * dot
             else:
-                ds = w_down_scale[e * HIDDEN + idx]
-            y[b] += dot * (rw * ds)
+                dot = interf[b, k] @ wdf[e].T
+                if w_scale_mode == "pertensor":
+                    ds = w_down_scale[0]
+                else:
+                    ds = w_down_scale[e * HIDDEN + idx]
+                y[b] += dot * (rw * ds)
     return y.to(torch.bfloat16)
 
 
 def _run_down_case(case, *, cos_thresh=0.999):
-    name, B, INTER, HIDDEN, E, TOPK, mode = case
+    name, B, INTER, HIDDEN, E, TOPK, mode, scale_block = case
     print("=" * 78)
     print(f"[flydsl] warp-decode down_reduce  case={name}")
     inter, w_down, router_ids, router_wts, wds = _gen_down(
-        B, INTER, HIDDEN, E, TOPK, mode
+        B, INTER, HIDDEN, E, TOPK, mode, scale_block
     )
     out = flydsl_warp_decode_down_reduce(
-        inter, w_down, router_ids, router_wts, wds, w_scale_mode=mode
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        wds,
+        w_scale_mode=mode,
+        scale_block=scale_block,
     )
     torch.cuda.synchronize()
-    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode)
+    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode, scale_block)
     cos = _cosine(ref, out)
     max_delta = (ref.float() - out.float()).abs().max().item()
     denom = ref.float().abs().max().item() + 1e-6
@@ -374,20 +440,22 @@ def test_down_reduce_fp8(case):
 # -------------------------------------------------------------------------
 # Perf sweep -- combined correctness + benchmark (SILOTIGER-667 ?2 standard)
 # -------------------------------------------------------------------------
-# Realistic decode shapes (weights >> last-level cache). name, B, HIDDEN, INTER,
-# E, TOPK, mode.  DeepSeek-V3-ish (H7168/I2048/TOPK8) is the headline case.
+# Realistic decode shapes (weights >> last-level cache). B, HIDDEN, INTER, E,
+# TOPK, mode, scale_block.  DeepSeek-V3-ish (H7168/I2048/TOPK8) is the headline.
 GATE_UP_PERF_SHAPES = [
-    (1, 7168, 2048, 8, 8, "pertensor"),
-    (4, 7168, 2048, 8, 8, "pertensor"),
-    (1, 7168, 2048, 8, 8, "pertoken"),
-    (1, 4096, 1024, 8, 8, "pertensor"),
+    (1, 7168, 2048, 8, 8, "pertensor", None),
+    (4, 7168, 2048, 8, 8, "pertensor", None),
+    (1, 7168, 2048, 8, 8, "pertoken", None),
+    (1, 7168, 2048, 8, 8, "block2d", (128, 128)),
+    (1, 4096, 1024, 8, 8, "pertensor", None),
 ]
-# name, B, INTER, HIDDEN, E, TOPK, mode.
+# B, INTER, HIDDEN, E, TOPK, mode, scale_block.
 DOWN_PERF_SHAPES = [
-    (1, 2048, 7168, 8, 8, "pertensor"),
-    (4, 2048, 7168, 8, 8, "pertensor"),
-    (1, 2048, 7168, 8, 8, "pertoken"),
-    (1, 1024, 4096, 8, 8, "pertensor"),
+    (1, 2048, 7168, 8, 8, "pertensor", None),
+    (4, 2048, 7168, 8, 8, "pertensor", None),
+    (1, 2048, 7168, 8, 8, "pertoken", None),
+    (1, 2048, 7168, 8, 8, "block2d", (128, 128)),
+    (1, 1024, 4096, 8, 8, "pertensor", None),
 ]
 
 
@@ -428,20 +496,32 @@ def _rotate_for(*tensors) -> int:
 
 
 @benchmark()
-def bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, timing, num_iters, num_warmup):
+def bench_gate_up(
+    B, HIDDEN, INTER, E, TOPK, mode, timing, num_iters, num_warmup, scale_block=None
+):
     x, w_gate, w_up, router_ids, wgs, wus = _gen_gate_up(
-        B, HIDDEN, INTER, E, TOPK, mode
+        B, HIDDEN, INTER, E, TOPK, mode, scale_block
     )
     # Faithful to the real call: pre-allocate and pass the output buffer.
     out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
-    ref = _ref_gate_up(x, w_gate, w_up, router_ids, wgs, wus, mode)  # not timed
+    ref = _ref_gate_up(
+        x, w_gate, w_up, router_ids, wgs, wus, mode, scale_block
+    )  # not timed
 
     outputs = B * TOPK * INTER
     flops = 4 * HIDDEN * outputs  # 2 dots (gate+up) x 2 (mul+add) x HIDDEN
     wbytes = 2 * outputs * HIDDEN  # gate+up FP8 rows streamed (1 B each)
 
     fn = lambda: flydsl_warp_decode_gate_up(  # noqa: E731
-        x, w_gate, w_up, router_ids, wgs, wus, w_scale_mode=mode, out=out
+        x,
+        w_gate,
+        w_up,
+        router_ids,
+        wgs,
+        wus,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        out=out,
     )
     got, us = run_perftest(
         fn,
@@ -472,19 +552,30 @@ def bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, timing, num_iters, num_warmup
 
 
 @benchmark()
-def bench_down(B, INTER, HIDDEN, E, TOPK, mode, timing, num_iters, num_warmup):
+def bench_down(
+    B, INTER, HIDDEN, E, TOPK, mode, timing, num_iters, num_warmup, scale_block=None
+):
     inter, w_down, router_ids, router_wts, wds = _gen_down(
-        B, INTER, HIDDEN, E, TOPK, mode
+        B, INTER, HIDDEN, E, TOPK, mode, scale_block
     )
     out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=inter.device)
-    ref = _ref_down(inter, w_down, router_ids, router_wts, wds, mode)  # not timed
+    ref = _ref_down(
+        inter, w_down, router_ids, router_wts, wds, mode, scale_block
+    )  # not timed
 
     outputs = B * HIDDEN
     flops = 2 * INTER * TOPK * outputs  # TOPK dots of length INTER x 2 (mul+add)
     wbytes = outputs * TOPK * INTER  # FP8 down rows streamed (1 B each)
 
     fn = lambda: flydsl_warp_decode_down_reduce(  # noqa: E731
-        inter, w_down, router_ids, router_wts, wds, w_scale_mode=mode, out=out
+        inter,
+        w_down,
+        router_ids,
+        router_wts,
+        wds,
+        w_scale_mode=mode,
+        scale_block=scale_block,
+        out=out,
     )
     got, us = run_perftest(
         fn,
@@ -530,16 +621,16 @@ def _run_perf_sweeps(args) -> None:
     )
 
     gate_rows = [
-        bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, **timing_kw)
-        for (B, HIDDEN, INTER, E, TOPK, mode) in args.gate_up_shapes
+        bench_gate_up(B, HIDDEN, INTER, E, TOPK, mode, scale_block=sb, **timing_kw)
+        for (B, HIDDEN, INTER, E, TOPK, mode, sb) in args.gate_up_shapes
     ]
     aiter.logger.info(
         "warp-decode gate_up perf (%s timing):\n%s", args.timing, _fmt_table(gate_rows)
     )
 
     down_rows = [
-        bench_down(B, INTER, HIDDEN, E, TOPK, mode, **timing_kw)
-        for (B, INTER, HIDDEN, E, TOPK, mode) in args.down_shapes
+        bench_down(B, INTER, HIDDEN, E, TOPK, mode, scale_block=sb, **timing_kw)
+        for (B, INTER, HIDDEN, E, TOPK, mode, sb) in args.down_shapes
     ]
     aiter.logger.info(
         "warp-decode down_reduce perf (%s timing):\n%s",
