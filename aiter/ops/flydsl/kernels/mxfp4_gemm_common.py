@@ -5,7 +5,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith
+from flydsl.expr import arith, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -15,6 +15,7 @@ from . import dpp_utils
 _PTR3 = "!llvm.ptr<3>"
 kStages = 2
 kBS_stride_k0_dw = 64
+LOG2E = 1.4426950408889634
 
 
 def _raw(v):
@@ -92,8 +93,10 @@ def _buffer_rsrc(addr_i64, num_records_bytes):
     )
 
 
-def _lds_swizzle_mask(row):
-    return (row & fx.Int32(14)) << fx.Int32(3)
+def _lds_swizzle_mask(row, row_bytes=128):
+    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns."""
+    assert row_bytes in (64, 128), f"unsupported FP4 LDS row width {row_bytes}"
+    return (row & fx.Int32(2 * (row_bytes // 16) - 2)) << fx.Int32(3)
 
 
 def lds_swizzle_mask_f8(row, row_bytes):
@@ -158,6 +161,69 @@ def _fabs_f32(x):
     return fx.Float32(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(x)], [], []))
 
 
+def _silu_mul_batch(gate_values, up_values):
+    exp_values = [
+        fx.Float32(rocdl.exp2(T.f32, _raw(gate * fx.Float32(-LOG2E))))
+        for gate in gate_values
+    ]
+    sigmoid_values = [
+        fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + exp_value)))
+        for exp_value in exp_values
+    ]
+    return [
+        gate_values[i] * sigmoid_values[i] * up_values[i]
+        for i in range(len(gate_values))
+    ]
+
+
+def _situ_mul_batch(gate_values, up_values, beta, linear_beta):
+    one = fx.Float32(1.0)
+    zero = fx.Float32(0.0)
+    beta_f32 = fx.Float32(float(beta))
+    beta_rcp = fx.Float32(1.0 / float(beta))
+    linear_beta_f32 = fx.Float32(float(linear_beta))
+    linear_beta_rcp = fx.Float32(1.0 / float(linear_beta))
+
+    def tanh_elem(x):
+        abs_x = x.maximumf(-x)
+        e = fx.Float32(rocdl.exp2(T.f32, _raw(abs_x * fx.Float32(-2.0 * LOG2E))))
+        tanh_abs = (one - e) * fx.Float32(rocdl.rcp(T.f32, _raw(one + e)))
+        return (x > zero).select(tanh_abs, -tanh_abs)
+
+    result = []
+    for gate, up in zip(gate_values, up_values):
+        sigmoid = fx.Float32(
+            rocdl.rcp(
+                T.f32,
+                _raw(
+                    one + fx.Float32(rocdl.exp2(T.f32, _raw(gate * fx.Float32(-LOG2E))))
+                ),
+            )
+        )
+        situ_gate = beta_f32 * tanh_elem(gate * beta_rcp) * sigmoid
+        situ_up = linear_beta_f32 * tanh_elem(up * linear_beta_rcp)
+        result.append(situ_gate * situ_up)
+    return result
+
+
+def _activation_mul_batch(
+    gate_values,
+    up_values,
+    *,
+    act,
+    situ_beta,
+    situ_linear_beta,
+):
+    if act == "situv2":
+        return _situ_mul_batch(
+            gate_values,
+            up_values,
+            beta=situ_beta,
+            linear_beta=situ_linear_beta,
+        )
+    return _silu_mul_batch(gate_values, up_values)
+
+
 def _e8m0_roundup(amax_f32):
     wi = fx.Int32(_raw(amax_f32 * fx.Float32(1.0 / 6.0)).bitcast(T.i32))
     bexp = (wi + fx.Int32(0x7FFFFF)).shrui(fx.Int32(23)) & fx.Int32(0xFF)
@@ -197,7 +263,7 @@ def kunroll_for(k, BK):
 
 
 def kas_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return (k + 255) // 256
 
 
 def kbs_c_k1_for(k):

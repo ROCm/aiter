@@ -36,6 +36,7 @@ SHAPES = [
     (385, 7168, 768, 7),  # dsv4 NE=385 TOPK=7 (tp4)
     (385, 7168, 512, 7),  # dsv4 NE=385 TOPK=7 (tp6/tp8)
     (257, 6144, 512, 9),  # GLM-5.2 TP=4 (256 routed + 1 shared -> topk 8+1, H=6144)
+    (896, 3584, 512, 16),  # Kimi-K3 inter=384 maps/pads to 512
 ]
 
 
