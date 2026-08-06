@@ -3,7 +3,8 @@
 Un-split decode launches num_seqs * num_kv_heads workgroups, which under-fills the GPU at
 low batch. Splitting the KV range adds workgroups but costs a second (reduce) kernel and
 partial-buffer traffic, so there is an optimum per shape. This sweeps NUM_SPLITS through
-the gluon wrapper's `num_splits=` override, finds the measured optimum per cell, then
+the raw kernel's NUM_SPLITS constexpr (the wrapper derives it and takes no override),
+finds the measured optimum per cell, then
 reports how close each candidate formula gets.
 
 Timing is attention + reduce, from torch.profiler filtered by kernel name (an L2 flush runs
@@ -56,8 +57,13 @@ def sweep(C, ctx, Hq, Hkv, dname, dt):
         if S > num_tiles:
             break
         try:
-            fn = lambda: glu_ua(q, k, v, out, cu, seqk, 1, ctx, scale, True, (-1, -1), bt,
-                                0, d[0], d[1], d[2], None, num_splits=S)
+            so, sm, se = B.alloc_segm(C, Hq, S) if S > 1 else (None, None, None)
+            fn = lambda: (
+                B.launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
+                                NUM_SPLITS=S, ALL_DECODE=True,
+                                partials=(sm, se, so) if S > 1 else None,
+                                MFMA_DIM=mfma, NUM_BUFFERS=nbuf, descales=d),
+                S > 1 and B.launch_reduce(out, cu, seqk, bt, TILE, S, 2, BQ, (so, sm, se)))
             fn(); torch.cuda.synchronize()
             times[S] = kernel_us(fn)
         except Exception:

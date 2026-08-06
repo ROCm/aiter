@@ -617,12 +617,12 @@ class AsyncGatherKVLoader:
         kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
         k_shared = gl.allocate_shared_memory(
             key_cache_ptr.type.element_ty,
-            [2, cfg.HEAD_SIZE, cfg.TILE_SIZE],
+            [cfg.NUM_BUFFERS, cfg.HEAD_SIZE, cfg.TILE_SIZE],
             layout=kv_cfg.shared_k_layout,
         )
         v_shared = gl.allocate_shared_memory(
             value_cache_ptr.type.element_ty,
-            [2, cfg.TILE_SIZE, cfg.HEAD_SIZE],
+            [cfg.NUM_BUFFERS, cfg.TILE_SIZE, cfg.HEAD_SIZE],
             layout=kv_cfg.shared_v_layout,
         )
         # Head + d-dimension offsets (tile-independent). The N-dim within-block
@@ -764,6 +764,7 @@ class AttentionProgram:
     context_len_q_pos_qk: gl.tensor
     QK_scale: gl.tensor
     out_scale: gl.tensor
+    v_descale: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -780,6 +781,7 @@ class AttentionProgram:
         context_len_q_pos_qk,
         QK_scale,
         out_scale,
+        v_descale,
     ):
         self.cfg = cfg
         self.q = q
@@ -793,6 +795,7 @@ class AttentionProgram:
         self.context_len_q_pos_qk = context_len_q_pos_qk
         self.QK_scale = QK_scale
         self.out_scale = out_scale
+        self.v_descale = v_descale
 
     @gluon.jit
     def initialize(
@@ -878,8 +881,10 @@ class AttentionProgram:
             out_scale = 1.0 / gl.load(out_scale_ptr)
         else:
             out_scale = 1.0
+        v_descale = 1.0
         if v_descale_ptr is not None:
-            out_scale = out_scale * gl.load(v_descale_ptr)
+            v_descale = gl.load(v_descale_ptr)
+            out_scale = out_scale * v_descale
 
         return AttentionProgram(
             cfg,
@@ -894,6 +899,7 @@ class AttentionProgram:
             context_len_q_pos_qk,
             QK_scale,
             out_scale,
+            v_descale,
         )
 
     @gluon.jit
@@ -1079,7 +1085,8 @@ class AttentionProgram:
             + split_idx * cfg.HEAD_SIZE
             + offs_d[None, :]
         )
-        gl.store(partial_acc_ptr + acc_offs, acc, mask=row_mask[:, None])
+        gl.store(partial_acc_ptr + acc_offs, acc * self.v_descale,
+                 mask=row_mask[:, None])
 
         ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
         ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx

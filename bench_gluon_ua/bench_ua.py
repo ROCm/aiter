@@ -30,7 +30,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 from aiter.ops.triton._gluon_kernels.gfx950.attention.unified_attention import (
-    kernel_unified_attention_2d as glu_2d,
+    _unified_attention_gluon_kernel as glu_2d,
 )
 from torch.profiler import profile, ProfilerActivity
 
@@ -141,9 +141,28 @@ def buffer_op_flags(k, out):
             out.nelement() * out.element_size() <= MAX_INT32)
 
 
+import aiter.ops.triton.attention.unified_attention as _UAM
+
+
+def call_triton_only(fn, *a, **kw):
+    """Run fn with the gfx950 gluon path disabled.
+
+    HACK -- unified_attention() now gates to the gluon kernel on gfx950, so calling it
+    as the "triton" baseline would measure gluon on both sides of the comparison.
+    Nulling the symbol the gate reads is the least invasive way to pin it to Triton.
+    Drop this once the wrapper takes an explicit backend argument.
+    """
+    saved = _UAM._unified_attention_gluon_kernel
+    _UAM._unified_attention_gluon_kernel = None
+    try:
+        return fn(*a, **kw)
+    finally:
+        _UAM._unified_attention_gluon_kernel = saved
+
+
 def launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
                   NUM_SPLITS=1, ALL_DECODE=False, partials=None, MFMA_DIM=32, NUM_BUFFERS=2,
-                  descales=(None, None, None)):
+                  descales=(None, None, None), SLIDING_WINDOW=0):
     nt, Hq, D = q.shape; NKV = k.shape[2]; NS = seqk.shape[0]; nqpk = Hq // NKV
     qd, kd, vd = descales
     use_load_buf, use_store_buf = buffer_op_flags(k, out)
@@ -160,7 +179,7 @@ def launch_glu_2d(q, k, v, out, cu, seqk, bt, scale, BM, TILE, nw, wpe,
         query_stride_0=q.stride(0), query_stride_1=q.stride(1),
         output_stride_0=out.stride(0), output_stride_1=out.stride(1),
         k_descale_ptr=kd, v_descale_ptr=vd, q_descale_ptr=qd, out_scale_ptr=None,
-        USE_SINKS=False, SLIDING_WINDOW=0, num_blocks=k.shape[0],
+        USE_SINKS=False, SLIDING_WINDOW=SLIDING_WINDOW, num_blocks=k.shape[0],
         stride_k_cache_0=k.stride(0), stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2), stride_k_cache_3=k.stride(3),
         stride_v_cache_0=v.stride(0), stride_v_cache_1=v.stride(1),
