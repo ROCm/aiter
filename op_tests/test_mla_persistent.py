@@ -622,20 +622,6 @@ def torch_mla_extend_split_kv(
         )
         or (
             get_gfx() == "gfx950"
-            and nheads == 32
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 2
-        )
-        or (
-            get_gfx() == "gfx950"
-            and nheads == 32
-            and is_fp8_q
-            and is_fp8_kvc
-            and max_seqlen_q == 1
-        )
-        or (
-            get_gfx() == "gfx950"
             and nheads == 8
             and is_fp8_q
             and is_fp8_kvc
@@ -653,14 +639,9 @@ def torch_mla_extend_split_kv(
             get_gfx() == "gfx950"
             and is_fp8_q
             and is_fp8_kvc
-            and (
-                (nheads == 32 and max_seqlen_q >= 4)
-                or (nheads == 64)
-                or (nheads == 128)
-            )
+            and ((nheads == 32) or (nheads == 64) or (nheads == 128))
         )
         or (
-            # gfx942 native QH64 fp8/fp8 PS decode
             get_gfx() == "gfx942"
             and nheads == 64
             and is_fp8_q

@@ -1169,6 +1169,12 @@ def get_mla_metadata_info_v1(
         and packed_qo_len >= 64
         and num_head_qo <= 64
         and (packed_qo_len < 128 or num_head_qo == 48)
+    ) or (
+        get_gfx() == "gfx950"
+        and q_dtype == dtypes.fp8
+        and kv_dtype == dtypes.fp8
+        and (num_head_qo == 32)
+        and (effective_seqlen_qo == 3)
     ):
         if num_head_qo * 2 > 64:
             # e.g. nhead=48: C++ does  `return seqlen_qo`  (not ceil)
