@@ -235,8 +235,7 @@ def _build_q_kernel(
                     w0 = w0 + fx.Float32(1.0)
                     w1 = w1 + fx.Float32(1.0)
                 # The production kernel stores RMSNorm output in vec_t<T>
-                # (T=bf16) before applying RoPE. Preserve that rounding point
-                # so values near an FP8 bin boundary follow the same path.
+                # (T=bf16) before applying RoPE, cast to match.
                 xn0 = (x0 * rstd * w0).to(fx.BFloat16).to(fx.Float32)
                 xn1 = (x1 * rstd * w1).to(fx.BFloat16).to(fx.Float32)
                 cos_v, sin_v = mrope_cos_sin(
