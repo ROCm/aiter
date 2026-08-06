@@ -396,7 +396,7 @@ class AScaleLoader:
             fx.Uint8, fx.add_offset(lds_ascale.ptr, fx.make_int_tuple(off))
         )
         v = fx.make_view(ptr, fx.make_layout(1, 1)).load()
-        return Vec(v)[0].to(fx.Int32)
+        return Vec(v, dtype=fx.Uint8)[0].to(fx.Int32)
 
 
 class MfmaScaleGU:

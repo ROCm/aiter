@@ -370,7 +370,6 @@ def compile_mega_moe_stage1(
             pe = expert_of_flat(flat)
             pe_index = payload_parity * fx.Int32(fz_epr) + pe
             mori_shmem.int32_wait_until_equals(addr_payload_ready + fx.Int64(pe_index) * fx.Int64(4), payload_expected)
-            comm_ops.fence_system_acquire()
 
         # Control CTAs join the work pool after dispatch.
         consumer_active = fx.Int32(1) == fx.Int32(1)
@@ -397,6 +396,8 @@ def compile_mega_moe_stage1(
             fx.barrier()
             has_work = Vec(work_scratch_view.load())[0]
             if has_work != fx.Int32(0):
+                if const_expr(not direct_fixed_slot):
+                    comm_ops.fence_system_acquire()
                 _do_scheduled_tile(work)
             consumer_active = has_work != fx.Int32(0)
 
