@@ -29,24 +29,6 @@ from flydsl.expr.typing import T
 _LOG2E = math.log2(math.e)  # 1.4426950408889634
 
 
-def _flat_buffer(ptr, numeric, align):
-    """Flat buffer-resource view over a raw global pointer slot.
-
-    The tensor slots come in through the ``fx.Pointer`` ABI, so the element type
-    is re-established here and the view keeps a trivial 1-element layout: every
-    access in this kernel is a hand-computed element offset (see ``_gtile``),
-    not a layout coordinate. ``align`` is the alignment guaranteed by the widest
-    access on that slot, so the vector copies stay single instructions.
-    """
-    ptr_ty = fx.PointerType.get(
-        numeric.ir_type, address_space=fx.AddressSpace.Global, alignment=align
-    )
-    base = fx.inttoptr(ptr_ty, fx.Int64(fx.ptrtoint(ptr)))
-    return fx.rocdl.make_buffer_tensor(
-        fx.make_view(base, fx.make_layout(1, 1)), max_size=True
-    )
-
-
 def _gtile(buf, elem_off, width):
     """``width``-element tile of ``buf`` at ELEMENT offset ``elem_off``."""
     return fx.make_view(
@@ -174,14 +156,14 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     assert BV % 16 == 0, f"BV must be a multiple of the MFMA N of 16, got BV={BV}"
     NUM_K_BLOCKS = K // 64
 
-    # Tensor slots use the ``fx.Pointer`` ABI (raw data pointer). The kernel
-    # body wraps every slot as a flat ``_flat_buffer`` view and never reads
-    # the FlyDSL-injected memref shape/stride, so passing a bare pointer
-    # produces identical device code while skipping the per-launch DLPack
-    # export + layout-buffer packing that the default layout-dynamic
-    # ``fx.Tensor`` memref incurs under flydsl >=0.2.0. The host side wraps
-    # each tensor with ``flyc.from_c_void_p`` (see ``_as_ptr`` in the host
-    # wrapper module), which requires flydsl >=0.2.0.
+    # Tensor slots use the ``fx.Tensor`` ABI, so each slot arrives as a memref
+    # carrying its element type and the kernel body turns it into a buffer
+    # resource with a single ``make_buffer_tensor``. The shape/stride of that
+    # memref is never read: every access is a hand-computed element offset off
+    # the base iterator (see ``_gtile``), because the varlen offsets are runtime
+    # scalars that no layout coordinate can express. Element types therefore
+    # come from the host tensors -- the placeholder tensors the host passes for
+    # unused slots must match the dtype the body assumes for that slot.
 
     _fast_exp = _make_fast_exp(G_IS_LOG2_SCALED)
     # fp32->bf16 output converter selected by the compile option (arch-aware).
@@ -265,18 +247,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
 
     @flyc.kernel(name="chunk_gdn_fwd_h_flydsl_mfma16_hip")
     def gdn_h_kernel(
-        k_tensor: fx.Pointer,
-        v_tensor: fx.Pointer,
-        w_tensor: fx.Pointer,
-        v_new_tensor: fx.Pointer,
-        g_tensor: fx.Pointer,
-        gk_tensor: fx.Pointer,
-        h_tensor: fx.Pointer,
-        h0_tensor: fx.Pointer,
-        ht_tensor: fx.Pointer,
-        cu_seqlens_tensor: fx.Pointer,
-        chunk_offsets_tensor: fx.Pointer,
-        state_indices_tensor: fx.Pointer,
+        k_tensor: fx.Tensor,
+        v_tensor: fx.Tensor,
+        w_tensor: fx.Tensor,
+        v_new_tensor: fx.Tensor,
+        g_tensor: fx.Tensor,
+        gk_tensor: fx.Tensor,
+        h_tensor: fx.Tensor,
+        h0_tensor: fx.Tensor,
+        ht_tensor: fx.Tensor,
+        cu_seqlens_tensor: fx.Tensor,
+        chunk_offsets_tensor: fx.Tensor,
+        state_indices_tensor: fx.Tensor,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         # Unused by the kernel body: N is already encoded in the grid.y extent.
@@ -302,7 +284,7 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         cp_bf16x8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
 
         if const_expr(USE_STATE_INDICES):
-            si_ = _flat_buffer(state_indices_tensor, fx.Int32, 4)
+            si_ = fx.rocdl.make_buffer_tensor(state_indices_tensor, max_size=True)
             state_n = _gload(cp_i32, si_, fx.Int64(i_n), 1, fx.Int32)
         else:
             state_n = i_n
@@ -312,38 +294,37 @@ def compile_chunk_gated_delta_h_mfma16_hip(
         wid = tid // WARP_SIZE
         lane = tid % WARP_SIZE
 
-        # Flat 1-D buffer views with hand-computed i64 element offsets rather
-        # than a shaped view + layout coordinates: every access here is a
+        # Buffer resources over the raw slots, addressed by hand-computed i64
+        # element offsets rather than layout coordinates: every access here is a
         # runtime scalar offset that is already clamped (safe_row / in_bounds
         # selects), so there is no tile structure for the layout algebra to
-        # exploit. ``align`` is the widest access on that slot -- 16 B for the
-        # 8-element cooperative loads, element size for the scalar ones.
-        k_ = _flat_buffer(k_tensor, fx.BFloat16, 16)
-        v_ = _flat_buffer(v_tensor, fx.BFloat16, 2)
-        w_ = _flat_buffer(w_tensor, fx.BFloat16, 16)
-        h_ = _flat_buffer(h_tensor, fx.BFloat16, 16)
-        g_ = _flat_buffer(g_tensor, fx.Float32, 4)
+        # exploit. ``max_size`` leaves the descriptor unbounded, matching those
+        # in-kernel clamps.
+        k_ = fx.rocdl.make_buffer_tensor(k_tensor, max_size=True)
+        v_ = fx.rocdl.make_buffer_tensor(v_tensor, max_size=True)
+        w_ = fx.rocdl.make_buffer_tensor(w_tensor, max_size=True)
+        h_ = fx.rocdl.make_buffer_tensor(h_tensor, max_size=True)
+        g_ = fx.rocdl.make_buffer_tensor(g_tensor, max_size=True)
         if const_expr(USE_GK):
-            gk_ = _flat_buffer(gk_tensor, fx.Float32, 4)
+            gk_ = fx.rocdl.make_buffer_tensor(gk_tensor, max_size=True)
 
-        vn_ = _flat_buffer(v_new_tensor, fx.BFloat16, 2)
-        # SSM-state dtype is selected by the compile-time flag. The h0/ht
-        # accesses are 4 contiguous K, so the state buffers are 16 B aligned in
-        # f32 and 8 B in bf16, and the copy atom is sized to match.
+        vn_ = fx.rocdl.make_buffer_tensor(v_new_tensor, max_size=True)
+        # SSM-state dtype is selected by the compile-time flag; the h0/ht slots
+        # carry it as their memref element type. The accesses are 4 contiguous
+        # K, so the copy atom is sized to match (b64 in bf16, b128 in f32).
         state_num = fx.BFloat16 if STATE_DTYPE_BF16 else fx.Float32
-        state_bytes = 2 if STATE_DTYPE_BF16 else 4
         cp_state_x4 = fx.make_copy_atom(
             fx.rocdl.BufferCopy64b() if STATE_DTYPE_BF16 else fx.rocdl.BufferCopy128b(),
             state_num,
         )
         if const_expr(USE_INITIAL_STATE):
-            h0_ = _flat_buffer(h0_tensor, state_num, 4 * state_bytes)
+            h0_ = fx.rocdl.make_buffer_tensor(h0_tensor, max_size=True)
         if const_expr(STORE_FINAL_STATE):
-            ht_ = _flat_buffer(ht_tensor, state_num, 4 * state_bytes)
+            ht_ = fx.rocdl.make_buffer_tensor(ht_tensor, max_size=True)
 
         if const_expr(IS_VARLEN):
-            cu_ = _flat_buffer(cu_seqlens_tensor, fx.Int32, 4)
-            co_ = _flat_buffer(chunk_offsets_tensor, fx.Int32, 4)
+            cu_ = fx.rocdl.make_buffer_tensor(cu_seqlens_tensor, max_size=True)
+            co_ = fx.rocdl.make_buffer_tensor(chunk_offsets_tensor, max_size=True)
 
         # -- LDS --
         # Each MMA operand panel is a layout view in the shape the tiled MMA
@@ -1108,18 +1089,18 @@ def compile_chunk_gated_delta_h_mfma16_hip(
     # -- Host launcher ------------------------------------------------------
     @flyc.jit
     def launch_gdn_h(
-        k_tensor: fx.Pointer,
-        v_tensor: fx.Pointer,
-        w_tensor: fx.Pointer,
-        v_new_tensor: fx.Pointer,
-        g_tensor: fx.Pointer,
-        gk_tensor: fx.Pointer,
-        h_tensor: fx.Pointer,
-        h0_tensor: fx.Pointer,
-        ht_tensor: fx.Pointer,
-        cu_seqlens_tensor: fx.Pointer,
-        chunk_offsets_tensor: fx.Pointer,
-        state_indices_tensor: fx.Pointer,
+        k_tensor: fx.Tensor,
+        v_tensor: fx.Tensor,
+        w_tensor: fx.Tensor,
+        v_new_tensor: fx.Tensor,
+        g_tensor: fx.Tensor,
+        gk_tensor: fx.Tensor,
+        h_tensor: fx.Tensor,
+        h0_tensor: fx.Tensor,
+        ht_tensor: fx.Tensor,
+        cu_seqlens_tensor: fx.Tensor,
+        chunk_offsets_tensor: fx.Tensor,
+        state_indices_tensor: fx.Tensor,
         T_val: fx.Int32,
         T_flat: fx.Int32,
         N_val: fx.Int32,

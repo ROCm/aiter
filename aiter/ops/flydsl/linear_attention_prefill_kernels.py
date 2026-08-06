@@ -22,15 +22,12 @@ import functools
 import math
 import os
 
-# NOTE (mfma16_hip fork): ``flydsl.compiler`` / ``flydsl.expr`` /
-# ``get_rocm_arch`` are imported here for the additive HIP-aligned fork below.
-# They are side-effect-free (``flydsl`` is already a hard dependency of the
-# baseline ``compile_chunk_gated_delta_h``) and do NOT raise on flydsl <0.2.0 --
-# the mfma16_hip-only ``>=0.2.0`` requirement (fx.Pointer ABI) is enforced
+# NOTE (mfma16_hip fork): ``get_rocm_arch`` is imported here for the additive
+# HIP-aligned fork below. It is side-effect-free (``flydsl`` is already a hard
+# dependency of the baseline ``compile_chunk_gated_delta_h``) and does NOT raise
+# on flydsl <0.2.0 -- the mfma16_hip-only ``>=0.2.0`` requirement is enforced
 # lazily in ``_get_or_compile_mfma16_hip`` so the baseline path keeps its
 # original ``>=0.1.8`` compatibility.
-import flydsl.compiler as flyc
-import flydsl.expr as fx
 import torch
 import triton
 from flydsl.runtime.device import get_rocm_arch
@@ -647,16 +644,17 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 #
 # Everything below is self-contained and does NOT touch the baseline wrapper
 # above: it has its own compiled-kernel cache, BV selection (reusing the hip
-# K5 selector), pointer-ABI launch, and public entry point
+# K5 selector), launch path, and public entry point
 # ``chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip``. The baseline path keeps
-# its original behaviour / flydsl>=0.1.8 compatibility; the mfma16_hip fork's
-# fx.Pointer ABI requires flydsl>=0.2.0, enforced lazily below.
+# its original behaviour / flydsl>=0.1.8 compatibility; the mfma16_hip fork
+# requires flydsl>=0.2.0, enforced lazily below.
 # ==========================================================================
 
-# mfma16_hip fork requires the fx.Pointer argument ABI (flyc.from_c_void_p +
-# PointerAdaptor fast dispatch), which only exists from flydsl 0.2.0. Enforced
-# lazily (in ``_get_or_compile_mfma16_hip``) so importing this module and using
-# the baseline wrapper keeps working on flydsl>=0.1.8.
+# mfma16_hip fork is written against the fx layout / tiled-copy / tiled-MMA API
+# surface (``make_buffer_tensor``, ``fx.copy``, ``fx.gemm``) that only exists
+# from flydsl 0.2.0. Enforced lazily (in ``_get_or_compile_mfma16_hip``) so
+# importing this module and using the baseline wrapper keeps working on
+# flydsl>=0.1.8.
 _MFMA16_HIP_MIN_FLYDSL_VERSION = "0.2.0"
 
 # gfx942 gate: only the mfma16_hip fork toggles the gfx942 GEMM1 ds-scheduling
@@ -666,16 +664,6 @@ _IS_GFX942 = get_rocm_arch().split(":")[0].startswith("gfx942")
 
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
-
-
-def _as_ptr(t: torch.Tensor):
-    """Wrap a torch tensor as a flydsl ``Pointer`` argument (raw data ptr).
-
-    Uses ``fx.Uint8`` element type: the mfma16_hip kernel re-types every slot
-    inside the body via its ``_flat_buffer`` view, so the host-side element
-    type is irrelevant to codegen and only needs to be a valid 1-byte unit.
-    """
-    return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
 
 def _as_int32(t: torch.Tensor) -> torch.Tensor:
@@ -815,8 +803,8 @@ def _get_or_compile_mfma16_hip(
     if installed < Version(_MFMA16_HIP_MIN_FLYDSL_VERSION):
         raise ImportError(
             "FlyDSL K5 mfma16_hip fork requires `flydsl` "
-            f">=`{_MFMA16_HIP_MIN_FLYDSL_VERSION}` (for the fx.Pointer argument "
-            f"ABI), but got `{getattr(flydsl, '__version__', 'unknown')}`."
+            f">=`{_MFMA16_HIP_MIN_FLYDSL_VERSION}` (for the fx layout / "
+            f"tiled-copy API), but got `{getattr(flydsl, '__version__', 'unknown')}`."
         )
 
     from .kernels.chunk_gated_delta_h_mfma16x16x16 import (
@@ -1260,31 +1248,29 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     else:
         final_state = k.new_empty(fs_shape, dtype=fs_dtype)
 
-    # The 11 tensor slots, wrapped as raw fx.Pointer args. Keep the torch
-    # tensors referenced as locals so the storage stays alive across the
-    # (synchronous) launch -- ``from_c_void_p`` only captures the data pointer.
-    tensor_args = tuple(
-        _as_ptr(t)
-        for t in (
-            k,
-            u,
-            w,
-            v_new_buf,
-            g if g is not None else dummy,
-            gk if gk is not None else dummy,
-            h,
-            initial_state if initial_state is not None else dummy,
-            final_state if final_state is not None else dummy,
-            cu_arg,
-            co_arg,
-        )
+    # The 11 tensor slots, passed as fx.Tensor args. The kernel body only reads
+    # each slot's base pointer and element type, so the placeholder ``dummy``
+    # stands in for the slots this configuration disables -- its float32 dtype
+    # matches the only such slot the body still views unconditionally (g).
+    tensor_args = (
+        k,
+        u,
+        w,
+        v_new_buf,
+        g if g is not None else dummy,
+        gk if gk is not None else dummy,
+        h,
+        initial_state if initial_state is not None else dummy,
+        final_state if final_state is not None else dummy,
+        cu_arg,
+        co_arg,
     )
 
     # The mfma16_hip kernel carries an extra ``state_indices`` slot (12th tensor
     # arg): a real int32 [N] index array when indexed, else a 1-elem int32 dummy.
     if not use_state_indices:
         si_i32 = dummy.to(torch.int32)
-    tensor_args = tensor_args + (_as_ptr(si_i32),)
+    tensor_args = tensor_args + (si_i32,)
 
     _run_compiled(
         launch_fn,
