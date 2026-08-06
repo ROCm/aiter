@@ -15,7 +15,7 @@
 #   - Configurable 6-stage wave64 DPP or bpermute reduction (no LDS)
 #   - Lane 63 converts FP32 to BF16 with configurable compile-time rounding
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
 
@@ -73,6 +73,7 @@ class GemmDecodeConfig:
     kvec: int = 8
     n_per_wave: int = 2
     m_per_wave: int = 4
+    prefetch_depth: int = 0
     waves_per_eu: int = 2
     b_cache_modifier: int = CACHE_POLICY_DEFAULT
     reduction: ReductionMode = ReductionMode.DPP
@@ -84,8 +85,10 @@ class GemmDecodeConfig:
             raise ValueError("kvec must be one of 2, 4, or 8")
         if self.n_per_wave not in (1, 2, 4):
             raise ValueError("n_per_wave must be one of 1, 2, or 4")
-        if self.m_per_wave not in (1, 2, 4):
-            raise ValueError("m_per_wave must be one of 1, 2, or 4")
+        if self.m_per_wave not in (1, 2, 3, 4):
+            raise ValueError("m_per_wave must be one of 1, 2, 3, or 4")
+        if self.prefetch_depth not in (0, 1, 2, 4):
+            raise ValueError("prefetch_depth must be one of 0, 1, 2, or 4")
         if self.waves_per_eu <= 0:
             raise ValueError("waves_per_eu must be positive")
         validate_cache_policy(self.b_cache_modifier)
@@ -279,6 +282,20 @@ def _load_kvec(rsrc, base_elem, kvec, cache_modifier=0):
     )
 
 
+def _const_index(value: int) -> ir.Value:
+    """Create an index constant for an explicit SCF loop."""
+    index_type = ir.IndexType.get()
+    return _arith_dialect.ConstantOp(
+        index_type,
+        ir.IntegerAttr.get(index_type, value),
+    ).result
+
+
+def _index_to_i32(value: ir.Value) -> ir.Value:
+    """Cast an SCF induction variable to the kernel's i32 arithmetic type."""
+    return _arith_dialect.IndexCastOp(T.i32, value).result
+
+
 def _load_tail_pair(
     rsrc,
     row,
@@ -348,6 +365,7 @@ def _make_kernel(config: GemmDecodeConfig):
     kvec = config.kvec
     np = config.n_per_wave
     mp = config.m_per_wave
+    prefetch_depth = config.prefetch_depth
     cache_modifier = config.b_cache_modifier
     reduction = config.reduction
     rounding = config.output_rounding
@@ -386,6 +404,27 @@ def _make_kernel(config: GemmDecodeConfig):
             return packed_fma_bf16x2(acc, a_pair, b_pair)
         return scalar_fma_bf16x2(acc, a_pair, b_pair)
 
+    def _accumulate_loaded_kvecs(accs, avs, bvs, mp, np, npairs):
+        """Accumulate one loaded K tile with the selected contraction."""
+        for pair in range_constexpr(npairs):
+            ap = [
+                prepare_pair(pack_bf16x2(av[2 * pair], av[2 * pair + 1]))
+                for av in avs
+            ]
+            bp = [
+                prepare_pair(pack_bf16x2(bv[2 * pair], bv[2 * pair + 1]))
+                for bv in bvs
+            ]
+            for row in range_constexpr(mp):
+                for col in range_constexpr(np):
+                    idx = row * np + col
+                    accs[idx] = contract_pair(
+                        accs[idx],
+                        ap[row],
+                        bp[col],
+                    )
+        return accs
+
     @flyc.kernel
     def kernel(
         A: fx.Tensor,
@@ -415,38 +454,105 @@ def _make_kernel(config: GemmDecodeConfig):
         ]
         k_tile = 64 * kvec
         npairs = kvec // 2
-        for i in range_constexpr(K // k_tile):
-            k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(kvec)
-            avs = [
-                _load_kvec(rsrc_a, row * fx.Int32(K) + k_elem, kvec)
-                for row in m_rows
-            ]
-            bvs = [
-                _load_kvec(
-                    rsrc_b,
-                    col * fx.Int32(K) + k_elem,
-                    kvec,
-                    cache_modifier,
+        full_k_tiles = K // k_tile
+        if prefetch_depth == 0:
+            for i in range_constexpr(full_k_tiles):
+                k_elem = fx.Int32(i * k_tile) + lane * fx.Int32(kvec)
+                avs = [
+                    _load_kvec(rsrc_a, row * fx.Int32(K) + k_elem, kvec)
+                    for row in m_rows
+                ]
+                bvs = [
+                    _load_kvec(
+                        rsrc_b,
+                        col * fx.Int32(K) + k_elem,
+                        kvec,
+                        cache_modifier,
+                    )
+                    for col in n_load
+                ]
+                accs = _accumulate_loaded_kvecs(
+                    accs,
+                    avs,
+                    bvs,
+                    mp,
+                    np,
+                    npairs,
                 )
-                for col in n_load
-            ]
-            for pair in range_constexpr(npairs):
-                ap = [
-                    prepare_pair(pack_bf16x2(av[2 * pair], av[2 * pair + 1]))
-                    for av in avs
+        else:
+            full_prefetch_batches = full_k_tiles // prefetch_depth
+            prefetch_remainder = full_k_tiles % prefetch_depth
+            prefetch_loop = _scf.ForOp(
+                _const_index(0),
+                _const_index(full_prefetch_batches),
+                _const_index(1),
+                accs,
+            )
+            with ir.InsertionPoint(prefetch_loop.body):
+                batch = _index_to_i32(prefetch_loop.induction_variable)
+                current_accs = list(prefetch_loop.inner_iter_args)
+                prefetched_a = []
+                prefetched_b = []
+                for stage in range_constexpr(prefetch_depth):
+                    tile = batch * fx.Int32(prefetch_depth) + fx.Int32(stage)
+                    k_elem = tile * fx.Int32(k_tile) + lane * fx.Int32(kvec)
+                    prefetched_a.append(
+                        [
+                            _load_kvec(
+                                rsrc_a,
+                                row * fx.Int32(K) + k_elem,
+                                kvec,
+                            )
+                            for row in m_rows
+                        ]
+                    )
+                    prefetched_b.append(
+                        [
+                            _load_kvec(
+                                rsrc_b,
+                                col * fx.Int32(K) + k_elem,
+                                kvec,
+                                cache_modifier,
+                            )
+                            for col in n_load
+                        ]
+                    )
+                for stage in range_constexpr(prefetch_depth):
+                    current_accs = _accumulate_loaded_kvecs(
+                        current_accs,
+                        prefetched_a[stage],
+                        prefetched_b[stage],
+                        mp,
+                        np,
+                        npairs,
+                    )
+                _scf.YieldOp([_to_ir(acc) for acc in current_accs])
+            accs = list(prefetch_loop.results)
+
+            for stage in range_constexpr(prefetch_remainder):
+                tile = full_prefetch_batches * prefetch_depth + stage
+                k_elem = fx.Int32(tile * k_tile) + lane * fx.Int32(kvec)
+                avs = [
+                    _load_kvec(rsrc_a, row * fx.Int32(K) + k_elem, kvec)
+                    for row in m_rows
                 ]
-                bp = [
-                    prepare_pair(pack_bf16x2(bv[2 * pair], bv[2 * pair + 1]))
-                    for bv in bvs
+                bvs = [
+                    _load_kvec(
+                        rsrc_b,
+                        col * fx.Int32(K) + k_elem,
+                        kvec,
+                        cache_modifier,
+                    )
+                    for col in n_load
                 ]
-                for row in range_constexpr(mp):
-                    for col in range_constexpr(np):
-                        idx = row * np + col
-                        accs[idx] = contract_pair(
-                            accs[idx],
-                            ap[row],
-                            bp[col],
-                        )
+                accs = _accumulate_loaded_kvecs(
+                    accs,
+                    avs,
+                    bvs,
+                    mp,
+                    np,
+                    npairs,
+                )
 
         if K % k_tile != 0:
             tail_start = (K // k_tile) * k_tile
@@ -624,6 +730,7 @@ def _launch_gemm_decode_bf16(
     kvec: fx.Constexpr[int],
     mp: fx.Constexpr[int],
     np: fx.Constexpr[int],
+    prefetch_depth: fx.Constexpr[int],
     waves_per_eu: fx.Constexpr[int],
     cache_modifier: fx.Constexpr[int],
     reduction_code: fx.Constexpr[int],
@@ -658,6 +765,7 @@ def _launch_gemm_decode_bf16(
         kvec=kvec,
         n_per_wave=np,
         m_per_wave=mp,
+        prefetch_depth=prefetch_depth,
         waves_per_eu=waves_per_eu,
         b_cache_modifier=cache_modifier,
         reduction=reduction,
@@ -724,6 +832,7 @@ def gemm_decode_bf16_configured(
         config.kvec,
         config.m_per_wave,
         config.n_per_wave,
+        config.prefetch_depth,
         config.waves_per_eu,
         config.b_cache_modifier,
         reduction_code,
@@ -868,19 +977,15 @@ def select_gemm_decode_config(M: int, N: int, K: int) -> GemmDecodeConfig:
     elif M == 4:
         config = _M4_LOW_K_CONFIG if K <= 1536 else _M4_HIGH_K_CONFIG
     else:
-        mp = 2 if M == 2 else 1
         config = GemmDecodeConfig(
             kvec=2 if K <= 1536 else 8,
             n_per_wave=4 if K <= 1536 else 2,
-            m_per_wave=mp,
+            m_per_wave=M,
+            prefetch_depth=2 if M == 3 and (N, K) == (16384, 7168) else 0,
         )
     np = config.n_per_wave
     if N % np != 0:
-        return GemmDecodeConfig(
-            kvec=config.kvec,
-            n_per_wave=1,
-            m_per_wave=config.m_per_wave,
-        )
+        return replace(config, n_per_wave=1)
     return config
 
 

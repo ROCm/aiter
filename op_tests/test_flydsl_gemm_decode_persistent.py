@@ -91,10 +91,127 @@ def test_persistent_bf16_decode_is_deterministic():
             assert torch.equal(c, first)
 
 
+def test_persistent_runtime_loop_handles_multiple_turns():
+    m, n, k = 4, 65, 257
+    a, b, c, reference = _make_tensors(m, n, k)
+    config = PersistentDecodeConfig(
+        waves_per_workgroup=4,
+        columns_per_wave=1,
+    )
+    launcher = compile_gemm_decode_persistent_bf16(
+        m,
+        n,
+        k,
+        1,
+        config,
+    )
+    assert launcher.persistent_turns > 1
+    launcher(a, b, c)
+    torch.cuda.synchronize()
+    _assert_correct(c, reference)
+    assert launcher._last_compiled[1].source_ir.count("scf.while") >= 2
+
+
 def test_persistent_config_rejects_unsafe_lds_residency():
     config = PersistentDecodeConfig(workgroups_per_cu=4)
     with pytest.raises(ValueError, match="LDS capacity"):
         config.validate(m=4, k=7168)
+
+
+def test_persistent_config_selects_wide_loads_for_high_k_multirow():
+    m1_config = select_persistent_decode_config(1, 16384, 7168)
+    m3_config = select_persistent_decode_config(3, 16384, 7168)
+    large_m4_config = select_persistent_decode_config(4, 36864, 7168)
+    low_k_config = select_persistent_decode_config(3, 7168, 896)
+    assert m1_config.b_load_width == 4
+    assert m1_config.prefetch_stages == 1
+    assert m3_config.b_load_width == 8
+    assert m3_config.prefetch_stages == 2
+    assert m3_config.waves_per_eu == 2
+    assert large_m4_config.waves_per_workgroup == 8
+    assert large_m4_config.b_cache_modifier == 2
+    assert low_k_config.b_load_width == 4
+    assert low_k_config.prefetch_stages == 1
+
+
+def test_persistent_config_rejects_unsupported_b_load_width():
+    config = PersistentDecodeConfig(b_load_width=16)
+    with pytest.raises(ValueError, match="b_load_width"):
+        config.validate(m=1, k=128)
+
+
+def test_persistent_config_rejects_unsupported_prefetch_stages():
+    config = PersistentDecodeConfig(prefetch_stages=3)
+    with pytest.raises(ValueError, match="prefetch_stages"):
+        config.validate(m=1, k=128)
+
+
+def test_persistent_config_rejects_prefetch_register_spill():
+    config = PersistentDecodeConfig(
+        columns_per_wave=4,
+        prefetch_stages=2,
+    )
+    with pytest.raises(ValueError, match="register budget"):
+        config.validate(m=4, k=7168)
+
+
+def test_persistent_config_rejects_architecture_specific_noops():
+    with pytest.raises(ValueError, match="gfx950-only"):
+        PersistentDecodeConfig(b_load_width=8).validate(
+            m=1,
+            k=7168,
+            gpu_arch="gfx942",
+        )
+    with pytest.raises(ValueError, match="gfx942-only"):
+        PersistentDecodeConfig(preload_b_tile=True).validate(
+            m=1,
+            k=7168,
+            gpu_arch="gfx950",
+        )
+
+
+def test_persistent_wide_b_loads():
+    m, n, k = 3, 65, 769
+    a, b, c, reference = _make_tensors(m, n, k)
+    num_cus = torch.cuda.get_device_properties(0).multi_processor_count
+    config = PersistentDecodeConfig(
+        waves_per_workgroup=4,
+        columns_per_wave=2,
+        b_load_width=8,
+    )
+    launcher = compile_gemm_decode_persistent_bf16(
+        m,
+        n,
+        k,
+        num_cus,
+        config,
+    )
+    launcher(a, b, c)
+    torch.cuda.synchronize()
+    _assert_correct(c, reference)
+    assert "vector<8xbf16>" in launcher._last_compiled[1].source_ir
+
+
+def test_persistent_two_stage_b_prefetch():
+    m, n, k = 3, 65, 1025
+    a, b, c, reference = _make_tensors(m, n, k)
+    num_cus = torch.cuda.get_device_properties(0).multi_processor_count
+    config = PersistentDecodeConfig(
+        waves_per_workgroup=4,
+        columns_per_wave=2,
+        b_load_width=8,
+        prefetch_stages=2,
+    )
+    launcher = compile_gemm_decode_persistent_bf16(
+        m,
+        n,
+        k,
+        num_cus,
+        config,
+    )
+    launcher(a, b, c)
+    torch.cuda.synchronize()
+    _assert_correct(c, reference)
 
 
 def test_persistent_wrapper_validates_tensor_contract():
@@ -364,13 +481,24 @@ def _benchmark(args):
                         else args.b_cache_modifier
                     ),
                     preload_b_tile=args.preload_b_tile,
+                    b_load_width=(
+                        4 if args.b_load_width is None else args.b_load_width
+                    ),
+                    prefetch_stages=(
+                        1 if args.prefetch_stages is None else args.prefetch_stages
+                    ),
                 )
             )
-            if args.auto_config and args.b_cache_modifier is not None:
-                config = replace(
-                    config,
-                    b_cache_modifier=args.b_cache_modifier,
-                )
+            if args.auto_config:
+                overrides = {}
+                if args.b_cache_modifier is not None:
+                    overrides["b_cache_modifier"] = args.b_cache_modifier
+                if args.b_load_width is not None:
+                    overrides["b_load_width"] = args.b_load_width
+                if args.prefetch_stages is not None:
+                    overrides["prefetch_stages"] = args.prefetch_stages
+                if overrides:
+                    config = replace(config, **overrides)
             a, b, c, reference = _make_tensors(m, n, k)
             for provider in args.providers:
                 c.fill_(torch.nan)
@@ -449,6 +577,8 @@ def main():
         type=lambda value: int(value, 0),
         default=None,
     )
+    parser.add_argument("--b-load-width", type=int, choices=(4, 8), default=None)
+    parser.add_argument("--prefetch-stages", type=int, choices=(1, 2), default=None)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--graph", action="store_true")

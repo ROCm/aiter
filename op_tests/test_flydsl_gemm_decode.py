@@ -153,6 +153,13 @@ def test_gemm_decode_validates_tensor_contract(monkeypatch):
     [
         GemmDecodeConfig(kvec=2, m_per_wave=1, n_per_wave=1),
         GemmDecodeConfig(kvec=4, m_per_wave=2, n_per_wave=2),
+        GemmDecodeConfig(kvec=8, m_per_wave=3, n_per_wave=2),
+        GemmDecodeConfig(
+            kvec=8,
+            m_per_wave=3,
+            n_per_wave=2,
+            prefetch_depth=2,
+        ),
         GemmDecodeConfig(kvec=8, m_per_wave=4, n_per_wave=4),
         GemmDecodeConfig(
             kvec=8,
@@ -171,7 +178,7 @@ def test_gemm_decode_validates_tensor_contract(monkeypatch):
     ],
 )
 def test_gemm_decode_compile_time_axes(config):
-    M, N, K = 4, 64, 128
+    M, N, K = config.m_per_wave, 64, 128
     torch.manual_seed(1)
     A = torch.randn(M, K, dtype=torch.bfloat16, device="cuda")
     B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda")
@@ -231,6 +238,17 @@ def test_gemm_decode_config_selection():
         m_per_wave=4,
         n_per_wave=4,
         reduction=ReductionMode.BPERMUTE_REFERENCE,
+    )
+    assert select_gemm_decode_config(3, 16384, 7168) == GemmDecodeConfig(
+        kvec=8,
+        m_per_wave=3,
+        n_per_wave=2,
+        prefetch_depth=2,
+    )
+    assert select_gemm_decode_config(3, 65, 128) == GemmDecodeConfig(
+        kvec=2,
+        m_per_wave=3,
+        n_per_wave=1,
     )
     assert select_gemm_decode_config(4, 65, 128).n_per_wave == 1
 
