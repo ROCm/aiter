@@ -28,7 +28,9 @@ from aiter.ops.flydsl.kernels.warp_decode_moe import (
 
 
 @functools.lru_cache(maxsize=64)
-def _get_gate_up(hidden, inter, top_k, kvector, w_scale_mode, serialize_dot2):
+def _get_gate_up(
+    hidden, inter, top_k, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+):
     return build_gate_up_fp8_module(
         hidden,
         inter,
@@ -36,11 +38,15 @@ def _get_gate_up(hidden, inter, top_k, kvector, w_scale_mode, serialize_dot2):
         kvector=kvector,
         w_scale_mode=w_scale_mode,
         serialize_dot2=serialize_dot2,
+        scale_bn=scale_bn,
+        scale_bk=scale_bk,
     )
 
 
 @functools.lru_cache(maxsize=64)
-def _get_down_reduce(inter, hidden, top_k, kvector, w_scale_mode, serialize_dot2):
+def _get_down_reduce(
+    inter, hidden, top_k, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+):
     return build_down_reduce_fp8_module(
         inter,
         hidden,
@@ -48,6 +54,8 @@ def _get_down_reduce(inter, hidden, top_k, kvector, w_scale_mode, serialize_dot2
         kvector=kvector,
         w_scale_mode=w_scale_mode,
         serialize_dot2=serialize_dot2,
+        scale_bn=scale_bn,
+        scale_bk=scale_bk,
     )
 
 
@@ -70,6 +78,7 @@ def flydsl_warp_decode_gate_up(
     w_up_scale: torch.Tensor,
     *,
     w_scale_mode: str = "pertensor",
+    scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -87,14 +96,17 @@ def flydsl_warp_decode_gate_up(
         w_gate/w_up:  [E, INTER, HIDDEN] float8_e4m3fn (row = e*INTER + j).
         router_ids:   [B, TOPK] int32.
         w_gate_scale/w_up_scale: float32 weight scales.  ``pertensor`` -> shape
-            [1]; ``pertoken`` -> shape [E*INTER] (one per weight row).
-        w_scale_mode: "pertensor" or "pertoken".
+            [1]; ``pertoken`` -> shape [E*INTER] (one per weight row);
+            ``block2d`` -> shape [(E*INTER)//BN * HIDDEN//BK] row-major over
+            (row-block, K-block) with (BN, BK) = ``scale_block``.
+        w_scale_mode: "pertensor", "pertoken" or "block2d".
+        scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
         out:          optional [B, TOPK, INTER] bfloat16 output buffer.
 
     Returns:
         [B, TOPK, INTER] bfloat16 intermediate.
     """
-    if w_scale_mode not in ("pertensor", "pertoken"):
+    if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert x.dtype == torch.bfloat16, "activation must be bfloat16 for this path"
     assert x.is_contiguous() and w_gate.is_contiguous() and w_up.is_contiguous()
@@ -105,11 +117,21 @@ def flydsl_warp_decode_gate_up(
     assert w_up.shape == w_gate.shape, "w_gate and w_up must share shape"
     TOPK = router_ids.shape[1]
 
+    scale_bn = scale_bk = None
+    if w_scale_mode == "block2d":
+        if scale_block is None:
+            raise ValueError("block2d requires scale_block=(BN, BK)")
+        scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
+        assert (E * INTER) % scale_bn == 0, "(E*INTER) must be divisible by BN"
+        assert HIDDEN % scale_bk == 0, "HIDDEN must be divisible by BK"
+
     kvector = pick_kvector(HIDDEN)
     if out is None:
         out = torch.empty((B, TOPK, INTER), dtype=torch.bfloat16, device=x.device)
 
-    launcher = _get_gate_up(HIDDEN, INTER, TOPK, kvector, w_scale_mode, serialize_dot2)
+    launcher = _get_gate_up(
+        HIDDEN, INTER, TOPK, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+    )
     grid_x = B * TOPK * INTER
     _run(
         launcher,
@@ -136,6 +158,7 @@ def flydsl_warp_decode_down_reduce(
     w_down_scale: torch.Tensor,
     *,
     w_scale_mode: str = "pertensor",
+    scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -145,8 +168,8 @@ def flydsl_warp_decode_down_reduce(
 
         y[b,out_j] = ?_k router_wts[b,k] . ds_k . (?_i inter[b,k,i].w_down[e,out_j,i])
 
-    where ``e = router_ids[b,k]`` and ``ds_k`` is the (PerTensor/PerToken) weight
-    scale for row ``e*HIDDEN + out_j``.
+    where ``e = router_ids[b,k]`` and ``ds_k`` is the weight scale for row
+    ``e*HIDDEN + out_j`` (Block2D also varies with the K index ``i``).
 
     Args:
         intermediate: [B, TOPK, INTER] bfloat16 (row = b*TOPK + k, contiguous).
@@ -154,14 +177,16 @@ def flydsl_warp_decode_down_reduce(
         router_ids:   [B, TOPK] int32.
         router_wts:   [B, TOPK] float32 (normalized to sum 1 per token).
         w_down_scale: float32 weight scales.  ``pertensor`` -> [1];
-            ``pertoken`` -> [E*HIDDEN] (one per weight row).
-        w_scale_mode: "pertensor" or "pertoken".
+            ``pertoken`` -> [E*HIDDEN] (one per weight row); ``block2d`` ->
+            [(E*HIDDEN)//BN * INTER//BK] row-major over (row-block, K-block).
+        w_scale_mode: "pertensor", "pertoken" or "block2d".
+        scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
         [B, HIDDEN] bfloat16 output.
     """
-    if w_scale_mode not in ("pertensor", "pertoken"):
+    if w_scale_mode not in ("pertensor", "pertoken", "block2d"):
         raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
     assert intermediate.dtype == torch.bfloat16, "intermediate must be bfloat16"
     assert intermediate.is_contiguous() and w_down.is_contiguous()
@@ -172,12 +197,20 @@ def flydsl_warp_decode_down_reduce(
     assert Ik == INTER, f"w_down INTER {Ik} != intermediate INTER {INTER}"
     assert router_ids.shape == (B, TOPK), "router_ids must be [B, TOPK]"
 
+    scale_bn = scale_bk = None
+    if w_scale_mode == "block2d":
+        if scale_block is None:
+            raise ValueError("block2d requires scale_block=(BN, BK)")
+        scale_bn, scale_bk = int(scale_block[0]), int(scale_block[1])
+        assert (E * HIDDEN) % scale_bn == 0, "(E*HIDDEN) must be divisible by BN"
+        assert INTER % scale_bk == 0, "INTER must be divisible by BK"
+
     kvector = pick_kvector(INTER)
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
     launcher = _get_down_reduce(
-        INTER, HIDDEN, TOPK, kvector, w_scale_mode, serialize_dot2
+        INTER, HIDDEN, TOPK, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
     )
     grid_x = B * HIDDEN
     _run(

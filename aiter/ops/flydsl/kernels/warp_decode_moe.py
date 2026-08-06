@@ -241,6 +241,8 @@ def build_gate_up_fp8_module(
     kvector: int | None = None,
     w_scale_mode: str = "pertensor",
     serialize_dot2: bool = True,
+    scale_bn: int | None = None,
+    scale_bk: int | None = None,
 ):
     """Build the gate_up FP8 launcher (BF16 activation, FP8 e4m3 weights).
 
@@ -269,6 +271,20 @@ def build_gate_up_fp8_module(
     n_pairs = kvector // 2  # x uint32 words / weight pairs per lane per iter
     n_wwords = kvector // 4  # fp8 weight dwords/lane/iter (4 fp8 each)
     per_token_scale = const_expr(w_scale_mode == "pertoken")
+    block2d = const_expr(w_scale_mode == "block2d")
+    if w_scale_mode == "block2d":
+        if scale_bn is None or scale_bk is None:
+            raise ValueError("block2d scales require scale_bn and scale_bk")
+        if hidden % scale_bk != 0:
+            raise ValueError(f"HIDDEN={hidden} not divisible by scale_bk={scale_bk}")
+        if scale_bk % kvector != 0:
+            raise ValueError(
+                f"block2d scale_bk={scale_bk} must be a multiple of kVector={kvector} "
+                "so each lane's K-chunk lies in one scale block"
+            )
+    elif w_scale_mode not in ("pertensor", "pertoken"):
+        raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
+    scale_cols_g = (hidden // scale_bk) if w_scale_mode == "block2d" else 0
 
     @flyc.kernel
     def _kernel(
@@ -301,44 +317,82 @@ def build_gate_up_fp8_module(
         wu_rsrc = _ptr_rsrc(wu_ptr)
 
         one_f32 = fx.Float32(1.0).ir_value()
-        gate_dot = fx.Float32(0.0).ir_value()
-        up_dot = fx.Float32(0.0).ir_value()
-
-        for i in range_constexpr(num_iter):
-            k_base = i * ktile_n + lane * kvector
-            # element bases -> word (i32) offsets: x is 2 bf16/word, w is 4 fp8/word.
-            x_word0 = (token_b * hidden + k_base) // 2
-            w_word0 = (w_row * hidden + k_base) // 4
-            # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
-            xw = load_i32_words(x_rsrc, x_word0, n_pairs)
-            gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
-            uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
-            for ipair in range_constexpr(n_pairs):
-                w_word = ipair // 2
-                w_hi = (ipair % 2) == 1
-                x_i32 = xw[ipair]
-                g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
-                u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
-                gate_dot = dot2_f32_bf16(
-                    x_i32, g_i32, gate_dot, serialize=serialize_dot2
-                )
-                up_dot = dot2_f32_bf16(x_i32, u_i32, up_dot, serialize=serialize_dot2)
-
-        gate_sum = wave_reduce_add_f32(gate_dot)
-        up_sum = wave_reduce_add_f32(up_dot)
-
-        # Weight scales (PerTensor -> p[0]; PerToken -> p[w_row]).
         wgs_rsrc = _ptr_rsrc(wgs_ptr)
         wus_rsrc = _ptr_rsrc(wus_ptr)
-        if const_expr(per_token_scale):
-            scale_off = w_row
-        else:
-            scale_off = fx.Int32(0)
-        gs = buffer_ops.buffer_load(wgs_rsrc, scale_off, vec_width=1, dtype=T.f32())
-        us = buffer_ops.buffer_load(wus_rsrc, scale_off, vec_width=1, dtype=T.f32())
 
-        gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
-        up_acc = fx.Float32(up_sum) * fx.Float32(us)
+        if const_expr(block2d):
+            # Block2D<BN,BK> scales vary along K, so fold each K-block's scale into
+            # the per-lane partial before the single reduce. scale_bk % kVector == 0
+            # guarantees a lane's K-chunk sits in one block -> one scale per iter.
+            row_blk = w_row // scale_bn
+            gate_acc_l = fx.Float32(0.0)
+            up_acc_l = fx.Float32(0.0)
+            for i in range_constexpr(num_iter):
+                k_base = i * ktile_n + lane * kvector
+                x_word0 = (token_b * hidden + k_base) // 2
+                w_word0 = (w_row * hidden + k_base) // 4
+                xw = load_i32_words(x_rsrc, x_word0, n_pairs)
+                gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
+                uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+                gd = fx.Float32(0.0).ir_value()
+                ud = fx.Float32(0.0).ir_value()
+                for ipair in range_constexpr(n_pairs):
+                    w_word = ipair // 2
+                    w_hi = (ipair % 2) == 1
+                    x_i32 = xw[ipair]
+                    g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
+                    u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
+                    gd = dot2_f32_bf16(x_i32, g_i32, gd, serialize=serialize_dot2)
+                    ud = dot2_f32_bf16(x_i32, u_i32, ud, serialize=serialize_dot2)
+                sidx = fx.Int32(row_blk * scale_cols_g + k_base // scale_bk)
+                gs_i = buffer_ops.buffer_load(
+                    wgs_rsrc, sidx, vec_width=1, dtype=T.f32()
+                )
+                us_i = buffer_ops.buffer_load(
+                    wus_rsrc, sidx, vec_width=1, dtype=T.f32()
+                )
+                gate_acc_l = gate_acc_l + fx.Float32(gd) * fx.Float32(gs_i)
+                up_acc_l = up_acc_l + fx.Float32(ud) * fx.Float32(us_i)
+            gate_acc = fx.Float32(wave_reduce_add_f32(gate_acc_l.ir_value()))
+            up_acc = fx.Float32(wave_reduce_add_f32(up_acc_l.ir_value()))
+        else:
+            gate_dot = fx.Float32(0.0).ir_value()
+            up_dot = fx.Float32(0.0).ir_value()
+            for i in range_constexpr(num_iter):
+                k_base = i * ktile_n + lane * kvector
+                # element bases -> word (i32) offsets: x 2 bf16/word, w 4 fp8/word.
+                x_word0 = (token_b * hidden + k_base) // 2
+                w_word0 = (w_row * hidden + k_base) // 4
+                # Coalesced 128-bit loads: n_pairs x dwords, n_wwords gate/up dwords.
+                xw = load_i32_words(x_rsrc, x_word0, n_pairs)
+                gw = load_i32_words(wg_rsrc, w_word0, n_wwords)
+                uw = load_i32_words(wu_rsrc, w_word0, n_wwords)
+                for ipair in range_constexpr(n_pairs):
+                    w_word = ipair // 2
+                    w_hi = (ipair % 2) == 1
+                    x_i32 = xw[ipair]
+                    g_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(gw[w_word], one_f32, hi=w_hi))
+                    u_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(uw[w_word], one_f32, hi=w_hi))
+                    gate_dot = dot2_f32_bf16(
+                        x_i32, g_i32, gate_dot, serialize=serialize_dot2
+                    )
+                    up_dot = dot2_f32_bf16(
+                        x_i32, u_i32, up_dot, serialize=serialize_dot2
+                    )
+
+            gate_sum = wave_reduce_add_f32(gate_dot)
+            up_sum = wave_reduce_add_f32(up_dot)
+
+            # Weight scales (PerTensor -> p[0]; PerToken -> p[w_row]).
+            if const_expr(per_token_scale):
+                scale_off = w_row
+            else:
+                scale_off = fx.Int32(0)
+            gs = buffer_ops.buffer_load(wgs_rsrc, scale_off, vec_width=1, dtype=T.f32())
+            us = buffer_ops.buffer_load(wus_rsrc, scale_off, vec_width=1, dtype=T.f32())
+            gate_acc = fx.Float32(gate_sum) * fx.Float32(gs)
+            up_acc = fx.Float32(up_sum) * fx.Float32(us)
+
         sig = fx.Float32(1.0) / (
             fx.Float32(1.0) + fxmath.exp(fx.Float32(0.0) - gate_acc)
         )
@@ -384,6 +438,8 @@ def build_down_reduce_fp8_module(
     kvector: int | None = None,
     w_scale_mode: str = "pertensor",
     serialize_dot2: bool = True,
+    scale_bn: int | None = None,
+    scale_bk: int | None = None,
 ):
     """Build the down_reduce FP8 launcher (BF16 intermediate, FP8 e4m3 weights).
 
@@ -413,6 +469,20 @@ def build_down_reduce_fp8_module(
     n_pairs = kvector // 2
     n_wwords = kvector // 4  # fp8 weight dwords/lane/iter (4 fp8 each)
     per_token_scale = const_expr(w_scale_mode == "pertoken")
+    block2d = const_expr(w_scale_mode == "block2d")
+    if w_scale_mode == "block2d":
+        if scale_bn is None or scale_bk is None:
+            raise ValueError("block2d scales require scale_bn and scale_bk")
+        if inter % scale_bk != 0:
+            raise ValueError(f"INTER={inter} not divisible by scale_bk={scale_bk}")
+        if scale_bk % kvector != 0:
+            raise ValueError(
+                f"block2d scale_bk={scale_bk} must be a multiple of kVector={kvector} "
+                "so each lane's K-chunk lies in one scale block"
+            )
+    elif w_scale_mode not in ("pertensor", "pertoken"):
+        raise ValueError(f"unsupported w_scale_mode: {w_scale_mode!r}")
+    scale_cols_d = (inter // scale_bk) if w_scale_mode == "block2d" else 0
 
     @flyc.kernel
     def _kernel(
@@ -446,32 +516,67 @@ def build_down_reduce_fp8_module(
             rw = buffer_ops.buffer_load(rwt_rsrc, ridx, vec_width=1, dtype=T.f32())
             w_row = e * hidden + out_j
 
-            if const_expr(per_token_scale):
-                scale_off = w_row
-            else:
-                scale_off = fx.Int32(0)
-            ds = buffer_ops.buffer_load(wds_rsrc, scale_off, vec_width=1, dtype=T.f32())
-
-            dot_k = fx.Float32(0.0).ir_value()
-            for i in range_constexpr(num_iter):
-                k_base = i * ktile_n + lane * kvector
-                inter_row = token_b * top_k + k
-                a_word0 = (inter_row * inter + k_base) // 2
-                wd_word0 = (w_row * inter + k_base) // 4
-                # Coalesced 128-bit loads: n_pairs inter dwords, n_wwords w dwords.
-                aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
-                dw = load_i32_words(wd_rsrc, wd_word0, n_wwords)
-                for ipair in range_constexpr(n_pairs):
-                    w_word = ipair // 2
-                    w_hi = (ipair % 2) == 1
-                    d_i32 = bf16x2_to_i32(fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi))
-                    dot_k = dot2_f32_bf16(
-                        aw[ipair], d_i32, dot_k, serialize=serialize_dot2
+            if const_expr(block2d):
+                # Block2D<BN,BK> scale varies along K -> fold each K-block's
+                # (router_wt * ds_block) into the per-lane partial per iter.
+                row_blk = w_row // scale_bn
+                for i in range_constexpr(num_iter):
+                    k_base = i * ktile_n + lane * kvector
+                    inter_row = token_b * top_k + k
+                    a_word0 = (inter_row * inter + k_base) // 2
+                    wd_word0 = (w_row * inter + k_base) // 4
+                    aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                    dw = load_i32_words(wd_rsrc, wd_word0, n_wwords)
+                    dot_i = fx.Float32(0.0).ir_value()
+                    for ipair in range_constexpr(n_pairs):
+                        w_word = ipair // 2
+                        w_hi = (ipair % 2) == 1
+                        d_i32 = bf16x2_to_i32(
+                            fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi)
+                        )
+                        dot_i = dot2_f32_bf16(
+                            aw[ipair], d_i32, dot_i, serialize=serialize_dot2
+                        )
+                    sidx = fx.Int32(row_blk * scale_cols_d + k_base // scale_bk)
+                    ds_i = buffer_ops.buffer_load(
+                        wds_rsrc, sidx, vec_width=1, dtype=T.f32()
                     )
+                    acc_lane = acc_lane + fx.Float32(dot_i) * (
+                        fx.Float32(rw) * fx.Float32(ds_i)
+                    )
+            else:
+                if const_expr(per_token_scale):
+                    scale_off = w_row
+                else:
+                    scale_off = fx.Int32(0)
+                ds = buffer_ops.buffer_load(
+                    wds_rsrc, scale_off, vec_width=1, dtype=T.f32()
+                )
 
-            # router_wt * ds is lane-uniform, so fold it into the per-lane partial
-            # before the single cross-lane reduce (exact; avoids a reduce per k).
-            acc_lane = acc_lane + fx.Float32(dot_k) * (fx.Float32(rw) * fx.Float32(ds))
+                dot_k = fx.Float32(0.0).ir_value()
+                for i in range_constexpr(num_iter):
+                    k_base = i * ktile_n + lane * kvector
+                    inter_row = token_b * top_k + k
+                    a_word0 = (inter_row * inter + k_base) // 2
+                    wd_word0 = (w_row * inter + k_base) // 4
+                    # Coalesced 128-bit loads: n_pairs inter dwords, n_wwords w dwords.
+                    aw = load_i32_words(inter_rsrc, a_word0, n_pairs)
+                    dw = load_i32_words(wd_rsrc, wd_word0, n_wwords)
+                    for ipair in range_constexpr(n_pairs):
+                        w_word = ipair // 2
+                        w_hi = (ipair % 2) == 1
+                        d_i32 = bf16x2_to_i32(
+                            fp8x2_to_bf16x2(dw[w_word], one_f32, hi=w_hi)
+                        )
+                        dot_k = dot2_f32_bf16(
+                            aw[ipair], d_i32, dot_k, serialize=serialize_dot2
+                        )
+
+                # router_wt * ds is lane-uniform, so fold it into the per-lane
+                # partial before the single cross-lane reduce (avoids reduce/k).
+                acc_lane = acc_lane + fx.Float32(dot_k) * (
+                    fx.Float32(rw) * fx.Float32(ds)
+                )
 
         # Reduce runs on all lanes (cross-lane shuffles); only lane 0 stores.
         y_sum = wave_reduce_add_f32(acc_lane.ir_value())
