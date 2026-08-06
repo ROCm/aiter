@@ -37,7 +37,8 @@ row's dword count is not a multiple of 4 the trailing group falls back to a
 per-lane scalar tail (mirroring ``compile_moe_reduction`` in
 ``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
 slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
-nothing and need no branch.
+nothing and need no branch; EP routes that own no grouped row instead carry
+``moe_route_maps.DROPPED_ROUTE_ROW`` and read through a zero-sized descriptor.
 
 ``build_moe_gather_reduce_wave_module`` is the wave-per-row variant: one wave
 owns a whole row and lanes stride it a dword at a time, so the per-token
@@ -243,7 +244,7 @@ def build_moe_gather_reduce_module(
                     acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
 
                     for k in range_constexpr(topk):
-                        row_i32, w_f32 = row_weights[k]
+                        row_i32, nrec_bytes, w_f32 = row_weights[k]
                         red = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         for sk in range_constexpr(split_k):
                             raw_vec = buffer_ops.buffer_load(
@@ -285,7 +286,7 @@ def build_moe_gather_reduce_module(
                             acc_lo = fx.Float32(0.0)
                             acc_hi = fx.Float32(0.0)
                             for k in range_constexpr(topk):
-                                row_i32, w_f32 = row_weights[k]
+                                row_i32, nrec_bytes, w_f32 = row_weights[k]
                                 red_lo = fx.Float32(0.0)
                                 red_hi = fx.Float32(0.0)
                                 for sk in range_constexpr(split_k):
