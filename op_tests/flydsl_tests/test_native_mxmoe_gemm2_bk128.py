@@ -285,3 +285,35 @@ def test_native_tuner_candidate_bks(monkeypatch, inter_dim, expected_bks):
     ]
     bks = {_parse_mxfp4_g2_kname(name)["BK"] for name in native_names}
     assert bks == expected_bks
+
+
+def test_native_core_cache_epoch_changes_launcher_key(monkeypatch):
+    from flydsl.compiler.jit_function import _jit_function_cache_key
+
+    from aiter.ops.flydsl.kernels import mxfp4_gemm2
+
+    original_epoch = mxfp4_gemm2.NATIVE_GEMM2_CORE_CACHE_EPOCH
+
+    def launcher_key(epoch):
+        monkeypatch.setattr(mxfp4_gemm2, "NATIVE_GEMM2_CORE_CACHE_EPOCH", epoch)
+        launch = mxfp4_gemm2.compile_gemm2_a4w4_port(
+            BM=32,
+            use_nt=False,
+            NE=2,
+            N_OUT=256,
+            epilog="atomic",
+            D_INTER=512,
+            BN=256,
+            BK=256,
+        )
+        return _jit_function_cache_key(launch.func)
+
+    try:
+        key_n = launcher_key(original_epoch)
+        key_next = launcher_key(original_epoch + 1)
+    finally:
+        monkeypatch.setattr(
+            mxfp4_gemm2, "NATIVE_GEMM2_CORE_CACHE_EPOCH", original_epoch
+        )
+
+    assert key_n != key_next, (key_n, key_next)

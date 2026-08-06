@@ -1516,12 +1516,12 @@ rm -rf /tmp/native_mxmoe_bk128_cache
 FLYDSL_RUNTIME_CACHE_DIR=/tmp/native_mxmoe_bk128_cache \
 python -m pytest \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128_gpu.py \
-  -k "native_atomic_bm32_high_level and k384-bk128" \
+  -k "native_atomic_bm32_direct_stage2 and k384-bk128" \
   -q
 FLYDSL_RUNTIME_CACHE_DIR=/tmp/native_mxmoe_bk128_cache \
 python -m pytest \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128_gpu.py \
-  -k "native_atomic_bm32_high_level and k384-bk128" \
+  -k "native_atomic_bm32_direct_stage2 and k384-bk128" \
   -q
 ```
 
@@ -1599,7 +1599,7 @@ FLYDSL_DUMP_DIR=/tmp/native_mxmoe_bk256_after \
 FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python -m pytest \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128_gpu.py \
-  -k "native_atomic_bm32_high_level and k512-bk256" \
+  -k "native_atomic_bm32_direct_stage2 and k512-bk256" \
   -q
 ```
 

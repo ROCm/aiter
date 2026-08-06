@@ -38,9 +38,9 @@ from .mxfp4_gemm_common import (
 )
 
 NUM_CU = 256
-# `_gemm2_body` is a module-level @flyc.jit whose source is not currently
-# collected into the launcher disk-cache key. Bump this epoch whenever its
-# semantics change so existing launch_gemm2 cache entries cannot go stale.
+# FlyDSL keys scalar closure values referenced by a launcher, but it does not
+# transitively collect the module-level `_gemm2_body` source. The factory below
+# captures this epoch in `launch_gemm2`; bump it whenever core semantics change.
 NATIVE_GEMM2_CORE_CACHE_EPOCH = 2
 
 
@@ -130,6 +130,7 @@ def compile_gemm2_a4w4_port(
     )
     _num_n_blocks = num_n_blocks_for(N_OUT, BN)
     _n_load_waves, _rows_per_wave, _load_groups = tiling(BM, KH_TILE)
+    _core_cache_epoch = NATIVE_GEMM2_CORE_CACHE_EPOCH
     _epi_tag = {
         "atomic": "atomic",
         "nonatomic": "nonatomic",
@@ -140,7 +141,7 @@ def compile_gemm2_a4w4_port(
     _tag = (
         f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}"
         f"{'_nt' if use_nt else ''}_{_epi_tag}"
-        f"_core{NATIVE_GEMM2_CORE_CACHE_EPOCH}_bk{BK}"
+        f"_core{_core_cache_epoch}_bk{BK}"
     )
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
@@ -321,6 +322,7 @@ def compile_gemm2_a4w4_port(
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
     ):
+        _ = _core_cache_epoch
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
             persist = _raw(tw > fx.Int32(NUM_CU * 4))
