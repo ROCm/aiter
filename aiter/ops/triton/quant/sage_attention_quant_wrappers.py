@@ -327,6 +327,53 @@ def _f4f4_v_kperm(device):
     return kp
 
 
+def sage_quant_v_f4f4(v, layout="bshd"):
+    """Pack per-channel FP4 V into the F4F4 kernel's col-major LDS layout."""
+    if layout == "bshd":
+        b, kv_len, h_kv, head_dim = v.shape
+        v_tok = v.permute(0, 2, 1, 3)
+    elif layout == "bhsd":
+        b, h_kv, kv_len, head_dim = v.shape
+        v_tok = v
+    else:
+        raise ValueError(f"Unknown tensor layout: {layout}")
+
+    tile = 128
+    assert head_dim == 128, f"f4f4 requires head_dim=128, got {head_dim}"
+    assert kv_len % tile == 0, (
+        f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
+    )
+    nT = kv_len // tile
+    amax = v_tok.abs().amax(dim=-2).to(torch.float32)
+    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
+    kperm = _f4f4_v_kperm(v.device)
+    packed = torch.empty((b, h_kv, nT * 8192), dtype=torch.uint8, device=v.device)
+    sage_quant_v_fp4_colmajor_kernel[(b * h_kv * nT * 8,)](
+        v_tok,
+        packed,
+        v_descale,
+        kperm,
+        v_tok.stride(0),
+        v_tok.stride(1),
+        v_tok.stride(2),
+        v_tok.stride(3),
+        packed.stride(0),
+        packed.stride(1),
+        v_descale.stride(0),
+        v_descale.stride(1),
+        h_kv,
+        nT,
+        kv_len,
+    )
+    buf = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
+    v_fp4_view = torch.as_strided(
+        buf,
+        (b, kv_len, h_kv, 128),
+        (h_kv * kv_len * 64, 64, kv_len * 64, 1),
+    )
+    return v_fp4_view, v_descale
+
+
 def sage_quant_f4f4(
     q,
     k,
@@ -359,11 +406,9 @@ def sage_quant_f4f4(
     if layout == "bshd":
         b, qo_len, h_qo, head_dim = q.shape
         _, kv_len, h_kv, _ = v.shape
-        v_tok = v.permute(0, 2, 1, 3)  # [b, h_kv, sk, d] (strided view; kernel reads strides)
     elif layout == "bhsd":
         b, h_qo, qo_len, head_dim = q.shape
         _, h_kv, kv_len, _ = v.shape
-        v_tok = v  # [b, h_kv, sk, d]
     else:
         raise ValueError(f"Unknown tensor layout: {layout}")
 
@@ -372,7 +417,6 @@ def sage_quant_f4f4(
     assert (
         kv_len % tile == 0
     ), f"f4f4 col-major V pack requires kv_len % {tile} == 0, got {kv_len}"
-    nT = kv_len // tile
 
     if sm_scale is None:
         sm_scale = head_dim**-0.5
@@ -391,38 +435,7 @@ def sage_quant_f4f4(
     q_fp4, q_scale = downcast_to_mxfp(q, torch.uint8, axis=-1)
     k_fp4, k_scale = downcast_to_mxfp(k, torch.uint8, axis=-1)
 
-    # V: per-channel fp4 (E2M1) col-major LDS pack. descale = per-channel amax over kv / 6
-    # (E2M1 max), computed in torch like the fp8 sage_quant_v path (scale-outside).
-    amax = v_tok.abs().amax(dim=-2).to(torch.float32)  # [b, h_kv, d]
-    v_descale = torch.where(amax > 0, amax / 6.0, torch.ones_like(amax)).contiguous()
-    kperm = _f4f4_v_kperm(v.device)
-    packed = torch.empty((b, h_kv, nT * 8192), dtype=torch.uint8, device=v.device)
-    grid = (b * h_kv * nT * 8,)
-    sage_quant_v_fp4_colmajor_kernel[grid](
-        v_tok,
-        packed,
-        v_descale,
-        kperm,
-        v_tok.stride(0),
-        v_tok.stride(1),
-        v_tok.stride(2),
-        v_tok.stride(3),
-        packed.stride(0),
-        packed.stride(1),
-        v_descale.stride(0),
-        v_descale.stride(1),
-        h_kv,
-        nT,
-        kv_len,
-    )
-    # +64 B slack so the strided view's last-token window (seq stride 64 < 128) stays in
-    # storage bounds (kernel reads are separately bounds-checked by num_records).
-    buf = torch.cat([packed.reshape(-1), packed.new_zeros(64)])
-    v_fp4_view = torch.as_strided(
-        buf,
-        (b, kv_len, h_kv, 128),
-        (h_kv * kv_len * 64, 64, kv_len * 64, 1),
-    )
+    v_fp4_view, v_descale = sage_quant_v_f4f4(v, layout=layout)
     return q_fp4, q_scale, k_fp4, k_scale, v_fp4_view, v_descale, delta_s
 
 
@@ -440,7 +453,6 @@ def sage_quant_mxfp6(
     R=None,
     BLOCK_R=32,
     f6f4=False,
-    v_fp4_packer=None,
     q_packer=None,
     k_packer=None,
 ):
@@ -453,10 +465,7 @@ def sage_quant_mxfp6(
     k_packer callables to override (e.g. a bench that swaps the packer via AITER_MXFP6_PACK
     or forces the numpy path). The V operand is selected by f6f4:
       * f6f4=False (f6f8): raw fp8 V via sage_quant_v_kernel (per-channel descale).
-      * f6f4=True:         per-channel fp4 (E2M1) V via v_fp4_packer(v). The caller
-                           supplies the packer (it is co-located with the .co byte
-                           layout in the research asm module), keeping aiter free of
-                           that dependency.
+            * f6f4=True:          per-channel fp4 (E2M1) V via sage_quant_v_f4f4.
     Only the selected V operand is computed (no wasted fp8 quant on the f6f4 path).
     Returns (q_fp6, q_scale, k_view, k_scale, v_quantized, v_scale, delta_s). bshd only.
     """
@@ -470,10 +479,15 @@ def sage_quant_mxfp6(
         _use_triton_qk = _os.environ.get("AITER_MXFP6_QK_TRITON", "1") != "0"
         if _use_triton_qk:
             _default_q_packer = _hp.quantize_fp6_lastdim_triton
-            _default_k_packer = lambda _k: _hp.quantize_fp6_k_lds_order_triton(_k, tile=128)
+
+            def _default_k_packer(_k):
+                return _hp.quantize_fp6_k_lds_order_triton(_k, tile=128)
+
         else:
             _default_q_packer = _hp.quantize_fp6_lastdim_torch
-            _default_k_packer = lambda _k: _hp.quantize_fp6_k_lds_order_torch(_k, tile=128)
+
+            def _default_k_packer(_k):
+                return _hp.quantize_fp6_k_lds_order_torch(_k, tile=128)
 
     assert layout == "bshd", f"sage_quant_mxfp6 expects bshd, got {layout}"
     b, qo_len, h_qo, head_dim = q.shape
@@ -494,8 +508,7 @@ def sage_quant_mxfp6(
 
     # V operand: per-channel fp4 (f6f4) or raw fp8 (f6f8) -- only the selected one.
     if f6f4:
-        assert v_fp4_packer is not None, "sage_quant_mxfp6(f6f4=True) requires v_fp4_packer"
-        v_quantized, v_scale = v_fp4_packer(v)
+        v_quantized, v_scale = sage_quant_v_f4f4(v, layout=layout)
     else:
         v_quantized = torch.empty_like(v, dtype=FP8_TYPE, device=v.device)
         K_NUM_BLKS = (kv_len + BLKK - 1) // BLKK
