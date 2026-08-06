@@ -210,12 +210,10 @@ def build_moe_gather_reduce_module(
                 raw_row = fx.Int32(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
-                # An EP route with no grouped row carries moe_route_maps'
-                # DROPPED_ROUTE_ROW (negative) sentinel. Its weight is already 0, but
-                # the row still must not be dereferenced: no such row exists in the
-                # grouped buffer and those bytes may never have been written (a stale
-                # NaN would survive the multiply by 0). Aim the descriptor at row 0
-                # with zero size so the hardware OOB check returns 0 instead.
+                # DROPPED_ROUTE_ROW: no such row exists, and those bytes may never
+                # have been written -- a stale NaN would survive the multiply by
+                # the (already zero) weight. Point the descriptor at row 0 with
+                # zero size so the hardware OOB check returns 0 instead.
                 is_mapped = raw_row >= fx.Int32(0)
                 row_i32 = fx.Uint32(is_mapped.select(raw_row, fx.Int32(0)))
                 nrec_bytes = is_mapped.select(row_bytes, no_bytes)
