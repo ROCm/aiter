@@ -850,7 +850,9 @@ def _fused_moe_impl(
                 "MXFP4 a4w4 FlyDSL port does not support expert-parallel yet "
                 "(expert_mask is dropped by the output_aux sort path)."
             )
-        _kn2 = metadata.stage2.keywords.get("kernelName2", "")
+        _kn2 = metadata.stage2.keywords.get(
+            "kernelName2", metadata.stage2.keywords.get("kernelName", "")
+        )
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         (
             sorted_ids,
@@ -1852,6 +1854,7 @@ def _mxfp4_a4w4_stage2_fw(
             a2_scale=a2_scale,
             sorted_weights=sorted_weights,
             block_m=block_m,
+            reverse_sorted=reverse_sorted,
         )
     out = _mxfp4_a4w4_stage2(
         inter_states,
@@ -1917,9 +1920,13 @@ def _flydsl_v2_stage2_wrapper(
     block_m=None,
     expert_mask=None,
     topk_ids=None,
+    reverse_sorted=None,
     **_kwargs,
 ):
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+        is_g2_nonatomic_config,
+        mxfp4_moe_gemm2,
+    )
 
     cfg = parse_flydsl_v2_gemm2_kernel(kernelName)
     if cfg is None:
@@ -1938,8 +1945,28 @@ def _flydsl_v2_stage2_wrapper(
     _s2_fp8_inter = (
         epilog == "reduce" and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
     )
+    nonatomic = is_g2_nonatomic_config(
+        bm,
+        bn,
+        bk,
+        epilog,
+        cfg["a_dtype"],
+        "fp8" if _s2_fp8_inter else "bf16",
+        inter_dim,
+        model_dim,
+    )
     if epilog == "reduce":
-        if _s2_fp8_inter:
+        if nonatomic:
+            if reverse_sorted is None or sorted_weights is None:
+                raise ValueError(
+                    "nonatomic FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
+                )
+            target = torch.empty(
+                (max_sorted, model_dim_runtime),
+                dtype=out.dtype,
+                device=out.device,
+            )
+        elif _s2_fp8_inter:
             if model_dim_runtime % 8 != 0:
                 raise ValueError(
                     "AITER_FLYDSL_STAGE2_FP8 requires model_dim to be divisible by 8"
@@ -1988,6 +2015,18 @@ def _flydsl_v2_stage2_wrapper(
         model_dim_pad=model_dim_pad,
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
+    if nonatomic:
+        aiter.mxfp4_moe_scatter_reduce(
+            flat_out=target,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            out=out,
+            NE=num_experts,
+            TOPK=topk,
+            D_HIDDEN=model_dim_runtime,
+            MB=bm,
+        )
+        return out
     if epilog == "reduce":
         from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -2437,6 +2476,22 @@ def get_2stage_cfgs(
         if flydsl_v2_stage2_cfg is not None:
             stage1_func.keywords["out_dtype"] = flydsl_v2_stage2_cfg["a_dtype"]
             _fuse_quant = flydsl_v2_stage2_cfg["a_dtype"]
+            from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+                is_g2_nonatomic_config,
+            )
+
+            v2_nonatomic = is_g2_nonatomic_config(
+                flydsl_v2_stage2_cfg["tile_m"],
+                flydsl_v2_stage2_cfg["tile_n"],
+                flydsl_v2_stage2_cfg["tile_k"],
+                flydsl_v2_stage2_cfg["epilog"],
+                flydsl_v2_stage2_cfg["a_dtype"],
+                "bf16",
+                inter_dim,
+                model_dim,
+            )
+        else:
+            v2_nonatomic = False
         return MOEMetadata(
             stage1_func,
             stage2_func,
@@ -2448,6 +2503,7 @@ def get_2stage_cfgs(
             stage2_has_bias=enable_bias
             and ((is_flydsl2 and not is_flydsl2_layout) or is_cktile2),
             skip_inter_quant=is_flydsl2_layout,
+            output_aux=v2_nonatomic,
             **route_bucket_metadata,
         )
     if (
