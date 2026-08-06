@@ -81,6 +81,8 @@ def _fused_clamp_silu_mul_kernel(
     )
 
     shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    pid = gl.program_id(0)                 
+    m_start = pid * ROWS_PER_PROG
 
     gate_smem = gl.allocate_shared_memory(
         inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
@@ -110,8 +112,6 @@ def _fused_clamp_silu_mul_kernel(
         gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem.index(i))
 
     # setup + setup store
-    pid = gl.program_id(0)                 
-    m_start = pid * ROWS_PER_PROG
     offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
     mask = offs < n_half                        
     num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        

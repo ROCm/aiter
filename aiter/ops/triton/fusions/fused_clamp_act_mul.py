@@ -221,7 +221,7 @@ def fused_clamp_act_mul(
         elif (M*D*2*2+M*D*2 < 500):
             num_buffers = 2
         else:
-            num_buffers = 6
+            num_buffers = 2
 
 
     # Args are identical for both kernels; the Gluon kernel takes one extra
