@@ -193,7 +193,13 @@ def _heuristic_bv(
     target_ctas = (
         _grid_ctas(H=H, V=V, N=N, BV=target_bv) if target_bv is not None else 256
     )
-    return _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
+    bv = _select_bv_for_grid(H=H, V=V, N=N, target_ctas=target_ctas)
+    # gfx942 LDS budget caps BV at 32 (BV=64 needs 73.5 KiB > 64 KiB/CU at
+    # K=128, BT=64). The gfx942 kernel asserts this; clamp here so the CTA-target
+    # rule can never select an allocation that fails at launch.
+    if _ARCH == "gfx942":
+        bv = min(bv, 32)
+    return bv
 
 
 def _get_or_compile(

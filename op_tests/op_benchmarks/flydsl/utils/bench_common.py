@@ -75,13 +75,13 @@ def add_verification_args(parser) -> None:
     """Add ``--verification`` and ``--verify`` shorthand to *parser*."""
     parser.add_argument(
         "--verification",
-        default="none",
+        default="reference",
         choices=("none", "reference", "triton"),
         help=(
             "Verification mode: "
-            "'reference' uses fp32 torch reference, "
+            "'reference' uses torch reference (default), "
             "'triton' checks against the Triton baseline, "
-            "'none' skips (default)."
+            "'none' skips verification."
         ),
     )
     parser.add_argument(

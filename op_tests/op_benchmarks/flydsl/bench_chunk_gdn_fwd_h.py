@@ -96,6 +96,14 @@ PRESET_SHAPES: list[tuple] = [
 
 _BENCH_TITLE = "GDN K5 inter-chunk state scan"
 
+# The bench builds gates (``g``/``gk``) in the natural-log domain and the fp32
+# reference applies ``torch.exp``. The K5 wrapper's ``use_exp2=True`` path expects
+# the scalar ``g`` already pre-scaled to log2 by an upstream K1+K2 producer (it does
+# NOT rescale ``g`` itself), which would double-apply log2(e) here and corrupt the
+# scalar-gate result. ``use_exp2=False`` selects the kernel's ``exp2(x*log2(e)) ==
+# exp(x)`` lowering, matching the reference for both the ``g`` and ``gk`` paths.
+_USE_EXP2 = False
+
 
 def _shape_label(idx: int, shape: tuple) -> str:
     model_tag, H, Hg, T_flat, N, K, V, BT, gate = shape
@@ -108,10 +116,15 @@ def _shape_label(idx: int, shape: tuple) -> str:
 def _make_inputs(shape: tuple, device="cuda"):
     """Build all K5 input tensors for the given shape tuple.
 
+    ``N`` is the number of variable-length sequences packed into the flat
+    ``T_flat`` token axis. When ``N > 1`` a ``cu_seqlens`` of ``N`` equal-length
+    sequences is built and the varlen path is exercised (matching the pytest
+    fixture); the SSM state ``h0`` is ``[N, H, V, K]`` (one state per sequence).
+
     Returns:
-        k, w_hm, u_hm, w_tm, g, gk, initial_state
+        k, w_hm, u_hm, w_tm, g, gk, initial_state, cu_seqlens
         where w_hm/u_hm are head-major (kernel input) and w_tm is token-major
-        (reference input).
+        (reference input). ``cu_seqlens`` is ``None`` when ``N == 1``.
     """
     model_tag, H, Hg, T_flat, N, K, V, BT, gate_mode = shape
     B = 1
@@ -132,7 +145,18 @@ def _make_inputs(shape: tuple, device="cuda"):
               ).cumsum(dim=0).contiguous()
 
     h0 = torch.randn(N, H, V, K, dtype=torch.float32, device=device) * 0.01
-    return k, w_hm, u_hm, w_tm, g, gk, h0
+
+    # cu_seqlens: split T_flat into N equal sequences (last absorbs remainder).
+    if N > 1:
+        per = T_flat // N
+        bounds = [0]
+        for i in range(N):
+            bounds.append(T_flat if i == N - 1 else bounds[-1] + per)
+        cu = torch.tensor(bounds, dtype=torch.int32, device=device)
+    else:
+        cu = None
+
+    return k, w_hm, u_hm, w_tm, g, gk, h0, cu
 
 
 # --------------------------------------------------------------------------- #
@@ -188,14 +212,30 @@ _ref_fn = None   # loaded lazily on first use
 
 
 def _load_ref():
-    """Load ref_chunk_gated_delta_rule_fwd_h from the unit test file."""
+    """Load ``ref_chunk_gated_delta_rule_fwd_h`` from the unit test module.
+
+    Import via the package path (``importlib.import_module``) rather than
+    ``spec_from_file_location``: the test module has top-level
+    ``pytest.skip(..., allow_module_level=True)`` guards that only trip inside a
+    pytest session, so a normal import resolves the reference cleanly. Falls back
+    to file-loading if the package import is unavailable (e.g. run from a tree
+    where ``op_tests`` is not importable).
+    """
     global _ref_fn
     if _ref_fn is not None:
         return _ref_fn
-    test_path = Path(_REPO_ROOT) / "op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py"
-    spec = importlib.util.spec_from_file_location("_test_prefill", test_path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    try:
+        mod = importlib.import_module(
+            "op_tests.flydsl_tests.test_flydsl_linear_attention_prefill"
+        )
+    except Exception:
+        test_path = (
+            Path(_REPO_ROOT)
+            / "op_tests/flydsl_tests/test_flydsl_linear_attention_prefill.py"
+        )
+        spec = importlib.util.spec_from_file_location("_test_prefill", test_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
     _ref_fn = mod.ref_chunk_gated_delta_rule_fwd_h
     return _ref_fn
 
@@ -217,14 +257,15 @@ def calculate_tflops(N: int, H: int, T_flat: int, K: int, V: int, time_us: float
 # --------------------------------------------------------------------------- #
 # Per-shape timing
 # --------------------------------------------------------------------------- #
-def _make_closure(fn, k, w_hm, u_hm, g, gk, h0):
+def _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu):
     def _run():
         fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
-           initial_state=h0, output_final_state=True, save_new_value=True, use_exp2=True)
+           initial_state=h0, output_final_state=True, save_new_value=True,
+           cu_seqlens=cu, use_exp2=_USE_EXP2)
     return _run
 
 
-def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, verification: str,
+def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu, verification: str,
                  baseline_fn=None) -> str:
     """Run correctness check. Returns a grade string."""
     if verification == "none":
@@ -232,7 +273,7 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, verification: str,
     try:
         h, v_new, fs = fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
                           initial_state=h0, output_final_state=True,
-                          save_new_value=True, use_exp2=True)
+                          save_new_value=True, cu_seqlens=cu, use_exp2=_USE_EXP2)
     except Exception as e:
         return f"ERROR({type(e).__name__})"
 
@@ -246,7 +287,7 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, verification: str,
             # Reference expects token-major w; accepts exactly one of g/gk.
             h_ref, _, _ = ref(k=k, w=w_tm, u=u_hm.permute(0, 2, 1, 3),
                                g=g, gk=gk, initial_state=h0,
-                               output_final_state=True)
+                               output_final_state=True, cu_seqlens=cu)
         except Exception as e:
             return f"REF-ERROR({e})"
         ratio = _rmse_ratio(h, h_ref)
@@ -256,7 +297,8 @@ def _verify_impl(fn, k, w_hm, u_hm, w_tm, g, gk, h0, verification: str,
         try:
             h_base, _, _ = baseline_fn(k=k, w=w_hm, u=u_hm, g=g, gk=gk,
                                         initial_state=h0, output_final_state=True,
-                                        save_new_value=False, use_exp2=True)
+                                        save_new_value=False, cu_seqlens=cu,
+                                        use_exp2=_USE_EXP2)
         except Exception as e:
             return f"BASELINE-ERROR({e})"
         ratio = _rmse_ratio(h, h_base)
@@ -271,7 +313,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
     label = _shape_label(idx, shape)
 
     try:
-        k, w_hm, u_hm, w_tm, g, gk, h0 = _make_inputs(shape)
+        k, w_hm, u_hm, w_tm, g, gk, h0, cu = _make_inputs(shape)
     except Exception as e:
         return {"label": label, "error": str(e)}
 
@@ -284,7 +326,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
 
     for impl_name, fn in impls.items():
         print(f"  {impl_name}...", end=" ", flush=True)
-        closure = _make_closure(fn, k, w_hm, u_hm, g, gk, h0)
+        closure = _make_closure(fn, k, w_hm, u_hm, g, gk, h0, cu)
 
         try:
             closure()
@@ -315,7 +357,7 @@ def _run_one(idx: int, impls: dict, shape: tuple, args, cfg: MeasureConfig) -> d
         verify_str = "N/A"
         if args.verification != "none":
             verify_str = _verify_impl(
-                fn, k, w_hm, u_hm, w_tm, g, gk, h0,
+                fn, k, w_hm, u_hm, w_tm, g, gk, h0, cu,
                 verification=args.verification,
                 baseline_fn=baseline_fn if impl_name != baseline_name else None,
             )
