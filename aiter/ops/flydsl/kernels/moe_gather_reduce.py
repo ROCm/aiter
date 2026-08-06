@@ -37,7 +37,8 @@ row's dword count is not a multiple of 4 the trailing group falls back to a
 per-lane scalar tail (mirroring ``compile_moe_reduction`` in
 ``moe_gemm_2stage.py``), so any even ``model_dim`` is supported.  Unused (t,k)
 slots are filled with row 0 and weight 0 by the host wrapper, so they contribute
-nothing and need no branch.
+nothing and need no branch; EP routes that own no grouped row instead carry
+``moe_route_maps.DROPPED_ROUTE_ROW`` and read through a zero-sized descriptor.
 """
 
 import flydsl.compiler as flyc
@@ -184,12 +185,15 @@ def build_moe_gather_reduce_module(
             # arith.extui these row/stride byte offsets used to go through.
             slice_stride_by_i64 = fx.Uint64(slice_stride_dw_i32) * 4
 
-            def src_row_rsrc(row_i32, sk):
+            row_bytes = fx.Int32(model_dim * 2)
+            no_bytes = fx.Int32(0)
+
+            def src_row_rsrc(row_i32, sk, nrec_bytes):
                 base = in_base_i64 + fx.Uint64(row_i32) * (model_dim * 2)
                 if sk != 0:
                     base = base + sk * slice_stride_by_i64
                 return buffer_ops.create_buffer_resource_from_addr(
-                    base, num_records_bytes=model_dim * 2
+                    base, num_records_bytes=nrec_bytes
                 )
 
             thread_id = fx.Uint32(tid)
@@ -201,17 +205,26 @@ def build_moe_gather_reduce_module(
             out_row_dw_base = bid_i32 * out_dwords_i32
 
             def _load_row_weight(k):
-                """Load (source grouped row, route weight as f32) for slot k."""
+                """Load (source grouped row, descriptor bytes, weight as f32) for k."""
                 map_off = map_base + k
-                row_i32 = fx.Uint32(
+                raw_row = fx.Int32(
                     buffer_ops.buffer_load(rows_rsrc, map_off, vec_width=1, dtype=i32)
                 )
+                # An EP route with no grouped row carries moe_route_maps'
+                # DROPPED_ROUTE_ROW (negative) sentinel. Its weight is already 0, but
+                # the row still must not be dereferenced: no such row exists in the
+                # grouped buffer and those bytes may never have been written (a stale
+                # NaN would survive the multiply by 0). Aim the descriptor at row 0
+                # with zero size so the hardware OOB check returns 0 instead.
+                is_mapped = raw_row >= fx.Int32(0)
+                row_i32 = fx.Uint32(is_mapped.select(raw_row, fx.Int32(0)))
+                nrec_bytes = is_mapped.select(row_bytes, no_bytes)
                 # weight loaded in its native dtype, extended to f32.
                 w_loaded = buffer_ops.buffer_load(
                     w_rsrc, map_off, vec_width=1, dtype=w_dt
                 )
                 # .to(Float32) is a no-op when the route weights are already f32.
-                return row_i32, w_dt_fx(w_loaded).to(fx.Float32)
+                return row_i32, nrec_bytes, w_dt_fx(w_loaded).to(fx.Float32)
 
             dw_base = thread_id * vec_i32 + iter_idx_i32 * DWORDS_PER_ITER
             dw_valid = dw_base < out_dwords_i32
@@ -221,11 +234,11 @@ def build_moe_gather_reduce_module(
                     acc = [fx.Float32(0.0) for _ in range(2 * VEC)]
 
                     for k in range_constexpr(topk):
-                        row_i32, w_f32 = _load_row_weight(k)
+                        row_i32, nrec_bytes, w_f32 = _load_row_weight(k)
                         red = [fx.Float32(0.0) for _ in range(2 * VEC)]
                         for sk in range_constexpr(split_k):
                             raw_vec = buffer_ops.buffer_load(
-                                src_row_rsrc(row_i32, sk),
+                                src_row_rsrc(row_i32, sk, nrec_bytes),
                                 dw_base,
                                 vec_width=VEC,
                                 dtype=i32,
@@ -263,13 +276,13 @@ def build_moe_gather_reduce_module(
                             acc_lo = fx.Float32(0.0)
                             acc_hi = fx.Float32(0.0)
                             for k in range_constexpr(topk):
-                                row_i32, w_f32 = _load_row_weight(k)
+                                row_i32, nrec_bytes, w_f32 = _load_row_weight(k)
                                 red_lo = fx.Float32(0.0)
                                 red_hi = fx.Float32(0.0)
                                 for sk in range_constexpr(split_k):
                                     raw_dw = fx.Uint32(
                                         buffer_ops.buffer_load(
-                                            src_row_rsrc(row_i32, sk),
+                                            src_row_rsrc(row_i32, sk, nrec_bytes),
                                             dw_idx,
                                             vec_width=1,
                                             dtype=i32,

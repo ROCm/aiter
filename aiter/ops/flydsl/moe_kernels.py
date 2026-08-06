@@ -2163,8 +2163,12 @@ def flydsl_moe_topids_to_rows(
 
     When ``g2l_lut`` is given, ``topk_ids`` are treated as GLOBAL expert ids and
     remapped to local buckets on-device (EP fusion): ``g2l_lut[global] -> local``
-    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes fold into
-    bucket 0. The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
+    in [0, E), or the sentinel ``E`` for dropped routes. Dropped routes claim no
+    slot and get ``moe_route_maps.DROPPED_ROUTE_ROW`` as their row, so the returned
+    counts (== ``masked_m``) cover only the routes whose expert is local to this
+    rank -- everything downstream (psum, contiguous row count, the grouped GEMM's
+    M) shrinks with them, and every consumer of the row map must skip the sentinel.
+    The kernel casts the f32 ``weight_in`` route weights into ``gather_w``
     (``weight_dtype``, out) in the same pass -- kept -> cast, dropped -> 0 --
     folding the host ``topk_weight.to(bf16)`` copy + dropped-weight masked_fill.
 
@@ -2303,7 +2307,9 @@ def flydsl_moe_fused_route_quant_scatter(
 
     When ``g2l_lut`` is given (EP fusion), ``topk_ids`` are GLOBAL expert ids and
     the kernel remaps them to local buckets in [0, E) on-device (sentinel ``E``
-    for dropped routes, folded into bucket 0 with their ``gather_w`` entry zeroed).
+    for dropped routes). A dropped route claims no slot, is tagged with
+    ``moe_route_maps.DROPPED_ROUTE_ROW``, has its ``gather_w`` entry zeroed and is
+    not quantized/scattered, so ``masked_m`` counts local routes only.
 
     ``counter`` is the ``(E,)`` per-expert atomic slot counter; a pre-zeroed
     buffer (from the g2l-LUT kernel) skips the host ``torch.zeros(E)`` launch.
