@@ -9,7 +9,6 @@
 #include "quant.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 
 const int32_t BlockSize           = 256;
@@ -95,7 +94,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     {
         absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
     }
-    absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+    absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
     // MX e8m0 path: use the project-wide default round mode
     // (``kDefaultMxScaleRoundMode``, currently RoundUp = NV / DSv4 RCEIL).
@@ -233,10 +232,7 @@ __device__ std::tuple<float, DTYPE_I*> data_to_per_row_scale(const DTYPE_I* __re
     }
     // double load core loop end
 
-    // using BlockReduce = hipcub::BlockReduce<float, BlockSize>;
-    // __shared__ typename BlockReduce::TempStorage temp_storage;
-    // absMax = BlockReduce(temp_storage).Reduce(absMax, hipcub::Max());
-    absMax = block_reduce<float, hipcub::Max, BlockSize, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, BlockSize, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -448,7 +444,7 @@ smooth_data_to_per_row_scale(const DTYPE_I* __restrict__ input,
         absMax         = max(absMax, abs(smscale_cur[j]));
     }
 
-    absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+    absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
     float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                           ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -1539,7 +1535,7 @@ __global__ void moe_smooth_per_token_scaled_quant_kernel_v2(DTYPE_O* __restrict_
                 vec_input_f[j] = vec_input_f[j] * smscale[j];
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = block_reduce<float, hipcub::Max, block_size, true>(absMax, hipcub::Max());
+            absMax = block_reduce<float, aiter::Max, block_size, true>(absMax, aiter::Max());
 
             float row_scale = std::is_same_v<DTYPE_O, opus::fp4_t>
                                 ? aiter::fp4_f32_to_e8m0_scale(absMax)
@@ -1841,7 +1837,7 @@ __global__ void fused_mx_quant_moe_sort_kernel(
                 vec_input_f[j] = static_cast<float>(vec_input[j]);
                 absMax         = max(absMax, abs(vec_input_f[j]));
             }
-            absMax = multithread_reduce(absMax, hipcub::Max(), num_thread_per_group);
+            absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
             // MXFP4 / MXFP8 use the project-wide default round mode
             // (kDefaultMxScaleRoundMode, currently NV ROUND_UP =

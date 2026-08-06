@@ -8,7 +8,6 @@
 #include "aiter_stream.h"
 #include "fused_qk_rmsnorm_group_quant.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 #include <type_traits>
 
 namespace aiter {
@@ -272,7 +271,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             float quant_scale = 0.0f;
             if constexpr(PER_TOKEN_QUANT)
             {
-                float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+                float max = block_reduce<float, aiter::Max, BlockSize, true>(thread_max, aiter::Max());
                 quant_scale = max * inverted_dtype_max;
                 if(tid == 0)
                 {

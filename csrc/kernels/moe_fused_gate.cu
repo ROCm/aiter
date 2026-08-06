@@ -23,8 +23,6 @@
 #include <algorithm>
 #include <cfloat>
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 #include <stdio.h>
 #include <type_traits>
 
@@ -246,10 +244,10 @@ __device__ void moe_fused_gate_impl(void* input,
         //       }
         //     }
 
-        using kvp = hipcub::KeyValuePair<int, float>;
+        using kvp = aiter::KeyValuePair<int, float>;
 
-        hipcub::ArgMax arg_max;
-        hipcub::ArgMin arg_min;
+        aiter::ArgMax arg_max;
+        aiter::ArgMin arg_min;
 
         kvp thread_kvp;
         thread_kvp.key       = expert;
@@ -300,8 +298,8 @@ __device__ void moe_fused_gate_impl(void* input,
             max_val = -FLT_MAX;
         }
 
-        using kvp = hipcub::KeyValuePair<int, float>;
-        hipcub::ArgMax arg_max;
+        using kvp = aiter::KeyValuePair<int, float>;
+        aiter::ArgMax arg_max;
         kvp thread_kvp;
         thread_kvp.key       = expert;
         thread_kvp.value     = max_val;

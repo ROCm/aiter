@@ -71,6 +71,76 @@ __device__ __forceinline__ T shuffle(const T& input, const int src_lane, const i
 
 } // namespace aiter_dpp
 
+// Reduction operators and the key/value pair the arg-reductions carry.
+//
+// The comparisons below look gratuitously specific -- they are not. Each one is
+// the exact expression the corresponding hipcub functor uses, so that swapping a
+// call site over does not shift results:
+//   - Max/Min compare the *second* argument against the first, which decides
+//     which operand survives when one of them is NaN;
+//   - ArgMax/ArgMin break value ties on the smaller key, so the winner does not
+//     depend on the order lanes happen to be combined in.
+namespace aiter {
+
+template <typename Key, typename Value>
+struct KeyValuePair
+{
+    Key key;
+    Value value;
+};
+
+struct Max
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return (u > t) ? u : t;
+    }
+};
+
+struct Min
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return (u < t) ? u : t;
+    }
+};
+
+struct Sum
+{
+    template <typename T, typename U>
+    __host__ __device__ constexpr typename std::common_type<T, U>::type
+    operator()(T&& t, U&& u) const
+    {
+        return t + u;
+    }
+};
+
+struct ArgMax
+{
+    template <typename Key, typename Value>
+    __host__ __device__ constexpr KeyValuePair<Key, Value>
+    operator()(const KeyValuePair<Key, Value>& a, const KeyValuePair<Key, Value>& b) const
+    {
+        return ((b.value > a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+struct ArgMin
+{
+    template <typename Key, typename Value>
+    __host__ __device__ constexpr KeyValuePair<Key, Value>
+    operator()(const KeyValuePair<Key, Value>& a, const KeyValuePair<Key, Value>& b) const
+    {
+        return ((b.value < a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+} // namespace aiter
+
 template <typename T, typename F>
 __device__ constexpr T wave_reduce_ds(T local, F reduce_op)
 {
@@ -295,6 +365,13 @@ __device__ constexpr T multithread_reduce(T data, F reduce_op, int thread_num)
     return data;
 }
 
+// Reduce across the whole block. With waveBroadcast the result is valid in every
+// thread, not just thread 0.
+//
+// The cross-wave stage stages partials through a block-scoped smem buffer, and
+// the only barrier inside sits *after* the write. Two calls of the same template
+// instantiation therefore need a __syncthreads() between them, or one thread's
+// write races the next thread's read of the previous round.
 template <typename T, typename F, int BlockSize, bool waveBroadcast = true>
 __device__ constexpr T block_reduce(T local, F reduce_op)
 {
@@ -309,7 +386,9 @@ __device__ constexpr T block_reduce(T local, F reduce_op)
     {
         int wave_id = threadIdx.x / wave_size;
         int lane_id = threadIdx.x % wave_size;
-        __shared__ float smem[waves];
+        // Must follow T: this staging buffer carries whatever the caller reduces
+        // (e.g. a KeyValuePair), not just float.
+        __shared__ T smem[waves];
 
         local = wave_reduce<T, F, WARP_SIZE, false>(local, reduce_op);
 

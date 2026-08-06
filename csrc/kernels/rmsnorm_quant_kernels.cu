@@ -12,7 +12,6 @@
 #include "aiter_tensor.h"
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
@@ -227,7 +226,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 float quant_scale;
                 if(group_size ==  0)
                 {
-                    float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+                    float max = block_reduce<float, aiter::Max, BlockSize, true>(thread_max, aiter::Max());
                     quant_scale = max * inverted_DTYPE_MAX;
                     if(threadIdx.x == 0)
                     {
@@ -237,7 +236,7 @@ __global__ void add_rmsnorm_quant_kernel(
                 else
                 {
                     int reduce_thread_size = group_size / thread_data_size;
-                    float max= multithread_reduce(thread_max, hipcub::Max(), reduce_thread_size);
+                    float max= multithread_reduce(thread_max, aiter::Max(), reduce_thread_size);
                     if(use_e8m0)
                     {
                         constexpr aiter::MxDtype kMxDtype = is_fp4_out

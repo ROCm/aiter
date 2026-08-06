@@ -36,8 +36,6 @@
 #include <torch/all.h>
 
 #include <hip/hip_runtime.h>
-#include <hipcub/hipcub.hpp>
-#include <hipcub/util_type.hpp>
 
 #include "dispatch_utils.h"
 #include "opus/opus.hpp"

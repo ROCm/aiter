@@ -7,7 +7,6 @@
 #include "aiter_stream.h"
 #include "dsv4_rotate_quant.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 
 namespace aiter {
 
