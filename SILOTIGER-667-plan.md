@@ -279,6 +279,10 @@ entry point auto-selects `kh=2` when `HIDDEN` is even. **Measured (gfx950, cold 
 interleaved A/B):** H1→H2 is **+15–28%** — B1 pertensor 6.63→7.95 TB/s (83→99% peak),
 B4 pertensor 7.66→9.81, B1 pertoken 6.49→7.44, B1 block2d 6.44→7.66, all cos 1.0. This gives
 `down` the two-stream memory-level parallelism that already puts `gate_up` at ~peak.
+**`kh=2` is the optimum** — H4/H8 were measured and *regress* (see §10 H4 experiment): the
+kernel generalizes over `kh`, but doubling `kh` halves the wave count (`B*HIDDEN/kh`) while total
+in-flight streams (`waves×kh`) stays constant, so past `kh=2` there aren't enough resident waves
+to fill the CUs even though per-wave MLP saturated. Not a spill cliff (VGPR 36, scratch 0 ∀ kh).
 The win is MLP (two weight loads in flight + activation reuse). Ship 1-output first, then H2.
 
 ### 7.5 Primitives — what to build locally vs. reuse
@@ -461,4 +465,14 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   A/B (8 trials each, cold reads, bit-identical output): **H1→H2 +15–28%** — B1 pertensor
   **6.63→7.95 TB/s (83→99% peak)**, B4 pertensor **7.66→9.81**, B1 pertoken 6.49→7.44,
   B1 block2d 6.44→7.66, B1 I1024/H4096 5.54→6.54. `down` now matches `gate_up`'s ~peak BW.
-  Remaining: CK-Tile reference-number comparison (possible further lever: H4).
+- _perf: H4/H8 experiment (rejected)_ — swept `kh_per_warp ∈ {1,2,4,8}` (interleaved, 8 trials,
+  cold reads, cos 1.0 throughout). **`kh=2` wins on every shape/mode; `kh≥4` regresses** back
+  toward H1: B1 pertensor 7.67(kh2)→6.26(kh4)→6.27(kh8); B1 pertoken 7.38→6.24→6.10; B1 block2d
+  7.41→6.85→5.59; B1 I1024/H4096 5.85→4.92→3.82; B4 pertensor 9.85→8.69→9.07. Cause is **not**
+  register spill — rocprofv3 kernel-trace reports VGPR=36, Scratch=0, LDS=0 for all `kh`. It's
+  occupancy/wave-count: resident waves = `B*HIDDEN/kh` (B1/H7168: 7168/3584/1792/896), while
+  total in-flight weight streams `waves×kh` is constant (7168). `kh=2` is the balance point —
+  enough intra-wave MLP (2 loads in flight; kh=1 has only 1) *and* enough waves to fill the CUs;
+  `kh≥4` drops wave count below the fill threshold after per-wave MLP has already saturated.
+  Kept `kh=2` as the default; no code change (the kernel already generalizes over `kh`).
+  Remaining: CK-Tile reference-number comparison.
