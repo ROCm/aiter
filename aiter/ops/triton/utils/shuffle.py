@@ -186,13 +186,16 @@ def shuffle_scale_moe(
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
+        scale = tiled.transpose(-1, -2)
         layout = "GFX1250_SCALE"
-    elif (arch or get_arch()) == "gfx950":
+    elif arch == "gfx950":
         tiled = _shuffle_scale_tile_gfx950(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth
         )
+        scale = tiled.transpose(-1, -2)
         layout = "CDNA4_SCALE"
-    scale = tiled.transpose(-1, -2)
+    else:
+        scale = data
     return (scale, layout) if return_layout else scale
 
 
