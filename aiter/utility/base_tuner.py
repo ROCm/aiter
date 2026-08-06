@@ -42,7 +42,7 @@ class TunerCommon:
         "errRatio": 0.05,
         "batch": 100,
         "profile_file": "",  # for all results
-        "timeout": None,  # 100s timeout for per test
+        "timeout": 100,  # per task group; without it a lost worker is never reaped
         "warmup": 5,  # 5 warmup iters for profiling
         "iters": 101,  # 101 run iters for profiling
         "min_improvement_pct": 3.0,  # only write shapes improved by >= N%
