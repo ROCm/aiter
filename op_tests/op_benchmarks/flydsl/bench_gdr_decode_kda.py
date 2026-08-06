@@ -11,6 +11,12 @@ WARP_THREADS_K=8, so any timing taken before the sweep measures the fallback
 rather than the kernel. ``--sweep`` produces the missing rows; ``--bench``
 compares the tuned kernel against the deployed Triton kernel.
 
+``--bench`` reports two things, because at decode batch sizes they differ by
+about 2x and quoting the wrong one is the easy mistake: how fast a decode *loop*
+runs (``call_us``, host cost included -- below B=64 both kernels are host-bound,
+so this is set by the host and not the kernel) and how fast the *kernels* are
+(``kernel_us``, host cost excluded -- what the sweep ranks on).
+
 Usage:
     # Tuning sweep, emits rows in gdr_decode_tuned.csv format
     python bench_gdr_decode_kda.py --sweep -o rows.csv
@@ -34,6 +40,7 @@ import math
 import os
 import statistics
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -51,10 +58,13 @@ STATE_DTYPE = torch.float32
 G_MIN = -5.0
 BATCHES = (1, 4, 64, 256)
 
-# The search space the existing table was built over.
-NUM_BLOCKS_PER_V_DIM_CHOICES = (1, 2, 4, 8)
-NUM_WARPS_CHOICES = (1, 2, 4)
-WARP_THREADS_K_CHOICES = (4, 8, 16, 32)
+# Wider than the space the existing table was built over, which stopped at
+# NUM_BLOCKS_PER_V_DIM=8 / NUM_WARPS=4. That was sized for GQA shapes with 32-64
+# value heads; K3 has 12, so the grid (B * H_v * NUM_BLOCKS_PER_V_DIM) is far
+# smaller and splitting V harder is the only way to fill the GPU at low batch.
+NUM_BLOCKS_PER_V_DIM_CHOICES = (1, 2, 4, 8, 16, 32, 64)
+NUM_WARPS_CHOICES = (1, 2, 4, 8, 16)
+WARP_THREADS_K_CHOICES = (1, 2, 4, 8, 16, 32)
 
 # What get_default_kwargs falls back to when no row matches the shape.
 FALLBACK_CONFIG = (1, 4, 8)
@@ -62,6 +72,11 @@ FALLBACK_CONFIG = (1, 4, 8)
 # How many of the sweep's leaders get re-timed, and over how many trials.
 TOP_N = 5
 TRIALS = 5
+
+# Calls per call_us measurement. Long enough that the trailing sync -- the last
+# call's device time, the only part not overlapped by the next enqueue -- is lost
+# in the average, short enough that B=256 still costs ~30 ms.
+LOOP_ITERS = 500
 
 CSV_HEADER = (
     "arch,dtype,state_dtype,b,sq,num_k_heads,num_v_heads,head_k_dim,head_v_dim,"
@@ -221,8 +236,37 @@ def check(inp, out, state_after, pool_before):
     return ok, max(o_abs, s_abs)
 
 
-def time_us(fn):
+def kernel_us(fn):
+    """Time the *kernel*: device time for one call, via CUDA events, L2 flushed.
+
+    Host cost is invisible here -- the events sit on the device timeline, so
+    whatever Python took to enqueue the call is not in the number.
+    """
     return triton.testing.do_bench(fn, warmup=25, rep=100) * 1e3
+
+
+def call_us(fn):
+    """Time the *call*: wall clock per call with calls issued back to back.
+
+    Host cost is included, so this is the larger of the two whenever the host
+    cannot keep the GPU fed -- which at these shapes is every batch below 64.
+    A decode loop is thousands of these back to back, and it runs at whichever
+    of host or device is slower, so this is the one that answers "how fast does
+    decode go". That the host cost survives to production is not an assumption:
+    vLLM marks this op ``@eager_break_during_capture``, so it is re-run eagerly
+    on every decode step rather than replayed from a captured graph.
+
+    One sync, at the end. Syncing per call would serialise host and device and
+    measure neither.
+    """
+    for _ in range(25):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(LOOP_ITERS):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / LOOP_ITERS * 1e6
 
 
 def confirm(B, candidates):
@@ -246,7 +290,7 @@ def confirm(B, candidates):
             if t == 0:
                 _, err = check(inp, out, inp["pool"], pool0)
             inp["pool"].copy_(pool0)
-            times.append(time_us(run))
+            times.append(kernel_us(run))
         rows.append((statistics.median(times), min(times), max(times), cfg, err))
 
     fallback = next(r[0] for r in rows if r[3] == FALLBACK_CONFIG)
@@ -294,7 +338,7 @@ def sweep(args):
 
             inp["pool"].copy_(baseline_pool)
             run, _ = flydsl_runner(inp, cfg)
-            us = time_us(run)
+            us = kernel_us(run)
             results.append((us, cfg, err))
 
         results.sort()
@@ -383,11 +427,12 @@ def load_triton(vllm_path):
 
 
 def bench_one(B, flydsl_gdr_decode, triton_fn):
-    """One row of the A/B table.
+    """One row of both A/B tables: every measurement at one batch size.
 
     Its own function so the timed closures bind parameters rather than a loop
     variable, and so every timing starts from the same pre-run state -- both
-    kernels update the paged state in place.
+    kernels update the paged state in place, hence the ``copy_(pool0)`` before
+    each one.
     """
     inp = make_inputs(B)
     pool0 = inp["pool"].clone()
@@ -421,7 +466,9 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
     torch.cuda.synchronize()
     fly_ok, fly_err = check(inp, out, inp["pool"], pool0)
     inp["pool"].copy_(pool0)
-    fly_us = time_us(fly)
+    fly_kernel = kernel_us(fly)
+    inp["pool"].copy_(pool0)
+    fly_call = call_us(fly)
 
     def tri():
         return triton_fn(
@@ -435,14 +482,16 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
             inp["indices"],
         )
 
-    tri_us, tri_ok, tri_err = math.nan, None, math.nan
+    tri_kernel, tri_call, tri_ok, tri_err = math.nan, math.nan, None, math.nan
     if triton_fn is not None:
         inp["pool"].copy_(pool0)
         tri_out, _ = tri()
         torch.cuda.synchronize()
         tri_ok, tri_err = check(inp, tri_out[0].unsqueeze(1), inp["pool"], pool0)
         inp["pool"].copy_(pool0)
-        tri_us = time_us(tri)
+        tri_kernel = kernel_us(tri)
+        inp["pool"].copy_(pool0)
+        tri_call = call_us(tri)
 
     # What a caller got before the sweep: with no 12x12 row the wrapper falls
     # back to (1, 4, 8). Bound directly, since the wrapper now finds a row.
@@ -451,22 +500,34 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
     untuned_run()
     torch.cuda.synchronize()
     inp["pool"].copy_(pool0)
-    untuned_us = time_us(untuned_run)
+    untuned_kernel = kernel_us(untuned_run)
 
-    unpack_us = time_us(
+    unpack_kernel = kernel_us(
         lambda: (
             inp["q"].contiguous(),
             inp["k"].contiguous(),
             inp["v"].contiguous(),
         )
     )
+
+    def ratio(tri, fly):
+        return math.nan if math.isnan(tri) else tri / fly
+
     return {
         "B": B,
-        "tri_us": tri_us,
-        "untuned_us": untuned_us,
-        "fly_us": fly_us,
-        "speedup": math.nan if math.isnan(tri_us) else tri_us / fly_us,
-        "unpack_us": unpack_us,
+        # How fast a decode loop runs. Host cost included; the ticket's number.
+        "tri_call": tri_call,
+        "fly_call": fly_call,
+        "call_speedup": ratio(tri_call, fly_call),
+        # How fast the kernels are. Host cost excluded; what the sweep ranks on.
+        "tri_kernel": tri_kernel,
+        "fly_kernel": fly_kernel,
+        "kernel_speedup": ratio(tri_kernel, fly_kernel),
+        # Two asides that only make sense on the kernel axis: what the sweep
+        # bought over the untuned fallback, and what a packed-QKV caller would
+        # pay to unpack (a deferred ticket, reported rather than hidden).
+        "untuned_kernel": untuned_kernel,
+        "unpack_kernel": unpack_kernel,
         "fly_ok": fly_ok,
         "fly_err": fly_err,
         "tri_ok": tri_ok,
@@ -474,8 +535,34 @@ def bench_one(B, flydsl_gdr_decode, triton_fn):
     }
 
 
+def print_table(caption, columns, table):
+    """``columns`` is (heading, width, key) each, plus 'x' on any *_speedup key."""
+    print(f"\n{caption}\n")
+    header = " ".join(f"{head:>{w}}" for head, w, _ in columns)
+    print(header)
+    print("-" * len(header))
+    for r in table:
+        cells = []
+        for _, w, key in columns:
+            if key == "B":
+                cells.append(f"{r['B']:>{w}}")
+            elif key.endswith("speedup"):
+                cells.append(f"{r[key]:>{w - 1}.2f}x")
+            else:
+                cells.append(f"{r[key]:>{w}.2f}")
+        print(" ".join(cells))
+
+
 def bench(args):
     """A/B at the ticket's batch sizes, both kernels on identical values.
+
+    Two tables, because "how fast is it" has two answers here and quoting the
+    wrong one is the easy mistake. The first times the *call* and is the ticket's
+    number: below B=64 both kernels are host-bound, so a decode loop runs at the
+    rate the host can drive it and the kernel is not the constraint. The second
+    times the *kernel* with host cost excluded, which is what the sweep ranks on
+    and where the tuning shows up. They disagree by about 2x at B=1, and both are
+    true -- see ``kernel_us`` and ``call_us``.
 
     FlyDSL is run through the public wrapper so the number reflects what a
     consumer gets, tuning table included -- not a hand-picked config.
@@ -484,23 +571,32 @@ def bench(args):
 
     arch = get_rocm_arch()
     triton_fn = load_triton(args.vllm)
-    print(f"\narch {arch} · H={H} K=V={K} bf16 · f32 state · per-call us\n")
-    header = (
-        f"{'B':>5} {'Triton (baseline)':>18} {'FlyDSL (untuned)':>17}"
-        f" {'FlyDSL (tuned)':>16} {'speedup':>9} {'QKV unpack':>13}"
-    )
-    print(header)
-    print("-" * len(header))
+    print(f"\narch {arch} · H={H} K=V={K} bf16 · f32 state · all times us")
 
-    table = []
-    for B in BATCHES:
-        row = bench_one(B, flydsl_gdr_decode, triton_fn)
-        print(
-            f"{row['B']:>5} {row['tri_us']:>18.2f} {row['untuned_us']:>17.2f}"
-            f" {row['fly_us']:>16.2f} {row['speedup']:>8.2f}x"
-            f" {row['unpack_us']:>13.2f}"
-        )
-        table.append(row)
+    table = [bench_one(B, flydsl_gdr_decode, triton_fn) for B in BATCHES]
+
+    print_table(
+        "how fast a decode loop runs -- wall clock per call, calls back to back",
+        [
+            ("B", 5, "B"),
+            ("Triton", 10, "tri_call"),
+            ("FlyDSL", 10, "fly_call"),
+            ("speedup", 9, "call_speedup"),
+        ],
+        table,
+    )
+    print_table(
+        "how fast the kernels are -- device time per call, host cost excluded",
+        [
+            ("B", 5, "B"),
+            ("Triton", 10, "tri_kernel"),
+            ("FlyDSL", 10, "fly_kernel"),
+            ("speedup", 9, "kernel_speedup"),
+            ("FlyDSL untuned", 15, "untuned_kernel"),
+            ("QKV unpack", 12, "unpack_kernel"),
+        ],
+        table,
+    )
 
     print("\nparity vs the torch reference (both must hold, or the timing is noise):")
     for r in table:
