@@ -35,7 +35,7 @@ on:
           - build-only-aiter
           - linux-aiter-mi35x-1
           - linux-aiter-mi355-1
-          - aiter-1gpu-runner
+          - linux-aiter-oci-mi300x-1
       release_type:
         description: 'Release type for S3 publishing'
         type: choice

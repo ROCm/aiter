@@ -41,14 +41,11 @@ to use the legacy single-kernel ``flydsl_fused_compress_attn``.
 """
 
 import math
-from contextlib import contextmanager
 from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
 from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
@@ -63,17 +60,6 @@ BLOCK_THREADS = 64  # 1 wave64
 SLICE = 64  # head_dim elements per block (grid-Y split)
 _NEG_INF = float("-inf")
 _LOG2E = math.log2(math.e)
-
-
-@contextmanager
-def _if_then(if_op):
-    with ir.InsertionPoint(if_op.then_block):
-        try:
-            yield if_op.then_block
-        finally:
-            blk = if_op.then_block
-            if (not blk.operations) or not isinstance(blk.operations[-1], scf.YieldOp):
-                scf.YieldOp([])
 
 
 # ============================================================================
@@ -201,9 +187,7 @@ def _build_compress_forward_kernel(
         c_state_size = arith.constant(state_size, type=i32)
 
         def fexp_f32(x):
-            return llvm.call_intrinsic(
-                f32, "llvm.amdgcn.exp2.f32", [x * c_log2e], [], []
-            )
+            return fx.rocdl.exp2(f32, x * c_log2e)
 
         # Per-thread wave / lane (block-local).
         wid = arith.divsi(_to_raw(tid), c_64)  # ? [0, NW)
@@ -218,9 +202,9 @@ def _build_compress_forward_kernel(
         position = vector.extract(plan_vec, static_position=[2], dynamic_position=[])
         window_len = vector.extract(plan_vec, static_position=[3], dynamic_position=[])
 
-        is_active = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        # Sentinel-skip: run the whole body only for position >= 0, as a closure
+        # under a runtime `if` (rewriter sees an opaque call -> scf.if).
+        def _body():
             # Per-thread head_dim base: each thread owns VEC contiguous
             # elements starting at slice_base + lid * VEC.
             slice_base_i32 = ArithValue(sid) * c_SLICE
@@ -499,9 +483,7 @@ def _build_compress_forward_kernel(
             # (VEC elements per thread). For each owned element, the thread
             # reads NW values from LDS (one per K-split wave) and computes
             # the global online-softmax.
-            is_wave0 = arith.cmpi(CmpIPredicate.eq, wid, c_zero_i32)
-            _if_w0 = scf.IfOp(is_wave0)
-            with _if_then(_if_w0):
+            def _wave0():
                 comp_list = []
                 for i in range_constexpr(VEC):
                     lane_off = ArithValue(lid) * c_VEC + arith.constant(i, type=i32)
@@ -525,11 +507,7 @@ def _build_compress_forward_kernel(
                         scale_w = fx.Float32(fexp_f32(_to_raw(m_w - m_g)))
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
-                    rcp_w = fx.Float32(
-                        llvm.call_intrinsic(
-                            f32, "llvm.amdgcn.rcp.f32", [_to_raw(w_sum)], [], []
-                        )
-                    )
+                    rcp_w = fx.Float32(fx.rocdl.rcp(f32, _to_raw(w_sum)))
                     comp_list.append(_to_raw(kv_sum * rcp_w))
 
                 # -- Vectorized write of VEC f32 comp values --
@@ -558,6 +536,12 @@ def _build_compress_forward_kernel(
                         ArithValue(out_off) + arith.constant(half, type=i32),
                     )
 
+            if wid == 0:
+                _wave0()
+
+        if fx.Int32(position) >= 0:
+            _body()
+
     @flyc.jit
     def launch_hca_compress_forward(
         kv_in: fx.Tensor,
@@ -578,8 +562,8 @@ def _build_compress_forward_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = arith.index_cast(T.index, _to_raw(plan_capacity))
-        idx_s = arith.index_cast(T.index, arith.constant(NUM_SPLIT, type=T.i32))
+        idx_p = fx.Int64(plan_capacity)
+        idx_s = fx.Int64(NUM_SPLIT)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -720,11 +704,10 @@ def _build_norm_rope_scatter_kernel(
         # active = real plan row (position>=0 sentinel) AND within capacity (tail
         # waves of the last block have pid>=cap and must bail; their plan load is
         # bounds-checked to 0 by the buffer resource, so guard explicitly here).
-        pos_ok = arith.cmpi(CmpIPredicate.sge, _to_raw(position), c_zero_i32)
-        row_ok = arith.cmpi(CmpIPredicate.slt, _to_raw(pid), _to_raw(plan_capacity))
-        is_active = arith.andi(pos_ok, row_ok)
-        _if_active = scf.IfOp(is_active)
-        with _if_then(_if_active):
+        is_active = (fx.Int32(position) >= 0) & (pid < plan_capacity)
+
+        # Whole body as a closure under the runtime guard (opaque call -> scf.if).
+        def _body():
             tid_x_vec = ArithValue(lane) * arith.constant(VEC, type=i32)
 
             # -- Load kv_compressed[pid, tid*VEC : tid*VEC + VEC] --
@@ -971,6 +954,9 @@ def _build_norm_rope_scatter_kernel(
                 else:
                     buffer_ops.buffer_store(bf16_as_i32, out_rsrc, cache_off_dw)
 
+        if is_active:
+            _body()
+
     @flyc.jit
     def launch_hca_norm_rope_scatter(
         kv_compressed: fx.Tensor,
@@ -996,7 +982,7 @@ def _build_norm_rope_scatter_kernel(
             arith.addi(cap_raw, arith.constant(KW - 1, type=T.i32)),
             arith.constant(KW, type=T.i32),
         )
-        idx_p = arith.index_cast(T.index, nblocks)
+        idx_p = fx.Int64(nblocks)
         k = kernel(
             kv_compressed,
             kv_compressed_row_stride,
