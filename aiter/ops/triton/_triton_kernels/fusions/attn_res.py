@@ -13,7 +13,7 @@ _LOG2E = tl.constexpr(1.4426950408889634)
         for BH in [512, 1024, 2048]
         for nw in [2, 4, 8]
     ],
-    key=["L2", "D", "HAS_ONORM", "SAVE_OPRE", "LOAD_CACHE", "STORE_CACHE", "EXP2"],
+    key=["L2", "D", "HAS_ONORM", "LOAD_CACHE", "STORE_CACHE", "EXP2"],
 )
 @triton.jit(do_not_specialize=["L"])
 def _attn_res_fwd_sequence_2pass_kernel(
@@ -23,9 +23,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
     ow,
     o,
     o_pre,
-    rstd,
-    logit,
-    lse,
     N,
     L,
     L2: tl.constexpr,
@@ -35,7 +32,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
     BH: tl.constexpr,
     NS: tl.constexpr,
     HAS_ONORM: tl.constexpr,
-    SAVE_OPRE: tl.constexpr,
     LOAD_CACHE: tl.constexpr,
     STORE_CACHE: tl.constexpr,
     EXP2: tl.constexpr,
@@ -45,6 +41,9 @@ def _attn_res_fwd_sequence_2pass_kernel(
     Only the per-source scalars stay resident (~100 VGPR), so occupancy is high
     and the kernel saturates HBM at large N. The residual is read twice: once
     for the reductions and once for the weighted sum.
+
+    ``o_pre`` is an internal fp32 scratch used only when HAS_ONORM (pass 2 writes
+    it, pass 3 reads it back); it is not produced for the caller.
     """
     i_n = tl.program_id(0).to(tl.int64)
     inv_d = 1.0 / D
@@ -85,10 +84,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
     b_acc = tl.sum(b_p, axis=0)
     probs = b_p / b_acc
 
-    tl.store(lse + i_n, b_m + tl.log(b_acc))
-    tl.store(rstd + b_idx * N + i_n, b_rstd.to(rstd.dtype.element_ty), mask=b_valid)
-    tl.store(logit + b_idx * N + i_n, b_logit.to(logit.dtype.element_ty), mask=b_valid)
-
     # ---- PASS 2: o_pre = sum_l p_l v_l, tiled over D ----
     acc_o_sq = tl.zeros([], dtype=tl.float32)
     for h0 in tl.range(0, D, BH, num_stages=NS):
@@ -107,13 +102,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
             tl.store(o_pre + i_n * D + cols, o_blk, mask=h_mask)  # fp32 scratch
             acc_o_sq += tl.sum(tl.where(h_mask, o_blk * o_blk, 0.0), axis=0)
         else:
-            if SAVE_OPRE:
-                tl.store(
-                    o_pre + i_n * D + cols,
-                    o_blk.to(o_pre.dtype.element_ty),
-                    mask=h_mask,
-                    cache_modifier=STORE_CACHE,
-                )
             tl.store(
                 o + i_n * D + cols,
                 o_blk.to(o.dtype.element_ty),
@@ -143,10 +131,8 @@ def _attn_res_fwd_sequence_2pass_kernel(
         "L2",
         "D",
         "HAS_ONORM",
-        "SAVE_OPRE",
         "HAS_PREFIX",
         "DO_ADD",
-        "SAVE_STATS",
         "HAS_W",
         "LOAD_CACHE",
         "STORE_CACHE",
@@ -160,10 +146,6 @@ def _attn_res_fwd_packed_1pass_kernel(
     w,
     ow,
     o,
-    o_pre,
-    rstd,
-    logit,
-    lse,
     prefix,
     add_hidden,
     prefix_out,
@@ -177,11 +159,9 @@ def _attn_res_fwd_packed_1pass_kernel(
     scale: tl.constexpr,
     BD: tl.constexpr,
     HAS_ONORM: tl.constexpr,
-    SAVE_OPRE: tl.constexpr,
     HAS_PREFIX: tl.constexpr,
     DO_ADD: tl.constexpr,
     WRITE_PREF: tl.constexpr,
-    SAVE_STATS: tl.constexpr,
     HAS_W: tl.constexpr,
     LOAD_CACHE: tl.constexpr,
     STORE_CACHE: tl.constexpr,
@@ -257,23 +237,7 @@ def _attn_res_fwd_packed_1pass_kernel(
     b_acc = tl.sum(b_p, axis=0)
     probs = b_p / b_acc
 
-    # Inference only needs o, so the backward statistics are opt-in: writing
-    # them costs an extra (2 * L + 1) fp32 stores per token.
-    if SAVE_STATS:
-        tl.store(lse + i_n, b_m + tl.log(b_acc))
-        tl.store(rstd + b_idx * N + i_n, b_rstd.to(rstd.dtype.element_ty), mask=b_valid)
-        tl.store(
-            logit + b_idx * N + i_n, b_logit.to(logit.dtype.element_ty), mask=b_valid
-        )
-
     b_o = tl.sum(probs[:, None] * v, axis=0)  # [BD] pre-norm mix
-    if SAVE_OPRE:
-        tl.store(
-            o_pre + i_n * D + cols,
-            b_o.to(o_pre.dtype.element_ty),
-            mask=m_d,
-            cache_modifier=STORE_CACHE,
-        )
     if HAS_ONORM:
         o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) * inv_d + eps)
         owv = tl.load(ow + cols, mask=m_d, other=0.0).to(tl.float32)

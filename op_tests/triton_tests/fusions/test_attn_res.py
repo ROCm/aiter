@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.fusions.attn_res import attn_res, attn_res_fwd, attn_res_gate
+from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
 
 # (dtype -> (atol, rtol)) for comparing against the fp32 torch reference.
 _TOL = {
@@ -53,10 +53,10 @@ def test_attn_res(layout, shape, L, with_onorm, dtype):
         N, D, L, dtype, with_onorm
     )
 
-    o_ref, _, rstd_ref, logit_ref, _ = run_torch(
+    o_ref, *_ = run_torch(
         query, residuals, rms_weight, output_rms_weight, rms_eps, scale
     )
-    o, o_pre, rstd, logit, _lse = attn_res_fwd(
+    o = attn_res_fwd(
         query,
         residuals,
         rms_weight,
@@ -68,10 +68,6 @@ def test_attn_res(layout, shape, L, with_onorm, dtype):
 
     atol, rtol = _TOL[dtype]
     torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
-    torch.testing.assert_close(rstd, rstd_ref, atol=atol, rtol=rtol)
-    torch.testing.assert_close(logit, logit_ref, atol=atol, rtol=rtol)
-    # checkpoint_level defaults to 1, so the pre-norm mix is not returned.
-    assert o_pre is None
 
 
 @pytest.mark.parametrize("layout", ["sequence", "packed"])
@@ -87,7 +83,7 @@ def test_attn_res_toggles(layout, use_exp2, use_cache_modifier):
     )
 
     o_ref, *_ = run_torch(query, residuals, rms_weight, None, rms_eps, scale)
-    o, *_ = attn_res_fwd(
+    o = attn_res_fwd(
         query,
         residuals,
         rms_weight,
@@ -103,35 +99,6 @@ def test_attn_res_toggles(layout, use_exp2, use_cache_modifier):
     torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("layout", ["sequence", "packed"])
-def test_attn_res_checkpoint_level_0(layout):
-    """checkpoint_level=0 also returns the pre-norm mix used by backward."""
-    N, D, L = 64, 256, 4
-    rms_eps, scale = 1e-6, 1.0
-    dtype = torch.float32
-    query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
-        N, D, L, dtype, with_onorm=True
-    )
-
-    _, o_pre_ref, *_ = run_torch(
-        query, residuals, rms_weight, output_rms_weight, rms_eps, scale
-    )
-    _o, o_pre, *_ = attn_res_fwd(
-        query,
-        residuals,
-        rms_weight,
-        output_rms_weight,
-        rms_eps,
-        scale,
-        checkpoint_level=0,
-        layout=layout,
-    )
-
-    atol, rtol = _TOL[dtype]
-    assert o_pre is not None
-    torch.testing.assert_close(o_pre.float(), o_pre_ref, atol=atol, rtol=rtol)
-
-
 def test_attn_res_packed_tensor_input():
     """The packed layout also accepts a pre-stacked [N, L, D] tensor."""
     N, D, L = 64, 512, 4
@@ -142,43 +109,14 @@ def test_attn_res_packed_tensor_input():
     )
     packed = torch.stack(residuals, dim=-2).contiguous()  # [N, L, D]
 
-    o_list, *_ = attn_res_fwd(
+    o_list = attn_res_fwd(
         query, residuals, rms_weight, None, rms_eps, scale, layout="packed"
     )
-    o_packed, *_ = attn_res_fwd(
+    o_packed = attn_res_fwd(
         query, packed, rms_weight, None, rms_eps, scale, layout="packed"
     )
 
     torch.testing.assert_close(o_packed, o_list, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("layout", ["sequence", "packed"])
-def test_attn_res_return_weights(layout):
-    """attn_res(return_weights=True) reproduces the softmax gate."""
-    N, D, L = 64, 256, 4
-    rms_eps, scale = 1e-6, 0.5
-    dtype = torch.float32
-    query, residuals, rms_weight, _ = generate_attn_res_inputs(
-        N, D, L, dtype, with_onorm=False
-    )
-
-    o_ref, _, _, _, probs_ref = run_torch(
-        query, residuals, rms_weight, None, rms_eps, scale
-    )
-    o, probs = attn_res(
-        query,
-        residuals,
-        rms_weight,
-        None,
-        rms_eps,
-        scale,
-        return_weights=True,
-        layout=layout,
-    )
-
-    atol, rtol = _TOL[dtype]
-    torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
-    torch.testing.assert_close(probs.float(), probs_ref, atol=atol, rtol=rtol)
 
 
 def generate_attn_res_gate_inputs(N, D, B, dtype, with_add, seed=33):
@@ -324,7 +262,7 @@ def test_attn_res_gate_matches_attn_res_fwd(B):
     # and a unit rms_weight, with the prefix materialized as the last candidate.
     packed = torch.cat([block_residual, prefix.unsqueeze(-2)], dim=-2).contiguous()
     ones = torch.ones(D, dtype=dtype, device=prefix.device)
-    y_fwd, *_ = attn_res_fwd(
+    y_fwd = attn_res_fwd(
         score_weight, packed, ones, None, eps, scale, layout="packed"
     )
 

@@ -28,8 +28,12 @@ won for it in benchmarking:
 
 :func:`attn_res_gate` exposes the same math under the inference contract used
 by serving stacks: the candidate set is a packed ``[.., B, D]`` block plus a
-separate ``prefix`` row, the caller's ``prefix += hidden`` add can be folded
-into the kernel, and the backward statistics are not produced.
+separate ``prefix`` row, and the caller's ``prefix += hidden`` add can be
+folded into the kernel.
+
+This is a forward-only port: the kernels compute only the mixed residual, so
+none of the backward checkpoint (the pre-norm mix, the per-candidate rstd, and
+the softmax logit/lse stats) is produced.
 """
 
 from collections.abc import Sequence
@@ -71,12 +75,11 @@ def attn_res_fwd(
     output_rms_weight: torch.Tensor | None = None,
     rms_eps: float = 1e-6,
     scale: float = 1.0,
-    checkpoint_level: int = 1,
     *,
     layout: str = "sequence",
     use_exp2: bool = True,
     use_cache_modifier: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Attention-residual forward.
 
     Key parameters:
@@ -88,15 +91,12 @@ def attn_res_fwd(
     - output_rms_weight: optional ``[D]`` weight enabling the output RMSNorm.
     - rms_eps: epsilon of both the per-candidate and the output RMSNorm.
     - scale: multiplies the logits before the softmax.
-    - checkpoint_level: 0 also returns the pre-norm mix ``o_pre`` for backward.
     - layout: "sequence" (two-pass) or "packed" (one-pass).
     - use_exp2: softmax via the hardware exp2 instead of exp.
     - use_cache_modifier: residual ``.cg`` load / output ``.cs`` store instead
       of default caching.
 
-    Returns:
-    - (o, o_pre, rstd, logit, lse); ``o_pre`` is None unless
-      ``checkpoint_level == 0``.
+    Returns the mixed residual ``o`` of shape ``[.., D]``.
     """
     if layout not in ("sequence", "packed"):
         raise ValueError(f"layout must be 'sequence' or 'packed', got {layout!r}")
@@ -108,7 +108,6 @@ def attn_res_fwd(
 
     load_cache, store_cache = _cache_modifiers(use_cache_modifier)
     has_onorm = output_rms_weight is not None
-    save_opre = checkpoint_level == 0
     q_flat = query.flatten().contiguous()
     w_flat = rms_weight.flatten().contiguous()
     ow_flat = output_rms_weight.flatten().contiguous() if has_onorm else None
@@ -122,7 +121,6 @@ def attn_res_fwd(
         rms_eps,
         scale,
         has_onorm,
-        save_opre,
         load_cache,
         store_cache,
         use_exp2,
@@ -137,7 +135,6 @@ def _run_sequence(
     rms_eps,
     scale,
     has_onorm,
-    save_opre,
     load_cache,
     store_cache,
     use_exp2,
@@ -159,12 +156,11 @@ def _run_sequence(
     device = flat_residuals[0].device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    need_opre = save_opre or has_onorm
-    opre_dtype = torch.float32 if has_onorm else dtype
-    o_pre = torch.empty((N, D), device=device, dtype=opre_dtype) if need_opre else None
-    lse = torch.empty((N,), device=device, dtype=torch.float32)
-    rstd = torch.empty((L, N), device=device, dtype=torch.float32)
-    logit = torch.empty_like(rstd)
+    # o_pre is only the kernel's fp32 scratch for the output RMSNorm; it is
+    # never dereferenced (nor allocated) when the output RMSNorm is off.
+    o_pre = (
+        torch.empty((N, D), device=device, dtype=torch.float32) if has_onorm else None
+    )
     L2 = max(1, triton.next_power_of_2(L))
 
     _attn_res_fwd_sequence_2pass_kernel[(N,)](
@@ -173,10 +169,7 @@ def _run_sequence(
         w=w_flat,
         ow=ow_flat,
         o=o,
-        o_pre=o_pre if o_pre is not None else o,
-        rstd=rstd,
-        logit=logit,
-        lse=lse,
+        o_pre=o_pre,
         N=N,
         L=L,
         L2=L2,
@@ -185,21 +178,11 @@ def _run_sequence(
         scale=scale,
         NS=1,
         HAS_ONORM=has_onorm,
-        SAVE_OPRE=save_opre,
         LOAD_CACHE=load_cache,
         STORE_CACHE=store_cache,
         EXP2=use_exp2,
     )
-    o = o.view(output_shape)
-    o_pre_out = (
-        o_pre.to(dtype).view(output_shape)
-        if (save_opre and o_pre is not None)
-        else None
-    )
-    rstd = rstd.view(L, *output_shape[:-1])
-    logit = logit.view(L, *output_shape[:-1])
-    lse = lse.view(output_shape[:-1])
-    return o, o_pre_out, rstd, logit, lse
+    return o.view(output_shape)
 
 
 def _run_packed(
@@ -210,7 +193,6 @@ def _run_packed(
     rms_eps,
     scale,
     has_onorm,
-    save_opre,
     load_cache,
     store_cache,
     use_exp2,
@@ -232,13 +214,6 @@ def _run_packed(
     device = packed.device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    # One pass keeps the pre-norm mix in registers, so unlike the sequence path
-    # the output RMSNorm needs no scratch buffer here: allocate o_pre only when
-    # the caller actually wants it back.
-    o_pre = torch.empty((N, D), device=device, dtype=dtype) if save_opre else None
-    lse = torch.empty((N,), device=device, dtype=torch.float32)
-    rstd = torch.empty((L, N), device=device, dtype=torch.float32)
-    logit = torch.empty_like(rstd)
     L2 = max(1, triton.next_power_of_2(L))
 
     _attn_res_fwd_packed_1pass_kernel[(N,)](
@@ -247,10 +222,6 @@ def _run_packed(
         w=w_flat,
         ow=ow_flat,
         o=o,
-        o_pre=o_pre if o_pre is not None else o,
-        rstd=rstd,
-        logit=logit,
-        lse=lse,
         prefix=packed,
         add_hidden=packed,
         prefix_out=packed,
@@ -264,61 +235,15 @@ def _run_packed(
         scale=scale,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
-        SAVE_OPRE=save_opre,
         HAS_PREFIX=False,
         DO_ADD=False,
         WRITE_PREF=False,
-        SAVE_STATS=True,
         HAS_W=True,
         LOAD_CACHE=load_cache,
         STORE_CACHE=store_cache,
         EXP2=use_exp2,
     )
-    o = o.view(output_shape)
-    o_pre_out = o_pre.view(output_shape) if o_pre is not None else None
-    rstd = rstd.view(L, *output_shape[:-1])
-    logit = logit.view(L, *output_shape[:-1])
-    lse = lse.view(output_shape[:-1])
-    return o, o_pre_out, rstd, logit, lse
-
-
-def attn_res(
-    query: torch.Tensor,
-    residuals,
-    rms_weight: torch.Tensor,
-    output_rms_weight: torch.Tensor | None = None,
-    rms_eps: float = 1e-6,
-    scale: float = 1.0,
-    return_weights: bool = False,
-    checkpoint_level: int = 1,
-    *,
-    layout: str = "sequence",
-    use_exp2: bool = True,
-    use_cache_modifier: bool = True,
-):
-    """Convenience forward wrapper around :func:`attn_res_fwd`.
-
-    Returns the mixed residual ``o``, plus the depth-softmax probabilities
-    ``p`` when ``return_weights`` is set.
-    """
-    if len(residuals) == 0:
-        raise ValueError("residuals must contain at least one source")
-    o, _o_pre, _rstd, logit, lse = attn_res_fwd(
-        query,
-        residuals,
-        rms_weight,
-        output_rms_weight,
-        rms_eps,
-        scale,
-        checkpoint_level,
-        layout=layout,
-        use_exp2=use_exp2,
-        use_cache_modifier=use_cache_modifier,
-    )
-    if return_weights:
-        p = (logit * scale - lse.unsqueeze(0)).exp()
-        return o, p
-    return o
+    return o.view(output_shape)
 
 
 def attn_res_gate(
@@ -337,8 +262,8 @@ def attn_res_gate(
 
     Same math as :func:`attn_res_fwd` on the packed layout, specialized for the
     decode/prefill contract: the candidate set is the ``B`` rows of
-    ``block_residual`` plus ``prefix`` as the last candidate, and no backward
-    statistics are produced.
+    ``block_residual`` plus ``prefix`` as the last candidate, and only the mixed
+    output is produced (no softmax stats, since inference never rebuilds them).
 
     Key parameters:
     - prefix: ``[.., D]`` running residual, used as the last candidate.
@@ -393,8 +318,8 @@ def attn_res_gate(
         hs = add_hidden.reshape(-1, D).contiguous()
         prefix_out = torch.empty_like(pf)
     else:
-        # Never dereferenced (DO_ADD / WRITE_PREF are off) but Triton still
-        # needs a tensor for the argument.
+        # add_hidden / prefix_out are unused (DO_ADD / WRITE_PREF are off) but
+        # Triton still needs a tensor argument, so reuse the prefix.
         hs = pf
         prefix_out = pf
 
@@ -404,10 +329,6 @@ def attn_res_gate(
         w=sw,
         ow=ow,
         o=y,
-        o_pre=y,
-        rstd=y,
-        logit=y,
-        lse=y,
         prefix=pf,
         add_hidden=hs,
         prefix_out=prefix_out,
@@ -421,11 +342,9 @@ def attn_res_gate(
         scale=scale,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
-        SAVE_OPRE=False,
         HAS_PREFIX=True,
         DO_ADD=do_add,
         WRITE_PREF=do_add,
-        SAVE_STATS=False,
         HAS_W=False,
         LOAD_CACHE=load_cache,
         STORE_CACHE=store_cache,
