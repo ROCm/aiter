@@ -82,22 +82,11 @@ def _fused_clamp_silu_mul_kernel(
 
     shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
-    # setup
-    pid = gl.program_id(0)                 
-    m_start = pid * ROWS_PER_PROG
-    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
-    mask = offs < n_half                        
-    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        
-    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  
-
     gate_smem = gl.allocate_shared_memory(
         inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
     )
     up_smem = gl.allocate_shared_memory(
         inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
-    )
-    out_acc = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
     )
 
     # prologue + setup TDM
@@ -110,6 +99,7 @@ def _fused_clamp_silu_mul_kernel(
             block_shape=[BLOCK_SIZE_N],
             layout=shared_tdm_layout,
         )
+        gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem.index(i))
         up_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=inp_ptr + row_base + n_half * inp_stride_n,
             shape=[n_half],
@@ -117,8 +107,18 @@ def _fused_clamp_silu_mul_kernel(
             block_shape=[BLOCK_SIZE_N],
             layout=shared_tdm_layout,
         )
-        gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem.index(i))
         gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem.index(i))
+
+    # setup + setup store
+    pid = gl.program_id(0)                 
+    m_start = pid * ROWS_PER_PROG
+    offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
+    mask = offs < n_half                        
+    num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        
+    g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  
+    out_acc = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
+    )
 
     # main loop
     for i in gl.static_range(ROWS_PER_PROG):
