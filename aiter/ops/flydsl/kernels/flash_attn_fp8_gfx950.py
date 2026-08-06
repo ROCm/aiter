@@ -26,6 +26,7 @@ from aiter.ops.flydsl.kernels.flash_attn_dualwave_common import (
     DualwaveFp8KernelContext,
     DualwaveFp8KvGmemToLdsLoader,
     DualwaveFp8KvLdsToVgprLoader,
+    DualwaveFp8PageIdLoader,
     DualwaveFp8QLoader,
     DualwaveFp8SoftmaxHelper,
     DualwaveFp8StoreHelper,
@@ -56,13 +57,16 @@ def build_flash_attn_dualwave_swp_fp8_module(
     varlen=False,
     cross_seqlen=False,
     bn128=None,
+    paged=False,
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
     The dense path supports bf16/f16/fp8 QKV. ``varlen`` builds the packed
     self-attention variant for bf16/f16: Q/O are ``[total_q, H, D]``, K/V are
     ``[total_kv, H_kv, D]``, and per-batch ranges come from int32
-    ``cu_seqlens_q`` / ``cu_seqlens_kv``. fp8 currently stays dense-only."""
+    ``cu_seqlens_q`` / ``cu_seqlens_kv``. fp8 currently stays dense-only.
+    ``paged`` addresses KV through a block table instead of contiguously,
+    with page size fixed at BLOCK_N=64."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -113,6 +117,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         varlen=varlen,
         cross_seqlen=cross_seqlen,
         bn128=bn128,
+        paged=paged,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -122,14 +127,26 @@ def build_flash_attn_dualwave_swp_fp8_module(
     NUM_HEADS_Q = traits.NUM_HEADS_Q
     DEFAULT_STRIDE_Q_N = traits.DEFAULT_STRIDE_Q_N
     DEFAULT_STRIDE_KV_N = traits.DEFAULT_STRIDE_KV_N
+    PAGED = traits.PAGED
     _dualwave_swp_fp8_cache_tag = traits.cache_tag
     _lds_elem_dtype = dtype_to_elem_type(traits.DTYPE_STR)
 
-    @fx.struct
-    class SharedStorage:
-        kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
-        vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
-        q: fx.Array[_lds_elem_dtype, BLOCK_M * HEAD_DIM, 16]
+    if const_expr(traits.PAGED):
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, BLOCK_M * HEAD_DIM, 16]
+            bt: fx.Array[fx.Int32, traits.PAGED_BT_LDS_SIZE, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            kv: fx.Array[_lds_elem_dtype, traits.LDS_KV_TOTAL_SIZE, 16]
+            vt: fx.Array[fx.BFloat16, traits.VT_BF16_TOTAL, 16]
+            q: fx.Array[_lds_elem_dtype, BLOCK_M * HEAD_DIM, 16]
 
     # BN128: two BLOCK_N=64 KV tiles per iteration, one merged softmax correction.
     @flyc.kernel(known_block_size=[BLOCK_SIZE, 1, 1])
@@ -144,11 +161,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
+        BlockTable: fx.Tensor,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
     ):
         ctx = DualwaveFp8KernelContext(
             traits,
@@ -167,6 +186,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            BlockTable=BlockTable,
+            block_table_stride=block_table_stride,
         )
         ctx.init_types_and_constants()
         ctx.init_runtime_indices()
@@ -190,6 +211,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
         kv_gmem_to_lds = DualwaveFp8KvGmemToLdsLoader(ctx)
         kv_lds_to_regs = DualwaveFp8KvLdsToVgprLoader(ctx)
         output_store = DualwaveFp8StoreHelper(ctx)
+        page_ids = DualwaveFp8PageIdLoader(ctx)
+
+        # Stage the block table into LDS before any page id is read. Outside the
+        # active guard below: it's a whole-CTA op, unlike the per-tile KV loads.
+        if const_expr(traits.PAGED):
+            page_ids.load_block_table_to_lds()
+            rocdl.s_waitcnt(0)
+            rocdl.s_barrier()
 
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
@@ -373,12 +402,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
         QDescale: fx.Tensor,
         KDescale: fx.Tensor,
         VDescale: fx.Tensor,
+        BlockTable: fx.Tensor,
         batch_size: fx.Int32,
         seq_len: fx.Int32,
         seq_len_kv: fx.Int32,
         stride_q_n: fx.Int32,
         stride_kv_n: fx.Int32,
         head_dim_runtime: fx.Int32,
+        block_table_stride: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         # Make shape/mode traits visible to the JIT cache key.
@@ -411,11 +442,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             QDescale,
             KDescale,
             VDescale,
+            BlockTable,
             seq_len,
             seq_len_kv,
             stride_q_n,
             stride_kv_n,
             head_dim_runtime,
+            block_table_stride,
             value_attrs={
                 "rocdl.waves_per_eu": waves_per_eu,
                 "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
@@ -462,6 +495,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        block_table=None,
+        block_table_stride=None,
         stream=None,
     ):
         if stride_kv_n is None:
@@ -493,6 +528,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
             k_descale = O
         if v_descale is None:
             v_descale = O
+        # BlockTable is only read under const_expr(PAGED); use O as a placeholder
+        # otherwise. block_table_stride defaults to 0 (unused without paging).
+        if block_table is None:
+            block_table = O
+        if block_table_stride is None:
+            block_table_stride = 0
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return _run_compiled(
                 launch_flash_attn_dualwave_swp,
@@ -506,12 +547,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 q_descale,
                 k_descale,
                 v_descale,
+                block_table,
                 batch_size,
                 seq_len,
                 seq_len_kv,
                 stride_q_n,
                 stride_kv_n,
                 head_dim_runtime,
+                block_table_stride,
                 fx.Stream(stream),
             )
 
@@ -534,6 +577,8 @@ def build_flash_attn_dualwave_swp_fp8_module(
         q_descale=None,
         k_descale=None,
         v_descale=None,
+        block_table=None,
+        block_table_stride=None,
         stream=None,
     ):
         if stride_kv_n is None:
@@ -560,6 +605,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
             k_descale = O
         if v_descale is None:
             v_descale = O
+        if block_table is None:
+            block_table = O
+        if block_table_stride is None:
+            block_table_stride = 0
         with CompilationContext.compile_hints(_dualwave_swp_compile_hints):
             return flyc.compile(
                 launch_flash_attn_dualwave_swp,
@@ -573,12 +622,14 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 q_descale,
                 k_descale,
                 v_descale,
+                block_table,
                 batch_size,
                 seq_len,
                 seq_len_kv,
                 stride_q_n,
                 stride_kv_n,
                 head_dim_runtime,
+                block_table_stride,
                 fx.Stream(stream),
             )
 

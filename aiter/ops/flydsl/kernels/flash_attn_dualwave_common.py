@@ -368,6 +368,30 @@ def _cu_load(div, idx, cu_atom, cu_v1i32):
     v = fly.copy_atom_call_ssa([cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx))))
     return fx.Index(Vec(v, (1,), fx.Int32)[0])
 
+def _make_page_view(
+    base_iter, base_iter_ty, align, page_id, page_byte_stride, page_nrec_bytes, page_layout, elem_ir, buf_flags_i32
+):
+    """Buffer descriptor covering exactly one KV page.
+
+    Vendored from upstream ``flash_attn_utils._make_page_view`` (v0.3.0), which is
+    already dtype-parametric via ``elem_ir`` -- the fp8 caller passes i8 to match its
+    byte-indexed dense descriptors. ``num_records`` is one page, so a read past the
+    page end returns 0 instead of the neighbouring page: the bound is the OOB guard.
+    """
+    base_i64 = fx.Int64(fx.ptrtoint(base_iter))
+    off_i64 = fx.Int64(page_id * page_byte_stride)
+    shifted = fx.inttoptr(base_iter_ty, base_i64 + off_i64)
+    buf_ptr_ty = fx.PointerType.get(elem_ty=elem_ir, address_space=_TargetAddressSpace.BufferDesc, alignment=align)
+    buf_ptr = fx.make_ptr(
+        buf_ptr_ty,
+        [shifted, fx.Int16(0).ir_value(), page_nrec_bytes.ir_value(), buf_flags_i32.ir_value()],
+    )
+    return fx.logical_divide(fx.make_view(buf_ptr, page_layout), fx.make_layout(1, 1))
+
+def _paged_bt_byte_offset(tile_idx, split_t0):
+    """Byte offset of `tile_idx`'s page-id entry in the LDS block-table cache."""
+    return fx.Int32((tile_idx - split_t0) * fx.Index(4))
+
 def _make_ws_rsrc(ws_base_i64, byte_offset, nrec_bytes):
     addr_i64 = as_mlir_value(ws_base_i64 + fx.Int64(byte_offset))
     return buffer_ops.create_buffer_resource_from_addr(addr_i64, num_records_bytes=as_mlir_value(fx.Int64(nrec_bytes)))
@@ -479,6 +503,8 @@ class DualwaveSwpFp8Traits:
     SPLITK: bool
     VARLEN: bool
     CROSS_SEQLEN: bool
+    PAGED: bool
+    PAGED_BT_LDS_SIZE: int
     FP8_PV: bool
     FP8_PV_DIRECT: bool
     BN128: bool
@@ -546,6 +572,11 @@ class DualwaveSwpFp8Traits:
             self.SPLITK,
             self.VARLEN,
             self.CROSS_SEQLEN,
+            # PAGED must stay in the tag: dense and paged differ only in const_expr
+            # branches, so without it both hash to one key and the builder's cache
+            # hands back whichever compiled first.
+            self.PAGED,
+            self.PAGED_BT_LDS_SIZE,
             "fp8_wide_qk_hiprec_pv",
             self.ELEM_BYTES,
             self.OUT_ELEM_BYTES,
@@ -576,6 +607,7 @@ def _make_dualwave_swp_fp8_traits(
     varlen=False,
     cross_seqlen=False,
     bn128=None,
+    paged=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
@@ -584,6 +616,12 @@ def _make_dualwave_swp_fp8_traits(
     upstream's behaviour of deriving it from ``num_kv_splits``/``varlen``;
     pass True or False to choose it independently of those. See the comment at
     the derivation site for why the two are separable.
+
+    ``paged`` addresses KV through a block table instead of contiguously. Page
+    size is not a parameter: it is structurally ``BLOCK_N`` (64), which is why
+    the host pins ``_PAGED_PAGE_SIZE = 64``. Only the linear cache layout is
+    supported here -- the vectorized 5D layout is bf16-only upstream and the
+    target workload reports ``SHUFFLED_KV_CACHE_0``.
     """
     # Tile shape and wave geometry follow the gfx950 dual-wave 8-wave CTA.
     block_m = 256
@@ -698,6 +736,10 @@ def _make_dualwave_swp_fp8_traits(
         SPLITK=splitk,
         VARLEN=bool(varlen),
         CROSS_SEQLEN=bool(cross_seqlen),
+        PAGED=bool(paged),
+        # 2048 int32 entries = 8 KB of LDS, matching bf16. Caps a split's tile
+        # count; the host checks the window before dispatching.
+        PAGED_BT_LDS_SIZE=2048,
         FP8_PV=fp8_pv,
         FP8_PV_DIRECT=bool(fp8_pv_direct),
         BN128=bool(bn128),
@@ -772,6 +814,8 @@ class DualwaveFp8KernelContext:
         stride_q_n=None,
         stride_kv_n=None,
         head_dim_runtime=None,
+        BlockTable=None,
+        block_table_stride=None,
     ):
         if isinstance(traits_or_ctx, DualwaveFp8KernelContext):
             self.__dict__.update(traits_or_ctx.__dict__)
@@ -794,6 +838,8 @@ class DualwaveFp8KernelContext:
         self.stride_q_n = stride_q_n
         self.stride_kv_n = stride_kv_n
         self.head_dim_runtime = head_dim_runtime
+        self.BlockTable = BlockTable
+        self.block_table_stride = block_table_stride
 
     def init_types_and_constants(self):
         traits = self.traits
@@ -841,6 +887,12 @@ class DualwaveFp8KernelContext:
         self.lds_vt_base_ptr = buffer_ops.create_llvm_ptr(self.lds_vt_base_idx, address_space=3)
         self.lds_q_base_idx = fx.Index(fx.ptrtoint(lds.q.ptr))
         self.lds_q_base_ptr = buffer_ops.create_llvm_ptr(self.lds_q_base_idx, address_space=3)
+        if const_expr(self.traits.PAGED):
+            self.lds_bt_base_idx = fx.Index(fx.ptrtoint(lds.bt.ptr))
+            self.lds_bt_base_ptr = buffer_ops.create_llvm_ptr(self.lds_bt_base_idx, address_space=3)
+        else:
+            self.lds_bt_base_idx = None
+            self.lds_bt_base_ptr = None
 
     def init_thread_mapping(self):
         _init_dualwave_thread_mapping(self)
@@ -880,7 +932,15 @@ class DualwaveFp8KernelContext:
         self.q_gmem_elem_offset = (
             self.q_tok_base + self.q_start
         ) * self.stride_q_n_v + self.q_head_idx * traits.HEAD_DIM
-        self.kv_gmem_elem_offset = self.kv_tok_base * self.stride_kv_n_v + self.kv_head_idx * traits.HEAD_DIM
+        # Dense fp8 carries the batch token base in the voffset, because its K/V
+        # descriptors span the whole tensor. Under paging the descriptor is rebased
+        # per page, so the token base is meaningless there -- keeping it would push
+        # every batch above 0 past a one-page num_records and silently read zeros.
+        self.kv_head_elem_offset = self.kv_head_idx * traits.HEAD_DIM
+        if const_expr(traits.PAGED):
+            self.kv_gmem_elem_offset = self.kv_head_elem_offset
+        else:
+            self.kv_gmem_elem_offset = self.kv_tok_base * self.stride_kv_n_v + self.kv_head_elem_offset
 
     def init_descriptors(self):
         traits = self.traits
@@ -903,10 +963,63 @@ class DualwaveFp8KernelContext:
             return fx.logical_divide(bt, fx.make_layout(1, 1))
 
         self.q_div = _make_buf_div(self.Q, q_nrec_bytes)
-        self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
-        self.v_div = _make_buf_div(self.V, kv_nrec_bytes)
         self.o_div = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(self.O, num_records_bytes=o_nrec_bytes), fx.make_layout(1, 1)
+        )
+
+        if const_expr(traits.PAGED):
+            # No whole-tensor K/V view under paging: each tile builds its own
+            # page-bounded descriptor. Left None so any missed call site faults
+            # rather than reading the dense view at a page-relative offset.
+            self.k_div = None
+            self.v_div = None
+            # Byte quantities throughout: the page view is i8-typed to match the
+            # dense descriptors, so buffer offsets are unscaled and `page_elems`
+            # is already a byte count at ELEM_BYTES=1. Upstream's BF16_BYTES here
+            # would double the stride and land every page but the first too far.
+            page_elems = fx.Index(traits.BLOCK_N) * self.stride_kv_n_v * fx.Index(eb)
+            self.page_byte_stride = page_elems
+            self.page_nrec_bytes = fx.Int64(self.page_byte_stride)
+            self.page_layout = fx.make_layout(fx.Int32(page_elems), fx.Int32(1))
+            self.buf_flags_i32 = fx.Int32(buffer_ops._get_buffer_flags())
+            self.page_elem_ir = fx.Int8.ir_type
+            # Raw tensor iters, as upstream's _kv_src_div does: the page view
+            # rebases the pointer itself and sets its own num_records, so a
+            # whole-tensor buffer descriptor would be built and discarded.
+            self.k_iter = fx.get_iter(self.K)
+            self.v_iter = fx.get_iter(self.V)
+            self.block_table_stride_v = fx.Index(self.block_table_stride)
+            self.bt_div = fx.logical_divide(fx.rocdl.make_buffer_tensor(self.BlockTable), fx.make_layout(1, 1))
+            self.bt_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+            self.bt_v1i32 = Vec.make_type(1, fx.Int32)
+        else:
+            self.k_div = _make_buf_div(self.K, kv_nrec_bytes)
+            self.v_div = _make_buf_div(self.V, kv_nrec_bytes)
+            self.page_byte_stride = None
+            self.page_nrec_bytes = None
+            self.page_layout = None
+            self.buf_flags_i32 = None
+            self.page_elem_ir = None
+            self.k_iter = None
+            self.v_iter = None
+            self.block_table_stride_v = None
+            self.bt_div = None
+            self.bt_atom = None
+            self.bt_v1i32 = None
+
+    def kv_page_div(self, which, page_id):
+        """Per-tile page-bounded K or V descriptor. `which` is "k" or "v"."""
+        base_iter = self.k_iter if which == "k" else self.v_iter
+        return _make_page_view(
+            base_iter,
+            base_iter.type,
+            fx.PointerType(base_iter.type).alignment,
+            page_id,
+            self.page_byte_stride,
+            self.page_nrec_bytes,
+            self.page_layout,
+            self.page_elem_ir,
+            self.buf_flags_i32,
         )
 
     def init_atoms_and_lds_ptrs(self):
@@ -956,6 +1069,9 @@ class DualwaveFp8KernelContext:
         traits = self.traits
         kv_tile_size = traits.BLOCK_N
         num_kv_tiles = (self.seqlen_kv_v + kv_tile_size - 1) // kv_tile_size
+        # Retained for the paged block-table stage, which zero-fills past the
+        # real tile count so out-of-range page ids are 0 rather than garbage.
+        self.num_kv_tiles = num_kv_tiles
         if const_expr(traits.CAUSAL):
             causal_end_i32 = fx.Int32(self.q_start + traits.BLOCK_M) + self.delta_i32
             causal_end_i32 = fx.Int32((causal_end_i32 > fx.Int32(0)).select(causal_end_i32, fx.Int32(0)))
@@ -1244,13 +1360,111 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
             v_o = self.pv_step_k(step, v_p, v_v, v_o)
         return v_o
 
-class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
+class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
+    """Block-table staging and page-id lookup for the paged fp8 path.
+
+    Vendored from upstream ``DualwavePageIdLoader`` (v0.3.0) with the base class
+    swapped to the fp8 context; the arithmetic is unchanged, and it was only ever
+    coupled to bf16 by inheritance -- every field it reads is named explicitly.
+
+    Unlike bf16, the fp8 kernel body does not thread page ids through its pipeline.
+    bf16 splits issue (``load_page_id_lds``) from finish (``finish_page_id``) across
+    ~30 call sites to keep the ``s_waitcnt lgkmcnt(0)`` drain away from in-flight
+    K/V ``ds_read``s. The fp8 BN128 ring issues four tile loads per iteration, so
+    that pattern would drain four times per iteration; instead the KV loader looks
+    the page id up from ``tile_start`` at its own call site. Correctness first --
+    the scheduling cost of the drain is measured, not assumed.
+    """
+
     def __init__(self, ctx):
         super().__init__(ctx)
+
+    def load_block_table_to_lds(self):
+        traits = self.traits
+        tid = self.tid
+        split_t0 = self.split_t0
+        split_t_end = self.split_t_end
+        num_kv_tiles = self.num_kv_tiles
+        batch_idx = self.batch_idx
+        block_table_stride_v = self.block_table_stride_v
+        lds_bt_base_ptr = self.lds_bt_base_ptr
+        bt_div = self.bt_div
+        bt_atom = self.bt_atom
+        bt_v1i32 = self.bt_v1i32
+
+        @flyc.jit
+        def _load_block_table_to_lds():
+            segment_tiles = split_t_end - split_t0
+            for pass_id in range_constexpr(traits.PAGED_BT_LDS_SIZE // traits.BLOCK_SIZE):
+                local_tile = tid + fx.Index(pass_id * traits.BLOCK_SIZE)
+                if local_tile < segment_tiles:
+                    tile_idx = split_t0 + local_tile
+                    byte_off = as_mlir_value(fx.Int32(local_tile * fx.Index(4)))
+                    dst = buffer_ops.get_element_ptr(lds_bt_base_ptr, byte_offset=byte_off, elem_type=T.i8)
+                    llvm.StoreOp(as_mlir_value(fx.Int32(0)), dst)
+                    if tile_idx < num_kv_tiles:
+                        row_idx = batch_idx * block_table_stride_v + tile_idx
+                        v = fly.copy_atom_call_ssa([bt_v1i32], bt_atom, fx.slice(bt_div, (None, fx.Int32(row_idx))))
+                        page_id_i32 = as_mlir_value(fx.Int32(Vec(v, (1,), fx.Int32)[0]))
+                        llvm.StoreOp(page_id_i32, dst)
+
+        _load_block_table_to_lds()
+
+    def load_page_id_lds(self, tile_idx):
+        src = buffer_ops.get_element_ptr(
+            self.lds_bt_base_ptr,
+            byte_offset=as_mlir_value(_paged_bt_byte_offset(tile_idx, split_t0=self.split_t0)),
+            elem_type=T.i8,
+        )
+        return llvm.LoadOp(T.i32, src).result
+
+    def finish_page_id(self, v):
+        # readfirstlane: the page id lands in an SGPR buffer-descriptor base, so it
+        # must be wave-uniform. It already is -- every lane reads the same LDS slot.
+        rocdl.s_waitcnt(self.traits.LGKMCNT_0_ONLY)
+        v = rocdl.readfirstlane(T.i32, v)
+        return fx.Index(fx.Int32(v))
+
+    def page_id_for_tile(self, tile_idx):
+        # Clamp into the staged window. The BN128 ring prefetches up to 5 tiles
+        # past split_t_end, and those tiles' LDS slots hold no valid page id.
+        # Dense absorbs the same overrun via num_records; paged cannot, because
+        # the page id picks the descriptor base before any bound applies -- an
+        # unstaged slot sends the DMA outside the page pool entirely. Clamping
+        # re-reads the last live page instead; the data is wrong but in-bounds,
+        # and the epilogue masks these tiles out regardless.
+        last = self.split_t_end - fx.Index(1)
+        safe = fx.Index((tile_idx < last).select(tile_idx, last))
+        return self.finish_page_id(self.load_page_id_lds(safe))
+
+class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
+    def __init__(self, ctx):
+        super().__init__(ctx)
+
+    def _kv_src(self, which, tile_start):
+        """Resolve (descriptor, tile_soffset) for a KV tile.
+
+        Dense keeps one whole-tensor descriptor and moves with soffset; paged
+        rebases per page and the tile term vanishes -- the page view already
+        starts at the tile. Callers that fold the tile into their voffset must
+        use ``tile_voffset`` instead of adding it themselves.
+        """
+        if const_expr(self.traits.PAGED):
+            page_id = self.page_id_for_tile(tile_start // fx.Index(self.traits.BLOCK_N))
+            return self.kv_page_div(which, page_id), 0
+        div = self.k_div if which == "k" else self.v_div
+        return div, tile_start * self.stride_kv_n_v
+
+    def tile_voffset(self, tile_start):
+        """Tile term for the V paths that carry it in the voffset, not the soffset."""
+        if const_expr(self.traits.PAGED):
+            return fx.Index(0)
+        return tile_start * self.stride_kv_n_v
 
     def load_k(self, tile_start, buf_id):
         traits = self.traits
         eb = traits.ELEM_BYTES
+        k_div, k_soffset = self._kv_src("k", tile_start)
         k_lds_byte_base = self.lds_kv_base_idx + self.k_buf_base(buf_id) * eb
         for d in range_constexpr(self.NUM_DMA_K):
             lds_addr = (
@@ -1261,7 +1475,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
             n_in_tile = self.n_in_warp * traits.NUM_WAVES + self.wave_id
             global_d = self.d_bucket * traits.VEC_KV + (d * traits.D_128B_SIZE)
             src_elem = self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
-            self.buffer_load_lds_128(self.k_div, lds_addr, src_elem, tile_start * self.stride_kv_n_v)
+            self.buffer_load_lds_128(k_div, lds_addr, src_elem, k_soffset)
 
     def load_v(self, tile_start, buf_id):
         if const_expr(self.traits.FP8_PV):
@@ -1289,11 +1503,15 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
         buf_off = buf_id * v_tile_bytes
         n = self.wave_id * fx.Index(8) + self.lane // fx.Index(8)
         d_block = self.lane % fx.Index(8)
+        v_div, _ = self._kv_src("v", tile_start)
         src_elem = (
-            self.kv_gmem_elem_offset + n * self.stride_kv_n_v + d_block * fx.Index(16) + tile_start * self.stride_kv_n_v
+            self.kv_gmem_elem_offset
+            + n * self.stride_kv_n_v
+            + d_block * fx.Index(16)
+            + self.tile_voffset(tile_start)
         )
         v16 = fly.copy_atom_call_ssa(
-            [Vec.make_type(4, fx.Int32)], self.load_atom_128, fx.slice(self.v_div, (None, fx.Int32(src_elem)))
+            [Vec.make_type(4, fx.Int32)], self.load_atom_128, fx.slice(v_div, (None, fx.Int32(src_elem)))
         )
         n_i = fx.Int32(n)
         w16 = n_i % fx.Int32(16)
@@ -1320,8 +1538,9 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
         c_sub = (w16 >= fx.Int32(8)) & (w16 < fx.Int32(12))
         n = dest_n + c_add.select(fx.Int32(4), fx.Int32(0)) - c_sub.select(fx.Int32(4), fx.Int32(0))
         d_block = self.lane // fx.Index(8)
+        v_div, v_soffset = self._kv_src("v", tile_start)
         src_elem = self.kv_gmem_elem_offset + fx.Index(n) * self.stride_kv_n_v + d_block * fx.Index(16)
-        self.buffer_load_lds_128(self.v_div, lds_addr, src_elem, tile_start * self.stride_kv_n_v)
+        self.buffer_load_lds_128(v_div, lds_addr, src_elem, v_soffset)
 
     def _stage_vt_dequant_fp8(self, tile_start, buf_id):
         # Dequantize fp8 V into the exact bf16 V staging positions. The two d-iters
@@ -1329,13 +1548,13 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
         traits = self.traits
         vt_buf = buf_id * traits.VT_BF16_ELEMS
         n_in_tile = self.n_in_warp * traits.NUM_WAVES + self.wave_id
+        v_div, _ = self._kv_src("v", tile_start)
+        tile_off = self.tile_voffset(tile_start)
         for d in range_constexpr(traits.SDRPT_BF):
             global_d = self.d_bucket * traits.VEC_BF + (d * traits.D128_BF)
-            src_elem = (
-                self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d + tile_start * self.stride_kv_n_v
-            )
+            src_elem = self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d + tile_off
             v_i32x2 = fly.copy_atom_call_ssa(
-                [self.v2i32_type], self.v_fp8_load64_atom, fx.slice(self.v_div, (None, fx.Int32(src_elem)))
+                [self.v2i32_type], self.v_fp8_load64_atom, fx.slice(v_div, (None, fx.Int32(src_elem)))
             )
             v_words = Vec(v_i32x2, (2,), fx.Int32)
             bf = []
