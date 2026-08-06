@@ -20,7 +20,6 @@ from aiter.ops.gemm_op_a4w4 import MXFP8_OUT_SCALE_BLOCK, unpack_mxfp8_out_scale
 from aiter.ops.shuffle import shuffle_scale_f4, shuffle_weight_f4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
-from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
 
 try:
     import bench_init
@@ -39,6 +38,8 @@ SUPPORTED_GFX = ["gfx1250"]
 SUBK = 256  # asm inner-K step: the ONLY hard shape constraint is K % SUBK == 0
 
 PERF_SHAPES = [(16384, 16384, 16384)]
+# requires M % 32 == 0 and N % 32 == 0 and K % 256 == 0;
+# ragged M/N/K need paded to satisfy during preshuffle.
 FUNC_SHAPES = [
     (1024, 1024, 256),
     (1024, 1024, 512),
@@ -54,30 +55,67 @@ FUNC_SHAPES = [
     (5120, 1024, 256),
     (3072, 8192, 256),
     (5120, 5120, 256),
+    (32, 32, 256),
+    (32, 32, 512),
+    (32, 32, 768),
+    (32, 32, 1024),
+    (32, 32, 1280),
+    (32, 32, 2048),
+    (64, 64, 2048),
+    (128, 128, 2048),
+    (160, 160, 2048),
+    (256, 256, 2048),
+    (512, 512, 2048),
+    (768, 768, 2048),
+    (1024, 1024, 1024),
+    (1024, 1024, 2048),
+    (4096, 4096, 2048),
+    (4128, 4128, 2048),
+    (4160, 4160, 2048),
+    (4192, 4192, 2048),
+    (4352, 4352, 2048),
+    (4608, 4608, 2048),
+    (4864, 4864, 2048),
+    (5120, 5120, 2048),
+    (6144, 6144, 2048),
+    (7168, 7168, 2048),
+    (8192, 8192, 256),
+    (8192, 8192, 512),
+    (8192, 8192, 768),
+    (8192, 8192, 1024),
+    (8192, 8192, 1280),
+    (8192, 8192, 1536),
+    (8192, 8192, 1792),
+    (8192, 8192, 2048),
+    (8192, 8192, 8192),
+    (8224, 8224, 2048),
+    (8448, 8448, 2048),
+    (8704, 8704, 2048),
+    (8960, 8960, 2048),
+    (8992, 8992, 2048),
+    (16384, 16384, 16384),
 ]
 
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
 # MXFP8_OUT_SCALE_BLOCK (=128) is imported from gemm_op_a4w4.
 
-# mxfp8 output E8M0 reference: RoundUp (ceil(amax/448)), compared with atol=1
-# (kernel rounds within +-1 step). RoundUp keeps ref data <= 448; Even/RNE can
-# round the scale down and overflow e4m3 to NaN, so must NOT be used here.
-MXFP8_SCALE_MODE = MxScaleRoundModeInt.RoundUp
-MXFP8_SCALE_ATOL = 1.0  # +-1 e8m0 step
+
+# mxfp8 output E8M0 scale, bit-identical to the fp8out kernel: amax/256, then
+# exp[30:23] + guard[22] (single guard-bit round, no RNE). Compared byte-exact.
+def _e8m0_out_scale(amax):
+    u = (amax / 256.0).view(torch.int32)
+    return (((u >> 23) & 0xFF) + ((u >> 22) & 1)).to(torch.uint8)
 
 
 def _quant_mxfp8_blockN(x_f32, block=MXFP8_OUT_SCALE_BLOCK):
-    """Golden mxfp8 output quant: per-128-col block amax -> E8M0 scale via
-    fp4_utils.f32_to_mx_e8m0_scale (RoundUp, FP8_E4M3) + e4m3 data. Returns
-    (fp8 [M,N], e8m0 row-major [M, N/block])."""
+    """Golden mxfp8 output quant: per-128-col block amax -> E8M0 scale (kernel-
+    exact) + e4m3 data. Returns (fp8 [M,N], e8m0 row-major [M, N/block])."""
     M, N = x_f32.shape
     assert N % block == 0, f"mxfp8 golden requires N % {block} == 0"
     xb = x_f32.reshape(M, N // block, block)
     amax = xb.abs().amax(dim=-1).clamp(min=torch.finfo(torch.float32).tiny)
-    scale_e8m0 = fp4_utils.f32_to_mx_e8m0_scale(
-        amax, mode=MXFP8_SCALE_MODE, dtype=MxDtypeInt.FP8_E4M3
-    )
+    scale_e8m0 = _e8m0_out_scale(amax)
     scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0).unsqueeze(-1)
     q_fp8 = (xb / scale_f32).reshape(M, N).to(dtypes.fp8)
     return q_fp8, scale_e8m0
@@ -380,8 +418,8 @@ def test_gemm(
                 msg=f"{intype} {name} fp4",
             )
         elif out_fp8:
-            # (fp8 data, packed e8m0). Unpack scale to row-major; judge e8m0 with
-            # atol=1 (kernel within +-1 of RNE) and dequant data with tolerance.
+            # (fp8 data, packed e8m0). Unpack scale to row-major; e8m0 byte-exact,
+            # data dequant with tolerance.
             ref_fp8, ref_scale = ref
             o_fp8, o_scale = out  # o_* avoids shadowing the out_fp8 flag
             M_out, N_out = o_fp8.shape
@@ -390,8 +428,8 @@ def test_gemm(
                 ref_scale.view(torch.uint8).float(),
                 out_scale_rm.view(torch.uint8).float(),
                 rtol=0,
-                atol=MXFP8_SCALE_ATOL,
-                msg=f"{intype} {name} fp8 e8m0 (+-1)",
+                atol=0,
+                msg=f"{intype} {name} fp8 e8m0",
             )
             err_d = checkAllclose(
                 _dequant_mxfp8_blockN(ref_fp8, ref_scale),
