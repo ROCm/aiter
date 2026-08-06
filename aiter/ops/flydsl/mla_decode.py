@@ -1,20 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""
-flydsl_mla_decode(
-    output,       # [num_seqs, num_q_heads, kv_lora_rank]
-    query,        # [num_seqs, num_q_heads, kv_lora_rank + qk_rope_head_dim]
-    kv_cache,     # [num_blocks, num_kv_heads, block_size, kv_lora_rank + qk_rope_head_dim]
-                  # (pre-shuffled — see shuffle_kv_buffer in the test)
-    block_tables, # [num_seqs, max_num_blocks_per_seq]
-    seq_lens,     # [num_seqs]
-    attn_scale,   # float
-    kv_lora_rank=512,
-    qk_rope_head_dim=64,
-)
-"""
-
 from __future__ import annotations
 
 import struct
@@ -26,9 +12,28 @@ from .kernels.mla_decode_shuffled_gfx1250 import (
     compile_mla_decode_reduce,
 )
 
-_DEFAULT_NUM_SEGS = 2
-_DEFAULT_NUM_WARPS = 2
-_DEFAULT_KV_COMPUTE_BLOCK_SIZE = 32
+# returns (num_segs, num_warps, kv_compute_block_size, warp_token_split, warp_head_split)
+def _resolve_mla_config(num_q_heads, num_seqs, max_seqlen):
+
+    warp_token_split = num_q_heads <= 32
+    warp_head_split = not warp_token_split
+
+    kvc = 32 if num_q_heads >= 128 else 64
+
+    if warp_token_split:
+        num_warps = min(2, max(1, kvc // 32))   # WMMA_K=32 so can't have num_warps > kvc//32
+    else:
+        # num_warps should be power of two and divide 16 head tile count
+        # n & -n gives the largest power of 2 dividing n
+        head_tiles = (num_q_heads + 16 - 1) // 16
+        num_warps = min(head_tiles & -head_tiles, 8)
+
+    wgs_to_fill = 1024 // min(num_warps, 4)
+    num_segs = (wgs_to_fill + num_seqs - 1) // num_seqs
+    
+    # A segment past the last KV tile does no work but still writes a partial.
+    num_segs = min(num_segs, (max_seqlen + kvc - 1) // kvc)
+    return num_segs, num_warps, kvc, warp_token_split, warp_head_split
 
 
 def _dtype_to_str(dt: torch.dtype) -> str:
@@ -43,19 +48,7 @@ def _mla_num_partitions(num_segs: int, num_warps: int, warp_token_split: bool) -
     return num_segs * (num_warps if warp_token_split else 1)
 
 
-# move allocation of temp buffers out of the main wrapper incase we want to do a 
-# cuda graph catpure and replay so same allocation can be used for each replay
-def alloc_mla_decode_partials(
-    *,
-    num_seqs: int,
-    num_q_heads: int,
-    kv_lora_rank: int,
-    num_segs: int = _DEFAULT_NUM_SEGS,
-    num_warps: int = _DEFAULT_NUM_WARPS,
-    warp_token_split: bool = True,
-    device,
-):
-    num_partitions = _mla_num_partitions(num_segs, num_warps, warp_token_split)
+def _alloc_partials(num_seqs, num_partitions, num_q_heads, kv_lora_rank, device):
     tmp_out = torch.empty(
         (num_seqs, num_partitions, num_q_heads, kv_lora_rank),
         dtype=torch.float32,
@@ -86,12 +79,7 @@ def flydsl_mla_decode(
     max_seqlen: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-    num_segs: int = _DEFAULT_NUM_SEGS,
-    num_warps: int = _DEFAULT_NUM_WARPS,
-    kv_compute_block_size: int = _DEFAULT_KV_COMPUTE_BLOCK_SIZE,
-    warp_token_split: bool = True,
-    warp_head_split: bool = False,
-    skip_reduce: bool = False,
+    # Pre-allocated (tmp_out, max_logits, exp_sums) to reuse across calls when capturing a cudagraph
     partials: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     stream: torch.cuda.Stream | None = None,
 ):
@@ -188,25 +176,20 @@ def flydsl_mla_decode(
     device = query.device
     dtype_str = _dtype_to_str(query.dtype)
 
-    # tmp buffers may be preallocated and passed through partials=
-    # otherwise we just allocate them here
+    num_segs, num_warps, kv_compute_block_size, warp_token_split, warp_head_split = (
+        _resolve_mla_config(num_q_heads, num_seqs, max_seqlen)
+    )
     num_partitions = _mla_num_partitions(num_segs, num_warps, warp_token_split)
 
     # A single partition has nothing to merge, so the main kernel normalizes in-register and
     # writes `output` directly and no need for reduce kernel
-    write_final_output = num_partitions == 1 and not skip_reduce
+    write_final_output = num_partitions == 1
 
     if write_final_output:
         tmp_out = max_logits = exp_sums = output
     elif partials is None:
-        tmp_out, max_logits, exp_sums = alloc_mla_decode_partials(
-            num_seqs=num_seqs,
-            num_q_heads=num_q_heads,
-            kv_lora_rank=kv_lora_rank,
-            num_segs=num_segs,
-            num_warps=num_warps,
-            warp_token_split=warp_token_split,
-            device=device,
+        tmp_out, max_logits, exp_sums = _alloc_partials(
+            num_seqs, num_partitions, num_q_heads, kv_lora_rank, device
         )
     else:
         tmp_out, max_logits, exp_sums = partials
@@ -236,7 +219,6 @@ def flydsl_mla_decode(
         raise ValueError(f"`stream` must be on {device}, got {stream.device}")
 
     scale_i32 = struct.unpack("<i", struct.pack("<f", float(attn_scale)))[0]
-
     with torch.cuda.device(device):
         main_launch = compile_mla_decode_main(
             KV_LORA_RANK=kv_lora_rank,
@@ -275,8 +257,6 @@ def flydsl_mla_decode(
             max_blocks_per_seq,
             stream,
         )
-        if skip_reduce:
-            return tmp_out, max_logits, exp_sums
         if write_final_output:
             return output
         reduce_launch(
@@ -291,4 +271,4 @@ def flydsl_mla_decode(
     return output
 
 
-__all__ = ["flydsl_mla_decode", "alloc_mla_decode_partials"]
+__all__ = ["flydsl_mla_decode"]

@@ -185,41 +185,11 @@ def _run_decode_case(
     *,
     num_seqs,
     ctx_len,
-    num_segs,
     dtype,
     varlen,
     block_size,
-    num_warps,
-    compute_block_size,
     num_query_heads,
-    warp_token_split=True,
 ):
-    # KV_BLOCK_SIZE=128 with num_warps=1 overflows TDM descriptor's 16-bit tile_dim0 field (max 65535).
-    # per-warp lora load tile = block_size*KV_LORA_RANK/num_warps = 65536 elements. Skip this combo.
-    # need to add this to wrapper as well. an assert or adjust num_warps dynamically
-    if (block_size * _KV_LORA_RANK) // num_warps > 0xFFFF:
-        pytest.skip(
-            f"FlyDSL TDM descriptor tile_dim0 16-bit overflow: "
-            f"block_size*{_KV_LORA_RANK}//num_warps = "
-            f"{(block_size * _KV_LORA_RANK) // num_warps} > 65535 "
-            f"(block_size={block_size}, num_warps={num_warps})"
-        )
-
-    # Scheme A (warp_token_split) splits the compute block's 16-token score-tiles across
-    # warps and pairs them into 32-token PV K-steps, so each warp must own an even number
-    # (>=2) of tiles -- i.e. compute_block_size must be a multiple of 32*num_warps. Configs
-    # that violate this are unsupported under Scheme A (the kernel raises a ValueError);
-    # skip them on this path. They are still exercised on the baseline path
-    # (warp_token_split=False), which has no such constraint.
-    if warp_token_split:
-        n_qk_tiles = compute_block_size // 16  # WMMA_N
-        nqk_local = n_qk_tiles // num_warps
-        if n_qk_tiles % num_warps != 0 or nqk_local < 2 or nqk_local % 2 != 0:
-            pytest.skip(
-                f"warp_token_split needs compute_block_size a multiple of 32*num_warps "
-                f"(got compute_block_size={compute_block_size}, num_warps={num_warps})"
-            )
-
     num_kv_heads = 1
     query, kv_cache, block_tables, seq_lens = _generate_inputs(
         num_seqs=num_seqs,
@@ -256,10 +226,6 @@ def _run_decode_case(
         max_seqlen=int(seq_lens.max().item()),
         kv_lora_rank=_KV_LORA_RANK,
         qk_rope_head_dim=_QK_ROPE_HEAD_DIM,
-        num_segs=num_segs,
-        num_warps=num_warps,
-        kv_compute_block_size=compute_block_size,
-        warp_token_split=warp_token_split,
     )
 
     assert not torch.isnan(output).any(), "output contains NaN"
@@ -267,64 +233,47 @@ def _run_decode_case(
 
 # (num_seqs, ctx_len)
 _CASES = [
-    (1, 200, 1),
-    (1, 200, 4),
-    (1, 200, 8),
-    (1, 600, 2),
-    (1, 256, 2),
-    (2, 400, 1),
+    (1, 200),
+    (1, 600),
+    (1, 256),
+    (2, 400),
+    (8, 1024),
 ]
+_BLOCK_SIZES = [16, 64, 128]
 
-_BLOCK_SIZES = [
-    (16, 32),
-    (16, 64),
-    (64, 64),
-    (64, 128),
-    (128, 128),    
-]
+_NUM_Q_HEADS = [16, 32, 48, 128]
 
-_NUM_Q_HEADS = [16, 32, 128]
-
-@pytest.mark.parametrize("num_seqs,ctx_len,num_segs", _CASES)
+@pytest.mark.parametrize("num_seqs,ctx_len", _CASES)
 @pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("varlen", [True, False])
-@pytest.mark.parametrize("num_warps", [1, 2])
-@pytest.mark.parametrize("warp_token_split", [False, True])
-@pytest.mark.parametrize("block_size, compute_block_size", _BLOCK_SIZES)
-def test_flydsl_mla_decode(num_seqs, ctx_len, num_segs, num_q_heads, dtype, varlen, warp_token_split, block_size, num_warps, compute_block_size):
+@pytest.mark.parametrize("block_size", _BLOCK_SIZES)
+def test_flydsl_mla_decode(num_seqs, ctx_len, num_q_heads, dtype, varlen, block_size):
     _run_decode_case(
         num_seqs=num_seqs,
         ctx_len=ctx_len,
-        num_segs=num_segs,
         dtype=dtype,
         varlen=varlen,
         block_size=block_size,
-        num_warps=num_warps,
-        compute_block_size=compute_block_size,
         num_query_heads=num_q_heads,
-        warp_token_split=warp_token_split,
     )
 
 
 _LARGE_CASES = [
-    (1024, 8192, 1),
-    (1024, 16384, 1),
-    (1024, 32768, 1),
+    (1024, 8192),
+    (1024, 16384),
+    (1024, 32768),
 ]
 
-@pytest.mark.parametrize("num_seqs,ctx_len,num_segs", _LARGE_CASES)
+@pytest.mark.parametrize("num_seqs,ctx_len", _LARGE_CASES)
 @pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_flydsl_mla_decode_large(num_seqs, ctx_len, num_segs, num_q_heads, dtype):
+def test_flydsl_mla_decode_large(num_seqs, ctx_len, num_q_heads, dtype):
     _run_decode_case(
         num_seqs=num_seqs,
         ctx_len=ctx_len,
-        num_segs=num_segs,
         dtype=dtype,
         varlen=True,
         block_size=64,
-        num_warps=2,
-        compute_block_size=64,
         num_query_heads=num_q_heads,
     )
