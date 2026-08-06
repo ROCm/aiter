@@ -267,6 +267,9 @@ def _build_q_kernel(
                 x1 = fx.Float32(qkv[tok, head, col + HALF])
                 x0s.append(x0)
                 x1s.append(x1)
+
+            # Split here to ostensibly hide some latency
+            # TODO: Verify with better benchmarks
             sumsq = rms_reduce_add(sumsq_local, tid)
             rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
