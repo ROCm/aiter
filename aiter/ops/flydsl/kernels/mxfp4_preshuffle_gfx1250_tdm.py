@@ -658,15 +658,12 @@ def launch_gemm_a8w4_tdm(
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                 begin = sub_wn * 2
                                 local_words = [
-                                    packed_bf16[begin + i]
-                                    for i in range_constexpr(2)
+                                    packed_bf16[begin + i] for i in range_constexpr(2)
                                 ]
                                 local_bf16_words.append(local_words)
                                 peer_bf16_words.append(
                                     [
-                                        word.shuffle_xor(
-                                            fx.Int32(16), fx.Int32(WAVE)
-                                        )
+                                        word.shuffle_xor(fx.Int32(16), fx.Int32(WAVE))
                                         for word in local_words
                                     ]
                                 )

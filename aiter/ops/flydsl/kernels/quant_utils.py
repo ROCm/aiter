@@ -267,9 +267,7 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
 
     abs_vals = []
     for v in all_vals:
-        abs_vals.append(
-            llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        )
+        abs_vals.append(llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], []))
 
     # Build a balanced max tree instead of a serial dependency chain. The
     # epilogue contributes 16 values per lane, so this reduces local amax depth
