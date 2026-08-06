@@ -11,6 +11,10 @@ from flydsl.expr.typing import Int8, T
 
 from aiter.jit.utils.chip_info import get_cu_num
 
+from .mxfp4_gemm_common import _buffer_rsrc, flat_persistent_tile
+from .mxfp4_gemm2 import (
+    _issue_a_load_lds as issue_base_a_load_lds,
+)
 from .mxmoe_gemm_v2 import (
     gemm2_body_v2,
     global_typed_ptr,
@@ -36,6 +40,35 @@ def _active_m_blocks_upper_bound(M_logical, topk, NE, BM, SBM):
     active_experts = min(routes, NE)
     sort_blocks = (routes + active_experts * (SBM - 1) + SBM - 1) // SBM
     return sort_blocks * (SBM // BM)
+
+
+def _jit_persist_flat_enabled(persist):
+    """Enable flat persistence only for runtime JIT compilation."""
+    return (
+        persist
+        and os.environ.get("MXFP4_G2_PERSIST_FLAT", "0") == "1"
+        and os.environ.get("COMPILE_ONLY", "0") != "1"
+        and os.environ.get("FLYDSL_RUNTIME_RUN_ONLY", "0") != "1"
+    )
+
+
+def is_g2_nonatomic_config(BM, BN, BK, epilog, a_dtype, out_dtype, D_INTER, D_HIDDEN):
+    return (
+        os.environ.get("MXFP4_G2_NONATOMIC", "0") == "1"
+        and epilog == "reduce"
+        and str(out_dtype).strip().lower() in ("bf16", "fp8")
+        and (
+            a_dtype == "fp4"
+            or (
+                a_dtype == "fp8"
+                and str(out_dtype).strip().lower() == "fp8"
+            )
+        )
+        and (
+            str(out_dtype).strip().lower() == "bf16"
+            or (BM in (64, 128) and BN == 256 and BK in (128, 256))
+        )
+    )
 
 
 # ---- gemm2 (down-proj) compile ----
@@ -90,17 +123,25 @@ def compile_gemm2_a4w4_port(
     topk=1,
     SBM=None,
     persist=False,
+    persist_flat=False,
     cu_num=0,
     has_pad=False,
     g2_kstages=None,
     g2_bhoist=None,
     g2_ascale_pf=None,
+    g2_base_a_dma=None,
+    g2_base_loop=None,
     g2_spart=None,
     g2_bf16_lds=None,
     out_dtype="bf16",
+    g2_inter=None,
+    g2_hidden=None,
 ):
-    """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
+    """Compile gemm2 a4w4 down-proj; persistent kernels support the default
+    fixed-N/persist-M schedule and an opt-in flat persist-M+N schedule.
+    """
     SBM = _norm_sbm(SBM, BM)
+    persist_flat = bool(persist and persist_flat)
     if BM not in (16, 32, 64, 128) or epilog not in ("atomic", "reduce"):
         raise AssertionError(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
@@ -130,6 +171,12 @@ def compile_gemm2_a4w4_port(
     if g2_ascale_pf is None:
         g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_ascale_pf = bool(g2_ascale_pf)
+    if g2_base_a_dma is None:
+        g2_base_a_dma = os.environ.get("MXFP4_G2_BASE_A_DMA", "0") == "1"
+    g2_base_a_dma = bool(g2_base_a_dma)
+    if g2_base_loop is None:
+        g2_base_loop = os.environ.get("MXFP4_G2_BASE_LOOP", "0") == "1"
+    g2_base_loop = bool(g2_base_loop)
     if g2_spart is None:
         g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_spart = int(g2_spart)
@@ -146,10 +193,30 @@ def compile_gemm2_a4w4_port(
     if g2_bf16_lds is None:
         g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
     g2_bf16_lds = bool(g2_bf16_lds)
+    nonatomic = is_g2_nonatomic_config(
+        BM, BN, BK, epilog, a_dtype, out_dtype, g2_inter, g2_hidden
+    )
+    nonatomic_fp8 = nonatomic and route_out_fp8
+    if g2_base_loop and not nonatomic:
+        raise AssertionError(
+            "MXFP4_G2_BASE_LOOP=1 requires MXFP4_G2_NONATOMIC=1"
+        )
+    g2_base_a_dma = (
+        g2_base_a_dma
+        and nonatomic
+        and not has_pad
+        and not is_f8
+    )
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
-    aStages = 2 if g2_bf16_lds else 3
-    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
+    aStages = (
+        min(kStages, g2_inter // BK) if nonatomic else (2 if g2_bf16_lds else 3)
+    )
+    c_lds_bytes = (
+        BM * BN * 4
+        if nonatomic_fp8
+        else (0 if nonatomic else BM * BN * (2 if g2_bf16_lds else 4))
+    )
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
@@ -176,11 +243,14 @@ def compile_gemm2_a4w4_port(
     ks_tag = "" if g2_kstages == 1 else f"_g2ks{g2_kstages}"
     bh_tag = "_bhoist" if g2_bhoist else ""
     apf_tag = "_apf" if g2_ascale_pf else ""
+    base_a_dma_tag = "_baseadma" if g2_base_a_dma else ""
+    base_loop_tag = "_baseloop" if g2_base_loop else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
     out_tag = "_fp8out" if route_out_fp8 else ""
+    nonatomic_tag = "_nonatomic" if nonatomic else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{base_a_dma_tag}{base_loop_tag}{spart_tag}{bf16lds_tag}{out_tag}{nonatomic_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -218,24 +288,44 @@ def compile_gemm2_a4w4_port(
         aq_num = fx.Int64(i32_max_m_blocks) * fx.Int64(BM * k_bytes)
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         lds_base_i32 = fx.Int32(fx.ptrtoint(lds.buf.ptr))
+        aq_rsrc = None
+        if const_expr(g2_base_a_dma):
+            aq_rsrc = _buffer_rsrc(arg_aq, aq_num)
 
         # Preload the first kStages K-tiles (the streaming prologue).
         def issue_all_a_loads(m_row0):
             for slot in range_constexpr(kStages):
-                issue_a_load_lds_dt(
-                    arg_aq,
-                    aq_num,
-                    lds_base_i32,
-                    slot,
-                    slot,
-                    m_row0,
-                    wave,
-                    lane,
-                    is_f8,
-                    KH_TILE_A,
-                    k_bytes,
-                    BM=BM,
-                )
+                if const_expr(g2_base_a_dma):
+                    for sub in range_constexpr(BM // 32):
+                        lds_row = wave * fx.Int32(BM // 4) + fx.Int32(sub * 8)
+                        car = m_row0 + lds_row + lane // fx.Int32(8)
+                        issue_base_a_load_lds(
+                            aq_rsrc,
+                            lds_base_i32,
+                            slot,
+                            slot,
+                            car,
+                            lane,
+                            BM * KH_TILE_A,
+                            lds_row,
+                            KH_TILE=KH_TILE_A,
+                            k_half=k_bytes,
+                        )
+                else:
+                    issue_a_load_lds_dt(
+                        arg_aq,
+                        aq_num,
+                        lds_base_i32,
+                        slot,
+                        slot,
+                        m_row0,
+                        wave,
+                        lane,
+                        is_f8,
+                        KH_TILE_A,
+                        k_bytes,
+                        BM=BM,
+                    )
 
         # One (m_block, n_block) unit for a synthesized unit_bx; non-persist calls once, persist per m-tile.
         def run_unit(unit_bx):
@@ -274,6 +364,11 @@ def compile_gemm2_a4w4_port(
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
                 route_out_fp8=route_out_fp8,
+                nonatomic=nonatomic,
+                g2_ktiles=g2_inter // BK if nonatomic else None,
+                g2_inter=g2_inter if nonatomic else None,
+                g2_hidden=g2_hidden if nonatomic else None,
+                g2_base_loop=g2_base_loop,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -300,6 +395,32 @@ def compile_gemm2_a4w4_port(
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
                 issue_all_a_loads(m_block_idx * fx.Int32(BM))
                 rocdl.sched_barrier(0)
+                run_unit(unit_bx)
+        elif const_expr(persist_flat):
+            # Flat persistent M+N: remap each grid-stride work-unit across XCDs,
+            # then decode the resulting linear tile in gemm2_body_v2.
+            cumsum0 = global_typed_ptr(arg_cumsum, T.i32)[0]
+            total_m_blocks = cumsum0 // BM
+            bound = total_m_blocks * fx.Int32(num_n_blocks)
+            grid_nb = fx.Int32(gpu.grid_dim.x)
+
+            if bx_i32 < bound:
+                unit_bx = flat_persistent_tile(
+                    bx_i32, bound, total_m_blocks, num_n_blocks
+                )
+                m_block = unit_bx // fx.Int32(num_n_blocks)
+                issue_all_a_loads(m_block * fx.Int32(BM))
+                rocdl.sched_barrier(0)
+                run_unit(unit_bx)
+
+            for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
+                work_unit = fx.Int32(iv)
+                gpu.barrier()
+                unit_bx = flat_persistent_tile(
+                    work_unit, bound, total_m_blocks, num_n_blocks
+                )
+                m_block = unit_bx // fx.Int32(num_n_blocks)
+                issue_all_a_loads(m_block * fx.Int32(BM))
                 run_unit(unit_bx)
         else:
             # Persistent-m: fixed cu_num*num_n_blocks grid; each block grid-strides m-tiles by cu_num (aiter `_persist`).
@@ -393,9 +514,15 @@ def compile_gemm2_a4w4_port(
         arg_out_scale: fx.Int64,
         stream: fx.Stream,
     ):
-        # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the launch to real m-blocks.
+        # i32_max_m_blocks sizes buffer resources; i32_grid_blocks bounds the
+        # non-flat launch to real m-blocks.
         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
-        grid_x = i32_grid_blocks * num_n_blocks
+        if const_expr(persist_flat):
+            total_work = i32_max_m_blocks * num_n_blocks
+            use_persistent_grid = total_work > fx.Int32(4 * cu_num)
+            grid_x = use_persistent_grid.select(fx.Int32(cu_num), total_work)
+        else:
+            grid_x = i32_grid_blocks * num_n_blocks
         gemm2_kernel(
             arg_aq,
             arg_ascale,
@@ -437,6 +564,8 @@ def get_g2(
     cu_num=0,
     has_pad=False,
     out_dtype="bf16",
+    D_HIDDEN=None,
+    D_INTER=None,
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
     # launcher while remaining within their respective caps.
@@ -444,12 +573,25 @@ def get_g2(
     out_dtype = str(out_dtype).strip().lower()
     topk_key = topk if epilog == "reduce" else 1
     cu_key = cu_num if persist else 0
+    persist_flat = _jit_persist_flat_enabled(persist)
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
     g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
+    g2_base_a_dma = os.environ.get("MXFP4_G2_BASE_A_DMA", "0") == "1"
+    g2_base_loop = os.environ.get("MXFP4_G2_BASE_LOOP", "0") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
+    g2_nonatomic = is_g2_nonatomic_config(
+        BM, BN, BK, epilog, a_dtype, out_dtype, D_INTER, D_HIDDEN
+    )
+    g2_base_a_dma = (
+        g2_base_a_dma
+        and g2_nonatomic
+        and not has_pad
+        and a_dtype == "fp4"
+        and os.environ.get("FLYDSL_RUNTIME_RUN_ONLY", "0") != "1"
+    )
     key = (
         BM,
         BN,
@@ -462,14 +604,20 @@ def get_g2(
         topk_key,
         SBM,
         persist,
+        persist_flat,
         cu_key,
         has_pad,
         g2_kstages,
         g2_bhoist,
         g2_ascale_pf,
+        g2_base_a_dma,
+        g2_base_loop,
         g2_spart,
         g2_bf16_lds,
         out_dtype,
+        g2_nonatomic,
+        D_INTER if g2_nonatomic else None,
+        D_HIDDEN if g2_nonatomic else None,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -485,14 +633,19 @@ def get_g2(
             topk=topk_key,
             SBM=SBM,
             persist=persist,
+            persist_flat=persist_flat,
             cu_num=cu_key,
             has_pad=has_pad,
             g2_kstages=g2_kstages,
             g2_bhoist=g2_bhoist,
             g2_ascale_pf=g2_ascale_pf,
+            g2_base_a_dma=g2_base_a_dma,
+            g2_base_loop=g2_base_loop,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
             out_dtype=out_dtype,
+            g2_inter=D_INTER if g2_nonatomic else None,
+            g2_hidden=D_HIDDEN if g2_nonatomic else None,
         )
         G2_CACHE[key] = launch
     return launch
@@ -532,7 +685,13 @@ def mxfp4_moe_gemm2(
     INTER_MAX=8192,
     stream=None,
 ):
-    """Stage-2 down-proj gemm; epilog 'atomic' (weighted atomic.fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim_pad/model_dim_pad>0 enable has_pad pad-skip (both 0 -> byte-identical); persist = fixed cu_num m-slot grid (default OFF)."""
+    """Stage-2 down-proj gemm.
+
+    ``persist`` defaults to fixed-N/persist-M scheduling. Runtime JIT callers
+    can set ``MXFP4_G2_PERSIST_FLAT=1`` for flat persist-M+N scheduling; AOT
+    compile/run-only paths retain the default schedule.
+    ``MXFP4_G2_BASE_LOOP=1`` swaps in the base GEMM2 K-loop.
+    """
     import torch
 
     if persist and cu_num <= 0:
@@ -575,10 +734,13 @@ def mxfp4_moe_gemm2(
         cu_num=cu_num,
         has_pad=has_pad,
         out_dtype=out_dtype,
+        D_HIDDEN=D_HIDDEN,
+        D_INTER=D_INTER,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
-        # Fixed grid: cu_num m-slots; each block loops over its m-tiles.
+        # The compiled launcher expands this to cu_num*num_n_blocks for the
+        # default schedule, or derives the adaptive flat grid from max_m_blocks.
         grid_blocks = cu_num
     elif n_sorted_padded is not None:
         grid_blocks = n_sorted_padded // BM

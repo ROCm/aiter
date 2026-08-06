@@ -20,6 +20,7 @@ from flydsl.expr.typing import Vector as Vec
 from .mxfp4_gemm_common import _fabs_f32 as fabs_f32
 from .mxfp4_gemm_common import _lds_swizzle_mask as lds_swizzle_mask
 from .mxfp4_gemm_common import (
+    _global_base_ptr1,
     flat_buffer_view,
     global_typed_ptr,
     kBS_stride_k0_dw,
@@ -30,6 +31,7 @@ from .mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
+from .mxfp4_gemm2 import _flat_bf16_epilog, _flat_mxfp8_epilog, gemm2_main_loop
 
 
 def bq_view(
@@ -170,7 +172,7 @@ def issue_a_load_lds_dt(
         mask = (
             lds_swizzle_mask_f8(lds_row + a_lane_row, KH_TILE_A)
             if const_expr(is_f8)
-            else lds_swizzle_mask(lds_row + a_lane_row, KH_TILE_A)
+            else lds_swizzle_mask(lds_row + a_lane_row)
         )
         car = m_row + lds_row + a_lane_row  # direct sorted row
         voffset = (lane_col ^ mask) + car * K_BYTES
@@ -219,6 +221,11 @@ def gemm2_body_v2(
     g2_ascale_pf=True,
     g2_bf16_lds=False,
     route_out_fp8=False,
+    nonatomic=False,
+    g2_ktiles=None,
+    g2_inter=None,
+    g2_hidden=None,
+    g2_base_loop=False,
 ):
     # gemm2 K-loop perf knobs (default ON, no-op unless g2_kstages==2): kstages=2 double-buffers B weight+scale one tile ahead; bhoist issues that prefetch above the LDS barrier; ascale_pf prefetches A-scale one tile ahead.
     if g2_kstages not in (1, 2):
@@ -239,14 +246,14 @@ def gemm2_body_v2(
     KH_TILE_A = BK // a_pack
     slot_bytes = BM * KH_TILE_A
     # Contraction K = inter_dim runtime (i32_inter); INTER_MAX caps compile-time view/fragment bounds.
-    K_rt = fx.Int32(i32_inter)
+    K_rt = fx.Int32(g2_inter) if const_expr(nonatomic) else fx.Int32(i32_inter)
     K_BYTES = K_rt // fx.Int32(a_pack)  # A row stride bytes (runtime)
     kc_rt = (K_rt + fx.Int32(255)) // fx.Int32(256)
     K_TILES_RT = K_rt // fx.Int32(BK)  # runtime K-tile trip count
     kAS_per_chunk_dw = kc_rt * fx.Int32(64)
     kBS_stride_n0_dw = kc_rt * fx.Int32(64)
     # N_OUT = model_dim/hidden is the gemm2 output N dim; runtime via i32_hidden (no K-loop dependency).
-    N_OUT_rt = fx.Int32(i32_hidden)
+    N_OUT_rt = fx.Int32(g2_hidden) if const_expr(nonatomic) else fx.Int32(i32_hidden)
     kbs_per_expert_dw = (N_OUT_rt // fx.Int32(32)) * kBS_stride_n0_dw
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
@@ -335,7 +342,7 @@ def gemm2_body_v2(
                     a64 = Vec.from_elements([lo[0], lo[1], hi[0], hi[1]], fx.Int64)
                     a_frags[i][k].store(a64.bitcast(fx.Int32))
                 else:
-                    mask = lds_swizzle_mask(lane_mod_16, KH_TILE_A)
+                    mask = lds_swizzle_mask(lane_mod_16)
                     lds_col = (lane_div_16 * 16 + k * 64) ^ mask
                     vec = lds_vec_load(
                         s_aq_base,
@@ -501,8 +508,9 @@ def gemm2_body_v2(
                     k_halves=kHalves,
                 )
 
-    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     zero4 = Vec.filled(4, 0.0, Float32)
+
+    # C accumulator: register fragments, zeroed then accumulated in place; (un)packed to K-loop carry.
     c_frags = [
         [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(numAccN)]
         for _ in range_constexpr(kMChunks)
@@ -522,7 +530,34 @@ def gemm2_body_v2(
                 n += 1
         return n
 
-    if const_expr(g2_kstages == 1):
+    if const_expr(g2_base_loop):
+        def load_b_bundle(kt):
+            return stream_b_tile(fx.Int32(kt))
+
+        def read_a_tile(slot):
+            issue_a_ds_read(slot)
+            return a_frags
+
+        def mfma_tile(bundle, _a, sa, *, init, kt):
+            bqf, bsf = bundle
+            mfma_cluster(bqf, bsf, sa, fx.Int32(kt))
+
+        gemm2_main_loop(
+            load_a_scale_tile,
+            load_b_bundle,
+            read_a_tile,
+            issue_a_load_lds,
+            mfma_tile,
+            k_tiles_total=g2_ktiles,
+            a_stages=aStages,
+        )
+        if const_expr(nonatomic):
+            c_ssa = [
+                [c_frags[i][J].load() for J in range(numAccN)]
+                for i in range(kMChunks)
+            ]
+
+    if const_expr(not g2_base_loop and g2_kstages == 1):
         # 1-deep pipe: synchronous B load per K-tile.
         for kt_iv, state in range(
             fx.Int32(0),
@@ -542,7 +577,12 @@ def gemm2_body_v2(
             mfma_cluster(bqf, bsf, sa, kt_rt)
             results = yield load_c_carry()
         store_c_carry(results)
-    else:
+        if const_expr(nonatomic):
+            c_ssa = [
+                [c_frags[i][J].load() for J in range(numAccN)]
+                for i in range(kMChunks)
+            ]
+    elif const_expr(not g2_base_loop):
         # 2-stage B pipeline: consume carried "current" B, prefetch next tile into the same fragments via scf.for state.
         cur_bqf = make_bq_fragments()
         cur_bsf = make_scale_fragments(nPairs)
@@ -651,31 +691,63 @@ def gemm2_body_v2(
             rocdl.sched_barrier(0)
             results = yield yield_carry()
         store_carry(results)
+        if const_expr(nonatomic):
+            c_ssa = [
+                [c_frags[i][J].load() for J in range(numAccN)]
+                for i in range(kMChunks)
+            ]
 
-    accm_vecs = [
-        [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
-    ]
-    atomic_bf16_epilog(
-        lds_acc_base,
-        accm_vecs,
-        arg_out,
-        arg_stids,
-        arg_sweights,
-        m_row,
-        n_block_idx,
-        wave,
-        lane,
-        i32_M,
-        BM,
-        N_OUT_rt,
-        BN=BN,
-        use_reduce=use_reduce,
-        topk=topk,
-        SBM=SBM,
-        g2_bf16_lds=g2_bf16_lds,
-        route_out_fp8=route_out_fp8,
-    )
-
+    if const_expr(nonatomic):
+        if const_expr(route_out_fp8):
+            _flat_mxfp8_epilog(
+                c_ssa,
+                _global_base_ptr1(arg_out),
+                m_row,
+                n_block_idx,
+                wave,
+                lane,
+                fx.Int32(gpu.thread_id("x")),
+                g2_hidden,
+                BN,
+                lds_acc_base,
+                kMChunks,
+            )
+        else:
+            _flat_bf16_epilog(
+                c_ssa,
+                _global_base_ptr1(arg_out),
+                m_row,
+                n_block_idx,
+                wave,
+                lane,
+                g2_hidden,
+                BN,
+                kMChunks,
+            )
+    else:
+        accm_vecs = [
+            [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)
+        ]
+        atomic_bf16_epilog(
+            lds_acc_base,
+            accm_vecs,
+            arg_out,
+            arg_stids,
+            arg_sweights,
+            m_row,
+            n_block_idx,
+            wave,
+            lane,
+            i32_M,
+            BM,
+            N_OUT_rt,
+            BN=BN,
+            use_reduce=use_reduce,
+            topk=topk,
+            SBM=SBM,
+            g2_bf16_lds=g2_bf16_lds,
+            route_out_fp8=route_out_fp8,
+        )
 
 # ---- Atomic bf16 epilogue (shared store path; gemm2 down-proj) ----
 def atomic_bf16_epilog(

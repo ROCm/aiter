@@ -23,6 +23,39 @@ def _raw(v):
     return v
 
 
+def flat_persistent_tile(
+    pid, bound, total_m_blocks, num_n_blocks, xcd_swizzle=0
+):
+    """Map a flat persistent work-unit id to a linear (M, N) tile.
+
+    The first remap distributes a possibly uneven tile count over eight XCDs.
+    The optional second remap preserves the base GEMM's local M swizzle.
+    """
+    nxcd = fx.Int32(8)
+    xq = fx.Int32(arith.divui(_raw(bound), _raw(nxcd)))
+    xr = fx.Int32(arith.remui(_raw(bound), _raw(nxcd)))
+    xc = fx.Int32(arith.remui(_raw(pid), _raw(nxcd)))
+    wgid = (
+        xc * xq
+        + fx.Int32(arith.minsi(_raw(xc), _raw(xr)))
+        + fx.Int32(arith.divui(_raw(pid), _raw(nxcd)))
+    )
+    if xcd_swizzle <= 0:
+        return wgid
+
+    ng = fx.Int32(xcd_swizzle * num_n_blocks)
+    group_id = wgid // ng
+    first_pid_m = group_id * fx.Int32(xcd_swizzle)
+    remaining_m = total_m_blocks - first_pid_m
+    group_size_m = fx.Int32(
+        arith.minsi(_raw(remaining_m), _raw(fx.Int32(xcd_swizzle)))
+    )
+    wig = wgid % ng
+    m_block = first_pid_m + (wig % group_size_m)
+    n_block = wig // group_size_m
+    return m_block * fx.Int32(num_n_blocks) + n_block
+
+
 def _lds_ptr3(base_i32, byte_off_i32):
     addr_i64 = fx.Int64(base_i32 + byte_off_i32)
     return llvm.inttoptr(ir.Type.parse(_PTR3), _raw(addr_i64))
@@ -59,10 +92,8 @@ def _buffer_rsrc(addr_i64, num_records_bytes):
     )
 
 
-def _lds_swizzle_mask(row, row_bytes=128):
-    """XOR16 swizzle for an FP4 LDS row of `row_bytes`; permutes its 16-byte columns."""
-    assert row_bytes in (64, 128), f"unsupported FP4 LDS row width {row_bytes}"
-    return (row & fx.Int32(2 * (row_bytes // 16) - 2)) << fx.Int32(3)
+def _lds_swizzle_mask(row):
+    return (row & fx.Int32(14)) << fx.Int32(3)
 
 
 def lds_swizzle_mask_f8(row, row_bytes):

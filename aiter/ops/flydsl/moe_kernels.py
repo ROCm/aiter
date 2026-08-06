@@ -997,6 +997,8 @@ def _run_moe_reduction(
     topk_ids=None,
     stream=None,
     is_fp8=False,
+    reverse_sorted=None,
+    sorted_weights=None,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1026,6 +1028,9 @@ def _run_moe_reduction(
 
     reduce_out_dtype_str = None
     X = target
+    sorted_fp8 = is_fp8 and reverse_sorted is not None
+    if sorted_fp8 and sorted_weights is None:
+        raise ValueError("sorted FP8 reduction requires sorted_weights")
     if is_fp8:
         _reduce_dtype_str = "fp8"
         reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
@@ -1045,6 +1050,7 @@ def _run_moe_reduction(
     }
     if is_fp8:
         reduce_kwargs["out_dtype_str"] = reduce_out_dtype_str
+        reduce_kwargs["sorted_input"] = sorted_fp8
     reduce_exe = compile_moe_reduction(**reduce_kwargs)
     if use_mask:
         em = expert_mask.to(torch.int32).contiguous()
@@ -1053,19 +1059,41 @@ def _run_moe_reduction(
         # Placeholders; kernel ignores them when use_mask=False (and for fp8).
         em = torch.empty(0, device=out.device, dtype=torch.int32)
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
+    rs = (
+        reverse_sorted
+        if sorted_fp8
+        else torch.empty(0, device=out.device, dtype=torch.int32)
+    )
+    sw = (
+        sorted_weights
+        if sorted_fp8
+        else torch.empty(0, device=out.device, dtype=torch.float32)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
-    _run_compiled(
-        reduce_exe,
+    args = (
         (
+            ptr_arg(X),
+            ptr_arg(out),
+            ptr_arg(em),
+            ptr_arg(tk),
+            ptr_arg(rs),
+            ptr_arg(sw),
+            token_num,
+            int(target.shape[0]),
+            stream,
+        )
+        if is_fp8
+        else (
             ptr_arg(X),
             ptr_arg(out),
             ptr_arg(em),
             ptr_arg(tk),
             token_num,
             stream,
-        ),
+        )
     )
+    _run_compiled(reduce_exe, args)
 
 
 # ---------------------------------------------------------------------------

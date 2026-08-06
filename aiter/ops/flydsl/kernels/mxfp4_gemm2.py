@@ -24,6 +24,7 @@ from .mxfp4_gemm_common import (
     _raw,
     bq_bytes_for,
     bscale_bytes_for,
+    flat_persistent_tile,
     k_half_for,
     k_tiles_total_for,
     kas_per_chunk_dw_for,
@@ -32,7 +33,6 @@ from .mxfp4_gemm_common import (
     kbs_stride_n0_dw_for,
     kmchunks_for,
     kStages,
-    kunroll_for,
     lds_acc_bytes_for,
     num_n_blocks_for,
 )
@@ -59,11 +59,6 @@ def _udiv(a, c):
     return fx.Int32(arith.divui(_raw(a), _raw(cc)))
 
 
-def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
-
-
 def _issue_a_load_lds(
     aq_rsrc, saq_base_i32, slot, kt, car, lane, slot_bytes, lds_row, KH_TILE, k_half
 ):
@@ -81,6 +76,66 @@ def _issue_a_load_lds(
         fx.Int32(0),
         fx.Int32(0),
     )
+
+
+def gemm2_main_loop(
+    load_a_scale_tile,
+    load_b_tile,
+    issue_a_ds_read,
+    issue_a_load_lds,
+    mfma_tile,
+    *,
+    k_tiles_total,
+    a_stages,
+    prefetch_stages=kStages,
+):
+    """Emit the base GEMM2 compile-time K loop.
+
+    ``load_b_tile`` may return any bundle understood by ``mfma_tile``. This
+    keeps the schedule reusable by GEMM2 bodies with different fragment APIs.
+    """
+    a_scale_v = [
+        load_a_scale_tile(kt) for kt in range_constexpr(k_tiles_total)
+    ]
+    b_tiles = [load_b_tile(kt) for kt in range_constexpr(k_tiles_total)]
+
+    if const_expr(k_tiles_total <= prefetch_stages):
+        for kt in range_constexpr(k_tiles_total):
+            gpu.barrier()
+            a_tile = issue_a_ds_read(kt % prefetch_stages)
+            mfma_tile(
+                b_tiles[kt],
+                a_tile,
+                a_scale_v[kt],
+                init=(kt == 0),
+                kt=kt,
+            )
+    else:
+        for kt in range_constexpr(k_tiles_total - prefetch_stages):
+            slot = kt % a_stages
+            next_kt = prefetch_stages + kt
+            gpu.barrier()
+            a_tile = issue_a_ds_read(slot)
+            issue_a_load_lds(next_kt % a_stages, next_kt)
+            mfma_tile(
+                b_tiles[kt],
+                a_tile,
+                a_scale_v[kt],
+                init=(kt == 0),
+                kt=kt,
+            )
+
+        for tail in range_constexpr(prefetch_stages):
+            kt = k_tiles_total - prefetch_stages + tail
+            gpu.barrier()
+            a_tile = issue_a_ds_read(kt % a_stages)
+            mfma_tile(
+                b_tiles[kt],
+                a_tile,
+                a_scale_v[kt],
+                init=False,
+                kt=kt,
+            )
 
 
 def compile_gemm2_a4w4_port(
@@ -221,34 +276,14 @@ def compile_gemm2_a4w4_port(
             bound = total_m_blocks * fx.Int32(_num_n_blocks)
             grid_nb = fx.Int32(gpu.grid_dim.x)
 
-            _NXCD = 8
-            _xq = _udiv(bound, _NXCD)
-            _xr = _umod(bound, _NXCD)
-            _SW = xcd_swizzle
-
-            def _xcd(pid):
-                xc = _umod(pid, _NXCD)
-                wgid = (
-                    xc * _xq
-                    + fx.Int32(arith.minsi(_raw(xc), _raw(_xr)))
-                    + _udiv(pid, _NXCD)
-                )
-                if const_expr(_SW <= 0):
-                    return wgid
-                _ng = fx.Int32(_SW * _num_n_blocks)
-                group_id = wgid // _ng
-                first_pid_m = group_id * fx.Int32(_SW)
-                remaining_m = total_m_blocks - first_pid_m
-                group_size_m = fx.Int32(
-                    arith.minsi(_raw(remaining_m), _raw(fx.Int32(_SW)))
-                )
-                wig = wgid % _ng
-                m_block = first_pid_m + (wig % group_size_m)
-                n_block = wig // group_size_m
-                return m_block * fx.Int32(_num_n_blocks) + n_block
-
             if bx_i32 < bound:
-                tile = _xcd(bx_i32)
+                tile = flat_persistent_tile(
+                    bx_i32,
+                    bound,
+                    total_m_blocks,
+                    _num_n_blocks,
+                    xcd_swizzle,
+                )
                 _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
@@ -256,7 +291,13 @@ def compile_gemm2_a4w4_port(
             for iv in range(bx_i32 + grid_nb, bound, gpu.grid_dim.x):
                 wu = fx.Int32(iv)
                 gpu.barrier()
-                tile = _xcd(wu)
+                tile = flat_persistent_tile(
+                    wu,
+                    bound,
+                    total_m_blocks,
+                    _num_n_blocks,
+                    xcd_swizzle,
+                )
                 _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 _run_tile(tile)
         else:
@@ -359,7 +400,6 @@ def _gemm2_body(
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
     _n_real_half = (_K_REAL + 127) // 128
-    _kUnroll = kunroll_for(_K, BK)
     _kAS_per_chunk_dw = kas_per_chunk_dw_for(_K)
     _kBS_stride_n0_dw = kbs_stride_n0_dw_for(_K)
     _asc_chunk_div = 16 if const_expr(BM == 16) else 32
@@ -545,43 +585,22 @@ def _gemm2_body(
                             [a[i1][1], b_J1, accm[i1][J], 4, 4, 3, sa, 2 + in_b, sb],
                         )
 
-    def _kloop_fence():
-        gpu.barrier()
+    def load_b_bundle(kt):
+        return load_b_tile(kt), load_b_scale_tile(kt)
 
-    if const_expr(_K_TILES_TOTAL <= kStages):
-        a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        for S in range_constexpr(_K_TILES_TOTAL):
-            kt = S
-            slot = kt % kStages
-            _kloop_fence()
-            a = issue_a_ds_read(slot)
-            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
-            mfma_cluster(b[slot], a, a_scale_sub, b_scale_v[slot], init=(S == 0), kt=kt)
-    else:
-        a_scale_v = [load_a_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        b_scale_v = [load_b_scale_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
-        b = [load_b_tile(kt) for kt in range_constexpr(_K_TILES_TOTAL)]
+    def mfma_tile(bundle, a, a_scale_sub, *, init, kt):
+        b_tile, b_scale = bundle
+        mfma_cluster(b_tile, a, a_scale_sub, b_scale, init=init, kt=kt)
 
-        for OFFSET in range_constexpr(_kUnroll):
-            kt = OFFSET
-            slot = kt % _aStages
-            next_kt = kStages + OFFSET
-            write_slot = next_kt % _aStages
-            _kloop_fence()
-            a = issue_a_ds_read(slot)
-            issue_a_load_lds(write_slot, next_kt)
-            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
-            mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=(OFFSET == 0))
-
-        for S in range_constexpr(kStages):
-            kt = _K_TILES_TOTAL - kStages + S
-            slot = kt % _aStages
-            _kloop_fence()
-            a = issue_a_ds_read(slot)
-            a_scale_sub = [a_scale_v[kt][sub] for sub in range_constexpr(_kSubBlocks)]
-            mfma_cluster(b[kt], a, a_scale_sub, b_scale_v[kt], init=False)
+    gemm2_main_loop(
+        load_a_scale_tile,
+        load_b_bundle,
+        issue_a_ds_read,
+        issue_a_load_lds,
+        mfma_tile,
+        k_tiles_total=_K_TILES_TOTAL,
+        a_stages=_aStages,
+    )
 
     if epilog == "nonatomic":
         out_base = _global_base_ptr1(arg_out)
@@ -686,6 +705,108 @@ def _cshuffle_flat_bf16_epilog(
             n_col = n_block_idx * fx.Int32(BN) + col_start + fx.Int32(s * 64)
             elem = fx.Int64(sorted_row) * fx.Int64(N_OUT) + fx.Int64(n_col)
             llvm.StoreOp(_raw(pk), _gep1(out_base, elem * fx.Int64(2)))
+
+
+@flyc.jit
+def _flat_mxfp8_epilog(
+    accm,
+    out_base,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    tid_i32,
+    N_OUT,
+    BN,
+    lds_acc_base_i32,
+    kMChunks,
+):
+    """Store unweighted sorted rows as [N fp8 bytes | N/8 e8m0 bytes]."""
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    for i in range_constexpr(kMChunks):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        for J in range_constexpr(BN // 64):
+            col = wave * fx.Int32(BN // 4) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+    gpu.barrier()
+
+    m_lane = tid_i32 // fx.Int32(16)
+    n_lane = tid_i32 % fx.Int32(16)
+    row_bytes = N_OUT + N_OUT // fx.Int32(8)
+    blocks_per_lane = BN // 128
+    pk_ty = T.vec(2, T.i16)
+
+    for mr in range_constexpr(kMChunks):
+        row_local = fx.Int32(mr * 16) + m_lane
+        sorted_row = m_row + row_local
+        row_byte_base = fx.Int64(sorted_row) * fx.Int64(row_bytes)
+        for half in range_constexpr(blocks_per_lane):
+            group = n_lane + fx.Int32(half * 16)
+            col0 = group * fx.Int32(8)
+            base_idx = row_local * fx.Int32(BN) + col0
+            v0 = Vec(
+                llvm.load(T.vec(4, T.f32), _gep3(lds_base, base_idx * fx.Int32(4)))
+            )
+            v1 = Vec(
+                llvm.load(
+                    T.vec(4, T.f32),
+                    _gep3(lds_base, (base_idx + fx.Int32(4)) * fx.Int32(4)),
+                )
+            )
+            vals = [v0[0], v0[1], v0[2], v0[3], v1[0], v1[1], v1[2], v1[3]]
+
+            local_max = _fabs_f32(vals[0])
+            for q in range_constexpr(1, 8):
+                local_max = fx.Float32(
+                    arith.maxnumf(_raw(local_max), _raw(_fabs_f32(vals[q])))
+                )
+            amax_bits = fx.Int32(arith.bitcast(T.i32, _raw(local_max)))
+            ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
+            e8m0 = ax_e - fx.Int32(7)
+            e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
+            e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
+            qscale = arith.bitcast(T.f32, _raw(e8m0 << fx.Int32(23)))
+
+            packed_lo = _raw(Vec.filled([2], 0, fx.Int16))
+            packed_lo = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_lo, _raw(vals[0]), _raw(vals[1]), qscale, 0
+            )
+            packed_lo = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_lo, _raw(vals[2]), _raw(vals[3]), qscale, 1
+            )
+            packed_hi = _raw(Vec.filled([2], 0, fx.Int16))
+            packed_hi = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_hi, _raw(vals[4]), _raw(vals[5]), qscale, 0
+            )
+            packed_hi = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_hi, _raw(vals[6]), _raw(vals[7]), qscale, 1
+            )
+
+            global_col = n_block_idx * fx.Int32(BN) + col0
+            q_byte = row_byte_base + fx.Int64(global_col)
+            llvm.StoreOp(
+                _raw(Vec(packed_lo).bitcast(fx.Int32)[0]),
+                _gep1(out_base, q_byte),
+                nontemporal=True,
+            )
+            llvm.StoreOp(
+                _raw(Vec(packed_hi).bitcast(fx.Int32)[0]),
+                _gep1(out_base, q_byte + fx.Int64(4)),
+                nontemporal=True,
+            )
+            scale_byte = (
+                row_byte_base
+                + fx.Int64(N_OUT)
+                + fx.Int64(global_col // fx.Int32(8))
+            )
+            llvm.StoreOp(
+                arith.trunci(T.i8, _raw(e8m0)), _gep1(out_base, scale_byte)
+            )
 
 
 @flyc.jit
