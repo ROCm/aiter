@@ -16,6 +16,7 @@ from ..jit.core import (
 )
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_common import get_padded_m
 
@@ -253,32 +254,21 @@ def lookup_mxscale_bmm_config(
 _MXSCALE_BMM_DEFAULT_LIBTYPE = "opus"
 
 
-def batched_gemm_a8w8_mxscale(
+def _batched_gemm_a8w8_mxscale_impl(
     x: Tensor,
     wo_a: Tensor,
     x_scale: Tensor,
     w_scale: Tensor,
-    out: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
 ) -> Tensor:
-    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
 
-    mmajor DSV4 wo_a layout (matches the opus kernels + op test):
-
-    * ``x``       : [M, G, K] fp8 activation (per-token e8m0; transposed view
-                    of batch-major [G, M, K]).
-    * ``wo_a``    : [G, N, K] fp8 weight (batch-major).
-    * ``x_scale`` : [M, G, K/128] uint8 e8m0 activation scale.
-    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0 weight scale.
-    * ``out``     : optional preallocated [M, G, N] output (fp32 or bf16).
-
-    Note this is *microscaling* (e8m0) block scale -- distinct from
-    ``gemm_a8w8_blockscale`` which uses fp32 block scale. Scale type is baked
-    into the name so a future fp32-block batched variant stays separate.
-
-    The shape is looked up in the tuned CSV here and the winning row's libtype
-    picks the backend. No kernel override lives on this entry: how a kernel is
-    named is backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
+    Kept unwrapped (plain Python) so tests can introspect the real dispatch
+    (which kernelId a shape resolves to) on meta tensors. The public
+    ``batched_gemm_a8w8_mxscale`` is the torch.compile-guarded custom op over
+    this; a caller that must write into its own (e.g. batch-major) output buffer
+    calls the opus backend (``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus``)
+    directly, which keeps the ``out=`` argument.
     """
     from .opus.bmm_op import bmm_a8w8_mxscale_opus
 
@@ -300,11 +290,62 @@ def batched_gemm_a8w8_mxscale(
         wo_a,
         x_scale,
         w_scale,
-        out,
+        None,
         dtype=dtype,
         kernelId=int(cfg["kernelId"]) if cfg is not None else None,
         splitK=int(cfg["splitK"]) if cfg is not None else None,
     )
+
+
+def _batched_gemm_a8w8_mxscale_fake(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    # token-major [M, G, N]; mirrors the eager allocation in bmm_a8w8_mxscale_opus.
+    return torch.empty(
+        (x.shape[0], x.shape[1], wo_a.shape[1]),
+        dtype=dtype,
+        device=x.device,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """fp8 e8m0 mxscale (128x128 block-scale) batched GEMM.
+
+    mmajor DSV4 wo_a layout (matches the opus kernels + op test):
+
+    * ``x``       : [M, G, K] fp8 activation (per-token e8m0; transposed view
+                    of batch-major [G, M, K]).
+    * ``wo_a``    : [G, N, K] fp8 weight (batch-major).
+    * ``x_scale`` : [M, G, K/128] uint8 e8m0 activation scale.
+    * ``w_scale`` : [G, N/128, K/128] uint8 e8m0 weight scale.
+
+    Returns a fresh **token-major** [M, G, N] output. This entry is
+    torch.compile-guarded (registered as an ``aiter::`` custom op with a meta
+    kernel), so a framework can call it inside a compiled graph without the
+    tuned-CSV lookup / heuristic being traced. A caller that must write into its
+    own preallocated (e.g. batch-major) buffer uses
+    ``aiter.ops.opus.bmm_op.bmm_a8w8_mxscale_opus`` directly (it keeps ``out=``).
+
+    Note this is *microscaling* (e8m0) block scale -- distinct from
+    ``gemm_a8w8_blockscale`` which uses fp32 block scale. Scale type is baked
+    into the name so a future fp32-block batched variant stays separate.
+
+    The shape is looked up in the tuned CSV and the winning row's libtype picks
+    the backend. No kernel override lives on this entry: how a kernel is named is
+    backend-specific, so pin one at the backend (aiter.ops.opus.bmm_op).
+    """
+    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(

@@ -5,7 +5,9 @@
 Covers the mmajor DeepSeek-V4 wo_a path: O/Y are [M, G, *] (transposed views of
 batch-major [G, M, *]); wo_a + w_scale stay batch-major. Activation scale is
 per-token e8m0 (GROUP_M=1), weight scale is 128x128-block e8m0. Candidates are
-the curated flatmm kernel IDs; the reference is a dequantized fp32 einsum.
+kid 0 (always-runnable baseline) and the public dispatch path; the reference is
+a dequantized fp32 einsum. Per-kid perf comparison / winner selection lives in
+``csrc/opus_gemm/opus_bmm_mxscale_tune.py``.
 
 ``--check-m-align`` runs a different check instead of the sweep: an every-kid
 guard that OpusGemmInstance.m_align still matches launcher behaviour (see
@@ -28,7 +30,8 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw
+from aiter.ops.batched_gemm_op_a8w8 import lookup_mxscale_bmm_config
+from aiter.ops.opus.bmm_op import _opus_bmm_a8w8_mxscale_raw, bmm_a8w8_mxscale_opus
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -36,22 +39,6 @@ torch.set_default_device("cuda")
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
 GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
 _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
-
-# Curated flatmm kernel IDs (splitK == 1, direct store). Each requires
-# m % B_M == 0, n % B_N == 0, k % 128 == 0 for its tile.
-FLATMM_KIDS = {
-    "m64n64k128": (650, 64, 64),
-    "m64n64k128_scale_prefetch": (653, 64, 64),
-    # M-tile interleaved 128x128 (MI=2 tiles/WG share B). Needs M % 256 == 0;
-    # wins on large-M shapes where the 64x64 tiles are memory/pipeline bound.
-    "m128n128k128_minterleave": (163, 256, 128),
-    # tileN (T_N=2) COM_REP_N>1 regression guards: these are the configs that
-    # transposed output column groups on signed / varied-block-scale data (the
-    # DSV4 wo_a DP-attention G=16 small-M case). Kept in the sweep so the
-    # correctness check keeps exercising the fixed consumer-store column map.
-    "m16n64k256_tileN_crn2": (313, 16, 64),
-    "m16n128k256_tileN_crn4": (312, 16, 128),
-}
 
 
 def _to_e8m0_scale(scale):
@@ -134,17 +121,16 @@ def test_mxscale_bmm(g, m, n, k, dtype):
         _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, Y, xs_in, ws_mx, 1, kid)
         return Y
 
-    candidates = {}
-    for name, (kid, bm, bn) in FLATMM_KIDS.items():
-        # Skip a tile whose block shape does not divide this (m, n).
-        if m % bm == 0 and n % bn == 0 and k % GROUP == 0:
-            candidates[name] = (lambda kid=kid: _call(kid), ref)
+    # Correctness-focused: kid 0 (k32 fused) is a fixed baseline with no
+    # tile-alignment requirement (always runnable), plus the public dispatch path
+    # end to end. Per-kid perf comparison / winner selection lives in
+    # csrc/opus_gemm/opus_bmm_mxscale_tune.py, not here.
+    candidates = {"kid0_k32_fused": (lambda: _call(0), ref)}
 
     # Public backend-neutral entry: no kernelId -> per-(g,m,n,k) tuned-CSV
     # lookup + heuristic fallback + libtype backend routing. Exercises the
     # whole aiter.batched_gemm_a8w8_mxscale -> bmm_a8w8_mxscale_opus path end
-    # to end (not the raw binding). Always runnable: on a CSV/heuristic miss it
-    # falls back to kid 0 (k32 fused), which has no tile-alignment requirement.
+    # to end (not the raw binding).
     candidates["auto (batched_gemm_a8w8_mxscale)"] = (
         lambda: aiter.batched_gemm_a8w8_mxscale(O_in, W_mx, xs_in, ws_mx, dtype=ydt),
         ref,
@@ -211,19 +197,29 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         return Yb  # [g, m, n]
 
     def _call_auto():
+        # Same tuned-CSV lookup the public entry does, but writing into a
+        # caller-owned batch-major buffer -- which the guarded public entry no
+        # longer exposes (it returns fresh token-major), so drive the opus
+        # backend directly with the looked-up kid + the batch-major out= view.
         Yb = torch.empty((g, m, n), dtype=ydt)
-        aiter.batched_gemm_a8w8_mxscale(
-            O_in, W_mx, xs_in, ws_mx, out=Yb.transpose(0, 1), dtype=ydt
+        cfg = lookup_mxscale_bmm_config(g, m, n, k)
+        bmm_a8w8_mxscale_opus(
+            O_in,
+            W_mx,
+            xs_in,
+            ws_mx,
+            out=Yb.transpose(0, 1),
+            dtype=ydt,
+            kernelId=int(cfg["kernelId"]) if cfg is not None else None,
+            splitK=int(cfg["splitK"]) if cfg is not None else None,
         )
         return Yb
 
-    # kid 0 (k32 fused) has no tile-alignment requirement -> always runnable.
+    # Correctness-focused: kid 0 (always runnable) as the batch-major baseline,
+    # plus the backend dispatch path writing into the batch-major buffer via
+    # out=. Per-kid perf sweep lives in csrc/opus_gemm/opus_bmm_mxscale_tune.py.
     candidates = {"kid0_k32_fused": (lambda: _call_raw(0), ref)}
-    for name, (kid, bm, bn) in FLATMM_KIDS.items():
-        if m % bm == 0 and n % bn == 0 and k % GROUP == 0:
-            candidates[name] = (lambda kid=kid: _call_raw(kid), ref)
-    # Public dispatch path, writing into the batch-major buffer via out=.
-    candidates["auto (batched_gemm_a8w8_mxscale)"] = (_call_auto, ref)
+    candidates["auto (bmm_a8w8_mxscale_opus)"] = (_call_auto, ref)
 
     flops = 2.0 * g * m * n * k
     # fp8 A + fp8 W + e8m0 scales (uint8) + output.
@@ -250,6 +246,48 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+# --- tileN column-map regression guard ------------------------------------
+# These COM_REP_N>1 kernels previously transposed output column groups. Keep
+# them out of the narrow perf table, but always exercise both output layouts
+# with signed, varied-block-scale data so the bug cannot silently return.
+_TILEN_REGRESSION_KIDS = (312, 313)
+_TILEN_REGRESSION_SHAPE = (2, 16, 128, 1024)  # G, M, N, K; accepts both kids
+_TILEN_REGRESSION_ERR_TOL = 0.003
+
+
+def check_tilen_column_map():
+    """Check kid312/313 column mapping for token- and batch-major output."""
+    g, m, n, k = _TILEN_REGRESSION_SHAPE
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+    O_in = O_mx.transpose(0, 1)
+    xs_in = xs_mx.transpose(0, 1)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+    failures = []
+
+    for kid in _TILEN_REGRESSION_KIDS:
+        for layout in ("token-major", "batch-major"):
+            if layout == "token-major":
+                out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+            else:
+                out = torch.full((g, m, n), float("nan"), dtype=dtypes.bf16).transpose(
+                    0, 1
+                )
+            _opus_bmm_a8w8_mxscale_raw(O_in, W_mx, out, xs_in, ws_mx, 1, kid)
+            torch.cuda.synchronize()
+            delta = (out.to(dtypes.fp32) - ref).abs()
+            rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+            err = rows.max().item()
+            if not (err <= _TILEN_REGRESSION_ERR_TOL):
+                failures.append(
+                    f"kid {kid} {layout}: worst row rel err {err:.4f} "
+                    f"> {_TILEN_REGRESSION_ERR_TOL}"
+                )
+
+    assert not failures, "tileN column-map regression:\n  " + "\n  ".join(failures)
+    return len(_TILEN_REGRESSION_KIDS) * 2
 
 
 # --- m_align guard ---------------------------------------------------------
@@ -425,6 +463,11 @@ def main():
         help="run the every-kid m_align guard instead of the perf sweep",
     )
     args = parser.parse_args()
+
+    n_tilen_checks = check_tilen_column_map()
+    aiter.logger.info(
+        "tileN column mapping passed for %d kid/layout combinations", n_tilen_checks
+    )
 
     if args.check_m_align:
         try:
