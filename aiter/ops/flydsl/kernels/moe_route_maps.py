@@ -30,14 +30,11 @@ MAX_G2L_EXPERTS = 512
 # the plain device-atomic kernel when the local bucket count (E) exceeds it.
 MAX_ROUTE_BUCKETS = 512
 
-# ``topids_to_rows`` value for an EP route that owns no grouped row: a non-local
-# (expert-mask dropped) route, or a dead-tail padding route. Such routes claim no
-# per-expert slot, so they contribute nothing to masked_m / psum / the grouped
-# GEMM -- under EP that is the difference between computing every received
-# route and only the routes this rank actually owns. Consumers of the route map
-# (contiguous psum remap, the stage1 route-indexed quant scatter, gather-reduce)
-# must skip this value instead of using it as a row index; ``gather_w`` is 0 for
-# the same routes.
+# ``topids_to_rows`` value for an EP route that owns no grouped row (non-local
+# expert, or dead-tail padding). Such routes claim no per-expert slot, so
+# masked_m / psum / the grouped GEMM cover only the routes this rank owns instead
+# of every route it received. Consumers (psum remap, the stage1 route-indexed
+# quant scatter, gather-reduce) must skip it rather than use it as a row index.
 DROPPED_ROUTE_ROW = -1
 
 
@@ -279,8 +276,8 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             )
             le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
             is_drop = le == fx.Uint32(n_buckets)
-            # Dropped routes address bucket 0 so the atomic stays in bounds, but
-            # they add 0 to it (see incr below) and never keep the row.
+            # Dropped routes address bucket 0 to keep the atomic in bounds, but
+            # add 0 to it (incr below) and keep the sentinel instead of the row.
             eff_e = is_drop.select(fx.Uint32(0), le)
 
             # Fused weight cast+mask: read f32 route weight, write weight_dtype
@@ -291,11 +288,9 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
             buffer_ops.buffer_store(w_out, w_rsrc, route)
 
-            # Non-local routes take no slot (incr 0), so masked_m -- and with it
-            # psum, the contiguous row count and the grouped GEMM's M -- covers
-            # only the routes whose expert lives on this rank. They get the
-            # DROPPED_ROUTE_ROW sentinel instead of a row that would alias the
-            # bucket-0 route holding the same slot.
+            # A dropped route that claimed a slot would still cost a grouped GEMM
+            # row, and its computed row would alias the bucket-0 route holding
+            # that slot -- hence incr 0 plus the sentinel.
             incr = _raw(is_drop.select(c0, c1))
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
@@ -425,13 +420,11 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
         gpu.barrier()
 
         # Phase 1: classify each route, cast/mask its weight, and take an
-        # intra-block per-bucket rank via a workgroup-scope LDS atomic. Only KEPT
-        # (local, in-range) routes take a rank, so the buckets -- and therefore
-        # masked_m, psum and the grouped GEMM's row count -- hold this rank's own
-        # routes only. Routes >= nvr (EP dead-tail padding) are skipped entirely:
-        # no LDS increment, and their topids_to_rows/gather_w slots are left
-        # unwritten (every downstream consumer is bounded by the same nvr/nvt),
-        # matching the fused kernel.
+        # intra-block per-bucket rank via a workgroup-scope LDS atomic. Only kept
+        # routes take a rank, so the buckets -- and therefore masked_m, psum and
+        # the grouped GEMM's row count -- hold this rank's own routes only.
+        # Dead-tail routes (>= nvr) leave topids_to_rows/gather_w unwritten; every
+        # downstream consumer is bounded by the same nvr/nvt.
         in_range = route < nvr_i32
         oob = route >= nvr_i32
 
@@ -445,9 +438,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
 
         le = fx.Uint32(buffer_ops.buffer_load(g2l_rsrc, ge, vec_width=1, dtype=i32))
         is_drop = (le == n_buckets_i32) | oob
-        # Kept == in-range AND local. ``oob`` routes read g2l_lut[0], which can be
-        # a valid bucket, so in_range has to gate the rank as well as the lookup.
-        is_kept = (le != n_buckets_i32) & in_range
+        is_kept = ~is_drop
         eff_e = is_drop.select(fx.Uint32(0), le)
 
         # Fused weight cast+mask (kept -> cast(f32->wdt), dropped -> 0).
@@ -497,9 +488,9 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16"):
             _lds_store(lds_cnt, base_v, fx.Uint32(b))
         gpu.barrier()
 
-        # Phase 3: final row = base[eff_e] + intra-block rank + eff_e*max_m for a
-        # kept route; the sentinel for a dropped one (it never claimed a rank, so
-        # the computed row would alias the bucket's rank-0 route).
+        # Phase 3: kept route -> base[eff_e] + intra-block rank + eff_e*max_m;
+        # dropped route -> sentinel (it took no rank, so that row belongs to the
+        # bucket's rank-0 route).
         if in_range:
             base = fx.Uint32(_lds_load(lds_cnt, eff_e))
             row = base + my_rank + eff_e * fx.Uint32(max_m)
@@ -681,12 +672,9 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             w_out = is_drop.select(arith.constant(0.0, type=wdt), w_cast)
             buffer_ops.buffer_store(w_out, w_rsrc, route)
 
-            # Dropped routes (non-local expert, or the dead-tail padding) must NOT
-            # claim a slot: counting them inflates masked_m, which grows psum and
-            # makes the grouped GEMM compute rows that only ever fold away via
-            # gather_w=0. Add 0 for them and tag the route with the sentinel, so
-            # masked_m holds exactly this rank's own routes and every consumer can
-            # tell "no grouped row" from a real row index.
+            # Counting a dropped route inflates masked_m, which grows psum and
+            # makes the grouped GEMM compute rows that only fold away via
+            # gather_w=0; the sentinel keeps that row unclaimed and unambiguous.
             incr = _raw(is_drop.select(c0, c1))
             slot = llvm.AtomicRMWOp(
                 llvm.AtomicBinOp.add,
