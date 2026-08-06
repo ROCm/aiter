@@ -206,7 +206,7 @@ def make_dispatch(
                         window.lsa_ptr(dest_pe, off_pg_running)
                     ) + fx.Int64(local_expert) * fx.Int64(4)
                     cur_lane0 = P.atomic_add_global(peer_run, fx.Int32(1))
-                cursor = readlane(T.i32(), cur_lane0, 0)
+                cursor = readlane(T.i32, cur_lane0, 0)
                 grouped_row = local_expert * push_group_cap + cursor
                 overflow = cursor >= push_group_cap
                 dest_tok_id = grouped_row
@@ -261,14 +261,14 @@ def make_dispatch(
                             rsrc_inp_wts,
                             src_tok * experts_per_token + k_slot,
                             vec_width=1,
-                            dtype=T.f32(),
+                            dtype=T.f32,
                         )
                         peer_rowmap = create_buffer_resource_from_addr(
                             fx.Int64(window.lsa_ptr(dest_pe, off_pg_rowmap))
                         )
                         buffer_store(dst_packed, peer_rowmap, dest_tok_id * 2)
                         buffer_store(
-                            arith.bitcast(T.i32(), pg_w),
+                            arith.bitcast(T.i32, pg_w),
                             peer_rowmap,
                             dest_tok_id * 2 + 1,
                         )

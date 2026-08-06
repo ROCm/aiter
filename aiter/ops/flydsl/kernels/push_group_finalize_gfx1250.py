@@ -38,7 +38,7 @@ is summed via a cheap atomic_add.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import arith, const_expr, T
-from flydsl.expr.buffer_ops import (
+from aiter.ops.flydsl.kernels.buffer_ops import (
     buffer_load,
     buffer_store,
     create_buffer_resource_from_addr,
@@ -69,7 +69,7 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
             rsrc_eid = create_buffer_resource_from_addr(expert_ids_addr)
             rsrc_tv = create_buffer_resource_from_addr(tile_valid_addr)
 
-            count = buffer_load(rsrc_run, le, vec_width=1, dtype=T.i32())
+            count = buffer_load(rsrc_run, le, vec_width=1, dtype=T.i32)
             # Read-then-zero the accumulator here (NOT in a separate host reset
             # before dispatch): finalize runs after dispatch's end cross-device
             # barrier (all peer atomic_add landings visible) and before the next
