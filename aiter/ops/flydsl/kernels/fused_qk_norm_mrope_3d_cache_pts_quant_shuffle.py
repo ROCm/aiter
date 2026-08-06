@@ -49,8 +49,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, vector
-from flydsl.expr import math as fmath
+from flydsl.expr import const_expr, gpu, range_constexpr, vector
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.utils import get_shared_memory_per_block
@@ -111,7 +110,7 @@ def rms_reduce_add(x, lane, broadcast_half=True):
     for sh_exp in range_constexpr(_LOG2_RMS_GROUP):
         off = RMS_GROUP // (2 << sh_exp)
         peer = v.shuffle_xor(off, RMS_GROUP)
-        v = v.addf(peer, fastmath=arith.FastMathFlags.fast)
+        v = v.addf(peer, fastmath=fx.FastMathFlags.fast)
     if const_expr(WAVE > RMS_GROUP and broadcast_half):
         other_half = v.shuffle_xor(RMS_GROUP, WAVE)
         return (lane < RMS_GROUP).select(v, other_half)
@@ -194,7 +193,7 @@ def _build_q_kernel(
         num_heads_q: fx.Int32,
         token_offset: fx.Int32,
     ):
-        fm_fast = arith.FastMathFlags.fast
+        fm_fast = fx.FastMathFlags.fast
         cos_t = fx.Tensor(
             fx.make_view(
                 fx.get_iter(cos_sin),
@@ -228,7 +227,7 @@ def _build_q_kernel(
                     norm_x = fx.Float32(qkv[tok, head, norm_col])
                     sumsq_local = sumsq_local + norm_x * norm_x
                 sumsq = rms_reduce_add(sumsq_local, logical_lane, broadcast_half=False)
-                rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
+                rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
                 w0 = fx.Float32(q_norm_w[logical_lane])
                 w1 = fx.Float32(q_norm_w[logical_lane + HALF])
                 if const_expr(gemma_norm):
@@ -269,7 +268,7 @@ def _build_q_kernel(
                 x0s.append(x0)
                 x1s.append(x1)
             sumsq = rms_reduce_add(sumsq_local, tid)
-            rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
+            rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
             # ---- Pass 2: per-pair weight + RoPE + store. ----
             for k in range_constexpr(VEC_PAIRS):
@@ -416,7 +415,7 @@ def _build_kv_kernel(
         num_tokens: fx.Int32,
         page_block_offset: fx.Int32,
     ):
-        fm_fast = arith.FastMathFlags.fast
+        fm_fast = fx.FastMathFlags.fast
         cos_t = fx.Tensor(
             fx.make_view(
                 fx.get_iter(cos_sin),
@@ -583,7 +582,7 @@ def _build_kv_kernel(
                         pair_lane,
                         broadcast_half=D != 64,
                     )
-                    rstd = fmath.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
+                    rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
 
                     if pair_lane < PAIR_LANES:
                         k_pairs = partition_pairs(k_row, pair_lane)
