@@ -222,16 +222,17 @@ def _fused_clamp_silu_mul_kernel(
             # no quant
             out_acc.index(i).store(out.to(out_ptr.dtype.element_ty))
 
-    # epilogue
-    if num_warps > 1:
-        gl.barrier()
-    for i in gl.static_range(ROWS_PER_PROG):
+        # store
+        if num_warps > 1:
+            gl.barrier()
         out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=out_ptr + (m_start + i) * out_stride_m,
+            base=out_ptr + row * out_stride_m,
             shape=[n_half],
             strides=[out_stride_n],
             block_shape=[BLOCK_SIZE_N],
             layout=shared_tdm_layout,
         )
         gl.amd.gfx1250.tdm.async_store(out_desc, [0], out_acc.index(i))
+
+    # wait for stores to complete
     gl.amd.gfx1250.tdm.async_wait(0)
