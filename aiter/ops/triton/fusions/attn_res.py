@@ -11,29 +11,25 @@ candidate axis, and mixes the raw residuals with that gate::
     logit_l = rstd_l * sum_d v[l, n, d] * (q_d * w_d)
     o[n]    = onorm( sum_l softmax_l(scale * logit_l) * v[l, n] )
 
-Two residual layouts are supported, each paired with the pass structure that
-won for it in benchmarking:
+This is a forward-only port of fla 0.5.2's ``fused_attnres`` (see
+``attnres_fwd_kernel``): the kernel structure, math, and launch surface follow
+fla, but the backward pass is not ported. The backward checkpoint tensors
+(``o_pre`` and the per-candidate ``rstd`` / ``logit`` / softmax ``lse``) are kept
+as kernel parameters so a backward kernel can be reintroduced later, but they are
+passed as ``None`` with their save flags off here.
 
-* ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors,
-  which is the native form of the fla ``fused_attnres`` API. Served by a
-  two-pass D-tiled kernel: only per-source scalars stay resident (~100 VGPR),
-  so occupancy is high and it saturates HBM at large N, but the residual is
-  read twice and the gather costs O(L^2) traffic.
-* ``layout="packed"``: one contiguous ``[.., L, D]`` tensor, served by a
-  one-pass whole-row kernel that loads ``v[L, D]`` once into registers and
-  reuses it for both the reduction and the output, reading the residual from
-  HBM exactly once. Faster whenever the caller can hand over a packed tensor;
-  a ``Sequence`` is accepted too but has to be stacked first, which costs an
-  extra ``L * N * D`` copy.
+Both residual layouts are served by the single ``attnres_fwd_kernel`` via an
+``IS_PACKED`` switch:
 
-:func:`attn_res_gate` exposes the same math under the inference contract used
-by serving stacks: the candidate set is a packed ``[.., B, D]`` block plus a
-separate ``prefix`` row, and the caller's ``prefix += hidden`` add can be
-folded into the kernel.
+* ``layout="sequence"``: a ``Sequence`` of L independent ``[.., D]`` tensors, the
+  native form of the fla ``fused_attnres`` API, gathered through a length-``L2``
+  pointer table.
+* ``layout="packed"``: one contiguous ``[.., L, D]`` tensor read with row strides.
 
-This is a forward-only port: the kernels compute only the mixed residual, so
-none of the backward checkpoint (the pre-norm mix, the per-candidate rstd, and
-the softmax logit/lse stats) is produced.
+:func:`attn_res_gate` exposes the same packed kernel under the inference contract
+used by serving stacks (the candidate set is a packed ``[.., B, D]`` block plus a
+separate ``prefix`` row, and the caller's ``prefix += hidden`` add can be folded
+into the kernel) -- this mirrors ATOM's ``apply_attn_res``.
 """
 
 from collections.abc import Sequence
@@ -41,10 +37,7 @@ from collections.abc import Sequence
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.fusions.attn_res import (
-    _attn_res_fwd_packed_1pass_kernel,
-    _attn_res_fwd_sequence_2pass_kernel,
-)
+from aiter.ops.triton._triton_kernels.fusions.attn_res import attnres_fwd_kernel
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -52,7 +45,8 @@ _LOGGER = AiterTritonLogger()
 
 def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
     # Pad the per-source tuple to a power-of-2 length so Triton compiles one
-    # kernel per L2 bucket instead of one per L.
+    # kernel per L2 bucket instead of one per L. Padded slots reuse tensors[0]
+    # and are masked out in the kernel.
     L2 = max(1, triton.next_power_of_2(len(tensors)))
     assert 1 <= len(tensors) <= L2
     for t in tensors:
@@ -83,7 +77,7 @@ def attn_res_fwd(
     - output_rms_weight: optional ``[D]`` weight enabling the output RMSNorm.
     - rms_eps: epsilon of both the per-candidate and the output RMSNorm.
     - scale: multiplies the logits before the softmax.
-    - layout: "sequence" (two-pass) or "packed" (one-pass).
+    - layout: "sequence" or "packed".
 
     Returns the mixed residual ``o`` of shape ``[.., D]``.
     """
@@ -101,26 +95,10 @@ def attn_res_fwd(
     ow_flat = output_rms_weight.flatten().contiguous() if has_onorm else None
 
     runner = _run_packed if layout == "packed" else _run_sequence
-    return runner(
-        q_flat,
-        residuals,
-        w_flat,
-        ow_flat,
-        rms_eps,
-        scale,
-        has_onorm,
-    )
+    return runner(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm)
 
 
-def _run_sequence(
-    q_flat,
-    residuals,
-    w_flat,
-    ow_flat,
-    rms_eps,
-    scale,
-    has_onorm,
-):
+def _run_sequence(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     if not residuals[0].is_cuda:
         raise ValueError("Triton attn_res requires CUDA/ROCm tensors")
     output_shape = residuals[0].shape
@@ -138,41 +116,44 @@ def _run_sequence(
     device = flat_residuals[0].device
 
     o = torch.empty((N, D), device=device, dtype=dtype)
-    # o_pre is only the kernel's fp32 scratch for the output RMSNorm; it is
-    # never dereferenced (nor allocated) when the output RMSNorm is off.
-    o_pre = (
-        torch.empty((N, D), device=device, dtype=torch.float32) if has_onorm else None
-    )
     L2 = max(1, triton.next_power_of_2(L))
 
-    _attn_res_fwd_sequence_2pass_kernel[(N,)](
+    attnres_fwd_kernel[(N,)](
         q=q_flat,
         res=res,
         w=w_flat,
         ow=ow_flat,
         o=o,
-        o_pre=o_pre,
+        o_pre=None,
+        rstd=None,
+        logit=None,
+        lse=None,
+        res_packed=None,
+        prefix=None,
+        add_hidden=None,
+        prefix_out=None,
         N=N,
         L=L,
+        stride_res_n=0,
+        stride_res_l=0,
         L2=L2,
         D=D,
         eps=rms_eps,
         scale=scale,
-        NS=1,
+        BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
+        SAVE_OPRE=False,
+        SAVE_STATS=False,
+        IS_PACKED=False,
+        HAS_PREFIX=False,
+        DO_ADD=False,
+        WRITE_PREF=False,
+        HAS_W=True,
     )
     return o.view(output_shape)
 
 
-def _run_packed(
-    q_flat,
-    residuals,
-    w_flat,
-    ow_flat,
-    rms_eps,
-    scale,
-    has_onorm,
-):
+def _run_packed(q_flat, residuals, w_flat, ow_flat, rms_eps, scale, has_onorm):
     if isinstance(residuals, (list, tuple)):
         L = len(residuals)
         output_shape = residuals[0].shape  # [.., D]
@@ -192,15 +173,20 @@ def _run_packed(
     o = torch.empty((N, D), device=device, dtype=dtype)
     L2 = max(1, triton.next_power_of_2(L))
 
-    _attn_res_fwd_packed_1pass_kernel[(N,)](
+    attnres_fwd_kernel[(N,)](
         q=q_flat,
-        res=packed,
+        res=(packed,) * L2,  # unused when IS_PACKED (sequence branch is dead)
         w=w_flat,
         ow=ow_flat,
         o=o,
-        prefix=packed,
-        add_hidden=packed,
-        prefix_out=packed,
+        o_pre=None,
+        rstd=None,
+        logit=None,
+        lse=None,
+        res_packed=packed,
+        prefix=None,
+        add_hidden=None,
+        prefix_out=None,
         N=N,
         L=L,
         stride_res_n=packed.stride(0),
@@ -211,6 +197,9 @@ def _run_packed(
         scale=scale,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
+        SAVE_OPRE=False,
+        SAVE_STATS=False,
+        IS_PACKED=True,
         HAS_PREFIX=False,
         DO_ADD=False,
         WRITE_PREF=False,
@@ -232,9 +221,8 @@ def attn_res_gate(
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
     Same math as :func:`attn_res_fwd` on the packed layout, specialized for the
-    decode/prefill contract: the candidate set is the ``B`` rows of
-    ``block_residual`` plus ``prefix`` as the last candidate, and only the mixed
-    output is produced (no softmax stats, since inference never rebuilds them).
+    decode/prefill contract (mirrors ATOM's ``apply_attn_res``): the candidate set
+    is the ``B`` rows of ``block_residual`` plus ``prefix`` as the last candidate.
 
     Key parameters:
     - prefix: ``[.., D]`` running residual, used as the last candidate.
@@ -293,12 +281,19 @@ def attn_res_gate(
         hs = pf
         prefix_out = pf
 
-    _attn_res_fwd_packed_1pass_kernel[(N,)](
+    L2 = max(1, triton.next_power_of_2(L))
+
+    attnres_fwd_kernel[(N,)](
         q=sw,
-        res=br,
+        res=(br,) * L2,  # unused when IS_PACKED (sequence branch is dead)
         w=sw,
         ow=ow,
         o=y,
+        o_pre=None,
+        rstd=None,
+        logit=None,
+        lse=None,
+        res_packed=br,
         prefix=pf,
         add_hidden=hs,
         prefix_out=prefix_out,
@@ -306,12 +301,15 @@ def attn_res_gate(
         L=L,
         stride_res_n=br.stride(0),
         stride_res_l=br.stride(1),
-        L2=max(1, triton.next_power_of_2(L)),
+        L2=L2,
         D=D,
         eps=eps,
         scale=scale,
         BD=triton.next_power_of_2(D),
         HAS_ONORM=has_onorm,
+        SAVE_OPRE=False,
+        SAVE_STATS=False,
+        IS_PACKED=True,
         HAS_PREFIX=True,
         DO_ADD=do_add,
         WRITE_PREF=do_add,

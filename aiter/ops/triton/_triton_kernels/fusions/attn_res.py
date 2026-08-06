@@ -7,126 +7,33 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({"BH": BH}, num_warps=nw, num_stages=1)
-        for BH in [512, 1024, 2048]
-        for nw in [2, 4, 8]
+        triton.Config({"BL": BL}, num_warps=nw, num_stages=ns)
+        for BL in [1, 2, 4, 8]
+        for nw in [4, 8, 16]
+        for ns in [2, 3]
     ],
-    key=["L2", "D", "HAS_ONORM"],
-)
-@triton.jit(do_not_specialize=["L"])
-def _attn_res_fwd_sequence_2pass_kernel(
-    q,
-    res,
-    w,
-    ow,
-    o,
-    o_pre,
-    N,
-    L,
-    L2: tl.constexpr,
-    D: tl.constexpr,
-    eps: tl.constexpr,
-    scale: tl.constexpr,
-    BH: tl.constexpr,
-    NS: tl.constexpr,
-    HAS_ONORM: tl.constexpr,
-):
-    """Sequence layout (L independent [N, D] tensors), two-pass over D.
-
-    Only the per-source scalars stay resident (~100 VGPR), so occupancy is high
-    and the kernel saturates HBM at large N. The residual is read twice: once
-    for the reductions and once for the weighted sum.
-
-    ``o_pre`` is an internal fp32 scratch used only when HAS_ONORM (pass 2 writes
-    it, pass 3 reads it back); it is not produced for the caller.
-    """
-    i_n = tl.program_id(0).to(tl.int64)
-    inv_d = 1.0 / D
-    b_idx = tl.arange(0, L2)
-    b_valid = b_idx < L
-
-    # ---- PASS 1: per-source reductions over D ----
-    acc_sq = tl.zeros([L2], dtype=tl.float32)
-    acc_dot = tl.zeros([L2], dtype=tl.float32)
-    for h0 in tl.range(0, D, BH, num_stages=NS):
-        cols = h0 + tl.arange(0, BH)
-        h_mask = cols < D
-        qw = tl.load(q + cols, mask=h_mask, other=0.0).to(tl.float32) * tl.load(
-            w + cols, mask=h_mask, other=0.0
-        ).to(tl.float32)
-        v = tl.zeros([L2, BH], dtype=tl.float32)
-        # A tensor-of-pointers + select chain fails to compile on the AMD
-        # backend (CanonicalizePointers), so scan the padded slots with a
-        # scalar base pointer per slot and keep the matching row via a mask.
-        for i in tl.static_range(0, L2):
-            v += tl.load(
-                tl.multiple_of(res[i] + (i_n * D + cols[None, :]), (1, 16)),
-                mask=(b_idx == i)[:, None] & b_valid[:, None] & h_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-        acc_sq += tl.sum(v * v, axis=1)
-        acc_dot += tl.sum(v * qw[None, :], axis=1)
-
-    b_rstd = tl.rsqrt(acc_sq * inv_d + eps)
-    b_logit = acc_dot * b_rstd
-    b_s = tl.where(b_valid, b_logit * scale, float("-inf"))
-    b_m = tl.max(b_s, axis=0)
-    b_p = tl.exp(b_s - b_m)
-    b_acc = tl.sum(b_p, axis=0)
-    probs = b_p / b_acc
-
-    # ---- PASS 2: o_pre = sum_l p_l v_l, tiled over D ----
-    acc_o_sq = tl.zeros([], dtype=tl.float32)
-    for h0 in tl.range(0, D, BH, num_stages=NS):
-        cols = h0 + tl.arange(0, BH)
-        h_mask = cols < D
-        v = tl.zeros([L2, BH], dtype=tl.float32)
-        for i in tl.static_range(0, L2):
-            v += tl.load(
-                tl.multiple_of(res[i] + (i_n * D + cols[None, :]), (1, 16)),
-                mask=(b_idx == i)[:, None] & b_valid[:, None] & h_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
-        o_blk = tl.sum(probs[:, None] * v, axis=0)
-        if HAS_ONORM:
-            tl.store(o_pre + i_n * D + cols, o_blk, mask=h_mask)  # fp32 scratch
-            acc_o_sq += tl.sum(tl.where(h_mask, o_blk * o_blk, 0.0), axis=0)
-        else:
-            tl.store(o + i_n * D + cols, o_blk.to(o.dtype.element_ty), mask=h_mask)
-
-    # ---- PASS 3 (onorm only): reload fp32 o_pre, apply output RMSNorm ----
-    if HAS_ONORM:
-        o_rstd = tl.rsqrt(acc_o_sq * inv_d + eps)
-        for h0 in tl.range(0, D, BH, num_stages=NS):
-            cols = h0 + tl.arange(0, BH)
-            h_mask = cols < D
-            opre = tl.load(o_pre + i_n * D + cols, mask=h_mask, other=0.0)
-            owv = tl.load(ow + cols, mask=h_mask, other=0.0).to(tl.float32)
-            tl.store(
-                o + i_n * D + cols,
-                (opre * o_rstd * owv).to(o.dtype.element_ty),
-                mask=h_mask,
-            )
-
-
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=nw, num_stages=1) for nw in [8, 16]],
     key=[
         "L2",
         "D",
         "HAS_ONORM",
+        "IS_PACKED",
         "HAS_PREFIX",
         "DO_ADD",
         "HAS_W",
     ],
 )
 @triton.jit(do_not_specialize=["L"])
-def _attn_res_fwd_packed_1pass_kernel(
+def attnres_fwd_kernel(
     q,
     res,
     w,
     ow,
     o,
+    o_pre,
+    rstd,
+    logit,
+    lse,
+    res_packed,
     prefix,
     add_hidden,
     prefix_out,
@@ -138,82 +45,137 @@ def _attn_res_fwd_packed_1pass_kernel(
     D: tl.constexpr,
     eps: tl.constexpr,
     scale: tl.constexpr,
+    BL: tl.constexpr,
     BD: tl.constexpr,
     HAS_ONORM: tl.constexpr,
+    SAVE_OPRE: tl.constexpr,
+    SAVE_STATS: tl.constexpr,
+    IS_PACKED: tl.constexpr,
     HAS_PREFIX: tl.constexpr,
     DO_ADD: tl.constexpr,
     WRITE_PREF: tl.constexpr,
     HAS_W: tl.constexpr,
 ):
-    """Packed layout (one contiguous [N, L, D] tensor), whole-row single pass.
+    """AttnRes forward, ported from fla 0.5.2 ``attnres_fwd_kernel``.
 
-    The entire v[L, D] tile is loaded ONCE into registers and reused for both
-    the reduction and the weighted output, so the residual is read from HBM
-    exactly once. Register pressure is high (~330 VGPR), but the coalesced
-    packed load plus the single read win at short sequence lengths where the
-    grid is program-starved and occupancy does not matter.
+    Per token: RMS-normalize each of the L residual candidates, score each with a
+    dot product against ``q * w``, softmax over the candidate axis, and return the
+    weighted sum (optionally output-RMSNorm'd). One program per row; the whole D
+    stays in registers (``BD = next_pow2(D)``) and the candidate axis is streamed
+    in ``BL`` tiles with an online softmax, so each candidate tile is read once.
 
-    HAS_PREFIX makes the LAST of the L candidates come from a separate [N, D]
-    ``prefix`` tensor instead of from ``res`` (which then holds L-1 rows), so
-    the caller does not have to materialize a concatenation. DO_ADD folds the
-    caller's ``prefix = prefix + add_hidden`` into that on-load, and WRITE_PREF
-    stores the summed prefix back for downstream reuse.
+    Two residual layouts share the same math via ``IS_PACKED``:
+
+    * ``IS_PACKED=False`` (sequence): ``res`` is a length-``L2`` tuple of the
+      per-source ``[N, D]`` base pointers. fla gathers row ``l`` with a
+      tensor-of-pointers ``tl.where`` chain, but that fails to compile on the AMD
+      backend (CanonicalizePointers), so we scan the padded slots with a scalar
+      base pointer per slot and keep the matching row via a mask -- same result.
+    * ``IS_PACKED=True`` (packed): ``res_packed`` is one contiguous ``[N, L, D]``
+      tensor read with row strides. ``HAS_PREFIX`` makes the LAST candidate come
+      from a separate ``prefix`` row (so ``res_packed`` holds only the first L-1),
+      ``DO_ADD`` folds the caller's ``prefix += add_hidden`` on-load, and
+      ``WRITE_PREF`` stores the summed prefix back for downstream reuse. ``HAS_W``
+      off means ``q`` already carries the folded ``query * rms_weight`` product.
+
+    ``o_pre`` / ``rstd`` / ``logit`` / ``lse`` are the fla backward checkpoint; this
+    is a forward-only port, so ``SAVE_OPRE`` / ``SAVE_STATS`` are off and those
+    pointers are passed as ``None``. The parameters are kept so a backward kernel
+    can be reintroduced by flipping the flags without changing the launch surface.
     """
     i_n = tl.program_id(0).to(tl.int64)
-    inv_d = 1.0 / D
-    b_idx = tl.arange(0, L2)
-    b_valid = b_idx < L
-    # With a prefix candidate the packed tensor only holds the first L-1 rows.
-    if HAS_PREFIX:
-        n_res = L - 1
-    else:
-        n_res = L
-    m_res = b_idx < n_res
-    b_safe = tl.minimum(b_idx, tl.maximum(n_res - 1, 0))
 
-    cols = tl.arange(0, BD)
-    m_d = cols < D
-    # HAS_W=False means q already carries the folded query * rms_weight product.
-    qw = tl.load(q + cols, mask=m_d, other=0.0).to(tl.float32)
+    # [BD]
+    o_d = tl.max_contiguous(tl.multiple_of(tl.arange(0, BD), BD), BD)
+    m_d = o_d < D
+    # [BD] q * w, reused across all candidate tiles. HAS_W off => q is pre-folded.
+    b_qw = tl.load(q + o_d, mask=m_d, other=0.0).to(tl.float32)
     if HAS_W:
-        qw *= tl.load(w + cols, mask=m_d, other=0.0).to(tl.float32)
+        b_qw *= tl.load(w + o_d, mask=m_d, other=0.0).to(tl.float32)
 
-    # whole-row load of the entire v[L, D] tile ONCE (reused for reduction + output)
-    res_base = i_n * stride_res_n + b_safe * stride_res_l
-    v = tl.load(
-        res + res_base[:, None] + cols[None, :],
-        mask=m_res[:, None] & m_d[None, :],
-        other=0.0,
-    ).to(tl.float32)
-
-    if HAS_PREFIX:
-        ps = tl.load(prefix + i_n * D + cols, mask=m_d, other=0.0).to(tl.float32)
+    # Packed prefix candidate is a single [D] row; load (and fold the add) once.
+    if IS_PACKED and HAS_PREFIX:
+        n_res = L - 1  # res_packed holds the first L-1 rows; prefix is candidate L-1
+        ps = tl.load(prefix + i_n * D + o_d, mask=m_d, other=0.0).to(tl.float32)
         if DO_ADD:
-            ps += tl.load(add_hidden + i_n * D + cols, mask=m_d, other=0.0).to(
-                tl.float32
-            )
+            ps += tl.load(add_hidden + i_n * D + o_d, mask=m_d, other=0.0).to(tl.float32)
         if WRITE_PREF:
             tl.store(
-                prefix_out + i_n * D + cols,
+                prefix_out + i_n * D + o_d,
                 ps.to(prefix_out.dtype.element_ty),
                 mask=m_d,
             )
-        # ps broadcasts into the last candidate row while still in registers.
-        v = tl.where((b_idx == n_res)[:, None], ps[None, :], v)
+    else:
+        n_res = L
 
-    acc_sq = tl.sum(v * v, axis=1)
-    acc_dot = tl.sum(v * qw[None, :], axis=1)
-    b_rstd = tl.rsqrt(acc_sq * inv_d + eps)
-    b_logit = acc_dot * b_rstd
-    b_s = tl.where(b_valid, b_logit * scale, float("-inf"))
-    b_m = tl.max(b_s, axis=0)
-    b_p = tl.exp(b_s - b_m)
-    b_acc = tl.sum(b_p, axis=0)
-    probs = b_p / b_acc
+    # online softmax over L; b_o accumulates in registers so each v tile is read once
+    b_m = tl.full([], float("-inf"), dtype=tl.float32)
+    b_acc = tl.zeros([], dtype=tl.float32)
+    b_o = tl.zeros([BD], dtype=tl.float32)
+    for i_l in range(tl.cdiv(L, BL)):
+        # [BL]
+        o_l = i_l * BL + tl.arange(0, BL)
+        m_l = o_l < L
 
-    b_o = tl.sum(probs[:, None] * v, axis=0)  # [BD] pre-norm mix
+        # [BL, BD] candidate tile
+        if IS_PACKED:
+            if HAS_PREFIX:
+                m_res = o_l < n_res
+                l_safe = tl.minimum(o_l, tl.maximum(n_res - 1, 0))
+            else:
+                m_res = m_l
+                l_safe = o_l
+            b_v = tl.load(
+                res_packed
+                + i_n * stride_res_n
+                + l_safe[:, None] * stride_res_l
+                + o_d[None, :],
+                mask=m_res[:, None] & m_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            if HAS_PREFIX:
+                # broadcast the prefix row into the last candidate while in-reg
+                b_v = tl.where((o_l == n_res)[:, None], ps[None, :], b_v)
+        else:
+            # AMD-safe gather: scan the padded slots, mask in the matching row.
+            b_v = tl.zeros([BL, BD], dtype=tl.float32)
+            for i in tl.static_range(0, L2):
+                b_v += tl.load(
+                    tl.multiple_of(res[i] + (i_n * D + o_d[None, :]), (1, 16)),
+                    mask=(o_l == i)[:, None] & m_l[:, None] & m_d[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+
+        # [BL] per-candidate RMSNorm + logit
+        b_rstd = tl.rsqrt(tl.sum(b_v * b_v, axis=1) / D + eps)
+        b_logit = tl.sum(b_v * b_qw[None, :], axis=1) * b_rstd
+        b_s = tl.where(m_l, b_logit * scale, float("-inf"))
+
+        b_m, b_mp = tl.maximum(b_m, tl.max(b_s, axis=0)), b_m
+        b_r = tl.exp(b_mp - b_m)
+        # [BL]
+        b_p = tl.exp(b_s - b_m)
+        b_acc = b_acc * b_r + tl.sum(b_p, axis=0)
+        # [BD]
+        b_o = b_o * b_r + tl.sum(b_p[:, None] * b_v, axis=0)
+
+        # rstd and logit are the fla bwd_dv checkpoint; off in this forward-only port
+        if SAVE_STATS:
+            p_rstd = rstd + i_n + o_l * N
+            p_logit = logit + i_n + o_l * N
+            tl.store(p_rstd, b_rstd.to(rstd.dtype.element_ty), mask=m_l)
+            tl.store(p_logit, b_logit.to(logit.dtype.element_ty), mask=m_l)
+
+    if SAVE_STATS:
+        tl.store(lse + i_n, b_m + tl.log(b_acc))
+
+    # [BD] pre-norm mixed residual sum_l p_l * v_l
+    b_o = b_o / b_acc
+    if SAVE_OPRE:
+        tl.store(o_pre + i_n * D + o_d, b_o.to(o_pre.dtype.element_ty), mask=m_d)
+    # fold the optional output RMSNorm into the returned output o
     if HAS_ONORM:
-        o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) * inv_d + eps)
-        owv = tl.load(ow + cols, mask=m_d, other=0.0).to(tl.float32)
-        b_o = b_o * o_rstd * owv
-    tl.store(o + i_n * D + cols, b_o.to(o.dtype.element_ty), mask=m_d)
+        b_o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) / D + eps)
+        b_ow = tl.load(ow + o_d, mask=m_d, other=0.0).to(tl.float32)
+        b_o = b_o * b_o_rstd * b_ow
+    tl.store(o + i_n * D + o_d, b_o.to(o.dtype.element_ty), mask=m_d)
