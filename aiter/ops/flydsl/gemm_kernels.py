@@ -1066,3 +1066,64 @@ def flydsl_preshuffle_gemm_a8(
         Out.copy_(out_contig)
 
     return Out
+
+
+# ---------------------------------------------------------------------------
+# Expose flydsl_hgemm to the PyTorch dispatcher (torch.ops.aiter.flydsl_hgemm)
+#
+# FlyDSL kernels are JIT-compiled via `flyc.compile` and bypass the dispatcher,
+# so they carry no `Input Dims` in profiler traces and are opaque to
+# torch.compile. Registering a real `torch.ops.aiter.flydsl_hgemm` op gives both
+# profiler shape metadata and torch.compile compatibility (via `fake_impl`).
+#
+# We copy the original signature and drop only `stream` (fx.Stream /
+# torch.cuda.Stream is not a legal torch schema type; it is never passed on the
+# runtime path — see aiter/tuned_gemm.py). `infer_schema` resolves the module's
+# stringized annotations, so no explicit annotation table is needed.
+# ---------------------------------------------------------------------------
+import functools as _ft
+import inspect as _insp
+
+from aiter.csrc.cpp_itfs.torch_utils import direct_register_custom_op
+
+_orig_flydsl_hgemm = flydsl_hgemm
+_flydsl_hgemm_sig = _insp.signature(_orig_flydsl_hgemm)
+
+
+@_ft.wraps(_orig_flydsl_hgemm)
+def _flydsl_hgemm_op(*args, **kwargs):
+    kwargs.pop("stream", None)
+    # `bias`/tuning params are keyword-only on the original; the dispatcher calls
+    # us positionally, so bind then forward by keyword.
+    bound = _flydsl_hgemm_op.__signature__.bind(*args, **kwargs)
+    bound.apply_defaults()
+    return _orig_flydsl_hgemm(**bound.arguments)
+
+
+# Copy signature + annotations from the original, minus `stream`.
+_flydsl_hgemm_op.__signature__ = _flydsl_hgemm_sig.replace(
+    parameters=[p for n, p in _flydsl_hgemm_sig.parameters.items() if n != "stream"]
+)
+_flydsl_hgemm_op.__annotations__ = {
+    k: v for k, v in _orig_flydsl_hgemm.__annotations__.items() if k != "stream"
+}
+
+if not hasattr(torch.ops.aiter, "flydsl_hgemm"):
+    direct_register_custom_op(
+        "flydsl_hgemm",
+        _flydsl_hgemm_op,
+        mutates_args=["out"],
+        # out shape is (m, n) with a=(m, k) and b=(n, k); dtype/device follow `a`.
+        fake_impl=lambda a, b, out=None, bias=None, *a_, **k_: torch.empty(
+            (a.shape[0], b.shape[0]), dtype=a.dtype, device=a.device
+        ),
+    )
+
+
+# Rebind the public symbol so callers (e.g. aiter/tuned_gemm.py) route through
+# torch.ops.aiter.flydsl_hgemm; a real `stream` (never used at runtime) bypasses.
+def flydsl_hgemm(*args, **kwargs):
+    if kwargs.get("stream") is not None:
+        return _orig_flydsl_hgemm(*args, **kwargs)
+    kwargs.pop("stream", None)
+    return torch.ops.aiter.flydsl_hgemm(*args, **kwargs)
