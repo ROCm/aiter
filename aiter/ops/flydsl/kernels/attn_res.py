@@ -24,29 +24,41 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, gpu, range_constexpr
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate
 from flydsl.expr.typing import ReductionOp, Stream
 
 from .tensor_shim import _run_compiled
 
-KERNEL_NAME = "flydsl_attn_res_mix"
+KERNEL_NAME = "flydsl_attn_res"
 
 _HIDDEN_SIZE = 7168
-_NUM_SOURCES = 9
+_MAX_BLOCKS = 8
 _BLOCK_THREADS = 448
 _WARP_SIZE = 64
 _VEC_WIDTH = 8  # 8 bf16 values = one 128-bit global-memory transaction.
 _LOG2E = math.log2(math.e)
 
 
-@lru_cache(maxsize=16)
-def _build_attn_res_mix(hidden_size: int, eps: float):
-    """Return the cached D=7168 / nine-source mix-only launcher."""
+@lru_cache(maxsize=64)
+def _build_attn_res(
+    hidden_size: int,
+    num_blocks: int,
+    eps: float,
+    output_norm_eps: float,
+    has_delta: bool,
+    write_block: bool,
+    apply_output_norm: bool,
+):
+    """Return one fixed-shape, compile-time-specialized AttnRes launcher."""
     if hidden_size != _HIDDEN_SIZE:
         raise ValueError(
             f"only hidden_size={_HIDDEN_SIZE} is supported, got {hidden_size}"
+        )
+    if not 0 <= num_blocks <= _MAX_BLOCKS:
+        raise ValueError(
+            f"num_blocks must be in [0, {_MAX_BLOCKS}], got {num_blocks}"
         )
 
     num_vec = hidden_size // _VEC_WIDTH
@@ -56,8 +68,11 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
         )
     tiles_per_thread = num_vec // _BLOCK_THREADS
     red_slots = _BLOCK_THREADS // _WARP_SIZE
+    num_sources = num_blocks + 1
     kernel_name = (
-        f"{KERNEL_NAME}_d{hidden_size}_k{_NUM_SOURCES}_bt{_BLOCK_THREADS}_v{_VEC_WIDTH}"
+        f"{KERNEL_NAME}_d{hidden_size}_k{num_sources}_bt{_BLOCK_THREADS}"
+        f"_v{_VEC_WIDTH}_delta{int(has_delta)}_write{int(write_block)}"
+        f"_onorm{int(apply_output_norm)}"
     )
 
     @fx.struct
@@ -66,12 +81,15 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
         dot: fx.Array[fx.Float32, red_slots, 16]
 
     @flyc.kernel(name=kernel_name, known_block_size=[_BLOCK_THREADS, 1, 1])
-    def attn_res_mix_kernel(
+    def attn_res_kernel(
         prefix: fx.Tensor,
+        delta: fx.Tensor,
         blocks: fx.Tensor,
         norm_weight: fx.Tensor,
         qk_weight: fx.Tensor,
+        output_norm_weight: fx.Tensor,
         out: fx.Tensor,
+        block_write_idx: fx.Int32,
     ):
         token = fx.block_idx.x
         tid = fx.thread_idx.x
@@ -126,6 +144,33 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
 
             return fx.memref_load(s_sumsq, 0), fx.memref_load(s_dot, 0)
 
+        def block_reduce_add(value):
+            # Keep this structurally aligned with block_reduce_add2. The output
+            # RMSNorm epilogue has one payload, so reducing a dummy zero through
+            # s_dot would spend shuffles and LDS traffic for no result.
+            gpu.barrier()
+
+            lane = tid % _WARP_SIZE
+            wave = tid // _WARP_SIZE
+            wave_total = wave_reduce_add(value)
+
+            if lane == 0:
+                fx.memref_store(wave_total, s_sumsq, wave)
+            gpu.barrier()
+
+            if wave == 0:
+                in_range = lane < red_slots
+                lane_safe = in_range.select(lane, 0)
+                partial = fx.memref_load(s_sumsq, lane_safe)
+                partial = in_range.select(partial, zero)
+                total = wave_reduce_add(partial)
+
+                if lane == 0:
+                    fx.memref_store(total, s_sumsq, 0)
+            gpu.barrier()
+
+            return fx.memref_load(s_sumsq, 0)
+
         copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 16)
         vector_layout = fx.make_layout(_VEC_WIDTH, 1)
 
@@ -155,9 +200,13 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
         norm_weight_div = fx.logical_divide(norm_weight_buf, vector_layout)
         qk_weight_div = fx.logical_divide(qk_weight_buf, vector_layout)
         out_div = fx.logical_divide(out_row, vector_layout)
+        if const_expr(has_delta):
+            delta_buf = fx.rocdl.make_buffer_tensor(delta)
+            delta_row = fx.slice(delta_buf, (token, None))
+            delta_div = fx.logical_divide(delta_row, vector_layout)
 
         # q = gamma * w is invariant over all depth sources.  Keep q and the
-        # live prefix in registers so source eight requires no global load.
+        # live prefix in registers so the final source requires no global load.
         q_local = []
         prefix_local = []
         for tile in range_constexpr(tiles_per_thread):
@@ -165,7 +214,21 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
             gamma = load_bf16_vec(norm_weight_div, vector_index).to(fx.Float32)
             weight = load_bf16_vec(qk_weight_div, vector_index).to(fx.Float32)
             q_local.append(gamma * weight)
-            prefix_local.append(load_bf16_vec(prefix_div, vector_index))
+            prefix_value = load_bf16_vec(prefix_div, vector_index)
+            if const_expr(has_delta):
+                delta_value = load_bf16_vec(delta_div, vector_index).to(fx.Float32)
+                prefix_value = (
+                    prefix_value.to(fx.Float32) + delta_value
+                ).to(fx.BFloat16)
+                store_bf16_vec(prefix_value, prefix_div, vector_index)
+            prefix_local.append(prefix_value)
+
+        if const_expr(write_block):
+            block_out_row = fx.slice(blocks_buf, (token, block_write_idx, None))
+            block_out_div = fx.logical_divide(block_out_row, vector_layout)
+            for tile in range_constexpr(tiles_per_thread):
+                vector_index = tid + tile * _BLOCK_THREADS
+                store_bf16_vec(prefix_local[tile], block_out_div, vector_index)
 
         mixed_local = [
             fx.Vector.filled(_VEC_WIDTH, 0.0, fx.Float32)
@@ -209,9 +272,9 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
                 )
             return new_max, new_denominator, new_mixed
 
-        # Sources 0..7 are block snapshots. Together with the resident-prefix
-        # call below, the constexpr loop produces nine explicit source bodies.
-        for source in range_constexpr(_NUM_SOURCES - 1):
+        # The loop is specialized by num_blocks, then followed by the resident
+        # prefix source so the kernel never reads an invalid block slot.
+        for source in range_constexpr(num_blocks):
             block_row = fx.slice(blocks_buf, (token, source, None))
             block_div = fx.logical_divide(block_row, vector_layout)
             source_local = []
@@ -226,29 +289,68 @@ def _build_attn_res_mix(hidden_size: int, eps: float):
             prefix_local, max_logit, denominator, mixed_local
         )
 
-        inverse_denominator = 1.0 / denominator
-        for tile in range_constexpr(tiles_per_thread):
-            vector_index = tid + tile * _BLOCK_THREADS
-            result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
-            store_bf16_vec(result, out_div, vector_index)
+        if const_expr(apply_output_norm):
+            thread_sumsq = zero
+            for tile in range_constexpr(tiles_per_thread):
+                thread_sumsq = thread_sumsq + (
+                    mixed_local[tile] * mixed_local[tile]
+                ).reduce(ReductionOp.ADD, fastmath=fm_fast)
+            sumsq = block_reduce_add(thread_sumsq)
+            scale = fmath.rsqrt(
+                sumsq * inv_hidden_size
+                + output_norm_eps * denominator * denominator,
+                fastmath=fm_fast,
+            )
+
+            output_norm_weight_buf = fx.rocdl.make_buffer_tensor(output_norm_weight)
+            output_norm_weight_div = fx.logical_divide(
+                output_norm_weight_buf, vector_layout
+            )
+            for tile in range_constexpr(tiles_per_thread):
+                vector_index = tid + tile * _BLOCK_THREADS
+                output_gamma = load_bf16_vec(
+                    output_norm_weight_div, vector_index
+                ).to(fx.Float32)
+                result = (
+                    mixed_local[tile] * scale * output_gamma
+                ).to(fx.BFloat16)
+                store_bf16_vec(result, out_div, vector_index)
+        else:
+            inverse_denominator = 1.0 / denominator
+            for tile in range_constexpr(tiles_per_thread):
+                vector_index = tid + tile * _BLOCK_THREADS
+                result = (mixed_local[tile] * inverse_denominator).to(fx.BFloat16)
+                store_bf16_vec(result, out_div, vector_index)
 
     @flyc.jit
-    def launch_attn_res_mix(
+    def launch_attn_res(
         prefix: fx.Tensor,
+        delta: fx.Tensor,
         blocks: fx.Tensor,
         norm_weight: fx.Tensor,
         qk_weight: fx.Tensor,
+        output_norm_weight: fx.Tensor,
         out: fx.Tensor,
+        block_write_idx: fx.Int32,
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        attn_res_mix_kernel(prefix, blocks, norm_weight, qk_weight, out).launch(
+        attn_res_kernel(
+            prefix,
+            delta,
+            blocks,
+            norm_weight,
+            qk_weight,
+            output_norm_weight,
+            out,
+            block_write_idx,
+        ).launch(
             grid=(num_tokens, 1, 1),
             block=(_BLOCK_THREADS, 1, 1),
             stream=stream,
         )
 
-    return launch_attn_res_mix
+    return launch_attn_res
 
 
 def flydsl_attn_res(
@@ -264,23 +366,32 @@ def flydsl_attn_res(
     output_norm_eps: float,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
-    """Run the mix-only FlyDSL AttnRes specialization.
+    """Run one supported contiguous BF16 FlyDSL AttnRes specialization.
 
-    The public signature intentionally matches the eventual fully fused
-    operator.  Unsupported paths fail explicitly rather than silently dropping
-    a required side effect.
+    The mix-only path reads eight block snapshots plus ``prefix``. The canonical
+    all-on append path updates ``prefix`` in place, stores that updated row in
+    ``blocks[:, block_write_idx]``, and applies output RMSNorm in the same launch.
     """
-    del output_norm_eps  # Reserved for the output-RMSNorm specialization.
-
-    if delta is not None:
-        raise NotImplementedError("delta fusion is not implemented yet")
-    if block_write_idx >= 0:
-        raise NotImplementedError("block snapshot writes are not implemented yet")
-    if output_norm_weight is not None:
-        raise NotImplementedError("output RMSNorm is not implemented yet")
-    if num_blocks != _NUM_SOURCES - 1:
+    has_delta = delta is not None
+    write_block = block_write_idx >= 0
+    apply_output_norm = output_norm_weight is not None
+    flags = (has_delta, write_block, apply_output_norm)
+    if flags not in ((False, False, False), (True, True, True)):
         raise NotImplementedError(
-            f"Currently only supports num_blocks={_NUM_SOURCES - 1}, got {num_blocks}"
+            "supported configurations are mix-only at num_blocks=8 and fully "
+            "fused append at block_write_idx == num_blocks < 8; "
+            f"got has_delta/write_block/output_norm={flags}"
+        )
+    if not has_delta:
+        if num_blocks != _MAX_BLOCKS or block_write_idx != -1:
+            raise NotImplementedError(
+                "mix-only requires num_blocks=8 and block_write_idx=-1"
+            )
+    elif not (
+        0 <= num_blocks < _MAX_BLOCKS and block_write_idx == num_blocks
+    ):
+        raise NotImplementedError(
+            "fully fused append requires block_write_idx == num_blocks in [0, 7]"
         )
 
     if prefix.ndim != 2 or prefix.shape[1] != _HIDDEN_SIZE:
@@ -289,23 +400,36 @@ def flydsl_attn_res(
         )
     if blocks.ndim != 3 or blocks.shape != (
         prefix.shape[0],
-        _NUM_SOURCES - 1,
+        _MAX_BLOCKS,
         _HIDDEN_SIZE,
     ):
         raise ValueError(
             "blocks must have shape "
-            f"[T, {_NUM_SOURCES - 1}, {_HIDDEN_SIZE}], got {tuple(blocks.shape)}"
+            f"[T, {_MAX_BLOCKS}, {_HIDDEN_SIZE}], got {tuple(blocks.shape)}"
         )
     if norm_weight.shape != (_HIDDEN_SIZE,) or qk_weight.shape != (_HIDDEN_SIZE,):
         raise ValueError(
             f"norm_weight and qk_weight must each have shape ({_HIDDEN_SIZE},)"
         )
+    if has_delta and delta.shape != prefix.shape:
+        raise ValueError(
+            f"delta must have shape {tuple(prefix.shape)}, got {tuple(delta.shape)}"
+        )
+    if apply_output_norm and output_norm_weight.shape != (_HIDDEN_SIZE,):
+        raise ValueError(
+            "output_norm_weight must have shape "
+            f"({_HIDDEN_SIZE},), got {tuple(output_norm_weight.shape)}"
+        )
 
     tensors = (prefix, blocks, norm_weight, qk_weight)
+    if has_delta:
+        tensors += (delta,)
+    if apply_output_norm:
+        tensors += (output_norm_weight,)
     if any(t.device != prefix.device for t in tensors):
         raise ValueError("all tensors must be on prefix.device")
     if any(t.dtype != torch.bfloat16 for t in tensors):
-        raise TypeError("Currently supports BF16 prefix, blocks, and weights only")
+        raise TypeError("only contiguous BF16 inputs are supported")
     if not all(t.is_cuda for t in tensors):
         raise ValueError("all tensors must be CUDA tensors")
     if not all(t.is_contiguous() for t in tensors):
@@ -317,14 +441,30 @@ def flydsl_attn_res(
 
     if stream is None:
         stream = torch.cuda.current_stream(prefix.device)
-    launcher = _build_attn_res_mix(prefix.shape[1], float(eps))
+    delta_arg = delta if has_delta else prefix
+    output_norm_weight_arg = (
+        output_norm_weight if apply_output_norm else norm_weight
+    )
+    block_write_idx_arg = block_write_idx if write_block else 0
+    launcher = _build_attn_res(
+        prefix.shape[1],
+        num_blocks,
+        float(eps),
+        float(output_norm_eps) if apply_output_norm else 0.0,
+        has_delta,
+        write_block,
+        apply_output_norm,
+    )
     _run_compiled(
         launcher,
         prefix,
+        delta_arg,
         blocks,
         norm_weight,
         qk_weight,
+        output_norm_weight_arg,
         out,
+        block_write_idx_arg,
         prefix.shape[0],
         Stream(stream),
     )
