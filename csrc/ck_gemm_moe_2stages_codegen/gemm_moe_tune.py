@@ -717,6 +717,7 @@ class FmoeTuner(TunerCommon):
         topk,
         kparams,
         blockM,
+        act_type,
     ):
         from aiter.ops.opus.moe_stage1_a8w4 import opus_moe_stage1_a8w4_fwd
 
@@ -731,6 +732,7 @@ class FmoeTuner(TunerCommon):
             topk=topk,
             block_m=blockM,
             kernelName=str(kparams["kernelName"]),
+            activation=act_type,
             inter_dim_pad=0,
             bias=bias,
         )
@@ -3749,24 +3751,18 @@ class FmoeTuner(TunerCommon):
         ):
             return tasks_opus
 
-        stage1_activation = {
-            ActivationType.Silu: "silu",
-            ActivationType.Swiglu: "swiglu",
-        }.get(act_type)
-
-        stage1_insts = (
-            opus_a8w4_stage1_instances_for_shape(
-                model_dim=model_dim,
-                logical_inter_dim=inter_dim,
-                inter_dim_pad=0,
-                activation=stage1_activation,
-            )
-            if stage1_activation is not None
-            else ()
+        stage1_insts = opus_a8w4_stage1_instances_for_shape(
+            model_dim=model_dim,
+            logical_inter_dim=inter_dim,
+            inter_dim_pad=0,
         )
 
         stage1_supported = (
-            dtype == dtypes.bf16 and not doweight_stage1 and bool(stage1_insts)
+            dtype == dtypes.bf16
+            and act_type
+            in (ActivationType.Silu, ActivationType.Swiglu, ActivationType.Situv2)
+            and not doweight_stage1
+            and bool(stage1_insts)
         )
 
         s1_ref_args = (
@@ -3868,6 +3864,7 @@ class FmoeTuner(TunerCommon):
                                 topk,
                                 s1_params,
                                 blockM,
+                                act_type,
                             ),
                             {},
                             FmoeTuner.run_torch_moe_stage1,
