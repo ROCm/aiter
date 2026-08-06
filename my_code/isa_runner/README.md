@@ -191,6 +191,11 @@ are checked: production-written positions still poisoned by the candidate are
 reported as `missing_writes`, and candidate writes in production padding are
 reported as `unexpected_writes`; either condition fails the run.
 
+The report also includes `output_hash`: SHA256 values for the production and
+ISA outputs over their complete raw tensor bytes, including poison padding.
+`match=true` therefore means exact byte equality, while the existing `passed`
+field remains the numerical correctness gate.
+
 ### Gotchas the adapter handles
 
 - **Pin every captured tensor.** `ptr_arg` keeps only a raw pointer, so once the

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import sys
@@ -205,6 +206,14 @@ def _poison_mask(tensor):
     # In bf16, -12345.0 is stored as -12352.0. Constructing the scalar in the
     # tensor's dtype is therefore required before comparing.
     return tensor.eq(tensor.new_full((), _POISON))
+
+
+def _tensor_sha256(tensor) -> str:
+    """SHA256 over the contiguous tensor's exact raw bytes."""
+    import torch
+
+    raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _compare_outputs(reference, candidate) -> dict[str, Any]:
@@ -644,6 +653,17 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         got = live.detach().clone()
         torch.cuda.synchronize(live.device)
         report.update(_compare_outputs(cap.reference, got))
+        production_sha256 = _tensor_sha256(cap.reference)
+        isa_sha256 = _tensor_sha256(got)
+        report["output_hash"] = {
+            "algorithm": "sha256",
+            "scope": "full_tensor_raw_bytes_including_poison_padding",
+            "production_kernel": cap.kernel,
+            "production_sha256": production_sha256,
+            "isa_kernel": name,
+            "isa_sha256": isa_sha256,
+            "match": production_sha256 == isa_sha256,
+        }
 
         if iters:
             kernargs = cap.pack_kernargs()

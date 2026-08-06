@@ -17,6 +17,7 @@ from tdm_adapter import (
     _find_output_tensor,
     _flydsl_timer_enabled,
     _iqr_trimmed_median_us,
+    _tensor_sha256,
     Capture,
     IsaRunnerError,
     replay,
@@ -57,6 +58,13 @@ class TdmAdapterInterfaceTest(unittest.TestCase):
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
 class TdmAdapterHelpersTest(unittest.TestCase):
+    def test_tensor_sha256_compares_exact_raw_bytes(self):
+        positive_zero = torch.tensor([0.0], dtype=torch.float32)
+        negative_zero = torch.tensor([-0.0], dtype=torch.float32)
+
+        self.assertEqual(_tensor_sha256(positive_zero), _tensor_sha256(positive_zero.clone()))
+        self.assertNotEqual(_tensor_sha256(positive_zero), _tensor_sha256(negative_zero))
+
     def test_bfloat16_poison_padding_is_masked_before_float_conversion(self):
         production = torch.full((4,), _POISON, dtype=torch.bfloat16)
         production[:2] = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
