@@ -863,7 +863,7 @@ def _precompile_a16w4_to_cache(
     builders.  Instead drive the SAME runtime launchers (``flydsl_a16w4_gemm{1,2}``)
     the fused-MoE op uses, under ``COMPILE_ONLY=1`` — the cache key then matches
     runtime by construction (``waves_per_eu=None``, ``persist=False``,
-    ``w_layout="guinterleave"``, g2 tile downgrade are all applied inside the
+    ``w_layout="standard"``, g2 tile downgrade are all applied inside the
     launcher).  The compiled artifact is keyed only on the kernel's constexpr
     params (shapes/tiles/topk/act), never on the launch pointers, grid, or
     ``n_tokens``, so a single 1-elem real placeholder covers every buffer (real,
@@ -904,7 +904,7 @@ def _precompile_a16w4_to_cache(
                 tile_k=tile_k,
                 k_wave=k_wave,
                 act=("situv2" if act in ("situv2", "situ") else act),
-                w_layout="guinterleave",
+                w_layout="standard",
                 **common,
             )
         else:

@@ -96,10 +96,10 @@ def test_flydsl_a16wfp4_situv2_e2e(model_dim, inter_dim, token):
         doweight=True,
     )
 
-    # caller contract: standard guinterleave (a8w4/mxfp8-shared) weight layout
-    w1_gui = shuffle_weight_a16w4(w1_qt, 16, True)
+    # caller contract: standard GGUU (separated gate/up) W1 layout, matching main
+    w1_gui = shuffle_weight_a16w4(w1_qt, 16, False)
     w2_gui = shuffle_weight_a16w4(w2_qt, 16, False)
-    w1_scale_gui = shuffle_scale_a16w4(w1_scale, E, True)
+    w1_scale_gui = shuffle_scale_a16w4(w1_scale, E, False)
     w2_scale_gui = shuffle_scale_a16w4(w2_scale, E, False)
 
     out = fused_moe(

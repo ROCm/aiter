@@ -575,7 +575,7 @@ def compile_flydsl_moe_stage1(
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w4 (bf16 A x fp4 W) SiTUv2: build the ported gemm1 (moe_2stage_a16wmix),
-    # consuming aiter's native guinterleave W1+scale (w_layout="guinterleave").
+    # consuming the standard GGUU W1+scale layout (w_layout="standard"), matching main.
     if a_dtype == "bf16" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
@@ -597,7 +597,7 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             waves_per_eu=waves_per_eu,
             w_dtype="fp4",
-            w_layout="guinterleave",
+            w_layout="standard",
             k_wave=k_wave,
             use_k16=a16wmix_use_k16(get_rocm_arch()),
         )
@@ -1501,7 +1501,7 @@ def _flydsl_moe_stage1_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
-            w_layout="guinterleave",
+            w_layout="standard",
         )
         return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned

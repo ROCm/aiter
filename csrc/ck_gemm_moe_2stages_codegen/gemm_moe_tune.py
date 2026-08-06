@@ -122,6 +122,26 @@ _TUNER_SITU_BETA = 4.0
 _TUNER_SITU_LINEAR_BETA = 25.0
 
 
+def _a16w_sorted_row_map(sorted_ids, sorted_expert_ids, topk_ids, token_num, tile_m):
+    """Map a16w-mix SORTED rows <-> unsorted ``[token, topk, inter]`` per the moe_sorting
+    contract: ``tok = sorted_ids & 0xFFFFFF``; the row's expert is
+    ``sorted_expert_ids[row // tile_m]``; the topk_slot is the index where
+    ``topk_ids[tok] == expert`` (same rule as ``v2_stage1_sorted_ref``). Returns the valid
+    ``(rows, token, topk_slot)`` index arrays. NOTE: the topk_slot must be resolved by
+    expert-match, NOT by decoding ``sorted_ids >> 24`` (which is not the topk slot).
+    """
+    sid = sorted_ids.to(torch.int64)
+    tok = sid & 0xFFFFFF
+    row_expert = sorted_expert_ids.to(torch.int64)[
+        torch.arange(sid.numel(), device=sid.device) // int(tile_m)
+    ]
+    cand = (tok < token_num).nonzero(as_tuple=True)[0]
+    match = topk_ids.to(torch.int64)[tok[cand]] == row_expert[cand].unsqueeze(1)
+    has = match.any(dim=1)
+    rows = cand[has]
+    return rows, tok[rows], match[has].to(torch.int32).argmax(dim=1)
+
+
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
     """Map ``knl_name`` -> 0/1 when the manifest has a ``flat`` column.
 
@@ -653,6 +673,7 @@ class FmoeTuner(TunerCommon):
         w1_scale_aiter,
         a1_scale,
         bias,
+        topk_ids,
         dtype,
         topk,
         kparams,
@@ -708,6 +729,20 @@ class FmoeTuner(TunerCommon):
             else:
                 # fuse_fp8: out_raw is fp8 tensor, shape (token_num, topk, inter_dim)
                 return out_raw.reshape(token_num, topk, -1)
+        # a16w-mix (bf16/fp16 activation) returns a SORTED bf16 buffer
+        # [sorted_size, inter] (moe_kernels _flydsl_moe_stage1_impl inter_sorted);
+        # gather it back to the unsorted [token, topk, inter] torch-ref layout.
+        if q_dtype_a in (dtypes.bf16, dtypes.fp16) and result.dim() == 2:
+            rows, tok, slot = _a16w_sorted_row_map(
+                sorted_ids, sorted_expert_ids, topk_ids, token_num, kparams["tile_m"]
+            )
+            out_unsorted = torch.zeros(
+                (token_num, topk, result.shape[1]),
+                dtype=result.dtype,
+                device=result.device,
+            )
+            out_unsorted[tok, slot] = result[rows]
+            return out_unsorted
         return result
 
     @staticmethod
@@ -754,6 +789,7 @@ class FmoeTuner(TunerCommon):
         a2_scale,
         moe_buf,
         bias,
+        topk_ids,
         dtype,
         topk,
         kparams,
@@ -766,6 +802,24 @@ class FmoeTuner(TunerCommon):
 
         sort_block_m = kparams.get("sort_block_m", 0)
         persist = kparams.get("persist", None)
+
+        # a16w-mix (bf16 activation) stage2 consumes a SORTED bf16 intermediate
+        # [sorted_size, inter]; the tuner's a2_qt is the unsorted [token, topk, inter]
+        # torch intermediate. Scatter it into sorted layout and drop a2_scale (bf16,
+        # no inter-stage act quant). Feeding the unsorted 3D tensor OOB-faults.
+        if kparams["a_dtype"] == "bf16":
+            token_num, _, inter = a2_qt.shape
+            sorted_size = int(sorted_expert_ids.shape[0]) * int(kparams["tile_m"])
+            rows, tok, slot = _a16w_sorted_row_map(
+                sorted_ids, sorted_expert_ids, topk_ids, token_num, kparams["tile_m"]
+            )
+            a2_sorted = torch.zeros(
+                (sorted_size, inter), dtype=torch.bfloat16, device=a2_qt.device
+            )
+            a2_sorted[rows] = a2_qt[tok, slot].to(torch.bfloat16)
+            a2_qt = a2_sorted
+            a2_scale = None
+
         return flydsl_moe_stage2(
             inter_states=a2_qt,
             w2=w2_shuffled_flydsl,
@@ -1582,10 +1636,10 @@ class FmoeTuner(TunerCommon):
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
             w2_scale_aiter = fp4_utils.e8m0_shuffle(w2_scale)
         elif q_dtype_w == dtypes.fp4x2 and q_dtype_a in (dtypes.bf16, dtypes.fp16):
-            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): same wfp4 weight layout
-            # as a8w4 but separated gate (gate_up=False) and w2 scale via plain
-            # e8m0_shuffle (no act-scale interleave). Mirrors the reference
-            # op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py data prep.
+            # a16w4 mxfp4 (bf16/fp16 activation, SiTUv2): standard GGUU (separated
+            # gate/up) W1 layout, matching main (moe_kernels a16w4 dispatch uses
+            # w_layout="standard"). w2 has no gate/up (gate_up=False), scale via
+            # plain e8m0_shuffle.
             w1_qt_shffle_ck = shuffle_weight_a16w4(w1_qt, 16, False)
             w1_scale_aiter = shuffle_scale_a16w4(w1_scale, expert, False)
             w2_qt_shffle_ck = shuffle_weight_a16w4(w2_qt, 16, False)
@@ -2864,6 +2918,16 @@ class FmoeTuner(TunerCommon):
         if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.i4x2:
             return tasks_ck
 
+        # CK gemm1 codegen has no b16 x fp4x2 combo (get_gemm1_kernels_list
+        # raises "Unsupported data type combination: b16, fp4x2"); a16w4
+        # (bf16 activation x mxfp4 weight) is FlyDSL-only -> skip CK.
+        if (
+            q_type == QuantType.per_1x32
+            and q_dtype_w == dtypes.fp4x2
+            and q_dtype_a == dtypes.bf16
+        ):
+            return tasks_ck
+
         # CK2stages codegen does not support SwiGLU activation. GPT-OSS MXFP4
         # cases are covered by FlyDSL (or the a8w4 CK-Tile path above).
         if (
@@ -3293,6 +3357,16 @@ class FmoeTuner(TunerCommon):
                 ):
                     continue
 
+                # a16w-mix gemm1 splits TILE_N across (4//k_wave) N-waves, each
+                # accumulating (TILE_N//n_waves)//16 MFMA n-tiles. When that is 0
+                # (e.g. tile_n=32 with k_wave=1) the epilogue writes nothing ->
+                # NaN/garbage output that times fast but is wrong; the tuner would
+                # otherwise pick it. Require num_acc_n >= 1 for a16w4.
+                if a_dtype_str == "bf16":
+                    _n_waves = max(1, 4 // _kw)
+                    if (kparams["tile_n"] // _n_waves) < 16:
+                        continue
+
                 # (kernel_name, kparams, is_fp4, is_fp8)
                 # out_dtype encodes fused quant type: "fp4" or "fp8"
                 #   a8w4 (a_dtype_str="fp8"): stage2 expects fp8 activations -> out_dtype="fp8"
@@ -3401,6 +3475,7 @@ class FmoeTuner(TunerCommon):
                                     "w1_scale_aiter",
                                     "a1_scale_fp4_sort",
                                     "bias",
+                                    "topk_ids",
                                 ],
                                 dtype,
                                 topk,
@@ -3427,6 +3502,26 @@ class FmoeTuner(TunerCommon):
                     continue
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
                 if s2_tile_m != blockM and s2_tile_m != blockM // 2:
+                    continue
+                # a16w4 (bf16) consumes the SORTED [sorted_size, inter] intermediate
+                # laid out on the moe_sorting blockM grid; the _sbm (tile_m<blockM)
+                # variants re-tile the sorted stream at a finer granularity than the
+                # sorted_ids/sorted_expert_ids padding and fault the queue. Restrict
+                # a16w4 stage2 to the matched tile_m==blockM candidates.
+                if a_dtype_str == "bf16" and s2_tile_m != blockM:
+                    continue
+                # a16w4 gemm2 tile_n=256 at large tile_m over-allocates LDS
+                # (>163840B "local memory exceeds limit" compile failure), and
+                # the failed compile under the worker pool takes the queue down.
+                # tile_n=128 covers the shape (byte-identical output); skip 256.
+                if a_dtype_str == "bf16" and kparams["tile_n"] == 256:
+                    continue
+                # a16w4 gemm2 K axis is inter_dim; tile_k must divide it. For non-
+                # 256-aligned inter_dim (e.g. 384) a tile_k=256 candidate produces
+                # wrong output (the runtime wrapper parses the kernelName tile_k
+                # verbatim -> OOB), yet the tuner would score it as passing. Skip
+                # tile_k that doesn't divide inter_dim so only valid tiles are tuned.
+                if a_dtype_str == "bf16" and inter_dim % kparams["tile_k"] != 0:
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
@@ -3501,6 +3596,7 @@ class FmoeTuner(TunerCommon):
                                 "a2_scale_mxfp4_sort",
                                 "moe_buf",
                                 "bias",
+                                "topk_ids",
                             ],
                             dtype,
                             topk,
@@ -4034,6 +4130,7 @@ class FmoeTuner(TunerCommon):
                                 "w1_scale_flydsl",
                                 "a1_scale_fp4_sort",
                                 "bias",
+                                "topk_ids",
                             ],
                             dtype,
                             topk,
@@ -4138,6 +4235,7 @@ class FmoeTuner(TunerCommon):
                                 "a2_scale_mxfp4_sort",
                                 "moe_buf",
                                 "bias",
+                                "topk_ids",
                             ],
                             dtype,
                             topk,

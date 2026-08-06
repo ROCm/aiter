@@ -332,8 +332,11 @@ def test_fmoe(
         and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
         and (WQDType == dtypes.fp4x2)
     ):  # a16w4 / a8w4
-        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, True)
-        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, True)
+        # a16w4 (bf16/fp16 act) uses standard GGUU (gate_up=False), matching main;
+        # a8w4 (fp8 act) keeps the gate/up-interleaved GUGU (gate_up=True).
+        _w1_gu = AQDType == dtypes.fp8
+        w1_qt_aiter = shuffle_weight_a16w4(w1_qt_aiter, 16, _w1_gu)
+        w1_scale_aiter = shuffle_scale_a16w4(w1_scale, E, _w1_gu)
         w2_qt_aiter = shuffle_weight_a16w4(w2_qt_aiter, 16, False)
         w2_scale_aiter = shuffle_scale_a16w4(w2_scale, E, False)
     elif is_mxfp8:  # mxfp8 (a8w8): gate-up interleaved fp8 weight + e8m0 scale
