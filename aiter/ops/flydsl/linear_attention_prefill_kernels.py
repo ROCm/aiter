@@ -569,9 +569,14 @@ def chunk_gated_delta_rule_fwd_h_flydsl(
 # -- K1..K4 prepare host wrapper (single fused FlyDSL kernel) --------------
 
 
+def _device_index(t: torch.Tensor) -> int:
+    """Concrete ordinal of a CUDA tensor's device (``None`` = the current one)."""
+    return t.device.index if t.device.index is not None else torch.cuda.current_device()
+
+
 @functools.cache
-def _num_xcd() -> int:
-    """XCD (Accelerator Complex Die) count on the visible device.
+def _num_xcd(device_index: int) -> int:
+    """XCD (Accelerator Complex Die) count on the given device.
 
     The HW workgroup->XCD dispatch is the dominant partition behind the grid_x
     camping (see the anti-camping padding in the wrapper).  On CDNA each XCD
@@ -581,7 +586,7 @@ def _num_xcd() -> int:
         gfx942  MI300X/MI325X = 304 CU, MI300A = 228 CU  @ 38 CU/XCD -> 8 or 6
         gfx950  MI350/MI355   = 256 CU                    @ 32 CU/XCD -> 8
     """
-    p = torch.cuda.get_device_properties(torch.cuda.current_device())
+    p = torch.cuda.get_device_properties(device_index)
     arch = getattr(p, "gcnArchName", "").split(":")[0]
     cu_per_xcd = {"gfx942": 38, "gfx950": 32}.get(arch)
     if cu_per_xcd:
@@ -600,13 +605,19 @@ def _pad_grid_x_coprime(grid_x: int, num_xcd: int) -> int:
 @functools.cache
 def _is_cdna_mfma_arch(device_index: int) -> bool:
     """Whether the device runs the CDNA bf16 MFMA path the prepare kernel needs."""
-    try:
-        arch = getattr(
-            torch.cuda.get_device_properties(device_index), "gcnArchName", ""
-        )
-    except Exception:  # noqa: BLE001 -- absent/unreadable properties => unsupported
-        return False
+    arch = getattr(torch.cuda.get_device_properties(device_index), "gcnArchName", "")
     return arch.split(":")[0].startswith(("gfx94", "gfx95"))
+
+
+# The launch hands flattened views to FlyDSL's C-ABI packer, which describes
+# sizes as C ``int``, so a view of 2**31 elements or more dies with a bare
+# ``struct.error`` before the kernel ever runs. ``w_bar``/``u_bar`` are the
+# widest views at ``B*H*T*K`` elements -- equal to ``v.numel()`` here, since the
+# predicate already pins ``K == V`` -- so bounding v bounds them. Measured on
+# gfx950 (H=32, Hg=16, K=V=128): clean at T_flat=524160, raises at 524288, which
+# is exactly 2**31 output elements. The Triton pair computes both, so falling
+# back keeps that shape working instead of crashing.
+_MAX_FLAT_ELEMS = 2**31
 
 
 def gdn_prepare_flydsl_supported(
@@ -619,9 +630,10 @@ def gdn_prepare_flydsl_supported(
 
     The fused kernel covers a deliberately narrow slice of what the Triton
     K1+K2 pair accepts -- ``compile_gdn_prepare`` hard-asserts ``BT=64``,
-    ``K=128`` and ``V=128``, the epilogue emits bf16, and the GEMMs are CDNA
-    bf16 MFMA. Callers use this to pick the fused path only where it applies and
-    fall back to Triton everywhere else, instead of tripping an assert.
+    ``K=128`` and ``V=128``, the epilogue emits bf16, the GEMMs are CDNA bf16
+    MFMA, and the launch ABI caps a flattened view at ``2**31`` elements.
+    Callers use this to pick the fused path only where it applies and fall back
+    to Triton everywhere else, instead of tripping an assert.
     """
     return (
         BT == 64
@@ -630,7 +642,8 @@ def gdn_prepare_flydsl_supported(
         and k.dtype is torch.bfloat16
         and v.dtype is torch.bfloat16
         and k.is_cuda
-        and _is_cdna_mfma_arch(k.device.index if k.device.index is not None else 0)
+        and v.numel() < _MAX_FLAT_ELEMS
+        and _is_cdna_mfma_arch(_device_index(k))
     )
 
 
@@ -693,7 +706,7 @@ def gdn_prepare_fwd_flydsl(
     16x16x16; see ``kernels.gdn_prepare.compile_gdn_prepare`` for the LDS
     layout and the fixed ``s_vT`` bank-swizzle.
     """
-    B, T0, Hg_in, K = k.shape
+    B, T, Hg_in, K = k.shape
     H = v.shape[2]
     V = v.shape[3]
     if Hg is None:
@@ -736,7 +749,7 @@ def gdn_prepare_fwd_flydsl(
                 chunk_size=BT,
                 num_decodes=num_decodes,
                 num_decode_tokens=num_decode_tokens,
-                total_prefill_tokens=T0,
+                total_prefill_tokens=T,
                 num_sequences=len(cu_seqlens) - 1,
             )
             schedule = prefill_metadata.get_chunk_schedule(
@@ -760,9 +773,10 @@ def gdn_prepare_fwd_flydsl(
         # Device-to-device narrowing cast; the result feeds only the launch, so
         # its identity does not matter to the caches above.
         cu = kernel_cu_seqlens.to(device=k.device, dtype=torch.int32).contiguous()
-        T = T0
     else:
-        cu = torch.empty(0, device=k.device, dtype=torch.int32)
+        # The dense build never dereferences ``cu_t``, so hand it ``k`` as the
+        # placeholder pointer instead of allocating a dummy buffer for it.
+        cu = k
         num_seqs = B
         # No input padding for a ragged last chunk: every global access in the
         # kernel is already bounded by ``seqlen`` -- the buffer descriptors are
@@ -770,10 +784,9 @@ def gdn_prepare_fwd_flydsl(
         # and out-of-range stores are dropped, in hardware.  A dense tail
         # therefore behaves exactly like varlen's ragged last chunk.  Padding
         # instead cost four input copies plus an oversized output allocation,
-        # and forced a trailing ``[:, :T0]`` slice that returned non-contiguous
+        # and forced a trailing ``[:, :T]`` slice that returned non-contiguous
         # tensors for B > 1.
-        T = T0
-        NT = (T0 + BT - 1) // BT
+        NT = (T + BT - 1) // BT
 
     # The kernel writes every output position (dense: row r is written by chunk
     # r // BT; varlen: each packed token is written by exactly one block), so
@@ -798,7 +811,7 @@ def gdn_prepare_fwd_flydsl(
     # are >= every seqlen so they early-exit and the output is bit-identical.
     # Only varlen skews (dense = uniform full chunks).
     if is_varlen and NT >= 2:
-        grid_x = _pad_grid_x_coprime(NT, _num_xcd())
+        grid_x = _pad_grid_x_coprime(NT, _num_xcd(_device_index(k)))
 
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -816,7 +829,7 @@ def gdn_prepare_fwd_flydsl(
         v.view(-1),
         g.view(-1),
         beta.view(-1),
-        (cu if is_varlen else k).view(-1),
+        cu.view(-1),
         w_bar.view(-1),
         u_bar.view(-1),
         g_cumsum.view(-1),

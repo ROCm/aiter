@@ -315,22 +315,23 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     ):
         use_chunk_hip = False
 
-    fused_prepare = None
     if use_prepare_flydsl:
         from aiter.ops.flydsl.linear_attention_prefill_kernels import (
             gdn_prepare_flydsl_supported,
-            gdn_prepare_fwd_flydsl,
         )
 
         # Outside the fused kernel's bf16 / K=V=128 / CDNA slice, keep Triton.
-        if gdn_prepare_flydsl_supported(k, v):
-            fused_prepare = gdn_prepare_fwd_flydsl
+        use_prepare_flydsl = gdn_prepare_flydsl_supported(k, v)
 
-    if fused_prepare is not None:
+    if use_prepare_flydsl:
+        from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+            gdn_prepare_fwd_flydsl,
+        )
+
         # One kernel for K1..K4. Emits w/u head-major [B, H, T, K/V] and
         # g_cumsum head-major [B, H, T] in the same exponent domain as the
         # Triton pair, so everything downstream is unchanged.
-        w, u, g_cumsum = fused_prepare(
+        w, u, g_cumsum = gdn_prepare_fwd_flydsl(
             k=k,
             v=v,
             g=g,

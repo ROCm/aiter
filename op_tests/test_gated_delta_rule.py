@@ -25,6 +25,9 @@ from aiter.ops.triton._triton_kernels.gated_delta_rule.gated_delta_rule_utils im
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill import (
     chunk_gated_delta_rule_fwd_h_opt_vk,
 )
+from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+    build_gated_delta_rule_prefill_metadata,
+)
 from aiter.ops.triton.gated_delta_net import (
     chunk_gated_delta_rule,
     chunk_gated_delta_rule_opt,
@@ -1284,9 +1287,6 @@ try:
         gdn_prepare_flydsl_supported,
     )
     from aiter.ops.flydsl.utils import is_flydsl_available
-    from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
-        build_gated_delta_rule_prefill_metadata,
-    )
 
     _HAS_FLYDSL_PREPARE = is_flydsl_available()
 except ImportError:  # pragma: no cover - import guard
@@ -1503,9 +1503,6 @@ def test_chunk_opt_vk_prepare_flydsl_does_not_sync():
     exist to remove exactly that. Only the cached path is pinned here -- with a
     prebuilt schedule every host value is host-resident by construction.
     """
-    if not hasattr(torch.cuda, "set_sync_debug_mode"):
-        pytest.skip("torch.cuda.set_sync_debug_mode is unavailable")
-
     cu_list = [0, 128, 300, 600]
     cu_seqlens = torch.tensor(cu_list, dtype=torch.int64, device=device)
     inputs = _prepare_make_inputs(
