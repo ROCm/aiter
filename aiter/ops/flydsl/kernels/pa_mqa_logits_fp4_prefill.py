@@ -12,11 +12,9 @@ import torch
 import triton
 import triton.language as tl
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, gpu, rocdl
+from flydsl.expr import gpu, rocdl
 from flydsl.expr.primitive import range_constexpr
 from flydsl.expr.typing import Int32, T
-
-from aiter.ops.flydsl.kernels import buffer_ops
 
 DEFAULT_HEADS = 64
 DEFAULT_HEAD_DIM = 128
@@ -40,6 +38,43 @@ def _pack_lo_i64x2_to_i32x8(x0, x1):
     return fx.Vector.from_elements([x0, x1, undef0, undef1], dtype=fx.Int64).bitcast(
         fx.Int32
     )
+
+
+_I32_MAX_RECORDS = fx.Int64(0xFFFFFFFF)
+
+
+def _i32_buffer(ptr, width=1):
+    """OOB-checked global i32 buffer-tensor over ``ptr`` (mirrors a max_size V#).
+
+    ``width`` shapes it ``(N, width)`` so a per-``width`` row can be sliced and
+    vector-copied; ``width=1`` gives a flat tensor for scalar ``[idx]`` loads.
+    """
+    p = fx.inttoptr(
+        fx.PointerType.get(T.i32, address_space=fx.AddressSpace.Global, alignment=4),
+        fx.Int64(fx.ptrtoint(fx.get_iter(ptr))),
+    )
+    if width == 1:
+        lay = fx.make_layout((1 << 30,), (1,))
+    else:
+        lay = fx.make_layout((1 << 28, width), (width, 1))
+    return fx.rocdl.make_buffer_tensor(
+        fx.make_view(p, lay), num_records_bytes=_I32_MAX_RECORDS
+    )
+
+
+def _load_vec4_i32(bt2d, elem_off):
+    """Load 4 contiguous i32 at ``elem_off`` (multiple of 4) from a width-4
+    buffer-tensor, returning a raw v4i32 (OOB lanes read 0)."""
+    row = fx.slice(bt2d, (elem_off // fx.Int32(4), None))
+    row_div = fx.logical_divide(row, fx.make_layout(4, 1))
+    reg_ty = fx.MemRefType.get(T.i32, fx.LayoutType.get(4, 1), fx.AddressSpace.Register)
+    r = fx.memref_alloca(reg_ty, fx.make_layout(4, 1))
+    fx.copy_atom_call(
+        fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 4),
+        fx.slice(row_div, (None, fx.Int32(0))),
+        r,
+    )
+    return fx.memref_load_vec(r).ir_value()
 
 
 def compute_prefill_schedule(
@@ -287,37 +322,44 @@ def build_pa_mqa_logits_fp4_prefill_module(
         lane_mod_16 = lane_id & 15
         lane_div_16 = (lane_id >> 4) & 3
 
-        # Per-CTA assignment: first 4 fields via dwordx4, window bounds via 2 scalar loads.
-        cta_info_rsrc = buffer_ops.create_buffer_resource(cta_info_ptr, max_size=True)
-        cta_base = pid * fx.Int32(CTA_INFO_WIDTH)
-        cta_info_4xi32 = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base, vec_width=4, dtype=T.i32
+        # Per-CTA assignment: pid*CTA_INFO_WIDTH (wave-uniform) folded into the V#
+        # base pointer so the row of 4 fields loads as a dwordx4 at offset 0; the
+        # window bounds (+4,+5) load as scalars off the same base.
+        cta_base = fx.Int64(pid) * fx.Int64(CTA_INFO_WIDTH)
+        cta_p = fx.inttoptr(
+            fx.PointerType.get(
+                T.i32, address_space=fx.AddressSpace.Global, alignment=4
+            ),
+            fx.Int64(fx.ptrtoint(fx.get_iter(cta_info_ptr))) + cta_base * fx.Int64(4),
         )
-        local_start = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base + fx.Int32(4), vec_width=1, dtype=T.i32
+        cta_info_bt = fx.rocdl.make_buffer_tensor(
+            fx.make_view(cta_p, fx.make_layout((1 << 28, 4), (4, 1))),
+            num_records_bytes=_I32_MAX_RECORDS,
         )
-        local_end = buffer_ops.buffer_load(
-            cta_info_rsrc, cta_base + fx.Int32(5), vec_width=1, dtype=T.i32
+        cta_info_flat = fx.rocdl.make_buffer_tensor(
+            fx.make_view(cta_p, fx.make_layout((1 << 30,), (1,))),
+            num_records_bytes=_I32_MAX_RECORDS,
         )
+        cta_info_vec = fx.Vector(_load_vec4_i32(cta_info_bt, fx.Int32(0)))
+        local_start = cta_info_flat[fx.Int32(4)]
+        local_end = cta_info_flat[fx.Int32(5)]
 
-        kv_rsrc = buffer_ops.create_buffer_resource(kv_cache_ptr, max_size=True)
-        kvs_rsrc = buffer_ops.create_buffer_resource(kv_scale_ptr, max_size=True)
-        bt_rsrc = buffer_ops.create_buffer_resource(kv_indices_ptr, max_size=True)
+        kv_bt = _i32_buffer(kv_cache_ptr, width=4)
+        kvs_bt = _i32_buffer(kv_scale_ptr, width=1)
+        bt_bt = _i32_buffer(kv_indices_ptr, width=1)
 
         ZERO_F = fx.Float32(0.0)
         c0_i32 = fx.Int32(0)
 
-        cta_info_vec = fx.Vector(cta_info_4xi32)
         row_id = cta_info_vec[0]
         batch_id = cta_info_vec[1]
         chunk_start = cta_info_vec[2]
         chunk_count = cta_info_vec[3]
 
-        # sizeof(f32) = 4; compute the per-row base byte offset in i64.
-        _row_bytes_i64 = (fx.Int64(row_id) * fx.Int64(stride_out_row) * 4).ir_value()
-        out_rsrc = buffer_ops.create_buffer_resource(
-            out_logits_ptr, max_size=True, base_byte_offset=_row_bytes_i64
-        )
+        # out row base folded into an f32 global pointer (sizeof(f32)=4); the
+        # per-token store offset below stays small (no i32 overflow).
+        _row_elems = fx.Int64(row_id) * fx.Int64(stride_out_row)
+        out_base = fx.add_offset(fx.get_iter(out_logits_ptr), _row_elems)
 
         # Q load (hoisted): per (k_tile, mi_idx) a thread loads its 16-byte FP4
         # chunk for head row mi_idx*16+lane_mod_16. Q: [total_tokens, H, D/2] uint8.
@@ -394,9 +436,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 + lane_mod_16
             )
             bi_base = _floordiv_kb(token_local_base)
-            phys_vec = buffer_ops.buffer_load(
-                bt_rsrc, batch_id * _stride_bt + bi_base, vec_width=N_PHYS, dtype=T.i32
-            )
+            phys_vec = bt_bt[batch_id * _stride_bt + bi_base]
             return _phys_to_list(phys_vec)
 
         def _prefetch_chunk(c_i32_arg, phys_list):
@@ -413,13 +453,9 @@ def build_pa_mqa_logits_fp4_prefill_module(
                 + lane_mod_16 * fx.Int32(N_TILES_PER_WARP)
             ) >> fx.Int32(2)
             for k_tile in range_constexpr(k_tiles):
-                kvs_packed = buffer_ops.buffer_load(
-                    kvs_rsrc,
-                    kvs_base_off_elems,
-                    vec_width=1,
-                    dtype=T.i32,
-                    soffset_bytes=k_tile * _stride_kvs_ktile,
-                )
+                kvs_packed = kvs_bt[
+                    kvs_base_off_elems + fx.Int32(k_tile * _stride_kvs_ktile // 4)
+                ]
                 kvs_packed_list.append(kvs_packed)
 
             ni0 = warp_id * fx.Int32(N_TILES_PER_WARP)
@@ -437,12 +473,8 @@ def build_pa_mqa_logits_fp4_prefill_module(
             for nt in range_constexpr(N_TILES_PER_WARP):
                 for k_tile in range_constexpr(k_tiles):
                     kv_soffset = k_tile * _stride_kv_ktile + nt * _stride_kv_ntile
-                    kv_c = buffer_ops.buffer_load(
-                        kv_rsrc,
-                        kv_base_off_elems,
-                        vec_width=4,
-                        dtype=T.i32,
-                        soffset_bytes=kv_soffset,
+                    kv_c = _load_vec4_i32(
+                        kv_bt, kv_base_off_elems + fx.Int32(kv_soffset // 4)
                     )
                     kv_list.append(kv_c)
 
@@ -492,30 +524,25 @@ def build_pa_mqa_logits_fp4_prefill_module(
             lane_i32 = fx.Int32(lane_id)
 
             def _bperm_xor_add(val, sh):
-                peer_lane = lane_i32 ^ fx.Int32(sh)
-                peer_byte = peer_lane * fx.Int32(4)
-                val_i32 = arith.ArithValue(val).bitcast(T.i32)
-                peer_i32 = rocdl.ds_bpermute(T.i32, peer_byte, val_i32)
-                peer_f32 = arith.ArithValue(peer_i32).bitcast(T.f32)
-                return arith.ArithValue(val).addf(peer_f32)
+                peer_byte = (lane_i32 ^ fx.Int32(sh)) * fx.Int32(4)
+                peer_i32 = fx.Int32(
+                    rocdl.ds_bpermute(T.i32, peer_byte, val.bitcast(fx.Int32))
+                )
+                return val + peer_i32.bitcast(fx.Float32)
 
             thread_sum = _bperm_xor_add(thread_sum, 16)
             thread_sum = _bperm_xor_add(thread_sum, 32)
             # `weight_scale` already folded into `w_per_lane` (hoisted, once/wave).
 
-            # Only [local_start, local_end) is written (one writer lane per
-            # token); the rest stays at the caller's -inf pre-fill.
-            oob_off = fx.Int32(-1)
+            # Only [local_start, local_end) is written (one writer lane per token);
+            # the rest stays at the caller's -inf pre-fill. Sparse 1-writer
+            # scatter: guard the plain store instead of a V# OOB sentinel. Row base
+            # is folded into out_base, so the store offset is the token index.
             is_writer = lane_div_16 < fx.Int32(1)
             out_token = token_base + lane_mod_16
             in_window = (out_token >= local_start) & (out_token < local_end)
-            # Row base is folded into `out_rsrc`'s i64 base pointer (see above),
-            # so the per-token store offset is just the (small) token index —
-            # no i32 overflow even for very large stride_out_row * row_id.
-            out_off_real = out_token
-            out_off = in_window.select(out_off_real, oob_off)
-            out_off = is_writer.select(out_off, oob_off)
-            buffer_ops.buffer_store(thread_sum, out_rsrc, out_off)
+            if is_writer & in_window:
+                fx.ptr_store(thread_sum, fx.add_offset(out_base, out_token))
 
         def _compute_chunk(kv_list_in, kvs_packed_list_in, c_i32_arg, nt0_accs_in=None):
             assert (
