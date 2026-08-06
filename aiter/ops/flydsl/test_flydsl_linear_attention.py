@@ -452,3 +452,221 @@ def test_flydsl_gdr_decode(args):
         maxdiff_state = (inouts[-2] - ref_inouts[-2]).abs().max()
         print(f"maxdiff_out:{maxdiff_out}\nmaxdiff_state:{maxdiff_state}")
         assert is_allclose
+
+
+def test_flydsl_gdr_decode_supports_strided_ab():
+    args = Args(
+        dtype=torch.bfloat16,
+        b=2,
+        sq=1,
+        num_k_heads=2,
+        num_v_heads=8,
+        head_k_dim=128,
+        head_v_dim=128,
+        use_qk_l2norm=True,
+    )
+    (
+        _,
+        query,
+        key,
+        value,
+        a_contiguous,
+        b_contiguous,
+        dt_bias,
+        A_log,
+        indices,
+        state,
+    ) = create_inputs(args)
+    a_storage = torch.empty(
+        (args.b * 2, args.sq, args.num_v_heads), dtype=args.dtype
+    )
+    b_storage = torch.empty_like(a_storage)
+    a = a_storage[::2]
+    b = b_storage[::2]
+    a.copy_(a_contiguous)
+    b.copy_(b_contiguous)
+    assert not a.is_contiguous()
+    assert not b.is_contiguous()
+
+    out = create_outputs(args)[0]
+    state_actual = state.clone()
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        indices,
+        state_actual,
+        out,
+        use_qk_l2norm=args.use_qk_l2norm,
+        need_shuffle_state=True,
+    )
+
+    out_ref = create_outputs(args)[0]
+    state_ref = state.clone()
+    run_triton_kernel(
+        out_ref,
+        A_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        a.contiguous(),
+        b.contiguous(),
+        state_ref,
+        indices,
+        float(1.0 / (args.head_k_dim**0.5)),
+        args.use_qk_l2norm,
+    )
+
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(state_actual, state_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 48), (2, 8)])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24, 32, 64])
+def test_flydsl_gdr_decode_pr3135_target_shape_matrix(
+    num_k_heads,
+    num_v_heads,
+    batch_size,
+):
+    args = Args(
+        dtype=torch.bfloat16,
+        b=batch_size,
+        sq=1,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=128,
+        head_v_dim=128,
+        use_qk_l2norm=True,
+    )
+    inputs = create_inputs(args)
+    out = create_outputs(args)[0]
+    out_ref = create_outputs(args)[0]
+    actual = list(inputs + (out,))
+    reference = list(inputs + (out_ref,))
+    actual[-2] = actual[-2].clone()
+    reference[-2] = reference[-2].clone()
+
+    func(*actual)
+    ref_func(*reference)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        actual[-2],
+        reference[-2],
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("num_k_heads,num_v_heads", [(16, 48), (2, 8)])
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 24, 32, 64])
+def test_flydsl_gdr_decode_pr3135_graph_replay_changed_indices(
+    num_k_heads,
+    num_v_heads,
+    batch_size,
+):
+    args = Args(
+        dtype=torch.bfloat16,
+        b=batch_size,
+        sq=1,
+        num_k_heads=num_k_heads,
+        num_v_heads=num_v_heads,
+        head_k_dim=128,
+        head_v_dim=128,
+        use_qk_l2norm=True,
+    )
+    (
+        _,
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        _,
+        _,
+    ) = create_inputs(args)
+    pool_size = batch_size + 2
+    initial_state_vk = torch.randn(
+        (pool_size, num_v_heads, 128, 128),
+        dtype=torch.float32,
+    )
+    state_actual_vk = initial_state_vk.clone()
+    capture_indices = torch.arange(batch_size, dtype=torch.int32)
+    replay_indices = torch.arange(
+        batch_size + 1,
+        1,
+        -1,
+        dtype=torch.int32,
+    )
+    static_indices = capture_indices.clone()
+    out = create_outputs(args)[0]
+
+    flydsl_gdr_decode(
+        query,
+        key,
+        value,
+        a,
+        b,
+        dt_bias,
+        A_log,
+        static_indices,
+        state_actual_vk,
+        out,
+        use_qk_l2norm=True,
+        need_shuffle_state=False,
+    )
+    state_actual_vk.copy_(initial_state_vk)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flydsl_gdr_decode(
+            query,
+            key,
+            value,
+            a,
+            b,
+            dt_bias,
+            A_log,
+            static_indices,
+            state_actual_vk,
+            out,
+            use_qk_l2norm=True,
+            need_shuffle_state=False,
+        )
+
+    state_actual_vk.copy_(initial_state_vk)
+    static_indices.copy_(replay_indices)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    out_ref = create_outputs(args)[0]
+    state_ref_kv = initial_state_vk.transpose(-1, -2).contiguous()
+    run_triton_kernel(
+        out_ref,
+        A_log,
+        dt_bias,
+        query,
+        key,
+        value,
+        a,
+        b,
+        state_ref_kv,
+        replay_indices,
+        float(1.0 / (args.head_k_dim**0.5)),
+        True,
+    )
+    state_ref_vk = state_ref_kv.transpose(-1, -2)
+
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(
+        state_actual_vk,
+        state_ref_vk,
+        atol=1e-3,
+        rtol=1e-3,
+    )
