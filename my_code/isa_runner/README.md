@@ -19,14 +19,14 @@ installed in that image.
 ```bash
 cd /data/yanguahe/code/wk_sp1/aiter/my_code/isa_runner
 
-python isa_runner.py inspect smoke_gfx1250.s               # assemble + verify order
-python isa_runner.py run     smoke_gfx1250.s --smoke       # launch, check sentinel
-python isa_runner.py bench   smoke_gfx1250.s --smoke --iters 200 --json
+python isa_runner.py smoke_gfx1250.s                       # assemble + verify order
+python isa_runner.py smoke_gfx1250.s --smoke               # launch exactly once
+python isa_runner.py smoke_gfx1250.s --smoke --iters 200 --json
 
 # reassemble the real gemm1 kernel and confirm nothing was reordered
-python isa_runner.py inspect \
+python isa_runner.py \
   ../isa_cmp/w1/gemm_a8w4_tdm_t64x256x256_w1x4_b3_e384_afp8_outbf16_silu_bias1_qout0_qrep1_v1/21_final_isa.s \
-  --verify-order --json
+  --json
 ```
 
 Exit codes: `0` ok, `1` build/load error, `2` instruction order changed,
@@ -120,25 +120,26 @@ The gemm1 TDM kernel's profile is recorded in `isa_runner.py` as
 `TDM_GEMM1_BLOCK = (128, 1, 1)` and `TDM_GEMM1_LDS_BYTES = 159744`, taken from
 `19_gpu_module_to_binary.mlir` (`threads in (%4,1,1)` with `%4 = 128`,
 `dynamic_shared_memory_size %3` with `%3 = 159744`). That kernel takes 15
-arguments and is **not** launched at this stage — argument initialisation is a
-later adapter. Reassembling and loading it is covered, though, which is what
-proves the toolchain path works on a real kernel.
+arguments and is **not** launched by the generic runner at this stage;
+`tdm_adapter.py` captures its real arguments and performs that launch.
+Reassembling and loading it is covered here, which proves the toolchain path
+works on a real kernel.
 
 ## Verifying nothing moved
 
-`--verify-order` disassembles the built object and compares the mnemonic
-sequence with the source. Operand syntax and `_e32`/`_e64` suffixes are
-normalised away; an insertion, deletion or reorder is reported with the index
-and surrounding context. This is the guard that the assembler did not
-reschedule anything.
+Every `isa_runner.py <source.s>` invocation disassembles the built object and
+compares its mnemonic sequence with the source before any optional launch.
+Operand syntax and `_e32`/`_e64` suffixes are normalised away; an insertion,
+deletion or reorder is reported with the index and surrounding context. A
+failed order check prevents `--smoke` from launching.
 
 ## Iterating on a kernel
 
 1. Copy the `21_final_isa.s` you want to modify.
 2. Edit instructions. Keep `.amdhsa_next_free_vgpr`/`_sgpr` ≥ what you use.
-3. `python isa_runner.py inspect edited.s --verify-order` — catches typos and
-   any reordering.
-4. `python isa_runner.py run edited.s --kernel <name>` once inputs exist.
+3. `python isa_runner.py edited.s` — catches syntax errors and any reordering.
+4. Use `tdm_adapter.py replay --which gemm1 --isa edited.s` to launch a real
+   TDM GEMM with captured production inputs.
 
 Builds are cached in `~/.isa_runner_cache` keyed by source hash + arch; use
 `--force` to rebuild. Binary `.text` patching is only a fallback for same-size
@@ -157,40 +158,46 @@ production path once, and records the device pointers the kernel really got.
 cd /data/yanguahe/code/wk_sp1/aiter        # repo root: shadows /app/aiter
 K=my_code/isa_cmp/w1/<kernel>/21_final_isa.s
 
-# sanity: identical ISA on both sides must be bit-exact
+# sanity: compare the unmodified candidate with the captured production gemm1
 python my_code/isa_runner/tdm_adapter.py replay --which gemm1 \
-    --isa $K --reference-isa $K --out r.json
+    --isa "$K" --out r.json
 
-# edit, then compare against the unmodified dump
+# edit, then compare the candidate against production
 python my_code/isa_runner/make_variant.py $K edited.s --wait-after-wmma
 python my_code/isa_runner/tdm_adapter.py replay --which gemm1 \
-    --isa edited.s --reference-isa $K --iters 100 --out r.json
+    --isa edited.s --iters 100 --out r.json
 python my_code/isa_runner/show_report.py r.json
 ```
 
-Capture and replay must be in the **same process** — the pointers are device
-addresses, so a saved JSON is metadata only.
+Production capture and candidate replay must be in the **same process** — the
+pointers are device addresses, so a saved JSON is metadata only. `--which
+gemm2` selects the no-activation production dispatch and applies the same flow;
+the candidate ISA must match the selected kernel's signature and launch shape.
 
-### Why the reference is another ISA run
+### The production kernel is the reference
 
-`--reference-isa` is launched through the identical path first, and its output
-is the reference. Comparing against the tensor left behind by the torch run does
-not work: `i32_m` is the `align_m`-padded row count (49152 for 24576 real
-routes), the kernel skips padding tiles, and those rows hold uninitialised
-values near `FLT_MAX`. Both norms then overflow to `inf` and `rel_l2` is `NaN`.
-With an ISA-vs-ISA reference the skipped rows hold the same poison value on both
-sides and cancel exactly.
+Immediately before the selected production GEMM launches, the adapter fills its
+output with `_POISON` and synchronizes. It then invokes the real production
+launch, synchronizes as soon as that launch returns, and clones the output
+before the rest of the fused MoE can reuse or modify it. The candidate receives
+the captured arguments and its output is filled with `_POISON` again before its
+launch.
 
-Validated on c9-3: same ISA both sides → `rel_l2 = 0.0`, `passed: true`, with
-`reference_wrote_elems` exactly half the buffer. Negative control (drop one of
-96 WMMA) → `rel_l2 = 7.4e-4`, `max_abs_diff = 98.0`, `passed: false`.
+Padding is detected from the poison masks in the output's original dtype.
+This matters for BF16: `-12345.0` is represented as `-12352.0`, so converting
+to float before comparing with the source literal would miss every sentinel.
+Positions that remain poison in both outputs are skipped. All other positions
+are checked: production-written positions still poisoned by the candidate are
+reported as `missing_writes`, and candidate writes in production padding are
+reported as `unexpected_writes`; either condition fails the run.
 
 ### Gotchas the adapter handles
 
-- **Pin the inputs.** `ptr_arg` keeps only a raw pointer, so once the
-  production call returns, torch's caching allocator reuses those buffers and
-  the replay silently reads freed memory (NaN, not an error). The adapter holds
-  references to every captured tensor.
+- **Pin every captured tensor.** `ptr_arg` keeps only a raw pointer, so once the
+  production call returns, torch's caching allocator can reuse those buffers
+  and replay silently reads freed memory (NaN, not an error). The adapter keeps
+  the wrapper tensors alive and resolves `arg_c` back to its live torch output;
+  capture fails explicitly if that output cannot be found.
 - **Dynamic LDS is computed, not guessed.** `arena_bytes()` mirrors the
   frontend's arena math; it reproduces both the kernel's own `ARENA=158208` log
   and the `dynamic_shared_memory_size 159744` in the MLIR (the same arena after
@@ -205,7 +212,19 @@ Validated on c9-3: same ISA both sides → `rel_l2 = 0.0`, `passed: true`, with
 
 ## Timing
 
-`bench` uses HIP events around a loop of launches, so the number is
-**dispatch-level** and includes launch overhead. The module stays loaded across
-iterations, so load cost is excluded. For single-wave cycle counts, put
-`s_get_shader_cycles_u64` in the ISA itself and write the delta to a buffer.
+`--smoke --iters N` and the library-level `IsaModule.benchmark()` use HIP
+events around a loop of launches, so the number is **dispatch-level** and
+includes queue-visible launch overhead. The module stays loaded across
+iterations, so load cost is excluded. The smoke CLI uses no hidden warmup:
+`--iters 200` launches exactly 200 times.
+
+`tdm_adapter.py --iters N` matches FlyDSL
+`tests/kernels/benchmark_common.py::bench_kernel_us`: it flushes L2 and
+poison-fills the output before each launch, records a separate torch CUDA event
+pair around each kernel only, removes IQR outliers, and reports the median as
+`per_launch_us`. Warmups use the same preparation but are excluded from the
+samples. L2 flushing is on by default; pass `--no-flush-l2` to measure hot-L2
+latency instead.
+
+For single-wave cycle counts, put `s_get_shader_cycles_u64` in the ISA itself
+and write the delta to a buffer.

@@ -2,15 +2,14 @@
 """Assemble a gfx1250 .s into a loadable code object and launch it via HIP.
 
 This bypasses LLVM IR optimisation, register allocation and machine scheduling:
-LLVM MC is used only as an assembler, so what you write is what runs. Verify
-that with ``inspect`` / ``--verify-order``, which disassemble the built object
-and diff the instruction sequence against the source.
+LLVM MC is used only as an assembler, so what you write is what runs. Every CLI
+invocation disassembles the built object and verifies its instruction order
+against the source before optionally loading it.
 
-    python isa_runner.py build   smoke_gfx1250.s
-    python isa_runner.py inspect smoke_gfx1250.s
-    python isa_runner.py run     smoke_gfx1250.s --smoke
-    python isa_runner.py bench   smoke_gfx1250.s --smoke --iters 200
-    python isa_runner.py inspect ../isa_cmp/w1/<kernel>/21_final_isa.s --verify-order
+    python isa_runner.py smoke_gfx1250.s
+    python isa_runner.py smoke_gfx1250.s --smoke
+    python isa_runner.py smoke_gfx1250.s --smoke --iters 200
+    python isa_runner.py ../isa_cmp/w1/<kernel>/21_final_isa.s --json
 
 As a library::
 
@@ -469,11 +468,15 @@ class IsaModule:
 
 def run_smoke(module: IsaModule, kernel: str = "isa_smoke", *,
               blocks: int = 4, block_size: int = 64, sentinel: int = 0x5A5A0000,
-              iters: int = 0, warmup: int = 20) -> dict:
-    """Launch the smoke kernel and check every element equals sentinel + gid.
+              iters: int = 1) -> dict:
+    """Launch exactly *iters* times, then check sentinel + gid output.
 
-    Allocates through HIP directly so the check does not depend on torch.
+    Allocates through HIP directly so the check does not depend on torch. The
+    launches are one HIP-event timed region with no warmup launches.
     """
+    if iters < 1:
+        raise IsaRunnerError(f"smoke iterations must be at least 1, got {iters}")
+
     hip = _Hip()
     n = blocks * block_size
     nbytes = n * 4
@@ -485,8 +488,7 @@ def run_smoke(module: IsaModule, kernel: str = "isa_smoke", *,
         args = [ctypes.c_uint64(buf.value), ctypes.c_uint32(sentinel),
                 ctypes.c_uint32(block_size), ctypes.c_uint32(n)]
 
-        module.launch(kernel, args, spec)
-        module.synchronize()
+        timing = module.benchmark(kernel, args, spec, iters=iters, warmup=0)
 
         host = (ctypes.c_uint32 * n)()
         hip.check(hip.lib.hipMemcpyDtoH(ctypes.cast(host, ctypes.c_void_p), buf, nbytes))
@@ -496,16 +498,15 @@ def run_smoke(module: IsaModule, kernel: str = "isa_smoke", *,
 
         result = {
             "kernel": kernel,
+            "launches": iters,
             "elements": n,
             "sentinel": hex(sentinel),
             "passed": not bad,
             "mismatches": len(bad),
             "first_mismatches": bad[:8],
             "sample": [hex(x) for x in got[:4]],
+            "benchmark": timing,
         }
-        if iters and not bad:
-            result["benchmark"] = module.benchmark(
-                kernel, args, spec, iters=iters, warmup=warmup)
         return result
     finally:
         hip.lib.hipFree(buf)
@@ -530,7 +531,6 @@ def _emit(obj: dict, as_json: bool, path: str | None = None):
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("command", choices=["build", "inspect", "run", "bench"])
     p.add_argument("source", help="path to the .s file")
     p.add_argument("--arch", default=DEFAULT_ARCH)
     p.add_argument("--kernel", help="kernel name (default: the only one found)")
@@ -538,37 +538,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--force", action="store_true", help="ignore the build cache")
     p.add_argument("--json", action="store_true")
     p.add_argument("--out", help="also write the result JSON here")
-    p.add_argument("--verify-order", action="store_true",
-                   help="diff disassembly against source mnemonics")
     p.add_argument("--disasm", help="write the disassembly to this path")
     p.add_argument("--smoke", action="store_true",
-                   help="run/bench the built-in smoke check")
+                   help="load and run the built-in smoke check")
     p.add_argument("--blocks", type=int, default=4)
     p.add_argument("--block-size", type=int, default=64)
-    p.add_argument("--iters", type=int, default=100)
-    p.add_argument("--warmup", type=int, default=20)
+    p.add_argument("--iters", type=int, default=None, metavar="N",
+                   help="exact smoke launch count (default: 1; requires --smoke)")
     args = p.parse_args(argv)
+
+    if args.iters is not None and not args.smoke:
+        p.error("--iters requires --smoke")
+    iters = 1 if args.iters is None else args.iters
+    if iters < 1:
+        p.error("--iters must be at least 1")
 
     try:
         res = build(args.source, args.arch, force=args.force)
-    except IsaRunnerError as e:
-        print(f"[isa_runner] build failed: {e}", file=sys.stderr)
-        return 1
-
-    report: dict[str, Any] = res.as_dict()
-
-    if args.command in ("inspect", "build") or args.verify_order or args.disasm:
+        report: dict[str, Any] = res.as_dict()
         if args.disasm:
             Path(args.disasm).write_text(disassemble(res.code_object, args.arch))
             report["disasm_path"] = args.disasm
-        if args.verify_order or args.command == "inspect":
-            report["verify_order"] = verify_order(
-                res.source, res.code_object, args.arch)
+        report["verify_order"] = verify_order(
+            res.source, res.code_object, args.arch)
+    except IsaRunnerError as e:
+        print(f"[isa_runner] build/verify failed: {e}", file=sys.stderr)
+        return 1
 
-    if args.command in ("build", "inspect"):
+    if not report["verify_order"]["ok"]:
         _emit(report, args.json, args.out)
-        ok = report.get("verify_order", {"ok": True})["ok"]
-        return 0 if ok else 2
+        return 2
+
+    if not args.smoke:
+        _emit(report, args.json, args.out)
+        return 0
 
     kernel = args.kernel
     if not kernel:
@@ -583,15 +586,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             report["loaded"] = True
             mod.function(kernel)
             report["symbol_found"] = kernel
-            if args.smoke:
-                report["smoke"] = run_smoke(
-                    mod, kernel, blocks=args.blocks, block_size=args.block_size,
-                    iters=args.iters if args.command == "bench" else 0,
-                    warmup=args.warmup)
-            elif args.command == "bench":
-                print("[isa_runner] bench without --smoke needs explicit args; "
-                      "use the IsaModule API", file=sys.stderr)
-                return 1
+            report["smoke"] = run_smoke(
+                mod, kernel, blocks=args.blocks, block_size=args.block_size,
+                iters=iters)
     except IsaRunnerError as e:
         report["error"] = str(e)
         _emit(report, args.json, args.out)

@@ -11,18 +11,16 @@ pointers and scalars the kernel was actually called with. Those exact arguments
 are then replayed into a code object built by isa_runner from a .s file, so a
 hand-edited ISA runs against production data.
 
-    # capture once, then replay a hand-edited kernel against it
-    python tdm_adapter.py capture --out capture.json
-    python tdm_adapter.py replay --capture capture.json --isa edited.s --check
+    python tdm_adapter.py replay --which gemm1 --isa edited.s
 
-The buffers live on the GPU only for the lifetime of the process, so capture
-and replay must happen in the same run; ``run`` does both.
+The buffers live on the GPU only for the lifetime of the process, so production
+capture and candidate replay always happen in the same invocation.
 
     python tdm_adapter.py run --isa edited.s --iters 100
 
-Correctness is checked against the *captured output buffer*: the reference is
-produced by the unmodified kernel in the same process, on the same inputs, so a
-mismatch means the ISA edit changed behaviour and nothing else.
+Correctness is checked against the selected production kernel's output, cloned
+immediately after that launch. A mismatch therefore means the candidate ISA
+changed the selected GEMM's behaviour.
 """
 
 from __future__ import annotations
@@ -71,9 +69,10 @@ KERNARG_LAYOUT = [
 ]
 KERNARG_SIZE = 104
 
-# Written into the output before replay: a value the kernel would never
-# produce, so "never written" is distinguishable from "wrote zero".
+# Written before both production and candidate launches: a value the kernel
+# would never produce, so "never written" differs from "wrote zero".
 _POISON = -12345.0
+_REL_L2_TOL = 1e-6
 
 
 def arena_bytes(tile_m, tile_n, tile_k, num_buffers, m_warp=1, n_warp=4,
@@ -115,8 +114,7 @@ class Capture:
     out_nbytes: int
     lds_bytes: int = 0
     tiles: dict[str, int] = field(default_factory=dict)
-    reference: Any = field(default=None, repr=False)  # torch tensor clone
-    reference_isa: Any = field(default=None, repr=False)  # unmodified .s
+    reference: Any = field(default=None, repr=False)  # production tensor clone
 
     def to_json(self) -> dict:
         return {
@@ -165,6 +163,114 @@ def _ptr_of(v) -> int:
     raise IsaRunnerError(f"cannot extract device pointer from {type(v)}")
 
 
+def _find_output_tensor(arg_c, keepalive):
+    """Find the live torch output whose device pointer was passed as arg_c."""
+    import torch
+
+    target_ptr = _ptr_of(arg_c)
+    seen: set[int] = set()
+
+    def tensors_in(value):
+        if value is None or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, torch.Tensor):
+            yield value
+            return
+        if isinstance(value, dict):
+            for child in value.values():
+                yield from tensors_in(child)
+            return
+        if isinstance(value, (list, tuple)):
+            for child in value:
+                yield from tensors_in(child)
+            return
+        # FlyDSL argument wrappers have used each of these names.
+        for attr in ("tensor", "_tensor", "obj"):
+            yield from tensors_in(getattr(value, attr, None))
+
+    for root in (arg_c, *reversed(keepalive)):
+        for tensor in tensors_in(root):
+            if int(tensor.data_ptr()) == target_ptr:
+                return tensor
+
+    raise IsaRunnerError(
+        "cannot find a live torch output tensor for "
+        f"arg_c pointer 0x{target_ptr:x} in arg_c or the capture keepalive"
+    )
+
+
+def _poison_mask(tensor):
+    """Return a poison mask without converting away the tensor's dtype."""
+    # In bf16, -12345.0 is stored as -12352.0. Constructing the scalar in the
+    # tensor's dtype is therefore required before comparing.
+    return tensor.eq(tensor.new_full((), _POISON))
+
+
+def _compare_outputs(reference, candidate) -> dict[str, Any]:
+    """Compare production and candidate outputs with poison-aware padding."""
+    import torch
+
+    if reference.shape != candidate.shape:
+        raise IsaRunnerError(
+            f"output shape changed: production={tuple(reference.shape)}, "
+            f"candidate={tuple(candidate.shape)}"
+        )
+    if reference.dtype != candidate.dtype:
+        raise IsaRunnerError(
+            f"output dtype changed: production={reference.dtype}, "
+            f"candidate={candidate.dtype}"
+        )
+    if reference.device != candidate.device:
+        raise IsaRunnerError(
+            f"output device changed: production={reference.device}, "
+            f"candidate={candidate.device}"
+        )
+
+    production_poison = _poison_mask(reference)
+    candidate_poison = _poison_mask(candidate)
+    padding = production_poison & candidate_poison
+    missing = (~production_poison) & candidate_poison
+    unexpected = production_poison & (~candidate_poison)
+    compared = ~padding
+
+    # Determine poison status above in the original dtype. Float conversion is
+    # safe only after the masks have captured the representable sentinel value.
+    production_f = reference.float()
+    candidate_f = candidate.float()
+    zeros = torch.zeros_like(production_f)
+    delta = torch.where(padding, zeros, candidate_f - production_f)
+    base = torch.where(padding, zeros, production_f)
+    denom = base.norm().item() or 1.0
+    rel_l2 = delta.norm().item() / denom
+    max_abs_diff = delta.abs().max().item() if delta.numel() else 0.0
+
+    production_wrote = int((~production_poison).sum().item())
+    candidate_wrote = int((~candidate_poison).sum().item())
+    skipped_padding = int(padding.sum().item())
+    compared_elems = int(compared.sum().item())
+    missing_writes = int(missing.sum().item())
+    unexpected_writes = int(unexpected.sum().item())
+    return {
+        "production_wrote_elems": production_wrote,
+        "candidate_wrote_elems": candidate_wrote,
+        "skipped_padding_elems": skipped_padding,
+        "compared_elems": compared_elems,
+        "rel_l2": rel_l2,
+        "max_abs_diff": max_abs_diff,
+        # Keep the old name in reports while making the failure mode explicit.
+        "still_poisoned": missing_writes,
+        "missing_writes": missing_writes,
+        "unexpected_writes": unexpected_writes,
+        "passed": bool(
+            rel_l2 < _REL_L2_TOL
+            and missing_writes == 0
+            and unexpected_writes == 0
+            and compared_elems > 0
+        ),
+    }
+
+
 def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
                      experts: int = 384, topk: int = 6,
                      model_dim: int = 7168, inter_dim: int = 768) -> Capture:
@@ -187,12 +293,10 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
                  ("AITER_TDM_TILE_K2", "128"), ("AITER_TDM_NUM_BUFFERS2", "3")):
         os.environ.setdefault(k, v)
 
-    import flydsl.compiler as flyc
-
     records: list[Capture] = []
 
     # Everything the kernel reads must outlive run_moe: the kernel-level args
-    # are raw pointers (ptr_arg), so without a reference torch's caching
+    # are raw pointers (ptr_arg), so without a Python reference torch's caching
     # allocator reuses those buffers and the replay reads freed memory --
     # which shows up as a NaN result, not as an error. Hold the tensors from
     # the wrapper, which still has them as tensors.
@@ -230,9 +334,18 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
         n_tiles = (N + tile_n - 1) // tile_n
 
         # gemm1 is the activated stage, gemm2 is noact.
-        want_silu = which == "gemm1"
-        if (stage1_act != 0) == want_silu and not records:
-            records.append(Capture(
+        want_activated = which == "gemm1"
+        if (stage1_act != 0) == want_activated and not records:
+            out_tensor = _find_output_tensor(arg_c, keepalive)
+            keepalive.append(out_tensor)
+
+            # Establish known padding before the real production dispatch.
+            # A device-wide sync also orders this torch fill before a FlyDSL
+            # launch even if the caller supplied a different stream object.
+            out_tensor.fill_(_POISON)
+            torch.cuda.synchronize(out_tensor.device)
+
+            record = Capture(
                 kernel=name,
                 grid=(m_tiles * n_tiles, 1, 1),
                 block=(block, 1, 1),
@@ -254,21 +367,34 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
                 tiles={"tile_m": tile_m, "tile_n": tile_n, "tile_k": tile_k,
                        "num_buffers": num_buffers, "m_warp": m_warp,
                        "n_warp": n_warp},
-            ))
-            records[-1]._out_tensor = arg_c  # keep alive; sized after the run
-        return real_launch(
+            )
+            record._out_tensor = out_tensor
+            record.out_nbytes = out_tensor.numel() * out_tensor.element_size()
+            records.append(record)
+        else:
+            record = None
+
+        result = real_launch(
             arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, i32_m, stream, N, K,
             tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
             a_is_fp4, arg_m_tile_map, n_experts, stage1_act, has_bias, arg_bias,
             f32_swiglu_limit, stage1_quant_out, quant_wmma_rep, arg_quant_scale,
             **kw)
+        if record is not None:
+            # Capture the selected GEMM immediately. Waiting for run_moe to
+            # return is too late because later fused stages may reuse or modify
+            # this buffer.
+            torch.cuda.synchronize(out_tensor.device)
+            record.reference = out_tensor.detach().clone()
+            torch.cuda.synchronize(out_tensor.device)
+        return result
 
     tdm_mod.launch_gemm_a8w4_tdm = spy
     bgm.flydsl_grouped_gemm_a8w4_masked = grouped_spy
     # batched_gemm_mxfp4 imports launch_gemm_a8w4_tdm inside the function body,
     # so the module-level patch above is picked up on the next call.
     try:
-        _run_reference_moe(tokens, experts, topk, model_dim, inter_dim)
+        _run_production_moe(tokens, experts, topk, model_dim, inter_dim)
     finally:
         tdm_mod.launch_gemm_a8w4_tdm = real_launch
         bgm.flydsl_grouped_gemm_a8w4_masked = real_grouped
@@ -279,9 +405,14 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
     cap = records[0]
     cap._keepalive = keepalive  # inputs must stay allocated for the replay
     t = getattr(cap, "_out_tensor", None)
-    if t is not None and hasattr(t, "numel"):
-        cap.out_nbytes = t.numel() * t.element_size()
-        cap.reference = t.detach().clone()
+    if t is None or not hasattr(t, "numel"):
+        raise IsaRunnerError(
+            f"captured {which} arg_c but could not retain its torch output tensor"
+        )
+    if cap.reference is None:
+        raise IsaRunnerError(
+            f"captured {which} launch but no immediate production output clone"
+        )
 
     # Fail loudly if a captured pointer no longer belongs to a live tensor.
     live_ptrs = {int(x.data_ptr()) for x in keepalive
@@ -293,7 +424,7 @@ def capture_launches(which: str = "gemm1", *, tokens: int = 4096,
     return cap
 
 
-def _run_reference_moe(tokens, experts, topk, model_dim, inter_dim):
+def _run_production_moe(tokens, experts, topk, model_dim, inter_dim):
     """Drive one production MoE call with the standard bench shapes.
 
     Reuses the op_test's data prep (preshuffle, scales, routing) rather than
@@ -319,89 +450,172 @@ def _launch_into(cap: Capture, isa_source, name_hint, spec, device, live):
     import torch
     res = build(isa_source)
     name = name_hint or (res.kernels[0] if len(res.kernels) == 1 else cap.kernel)
-    if live is not None:
-        live.fill_(_POISON)
-        torch.cuda.synchronize()
+    if live is None:
+        raise IsaRunnerError("no output tensor captured; rerun capture in-process")
+    live.fill_(_POISON)
+    torch.cuda.synchronize(live.device)
     mod = IsaModule(res.code_object, device=device, source=res.source)
     mod.function(name)
     mod.launch(name, cap.pack_kernargs(), spec)
     mod.synchronize()
-    torch.cuda.synchronize()
+    torch.cuda.synchronize(live.device)
     return mod, name, res
+
+
+def _iqr_trimmed_median_us(latencies_us):
+    """Match FlyDSL's benchmark_common IQR filter and upper median."""
+    values = sorted(float(value) for value in latencies_us)
+    if not values:
+        raise IsaRunnerError("cannot summarize an empty benchmark")
+    raw_count = len(values)
+    if raw_count >= 8:
+        q1, q3 = values[raw_count // 4], values[3 * raw_count // 4]
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        filtered = [value for value in values if lo <= value <= hi]
+        if filtered:
+            values = filtered
+    return values[len(values) // 2], raw_count, len(values)
+
+
+def _benchmark_like_flydsl(
+    mod,
+    name,
+    args,
+    spec,
+    live,
+    *,
+    iters,
+    warmup,
+    flush_l2,
+):
+    """Use the FlyDSL MoE test's per-iteration event/median methodology."""
+    import torch
+
+    if iters < 1:
+        raise IsaRunnerError(f"benchmark iterations must be at least 1, got {iters}")
+    if warmup < 0:
+        raise IsaRunnerError(f"benchmark warmup must be non-negative, got {warmup}")
+
+    stream = torch.cuda.current_stream(live.device)
+    stream_ptr = int(stream.cuda_stream)
+    if int(spec.stream) != stream_ptr:
+        raise IsaRunnerError(
+            f"benchmark stream mismatch: HIP=0x{int(spec.stream):x}, "
+            f"torch=0x{stream_ptr:x}"
+        )
+
+    flush_buf = None
+    flush_bytes = 0
+    if flush_l2:
+        props = torch.cuda.get_device_properties(live.device)
+        l2_bytes = getattr(props, "L2_cache_size", 4 * 1024 * 1024)
+        flush_bytes = max(int(l2_bytes) * 2, 8 * 1024 * 1024)
+        flush_buf = torch.empty(
+            flush_bytes, dtype=torch.uint8, device=live.device
+        )
+
+    def prepare():
+        if flush_buf is not None:
+            flush_buf.zero_()
+        # Like the FlyDSL test's output zeroing, this is outside the timed
+        # interval and gives every launch the same destination state.
+        live.fill_(_POISON)
+
+    for _ in range(warmup):
+        prepare()
+        mod.launch(name, args, spec)
+    torch.cuda.synchronize(live.device)
+
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        prepare()
+        starts[i].record(stream)
+        mod.launch(name, args, spec)
+        ends[i].record(stream)
+    torch.cuda.synchronize(live.device)
+
+    latencies = [
+        starts[i].elapsed_time(ends[i]) * 1e3 for i in range(iters)
+    ]
+    median_us, raw_count, filtered_count = _iqr_trimmed_median_us(latencies)
+    return {
+        "kernel": name,
+        "iters": iters,
+        "warmup": warmup,
+        "timer": "torch_cuda_events_per_iteration",
+        "statistic": "iqr_trimmed_median",
+        "flush_l2": bool(flush_l2),
+        "l2_flush_bytes": flush_bytes,
+        "sample_count": raw_count,
+        "filtered_sample_count": filtered_count,
+        "min_us": min(latencies),
+        "max_us": max(latencies),
+        "per_launch_us": median_us,
+        "grid": list(spec.grid),
+        "block": list(spec.block),
+        "shared_mem_bytes": spec.shared_mem_bytes,
+    }
 
 
 def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
            device: int = 0, lds_bytes: int | None = None,
-           iters: int = 0, warmup: int = 20, check: bool = True,
-           reference_isa: str | Path | None = None) -> dict:
+           iters: int = 0, warmup: int = 20,
+           flush_l2: bool = True) -> dict:
     """Launch *isa_source* with the captured arguments.
 
-    The reference is produced by launching *reference_isa* (the unmodified dump)
-    through this same path first. That makes the comparison self-consistent:
-    the padded rows the kernel skips keep the poison value in both runs and
-    compare equal, so no heuristic mask is needed. Comparing against the tensor
-    left by the torch run instead does not work -- its skipped rows hold
-    uninitialised garbage near FLT_MAX, and both norms overflow to inf.
+    The reference is the selected production output cloned immediately after
+    its real launch. Both launches begin with the same poison fill. Positions
+    left poison by both are padding; missing and unexpected writes fail.
     """
     import torch
 
     live = getattr(cap, "_out_tensor", None)
-    if check and live is None:
+    if live is None:
         raise IsaRunnerError("no output tensor captured; rerun capture in-process")
+    if cap.reference is None:
+        raise IsaRunnerError(
+            "no production output captured; rerun capture in-process"
+        )
 
+    torch_stream = torch.cuda.current_stream(live.device)
     spec = KernelLaunchSpec(
         grid=cap.grid, block=cap.block,
         shared_mem_bytes=(lds_bytes if lds_bytes is not None else cap.lds_bytes),
+        stream=int(torch_stream.cuda_stream),
         device=device,
     )
     report: dict[str, Any] = {
         "grid": list(spec.grid), "block": list(spec.block),
         "shared_mem_bytes": spec.shared_mem_bytes,
         "capture": cap.to_json(),
+        "reference": "production",
+        "production_kernel": cap.kernel,
     }
     unpinned = getattr(cap, "args_not_pinned", None)
     if unpinned:
         # Reading recycled memory yields NaN rather than an error, so surface it.
         report["args_not_pinned"] = unpinned
 
-    ref_t = None
-    if check:
-        ref_isa = reference_isa or cap.reference_isa
-        if ref_isa is None:
-            raise IsaRunnerError("--reference-isa is required for --check")
-        rmod, rname, rres = _launch_into(cap, ref_isa, None, spec, device, live)
-        ref_t = live.detach().clone()
-        rmod.close()
-        report["reference_isa"] = str(rres.source)
-        report["reference_kernel"] = rname
-        report["reference_wrote_elems"] = int(
-            (ref_t != _POISON).sum().item())
-
     mod, name, res = _launch_into(cap, isa_source, kernel, spec, device, live)
     report["isa"], report["kernel"] = str(res.source), name
     try:
-        if check:
-            got = live.float()
-            ref = ref_t.float()
-            same_poison = (got == _POISON) & (ref == _POISON)
-            report["skipped_padding_elems"] = int(same_poison.sum().item())
-            report["compared_elems"] = int((~same_poison).sum().item())
-
-            d = torch.where(same_poison, torch.zeros_like(ref), got - ref)
-            base = torch.where(same_poison, torch.zeros_like(ref), ref)
-            denom = base.norm().item() or 1.0
-            rel_l2 = d.norm().item() / denom
-            report["rel_l2"] = rel_l2
-            report["max_abs_diff"] = d.abs().max().item()
-            report["still_poisoned"] = int(
-                ((got == _POISON) & (ref != _POISON)).sum().item())
-            report["passed"] = bool(rel_l2 < 1e-6
-                                    and report["still_poisoned"] == 0
-                                    and report["compared_elems"] > 0)
+        got = live.detach().clone()
+        torch.cuda.synchronize(live.device)
+        report.update(_compare_outputs(cap.reference, got))
 
         if iters:
-            report["benchmark"] = mod.benchmark(
-                name, cap.pack_kernargs(), spec, iters=iters, warmup=warmup)
+            report["benchmark"] = _benchmark_like_flydsl(
+                mod,
+                name,
+                cap.pack_kernargs(),
+                spec,
+                live,
+                iters=iters,
+                warmup=warmup,
+                flush_l2=flush_l2,
+            )
     finally:
         mod.close()
 
@@ -419,13 +633,15 @@ def main(argv=None) -> int:
                                      " per-process and cannot be reused)")
     p.add_argument("--out", help="write the report JSON here")
     p.add_argument("--lds-bytes", type=int)
-    p.add_argument("--reference-isa",
-                   help="unmodified .s used to produce the reference output; "
-                        "required with --check")
     p.add_argument("--iters", type=int, default=0)
     p.add_argument("--warmup", type=int, default=20)
-    p.add_argument("--check", action="store_true", default=True)
-    p.add_argument("--no-check", dest="check", action="store_false")
+    p.add_argument(
+        "--no-flush-l2",
+        "--no_flush_l2",
+        dest="no_flush_l2",
+        action="store_true",
+        help="disable the FlyDSL-style L2 flush before each timed launch",
+    )
     p.add_argument("--tokens", type=int, default=4096)
     p.add_argument("--experts", type=int, default=384)
     p.add_argument("--topk", type=int, default=6)
@@ -445,8 +661,8 @@ def main(argv=None) -> int:
             return 1
         report = replay(cap, args.isa, kernel=args.kernel,
                         lds_bytes=args.lds_bytes, iters=args.iters,
-                        warmup=args.warmup, check=args.check,
-                        reference_isa=args.reference_isa)
+                        warmup=args.warmup,
+                        flush_l2=not args.no_flush_l2)
 
     text = json.dumps(report, indent=2)
     print(text)
