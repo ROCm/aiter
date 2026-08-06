@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
+  DOCKER_IMAGE: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
   GPU_ARCH_LIST: "gfx942;gfx950"
   AITER_TEST: "op_tests"
   AITER_WHEEL_ARTIFACT_NAME: aiter-whl-${{ github.run_id }}
@@ -62,7 +62,7 @@ jobs:
             docker_image: "rocm/pytorch:rocm7.2.4_ubuntu22.04_py3.10_pytorch_release_2.10.0"
             build_enabled: ${{ github.ref == 'refs/heads/main' }}
           - python_version: "3.12"
-            docker_image: "rocm/pytorch:latest"
+            docker_image: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
             build_enabled: true
     steps:
       # ---- Common steps (fork and non-fork) ----
@@ -354,7 +354,7 @@ jobs:
     needs: check-signal
     uses: ./.github/workflows/prepare-triton-wheel.yaml
     with:
-      docker-image: rocm/pytorch:latest
+      docker-image: rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
       artifact-name: triton_wheelhouse
       retention-days: 3
 
@@ -400,35 +400,35 @@ jobs:
             label: MI35X
             shard_total: 8
             shard_idx: 7
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 0
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 1
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 2
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 3
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 4
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 5
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 6
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
             shard_total: 8
             shard_idx: 7
@@ -700,7 +700,7 @@ jobs:
           echo "Checking Standard Test Results..."
           all_passed=true
           for shard in {0..7}; do
-            for runner in {linux-aiter-mi35x-1,aiter-1gpu-runner}; do
+            for runner in {linux-aiter-mi35x-1,linux-aiter-oci-mi300x-1}; do
               if [ ! -f standard-test-log-${runner}-shard-${shard}/latest_test.log ]; then
                 echo "Test report for ${runner} shard ${shard} not found."
                 all_passed=false
@@ -723,8 +723,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: linux-aiter-mi35x-8
-            label: MI35X
+          - runner: linux-aiter-do-mi350x-8
+            label: MI350X
     runs-on: ${{ matrix.runner }}
 
     steps:
