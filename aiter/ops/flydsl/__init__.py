@@ -68,6 +68,7 @@ if is_flydsl_available():
         "flydsl_fp8_mqa_logits",
         "flydsl_gdr_decode",
         "flydsl_hgemm",
+        "flydsl_mla_reduce_v1",
         "flydsl_moe_stage1",
         "flydsl_moe_stage2",
         "flydsl_pa_mqa_logits_fp4",
