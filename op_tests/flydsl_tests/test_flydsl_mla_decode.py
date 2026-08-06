@@ -11,7 +11,28 @@ import random
 import pytest
 import torch
 
+pytest.importorskip("flydsl")
+from aiter.ops.flydsl import is_flydsl_available
 from aiter.ops.flydsl.mla_decode import flydsl_mla_decode
+
+if not is_flydsl_available():
+    pytest.skip("flydsl is not available", allow_module_level=True)
+
+
+def _is_gfx1250() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:  # noqa: BLE001
+        return False
+    return arch.lower().split(":")[0].startswith("gfx1250")
+
+
+pytestmark = pytest.mark.skipif(
+    not _is_gfx1250(),
+    reason="flydsl_mla_decode is gfx1250 only",
+)
 
 
 # need to update it for fp8 dtype
@@ -34,7 +55,7 @@ def shuffle_kv_buffer(
     # 16-bit dtypes use a (16, 8) lane layout on gfx1250.
     num_lanes, num_elements_per_thread = (16, 8)
 
-    num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
+    _num_blocks, block_size, num_kv_heads, head_size = kv_buffer.shape
     assert block_size >= 16
     assert block_size % num_lanes == 0
 
@@ -92,8 +113,7 @@ def _torch_mla_decode_ref(
     scale: float,
     kv_lora_rank: int,
 ) -> torch.Tensor:
-    """MLA decode golden. Returns [num_seqs, num_q_heads, kv_lora_rank].
-    """
+    """MLA decode golden. Returns [num_seqs, num_q_heads, kv_lora_rank]."""
     num_seqs, num_q_heads, head_size = query.shape
     _, block_size, num_kv_heads, qk_head_dim = kv_cache.shape
     assert head_size == qk_head_dim
@@ -181,6 +201,7 @@ def _generate_inputs(
 _KV_LORA_RANK = 512
 _QK_ROPE_HEAD_DIM = 64
 
+
 def _run_decode_case(
     *,
     num_seqs,
@@ -231,6 +252,7 @@ def _run_decode_case(
     assert not torch.isnan(output).any(), "output contains NaN"
     torch.testing.assert_close(output, ref, atol=1.5e-2, rtol=1e-2)
 
+
 # (num_seqs, ctx_len)
 _CASES = [
     (1, 200),
@@ -241,7 +263,8 @@ _CASES = [
 ]
 _BLOCK_SIZES = [16, 64, 128]
 
-_NUM_Q_HEADS = [16, 32, 48, 128]
+_NUM_Q_HEADS = [16, 32, 48, 64, 128]
+
 
 @pytest.mark.parametrize("num_seqs,ctx_len", _CASES)
 @pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
@@ -264,6 +287,7 @@ _LARGE_CASES = [
     (1024, 16384),
     (1024, 32768),
 ]
+
 
 @pytest.mark.parametrize("num_seqs,ctx_len", _LARGE_CASES)
 @pytest.mark.parametrize("num_q_heads", _NUM_Q_HEADS)
