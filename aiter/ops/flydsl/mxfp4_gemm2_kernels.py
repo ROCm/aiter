@@ -79,6 +79,14 @@ def _assert_supported(
     BN=256,
     BK=256,
 ):
+    if BN != 256:
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 native kernel requires BN=256, got BN={BN}"
+        )
+    if BK not in (128, 256):
+        raise NotImplementedError(
+            f"flydsl mxfp4 gemm2 native kernel BK must be one of (128, 256), got BK={BK}"
+        )
     if D_INTER % BK != 0:
         raise NotImplementedError(
             f"flydsl mxfp4 gemm2 contraction D_INTER (=inter_dim) must be a "
