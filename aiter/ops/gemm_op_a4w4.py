@@ -349,31 +349,25 @@ def _alloc_f4gemm_out_scale(
 ) -> Tensor | None:
     """Allocate the mxfp8 output E8M0 block-scale buffer (``None`` for bf16/fp4).
 
-    Shaped ``[M, N//128]`` for the byte count; the kernel fills it in the packed
-    ``(M/64, N//128, 16, 4)`` layout -- unpack via :func:`unpack_mxfp8_out_scale`."""
+    The kernel fills it in the packed ``(Mpad/64, scaleN, 16, 4)`` layout with
+    ``Mpad = ceil(M/64)*64`` (POC host Mpad64) and ``scaleN = ceil(N/128)``, so
+    the buffer is ``[Mpad, scaleN]``; unpack via :func:`unpack_mxfp8_out_scale`."""
     if not _is_mxfp8_out(dtype):
         return None
-    assert (
-        N % MXFP8_OUT_SCALE_BLOCK == 0
-    ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
-    assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
-    return torch.empty(
-        (M, N // MXFP8_OUT_SCALE_BLOCK), dtype=dtypes.fp8_e8m0, device=device
-    )
+    Mpad = (M + 63) // 64 * 64
+    scaleN = (N + MXFP8_OUT_SCALE_BLOCK - 1) // MXFP8_OUT_SCALE_BLOCK
+    return torch.empty((Mpad, scaleN), dtype=dtypes.fp8_e8m0, device=device)
 
 
 def unpack_mxfp8_out_scale(packed: Tensor, M: int, N: int) -> Tensor:
     """Unpack the mxfp8 output E8M0 scale from the kernel's packed
-    ``(M/64, N//128, 16, 4)`` layout to row-major ``[M, N//128]`` (requires
-    ``M % 64 == 0``)."""
-    assert M % 64 == 0, f"mxfp8 output-scale packing requires M % 64 == 0, got M={M}"
-    assert (
-        N % MXFP8_OUT_SCALE_BLOCK == 0
-    ), f"mxfp8 output requires N % {MXFP8_OUT_SCALE_BLOCK} == 0, got N={N}"
-    scaleN = N // MXFP8_OUT_SCALE_BLOCK
-    u8 = packed.reshape(-1).view(torch.uint8)[: (M // 64) * scaleN * 16 * 4]
-    rm = u8.reshape(M // 64, scaleN, 16, 4).permute(0, 3, 2, 1).reshape(M, scaleN)
-    return rm.contiguous().view(dtypes.fp8_e8m0)
+    ``(Mpad/64, scaleN, 16, 4)`` layout to row-major ``[M, ceil(N/128)]``
+    (``Mpad = ceil(M/64)*64``; padding rows are dropped)."""
+    scaleN = (N + MXFP8_OUT_SCALE_BLOCK - 1) // MXFP8_OUT_SCALE_BLOCK
+    Mpad = (M + 63) // 64 * 64
+    u8 = packed.reshape(-1).view(torch.uint8)[: (Mpad // 64) * scaleN * 16 * 4]
+    rm = u8.reshape(Mpad // 64, scaleN, 16, 4).permute(0, 3, 2, 1).reshape(Mpad, scaleN)
+    return rm[:M].contiguous().view(dtypes.fp8_e8m0)
 
 
 def gemm_mxfp4_asm(
@@ -525,8 +519,10 @@ def gemm_a4w4o8_fake(
     n = B.shape[0]
     lead = A.shape[:-1]
     out = _alloc_f4gemm_out(m, n, dtypes.fp8, A.device)
+    # scale is a packed [Mpad, scaleN] buffer (not row-aligned to M): returned
+    # as-is, unpack via unpack_mxfp8_out_scale.
     scale = _alloc_f4gemm_out_scale(m, n, dtypes.fp8, A.device)
-    return out.view(*lead, out.shape[-1]), scale.view(*lead, scale.shape[-1])
+    return out.view(*lead, out.shape[-1]), scale
 
 
 @torch_compile_guard(gen_fake=gemm_a4w4o8_fake)
@@ -564,7 +560,8 @@ def gemm_a4w4o8(
         beta=beta,
     )
     lead = A.shape[:-1]
-    return o.view(*lead, o.shape[-1]), s.view(*lead, s.shape[-1])
+    # s is the packed [Mpad, scaleN] scale buffer; return as-is (see o8_fake).
+    return o.view(*lead, o.shape[-1]), s
 
 
 def gen_gemm_a4w4_blockscale_fake_tensors(
