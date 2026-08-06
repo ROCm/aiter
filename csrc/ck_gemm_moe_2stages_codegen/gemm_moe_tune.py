@@ -41,6 +41,7 @@ from aiter.int4_utils import (
     convert_int8_to_uint32_int4,
 )
 from aiter.ops.quant import per_1x32_i4_quant
+from aiter.ops.flydsl.moe_common import GateMode
 from aiter import dtypes
 from aiter import ActivationType as ActivationType
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
@@ -1776,7 +1777,16 @@ class FmoeTuner(TunerCommon):
         )
         AQDType = hidden_states.dtype
 
-        if quant_type == aiter.QuantType.per_1x128:
+        if (
+            get_gfx() == "gfx942"
+            and quant_type == aiter.QuantType.per_1x32
+            and hidden_states.dtype in [dtypes.bf16, dtypes.fp16]
+            and w1.dtype == dtypes.fp4x2
+        ):
+            # gfx942 a16w4 keeps the SiTUv2/SwiGLU stage1 output in BF16;
+            # there is no inter-stage MXFP4 activation quantization.
+            a2_qt, a2_scale = ref1, None
+        elif quant_type == aiter.QuantType.per_1x128:
             a2_qt, a2_scale = aiter.pertoken_quant(
                 ref1.view(hidden_states.shape[0], -1, 128), quant_dtype=AQDType
             )
@@ -3569,10 +3579,30 @@ class FmoeTuner(TunerCommon):
                     and q_dtype_a in [dtypes.bf16, dtypes.fp16, dtypes.fp8]
                     and q_dtype_w == dtypes.fp4x2
                 ):
-                    w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
-                    w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
-                    w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
-                    w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
+                    if get_gfx() == "gfx942":
+                        w1_qt_fmoe, w1_scale_fmoe = (
+                            repack_mxfp4_for_gfx942_fp4_bf16(
+                                w1_qt_fmoe,
+                                w1_scale,
+                                expert,
+                                w1.shape[1],
+                                w1.shape[2],
+                            )
+                        )
+                        w2_qt_fmoe, w2_scale_fmoe = (
+                            repack_mxfp4_for_gfx942_fp4_bf16(
+                                w2_qt_fmoe,
+                                w2_scale,
+                                expert,
+                                w2.shape[1],
+                                w2.shape[2],
+                            )
+                        )
+                    else:
+                        w1_qt_fmoe = shuffle_weight_a16w4(w1_qt_fmoe, 16, True)
+                        w1_scale_fmoe = shuffle_scale_a16w4(w1_scale, expert, True)
+                        w2_qt_fmoe = shuffle_weight_a16w4(w2_qt_fmoe, 16, False)
+                        w2_scale_fmoe = shuffle_scale_a16w4(w2_scale, expert, False)
                 elif q_dtype_w != dtypes.fp4x2:
                     w1_qt_fmoe = shuffle_weight(w1_qt_fmoe, (16, 16))
                     w2_qt_fmoe = shuffle_weight(w2_qt_fmoe, (16, 16))
@@ -3623,6 +3653,16 @@ class FmoeTuner(TunerCommon):
                     torch_quant = aiter.get_torch_quant(q_type)
                     a1_qt, a1_scale = torch_quant(hidden, quant_dtype=q_dtype_a)
 
+                gate_mode = (
+                    GateMode.INTERLEAVE.value
+                    if (
+                        get_gfx() == "gfx942"
+                        and q_type == QuantType.per_1x32
+                        and q_dtype_w == dtypes.fp4x2
+                        and q_dtype_a in [dtypes.bf16, dtypes.fp16]
+                    )
+                    else GateMode.SEPARATED.value
+                )
                 out, us = run_perftest(
                     fused_moe,
                     hidden,
@@ -3631,6 +3671,9 @@ class FmoeTuner(TunerCommon):
                     topk_weights,
                     topk_ids,
                     activation=act_type,
+                    beta=_TUNER_SITU_BETA,
+                    linear_beta=_TUNER_SITU_LINEAR_BETA,
+                    gate_mode=gate_mode,
                     quant_type=q_type,
                     doweight_stage1=doweight_stage1,
                     w1_scale=w1_scale_fmoe,

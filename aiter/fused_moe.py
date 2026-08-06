@@ -31,6 +31,8 @@ from aiter import (
 )
 
 BLOCK_SIZE_M = 32
+_SITUV2_BETA = 4.0
+_SITUV2_LINEAR_BETA = 25.0
 
 # Default to Opus unless CK sorting is explicitly requested.
 _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
@@ -401,6 +403,25 @@ def fused_moe_(
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
     q_dtype_a = w1.dtype if w1.dtype != torch.uint32 else dtypes.fp8
+    if activation == ActivationType.Situv2:
+        if (
+            get_gfx() != "gfx942"
+            or quant_type != QuantType.per_1x32
+            or q_dtype_w != dtypes.fp4x2
+            or hidden_states.dtype != dtypes.bf16
+            or dtype != dtypes.bf16
+            or not isG1U1
+            or not is_flydsl_available()
+        ):
+            raise NotImplementedError(
+                "SiTUv2 is supported only for gfx942 FlyDSL BF16xMXFP4 gate/up MoE"
+            )
+        beta = _SITUV2_BETA if beta is None else float(beta)
+        linear_beta = (
+            _SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+        )
+        if beta <= 0.0 or linear_beta <= 0.0:
+            raise ValueError("SiTUv2 beta and linear_beta must be positive")
     # If input is already FP8-quantized (e.g. from FP8 dispatch) with block scale,
     # use FP8 as activation dtype to skip redundant re-quantization
     if (
@@ -974,8 +995,8 @@ def _flydsl_stage1_wrapper(
     bias1=None,
     topk_ids=None,
     swiglu_limit: float = 0.0,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = _SITUV2_BETA,
+    situ_linear_beta: float = _SITUV2_LINEAR_BETA,
     inter_dim_pad: int = 0,
     model_dim_pad: int = 0,
     **_kwargs,
@@ -1571,6 +1592,8 @@ def get_2stage_cfgs(
                 for kb in (2, 4)
                 if model_dim % kb == 0
                 and (model_dim // kb) % _tile_k == 0
+                and (model_dim // kb) // _tile_k >= 4
+                and ((model_dim // kb) // _tile_k) % 2 == 0
                 and get_flydsl_kernel_params(f"{_base_kn1}_kb{kb}") is not None
             )
             if _splitk_candidates:
@@ -1611,6 +1634,8 @@ def get_2stage_cfgs(
                 for kb in (2, 4)
                 if model_dim % kb == 0
                 and (model_dim // kb) % _tile_k == 0
+                and (model_dim // kb) // _tile_k >= 4
+                and ((model_dim // kb) // _tile_k) % 2 == 0
                 and get_flydsl_kernel_params(f"{_base_kn1}_kb{kb}") is not None
             )
             if _splitk_candidates:
@@ -2040,7 +2065,8 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation == ActivationType.Swiglu or gate_mode == GateMode.INTERLEAVE
+                activation in [ActivationType.Swiglu, ActivationType.Situv2]
+                or gate_mode == GateMode.INTERLEAVE
             )
             or (q_dtype_a in [dtypes.fp4x2] and metadata.ksplit > 1 and is_shuffled)
         )
@@ -2148,9 +2174,11 @@ def fused_moe_2stages(
         extra_stage1_args["swiglu_limit"] = swiglu_limit
         # SiTUv2 parameters are compile-time constants in both the direct
         # epilogue and split-K post-activation kernel.
-        extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
+        extra_stage1_args["situ_beta"] = (
+            _SITUV2_BETA if beta is None else float(beta)
+        )
         extra_stage1_args["situ_linear_beta"] = (
-            1.0 if linear_beta is None else float(linear_beta)
+            _SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
         )
     _stage1_out = (
         None
@@ -2196,7 +2224,7 @@ def fused_moe_2stages(
         and (
             q_dtype_a in [dtypes.bf16, dtypes.fp16]
             and (
-                activation == ActivationType.Swiglu
+                activation in [ActivationType.Swiglu, ActivationType.Situv2]
                 or gate_mode == GateMode.INTERLEAVE
             )
             or (metadata.ksplit > 1 and is_shuffled)
@@ -2435,8 +2463,8 @@ def swiglu(x_glu, x_linear, alpha: float = 1.702, limit: float = 7.0):
 def situv2(
     gate: torch.Tensor,
     up: torch.Tensor,
-    beta: float = 2.0,
-    linear_beta: float = 1.5,
+    beta: float = _SITUV2_BETA,
+    linear_beta: float = _SITUV2_LINEAR_BETA,
 ) -> torch.Tensor:
     situ_gate = beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
     up_scaled = linear_beta * torch.tanh(up / linear_beta)
@@ -2458,8 +2486,8 @@ def torch_moe_stage1(
     w1_bias=None,  # [expert, inter_dim, 1]
     doweight=False,
     swiglu_limit=0.0,
-    situ_beta: float = 2.0,
-    situ_linear_beta: float = 1.5,
+    situ_beta: float = _SITUV2_BETA,
+    situ_linear_beta: float = _SITUV2_LINEAR_BETA,
 ):
     quant_type = quant_remap.get(quant_type, quant_type)
     ctype = dtypes.fp32  # compute type

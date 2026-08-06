@@ -76,6 +76,8 @@ def test_fmoe(
     strict_accuracy=True,
     check_aot_cache=True,
     swiglu_limit=0.0,
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
 ):
     if get_gfx() not in ["gfx950", "gfx942"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -325,6 +327,8 @@ def test_fmoe(
         w1_bias=exp_bias1,
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
 
     # ######################## stage 2 start ###########
@@ -387,6 +391,8 @@ def test_fmoe(
         bias1=exp_bias1_aiter,
         bias2=exp_bias2_aiter,
         swiglu_limit=swiglu_limit,
+        beta=situ_beta,
+        linear_beta=situ_linear_beta,
         gate_mode=gateMode,
         num_iters=5,
         num_warmup=2,
@@ -808,21 +814,29 @@ def _iter_legacy_cases():
                     pad_pairs = [(0, 0)]
             for hidden_pad, intermediate_pad in pad_pairs:
                 use_inter_dim = inter_dim
-                for m in args.tokenNum:
-                    yield _kw(
-                        dtype,
-                        m,
-                        model_dim,
-                        use_inter_dim,
-                        quant_type,
-                        aq_dtype,
-                        wq_dtype,
-                        doweight_stage1,
-                        # g1u1 fp4_bf16 requires Swiglu; Silu epilogue is broken
-                        aiter.ActivationType.Swiglu,
-                        hidden_pad=hidden_pad,
-                        intermediate_pad=intermediate_pad,
-                    ), extras
+                for requested_act_type in args.act:
+                    # The legacy Silu case uses Swiglu because that epilogue is
+                    # the supported gate/up path. Preserve explicit activations
+                    # such as SiTUv2 instead of silently replacing them.
+                    act_type = (
+                        aiter.ActivationType.Swiglu
+                        if requested_act_type == aiter.ActivationType.Silu
+                        else requested_act_type
+                    )
+                    for m in args.tokenNum:
+                        yield _kw(
+                            dtype,
+                            m,
+                            model_dim,
+                            use_inter_dim,
+                            quant_type,
+                            aq_dtype,
+                            wq_dtype,
+                            doweight_stage1,
+                            act_type,
+                            hidden_pad=hidden_pad,
+                            intermediate_pad=intermediate_pad,
+                        ), extras
         elif triple == _PER1X32_FP8_FP4:
             pad_pairs = list(args.hidden_intermediate_pad)
             if get_gfx() == "gfx942":

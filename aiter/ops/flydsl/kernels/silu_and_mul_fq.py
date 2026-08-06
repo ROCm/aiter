@@ -50,8 +50,8 @@ def build_silu_and_mul_fq_module(
     act: str = "silu",
     enable_bias: bool = False,
     swiglu_limit: float = 0.0,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ):
     """Return a JIT launcher for fused gate activation + optional quant + scale sort.
 

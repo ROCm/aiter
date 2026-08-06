@@ -130,8 +130,8 @@ def compile_moe_gemm1(
     scale_is_bf16: bool = False,
     k_batch: int = 1,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ):
     """Compile stage1 kernel (`moe_gemm1`) and return the compiled executable.
 

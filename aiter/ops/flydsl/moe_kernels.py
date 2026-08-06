@@ -567,8 +567,8 @@ def compile_flydsl_moe_stage1(
     b_dtype: str,
     out_dtype: str,
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     persist_m: int = 1,
     use_async_copy: bool = False,
     k_batch: int = 1,
@@ -1308,8 +1308,8 @@ def _get_compiled_silu_fused(
     act: str = "silu",
     enable_bias: bool = False,
     swiglu_limit: float = 0.0,
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
 ):
     """Compile and cache the fused gate activation + quant + scale-sort kernel."""
     from aiter.ops.flydsl.kernels.silu_and_mul_fq import build_silu_and_mul_fq_module
@@ -1421,8 +1421,8 @@ def flydsl_moe_stage1(
     b_dtype: str = "fp4",
     out_dtype: str = "bf16",
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
+    situ_beta: float = 4.0,
+    situ_linear_beta: float = 25.0,
     w1_scale: Optional[torch.Tensor] = None,
     a1_scale: Optional[torch.Tensor] = None,
     sorted_weights: Optional[torch.Tensor] = None,
