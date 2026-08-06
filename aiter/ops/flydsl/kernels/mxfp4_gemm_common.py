@@ -234,7 +234,7 @@ def kas_c_k1_for(k):
 
 
 def kbs_c_k1_for(k):
-    return (k // 32) // 4 // 2
+    return (k + 255) // 256
 
 
 def kbs_stride_n0_dw_for(k):
