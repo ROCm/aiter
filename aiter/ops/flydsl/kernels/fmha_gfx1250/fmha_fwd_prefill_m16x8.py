@@ -316,13 +316,43 @@ def _softmax(*, s, m_prev, d_prev, lane_idx, n_block,
     return p, m_new, d_new, corr
 
 
-def _pv_gemm(**kw):
-    """GEMM2: O^T += V @ P^T for the current KV tile.
+def _pv_gemm(*, v_mgr, v_lds, p, v_hdim, n_block, lane_idx, o_acc=None):
+    """GEMM2: O^T = V^T @ P^T for one resident KV tile — the second WMMA.
 
-    Reads V^T (ds_load_tr16_b128, WMMA A-operand) and contracts it against the
-    bf16 P^T B-frags, accumulating into the fp32 O accumulator. Empty for now.
+    WMMA convention (gfx1250): D[M=d, N=q] with **A = V^T** (src_a, transpose-loaded
+    via ds_load_tr16_b128) and **B = P^T** (src_b, the bf16 softmax output). Contract
+    kv in ``nkt = n_block//WMMA_K`` tiles (K=32); produce ``d_tiles = v_hdim//WMMA_M``
+    output d-tiles (M axis). Returns ``o_acc``: a list of ``d_tiles`` v8-f32
+    accumulators; lane ``l`` element ``si`` of tile ``dt`` holds
+    O[q = l%16, d = dt*WMMA_M + (l//16)*8 + si] — the OManager16b frag layout.
+
+    Online accumulation: pass the running ``o_acc`` (already rescaled by ``corr``);
+    each tile's PV adds onto it. ``o_acc=None`` starts from zero (single tile / first
+    tile). Each WMMA operand is a v16 bf16 fragment = two 16-wide halves shuffled:
+    A from V-tiles (kv, kv+16), B from softmax tiles (p[2kt], p[2kt+1]).
     """
-    raise NotImplementedError("PvGemm not implemented yet")
+    d_tiles = v_hdim // WMMA_M       # output d-tiles (M axis, WMMA_M d rows each)
+    nkt = n_block // WMMA_K          # kv contraction tiles (K=32 kv each)
+
+    out = []
+    for dt in range(d_tiles):
+        acc = o_acc[dt] if o_acc is not None else fx.Vector.filled(8, 0.0, fx.Float32)
+        for kt in range(nkt):
+            # A-operand: V^T frag = two 16-kv transpose-load tiles -> v16 bf16.
+            v_lo = v_mgr.load_lds_to_vgpr_tile_as_v(
+                ptr_lds=v_lds, kv_idx=kt * WMMA_K, d_idx=dt * WMMA_M, lane_idx=lane_idx,
+            )
+            v_hi = v_mgr.load_lds_to_vgpr_tile_as_v(
+                ptr_lds=v_lds, kv_idx=kt * WMMA_K + WMMA_N, d_idx=dt * WMMA_M,
+                lane_idx=lane_idx,
+            )
+            rocdl.s_wait_dscnt(0)
+            v_frag = v_lo.shuffle(v_hi, list(range(16)))
+            # B-operand: P^T frag = two consecutive softmax kv-tiles -> v16 bf16.
+            p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
+            acc = _wmma_bf16(v_frag, p_frag, acc)
+        out.append(acc)
+    return out
 
 
 # ============================================================================
