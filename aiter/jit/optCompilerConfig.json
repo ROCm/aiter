@@ -1789,8 +1789,7 @@
         ],
         "flags_extra_hip": [
             "'-O3'",
-            "'-ffast-math'",
-            "'--offload-arch=gfx950'"
+            "'-ffast-math'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],

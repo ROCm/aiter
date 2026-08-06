@@ -41,7 +41,13 @@ def gdn_decode_packed_bf16_hip(
     *,
     scale: float | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Decode one token from packed QKV and update BF16 V-major state in place."""
+    """Decode one token from packed QKV and update BF16 V-major state in place.
+
+    Every non-negative entry in ``indices`` must be smaller than the state-pool
+    size and unique within the batch. Negative sentinel entries may repeat.
+    Duplicate valid indices cause unsynchronized concurrent state updates and
+    therefore have undefined behavior.
+    """
     if not torch.cuda.is_available():
         raise RuntimeError("packed BF16 GDN decode requires an available ROCm GPU")
 

@@ -17,6 +17,8 @@ HEAD_K_DIM = 128
 HEAD_V_DIM = 128
 QKV_DIM = 6144
 SCALE = HEAD_K_DIM**-0.5
+RTOL = 1.0e-2
+ATOL = 1.0e-3
 
 
 def _is_gfx950() -> bool:
@@ -171,7 +173,7 @@ def _run(
 
 
 def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
-    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.05, atol=0.05)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=RTOL, atol=ATOL)
 
 
 def test_valid_accuracy_alias_and_untouched_slots() -> None:
@@ -235,6 +237,35 @@ def test_mixed_indices_and_strided_rows() -> None:
         actual_state.index_select(0, untouched).view(torch.int16),
         state_before.index_select(0, untouched).view(torch.int16),
     )
+
+
+def test_multi_step_bf16_state_drift() -> None:
+    batch, pool, steps = 4, 6, 16
+    indices = torch.tensor([5, 0, 3, 1], device="cuda", dtype=torch.int32)
+    initial = _make_inputs(batch=batch, pool=pool, seed=2026080600)
+    actual_state = initial["state"].clone()
+    expected_state = initial["state"].clone()
+    untouched_before = actual_state[2].clone()
+
+    for step in range(steps):
+        step_inputs = _make_inputs(
+            batch=batch,
+            pool=pool,
+            seed=2026080601 + step,
+        )
+
+        reference_inputs = {**step_inputs, "state": expected_state}
+        expected_out, expected_state = _reference(reference_inputs, indices)
+
+        actual_inputs = {**step_inputs, "state": actual_state}
+        actual_out, returned_state = _run(actual_inputs, indices)
+        assert returned_state.data_ptr() == actual_state.data_ptr()
+        _assert_close(actual_out, expected_out)
+        _assert_close(returned_state, expected_state)
+        actual_state = returned_state
+
+    torch.cuda.synchronize()
+    assert torch.equal(actual_state[2].view(torch.int16), untouched_before.view(torch.int16))
 
 
 def _bad_scale(inputs: dict[str, torch.Tensor]) -> dict[str, object]:

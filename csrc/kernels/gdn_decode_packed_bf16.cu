@@ -123,7 +123,10 @@ __global__ __launch_bounds__(kWarps* kWaveSize, 1) void gdn_decode_packed_bf16_k
         return;
     }
 
-    const int v_idx     = tile * kVPerBlock + warp * kVThreads + v_lane;
+    const int v_idx = tile * kVPerBlock + warp * kVThreads + v_lane;
+    // Contract: non-negative state indices are unique within a batch. Duplicate valid slots
+    // would make independent workgroups race on the state read-modify-write. Negative sentinel
+    // indices may repeat because they return before touching state.
     const int state_idx = indices[static_cast<int64_t>(row) * indices_stride];
     if(static_cast<uint32_t>(state_idx) >= static_cast<uint32_t>(state_pool_size))
     {
