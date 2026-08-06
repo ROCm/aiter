@@ -30,7 +30,6 @@ from .mxfp4_gemm_common import (
     bq_bytes_for,
     bscale_bytes_for,
     k_half_for,
-    k_tiles_total_for,
     kas_per_chunk_dw_for,
     kbs_per_expert_dw_for,
     kBS_stride_k0_dw,
@@ -39,14 +38,9 @@ from .mxfp4_gemm_common import (
     kStages,
     kunroll_for,
     lds_acc_bytes_for,
-    num_n_blocks_for,
 )
 
 ACC_LDS_PAD_DW = 4
-
-
-def n_out_for(inter):
-    return 2 * inter
 
 
 def k_g2_half_for(inter):
@@ -61,7 +55,7 @@ def out_as_per_chunk_dw_for(inter):
 
 
 def gemm1_grid(n_tokens, BM, *, NE, TOPK, INTER, BN=256):
-    num_n_blocks = num_n_blocks_for(n_out_for(INTER), BN)
+    num_n_blocks = 2 * INTER // BN
     if BM == 128:
         max_m_blocks = (n_tokens * TOPK + NE * (BM - 1) + BM - 1) // BM
     else:
@@ -111,7 +105,7 @@ def _gemm1_body(
     K_HALF = k_half_for(K)
     # A row bytes: fp4 = K/2, fp8 = K (B is always mxfp4 -> keeps K_HALF).
     A_ROW_BYTES = K if a_dtype == "fp8" else K_HALF
-    K_TILES_TOTAL = k_tiles_total_for(K, BK)
+    K_TILES_TOTAL = K // BK
     kUnroll = kunroll_for(K, BK)
     kAS_per_chunk_dw = kas_per_chunk_dw_for(K)
     ASCALE_CHUNK_BYTES = kAS_per_chunk_dw * 4
@@ -119,7 +113,7 @@ def _gemm1_body(
     kBS_per_expert_dw = kbs_per_expert_dw_for(N_OUT, K)
     BQ_BYTES = bq_bytes_for(NE, N_OUT, K)
     BSCALE_BYTES = bscale_bytes_for(NE, N_OUT, K)
-    NUM_N_BLOCKS = num_n_blocks_for(N_OUT, BN)
+    NUM_N_BLOCKS = N_OUT // BN
     inter = N_OUT // 2
     OUT_AS_PER_CHUNK_DW = out_as_per_chunk_dw_for(inter)
     OUT_ROW_BYTES = inter if out_dtype == "fp8" else k_g2_half_for(inter)
@@ -670,15 +664,10 @@ def _gemm1_body(
                     _mma(accm[i1][J], 3, 2 + in_b, a[i1][1], bJ1, sa, sb)
 
         if const_expr(BN == 128 and not interleave):
-
-            @flyc.jit
-            def issue_bn128_cluster():
-                if (wave & fx.Int32(1)) == fx.Int32(0):
-                    issue_cluster(0)
-                else:
-                    issue_cluster(1)
-
-            issue_bn128_cluster()
+            if (wave & fx.Int32(1)) == fx.Int32(0):
+                issue_cluster(0)
+            else:
+                issue_cluster(1)
         else:
             issue_cluster(J % 2 if const_expr(interleave) else J // 2)
 
@@ -1085,24 +1074,23 @@ def compile_gemm1_a4w4_port(
     ), f"only BN in (128, 256) and BK==256 supported, got BN={BN} BK={BK}"
     assert BN == 256 or not interleave, "BN=128 only supports separated gate/up layout"
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
-    _K = D_HIDDEN
-    assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
-    _INTER = D_INTER
-    _N_OUT = n_out_for(_INTER)
     assert (
-        _N_OUT % BN == 0
-    ), f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {_N_OUT}"
-    _NE = NE
-    _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
-    _NUM_N_BLOCKS = num_n_blocks_for(_N_OUT, BN)
+        D_HIDDEN % BK == 0
+    ), f"D_HIDDEN (K) must be a multiple of {BK}, got {D_HIDDEN}"
+    N_OUT = 2 * D_INTER
+    assert N_OUT % BN == 0, f"2*D_INTER (N_OUT) must be a multiple of {BN}, got {N_OUT}"
+    K_TILES_TOTAL = D_HIDDEN // BK
+    NUM_N_BLOCKS = N_OUT // BN
 
-    _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, _K_TILES_TOTAL)
+    _, _, _, lds_bytes = _bm_constants(BM, BN, KH_TILE, K_TILES_TOTAL)
 
     variant_tag = "iq" if inline_quant else ("nt" if use_nt else "cached")
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = f"{a_dtype}_h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    name_suffix = (
+        f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
+    )
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
@@ -1143,37 +1131,38 @@ def compile_gemm1_a4w4_port(
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
-        bound = total_m_blocks * fx.Int32(_NUM_N_BLOCKS)
+        bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
-        _NXCD = 8
-        _xq = _udiv(bound, _NXCD)
-        _xr = _umod(bound, _NXCD)
-        _SW = xcd_swizzle
+        NXCD = 8
+        xq = _udiv(bound, NXCD)
+        xr = _umod(bound, NXCD)
 
         def _xcd(pid):
-            xc = _umod(pid, _NXCD)
+            xc = _umod(pid, NXCD)
             wgid = (
-                xc * _xq
-                + fx.Int32(arith.minsi(as_ir_value(xc), as_ir_value(_xr)))
-                + _udiv(pid, _NXCD)
+                xc * xq
+                + fx.Int32(arith.minsi(as_ir_value(xc), as_ir_value(xr)))
+                + _udiv(pid, NXCD)
             )
-            _ng = fx.Int32(_SW * _NUM_N_BLOCKS)
-            group_id = wgid // _ng
-            first_pid_m = group_id * fx.Int32(_SW)
+            ng = fx.Int32(xcd_swizzle * NUM_N_BLOCKS)
+            group_id = wgid // ng
+            first_pid_m = group_id * fx.Int32(xcd_swizzle)
             remaining_m = total_m_blocks - first_pid_m
             group_size_m = fx.Int32(
-                arith.minsi(as_ir_value(remaining_m), as_ir_value(fx.Int32(_SW)))
+                arith.minsi(
+                    as_ir_value(remaining_m), as_ir_value(fx.Int32(xcd_swizzle))
+                )
             )
-            wig = wgid % _ng
+            wig = wgid % ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
-            return m_block * fx.Int32(_NUM_N_BLOCKS) + n_block
+            return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
         if bx_i32 < bound:
-            if const_expr(_SW > 0):
-                _tile = _xcd(bx_i32)
+            if const_expr(xcd_swizzle > 0):
+                tile = _xcd(bx_i32)
             else:
-                _tile = bx_i32
+                tile = bx_i32
             _gemm1_body(
                 lds_raw_ptr,
                 arg_aq,
@@ -1186,7 +1175,7 @@ def compile_gemm1_a4w4_port(
                 arg_ascaleout,
                 arg_hidden,
                 arg_bias,
-                _tile,
+                tile,
                 lane,
                 wave,
                 use_nt,
@@ -1203,9 +1192,9 @@ def compile_gemm1_a4w4_port(
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=swiglu_limit,
                 enable_bias=enable_bias,
-                K=_K,
-                N_OUT=_N_OUT,
-                NE=_NE,
+                K=D_HIDDEN,
+                N_OUT=N_OUT,
+                NE=NE,
                 interleave=interleave,
             )
 
