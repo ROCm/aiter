@@ -170,7 +170,13 @@ Status legend: [ ] todo · [~] in progress · [x] done
   `test_down_reduce_fp8` in the op_test (10 pass total).
 
 ### Phase 4 — Scale layouts + integration  [~]
-- [~] Scale layouts: PerTensor + PerToken done (Phase 2, gate_up); **Block2D pending**.
+- [x] Scale layouts: PerTensor + PerToken + **Block2D** all done for both `gate_up` and
+      `down`. Block2D<BN,BK> scale index `p[(w_row//BN)*(max_cols//BK) + col//BK]`; since it
+      varies along K, each K-block's scale is folded into the per-lane partial per iter (exact
+      f32, reusing the per-lane-fold structure) before the single butterfly reduce. Requires
+      `BK % kVector == 0` (lane K-chunk sits in one block). Entry points take
+      `scale_block=(BN,BK)`. Correctness **exact** (cos 1.0, max_delta 0.0) for kv16/kv8;
+      perf at/near peak (gate_up block2d ~8.0 TB/s, down block2d ~6.1 TB/s).
 - [x] Python entry point in `aiter/ops/flydsl/warp_decode_moe.py` (added in Phase 2;
       extend with `down_reduce` + Block2D).
 - [x] op_test at `op_tests/flydsl_tests/test_flydsl_warp_decode_moe.py` now meets the locked
@@ -362,8 +368,11 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
 - [open] How the FlyDSL tile/copy path exposes each lane's `kVector` FP8/BF16 chunk as
   consecutive `uint32` words (reference relies on `get_as<uint32_t>(word)`); decide between
   copy-atom tiles vs. `make_buffer_tensor` raw loads.
-- [open] Block2D scale indexing in FlyDSL (start with direct HBM per-K-block read;
-  the LDS-broadcast optimization from §5.4 is gate_up-only and can come later).
+- [resolved] Block2D scale indexing in FlyDSL: direct HBM per-K-block read, one scale
+  load per (lane, iter). Each K-block's f32 scale is folded into the per-lane partial
+  before the single reduce (exact; no e8m0 rounding). Constraint `BK % kVector == 0`.
+  The LDS-broadcast optimization from §5.4 is gate_up-only and can come later (block2d is
+  already at peak BW, so it is not currently a lever).
 - [deferred] MXFP4 s_nop-free dot2 + `dot2_drain4` scheduling (MXFP4 phase).
 
 ## 10. Changelog
@@ -424,3 +433,12 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   down **+1.3%** pertensor (6.95→7.04, separable) / **0%** pertoken. The original
   ~1.4–1.6→~6.9 gate_up "jump" was a bad-baseline artifact; both kernels were already
   BW-bound near peak. Kept the vectorized code (correct, cleaner); corrected §5 Phase 2/3.
+- _phase 4: Block2D scales_ — added `block2d` `w_scale_mode` to both kernels, entry points,
+  and op_test. Scale index `p[(w_row//BN)*(max_cols//BK) + col//BK]`; since it varies along K
+  it is folded per (lane, iter) into the per-lane partial (exact f32) before the single reduce,
+  reusing the proven fold structure via a `const_expr(block2d)` branch (zero regression to the
+  PerTensor/PerToken fast path). Constraint `BK % kVector == 0`; entry points take
+  `scale_block=(BN,BK)`. 4 new op_test cases (kv16 + kv8, both stages) → **14 pass**, all
+  **exact** (cos 1.0, max_delta 0.0). Perf sweep block2d rows: **gate_up ~8.0 TB/s (~100% peak)**,
+  **down ~6.1 TB/s (~76% peak)** — same BW band as PerTensor/PerToken (scale reads negligible).
+  Scale layouts now complete; remaining levers are H2 (down) and CK-Tile reference comparison.
