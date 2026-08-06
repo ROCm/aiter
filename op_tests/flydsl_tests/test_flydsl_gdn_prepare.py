@@ -36,7 +36,10 @@ if not is_flydsl_available():
     )
 
 try:
-    from aiter.ops.flydsl.linear_attention_prefill_kernels import gdn_prepare_fwd_flydsl
+    from aiter.ops.flydsl.linear_attention_prefill_kernels import (
+        gdn_prepare_flydsl_supported,
+        gdn_prepare_fwd_flydsl,
+    )
 except ImportError as exc:
     pytest.skip(
         f"Unable to import the FlyDSL GDN prepare kernel: {exc}",
@@ -261,3 +264,34 @@ def test_gdn_prepare_matches_triton_k1_k2(case, use_exp2):
     assert _max_abs(gc_f, gc_t) < ATOL_G
     assert _max_abs(w_f, w_t) < ATOL_WU
     assert _max_abs(u_f, u_t) < ATOL_WU
+
+
+def test_gdn_prepare_refuses_unsupported_inputs():
+    """The predicate and the wrapper agree on the supported slice.
+
+    ``chunk.py`` selects the fused path off the predicate alone, so anything the
+    single launch cannot serve has to be refused up front -- a head dim the
+    kernel does not compile for, or an operand on another device, would
+    otherwise surface as a compile assert or a fault inside the launch.
+    """
+    k, v, g, beta, _ = _make_inputs(1, 128, 4, 4, 128, 128, seed=11)
+    assert gdn_prepare_flydsl_supported(k, v)
+
+    # One kernel reads both operands, so checking only ``k`` is not enough.
+    misplaced = [v.cpu()]
+    if torch.cuda.device_count() > 1:
+        misplaced.append(v.to("cuda:1"))
+    for bad_v in misplaced:
+        assert not gdn_prepare_flydsl_supported(k, bad_v)
+        with pytest.raises(ValueError):
+            gdn_prepare_fwd_flydsl(k, bad_v, g, beta)
+
+    k64, v64, g64, beta64, _ = _make_inputs(1, 128, 4, 4, 64, 64, seed=12)
+    assert not gdn_prepare_flydsl_supported(k64, v64)
+    with pytest.raises(ValueError):
+        gdn_prepare_fwd_flydsl(k64, v64, g64, beta64)
+
+    # fp16 keeps its own targeted error ahead of the generic slice check,
+    # because silently emitting bf16 w/u is the dangerous case.
+    with pytest.raises(TypeError):
+        gdn_prepare_fwd_flydsl(k.half(), v.half(), g, beta)
