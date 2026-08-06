@@ -11,10 +11,11 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     reduce_segments,
 )
 from aiter.ops.triton.utils.device_info import get_num_sms
+
 try:
     from aiter.ops.triton._gluon_kernels.gfx950.attention.unified_attention import (
-            _unified_attention_gluon_kernel,
-        )
+        _unified_attention_gluon_kernel,
+    )
 except:  # noqa: E722
     _unified_attention_gluon_kernel = None
 
@@ -66,6 +67,7 @@ def is_2d_gfx1250_gluon_available(
         and q_dtype == kv_cache_dtype
     )
     return use_gluon_2d
+
 
 def is_gfx950_gluon_available(
     q_dtype,
@@ -398,7 +400,7 @@ def unified_attention(
             sinks,
             output_scale,
             skip_reduce,
-        )    
+        )
 
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
@@ -987,7 +989,10 @@ def _gfx1250_unified_attention_2d(
         LOOP_VARIANT=loop_variant,
     )
 
-def _gfx950_gluon_select_num_splits(num_seqs, num_kv_heads, num_tiles, num_warps, fp8=False):
+
+def _gfx950_gluon_select_num_splits(
+    num_seqs, num_kv_heads, num_tiles, num_warps, fp8=False
+):
     if num_tiles <= 4:
         return 1
     # Workgroups per CU target
@@ -1029,7 +1034,6 @@ def _gfx950_unified_attention(
     HEAD_SIZE = q.shape[2]
     num_blocks = k.shape[0]
     Q_FP8 = q.element_size() == 1
-    KV_FP8 = k.element_size() == 1
     ARCH_NAME = arch_info.get_arch()
     assert ARCH_NAME == "gfx950", "this kernel only supports gfx950"
     assert softcap == 0, "Softcap is not supported"
@@ -1075,9 +1079,8 @@ def _gfx950_unified_attention(
         num_warps, block_m, mfma_dim, num_buffers = 4, 128, 32, 2
         if HEAD_SIZE >= 256 and Q_FP8:
             num_buffers = 1
-        elif HEAD_SIZE >= 256:
-            if BLOCK_SIZE >= 32:
-                num_warps, block_m, TILE_SIZE = 2, 64, 32
+        elif HEAD_SIZE >= 256 and BLOCK_SIZE >= 32:
+            num_warps, block_m, TILE_SIZE = 2, 64, 32
 
     # LDS limit for 2 buffer config
     if 4 * TILE_SIZE * HEAD_SIZE * k.element_size() > 160 * 1024:
@@ -1095,7 +1098,9 @@ def _gfx950_unified_attention(
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
     if num_splits > 1:
         partial_acc = torch.empty(
-            (q.shape[0], NUM_Q_HEADS, num_splits, HEAD_SIZE), dtype=torch.float32, device=q.device
+            (q.shape[0], NUM_Q_HEADS, num_splits, HEAD_SIZE),
+            dtype=torch.float32,
+            device=q.device,
         )
         partial_m = torch.empty(
             (q.shape[0], NUM_Q_HEADS, num_splits), dtype=torch.float32, device=q.device
@@ -1103,7 +1108,11 @@ def _gfx950_unified_attention(
         partial_l = torch.empty_like(partial_m)
     else:
         partial_acc = partial_m = partial_l = None
-    grid = (total_query_blocks, NUM_KV_HEADS) if ALL_DECODE else (NUM_KV_HEADS, total_query_blocks)
+    grid = (
+        (total_query_blocks, NUM_KV_HEADS)
+        if ALL_DECODE
+        else (NUM_KV_HEADS, total_query_blocks)
+    )
     if num_splits > 1:
         grid = grid + (num_splits,)
     _unified_attention_gluon_kernel[grid](
@@ -1185,6 +1194,6 @@ def _gfx950_unified_attention(
                 num_stages=1,
             )
         else:
-            return partial_acc, partial_m, partial_l   
+            return partial_acc, partial_m, partial_l
 
     return out
