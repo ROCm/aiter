@@ -637,14 +637,15 @@ def launch_gemm_a8w4_tdm(
                 # rocdl.s_wait_dscnt(len(BACK) * DS_A)
             else:
                 pass
+            if const_expr(nxt_ksl is not None):
+                prefetch = load_b_and_scales(buf, nxt_ksl)
+            else:
+                prefetch = None
             mma_rows(FRONT, act_f, wt, sa_k, sb_k)
-            prefetch = load_b_and_scales(buf, nxt_ksl)
             if const_expr(len(BACK) > 0):
                 # rocdl.s_wait_dscnt(0)
                 mma_rows(BACK, act_b, wt, sa_k, sb_k)
-            if const_expr(xt_buf is not None):
-                xt_store(xt_buf)
-            return prefetch if const_expr(nxt_ksl is not None) else None
+            return prefetch
 
         def compute_ktile(buf, prefetch_kt, from_xt=False, nxt_buf=None, my_jobs=None):
             """Compute one k-tile, carrying one k128 of B/scales across tiles.
@@ -667,6 +668,39 @@ def launch_gemm_a8w4_tdm(
                 nxt_ksl = ksl + 1 if const_expr(ksl + 1 < KWS) else None
                 xt_buf = nxt_buf if const_expr(ksl + 1 == KWS) else None
                 prev = k_step(buf, ksl, prev[0], prev[1], prev[2], nxt_ksl, xt_buf)
+            front_mma = front_wm * wmma_n_rep
+            back_mma = len(BACK) * wmma_n_rep
+
+            def spread(total, slots):
+                counts = []
+                previous = 0
+                for slot in range_constexpr(slots):
+                    current = ((slot + 1) * total + slots - 1) // slots
+                    counts.append(current - previous)
+                    previous = current
+                return counts
+
+            for ksl in range_constexpr(KWS):
+                has_next = ksl + 1 < KWS or (
+                    ksl + 1 == KWS and nxt_buf is not None
+                )
+                if const_expr(ksl == 0):
+                    initial_b = BS_DS if not from_xt else 0
+                    rocdl.sched_dsrd(initial_b + front_wm * DS_A)
+                back_loads = spread(len(BACK) * DS_A, front_mma)
+                for i in range_constexpr(front_mma):
+                    rocdl.sched_mfma(1)
+                    if const_expr(back_loads[i] > 0):
+                        rocdl.sched_dsrd(back_loads[i])
+                future_loads = BS_DS if has_next else 0
+                if const_expr(ksl + 1 < KWS):
+                    future_loads += front_wm * DS_A
+                future_schedule = spread(future_loads, back_mma)
+                for i in range_constexpr(back_mma):
+                    rocdl.sched_mfma(1)
+                    if const_expr(future_schedule[i] > 0):
+                        rocdl.sched_dsrd(future_schedule[i])
+            rocdl.sched_barrier(0)
 
         # Skip padding tiles (expert id == n_experts); uniform across workgroup
         if expert < n_experts:
