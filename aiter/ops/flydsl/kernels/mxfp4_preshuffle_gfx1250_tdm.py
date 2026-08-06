@@ -706,11 +706,16 @@ def launch_gemm_a8w4_tdm(
                 )
                 if const_expr(ksl == 0):
                     rocdl.sched_dsrd(STATE_DS if not from_xt else 0)
+                mma_total = front_mma + back_mma
+                # K256 needs grouping to limit VGPR-bank switches without
+                # turning the complete A/B/scale prefetch into long LDS bursts.
+                mma_group = 16 if KWS > 1 else 1
+                schedule_slots = mma_total // mma_group
                 future_schedule = spread(
-                    STATE_DS if has_next else 0, front_mma + back_mma
+                    STATE_DS if has_next else 0, schedule_slots
                 )
-                for i in range_constexpr(front_mma + back_mma):
-                    rocdl.sched_mfma(1)
+                for i in range_constexpr(schedule_slots):
+                    rocdl.sched_mfma(mma_group)
                     if const_expr(future_schedule[i] > 0):
                         rocdl.sched_dsrd(future_schedule[i])
             rocdl.sched_barrier(0)
