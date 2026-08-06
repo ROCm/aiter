@@ -445,9 +445,14 @@ def _grouped_a8w4_tdm_moe(
     # route kernel remaps them to local buckets via ``g2l_lut`` (sentinel E =
     # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
     # (kept -> weight_dtype, dropped -> 0), and skips the EP dead-tail (routes >=
-    # num_valid_routes / tokens >= num_valid_tokens). The felix TDM batched
-    # GEMMs themselves are EP-agnostic: they operate on the already-routed
-    # contiguous layout.
+    # num_valid_routes / tokens >= num_valid_tokens). Non-local routes claim no
+    # per-expert slot and are tagged ``DROPPED_ROUTE_ROW``, so ``_masked_m`` /
+    # ``psum`` -- and therefore the rows the GEMMs actually compute -- cover only
+    # the routes this rank owns (~1/ep of what it received), not every received
+    # route. ``contiguous_m`` below stays the static worst case so the launch grid
+    # is CUDAGraph-safe; the surplus tiles fall past ``psum`` and exit early. The
+    # felix TDM batched GEMMs themselves are EP-agnostic: they operate on the
+    # already-routed contiguous layout.
     _is_ep = expert_mask is not None
     _g2l_lut = None
     _g2l_counter = None
@@ -777,7 +782,9 @@ def _grouped_a8w4_tdm_moe(
     moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
     if _is_ep:
         # Route kernel already produced gather weights (dropped routes zeroed);
-        # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens.
+        # the dead-tail (tokens >= total_recv) is skipped via num_valid_tokens, and
+        # non-local routes read through a zero-sized descriptor (DROPPED_ROUTE_ROW),
+        # so a token whose every route is remote reduces to zeros.
         gather_w = _gather_w_buf
     else:
         gather_w = (
@@ -1559,7 +1566,9 @@ def flydsl_moe_gather_reduce(
     """One-pass gather-reduce: out[t] = sum_k w[t,k] * grouped[topids_to_rows[t,k]].
 
     ``gather_w`` may be f32 (native route weights, no host-side cast) or match
-    ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way.
+    ``grouped_out``'s bf16/f16; the kernel accumulates in f32 either way. Slots
+    holding ``moe_route_maps.DROPPED_ROUTE_ROW`` (EP routes with no grouped row)
+    contribute 0 without touching ``grouped_out``.
     """
     if grouped_out.dim() == 4:
         split_k, E, max_m, model_dim = grouped_out.shape
