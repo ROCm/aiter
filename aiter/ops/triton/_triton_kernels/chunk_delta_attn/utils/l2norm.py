@@ -67,12 +67,53 @@ def l2norm_fwd_kernel(
         tl.store(Rstd + row1d, rstd, mask=row1d < T)
 
 
+@triton.jit(do_not_specialize=["T"])
+def l2norm_fwd_kernel_persistent(
+    X,
+    Y,
+    Rstd,
+    eps,
+    T,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    N_CU: tl.constexpr,
+    STORE_RSTD: tl.constexpr,
+):
+    """Persistent l2norm fwd: N_CU CTAs stride through all rows.
+
+    Each CTA processes BT rows per iteration, then advances by N_CU*BT.
+    Reduces kernel launch overhead vs one-CTA-per-block for small T.
+    """
+    i_cta = tl.program_id(0)
+    cols = tl.arange(0, D)
+
+    row_base = i_cta * BT
+    while row_base < T:
+        rows = tl.arange(0, BT)
+        row_mask = (row_base + rows) < T
+        mask = row_mask[:, None]
+        offs = (row_base + rows)[:, None] * D + cols[None, :]
+
+        b_x = tl.load(X + offs, mask=mask, other=0.0, cache_modifier=".cg")
+        b_x_f = b_x.to(tl.float32)
+
+        b_rstd = 1.0 / tl.sqrt(tl.sum(b_x_f * b_x_f, axis=1) + eps)
+        b_y = b_x_f * b_rstd[:, None]
+
+        tl.store(Y + offs, b_y.to(Y.dtype.element_ty), mask=mask)
+        if STORE_RSTD:
+            tl.store(Rstd + row_base + rows, b_rstd, mask=row_mask)
+
+        row_base += N_CU * BT
+
+
 def l2norm_fwd(
     x: torch.Tensor,
     eps: float = 1e-6,
     output_dtype: torch.dtype | None = None,
     *,
     need_rstd: bool = False,
+    use_persistent: bool = False,
 ):
     """
     Forward pass for L2 normalization.
@@ -105,7 +146,21 @@ def l2norm_fwd(
     else:
         rstd = y  # placeholder; STORE_RSTD=False → never dereferenced
 
-    if D <= 512:
+    if use_persistent and D == 128:
+        n_cu = torch.cuda.get_device_properties(x.device).multi_processor_count
+        l2norm_fwd_kernel_persistent[(n_cu,)](
+            x,
+            y,
+            rstd,
+            eps,
+            T,
+            D,
+            BT=128,
+            N_CU=n_cu,
+            STORE_RSTD=need_rstd,
+            num_warps=4,
+        )
+    elif D <= 512:
         BT = _L2NORM_FWD_BT
         l2norm_fwd_kernel[(triton.cdiv(T, BT),)](
             x,

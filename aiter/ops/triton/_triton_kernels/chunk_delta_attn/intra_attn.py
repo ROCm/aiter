@@ -252,6 +252,10 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    CACHE_QK: tl.constexpr = "",
+    CACHE_G: tl.constexpr = "",
+    CACHE_BETA: tl.constexpr = "",
+    USE_REG_SUBSTITUTION: tl.constexpr = False,
 ):
     i_t, i_i, i_bh = (
         tl.program_id(0).to(tl.int64),
@@ -289,7 +293,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     Akk = Akk + (bos * HV + i_hv) * BC
 
     p_beta = beta + o_c * HV
-    b_beta = tl.load(p_beta, mask=m_c, other=0.0)
+    b_beta = tl.load(p_beta, mask=m_c, other=0.0, cache_modifier=CACHE_BETA)
 
     # Reference gate at the mid-point of this sub-chunk (same for all K tiles)
     i_gn = i_ti + min(BC // 2, T - i_ti - 1)
@@ -304,9 +308,9 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
         p_q = q + o_c[:, None] * (H * K) + o_k[None, :]
         p_k = k + o_c[:, None] * (H * K) + o_k[None, :]
         p_g = g + o_c[:, None] * (HV * K) + o_k[None, :]
-        b_q = tl.load(p_q, mask=m_ck, other=0.0)
-        b_k = tl.load(p_k, mask=m_ck, other=0.0)
-        b_g = tl.load(p_g, mask=m_ck, other=0.0)
+        b_q = tl.load(p_q, mask=m_ck, other=0.0, cache_modifier=CACHE_QK)
+        b_k = tl.load(p_k, mask=m_ck, other=0.0, cache_modifier=CACHE_QK)
+        b_g = tl.load(p_g, mask=m_ck, other=0.0, cache_modifier=CACHE_G)
 
         if USE_GATHER:
             b_gn = _gather(
@@ -316,7 +320,7 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
             )
         else:
             p_gn = g + i_gn * HV * K + o_k
-            b_gn = tl.load(p_gn, mask=m_k, other=0.0)
+            b_gn = tl.load(p_gn, mask=m_k, other=0.0, cache_modifier=CACHE_G)
             b_gn = b_gn[None, :]
 
         b_gm = (b_g - b_gn).to(tl.float32)
@@ -344,18 +348,30 @@ def chunk_delta_attn_fwd_kernel_intra_sub_chunk(
     p_Akk = Akk + o_c[:, None] * (HV * BC) + o_i[None, :]
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), mask=m_Aqk_st)
 
-    # Forward substitution (in-place into register, then store)
-    tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), mask=m_Akk_st)
-    tl.debug_barrier()
+    # Forward substitution
+    if USE_REG_SUBSTITUTION:
+        # Register-based: no global load-back
+        b_Ai = -b_Akk
+        for i in range(2, min(BC, T - i_ti)):
+            b_a = tl.sum(b_Ai * (o_i == i)[:, None].to(b_Ai.dtype), 0)
+            b_a = tl.where(o_i < i, b_a, 0.0)
+            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
+            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+        b_Ai += m_I
+        tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
+    else:
+        # Global load-back
+        tl.store(p_Akk, b_Akk.to(Akk.dtype.element_ty), mask=m_Akk_st)
+        tl.debug_barrier()
 
-    b_Ai = -b_Akk
-    for i in range(2, min(BC, T - i_ti)):
-        b_a = -tl.load(Akk + (i_ti + i) * HV * BC + o_i)
-        b_a = tl.where(o_i < i, b_a, 0.0)
-        b_a += tl.sum(b_a[:, None] * b_Ai, 0)
-        b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
-    b_Ai += m_I
-    tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
+        b_Ai = -b_Akk
+        for i in range(2, min(BC, T - i_ti)):
+            b_a = -tl.load(Akk + (i_ti + i) * HV * BC + o_i)
+            b_a = tl.where(o_i < i, b_a, 0.0)
+            b_a += tl.sum(b_a[:, None] * b_Ai, 0)
+            b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
+        b_Ai += m_I
+        tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_st)
 
 
 @triton.heuristics(
@@ -690,6 +706,7 @@ def chunk_delta_attn_fwd_intra(
     chunk_indices: torch.Tensor | None = None,
     safe_gate: bool = False,
     disable_recompute: bool = False,
+    skip_recompute_wu: bool = False,
 ) -> tuple:
     """Intra-chunk attention (base Triton sub-chunk kernel)."""
     B, T, H, K = k.shape
@@ -766,6 +783,119 @@ def chunk_delta_attn_fwd_intra(
         NC=NC,
         USE_SAFE_GATE=safe_gate,
     )
+
+    if skip_recompute_wu:
+        return None, None, None, None, Aqk, Akk
+
+    w, u, qg, kg = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=Akk,
+        gk=gk,
+        q=q if disable_recompute else None,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
+    return w, u, qg, kg, Aqk, Akk
+
+
+@input_guard
+def chunk_delta_attn_fwd_intra_opt(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gk: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.Tensor | None = None,
+    safe_gate: bool = False,
+    disable_recompute: bool = False,
+    skip_recompute_wu: bool = False,
+) -> tuple:
+    """Intra-chunk attention (optimized single-tile Triton sub-chunk kernel)."""
+    B, T, H, K = k.shape
+    HV = gk.shape[2]
+    BT = chunk_size
+    if BT not in (32, 64):
+        raise ValueError(
+            f"chunk_delta_attn intra kernel only supports chunk_size 32 or 64, got {BT}."
+        )
+    BC = 16
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    NC = triton.cdiv(BT, BC)
+
+    Aqk = torch.empty(B, T, HV, BT, device=k.device, dtype=k.dtype)
+    Akk = torch.zeros(B, T, HV, BT, device=k.device, dtype=k.dtype)
+    Akkd = torch.empty(B, T, HV, BC, device=k.device, dtype=torch.float32)
+
+    if safe_gate:
+        BK = triton.next_power_of_2(K)
+        grid = (NT, NC, B * HV)
+        chunk_delta_attn_fwd_kernel_intra_sub_chunk[grid](
+            q=q,
+            k=k,
+            g=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akk=Akkd,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            T=T,
+            H=H,
+            HV=HV,
+            K=K,
+            BT=BT,
+            BC=BC,
+            BK=BK,
+            USE_GATHER=IS_GATHER_SUPPORTED,
+            CACHE_QK=".cs",
+            CACHE_G=".cs",
+            USE_REG_SUBSTITUTION=True,
+        )
+    else:
+        _chunk_delta_attn_fwd_intra_token_parallel(
+            q=q,
+            k=k,
+            gk=gk,
+            beta=beta,
+            Aqk=Aqk,
+            Akk=Akkd,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=BT,
+            sub_chunk_size=BC,
+        )
+
+    grid = (NT, B * HV)
+    chunk_delta_attn_fwd_kernel_inter_solve_fused[grid](
+        q=q,
+        k=k,
+        g=gk,
+        beta=beta,
+        Aqk=Aqk,
+        Akkd=Akkd,
+        Akk=Akk,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        BT=BT,
+        BC=BC,
+        NC=NC,
+        USE_SAFE_GATE=safe_gate,
+    )
+
+    if skip_recompute_wu:
+        return None, None, None, None, Aqk, Akk
 
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,

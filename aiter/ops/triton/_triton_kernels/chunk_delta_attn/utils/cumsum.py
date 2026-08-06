@@ -56,6 +56,8 @@ def chunk_gate_cumsum_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    CACHE_INPUT: tl.constexpr = "",
+    CACHE_OUTPUT: tl.constexpr = "",
 ):
     i_s, i_t, i_bh = (
         tl.program_id(0),
@@ -83,7 +85,7 @@ def chunk_gate_cumsum_kernel(
     p_s = s + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
     p_o = o + (bos * H + i_h) * S + o_t[:, None] * (H * S) + o_s[None, :]
 
-    b_s = tl.load(p_s, mask=m_s, other=0.0).to(tl.float32)
+    b_s = tl.load(p_s, mask=m_s, other=0.0, cache_modifier=CACHE_INPUT).to(tl.float32)
 
     if HAS_BIAS:
         b_bias = tl.load(dt_bias + i_h * S + o_s, mask=o_s < S, other=0.0).to(
@@ -102,7 +104,7 @@ def chunk_gate_cumsum_kernel(
     if HAS_SCALE:
         b_o *= scale
 
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_s)
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_s, cache_modifier=CACHE_OUTPUT)
 
 
 @input_guard
@@ -116,8 +118,15 @@ def chunk_gate_cumsum(
     chunk_indices: torch.Tensor | None = None,
     lower_bound: float | None = None,
     output_dtype: torch.dtype | None = torch.float,
+    cache_input: str = "",
+    cache_output: str = "",
 ) -> torch.Tensor:
-    """Chunk-local gate cumsum with fused A_log / softplus-or-sigmoid gating."""
+    """Chunk-local gate cumsum.
+
+    Args:
+        cache_input: Cache modifier for loads (e.g. ".cs"), empty string to disable.
+        cache_output: Cache modifier for stores (e.g. ".wt"), empty string to disable.
+    """
     if cu_seqlens is not None:
         assert g.shape[0] == 1, "Varlen mode requires B=1"
     assert g.dim() == 4, f"Expected g.dim()==4, got {g.dim()}"
@@ -146,5 +155,7 @@ def chunk_gate_cumsum(
         H=H,
         S=S,
         BT=BT,
+        CACHE_INPUT=cache_input,
+        CACHE_OUTPUT=cache_output,
     )
     return g_out

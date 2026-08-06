@@ -101,7 +101,6 @@ def cumsum_inputs(request):
 
 
 class TestChunkGateCumsum:
-
     def test_softplus_no_bias(self, cumsum_inputs):
         g, A_log, B, T, H, S = cumsum_inputs
         ref = _ref_gate_cumsum_softplus(g, A_log, 32)
@@ -168,7 +167,6 @@ class TestChunkGateCumsum:
 
 
 class TestChunkDeltaAttnFwdSmoke:
-
     @pytest.mark.parametrize(
         "B,T,H,HV,K,V",
         [
@@ -439,7 +437,6 @@ class TestStateVFirst:
 
 @pytest.mark.skipif(not HAS_FLA, reason="flash-linear-attention not available")
 class TestChunkDeltaAttnFwdVsFLA:
-
     @pytest.mark.parametrize(
         "B,T,H,K,V",
         [
@@ -494,4 +491,143 @@ class TestChunkDeltaAttnFwdVsFLA:
             atol=1e-2,
             rtol=1e-2,
             msg=f"Output mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+
+
+class TestOptVsBaseline:
+    """Compare optimized (DA_TRITON_OPT=1) vs baseline (DA_TRITON_OPT=0) output."""
+
+    def _run(self, q, k, v, g, beta, A_log, dt_bias, scale, env_overrides):
+        old_env = {}
+        for key, val in env_overrides.items():
+            old_env[key] = os.environ.get(key)
+            os.environ[key] = val
+        try:
+            o, fs, *_ = chunk_delta_attn_fwd(
+                q=q.clone(),
+                k=k.clone(),
+                v=v.clone(),
+                g=g.clone(),
+                beta=beta.clone(),
+                scale=scale,
+                initial_state=None,
+                output_final_state=True,
+                chunk_size=64,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                use_beta_sigmoid_in_kernel=True,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                lower_bound=-5.0,
+                safe_gate=True,
+            )
+        finally:
+            for key, val in old_env.items():
+                if val is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = val
+        return o.float(), fs.float()
+
+    @pytest.mark.parametrize(
+        "B,T,H,K,V",
+        [
+            (1, 64, 4, 64, 64),
+            (2, 128, 8, 64, 64),
+            (1, 256, 64, 128, 128),
+            (1, 256, 128, 128, 128),
+        ],
+    )
+    def test_triton_opt_matches_baseline(self, B, T, H, K, V):
+        """DA_TRITON_OPT=1 must match DA_TRITON_OPT=0."""
+        HV = H
+        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
+
+        o_base, s_base = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "0", "DA_USE_GLUON": "0"},
+        )
+        o_opt, s_opt = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "0"},
+        )
+
+        torch.testing.assert_close(
+            o_opt,
+            o_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"triton_opt output mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+        torch.testing.assert_close(
+            s_opt,
+            s_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"triton_opt state mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+
+    @pytest.mark.parametrize(
+        "B,T,H,K,V",
+        [
+            (1, 64, 4, 64, 64),
+            (1, 256, 64, 128, 128),
+            (1, 256, 128, 128, 128),
+        ],
+    )
+    def test_gluon_matches_baseline(self, B, T, H, K, V):
+        """DA_USE_GLUON=1 must match DA_USE_GLUON=0 (on eligible hardware)."""
+        HV = H
+        q, k, v, g, beta, A_log, dt_bias, scale = make_inputs(B, T, H, HV, K, V)
+
+        o_base, s_base = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "0"},
+        )
+        o_gluon, s_gluon = self._run(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            scale,
+            {"DA_TRITON_OPT": "1", "DA_USE_GLUON": "1"},
+        )
+
+        torch.testing.assert_close(
+            o_gluon,
+            o_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"Gluon output mismatch for B={B} T={T} H={H} K={K} V={V}",
+        )
+        torch.testing.assert_close(
+            s_gluon,
+            s_base,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"Gluon state mismatch for B={B} T={T} H={H} K={K} V={V}",
         )
