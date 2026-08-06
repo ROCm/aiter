@@ -505,6 +505,7 @@ class DualwaveSwpFp8Traits:
     CROSS_SEQLEN: bool
     PAGED: bool
     PAGED_BT_LDS_SIZE: int
+    PREFETCH_BOUND: str
     FP8_PV: bool
     FP8_PV_DIRECT: bool
     BN128: bool
@@ -577,6 +578,7 @@ class DualwaveSwpFp8Traits:
             # hands back whichever compiled first.
             self.PAGED,
             self.PAGED_BT_LDS_SIZE,
+            self.PREFETCH_BOUND,
             "fp8_wide_qk_hiprec_pv",
             self.ELEM_BYTES,
             self.OUT_ELEM_BYTES,
@@ -608,6 +610,7 @@ def _make_dualwave_swp_fp8_traits(
     cross_seqlen=False,
     bn128=None,
     paged=False,
+    prefetch_bound="none",
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
@@ -622,6 +625,18 @@ def _make_dualwave_swp_fp8_traits(
     the host pins ``_PAGED_PAGE_SIZE = 64``. Only the linear cache layout is
     supported here -- the vectorized 5D layout is bf16-only upstream and the
     target workload reports ``SHUFFLED_KV_CACHE_0``.
+
+    ``prefetch_bound="clamp"`` bounds the ring's forward prefetch; it defaults
+    off so the dense path stays bit-identical to upstream, and it is not a perf
+    win (see its use site).
+
+    Two things deliberately absent, both investigated and rejected 2026-08-06.
+    ``block_m`` is not a parameter: it is bound by ``block_m = num_waves * 32``
+    (rows_per_wave is pinned by the MFMA tile), so lowering it halves wave
+    occupancy without reaching a second workgroup per CU -- the KV ring alone
+    is 96.8 KB against an 80 KB half-budget, at any block_m. And there is no
+    short-KV prologue variant: the prologue stages exactly the 4 tiles the
+    minimum two loop iterations consume, so there is nothing to trim.
     """
     # Tile shape and wave geometry follow the gfx950 dual-wave 8-wave CTA.
     block_m = 256
@@ -740,6 +755,7 @@ def _make_dualwave_swp_fp8_traits(
         # 2048 int32 entries = 8 KB of LDS, matching bf16. Caps a split's tile
         # count; the host checks the window before dispatching.
         PAGED_BT_LDS_SIZE=2048,
+        PREFETCH_BOUND=str(prefetch_bound),
         FP8_PV=fp8_pv,
         FP8_PV_DIRECT=bool(fp8_pv_direct),
         BN128=bool(bn128),

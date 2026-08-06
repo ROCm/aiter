@@ -58,15 +58,20 @@ def build_flash_attn_dualwave_swp_fp8_module(
     cross_seqlen=False,
     bn128=None,
     paged=False,
+    prefetch_bound="none",
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
     The dense path supports bf16/f16/fp8 QKV. ``varlen`` builds the packed
-    self-attention variant for bf16/f16: Q/O are ``[total_q, H, D]``, K/V are
-    ``[total_kv, H_kv, D]``, and per-batch ranges come from int32
-    ``cu_seqlens_q`` / ``cu_seqlens_kv``. fp8 currently stays dense-only.
-    ``paged`` addresses KV through a block table instead of contiguously,
-    with page size fixed at BLOCK_N=64."""
+    variant: Q/O are ``[total_q, H, D]``, K/V are ``[total_kv, H_kv, D]``, and
+    per-batch ranges come from int32 ``cu_seqlens_q`` / ``cu_seqlens_kv``.
+    ``paged`` addresses KV through a block table instead of contiguously, with
+    page size fixed at BLOCK_N=64. fp8 supports all three of varlen, paged and
+    split-K, including in combination.
+
+    ``prefetch_bound="clamp"`` bounds the ring's forward prefetch. It defaults
+    off so the dense path stays bit-identical to upstream, and it is not a perf
+    win -- see the comment at its use site."""
     gpu_arch = get_hip_arch()
 
     if not gpu_arch.startswith("gfx950"):
@@ -116,6 +121,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         cross_seqlen=cross_seqlen,
         bn128=bn128,
         paged=paged,
+        prefetch_bound=prefetch_bound,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
@@ -286,6 +292,30 @@ def build_flash_attn_dualwave_swp_fp8_module(
             def _ring_wrap(x):
                 return (x >= NPF_I).select(x - NPF_I, x)
 
+            # The ring prefetches two iterations ahead unconditionally, so the
+            # last iterations fetch tiles past t_end -- a fixed 4-tile overshoot
+            # however long the range is, hence 1.29x KV traffic at M=1384 against
+            # 1.016x at M=32768. Clamping re-reads a live tile from L2 instead.
+            #
+            # Measured 2026-08-06: this changes nothing at any shape. The kernel
+            # is latency-bound, not bandwidth-bound, at every measured size, so
+            # the overshoot was already absorbed by ring slack. Kept because it
+            # is free and strictly less wasteful, not because it is a win; do not
+            # expect it to help, and do not remove it expecting a regression.
+            #
+            # Clamping the tile INDEX rather than branching keeps the loop one
+            # basic block. That matters: the loop carries a dense
+            # sched_group_barrier schedule, and causal_mask_pair_if_needed
+            # documents that an scf.if here splits it into five blocks and
+            # breaks the QK/softmax/PV interleave. Same trick as
+            # page_id_for_tile, for the same reason.
+            t_last = t_end - fx.Index(1)
+
+            def _pf_tile(x):
+                if const_expr(traits.PREFETCH_BOUND != "clamp"):
+                    return x
+                return fx.Index((x < t_last).select(x, t_last))
+
             init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
             loop_results = init_args
             for j, loop_args in range(fx.Index(t0), t_end, fx.Index(2), init=init_args):
@@ -310,10 +340,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
                 v_v_a = kv_lds_to_regs.load_v(a_buf)
 
-                kv_gmem_to_lds.load_k((j + fx.Index(4)) * BN, f_a_buf)
-                kv_gmem_to_lds.load_k((j + fx.Index(5)) * BN, f_b_buf)
-                kv_gmem_to_lds.load_v((j + fx.Index(4)) * BN, f_a_buf)
-                kv_gmem_to_lds.load_v((j + fx.Index(5)) * BN, f_b_buf)
+                pf_a = _pf_tile(j + fx.Index(4))
+                pf_b = _pf_tile(j + fx.Index(5))
+                kv_gmem_to_lds.load_k(pf_a * BN, f_a_buf)
+                kv_gmem_to_lds.load_k(pf_b * BN, f_b_buf)
+                kv_gmem_to_lds.load_v(pf_a * BN, f_a_buf)
+                kv_gmem_to_lds.load_v(pf_b * BN, f_b_buf)
 
                 m_tile = _merge_tile_max(v_s_a, v_s_b)
                 v_o, m_new, l_row = softmax_helper.lazy_correct_o(v_o, m_row, l_row, m_tile)
