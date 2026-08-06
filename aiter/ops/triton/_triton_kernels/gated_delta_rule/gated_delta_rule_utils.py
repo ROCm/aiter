@@ -4,6 +4,7 @@ import contextlib
 import functools
 import inspect
 import logging
+import math
 import os
 import sys
 import warnings
@@ -27,8 +28,13 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
+# `fla` is an optional dependency. TC004 wants this import at runtime because
+# __version__ is read inside the deprecation decorator below, but hoisting it
+# makes importing this module fail outright wherever fla is absent. Keep it
+# guarded; that decorator path is the only thing that needs it.
 if TYPE_CHECKING:
-    from fla import __version__
+    from fla import __version__  # noqa: TC004
+
 
 FLA_CI_ENV = os.getenv("FLA_CI_ENV") == "1"
 FLA_CACHE_RESULTS = os.getenv("FLA_CACHE_RESULTS", "1") == "1"
@@ -42,32 +48,31 @@ autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
 
-FLA_USE_AUTOTUNE = False
+GATED_DELTA_RULE_TRITON_AUTOTUNE = os.environ.get(
+    "GATED_DELTA_RULE_TRITON_AUTOTUNE", "0"
+).lower() in ("1", "true", "yes", "on")
+
+# log2(e) == 1/ln(2). Converts natural-log gate values to log2 space so
+# kernels can use exp2 instead of exp. Python/wrapper-only: pass into kernels
+# as a constexpr scale (e.g. G_SCALE); never reference inside @triton.jit kernels.
+RCP_LN2: float = math.log2(math.e)
 
 
-def maybe_autotune(configs, default_config=None, **kwargs):
+def gated_delta_rule_autotune_configs(
+    configs: list[triton.Config], default_config: triton.Config | None = None
+) -> list[triton.Config]:
     """
-    Conditional autotune decorator.
+    Select Triton autotune configs based on the gated delta rule env flag.
 
-    When FLA_USE_AUTOTUNE is True, behaves identically to @triton.autotune.
-    When FLA_USE_AUTOTUNE is False (default), uses only the single default_config
-    (first config in the list if not specified), skipping all benchmark overhead.
-
-    Usage::
-
-        @maybe_autotune(
-            configs=[triton.Config(...), triton.Config(...), ...],
-            default_config=triton.Config({"BV": 64}, num_warps=4, num_stages=2),
-            key=[...],
-        )
-        @triton.jit
-        def my_kernel(...):
-            ...
+    When ``GATED_DELTA_RULE_TRITON_AUTOTUNE`` is enabled, return the full config
+    list so ``@triton.autotune`` benchmarks candidate kernels. When disabled,
+    return only ``default_config`` (or the first config) to skip tuning overhead
+    while keeping the decorator shape uniform across decode and prefill kernels.
     """
-    if FLA_USE_AUTOTUNE:
-        return triton.autotune(configs=configs, **kwargs)
+    if GATED_DELTA_RULE_TRITON_AUTOTUNE:
+        return configs
     cfg = default_config if default_config is not None else configs[0]
-    return triton.autotune(configs=[cfg], **kwargs)
+    return [cfg]
 
 
 @lru_cache(maxsize=1)
@@ -104,8 +109,6 @@ def check_environments():
             f"Current Python version {py_version} is below the recommended 3.11 version. "
             "It is recommended to upgrade to Python 3.11 or higher for the best experience.",
         )
-
-    return None
 
 
 check_environments()
@@ -161,12 +164,15 @@ def tensor_cache(
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         nonlocal last_args, last_kwargs, last_result
 
-        if last_args is not None and last_kwargs is not None:
-            if len(args) == len(last_args) and len(kwargs) == len(last_kwargs):
-                if all(a is b for a, b in zip(args, last_args, strict=False)) and all(
-                    k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items()
-                ):
-                    return last_result
+        if (
+            last_args is not None
+            and last_kwargs is not None
+            and len(args) == len(last_args)
+            and len(kwargs) == len(last_kwargs)
+            and all(a is b for a, b in zip(args, last_args, strict=False))
+            and all(k in last_kwargs and v is last_kwargs[k] for k, v in kwargs.items())
+        ):
+            return last_result
 
         result = fn(*args, **kwargs)
         last_args, last_kwargs, last_result = args, kwargs, result
@@ -430,7 +436,7 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
         return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
             "multiprocessor_count"
         ]
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         # Maybe we use a NPU device.
         if triton.runtime.driver.active.get_current_target().backend == "npu":
             return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)[
@@ -444,7 +450,7 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
 def get_available_device() -> str:
     try:
         return triton.runtime.driver.active.get_current_target().backend
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         _cpu_device_warning()
         return "cpu"
 
@@ -510,7 +516,7 @@ def get_all_max_shared_mem():
             ]
             for i in range(device_torch_lib.device_count())
         ]
-    except BaseException:
+    except BaseException:  # noqa: BLE001
         _cpu_device_warning()
         return [-1]
 
@@ -535,7 +541,7 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
         device_shared_mem_list = get_all_max_shared_mem()
         max_shared_memory = device_shared_mem_list[tensor_idx]
         return max_shared_memory >= Backend.get_shared_memory(arch)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

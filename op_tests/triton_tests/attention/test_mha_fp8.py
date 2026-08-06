@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import pytest
 import logging
+
+import pytest
+import torch
+
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 from aiter.ops.triton.attention.mha import (
     mha_set_use_fused_bwd_kernel,
 )
@@ -11,15 +14,13 @@ from aiter.ops.triton.attention.mha_v3 import (
     flash_attn_fp8_func,
     flash_attn_varlen_fp8_func,
 )
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.test_mha_common import (
     attention_ref,
     attention_ref_with_tol,
-    generate_random_padding_mask,
     generate_qkv,
+    generate_random_padding_mask,
 )
-
-from aiter.ops.triton.utils._triton.arch_info import get_arch
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import FP8_ARCHS
 
 arch = get_arch()
 
@@ -124,12 +125,6 @@ def test_mha_varlen(
     dtype=torch.bfloat16,
 ):
     HEAD_SZ: int = 128
-
-    # TO DO: remove once Triton/LLVM async-copy compiler issue is fixed
-    if arch == "gfx950" and CAUSAL:
-        pytest.skip(
-            "Known gfx950 FP8 varlen MHA compiler crash with async copy enabled"
-        )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()
@@ -301,14 +296,6 @@ def test_mha_backward_varlen(
 
     if FUSED and CAUSAL:
         pytest.skip("FUSED+CAUSAL results in NaNs")
-
-    # TO DO: Remove  once the Triton/LLVM async-copy compiler issue is fixed
-    if arch == "gfx950" and (
-        (CAUSAL and not FUSED) or (not CAUSAL and NUM_Q_HEADS == 32)
-    ):
-        pytest.skip(
-            "Known gfx950 FP8 backward varlen MHA compiler crash with async copy enabled"
-        )
 
     torch.cuda.empty_cache()
     torch.manual_seed(20)

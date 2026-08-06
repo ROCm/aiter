@@ -1,22 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import sys
-
-import aiter
 import argparse
 import itertools
+import random
+import sys
+
 import numpy as np
 import pandas as pd
-import random
 import torch
 
-from aiter import dtypes
-from aiter import per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
+import aiter
+from aiter import dtypes, per_tensor_quant
 from aiter.jit.utils.chip_info import get_gfx
-
-from typing import Tuple, Optional
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 
 # This test only supports gfx950, skip on gfx942
 if get_gfx() == "gfx942":
@@ -172,10 +169,10 @@ def run_aiter_mla_prefill_asm(
     softmax_scale: float,
     logits: torch.Tensor,
     attn_lse: torch.Tensor,
-    q_scale: Optional[torch.Tensor] = None,
-    k_scale: Optional[torch.Tensor] = None,
-    v_scale: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aiter.mla_prefill_ps_asm_fwd(
         Q,
         K,
@@ -208,7 +205,7 @@ def run_aiter_mla_reduce(
     tile_q: int,
     output: torch.Tensor,
     final_lse: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     aiter.mla_reduce_v1(
         logits,
         attn_lse,
@@ -216,6 +213,7 @@ def run_aiter_mla_reduce(
         reduce_final_map,
         reduce_partial_map,
         tile_q,
+        0,
         output,
         final_lse,
     )
@@ -234,10 +232,10 @@ def test_mla_prefill(
     block_size: int,
     varlen: bool = False,
     is_causal: bool = True,
-    load_metadata: Optional[bool] = False,
-    dump_metadata: Optional[bool] = False,
-    profile_ps: Optional[bool] = False,
-    skip_reference: Optional[bool] = False,
+    load_metadata: bool | None = False,
+    dump_metadata: bool | None = False,
+    profile_ps: bool | None = False,
+    skip_reference: bool | None = False,
 ):
     ret = {}
     out_dtype = torch.bfloat16
@@ -533,7 +531,7 @@ def test_mla_prefill(
     if not skip_reference:
         # TODO: optimize reference implementation(too slow for large context length)
         kv_buffer = K_bf16.view(-1, num_head_kv, qk_head_dim)
-        out_ref, lse_ref = torch_mla_extend(
+        out_ref, _lse_ref = torch_mla_extend(
             Q_bf16,
             kv_buffer,
             qo_indptr,

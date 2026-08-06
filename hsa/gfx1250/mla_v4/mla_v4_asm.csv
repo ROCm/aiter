@@ -1,0 +1,3 @@
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
+fp8,fp8,64,0,1,0,0,0,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,16,0,4,0,0,0,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co

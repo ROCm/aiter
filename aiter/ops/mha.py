@@ -1,18 +1,19 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import Any, Optional, Tuple
+import os
+from typing import Any
 
 import torch
 from torch import Generator, Tensor
 
-from ..jit.core import CK_DIR, AITER_META_DIR, ENABLE_CK, compile_ops
-from ..jit.utils.chip_info import get_gfx
-from ..jit.utils.torch_guard import torch_compile_guard
+from ..jit.core import AITER_META_DIR, CK_DIR, ENABLE_CK, compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..jit.utils.mha_recipes import (
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 
 
@@ -28,16 +29,16 @@ def cmdGenFunc_mha_fwd(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
 ):
     _, seqlen_q, _, _ = q.shape
     # causal=true is the same as causal=false in this case
@@ -111,7 +112,7 @@ def common_mha_fwd_fake_tensors(
     dropout_p: float,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
 ):
     batch_size = q.size(0)
     seqlen_q = q.size(1)
@@ -173,17 +174,17 @@ def gen_mha_fwd_fake_tensors(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
         q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
     )
@@ -207,17 +208,60 @@ def mha_fwd(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
+
+
+def gen_mha_fwd_native_splitkv_fake_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor | None,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, nhead_q, hdim = q.shape
+    o = (
+        torch.empty(
+            (batch_size, seqlen_q, nhead_q, hdim), dtype=q.dtype, device=q.device
+        )
+        if out is None
+        else out
+    )
+    if return_lse:
+        lse = torch.empty(
+            (batch_size, nhead_q, seqlen_q), dtype=torch.float32, device=q.device
+        )
+    else:
+        lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+    return o, lse
+
+
+@compile_ops(
+    "module_mha_fwd_native_splitkv",
+    gen_fake=gen_mha_fwd_native_splitkv_fake_tensors,
+)
+def mha_fwd_native_splitkv(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor | None,
+    softmax_scale: float,
+    causal: bool,
+    return_lse: bool,
+    num_splits: int,
+) -> tuple[Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_fwd_fake_tensors(
@@ -232,14 +276,14 @@ def gen_fmha_v3_fwd_fake_tensors(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     how_v3_bf16_cvt: int,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return common_mha_fwd_fake_tensors(
         q, k, v, dropout_p, return_softmax_lse, return_dropout_randval, out
     )
@@ -260,14 +304,413 @@ def fmha_v3_fwd(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     how_v3_bf16_cvt: int,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
+
+
+def gen_fmha_fwd_bf16_opus_fwd_fake(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    causal: bool,
+    softmax_scale: float,
+    seqstart_q: Tensor | None = None,
+    seqstart_k: Tensor | None = None,
+    seqstart_q_pad: Tensor | None = None,
+    seqstart_k_pad: Tensor | None = None,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+) -> None:
+    return None
+
+
+# OPUS gfx950 bf16 forward (shared entry point): low-level @compile_ops stub bound to
+# the pybind symbol via fc_name. Dispatches by head dim in C++ to the symmetric D=128
+# kernel (batch only) or the asymmetric D_QK=192/D_V=128 kernel (batch + group/varlen).
+# Writes `out` in place, returns None.
+@compile_ops(
+    "module_fmha_fwd_bf16_opus",
+    fc_name="fmha_fwd_bf16_opus_fwd",
+    gen_fake=gen_fmha_fwd_bf16_opus_fwd_fake,
+    develop=True,
+)
+def _fmha_fwd_bf16_opus_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    causal: bool,
+    softmax_scale: float,
+    seqstart_q: Tensor | None = None,
+    seqstart_k: Tensor | None = None,
+    seqstart_q_pad: Tensor | None = None,
+    seqstart_k_pad: Tensor | None = None,
+    max_seqlen_q: int = 0,
+    max_seqlen_k: int = 0,
+) -> None: ...
+
+
+def fmha_fwd_bf16_opus_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Public wrapper for the OPUS gfx950 bf16 dense (batch) forward (D=128 and
+    D_QK=192/D_V=128). q/k/v are dense bshd [B, S, H, D]; allocates `out`
+    ([B, S, H_q, D_v]) if needed and forwards. The kernel applies `softmax_scale`
+    to Q·K^T internally, handles GQA fan-out, and produces no LSE.
+
+    Varlen / packed inputs go through `fmha_fwd_bf16_opus_varlen_fwd` instead.
+    """
+    v_head_dim = v.size(-1)
+
+    if out is None:
+        batch, q_seq_len, q_head_num = q.size(0), q.size(1), q.size(2)
+        out = torch.empty(
+            (batch, q_seq_len, q_head_num, v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+    _fmha_fwd_bf16_opus_fwd(q, k, v, out, bool(causal), float(softmax_scale))
+    return out
+
+
+def fmha_fwd_bf16_opus_varlen_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: float,
+    causal: bool,
+    seqstart_q: Tensor,
+    seqstart_k: Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    out: Tensor | None = None,
+    seqstart_q_pad: Tensor | None = None,
+    seqstart_k_pad: Tensor | None = None,
+) -> Tensor:
+    """Public wrapper for the OPUS gfx950 bf16 group/varlen forward (D_QK=192/D_V=128
+    only). q/k/v are packed [total, H, D]; allocates `out` ([total_q, H_q, D_v]) if
+    needed and forwards. The kernel applies `softmax_scale` to Q·K^T internally,
+    handles GQA fan-out, and produces no LSE.
+
+    seqstart_q / seqstart_k          : cumulative REAL sequence lengths (int32, len
+                                       num_groups+1; drive masks / tile counts).
+    seqstart_q_pad / seqstart_k_pad  : cumulative PHYSICAL row offsets (KV-padding
+                                       variant); default to the real arrays when None.
+    max_seqlen_q / max_seqlen_k      : upper bounds driving the grid.
+    """
+    v_head_dim = v.size(-1)
+
+    if out is None:
+        total_q, q_head_num = q.size(0), q.size(1)
+        out = torch.empty(
+            (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
+        )
+
+    seqstart_q = seqstart_q.to(torch.int32).contiguous()
+    seqstart_k = seqstart_k.to(torch.int32).contiguous()
+    if seqstart_q_pad is not None:
+        seqstart_q_pad = seqstart_q_pad.to(torch.int32).contiguous()
+    if seqstart_k_pad is not None:
+        seqstart_k_pad = seqstart_k_pad.to(torch.int32).contiguous()
+
+    _fmha_fwd_bf16_opus_fwd(
+        q,
+        k,
+        v,
+        out,
+        bool(causal),
+        float(softmax_scale),
+        seqstart_q,
+        seqstart_k,
+        seqstart_q_pad if seqstart_q_pad is not None else seqstart_q,
+        seqstart_k_pad if seqstart_k_pad is not None else seqstart_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# fmha_fwd_with_sink_asm (gfx1250) — single-shot batched FMHA forward.
+#
+# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]); strides are
+# read directly from the tensor so non-contiguous bshd-shaped views (e.g. of
+# sbhd / bhsd allocations) are accepted.  Only `tensor.stride(-1) == 1` is
+# required.  softmax_scale is forwarded to the kernel as-is (the kernel
+# applies it internally to Q·K^T before softmax).
+#
+# Memory-allocation policy: all GPU tensors (out, lse, sink) are allocated on
+# the Python side; the C++ entry point performs only pointer + stride
+# bookkeeping and kernel launch (no torch dependency).  The public wrapper
+# `fmha_fwd_with_sink_asm` below handles allocation and the AITER-post-scale →
+# kernel-pre-scale conversion for sink (multiply by sqrt(qk_head_dim)).
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_fmha_fwd_with_sink_asm",
+    fc_name="fmha_fwd_with_sink_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_with_sink_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    sink: Tensor | None,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_with_sink_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+    sink: Tensor | None = None,
+    out: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Public wrapper: allocates `out`/`lse` buffers as needed and forwards to
+    the ctypes-backed kernel entry point.
+
+    Contract details:
+      * `sink` is passed through verbatim — it is the value the kernel
+        consumes directly (no host-side scaling). It is optional: pass `None`
+        for no sink. Whether the kernel reads it is decided inside the `.co`
+        (ENABLE_SINK). When provided it must be a 1-D fp32 tensor of shape
+        [q_head_num].
+      * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
+        allocated even when `return_lse=False`; in that case the contents are
+        undefined and callers should ignore the returned `lse`.
+    """
+    batch, q_seq_len, q_head_num, _qk_head_dim = q.shape
+    v_head_dim = v.size(3)
+
+    if out is None:
+        out = torch.empty(
+            (batch, q_seq_len, q_head_num, v_head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+    lse = torch.empty(
+        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+    )
+
+    _fmha_fwd_with_sink_asm(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        sink,
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
+
+
+@compile_ops(
+    "module_fmha_fwd_with_sink_varlen_asm",
+    fc_name="fmha_fwd_with_sink_varlen_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_with_sink_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    sink: Tensor | None,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_with_sink_varlen_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    cu_seqlens_q: Tensor,
+    cu_seqlens_k: Tensor,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+    sink: Tensor | None = None,
+    out: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Public wrapper: varlen / packed BF16 ASM forward (gfx1250).
+
+    Layout is packed [token, head, dim] (THD), batch folded into the token
+    axis; per-batch boundaries come from cumulative-length arrays:
+      * q   : (total_q, nheads,   hdim_q)
+      * k   : (total_k, nheads_k, hdim_q)
+      * v   : (total_k, nheads_k, hdim_v)
+      * out : (total_q, nheads,   hdim_v)
+      * lse : (total_q, nheads, 1)  fp32  (kernel writes packed [total_q, nheads])
+      * cu_seqlens_q/k : int32 [batch+1] cumulative (cu[batch] == total)
+
+    Contract details:
+      * The varlen kernel carries NO strides; q/k/v/out MUST be densely packed,
+        so this wrapper calls `.contiguous()` defensively.
+      * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
+        supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
+        count; the kernel early-exits tiles beyond each batch's actual length.
+      * `sink` is passed through verbatim (the value the kernel consumes
+        directly, no host-side scaling); optional. Allocation is caller-side.
+      * The kernel always accesses `ptr_LSE`, so an LSE buffer is always
+        allocated even when `return_lse=False`; in that case ignore the result.
+    """
+    q, k, v = (x.contiguous() for x in (q, k, v))
+    cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
+    cu_seqlens_k = cu_seqlens_k.to(torch.int32).contiguous()
+
+    total_q, q_head_num, _qk_head_dim = q.shape
+    v_head_dim = v.size(2)
+
+    if out is None:
+        out = torch.empty(
+            (total_q, q_head_num, v_head_dim), dtype=q.dtype, device=q.device
+        )
+
+    lse = torch.empty((total_q, q_head_num, 1), dtype=torch.float32, device=q.device)
+
+    _fmha_fwd_with_sink_varlen_asm(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        sink,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
+
+
+# ---------------------------------------------------------------------------
+# fmha_fwd_mxfp8_asm (gfx1250) — dedicated MXFP8 FMHA forward.
+#
+# This is an intentionally separate integration path from both the bf16
+# `fmha_fwd_with_sink_asm` and the shared `fmha_v3` paths.  The MXFP8 kernel
+# uses its own slot-padded kernarg ABI carrying q/k/v micro-scaling (e8m0)
+# descale pointers, expected to diverge further from the MI350 layout — so it
+# gets its own C++ translation unit (csrc/py_itfs_cu/asm_fmha_fwd_mxfp8.cu)
+# and its own Python entry point here.
+#
+# API contract: q/k/v are **bshd shape** ([batch, seq, head, dim]) fp8 (e4m3),
+# in bhsd memory order (stride_head > stride_seq); strides are read directly
+# from the tensors.  q/k/v_scale are 1-D float8_e8m0fnu descale buffers laid
+# out as the kernel expects (block_size=32 along head_dim).  All GPU tensors
+# (out, lse, scales) are allocated on the Python side.
+# ---------------------------------------------------------------------------
+@compile_ops(
+    "module_fmha_fwd_mxfp8_asm",
+    fc_name="fmha_fwd_mxfp8_asm",
+    ffi_type="ctypes",
+)
+def _fmha_fwd_mxfp8_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    out: Tensor,
+    lse: Tensor,
+    softmax_scale: float,
+    is_causal: bool,
+    return_lse: bool,
+) -> None: ...
+
+
+def fmha_fwd_mxfp8_asm(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_scale: Tensor,
+    k_scale: Tensor,
+    v_scale: Tensor,
+    softmax_scale: float | None = None,
+    is_causal: bool = False,
+    return_lse: bool = False,
+    out: Tensor | None = None,
+) -> tuple[Tensor, Tensor]:
+    """Public wrapper for the gfx1250 MXFP8 ASM FMHA forward.
+
+    Args:
+        q: (batch, seqlen_q, nheads, hdim_q) fp8 (e4m3), bhsd memory layout
+        k: (batch, seqlen_k, nheads_k, hdim_q) fp8 (e4m3), bhsd memory layout
+        v: (batch, seqlen_k, nheads_k, hdim_v) fp8 (e4m3), bhsd memory layout
+        q_scale/k_scale/v_scale: float8_e8m0fnu micro-scaling descale buffers.
+        softmax_scale: softmax scaling; defaults to hdim_q ** -0.5.
+        is_causal: causal masking (requires seqlen_q == seqlen_k).
+        return_lse: whether the returned lse contents are meaningful.
+        out: optional preallocated bf16 output [batch, seqlen_q, nheads, hdim_v].
+
+    Returns:
+        (out, lse). The kernel always touches the lse buffer; when
+        return_lse=False its contents are undefined and should be ignored.
+    """
+    batch, q_seq_len, q_head_num, qk_head_dim = q.shape
+    v_head_dim = v.size(3)
+
+    if softmax_scale is None:
+        softmax_scale = qk_head_dim ** (-0.5)
+
+    if out is None:
+        # bf16 output in bhsd memory layout, returned as a bshd-shaped view.
+        out_bhsd = torch.empty(
+            (batch, q_head_num, q_seq_len, v_head_dim),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        out = out_bhsd.transpose(1, 2)
+
+    lse = torch.empty(
+        (batch, q_head_num, q_seq_len), dtype=torch.float32, device=q.device
+    )
+
+    _fmha_fwd_mxfp8_asm(
+        q,
+        k,
+        v,
+        q_scale,
+        k_scale,
+        v_scale,
+        out,
+        lse,
+        float(softmax_scale),
+        bool(is_causal),
+        bool(return_lse),
+    )
+    return out, lse
 
 
 def cmdGenFunc_mha_varlen_fwd(
@@ -275,7 +718,7 @@ def cmdGenFunc_mha_varlen_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -289,17 +732,17 @@ def cmdGenFunc_mha_varlen_fwd(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    gen: torch.Generator | None = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+    sink_ptr: torch.Tensor | None = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -405,7 +848,7 @@ def gen_mha_varlen_fwd_fake_tensor(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -419,18 +862,18 @@ def gen_mha_varlen_fwd_fake_tensor(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    gen: torch.Generator | None = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
 
@@ -475,7 +918,7 @@ def mha_varlen_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: Optional[torch.Tensor],
+    cu_seqlens_k: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -489,18 +932,18 @@ def mha_varlen_fwd(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    gen: torch.Generator | None = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_fwd_fake_tensor(
@@ -522,18 +965,17 @@ def gen_fmha_v3_varlen_fwd_fake_tensor(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     how_v3_bf16_cvt: int,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-
+    out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    gen: torch.Generator | None = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     device = q.device
     dtype = q.dtype
 
@@ -590,17 +1032,17 @@ def fmha_v3_varlen_fwd(
     return_softmax_lse: bool,
     return_dropout_randval: bool,
     how_v3_bf16_cvt: int,
-    out: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[Tensor] = None,
-    k_descale: Optional[Tensor] = None,
-    v_descale: Optional[Tensor] = None,
-    gen: Optional[torch.Generator] = None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    out: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: Tensor | None = None,
+    k_descale: Tensor | None = None,
+    v_descale: Tensor | None = None,
+    gen: torch.Generator | None = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_bwd(
@@ -616,16 +1058,16 @@ def cmdGenFunc_mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    dbias: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    dbias: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
 ):
     md_name = "mha_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -695,9 +1137,9 @@ def common_mha_bwd_fake_tensors(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
 ):
     batch_size = q.size(0)
     seqlen_q = q.size(1)
@@ -768,17 +1210,17 @@ def gen_mha_bwd_fake_tensors(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    dbias: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    dbias: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -801,17 +1243,17 @@ def mha_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    dbias: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    dbias: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_bwd_fake_tensors(
@@ -829,13 +1271,13 @@ def gen_fmha_v3_bwd_fake_tensors(
     deterministic: bool,
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return common_mha_bwd_fake_tensors(q, k, v, dq, dk, dv)
 
 
@@ -857,13 +1299,13 @@ def fmha_v3_bwd(
     deterministic: bool,
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def cmdGenFunc_mha_varlen_bwd(
@@ -884,16 +1326,16 @@ def cmdGenFunc_mha_varlen_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    cu_seqlens_q_padded: Optional[Tensor] = None,
-    cu_seqlens_k_padded: Optional[Tensor] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    cu_seqlens_q_padded: Tensor | None = None,
+    cu_seqlens_k_padded: Tensor | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
 ) -> dict[str, Any]:
     md_name = "mha_varlen_bwd"
     filter1 = "*"  # get_bwd_dot_do_o_blobs()
@@ -968,21 +1410,21 @@ def cmdGenFunc_mha_batch_prefill(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
     # Per-tensor descale for PERTENSOR mode (Q/K/V each have one scale value)
-    q_descale: Optional[Tensor] = None,  # [1] per-tensor Q descale
-    k_descale: Optional[Tensor] = None,  # [1] per-tensor K descale
-    v_descale: Optional[Tensor] = None,  # [1] per-tensor V descale
+    q_descale: Tensor | None = None,  # [1] per-tensor Q descale
+    k_descale: Tensor | None = None,  # [1] per-tensor K descale
+    v_descale: Tensor | None = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (Q per-tensor, K/V per-page)
     # Mutually exclusive with k_descale/v_descale
-    kv_block_descale: Optional[Tensor] = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    kv_last_page_lens: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    seqlen_k: Optional[Tensor] = None,
+    kv_block_descale: Tensor | None = None,  # [num_block, num_kv_head, 2]
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
+    kv_last_page_lens: Tensor | None = None,
+    block_table: Tensor | None = None,
+    seqlen_k: Tensor | None = None,
 ):
     # causal=true is the same as causal=false in this case
     causal = is_causal
@@ -1075,9 +1517,9 @@ def gen_mha_varlen_bwd_fake_tensors_common(
     cu_seqlens_q: Tensor,
     max_seqlen_q: int,
     zero_tensors: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
 ):
     num_heads = q.size(1)
 
@@ -1127,15 +1569,15 @@ def gen_mha_varlen_bwd_fake_tensors(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return gen_mha_varlen_bwd_fake_tensors_common(
         q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
     )
@@ -1166,17 +1608,17 @@ def mha_varlen_bwd(
     window_size_left: int,
     window_size_right: int,
     deterministic: bool,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    cu_seqlens_q_padded: Optional[Tensor] = None,
-    cu_seqlens_k_padded: Optional[Tensor] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    cu_seqlens_q_padded: Tensor | None = None,
+    cu_seqlens_k_padded: Tensor | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def gen_fmha_v3_varlen_bwd_fake_tensor(
@@ -1199,14 +1641,14 @@ def gen_fmha_v3_varlen_bwd_fake_tensor(
     deterministic: bool,
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    cu_seqlens_q_padded: Optional[Tensor] = None,
-    cu_seqlens_k_padded: Optional[Tensor] = None,
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    cu_seqlens_q_padded: Tensor | None = None,
+    cu_seqlens_k_padded: Tensor | None = None,
 ):
     return gen_mha_varlen_bwd_fake_tensors_common(
         q, k, v, cu_seqlens_q, max_seqlen_q, zero_tensors, dq, dk, dv
@@ -1239,19 +1681,66 @@ def fmha_v3_varlen_bwd(
     deterministic: bool,
     is_v3_atomic_fp32: bool,
     how_v3_bf16_cvt: int,
-    dq: Optional[Tensor] = None,
-    dk: Optional[Tensor] = None,
-    dv: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
-    rng_state: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    cu_seqlens_q_padded: Optional[Tensor] = None,
-    cu_seqlens_k_padded: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    dq: Tensor | None = None,
+    dk: Tensor | None = None,
+    dv: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
+    rng_state: Tensor | None = None,
+    gen: Generator | None = None,
+    cu_seqlens_q_padded: Tensor | None = None,
+    cu_seqlens_k_padded: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _native_splitkv_heuristic(batch, nhead_q, seqlen_q, seqlen_k, num_cu):
+    # Pick split-KV group count G for the native D64 kernel; G == 0 falls back to
+    # the CK non-split-KV kernel. Tuned on 100 measured shapes
+    # (fmha_native scripts/splitkv_heuristic.py).
+    # nwg = workgroups (occupancy); skvt = KV tiles (reduction work to split).
+    # Tile sizes are the kernel block geometry: kM0=128 query, kN0=64 key.
+    SQ_TILE = 128
+    KV_TILE = 64
+
+    def snap(x):
+        # Largest split in {2,4,8,16} that is <= x (0 if none).
+        g = 0
+        for c in (2, 4, 8, 16):
+            if c <= x:
+                g = c
+        return g
+
+    sqt = (seqlen_q + SQ_TILE - 1) // SQ_TILE
+    skvt = (seqlen_k + KV_TILE - 1) // KV_TILE
+    nwg = batch * nhead_q * sqt
+
+    # Cap G so each split keeps enough KV tiles to amortize combine cost.
+    kvdiv = 10 if nwg < 24 else 28
+    kv_cap = snap(skvt / kvdiv)
+
+    # Regime A -- undersubscribed: split to fill the machine, capped by KV work.
+    if nwg < num_cu:
+        occ_cap = snap(3.5 * num_cu / nwg)
+        return min(occ_cap, kv_cap)
+
+    # Regime B -- saturated: batch >= 2 has ample independent work, split is loss.
+    if batch >= 2:
+        return 0
+
+    # batch == 1: a small split hides the long per-CU KV reduction, but only if
+    # KV is long enough relative to oversubscription.
+    over = nwg / num_cu
+    if skvt < 10 * over and over < 30:
+        return 0
+
+    # Modest split; fewer heads leave more headroom, extreme corner splits more.
+    g = 4 if nhead_q <= 8 else 2
+    if over >= 30:
+        g = max(g, snap(skvt / 160))
+    return min(g, kv_cap) if kv_cap > 0 else 0
 
 
 def _flash_attn_forward(
@@ -1264,20 +1753,20 @@ def _flash_attn_forward(
     window_size_left: int,
     window_size_right: int,
     sink_size: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
-    q_descale: Optional[torch.Tensor],
-    k_descale: Optional[torch.Tensor],
-    v_descale: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
     return_lse: bool,
     return_softmax: bool,
-    how_v3_bf16_cvt: Optional[int] = 1,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-    out: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
+    how_v3_bf16_cvt: int | None = 1,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    out: torch.Tensor | None = None,
+    num_splits: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch_size, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     if sink_ptr is not None:
@@ -1294,7 +1783,10 @@ def _flash_attn_forward(
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -1327,11 +1819,16 @@ def _flash_attn_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 is hand-written gfx9 ASM; non-gfx9 must fall back to ck-tile.
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8() or is_fmha_v3_i8fp8())
@@ -1343,11 +1840,155 @@ def _flash_attn_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
+    def can_impl_fmha_fwd_with_sink_asm():
+        # gfx1250 ASM bf16 forward (fmha_fwd_with_sink_asm).  Single-shot batched
+        # (no varlen / dropout / swa / quant / alibi / bias).  Sink logits
+        # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        # Per-hdim sink eligibility:
+        #
+        #   D128 kernels (`_rxy`) compile ENABLE_SINK=0 -- the kernel ignores
+        #   any sink buffer.  Routing a caller's sink_ptr to it would silently
+        #   drop the sink term, so we fall back to CK whenever sink_ptr is set.
+        #
+        #   D64 kernels (`_rxy_sink`) compile ENABLE_SINK=1 -- the kernel
+        #   ALWAYS reads SINK and adds `exp((sink - max) * scale)` to the
+        #   softmax denominator.  There is no "skip sink" mode on this binary,
+        #   so calling it with sink_ptr=None now forwards a null pointer to the
+        #   kernel (the wrapper no longer raises / zero-fills), which the D64
+        #   binary would dereference.  To preserve flash_attn_func's documented
+        #   `sink_ptr is None` semantics we keep requiring an explicit sink for
+        #   D64 here and fall back to CK otherwise.
+        if hdim_q == 128:
+            ret = ret and (sink_ptr is None)
+        elif hdim_q == 64:
+            ret = ret and (sink_ptr is not None)
+        return ret
+
+    def can_impl_fmha_fwd_mxfp8_asm():
+        # gfx1250 ASM MXFP8 forward (fmha_fwd_mxfp8_asm).  Dedicated path: fp8
+        # (e4m3) q/k/v with microscaling (e8m0) block-scale descale buffers.
+        # The e8m0 descale dtype is what distinguishes MXFP8 from the per-tensor
+        # fp8 path (is_fmha_v3_fp8, which uses fp32 descales on gfx942/gfx950).
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.fp8)
+        ret = ret and (
+            q_descale is not None and k_descale is not None and v_descale is not None
+        )
+        ret = ret and (
+            q_descale.dtype == dtypes.fp8_e8m0
+            and k_descale.dtype == dtypes.fp8_e8m0
+            and v_descale.dtype == dtypes.fp8_e8m0
+        )
+
+        # The MXFP8 ASM kernel is validated only for BHSD memory order: a
+        # bshd-shaped [b, s, h, d] tensor whose head stride exceeds its seq
+        # stride (i.e. backed by [b, h, s, d] memory), with a contiguous last
+        # dim.  Any other layout (e.g. plain contiguous BSHD) is left to the
+        # other forward implementations rather than risking a wrong result.
+        def _is_bhsd(t):
+            return t.dim() == 4 and t.stride(-1) == 1 and t.stride(2) > t.stride(1)
+
+        ret = ret and _is_bhsd(q) and _is_bhsd(k) and _is_bhsd(v)
+        # Both D128 non-causal (mask=0) and causal (mask=1) kernels are
+        # registered in fmha_fwd_mxfp8.csv; causal uses seqlen_q == seqlen_k.
+        ret = ret and (hdim_q == 128)
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and ((not causal) or (seqlen_q == seqlen_k))
+        ret = ret and (seqlen_k % 128 == 0)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0 and sink_ptr is None)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        return ret
+
+    def can_impl_fmha_native():
+        # Native hand-written HIP D64 split-K forward. gfx942-only, dense bf16, no
+        # bias/alibi/swa/dropout/sink/fp8/varlen. See design doc.
+        ret = get_gfx() == "gfx942"
+        ret = ret and (
+            q.dtype == dtypes.bf16 and k.dtype == dtypes.bf16 and v.dtype == dtypes.bf16
+        )
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (hdim_q == 64 and hdim_v == 64)
+        ret = ret and (seqlen_q > 0 and seqlen_k > 0)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (bias is None) and (alibi_slopes is None)
+        # Native has only two mask modes: full (causal=False) and full causal
+        # (causal=True). Require the exact no-window sentinel -- `not swa` is too
+        # loose because swa only tests >0, so a finite 0 window (e.g.
+        # window_size=(-1, 0), which is semantically causal) would slip through and
+        # be computed as unmasked. Any window/sink restriction falls back to CK/ASM.
+        ret = ret and (window_size_left == -1 and window_size_right == -1)
+        ret = ret and (sink_size == 0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)
+        ret = ret and (sink_ptr is None)
+        ret = ret and (nhead_q % nhead_k == 0)
+        if causal:
+            # sq>sk causal would NaN fully-masked rows in attention_ref but combine
+            # returns 0 -> divergence; let those fall back to ASM/CK. decode/square
+            # always satisfy sk>=sq.
+            ret = ret and (seqlen_k >= seqlen_q)
+        return ret
+
+    def _can_impl_fmha_fwd_hd128_bf16_opus():
+        if int(os.environ.get("AITER_ENABLE_FMHA_OPUS", "0")) == 0:
+            return False
+        if not (hdim_q == 128 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset; fall back to
+        # v3/CK. Actual seqlen stride (layout-aware, matches the C++ guard).
+        return not seqlen_k * k.stride(1) * k.element_size() >= 1 << 32
+
+    def _can_impl_fmha_fwd_hd192_v128_bf16_opus():
+        # OPUS gfx950 dense D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT (no env)
+        if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
+            return False
+        if not (hdim_q == 192 and hdim_v == 128):
+            return False
+        # KV byte extent >= 2^32 wraps the kernel's 32-bit async-load soffset (same as D=128).
+        if seqlen_k * k.stride(1) * k.element_size() >= (1 << 32):
+            return False
+        return not seqlen_k * v.stride(1) * v.element_size() >= 1 << 32
+
+    def can_impl_fmha_fwd_bf16_opus():
+        # Shared eligibility for the OPUS gfx950 bf16 forward kernels (inference-only:
+        # no LSE/dropout mask, so it must never capture return_lse / the autograd path).
+        # Cheapest / most-selective gates first so the per-head-dim helpers (which read
+        # env vars) are only evaluated once the common conditions already hold.
+        ret = get_gfx() == "gfx950"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (cu_seqlens_q is None and cu_seqlens_kv is None)  # dense here
+        ret = ret and (bias is None and alibi_slopes is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (window_size_left == -1 and window_size_right == -1)
+        ret = ret and (sink_size == 0 and sink_ptr is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (not return_lse) and (not return_softmax)
+        ret = ret and (
+            _can_impl_fmha_fwd_hd128_bf16_opus()
+            or _can_impl_fmha_fwd_hd192_v128_bf16_opus()
+        )
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
     # Validate newly added optional cumulative length / padded arrays if provided.
     # They are currently only plumbed through for future CK support enabling per-batch padding.
-    def _validate_cu(name: str, x: Optional[torch.Tensor]):
+    def _validate_cu(name: str, x: torch.Tensor | None):
         if x is None:
             return
         assert x.dim() == 1, f"{name} must be 1D"
@@ -1357,7 +1998,87 @@ def _flash_attn_forward(
     _validate_cu("cu_seqlens_q", cu_seqlens_q)
     _validate_cu("cu_seqlens_kv", cu_seqlens_kv)
 
-    if can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
+    assert num_splits >= 0, f"num_splits must be >= 0 (0=auto), got {num_splits}"
+    if can_impl_fmha_native():
+        ns = (
+            num_splits
+            if num_splits >= 1
+            else _native_splitkv_heuristic(
+                batch_size, nhead_q, seqlen_q, seqlen_k, get_cu_num()
+            )
+        )
+        if ns > 1:
+            assert (
+                ns <= (seqlen_k + 63) // 64
+            ), (  # ceil(seqlen_k/64); don't silently clamp
+                f"num_splits={ns} too large for seqlen_k={seqlen_k}"
+            )
+            out_, softmax_lse = mha_fwd_native_splitkv(
+                q, k, v, out, softmax_scale, causal, return_lse, ns
+            )
+            S_dmask = None
+            # grad path needs a real rng_state tensor (dropout=0 -> no-dropout path).
+            rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+            return out_, softmax_lse, S_dmask, rng_state
+        # ns <= 1 (0 = heuristic fallback, 1 = forced no-split) -> existing dispatch
+    # can_impl_fmha_native() False -> num_splits ignored, existing dispatch
+    if can_impl_fmha_fwd_with_sink_asm():
+        # gfx1250 ASM bf16 path: q/k/v are bshd; kernel reads strides directly,
+        # no API-side permute.  softmax_scale is forwarded as-is (kernel applies
+        # it internally to Q·K^T).  sink_ptr is passed through verbatim -- it is
+        # the value the kernel consumes directly (no host-side scaling); whether
+        # the kernel reads it is decided inside the .co.
+        #
+        # `can_impl_fmha_fwd_with_sink_asm` still enforces the current-binary
+        # (hdim, sink_ptr) matrix (D128 requires sink_ptr is None; D64 requires
+        # sink_ptr is not None) so we never feed a null sink to a D64 binary that
+        # unconditionally reads it -- forward the caller's sink_ptr unmodified.
+        out_, softmax_lse = fmha_fwd_with_sink_asm(
+            q,
+            k,
+            v,
+            float(softmax_scale),
+            bool(causal),
+            True,
+            sink_ptr,
+            out,
+        )
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_mxfp8_asm():
+        # gfx1250 ASM MXFP8 path: fp8 q/k/v with e8m0 block-scale descales.
+        # q/k/v are bshd; the kernel reads strides directly (no API-side
+        # permute).  Output is bf16; softmax_scale is forwarded as-is.
+        out_, softmax_lse = fmha_fwd_mxfp8_asm(
+            q,
+            k,
+            v,
+            q_descale,
+            k_descale,
+            v_descale,
+            float(softmax_scale),
+            bool(causal),
+            True,
+            out,
+        )
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_bf16_opus():
+        # OPUS gfx950 dense forward (shared entry point; dispatches D=128 vs
+        # D_QK=192/D_V=128 in C++ by head dim). Inference-only: the lse/S_dmask/rng
+        # slots are unused placeholders (gate guarantees not return_lse/return_softmax).
+        out_ = fmha_fwd_bf16_opus_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            out=out,
+        )
+        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_v3_fwd() and seqlen_q > 128:  # Prefer CK for decode cases
         out_, softmax_lse, S_dmask, rng_state = fmha_v3_fwd(
             q,
             k,
@@ -1412,19 +2133,18 @@ def can_impl_fmha_v3_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    dbias: Optional[torch.Tensor],
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    dbias: torch.Tensor | None,
     dropout_p: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     deterministic: bool,
-    is_v3_atomic_fp32: Optional[bool] = True,
+    is_v3_atomic_fp32: bool | None = True,
 ) -> bool:
-
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
     batch_stride_q = q.stride(0)
@@ -1593,23 +2313,23 @@ def _flash_attn_backward_fake(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    dbias: Optional[torch.Tensor],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    dbias: torch.Tensor | None,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
+    rng_state: torch.Tensor | None = None,
+    is_v3_atomic_fp32: bool | None = True,
+    how_v3_bf16_cvt: int | None = 1,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = q.size(0)
     seqlen_q = q.size(1)
@@ -1633,23 +2353,23 @@ def _flash_attn_backward(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-    dbias: Optional[torch.Tensor],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
+    dbias: torch.Tensor | None,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    bias: Optional[torch.Tensor],
-    alibi_slopes: Optional[torch.Tensor],
+    bias: torch.Tensor | None,
+    alibi_slopes: torch.Tensor | None,
     deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
+    rng_state: torch.Tensor | None = None,
+    is_v3_atomic_fp32: bool | None = True,
+    how_v3_bf16_cvt: int | None = 1,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
 ) -> torch.Tensor:
     # rtna & rtz are deprecated in gfx950
     if get_gfx() == "gfx950" and how_v3_bf16_cvt != 0:
@@ -1679,7 +2399,6 @@ def _flash_attn_backward(
 
     _, seqlen_q, nhead_q, hdim_q = q.shape
     _, seqlen_k, nhead_k, hdim_v = v.shape
-    nmask = not causal and window_size_left == -1 and window_size_right == -1  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     # only 1 block when sk <= 256, thus deterministic
@@ -1790,11 +2509,12 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse,
         return_softmax,
         is_grad_enabled,
-        is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1,
-        cu_seqlens_q: Optional[torch.Tensor] = None,
-        cu_seqlens_kv: Optional[torch.Tensor] = None,
-        sink_ptr: Optional[Tensor] = None,
+        is_v3_atomic_fp32: bool | None = True,
+        how_v3_bf16_cvt: int | None = 1,
+        cu_seqlens_q: torch.Tensor | None = None,
+        cu_seqlens_kv: torch.Tensor | None = None,
+        sink_ptr: Tensor | None = None,
+        num_splits: int = 0,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
@@ -1827,6 +2547,7 @@ class FlashAttnFunc(torch.autograd.Function):
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_kv,
             sink_ptr=sink_ptr,  # fwd kernel still uses sink_ptr naming
+            num_splits=num_splits,
         )
         if is_grad:
             assert return_lse
@@ -1911,7 +2632,8 @@ class FlashAttnFunc(torch.autograd.Function):
         # 18 sink_ptr (fwd-only sink scores; not differentiable via autograd.
         #              bwd sink gradient d_sink is computed inside mha_bwd kernel,
         #              not returned here as a positional gradient.)
-        # Need to return exactly 18 gradient entries.
+        # 19 num_splits
+        # Need to return exactly 19 gradient entries.
         return (
             dq,  # q
             dk,  # k
@@ -1931,6 +2653,7 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # cu_seqlens_q
             None,  # cu_seqlens_kv
             None,  # sink_ptr (not differentiable; bwd uses sink/d_sink args separately)
+            None,  # num_splits
         )
 
 
@@ -1948,9 +2671,10 @@ def flash_attn_func(
     return_lse=False,
     return_attn_probs=False,
     how_v3_bf16_cvt=1,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_kv: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
+    cu_seqlens_q: torch.Tensor | None = None,
+    cu_seqlens_kv: torch.Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    num_splits: int = 0,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -1994,6 +2718,10 @@ def flash_attn_func(
            (they might not have the right scaling).
         cu_seqlens_q: (batch_size + 1,). The cumulative sequence lengths of the query sequences.
         cu_seqlens_kv: (batch_size + 1,). The cumulative sequence lengths of the key/value sequences.
+        num_splits: int. Number of key/value splits for the native split-K forward path.
+            0 (default) lets aiter decide via a heuristic; 1 disables split-K (uses the
+            standard CK/ASM dispatch); >=2 forces the native split-K kernel with that many
+            splits when that path is applicable, otherwise num_splits is ignored.
     Return:
         out: (batch_size, seqlen, nheads, headdim_v).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen). The
@@ -2040,6 +2768,7 @@ def flash_attn_func(
         cu_seqlens_q,
         cu_seqlens_kv,
         sink_ptr,
+        num_splits,
     )
 
 
@@ -2049,8 +2778,8 @@ def _flash_attn_varlen_forward(
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
-    cu_seqlens_q_padded: Optional[torch.Tensor],
-    cu_seqlens_k_padded: Optional[torch.Tensor],
+    cu_seqlens_q_padded: torch.Tensor | None,
+    cu_seqlens_k_padded: torch.Tensor | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     min_seqlen_q: int,
@@ -2061,20 +2790,19 @@ def _flash_attn_varlen_forward(
     window_size_left: int = -1,
     window_size_right: int = -1,
     sink_size: int = 0,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
     return_lse: bool = False,
     return_softmax: bool = False,
-    how_v3_bf16_cvt: Optional[int] = 1,
-    block_table: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
+    how_v3_bf16_cvt: int | None = 1,
+    block_table: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
     zero_tensors: bool = False,
-    sink_ptr: Optional[Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
+    sink_ptr: Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, nhead_q, hdim_q = q.shape
     batch_size = cu_seqlens_q.numel() - 1
 
@@ -2089,15 +2817,14 @@ def _flash_attn_varlen_forward(
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
     sink_size = 0 if sink_size >= max_seqlen_k else sink_size
-    mask = causal == True and window_size_left == -1  # causal mask
-    nmask = (
-        causal == False and window_size_left == -1 and window_size_right == -1
-    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def is_fmha_v3_fp8():
         ret = get_gfx() in ("gfx942", "gfx950")
-        ret = ret and (hdim_q == 128)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and get_gfx() == "gfx950")
+        )
         ret = ret and (q.dtype == dtypes.fp8)
         ret = ret and (
             q_descale is not None and k_descale is not None and v_descale is not None
@@ -2113,11 +2840,17 @@ def _flash_attn_varlen_forward(
 
     def can_impl_fmha_v3_fwd():
         # basic
-        ret = alibi_slopes is None
+        # fmha v3 varlen is hand-written gfx9 ASM; non-gfx9 must fall back to
+        # ck-tile (mha_varlen_fwd, the else branch below).
+        ret = get_gfx() in ("gfx942", "gfx950")
+        ret = ret and (alibi_slopes is None)
         ret = ret and (bias is None)
         ret = ret and (dropout_p == 0.0)
-        ret = ret and (hdim_v == 128)
-        ret = ret and (hdim_q == 128 or hdim_q == 192)
+        ret = ret and (
+            (hdim_q == 128 and hdim_v == 128)
+            or (hdim_q == 192 and hdim_v == 128)
+            or (hdim_q == 256 and hdim_v == 256 and is_fmha_v3_fp8())
+        )
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
         ret = ret and (q.dtype == dtypes.bf16 or is_fmha_v3_fp8())
@@ -2129,9 +2862,112 @@ def _flash_attn_varlen_forward(
             ret = ret and ((gqa_ratio & (gqa_ratio - 1)) == 0)
         return ret
 
+    def can_impl_fmha_fwd_with_sink_varlen_asm():
+        # gfx1250 ASM bf16 packed/varlen forward (fmha_fwd_with_sink_varlen_asm).
+        # Packed THD (batch folded into the token axis); no dropout / swa /
+        # quant / alibi / bias / paged (block_table) / logits-soft-cap.  Sink
+        # logits (per-Q-head fp32) supported; sink-token (sink_size) not.
+        ret = get_gfx() == "gfx1250"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_v == hdim_q)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (sink_size == 0)
+        ret = ret and (alibi_slopes is None and bias is None)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
+        ret = ret and (block_table is None)
+        # The varlen ASM wrapper carries no physical-padding arrays; route any
+        # padded-cu request to CK (mha_varlen_fwd) which understands them.
+        ret = ret and (cu_seqlens_q_padded is None and cu_seqlens_k_padded is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        # Per-hdim sink eligibility (mirrors the fixed-batch path):
+        #   D128 (`_rxy`) binaries compile ENABLE_SINK=0 and ignore the sink
+        #   buffer, so routing a caller's sink_ptr to them would silently drop
+        #   the sink term -- fall back to CK whenever sink_ptr is set.
+        #   D64  (`_rxy_sink`) binaries compile ENABLE_SINK=1 and ALWAYS read
+        #   SINK, so calling with sink_ptr=None would dereference a null pointer
+        #   -- require an explicit sink for D64 and fall back to CK otherwise.
+        if hdim_q == 128:
+            ret = ret and (sink_ptr is None)
+        elif hdim_q == 64:
+            ret = ret and (sink_ptr is not None)
+        return ret
+
+    def can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+        # OPUS gfx950 group/varlen D_QK=192 / D_V=128 bf16 forward. Enabled by DEFAULT
+        # (no env). Packed THD q/k/v; supports KV padding (cu_seqlens_*_padded) and
+        # cross-attention (causal bottom-right aligned). Inference-only: no LSE / dropout
+        # / bias / alibi / swa / sink / quant / paged.
+        # AITER_DISABLE_FMHA_OPUS=1 force-disables it (fall back to v3/CK; for A/B).
+        if int(os.environ.get("AITER_DISABLE_FMHA_OPUS", "0")) != 0:
+            return False
+        ret = get_gfx() == "gfx950"
+        ret = ret and (q.dtype == dtypes.bf16)
+        ret = ret and (hdim_q == 192 and hdim_v == 128)
+        ret = ret and (nhead_q % nhead_k == 0)
+        ret = ret and (not swa)
+        ret = ret and (dropout_p == 0.0)
+        ret = ret and (logits_soft_cap == 0.0)
+        ret = ret and (bias is None and alibi_slopes is None)
+        ret = ret and (sink_size == 0 and sink_ptr is None)
+        ret = ret and (q_descale is None and k_descale is None and v_descale is None)
+        ret = ret and (block_table is None)
+        ret = ret and (not return_lse) and (not return_softmax)
+        return ret
+
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
 
-    if can_impl_fmha_v3_fwd():
+    if can_impl_fmha_fwd_hd192_v128_bf16_opus_varlen():
+        # OPUS gfx950 group/varlen D=192 path. cu_seqlens_* are the REAL cumulative
+        # lengths (masks / tile counts); cu_seqlens_*_padded are the PHYSICAL row
+        # offsets (KV padding). When no padded arrays are given, physical == real.
+        out = fmha_fwd_bf16_opus_varlen_fwd(
+            q,
+            k,
+            v,
+            softmax_scale=float(softmax_scale),
+            causal=bool(causal),
+            out=out,
+            seqstart_q=cu_seqlens_q,
+            seqstart_k=cu_seqlens_k,
+            seqstart_q_pad=cu_seqlens_q_padded,
+            seqstart_k_pad=cu_seqlens_k_padded,
+            max_seqlen_q=int(max_seqlen_q),
+            max_seqlen_k=int(max_seqlen_k),
+        )
+        softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_fwd_with_sink_varlen_asm():
+        # gfx1250 packed/varlen ASM bf16 path.  q/k/v are packed THD; the kernel
+        # requires dense packing (the wrapper calls `.contiguous()` defensively)
+        # and carries no strides.  softmax_scale is forwarded as-is (the kernel
+        # applies it internally to Q·K^T).  sink_ptr is passed through verbatim;
+        # `can_impl_fmha_fwd_with_sink_varlen_asm` already enforces the per-hdim
+        # (D128→no sink, D64→sink) contract so we never feed a null sink to a
+        # D64 binary that unconditionally reads it.
+        out, lse_asm = fmha_fwd_with_sink_varlen_asm(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            float(softmax_scale),
+            bool(causal),
+            True,
+            sink_ptr,
+            out,
+        )
+        # The ASM kernel writes packed lse (total_q, nheads, 1); the varlen API
+        # convention (mha_varlen_fwd) is (nheads, total_q).  Reshape so callers
+        # and the autograd backward see a consistent layout regardless of path.
+        softmax_lse = lse_asm.squeeze(-1).transpose(0, 1).contiguous()
+        S_dmask = torch.empty((0,), dtype=torch.float32, device=q.device)
+        rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
+    elif can_impl_fmha_v3_fwd():
         out, softmax_lse, S_dmask, rng_state = fmha_v3_varlen_fwd(
             q,
             k,
@@ -2221,9 +3057,9 @@ def _flash_attn_varlen_backward(
     v: torch.Tensor,
     out: torch.Tensor,
     softmax_lse: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
+    dq: torch.Tensor | None,
+    dk: torch.Tensor | None,
+    dv: torch.Tensor | None,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -2233,18 +3069,17 @@ def _flash_attn_varlen_backward(
     causal: bool,
     window_size_left: int,
     window_size_right: int,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     deterministic: bool,
-    rng_state: Optional[torch.Tensor] = None,
-    is_v3_atomic_fp32: Optional[bool] = True,
-    how_v3_bf16_cvt: Optional[int] = 1,
+    rng_state: torch.Tensor | None = None,
+    is_v3_atomic_fp32: bool | None = True,
+    how_v3_bf16_cvt: int | None = 1,
     zero_tensors: bool = False,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink: Optional[Tensor] = None,
-    d_sink: Optional[Tensor] = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+    sink: Tensor | None = None,
+    d_sink: Tensor | None = None,
 ) -> torch.Tensor:
-
     _, nhead_q, hdim_q = q.shape
 
     nhead_k = v.shape[-2]
@@ -2253,10 +3088,6 @@ def _flash_attn_varlen_backward(
     # mask
     window_size_left = -1 if window_size_left >= max_seqlen_k else window_size_left
     window_size_right = -1 if window_size_right >= max_seqlen_k else window_size_right
-    mask = causal == True and window_size_left == -1  # causal mask
-    nmask = (
-        causal == False and window_size_left == -1 and window_size_right == -1
-    )  # no mask
     swa = (window_size_left > 0) or (window_size_right > 0)
 
     def pssk():
@@ -2438,8 +3269,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         is_grad_enabled,
         cu_seqlens_q_padded=None,
         cu_seqlens_k_padded=None,
-        is_v3_atomic_fp32: Optional[bool] = True,
-        how_v3_bf16_cvt: Optional[int] = 1,
+        is_v3_atomic_fp32: bool | None = True,
+        how_v3_bf16_cvt: int | None = 1,
         sink_ptr=None,
     ):
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
@@ -2483,7 +3314,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sink_ptr=sink_ptr,
         )
         if is_grad:
-
             assert return_lse
             ctx.save_for_backward(
                 q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
@@ -2639,9 +3469,9 @@ def flash_attn_varlen_func(
     how_v3_bf16_cvt=1,
     block_table=None,
     out=None,
-    cu_seqlens_q_padded: Optional[torch.Tensor] = None,
-    cu_seqlens_k_padded: Optional[torch.Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
+    cu_seqlens_q_padded: torch.Tensor | None = None,
+    cu_seqlens_k_padded: torch.Tensor | None = None,
+    sink_ptr: Tensor | None = None,
 ):
     if block_table is not None and (
         cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None
@@ -2706,6 +3536,94 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+
+    # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
+    def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+        # Keep this public-router gate intentionally narrow so the PR3039
+        # prefill ASM path can be measured without changing decode or other
+        # FlyDSL/CK coverage.
+        if get_gfx() != "gfx1250" or q.dtype != dtypes.bf16:
+            return False
+        hdim_q = q.shape[-1]
+        hdim_v = v.shape[-1]
+        nhead_q = q.shape[-2]
+        nhead_k = k.shape[-2]
+        if hdim_q not in (64, 128) or hdim_v != hdim_q:
+            return False
+        if nhead_q % nhead_k != 0:
+            return False
+        if not causal or dropout_p != 0.0 or logits_soft_cap != 0.0:
+            return False
+        if window_size[0] != -1 or window_size[1] != -1:
+            return False
+        sink_size = window_size[2] if len(window_size) > 2 else 0
+        if sink_size != 0:
+            return False
+        if bias is not None or alibi_slopes is not None or block_table is not None:
+            return False
+        if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+            return False
+        if hdim_q == 64:
+            return sink_ptr is not None
+        return sink_ptr is None
+
+    if can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
+        return FlashAttnVarlenFunc.apply(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            min_seqlen_q,
+            dropout_p,
+            softmax_scale,
+            logits_soft_cap,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+            block_table,
+            out,
+            torch.is_grad_enabled(),
+            cu_seqlens_q_padded,
+            cu_seqlens_k_padded,
+            True,
+            how_v3_bf16_cvt,
+            sink_ptr,
+        )
+
+    # FlyDSL path returns result if supported, None otherwise.
+    from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
+
+    _flydsl_result = flydsl_flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        return_lse=return_lse,
+        dropout_p=dropout_p,
+        window_size=window_size,
+        bias=bias,
+        alibi_slopes=alibi_slopes,
+        deterministic=deterministic,
+        return_attn_probs=return_attn_probs,
+        block_table=block_table,
+        out=out,
+        sink=sink_ptr,
+    )
+    if _flydsl_result is not None:
+        return _flydsl_result
+
     if not ENABLE_CK:
         from .triton.attention.mha import (
             flash_attn_varlen_func as flash_attn_varlen_func_triton,
@@ -2781,21 +3699,21 @@ def mha_batch_prefill_fake_tensors(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[torch.Tensor] = None,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    out: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     # Per-tensor descale for PERTENSOR mode
-    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
-    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
-    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    q_descale: torch.Tensor | None = None,  # [1] per-tensor Q descale
+    k_descale: torch.Tensor | None = None,  # [1] per-tensor K descale
+    v_descale: torch.Tensor | None = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
-    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-    kv_last_page_lens: Optional[torch.Tensor] = None,
-    block_table: Optional[torch.Tensor] = None,
-    seqlen_k: Optional[torch.Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    kv_block_descale: torch.Tensor | None = None,  # [num_block, num_kv_head, 2]
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
+    kv_last_page_lens: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    seqlen_k: torch.Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     is_vectorized = k.dim() == 5 and v.dim() == 5
     is_linear = (k.dim() == 4 and v.dim() == 4) or (k.dim() == 3 and v.dim() == 3)
@@ -2866,21 +3784,21 @@ def mha_batch_prefill(
     sink_size: int,
     return_softmax_lse: bool,
     return_dropout_randval: bool,
-    out: Optional[Tensor] = None,
-    bias: Optional[Tensor] = None,
-    alibi_slopes: Optional[Tensor] = None,
+    out: Tensor | None = None,
+    bias: Tensor | None = None,
+    alibi_slopes: Tensor | None = None,
     # Per-tensor descale for PERTENSOR mode
-    q_descale: Optional[torch.Tensor] = None,  # [1] per-tensor Q descale
-    k_descale: Optional[torch.Tensor] = None,  # [1] per-tensor K descale
-    v_descale: Optional[torch.Tensor] = None,  # [1] per-tensor V descale
+    q_descale: torch.Tensor | None = None,  # [1] per-tensor Q descale
+    k_descale: torch.Tensor | None = None,  # [1] per-tensor K descale
+    v_descale: torch.Tensor | None = None,  # [1] per-tensor V descale
     # Per-page descale for KV_BLOCKSCALE mode (mutually exclusive with k_descale/v_descale)
-    kv_block_descale: Optional[torch.Tensor] = None,  # [num_block, num_kv_head, 2]
-    kv_last_page_lens: Optional[Tensor] = None,
-    block_table: Optional[Tensor] = None,
-    seqlen_k: Optional[Tensor] = None,
-    sink_ptr: Optional[Tensor] = None,
-    gen: Optional[Generator] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]: ...
+    kv_block_descale: torch.Tensor | None = None,  # [num_block, num_kv_head, 2]
+    kv_last_page_lens: Tensor | None = None,
+    block_table: Tensor | None = None,
+    seqlen_k: Tensor | None = None,
+    sink_ptr: Tensor | None = None,
+    gen: Generator | None = None,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]: ...
 
 
 def _mha_batch_prefill(
@@ -2899,8 +3817,8 @@ def _mha_batch_prefill(
     window_size_left: int = -1,
     window_size_right: int = -1,
     sink_size: int = 0,
-    bias: Optional[torch.Tensor] = None,
-    alibi_slopes: Optional[torch.Tensor] = None,
+    bias: torch.Tensor | None = None,
+    alibi_slopes: torch.Tensor | None = None,
     return_lse: bool = False,
     return_softmax: bool = False,
     zero_tensors: bool = False,
@@ -2908,15 +3826,14 @@ def _mha_batch_prefill(
     kv_last_page_lens: torch.Tensor = None,
     block_table: torch.Tensor = None,
     seqlen_k: torch.Tensor = None,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
-    kv_block_descale: Optional[
-        torch.Tensor
-    ] = None,  # [num_block, num_kv_head, 2] per-page K/V descales
-    sink_ptr: Optional[Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-
+    q_descale: torch.Tensor | None = None,
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    kv_block_descale: (
+        torch.Tensor | None
+    ) = None,  # [num_block, num_kv_head, 2] per-page K/V descales
+    sink_ptr: Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = mha_batch_prefill(
         q,
@@ -3018,7 +3935,7 @@ def mha_batch_prefill_func(
             raise ValueError("K/V linear layout must match page size and head count")
     if k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("Batch prefill requires K/V with contiguous last dimension")
-    out_padded, softmax_lse, S_dmask, rng_state = _mha_batch_prefill(
+    out_padded, softmax_lse, S_dmask, _rng_state = _mha_batch_prefill(
         q,
         k,
         v,

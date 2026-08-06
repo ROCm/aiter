@@ -3,15 +3,19 @@
 
 import functools
 import json
+
 import torch
 import triton
 import triton.language as tl
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
-from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.mha_kernel_utils import _compute_fp8_scaling_factors
+from aiter.ops.triton.utils._triton.pid_preprocessing import (
+    remap_workgroup_spatial,
+    remap_xcd,
+)
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 
 
 @triton.jit
@@ -359,9 +363,11 @@ def _attn_fwd(
     VARLEN: tl.constexpr,
     BATCH,
     NUM_XCD: tl.constexpr,
+    SWIZZLE: tl.constexpr,
     USE_INT64_STRIDES: tl.constexpr,
     ENABLE_SINK: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr,
+    HEAD_STRIDE_ALIGNED_8: tl.constexpr = False,
 ):
     NUM_BLOCKS = (SEQLEN_Q + BLOCK_M - 1) // BLOCK_M
     # calculate offsets
@@ -370,10 +376,22 @@ def _attn_fwd(
     )  # workgroup id ranging: 0,1,2,...., (BATCH * NUM_Q_HEADS * NUM_BLOCKS - 1)
     # num blocks along seqlen
 
-    off_q_head = wid % NUM_Q_HEADS
-    off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
-    start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
-    off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    tl.static_assert(
+        SWIZZLE == "default" or SWIZZLE == "spatial",
+        "SWIZZLE must be 'default' or 'spatial'; set via AITER_TRITON_MHA_SWIZZLE or mha_set_swizzle()",
+    )
+    if SWIZZLE == "default":
+        # Default: head-first round-robin with XCD-aware head remapping.
+        off_q_head = wid % NUM_Q_HEADS
+        off_q_head = remap_xcd(off_q_head, NUM_Q_HEADS, NUM_XCD)
+        start_m = (wid // NUM_Q_HEADS) % NUM_BLOCKS
+        off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
+    else:
+        # Spatial: XCD-aware KV-head mapping for MHA and GQA.
+        NUM_QUERIES_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_K_HEADS
+        off_q_head, start_m, off_z = remap_workgroup_spatial(
+            wid, NUM_Q_HEADS, NUM_BLOCKS, BATCH, NUM_QUERIES_PER_KV, NUM_XCD
+        )
 
     # offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -564,9 +582,22 @@ def _attn_fwd(
         off_k_head = off_q_head
 
     # q,k,v offsets
+    # When the caller guarantees that the head-axis strides of Q/K/V are
+    # multiples of 8 elements (set via HEAD_STRIDE_ALIGNED_8), the head-axis
+    # byte offset is 16-byte aligned. Auto-specialization only fires at the
+    # 16-element threshold, so hint the smaller multiple explicitly to let
+    # AxisInfo widen the global load.
+    qh_off = off_q_head * stride_qh
+    kh_off = off_k_head * stride_kh
+    vh_off = off_k_head * stride_vh
+    if HEAD_STRIDE_ALIGNED_8:
+        qh_off = tl.multiple_of(qh_off, 8)
+        kh_off = tl.multiple_of(kh_off, 8)
+        vh_off = tl.multiple_of(vh_off, 8)
+
     q_offs = (
         off_z * stride_qz
-        + off_q_head * stride_qh
+        + qh_off
         + cu_seqlens_q_start * stride_qm
         + offs_m[:, None] * stride_qm
         + offs_d[None, :] * stride_qk
@@ -575,7 +606,7 @@ def _attn_fwd(
     if HAS_PE:
         q_pe_offs = (
             off_z * stride_qz
-            + off_q_head * stride_qh
+            + qh_off
             + cu_seqlens_q_start * stride_qm
             + offs_m[:, None] * stride_qm
             + offs_pe[None, :] * stride_qk
@@ -586,7 +617,7 @@ def _attn_fwd(
 
     k_offs = (
         off_z * stride_kz
-        + off_k_head * stride_kh
+        + kh_off
         + cu_seqlens_k_start * stride_kn
         + offs_d[:, None] * stride_kk
         + offs_n[None, :] * stride_kn
@@ -595,7 +626,7 @@ def _attn_fwd(
     if HAS_PE:
         k_pe_offs = (
             off_z * stride_kz
-            + off_k_head * stride_kh
+            + kh_off
             + cu_seqlens_k_start * stride_kn
             + offs_pe[:, None] * stride_kk
             + offs_n[None, :] * stride_kn
@@ -606,7 +637,7 @@ def _attn_fwd(
 
     v_offs = (
         off_z * stride_vz
-        + off_k_head * stride_vh
+        + vh_off
         + cu_seqlens_k_start * stride_vn
         + offs_n[:, None] * stride_vn
         + offs_d[None, :] * stride_vk
@@ -856,15 +887,14 @@ def _attn_fwd(
     end_m_idx = (start_m + 1) * BLOCK_M
     start_m_idx = start_m * BLOCK_M
     causal_start_idx = seqlen_q - seqlen_k
-    if IS_CAUSAL:
-        if causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
-            out_mask_boundary = tl.full(
-                (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
-            )
-            mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
-            out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
-            z = 0.0
-            acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
+    if IS_CAUSAL and causal_start_idx > start_m_idx and causal_start_idx < end_m_idx:
+        out_mask_boundary = tl.full(
+            (BLOCK_DMODEL_POW2,), causal_start_idx, dtype=tl.int32
+        )
+        mask_m_offsets = start_m_idx + tl.arange(0, BLOCK_M)
+        out_ptrs_mask = mask_m_offsets[:, None] >= out_mask_boundary[None, :]
+        z = 0.0
+        acc = tl.where(out_ptrs_mask, acc, z.to(acc.type.element_ty))
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     overflow_size = end_m_idx - seqlen_q
@@ -921,6 +951,7 @@ def _get_config(
     enable_dropout: bool,
     dtype: torch.dtype,
     has_pe: bool = False,
+    head_dim_v: int | None = None,
 ):
     if not hasattr(_get_config, "_config_dict"):
         dev = arch_info.get_arch()
@@ -938,5 +969,11 @@ def _get_config(
         return fwd_cfg["pe"]
     elif enable_dropout or dtype == torch.float32:
         return fwd_cfg["dropout_or_fp32"]
+    elif head_dim_v is not None and 16 < head_dim_v <= 64 and "small_head" in fwd_cfg:
+        # Mid-small V head dims (16 < d <= 64) hit a num_stages=1 software-pipelining
+        # pathology on this backend (e.g. ~3x slower at d64). Using num_stages=3
+        # recovers performance and is numerically verified for these dims, but
+        # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
+        return fwd_cfg["small_head"]
     else:
         return fwd_cfg["default"]

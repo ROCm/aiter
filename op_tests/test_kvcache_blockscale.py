@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import torch
-import aiter
-from aiter.test_common import checkAllclose, run_perftest, benchmark
-from typing import Tuple
-from aiter import dtypes
-import functools
 import argparse
+import functools
+
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 MAX_TOKEN_SUPPORTED = 16384
 
@@ -23,9 +24,11 @@ def run_torch(
     block_size,
     x,
     asm_layout,
-    quantCfg={},
+    quantCfg=None,
 ):
-    num_batch, num_tokens, num_heads, head_size = key.shape
+    if quantCfg is None:
+        quantCfg = {}
+    _num_batch, _num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
     k_cache_shape = k_cache.shape
     v_cache_shape = v_cache.shape
@@ -133,8 +136,10 @@ def run_aiter(
     block_size,
     x,
     asm_layout,
-    quantCfg={},
+    quantCfg=None,
 ):
+    if quantCfg is None:
+        quantCfg = {}
     aiter.reshape_and_cache_with_block_quant(
         key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping, asm_layout
     )
@@ -152,11 +157,13 @@ def run_torch_for_asmpa(
     block_size,
     x,
     asm_layout,
-    quantCfg={},
+    quantCfg=None,
     ori_block_size=128,
 ):
+    if quantCfg is None:
+        quantCfg = {}
     block_split = ori_block_size // block_size
-    num_batch, num_tokens, num_heads, head_size = key.shape
+    _num_batch, _num_tokens, num_heads, head_size = key.shape
     num_blocks = k_cache.shape[0]
     k_cache_shape = k_cache.shape
     v_cache_shape = v_cache.shape
@@ -302,9 +309,11 @@ def run_aiter_for_asmpa(
     block_size,
     x,
     asm_layout,
-    quantCfg={},
+    quantCfg=None,
     ori_block_size=128,
 ):
+    if quantCfg is None:
+        quantCfg = {}
     aiter.reshape_and_cache_with_block_quant_for_asm_pa(
         key,
         value,
@@ -323,14 +332,16 @@ def run_aiter_for_asmpa(
 def test_reshape_and_cache(
     ctx_lens: int,
     bs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     block_size: int,
     DTyoe_KV: torch.dtype,
     DTyoe_KVCache: torch.dtype,
-    quantCfg: dict = {},
+    quantCfg: dict | None = None,
     ori_block_size=0,  # test for asm pa , only support 128 / 256, 0 mean off
 ):
+    if quantCfg is None:
+        quantCfg = {}
     asm_layout = True
     qhead, kvhead = num_heads
     if ori_block_size:
