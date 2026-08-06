@@ -895,15 +895,11 @@ void mla_decode_stage1_asm_fwd(
         }else if (q_type == "fp8"){
             if(max_seqlen_q == 1){
                 config_max_seqlen_q = 1;
-            }else if(max_seqlen_q == 2 && !(persistent && arch_id == "gfx950")){
+            }else if(max_seqlen_q == 2){
                 config_max_seqlen_q = 2;
             }else if(max_seqlen_q <= 4){
                 sub_Q = 64;
                 config_max_seqlen_q = 4;
-                if(persistent && arch_id == "gfx950" && max_seqlen_q >= 2)
-                {
-                    args.s_MQA = static_cast<unsigned int>(gqa_ratio);
-                }
             }else if (max_seqlen_q > 4 && persistent && arch_id == "gfx950"){
                 config_max_seqlen_q = 4;
                 config_gqa_ratio = 32;

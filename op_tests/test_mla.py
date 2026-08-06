@@ -603,8 +603,23 @@ def test_mla(
     # ASM/CK decode baseline only supports MTP up to qlen=4; skip it beyond that
     # (gluon still validates against the torch reference).
     asm_supports_mtp = decode_qlen <= 4
+    # --no-causal needs a non-masked (msk0) kernel. decode_qlen==1 always works:
+    # a single query token makes the mask a no-op, so the dispatch reuses the
+    # masked kernel. Beyond that the non-persistent side only ships fp8/fp8 msk0
+    # builds for nhead=128 (any qlen) and nhead=16 qlen 3/4 -- see the ps=0,
+    # causal=0 rows of hsa/gfx950/mla/mla_asm.csv. Everything else would abort in
+    # get_heuristic_kernel_mla, so skip it instead of killing the sweep.
+    asm_supports_non_causal = (
+        is_causal
+        or decode_qlen == 1
+        or (
+            dtype == dtypes.fp8
+            and kvtype == dtypes.fp8
+            and (nhead == 128 or (nhead == 16 and decode_qlen in (3, 4)))
+        )
+    )
     # The ASM decode baseline aborts for these MLA configs when lse is requested
-    if return_lse or not asm_supports_mtp:
+    if return_lse or not asm_supports_mtp or not asm_supports_non_causal:
         pass
     elif (
         (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
@@ -699,6 +714,9 @@ def test_mla(
         and kvtype == torch.bfloat16
         and nhead <= 96
         and 1 <= decode_qlen <= 17  # MTP: qlen>1 uses the causal tail path
+        # mla_gluon has no causal switch and its MTP path is always the causal
+        # tail, so a non-causal golden would never match it for qlen>1.
+        and (is_causal or decode_qlen == 1)
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
