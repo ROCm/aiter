@@ -267,16 +267,15 @@ def launch_gemm_a8w4_tdm(
             waves, nw = [(None,)] * 4, num_waves
         base_i32 = fx.recast_iter(p32_shared, base_ptr)
 
-        # The waves listed in one ``wv`` load disjoint halves of the same tile, so
+        # The waves listed in one ``wv`` load disjoint slices of the same tile, so
         # they agree on every compile-time field of the atom (tile shape, padding,
         # num_warps) and differ only in global offset, LDS offset and OOB extent --
-        # all runtime atom state. Folding the half index into those three collapses
-        # the pair to one atom, which makes a wave *group* (which tensor it feeds),
-        # not a single wave, the smallest unit that needs its own code.
-        wave_half = wave % 2
-        wave_grp = wave // 2
-
-        Job = namedtuple("Job", "atom gt on_i32 lds_off lds_row inner outer k_adv grp")
+        # all runtime atom state. Folding the slice index into those three collapses
+        # the whole list to one atom, so ``wv`` itself -- not a single wave -- is the
+        # smallest unit that needs its own code.
+        Job = namedtuple(
+            "Job", "atom gt on_i32 lds_off lds_row inner outer k_adv waves"
+        )
         jobs = []
 
         def add_tdm_loads(
@@ -295,17 +294,18 @@ def launch_gemm_a8w4_tdm(
             pad=None,
         ):
             seg = outer // len(wv)
-            # Rows this wave skips inside the tile: runtime when a wave pair splits
-            # the tile, a compile-time 0 when one wave owns the whole thing. The LDS
+            # Where this wave's slice starts along the outer dim: ``wave - wv[0]`` is
+            # 0 on the first owner and steps by one down the list, so the offset is a
+            # runtime value; a compile-time 0 when the list is cooperative. The LDS
             # term carries lds_row's unit (bytes for A/B, dwords for the scales).
-            hseg = wave_half * seg if const_expr(len(wv) > 1) else 0
+            wave_outer_off = (wave - wv[0]) * seg if const_expr(len(wv) > 1) else 0
             gt = global_view(
                 g_base,
-                g_off + fx.Int64(hseg) * g_stride,
+                g_off + fx.Int64(wave_outer_off) * g_stride,
                 (seg, inner),
                 (inner, 1),
             )
-            ext = None if oob is None else oob - hseg
+            ext = None if oob is None else oob - wave_outer_off
             pad_kw = {"pad_interval": pad[0], "pad_amount": pad[1]} if pad else {}
             atom = fx.rocdl.make_tdm_atom(
                 gt, [ext, None], strides=[g_stride, None], num_warps=nw, **pad_kw
@@ -315,12 +315,12 @@ def launch_gemm_a8w4_tdm(
                     atom,
                     gt,
                     on_i32,
-                    lds_off + hseg * lds_row,
+                    lds_off + wave_outer_off * lds_row,
                     lds_row,
                     inner,
                     seg,
                     k_adv,
-                    None if wv[0] is None else wv[0] // 2,
+                    wv,
                 )
             )
 
@@ -379,11 +379,21 @@ def launch_gemm_a8w4_tdm(
         )
 
         # Wave ids are runtime values, so ownership cannot be resolved while tracing
-        # -- one instruction stream serves every wave. Branching once per group is
-        # the floor here: within a group the halves are already runtime offsets, so
-        # its jobs share one test and one block. Callers that have already selected
-        # a group (the unswitched k-loop) pass ``my_jobs`` and get no test at all.
-        job_grps = sorted({j.grp for j in jobs}) if jobs[0].grp is not None else []
+        # -- one instruction stream serves every wave. One test per owner list is the
+        # floor here: the slice index inside a list is already a runtime offset, so
+        # every job with the same owners shares one test and one block. Callers that
+        # have already selected a list (the unswitched k-loop) pass ``my_jobs`` and
+        # get no test at all.
+        job_waves = (
+            sorted({j.waves for j in jobs}) if jobs[0].waves[0] is not None else []
+        )
+
+        def owns(wv):
+            """Runtime predicate: is this wave one of ``wv``?"""
+            pred = wave == wv[0]
+            for w in wv[1:]:
+                pred = pred | (wave == w)
+            return pred
 
         def issue(s, kt, my_jobs=None):
             pa = fx.recast_iter(p8_shared, buf_ptr(s))
@@ -401,31 +411,32 @@ def launch_gemm_a8w4_tdm(
             if const_expr(my_jobs is not None):
                 for j in my_jobs:
                     emit(j)
-            elif const_expr(not job_grps):
+            elif const_expr(not job_waves):
                 for j in jobs:
                     emit(j)
             else:
-                for g in range_constexpr(len(job_grps)):
-                    if wave_grp == job_grps[g]:
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
                         for j in jobs:
-                            if const_expr(j.grp == job_grps[g]):
+                            if const_expr(j.waves == job_waves[g]):
                                 emit(j)
 
         def unswitch(body):
-            """Run ``body`` once per wave group, with that group's jobs bound.
+            """Run ``body`` once per owner list, with that list's jobs bound.
 
-            Hoisting the group test out of the k-loop leaves the loop body free of
-            any wave comparison: each copy issues its own two TDMs unconditionally.
-            The copies are identical apart from those two descriptors, and every
-            wave executes exactly one of them, so the barrier and tensorcnt counts
-            per iteration are the same as before the split.
+            Hoisting the ownership test out of the k-loop leaves the loop body free
+            of any wave comparison: each copy issues its list's TDMs unconditionally.
+            The copies are identical apart from those descriptors, and every wave
+            appears in exactly one list, so it runs exactly one copy and the barrier
+            and tensorcnt counts per iteration are the same as before the split. A
+            wave in no list would skip the barriers and hang the workgroup.
             """
-            if const_expr(not job_grps):
+            if const_expr(not job_waves):
                 body(None)
             else:
-                for g in range_constexpr(len(job_grps)):
-                    if wave_grp == job_grps[g]:
-                        body([j for j in jobs if j.grp == job_grps[g]])
+                for g in range_constexpr(len(job_waves)):
+                    if owns(job_waves[g]):
+                        body([j for j in jobs if j.waves == job_waves[g]])
 
         wmb = wave_m * warp_tile_m
         wnb = wave_n * warp_tile_n
