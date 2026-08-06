@@ -1,7 +1,10 @@
 # adapted from triton_kernels package
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_ogs.py
 
+import functools
 import itertools
+import json
+import os
 
 import torch
 import triton
@@ -19,6 +22,7 @@ from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import reduce_grouped
 from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils.core import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
 
 GLUON_SUPPORTED_ARCHS = {"gfx1250"}
@@ -27,6 +31,15 @@ GLUON_SUPPORTED_ARCHS = {"gfx1250"}
 def is_gluon_supported():
     arch = get_arch()
     return arch in GLUON_SUPPORTED_ARCHS
+
+
+@functools.lru_cache
+def _get_a4w4_dispatch(arch: str) -> dict:
+    fpath = f"{AITER_TRITON_CONFIGS_PATH}/moe/{arch}-A4W4.json"
+    if os.path.exists(fpath):
+        with open(fpath, "r") as f:
+            return json.load(f)
+    return {}
 
 
 # -----------------------------------------------------------------------------
@@ -132,67 +145,37 @@ def get_kernel_config_triton(m, n, k, routing_data):
     return ret
 
 
+def m2bucket(m):
+    if m <= 8:
+        return "tiny"
+    if m <= 32:
+        return "small"
+    if m <= 128:
+        return "medium"
+    if m <= 256:
+        return "medium2"
+    if m <= 512:
+        return "large"
+    return "xlarge"
+
+
 def get_kernel_config_gluon(m, n, k, routing_data):
     block_m = routing_data.block_m
     num_xcds = 1
-    num_warps = 4
 
-    if block_m == 16:
-        block_k = 512
-        if n <= 512:
-            block_n = 512
-            num_buffers = 2
-        elif n <= 1024:
-            block_n = 128
-            num_buffers = 1
-        elif n <= 4096:
-            block_n = 256
-            num_buffers = 1
-        elif k <= 256:
-            block_n = 512
-            num_buffers = 1
-        else:
-            block_n = 128
-            num_buffers = 1
-    elif block_m == 32:
-        if n <= 512:
-            block_n = 256
-            block_k = 256
-            num_buffers = 2
-        elif n <= 1024:
-            block_n = 128
-            block_k = 512
-            num_buffers = 2
-        elif n <= 4096:
-            block_n = 256
-            block_k = 256
-            num_buffers = 2
-        elif k <= 1024:
-            block_n = 512
-            block_k = 512
-            num_buffers = 2
-        else:
-            block_n = 128
-            block_k = 512
-            num_buffers = 2
-    elif block_m == 64:
-        block_k = 256
-        if n <= 1024:
-            block_n = 512
-            num_buffers = 2
-        elif n <= 2048:
-            block_n = 256
-            num_buffers = 2
-        else:
-            block_n = 512
-            num_buffers = 1
-    else:
-        block_n = 512
-        block_k = 256
-        if n > 4096:
-            num_buffers = 1
-        else:
-            num_buffers = 2
+    arch = get_arch()
+    tuned = _get_a4w4_dispatch(arch)
+    key = f"bm{block_m}_n{n}_k{k}_{m2bucket(m)}"
+    if key not in tuned:
+        key = f"bm{block_m}_any"
+    assert key in tuned, f"no a4w4 gluon config for {arch}: {key}"
+    cfg = tuned[key]
+    block_n, block_k, num_buffers, num_warps = (
+        cfg["block_n"],
+        cfg["block_k"],
+        cfg["num_buffers"],
+        cfg["num_warps"],
+    )
 
     num_buffers = min(num_buffers, triton.cdiv(k, block_k))
 
