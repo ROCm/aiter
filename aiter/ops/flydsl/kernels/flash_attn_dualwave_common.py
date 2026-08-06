@@ -575,8 +575,16 @@ def _make_dualwave_swp_fp8_traits(
     num_kv_splits=1,
     varlen=False,
     cross_seqlen=False,
+    bn128=None,
 ):
-    """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8)."""
+    """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
+
+    ``bn128`` selects the deep-pipeline shape (6-deep K prefetch ring, Q in
+    registers, DMA V staging, direct packed-i32x8 PV). ``None`` keeps
+    upstream's behaviour of deriving it from ``num_kv_splits``/``varlen``;
+    pass True or False to choose it independently of those. See the comment at
+    the derivation site for why the two are separable.
+    """
     # Tile shape and wave geometry follow the gfx950 dual-wave 8-wave CTA.
     block_m = 256
     block_n = 64
@@ -611,7 +619,22 @@ def _make_dualwave_swp_fp8_traits(
     smem_v_line_stride = smem_linear_wave + smem_v_pad
     smem_k_tile_elems = smem_n_rpt * smem_d_rpt * smem_k_line_stride
     smem_v_tile_elems = smem_n_rpt * smem_d_rpt * smem_v_line_stride
-    bn128 = (num_kv_splits <= 1) and (not varlen)
+    # BN128 is the deep-pipeline shape: a 6-deep K prefetch ring, Q held in
+    # registers, DMA V staging, and the packed-i32x8 direct PV path. Upstream
+    # derives it as `(num_kv_splits <= 1) and (not varlen)`, which conflates
+    # two unrelated things -- none of what BN128 selects depends on how Q is
+    # packed or on whether the KV range is split. Measured 2026-08-06: forcing
+    # FP8_PV_DIRECT true under varlen makes the kernel build and compute real
+    # attention (cos 0.96), and moves the split-K failure to an unrelated
+    # workspace fault. See the vault issue's bf16-template-assessment.
+    #
+    # So the pipeline shape is its own parameter here. It still defaults to
+    # upstream's expression, because the deep ring has only ever been measured
+    # dense (1804-1858 TFLOPS at NPF=6) and the shallow path is unexercised on
+    # the fp8 side -- callers opt in rather than inherit a silent change.
+    if bn128 is None:
+        bn128 = (num_kv_splits <= 1) and (not varlen)
+    bn128 = bool(bn128)
     bn128_pf = bn128
     qreg = bn128_pf
     vdma = bn128_pf
