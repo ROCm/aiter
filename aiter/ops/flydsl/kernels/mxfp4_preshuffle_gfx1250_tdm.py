@@ -93,6 +93,10 @@ def launch_gemm_a8w4_tdm(
     arg_ep_rowmap: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
+    push_group: Constexpr[int] = 0,
+    arg_tile_row_base: fx.Pointer = None,
+    arg_expert_ids: fx.Pointer = None,
+    arg_tile_valid: fx.Pointer = None,
 ):
     cache_tag = (
         K, tile_m, tile_n, tile_k, m_warp, n_warp, out_is_f16, num_buffers,
@@ -100,6 +104,7 @@ def launch_gemm_a8w4_tdm(
         stage1_quant_out, quant_wmma_rep,
         ep_p2p_write, ep_off_comb_inp, ep_wire_nbytes, ep_slot_stride,
         ep_arena_handle, ep_world,
+        push_group,
     )
     _ = cache_tag
     if ep_p2p_write:
@@ -190,6 +195,9 @@ def launch_gemm_a8w4_tdm(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Tensor,
         arg_ep_rowmap: fx.Tensor,
+        arg_tile_row_base: fx.Pointer,
+        arg_expert_ids: fx.Pointer,
+        arg_tile_valid: fx.Pointer,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
@@ -225,23 +233,32 @@ def launch_gemm_a8w4_tdm(
         m_tile = group_first_tile + (in_group - (in_group // group_tiles) * group_tiles)
         blk_m = m_tile * tile_m
         blk_n = (in_group // group_tiles) * tile_n
+        i32_ptr = fx.PointerType.get(elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4)
+        tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
+        if const_expr(push_group):
+            # Fixed-slot push-group schedule (finalize tables): the A/scale row is
+            # the grouped-recv row le*CAP+t*tile_m (NOT the compact m_tile*tile_m),
+            # and the expert is read directly (padding tiles carry expert==n_experts
+            # so the `expert < n_experts` guard below skips them). Every downstream
+            # use of blk_m/expert is thus the fixed-slot address with no bisect.
+            trb = fx.recast_iter(i32_ptr, arg_tile_row_base)
+            eids = fx.recast_iter(i32_ptr, arg_expert_ids)
+            blk_m = trb[m_tile]
+            expert = eids[m_tile]
         blk_m64 = fx.Int64(blk_m)
         blk_n64 = fx.Int64(blk_n)
         n64 = fx.Int64(i32_n)
 
-        # In-kernel bisect: find expert owning this M-tile via psum
-        i32_ptr = fx.PointerType.get(
-            elem_ty=fx.Int32.ir_type, address_space=fx.AddressSpace.Global, alignment=4
-        )
-        tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
-        lo, hi = blk_m * 0, blk_m * 0 + n_experts
-        for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
-            mid = (lo + hi) >> 1
-            mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
-            go_right = tile_map[mid_clamped] <= blk_m
-            lo = go_right.select(mid + 1, lo)
-            hi = go_right.select(hi, mid)
-        expert = lo
+        if const_expr(not push_group):
+            # In-kernel bisect: find expert owning this M-tile via psum
+            lo, hi = blk_m * 0, blk_m * 0 + n_experts
+            for _ in range_constexpr(max(1, math.ceil(math.log2(max(2, n_experts))) + 1)):
+                mid = (lo + hi) >> 1
+                mid_clamped = (mid < n_experts - 1).select(mid, n_experts - 1)
+                go_right = tile_map[mid_clamped] <= blk_m
+                lo = go_right.select(mid + 1, lo)
+                hi = go_right.select(hi, mid)
+            expert = lo
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
@@ -250,8 +267,17 @@ def launch_gemm_a8w4_tdm(
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
         sb_batch_off = eb64 * (N_SUPERS * K4)
-        # Per-expert A-data OOB: bound to the owning expert's valid-row
-        mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
+        # Per-expert A-data OOB: valid rows in this tile. push-group loads the full
+        # tile (padding rows read stale within-CAP data, discarded downstream);
+        # else bound to the owning expert's valid-row end.
+        if const_expr(push_group):
+            # valid rows in this fixed-slot tile (from finalize): padding rows
+            # (>= mn_oob) load 0, so they never compute Inf/NaN from stale recv data
+            # and the scatter drops them (r < mn_oob guard) -- matches the pull path.
+            tvw = fx.recast_iter(i32_ptr, arg_tile_valid)
+            mn_oob = tvw[m_tile]
+        else:
+            mn_oob = tile_map[(expert < n_experts).select(expert, n_experts - 1)] - blk_m
 
         _smem = fx.SharedAllocator(static=False)
         base_ptr = _smem.allocate(ARENA_B)._ptr
@@ -928,9 +954,16 @@ def launch_gemm_a8w4_tdm(
     # ABI when the caller left it unset (batched / non-EP paths).
     if arg_ep_rowmap is None:
         arg_ep_rowmap = arg_c
+    if arg_tile_row_base is None:
+        arg_tile_row_base = arg_a
+    if arg_expert_ids is None:
+        arg_expert_ids = arg_a
+    if arg_tile_valid is None:
+        arg_tile_valid = arg_a
     kernel(
         arg_c, arg_a, arg_b, arg_scale_a, arg_scale_b, arg_m_tile_map,
-        arg_bias, arg_quant_scale, arg_ep_rowmap, i32_m, N, f32_swiglu_limit,
+        arg_bias, arg_quant_scale, arg_ep_rowmap, arg_tile_row_base, arg_expert_ids, arg_tile_valid,
+        i32_m, N, f32_swiglu_limit,
         f32_situ_beta, f32_situ_linear_beta,
     ).launch(grid=(m_tiles * n_tiles, 1, 1), block=(block, 1, 1), stream=stream)
 
