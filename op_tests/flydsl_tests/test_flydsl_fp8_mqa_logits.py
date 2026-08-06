@@ -215,10 +215,10 @@ def test_fp8_mqa_logits(
             # Correctness is graded on a separate, NaN-initialized call -- not on
             # run_perftest's result.
             #
-            # This construction intercepts the regular torch.empty call the launcher 
-            # makes to allocate the output buffer, and fills it with NaN. 
-            # The kernel then writes into that buffer, and any unwritten positions remain NaN. 
-            # The correctness check below asserts that the -inf mask matches the reference, 
+            # This construction intercepts the regular torch.empty call the launcher
+            # makes to allocate the output buffer, and fills it with NaN.
+            # The kernel then writes into that buffer, and any unwritten positions remain NaN.
+            # The correctness check below asserts that the -inf mask matches the reference,
             # so any unwritten positions (which should be -inf) will fail the assert if they are still NaN.
             #
             # Applied to triton too where it essentially does nothing since its launcher still
