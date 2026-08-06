@@ -26,6 +26,7 @@ concatenation ``[Q | K | V]`` (``dim == 2*k_dim + v_dim``).
 import torch
 import triton
 
+from aiter.ops.prefill_batch_metadata import CausalConvPrefillMetadata
 from aiter.ops.triton._triton_kernels.gated_delta_rule.prefill.causal_conv1d_fwd_split_qkv import (
     PAD_SLOT_ID,
     _causal_conv1d_fwd_split_qkv_kernel,
@@ -207,8 +208,24 @@ def causal_conv1d_split_qkv_triton_tile_fn(
 
     # (sequence, chunk) schedule for the chosen BLOCK_M, optionally memoized
     # in ``metadata.nums_dict`` and shared with the HIP backend.
-    nums_dict = getattr(metadata, "nums_dict", None) if metadata is not None else None
-    if nums_dict is not None and BLOCK_M in nums_dict:
+    if isinstance(metadata, CausalConvPrefillMetadata):
+        metadata.validate(
+            query_start_loc,
+            total_tokens=cu_seqlen,
+            num_sequences=n_seqs,
+        )
+        grid = metadata.get_chunk_grid(BLOCK_M)
+        tot = grid.total_chunks
+        batch_ptr = grid.sequence_ids
+        token_chunk_offset_ptr = grid.chunk_ids
+        nums_dict = None
+    else:
+        nums_dict = (
+            getattr(metadata, "nums_dict", None) if metadata is not None else None
+        )
+    if not isinstance(metadata, CausalConvPrefillMetadata) and (
+        nums_dict is not None and BLOCK_M in nums_dict
+    ):
         entry = nums_dict[BLOCK_M]
         tot = int(entry["tot"])
         batch_ptr = entry["batch_ptr"]
@@ -216,7 +233,7 @@ def causal_conv1d_split_qkv_triton_tile_fn(
         if batch_ptr.device != x.device:
             batch_ptr = batch_ptr.to(x.device)
             token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
-    else:
+    elif not isinstance(metadata, CausalConvPrefillMetadata):
         tot, batch_ptr, token_chunk_offset_ptr = _build_chunk_schedule(
             query_start_loc, BLOCK_M
         )
