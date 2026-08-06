@@ -252,6 +252,77 @@ def test_kda_per_channel_gate_matches_torch_reference(
     assert out_err < 5e-4 and state_err < 5e-4, (out_err, state_err)
 
 
+def test_channel_strided_a_is_rejected():
+    """`a` is vector-loaded along D_k, so a strided channel axis reads garbage.
+
+    Rejected rather than silently wrong: unlike q/k/v the wrapper does not copy
+    `a`, it forwards the strides. The other axes stay free -- K3 passes a view of
+    a (1, B, H, K) buffer, which is padded in the batch stride.
+    """
+    B, H, dt = 2, 12, torch.bfloat16
+    args, pool, indices = _kda_inputs(
+        B, H, dt, first_index=0, padded=False, shuffle=True
+    )
+
+    # Every other channel of a 2K-wide buffer: stride(-1) == 2.
+    wide = torch.randn(B, 1, H, 2 * K, dtype=dt, device="cuda")
+    strided_a = wide[..., ::2]
+    assert strided_a.shape == args["a"].shape and strided_a.stride(-1) == 2
+
+    with pytest.raises(AssertionError, match="dense along D_k"):
+        flydsl_ops.flydsl_gdr_decode(
+            args["q"],
+            args["k"],
+            args["v"],
+            strided_a,
+            args["b"],
+            args["dt_bias"],
+            args["A_log"],
+            indices,
+            pool,
+            args["out"],
+            use_qk_l2norm=True,
+            need_shuffle_state=True,
+        )
+
+
+def test_non_contiguous_dt_bias_is_copied_not_rejected():
+    """The counterpart: dt_bias is copied contiguous, so its strides are free.
+
+    Pinned because the obvious "be strict everywhere" edit is to assert
+    contiguity here too, which would reject an input that computes correctly.
+    """
+    B, H, dt = 2, 12, torch.bfloat16
+    args, pool, indices = _kda_inputs(
+        B, H, dt, first_index=0, padded=False, shuffle=True
+    )
+
+    wide_bias = torch.randn(H, 2 * K, dtype=torch.float32, device="cuda") * 0.1
+    args["dt_bias"] = wide_bias[:, ::2]
+    assert not args["dt_bias"].is_contiguous()
+
+    initial_state = pool[indices.long()].clone()
+    kernel_pool = pool.clone()
+    flydsl_ops.flydsl_gdr_decode(
+        args["q"],
+        args["k"],
+        args["v"],
+        args["a"],
+        args["b"],
+        args["dt_bias"],
+        args["A_log"],
+        indices,
+        kernel_pool,
+        args["out"],
+        use_qk_l2norm=True,
+        need_shuffle_state=True,
+    )
+
+    ref_out, ref_state = _kda_reference(args, initial_state)
+    assert_close_rmse("o", ref_out, args["out"])
+    assert_close_rmse("ht", ref_state, kernel_pool[indices.long()])
+
+
 def test_negative_slot_is_skipped_and_zero_is_not():
     """Pins this kernel's invalid-slot contract, which is not the reference's.
 

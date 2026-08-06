@@ -125,7 +125,13 @@ def flydsl_gdr_decode(
             f"dt_bias {tuple(dt_bias.shape)} does not match `a` heads/channels "
             f"{(a.shape[2], a.shape[3])}"
         )
-        assert dt_bias.is_contiguous(), "dt_bias must be contiguous"
+        # `a` reaches the kernel with its own strides and is read as vectors
+        # along D_k, so that axis has to be dense -- a strided one would be
+        # misread, not rejected. dt_bias needs no such check: it is copied
+        # contiguous below.
+        assert (
+            a.stride(-1) == 1
+        ), f"`a` must be dense along D_k, got stride {a.stride(-1)}"
     else:
         assert (
             dt_bias.dim() == 1
