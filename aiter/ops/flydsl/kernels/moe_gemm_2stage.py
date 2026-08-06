@@ -3822,6 +3822,242 @@ def _compile_moe_reduction_fp8(
     return launch_moe_reduction_fp8
 
 
+@functools.lru_cache(maxsize=1024)
+def _compile_moe_reduction_fp4(
+    *,
+    topk: int,
+    model_dim: int,
+    out_dtype_str: str | None = None,
+    use_mask: bool = False,
+    num_experts: int = 0,
+):
+    """Compile reduction for MXFP4 route-out rows: [N/2 fp4 bytes | N/32 e8m0]."""
+    get_hip_arch()
+    ir.ShapedType.get_dynamic_size()
+
+    BLOCK_SIZE = 256
+    VEC_WIDTH = 8
+    SCALE_GROUP = 32
+    out_tag = out_dtype_str or "bf16"
+    if out_tag not in ("bf16", "f16"):
+        raise ValueError(f"fp4 reduce out_dtype must be bf16/f16, got {out_tag}")
+
+    out_numeric = fx.Float16 if out_tag == "f16" else fx.BFloat16
+
+    module_name = (
+        f"moe_reduction_fp4_kernel_{'masked' if use_mask else 'plain'}"
+        f"_{out_tag}_topk{topk}_md{model_dim}"
+    )
+    fp4_row_bytes_in = model_dim // 2 + model_dim // 32
+    elem_bytes_c = 2
+
+    @flyc.kernel(name=module_name)
+    def moe_reduction_fp4_kernel(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+    ):
+        m_tokens = fx.Int64(i32_m_tokens)
+        c_topk = fx.Int64(topk)
+        c_model_dim = fx.Int64(model_dim)
+
+        def _buffer_tensor(ptr, numeric, num_elems, num_bytes, byte_off_i64):
+            addr_i64 = fx.Int64(fx.ptrtoint(ptr)) + byte_off_i64
+            ptr_ty = fx.PointerType.get(
+                numeric.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=numeric.width // 8,
+            )
+            base = fx.inttoptr(ptr_ty, addr_i64)
+            view = fx.make_view(base, fx.make_layout(num_elems, 1))
+            return fx.rocdl.make_buffer_tensor(view, num_records_bytes=num_bytes)
+
+        def _tile(tensor, elem_offset, width):
+            ptr = fx.add_offset(fx.get_iter(tensor), elem_offset)
+            return fx.make_view(ptr, fx.make_layout(width, 1))
+
+        token_idx = fx.Int64(gpu.block_id("x"))
+        tile_idx = fx.Int64(gpu.block_id("y"))
+        tid = fx.Int64(gpu.thread_id("x"))
+
+        x_slab_nbytes = c_topk * fx.Int64(fp4_row_bytes_in)
+        y_slab_nbytes = c_model_dim * fx.Int64(elem_bytes_c)
+        x_base_off_i64 = token_idx * x_slab_nbytes
+        y_base_off_i64 = token_idx * c_model_dim * fx.Int64(elem_bytes_c)
+        x_buf = _buffer_tensor(X, fx.Int8, x_slab_nbytes, x_slab_nbytes, x_base_off_i64)
+        y_buf = _buffer_tensor(
+            Y, out_numeric, c_model_dim, y_slab_nbytes, y_base_off_i64
+        )
+
+        load_fp4x8 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int8)
+        load_i8_atom = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8)
+        load_i32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        store_out8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
+        store_out1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_numeric)
+
+        def _load_i8(elem_offset):
+            frag = fx.make_rmem_tensor(1, fx.Int8)
+            fx.copy(load_i8_atom, _tile(x_buf, elem_offset, 1), frag)
+            return fx.Vector(frag.load())[0]
+
+        if const_expr(use_mask):
+            tk_slab_nbytes = c_topk * fx.Int64(4)
+            topk_ids_buf = _buffer_tensor(
+                topk_ids,
+                fx.Int32,
+                c_topk,
+                tk_slab_nbytes,
+                token_idx * tk_slab_nbytes,
+            )
+            em_nbytes = fx.Int64(num_experts * 4)
+            expert_mask_buf = _buffer_tensor(
+                expert_mask,
+                fx.Int32,
+                fx.Int64(num_experts),
+                em_nbytes,
+                fx.Int64(0),
+            )
+        else:
+            topk_ids_buf = None
+            expert_mask_buf = None
+
+        def load_valid_mask(k):
+            eid_frag = fx.make_rmem_tensor(1, fx.Int32)
+            fx.copy(load_i32_atom, _tile(topk_ids_buf, fx.Int32(k), 1), eid_frag)
+            eid = fx.Vector(eid_frag.load())[0]
+            valid_frag = fx.make_rmem_tensor(1, fx.Int32)
+            fx.copy(load_i32_atom, _tile(expert_mask_buf, eid, 1), valid_frag)
+            return fx.Vector(valid_frag.load())[0] != fx.Int32(0)
+
+        if token_idx < m_tokens:
+            c_tile_cols = fx.Int64(BLOCK_SIZE * VEC_WIDTH)
+            c_vecw = fx.Int64(VEC_WIDTH)
+            col_base = tile_idx * c_tile_cols + tid * c_vecw
+
+            if col_base < c_model_dim:
+                c_row_bytes_in = fx.Int64(fp4_row_bytes_in)
+                c_scale_base = fx.Int64(model_dim // 2)
+                c_scale_group = fx.Int64(SCALE_GROUP)
+                vec2_f32 = T.vec(2, T.f32)
+
+                def load_scale_f32(scale_off):
+                    """Decode one e8m0 byte into an f32 microscale (2^(e-127))."""
+                    e8m0_i8 = _load_i8(scale_off)
+                    e8m0_i32 = fx.Uint32(fx.Uint8(e8m0_i8))
+                    return (e8m0_i32 << fx.Uint32(23)).bitcast(fx.Float32)
+
+                if col_base + c_vecw <= c_model_dim:
+                    acc = [fx.Float32(0.0) for _ in range(VEC_WIDTH)]
+                    scale_col = col_base // c_scale_group
+                    for k in range_constexpr(topk):
+                        k_row_base = fx.Int64(k) * c_row_bytes_in
+                        mv_ok = load_valid_mask(k) if const_expr(use_mask) else None
+                        val_byte_offset = k_row_base + col_base // fx.Int64(2)
+                        fp4_frag = fx.make_rmem_tensor(VEC_WIDTH // 2, fx.Int8)
+                        fx.copy(
+                            load_fp4x8,
+                            _tile(x_buf, val_byte_offset, VEC_WIDTH // 2),
+                            fp4_frag,
+                        )
+                        word = fx.Vector(fp4_frag.load()).bitcast(fx.Int32)[0]
+                        scale_f32 = load_scale_f32(
+                            k_row_base + c_scale_base + scale_col
+                        )
+                        for pi in range_constexpr(4):
+                            pair = fx.Vector(
+                                rocdl.cvt_scalef32_pk_f32_fp4(
+                                    vec2_f32, word, scale_f32, pi
+                                )
+                            )
+                            val0 = pair[0]
+                            val1 = pair[1]
+                            if const_expr(use_mask):
+                                val0 = mv_ok.select(val0, fx.Float32(0.0))
+                                val1 = mv_ok.select(val1, fx.Float32(0.0))
+                            acc[2 * pi] = acc[2 * pi] + val0
+                            acc[2 * pi + 1] = acc[2 * pi + 1] + val1
+                    out_vec = fx.Vector.from_elements(
+                        [acc[i].to(out_numeric) for i in range(VEC_WIDTH)], out_numeric
+                    )
+                    out_frag = fx.make_rmem_tensor(VEC_WIDTH, out_numeric)
+                    out_frag.store(out_vec)
+                    fx.copy(
+                        store_out8,
+                        out_frag,
+                        _tile(y_buf, col_base, VEC_WIDTH),
+                    )
+                else:
+                    for lane in range_constexpr(VEC_WIDTH):
+                        col = col_base + fx.Int64(lane)
+                        if col < c_model_dim:
+                            a = fx.Float32(0.0)
+                            scale_col = col // c_scale_group
+                            for k in range_constexpr(topk):
+                                k_row_base = fx.Int64(k) * c_row_bytes_in
+                                mv_ok = (
+                                    load_valid_mask(k) if const_expr(use_mask) else None
+                                )
+                                fp4_frag = fx.make_rmem_tensor(VEC_WIDTH // 2, fx.Int8)
+                                fx.copy(
+                                    load_fp4x8,
+                                    _tile(
+                                        x_buf,
+                                        k_row_base + col_base // fx.Int64(2),
+                                        VEC_WIDTH // 2,
+                                    ),
+                                    fp4_frag,
+                                )
+                                word = fx.Vector(fp4_frag.load()).bitcast(fx.Int32)[0]
+                                scale_f32 = load_scale_f32(
+                                    k_row_base + c_scale_base + scale_col
+                                )
+                                pair = fx.Vector(
+                                    rocdl.cvt_scalef32_pk_f32_fp4(
+                                        vec2_f32, word, scale_f32, lane // 2
+                                    )
+                                )
+                                val = pair[lane % 2]
+                                if const_expr(use_mask):
+                                    val = mv_ok.select(val, fx.Float32(0.0))
+                                a = a + val
+                            out_frag = fx.make_rmem_tensor(1, out_numeric)
+                            out_frag.store(
+                                fx.Vector.from_elements(
+                                    [a.to(out_numeric)], out_numeric
+                                )
+                            )
+                            fx.copy(
+                                store_out1,
+                                out_frag,
+                                _tile(y_buf, col, 1),
+                            )
+
+    tile_size = BLOCK_SIZE * VEC_WIDTH
+    gy_static = (model_dim + tile_size - 1) // tile_size
+    cache_tag = (module_name, out_tag)
+
+    @flyc.jit
+    def launch_moe_reduction_fp4(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        _ = cache_tag
+        gx = fx.Int64(i32_m_tokens)
+        moe_reduction_fp4_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
+            grid=(gx, gy_static, 1),
+            block=(BLOCK_SIZE, 1, 1),
+            stream=stream,
+        )
+
+    return launch_moe_reduction_fp4
+
+
 # MoE Reduction Kernel (reduce sum over topk dimension)
 @functools.lru_cache(maxsize=1024)
 def compile_moe_reduction(
@@ -3848,6 +4084,14 @@ def compile_moe_reduction(
     """
     if dtype_str == "fp8":
         return _compile_moe_reduction_fp8(
+            topk=topk,
+            model_dim=model_dim,
+            out_dtype_str=out_dtype_str,
+            use_mask=use_mask,
+            num_experts=num_experts,
+        )
+    if dtype_str == "fp4":
+        return _compile_moe_reduction_fp4(
             topk=topk,
             model_dim=model_dim,
             out_dtype_str=out_dtype_str,

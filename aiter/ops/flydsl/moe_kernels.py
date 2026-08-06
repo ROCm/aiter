@@ -997,6 +997,7 @@ def _run_moe_reduction(
     topk_ids=None,
     stream=None,
     is_fp8=False,
+    is_fp4=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1026,7 +1027,10 @@ def _run_moe_reduction(
 
     reduce_out_dtype_str = None
     X = target
-    if is_fp8:
+    if is_fp4:
+        _reduce_dtype_str = "fp4"
+        reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
+    elif is_fp8:
         _reduce_dtype_str = "fp8"
         reduce_out_dtype_str = "bf16" if out.dtype == torch.bfloat16 else "f16"
         # fp8 route-out is a flat uint8 [rows, model_dim + model_dim/8] buffer.
@@ -1043,7 +1047,7 @@ def _run_moe_reduction(
         # expert_mask is sized by global expert count (≠ w2.shape[0] under EP).
         "num_experts": int(expert_mask.numel()) if use_mask else 0,
     }
-    if is_fp8:
+    if is_fp8 or is_fp4:
         reduce_kwargs["out_dtype_str"] = reduce_out_dtype_str
     reduce_exe = compile_moe_reduction(**reduce_kwargs)
     if use_mask:

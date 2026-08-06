@@ -78,6 +78,33 @@ def _spart_output_tile_index(block_1d_id, M0, N0, group_num, m01):
     return m_block_idx, n_block_idx
 
 
+def _xcd_deinterleave(pid, bound, nxcd):
+    """Undo the hardware's round-robin workgroup->XCD spread (FlyDSL #959 xcd_swizzle).
+
+    gfx950 hands consecutive workgroup ids to consecutive XCDs, each with its own
+    L2, so any locality the spatial partitioner builds in linear-id space lands on
+    8 different caches. Remapping pid -> xc*floor(bound/nxcd) + min(xc,bound%nxcd)
+    + pid/nxcd is a bijection over [0,bound) that gives every XCD a *contiguous*
+    id range, so partitioner locality becomes L2 locality.
+    """
+    n = fx.Int32(nxcd)
+    xq = bound // n
+    xr = bound - xq * n
+    xc = pid % n
+    return xc * xq + (xc < xr).select(xc, xr) + pid // n
+
+
+_G2_ACC_LDS_CAP = 32 * 1024
+
+
+def _default_acc_rows(BM, BN, elem_bytes):
+    """Largest 16-row-aligned divisor of BM whose C-shuffle tile fits the cap."""
+    for rows in range(BM, 0, -16):
+        if BM % rows == 0 and rows * BN * elem_bytes <= _G2_ACC_LDS_CAP:
+            return rows
+    return 16
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     BN=256,
@@ -97,6 +124,8 @@ def compile_gemm2_a4w4_port(
     g2_ascale_pf=None,
     g2_spart=None,
     g2_bf16_lds=None,
+    g2_acc_rows=None,
+    g2_xcd=None,
     out_dtype="bf16",
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). inter_dim runtime; SBM None -> SBM==BM byte-identical."""
@@ -106,20 +135,27 @@ def compile_gemm2_a4w4_port(
             f"mxfp4_moe_gemm2 supports only (BM in {{16,32,64,128}}, epilog in {{'atomic','reduce'}}); "
             f"got (BM={BM}, epilog={epilog})"
         )
-    if BN not in (64, 128, 256) or BK not in (128, 256):
+    if BN not in (64, 128, 256, 512) or BK not in (128, 256):
         raise AssertionError(
             "mxfp4_moe_gemm2 supports only "
-            f"(BN in {{64,128,256}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
+            f"(BN in {{64,128,256,512}}, BK in {{128,256}}); got (BN={BN}, BK={BK})"
         )
     if SBM % BM != 0:
         raise AssertionError(f"SBM ({SBM}) must be a multiple of BM ({BM})")
     use_reduce = epilog == "reduce"
     out_dtype = str(out_dtype).strip().lower()
-    if out_dtype not in ("bf16", "fp8"):
-        raise AssertionError(f"out_dtype must be 'bf16' or 'fp8', got {out_dtype!r}")
+    if out_dtype not in ("bf16", "fp8", "fp4"):
+        raise AssertionError(
+            f"out_dtype must be 'bf16', 'fp8' or 'fp4', got {out_dtype!r}"
+        )
     route_out_fp8 = out_dtype == "fp8"
-    if route_out_fp8 and not use_reduce:
-        raise AssertionError("out_dtype='fp8' is supported only with epilog='reduce'")
+    route_out_fp4 = out_dtype == "fp4"
+    if (route_out_fp8 or route_out_fp4) and not use_reduce:
+        raise AssertionError(
+            f"out_dtype={out_dtype!r} is supported only with epilog='reduce'"
+        )
+    if route_out_fp4 and BN % 32:
+        raise AssertionError(f"fp4 route-out needs BN % 32 == 0, got BN={BN}")
     if g2_kstages is None:
         g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
     if g2_kstages not in (1, 2):
@@ -139,6 +175,11 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(
             f"g2_spart={g2_spart} must encode GroupNum>=1,M01>=1 as GroupNum*100+M01 (e.g. 402)"
         )
+    if g2_xcd is None:
+        g2_xcd = int(os.environ.get("MXFP4_G2_XCD", "8"))
+    g2_xcd = int(g2_xcd)
+    if g2_xcd < 0:
+        raise AssertionError(f"g2_xcd must be >= 0, got {g2_xcd}")
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     assert INTER_MAX % BK == 0, f"INTER_MAX must be a multiple of {BK}, got {INTER_MAX}"
@@ -149,7 +190,20 @@ def compile_gemm2_a4w4_port(
     KH_TILE_A = BK // (1 if is_f8 else 2)  # A LDS K-tile bytes (fp8 256, fp4 128)
     slot_bytes = BM * KH_TILE_A
     aStages = 2 if g2_bf16_lds else 3
-    c_lds_bytes = BM * BN * (2 if g2_bf16_lds else 4)
+    _elem = 2 if g2_bf16_lds else 4
+    if g2_acc_rows is None:
+        _env_ar = os.environ.get("MXFP4_G2_ACCROWS")
+        if _env_ar is None:
+            g2_acc_rows = _default_acc_rows(BM, BN, _elem)
+        else:
+            g2_acc_rows = int(_env_ar)
+    g2_acc_rows = int(g2_acc_rows)
+    if g2_acc_rows and (g2_acc_rows % 16 or BM % g2_acc_rows):
+        raise AssertionError(
+            f"g2_acc_rows must be a multiple of 16 dividing BM={BM}, got {g2_acc_rows}"
+        )
+    acc_rows = BM if not g2_acc_rows else min(g2_acc_rows, BM)
+    c_lds_bytes = acc_rows * BN * _elem
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.
@@ -178,9 +232,11 @@ def compile_gemm2_a4w4_port(
     apf_tag = "_apf" if g2_ascale_pf else ""
     spart_tag = f"_spart{g2_group_num}x{g2_m01}" if g2_spart > 0 else ""
     bf16lds_tag = "_bf16lds" if g2_bf16_lds else ""
-    out_tag = "_fp8out" if route_out_fp8 else ""
+    accrows_tag = "" if not g2_acc_rows else f"_ar{g2_acc_rows}"
+    xcd_tag = "" if g2_xcd <= 1 else f"_xcd{g2_xcd}"
+    out_tag = "_fp8out" if route_out_fp8 else ("_fp4out" if route_out_fp4 else "")
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
-    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{out_tag}_v2"
+    tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{sbm_tag}{persist_tag}{pad_tag}{ks_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{accrows_tag}{xcd_tag}{out_tag}_v2"
     name = f"gemm2_a4w4_port_{tag}"
 
     @fx.struct
@@ -274,6 +330,8 @@ def compile_gemm2_a4w4_port(
                 g2_ascale_pf=g2_ascale_pf,
                 g2_bf16_lds=g2_bf16_lds,
                 route_out_fp8=route_out_fp8,
+                route_out_fp4=route_out_fp4,
+                g2_acc_rows=g2_acc_rows,
             )
 
         if const_expr(not persist and g2_spart <= 0):
@@ -294,8 +352,13 @@ def compile_gemm2_a4w4_port(
             bound = total_m_blocks * fx.Int32(num_n_blocks)
 
             if fx.Int32(bx_i32) < bound:
+                pid = (
+                    _xcd_deinterleave(fx.Int32(bx_i32), bound, g2_xcd)
+                    if const_expr(g2_xcd > 1)
+                    else fx.Int32(bx_i32)
+                )
                 m_block_idx, n_block_idx = _spart_output_tile_index(
-                    bx_i32, total_m_blocks, num_n_blocks, g2_group_num, g2_m01
+                    pid, total_m_blocks, num_n_blocks, g2_group_num, g2_m01
                 )
                 unit_bx = m_block_idx * fx.Int32(num_n_blocks) + n_block_idx
                 issue_all_a_loads(m_block_idx * fx.Int32(BM))
@@ -436,6 +499,7 @@ def get_g2(
     persist=False,
     cu_num=0,
     has_pad=False,
+    d_inter=0,
     out_dtype="bf16",
 ):
     # Cache key uses compile-time buckets; runtime inter_dim/model_dim share a
@@ -445,11 +509,20 @@ def get_g2(
     topk_key = topk if epilog == "reduce" else 1
     cu_key = cu_num if persist else 0
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
-    g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", "2"))
+    _k_tiles = (d_inter or INTER_MAX) // BK
+    _ks_default = "2" if _k_tiles > 4 else "1"
+    g2_kstages = int(os.environ.get("MXFP4_G2_KSTAGES", _ks_default))
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
     g2_ascale_pf = os.environ.get("MXFP4_G2_ASCALE_PF", "1") == "1"
     g2_spart = int(os.environ.get("MXFP4_G2_SPART", "402"))
     g2_bf16_lds = os.environ.get("MXFP4_G2_BF16_LDS", "0") == "1"
+    _env_ar = os.environ.get("MXFP4_G2_ACCROWS")
+    g2_acc_rows = (
+        _default_acc_rows(BM, BN, 2 if g2_bf16_lds else 4)
+        if _env_ar is None
+        else int(_env_ar)
+    )
+    g2_xcd = int(os.environ.get("MXFP4_G2_XCD", "8"))
     key = (
         BM,
         BN,
@@ -469,6 +542,8 @@ def get_g2(
         g2_ascale_pf,
         g2_spart,
         g2_bf16_lds,
+        g2_acc_rows,
+        g2_xcd,
         out_dtype,
     )
     launch = G2_CACHE.get(key)
@@ -492,6 +567,8 @@ def get_g2(
             g2_ascale_pf=g2_ascale_pf,
             g2_spart=g2_spart,
             g2_bf16_lds=g2_bf16_lds,
+            g2_acc_rows=g2_acc_rows,
+            g2_xcd=g2_xcd,
             out_dtype=out_dtype,
         )
         G2_CACHE[key] = launch
@@ -574,6 +651,7 @@ def mxfp4_moe_gemm2(
         persist=persist,
         cu_num=cu_num,
         has_pad=has_pad,
+        d_inter=D_INTER,
         out_dtype=out_dtype,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
