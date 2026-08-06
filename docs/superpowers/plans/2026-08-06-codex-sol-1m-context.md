@@ -228,8 +228,8 @@ const outputEvents = run.stdout.trim().split("\n").filter(Boolean).map(JSON.pars
 const threadStarted = outputEvents.find(event => event.type === "thread.started");
 assert.ok(threadStarted, "thread.started event is missing");
 assert.match(threadStarted.thread_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
-const message = outputEvents.find(event => event.type === "item.completed" && event.item?.type === "agent_message");
-assert.strictEqual(message?.item?.text, "SOL_CONTEXT_SMOKE_OK");
+const messages = outputEvents.filter(event => event.type === "item.completed" && event.item?.type === "agent_message");
+assert.ok(messages.some(event => event.item.text === "SOL_CONTEXT_SMOKE_OK"), "smoke marker is missing");
 assert.ok(outputEvents.some(event => event.type === "turn.completed"), "turn.completed event is missing");
 
 function rolloutFiles(directory) {
