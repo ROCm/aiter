@@ -3503,25 +3503,18 @@ class FmoeTuner(TunerCommon):
                 # Only try matched (tile_m==blockM) and one smaller (blockM/2) to limit candidates
                 if s2_tile_m != blockM and s2_tile_m != blockM // 2:
                     continue
-                # a16w4 (bf16) consumes the SORTED [sorted_size, inter] intermediate
-                # laid out on the moe_sorting blockM grid; the _sbm (tile_m<blockM)
-                # variants re-tile the sorted stream at a finer granularity than the
-                # sorted_ids/sorted_expert_ids padding and fault the queue. Restrict
-                # a16w4 stage2 to the matched tile_m==blockM candidates.
-                if a_dtype_str == "bf16" and s2_tile_m != blockM:
-                    continue
-                # a16w4 gemm2 tile_n=256 at large tile_m over-allocates LDS
-                # (>163840B "local memory exceeds limit" compile failure), and
-                # the failed compile under the worker pool takes the queue down.
-                # tile_n=128 covers the shape (byte-identical output); skip 256.
-                if a_dtype_str == "bf16" and kparams["tile_n"] == 256:
-                    continue
-                # a16w4 gemm2 K axis is inter_dim; tile_k must divide it. For non-
-                # 256-aligned inter_dim (e.g. 384) a tile_k=256 candidate produces
-                # wrong output (the runtime wrapper parses the kernelName tile_k
-                # verbatim -> OOB), yet the tuner would score it as passing. Skip
-                # tile_k that doesn't divide inter_dim so only valid tiles are tuned.
-                if a_dtype_str == "bf16" and inter_dim % kparams["tile_k"] != 0:
+                # Skip a16w-mix stage2 candidates the port can't run correctly:
+                #  - _sbm (tile_m<blockM) re-tiles the SORTED [sorted_size, inter]
+                #    stream finer than the moe_sorting padding -> queue fault;
+                #  - tile_n=256 over-allocates LDS at large tile_m (compile failure
+                #    that takes the worker pool down); tile_n=128 covers the shape;
+                #  - tile_k must divide inter_dim (K); tile_k=256 on non-256 inter
+                #    (e.g. 384) is parsed verbatim by the wrapper -> OOB/wrong out.
+                if a_dtype_str == "bf16" and (
+                    s2_tile_m != blockM
+                    or kparams["tile_n"] == 256
+                    or inter_dim % kparams["tile_k"] != 0
+                ):
                     continue
                 s2_kparams = {**kparams, "sort_block_m": blockM}
                 s2_kname = kname if s2_tile_m == blockM else f"{kname}_sbm{blockM}"
