@@ -708,6 +708,108 @@ def _cshuffle_flat_bf16_epilog(
 
 
 @flyc.jit
+def _flat_mxfp8_epilog(
+    accm,
+    out_base,
+    m_row,
+    n_block_idx,
+    wave,
+    lane,
+    tid_i32,
+    N_OUT,
+    BN,
+    lds_acc_base_i32,
+    kMChunks,
+):
+    """Store unweighted sorted rows as [N fp8 bytes | N/8 e8m0 bytes]."""
+    lds_base = _lds_ptr3(lds_acc_base_i32, fx.Int32(0))
+    lane_div_16 = lane // fx.Int32(16)
+    lane_mod_16 = lane % fx.Int32(16)
+    for i in range_constexpr(kMChunks):
+        row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
+        for J in range_constexpr(BN // 64):
+            col = wave * fx.Int32(BN // 4) + fx.Int32(J * 16) + lane_mod_16
+            vec = Vec(accm[i][J])
+            for v in range_constexpr(4):
+                idx = (row_base + fx.Int32(v)) * fx.Int32(BN) + col
+                llvm.StoreOp(_raw(vec[v]), _gep3(lds_base, idx * fx.Int32(4)))
+    gpu.barrier()
+
+    m_lane = tid_i32 // fx.Int32(16)
+    n_lane = tid_i32 % fx.Int32(16)
+    row_bytes = N_OUT + N_OUT // fx.Int32(8)
+    blocks_per_lane = BN // 128
+    pk_ty = T.vec(2, T.i16)
+
+    for mr in range_constexpr(kMChunks):
+        row_local = fx.Int32(mr * 16) + m_lane
+        sorted_row = m_row + row_local
+        row_byte_base = fx.Int64(sorted_row) * fx.Int64(row_bytes)
+        for half in range_constexpr(blocks_per_lane):
+            group = n_lane + fx.Int32(half * 16)
+            col0 = group * fx.Int32(8)
+            base_idx = row_local * fx.Int32(BN) + col0
+            v0 = Vec(
+                llvm.load(T.vec(4, T.f32), _gep3(lds_base, base_idx * fx.Int32(4)))
+            )
+            v1 = Vec(
+                llvm.load(
+                    T.vec(4, T.f32),
+                    _gep3(lds_base, (base_idx + fx.Int32(4)) * fx.Int32(4)),
+                )
+            )
+            vals = [v0[0], v0[1], v0[2], v0[3], v1[0], v1[1], v1[2], v1[3]]
+
+            local_max = _fabs_f32(vals[0])
+            for q in range_constexpr(1, 8):
+                local_max = fx.Float32(
+                    arith.maxnumf(_raw(local_max), _raw(_fabs_f32(vals[q])))
+                )
+            amax_bits = fx.Int32(arith.bitcast(T.i32, _raw(local_max)))
+            ax_e = (amax_bits >> fx.Int32(23)) & fx.Int32(0xFF)
+            e8m0 = ax_e - fx.Int32(7)
+            e8m0 = (e8m0 < fx.Int32(1)).select(fx.Int32(1), e8m0)
+            e8m0 = (amax_bits == fx.Int32(0)).select(fx.Int32(0), e8m0)
+            qscale = arith.bitcast(T.f32, _raw(e8m0 << fx.Int32(23)))
+
+            packed_lo = _raw(Vec.filled([2], 0, fx.Int16))
+            packed_lo = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_lo, _raw(vals[0]), _raw(vals[1]), qscale, 0
+            )
+            packed_lo = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_lo, _raw(vals[2]), _raw(vals[3]), qscale, 1
+            )
+            packed_hi = _raw(Vec.filled([2], 0, fx.Int16))
+            packed_hi = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_hi, _raw(vals[4]), _raw(vals[5]), qscale, 0
+            )
+            packed_hi = rocdl.cvt_scalef32_pk_fp8_f32(
+                pk_ty, packed_hi, _raw(vals[6]), _raw(vals[7]), qscale, 1
+            )
+
+            global_col = n_block_idx * fx.Int32(BN) + col0
+            q_byte = row_byte_base + fx.Int64(global_col)
+            llvm.StoreOp(
+                _raw(Vec(packed_lo).bitcast(fx.Int32)[0]),
+                _gep1(out_base, q_byte),
+                nontemporal=True,
+            )
+            llvm.StoreOp(
+                _raw(Vec(packed_hi).bitcast(fx.Int32)[0]),
+                _gep1(out_base, q_byte + fx.Int64(4)),
+                nontemporal=True,
+            )
+            scale_byte = (
+                row_byte_base
+                + fx.Int64(N_OUT)
+                + fx.Int64(global_col // fx.Int32(8))
+            )
+            llvm.StoreOp(
+                arith.trunci(T.i8, _raw(e8m0)), _gep1(out_base, scale_byte)
+            )
+
+
+@flyc.jit
 def _flat_mxfp4_epilog(
     accm,
     out_q_base,

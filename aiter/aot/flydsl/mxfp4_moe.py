@@ -293,19 +293,32 @@ def _compile_stage2(job):
 def _compile_v2_stage2(job):
     import torch
 
-    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import mxfp4_moe_gemm2
+    from aiter.ops.flydsl.kernels.mxmoe_dispatcher import (
+        is_g2_nonatomic_config,
+        mxfp4_moe_gemm2,
+    )
 
     d = _dummy()
     max_sorted = job["BM"]
     if job["persist"]:
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
+    is_nonatomic_fp8 = is_fp8_route_out and is_g2_nonatomic_config(
+        job["BM"],
+        job["BN"],
+        job["BK"],
+        job["epilog"],
+        job["a_dtype"],
+        job["out_dtype"],
+        job["D_INTER"],
+        job["N_OUT"],
+    )
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
     if job["epilog"] == "reduce":
         if is_fp8_route_out:
             target = torch.empty(
                 (
-                    job["BM"] * job["topk"],
+                    max_sorted if is_nonatomic_fp8 else job["BM"] * job["topk"],
                     job["N_OUT"] + job["N_OUT"] // 8,
                 ),
                 dtype=torch.uint8,
@@ -363,6 +376,8 @@ def _compile_v2_stage2(job):
             topk_ids=None,
             stream=0,
             is_fp8=is_fp8_route_out,
+            reverse_sorted=d if is_nonatomic_fp8 else None,
+            sorted_weights=d if is_nonatomic_fp8 else None,
         )
 
 

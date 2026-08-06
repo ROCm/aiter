@@ -56,8 +56,18 @@ def is_g2_nonatomic_config(BM, BN, BK, epilog, a_dtype, out_dtype, D_INTER, D_HI
     return (
         os.environ.get("MXFP4_G2_NONATOMIC", "0") == "1"
         and epilog == "reduce"
-        and str(out_dtype).strip().lower() == "bf16"
-        and a_dtype == "fp4"
+        and str(out_dtype).strip().lower() in ("bf16", "fp8")
+        and (
+            a_dtype == "fp4"
+            or (
+                a_dtype == "fp8"
+                and str(out_dtype).strip().lower() == "fp8"
+            )
+        )
+        and (
+            str(out_dtype).strip().lower() == "bf16"
+            or (BM in (64, 128) and BN == 256 and BK in (128, 256))
+        )
     )
 
 
@@ -186,6 +196,7 @@ def compile_gemm2_a4w4_port(
     nonatomic = is_g2_nonatomic_config(
         BM, BN, BK, epilog, a_dtype, out_dtype, g2_inter, g2_hidden
     )
+    nonatomic_fp8 = nonatomic and route_out_fp8
     if g2_base_loop and not nonatomic:
         raise AssertionError(
             "MXFP4_G2_BASE_LOOP=1 requires MXFP4_G2_NONATOMIC=1"
@@ -201,7 +212,11 @@ def compile_gemm2_a4w4_port(
     aStages = (
         min(kStages, g2_inter // BK) if nonatomic else (2 if g2_bf16_lds else 3)
     )
-    c_lds_bytes = 0 if nonatomic else BM * BN * (2 if g2_bf16_lds else 4)
+    c_lds_bytes = (
+        BM * BN * 4
+        if nonatomic_fp8
+        else (0 if nonatomic else BM * BN * (2 if g2_bf16_lds else 4))
+    )
     lds_bytes = max(c_lds_bytes, aStages * slot_bytes)
     # N_OUT = model_dim/hidden is runtime; HIDDEN_MAX is a compile/cache bucket
     # so different runtime hidden sizes can reuse one compiled launcher.

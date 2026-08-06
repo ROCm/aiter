@@ -31,7 +31,7 @@ from .mxfp4_gemm_common import (
     lds_typed_ptr,
     lds_vec_load,
 )
-from .mxfp4_gemm2 import _flat_bf16_epilog, gemm2_main_loop
+from .mxfp4_gemm2 import _flat_bf16_epilog, _flat_mxfp8_epilog, gemm2_main_loop
 
 
 def bq_view(
@@ -698,17 +698,32 @@ def gemm2_body_v2(
             ]
 
     if const_expr(nonatomic):
-        _flat_bf16_epilog(
-            c_ssa,
-            _global_base_ptr1(arg_out),
-            m_row,
-            n_block_idx,
-            wave,
-            lane,
-            g2_hidden,
-            BN,
-            kMChunks,
-        )
+        if const_expr(route_out_fp8):
+            _flat_mxfp8_epilog(
+                c_ssa,
+                _global_base_ptr1(arg_out),
+                m_row,
+                n_block_idx,
+                wave,
+                lane,
+                fx.Int32(gpu.thread_id("x")),
+                g2_hidden,
+                BN,
+                lds_acc_base,
+                kMChunks,
+            )
+        else:
+            _flat_bf16_epilog(
+                c_ssa,
+                _global_base_ptr1(arg_out),
+                m_row,
+                n_block_idx,
+                wave,
+                lane,
+                g2_hidden,
+                BN,
+                kMChunks,
+            )
     else:
         accm_vecs = [
             [c_frags[i][J].load() for J in range(numAccN)] for i in range(kMChunks)

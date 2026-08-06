@@ -2013,11 +2013,18 @@ def _flydsl_v2_stage2_wrapper(
                 raise ValueError(
                     "nonatomic FlyDSL GEMM2 requires reverse_sorted and sorted_weights"
                 )
-            target = torch.empty(
-                (max_sorted, model_dim_runtime),
-                dtype=out.dtype,
-                device=out.device,
-            )
+            if _s2_fp8_inter:
+                target = torch.empty(
+                    (max_sorted, model_dim_runtime + model_dim_runtime // 8),
+                    dtype=torch.uint8,
+                    device=out.device,
+                )
+            else:
+                target = torch.empty(
+                    (max_sorted, model_dim_runtime),
+                    dtype=out.dtype,
+                    device=out.device,
+                )
         elif _s2_fp8_inter:
             if model_dim_runtime % 8 != 0:
                 raise ValueError(
@@ -2068,6 +2075,22 @@ def _flydsl_v2_stage2_wrapper(
         out_dtype="fp8" if _s2_fp8_inter else "bf16",
     )
     if nonatomic:
+        if _s2_fp8_inter:
+            from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+            _run_moe_reduction(
+                target,
+                out,
+                token_num,
+                topk,
+                model_dim_runtime,
+                expert_mask=expert_mask,
+                topk_ids=topk_ids,
+                is_fp8=True,
+                reverse_sorted=reverse_sorted,
+                sorted_weights=sorted_weights,
+            )
+            return out
         aiter.mxfp4_moe_scatter_reduce(
             flat_out=target,
             reverse_sorted=reverse_sorted,
@@ -2558,22 +2581,34 @@ def get_2stage_cfgs(
                 is_g2_nonatomic_config,
             )
 
+            v2_out_dtype = (
+                "fp8"
+                if flydsl_v2_stage2_cfg["epilog"] == "reduce"
+                and os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+                else "bf16"
+            )
             v2_nonatomic = is_g2_nonatomic_config(
                 flydsl_v2_stage2_cfg["tile_m"],
                 flydsl_v2_stage2_cfg["tile_n"],
                 flydsl_v2_stage2_cfg["tile_k"],
                 flydsl_v2_stage2_cfg["epilog"],
                 flydsl_v2_stage2_cfg["a_dtype"],
-                "bf16",
+                v2_out_dtype,
                 inter_dim,
                 model_dim,
             )
         else:
             v2_nonatomic = False
+        metadata_block_m = (
+            flydsl_v2_stage2_cfg["sort_block_m"]
+            if flydsl_v2_stage2_cfg is not None
+            and flydsl_v2_stage2_cfg["sort_block_m"]
+            else block_m
+        )
         return MOEMetadata(
             stage1_func,
             stage2_func,
-            block_m,
+            metadata_block_m,
             int(ksplit),
             run_1stage,
             has_bias=enable_bias and (is_opus1 or is_flydsl1),

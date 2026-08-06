@@ -3599,8 +3599,9 @@ def _compile_moe_reduction_fp8(
     out_dtype_str: str | None = None,
     use_mask: bool = False,
     num_experts: int = 0,
+    sorted_input: bool = False,
 ):
-    """Compile reduction for MXFP8 route-out rows: [N fp8 bytes | N/8 e8m0]."""
+    """Compile reduction for MXFP8 rows: [N fp8 bytes | N/8 e8m0]."""
     get_hip_arch()
     ir.ShapedType.get_dynamic_size()
 
@@ -3612,8 +3613,9 @@ def _compile_moe_reduction_fp8(
 
     out_numeric = fx.Float16 if out_tag == "f16" else fx.BFloat16
 
+    input_tag = "sorted" if sorted_input else "route"
     module_name = (
-        f"moe_reduction_fp8_kernel_{'masked' if use_mask else 'plain'}"
+        f"moe_reduction_fp8_kernel_{input_tag}_{'masked' if use_mask else 'plain'}"
         f"_{out_tag}_topk{topk}_md{model_dim}"
     )
     fp8_row_bytes_in = model_dim + model_dim // 8
@@ -3625,9 +3627,13 @@ def _compile_moe_reduction_fp8(
         Y: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
+        reverse_sorted: fx.Pointer,
+        sorted_weights: fx.Pointer,
         i32_m_tokens: fx.Int32,
+        i32_sorted_rows: fx.Int32,
     ):
         m_tokens = fx.Int64(i32_m_tokens)
+        sorted_rows = fx.Int64(i32_sorted_rows)
         c_topk = fx.Int64(topk)
         c_model_dim = fx.Int64(model_dim)
 
@@ -3652,9 +3658,18 @@ def _compile_moe_reduction_fp8(
 
         x_slab_nbytes = c_topk * fx.Int64(fp8_row_bytes_in)
         y_slab_nbytes = c_model_dim * fx.Int64(elem_bytes_c)
-        x_base_off_i64 = token_idx * x_slab_nbytes
+        x_base_off_i64 = (
+            fx.Int64(0) if const_expr(sorted_input) else token_idx * x_slab_nbytes
+        )
         y_base_off_i64 = token_idx * c_model_dim * fx.Int64(elem_bytes_c)
-        x_buf = _buffer_tensor(X, fx.Int8, x_slab_nbytes, x_slab_nbytes, x_base_off_i64)
+        x_total_nbytes = (
+            sorted_rows * fx.Int64(fp8_row_bytes_in)
+            if const_expr(sorted_input)
+            else x_slab_nbytes
+        )
+        x_buf = _buffer_tensor(
+            X, fx.Int8, x_total_nbytes, x_total_nbytes, x_base_off_i64
+        )
         y_buf = _buffer_tensor(
             Y, out_numeric, c_model_dim, y_slab_nbytes, y_base_off_i64
         )
@@ -3662,6 +3677,7 @@ def _compile_moe_reduction_fp8(
         load_fp8x8 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int8)
         load_i8_atom = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8)
         load_i32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
+        load_f32_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         store_out8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
         store_out1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), out_numeric)
 
@@ -3669,6 +3685,35 @@ def _compile_moe_reduction_fp8(
             frag = fx.make_rmem_tensor(1, fx.Int8)
             fx.copy(load_i8_atom, _tile(x_buf, elem_offset, 1), frag)
             return fx.Vector(frag.load())[0]
+
+        if const_expr(sorted_input):
+            reverse_elems = m_tokens * c_topk
+            reverse_buf = _buffer_tensor(
+                reverse_sorted,
+                fx.Int32,
+                reverse_elems,
+                reverse_elems * fx.Int64(4),
+                fx.Int64(0),
+            )
+            weights_buf = _buffer_tensor(
+                sorted_weights,
+                fx.Float32,
+                sorted_rows,
+                sorted_rows * fx.Int64(4),
+                fx.Int64(0),
+            )
+        else:
+            reverse_buf = None
+            weights_buf = None
+
+        def load_sorted_pos_and_weight(k):
+            route_pos = token_idx * c_topk + fx.Int64(k)
+            pos_frag = fx.make_rmem_tensor(1, fx.Int32)
+            fx.copy(load_i32_atom, _tile(reverse_buf, route_pos, 1), pos_frag)
+            sorted_pos = fx.Vector(pos_frag.load())[0]
+            weight_frag = fx.make_rmem_tensor(1, fx.Float32)
+            fx.copy(load_f32_atom, _tile(weights_buf, sorted_pos, 1), weight_frag)
+            return fx.Int64(sorted_pos), fx.Vector(weight_frag.load())[0]
 
         if const_expr(use_mask):
             tk_slab_nbytes = c_topk * fx.Int64(4)
@@ -3722,7 +3767,12 @@ def _compile_moe_reduction_fp8(
                     acc = [fx.Float32(0.0) for _ in range(VEC_WIDTH)]
                     scale_col = col_base // c_vecw
                     for k in range_constexpr(topk):
-                        k_row_base = fx.Int64(k) * c_row_bytes_in
+                        if const_expr(sorted_input):
+                            sorted_pos, route_weight = load_sorted_pos_and_weight(k)
+                            k_row_base = sorted_pos * c_row_bytes_in
+                        else:
+                            k_row_base = fx.Int64(k) * c_row_bytes_in
+                            route_weight = fx.Float32(1.0)
                         mv_ok = load_valid_mask(k) if const_expr(use_mask) else None
                         # Preserve the legacy i32-word address calculation, including
                         # its dword alignment, before unpacking into four f32 pairs.
@@ -3745,8 +3795,8 @@ def _compile_moe_reduction_fp8(
                             pair = fx.Vector(
                                 rocdl.cvt_pk_f32_fp8(vec2_f32, words[pi], bool(pi & 1))
                             )
-                            val0 = pair[0] * scale_f32
-                            val1 = pair[1] * scale_f32
+                            val0 = pair[0] * scale_f32 * route_weight
+                            val1 = pair[1] * scale_f32 * route_weight
                             if const_expr(use_mask):
                                 val0 = mv_ok.select(val0, fx.Float32(0.0))
                                 val1 = mv_ok.select(val1, fx.Float32(0.0))
@@ -3770,7 +3820,14 @@ def _compile_moe_reduction_fp8(
                             a = fx.Float32(0.0)
                             scale_col = col // c_vecw
                             for k in range_constexpr(topk):
-                                k_row_base = fx.Int64(k) * c_row_bytes_in
+                                if const_expr(sorted_input):
+                                    sorted_pos, route_weight = (
+                                        load_sorted_pos_and_weight(k)
+                                    )
+                                    k_row_base = sorted_pos * c_row_bytes_in
+                                else:
+                                    k_row_base = fx.Int64(k) * c_row_bytes_in
+                                    route_weight = fx.Float32(1.0)
                                 mv_ok = (
                                     load_valid_mask(k) if const_expr(use_mask) else None
                                 )
@@ -3782,7 +3839,7 @@ def _compile_moe_reduction_fp8(
                                 pair = fx.Vector(
                                     rocdl.cvt_pk_f32_fp8(vec2_f32, b_i32, False)
                                 )
-                                val = pair[0] * scale_f32
+                                val = pair[0] * scale_f32 * route_weight
                                 if const_expr(use_mask):
                                     val = mv_ok.select(val, fx.Float32(0.0))
                                 a = a + val
@@ -3808,12 +3865,24 @@ def _compile_moe_reduction_fp8(
         Y: fx.Pointer,
         expert_mask: fx.Pointer,
         topk_ids: fx.Pointer,
+        reverse_sorted: fx.Pointer,
+        sorted_weights: fx.Pointer,
         i32_m_tokens: fx.Int32,
+        i32_sorted_rows: fx.Int32,
         stream: fx.Stream,
     ):
         _ = cache_tag
         gx = fx.Int64(i32_m_tokens)
-        moe_reduction_fp8_kernel(X, Y, expert_mask, topk_ids, i32_m_tokens).launch(
+        moe_reduction_fp8_kernel(
+            X,
+            Y,
+            expert_mask,
+            topk_ids,
+            reverse_sorted,
+            sorted_weights,
+            i32_m_tokens,
+            i32_sorted_rows,
+        ).launch(
             grid=(gx, gy_static, 1),
             block=(BLOCK_SIZE, 1, 1),
             stream=stream,
@@ -3832,6 +3901,7 @@ def compile_moe_reduction(
     use_mask: bool = False,
     num_experts: int = 0,
     out_dtype_str: str | None = None,
+    sorted_input: bool = False,
 ):
     """Compile a reduction kernel that sums over the topk dimension.
 
@@ -3853,6 +3923,7 @@ def compile_moe_reduction(
             out_dtype_str=out_dtype_str,
             use_mask=use_mask,
             num_experts=num_experts,
+            sorted_input=sorted_input,
         )
     get_hip_arch()
     ir.ShapedType.get_dynamic_size()
