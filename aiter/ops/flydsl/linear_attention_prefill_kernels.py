@@ -672,7 +672,7 @@ def _as_ptr(t: torch.Tensor):
     """Wrap a torch tensor as a flydsl ``Pointer`` argument (raw data ptr).
 
     Uses ``fx.Uint8`` element type: the mfma16_hip kernel re-types every slot
-    inside the body via ``GTensor(ptr, dtype=...)``, so the host-side element
+    inside the body via its ``_flat_buffer`` view, so the host-side element
     type is irrelevant to codegen and only needs to be a valid 1-byte unit.
     """
     return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
@@ -865,6 +865,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
     inplace_final_state: bool | None = None,
     g_head_major: bool = False,
     bf16_convert_trunc: bool = True,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """mfma16 / HIP-aligned K5 implementation: NON-VWARP only -- uses the
     16x16x16 bf16 MFMA and the SAME split-M warp partition (BT split-M, K split
@@ -1035,9 +1036,28 @@ def chunk_gated_delta_rule_fwd_h_flydsl_mfma16_hip(
             )
         if not cu_seqlens.is_contiguous():
             raise ValueError("FlyDSL K5 mfma16_hip: cu_seqlens must be contiguous.")
-        NT, chunk_offsets, kernel_cu_seqlens, N, _min_seqlen = _resolve_prologue(
-            cu_seqlens, BT, num_decodes, num_decode_tokens, T_flat
-        )
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T_flat,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            NT = schedule.total_chunks
+            chunk_offsets = schedule.chunk_offsets
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            N = schedule.n_prefill
+        else:
+            NT, chunk_offsets, kernel_cu_seqlens, N, _min_seqlen = _resolve_prologue(
+                cu_seqlens, BT, num_decodes, num_decode_tokens, T_flat
+            )
         is_varlen = True
 
     if initial_state is not None:

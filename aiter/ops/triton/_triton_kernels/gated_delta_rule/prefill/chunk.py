@@ -303,7 +303,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     ):
         use_chunk_hip = False
     if use_chunk_flydsl:
-        if _is_gfx12_runtime():
+        if _is_gfx12_runtime(q.device):
             use_chunk_flydsl = False
         elif k.dtype != torch.bfloat16 or k.shape[-1] != 128 or v.shape[-1] != 128:
             raise ValueError(
