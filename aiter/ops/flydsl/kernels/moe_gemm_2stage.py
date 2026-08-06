@@ -24,6 +24,7 @@ from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 
 try:
     from flydsl.runtime.device import (
@@ -360,7 +361,7 @@ def compile_moe_gemm1(
             x_elem = (
                 T.bf16
                 if is_bf16
-                else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
             )
             # For int4/int4_bf16, weights are stored as packed bytes (i8) and unpacked in-kernel.
             w_elem = (
@@ -369,7 +370,7 @@ def compile_moe_gemm1(
                 else (
                     T.bf16
                     if is_bf16
-                    else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                    else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
                 )
             )
             scale_dtype = T.bf16 if _scale_is_bf16 else T.f32
@@ -469,7 +470,11 @@ def compile_moe_gemm1(
                     (
                         T.bf16
                         if is_bf16
-                        else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                        else (
+                            T.f16
+                            if is_f16
+                            else (T.i8 if is_int8 else default_f8_type())
+                        )
                     ),
                     shape=(lds_total_elems,),
                 )
@@ -2274,7 +2279,7 @@ def compile_moe_gemm2(
             x_elem = (
                 T.bf16
                 if is_bf16
-                else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
             )
             # For int4/int4_bf16, weights are stored as packed bytes (i8) and unpacked in-kernel.
             w_elem = (
@@ -2283,7 +2288,7 @@ def compile_moe_gemm2(
                 else (
                     T.bf16
                     if is_bf16
-                    else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                    else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
                 )
             )
             scale_dtype = T.bf16 if _scale_is_bf16 else T.f32
@@ -2353,7 +2358,7 @@ def compile_moe_gemm2(
                 (
                     T.bf16
                     if is_bf16
-                    else (T.f16 if is_f16 else (T.i8 if is_int8 else T.f8))
+                    else (T.f16 if is_f16 else (T.i8 if is_int8 else default_f8_type()))
                 ),
                 shape=(lds_total_elems,),
             )
