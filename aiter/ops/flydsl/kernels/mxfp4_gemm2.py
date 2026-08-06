@@ -38,6 +38,10 @@ from .mxfp4_gemm_common import (
 )
 
 NUM_CU = 256
+# `_gemm2_body` is a module-level @flyc.jit whose source is not currently
+# collected into the launcher disk-cache key. Bump this epoch whenever its
+# semantics change so existing launch_gemm2 cache entries cannot go stale.
+NATIVE_GEMM2_CORE_CACHE_EPOCH = 2
 
 
 def aq_bytes_for(max_m, k):
@@ -135,7 +139,8 @@ def compile_gemm2_a4w4_port(
     _rtag = "" if _K_REAL == _K else f"r{_K_REAL}"
     _tag = (
         f"ne{NE}_h{N_OUT}_i{_K}{_rtag}_bm{BM}"
-        f"{'_nt' if use_nt else ''}_{_epi_tag}_bk{BK}"
+        f"{'_nt' if use_nt else ''}_{_epi_tag}"
+        f"_core{NATIVE_GEMM2_CORE_CACHE_EPOCH}_bk{BK}"
     )
     if xcd_swizzle > 0:
         _tag += f"_xcd{xcd_swizzle}"
@@ -264,7 +269,12 @@ def compile_gemm2_a4w4_port(
 
             if bx_i32 < bound:
                 tile = _xcd(bx_i32)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                m_row0 = _udiv(tile, _num_n_blocks) * fx.Int32(BM)
+                if const_expr(_n_load_waves < 4):
+                    if wave < fx.Int32(_n_load_waves):
+                        _issue_all_a_loads(m_row0)
+                else:
+                    _issue_all_a_loads(m_row0)
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
 
@@ -272,7 +282,12 @@ def compile_gemm2_a4w4_port(
                 wu = fx.Int32(iv)
                 gpu.barrier()
                 tile = _xcd(wu)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                m_row0 = _udiv(tile, _num_n_blocks) * fx.Int32(BM)
+                if const_expr(_n_load_waves < 4):
+                    if wave < fx.Int32(_n_load_waves):
+                        _issue_all_a_loads(m_row0)
+                else:
+                    _issue_all_a_loads(m_row0)
                 _run_tile(tile)
         else:
             m_row0 = _udiv(bx_i32, _num_n_blocks) * fx.Int32(BM)

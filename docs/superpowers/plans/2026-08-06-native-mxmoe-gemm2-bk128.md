@@ -1445,6 +1445,7 @@ Expected: 22 PASS。
 Run:
 
 ```bash
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python -m pytest \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128_gpu.py \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128.py \
@@ -1489,6 +1490,7 @@ git commit -m "test(flydsl): cover native mxmoe gemm2 BK128 matrix"
 - [ ] **Step 1: 运行全部新增 host/GPU 测试**
 
 ```bash
+FLYDSL_RUNTIME_ENABLE_CACHE=0 \
 python -m pytest \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128.py \
   op_tests/flydsl_tests/test_native_mxmoe_gemm2_bk128_gpu.py \
