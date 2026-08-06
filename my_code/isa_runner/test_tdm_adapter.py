@@ -2,7 +2,9 @@
 """CPU-only unit tests for tdm_adapter capture and comparison helpers."""
 
 import inspect
+import os
 import unittest
+from unittest.mock import patch
 
 try:
     import torch
@@ -13,6 +15,7 @@ from tdm_adapter import (
     _POISON,
     _compare_outputs,
     _find_output_tensor,
+    _flydsl_timer_enabled,
     _iqr_trimmed_median_us,
     Capture,
     IsaRunnerError,
@@ -30,7 +33,7 @@ class TdmAdapterInterfaceTest(unittest.TestCase):
     def test_capture_has_no_reference_isa_state(self):
         self.assertNotIn("reference_isa", Capture.__dataclass_fields__)
 
-    def test_replay_defaults_to_flydsl_style_l2_flush(self):
+    def test_replay_enables_l2_flush_for_opt_in_flydsl_timer(self):
         parameters = inspect.signature(replay).parameters
 
         self.assertIn("flush_l2", parameters)
@@ -44,6 +47,12 @@ class TdmAdapterInterfaceTest(unittest.TestCase):
         self.assertEqual(median, 1.0)
         self.assertEqual(raw_count, 8)
         self.assertEqual(filtered_count, 7)
+
+    def test_flydsl_timer_requires_opt_in(self):
+        with patch.dict(os.environ, {"FLYDSL_TIMER": "0"}):
+            self.assertFalse(_flydsl_timer_enabled())
+        with patch.dict(os.environ, {"FLYDSL_TIMER": "1"}):
+            self.assertTrue(_flydsl_timer_enabled())
 
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")

@@ -218,13 +218,16 @@ includes queue-visible launch overhead. The module stays loaded across
 iterations, so load cost is excluded. The smoke CLI uses no hidden warmup:
 `--iters 200` launches exactly 200 times.
 
-`tdm_adapter.py --iters N` matches FlyDSL
-`tests/kernels/benchmark_common.py::bench_kernel_us`: it flushes L2 and
-poison-fills the output before each launch, records a separate torch CUDA event
-pair around each kernel only, removes IQR outliers, and reports the median as
-`per_launch_us`. Warmups use the same preparation but are excluded from the
-samples. L2 flushing is on by default; pass `--no-flush-l2` to measure hot-L2
-latency instead.
+By default, `tdm_adapter.py --iters N` uses
+`aiter.test_common.run_perftest(..., testGraph=False)`, the same path as
+`op_tests/test_flydsl_grouped_gemm_gfx1250.py` uses for isolated GEMM timing.
+
+Set `FLYDSL_TIMER=1` to use FlyDSL
+`tests/kernels/benchmark_common.py::bench_kernel_us` semantics instead: L2 is
+flushed and the output is poison-filled before each launch, a separate torch
+CUDA event pair measures each kernel, IQR outliers are removed, and
+`per_launch_us` is the median. Pass `--no-flush-l2` for hot-L2 timing in this
+mode.
 
 For single-wave cycle counts, put `s_get_shader_cycles_u64` in the ISA itself
 and write the delta to a buffer.

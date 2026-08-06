@@ -559,6 +559,46 @@ def _benchmark_like_flydsl(
     }
 
 
+def _flydsl_timer_enabled() -> bool:
+    return os.environ.get("FLYDSL_TIMER", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _benchmark_with_run_perftest(mod, name, args, spec, *, iters, warmup):
+    """Match the production grouped-MoE kernel benchmark path."""
+    from aiter.test_common import run_perftest
+
+    if iters < 1:
+        raise IsaRunnerError(f"benchmark iterations must be at least 1, got {iters}")
+    if warmup < 0:
+        raise IsaRunnerError(f"benchmark warmup must be non-negative, got {warmup}")
+
+    def launch():
+        mod.launch(name, args, spec)
+
+    _, per_launch_us = run_perftest(
+        launch,
+        num_warmup=warmup,
+        num_iters=iters,
+        testGraph=False,
+    )
+    return {
+        "kernel": name,
+        "iters": iters,
+        "warmup": warmup,
+        "timer": "aiter_run_perftest",
+        "test_graph": False,
+        "per_launch_us": float(per_launch_us),
+        "grid": list(spec.grid),
+        "block": list(spec.block),
+        "shared_mem_bytes": spec.shared_mem_bytes,
+    }
+
+
 def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
            device: int = 0, lds_bytes: int | None = None,
            iters: int = 0, warmup: int = 20,
@@ -606,16 +646,27 @@ def replay(cap: Capture, isa_source: str | Path, *, kernel: str | None = None,
         report.update(_compare_outputs(cap.reference, got))
 
         if iters:
-            report["benchmark"] = _benchmark_like_flydsl(
-                mod,
-                name,
-                cap.pack_kernargs(),
-                spec,
-                live,
-                iters=iters,
-                warmup=warmup,
-                flush_l2=flush_l2,
-            )
+            kernargs = cap.pack_kernargs()
+            if _flydsl_timer_enabled():
+                report["benchmark"] = _benchmark_like_flydsl(
+                    mod,
+                    name,
+                    kernargs,
+                    spec,
+                    live,
+                    iters=iters,
+                    warmup=warmup,
+                    flush_l2=flush_l2,
+                )
+            else:
+                report["benchmark"] = _benchmark_with_run_perftest(
+                    mod,
+                    name,
+                    kernargs,
+                    spec,
+                    iters=iters,
+                    warmup=warmup,
+                )
     finally:
         mod.close()
 
@@ -640,7 +691,7 @@ def main(argv=None) -> int:
         "--no_flush_l2",
         dest="no_flush_l2",
         action="store_true",
-        help="disable the FlyDSL-style L2 flush before each timed launch",
+        help="disable L2 flush when FLYDSL_TIMER=1",
     )
     p.add_argument("--tokens", type=int, default=4096)
     p.add_argument("--experts", type=int, default=384)
