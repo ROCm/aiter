@@ -65,6 +65,31 @@ def _fused_clamp_silu_mul_kernel(
 ):
     # constants
     NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
+
+    # one 2d shared layout for ROWS_PER_PROGx2*N
+    shared_tdm_layout_2d: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])
+    pid = gl.program_id(0)                 
+    m_start = pid * ROWS_PER_PROG
+
+    gate_smem = gl.allocate_shared_memory(
+        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
+    )
+    up_smem = gl.allocate_shared_memory(
+        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
+    )
+
+    inp_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=inp_ptr,
+        shape=[M, 2 * n_half],
+        strides=[inp_stride_m, inp_stride_n],
+        block_shape=[1, BLOCK_SIZE_N],
+        layout=shared_tdm_layout_2d,
+    )
+
+    # first load since static load cant run
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, 0], gate_smem.index(0))
+    gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start, n_half], up_smem.index(0))
+
     # 1D layouts for rows, 2D layouts give bad perf and buffer_load is not good for perf with llvm currently
     # TDM is more efficient than regular load
     row_layout: gl.constexpr = gl.BlockedLayout(
@@ -80,51 +105,37 @@ def _fused_clamp_silu_mul_kernel(
         order=[0],
     )
 
-    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
-    pid = gl.program_id(0)                 
-    m_start = pid * ROWS_PER_PROG
-
-    gate_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
-    )
-    up_smem = gl.allocate_shared_memory(
-        inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
-    )
-
-    # prologue + setup TDM
-    for i in gl.static_range(ROWS_PER_PROG):
-        row_base = (m_start + i) * inp_stride_m
-        gate_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=inp_ptr + row_base,
-            shape=[n_half],
-            strides=[inp_stride_n],
-            block_shape=[BLOCK_SIZE_N],
-            layout=shared_tdm_layout,
-        )
-        gl.amd.gfx1250.tdm.async_load(gate_desc, [0], gate_smem.index(i))
-        up_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=inp_ptr + row_base + n_half * inp_stride_n,
-            shape=[n_half],
-            strides=[inp_stride_n],
-            block_shape=[BLOCK_SIZE_N],
-            layout=shared_tdm_layout,
-        )
-        gl.amd.gfx1250.tdm.async_load(up_desc, [0], up_smem.index(i))
-
     # setup + setup store
     offs = gl.arange(0, BLOCK_SIZE_N, layout=row_layout).to(gl.int64) 
     mask = offs < n_half                        
     num_bs = gl.cdiv(n_half, QUANT_BLOCK_SIZE)        
     g_offs = gl.arange(0, NUM_N_Q_GROUPS, layout=row_scale_layout)  
+
     out_acc = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
+        out_ptr.dtype.element_ty, [ROWS_PER_PROG, 1, BLOCK_SIZE_N], shared_tdm_layout_2d
+    )
+
+    # store
+    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+        base=out_ptr,
+        shape=[M, n_half],
+        strides=[out_stride_m, out_stride_n],
+        block_shape=[1, BLOCK_SIZE_N],
+        layout=shared_tdm_layout_2d,
     )
 
     # main loop
-    for i in gl.static_range(ROWS_PER_PROG):
+    for i in range(ROWS_PER_PROG):
         row = m_start + i
 
-        # weights load first, hide TDM latency
+        # prefetch the NEXT row's gate/up one iteration ahead (fixed lookahead of
+        # 1) so its loads overlap this row's weights load + compute.
+        if i + 1 < ROWS_PER_PROG:
+            nxt = i + 1
+            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, 0], gate_smem.index(nxt))
+            gl.amd.gfx1250.tdm.async_load(inp_desc, [m_start + nxt, n_half], up_smem.index(nxt))
+
+        # weights load
         if HAVE_WEIGHTS:
             if WEIGHT_BROADCAST:
                 w = gl.load(weights_ptr + row * weights_stride_m).to(gl.float32)  # scalar applied to all out
@@ -134,9 +145,33 @@ def _fused_clamp_silu_mul_kernel(
                     mask=mask, other=0.0, cache_modifier=cache_modifier,
                 ).to(gl.float32)
 
-        gl.amd.gfx1250.tdm.async_wait(2 * (ROWS_PER_PROG - i - 1))
-        gate = gate_smem.index(i).load(row_layout).to(gl.float32)
-        up = up_smem.index(i).load(row_layout).to(gl.float32)
+        if SHUFFLE:
+            bs_offs_0 = row // 32          # row-tile of 32
+            bs_offs_1 = row % 32           # position within the 32-row tile
+            bs_offs_2 = bs_offs_1 % 16     # sub-position within 16
+            bs_offs_1 = bs_offs_1 // 16    # which half of the 32 (0/1)
+            bs_offs_3 = g_offs // 8        # block-col tile of 8
+            bs_offs_4 = g_offs % 8         # position within the 8-col tile
+            bs_offs_5 = bs_offs_4 % 4      # sub-position within 4
+            bs_offs_4 = bs_offs_4 // 4     # which half of the 8 (0/1)
+            bs_offs = (                    # weave the sub-indices into the tiled offset
+                bs_offs_1
+                + bs_offs_4 * 2
+                + bs_offs_2 * 2 * 2
+                + bs_offs_5 * 2 * 2 * 16
+                + bs_offs_3 * 2 * 2 * 16 * 4
+                + bs_offs_0 * 2 * 16 * SCALE_N_PAD
+            )
+        else:
+            bs_offs = 0 # not needed
+
+        if i + 1 < ROWS_PER_PROG:
+            gl.amd.gfx1250.tdm.async_wait(2)
+        else:
+            gl.amd.gfx1250.tdm.async_wait(0)
+
+        gate = gate_smem.index(i).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
+        up = up_smem.index(i).reshape([BLOCK_SIZE_N]).load(row_layout).to(gl.float32)
 
         # clamp
         if HAVE_SWIGLU_CLAMP:
@@ -185,30 +220,11 @@ def _fused_clamp_silu_mul_kernel(
                 )
 
             # accumulate
-            out_acc.index(i).store(out_q.to(out_ptr.dtype.element_ty))
+            out_acc.index(i).reshape([BLOCK_SIZE_N]).store(out_q.to(out_ptr.dtype.element_ty))
 
-            # scale store (per row, keyed on absolute row/group)
             if SHUFFLE:
-                # Preshuffled scale store: same tiled index math as the Triton
-                # reference (rows padded to 256, block-cols to 8, tiled layout).
-                bs_offs_0 = row // 32          # row-tile of 32
-                bs_offs_1 = row % 32           # position within the 32-row tile
-                bs_offs_2 = bs_offs_1 % 16     # sub-position within 16
-                bs_offs_1 = bs_offs_1 // 16    # which half of the 32 (0/1)
-                bs_offs_3 = g_offs // 8        # block-col tile of 8
-                bs_offs_4 = g_offs % 8         # position within the 8-col tile
-                bs_offs_5 = bs_offs_4 % 4      # sub-position within 4
-                bs_offs_4 = bs_offs_4 // 4     # which half of the 8 (0/1)
-                bs_offs = (                    # weave the sub-indices into the tiled offset
-                    bs_offs_1
-                    + bs_offs_4 * 2
-                    + bs_offs_2 * 2 * 2
-                    + bs_offs_5 * 2 * 2 * 16
-                    + bs_offs_3 * 2 * 2 * 16 * 4
-                    + bs_offs_0 * 2 * 16 * SCALE_N_PAD
-                )
                 gl.store(
-                    scale_ptr + bs_offs,
+                    scale_ptr + bs_offs, # exists
                     block_scales.to(scale_ptr.dtype.element_ty),
                     mask=g_offs < num_bs,
                 )
@@ -220,19 +236,15 @@ def _fused_clamp_silu_mul_kernel(
                 )
         else:
             # no quant
-            out_acc.index(i).store(out.to(out_ptr.dtype.element_ty))
+            out_acc.index(i).reshape([BLOCK_SIZE_N]).store(out.to(out_ptr.dtype.element_ty))
 
-        # store
-        if num_warps > 1:
-            gl.barrier()
-        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-            base=out_ptr + row * out_stride_m,
-            shape=[n_half],
-            strides=[out_stride_n],
-            block_shape=[BLOCK_SIZE_N],
-            layout=shared_tdm_layout,
-        )
-        gl.amd.gfx1250.tdm.async_store(out_desc, [0], out_acc.index(i))
+    if num_warps > 1:
+        gl.barrier()
 
-    # wait for stores to complete
+    # issue all stores
+    for i in range(ROWS_PER_PROG):
+        row = m_start + i
+        gl.amd.gfx1250.tdm.async_store(out_desc, [row, 0], out_acc.index(i))
+
+    # wait for all stores to complete
     gl.amd.gfx1250.tdm.async_wait(0)
