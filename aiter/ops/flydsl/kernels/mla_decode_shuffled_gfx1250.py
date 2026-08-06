@@ -185,6 +185,12 @@ def compile_mla_decode_main(
     # Warps split exactly one axis: Q head tiles, tokens, or d_c.
     if WARP_HEAD_SPLIT and WARP_TOKEN_SPLIT:
         raise ValueError("WARP_HEAD_SPLIT and WARP_TOKEN_SPLIT are mutually exclusive")
+
+    if NUM_WARPS & (NUM_WARPS - 1):
+        raise ValueError(
+            f"NUM_WARPS must be a power of 2, got {NUM_WARPS}"
+        )
+
     SPLIT = NUM_WARPS if WARP_TOKEN_SPLIT else 1
     NUM_PARTITIONS = NUM_SEGS * SPLIT
 
@@ -952,9 +958,7 @@ def compile_mla_decode_reduce(
         seq_len_i32 = buffer_ops.buffer_load(sl_rsrc, seq_idx, vec_width=1, dtype=T.i32)
         seq_len = fx.Index(seq_len_i32)
 
-        # Re-derive the main kernel's tiling to learn how many segments actually produced
-        # partials, then scale by SPLIT for the per-warp partitions (Scheme A). Each live
-        # segment contributes SPLIT contiguous live partitions (seg*SPLIT + warp).
+        # Re-derive the main kernel's tiling
         KVC = fx.Index(KV_COMPUTE_BLOCK_SIZE)
         num_tiles = (seq_len + KVC - fx.Index(1)) // KVC
         tiles_per_seg = (num_tiles + fx.Index(NUM_SEGS) - fx.Index(1)) // fx.Index(NUM_SEGS)
