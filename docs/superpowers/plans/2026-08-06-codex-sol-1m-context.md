@@ -247,16 +247,18 @@ const matches = rolloutFiles("/root/.codex/sessions").filter(file =>
 );
 assert.strictEqual(matches.length, 1, "smoke-test thread must resolve to one rollout");
 const events = fs.readFileSync(matches[0], "utf8").trim().split("\n").map(JSON.parse);
-const settings = events.find(event => event.type === "event_msg" && event.payload.type === "thread_settings_applied");
+const meta = events.find(event => event.type === "session_meta");
+const context = events.find(event => event.type === "turn_context");
 const started = events.find(event => event.type === "event_msg" && event.payload.type === "task_started");
-assert.strictEqual(settings.payload.thread_settings.model, "gpt-5.6-sol");
-assert.strictEqual(settings.payload.thread_settings.model_provider_id, "custom-gateway");
+assert.strictEqual(meta.payload.session_id, threadStarted.thread_id);
+assert.strictEqual(context.payload.model, "gpt-5.6-sol");
+assert.strictEqual(meta.payload.model_provider, "custom-gateway");
 assert.strictEqual(started.payload.model_context_window, 950000);
 console.log(JSON.stringify({
   thread_id: threadStarted.thread_id,
   rollout: matches[0],
-  model: settings.payload.thread_settings.model,
-  provider: settings.payload.thread_settings.model_provider_id,
+  model: context.payload.model,
+  provider: meta.payload.model_provider,
   model_context_window: started.payload.model_context_window
 }));
 '
