@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Rebuild a reassemblable, self-contained .s file from an AITER kernel object (.co).
 
 The output contains three parts, all recovered from the .co with LLVM tools:
@@ -70,7 +69,7 @@ class Tools:
         exe = os.path.join(self.bin, tool)
         if not os.path.exists(exe):
             sys.exit(f"error: {exe} not found (set ROCM_PATH or pass --llvm-bin)")
-        res = subprocess.run([exe, *args], capture_output=True, text=True)
+        res = subprocess.run([exe, *args], capture_output=True, text=True, check=False)
         if res.returncode != 0:
             sys.exit(f"error: {tool} {' '.join(args)} failed:\n{res.stderr}")
         return res.stdout
@@ -81,7 +80,7 @@ def detect_mcpu(tools: Tools, co: str) -> str:
     m = re.search(r"EF_AMDGPU_MACH_AMDGCN_(\w+)\s", hdr)
     if m:
         return m.group(1).lower()
-    m = re.search(r"^\s*Flags:\s*0x([0-9A-Fa-f]+)", hdr, re.M)
+    m = re.search(r"^\s*Flags:\s*0x([0-9A-Fa-f]+)", hdr, re.MULTILINE)
     if m and (int(m.group(1), 16) & 0xFF) in EF_AMDGPU_MACH:
         return EF_AMDGPU_MACH[int(m.group(1), 16) & 0xFF]
     sys.exit("error: could not detect the GPU architecture, pass --mcpu")
@@ -161,7 +160,7 @@ def extract_kernel_descriptor(tools: Tools, co: str, mcpu: str, kernel: str) -> 
     m = re.search(
         rf"^\.amdhsa_kernel {re.escape(kernel)}\n.*?^\.end_amdhsa_kernel$",
         dis,
-        re.S | re.M,
+        re.DOTALL | re.MULTILINE,
     )
     if not m:
         sys.exit(
@@ -204,7 +203,7 @@ def extract_kernel_descriptor(tools: Tools, co: str, mcpu: str, kernel: str) -> 
 def extract_metadata(tools: Tools, co: str) -> list:
     """The NT_AMDGPU_METADATA note as an .amdgpu_metadata YAML block."""
     notes = tools.run("llvm-readelf", "--notes", co)
-    m = re.search(r"^\s*---\n(.*?)^\.\.\.$", notes, re.S | re.M)
+    m = re.search(r"^\s*---\n(.*?)^\.\.\.$", notes, re.DOTALL | re.MULTILINE)
     if not m:
         sys.exit("error: no AMDGPU metadata note found")
     return [

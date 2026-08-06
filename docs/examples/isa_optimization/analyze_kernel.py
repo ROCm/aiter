@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Analyze AITER kernel ISA and rocprofv3 profiling results.
 
 Two modes:
@@ -26,7 +25,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from extract_asm import ADDR_COMMENT, Tools, default_llvm_bin, detect_mcpu  # noqa: E402
+from extract_asm import ADDR_COMMENT, Tools, default_llvm_bin, detect_mcpu
 
 # Ordered (first match wins), keyed on the instruction mnemonic.
 CATEGORIES = [
@@ -143,7 +142,7 @@ def analyze_profile(profile_dir: str, name_filter: str | None = None):
             f"Error: no .db file found under {profile_dir} "
             "(was rocprofv3 run with the default rocpd output format?)"
         )
-    db_path = sorted(db_files)[0]
+    db_path = min(db_files)
     print(f"Database: {db_path}\n")
 
     conn = sqlite3.connect(db_path)
