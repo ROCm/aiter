@@ -696,6 +696,7 @@ def grouped_a8w4_tdm_moe_push_scatter(
     from aiter.ops.flydsl.kernels.push_group_finalize_gfx1250 import (
         launch_push_group_finalize,
     )
+    from aiter.jit.utils.chip_info import get_cu_num
 
     device = disp_out.device
     if dtype is None:
@@ -800,6 +801,20 @@ def grouped_a8w4_tdm_moe_push_scatter(
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
     psum_dummy = torch.zeros(E, dtype=torch.int32, device=device)
+    persistent_gemm1_requested = os.environ.get(
+        "AITER_EP_PUSH_GROUP_PERSISTENT_GEMM1", "1"
+    ).lower() in _TRUTHY_ENV
+    # A persistent loop only removes work when the static compact grid still
+    # contains upper-bound tail tiles. Once grid_m == cm, every possible
+    # fixed-slot M tile is already scheduled and the loop's register/live-range
+    # cost can regress large-bs throughput.
+    persistent_gemm1 = persistent_gemm1_requested and grid_m < cm
+    workers_env = os.environ.get("AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS")
+    persistent_workers = int(workers_env) if workers_env else int(get_cu_num())
+    if persistent_workers < 1:
+        raise ValueError(
+            "AITER_EP_PUSH_GROUP_PERSISTENT_WORKERS must be >= 1"
+        )
 
     # 3) GEMM1 (+ fused silu/swiglu + fp8 quant epilogue), fixed-slot rows.
     if _fuse_quant:
@@ -816,6 +831,8 @@ def grouped_a8w4_tdm_moe_push_scatter(
             swiglu_limit=sl, num_buffers=num_buffers,
             stage1_quant_out=1, quant_scale=a2_scale, quant_wmma_rep=wmma_rep2,
             push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+            ep_persistent_gemm1=int(persistent_gemm1),
+            num_valid_rows=num_valid, persistent_workers=persistent_workers,
         )
     else:
         y = torch.empty((1, cm, inter_dim), dtype=dtype, device=device)
@@ -826,6 +843,8 @@ def grouped_a8w4_tdm_moe_push_scatter(
             out_is_f16=out_is_f16, a_is_fp4=0, stage1_act=stage1_act, bias=_b1,
             swiglu_limit=sl, num_buffers=num_buffers,
             push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+            ep_persistent_gemm1=int(persistent_gemm1),
+            num_valid_rows=num_valid, persistent_workers=persistent_workers,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y, 1, cm, wmma_rep=wmma_rep2, quant_mode="fp8",

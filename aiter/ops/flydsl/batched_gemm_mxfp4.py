@@ -63,6 +63,9 @@ def flydsl_grouped_gemm_a8w4_masked(
     tile_row_base=None,
     expert_ids=None,
     tile_valid=None,
+    ep_persistent_gemm1=0,
+    num_valid_rows=None,
+    persistent_workers=None,
 ):
     """Contiguous-M grouped a8w4 GEMM on the batched TDM kernel.
 
@@ -99,6 +102,12 @@ def flydsl_grouped_gemm_a8w4_masked(
     # into peers' comb_inp instead of TDM-storing arg_c. ep_rowmap carries the
     # per-row (dst_packed, f32 weight) map; when off, pass a dummy tensor (unread).
     ep_rowmap_tensor = ep_rowmap if ep_rowmap is not None else out
+    # The persistent push-GEMM1 scheduler reads this device scalar only when its
+    # constexpr gate is on. Keep a valid dummy pointer for every other caller so
+    # the JIT ABI never receives None.
+    num_valid_rows_tensor = num_valid_rows if num_valid_rows is not None else out
+    if persistent_workers is None:
+        persistent_workers = 1
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -138,6 +147,9 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_tile_row_base=ptr_arg(tile_row_base if tile_row_base is not None else a),
         arg_expert_ids=ptr_arg(expert_ids if expert_ids is not None else a),
         arg_tile_valid=ptr_arg(tile_valid if tile_valid is not None else a),
+        ep_persistent_gemm1=int(ep_persistent_gemm1),
+        persistent_workers=int(persistent_workers),
+        arg_num_valid_rows=ptr_arg(num_valid_rows_tensor),
     )
     return out
 

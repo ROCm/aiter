@@ -126,6 +126,10 @@ def test_push_group_gemm1_byte_exact():
     eids = torch.full((max_tiles,), E, dtype=torch.int32, device=dev)  # E == skip sentinel
     tvd = torch.zeros((max_tiles,), dtype=torch.int32, device=dev)
     num_valid = torch.zeros(1, dtype=torch.int32, device=dev)
+    # Request compact metadata layout: persistent GEMM enumerates exactly the
+    # [0, num_valid / tile_m) prefix, while valid_rows is unused in this test.
+    valid_rows = torch.empty(token_num * topk, dtype=torch.int32, device=dev)
+    valid_routes = torch.zeros(1, dtype=torch.int32, device=dev)
     launch_push_group_finalize(
         pg_running_ptr=counts_t.data_ptr(),
         tile_row_base_ptr=trb.data_ptr(),
@@ -133,6 +137,8 @@ def test_push_group_gemm1_byte_exact():
         num_valid_ptr=num_valid.data_ptr(),
         tile_valid_ptr=tvd.data_ptr(),
         num_local_experts=E, cap=CAP, tile_m=tile_m, rank=0, experts_per_rank=E,
+        valid_rows_ptr=valid_rows.data_ptr(),
+        valid_routes_ptr=valid_routes.data_ptr(),
     )
     torch.cuda.synchronize()
 
@@ -145,7 +151,21 @@ def test_push_group_gemm1_byte_exact():
         out_is_f16=0, a_is_fp4=0, stage1_act=1, bias=None, num_buffers=2,
         push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
     )
+
+    # The persistent scheduler receives the exact tile-aligned valid-row count
+    # produced by finalize, never reads it on the host, and must write the same
+    # fixed-slot output rows as the static compact scheduler above.
+    y_push_persistent = torch.zeros_like(y_push)
+    flydsl_grouped_gemm_a8w4_masked(
+        y_push_persistent, a1p_pg, w1_u8, a1s_pg, w1s_i32, psum_dummy,
+        n_experts=E, contiguous_m=cm_pg, N=two_inter, K=K,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+        out_is_f16=0, a_is_fp4=0, stage1_act=1, bias=None, num_buffers=2,
+        push_group=1, tile_row_base=trb, expert_ids=eids, tile_valid=tvd,
+        ep_persistent_gemm1=1, num_valid_rows=num_valid, persistent_workers=256,
+    )
     torch.cuda.synchronize()
+    assert torch.equal(y_push, y_push_persistent)
 
     # ===================== compare per (token, route) =====================
     tir = topids_to_rows.reshape(token_num, topk).cpu()
