@@ -1036,6 +1036,8 @@ def _gfx950_unified_attention(
     if ALL_DECODE:
         mfma_dim = 32 if Q_FP8 else 16
         num_buffers = 1 if HEAD_SIZE >= 256 else 2
+        if SLIDING_WINDOW > 0:
+            num_buffers = 2
         # BLOCK_M must hold a whole query group: BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
         # has to be >= 1
         block_m = max(mfma_dim, triton.next_power_of_2(NUM_QUERIES_PER_KV))
