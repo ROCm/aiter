@@ -1953,10 +1953,28 @@ class DualwaveFp8StoreHelper(DualwaveFp8KernelContext):
                         dw_col = dc * (self.traits.D_CHUNK // 2) + (2 * g + self.lane_div_32) * 4
                         self.ws_store_quad_i32(self._packed_o_128_dwords(v_o, dc, g), o_part_row_base + dw_col)
                 if self.lane < fx.Index(32):
-                    self.ws_store_f32(m_row, mrow_base + ml_row_idx)
+                    self.ws_store_f32(self.splitk_m_out(m_row), mrow_base + ml_row_idx)
                     self.ws_store_f32(l_row, lrow_base + ml_row_idx)
 
         _store_splitk_partial_if_qrow()
+
+    def splitk_m_out(self, m_row):
+        """Convert m_row into the units the combine pass expects.
+
+        Inside the kernel c_logit_scale -- which folds the q/k descales with
+        sm_scale*log2e -- is only ever applied to a difference (s - m), never to
+        m itself, so m_row is carried in raw un-descaled logit units and the
+        scale cancels among its consumers. The combine is a separate kernel with
+        no descale tensors: it computes exp2(m_i - m_max) directly, so it needs m
+        pre-scaled. Unscaled, the fp8 gaps are ~1e5 and every exp2 but the
+        largest split's flushes to zero, silently dropping those partials.
+
+        bf16 has no descale, so its c_logit_scale is just sm_scale*log2e and the
+        two conventions coincide -- which is why this only bites fp8.
+        """
+        if const_expr(not self.traits.FP8_PV):
+            return m_row
+        return fx.Float32(_fmul(as_mlir_value(m_row), as_mlir_value(self.c_logit_scale), self.fm_fast))
 
     def store_empty_split(self):
         @flyc.jit
@@ -2012,6 +2030,13 @@ class DualwaveSplitKCombineContext:
 
     def init_types_and_constants(self):
         self.elem_dtype = dtype_to_elem_type(self.traits.DTYPE_STR)
+        # Element type of the split-K partials in the workspace, and of the
+        # final output. NOT the input dtype: the main kernel packs partials
+        # with cvt_pk_bf16_f32 whatever it reads (see _o_pack_2dw), the row
+        # stride is HEAD_DIM // 2 i32, and store_output scales its offset by 2.
+        # For an fp8 kernel elem_dtype is one byte, so using it here unpacks 8
+        # elements where 4 are meant and packs 4 into one i32 instead of two.
+        self.part_dtype = fx.BFloat16 if self.traits.DTYPE_STR == "fp8" else self.elem_dtype
         self.fm_fast = fx.arith.FastMathFlags.fast
         self.c_zero_f = fx.Float32(0.0)
         self.c_zero_v4f32 = Vec.filled(4, 0.0, fx.Float32)
@@ -2129,7 +2154,7 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
                     dtype=T.i32,
                 )
                 o2_i32 = ir.Value(o2_raw)
-                o4 = Vec(o2_i32, (2,), fx.Int32).bitcast(self.elem_dtype).to(fx.Float32)
+                o4 = Vec(o2_i32, (2,), fx.Int32).bitcast(self.part_dtype).to(fx.Float32)
                 w4 = Vec.from_elements([fx.Float32(wl)], fx.Float32).broadcast_to(4)
                 acc = _fadd(acc, _fmul(w4, o4, self.fm_fast), self.fm_fast)
             return acc, den
@@ -2147,14 +2172,15 @@ class DualwaveSplitKCombineHelper(DualwaveSplitKCombineContext):
         inv = (fx.Float32(den) > self.c_zero_f).select(inv_rcp, self.c_zero_f)
         inv4 = Vec.from_elements([fx.Float32(inv)], fx.Float32).broadcast_to(4)
         out4 = Vec(_fmul(acc, inv4, self.fm_fast), (4,), fx.Float32)
-        if const_expr(self.traits.DTYPE_STR == "bf16"):
+        # part_dtype, not elem_dtype -- an fp8 kernel still writes bf16 out.
+        if const_expr(self.part_dtype is fx.BFloat16):
             lo = rocdl.cvt_pk_bf16_f32(out4[0], out4[1])
             hi = rocdl.cvt_pk_bf16_f32(out4[2], out4[3])
         else:
             o_f16 = []
             for i in range_constexpr(4):
-                o_f16.append(fx.Float32(out4[i]).to(self.elem_dtype))
-            pack = Vec.from_elements(o_f16, self.elem_dtype).bitcast(fx.Int32)
+                o_f16.append(fx.Float32(out4[i]).to(self.part_dtype))
+            pack = Vec.from_elements(o_f16, self.part_dtype).bitcast(fx.Int32)
             lo, hi = as_mlir_value(pack[0]), as_mlir_value(pack[1])
         return Vec.from_elements([fx.Int32(lo), fx.Int32(hi)], fx.Int32)
 

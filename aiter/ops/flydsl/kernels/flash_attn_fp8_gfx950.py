@@ -75,11 +75,9 @@ def build_flash_attn_dualwave_swp_fp8_module(
         raise RuntimeError(f"flash_attn_dualwave_swp is D=128 only, got head_dim={head_dim}")
     if dtype_str not in ("bf16", "f16", "fp8"):
         raise RuntimeError(f"flash_attn_dualwave_swp supports bf16/f16/fp8 only, got dtype={dtype_str}")
-    # fp8 split-K is still unimplemented -- it fails inside the partial-output
-    # store, not here -- so keep rejecting it at the boundary rather than
-    # building a path that would silently produce wrong results.
-    if dtype_str == "fp8" and int(num_kv_splits) > 1:
-        raise RuntimeError(f"fp8 flash_attn does not support split-K (num_kv_splits={num_kv_splits})")
+    # fp8 split-K was rejected here. What blocked it was the combine pass
+    # packing its output as DTYPE_STR (the input dtype) rather than the
+    # kernel's fixed 2-byte output; see pack_output in the common module.
     # fp8 varlen was rejected here too. It needed the active guard the fp8
     # context was missing (see compute_active_guard in the common module) plus
     # the BN128 pipeline held on independently of varlen; with both, it works.
@@ -344,7 +342,15 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 inv_l = ArithValue(inv_l) * ctx.vd_fp8
             softmax_helper.scale_o(v_o, inv_l)
             rocdl.s_barrier()
-            output_store.store_final_o(v_o, q_row)
+            if const_expr(not SPLITK):
+                output_store.store_final_o(v_o, q_row)
+            else:
+                # Under split-K this workgroup owns one KV range, so it writes a
+                # partial plus its (m, l) for the combine pass instead of the
+                # final output. The fp8 body previously called store_final_o
+                # unconditionally, leaving the workspace all zeros -- the
+                # partial-store helpers existed but nothing called them.
+                output_store.store_splitk_partial_o(v_o, m_row, l_row, q_row)
 
         # Skip workgroups whose Q block lies past their own sequence. The grid
         # is sized for the longest sequence, so under varlen the excess blocks
@@ -361,6 +367,12 @@ def build_flash_attn_dualwave_swp_fp8_module(
                     _main_body()
 
             _run_body_if_active()
+
+        # Outside the active guard on purpose: a split whose KV range is empty
+        # skips the body entirely but still has to mark its (m, l) slots, or the
+        # combine pass reads stale workspace for that split.
+        if const_expr(SPLITK):
+            output_store.store_empty_split()
 
     # Combine kernel: out = sum_s w_s * O_s / sum_s w_s * l_s, w_s = exp2(m_s - m_max).
     # One wave row of 32 lanes covers a (b, h, s) row, 4 contiguous cols/lane.
