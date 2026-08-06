@@ -1,0 +1,1548 @@
+
+import torch
+from triton.experimental import gluon
+import triton.experimental.gluon.language as gl
+from triton.language.core import _aggregate as aggregate
+import pytest
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.device_info import get_num_sms
+from aiter.ops.triton._triton_kernels.attention.unified_attention import reduce_segments
+from aiter.ops.triton.utils.common_utils import strip_annotate
+import os
+from aiter.ops.triton.utils.types import e4m3_dtype
+import triton.language as tl
+from triton.language.core import PropagateNan
+import triton
+from packaging.version import Version
+
+triton_version = Version(triton.__version__)
+
+TRITON_BEYOND_37 = gl.constexpr(triton_version >= Version("3.7"))
+
+
+def _async_copy_accepts_distributed_layout() -> bool:
+    # The offset_bases KV-load path builds a DistributedLinearLayout for the
+    # async_copy offsets. Triton >=3.8 accepts that; 3.7.x's async_copy requires
+    # BlockedLayout/SliceLayout. Detect by inspecting the op's source (version
+    # numbers alone aren't reliable across ROCm forks / dev builds).
+    try:
+        import inspect
+        from triton.experimental.gluon.language.amd.cdna4 import async_copy
+
+        src = inspect.getsource(async_copy.global_load_to_shared)
+    except (OSError, TypeError, ImportError, AttributeError):
+        return False
+    return "DistributedLayout" in src
+
+
+# Use the offset_bases / DistributedLinearLayout KV-load path only when async_copy
+# accepts it; otherwise fall back to the BlockedLayout path (works everywhere).
+ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
+float8_info = torch.finfo(e4m3_dtype)
+
+PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
+
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
+
+@gluon.jit
+def elementwise_max_prop_nan(a, b):
+    return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
+
+
+@gluon.jit
+def reduce_max_prop_nan(input, axis=None, keep_dims=False):
+    """Reduce-max that propagates NaN. Skipping NaN handling is extra work on AMD."""
+    return gl.reduce(input, axis, elementwise_max_prop_nan, keep_dims=keep_dims)
+
+
+
+
+@gluon.constexpr_function
+def _offset_bases_to_blocked(offset_bases, contiguity, num_warps, warp_size, shape):
+    """
+    Derive a DistributedLinearLayout from a PaddedSharedLayout's offset_bases.
+
+    Mirrors Triton's CoalesceAsyncCopy pass for CDNA4:
+      1) First log2(contiguity) bases - reg  (contiguous elements per vector load)
+      2) Next  log2(warp_size) bases  - lane (64 threads per warp)
+      3) Next  log2(num_warps) bases  - warp
+      4) Any remaining bases          - appended to reg
+    """
+    rank = len(shape)
+    lg2_c = contiguity.bit_length() - 1
+    lg2_nw = num_warps.bit_length() - 1
+    lg2_ws = warp_size.bit_length() - 1
+
+    i = 0
+    reg_bases = offset_bases[i : i + lg2_c]
+    i += lg2_c
+    lane_bases = offset_bases[i : i + lg2_ws]
+    i += lg2_ws
+    warp_bases = offset_bases[i : i + lg2_nw]
+    i += lg2_nw
+    warp_bases = warp_bases + [[0] * rank] * (lg2_nw - len(warp_bases))
+    reg_bases = reg_bases + offset_bases[i:]
+
+    return gl.DistributedLinearLayout(
+        reg_bases=reg_bases,
+        lane_bases=lane_bases,
+        warp_bases=warp_bases,
+        block_bases=[],
+        shape=shape,
+    )
+
+
+@gluon.constexpr_function
+def _make_cdna4_kv_load_layouts(HEAD_SIZE, TILE_SIZE, NUM_WARPS, FP8_KV, WARP_SIZE=64):
+    """
+    Build load and shared memory layouts for CDNA4 async KV cache loading.
+
+    The PaddedSharedLayout defines an XOR-swizzled shared memory mapping.
+    The DistributedLinearLayout (load layout) is derived from it by partitioning
+    offset_bases across reg/lane/warp — matching Triton's CoalesceAsyncCopy.
+
+    Returns (blocked_k, blocked_v, shared_k_layout, shared_v_layout).
+    """
+    # To support different triton versions: use the offset_bases /
+    # DistributedLinearLayout path only when async_copy accepts that layout.
+    if TRITON_BEYOND_37 and ASYNC_COPY_SUPPORTS_DISTRIBUTED:
+        CONTIGUITY = 16 if FP8_KV else 8  # elements per 128-bit vector load
+        LG2_C = CONTIGUITY.bit_length() - 1
+        LG2_HS = HEAD_SIZE.bit_length() - 1
+        LG2_TS = TILE_SIZE.bit_length() - 1
+        LG2_NW = NUM_WARPS.bit_length() - 1
+        LG2_WS = WARP_SIZE.bit_length() - 1  # WAVE SIZE is 64
+
+        # CDNA4 WARP_SIZE=64 → 6 lane bits, split between HEAD_SIZE and TILE_SIZE dims
+        hs_lane = LG2_HS - LG2_C  # lane bits covering the HEAD_SIZE (contiguous) dim
+        ts_lane = LG2_WS - hs_lane  # remaining lane bits for the TILE_SIZE dim
+        ts_reg = LG2_TS - ts_lane - LG2_NW  # leftover reg bits for TILE_SIZE dim
+
+        # K shared [HEAD_SIZE, TILE_SIZE]
+        # dim0 (HEAD_SIZE): identity.  dim1 (TILE_SIZE): XOR rotation by hs_lane.
+        k_offset = [[1 << i, 0] for i in range(LG2_HS)] + [
+            [0, 1 << ((i + hs_lane) % LG2_TS)] for i in range(LG2_TS)
+        ]
+
+        shared_k = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[1024, 16] if FP8_KV else [512, 8]],
+            offset_bases=k_offset,
+            cga_layout=[],
+            shape=[HEAD_SIZE, TILE_SIZE],
+        )
+
+        # V shared [TILE_SIZE, HEAD_SIZE]
+        # dim1 (HEAD_SIZE): identity.  dim0 (TILE_SIZE): XOR rotation by v_N
+        # within a swizzle window of v_M bits (bits above v_M are identity).
+        #
+        # v_N is the position of the first lane base among the TILE_SIZE dim0
+        # bases after CoalesceAsyncCopy partitioning.  The partitioning assigns
+        # dim0 bases to lane/warp/reg in an order that depends on whether warps
+        # are split (HEAD_SIZE <= TILE_SIZE) or consecutive (HEAD_SIZE > TILE_SIZE)
+        if HEAD_SIZE <= TILE_SIZE:
+            v_N = 1
+        elif ts_reg >= ts_lane:
+            v_N = LG2_NW + ts_reg
+        else:
+            v_N = LG2_NW
+        v_M = v_N + ts_lane
+
+        v_offset = [[0, 1 << i] for i in range(LG2_HS)] + [
+            ([1 << ((i + v_N) % v_M), 0] if i < v_M else [1 << i, 0])
+            for i in range(LG2_TS)
+        ]
+        shared_v = gl.PaddedSharedLayout(
+            interval_padding_pairs=[[1024, 32] if FP8_KV else [512, 32]],
+            offset_bases=v_offset,
+            cga_layout=[],
+            shape=[TILE_SIZE, HEAD_SIZE],
+        )
+
+        blocked_k = _offset_bases_to_blocked(
+            k_offset, CONTIGUITY, NUM_WARPS, WARP_SIZE, [HEAD_SIZE, TILE_SIZE]
+        )
+        blocked_v = _offset_bases_to_blocked(
+            v_offset, CONTIGUITY, NUM_WARPS, WARP_SIZE, [TILE_SIZE, HEAD_SIZE]
+        )
+    else:
+        CONTIGUITY = 16 if FP8_KV else 8
+        HEAD_SIZE_DIV = HEAD_SIZE // CONTIGUITY
+        blocked_v = gl.BlockedLayout(
+            size_per_thread=[1, CONTIGUITY],
+            threads_per_warp=[WARP_SIZE // HEAD_SIZE_DIV, HEAD_SIZE_DIV],
+            warps_per_cta=[NUM_WARPS, 1],
+            order=[1, 0],
+        )
+        blocked_k = gl.BlockedLayout(
+            size_per_thread=[CONTIGUITY, 1],
+            threads_per_warp=[HEAD_SIZE_DIV, WARP_SIZE // HEAD_SIZE_DIV],
+            warps_per_cta=[1, NUM_WARPS],
+            order=[0, 1],
+        )
+
+        shared_k = gl.SwizzledSharedLayout(
+            vec=CONTIGUITY, per_phase=2, max_phase=8, order=[0, 1]
+        )
+        shared_v = gl.SwizzledSharedLayout(
+            vec=CONTIGUITY, per_phase=1, max_phase=1 if not FP8_KV else 8, order=[1, 0]
+        )
+
+    return blocked_k, blocked_v, shared_k, shared_v
+
+
+@aggregate
+@strip_annotate
+class AttentionConfig:
+    """Layouts and derived constants for the unified attention kernel."""
+
+    ARCH_NAME: gl.constexpr
+    HEAD_SIZE: gl.constexpr
+    BLOCK_SIZE: gl.constexpr
+    BLOCK_M: gl.constexpr
+    TILE_SIZE: gl.constexpr
+    NUM_KV_BLOCKS: gl.constexpr
+    NUM_QUERY_HEADS: gl.constexpr
+    NUM_KV_HEADS: gl.constexpr
+    SLIDING_WINDOW: gl.constexpr
+    NUM_QUERIES_PER_KV: gl.constexpr
+    BLOCK_Q: gl.constexpr
+    RCP_LN2: gl.constexpr
+    QK_SCALE: gl.constexpr
+    SOFTMAX_SCALE: gl.constexpr
+    USE_SINKS: gl.constexpr 
+    WARP_SIZE: gl.constexpr
+    NUM_WARPS: gl.constexpr
+    qk_layout: gl.constexpr
+    pv_layout: gl.constexpr
+
+    q_layout: gl.constexpr
+    k_layout: gl.constexpr
+    v_layout: gl.constexpr
+    p_layout: gl.constexpr
+
+    Q_CACHE_MODIFIER: gl.constexpr
+    KV_CACHE_MODIFIER: gl.constexpr
+    USE_LOAD_BUFFER_OP: gl.constexpr
+    USE_STORE_BUFFER_OP: gl.constexpr
+    ALL_DECODE: gl.constexpr
+
+    Q_FP8: gl.constexpr
+    KV_FP8: gl.constexpr
+    DOT_FP8: gl.constexpr
+    K_WIDTH_QK: gl.constexpr
+    K_WIDTH_PV: gl.constexpr
+    CAUSAL: gl.constexpr
+    NUM_MASKED_TILES: gl.constexpr
+    NUM_BUFFERS: gl.constexpr
+    MFMA_DIM: gl.constexpr
+    # constexpr so the allocated-once vLLM cache strides constant-fold into addressing
+    stride_k_cache_0: gl.constexpr
+    stride_k_cache_1: gl.constexpr
+    stride_k_cache_2: gl.constexpr
+    stride_k_cache_3: gl.constexpr
+    stride_v_cache_0: gl.constexpr
+    stride_v_cache_1: gl.constexpr
+    stride_v_cache_2: gl.constexpr
+    stride_v_cache_3: gl.constexpr
+    block_table_stride: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        ARCH_NAME,
+        NUM_WARPS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
+        TILE_SIZE,
+        BLOCK_M,
+        BLOCK_Q,
+        NUM_QUERY_HEADS,
+        NUM_KV_HEADS,
+        SLIDING_WINDOW,
+        SCALE,
+        USE_SINKS,
+        USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP,
+        ALL_DECODE,
+        Q_FP8,
+        KV_FP8,
+        CAUSAL,
+        NUM_BUFFERS,
+        MFMA_DIM,
+        stride_k_cache_0,
+        stride_k_cache_1,
+        stride_k_cache_2,
+        stride_k_cache_3,
+        stride_v_cache_0,
+        stride_v_cache_1,
+        stride_v_cache_2,
+        stride_v_cache_3,
+        block_table_stride,
+    ):
+        self.HEAD_SIZE = gl.constexpr(HEAD_SIZE)
+        self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
+        self.BLOCK_M = gl.constexpr(BLOCK_M)
+        self.NUM_QUERY_HEADS = gl.constexpr(NUM_QUERY_HEADS)
+        self.NUM_KV_HEADS = gl.constexpr(NUM_KV_HEADS)
+        self.SLIDING_WINDOW = gl.constexpr(SLIDING_WINDOW)
+        self.NUM_QUERIES_PER_KV = gl.constexpr(NUM_QUERY_HEADS // NUM_KV_HEADS)
+        self.BLOCK_Q = gl.constexpr(BLOCK_Q)
+        self.NUM_KV_BLOCKS = gl.constexpr(TILE_SIZE // BLOCK_SIZE)
+        self.TILE_SIZE = gl.constexpr(TILE_SIZE)
+        self.RCP_LN2 = gl.constexpr(1.4426950408889634)
+        self.QK_SCALE = gl.constexpr(self.RCP_LN2 * SCALE)
+        self.SOFTMAX_SCALE = gl.constexpr(SCALE)
+        self.USE_LOAD_BUFFER_OP = gl.constexpr(USE_LOAD_BUFFER_OP)
+        self.USE_STORE_BUFFER_OP = gl.constexpr(USE_STORE_BUFFER_OP)
+        self.ALL_DECODE = gl.constexpr(ALL_DECODE)
+        self.Q_FP8 = gl.constexpr(Q_FP8)
+        self.KV_FP8 = gl.constexpr(KV_FP8)
+        self.ARCH_NAME = gl.constexpr(ARCH_NAME)
+        self.WARP_SIZE = gl.constexpr(64)
+        self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        self.DOT_FP8 = gl.constexpr(self.Q_FP8)
+        self.MFMA_DIM = gl.constexpr(MFMA_DIM)
+        # CDNA4 shapes: bf16 32x32x16 / 16x16x32, fp8 32x32x64 / 16x16x128.
+        if MFMA_DIM == 32:
+            mfma_instr = [32, 32, 16] if not self.DOT_FP8 else [32, 32, 64]
+            self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
+            self.K_WIDTH_PV = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(4)
+        else:
+            mfma_instr = [16, 16, 32] if not self.DOT_FP8 else [16, 16, 128]
+            self.K_WIDTH_QK = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
+            self.K_WIDTH_PV = gl.constexpr(16) if self.DOT_FP8 else gl.constexpr(8)
+        # The PV dot reduces over TILE_SIZE, so the tile has to supply at least the
+        # instruction's K
+        assert TILE_SIZE >= mfma_instr[2], (
+            f"TILE_SIZE={TILE_SIZE} is below the MFMA K={mfma_instr[2]} of "
+            f"{mfma_instr[0]}x{mfma_instr[1]}x{mfma_instr[2]} (MFMA_DIM={MFMA_DIM}): the PV "
+            f"dot reduces over TILE_SIZE"
+        )
+        self.CAUSAL = gl.constexpr(CAUSAL)
+        self.NUM_BUFFERS = gl.constexpr(NUM_BUFFERS)
+        self.USE_SINKS = gl.constexpr(USE_SINKS)
+
+        # calculate how many masked tiles we need, upper bound
+        QUERY_SPAN = gl.constexpr((self.BLOCK_M - 1) // self.NUM_QUERIES_PER_KV + 1)
+        self.NUM_MASKED_TILES = gl.constexpr(max(1, ((QUERY_SPAN + self.TILE_SIZE - 1) // self.TILE_SIZE)))
+        self.qk_layout = gl.constexpr(
+            gl.amd.AMDMFMALayout(
+                version=4,
+                transposed=True,
+                instr_shape=mfma_instr,
+                warps_per_cta=[NUM_WARPS, 1],
+            )
+        )
+
+        self.pv_layout = gl.constexpr(
+            gl.amd.AMDMFMALayout(
+                version=4,
+                transposed=True,
+                instr_shape=mfma_instr,
+                warps_per_cta=[NUM_WARPS, 1],
+            )
+        )
+        self.q_layout = gl.constexpr(gl.DotOperandLayout(0, self.qk_layout, self.K_WIDTH_QK))
+        self.k_layout = gl.constexpr(gl.DotOperandLayout(1, self.qk_layout, self.K_WIDTH_QK))
+        self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, self.K_WIDTH_PV))
+        self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, self.K_WIDTH_PV))
+
+        self.Q_CACHE_MODIFIER = gl.constexpr(".cg")
+        self.KV_CACHE_MODIFIER = gl.constexpr(".cg") if ALL_DECODE else gl.constexpr("")
+        self.stride_k_cache_0 = gl.constexpr(stride_k_cache_0)
+        self.stride_k_cache_1 = gl.constexpr(stride_k_cache_1)
+        self.stride_k_cache_2 = gl.constexpr(stride_k_cache_2)
+        self.stride_k_cache_3 = gl.constexpr(stride_k_cache_3)
+        self.stride_v_cache_0 = gl.constexpr(stride_v_cache_0)
+        self.stride_v_cache_1 = gl.constexpr(stride_v_cache_1)
+        self.stride_v_cache_2 = gl.constexpr(stride_v_cache_2)
+        self.stride_v_cache_3 = gl.constexpr(stride_v_cache_3)
+        self.block_table_stride = gl.constexpr(block_table_stride)
+
+
+@aggregate
+@strip_annotate
+class AsyncKVLoaderConfig:
+    """Derived blocked / shared-memory layouts for the async KV load path.
+    Only tuned for CDNA4. 2D (HEAD_SIZE, TILE_SIZE) / (TILE_SIZE, HEAD_SIZE)
+    tile layouts from _make_cdna4_kv_load_layouts.
+    """
+
+    blocked_k: gl.constexpr
+    blocked_v: gl.constexpr
+    shared_k_layout: gl.constexpr
+    shared_v_layout: gl.constexpr
+    REMOVE_INDIRECT_ACCESS: gl.constexpr
+
+    @gluon.constexpr_function
+    def __init__(self, cfg, REMOVE_INDIRECT_ACCESS):
+        blocked_k, blocked_v, shared_k, shared_v = _make_cdna4_kv_load_layouts(
+            cfg.HEAD_SIZE, cfg.TILE_SIZE, cfg.NUM_WARPS, cfg.KV_FP8, cfg.WARP_SIZE
+        )
+        self.blocked_k = gl.constexpr(blocked_k)
+        self.blocked_v = gl.constexpr(blocked_v)
+        self.shared_k_layout = gl.constexpr(shared_k)
+        self.shared_v_layout = gl.constexpr(shared_v)
+        self.REMOVE_INDIRECT_ACCESS = gl.constexpr(REMOVE_INDIRECT_ACCESS)
+
+
+@aggregate
+@strip_annotate
+class AsyncKVLoader:
+    cfg: AttentionConfig
+    kv_cfg: AsyncKVLoaderConfig
+    key_cache_ptr: gl.tensor
+    value_cache_ptr: gl.tensor
+    block_tables_ptr_shifted: gl.tensor
+    k_shared: gl.shared_memory_descriptor
+    v_shared: gl.shared_memory_descriptor
+    k_base_offset: gl.tensor
+    v_base_offset: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg,
+        kv_cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        k_shared,
+        v_shared,
+        k_base_offset,
+        v_base_offset,
+    ):
+        self.cfg = cfg
+        self.kv_cfg = kv_cfg
+        self.key_cache_ptr = key_cache_ptr
+        self.value_cache_ptr = value_cache_ptr
+        self.k_shared = k_shared
+        self.v_shared = v_shared
+        self.k_base_offset = k_base_offset
+        self.v_base_offset = v_base_offset
+        self.block_tables_ptr_shifted = block_tables_ptr_shifted
+
+    @gluon.jit
+    def initialize(
+        cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        num_blocks,
+        REMOVE_INDIRECT_ACCESS,
+    ):
+        kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, cfg.HEAD_SIZE, cfg.TILE_SIZE],
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, cfg.TILE_SIZE, cfg.HEAD_SIZE],
+            layout=kv_cfg.shared_v_layout,
+        )
+
+        # Precompute KV load offsets (constant across tiles)
+        offs_d_k = gl.arange(
+            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
+        )[:, None]
+        offs_n_k = gl.arange(
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+        )[None, :]
+        k_base_offset = (
+            kv_head_idx * cfg.stride_k_cache_2
+            + offs_d_k * cfg.stride_k_cache_3
+            + offs_n_k * cfg.stride_k_cache_1
+        )
+
+        offs_d_v = gl.arange(
+            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
+        )[None, :]
+        offs_n_v = gl.arange(
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
+        )[:, None]
+        v_base_offset = (
+            kv_head_idx * cfg.stride_v_cache_2
+            + offs_d_v * cfg.stride_v_cache_3
+            + offs_n_v * cfg.stride_v_cache_1
+        )
+
+        return AsyncKVLoader(
+            cfg,
+            kv_cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            k_shared,
+            v_shared,
+            k_base_offset,
+            v_base_offset,
+        )
+
+    @gluon.jit
+    def load_k_to_shared(self, k_offset, buffer_id=0):
+        # Async copy K tile from global to shared memory
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                self.k_shared.index(buffer_id),
+                self.key_cache_ptr,
+                self.k_base_offset + k_offset,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(
+                self.k_shared.index(buffer_id),
+                self.key_cache_ptr + self.k_base_offset + k_offset,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def load_v_to_shared(self, v_offset, buffer_id=0):
+        # Async copy V tile from global to shared memory
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                self.v_shared.index(buffer_id),
+                self.value_cache_ptr,
+                self.v_base_offset + v_offset,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(
+                self.v_shared.index(buffer_id),
+                self.value_cache_ptr + self.v_base_offset + v_offset,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        # Wait for async K copy and load from shared memory
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(
+            self.k_shared.index(buffer_id), self.cfg.k_layout
+        ).to(target_dtype)
+
+    @gluon.jit
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        # Wait for async V copy and load from shared memory
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(
+            self.v_shared.index(buffer_id), self.cfg.v_layout
+        ).to(target_dtype)
+
+    @gluon.jit
+    def load_block_ids(self, i):
+        if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
+            blk = i
+        else:
+            # clamp to the last column so the loop's j+2 prefetch
+            # never reads past the (padded) block table
+            if self.cfg.ALL_DECODE:
+                i = gl.minimum(i, self.cfg.block_table_stride - 1)
+            blk = gl.load(self.block_tables_ptr_shifted + i)
+        # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            return blk * self.cfg.stride_k_cache_0
+        else:
+            return blk.to(gl.int64) * self.cfg.stride_k_cache_0
+
+
+@aggregate
+@strip_annotate
+class AsyncGatherKVLoader:
+    """Async CDNA4 KV loader supporting TILE_SIZE != BLOCK_SIZE.
+
+    Works for:
+        TILE_SIZE > BLOCK_SIZE
+        TILE_SIZE < BLOCK_SIZE
+    """
+
+    cfg: AttentionConfig
+    kv_cfg: AsyncKVLoaderConfig
+    key_cache_ptr: gl.tensor
+    value_cache_ptr: gl.tensor
+    block_tables_ptr_shifted: gl.tensor
+    k_shared: gl.shared_memory_descriptor
+    v_shared: gl.shared_memory_descriptor
+    k_head_d_offset: gl.tensor
+    v_head_d_offset: gl.tensor
+    offs_n_k: gl.tensor
+    offs_n_v: gl.tensor
+    num_blocks: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg,
+        kv_cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        k_shared,
+        v_shared,
+        k_head_d_offset,
+        v_head_d_offset,
+        offs_n_k,
+        offs_n_v,
+        num_blocks,
+    ):
+        self.cfg = cfg
+        self.kv_cfg = kv_cfg
+        self.key_cache_ptr = key_cache_ptr
+        self.value_cache_ptr = value_cache_ptr
+        self.block_tables_ptr_shifted = block_tables_ptr_shifted
+        self.k_shared = k_shared
+        self.v_shared = v_shared
+        self.k_head_d_offset = k_head_d_offset
+        self.v_head_d_offset = v_head_d_offset
+        self.offs_n_k = offs_n_k
+        self.offs_n_v = offs_n_v
+        self.num_blocks = num_blocks
+
+    @gluon.jit
+    def initialize(
+        cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        num_blocks,
+        REMOVE_INDIRECT_ACCESS,
+    ):
+        kv_cfg = AsyncKVLoaderConfig(cfg, REMOVE_INDIRECT_ACCESS)
+        k_shared = gl.allocate_shared_memory(
+            key_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, cfg.HEAD_SIZE, cfg.TILE_SIZE],
+            layout=kv_cfg.shared_k_layout,
+        )
+        v_shared = gl.allocate_shared_memory(
+            value_cache_ptr.type.element_ty,
+            [cfg.NUM_BUFFERS, cfg.TILE_SIZE, cfg.HEAD_SIZE],
+            layout=kv_cfg.shared_v_layout,
+        )
+        # Head + d-dimension offsets (tile-independent). The N-dim within-block
+        # offset is computed per tile in the load methods, so this works for any
+        # TILE_SIZE vs BLOCK_SIZE.
+        offs_d_k = gl.arange(
+            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_k)
+        )[:, None]
+        offs_n_k = gl.arange(
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_k)
+        )[None, :]
+        k_head_d_offset = kv_head_idx * cfg.stride_k_cache_2 + offs_d_k * cfg.stride_k_cache_3
+
+        offs_d_v = gl.arange(
+            0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, kv_cfg.blocked_v)
+        )[None, :]
+        offs_n_v = gl.arange(
+            0, cfg.TILE_SIZE, layout=gl.SliceLayout(1, kv_cfg.blocked_v)
+        )[:, None]
+        v_head_d_offset = kv_head_idx * cfg.stride_v_cache_2 + offs_d_v * cfg.stride_v_cache_3
+
+        return AsyncGatherKVLoader(
+            cfg,
+            kv_cfg,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr_shifted,
+            k_shared,
+            v_shared,
+            k_head_d_offset,
+            v_head_d_offset,
+            offs_n_k,
+            offs_n_v,
+            num_blocks,
+        )
+
+    @gluon.jit
+    def load_k_to_shared(self, k_offset, buffer_id=0):
+        # k_offset is the tile index. Map each element's sequence position to its
+        # physical block and within-block row, then gather.
+        seq_offset_k = k_offset * self.cfg.TILE_SIZE + self.offs_n_k
+        block_table_idx = gl.minimum(
+            seq_offset_k // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
+        )
+        within_block_k = (seq_offset_k % self.cfg.BLOCK_SIZE) * self.cfg.stride_k_cache_1
+        block_ids = gl.amd.cdna4.buffer_load(
+            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
+        )
+        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            block_base_k = block_ids * self.cfg.stride_k_cache_0
+        else:
+            block_base_k = block_ids.to(gl.int64) * self.cfg.stride_k_cache_0
+        k_offset_tensor = self.k_head_d_offset + within_block_k + block_base_k
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                self.k_shared.index(buffer_id),
+                self.key_cache_ptr,
+                k_offset_tensor,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(
+                self.k_shared.index(buffer_id),
+                self.key_cache_ptr + k_offset_tensor,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def load_v_to_shared(self, v_offset, buffer_id=0):
+        seq_offset_v = v_offset * self.cfg.TILE_SIZE + self.offs_n_v
+        block_table_idx = gl.minimum(
+            seq_offset_v // self.cfg.BLOCK_SIZE, self.cfg.block_table_stride - 1
+        )
+        within_block_v = (seq_offset_v % self.cfg.BLOCK_SIZE) * self.cfg.stride_v_cache_1
+        block_ids = gl.amd.cdna4.buffer_load(
+            ptr=self.block_tables_ptr_shifted, offsets=block_table_idx
+        )
+        # Widen the block index for >2 GB caches (constexpr stride stays baked in).
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            block_base_v = block_ids * self.cfg.stride_v_cache_0
+        else:
+            block_base_v = block_ids.to(gl.int64) * self.cfg.stride_v_cache_0
+        v_offset_tensor = self.v_head_d_offset + within_block_v + block_base_v
+        if self.cfg.USE_LOAD_BUFFER_OP:
+            gl.amd.cdna4.async_copy.buffer_load_to_shared(
+                self.v_shared.index(buffer_id),
+                self.value_cache_ptr,
+                v_offset_tensor,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        else:
+            gl.amd.cdna4.async_copy.global_load_to_shared(
+                self.v_shared.index(buffer_id),
+                self.value_cache_ptr + v_offset_tensor,
+                cache_modifier=self.cfg.KV_CACHE_MODIFIER,
+            )
+        gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def load_k_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(
+            self.k_shared.index(buffer_id), self.cfg.k_layout
+        ).to(target_dtype)
+
+    @gluon.jit
+    def load_v_from_shared(self, wait_count, target_dtype, buffer_id=0, skip_wait: gl.constexpr = False):
+        if not skip_wait:
+            gl.amd.cdna4.async_copy.wait_group(wait_count)
+        return gl.amd.cdna4.async_copy.load_shared_relaxed(
+            self.v_shared.index(buffer_id), self.cfg.v_layout
+        ).to(target_dtype)
+
+    @gluon.jit
+    def load_block_ids(self, i):
+        # Per-element block lookups happen in load_{k,v}_to_shared; pass the tile
+        # index through.
+        return i
+
+
+@aggregate
+@strip_annotate
+class AttentionProgram:
+    cfg: AttentionConfig
+
+    q: gl.tensor
+
+    key_cache_ptr: gl.tensor
+    value_cache_ptr: gl.tensor
+    output_ptr: gl.tensor
+
+    tile_start: gl.tensor
+    tile_end: gl.tensor
+    safe_tile_end: gl.tensor
+    query_mask_qk: gl.tensor
+    context_len_q_pos_qk: gl.tensor
+    QK_scale: gl.tensor
+    out_scale: gl.tensor
+    v_descale: gl.tensor
+
+    @gluon.constexpr_function
+    def __init__(
+        self,
+        cfg,
+        q,
+        key_cache_ptr,
+        value_cache_ptr,
+        output_ptr,
+        tile_start,
+        tile_end,
+        safe_tile_end,
+        query_mask_qk,
+        context_len_q_pos_qk,
+        QK_scale,
+        out_scale,
+        v_descale,
+    ):
+        self.cfg = cfg
+        self.q = q
+        self.key_cache_ptr = key_cache_ptr
+        self.value_cache_ptr = value_cache_ptr
+        self.output_ptr = output_ptr
+        self.tile_start = tile_start
+        self.tile_end = tile_end
+        self.safe_tile_end = safe_tile_end
+        self.query_mask_qk = query_mask_qk
+        self.context_len_q_pos_qk = context_len_q_pos_qk
+        self.QK_scale = QK_scale
+        self.out_scale = out_scale
+        self.v_descale = v_descale
+
+    @gluon.jit
+    def initialize(
+        cfg,
+        q,
+        key_cache_ptr,
+        value_cache_ptr,
+        output_ptr,
+        q_descale_ptr,
+        k_descale_ptr,
+        v_descale_ptr,
+        out_scale_ptr,
+        max_seq_prefix_len,
+        q_block_local_idx,
+        cur_batch_query_len,
+        context_len,
+        query_pos,
+        query_mask,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        output_stride_0,
+        output_stride_1,
+        split_idx=0,
+        NUM_SPLITS: gl.constexpr = 1,
+    ):
+        num_tiles = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
+        tile_start = 0
+        tile_end = num_tiles
+        if cfg.CAUSAL:
+            if cfg.SLIDING_WINDOW > 0:
+                qpos_lo = q_block_local_idx * cfg.BLOCK_Q
+                qpos_hi = gl.minimum(
+                    qpos_lo + (cfg.BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV,
+                    cur_batch_query_len - 1,
+                )
+                first_allowed_key = context_len + qpos_lo - cfg.SLIDING_WINDOW + 1
+                last_allowed_key = context_len + qpos_hi
+                tile_start = gl.maximum(0, first_allowed_key // cfg.TILE_SIZE)
+                tile_end = gl.minimum((last_allowed_key // cfg.TILE_SIZE) + 1, num_tiles)
+
+            query_pos_qk = gl.convert_layout(query_pos, gl.SliceLayout(1, cfg.qk_layout))[
+                :, None
+            ]
+            query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
+
+            context_len_q_pos_qk = context_len + query_pos_qk
+
+            min_causal_pos = context_len + q_block_local_idx * cfg.BLOCK_Q
+            safe_tile_end = (min_causal_pos + 1) // cfg.TILE_SIZE
+
+        else:
+            context_len_q_pos_qk = max_seq_prefix_len - 1
+
+            tile_start = 0
+            tile_end = (max_seq_prefix_len + cfg.TILE_SIZE - 1) // cfg.TILE_SIZE
+            # Last tile is almost never safe
+            safe_tile_end = tile_end - 1
+            query_pos_qk = gl.convert_layout(query_pos, gl.SliceLayout(1, cfg.qk_layout))[
+                :, None
+            ]
+            query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
+
+        # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous
+        # split_idx==0 / NUM_SPLITS==1 is a no-op
+        if NUM_SPLITS > 1:
+            active_tiles = tile_end - tile_start
+            tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
+            split_start = tile_start + split_idx * tiles_per_split
+            tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+            tile_start = split_start
+
+        safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
+        safe_tile_end = gl.maximum(safe_tile_end, tile_start)
+
+        QK_scale = cfg.RCP_LN2 * cfg.SOFTMAX_SCALE
+
+        if q_descale_ptr is not None:
+            QK_scale = QK_scale * gl.load(q_descale_ptr)
+        if k_descale_ptr is not None:
+            QK_scale = QK_scale * gl.load(k_descale_ptr)
+
+        if out_scale_ptr is not None:
+            out_scale = 1.0 / gl.load(out_scale_ptr)
+        else:
+            out_scale = 1.0
+        # The split-KV path stores un-normalised partials and reduce_segments finishes
+        # them, but the reduce only knows about out_scale_ptr -- it never sees v_descale.
+        # So v_descale has to be folded into the partial acc instead of into out_scale,
+        # which only the single-split epilogue applies.
+        v_descale = 1.0
+        if v_descale_ptr is not None:
+            v_descale = gl.load(v_descale_ptr)
+            out_scale = out_scale * v_descale
+
+        return AttentionProgram(
+            cfg,
+            q,
+            key_cache_ptr,
+            value_cache_ptr,
+            output_ptr,
+            tile_start,
+            tile_end,
+            safe_tile_end,
+            query_mask_qk,
+            context_len_q_pos_qk,
+            QK_scale,
+            out_scale,
+            v_descale,
+        )
+
+    @gluon.jit
+    def compute_qk(self, k):
+        S = gl.zeros(
+            [self.cfg.BLOCK_M, self.cfg.TILE_SIZE],
+            dtype=gl.float32,
+            layout=self.cfg.qk_layout,
+        )
+        if not self.cfg.DOT_FP8:
+            return gl.amd.cdna4.mfma(self.q, k, S)
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=self.q,
+                a_scale=None,
+                a_format="e4m3",
+                b=k,
+                b_scale=None,
+                b_format="e4m3",
+                acc=S,
+            )
+
+    @gluon.jit
+    def apply_mask_qk(self, S, j):
+        seq_offset = (
+            j * self.cfg.TILE_SIZE
+            + gl.arange(
+                0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, S.type.layout)
+            )[None, :]
+        )
+
+        seq_mask = seq_offset < (self.context_len_q_pos_qk + 1)
+        if self.cfg.SLIDING_WINDOW > 0:
+            seq_mask = seq_mask & (
+                (self.context_len_q_pos_qk - seq_offset) < self.cfg.SLIDING_WINDOW
+            )
+        full_mask = seq_mask
+        S = gl.where(full_mask, S, float("-inf"))
+        return S
+
+    @gluon.jit
+    def softmax_part0(self, S, M):
+        # more numerically stable
+        # TODO: investigate why
+        if self.cfg.USE_SINKS:
+            return self.softmax_part0_cdna4(S, M)
+        m = reduce_max_prop_nan(S, -1)
+        m_ij = elementwise_max_prop_nan(M, m)
+        # Guard against all-masked rows
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        m_ij_scaled = m_ij * self.QK_scale
+        q_shifted = S * self.QK_scale - m_ij_scaled[:, None]
+        p = gl.exp2(q_shifted)
+        m_diff_scaled = M * self.QK_scale - m_ij_scaled
+        alpha = gl.exp2(m_diff_scaled)
+        return p, alpha, m_ij
+    
+    @gluon.jit
+    def softmax_part0_cdna4(self, S, M):
+        S = S * self.QK_scale
+        m_ij = gl.maximum(M, gl.max(S, axis=1))
+        m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+        p = gl.exp2(S - m_ij[:, None])
+        alpha = gl.exp2(M - m_ij)
+        return p, alpha, m_ij
+
+    @gluon.jit
+    def softmax_part1(self, p, L, acc, alpha, target_dtype=gl.bfloat16):
+        acc = acc * alpha[:, None]
+        l_ij = gl.sum(p, 1)
+        if target_dtype != gl.bfloat16:
+            p = p.to(target_dtype)
+        else:
+            p = p.to(target_dtype, fp_downcast_rounding="rtz")
+        L = L * alpha + l_ij
+        return p, L, acc
+
+    @gluon.jit
+    def compute_pv(self, p, v, acc):
+        p = gl.convert_layout(p, self.cfg.p_layout, assert_trivial=False)
+        if not self.cfg.DOT_FP8:
+            return gl.amd.cdna4.mfma(p, v, acc)
+        else:
+            return gl.amd.cdna4.mfma_scaled(
+                a=p,
+                a_scale=None,
+                a_format="e4m3",
+                b=v,
+                b_scale=None,
+                b_format="e4m3",
+                acc=acc,
+            )
+
+    @gluon.jit
+    def store_output(
+        self,
+        out,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        output_stride_0,
+        output_stride_1,
+    ):
+        casted_out = out.to(self.output_ptr.dtype.element_ty)
+
+        layout: gl.constexpr = self.cfg.pv_layout
+        offs_m_out = gl.arange(
+            0, self.cfg.BLOCK_M, layout=gl.SliceLayout(1, layout)
+        )
+        offs_d_out = gl.arange(
+            0, self.cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout)
+        )
+        query_pos_out = (
+            q_block_local_idx * self.cfg.BLOCK_Q
+            + offs_m_out // self.cfg.NUM_QUERIES_PER_KV
+        )
+        query_offset_0_out = cur_batch_in_all_start_index + query_pos_out
+        query_offset_1_out = (
+            kv_head_idx * self.cfg.NUM_QUERIES_PER_KV
+            + offs_m_out % self.cfg.NUM_QUERIES_PER_KV
+        )
+        o_offs = (
+            query_offset_0_out[:, None] * output_stride_0
+            + query_offset_1_out[:, None] * output_stride_1
+            + offs_d_out[None, :]
+        )
+        query_mask_0_out = query_pos_out < cur_batch_query_len
+        query_mask_1_out = query_offset_1_out < self.cfg.NUM_QUERY_HEADS
+        o_mask = query_mask_0_out[:, None] & query_mask_1_out[:, None]
+        if self.cfg.USE_STORE_BUFFER_OP:
+            gl.amd.cdna4.buffer_store(casted_out, self.output_ptr, offsets=o_offs, mask=o_mask)
+        else:
+            gl.store(self.output_ptr + o_offs, casted_out, mask=o_mask)
+
+    @gluon.jit
+    def store_partial(
+        self,
+        M,
+        L,
+        acc,
+        partial_m_ptr,
+        partial_l_ptr,
+        partial_acc_ptr,
+        split_idx,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        NUM_SPLITS: gl.constexpr,
+    ):
+        """Split-KV partials: store the un-reduced M (row max), L (exp sum) and acc
+        (un-normalized PV accumulator) for this split. The cross-split reduction is
+        done later by the shared Triton `reduce_segments`.
+
+        Buffers are contiguous:
+            partial_acc : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS, HEAD_SIZE]
+            partial_m/l : [num_tokens, NUM_QUERY_HEADS, NUM_SPLITS]
+        """
+        cfg: gl.constexpr = self.cfg
+        # The CDNA4 sink softmax (softmax_part0_cdna4) already keeps the running max in
+        # QK-scaled space; the non-sink path keeps the raw row-max, so scale it here.
+        if not cfg.USE_SINKS:
+            M = M * self.QK_scale
+        layout: gl.constexpr = cfg.pv_layout
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+        offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
+        query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
+        query_offset_0 = cur_batch_in_all_start_index + query_pos
+        query_offset_1 = (
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m % cfg.NUM_QUERIES_PER_KV
+        )
+        row_mask = (query_pos < cur_batch_query_len) & (
+            query_offset_1 < cfg.NUM_QUERY_HEADS
+        )
+
+        # acc: [BLOCK_M, HEAD_SIZE]
+        acc_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS * cfg.HEAD_SIZE
+        acc_stride_1: gl.constexpr = NUM_SPLITS * cfg.HEAD_SIZE
+        acc_offs = (
+            query_offset_0[:, None] * acc_stride_0
+            + query_offset_1[:, None] * acc_stride_1
+            + split_idx * cfg.HEAD_SIZE
+            + offs_d[None, :]
+        )
+        gl.store(partial_acc_ptr + acc_offs, acc * self.v_descale,
+                 mask=row_mask[:, None])
+
+        ml_stride_0: gl.constexpr = cfg.NUM_QUERY_HEADS * NUM_SPLITS
+        ml_offs = query_offset_0 * ml_stride_0 + query_offset_1 * NUM_SPLITS + split_idx
+        gl.store(partial_m_ptr + ml_offs, M, mask=row_mask)
+        gl.store(partial_l_ptr + ml_offs, L, mask=row_mask)
+
+
+
+@gluon.jit
+def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
+    # One shared buffer, and every warp reads the whole tile because operand B is
+    # replicated across warps
+    # barriers are needed for correctness but I expect compiler to insert them automatically.
+    # Not sure why that doesnt happen
+    for j in range(pgm.tile_start, pgm.safe_tile_end):
+        blk = kv_loader.load_block_ids(j)
+        kv_loader.load_k_to_shared(blk, buffer_id=0)
+        kv_loader.load_v_to_shared(blk, buffer_id=0)
+        gl.amd.cdna4.async_copy.wait_group(1)
+        gl.barrier()
+        k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype,
+                                         buffer_id=0, skip_wait=True)
+        S = pgm.compute_qk(k)
+        if pgm.cfg.SLIDING_WINDOW > 0:
+            S = pgm.apply_mask_qk(S, j)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        p, alpha, M = pgm.softmax_part0(S, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        gl.amd.cdna4.async_copy.wait_group(0)
+        gl.barrier()
+        v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype,
+                                         buffer_id=0, skip_wait=True)
+        acc = pgm.compute_pv(p, v, acc)
+        gl.barrier()
+
+    if not pgm.cfg.ALL_DECODE:
+        for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            blk = kv_loader.load_block_ids(j)
+            kv_loader.load_k_to_shared(blk, buffer_id=0)
+            kv_loader.load_v_to_shared(blk, buffer_id=0)
+            gl.amd.cdna4.async_copy.wait_group(1)
+            gl.barrier()
+            k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype,
+                                             buffer_id=0, skip_wait=True)
+            S = pgm.compute_qk(k)
+            S = pgm.apply_mask_qk(S, j)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+            gl.amd.cdna4.async_copy.wait_group(0)
+            gl.barrier()
+            v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype,
+                                             buffer_id=0, skip_wait=True)
+            acc = pgm.compute_pv(p, v, acc)
+            gl.barrier()
+
+    # Last tile is always masked
+    j = pgm.tile_end - 1
+    blk = kv_loader.load_block_ids(j)
+    kv_loader.load_k_to_shared(blk, buffer_id=0)
+    kv_loader.load_v_to_shared(blk, buffer_id=0)
+    gl.amd.cdna4.async_copy.wait_group(1)
+    gl.barrier()
+    k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype,
+                                     buffer_id=0, skip_wait=True)
+    S = pgm.compute_qk(k)
+    S = pgm.apply_mask_qk(S, j)
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+    p, alpha, M = pgm.softmax_part0(S, M)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    gl.barrier()
+    v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype,
+                                     buffer_id=0, skip_wait=True)
+    acc = pgm.compute_pv(p, v, acc)
+    return M, L, acc
+
+
+@gluon.jit
+def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
+    """Double-buffered attention loop, safe/masked tile split.
+
+    Per iter:
+        QK -> SM0 -> SM1 -> PV (K/V double-buffered across iters)
+    """
+    physical_block_idx = kv_loader.load_block_ids(pgm.tile_start)
+    next_physical_block_idx = kv_loader.load_block_ids(pgm.tile_start + 1)
+
+    buffer_id: gl.int32 = 0
+    kv_loader.load_k_to_shared(physical_block_idx, buffer_id=buffer_id)
+    kv_loader.load_v_to_shared(physical_block_idx, buffer_id=buffer_id)
+    # ---- Safe tiles (no mask) ----
+    for j in range(pgm.tile_start, pgm.safe_tile_end):
+        next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+        k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
+        kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+        kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+
+        S = pgm.compute_qk(k)
+        if pgm.cfg.SLIDING_WINDOW > 0:
+            S = pgm.apply_mask_qk(S, j)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        p, alpha, M = pgm.softmax_part0(S, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+
+        v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
+        acc = pgm.compute_pv(p, v, acc)
+        buffer_id = 1 - buffer_id
+        next_physical_block_idx = next2_physical_block_idx
+    if not pgm.cfg.ALL_DECODE:
+        # ---- Masked tiles (causal boundary) ----
+        for j in range(pgm.safe_tile_end, pgm.tile_end - 1):
+            next2_physical_block_idx = kv_loader.load_block_ids(j + 2)
+            k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
+            kv_loader.load_k_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+            kv_loader.load_v_to_shared(next_physical_block_idx, buffer_id=1 - buffer_id)
+
+            S = pgm.compute_qk(k)
+            S = pgm.apply_mask_qk(S, j)
+            S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+            p, alpha, M = pgm.softmax_part0(S, M)
+            p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+
+            v = kv_loader.load_v_from_shared(wait_count=2, target_dtype=q.dtype, buffer_id=buffer_id)
+            acc = pgm.compute_pv(p, v, acc)
+            buffer_id = 1 - buffer_id
+            next_physical_block_idx = next2_physical_block_idx
+
+    # Last tile is always masked
+    k = kv_loader.load_k_from_shared(wait_count=1, target_dtype=q.dtype, buffer_id=buffer_id)
+    S = pgm.compute_qk(k)
+    S = pgm.apply_mask_qk(S, pgm.tile_end - 1)
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+    p, alpha, M = pgm.softmax_part0(S, M)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=k.dtype)
+    v = kv_loader.load_v_from_shared(wait_count=0, target_dtype=q.dtype, buffer_id=buffer_id)
+    acc = pgm.compute_pv(p, v, acc)
+
+    return M, L, acc
+
+
+@gluon.jit
+def find_seq_idx(
+    query_start_len_ptr,
+    target_idx,
+    num_seqs,
+    BLOCK_Q: gl.constexpr,
+    use_q_block_mode: tl.constexpr = True,
+
+):
+    left = 0
+    right = num_seqs
+    while left < right:
+        mid = (left + right) // 2
+        val = gl.load(query_start_len_ptr + mid)
+        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
+        if mid_val <= target_idx:
+            left = mid + 1
+        else:
+            right = mid
+    return left - 1
+
+
+@gluon.jit(do_not_specialize=["num_blocks"])
+def _unified_attention_gluon_kernel(
+    query_ptr,  # [num_tokens, num_query_heads, head_size]
+    key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+    sink_ptr,  # [num_query_heads]
+    output_ptr,  # [num_tokens, num_query_heads, head_size]
+    block_tables_ptr,  # [num_seqs, max_num_blocks_per_seq]
+    seq_lens_ptr,  # [num_seqs]
+    query_start_len_ptr,  # [num_seqs+1]
+    query_stride_0,
+    query_stride_1,
+    output_stride_0,
+    output_stride_1,
+    k_descale_ptr,
+    v_descale_ptr,
+    q_descale_ptr,
+    out_scale_ptr,
+    USE_SINKS: gl.constexpr,  # bool
+    SLIDING_WINDOW: gl.constexpr,  # int
+    num_blocks,
+    stride_k_cache_0: gl.constexpr,
+    stride_k_cache_1: gl.constexpr,
+    stride_k_cache_2: gl.constexpr,
+    stride_k_cache_3: gl.constexpr,
+    stride_v_cache_0: gl.constexpr,
+    stride_v_cache_1: gl.constexpr,
+    stride_v_cache_2: gl.constexpr,
+    stride_v_cache_3: gl.constexpr,
+    block_table_stride: gl.constexpr,
+    num_seqs: gl.constexpr,
+    SCALE: gl.constexpr,
+    NUM_QUERY_HEADS: gl.constexpr,
+    NUM_KV_HEADS: gl.constexpr,
+    BLOCK_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+    HEAD_SIZE: gl.constexpr,
+    BLOCK_Q: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    ARCH_NAME: gl.constexpr,
+    USE_LOAD_BUFFER_OP: gl.constexpr = False,
+    USE_STORE_BUFFER_OP: gl.constexpr = False,
+    ALL_DECODE: gl.constexpr = False,
+    FP8_MIN: gl.constexpr = float8_info.min,
+    FP8_MAX: gl.constexpr = float8_info.max,
+    CAUSAL: gl.constexpr = True,
+    REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
+    NUM_BUFFERS: gl.constexpr = 2,
+    MFMA_DIM: gl.constexpr = 32,
+    # Split-KV (3d grid)
+    NUM_SPLITS: gl.constexpr = 1,
+    partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
+    partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
+    partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
+):
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    if ALL_DECODE:
+        q_block_global_idx = gl.num_programs(0) - 1 - gl.program_id(0)
+        kv_head_idx = gl.program_id(1)
+    else:
+        kv_head_idx = gl.program_id(0)
+        q_block_global_idx = gl.num_programs(1) - 1 - gl.program_id(1)
+    # program_id(2) is 0 for a 2d grid (NUM_SPLITS==1), so this is always safe.
+    split_idx = gl.program_id(2)
+    Q_FP8: gl.constexpr = query_ptr.dtype.is_fp8()
+    KV_FP8: gl.constexpr = key_cache_ptr.dtype.is_fp8()
+
+    cfg = AttentionConfig(
+        ARCH_NAME,
+        NUM_WARPS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
+        TILE_SIZE,
+        BLOCK_M,
+        BLOCK_Q,
+        NUM_QUERY_HEADS,
+        NUM_KV_HEADS,
+        SLIDING_WINDOW,
+        SCALE,
+        USE_SINKS,
+        USE_LOAD_BUFFER_OP,
+        USE_STORE_BUFFER_OP,
+        ALL_DECODE,
+        Q_FP8,
+        KV_FP8,
+        CAUSAL,
+        NUM_BUFFERS,
+        MFMA_DIM,
+        stride_k_cache_0,
+        stride_k_cache_1,
+        stride_k_cache_2,
+        stride_k_cache_3,
+        stride_v_cache_0,
+        stride_v_cache_1,
+        stride_v_cache_2,
+        stride_v_cache_3,
+        block_table_stride,
+    )
+
+    if not USE_STORE_BUFFER_OP:
+        output_stride_0 = output_stride_0.to(gl.int64)
+        output_stride_1 = output_stride_1.to(gl.int64)
+
+    if not ALL_DECODE:
+        seq_idx = find_seq_idx(
+            query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
+        )
+
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+        q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
+        q_block_local_idx = q_block_global_idx - q_block_start_idx
+
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+
+        # Not needed when num programs is computed precisely
+        if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
+            return
+    else:
+        # Decode fast path: one program per sequence, no binary search
+        seq_idx = q_block_global_idx
+        q_block_local_idx: gl.int32 = 0
+        cur_batch_query_len: gl.int32 = 1
+        cur_batch_in_all_start_index: gl.int32 = q_block_global_idx
+
+    offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
+    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.q_layout))
+    query_pos = q_block_local_idx * cfg.BLOCK_Q + offs_m // cfg.NUM_QUERIES_PER_KV
+
+    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_1 = (
+        kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m % cfg.NUM_QUERIES_PER_KV
+    )
+
+    query_mask_0 = query_pos < cur_batch_query_len
+    query_mask_1 = query_offset_1 < NUM_QUERY_HEADS
+    query_mask = query_mask_0[:, None] & query_mask_1[:, None]
+
+    q_offs = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+
+    q = gl.amd.cdna4.buffer_load(
+        ptr=query_ptr,
+        offsets=q_offs,
+        mask=query_mask,
+        other=0.0,
+        cache=cfg.Q_CACHE_MODIFIER,
+    )
+
+    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    context_len = seq_len - cur_batch_query_len
+    block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
+    if CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * cfg.BLOCK_Q
+            + (BLOCK_M - 1) // cfg.NUM_QUERIES_PER_KV
+            + 1
+        )
+        # Clamp to [1, seq_len]. The lower bound handles the degenerate case
+        # where every query in this M-block has an empty causally-allowed key
+        # set (happens when cur_batch_query_len > kv_len and q_pos+context_len<0
+        # for the whole block). Forcing tile_end >= 1 keeps the loop-final
+        # "last masked tile" well-defined (j=0 with all-mask, not j=-N).
+        max_seq_prefix_len = gl.maximum(1, gl.minimum(max_seq_prefix_len, seq_len))
+    else:
+        max_seq_prefix_len = seq_len
+
+    pgm = AttentionProgram.initialize(
+        cfg,
+        q,
+        key_cache_ptr,
+        value_cache_ptr,
+        output_ptr,
+        q_descale_ptr,
+        k_descale_ptr,
+        v_descale_ptr,
+        out_scale_ptr,
+        max_seq_prefix_len,
+        q_block_local_idx,
+        cur_batch_query_len,
+        context_len,
+        query_pos,
+        query_mask,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        output_stride_0,
+        output_stride_1,
+        split_idx,
+        NUM_SPLITS,
+    )
+
+    # This split owns no tiles
+    if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        return
+
+    # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
+    if TILE_SIZE == BLOCK_SIZE:
+        KVLoader: gl.constexpr = AsyncKVLoader
+    else:
+        KVLoader: gl.constexpr = AsyncGatherKVLoader
+
+    kv_loader = KVLoader.initialize(
+        cfg,
+        key_cache_ptr,
+        value_cache_ptr,
+        block_tables_ptr_shifted,
+        kv_head_idx,
+        num_blocks,
+        REMOVE_INDIRECT_ACCESS,
+    )
+
+    if not USE_SINKS:
+        M = gl.full(
+            [BLOCK_M],
+            float("-inf"),
+            dtype=gl.float32,
+            layout=gl.SliceLayout(1, cfg.pv_layout),
+        )
+    else:
+        offs_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
+        query_offset_1_pv = (
+            kv_head_idx * cfg.NUM_QUERIES_PER_KV + offs_m_pv % cfg.NUM_QUERIES_PER_KV
+        )
+        query_mask_1_pv = query_offset_1_pv < NUM_QUERY_HEADS
+        # Split-KV: only split 0 seeds M with the sink logit so it is counted
+        # exactly once
+        if NUM_SPLITS == 1 or split_idx == 0:
+            M = gl.amd.cdna4.buffer_load(
+                    ptr=sink_ptr,
+                    offsets=query_offset_1_pv,
+                    mask=query_mask_1_pv,
+                    other=float("-inf"),
+                ).to(dtype=gl.float32)
+            # NOTE: See softmax0 why
+            M = M * cfg.RCP_LN2
+        else:
+            M = gl.full(
+                [BLOCK_M],
+                float("-inf"),
+                dtype=gl.float32,
+                layout=gl.SliceLayout(1, cfg.pv_layout),
+            )
+
+
+    L = gl.full(
+        [BLOCK_M], 1.0, dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
+    )
+
+    gl.static_assert((NUM_BUFFERS == 1) | (NUM_BUFFERS == 2), "NUM_BUFFERS must be 1 or 2")
+    acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
+    if NUM_BUFFERS == 1:
+        M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
+    else:
+        M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
+
+    if NUM_SPLITS > 1:
+        pgm.store_partial(
+            M,
+            L,
+            acc,
+            partial_m_ptr,
+            partial_l_ptr,
+            partial_acc_ptr,
+            split_idx,
+            q_block_local_idx,
+            cur_batch_in_all_start_index,
+            kv_head_idx,
+            cur_batch_query_len,
+            NUM_SPLITS,
+        )
+        return
+
+    # Normalize and store output
+    l_recip = pgm.out_scale / L[:, None]
+    acc = acc * l_recip
+    if output_ptr.dtype.is_fp8():
+        acc = gl.minimum(acc, FP8_MAX)
+        acc = gl.maximum(acc, FP8_MIN)
+
+    pgm.store_output(
+        acc,
+        q_block_local_idx,
+        cur_batch_in_all_start_index,
+        kv_head_idx,
+        cur_batch_query_len,
+        output_stride_0,
+        output_stride_1,
+    )

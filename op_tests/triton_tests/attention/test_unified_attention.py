@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from aiter.ops.triton.attention.unified_attention import (
-    is_2d_gluon_available,
+    is_2d_gfx1250_gluon_available,
     unified_attention,
 )
 from aiter.ops.triton.utils._triton import arch_info
@@ -600,7 +600,7 @@ def test_triton_unified_attn(
     use_out_scale: bool,
     shuffled_kv_cache: bool,
 ) -> None:
-    use_gluon_2d = is_2d_gluon_available(q_dtype, kv_dtype, soft_cap, False, False)
+    use_gluon_2d = is_2d_gfx1250_gluon_available(q_dtype, kv_dtype, soft_cap, False, False)
     torch.manual_seed(0)
     # shuffling only supported for gfx1250 gluon kernels
     if shuffled_kv_cache and not use_gluon_2d:
