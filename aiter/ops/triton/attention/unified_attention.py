@@ -76,21 +76,23 @@ def is_gfx950_gluon_available(
     use_qq_bias,
     use_alibi_slopes,
     shuffled_kv_cache,
-    head_size,
+    head_size_k,
+    head_size_v,
 ):
-    use_gluon_2d = (
+    use_gluon = (
         DEVICE_ARCH == "gfx950"
         and _unified_attention_gluon_kernel is not None
-        and head_size <= 256
+        and head_size_k <= 256
+        and head_size_k == head_size_v
+        and triton.next_power_of_2(head_size_k) == head_size_k
         and not softcap
         and not use_qq_bias
         and not use_alibi_slopes
         and not shuffled_kv_cache
-        and q_dtype != torch.uint8
-        and kv_cache_dtype != torch.uint8
+        and q_dtype in [e4m3_dtype, torch.bfloat16]
         and q_dtype == kv_cache_dtype
     )
-    return use_gluon_2d
+    return use_gluon
 
 
 def select_2d_config(
@@ -382,7 +384,8 @@ def unified_attention(
         use_qq_bias,
         use_alibi_slopes,
         shuffled_kv_cache,
-        head_size,
+        k.shape[-1],  # k head size
+        v.shape[-1],  # v head size in case they are different
     ):
         return _gfx950_unified_attention(
             q,
