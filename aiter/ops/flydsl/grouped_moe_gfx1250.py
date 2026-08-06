@@ -446,13 +446,12 @@ def _grouped_a8w4_tdm_moe(
     # dropped/non-local route), casts the f32 route weights into ``_gather_w_buf``
     # (kept -> weight_dtype, dropped -> 0), and skips the EP dead-tail (routes >=
     # num_valid_routes / tokens >= num_valid_tokens). Non-local routes claim no
-    # per-expert slot and are tagged ``DROPPED_ROUTE_ROW``, so ``_masked_m`` /
-    # ``psum`` -- and therefore the rows the GEMMs actually compute -- cover only
-    # the routes this rank owns (~1/ep of what it received), not every received
-    # route. ``contiguous_m`` below stays the static worst case so the launch grid
-    # is CUDAGraph-safe; the surplus tiles fall past ``psum`` and exit early. The
-    # felix TDM batched GEMMs themselves are EP-agnostic: they operate on the
-    # already-routed contiguous layout.
+    # per-expert slot, so ``_masked_m`` / ``psum`` -- and the rows the GEMMs
+    # actually compute -- cover only the routes this rank owns (~1/ep of what it
+    # received). ``contiguous_m`` below stays the static worst case to keep the
+    # launch grid CUDAGraph-safe; the surplus tiles fall past ``psum`` and exit
+    # early. The felix TDM batched GEMMs themselves are EP-agnostic: they operate
+    # on the already-routed contiguous layout.
     _is_ep = expert_mask is not None
     _g2l_lut = None
     _g2l_counter = None
