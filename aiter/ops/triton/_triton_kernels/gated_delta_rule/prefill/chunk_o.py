@@ -18,7 +18,11 @@ from ..gated_delta_rule_utils import (
     check_shared_mem,
     gated_delta_rule_autotune_configs,
 )
-from ..utils import prepare_chunk_indices, prepare_rebased_cu_seqlens
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
@@ -847,7 +851,8 @@ def chunk_fwd_kernel_o_opt_vk(
     g,
     o,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     scale,
     T,
     T_flat,
@@ -860,6 +865,7 @@ def chunk_fwd_kernel_o_opt_vk(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
     USE_EXP2: tl.constexpr = False,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -868,8 +874,8 @@ def chunk_fwd_kernel_o_opt_vk(
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -896,7 +902,7 @@ def chunk_fwd_kernel_o_opt_vk(
         if IS_VARLEN:
             g += (i_h * T_flat + bos).to(tl.int64)
         else:
-            g += (((i_b * H + i_h) * T_flat)).to(tl.int64)
+            g += ((i_b * H + i_h) * T_flat).to(tl.int64)
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
@@ -956,6 +962,7 @@ def chunk_fwd_o_opt_vk(
     use_exp2: bool = True,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> torch.Tensor:
     """
     Optimized output forward with h layout [V, K].
@@ -983,16 +990,41 @@ def chunk_fwd_o_opt_vk(
     # (cached, no per-forward D2H); the kernel walks pre-sliced prefill data
     # via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(
-            cu_seqlens, BT, num_decodes, num_decode_tokens
-        )
-        kernel_cu_seqlens = prepare_rebased_cu_seqlens(
-            cu_seqlens, num_decodes, num_decode_tokens
-        )
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            sequence_ids = schedule.sequence_ids
+            chunk_ids = schedule.chunk_ids
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            index_stride = 1
+        else:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            flat_chunk_indices = chunk_indices.reshape(-1)
+            sequence_ids = flat_chunk_indices
+            chunk_ids = flat_chunk_indices[1:]
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            index_stride = 2
     else:
-        chunk_indices = None
+        sequence_ids = None
+        chunk_ids = None
         kernel_cu_seqlens = None
-    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+        index_stride = 1
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(sequence_ids) // index_stride
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -1009,7 +1041,8 @@ def chunk_fwd_o_opt_vk(
         g=g,
         o=o,
         cu_seqlens=kernel_cu_seqlens,
-        chunk_indices=chunk_indices,
+        sequence_ids=sequence_ids,
+        chunk_ids=chunk_ids,
         scale=scale,
         T=T,
         T_flat=T_flat,
@@ -1018,6 +1051,7 @@ def chunk_fwd_o_opt_vk(
         K=K,
         V=V,
         BT=BT,
+        INDEX_STRIDE=index_stride,
         USE_EXP2=use_exp2,
     )
     return o
@@ -1084,7 +1118,7 @@ def chunk_bwd_dv_local(
     g: torch.Tensor | None = None,
     g_gamma: torch.Tensor | None = None,
     A: torch.Tensor | None = None,
-    scale: float = None,
+    scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,

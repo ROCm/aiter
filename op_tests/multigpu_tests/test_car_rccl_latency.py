@@ -2,9 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import os
+from multiprocessing import Pool, freeze_support, set_start_method
+
 import torch
 import torch.distributed as dist
-from multiprocessing import Pool, freeze_support, set_start_method
 
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
@@ -71,14 +72,18 @@ def bench_worker(rank_id, tp_size, distributed_init_method):
 
         x_aiter = torch.randn(shape, dtype=DTYPE, device=device)
         aiter_lats = _measure_per_iter_us(
-            lambda: tensor_model_parallel_all_reduce(x_aiter)  # noqa: F821
+            lambda x_aiter=x_aiter: tensor_model_parallel_all_reduce(
+                x_aiter
+            )  # noqa: F821,RUF100
         )
 
         dist.barrier(group=group)
 
         x_rccl = torch.randn(shape, dtype=DTYPE, device=device)
         rccl_lats = _measure_per_iter_us(
-            lambda: dist.all_reduce(x_rccl, group=group)  # noqa: F821
+            lambda x_rccl=x_rccl: dist.all_reduce(
+                x_rccl, group=group
+            )  # noqa: F821,RUF100
         )
 
         dist.barrier(group=group)

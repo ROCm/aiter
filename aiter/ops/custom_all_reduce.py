@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from typing import List
 
 import torch
 
@@ -17,8 +16,8 @@ def init_custom_ar(
     meta_ptr: int,
     rank_data_ptr: int,
     rank_data_sz: int,
-    ipc_handle_ptrs: List[int],
-    offsets: List[int],
+    ipc_handle_ptrs: list[int],
+    offsets: list[int],
     rank: int,
     fully_connected: bool,
 ) -> int: ...
@@ -135,6 +134,7 @@ def fused_allreduce_rmsnorm_quant_per_group(
     reg_bytes: int,
     use_1stage: bool,
     bf16_out_ptr: int = 0,
+    transpose_scale: bool = False,
 ) -> None: ...
 
 
@@ -199,13 +199,13 @@ def meta_size() -> int: ...
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def register_input_buffer(
-    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...
 
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def register_output_buffer(
-    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...
 
 
@@ -219,7 +219,7 @@ def get_graph_buffer_ipc_meta(_fa: int, handle_out: int, offset_out: int) -> Non
 
 @compile_ops("module_custom_all_reduce", develop=True)
 def register_graph_buffers(
-    _fa: int, handle_ptrs: List[int], offset_ptrs: List[int]
+    _fa: int, handle_ptrs: list[int], offset_ptrs: list[int]
 ) -> None: ...
 
 
@@ -243,7 +243,7 @@ def init_custom_ar_gfx1250(
     meta_ptr: int,
     rank_data_ptr: int,
     rank_data_sz: int,
-    all_meta_ptrs: List[int],
+    all_meta_ptrs: list[int],
     rank: int,
     fully_connected: bool,
 ) -> int: ...
@@ -309,13 +309,13 @@ def meta_size_gfx1250() -> int: ...
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)
 def register_input_buffer_gfx1250(
-    _fa: int, self_ptr: int, all_ptrs: List[int]
+    _fa: int, self_ptr: int, all_ptrs: list[int]
 ) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_output_buffer", develop=True)
 def register_output_buffer_gfx1250(
-    _fa: int, self_ptr: int, all_ptrs: List[int]
+    _fa: int, self_ptr: int, all_ptrs: list[int]
 ) -> None: ...
 
 
@@ -329,8 +329,8 @@ def init_custom_ar_gfx1250_ipc(
     meta_ptr: int,
     rank_data_ptr: int,
     rank_data_sz: int,
-    ipc_handle_ptrs: List[int],
-    offsets: List[int],
+    ipc_handle_ptrs: list[int],
+    offsets: list[int],
     rank: int,
     fully_connected: bool,
 ) -> int: ...
@@ -338,13 +338,13 @@ def init_custom_ar_gfx1250_ipc(
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer_ipc", develop=True)
 def register_input_buffer_gfx1250_ipc(
-    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_output_buffer_ipc", develop=True)
 def register_output_buffer_gfx1250_ipc(
-    _fa: int, self_ptr: int, ipc_handle_ptrs: List[int], offsets: List[int]
+    _fa: int, self_ptr: int, ipc_handle_ptrs: list[int], offsets: list[int]
 ) -> None: ...
 
 
@@ -357,7 +357,7 @@ def get_graph_buffer_ptrs_gfx1250(_fa: int, ptrs_out: int) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="register_graph_buffers", develop=True)
-def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: List[int]) -> None: ...
+def register_graph_buffers_gfx1250(_fa: int, ptrs_per_rank: list[int]) -> None: ...
 
 
 @compile_ops(GFX1250_MD_NAME, fc_name="start_sync_latency", develop=True)

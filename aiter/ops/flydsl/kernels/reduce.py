@@ -18,7 +18,7 @@ def reduce_vec_max(vec_val, *, VEC_WIDTH, compute_type, vector):
         from flydsl.dialects.ext import arith as _arith
 
         vec_val = _arith.as_value(vec_val)
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return vector.reduction(compute_type, "maxnumf", vec_val)
 
@@ -30,7 +30,7 @@ def reduce_vec_sum(vec_val, *, VEC_WIDTH, compute_type, vector, fm_fast):
         from flydsl.dialects.ext import arith as _arith
 
         vec_val = _arith.as_value(vec_val)
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return vector.reduction(compute_type, "add", vec_val, fastmath=fm_fast)
 
@@ -163,7 +163,7 @@ def make_block_reduce(
 
     try:
         return lower_range_for_loops(block_reduce)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return block_reduce
 
 
@@ -303,7 +303,7 @@ def make_block_reduce_add(
 
     try:
         return lower_range_for_loops(block_reduce_add)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return block_reduce_add
 
 
@@ -429,5 +429,5 @@ def make_block_reduce_add2(
 
     try:
         return lower_range_for_loops(block_reduce_add2)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return block_reduce_add2

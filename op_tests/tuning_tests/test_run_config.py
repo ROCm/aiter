@@ -15,8 +15,8 @@ Run:
 import csv
 import os
 import re
-import sys
 import subprocess
+import sys
 import unittest
 
 AITER_ROOT = os.path.dirname(
@@ -70,7 +70,7 @@ def _resolve_config_via_aiter(config_property):
         config_file = getattr(AITER_CONFIGS, config_property, None)
         if config_file and os.path.exists(config_file):
             return config_file
-    except Exception:
+    except Exception:  # noqa: BLE001,S110
         pass
     return None
 
@@ -105,6 +105,7 @@ def _run_config(script, config_csv, timeout=600, extra_args=None):
             timeout=timeout,
             cwd=AITER_ROOT,
             env=env,
+            check=False,
         )
     except subprocess.TimeoutExpired as e:
         raise AssertionError(
@@ -165,7 +166,7 @@ def _parse_all_benchmark_results(lines):
         stripped = line.strip()
         if "| " not in stripped:
             continue
-        if stripped.startswith("Shape") or stripped.startswith("-"):
+        if stripped.startswith(("Shape", "-")):
             continue
         parts = [p.strip() for p in stripped.split("|")]
         if len(parts) < 3:
