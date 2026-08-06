@@ -33,16 +33,9 @@ from aiter.jit.utils.chip_info import (
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 try:
-    from aiter.ops.flydsl.moe_common import (
-        DEFAULT_SITUV2_BETA,
-        DEFAULT_SITUV2_LINEAR_BETA,
-        GateMode,
-        get_flydsl_activation_name,
-    )
+    from aiter.ops.flydsl.moe_common import GateMode
     from aiter.ops.flydsl.utils import is_flydsl_available
 except ImportError:
-    DEFAULT_SITUV2_BETA = 4.0
-    DEFAULT_SITUV2_LINEAR_BETA = 25.0
 
     class GateMode(Enum):
         SEPARATED = "separated"
@@ -50,15 +43,6 @@ except ImportError:
 
     def is_flydsl_available():
         return False
-
-    def get_flydsl_activation_name(activation):
-        if activation == ActivationType.Silu:
-            return "silu"
-        if activation == ActivationType.Swiglu:
-            return "swiglu"
-        if activation == ActivationType.Situv2:
-            return "situv2"
-        raise ValueError(f"unsupported FlyDSL activation: {activation!r}")
 
 
 from aiter.ops.flydsl.mxfp4_kname import (
@@ -85,8 +69,6 @@ _USE_FLYDSL_MOE_SORTING = os.environ.get("AITER_USE_FLYDSL_MOE_SORTING", "0") ==
 #   opus / ck -> never use adaptive (legacy; ck still needs AITER_USE_CK_MOE_SORTING)
 _MOE_SORT_BACKEND = os.environ.get("AITER_MOE_SORT_BACKEND", "auto").lower()
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
-# Activations the mxmoe a4w4 GEMM1 epilogue can compute (see _activation_mul_batch).
-_MXMOE_G1_ACTIVATIONS = ("silu", "situv2")
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
 
@@ -807,12 +789,8 @@ def _fused_moe_impl(
                 bias2=bias2,
                 swiglu_limit=swiglu_limit,
                 num_local_tokens=num_local_tokens,
-                situ_beta=DEFAULT_SITUV2_BETA if beta is None else float(beta),
-                situ_linear_beta=(
-                    DEFAULT_SITUV2_LINEAR_BETA
-                    if linear_beta is None
-                    else float(linear_beta)
-                ),
+                situ_beta=1.0 if beta is None else float(beta),
+                situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             )
 
     if grouped_a8w4_out is not None:
@@ -1542,9 +1520,6 @@ def _mxfp4_a4w4_stage1(
     device,
     use_nt=False,
     interleave=False,
-    act,
-    situ_beta,
-    situ_linear_beta,
 ):
     if not inline_quant:
         aiter.mxfp4_moe_quant(
@@ -1615,9 +1590,6 @@ def _mxfp4_a4w4_stage1(
         topk=topk,
         interleave=interleave,
         xcd_swizzle=_xcd1,
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
     )
     return inter_sorted_quant, inter_sorted_shuffled_scale
 
@@ -1780,22 +1752,9 @@ def _mxfp4_a4w4_stage1_fw(
     m_indices=None,
     moe_buf=None,
     interleave=False,
-    # No defaults: the activation and its SiTUv2 betas are compile-time constants
-    # baked into the kernel, so a caller that omits them must fail loudly rather
-    # than silently compile SiLU.
-    activation,
-    situ_beta,
-    situ_linear_beta,
     **_kwargs,
 ):
     device = hidden_states.device
-    act = get_flydsl_activation_name(activation)
-    if act not in _MXMOE_G1_ACTIVATIONS:
-        raise NotImplementedError(
-            f"MXMOE GEMM1 supports {sorted(_MXMOE_G1_ACTIVATIONS)}, got {act!r} "
-            f"(kernelName1={kernelName1!r}). The tuned config selected the mxmoe "
-            "port for an activation its epilogue cannot compute."
-        )
     p1 = _parse_mxfp4_g1_kname(kernelName1)
     BM = p1["BM"]
     inline_quant = p1["inline_quant"]
@@ -1837,9 +1796,6 @@ def _mxfp4_a4w4_stage1_fw(
         device=device,
         use_nt=p1["use_nt"],
         interleave=interleave,
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
     )
 
 
@@ -3176,20 +3132,10 @@ def fused_moe_2stages(
             extra_stage1_args["v2_output_layout"] = True
         # SiTUv2 beta/linear_beta are compile-time constants baked into the
         # FlyDSL kernel (see compile_mixed_moe_gemm1). Thread them through as the
-        # kernel's situ_beta/situ_linear_beta params.
-        extra_stage1_args["situ_beta"] = (
-            DEFAULT_SITUV2_BETA if beta is None else float(beta)
-        )
+        # kernel's situ_beta/situ_linear_beta params; None -> 1.0 (plain tanh).
+        extra_stage1_args["situ_beta"] = 1.0 if beta is None else float(beta)
         extra_stage1_args["situ_linear_beta"] = (
-            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
-        )
-    elif stage1_func is _mxfp4_a4w4_stage1_fw:
-        extra_stage1_args["activation"] = activation
-        extra_stage1_args["situ_beta"] = (
-            DEFAULT_SITUV2_BETA if beta is None else float(beta)
-        )
-        extra_stage1_args["situ_linear_beta"] = (
-            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
+            1.0 if linear_beta is None else float(linear_beta)
         )
     elif stage1_func is _opus_a8w4_stage1_wrapper:
         extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)

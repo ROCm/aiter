@@ -10,7 +10,6 @@ from flydsl.expr.typing import T
 from . import dpp_utils
 from .layout_utils import crd2idx
 from .mxfp4_gemm_common import (
-    _activation_mul_batch,
     _e8m0_from_amax,
     _e8m0_roundup,
     _fabs_f32,
@@ -32,7 +31,6 @@ from .mxfp4_gemm_common import (
     lds_acc_bytes_for,
     num_n_blocks_for,
 )
-from ..mxfp4_kname import _encode_mxfp4_float
 
 
 def _udiv(a, c):
@@ -95,6 +93,15 @@ def n_out_for(inter):
     return 2 * inter
 
 
+LOG2E = 1.4426950408889634
+
+
+def _silu_mul_batch(gs, us):
+    e = [fx.Float32(rocdl.exp2(T.f32, _raw(g * fx.Float32(-LOG2E)))) for g in gs]
+    sig = [fx.Float32(rocdl.rcp(T.f32, _raw(fx.Float32(1.0) + ei))) for ei in e]
+    return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
+
+
 def _pkmax_u16(a_i32, b_i32):
     _v2i16 = T.vec(2, T.i16)
     va = llvm.BitcastOp(_v2i16, _raw(a_i32)).result
@@ -150,9 +157,6 @@ def _gemm1_body(
     N_OUT,
     NE,
     interleave=False,
-    act="silu",
-    situ_beta=4.0,
-    situ_linear_beta=25.0,
 ):
     KH_TILE = BK // 2
     K_HALF = k_half_for(K)
@@ -697,13 +701,7 @@ def _gemm1_body(
             up_col = fx.Int32(128) + gate_col
             gate_vs[ee] = acc_load(acc_idx(row_local, gate_col))
             up_vs[ee] = acc_load(acc_idx(row_local, up_col))
-        result = _activation_mul_batch(
-            gate_vs,
-            up_vs,
-            act=act,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-        )
+        result = _silu_mul_batch(gate_vs, up_vs)
 
         local_max = _fabs_f32(result[0])
         for ee in range_constexpr(1, 8):
@@ -787,9 +785,6 @@ def compile_gemm1_a4w4_port(
     BK=256,
     interleave=False,
     xcd_swizzle=0,
-    act="silu",
-    situ_beta=4.0,
-    situ_linear_beta=25.0,
 ):
     if (BM, use_nt, inline_quant) not in {
         (32, True, False),
@@ -803,10 +798,6 @@ def compile_gemm1_a4w4_port(
         )
 
     assert BN == 256 and BK == 256, f"only BN==BK==256 supported, got BN={BN} BK={BK}"
-    if act not in ("silu", "situv2"):
-        raise AssertionError(f"act must be 'silu' or 'situv2', got {act!r}")
-    if act == "situv2" and (situ_beta <= 0.0 or situ_linear_beta <= 0.0):
-        raise AssertionError("SiTUv2 beta values must be positive")
     KH_TILE = BK // 2
     _K = D_HIDDEN
     assert _K % BK == 0, f"D_HIDDEN (K) must be a multiple of {BK}, got {_K}"
@@ -826,12 +817,6 @@ def compile_gemm1_a4w4_port(
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
     name_suffix = f"h{_K}_i{_INTER}_ne{_NE}_bm{BM}_{variant_tag}_{gu_tag}"
-    if act == "situv2":
-        name_suffix += (
-            "_situv2"
-            f"_sb{_encode_mxfp4_float(situ_beta)}"
-            f"_slb{_encode_mxfp4_float(situ_linear_beta)}"
-        )
     if xcd_swizzle > 0:
         name_suffix += f"_xcd{xcd_swizzle}"
 
@@ -916,9 +901,6 @@ def compile_gemm1_a4w4_port(
                 N_OUT=_N_OUT,
                 NE=_NE,
                 interleave=interleave,
-                act=act,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
             )
 
     @flyc.jit

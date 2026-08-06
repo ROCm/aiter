@@ -7,28 +7,6 @@ from enum import Enum
 
 import torch
 
-DEFAULT_SITUV2_BETA = 4.0
-DEFAULT_SITUV2_LINEAR_BETA = 25.0
-
-
-def get_flydsl_activation_name(activation) -> str:
-    # ActivationType is backed by module_aiter_core. Keep this import lazy because
-    # wheel AOT job discovery imports moe_common before that extension is importable.
-    from aiter.ops.enum import ActivationType
-
-    activation_names = {
-        ActivationType.Silu: "silu",
-        ActivationType.Swiglu: "swiglu",
-        ActivationType.Situv2: "situv2",
-    }
-    try:
-        return activation_names[activation]
-    except KeyError as error:
-        raise ValueError(
-            f"Unsupported FlyDSL MoE activation: {activation!r}"
-        ) from error
-
-
 class GateMode(str, Enum):
     """Gate/Up computation strategy for stage1 GEMM.
 

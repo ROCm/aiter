@@ -15,8 +15,6 @@ import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import run_only_env
 from aiter.fused_moe import (
-    DEFAULT_SITUV2_BETA,
-    DEFAULT_SITUV2_LINEAR_BETA,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
@@ -398,12 +396,10 @@ def test_fmoe(
         doweight=doweight_stage1,
         swiglu_limit=swiglu_limit,
         # pr1 torch_moe_stage1 exposes situ_beta/situ_linear_beta (no None
-        # handling); mirror fused_moe's None -> DEFAULT_SITUV2_* mapping so the
-        # reference matches it for SiTUv2 (harmless for other activations).
-        situ_beta=DEFAULT_SITUV2_BETA if beta is None else float(beta),
-        situ_linear_beta=(
-            DEFAULT_SITUV2_LINEAR_BETA if linear_beta is None else float(linear_beta)
-        ),
+        # handling); mirror the kernel's None -> 1.0 mapping so the reference
+        # matches fused_moe for SiTUv2 (harmless for other activations).
+        situ_beta=1.0 if beta is None else float(beta),
+        situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
     )
 
     # ######################## stage 2 start ###########
@@ -733,15 +729,14 @@ parser.add_argument(
     "--beta",
     type=float,
     default=None,
-    help=f"SiTUv2 gate scale param (beta). Default None -> {DEFAULT_SITUV2_BETA}. "
-    "Only affects SiTUv2.",
+    help="SiTUv2 gate scale param (beta). Default None -> 1.0. Only affects SiTUv2.",
 )
 parser.add_argument(
     "--linear-beta",
     type=float,
     default=None,
-    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> "
-    f"{DEFAULT_SITUV2_LINEAR_BETA}. Only affects SiTUv2.",
+    help="SiTUv2 up (linear) scale param (linear_beta). Default None -> 1.0. "
+    "Only affects SiTUv2.",
 )
 parser.add_argument(
     "--no-situv2",
@@ -1140,7 +1135,7 @@ def _iter_situv2_default_cases():
     SiTUv2 only routes to the FlyDSL MXFP4 kernel for per_1x32 + fp4/fp8, so we
     hardcode the supported quant family instead of relying on the -a list:
       * a8w4 (fp8 activation, fp4 weight) at a 256-aligned inter_dim shape
-    beta / linear_beta come from --beta / --linear-beta (None -> DEFAULT_SITUV2_*).
+    beta / linear_beta come from --beta / --linear-beta (None -> kernel 1.0).
     Non-gfx950 runs are skipped inside test_fmoe's per_1x32 gfx guard.
 
     Notes on cases intentionally kept out of this DEFAULT auto-run:

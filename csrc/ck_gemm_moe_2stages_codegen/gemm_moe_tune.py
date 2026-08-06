@@ -46,13 +46,7 @@ from aiter.jit.core import (
     get_asm_dir,
 )
 from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
-from aiter.ops.flydsl.moe_common import (
-    DEFAULT_SITUV2_BETA,
-    DEFAULT_SITUV2_LINEAR_BETA,
-    get_flydsl_activation_name,
-)
 from aiter.ops.flydsl.mxfp4_kname import (
-    _make_mxfp4_g1_kname,
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
@@ -119,6 +113,13 @@ TUNE_MOE_EXPERT_BALANCE = (
 )
 
 COS_DIFF_THRESHOLD = 1e-1
+
+# SiTUv2 params (Kimi-K3 config.json), passed to BOTH the torch reference and
+# the kernel launch -- they used to fall back to their own differing defaults
+# ((2.0, 1.5) vs (1.0, 1.0)), which scored every SiTUv2 stage1 candidate at
+# ~35% err and failed them all against --errRatio.
+_TUNER_SITU_BETA = 4.0
+_TUNER_SITU_LINEAR_BETA = 25.0
 
 
 def _manifest_flat_by_kernel(df: pd.DataFrame) -> dict:
@@ -660,6 +661,11 @@ class FmoeTuner(TunerCommon):
         q_type,
         act_type,
     ):
+        act = (
+            "swiglu"
+            if act_type == ActivationType.Swiglu
+            else ("situv2" if act_type == ActivationType.Situv2 else "silu")
+        )
         a_scale_one = kparams.get("a_scale_one", False)
         _out_dtype = kparams["out_dtype"]
         token_num = a1_qt.shape[0]
@@ -677,9 +683,9 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=_out_dtype,
-            act=get_flydsl_activation_name(act_type),
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            act=act,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
             w1_scale=w1_scale_aiter,
             a1_scale=a1_scale,
             sorted_weights=sorted_weights,
@@ -813,8 +819,6 @@ class FmoeTuner(TunerCommon):
             blockM,
             adtype=adtype,
             activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         # Precompute the sorted A-scale here so it is NOT timed in the run func.
@@ -865,6 +869,7 @@ class FmoeTuner(TunerCommon):
     ):
         # Time ONLY the runtime v2 gemm1 kernel: flydsl_moe_stage1(v2_output_layout=True).
         # a1_scale_sort is precomputed in generate_v2_stage1_data (not timed).
+        act = "swiglu" if act_type == ActivationType.Swiglu else "silu"
         out, _scale = flydsl_moe_stage1(
             a=a1_qt,
             w1=w1_shuf,
@@ -879,9 +884,7 @@ class FmoeTuner(TunerCommon):
             a_dtype=kparams["a_dtype"],
             b_dtype=kparams["b_dtype"],
             out_dtype=kparams["out_dtype"],
-            act=get_flydsl_activation_name(act_type),
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            act=act,
             w1_scale=w1_scale_shuf,
             a1_scale=a1_scale_sort,
             sorted_weights=None,
@@ -918,8 +921,6 @@ class FmoeTuner(TunerCommon):
             blockM,
             adtype=adtype,
             activation=act_type,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
         )
         v = _v2_build_inputs(d, token, model_dim, inter_dim, expert, topk, blockM)
         _v2_populate_stage2(d, v, token, topk, blockM)
@@ -1321,9 +1322,8 @@ class FmoeTuner(TunerCommon):
         use_g1u1,
         blockM,
         device="cuda",
-        seed=0,
     ):
-        torch.manual_seed(seed)
+        torch.manual_seed(0)
         input = torch.randn((token, model_dim), dtype=dtype) / 10
         if use_g1u1:
             w1 = torch.randn((expert, inter_dim * 2, model_dim), dtype=dtype) / 10
@@ -1955,8 +1955,6 @@ class FmoeTuner(TunerCommon):
         blockM=32,
         fuse_fp4=False,
         fuse_fp8=False,
-        situ_beta=DEFAULT_SITUV2_BETA,
-        situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
     ):
         # a16wi4: convert int8 weights to i4x2 so reference function detects the right path
         if (
@@ -1980,8 +1978,8 @@ class FmoeTuner(TunerCommon):
             w1_scale=w1_scale,
             w1_bias=w1_bias,
             doweight=doweight_stage1,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
         )
         token_num = a1_qt.shape[0]
         if fuse_fp4:
@@ -2260,8 +2258,8 @@ class FmoeTuner(TunerCommon):
             a1_scale=a1_scale,
             w1_scale=w1_scale,
             doweight=doweight_stage1,
-            situ_beta=DEFAULT_SITUV2_BETA,
-            situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+            situ_beta=_TUNER_SITU_BETA,
+            situ_linear_beta=_TUNER_SITU_LINEAR_BETA,
         )
         AQDType = hidden_states.dtype
 
@@ -5699,43 +5697,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
     }
 
     @staticmethod
-    def _activation(row):
-        value = row["act_type"]
-        if isinstance(value, ActivationType):
-            activation = value
-        elif isinstance(value, str) and value.startswith("ActivationType."):
-            name = value.removeprefix("ActivationType.")
-            try:
-                activation = getattr(ActivationType, name)
-            except AttributeError as exc:
-                raise ValueError(
-                    f"unsupported activation in tuning row: {value!r}"
-                ) from exc
-            if not isinstance(activation, ActivationType):
-                raise ValueError(f"unsupported activation in tuning row: {value!r}")
-        else:
-            raise ValueError(f"unsupported activation in tuning row: {value!r}")
-        try:
-            get_flydsl_activation_name(activation)
-        except ValueError as exc:
-            raise ValueError(
-                f"unsupported activation in tuning row: {value!r}"
-            ) from exc
-        return activation
-
-    @staticmethod
     def _g1_kname(bm, use_nt, inline_quant):
-        # The name carries only the tile/variant; activation and SiTUv2 betas are
-        # runtime arguments (act_type is already a tuned-config key column).
-        return _make_mxfp4_g1_kname(
-            BM=bm,
-            BN=256,
-            a_dtype="fp4",
-            out_dtype="fp4",
-            inline_quant=inline_quant,
-            use_nt=use_nt,
-            interleave=False,
-        )
+        # flydsl_mxmoe_g1_a4w4_<BM>x256x256[_f16in][_nt]; see mxfp4_kname.py.
+        name = f"flydsl_mxmoe_g1_a4w4_{bm}x256x256"
+        if inline_quant:
+            name += "_f16in"
+        if use_nt:
+            name += "_nt"
+        return name
 
     @staticmethod
     def _g2_kname(bm, use_nt, epilog):
@@ -5776,14 +5745,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
         from aiter.ops.flydsl.mxfp4_gemm2_kernels import _SUPPORTED as G2
 
         g2_bms = {v[0] for v in G2}
-        self._activation(row)  # reject unsupported act_type before enumerating
-        native_g2_supported = int(row["inter_dim"]) % 256 == 0
         cands = []
         for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms and native_g2_supported:
+                if bm in g2_bms:
                     for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
                         cands.append(
                             self._candidate_row(
@@ -5808,7 +5775,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return cands
 
     @staticmethod
-    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype, seed=0):
+    def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
         data = FmoeTuner.generate_data(
             token,
             model_dim,
@@ -5822,7 +5789,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             True,
             16,
             device="cuda",
-            seed=seed,
         )
         # True a4w4 runs the SEPARATED gate/up layout (gemm1 interleave=False),
         # so prepare weights/scales with is_guinterleave=False. The interleaved
@@ -5843,18 +5809,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return data
 
     @staticmethod
-    def _port_e2e(
-        data,
-        kn1,
-        kn2,
-        topk,
-        ne,
-        h,
-        dtype,
-        activation,
-        situ_beta,
-        situ_linear_beta,
-    ):
+    def _port_e2e(data, kn1, kn2, topk, ne, h, dtype):
         # kn2 may name either gemm2 family (path B or native mxmoe).
         _g2 = parse_g2_kname_any(kn2)
         BM = _g2["BM"]
@@ -5886,9 +5841,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             kernelName1=kn1,
             m_indices=m_indices,
             moe_buf=moe_buf,
-            activation=activation,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         return _mxfp4_a4w4_stage2_fw(
             inter_q,
@@ -5908,14 +5860,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _torch_ref(
-        data,
-        topk,
-        dtype,
-        activation,
-        situ_beta,
-        situ_linear_beta,
-    ):
+    def _torch_ref(data, topk, dtype, activation):
         ref1 = FmoeTuner.run_torch_moe_stage1(
             data["a1_qt"],
             data["w1_qt"],
@@ -5929,8 +5874,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
             quant_type=QuantType.per_1x32,
             doweight_stage1=False,
             topk=topk,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
         )
         return FmoeTuner.run_torch_moe_stage2(
             ref1,
@@ -5952,48 +5895,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
         token, topk = int(row["token"]), int(row["topk"])
         dtype = dtypes.bf16
         kn1, kn2 = candidate["kernelName1"], candidate["kernelName2"]
-        activation = self._activation(row)
-        situ_beta = DEFAULT_SITUV2_BETA
-        situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
-        seed = (token * 1000003 + h * 1009 + e * 101 + ne * 17 + topk) & 0x7FFFFFFF
-        torch.manual_seed(seed)
-        data = self._prepare_case(token, h, e, ne, topk, dtype, seed=seed)
-        out = self._port_e2e(
-            data,
-            kn1,
-            kn2,
-            topk,
-            ne,
-            h,
-            dtype,
-            activation,
-            situ_beta,
-            situ_linear_beta,
+        activation = (
+            ActivationType.Swiglu
+            if str(row["act_type"]).endswith("Swiglu")
+            else ActivationType.Silu
         )
-        ref = self._torch_ref(
-            data,
-            topk,
-            dtype,
-            activation,
-            situ_beta,
-            situ_linear_beta,
-        )
+        data = self._prepare_case(token, h, e, ne, topk, dtype)
+        out = self._port_e2e(data, kn1, kn2, topk, ne, h, dtype)
+        ref = self._torch_ref(data, topk, dtype, activation)
         err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
         if err is None or float(err) > args.errRatio:
             raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
         _, us = run_perftest(
-            lambda: self._port_e2e(
-                data,
-                kn1,
-                kn2,
-                topk,
-                ne,
-                h,
-                dtype,
-                activation,
-                situ_beta,
-                situ_linear_beta,
-            ),
+            lambda: self._port_e2e(data, kn1, kn2, topk, ne, h, dtype),
             num_warmup=int(args.warmup),
             num_iters=int(args.iters),
         )

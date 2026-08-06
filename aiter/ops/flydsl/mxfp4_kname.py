@@ -8,9 +8,7 @@
 # the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
 # cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
 
-import math
 import re
-import struct
 
 _MXMOE_NUMERIC_TOKENS = {"SK": "kSplitK", "XCD": "xcd_swizzle"}
 _MXMOE_G1_FLAG_TOKENS = {"NT", "F16IN"}
@@ -23,43 +21,6 @@ _FLYDSL_V2_GEMM2_RE = re.compile(
     r"t(?P<tm>\d+)x(?P<tn>\d+)x(?P<tk>\d+)_(?P<epilog>atomic|reduce)"
     r"(?P<persist>_persist)?(?P<nt>_nt)?(?:_sbm(?P<sbm>\d+))?$"
 )
-
-
-def _encode_mxfp4_float(value: float) -> str:
-    value = float(value)
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError(
-            f"MXMOE specialization value must be finite and positive: {value!r}"
-        )
-    return struct.pack(">d", value).hex().upper()
-
-
-def _make_mxfp4_g1_kname(
-    *,
-    BM: int,
-    BN: int = 256,
-    a_dtype: str = "fp4",
-    out_dtype: str = "fp4",
-    inline_quant: bool = False,
-    use_nt: bool = False,
-    interleave: bool = False,
-    xcd_swizzle: int = 0,
-) -> str:
-    if a_dtype != "fp4" or out_dtype != "fp4":
-        raise ValueError(
-            "legacy MXMOE GEMM1 requires a_dtype='fp4' and out_dtype='fp4'"
-        )
-    if interleave:
-        raise ValueError("legacy MXMOE GEMM1 does not encode interleaved gate/up")
-
-    name = f"{_MXMOE_PREFIX[1]}{int(BM)}x{int(BN)}x256"
-    if inline_quant:
-        name += "_f16in"
-    if use_nt:
-        name += "_nt"
-    if xcd_swizzle:
-        name += f"_xcd{int(xcd_swizzle)}"
-    return name
 
 
 def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
@@ -75,8 +36,6 @@ def _tokenize_mxfp4_kname(kname: str, stage: int, flag_tokens: set) -> dict:
         mt = _MXMOE_TILE_RE.match(tok)
         if mt:
             nums["BM"] = int(mt.group(1))
-            nums["BN"] = int(mt.group(2))
-            nums["BK"] = int(mt.group(3))
             continue
         utok = tok.upper()
         if utok in flag_tokens:
@@ -95,8 +54,6 @@ def _parse_mxfp4_g1_kname(kname: str) -> dict:
     nums, flags = parsed["nums"], parsed["flags"]
     return {
         "BM": nums["BM"],
-        "BN": nums["BN"],
-        "BK": nums["BK"],
         "splitk": "kSplitK" in nums,
         "kSplitK": nums.get("kSplitK", 0),
         "inline_quant": "F16IN" in flags,
