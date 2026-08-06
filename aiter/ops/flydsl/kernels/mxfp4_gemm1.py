@@ -73,6 +73,7 @@ def _gemm1_body(
     arg_bscale,
     arg_eids,
     arg_mind,
+    arg_sorted_token_ids,
     arg_aqout,
     arg_ascaleout,
     arg_hidden,
@@ -98,7 +99,9 @@ def _gemm1_body(
     K,
     N_OUT,
     NE,
+    TOPK,
     interleave=False,
+    v2_output_layout=False,
 ):
     # A-code tile bytes/row: fp4 packs 2 codes/byte (BK/2); fp8 is 1 B/elem (BK).
     KH_TILE = BK if a_dtype == "fp8" else BK // 2
@@ -806,6 +809,52 @@ def _gemm1_body(
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
         scales_per_mr = [None] * M_REPS
 
+        def store_payload(payload_row, packed0, packed1):
+            if const_expr(out_dtype == "fp8"):
+                byte_pos = (
+                    n_block_idx * fx.Int32(BN_INT)
+                    + wave_grp * fx.Int32(32)
+                    + kk * fx.Int32(8)
+                )
+                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
+                _scalar_store(
+                    aqout_tiles,
+                    store_off // fx.Int32(4),
+                    packed0,
+                    fx.Int32,
+                )
+                _scalar_store(
+                    aqout_tiles,
+                    (store_off + fx.Int32(4)) // fx.Int32(4),
+                    packed1,
+                    fx.Int32,
+                )
+            else:
+                byte_pos = (
+                    n_block_idx * fx.Int32(BN_INT // 2)
+                    + wave_grp * fx.Int32(16)
+                    + kk * fx.Int32(4)
+                )
+                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
+                _scalar_store(
+                    aqout_tiles,
+                    store_off // fx.Int32(4),
+                    packed0,
+                    fx.Int32,
+                )
+
+        def store_output(sorted_row, packed0, packed1):
+            if const_expr(v2_output_layout):
+                store_payload(sorted_row, packed0, packed1)
+            else:
+                fused_id = fx.Int32(_global_i32_at(arg_sorted_token_ids, sorted_row))
+                token_id = fused_id & fx.Int32(0x00FFFFFF)
+                slot_id = fused_id >> fx.Int32(24)
+                is_valid = (token_id < i32_ntok) & (slot_id < fx.Int32(TOPK))
+                if is_valid:
+                    payload_row = token_id * fx.Int32(TOPK) + slot_id
+                    store_payload(payload_row, packed0, packed1)
+
         for mr in range_constexpr(M_REPS):
             row_local = fx.Int32(mr * 16) + m_lane
 
@@ -853,7 +902,7 @@ def _gemm1_body(
             scales_per_mr[mr] = e8m0
 
             qscale_raw = as_ir_value(qscale)
-            out_row = m_row + row_local
+            sorted_out_row = m_row + row_local
             if const_expr(out_dtype == "fp8"):
                 i16x2 = fx.Vector.make_type(2, fx.Int16)
                 zero16 = fx.Vector.filled(2, 0, fx.Int16)
@@ -889,23 +938,10 @@ def _gemm1_body(
                     qscale_raw,
                     1,
                 )
-                byte_pos = (
-                    n_block_idx * fx.Int32(BN_INT)
-                    + wave_grp * fx.Int32(32)
-                    + kk * fx.Int32(8)
-                )
-                store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int32(4),
+                store_output(
+                    sorted_out_row,
                     fx.Vector(packed0).bitcast(fx.Int32)[0],
-                    fx.Int32,
-                )
-                _scalar_store(
-                    aqout_tiles,
-                    (store_off + fx.Int32(4)) // fx.Int32(4),
                     fx.Vector(packed1).bitcast(fx.Int32)[0],
-                    fx.Int32,
                 )
             else:
                 packed_i32 = as_ir_value(fx.Int32(0))
@@ -918,17 +954,10 @@ def _gemm1_body(
                         qscale_raw,
                         w,
                     )
-                byte_pos = (
-                    n_block_idx * fx.Int32(BN_INT // 2)
-                    + wave_grp * fx.Int32(16)
-                    + kk * fx.Int32(4)
-                )
-                store_off = _layout_idx(aqout_layout, out_row, byte_pos)
-                _scalar_store(
-                    aqout_tiles,
-                    store_off // fx.Int32(4),
+                store_output(
+                    sorted_out_row,
                     fx.Int32(packed_i32),
-                    fx.Int32,
+                    fx.Int32(0),
                 )
 
         # One scale chunk covers 32 sorted rows. Derive the runtime chunk extent
@@ -1053,7 +1082,9 @@ def compile_gemm1_a4w4_port(
     situ_linear_beta=1.0,
     swiglu_limit=7.0,
     enable_bias=False,
+    v2_output_layout=False,
 ):
+    """Compile GEMM1 with dense token/slot output or v2 expert-sorted output."""
     if a_dtype not in ("fp4", "fp8"):
         raise AssertionError(f"a_dtype must be 'fp4' or 'fp8', got {a_dtype!r}")
     if (BM, use_nt, inline_quant) not in _G1_VARIANTS[a_dtype]:
@@ -1088,9 +1119,8 @@ def compile_gemm1_a4w4_port(
     # Tag with H/INTER/NE so different shape specializations get distinct
     # kernel/smem symbols (so KIMI and non-KIMI instances never collide).
     gu_tag = "il" if interleave else "sep"
-    name_suffix = (
-        f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}"
-    )
+    output_layout_tag = "" if v2_output_layout else f"_denseout_tk{TOPK}"
+    name_suffix = f"{a_dtype}_h{D_HIDDEN}_i{D_INTER}_ne{NE}_bm{BM}_{variant_tag}_{gu_tag}{output_layout_tag}"
     if out_dtype != "fp4":
         name_suffix += f"_o{out_dtype}"
     if act != "silu":
@@ -1116,6 +1146,7 @@ def compile_gemm1_a4w4_port(
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
+        arg_sorted_token_ids: fx.Int64,
         i32_ntok: fx.Int32,
         arg_aqout: fx.Int64,
         arg_ascaleout: fx.Int64,
@@ -1171,6 +1202,7 @@ def compile_gemm1_a4w4_port(
                 arg_bscale,
                 arg_eids,
                 arg_mind,
+                arg_sorted_token_ids,
                 arg_aqout,
                 arg_ascaleout,
                 arg_hidden,
@@ -1195,7 +1227,9 @@ def compile_gemm1_a4w4_port(
                 K=D_HIDDEN,
                 N_OUT=N_OUT,
                 NE=NE,
+                TOPK=TOPK,
                 interleave=interleave,
+                v2_output_layout=v2_output_layout,
             )
 
     @flyc.jit
@@ -1207,6 +1241,7 @@ def compile_gemm1_a4w4_port(
         arg_eids: fx.Int64,
         arg_cumsum: fx.Int64,
         arg_mind: fx.Int64,
+        arg_sorted_token_ids: fx.Int64,
         i32_ntok: fx.Int32,
         i32_grid: fx.Int32,
         arg_aqout: fx.Int64,
@@ -1224,6 +1259,7 @@ def compile_gemm1_a4w4_port(
             arg_eids,
             arg_cumsum,
             arg_mind,
+            arg_sorted_token_ids,
             i32_ntok,
             arg_aqout,
             arg_ascaleout,
