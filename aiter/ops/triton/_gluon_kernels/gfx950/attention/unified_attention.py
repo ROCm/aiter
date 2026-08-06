@@ -42,7 +42,7 @@ float8_info = torch.finfo(e4m3_dtype)
 
 PRINT_IRS = os.environ.get("PRINT_IRS", "0") == "1"
 
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.NONE)
+_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
 @gluon.jit
 def elementwise_max_prop_nan(a, b):
@@ -1243,8 +1243,8 @@ def find_seq_idx(
     return left - 1
 
 
-@gluon.jit
-def kernel_unified_attention(
+@gluon.jit(do_not_specialize=["num_blocks"])
+def _unified_attention_gluon_kernel(
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
     value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]

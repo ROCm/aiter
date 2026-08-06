@@ -13,10 +13,10 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
 from aiter.ops.triton.utils.device_info import get_num_sms
 try:
     from aiter.ops.triton._gluon_kernels.gfx950.attention.unified_attention import (
-            kernel_unified_attention as _gluon_unified_attention_kernel,
+            _unified_attention_gluon_kernel,
         )
 except:  # noqa: E722
-    _gluon_unified_attention_kernel = None
+    _unified_attention_gluon_kernel = None
 
 try:
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.unified_attention_3d import (
@@ -52,7 +52,7 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 WAPR_SIZE_LOG2 = int(math.log2(WARP_SIZE))
 
 
-def is_2d_gluon_available(
+def is_2d_gfx1250_gluon_available(
     q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
 ):
     use_gluon_2d = (
@@ -61,6 +61,22 @@ def is_2d_gluon_available(
         and not softcap
         and not use_qq_bias
         and not use_alibi_slopes
+        and q_dtype != torch.uint8
+        and kv_cache_dtype != torch.uint8
+        and q_dtype == kv_cache_dtype
+    )
+    return use_gluon_2d
+
+def is_gfx950_gluon_available(
+    q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes, shuffled_kv_cache
+):
+    use_gluon_2d = (
+        DEVICE_ARCH == "gfx950"
+        and _unified_attention_gluon_kernel is not None
+        and not softcap
+        and not use_qq_bias
+        and not use_alibi_slopes
+        and not shuffled_kv_cache
         and q_dtype != torch.uint8
         and kv_cache_dtype != torch.uint8
         and q_dtype == kv_cache_dtype
@@ -342,6 +358,32 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == num_query_heads, "Sinks must be num_query_heads size"
 
+    # gfx950 gluon has its own heuristics
+    if is_gfx950_gluon_available(
+        q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes, shuffled_kv_cache
+    ):
+        return _gfx950_unified_attention(
+            q,
+            k,
+            v,
+            out,
+            cu_seqlens_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+            window_size,
+            block_table,
+            softcap,
+            q_descale,
+            k_descale,
+            v_descale,
+            sinks,
+            output_scale,
+            skip_reduce,
+        )    
+
     BLOCK_SCALES_SIZE = 16
     if q_dtype == torch.uint8:
         # A4W4
@@ -418,10 +460,10 @@ def unified_attention(
 
         # The gfx1250 Gluon 2d kernel only handles bf16/fp8 q+kv (with optional
         # sinks / output_scale / shuffled_kv_cache)
-        use_gluon_2d = is_2d_gluon_available(
+        use_gfx1250_gluon_2d = is_2d_gfx1250_gluon_available(
             q_dtype, kv_cache_dtype, softcap, use_qq_bias, use_alibi_slopes
         )
-        if use_gluon_2d:
+        if use_gfx1250_gluon_2d:
             _gfx1250_unified_attention_2d(
                 q,
                 k,
@@ -932,7 +974,7 @@ def _gfx1250_unified_attention_2d(
 def _gfx950_gluon_select_num_splits(num_seqs, num_kv_heads, num_tiles, num_warps, fp8=False):
     if num_tiles <= 4:
         return 1
-    # Workgroups to aim for, per CU
+    # Workgroups per CU target
     WGS_PER_CU = 4 if fp8 else 2
     SPLIT_WORK_THRESHOLD = 64
     target_wgs = get_num_sms() * WGS_PER_CU // max(1, num_warps)
@@ -963,6 +1005,7 @@ def _gfx950_unified_attention(
     v_descale,
     sinks,
     output_scale=None,
+    skip_reduce=False,
 ):
     remove_indirect_access = False
     NUM_SEQS = len(seqused_k)
@@ -972,7 +1015,7 @@ def _gfx950_unified_attention(
     Q_FP8 = q.element_size() == 1
     KV_FP8 = k.element_size() == 1
     ARCH_NAME = arch_info.get_arch()
-    assert ARCH_NAME == "gfx950", "unified_attention_2d_gfx950 only supports gfx950"
+    assert ARCH_NAME == "gfx950", "this kernel only supports gfx950"
     assert softcap == 0, "Softcap is not supported"
     BLOCK_SIZE = k.shape[1]
     NUM_KV_HEADS = k.shape[2]
@@ -982,36 +1025,45 @@ def _gfx950_unified_attention(
 
     if HEAD_SIZE < 128:
         waves_per_eu = 1 if ALL_DECODE else 3
-    elif HEAD_SIZE >= 256 and ALL_DECODE and Q_FP8:
-        waves_per_eu = 1
+    elif HEAD_SIZE >= 256:
+        waves_per_eu = 2 if (Q_FP8 and not ALL_DECODE) else 1
     else:
         waves_per_eu = 2
-    if ALL_DECODE:
-        if Q_FP8:
-            mfma_dim = 32
-            num_buffers = 1 if HEAD_SIZE >= 256 else 2
-        else:
-            mfma_dim = 16
-            num_buffers = 1 if HEAD_SIZE >= 256 else 2
-        # BLOCK_M must hold a whole query group: BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
-        # has to be >= 1
-        min_warps = 2 if (HEAD_SIZE >= 256 and not Q_FP8) else 1
-        block_m = max(mfma_dim * min_warps,
-                      triton.next_power_of_2(NUM_Q_HEADS // NUM_KV_HEADS))
-        num_warps = block_m // mfma_dim
-    else:
-        num_warps, block_m, mfma_dim = 4, 128, 32
-        # At head_size >= 256 the 32x32 MFMA is the wrong shape for prefill: its PV operand
-        # uses kWidth 4 against a 256-wide V tile, and 16x16 (kWidth 8) measures 1.4-3.1x
-        # faster. Keeping num_warps=4 puts BLOCK_M at 64. fp8 stays on 32x32 -- its 16x16
-        # variant reduces K=128, above TILE_SIZE.
-        if HEAD_SIZE >= 256 and not Q_FP8:
-            mfma_dim = 16
-            block_m = mfma_dim * num_warps
-        num_buffers = 1 if (HEAD_SIZE >= 256 and not Q_FP8) else 2
 
     # A page bigger or smaller than the tile is assembled by AsyncGatherKVLoader
     TILE_SIZE = 64
+    num_splits = 1
+    if ALL_DECODE:
+        mfma_dim = 32 if Q_FP8 else 16
+        num_buffers = 1 if HEAD_SIZE >= 256 else 2
+        # BLOCK_M must hold a whole query group: BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
+        # has to be >= 1
+        block_m = max(mfma_dim, triton.next_power_of_2(NUM_QUERIES_PER_KV))
+        num_warps = block_m // mfma_dim
+        num_tiles = max(1, triton.cdiv(max_seqlen_k, TILE_SIZE))
+        num_splits = _gfx950_gluon_select_num_splits(
+            NUM_SEQS, NUM_KV_HEADS, num_tiles, num_warps, fp8=Q_FP8
+        )
+        if SLIDING_WINDOW > 0:
+            num_splits = 1
+        if (
+            HEAD_SIZE >= 256
+            and num_splits == 1
+            and NUM_SEQS * NUM_KV_HEADS <= 2 * get_num_sms()
+        ):
+            block_m = max(mfma_dim * 2, triton.next_power_of_2(NUM_QUERIES_PER_KV))
+            num_warps = block_m // mfma_dim
+    else:
+        num_warps, block_m, mfma_dim, num_buffers = 4, 128, 32, 2
+        if HEAD_SIZE >= 256 and Q_FP8:
+            num_buffers = 1
+        elif HEAD_SIZE >= 256:
+            if BLOCK_SIZE >= 32:
+                num_warps, block_m, TILE_SIZE = 2, 64, 32
+
+    # LDS limit for 2 buffer config
+    if 4 * TILE_SIZE * HEAD_SIZE * k.element_size() > 160 * 1024:
+        num_buffers = 1
     BLOCK_M = block_m
     BLOCK_Q = BLOCK_M // NUM_QUERIES_PER_KV
     if ALL_DECODE:
@@ -1023,12 +1075,6 @@ def _gfx950_unified_attention(
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = kv_size <= MAX_INT32
     USE_STORE_BUFFER_OP = out.nelement() * out.element_size() <= MAX_INT32
-    num_tiles = max(1, triton.cdiv(max_seqlen_k, TILE_SIZE))
-    if ALL_DECODE:
-        num_splits = _gfx950_gluon_select_num_splits(NUM_SEQS, NUM_KV_HEADS, num_tiles, NUM_WARPS,
-                                        fp8=Q_FP8)
-    else:
-        num_splits = 1
     if num_splits > 1:
         partial_acc = torch.empty(
             (q.shape[0], NUM_Q_HEADS, num_splits, HEAD_SIZE), dtype=torch.float32, device=q.device
@@ -1042,7 +1088,7 @@ def _gfx950_unified_attention(
     grid = (total_query_blocks, NUM_KV_HEADS) if ALL_DECODE else (NUM_KV_HEADS, total_query_blocks)
     if num_splits > 1:
         grid = grid + (num_splits,)
-    _gluon_unified_attention_kernel[grid](
+    _unified_attention_gluon_kernel[grid](
         query_ptr=q,
         key_cache_ptr=k,
         value_cache_ptr=v,
@@ -1097,27 +1143,30 @@ def _gfx950_unified_attention(
     )
 
     if num_splits > 1:
-        reduce_segments[(q.shape[0], NUM_Q_HEADS)](
-            output_ptr=out,
-            segm_output_ptr=partial_acc,
-            segm_max_ptr=partial_m,
-            segm_expsum_ptr=partial_l,
-            seq_lens_ptr=seqused_k,
-            num_seqs=NUM_SEQS,
-            num_query_heads=NUM_Q_HEADS,
-            out_scale_ptr=output_scale,
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            block_table_stride=block_table.stride(0),
-            HEAD_SIZE=HEAD_SIZE,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(HEAD_SIZE),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            TILE_SIZE=TILE_SIZE,
-            NUM_SEGMENTS_PER_SEQ=num_splits,
-            num_warps=2,
-            waves_per_eu=2,
-            num_stages=1,
-        )
+        if not skip_reduce:
+            reduce_segments[(q.shape[0], NUM_Q_HEADS)](
+                output_ptr=out,
+                segm_output_ptr=partial_acc,
+                segm_max_ptr=partial_m,
+                segm_expsum_ptr=partial_l,
+                seq_lens_ptr=seqused_k,
+                num_seqs=NUM_SEQS,
+                num_query_heads=NUM_Q_HEADS,
+                out_scale_ptr=output_scale,
+                output_stride_0=out.stride(0),
+                output_stride_1=out.stride(1),
+                block_table_stride=block_table.stride(0),
+                HEAD_SIZE=HEAD_SIZE,
+                HEAD_SIZE_PADDED=triton.next_power_of_2(HEAD_SIZE),
+                query_start_len_ptr=cu_seqlens_q,
+                BLOCK_Q=BLOCK_Q,
+                TILE_SIZE=TILE_SIZE,
+                NUM_SEGMENTS_PER_SEQ=num_splits,
+                num_warps=2,
+                waves_per_eu=2,
+                num_stages=1,
+            )
+        else:
+            return partial_acc, partial_m, partial_l   
 
     return out
