@@ -62,12 +62,6 @@ def _build_ptr_table(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...
     return tuple(tensors) + (tensors[0],) * (L2 - len(tensors))
 
 
-def _cache_modifiers(use_cache_modifier: bool) -> tuple[str, str]:
-    # ".cg": bypass L1, stream the read-once residual through L2. ".cs":
-    # evict-first store for the write-once output. Both off -> default caching.
-    return (".cg", ".cs") if use_cache_modifier else ("", "")
-
-
 def attn_res_fwd(
     query: torch.Tensor,
     residuals,
@@ -77,8 +71,6 @@ def attn_res_fwd(
     scale: float = 1.0,
     *,
     layout: str = "sequence",
-    use_exp2: bool = True,
-    use_cache_modifier: bool = True,
 ) -> torch.Tensor:
     """Attention-residual forward.
 
@@ -92,9 +84,6 @@ def attn_res_fwd(
     - rms_eps: epsilon of both the per-candidate and the output RMSNorm.
     - scale: multiplies the logits before the softmax.
     - layout: "sequence" (two-pass) or "packed" (one-pass).
-    - use_exp2: softmax via the hardware exp2 instead of exp.
-    - use_cache_modifier: residual ``.cg`` load / output ``.cs`` store instead
-      of default caching.
 
     Returns the mixed residual ``o`` of shape ``[.., D]``.
     """
@@ -106,7 +95,6 @@ def attn_res_fwd(
         f"layout={layout}"
     )
 
-    load_cache, store_cache = _cache_modifiers(use_cache_modifier)
     has_onorm = output_rms_weight is not None
     q_flat = query.flatten().contiguous()
     w_flat = rms_weight.flatten().contiguous()
@@ -121,9 +109,6 @@ def attn_res_fwd(
         rms_eps,
         scale,
         has_onorm,
-        load_cache,
-        store_cache,
-        use_exp2,
     )
 
 
@@ -135,9 +120,6 @@ def _run_sequence(
     rms_eps,
     scale,
     has_onorm,
-    load_cache,
-    store_cache,
-    use_exp2,
 ):
     if not residuals[0].is_cuda:
         raise ValueError("Triton attn_res requires CUDA/ROCm tensors")
@@ -178,9 +160,6 @@ def _run_sequence(
         scale=scale,
         NS=1,
         HAS_ONORM=has_onorm,
-        LOAD_CACHE=load_cache,
-        STORE_CACHE=store_cache,
-        EXP2=use_exp2,
     )
     return o.view(output_shape)
 
@@ -193,9 +172,6 @@ def _run_packed(
     rms_eps,
     scale,
     has_onorm,
-    load_cache,
-    store_cache,
-    use_exp2,
 ):
     if isinstance(residuals, (list, tuple)):
         L = len(residuals)
@@ -239,9 +215,6 @@ def _run_packed(
         DO_ADD=False,
         WRITE_PREF=False,
         HAS_W=True,
-        LOAD_CACHE=load_cache,
-        STORE_CACHE=store_cache,
-        EXP2=use_exp2,
     )
     return o.view(output_shape)
 
@@ -255,8 +228,6 @@ def attn_res_gate(
     *,
     output_rms_weight: torch.Tensor | None = None,
     scale: float = 1.0,
-    use_exp2: bool = True,
-    use_cache_modifier: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Inference-shaped attention-residual gate over ``B + 1`` candidates.
 
@@ -293,7 +264,6 @@ def attn_res_gate(
         f"block_residual={tuple(block_residual.shape)}"
     )
 
-    load_cache, store_cache = _cache_modifiers(use_cache_modifier)
     output_shape = prefix.shape  # [.., D]
     D = output_shape[-1]
     B = block_residual.shape[-2]
@@ -346,8 +316,5 @@ def attn_res_gate(
         DO_ADD=do_add,
         WRITE_PREF=do_add,
         HAS_W=False,
-        LOAD_CACHE=load_cache,
-        STORE_CACHE=store_cache,
-        EXP2=use_exp2,
     )
     return y.view(output_shape), (prefix_out.view(output_shape) if do_add else prefix)

@@ -87,8 +87,6 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
             add_hidden,
             output_rms_weight=output_rms_weight,
             scale=args.scale,
-            use_exp2=not args.no_exp2,
-            use_cache_modifier=not args.no_cache_modifier,
         )
     else:
         query, residuals, rms_weight, output_rms_weight = generate_attn_res_inputs(
@@ -104,8 +102,6 @@ def bench_attn_res_fn(N, D, L, layout, metric, args):
             args.eps,
             args.scale,
             layout=layout,
-            use_exp2=not args.no_exp2,
-            use_cache_modifier=not args.no_cache_modifier,
         )
 
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
@@ -199,20 +195,6 @@ def parse_args():
     )
     parser.add_argument("--eps", type=float, default=1e-6, help="RMSNorm epsilon")
     parser.add_argument("--scale", type=float, default=1.0, help="Logit scale")
-    parser.add_argument(
-        "--no-exp2",
-        dest="no_exp2",
-        action="store_true",
-        default=False,
-        help="Use exp instead of the hardware exp2 in the softmax",
-    )
-    parser.add_argument(
-        "--no-cache-modifier",
-        dest="no_cache_modifier",
-        action="store_true",
-        default=False,
-        help="Use default caching instead of the .cg load / .cs store modifiers",
-    )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument(

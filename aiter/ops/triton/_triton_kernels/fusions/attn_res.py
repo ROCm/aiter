@@ -4,8 +4,6 @@
 import triton
 import triton.language as tl
 
-_LOG2E = tl.constexpr(1.4426950408889634)
-
 
 @triton.autotune(
     configs=[
@@ -13,7 +11,7 @@ _LOG2E = tl.constexpr(1.4426950408889634)
         for BH in [512, 1024, 2048]
         for nw in [2, 4, 8]
     ],
-    key=["L2", "D", "HAS_ONORM", "LOAD_CACHE", "STORE_CACHE", "EXP2"],
+    key=["L2", "D", "HAS_ONORM"],
 )
 @triton.jit(do_not_specialize=["L"])
 def _attn_res_fwd_sequence_2pass_kernel(
@@ -32,9 +30,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
     BH: tl.constexpr,
     NS: tl.constexpr,
     HAS_ONORM: tl.constexpr,
-    LOAD_CACHE: tl.constexpr,
-    STORE_CACHE: tl.constexpr,
-    EXP2: tl.constexpr,
 ):
     """Sequence layout (L independent [N, D] tensors), two-pass over D.
 
@@ -68,7 +63,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
                 tl.multiple_of(res[i] + (i_n * D + cols[None, :]), (1, 16)),
                 mask=(b_idx == i)[:, None] & b_valid[:, None] & h_mask[None, :],
                 other=0.0,
-                cache_modifier=LOAD_CACHE,
             ).to(tl.float32)
         acc_sq += tl.sum(v * v, axis=1)
         acc_dot += tl.sum(v * qw[None, :], axis=1)
@@ -77,10 +71,7 @@ def _attn_res_fwd_sequence_2pass_kernel(
     b_logit = acc_dot * b_rstd
     b_s = tl.where(b_valid, b_logit * scale, float("-inf"))
     b_m = tl.max(b_s, axis=0)
-    if EXP2:
-        b_p = tl.exp2((b_s - b_m) * _LOG2E)
-    else:
-        b_p = tl.exp(b_s - b_m)
+    b_p = tl.exp(b_s - b_m)
     b_acc = tl.sum(b_p, axis=0)
     probs = b_p / b_acc
 
@@ -95,19 +86,13 @@ def _attn_res_fwd_sequence_2pass_kernel(
                 tl.multiple_of(res[i] + (i_n * D + cols[None, :]), (1, 16)),
                 mask=(b_idx == i)[:, None] & b_valid[:, None] & h_mask[None, :],
                 other=0.0,
-                cache_modifier=LOAD_CACHE,
             ).to(tl.float32)
         o_blk = tl.sum(probs[:, None] * v, axis=0)
         if HAS_ONORM:
             tl.store(o_pre + i_n * D + cols, o_blk, mask=h_mask)  # fp32 scratch
             acc_o_sq += tl.sum(tl.where(h_mask, o_blk * o_blk, 0.0), axis=0)
         else:
-            tl.store(
-                o + i_n * D + cols,
-                o_blk.to(o.dtype.element_ty),
-                mask=h_mask,
-                cache_modifier=STORE_CACHE,
-            )
+            tl.store(o + i_n * D + cols, o_blk.to(o.dtype.element_ty), mask=h_mask)
 
     # ---- PASS 3 (onorm only): reload fp32 o_pre, apply output RMSNorm ----
     if HAS_ONORM:
@@ -121,7 +106,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
                 o + i_n * D + cols,
                 (opre * o_rstd * owv).to(o.dtype.element_ty),
                 mask=h_mask,
-                cache_modifier=STORE_CACHE,
             )
 
 
@@ -134,9 +118,6 @@ def _attn_res_fwd_sequence_2pass_kernel(
         "HAS_PREFIX",
         "DO_ADD",
         "HAS_W",
-        "LOAD_CACHE",
-        "STORE_CACHE",
-        "EXP2",
     ],
 )
 @triton.jit(do_not_specialize=["L"])
@@ -163,9 +144,6 @@ def _attn_res_fwd_packed_1pass_kernel(
     DO_ADD: tl.constexpr,
     WRITE_PREF: tl.constexpr,
     HAS_W: tl.constexpr,
-    LOAD_CACHE: tl.constexpr,
-    STORE_CACHE: tl.constexpr,
-    EXP2: tl.constexpr,
 ):
     """Packed layout (one contiguous [N, L, D] tensor), whole-row single pass.
 
@@ -206,7 +184,6 @@ def _attn_res_fwd_packed_1pass_kernel(
         res + res_base[:, None] + cols[None, :],
         mask=m_res[:, None] & m_d[None, :],
         other=0.0,
-        cache_modifier=LOAD_CACHE,
     ).to(tl.float32)
 
     if HAS_PREFIX:
@@ -230,10 +207,7 @@ def _attn_res_fwd_packed_1pass_kernel(
     b_logit = acc_dot * b_rstd
     b_s = tl.where(b_valid, b_logit * scale, float("-inf"))
     b_m = tl.max(b_s, axis=0)
-    if EXP2:
-        b_p = tl.exp2((b_s - b_m) * _LOG2E)
-    else:
-        b_p = tl.exp(b_s - b_m)
+    b_p = tl.exp(b_s - b_m)
     b_acc = tl.sum(b_p, axis=0)
     probs = b_p / b_acc
 
@@ -242,9 +216,4 @@ def _attn_res_fwd_packed_1pass_kernel(
         o_rstd = tl.rsqrt(tl.sum(tl.where(m_d, b_o * b_o, 0.0), axis=0) * inv_d + eps)
         owv = tl.load(ow + cols, mask=m_d, other=0.0).to(tl.float32)
         b_o = b_o * o_rstd * owv
-    tl.store(
-        o + i_n * D + cols,
-        b_o.to(o.dtype.element_ty),
-        mask=m_d,
-        cache_modifier=STORE_CACHE,
-    )
+    tl.store(o + i_n * D + cols, b_o.to(o.dtype.element_ty), mask=m_d)

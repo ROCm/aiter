@@ -70,35 +70,6 @@ def test_attn_res(layout, shape, L, with_onorm, dtype):
     torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("layout", ["sequence", "packed"])
-@pytest.mark.parametrize("use_exp2", [False, True])
-@pytest.mark.parametrize("use_cache_modifier", [False, True])
-def test_attn_res_toggles(layout, use_exp2, use_cache_modifier):
-    """exp2 and the cache modifiers must not change the result."""
-    N, D, L = 64, 512, 4
-    rms_eps, scale = 1e-6, 1.0
-    dtype = torch.float32
-    query, residuals, rms_weight, _ = generate_attn_res_inputs(
-        N, D, L, dtype, with_onorm=False
-    )
-
-    o_ref, *_ = run_torch(query, residuals, rms_weight, None, rms_eps, scale)
-    o = attn_res_fwd(
-        query,
-        residuals,
-        rms_weight,
-        None,
-        rms_eps,
-        scale,
-        layout=layout,
-        use_exp2=use_exp2,
-        use_cache_modifier=use_cache_modifier,
-    )
-
-    atol, rtol = _TOL[dtype]
-    torch.testing.assert_close(o.float(), o_ref, atol=atol, rtol=rtol)
-
-
 def test_attn_res_packed_tensor_input():
     """The packed layout also accepts a pre-stacked [N, L, D] tensor."""
     N, D, L = 64, 512, 4
