@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Status (2026-08-06): superseded for Q2 implementation.** Task 0 remains a valid release/acquire and generation-counter correctness spike. Tasks 1–4 must not be implemented as written: producer and consumer kernels queued on the same CUDA stream cannot overlap. The active Q2 plan is [`2026-08-06-persistent-push-group-overlap-gfx1250.md`](2026-08-06-persistent-push-group-overlap-gfx1250.md), which uses one fixed-grid persistent mega stage-1 kernel, a metadata-first count/prefix phase, and per-tile arrival counters.
+
 **Goal:** 在已落地的 fp8-transport 基座（T-A，-20%）之上，用**跨 CTA 全局内存 ring** 把 "pull-分组 dispatch" 与 GEMM1 的计算重叠起来——生产者 CTA 把（按本地 expert 分组的）fp8 token tile 填进 HBM ring 槽并置就绪位，GEMM1 消费者 CTA 自旋等就绪、消费该槽、再置释放位——从而消除独立 a1 gather kernel + grouped-a1 一整趟 HBM 往返，并让 dispatch 与 GEMM1 跨核重叠，而**不依赖任何 CTA 内 warp 专精 / flydsl 命名屏障**。
 
 **Architecture:** 明确放弃 CTA 内（workgroup 内）producer/consumer warp 专精——它需要 flydsl 侧从未验证过的命名屏障（`s_barrier_init/join`，仅在 opus C++ GEMM 验证过，flydsl 全路径只用过 `-1` 整-WG 屏障，成熟度未知）。改用**跨 CTA 粒度**的重叠：ring 在全局内存（HBM / 对称 arena），跨 CTA 同步只用 `flydsl_prims.py` 的系统作用域原子 + release/acquire fence + volatile 自旋——**这套原语正是现网 dispatch 的骨架，已验证**。重叠粒度比 DeepGEMM 的片上 L1 ring 粗（一个 CTA 一次吃一个 tile 槽），但零新原语风险，且可回退。
