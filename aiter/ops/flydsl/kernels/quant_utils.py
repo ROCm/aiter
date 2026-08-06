@@ -265,10 +265,26 @@ def emit_amax_e8m0_native_scale(all_vals, *, wave_size, dtype=_D.FP8_E4M3):
     c23 = arith.constant(23, type=T.i32)
     c_wave = arith.constant(wave_size, type=T.i32)
 
-    block_amax = arith.constant(0.0, type=T.f32)
+    abs_vals = []
     for v in all_vals:
-        abs_v = llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
-        block_amax = arith.maxnumf(block_amax, abs_v)
+        abs_vals.append(
+            llvm.call_intrinsic(T.f32, "llvm.fabs.f32", [_raw(v)], [], [])
+        )
+
+    # Build a balanced max tree instead of a serial dependency chain. The
+    # epilogue contributes 16 values per lane, so this reduces local amax depth
+    # from 16 maxnum operations to 4 before the cross-kgrp shuffle.
+    while len(abs_vals) > 1:
+        next_vals = []
+        for i in range(0, len(abs_vals), 2):
+            if i + 1 < len(abs_vals):
+                next_vals.append(arith.maxnumf(abs_vals[i], abs_vals[i + 1]))
+            else:
+                next_vals.append(abs_vals[i])
+        abs_vals = next_vals
+
+    c0_f32 = arith.constant(0.0, type=T.f32)
+    block_amax = arith.maxnumf(c0_f32, abs_vals[0]) if abs_vals else c0_f32
     block_amax = arith.minnumf(block_amax, c_flt_max)
     peer = block_amax.shuffle_xor(c16, c_wave)
     block_amax = arith.maxnumf(block_amax, peer)
