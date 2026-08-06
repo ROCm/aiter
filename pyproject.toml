@@ -8,10 +8,75 @@ requires = [
     "psutil",
     "ninja",
     "pandas",
-    "flydsl==0.1.9.dev599"
+    "flydsl==0.3.0"
+]
+
+[tool.ruff]
+# The style CI runs plain `ruff check .`, so without this section the enforced
+# rule set is whatever the installed ruff happens to default to -- and those
+# defaults widen between releases, which silently turns unrelated PRs red. The
+# workflow pins the ruff version; this section pins everything else.
+#
+# No `select`/`ignore` override on purpose: the rule set stays exactly ruff's
+# default for the pinned version, so this file changes no verdict today. It only
+# makes the inputs explicit. Bumping ruff in .github/workflows/pre-checks.yaml is
+# now the one reviewable place where the rule set can move.
+
+# Not derivable from this file: there is no [project] table, so ruff cannot read
+# `requires-python` and would fall back to its own default. Keep this in sync
+# with `python_requires` in setup.py. py310 is what ruff already resolved to, so
+# the UP0xx (PEP 585/604) verdicts are unchanged.
+target-version = "py310"
+
+# ruff's built-in exclude list contains the bare name `dist`, and a pattern with
+# no slash is matched against the basename at any depth -- so it silently skipped
+# aiter/dist/, a real source package that had never been linted. Restate the
+# default list with `dist/` instead: a pattern containing a slash is matched
+# against the root-relative path, so the setuptools output directory stays
+# excluded while aiter/dist/ is now checked (+348 pre-existing findings).
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist/",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+# Vendored submodules and generated/runtime output are not ours to lint. CI
+# checks out without submodules so it never saw 3rdparty/, but local runs do.
+extend-exclude = [
+    "3rdparty",
+    "aiter/jit/build",
+    "aiter_logs",
 ]
 
 [tool.setuptools_scm]
 write_to = "aiter/_version.py"
 write_to_template = "__version__ = '{version}'\n"
 fallback_version = "0.1.0"
+# Extract the PEP 440 version from a git tag, tolerating branch-marker suffixes.
+# Keep hyphenated pre/post/dev keywords in the version (e.g. v0.1.17-rc0 -> 0.1.17rc0,
+# v0.1.16.post1 -> 0.1.16.post1) but drop arbitrary hyphen suffixes such as
+# v0.1.17-longctx -> 0.1.17 (which the default regex fails to parse).
+tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2}[^-+]*(?:-(?:preview|alpha|beta|post|pre|dev|rev|rc|a|b|c|r)\\d*)?)(?:-.*)?(?:\\+.*)?$"

@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-import random
-from typing import List, Optional, Tuple, Union
-import itertools
-import torch
-import aiter
-import pytest
-from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
-from aiter import pertoken_quant
-from aiter import dtypes
-from enum import Enum
-from einops import rearrange
 import argparse
+import itertools
+import random
+from enum import Enum
+
+import pytest
+import torch
+from einops import rearrange
+
+import aiter
+from aiter import dtypes, pertoken_quant
+from aiter.test_common import checkAllclose, perftest, tensor_dump, tensor_load
 
 uniform_range = (-1, 1)
 STR_DTYPE_TO_TORCH_DTYPE = {
@@ -26,8 +26,8 @@ STR_DTYPE_TO_TORCH_DTYPE = {
 
 
 def get_kv_cache_torch_dtype(
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
 ) -> torch.dtype:
     if isinstance(cache_dtype, str):
         if cache_dtype == "auto":
@@ -46,7 +46,7 @@ def get_kv_cache_torch_dtype(
     elif isinstance(cache_dtype, torch.dtype):
         torch_dtype = cache_dtype
     else:
-        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")
+        raise ValueError(f"Invalid kv cache dtype: {cache_dtype}")  # noqa: TRY004
     return torch_dtype
 
 
@@ -56,11 +56,11 @@ def kv_cache_factory(
     num_layers: int,
     num_heads: int,
     head_size: int,
-    cache_dtype: Optional[Union[str, torch.dtype]],
-    model_dtype: Optional[Union[str, torch.dtype]] = None,
+    cache_dtype: str | torch.dtype | None,
+    model_dtype: str | torch.dtype | None = None,
     seed: int = 0,
-    device: Optional[str] = "cuda",
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    device: str | None = "cuda",
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
 
     if cache_dtype == "fp8" and head_size % 16:
         raise ValueError(
@@ -71,7 +71,7 @@ def kv_cache_factory(
 
     x = 16 // torch_dtype.itemsize
     key_cache_shape = (num_blocks, num_heads, head_size // x, block_size, x)
-    key_caches: List[torch.Tensor] = []
+    key_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         key_cache = torch.empty(size=key_cache_shape, dtype=torch_dtype, device=device)
         if cache_dtype in ["auto", "half", "bfloat16", "float"]:
@@ -81,7 +81,7 @@ def kv_cache_factory(
         key_caches.append(key_cache)
 
     value_cache_shape = (num_blocks, num_heads, head_size, block_size)
-    value_caches: List[torch.Tensor] = []
+    value_caches: list[torch.Tensor] = []
     for _ in range(num_layers):
         value_cache = torch.empty(
             size=value_cache_shape, dtype=torch_dtype, device=device
@@ -127,7 +127,7 @@ def ref_masked_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     scale: float,
-    attn_mask: Optional[torch.Tensor] = None,
+    attn_mask: torch.Tensor | None = None,
     logits_soft_cap: float = 0.0,
 ) -> torch.Tensor:
     attn_weights = scale * torch.einsum("qhd,khd->hqk", query, key).float()
@@ -147,7 +147,7 @@ def pertoken_quant_kvcache_symm(
     value_cache: torch.Tensor,
     quant_dtype: torch.dtype,  # e.g. dtypes.fp8
     scale_dtype: torch.dtype = dtypes.fp32,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     num_blocks = key_cache.shape[0]
     num_heads = key_cache.shape[1]
     head_dim = value_cache.shape[2]
@@ -230,8 +230,8 @@ def run_torch(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -292,8 +292,8 @@ def run_torch_new(
         block_table = block_tables_lst[i]
         seq_len = int(seq_lens_lst[i])
 
-        keys_lst: List[torch.Tensor] = []
-        values_lst: List[torch.Tensor] = []
+        keys_lst: list[torch.Tensor] = []
+        values_lst: list[torch.Tensor] = []
         for j in range(seq_len):
             block_number = int(block_table[j // block_size])
             block_offset = j % block_size
@@ -398,6 +398,122 @@ def run_aiter(
         return output
 
 
+def _run_paged_attention_ragged_nhd(
+    query,
+    key_cache,
+    value_cache,
+    kv_indptr,
+    kv_page_indices,
+    kv_last_page_lens,
+    max_seq_len,
+    kv_cache_dtype,
+):
+    partition_size = 256
+    num_seqs, num_heads, head_size = query.shape
+    block_size = key_cache.shape[1]
+    max_num_partitions = (max_seq_len + partition_size - 1) // partition_size
+    scale = 1.0 / (head_size**0.5)
+
+    output = torch.empty_like(query)
+    workspace_buffer = torch.empty(
+        (num_seqs * num_heads * max_num_partitions * head_size) * query.element_size()
+        + 2 * (num_seqs * num_heads * max_num_partitions) * FLOAT32_BYTES,
+        dtype=torch.uint8,
+        device=query.device,
+    )
+    k_scale = torch.tensor([1.0], dtype=dtypes.fp32, device=query.device)
+    v_scale = torch.tensor([1.0], dtype=dtypes.fp32, device=query.device)
+
+    torch.ops.aiter.paged_attention_ragged(
+        output,
+        workspace_buffer,
+        query,
+        key_cache,
+        value_cache,
+        scale,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        block_size,
+        max_num_partitions,
+        None,
+        kv_cache_dtype,
+        "NHD",
+        0.0,
+        k_scale,
+        v_scale,
+        None,
+        partition_size,
+    )
+    return output
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_paged_attention_ragged_glm_gqa_fp8_kv_nhd():
+    """GLM-style GQA decode should consume FP8 KV cache directly.
+
+    GLM-4.5-Air TP=1 uses 96 query heads, 8 KV heads, head dimension 128, and
+    SGLang's non-MLA AITER backend passes page-size-1 NHD KV cache tensors.
+    """
+
+    torch.manual_seed(0)
+    device = "cuda"
+    num_seqs = 2
+    num_query_heads = 96
+    num_kv_heads = 8
+    head_size = 128
+    block_size = 1
+    seq_len = 128
+    num_blocks = num_seqs * seq_len
+
+    query = torch.randn(
+        (num_seqs, num_query_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    key_bf16 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    value_bf16 = torch.randn(
+        (num_blocks, block_size, num_kv_heads, head_size),
+        dtype=dtypes.bf16,
+        device=device,
+    )
+    key_fp8 = key_bf16.to(dtypes.fp8)
+    value_fp8 = value_bf16.to(dtypes.fp8)
+
+    kv_indptr = torch.arange(
+        0, (num_seqs + 1) * seq_len, seq_len, dtype=torch.int32, device=device
+    )
+    kv_page_indices = torch.arange(num_blocks, dtype=torch.int32, device=device)
+    kv_last_page_lens = torch.ones((num_seqs,), dtype=torch.int32, device=device)
+
+    expected = _run_paged_attention_ragged_nhd(
+        query,
+        key_fp8.to(dtypes.bf16),
+        value_fp8.to(dtypes.bf16),
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        seq_len,
+        "auto",
+    )
+    actual = _run_paged_attention_ragged_nhd(
+        query,
+        key_fp8,
+        value_fp8,
+        kv_indptr,
+        kv_page_indices,
+        kv_last_page_lens,
+        seq_len,
+        "fp8_e4m3",
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+
 @perftest(num_iters=2)
 def run_aiter_naive(
     query,
@@ -474,7 +590,7 @@ def dump_input(
     kv_cache_dtype: str,
     num_kv_heads: int,
     scale: float,
-    alibi_slopes: Optional[torch.Tensor],
+    alibi_slopes: torch.Tensor | None,
     k_scale: float,
     v_scale: float,
 ):
@@ -554,7 +670,7 @@ DUMP_OUTPUT = False  # whether to dump output
 def test_paged_attention(
     ctx_lens: int,
     num_seqs: int,
-    num_heads: Tuple[int, int],
+    num_heads: tuple[int, int],
     head_size: int,
     use_alibi: bool,
     block_size: int,
@@ -579,9 +695,8 @@ def test_paged_attention(
             or quant_cache_dtype not in [None, dtypes.i8]
         ):
             pytest.skip()
-    elif pa_variant == PAVariant.Naive:
-        if use_alibi:
-            pytest.skip()
+    elif pa_variant == PAVariant.Naive and use_alibi:
+        pytest.skip()
 
     torch.manual_seed(seed)
     random.seed(seed)
@@ -773,9 +888,9 @@ def test_paged_attention(
         else:
             k_quant_, k_scale_, v_quant_, v_scale_ = (
                 key_cache,
-                torch.empty((0)),
+                torch.empty(0),
                 value_cache,
-                torch.empty((0)),
+                torch.empty(0),
             )
 
             out_aiter_naive, time_aiter_naive = run_aiter_naive(
@@ -923,7 +1038,7 @@ if __name__ == "__main__":
     )
     torch.set_printoptions(sci_mode=False)
     args = parser.parse_args()
-    if not args.pa_variant == [PAVariant.Shomy, PAVariant.Asm]:
+    if args.pa_variant != [PAVariant.Shomy, PAVariant.Asm]:
         args.pa_variant = [PAVariant[variant] for variant in args.pa_variant]
     args.quant_cache_dtype = [
         None if i == "none" else dtypes.d_dtypes[i] for i in args.quant_cache_dtype
@@ -935,12 +1050,10 @@ if __name__ == "__main__":
         args.quant_cache_dtype,
     ):
 
-        if pa_variant == PAVariant.Shomy:
-            if quant_cache_dtype is not None:
-                continue
-        elif pa_variant == PAVariant.Asm:
-            if quant_cache_dtype not in [None, dtypes.i8]:
-                continue
+        if pa_variant == PAVariant.Shomy and quant_cache_dtype is not None:
+            continue
+        if pa_variant == PAVariant.Asm and quant_cache_dtype not in [None, dtypes.i8]:
+            continue
 
         test_paged_attention(
             ctx_len,

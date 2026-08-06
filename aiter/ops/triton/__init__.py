@@ -16,12 +16,12 @@ try:
     from . import comms
 
     # Re-export communication primitives at this level for convenience
-    from .comms import (
-        IrisCommContext,
-        reduce_scatter,
-        all_gather,
-        reduce_scatter_rmsnorm_quant_all_gather,
+    from .comms import (  # noqa: F401  deliberate re-export for convenience
         IRIS_COMM_AVAILABLE,
+        IrisCommContext,
+        all_gather,
+        reduce_scatter,
+        reduce_scatter_rmsnorm_quant_all_gather,
     )
 
     _COMMS_AVAILABLE = True
@@ -38,12 +38,12 @@ if quant is not None:
 if _COMMS_AVAILABLE:
     __all__.extend(
         [
-            "comms",
-            "IrisCommContext",
-            "reduce_scatter",
-            "all_gather",
-            "reduce_scatter_rmsnorm_quant_all_gather",
             "IRIS_COMM_AVAILABLE",
+            "IrisCommContext",
+            "all_gather",
+            "comms",
+            "reduce_scatter",
+            "reduce_scatter_rmsnorm_quant_all_gather",
         ]
     )
 
@@ -85,6 +85,8 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
+    # Conv modules (conv/)
+    "conv2d": "conv.conv2d",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",
@@ -124,6 +126,7 @@ _BACKWARD_COMPAT_MAP = {
     "quant_moe": "moe.quant_moe",
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
+    "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
@@ -141,6 +144,9 @@ _BACKWARD_COMPAT_MAP = {
     # Quant modules (quant/)
     "fused_fp8_quant": "quant.fused_fp8_quant",
     "fused_mxfp4_quant": "quant.fused_mxfp4_quant",
+    # Conv modules (conv/)
+    "causal_conv1d": "conv.causal_conv1d",
+    "causal_conv1d_update_single_token": "conv.causal_conv1d_update_single_token",
 }
 
 

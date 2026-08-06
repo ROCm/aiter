@@ -2,8 +2,17 @@ import torch
 import triton
 import triton.language as tl
 
-from ..gated_delta_rule_utils import autotune_cache_kwargs, IS_AMD, maybe_autotune
-from ..utils import prepare_chunk_indices
+from ..gated_delta_rule_utils import (
+    IS_AMD,
+    RCP_LN2,
+    autotune_cache_kwargs,
+    gated_delta_rule_autotune_configs,
+)
+from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    prepare_chunk_indices,
+    prepare_rebased_cu_seqlens,
+)
 from ..utils.op import exp
 
 
@@ -102,7 +111,7 @@ def fused_cumsum_kkt(
         beta: [B, T, H]
 
     Returns:
-        g_cumsum: [B, T, H]
+        g_cumsum: [B, H, T]
         A: [B, T, H, chunk_size], strictly lower triangular
     """
     B, T, H = g.shape
@@ -137,14 +146,32 @@ def fused_cumsum_kkt(
     return g_cumsum, A
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@maybe_autotune(
-    configs=[
+if IS_AMD:
+    _CUMSUM_KKT_CONFIGS = [
+        triton.Config({"BK": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=8, num_stages=2),
+        triton.Config({"BK": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 32}, num_warps=2, num_stages=3),
+        triton.Config({"BK": 64}, num_warps=4, num_stages=2),
+    ]
+else:
+    _CUMSUM_KKT_CONFIGS = [
         triton.Config({"BK": BK}, num_warps=nw, num_stages=ns)
         for BK in [32, 64]
         for nw in [2, 4]
         for ns in ([2, 3] if IS_AMD else [2, 3, 4])
-    ],
+    ]
+
+_CUMSUM_KKT_DEFAULT_CONFIG = triton.Config({"BK": 32}, num_warps=4, num_stages=2)
+
+
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.autotune(
+    configs=gated_delta_rule_autotune_configs(
+        _CUMSUM_KKT_CONFIGS,
+        default_config=_CUMSUM_KKT_DEFAULT_CONFIG,
+    ),
     key=["H", "K", "BT", "IS_VARLEN"],
     **autotune_cache_kwargs,
 )
@@ -156,7 +183,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     g_cumsum_out,
     A_out,
     cu_seqlens,
-    chunk_indices,
+    sequence_ids,
+    chunk_ids,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -164,13 +192,17 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    INDEX_STRIDE: tl.constexpr,
+    USE_EXP2: tl.constexpr = False,
+    G_SCALE: tl.constexpr = 1.0,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
+    T_flat = T
     if IS_VARLEN:
         i_n, i_t = (
-            tl.load(chunk_indices + i_t * 2).to(tl.int32),
-            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+            tl.load(sequence_ids + i_t * INDEX_STRIDE).to(tl.int32),
+            tl.load(chunk_ids + i_t * INDEX_STRIDE).to(tl.int32),
         )
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int32),
@@ -186,10 +218,22 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,)).to(tl.float32)
     b_g_cumsum = tl.cumsum(b_g, axis=0)
+    # Store g_cumsum in log2 space when downstream kernels consume it with exp2:
+    # exp2(x * RCP_LN2) == exp(x), keeping results identical. The scale arrives
+    # as the constexpr G_SCALE (RCP_LN2 when use_exp2 else 1.0) so the kernel
+    # never reads a module-level global; cumsum's linearity makes scaling before
+    # or after the cumsum equivalent.
+    if G_SCALE != 1.0:
+        b_g_cumsum = b_g_cumsum * G_SCALE
 
-    p_go = tl.make_block_ptr(
-        g_cumsum_out + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
+    # g_cumsum is stored head-major [B, H, T] (stride 1 along T) so the
+    # downstream solve/recompute, hidden-state and output kernels can read it
+    # contiguously per (batch, head).
+    if IS_VARLEN:
+        g_out_base = g_cumsum_out + i_h * T_flat + bos
+    else:
+        g_out_base = g_cumsum_out + (i_b * H + i_h) * T_flat
+    p_go = tl.make_block_ptr(g_out_base, (T,), (1,), (i_t * BT,), (BT,), (0,))
     tl.store(p_go, b_g_cumsum.to(p_go.dtype.element_ty), boundary_check=(0,))
 
     p_beta = tl.make_block_ptr(
@@ -213,7 +257,8 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel(
 
     b_g_diff = b_g_cumsum[:, None] - b_g_cumsum[None, :]
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A * exp(b_g_diff), 0.0)
+    b_gate = tl.math.exp2(b_g_diff) if USE_EXP2 else exp(b_g_diff)
+    b_A = tl.where(m_A, b_A * b_gate, 0.0)
 
     p_A = tl.make_block_ptr(
         A_out + (bos * H + i_h) * BT,
@@ -234,6 +279,10 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
     chunk_size: int = 64,
     g_output_dtype: torch.dtype = torch.float32,
     A_output_dtype: torch.dtype = torch.float32,
+    use_exp2: bool = True,
+    num_decodes: int = 0,
+    num_decode_tokens: int = 0,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused cumsum + scaled dot KKT (optimized, with autotuning).
@@ -246,23 +295,61 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         chunk_size: int (must be 64)
         g_output_dtype: dtype for g_cumsum (default fp32)
         A_output_dtype: dtype for A_raw (default fp32)
+        use_exp2: when True, store g_cumsum in log2 space (scaled by RCP_LN2)
+            so downstream kernels can use exp2; A_raw is unaffected.
 
     Returns:
-        g_cumsum: [B, T, H]
+        g_cumsum: [B, H, T], head-major
         A_raw: [B, T, H, 64]
     """
     B, T, Hg, K = k.shape
     H = beta.shape[-1]
     BT = chunk_size
 
+    # Pass the ORIGINAL (cache-stable) cu_seqlens to prepare_chunk_indices
+    # together with num_decodes/num_decode_tokens, so the chunk-index build
+    # caches on the stable tensor identity and never re-fires the .tolist()
+    # D2H across forward calls. The kernel walks the pre-sliced prefill data
+    # via the rebased cu_seqlens.
     if cu_seqlens is not None:
-        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-        NT = len(chunk_indices)
+        if prefill_metadata is not None:
+            prefill_metadata.validate(
+                cu_seqlens=cu_seqlens,
+                chunk_size=BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                total_prefill_tokens=T,
+                num_sequences=len(cu_seqlens) - 1,
+            )
+            schedule = prefill_metadata.get_chunk_schedule(
+                BT,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+            )
+            sequence_ids = schedule.sequence_ids
+            chunk_ids = schedule.chunk_ids
+            kernel_cu_seqlens = schedule.kernel_cu_seqlens
+            index_stride = 1
+        else:
+            chunk_indices = prepare_chunk_indices(
+                cu_seqlens, BT, num_decodes, num_decode_tokens
+            )
+            flat_chunk_indices = chunk_indices.reshape(-1)
+            sequence_ids = flat_chunk_indices
+            chunk_ids = flat_chunk_indices[1:]
+            kernel_cu_seqlens = prepare_rebased_cu_seqlens(
+                cu_seqlens, num_decodes, num_decode_tokens
+            )
+            index_stride = 2
+        NT = len(sequence_ids) // index_stride
     else:
-        chunk_indices = None
+        sequence_ids = None
+        chunk_ids = None
+        kernel_cu_seqlens = None
+        index_stride = 1
         NT = triton.cdiv(T, BT)
 
-    g_cumsum_out = torch.empty(B, T, H, device=g.device, dtype=g_output_dtype)
+    g_cumsum_out = torch.empty(B, H, T, device=g.device, dtype=g_output_dtype)
     A_out = torch.empty(B, T, H, BT, device=k.device, dtype=A_output_dtype)
 
     fused_chunk_local_cumsum_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
@@ -271,12 +358,16 @@ def fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
         beta,
         g_cumsum_out,
         A_out,
-        cu_seqlens,
-        chunk_indices,
+        kernel_cu_seqlens,
+        sequence_ids,
+        chunk_ids,
         T=T,
         H=H,
         Hg=Hg,
         K=K,
         BT=BT,
+        INDEX_STRIDE=index_stride,
+        USE_EXP2=use_exp2,
+        G_SCALE=RCP_LN2 if use_exp2 else 1.0,
     )
     return g_cumsum_out, A_out

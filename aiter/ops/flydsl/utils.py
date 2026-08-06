@@ -4,7 +4,7 @@
 """General utilities shared across all FlyDSL kernel families."""
 
 import importlib.util
-from functools import lru_cache
+from functools import cache, lru_cache
 
 import torch
 
@@ -17,7 +17,9 @@ def addressable_lds_bytes_for_gfx(gfx: str) -> int:
         return _FALLBACK_MAX_LDS_BYTES
     if g.startswith("gfx950"):
         return 163840
-    if g.startswith("gfx7") or g.startswith("gfx8"):
+    if g.startswith("gfx1250"):
+        return 327680
+    if g.startswith(("gfx7", "gfx8")):
         return 32768
     return 65536
 
@@ -26,11 +28,11 @@ def addressable_lds_bytes_for_gfx(gfx: str) -> int:
 def _default_cuda_device_index():
     try:
         return int(torch.cuda.current_device())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
-@lru_cache(maxsize=None)
+@cache
 def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) -> int:
     try:
         props = torch.cuda.get_device_properties(device_index)
@@ -40,7 +42,7 @@ def _get_shared_memory_per_block_cached(device_index: int, fallback_gfx: str) ->
         return addressable_lds_bytes_for_gfx(
             getattr(props, "gcnArchName", fallback_gfx)
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return addressable_lds_bytes_for_gfx(fallback_gfx)
 
 
@@ -58,7 +60,7 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
     else:
         try:
             device = int(device)
-        except Exception:
+        except Exception:  # noqa: BLE001
             device = None
 
     if device is None:
@@ -66,5 +68,15 @@ def get_shared_memory_per_block(device=None, fallback_gfx: str = "") -> int:
     return _get_shared_memory_per_block_cached(device, fallback_gfx)
 
 
+@lru_cache(maxsize=1)
 def is_flydsl_available() -> bool:
-    return importlib.util.find_spec("flydsl") is not None
+    if importlib.util.find_spec("flydsl") is None:
+        return False
+    # flydsl only ships kernels for the architectures in its SMEM_CAPACITY_MAP.
+    # On other archs (e.g. gfx1100 / RDNA3) importing the kernel modules crashes
+    # during config registration, so report flydsl as unavailable there instead
+    # of failing the import.
+    from flydsl.runtime.device import get_rocm_arch
+    from flydsl.utils.smem_allocator import SMEM_CAPACITY_MAP
+
+    return get_rocm_arch() in SMEM_CAPACITY_MAP
