@@ -54,8 +54,7 @@ def run_case(
 
     qkv = torch.randn(
         num_tokens,
-        num_q_heads + 2 * num_kv_heads,
-        head_size,
+        (num_q_heads + 2 * num_kv_heads) * head_size,
         dtype=torch.bfloat16,
         device=device,
     )
@@ -115,9 +114,10 @@ def run_case(
     k_scale = torch.tensor(1.5, dtype=torch.float32, device=device)
     v_scale = torch.tensor(2.0, dtype=torch.float32, device=device)
 
-    q_fly = torch.empty(
-        num_tokens, num_q_heads, head_size, dtype=torch.bfloat16, device=device
+    initial_q_out = torch.randn(
+        num_tokens, num_q_heads * head_size, dtype=torch.bfloat16, device=device
     )
+    q_out = initial_q_out.clone()
 
     def allocate_caches():
         if not strided_caches:
@@ -134,16 +134,12 @@ def run_case(
         v_cache.copy_(initial_v_cache)
         return k_cache, v_cache
 
-    k_fly, v_fly = allocate_caches()
-    k_out_fly = initial_k_out.clone() if return_kv else None
-    v_out_fly = initial_v_out.clone() if return_kv else None
+    k_cache, v_cache = allocate_caches()
+    k_out = initial_k_out.clone() if return_kv else None
+    v_out = initial_v_out.clone() if return_kv else None
 
-    q_hip = torch.empty_like(q_fly)
-    k_hip, v_hip = allocate_caches()
-    k_out_hip = initial_k_out.clone() if return_kv else None
-    v_out_hip = initial_v_out.clone() if return_kv else None
-
-    common = (
+    op_args = (
+        qkv,
         qw,
         kw,
         cos_sin,
@@ -157,8 +153,14 @@ def run_case(
         sections,
         interleaved,
         EPS,
-    )
-    suffix = (
+        q_out,
+        k_cache,
+        v_cache,
+        slots,
+        k_scale,
+        v_scale,
+        k_out,
+        v_out,
         return_kv,
         True,
         page_size,
@@ -167,36 +169,29 @@ def run_case(
         gemma_norm,
     )
 
-    _, flydsl_us = run_perftest(
-        flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
-        qkv,
-        *common,
-        q_fly,
-        k_fly,
-        v_fly,
-        slots,
-        k_scale,
-        v_scale,
-        k_out_fly,
-        v_out_fly,
-        *suffix,
+    _, hip_us = run_perftest(
+        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+        *op_args,
         num_iters=iters,
         num_warmup=warmup,
         use_cuda_event=True,
     )
-    _, hip_us = run_perftest(
-        aiter.fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
-        qkv.view(num_tokens, -1),
-        *common,
-        q_hip.view(num_tokens, -1),
-        k_hip,
-        v_hip,
-        slots,
-        k_scale,
-        v_scale,
-        k_out_hip,
-        v_out_hip,
-        *suffix,
+    q_hip = q_out.clone()
+    k_cache_hip = k_cache.clone()
+    v_cache_hip = v_cache.clone()
+    k_out_hip = k_out.clone() if return_kv else None
+    v_out_hip = v_out.clone() if return_kv else None
+
+    q_out.copy_(initial_q_out)
+    k_cache.copy_(initial_k_cache)
+    v_cache.copy_(initial_v_cache)
+    if return_kv:
+        k_out.copy_(initial_k_out)
+        v_out.copy_(initial_v_out)
+
+    _, flydsl_us = run_perftest(
+        flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle,
+        *op_args,
         num_iters=iters,
         num_warmup=warmup,
         use_cuda_event=True,
@@ -212,15 +207,15 @@ def run_case(
     print(f"[case] {label}")
 
     outputs = [
-        ("q_out", q_fly, q_hip),
-        ("k_cache", k_fly.reshape(-1), k_hip.reshape(-1)),
-        ("v_cache", v_fly.reshape(-1), v_hip.reshape(-1)),
+        ("q_out", q_out, q_hip),
+        ("k_cache", k_cache, k_cache_hip),
+        ("v_cache", v_cache, v_cache_hip),
     ]
     if return_kv:
         outputs.extend(
             [
-                ("k_out", k_out_fly, k_out_hip),
-                ("v_out", v_out_fly, v_out_hip),
+                ("k_out", k_out, k_out_hip),
+                ("v_out", v_out, v_out_hip),
             ]
         )
 
