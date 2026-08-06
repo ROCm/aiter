@@ -1825,3 +1825,28 @@ def hk_mla_v40_decode_fwd(
         raise NotImplementedError(
             f"hk_mla_v40_decode_fwd has no implementation for arch {arch_id}"
         )
+
+
+@compile_ops("module_ds32_mla", develop=True)
+def mla_decode_stage1_opus_fwd_ds32(
+    q_nope: torch.Tensor,  # [B, H, D_NOPE]          fp8
+    q_rope: torch.Tensor,  # [B, H, D_ROPE]          bf16
+    kv_nope: torch.Tensor,  # [total_tokens, D_NOPE]  fp8
+    kv_rope: torch.Tensor,  # [total_tokens, D_ROPE]  bf16
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_last_page_lens: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    max_seqlen_q: int,
+    page_size: int,
+    nhead_kv: int,
+    softmax_scale: float,
+    logits: torch.Tensor,  # aiter split_output [num_partials,1,H,D_NOPE] fp32
+    attn_lse: torch.Tensor,  # aiter split_lse    [num_partials,1,H,1]      fp32
+    out: torch.Tensor,  # final [B, H, D_NOPE] bf16
+    final_lse: torch.Tensor,
+    q_scale: torch.Tensor,  # [B, H, D_SCALE]         uint8 (E8M0)
+    kv_scale: torch.Tensor,  # [total_tokens, D_SCALE] uint8
+) -> None: ...
