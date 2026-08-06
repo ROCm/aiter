@@ -21,7 +21,7 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  DOCKER_IMAGE: "rocm/pytorch:latest"
+  DOCKER_IMAGE: "rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
 
 jobs:
   check-signal:
@@ -49,7 +49,7 @@ jobs:
         include:
           - runner: linux-aiter-mi35x-1
             label: MI35X
-          - runner: aiter-1gpu-runner
+          - runner: linux-aiter-oci-mi300x-1
             label: MI300X
     runs-on: ${{ matrix.runner }}
 

@@ -228,6 +228,13 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
 
+    // Edge tile: partial-M or partial-N. OOB-zero buffer_loads on edge tiles
+    // make the counted `s_waitcnt_vmcnt(number<...>{})` producer drains
+    // unsafe — vmem completion is not FIFO and the count may not include
+    // slot 0 when the consumer crosses the barrier. Force full drain on
+    // edge tiles only; aligned tiles keep the counted fast path.
+    const bool tile_edge = (row + T::B_M > kargs.m) || (col + T::B_N > kargs.n);
+
     // K partitioning: chunk K into B_K-sized iters, distribute across splits.
     //   total_iters = ceil_div(K, B_K); iters_full = ceil_div(total_iters, split_k)
     //   First (split_k-1) splits each get `iters_full` full B_K iters (all in-range).
@@ -325,13 +332,15 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
         // Prologue barriers R_0..R_{pfk-3}: leave 2*mb in flight for depth-2 pipeline entry.
         opus::static_for<T::prefetch_k_iter - 2>([&](auto i_c) {
             constexpr int p = T::prefetch_k_iter - 1 - decltype(i_c)::value;
-            s_waitcnt_vmcnt(number<mb * p>{});
+            if (tile_edge) s_waitcnt_vmcnt(0_I);
+            else           s_waitcnt_vmcnt(number<mb * p>{});
             __builtin_amdgcn_s_barrier();
         });
 
         if constexpr (T::prefetch_k_iter == 3) {
             // Depth-1 pipeline for pfk=3.
-            s_waitcnt_vmcnt(number<mb>{});
+            if (tile_edge) s_waitcnt_vmcnt(0_I);
+            else           s_waitcnt_vmcnt(number<mb>{});
             __builtin_amdgcn_s_barrier();   // R_1
             for (int i = T::prefetch_k_iter - 1; i < loops - 1; i++) {
                 int issue_k = i + 1;
@@ -347,7 +356,8 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
                         async_load<T::VEC_B>(g_b, smem_b_at(slot, n, kg), u_gb, u_sb, b_offset(issue_k, n, kg));
                     });
                 });
-                s_waitcnt_vmcnt(number<mb>{});
+                if (tile_edge) s_waitcnt_vmcnt(0_I);
+                else           s_waitcnt_vmcnt(number<mb>{});
                 __builtin_amdgcn_s_barrier();
             }
             s_waitcnt_vmcnt(0_I);
@@ -369,12 +379,14 @@ void gemm_a16w16_flatmm_splitk_kernel(opus_gemm_flatmm_splitk_kargs_gfx950 kargs
                         async_load<T::VEC_B>(g_b, smem_b_at(slot, n, kg), u_gb, u_sb, b_offset(issue_k, n, kg));
                     });
                 });
-                s_waitcnt_vmcnt(number<2 * mb>{});
+                if (tile_edge) s_waitcnt_vmcnt(0_I);
+                else           s_waitcnt_vmcnt(number<2 * mb>{});
                 __builtin_amdgcn_s_barrier();
             }
 
             // Epilogue: drain the last two in-flight K's.
-            s_waitcnt_vmcnt(number<mb>{});
+            if (tile_edge) s_waitcnt_vmcnt(0_I);
+            else           s_waitcnt_vmcnt(number<mb>{});
             __builtin_amdgcn_s_barrier();
             s_waitcnt_vmcnt(0_I);
             __builtin_amdgcn_s_barrier();

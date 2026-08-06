@@ -4,11 +4,11 @@
 ## Build a container with Aiter installed and add a non-root user using the Dockerfile provided below:
 
 ```
-ARG BASE_DOCKER="rocm/pytorch:latest"
+ARG BASE_DOCKER="rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e"
 FROM $BASE_DOCKER
 RUN pip install pandas zmq einops && \
-    pip install numpy==1.26.2 && \
-    pip install --pre flydsl  # optional: FlyDSL MOE kernels
+    pip install numpy==1.26.2
+# FlyDSL is a required dependency and is installed automatically by `setup.py develop` below.
 # Create a new user
 RUN useradd -m newuser
 # Switch to the new user

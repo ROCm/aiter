@@ -2,7 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Union
+
+if TYPE_CHECKING:
+    from ..utility.mx_types import MxScaleRoundMode
 
 import torch
 import torch.nn.functional as F
@@ -11,10 +14,29 @@ from torch import Tensor
 from aiter.jit.utils.torch_guard import torch_compile_guard
 
 from ..jit.core import compile_ops
+from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes, fp4_utils
+from ..utility import mx_types as _mx_types
+from ..utility.mx_types import (
+    MX_DEFAULT_ROUND_MODE,
+    MxDtypeInt,
+    MxScaleRoundModeInt,
+)
 from . import triton
 from .enum import ActivationType, QuantType
-from ..jit.utils.chip_info import get_cu_num
+
+# Type alias for round-mode parameters; Union keeps int interop without
+# triggering the JIT build that loading MxScaleRoundMode would cause.
+RoundModeLike = Union[int, "MxScaleRoundMode"]
+
+
+def __getattr__(name):
+    if name in ("MxScaleRoundMode", "MxFp4RoundMode"):
+        cls = _mx_types.MxScaleRoundMode
+        globals()["MxScaleRoundMode"] = cls
+        globals()["MxFp4RoundMode"] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 @compile_ops("module_smoothquant")
@@ -30,11 +52,11 @@ def moe_smoothquant_fwd(
 
 
 # following are pure torch implement
-@functools.lru_cache()
+@functools.lru_cache
 def get_dtype_max(dtype):
     try:
         dtypeMax = torch.finfo(dtype).max
-    except:
+    except TypeError:
         dtypeMax = torch.iinfo(dtype).max
     return dtypeMax
 
@@ -73,39 +95,69 @@ def pertoken_quant(
 
 
 def per_1x32_f4_quant(
-    x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False, pack_dim=-1
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    pack_dim=-1,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
 ):
-    """Quantize a tensor to MXFP4 (e2m1) format with per-1x32 block scaling.
+    """Torch reference for MXFP4 (E2M1) per-1x32 block-scale quantization.
 
-    By default, packing is along the last dimension (dim=-1), which produces
-    output suitable for ``tl.dot_scaled`` **LHS** operand:
-        A(M, K) -> fp4=(M, K//2), scale=(M, K//32)
-
-    For ``tl.dot_scaled`` **RHS** operand, set ``pack_dim=0`` so the packing
-    is along the first dimension (the K / contraction dimension):
-        B(K, N) -> fp4=(K//2, N), scale=(K//32, N)
+    Mirrors the HIP path (:func:`per_1x32_f4_quant_hip` /
+    :func:`quant_mxfp4_hip`) and the Triton path
+    (:func:`per_1x32_f4_quant_triton`); all share the E8M0 block layout and
+    the :class:`MxScaleRoundMode` enum. PyTorch equivalent:
+    ``torchao/prototype/mx_formats/{config,mx_tensor}.py``.
 
     Args:
-        x: Input tensor of shape (..., N) or (M, N).
-        scale: Pre-computed scale tensor (optional, usually None).
-        quant_dtype: Target quantized dtype, must be ``dtypes.fp4x2``.
-        shuffle: Whether to apply e8m0 scale shuffling for hardware.
-        pack_dim: Dimension along which to pack two FP4 values into one byte.
-            -1 (default): pack along the last dimension (for dot_scaled LHS).
-             0: pack along the first dimension (for dot_scaled RHS).
+        x: Input of shape ``(..., N)`` or ``(M, N)``.
+        scale: Pre-computed scale (optional, usually ``None``).
+        quant_dtype: Must be ``dtypes.fp4x2``.
+        shuffle: Apply e8m0 scale shuffling for hardware.
+        pack_dim: ``-1`` (default) packs the last dim -> ``tl.dot_scaled``
+            **LHS** ``A(M,K) -> fp4=(M,K//2), scale=(M,K//32)``;
+            ``0`` packs the first dim -> **RHS**
+            ``B(K,N) -> fp4=(K//2,N), scale=(K//32,N)``.
+        round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
+            (interchangeable). Default ``RoundUp`` (industry default:
+            NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
+            See :class:`MxScaleRoundMode` for the four formulas and
+            cross-stack mapping.
 
     Returns:
-        Tuple of (quantized_tensor, scale_tensor).
+        ``(quantized_tensor, scale_tensor)``.
     """
     assert quant_dtype == dtypes.fp4x2
-    block_size = 32
-    F8E8M0_EXP_BIAS = 127  # noqa:F841
-    F4E2M1_MAX = 6.0
-    MAX_POW2 = int(torch.log2(torch.tensor(F4E2M1_MAX, dtype=torch.float32)).item())
-    # dtypeMax = F4E2M1_MAX
-    dtypeMax = 2.0**MAX_POW2
 
-    # For pack_dim=0, transpose so packing always happens along last dim internally
+    # For large (>4 GiB) >=3D inputs, iterate the outermost dim so peak memory
+    # scales with a single slice instead of the whole tensor. Quantization is
+    # per-block along the last dim, so slicing leading dims is exact; ``shuffle``
+    # is applied once on the assembled scale to preserve its cross-row layout.
+    if x.dim() >= 3 and x.numel() * x.element_size() > 4 * 1024**3:
+        assert pack_dim == -1, "pack_dim=0 requires a 2D input tensor (K, N)"
+        parts = [
+            per_1x32_f4_quant(
+                x[i],
+                scale=scale,
+                quant_dtype=quant_dtype,
+                shuffle=False,
+                pack_dim=-1,
+                round_mode=round_mode,
+            )
+            for i in range(x.shape[0])
+        ]
+        y = torch.stack([p[0] for p in parts], dim=0)
+        scale = torch.cat([p[1].view(torch.uint8) for p in parts], dim=0)
+        if shuffle:
+            scale = fp4_utils.e8m0_shuffle(scale)
+        scale = scale.view(dtypes.fp8_e8m0)
+        return y, scale
+
+    block_size = 32
+
+    # Internally we always pack along the last dim. For RHS layout
+    # (pack_dim=0) transpose the input here and the outputs at the end.
     transposed = False
     if pack_dim == 0:
         assert x.dim() == 2, "pack_dim=0 requires a 2D input tensor (K, N)"
@@ -115,16 +167,26 @@ def per_1x32_f4_quant(
     shape_original = x.shape
     x = x.view(-1, shape_original[-1])
 
-    m, n = x.shape
+    m, _n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
-    # max_abs = max_abs.view(torch.int32)
-    # max_abs = ((max_abs + 0x200000) & 0xFF800000).view(torch.float32)
 
-    # fp8e8m0fnu_from_fp32_value
-    scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+    # E8M0 block-scale dispatch via the generic helper; ``mode`` selects the
+    # formula (RoundDown / RoundUp / Even / Ceil) and ``dtype`` selects the
+    # ``max_pos`` / ``target_max_pow2`` / ``mbits`` constants -- see
+    # MxScaleRoundMode docstring for cross-stack equivalences.
+    try:
+        scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
+            max_abs, mode=round_mode, dtype=MxDtypeInt.FP4_E2M1
+        )
+    except ValueError as e:
+        raise ValueError(
+            "per_1x32_f4_quant: invalid "
+            f"round_mode={round_mode!r} (type={type(round_mode).__name__}); "
+            "expected 0 (RoundDown/FLOOR), 1 (RoundUp/RCEIL), "
+            "2 (Even), 3 (Ceil), or any MxScaleRoundMode value."
+        ) from e
 
-    # Float8_e8m0fnu to float
     scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
 
     y = x.float() / scale_f32.view(-1, 1)
@@ -135,7 +197,6 @@ def per_1x32_f4_quant(
         scale = fp4_utils.e8m0_shuffle(scale)
     scale = scale.view(dtypes.fp8_e8m0)
 
-    # For pack_dim=0, transpose results back: (N, K//2) -> (K//2, N)
     if transposed:
         y = y.T.contiguous()
         scale = scale.view(torch.uint8).T.contiguous().view(dtypes.fp8_e8m0)
@@ -166,7 +227,13 @@ def per_1x32_i4_quant(weight, group_size=32):
     return weight_qt, weight_scale
 
 
-def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_1x32_f4_quant_for_dot_scaled(
+    lhs,
+    rhs,
+    quant_dtype=dtypes.fp4x2,
+    shuffle=False,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
+):
     """Convenience function: quantize both LHS and RHS for ``tl.dot_scaled``.
 
     Handles the packing dimension automatically:
@@ -179,15 +246,25 @@ def per_1x32_f4_quant_for_dot_scaled(lhs, rhs, quant_dtype=dtypes.fp4x2, shuffle
     Args:
         lhs: LHS tensor of shape (M, K).
         rhs: RHS tensor of shape (K, N).
+        round_mode: Scale rounding strategy, forwarded to
+            :func:`per_1x32_f4_quant`. Default 1 (RoundUp / torchao RCEIL).
 
     Returns:
         Tuple of (lhs_fp4, lhs_scale, rhs_fp4, rhs_scale).
     """
     lhs_fp4, lhs_scale = per_1x32_f4_quant(
-        lhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=-1
+        lhs,
+        quant_dtype=quant_dtype,
+        shuffle=shuffle,
+        pack_dim=-1,
+        round_mode=round_mode,
     )
     rhs_fp4, rhs_scale = per_1x32_f4_quant(
-        rhs, quant_dtype=quant_dtype, shuffle=shuffle, pack_dim=0
+        rhs,
+        quant_dtype=quant_dtype,
+        shuffle=shuffle,
+        pack_dim=0,
+        round_mode=round_mode,
     )
     return lhs_fp4, lhs_scale, rhs_fp4, rhs_scale
 
@@ -204,7 +281,7 @@ def per_1x32_f8_scale_f8_quant(
     shape_original = x.shape
     x = x.view(-1, shape_original[-1])
 
-    m, n = x.shape
+    m, _n = x.shape
     x = x.view(-1, block_size)
     max_abs = torch.amax(torch.abs(x.float()), 1)
 
@@ -213,9 +290,19 @@ def per_1x32_f8_scale_f8_quant(
         scale_f32 = max_abs / dtypeMax
         scale_e8m0_biased = None
     else:
-        scale_e8m0_biased = fp4_utils.f32_to_e8m0(max_abs / dtypeMax)
+        # Route the e8m0 path through the centralized MX scale API so this
+        # reference honors MX_DEFAULT_ROUND_MODE (RoundUp / RCEIL =
+        # ceil_pow2(amax / max_pos)), matching the HIP kernel's
+        # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP8_E4M3{,_FNUZ}>.
+        # The legacy f32_to_e8m0(amax / floor_pow2(max)) bypassed the default
+        # and diverged by one exponent on ~1/8 of groups vs the RoundUp kernel.
+        fp8_mx_dtype = (
+            MxDtypeInt.FP8_E4M3_FNUZ if get_gfx() == "gfx942" else MxDtypeInt.FP8_E4M3
+        )
+        scale_e8m0_biased = fp4_utils.f32_to_mx_e8m0_scale(
+            max_abs, mode=MX_DEFAULT_ROUND_MODE, dtype=fp8_mx_dtype
+        )
         scale_f32 = fp4_utils.e8m0_to_f32(scale_e8m0_biased)
-        # scale_f32 = max_abs / dtypeMax
 
     y = x.float() / scale_f32.view(-1, 1)
     y = y.view(*shape_original[:-1], -1)
@@ -259,7 +346,7 @@ def per_block_quant_wrapper(block_shape=(1, 128)):
     return decorator
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_torch_quant(qType):
     tmp = {
         QuantType.No: lambda *a, **k: (a[0], None),
@@ -277,7 +364,7 @@ def get_torch_quant(qType):
     return tmp.get(qType, raise_NotImplementedError)
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_hip_quant(qType):
     # `per_1x32` points to the dtype-aware MX entry so callers can do
     # `get_hip_quant(QuantType.per_1x32)(x, quant_dtype=dtypes.fp4x2)` for
@@ -300,7 +387,7 @@ def get_hip_quant(qType):
     return tmp.get(qType.value, raise_NotImplementedError)
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_triton_quant(qType):
     tmp = {
         QuantType.No: lambda *a, **k: (a[0], None),
@@ -319,11 +406,11 @@ def get_triton_quant(qType):
 @torch_compile_guard()
 def per_token_quant_hip(
     x: Tensor,
-    scale: Optional[Tensor] = None,
+    scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
-    num_rows: Optional[Tensor] = None,
+    num_rows: Tensor | None = None,
     num_rows_factor: int = 1,
-) -> Tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor]:
     shape = x.shape
     device = x.device
     if scale is None:
@@ -352,18 +439,19 @@ def per_token_quant_hip(
 @torch_compile_guard()
 def per_group_quant_hip(
     x: Tensor,
-    scale: Optional[Tensor] = None,
+    scale: Tensor | None = None,
     quant_dtype: torch.dtype = dtypes.i8,
     group_size: int = 128,
     transpose_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: "torch.Tensor | None" = None,
     num_rows_factor: int = 1,
-) -> Tuple[Tensor, Tensor]:
+    scale_type: torch.dtype = dtypes.fp32,
+) -> "tuple[Tensor, Tensor]":
     shape = x.shape
     device = x.device
     if scale is None:
         scale = torch.empty(
-            (*shape[:-1], shape[-1] // group_size), dtype=dtypes.fp32, device=device
+            (*shape[:-1], shape[-1] // group_size), dtype=scale_type, device=device
         )
     else:
         raise ValueError("unsupported: static per token quant")
@@ -373,14 +461,25 @@ def per_group_quant_hip(
         128,
     ], f"unsupported group size {group_size=}, only support [32, 64, 128]"
     y = torch.empty(shape, dtype=quant_dtype, device=device)
-    dynamic_per_token_scaled_quant(
-        y,
-        x.view(-1, group_size),
-        scale,
-        shuffle_scale=transpose_scale,
-        num_rows=num_rows,
-        num_rows_factor=num_rows_factor,
-    )
+    if scale_type == dtypes.fp8_e8m0:
+        dynamic_per_group_scaled_quant(
+            y,
+            x,
+            scale,
+            group_size,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
+    else:
+        dynamic_per_token_scaled_quant(
+            y,
+            x.view(-1, group_size),
+            scale,
+            shuffle_scale=transpose_scale,
+            num_rows=num_rows,
+            num_rows_factor=num_rows_factor,
+        )
     return y, scale
 
 
@@ -389,7 +488,7 @@ def per_1x32_mx_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
 ):
@@ -503,7 +602,7 @@ def per_1x32_f4_quant_hip(
     scale=None,
     quant_dtype=dtypes.fp4x2,
     shuffle=False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
 ):
     """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
@@ -530,7 +629,7 @@ def per_tensor_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.i8,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
 ):
     assert num_rows is None, "num_rows is not supported for per_tensor_quant_hip"
@@ -577,7 +676,7 @@ def per_tensor_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_torch_act(aType):
     tmp = {
         ActivationType.No: lambda *a, **k: a[0],
@@ -597,7 +696,7 @@ def moe_smooth_per_token_scaled_quant(
     sorted_expert_ids: torch.Tensor,
     num_valid_ids: torch.Tensor,
     block_m: int,
-    local_expert_hash: Optional[torch.Tensor] = None,
+    local_expert_hash: torch.Tensor | None = None,
     shuffle_scale: bool = False,
     transpose_out: bool = False,
     is_balanced: bool = False,
@@ -657,9 +756,9 @@ def dynamic_per_token_scaled_quant(
     out: torch.Tensor,
     input: torch.Tensor,
     scales: torch.Tensor,
-    scale_ub: Optional[torch.Tensor] = None,
+    scale_ub: torch.Tensor | None = None,
     shuffle_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None: ...
 
@@ -671,19 +770,25 @@ def dynamic_per_group_scaled_quant(
     scales: torch.Tensor,
     group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None:
     """Dtype-aware per-group dynamic quant.
 
-    ``out.dtype`` selects the element format:
+    ``out.dtype`` selects the element format; ``scales.dtype`` selects the
+    scale format for fp8 output:
       * ``dtypes.fp4x2`` / ``torch.uint8`` -> MXFP4 (e8m0 byte scale)
-      * ``dtypes.fp8``                      -> MXFP8 (fp32 per-group scale today)
+      * ``dtypes.fp8``                      -> fp8, e8m0 or fp32 scale
+        depending on ``scales.dtype``
       * ``dtypes.i8``                       -> int8 per-group (fp32 scale)
+
+    For e8m0 scale output, ``shuffle_scale=True`` means the MX hardware
+    scale-load swizzle when ``group_size == 32``, and a plain transpose
+    (``(rows, scaleN) -> (scaleN, rows)`` byte layout) for other group
+    sizes.
 
     Only ``group_size`` in {32, 64, 128} is supported.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -693,7 +798,7 @@ def dynamic_per_group_scaled_quant_fp4(
     scales: torch.Tensor,
     group_size: int = 32,
     shuffle_scale: bool = True,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
 ) -> None:
     """Backward-compat fp4x2-only forwarder; delegates to
@@ -701,7 +806,6 @@ def dynamic_per_group_scaled_quant_fp4(
 
     Only support group_size in [32, 64, 128].
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -710,11 +814,11 @@ def smooth_per_token_scaled_quant(
     input: torch.Tensor,
     scales: torch.Tensor,
     smooth_scale: torch.Tensor,
-    smooth_scale_map: Optional[torch.Tensor] = None,
+    smooth_scale_map: torch.Tensor | None = None,
     shuffle_scale: bool = False,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     num_rows_factor: int = 1,
-    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    smooth_scale_map_hash: torch.Tensor | None = None,
     enable_ps: bool = True,
 ) -> None: ...
 
@@ -727,13 +831,12 @@ def moe_smooth_per_token_scaled_quant_v1(
     smooth_scale: torch.Tensor,
     smooth_scale_map: torch.Tensor,
     shuffle_scale: bool = False,
-    smooth_scale_map_hash: Optional[torch.Tensor] = None,
+    smooth_scale_map_hash: torch.Tensor | None = None,
     transpose_out: bool = False,
 ) -> None:
     """
     v1: token loops along topk experts. Only supports moe stage1.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -752,7 +855,6 @@ def moe_smooth_per_token_scaled_quant_v2(
     """
     v2: expert loops along sorted_token_ids. Supports both moe stage1 and stage2.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -767,7 +869,6 @@ def mxfp4_moe_sort_hip(
     """
     MoE scale sorting with MXFP4 shuffle layout.
     """
-    ...
 
 
 def mxfp4_moe_sort_fwd(
@@ -800,13 +901,13 @@ def fused_dynamic_mx_quant_moe_sort_hip(
     token_num: int,
     block_m: int,
     group_size: int = 32,
+    sorted_weights: torch.Tensor | None = None,
 ) -> None:
     """
     HIP path for fused dynamic MX (fp4 or fp8) quantization and MoE scale
     sorting. The output dtype of ``out`` selects the quant target: fp4x2/uint8
     for MXFP4, fp8 for MXFP8.
     """
-    ...
 
 
 @compile_ops("module_quant", develop=True)
@@ -826,23 +927,80 @@ def quant_mxfp4(
 def quant_mxfp4_hip(
     x: torch.Tensor,
     group_size: int = 32,
-    round_mode: int = 0,
+    round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
     e8m0_shuffle: bool = False,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
     shuffle_weight: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP4 quantization with optional weight/scale shuffle.
+    """HIP MXFP4 (E2M1) per-1x32 block-scale quantization.
+
+    Production fast path. Numerical reference is :func:`per_1x32_f4_quant`;
+    Triton variant is :func:`per_1x32_f4_quant_triton`. The C++ kernel lives
+    in ``csrc/kernels/quant_mxfp4.cu`` and dispatches on the same
+    :class:`MxScaleRoundMode` enum. PyTorch equivalent:
+    ``torchao/prototype/mx_formats/{config,mx_tensor}.py``.
+
+    When ``round_mode == RoundUp`` and no shuffle/gate_up flags are set, this
+    routes to :func:`per_1x32_f4_quant_hip` (the default FP4 path using
+    ``fp_f32_to_e8m0_scale<RoundUp, FP4_E2M1> = ceil_pow2(amax/6)``).
 
     Args:
-        round_mode: 0 = Even -- e8m0 scale via even-rounding group max
-            to nearest power-of-2. gfx950 uses HW builtin (exact RNE);
-            gfx942 uses SW fallback (round-half-away).
+        x: Input tensor, 2D, contiguous, dtype ``float16`` or ``bfloat16``.
+        group_size: Block size along the last dim (must divide ``cols``;
+            spec = 32).
+        round_mode: :class:`MxScaleRoundMode` or bare ``int`` 0..3
+            (interchangeable). Default ``RoundUp`` (industry default:
+            NV ROUND_UP / DSv4 Pro / FlashInfer / torchao RCEIL).
+            See :class:`MxScaleRoundMode` for the four formulas and
+            cross-stack mapping. (Note: ``Even`` mode uses
+            HW builtin RNE on gfx950 vs SW round-half-away on gfx942.)
+        e8m0_shuffle: Apply HW e8m0 scale shuffling layout.
+        a16w4_shuffle: Apply A16W4 weight shuffling.
+        gate_up: Pack gate / up activations together (MoE).
+        shuffle_weight: Apply weight shuffling.
+
+    Returns:
+        ``(out_packed, out_scale)`` -- fp4 (``float4_e2m1fn_x2``) and e8m0
+        (``float8_e8m0fnu``) tensors. With ``e8m0_shuffle=True`` the scale
+        tensor is row/col-padded for the HW shuffle layout.
     """
     assert x.is_contiguous() and x.dim() == 2
     assert x.dtype in (torch.float16, torch.bfloat16)
     rows, cols = x.shape
     assert cols % group_size == 0
+
+    # Normalise to the raw int the C++ ``static_cast<MxScaleRoundMode>(int)``
+    # binding expects. ``MxScaleRoundMode`` is an ``IntEnum`` so this is also
+    # a no-op (and a cheap one) for callers that already pass a bare int.
+    try:
+        round_mode_int = int(round_mode)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            "quant_mxfp4_hip: invalid "
+            f"round_mode={round_mode!r} (type={type(round_mode).__name__}); "
+            "expected int in {0,1,2,3} or MxScaleRoundMode."
+        ) from e
+
+    # Default-mode fast path: per_1x32_f4_quant_hip ->
+    # dynamic_per_group_scaled_quant_fp4 derives its scale via
+    # fp_f32_to_e8m0_scale<kDefaultMxScaleRoundMode, FP4_E2M1>, so it is only
+    # valid when the *requested* round_mode equals the project-wide default
+    # (MX_DEFAULT_ROUND_MODE). Comparing against MX_DEFAULT_ROUND_MODE (not a
+    # hard-coded RoundUp) keeps this routing correct if the default is ever
+    # changed in lockstep with C++ kDefaultMxScaleRoundMode. Any non-default
+    # mode falls through to the quant_mxfp4 kernel's explicit 4-way dispatch.
+    # Skip on gfx942: dynamic_per_group_scaled_quant_fp4 requires
+    # __Float4_e2m1fn_x2 which is not available on gfx942; fall through
+    # to the quant_mxfp4 kernel instead.
+    if (
+        round_mode_int == MxScaleRoundModeInt.RoundUp
+        and not a16w4_shuffle
+        and not gate_up
+        and not shuffle_weight
+        and get_gfx() != "gfx942"
+    ):
+        return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
 
     fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -866,7 +1024,7 @@ def quant_mxfp4_hip(
         out_packed,
         out_scale,
         group_size,
-        round_mode,
+        round_mode_int,
         e8m0_shuffle,
         a16w4_shuffle,
         gate_up,
@@ -883,9 +1041,10 @@ def fused_dynamic_mx_quant_moe_sort(
     topk: int,  # stage1 and stage2: same topk value
     block_size: int,
     quant_dtype: torch.dtype = dtypes.fp4x2,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Unified fused dynamic MX quant + MoE-sort entry (MXFP4 / MXFP8).
 
     Returns ``(out, scale)`` where:
@@ -966,6 +1125,7 @@ def fused_dynamic_mx_quant_moe_sort(
             token_num,
             block_size,
             group_size,
+            sorted_weights,
         )
     else:
         # Split path: per-token quant produces unswizzled e8m0 byte scale,
@@ -996,9 +1156,10 @@ def fused_dynamic_mxfp4_quant_moe_sort(
     token_num: int,
     topk: int,  # stage1 and stage2: same topk value
     block_size: int,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
     Forces ``quant_dtype=dtypes.fp4x2``; same dispatch + behaviour as the
@@ -1015,6 +1176,7 @@ def fused_dynamic_mxfp4_quant_moe_sort(
         quant_dtype=dtypes.fp4x2,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1025,14 +1187,20 @@ def fused_dynamic_mxfp8_quant_moe_sort(
     token_num: int,
     topk: int,
     block_size: int,
-    num_rows: Optional[torch.Tensor] = None,
+    num_rows: torch.Tensor | None = None,
     group_size: int = 32,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    sorted_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Backward-compat wrapper around :func:`fused_dynamic_mx_quant_moe_sort`.
 
     Forces ``quant_dtype=dtypes.fp8``; same dispatch + behaviour as the
     unified entry. New code should call ``fused_dynamic_mx_quant_moe_sort``
     directly with ``quant_dtype=dtypes.fp8``.
+
+    Returns (fp8_out, e8m0_scale) with the scale tensor laid out as
+    (pad32(M_o), N_o) fp8_e8m0 -- the same byte layout the FlyDSL stage1/stage2
+    GEMM consumes. ``topk`` is accepted for parity with the fp4 wrapper but
+    is inferred inside the HIP launcher from ``input.numel() / (cols * token_num)``.
 
     Note: ``num_rows`` was not part of the original signature but is exposed
     here so callers benefit from the new split-path dispatch on large ``M``
@@ -1049,6 +1217,7 @@ def fused_dynamic_mxfp8_quant_moe_sort(
         quant_dtype=dtypes.fp8,
         num_rows=num_rows,
         group_size=group_size,
+        sorted_weights=sorted_weights,
     )
 
 
@@ -1060,23 +1229,25 @@ def partial_transpose(
 ) -> None: ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation_fp4quant_inplace(
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rotate_activation_fp4quant", develop=True
+)
+def _rotate_activation_fp4quant(
     out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     group_size: int = 32,
+    shuffle_scale: bool = True,
 ) -> None:
-    """Hadamard-rotate activation, FP4-quantize, then dequantize back to BF16 in-place."""
-    ...
+    """Hadamard-rotate activation, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rotate_activation(
+@compile_ops("module_dsv4_rotate_quant", fc_name="rotate_activation", develop=True)
+def _rotate_activation_bf16(
     out: torch.Tensor,
     input: torch.Tensor,
 ) -> None:
     """Apply Walsh-Hadamard transform along last dim with 1/sqrt(N) scaling."""
-    ...
 
 
 @compile_ops("module_dsv4_rotate_quant", develop=True)
@@ -1101,22 +1272,86 @@ def rotate_activation_mxfp4_quant(
     ...
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
-def rope_rotate_activation_fp4quant_inplace(
+def rotate_activation(
     out: torch.Tensor,
+    input: torch.Tensor,
+    scale: torch.Tensor | None = None,
+    group_size: int | None = None,
+    shuffle_scale: bool = True,
+) -> None:
+    """Walsh-Hadamard transform along the last dim (1/sqrt(N) scaling),
+    dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain hadamard rotate in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: hadamard-rotate then FP4-quantize into packed ``out``
+      + e8m0 ``scale`` (``scale`` required; ``group_size`` defaults to 32).
+      ``shuffle_scale`` selects the dsv4 preshuffled scale layout.
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert scale is not None, "fp4 rotate_activation requires `scale`"
+        _rotate_activation_fp4quant(
+            out,
+            scale,
+            input,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+        )
+    else:
+        _rotate_activation_bf16(out, input)
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp4quant", develop=True
+)
+def _rope_rotate_activation_fp4quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
     input: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
     group_size: int = 32,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate,
-    FP4-quantize, then dequantize back to BF16."""
-    ...
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``,
+    Hadamard-rotate, then FP4-quantize into packed ``out`` + e8m0 ``scale``."""
 
 
-@compile_ops("module_dsv4_rotate_quant", develop=True)
+@compile_ops("module_dsv4_rotate_quant", fc_name="rope_rotate_activation", develop=True)
+def _rope_rotate_activation_bf16(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
+
+
+@compile_ops(
+    "module_dsv4_rotate_quant", fc_name="rope_rotate_activation_fp8quant", develop=True
+)
+def _rope_rotate_activation_fp8quant(
+    out: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    rope_dim: int,
+    group_size: int = 128,
+    do_rotate_act: bool = True,
+) -> None:
+    """Apply interleaved RoPE to trailing ``rope_dim``, Hadamard-rotate, then
+    fp8-quantize: ``out`` is fp8 and ``scale`` (``[m, dim // group_size]`` fp32)
+    receives the per-(row, ``1 x group_size``) block scales ``scale = absMax / fp8_max``.
+    """
+
+
 def rope_rotate_activation(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1124,6 +1359,81 @@ def rope_rotate_activation(
     sin: torch.Tensor,
     positions: torch.Tensor,
     rope_dim: int,
+    out_scale: torch.Tensor | None = None,
+    group_size: int | None = None,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = True,
 ) -> None:
-    """Apply interleaved RoPE to trailing ``rope_dim``, then Hadamard-rotate."""
-    ...
+    """Apply GPT-J style (interleaved) RoPE to trailing ``rope_dim``, then
+    Hadamard-rotate, dispatching on ``out.dtype``:
+
+    - bf16/fp16 ``out``: plain rope+hadamard in place (``scale`` ignored).
+    - ``fp4x2`` ``out``: FP4-quantize into packed ``out`` + e8m0 ``scale``
+      (``scale`` required; ``group_size`` defaults to 32). ``shuffle_scale``
+      selects the dsv4 preshuffled scale layout.
+    - ``fp8`` ``out``: per-(row, 1xGROUP) fp8-quantize into ``out`` + fp32
+      ``scale`` (``scale`` required; ``group_size`` defaults to 128).
+
+    When ``do_rotate_act`` is False, the Hadamard rotate is skipped and only
+    RoPE (plus any quantization) is applied.
+    """
+    if out.dtype == dtypes.fp4x2:
+        assert out_scale is not None, "fp4 rope_rotate_activation requires `out_scale`"
+        _rope_rotate_activation_fp4quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=32 if group_size is None else group_size,
+            shuffle_scale=shuffle_scale,
+            do_rotate_act=do_rotate_act,
+        )
+    elif out.dtype == dtypes.fp8:
+        assert out_scale is not None, "fp8 rope_rotate_activation requires `out_scale`"
+        _rope_rotate_activation_fp8quant(
+            out,
+            out_scale,
+            input,
+            cos,
+            sin,
+            positions,
+            rope_dim,
+            group_size=128 if group_size is None else group_size,
+            do_rotate_act=do_rotate_act,
+        )
+    else:
+        _rope_rotate_activation_bf16(
+            out, input, cos, sin, positions, rope_dim, do_rotate_act=do_rotate_act
+        )
+
+
+@compile_ops("module_dsv4_rotate_quant", develop=True)
+def rmsnorm_rope_rotate_activation_fp4quant_kvcache(
+    kvcache: torch.Tensor,
+    scale: torch.Tensor,
+    input: torch.Tensor,
+    norm_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    epsilon: float,
+    rope_dim: int,
+    kv_block_size: int = 16,
+    group_size: int = 32,
+    shuffle_scale: bool = True,
+    do_rotate_act: bool = False,
+) -> None:
+    """Fused RMSNorm, RoPE, optional Hadamard rotate, FP4 quant, and KV cache write.
+
+    When ``shuffle_scale`` is True, writes FlyDSL KV preshuffle layout:
+    kvcache [num_blocks, k_tiles, 4, kv_block_size, 16],
+    scale [num_blocks, k_tiles, 4, kv_block_size].
+
+    ``slot_mapping`` (int64 [num_tokens]) scatters each token to its paged KV
+    slot ``slot_mapping[token]`` (= physical_block * kv_block_size + offset); a
+    negative entry marks a padded token whose write is skipped.
+    """

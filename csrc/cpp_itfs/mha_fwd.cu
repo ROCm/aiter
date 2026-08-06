@@ -234,11 +234,15 @@ float fmha_fwd_v3(mha_fwd_args a, const ck_tile::stream_config& s)
 
     std::string arch_id = get_gpu_arch();
 
-    if((a.hdim_q != 192 && a.hdim_q != 128) || (a.hdim_v != 128) ||
-       (a.data_type != "bf16" && a.data_type != "fp8bf16" && 
-        a.data_type != "i8fp8bf16" && a.data_type != "mxfp4bf16" &&
-        a.data_type != "mxfp6bf16" && a.data_type != "f6f4bf16") ||
-       (a.bias_type != 0) || (a.p_drop > 0.f) || ((arch_id != "gfx942") && (arch_id != "gfx950")))
+    bool hdim_ok = (a.hdim_q == 128 && a.hdim_v == 128) ||
+                   (a.hdim_q == 192 && a.hdim_v == 128) ||
+                   (a.hdim_q == 256 && a.hdim_v == 256);
+    if(!hdim_ok ||
+    (a.data_type != "bf16" && a.data_type != "fp8bf16" &&
+     a.data_type != "i8fp8bf16" && a.data_type != "mxfp4bf16" &&
+     a.data_type != "mxfp6bf16" && a.data_type != "f6f4bf16") ||
+    (a.bias_type != 0) || (a.p_drop > 0.f) ||
+       ((arch_id != "gfx942") && (arch_id != "gfx950")))
     {
         AITER_LOG_WARNING("unsupported condition in fwd_v3!!! data type: " << a.data_type);
         return -1;
