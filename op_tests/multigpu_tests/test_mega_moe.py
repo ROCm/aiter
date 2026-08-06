@@ -438,7 +438,8 @@ class DeviceMoEPipeline:
     torch.profiler. No fp32-reference logic here."""
 
     def __init__(self, dist_ctx, E, hdim, idim, topk, spec, n_layers,
-                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather"):
+                 w1_bf, w2_bf, sw1, sw2, routings, ct, combine_mode="gather",
+                 push_group=False):
         self.dist_ctx = dist_ctx
         self.E, self.hdim, self.idim, self.topk = E, hdim, idim, topk
         self.spec = spec
@@ -448,6 +449,7 @@ class DeviceMoEPipeline:
         self.routings = routings
         self.ct = ct
         self.combine_mode = combine_mode
+        self.push_group = push_group
         self.EPR = E // dist_ctx.world
         self.dev = torch.device("cuda", dist_ctx.local_rank)
         self.comm = None
@@ -497,6 +499,7 @@ class DeviceMoEPipeline:
             num_experts_per_token=self.topk,
             data_type=self.transport_dtype,
             combine_mode=self.combine_mode,  # gather | scatter | scatter_fused
+            push_group=self.push_group,      # explicit switch (was AITER_EP_PUSH_GROUP)
         )
         self.op = EpDispatchCombineOp(cfg, self.comm)
         self.comm.barrier()
@@ -512,6 +515,41 @@ class DeviceMoEPipeline:
             xn, wts, None, ids, return_routing=True
         )
         ep_kwargs = None
+        if self.op.cfg.is_fused and self.op.cfg.push_group:
+            # push-group fixed-slot path: dispatch already landed tokens grouped by
+            # local expert AND emitted pg_rowmap (map[final_slot]={origin,weight}).
+            # Skip topids_to_rows/psum_remap/gather entirely; the gemm2 TDM epilogue
+            # scatters straight into peers' comb_inp via pg_rowmap.
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                grouped_a8w4_tdm_moe_push_scatter,
+            )
+
+            self.op.zero_fused_staging()
+            ep = self.op.ep_scatter_params()
+            pg = self.op.push_group_moe_inputs()
+            grouped_a8w4_tdm_moe_push_scatter(
+                pg["disp_out"].view(dtypes.bf16), pg["pg_running"], pg["pg_rowmap"],
+                self.w1_a, self.w2_a, self.w1_s, self.w2_s,
+                E_local=self.EPR, model_dim=self.hdim, inter_dim=self.idim,
+                cap=pg["cap"], activation=self.spec["activation"],
+                situ_beta=self.spec.get("situ_beta", 1.0),
+                situ_linear_beta=self.spec.get("situ_linear_beta", 1.0),
+                # GEMM1 K=hidden -> tile_k=256 (matches pull); GEMM2 K=inter_dim ->
+                # tile_k2=128, aligning to pull's tuned GEMM2 tile (don't inherit 256).
+                tile_m=64, tile_n=256, tile_k=256, num_buffers=2,
+                tile_k2=128,
+                ep_arena_handle=ep["ep_arena_handle"],
+                ep_comb_inp_off=ep["ep_comb_inp_off"],
+                ep_wire_nbytes=ep["ep_wire_nbytes"],
+                ep_slot_stride=pg["slot_stride"],
+                ep_world=self.dist_ctx.world,
+            )
+            # combine (scatter_fused) ignores its input arg -- it reads comb_inp.
+            combine_out, _ = self.op.combine(xn, routing=handle)
+            y = combine_out[: self.ct].to(dtypes.bf16)
+            if self.sw1 is not None:
+                y = y + _device_shared_ffn(xn, self.sw1, self.sw2)
+            return x + y
         if self.op.cfg.is_fused:
             # gemm2-fused scatter: zero the per-(token,k) comb_inp before gemm2's
             # P2P writes (dropped/unwritten slots must read 0 in the combine sum),
@@ -738,6 +776,7 @@ def main():
     pipe = DeviceMoEPipeline(
         dist_ctx, E, hdim, idim, topk, spec, n_layers, w1_bf, w2_bf, sw1, sw2, routings, ct,
         combine_mode=args.combine,
+        push_group=bool(args.push_group),
     )
     pipe.setup(x0)
     pipe.capture(x0)
@@ -830,6 +869,9 @@ def _parse_args():
                    default=os.environ.get("COMBINE", "gather"),
                    help="EP combine mode: gather | scatter | scatter_fused "
                         "(gemm2-fused P2P scatter; a8w4 only). Falls back to $COMBINE.")
+    p.add_argument("--push_group", type=int, default=0,
+                   help="1 = fixed-slot push-group dispatch->GEMM1 fusion (explicit "
+                        "switch; end-to-end push path, gfx1250 a8w4). Default 0 (pull).")
     return p.parse_args()
 
 
