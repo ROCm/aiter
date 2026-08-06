@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import csv
+
 import pytest
 import torch
 
@@ -138,3 +140,148 @@ def test_native_validation_accepts_k384_bk128():
 def test_native_validation_rejects_wrong_tile_contract(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _assert_supported(**_validation_kwargs(**overrides))
+
+
+def _write_native_csv(path, *, inter_dim, kernel_name2):
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=[
+                "topk",
+                "model_dim",
+                "expert",
+                "inter_dim",
+                "kernelName1",
+                "kernelName2",
+                "cu_num",
+                "act_type",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "topk": 2,
+                "model_dim": 256,
+                "expert": 2,
+                "inter_dim": inter_dim,
+                "kernelName1": "flydsl_mxmoe_g1_a4w4_32x256x256",
+                "kernelName2": kernel_name2,
+                "cu_num": 256,
+                "act_type": "ActivationType.Silu",
+            }
+        )
+
+
+def test_native_aot_preserves_bk128_and_stage1_k384(tmp_path):
+    from aiter.aot.flydsl.mxfp4_moe import _job_key, parse_csv
+
+    csv_path = tmp_path / "native_bk128.csv"
+    _write_native_csv(
+        csv_path,
+        inter_dim=384,
+        kernel_name2="flydsl_mxmoe_g2_a4w4_32x256x128_atomic",
+    )
+    jobs = parse_csv(str(csv_path))
+    stage1 = next(job for job in jobs if job["stage"] == 1)
+    stage2 = next(job for job in jobs if job["stage"] == 2)
+
+    assert stage1["D_INTER"] == 384
+    assert (stage2["BN"], stage2["BK"]) == (256, 128)
+    assert stage2["D_INTER"] == 384
+    assert stage2["D_INTER_REAL"] is None
+    assert _job_key(stage2) != _job_key({**stage2, "BK": 256})
+
+
+def test_native_aot_compile_forwards_tiles(monkeypatch):
+    from aiter.aot.flydsl import mxfp4_moe
+    from aiter.ops.flydsl import mxfp4_gemm2_kernels
+
+    called = {}
+    monkeypatch.setattr(
+        mxfp4_gemm2_kernels,
+        "flydsl_mxfp4_gemm2",
+        lambda **kwargs: called.update(kwargs),
+    )
+    mxfp4_moe._compile_stage2(
+        {
+            "stage": 2,
+            "kernel_name": "flydsl_mxmoe_g2_a4w4_32x256x128_atomic",
+            "BM": 32,
+            "BN": 256,
+            "BK": 128,
+            "use_nt": False,
+            "NE": 2,
+            "N_OUT": 256,
+            "epilog": "atomic",
+            "D_INTER": 384,
+            "D_INTER_REAL": None,
+            "topk": 2,
+            "xcd_swizzle": 0,
+        }
+    )
+    assert (called["BN"], called["BK"]) == (256, 128)
+
+
+_TUNER_KEYS = [
+    "gfx",
+    "cu_num",
+    "token",
+    "model_dim",
+    "inter_dim",
+    "expert",
+    "topk",
+    "act_type",
+    "dtype",
+    "q_dtype_a",
+    "q_dtype_w",
+    "q_type",
+    "use_g1u1",
+    "doweight_stage1",
+]
+
+
+def _tuner_row(inter_dim):
+    from aiter import ActivationType, QuantType, dtypes
+
+    return {
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "token": 4,
+        "model_dim": 256,
+        "inter_dim": inter_dim,
+        "expert": 2,
+        "topk": 2,
+        "act_type": ActivationType.Silu,
+        "dtype": dtypes.bf16,
+        "q_dtype_a": dtypes.fp4x2,
+        "q_dtype_w": dtypes.fp4x2,
+        "q_type": QuantType.per_1x32,
+        "use_g1u1": True,
+        "doweight_stage1": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("inter_dim", "expected_bks"),
+    [(384, {128}), (512, {128, 256}), (320, set())],
+)
+def test_native_tuner_candidate_bks(monkeypatch, inter_dim, expected_bks):
+    from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+    monkeypatch.setattr(
+        gemm_moe_tune,
+        "get_flydsl_stage2_v2_kernels",
+        lambda *args, **kwargs: {},
+    )
+    tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
+        gemm_moe_tune.Mxfp4FlydslTuner
+    )
+    tuner.keys = _TUNER_KEYS
+    candidates = tuner._candidate_rows(_tuner_row(inter_dim))
+    native_names = [
+        candidate["kernelName2"]
+        for candidate in candidates
+        if candidate["kernelName2"].startswith("flydsl_mxmoe_g2_")
+    ]
+    bks = {_parse_mxfp4_g2_kname(name)["BK"] for name in native_names}
+    assert bks == expected_bks

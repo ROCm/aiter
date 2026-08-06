@@ -5738,9 +5738,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
 
     @staticmethod
-    def _g2_kname(bm, use_nt, epilog):
-        # flydsl_mxmoe_g2_a4w4_<BM>x256x256[_atomic[_nt] | _f4out | _cshuffle].
-        name = f"flydsl_mxmoe_g2_a4w4_{bm}x256x256"
+    def _g2_kname(bm, use_nt, epilog, bk, bn=256):
+        name = f"flydsl_mxmoe_g2_a4w4_{bm}x{bn}x{bk}"
         if epilog == "atomic":
             name += "_atomic" + ("_nt" if use_nt else "")
         elif epilog == "nonatomic_mxfp4":
@@ -5777,19 +5776,28 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
         g2_bms = {v[0] for v in G2}
         self._activation(row)  # reject unsupported act_type before enumerating
-        native_g2_supported = int(row["inter_dim"]) % 256 == 0
+        inter_dim = int(row["inter_dim"])
+        native_bks = []
+        if inter_dim % 128 == 0:
+            native_bks.append(128)
+        if inter_dim % 256 == 0:
+            native_bks.append(256)
         cands = []
         for bm in sorted({v[0] for v in G1}):
             for _, n1, iq1 in sorted(v for v in G1 if v[0] == bm):
                 kn1 = self._g1_kname(bm, n1, iq1)
                 # (A) native mxmoe g2 candidates (flydsl_mxmoe_g2_a4w4_*).
-                if bm in g2_bms and native_g2_supported:
-                    for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
-                        cands.append(
-                            self._candidate_row(
-                                row, bm, kn1, self._g2_kname(bm, n2, ep)
+                if bm in g2_bms:
+                    for bk in native_bks:
+                        for _, n2, ep in sorted(v for v in G2 if v[0] == bm):
+                            cands.append(
+                                self._candidate_row(
+                                    row,
+                                    bm,
+                                    kn1,
+                                    self._g2_kname(bm, n2, ep, bk),
+                                )
                             )
-                        )
                 # (B) path B: flydsl_moe2_layout g2 candidates coupled with this
                 # mxmoe g1. Only the native SBM==tile_m==bm variants (verified
                 # correct for BM in {16,32,64,128} x {atomic,reduce}); re-tiling

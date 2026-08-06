@@ -87,6 +87,8 @@ def _job_key(job: dict) -> tuple:
     return (
         2,
         job["BM"],
+        job["BN"],
+        job["BK"],
         job["use_nt"],
         job["NE"],
         job["N_OUT"],
@@ -124,17 +126,37 @@ def parse_csv(csv_path: str):
             model_dim = int(row["model_dim"])
             expert = int(row["expert"])
             inter_dim = int(row["inter_dim"])
-            d_inter = ((inter_dim + 255) // 256) * 256
-            d_inter_real = inter_dim if inter_dim != d_inter else None
             kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
+            native_g2 = (
+                _parse_mxfp4_g2_kname(kn2)
+                if isinstance(kn2, str)
+                and kn2.startswith("flydsl_mxmoe_g2_a4w4_")
+                else None
+            )
             if v2_g2 is not None:
-                bk = v2_g2["tile_k"]
-                v2_d_inter = ((inter_dim + bk - 1) // bk) * bk
-                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
+                stage2_bk = v2_g2["tile_k"]
+                stage2_d_inter = (
+                    (inter_dim + stage2_bk - 1) // stage2_bk
+                ) * stage2_bk
+                stage2_d_inter_real = (
+                    inter_dim if inter_dim != stage2_d_inter else None
+                )
+            elif native_g2 is not None:
+                stage2_bk = native_g2["BK"]
+                if inter_dim % stage2_bk != 0:
+                    raise ValueError(
+                        f"native MXMOE GEMM2 requires inter_dim % BK == 0, "
+                        f"got inter_dim={inter_dim}, BK={stage2_bk}, "
+                        f"kernelName2={kn2!r}"
+                    )
+                stage2_d_inter = inter_dim
+                stage2_d_inter_real = None
             else:
-                v2_d_inter = d_inter
-                v2_d_inter_real = d_inter_real
+                stage2_d_inter = ((inter_dim + 255) // 256) * 256
+                stage2_d_inter_real = (
+                    inter_dim if inter_dim != stage2_d_inter else None
+                )
 
             kn1 = (row.get("kernelName1") or "").strip()
             if _is_mxfp4_kname(kn1):
@@ -147,7 +169,7 @@ def parse_csv(csv_path: str):
                         "use_nt": p1["use_nt"],
                         "inline_quant": p1["inline_quant"],
                         "D_HIDDEN": model_dim,
-                        "D_INTER": v2_d_inter,
+                        "D_INTER": stage2_d_inter,
                         "NE": expert,
                         "topk": topk,
                         "xcd_swizzle": p1["xcd_swizzle"],
@@ -160,7 +182,7 @@ def parse_csv(csv_path: str):
                 )
             if v2_g2 is not None:
                 bm = v2_g2["tile_m"]
-                inter_dim_pad = v2_d_inter - inter_dim
+                inter_dim_pad = stage2_d_inter - inter_dim
                 model_dim_pad = 0
                 out_dtype = (
                     "fp8"
@@ -179,8 +201,8 @@ def parse_csv(csv_path: str):
                         "NE": expert,
                         "N_OUT": model_dim,
                         "epilog": v2_g2["epilog"],
-                        "D_INTER": v2_d_inter,
-                        "D_INTER_REAL": v2_d_inter_real,
+                        "D_INTER": stage2_d_inter,
+                        "D_INTER_REAL": stage2_d_inter_real,
                         "topk": topk,
                         "SBM": v2_g2["sort_block_m"] or bm,
                         "persist": v2_g2["persist"],
@@ -201,14 +223,16 @@ def parse_csv(csv_path: str):
                         "stage": 2,
                         "kernel_name": kn2,
                         "BM": p2["BM"],
+                        "BN": p2["BN"],
+                        "BK": p2["BK"],
                         "use_nt": p2["use_nt"],
                         "NE": expert,
                         "N_OUT": model_dim,
                         "epilog": _epilog_of(
                             p2["atomic"], p2["mxfp4out"], p2["cshuffle"]
                         ),
-                        "D_INTER": d_inter,
-                        "D_INTER_REAL": d_inter_real,
+                        "D_INTER": stage2_d_inter,
+                        "D_INTER_REAL": stage2_d_inter_real,
                         "topk": topk,  # unused by the kernel; for the entry signature
                         "xcd_swizzle": p2["xcd_swizzle"],
                     }
@@ -285,6 +309,8 @@ def _compile_stage2(job):
         flat_out_scale=_dummy() if mxfp4out else None,
         cshuffle=epilog == "nonatomic_cshuffle",
         D_INTER_REAL=job["D_INTER_REAL"],
+        BN=job["BN"],
+        BK=job["BK"],
         xcd_swizzle=job["xcd_swizzle"],
         stream=0,
     )
