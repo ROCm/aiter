@@ -506,6 +506,7 @@ class DualwaveSwpFp8Traits:
     PAGED: bool
     PAGED_BT_LDS_SIZE: int
     PREFETCH_BOUND: str
+    PV_SPREAD: bool
     FP8_PV: bool
     FP8_PV_DIRECT: bool
     BN128: bool
@@ -579,6 +580,7 @@ class DualwaveSwpFp8Traits:
             self.PAGED,
             self.PAGED_BT_LDS_SIZE,
             self.PREFETCH_BOUND,
+            self.PV_SPREAD,
             "fp8_wide_qk_hiprec_pv",
             self.ELEM_BYTES,
             self.OUT_ELEM_BYTES,
@@ -611,6 +613,7 @@ def _make_dualwave_swp_fp8_traits(
     bn128=None,
     paged=False,
     prefetch_bound="none",
+    pv_spread=False,
 ):
     """Build gfx950 DUALWAVE_SWP fp8 compile-time layout traits (dtype fixed to fp8).
 
@@ -756,6 +759,7 @@ def _make_dualwave_swp_fp8_traits(
         # count; the host checks the window before dispatching.
         PAGED_BT_LDS_SIZE=2048,
         PREFETCH_BOUND=str(prefetch_bound),
+        PV_SPREAD=bool(pv_spread),
         FP8_PV=fp8_pv,
         FP8_PV_DIRECT=bool(fp8_pv_direct),
         BN128=bool(bn128),
@@ -1365,6 +1369,31 @@ class DualwaveFp8GemmHelper(DualwaveFp8KernelContext):
         for dc in range_constexpr(self.traits.D_CHUNKS):
             v_op = self._v_concat_i32x8(v_v, dc)
             v_o[dc] = self._mfma_acc_fp8_wide(v_op, p_fp8, v_o[dc])
+        if const_expr(self.traits.PV_SPREAD):
+            # The D_CHUNKS MFMAs above are mutually independent -- each
+            # accumulates a different v_o[dc] over a different D chunk -- and
+            # their operand prep is pure bitcasts the compiler hoists, so they
+            # emit back to back with nothing between. The matrix pipe is
+            # asynchronous: issuing into a full queue blocks rather than
+            # retiring faster. Measured across three distinct compiled kernels
+            # (causal paged+varlen at M=1384 and M=8192, non-causal dense at
+            # M=2048, all identical): the first MFMA of a run stalls 0% and
+            # every one after it stalls 94%, for 90% stalled overall.
+            #
+            # Ask the scheduler to alternate one MFMA with surrounding VALU
+            # instead, which is the cadence the hand-written ASM kernel keeps
+            # (84 of its 127 MFMA gaps are exactly 6 instructions, none are
+            # back to back). sched_group_barrier is a scheduling hint, not
+            # control flow, so the loop stays one basic block -- an scf.if here
+            # would split it into five and break the QK/softmax/PV interleave
+            # the rest of the schedule depends on.
+            #
+            # Not shape-specific: D_CHUNKS is HEAD_DIM // D_CHUNK = 4 for every
+            # configuration the builder accepts (D=128 is enforced), so the
+            # clustering and this fix are structurally identical everywhere.
+            for _ in range_constexpr(self.traits.D_CHUNKS):
+                rocdl.sched_group_barrier(self.traits.SCHED_MFMA_MASK, 1, 13)
+                rocdl.sched_group_barrier(self.traits.SCHED_VALU_MASK, 4, 13)
         return v_o
 
     def pv(self, v_p, v_v, v_o):

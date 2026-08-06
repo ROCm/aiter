@@ -59,6 +59,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
     bn128=None,
     paged=False,
     prefetch_bound="none",
+    pv_spread=False,
 ):
     """Build the gfx950 D=128 dual-wave flash-attention launcher.
 
@@ -122,6 +123,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         bn128=bn128,
         paged=paged,
         prefetch_bound=prefetch_bound,
+        pv_spread=pv_spread,
     )
     # Builder-level aliases used by SharedStorage and the launch/compile wrappers.
     SPLITK = traits.SPLITK
