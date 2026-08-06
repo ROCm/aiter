@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
 import itertools
@@ -1107,11 +1107,25 @@ if __name__ == "__main__":
 
 # ---------------------------------------------------------------------------
 # Sink backward tests (mha_varlen_bwd with sink / d_sink)
+#
+# `sink` is a learnable per-head softmax offset -- one scalar per Q head, shared
+# by every sequence in the batch -- so it has shape [H], matching its gradient
+# d_sink, which the kernel accumulates into a single cell per head across all
+# batches. See the comment block above the sink tests in test_mha.py for the
+# derivation of the reference formula.
 # ---------------------------------------------------------------------------
 
 
-def _vsink_run_fwd(q, k, v, softmax_scale, causal):
-    """Run mha_fwd and return (out, lse)."""
+def _vsink_run_fwd(q, k, v, softmax_scale, causal, sink=None):
+    """
+    Run mha_fwd and return (out, lse).
+
+    When `sink` is given it is forwarded as `sink_ptr`, so the returned LSE is
+    log(exp(lse_without_sink) + exp(sink)) and `out` is normalised by that same
+    denominator -- the state the backward reference assumes. Passing a sink-free
+    LSE instead would make P_sink = exp(sink - lse) exceed 1, which no softmax
+    can produce.
+    """
     out, lse, _, _ = aiter.mha_fwd(
         q,
         k,
@@ -1124,6 +1138,7 @@ def _vsink_run_fwd(q, k, v, softmax_scale, causal):
         sink_size=0,
         return_softmax_lse=True,
         return_dropout_randval=False,
+        sink_ptr=sink,
     )
     return out, lse
 
@@ -1134,23 +1149,23 @@ def _vsink_reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
 
     dout       : [total_q, H, Dv]
     out        : [total_q, H, Dv]
-    lse_group  : [H, total_q]   – group-mode LSE (flattened across batches)
-    sink       : [B, H]
+    lse_group  : [H, total_q]   - group-mode LSE (flattened across batches)
+    sink       : [H]            - shared by every sequence in the batch
     seqlens_q  : list of per-batch sequence lengths
     returns d_sink : [H]
     """
-    nhead = sink.shape[1]
+    nhead = sink.shape[0]
     d_sink = torch.zeros(nhead, device=sink.device, dtype=torch.float32)
 
     offset = 0
-    for b, sq in enumerate(seqlens_q):
+    for sq in seqlens_q:
         dout_b = dout[offset : offset + sq].float()
         out_b = out[offset : offset + sq].float()
         lse_b = lse_group[:, offset : offset + sq]
 
         D_qh = (dout_b * out_b).sum(dim=-1)
         D_hq = D_qh.permute(1, 0)
-        p_sink = torch.exp(sink[b].float().unsqueeze(-1) - lse_b)
+        p_sink = torch.exp(sink.float().unsqueeze(-1) - lse_b)
         d_sink += (-p_sink * D_hq).sum(dim=-1)
         offset += sq
 
@@ -1158,6 +1173,7 @@ def _vsink_reference_d_sink_varlen(dout, out, lse_group, sink, seqlens_q):
 
 
 _VSINK_DTYPES = [dtypes.fp16, dtypes.bf16]
+_VSINK_RANGE = (-1.0, 1.0)
 
 
 @pytest.mark.parametrize("dtype", _VSINK_DTYPES)
@@ -1181,17 +1197,18 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
     dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
 
+    sink = torch.empty(nhead, device=device, dtype=torch.float32).uniform_(
+        *_VSINK_RANGE
+    )
+
     q_b = q.view(batch, seqlen, nhead, hdim)
     k_b = k.view(batch, seqlen, nhead, hdim)
     v_b = v.view(batch, seqlen, nhead, hdim_v)
-    out_b, lse_b = _vsink_run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
+    out_b, lse_b = _vsink_run_fwd(q_b, k_b, v_b, softmax_scale, causal=False, sink=sink)
 
     out = out_b.view(total_q, nhead, hdim_v)
     lse = lse_b.permute(1, 0, 2).reshape(nhead, total_q).contiguous()
 
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
-        30.0, 60.0
-    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     dq, dk, dv, _ = aiter.mha_varlen_bwd(
@@ -1223,11 +1240,14 @@ def test_mha_varlen_bwd_sink_dsink(dtype):
     assert dv.shape == v.shape
 
     d_sink_ref = _vsink_reference_d_sink_varlen(dout, out, lse, sink, seqlens_q)
+    # See the matching assert in test_mha.py: with a physically reachable LSE
+    # the two sides differ only by fp32 accumulation order (~1e-6 relative),
+    # so the old rtol=0.02/atol=0.5 is no longer meaningful.
     torch.testing.assert_close(
         d_sink,
         d_sink_ref,
-        rtol=0.02,
-        atol=0.5,
+        rtol=1e-3,
+        atol=1e-3,
         msg="varlen d_sink mismatch vs reference",
     )
 
@@ -1242,7 +1262,6 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
 
     seqlens_q = [48, 80]
     seqlens_k = [48, 80]
-    batch = len(seqlens_q)
     max_seqlen_q = max(seqlens_q)
     max_seqlen_k = max(seqlens_k)
     total_q = sum(seqlens_q)
@@ -1264,13 +1283,19 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     v = torch.randn(total_k, nhead, hdim_v, device=device, dtype=dtype)
     dout = torch.randn(total_q, nhead, hdim_v, device=device, dtype=dtype)
 
+    sink = torch.empty(nhead, device=device, dtype=torch.float32).uniform_(
+        *_VSINK_RANGE
+    )
+
     out_parts, lse_parts = [], []
     offset_q, offset_k = 0, 0
     for sq, sk in zip(seqlens_q, seqlens_k):
         q_b = q[offset_q : offset_q + sq].unsqueeze(0)
         k_b = k[offset_k : offset_k + sk].unsqueeze(0)
         v_b = v[offset_k : offset_k + sk].unsqueeze(0)
-        out_b, lse_b = _vsink_run_fwd(q_b, k_b, v_b, softmax_scale, causal=False)
+        out_b, lse_b = _vsink_run_fwd(
+            q_b, k_b, v_b, softmax_scale, causal=False, sink=sink
+        )
         out_parts.append(out_b.squeeze(0))
         lse_parts.append(lse_b.squeeze(0).permute(1, 0))
         offset_q += sq
@@ -1279,9 +1304,6 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     out = torch.cat(out_parts, dim=0)
     lse = torch.cat(lse_parts, dim=0).permute(1, 0).contiguous()
 
-    sink = torch.empty(batch, nhead, device=device, dtype=torch.float32).uniform_(
-        30.0, 60.0
-    )
     d_sink = torch.zeros(nhead, device=device, dtype=torch.float32)
 
     _dq, _dk, _dv, _ = aiter.mha_varlen_bwd(
@@ -1313,7 +1335,7 @@ def test_mha_varlen_bwd_sink_variable_lengths(dtype):
     torch.testing.assert_close(
         d_sink,
         d_sink_ref,
-        rtol=0.02,
-        atol=0.5,
+        rtol=1e-3,
+        atol=1e-3,
         msg="varlen variable-length d_sink mismatch",
     )
