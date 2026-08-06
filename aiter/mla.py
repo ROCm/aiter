@@ -122,8 +122,48 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
+# Device-side split-offset tables handed straight to `mla_decode_stage1_asm_fwd`.
+#
+# A CUDA graph capture bakes this pointer into the kernel node, so the tensor has
+# to outlive every graph captured against it. It used to live in
+# `get_meta_param`'s `@functools.lru_cache`, whose default maxsize is 128 -- with
+# the cache as its only owner, entry number 129 evicted the first one, freed the
+# block back to the caching allocator, and left the already-captured graph
+# reading whatever took its place as a split-offset table. Graph runners capture
+# largest-batch-first, so with a dense bucket list (e.g. `--cuda-graph-bs
+# $(seq 1 256)`) precisely the buckets above 128 were the ones freed out from
+# under their graphs.
+#
+# Keyed on (bs, num_kv_splits, device) rather than on `get_meta_param`'s full
+# argument tuple: `total_kv` varies every step in serving, so keying on it would
+# grow without bound. This key space is capped at max_bs * 16 entries of
+# (bs+1) int32 -- a few hundred KB -- so it is safe to never evict.
+_num_kv_splits_indptr_cache = {}
+
+
+def _get_num_kv_splits_indptr(bs, num_kv_splits, device="cuda"):
+    # Resolve "cuda" to the concrete ordinal before keying: the bare string means
+    # "current device", so a cached entry created under one device must not be
+    # handed to a kernel launched on another.
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (bs, num_kv_splits, str(device))
+    indptr = _num_kv_splits_indptr_cache.get(key)
+    if indptr is None:
+        indptr = torch.arange(
+            0,
+            (bs + 1) * num_kv_splits,
+            num_kv_splits,
+            dtype=torch.int,
+            device=device,
+        )
+        _num_kv_splits_indptr_cache[key] = indptr
+    return indptr
+
+
 @functools.lru_cache
-def get_meta_param(
+def _pick_num_kv_splits(
     num_kv_splits,
     bs,
     total_kv,
@@ -212,11 +252,36 @@ def get_meta_param(
                 int(abs(total_kv / bs - max_seqlen_q) // min_block_n) + 1,
             )
 
-    num_kv_splits_indptr = torch.arange(
-        0, (bs + 1) * num_kv_splits, num_kv_splits, dtype=torch.int, device="cuda"
-    )
+    return num_kv_splits
 
-    return num_kv_splits, num_kv_splits_indptr
+
+def get_meta_param(
+    num_kv_splits,
+    bs,
+    total_kv,
+    nhead,
+    max_seqlen_q,
+    dtype,
+    tg_factor=1,
+    ignore_total_kv=0,
+):
+    """Split count plus its device-side offset table.
+
+    The split-count search is pure and stays cached; the table it indexes is
+    handed out from `_get_num_kv_splits_indptr`, which never evicts, so a
+    captured CUDA graph keeps reading live memory.
+    """
+    num_kv_splits = _pick_num_kv_splits(
+        num_kv_splits,
+        bs,
+        total_kv,
+        nhead,
+        max_seqlen_q,
+        dtype,
+        tg_factor,
+        ignore_total_kv,
+    )
+    return num_kv_splits, _get_num_kv_splits_indptr(bs, num_kv_splits)
 
 
 # Persistent MLA-decode kernel gate: the persistent kernel
