@@ -3580,6 +3580,9 @@ class FmoeTuner(TunerCommon):
                     continue
                 if kparams.get("k_batch", 1) != 1:
                     continue
+                k_wave = kparams.get("k_wave", 1)
+                if model_dim % (kparams["tile_k"] * k_wave) != 0:
+                    continue
                 # Only the FUSED variant (v2 always fuses quant). Fused name and
                 # params exactly as gen_flydsl_2stages_task builds them.
                 if adtype == "fp8":
