@@ -533,6 +533,7 @@ class DeviceMoEPipeline:
                 # tile_k2=128, aligning to pull's tuned GEMM2 tile (don't inherit 256).
                 tile_m=64, tile_n=256, tile_k=256, num_buffers=2,
                 tile_k2=128,
+                max_land=pg["max_land"],
                 ep_arena_handle=ep["ep_arena_handle"],
                 ep_comb_inp_off=ep["ep_comb_inp_off"],
                 ep_wire_nbytes=ep["ep_wire_nbytes"],

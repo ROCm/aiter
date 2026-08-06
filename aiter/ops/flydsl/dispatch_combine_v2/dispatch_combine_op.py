@@ -1279,4 +1279,14 @@ class EpDispatchCombineOp:
             num_local_experts=self.cfg.num_experts_per_rank,
             slot_stride=self.cfg.max_num_inp_token_per_rank
             * self.cfg.num_experts_per_token,
+            # Static upper bound on rows this rank can receive: every source rank
+            # sends at most max_tok tokens, each landing in at most topk local
+            # experts. Sizes the compact route-preshuffle grid (small at low bs);
+            # capped at the buffer (E_local*CAP) so it never exceeds disp_out.
+            max_land=min(
+                self.cfg.world_size
+                * self.cfg.max_num_inp_token_per_rank
+                * self.cfg.num_experts_per_token,
+                rrows,
+            ),
         )

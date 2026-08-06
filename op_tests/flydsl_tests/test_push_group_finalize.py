@@ -69,3 +69,84 @@ def test_finalize_metadata_matches_ref():
     assert tile_row_base.cpu().tolist() == ref_trb
     assert expert_ids.cpu().tolist() == ref_eid
     assert tile_valid.cpu().tolist() == ref_tv
+
+
+def test_finalize_compact_valid_rows():
+    """The optional compact path emits the exact set of OCCUPIED fixed-slot rows
+    (le*cap + slot for slot < min(count, cap)) plus their total, for the
+    route-indexed preshuffle. Order across experts is arbitrary (per-expert atomic
+    claim), so compare as a set over the first ``num_routes`` entries."""
+    from aiter.ops.flydsl.kernels.push_group_finalize_gfx1250 import (
+        launch_push_group_finalize,
+    )
+
+    dev = torch.device("cuda")
+    tile_m, cap, epr, rank = 64, 256, 4, 0
+    running_list = [70, 0, 130, 64]
+    running = torch.tensor(running_list, dtype=torch.int32, device=dev)
+
+    max_tiles = epr * (cap // tile_m)
+    tile_row_base = torch.full((max_tiles,), -1, dtype=torch.int32, device=dev)
+    expert_ids = torch.full((max_tiles,), -1, dtype=torch.int32, device=dev)
+    tile_valid = torch.zeros((max_tiles,), dtype=torch.int32, device=dev)
+    num_valid = torch.zeros(1, dtype=torch.int32, device=dev)
+
+    max_land = 512
+    valid_rows = torch.full((max_land,), -1, dtype=torch.int32, device=dev)
+    valid_routes = torch.zeros(1, dtype=torch.int32, device=dev)
+
+    launch_push_group_finalize(
+        pg_running_ptr=running.data_ptr(),
+        tile_row_base_ptr=tile_row_base.data_ptr(),
+        expert_ids_ptr=expert_ids.data_ptr(),
+        num_valid_ptr=num_valid.data_ptr(),
+        tile_valid_ptr=tile_valid.data_ptr(),
+        num_local_experts=epr,
+        cap=cap,
+        tile_m=tile_m,
+        rank=rank,
+        experts_per_rank=epr,
+        valid_rows_ptr=valid_rows.data_ptr(),
+        valid_routes_ptr=valid_routes.data_ptr(),
+    )
+    torch.cuda.synchronize()
+
+    expected_rows = set()
+    for le, count in enumerate(running_list):
+        for slot in range(min(count, cap)):
+            expected_rows.add(le * cap + slot)
+    n = int(valid_routes.item())
+    assert n == len(expected_rows), (n, len(expected_rows))
+    got = set(valid_rows[:n].cpu().tolist())
+    assert got == expected_rows, (sorted(got)[:8], sorted(expected_rows)[:8])
+    # tail beyond num_routes is untouched (never read by the preshuffle).
+    assert valid_rows[n:].cpu().eq(-1).all().item()
+
+    # In compact mode the tile metadata is also densely packed into
+    # [0, total_tiles) (arbitrary expert order via atomic claim), tail = sentinel.
+    # num_valid still == total_tiles*tile_m (num_valid atomic doubles as the tile
+    # cursor). Compare (tile_row_base, expert_id, tile_valid) triples as a set.
+    total_tiles = int(num_valid.item()) // tile_m
+    expected_tiles = set()
+    for le, count in enumerate(running_list):
+        count = min(count, cap)
+        nt = (count + tile_m - 1) // tile_m
+        for t in range(nt):
+            expected_tiles.add(
+                (le * cap + t * tile_m, rank * epr + le, min(tile_m, count - t * tile_m))
+            )
+    assert total_tiles == len(expected_tiles), (total_tiles, len(expected_tiles))
+    got_tiles = set(
+        zip(
+            tile_row_base[:total_tiles].cpu().tolist(),
+            expert_ids[:total_tiles].cpu().tolist(),
+            tile_valid[:total_tiles].cpu().tolist(),
+        )
+    )
+    assert got_tiles == expected_tiles, (
+        sorted(got_tiles)[:4],
+        sorted(expected_tiles)[:4],
+    )
+    # tail tiles keep host defaults (sentinel -> gemm skips them).
+    assert tile_row_base[total_tiles:].cpu().eq(-1).all().item()
+    assert tile_valid[total_tiles:].cpu().eq(0).all().item()

@@ -49,7 +49,9 @@ from aiter.ops.flydsl.dispatch_combine_v2.intranode_kernels import WAVE
 from aiter.ops.flydsl.dispatch_combine_v2 import flydsl_prims as P
 
 
-def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
+def _make_finalize(
+    *, num_local_experts, cap, tile_m, rank, experts_per_rank, emit_valid_rows=False
+):
     tiles_per_expert = (cap + tile_m - 1) // tile_m
     # one thread per local expert, rounded up to a whole wavefront (single block).
     block = ((num_local_experts + WAVE - 1) // WAVE) * WAVE
@@ -61,6 +63,8 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
         expert_ids_addr: Int64,
         num_valid_addr: Int64,
         tile_valid_addr: Int64,
+        valid_rows_addr: Int64,
+        valid_routes_addr: Int64,
     ):
         le = fx.thread_idx.x
         if le < num_local_experts:
@@ -84,11 +88,29 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
             # ceil(count / tile_m); tile_m is a power of two.
             num_tiles = (count + (tile_m - 1)) // tile_m
             gid = le + arith.constant(rank * experts_per_rank)
+            # Tile meta layout depends on the GEMM grid strategy:
+            #   * compact (emit_valid_rows): this expert claims a contiguous run of
+            #     compact tile indices [tile_base, tile_base+num_tiles) via the
+            #     num_valid atomic (old value is rows; /tile_m is the compact tile
+            #     base since every claim adds a multiple of tile_m). The GEMM then
+            #     launches a grid sized to the valid-tile upper bound instead of
+            #     E*tiles_per_expert, so it skips the padded tail tiles entirely
+            #     (not per-tile sentinel early-exit). This is the small-bs win.
+            #   * fixed (default): expert le's tile t lives at le*tiles_per_expert+t;
+            #     the GEMM launches the full grid and skips padding via the sentinel.
+            # num_valid ends == total_tiles*tile_m either way (host pre-zeroes it).
+            if const_expr(emit_valid_rows):
+                old_rows = P.atomic_add_global(num_valid_addr, num_tiles * tile_m)
+                tile_base = old_rows // tile_m
+            else:
+                tile_base = None
             for t in const_expr(range(tiles_per_expert)):
                 active = t < num_tiles
                 if active:
-                    # fixed (non-compacted) slot: le*tiles_per_expert + t.
-                    meta = le * tiles_per_expert + t
+                    if const_expr(emit_valid_rows):
+                        meta = tile_base + t
+                    else:
+                        meta = le * tiles_per_expert + t
                     buffer_store(le * cap + (t * tile_m), rsrc_trb, meta)
                     buffer_store(gid, rsrc_eid, meta)
                     # valid rows in THIS tile = min(tile_m, count - t*tile_m); the
@@ -98,9 +120,25 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
                     rem = count - arith.constant(t * tile_m)
                     valid = arith.select(rem < tile_m, rem, arith.constant(tile_m))
                     buffer_store(valid, rsrc_tv, meta)
-            # num_valid is unused by the GEMM (fixed grid + sentinel skip); kept
-            # correct for the unit test via a cheap atomic (host pre-zeroes it).
-            P.atomic_add_global(num_valid_addr, num_tiles * tile_m)
+            if const_expr(not emit_valid_rows):
+                # num_valid is unused by the fixed-grid GEMM (sentinel skip); kept
+                # correct for the unit test via a cheap atomic (host pre-zeroes it).
+                P.atomic_add_global(num_valid_addr, num_tiles * tile_m)
+
+            # Compact list of OCCUPIED fixed-slot rows (le*cap + slot for slot <
+            # count), for the route-indexed preshuffle whose grid is sized to the
+            # actual landed-token count instead of the full E*cap padded grid. Each
+            # expert claims a contiguous [base, base+count) range via one atomic on
+            # the shared cursor (== total landed after the kernel; host pre-zeroes
+            # it). Order across experts is arbitrary but each row is independent
+            # (src==dst per entry), so the preshuffle output is identical to the
+            # masked-grid path for every row the gemm consumes.
+            if const_expr(emit_valid_rows):
+                rsrc_vr = create_buffer_resource_from_addr(valid_rows_addr)
+                base = P.atomic_add_global(valid_routes_addr, count)
+                for w in const_expr(range(cap)):
+                    if w < count:
+                        buffer_store(le * cap + w, rsrc_vr, base + w)
 
     @flyc.jit
     def run(
@@ -109,6 +147,8 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
         expert_ids_addr: Int64,
         num_valid_addr: Int64,
         tile_valid_addr: Int64,
+        valid_rows_addr: Int64,
+        valid_routes_addr: Int64,
         stream=fx.Stream(None),
     ):
         finalize(
@@ -117,6 +157,8 @@ def _make_finalize(*, num_local_experts, cap, tile_m, rank, experts_per_rank):
             expert_ids_addr,
             num_valid_addr,
             tile_valid_addr,
+            valid_rows_addr,
+            valid_routes_addr,
         ).launch(grid=(1, 1, 1), block=[block, 1, 1], stream=stream)
 
     return run
@@ -137,12 +179,22 @@ def launch_push_group_finalize(
     tile_m,
     rank,
     experts_per_rank,
+    valid_rows_ptr=None,
+    valid_routes_ptr=None,
     stream=None,
 ):
-    """Launch the finalize kernel. Pointers are raw i64 device addresses."""
+    """Launch the finalize kernel. Pointers are raw i64 device addresses.
+
+    When ``valid_rows_ptr``/``valid_routes_ptr`` are provided the kernel also emits
+    a compact list of occupied fixed-slot rows (+ their total count) so the
+    route-indexed preshuffle can size its grid to the real landed-token count
+    instead of the full ``E*cap`` padded grid. ``valid_routes_ptr`` must be a
+    host-pre-zeroed ``(1,)`` int32 cursor.
+    """
     import torch
 
-    key = (num_local_experts, cap, tile_m, rank, experts_per_rank)
+    emit_valid_rows = valid_rows_ptr is not None and valid_routes_ptr is not None
+    key = (num_local_experts, cap, tile_m, rank, experts_per_rank, emit_valid_rows)
     run = _CACHE.get(key)
     if run is None:
         run = _make_finalize(
@@ -151,6 +203,7 @@ def launch_push_group_finalize(
             tile_m=tile_m,
             rank=rank,
             experts_per_rank=experts_per_rank,
+            emit_valid_rows=emit_valid_rows,
         )
         _CACHE[key] = run
 
@@ -165,5 +218,7 @@ def launch_push_group_finalize(
         int(expert_ids_ptr),
         int(num_valid_ptr),
         int(tile_valid_ptr),
+        int(valid_rows_ptr) if emit_valid_rows else 0,
+        int(valid_routes_ptr) if emit_valid_rows else 0,
         st,
     )
