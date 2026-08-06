@@ -143,6 +143,7 @@ def _moe_gemm_a8w4_decode_persistent(
     XCD_SWIZZLE: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     SWIZZLE_MX_SCALE: gl.constexpr,
+    X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
     CLAMP_BOUNDS: gl.constexpr,
     N_ITERS: gl.constexpr,
@@ -159,7 +160,7 @@ def _moe_gemm_a8w4_decode_persistent(
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
 
-    if is_x_microscaled:
+    if is_x_microscaled and X_SCALE_TDM:
         NUM_TDM_OPS: gl.constexpr = 4
     else:
         NUM_TDM_OPS: gl.constexpr = 3
@@ -256,8 +257,8 @@ def _moe_gemm_a8w4_decode_persistent(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
     if is_x_microscaled:
-        SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[MX_SCALE_BLOCK_K, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
+        SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
     if Quant_static_scale is not None:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -269,7 +270,7 @@ def _moe_gemm_a8w4_decode_persistent(
         )
     SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 
-    # -- Map 1-D pid → (pid_m, n_group_id) --
+    # -- Map 1-D pid -> (pid_m, n_group_id) --
     # Grid is (grid_m * n_groups,) where n_groups = ceil(grid_n / N_ITERS).
     pid = gl.program_id(0)
 
@@ -382,6 +383,17 @@ def _moe_gemm_a8w4_decode_persistent(
     )
 
     if is_x_microscaled:
+        X_SCALES_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0]
+        )
+
+        offs_xs_m = off_x_m + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
+        )
+        offs_xs_m = offs_xs_m % M
+        offs_xs_k = gl.arange(
+            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
+        )
         if GatherIndx is None:
             XMxScale += start_m.to(index_type) * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -391,6 +403,7 @@ def _moe_gemm_a8w4_decode_persistent(
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
             )
+            xs_row = offs_xs_m
         else:
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
@@ -399,6 +412,13 @@ def _moe_gemm_a8w4_decode_persistent(
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
             )
+            xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
+        xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
+        xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
     if B is not None:
         BPtrs = B + expt_id * stride_b_e
         BPtrs += pid_n * BLOCK_N_PERSISTENT
@@ -484,18 +504,26 @@ def _moe_gemm_a8w4_decode_persistent(
                 w_scales_buffer.index(write_idx % NUM_BUFFERS),
             )
             if is_x_microscaled:
-                if GatherIndx is None:
-                    gl.amd.gfx1250.tdm.async_load(
-                        x_scales_desc,
-                        [off_x_m, 0],
-                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    )
+                if X_SCALE_TDM:
+                    if GatherIndx is None:
+                        gl.amd.gfx1250.tdm.async_load(
+                            x_scales_desc,
+                            [off_x_m, 0],
+                            x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        )
+                    else:
+                        gl.amd.gfx1250.tdm.async_gather(
+                            x_scales_desc,
+                            offs_x_m,
+                            x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        )
                 else:
-                    gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
-                        offs_x_m,
+                    async_copy.global_to_shared(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        xs_ptrs,
                     )
+                    async_copy.commit_group()
+                    xs_ptrs += MX_SCALE_BLOCK_K
 
             w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 w_desc, add_offsets=[0, PACKED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
@@ -508,7 +536,7 @@ def _moe_gemm_a8w4_decode_persistent(
                 add_offsets=[0, PACKED_MX_BLOCK],
                 clamp_bounds=CLAMP_BOUNDS,
             )
-            if is_x_microscaled:
+            if is_x_microscaled and X_SCALE_TDM:
                 x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
                     add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -544,18 +572,26 @@ def _moe_gemm_a8w4_decode_persistent(
                 w_scales_buffer.index(write_idx % NUM_BUFFERS),
             )
             if is_x_microscaled:
-                if GatherIndx is None:
-                    gl.amd.gfx1250.tdm.async_load(
-                        x_scales_desc,
-                        [off_x_m, 0],
-                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                    )
+                if X_SCALE_TDM:
+                    if GatherIndx is None:
+                        gl.amd.gfx1250.tdm.async_load(
+                            x_scales_desc,
+                            [off_x_m, 0],
+                            x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        )
+                    else:
+                        gl.amd.gfx1250.tdm.async_gather(
+                            x_scales_desc,
+                            offs_x_m,
+                            x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        )
                 else:
-                    gl.amd.gfx1250.tdm.async_gather(
-                        x_scales_desc,
-                        offs_x_m,
+                    async_copy.global_to_shared(
                         x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                        xs_ptrs,
                     )
+                    async_copy.commit_group()
+                    xs_ptrs += MX_SCALE_BLOCK_K
 
             w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 w_desc, add_offsets=[0, PACKED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
@@ -568,7 +604,7 @@ def _moe_gemm_a8w4_decode_persistent(
                 add_offsets=[0, PACKED_MX_BLOCK],
                 clamp_bounds=CLAMP_BOUNDS,
             )
-            if is_x_microscaled:
+            if is_x_microscaled and X_SCALE_TDM:
                 x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                     x_scales_desc,
                     add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -586,6 +622,8 @@ def _moe_gemm_a8w4_decode_persistent(
             cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
             gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+            if is_x_microscaled and not X_SCALE_TDM:
+                async_copy.wait_group(NUM_BUFFERS - 1)
             cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
             w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
             if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
@@ -637,6 +675,8 @@ def _moe_gemm_a8w4_decode_persistent(
             gl.amd.gfx1250.tdm.async_wait(
                 (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
             )
+            if is_x_microscaled and not X_SCALE_TDM:
+                async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
             cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
             w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
@@ -739,18 +779,21 @@ def _moe_gemm_a8w4_decode_persistent(
             ],
         )
         if is_x_microscaled:
-            if GatherIndx is None:
-                x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                    x_scales_desc,
-                    add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
-                    set_bounds=[M, K_MX],
-                )
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc,
+                        add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
+                        set_bounds=[M, K_MX],
+                    )
+                else:
+                    x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+                        x_scales_desc,
+                        add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
+                        set_bounds=[num_tokens, K_MX],
+                    )
             else:
-                x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                    x_scales_desc,
-                    add_offsets=[0, -num_k_iter * MX_SCALE_BLOCK_K],
-                    set_bounds=[num_tokens, K_MX],
-                )
+                xs_ptrs -= num_k_iter * MX_SCALE_BLOCK_K
         if B is not None:
             bias_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 bias_desc, add_offsets=[0, BLOCK_N], clamp_bounds=True
@@ -817,6 +860,7 @@ def _moe_gemm_a8w4_decode(
     NUM_BUFFERS: gl.constexpr,
     # One of ["GFX1250", None]
     SWIZZLE_MX_SCALE: gl.constexpr,
+    X_SCALE_TDM: gl.constexpr,
     PRESHUFFLED: gl.constexpr,
     CLAMP_BOUNDS: gl.constexpr,
     num_warps: gl.constexpr,
@@ -826,7 +870,7 @@ def _moe_gemm_a8w4_decode(
     is_x_microscaled: gl.constexpr = XMxScale is not None
     MX_PACK_DIVISOR: gl.constexpr = 32
 
-    if is_x_microscaled:
+    if is_x_microscaled and X_SCALE_TDM:
         NUM_TDM_OPS: gl.constexpr = 4
     else:
         NUM_TDM_OPS: gl.constexpr = 3
@@ -949,8 +993,8 @@ def _moe_gemm_a8w4_decode(
         [[256, 16]], [SCALE_BLOCK_N, PACKED_MX_BLOCK], [1, 0]
     )
     if is_x_microscaled:
-        SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-            [[MX_SCALE_BLOCK_K, 16]], [BLOCK_M, MX_SCALE_BLOCK_K], [1, 0]
+        SHARED_LAYOUT_X_SCALES: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=1, per_phase=1, max_phase=1, order=[1, 0]
         )
     if Quant_static_scale is not None:
         SHARED_LAYOUT_Y: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
@@ -1028,6 +1072,17 @@ def _moe_gemm_a8w4_decode(
         DOT_LAYOUT_X_SCALES: gl.constexpr = gl.amd.gfx1250.get_wmma_scale_layout(
             DOT_LAYOUT_X, [BLOCK_M, MX_SCALE_BLOCK_K]
         )
+        X_SCALES_LOAD_LAYOUT: gl.constexpr = gl.BlockedLayout(
+            [1, MX_SCALE_BLOCK_K], [32, 1], [num_warps, 1], [1, 0]
+        )
+
+        offs_xs_m = off_x_m + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
+        )
+        offs_xs_m = offs_xs_m % M
+        offs_xs_k = gl.arange(
+            0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
+        )
         if GatherIndx is None:
             XMxScale += start_m.to(index_type) * stride_x_mx_m
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -1037,6 +1092,7 @@ def _moe_gemm_a8w4_decode(
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
             )
+            xs_row = offs_xs_m
         else:
             x_scales_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=XMxScale,
@@ -1045,6 +1101,13 @@ def _moe_gemm_a8w4_decode(
                 block_shape=(BLOCK_M, MX_SCALE_BLOCK_K),
                 layout=SHARED_LAYOUT_X_SCALES,
             )
+            xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
+        xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
+        xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -1090,18 +1153,26 @@ def _moe_gemm_a8w4_decode(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            if GatherIndx is None:
-                gl.amd.gfx1250.tdm.async_load(
-                    x_scales_desc,
-                    [off_x_m, 0],
-                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                )
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, 0],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
             else:
-                gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
-                    offs_x_m,
+                async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs,
                 )
+                async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
 
         w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_desc, add_offsets=[0, PACKED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
@@ -1112,7 +1183,7 @@ def _moe_gemm_a8w4_decode(
         w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_scales_desc, add_offsets=[0, PACKED_MX_BLOCK], clamp_bounds=CLAMP_BOUNDS
         )
-        if is_x_microscaled:
+        if is_x_microscaled and X_SCALE_TDM:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_scales_desc,
                 add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -1147,18 +1218,26 @@ def _moe_gemm_a8w4_decode(
             w_scales_buffer.index(write_idx % NUM_BUFFERS),
         )
         if is_x_microscaled:
-            if GatherIndx is None:
-                gl.amd.gfx1250.tdm.async_load(
-                    x_scales_desc,
-                    [off_x_m, 0],
-                    x_scales_buffer.index(write_idx % NUM_BUFFERS),
-                )
+            if X_SCALE_TDM:
+                if GatherIndx is None:
+                    gl.amd.gfx1250.tdm.async_load(
+                        x_scales_desc,
+                        [off_x_m, 0],
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
+                else:
+                    gl.amd.gfx1250.tdm.async_gather(
+                        x_scales_desc,
+                        offs_x_m,
+                        x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    )
             else:
-                gl.amd.gfx1250.tdm.async_gather(
-                    x_scales_desc,
-                    offs_x_m,
+                async_copy.global_to_shared(
                     x_scales_buffer.index(write_idx % NUM_BUFFERS),
+                    xs_ptrs,
                 )
+                async_copy.commit_group()
+                xs_ptrs += MX_SCALE_BLOCK_K
 
         w_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_desc, add_offsets=[0, PACKED_BLOCK_K_W], clamp_bounds=CLAMP_BOUNDS
@@ -1169,7 +1248,7 @@ def _moe_gemm_a8w4_decode(
         w_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
             w_scales_desc, add_offsets=[0, PACKED_MX_BLOCK], clamp_bounds=CLAMP_BOUNDS
         )
-        if is_x_microscaled:
+        if is_x_microscaled and X_SCALE_TDM:
             x_scales_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
                 x_scales_desc,
                 add_offsets=[0, MX_SCALE_BLOCK_K],
@@ -1187,6 +1266,8 @@ def _moe_gemm_a8w4_decode(
         cur_w = w_buffer_slice.permute((1, 0)).load(layout=DOT_LAYOUT_W)
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * NUM_TDM_OPS)
+        if is_x_microscaled and not X_SCALE_TDM:
+            async_copy.wait_group(NUM_BUFFERS - 1)
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
         if SWIZZLE_MX_SCALE == "GFX1250_SCALE":
@@ -1255,6 +1336,8 @@ def _moe_gemm_a8w4_decode(
         gl.amd.gfx1250.tdm.async_wait(
             (NUM_BUFFERS - 2 - k_ep) * NUM_TDM_OPS + TDM_BIAS_WAIT
         )
+        if is_x_microscaled and not X_SCALE_TDM:
+            async_copy.wait_group(NUM_BUFFERS - 2 - k_ep)
 
         cur_x = x_buffer.index(read_idx % NUM_BUFFERS).load(layout=DOT_LAYOUT_X)
         w_scales_buffer_slice = w_scales_buffer.index(read_idx % NUM_BUFFERS)
@@ -1321,7 +1404,7 @@ def _moe_gemm_a8w4_decode(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
+    # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
@@ -1614,7 +1697,7 @@ def _moe_gemm_a8w4_prefill(
         offs_xs_m = off_x_m + gl.arange(
             0, BLOCK_M, layout=gl.SliceLayout(1, X_SCALES_LOAD_LAYOUT)
         )
-        offs_xs_m = gl.max_contiguous(gl.multiple_of(offs_xs_m % M, BLOCK_M), BLOCK_M)
+        offs_xs_m = offs_xs_m % M
         offs_xs_k = gl.arange(
             0, MX_SCALE_BLOCK_K, layout=gl.SliceLayout(0, X_SCALES_LOAD_LAYOUT)
         )
@@ -1639,6 +1722,10 @@ def _moe_gemm_a8w4_prefill(
             xs_row = gl.load(GatherIndx + offs_xs_m) // N_EXPTS_ACT
         xs_ptrs_base = XMxScale + xs_row.to(index_type)[:, None] * stride_x_mx_m
         xs_ptrs = xs_ptrs_base + offs_xs_k.to(index_type)[None, :]
+        xs_ptrs = gl.max_contiguous(
+            gl.multiple_of(xs_ptrs, (1, MX_SCALE_BLOCK_K)),
+            (1, MX_SCALE_BLOCK_K),
+        )
 
     x_buffer = gl.allocate_shared_memory(
         x_desc.dtype, shape=[NUM_BUFFERS] + x_desc.block_shape, layout=x_desc.layout
@@ -1978,7 +2065,7 @@ def _moe_gemm_a8w4_prefill(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
+    # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,

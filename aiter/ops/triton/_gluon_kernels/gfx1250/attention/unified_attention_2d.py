@@ -6,6 +6,7 @@ from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
@@ -25,6 +26,7 @@ def reduce_max_prop_nan(input, axis=None, keep_dims=False):
 
 
 @aggregate
+@strip_annotate
 class AttentionConfig:
     """Layouts and derived constants for the unified attention kernel."""
 
@@ -232,6 +234,7 @@ class AttentionConfig:
 
 
 @aggregate
+@strip_annotate
 class TDMKVLoaderConfig:
     """Derived layouts for TDM KV loaders (both TDMKVLoader and TDMGatherKVLoader).
 
@@ -279,6 +282,7 @@ class TDMKVLoaderConfig:
 
 
 @aggregate
+@strip_annotate
 class TDMKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
@@ -495,6 +499,7 @@ class TDMKVLoader:
 
 
 @aggregate
+@strip_annotate
 class TDMGatherKVLoader:
     cfg: AttentionConfig
     kv_cfg: TDMKVLoaderConfig
@@ -688,6 +693,7 @@ class TDMGatherKVLoader:
 
 
 @aggregate
+@strip_annotate
 class AttentionProgram:
     cfg: AttentionConfig
 
@@ -882,7 +888,7 @@ class AttentionProgram:
     def softmax_part0_w_split(self, S, M):
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
-        # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
+        # Same guard as softmax_part0 -- avoid NaN from -inf - (-inf).
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]

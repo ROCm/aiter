@@ -9,9 +9,13 @@ This module implements the chunk-based parallel computation for the gated delta 
 Note: Only forward pass is implemented. Backward pass is not supported in aiter.
 """
 
+from collections.abc import Sequence
+
 import torch
 
 from ..utils import (
+    GatedDeltaRulePrefillMetadata,
+    build_gated_delta_rule_prefill_metadata,
     chunk_local_cumsum,
     chunk_scaled_dot_kkt_fwd,
     recompute_w_u_fwd,
@@ -27,9 +31,9 @@ from .fused_cumsum_kkt import fused_chunk_local_cumsum_scaled_dot_kkt_fwd
 from .fused_solve_tril_recompute import fused_solve_tril_recompute_w_u
 
 
-def _is_gfx12_runtime() -> bool:
+def _is_gfx12_runtime(device: torch.device) -> bool:
     try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = torch.cuda.get_device_properties(device)
         arch = getattr(props, "gcnArchName", "")
         return arch.split(":")[0].startswith("gfx12") if arch else False
     except Exception:  # noqa: BLE001
@@ -227,6 +231,8 @@ def chunk_gated_delta_rule_fwd_opt_vk(
     o: torch.Tensor | None = None,
     num_decodes: int = 0,
     num_decode_tokens: int = 0,
+    seq_lens_cpu: Sequence[int] | None = None,
+    prefill_metadata: GatedDeltaRulePrefillMetadata | None = None,
 ):
     """
     Optimized chunk gated delta rule forward with h layout [V, K].
@@ -242,17 +248,17 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
         v: [B, T, H, V]
-        g: [B, T, H] — raw gate (pre-cumsum)
+        g: [B, T, H] -- raw gate (pre-cumsum)
         beta: [B, T, H]
         scale: float
-        initial_state: optional [N, H, V, K] — note transposed h layout
+        initial_state: optional [N, H, V, K] -- note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
+        use_chunk_hip: bool -- use HIP kernel for hidden state (K5)
+        use_chunk_flydsl: bool -- use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
-        use_exp2: bool — use exp2 instead of exp for gate computation
+        use_exp2: bool -- use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by K6). If None, a fresh buffer is allocated.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in
@@ -262,6 +268,10 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             prepare_rebased_cu_seqlens) key on the original cu_seqlens identity,
             so chunk-index / offset builds stay cache-warm across forwards
             (no per-forward .tolist() D2H).
+        seq_lens_cpu: Host-resident original sequence lengths. Builds one
+            shared K1--K6 schedule without device readback.
+        prefill_metadata: Prebuilt reusable host/device schedule. This is the
+            preferred path when multiple layers process the same batch.
 
     Returns:
         tuple: (g_cumsum, o, final_state) where:
@@ -274,7 +284,23 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             "use_chunk_hip and use_chunk_flydsl are mutually exclusive; "
             "set at most one."
         )
-    if use_chunk_hip and (_is_gfx12_runtime() or num_decodes > 0):
+    if cu_seqlens is None:
+        if seq_lens_cpu is not None or prefill_metadata is not None:
+            raise ValueError(
+                "`seq_lens_cpu` and `prefill_metadata` require `cu_seqlens`."
+            )
+    elif prefill_metadata is None and seq_lens_cpu is not None:
+        prefill_metadata = build_gated_delta_rule_prefill_metadata(
+            seq_lens_cpu,
+            cu_seqlens=cu_seqlens,
+            chunk_size=64,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+        )
+
+    if use_chunk_hip and (
+        _is_gfx12_runtime(q.device) or (num_decodes > 0 and prefill_metadata is None)
+    ):
         use_chunk_hip = False
 
     g_cumsum, A_raw = fused_chunk_local_cumsum_scaled_dot_kkt_fwd(
@@ -285,6 +311,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
     )
 
     w, u = fused_solve_tril_recompute_w_u(
@@ -297,6 +324,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
     )
 
     if use_chunk_hip:
@@ -315,6 +343,9 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             state_dtype=state_dtype,
             use_exp2=use_exp2,
             g_head_major=True,
+            prefill_metadata=prefill_metadata,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
         )
     elif use_chunk_flydsl:
         # FlyDSL K5 wrapper expects ``g`` in head-major [B, H, T] layout
@@ -337,6 +368,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             use_exp2=use_exp2,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
         )
     else:
         h, v_new, final_state = chunk_gated_delta_rule_fwd_h_opt_vk(
@@ -351,6 +383,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
             state_dtype=state_dtype,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            prefill_metadata=prefill_metadata,
         )
 
     if o is None:
@@ -369,6 +402,7 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         use_exp2=use_exp2,
         num_decodes=num_decodes,
         num_decode_tokens=num_decode_tokens,
+        prefill_metadata=prefill_metadata,
     )
 
     return g_cumsum, o, final_state

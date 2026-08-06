@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
 import json
@@ -42,3 +42,28 @@ def serialize_dict(d: dict) -> str:
 
 def deserialize_str(s: str) -> dict:
     return json.loads(s)
+
+
+def strip_annotate(cls):
+    """
+    Neutralize '__annotate__' so Triton's aggregate hash walker skips it.
+
+    Triton's '@aggregate' builds 'hash_attrs' from 'inspect.getmembers'.
+    On Python 3.14 (PEP 649) that yields the compiler-generated annotate
+    function, and the JIT's 'record_reference' rejects it with
+    "Unsupported function referenced".
+
+    'strip_annotate' can be used like below to remove the problematic attribute:
+
+        @aggregate
+        @strip_annotate
+        class MyLoader:
+            field: gl.constexpr
+
+    No-op on Python < 3.14.
+
+    Fixed upstream in triton-lang/triton main (PR #9529), but NOT in any 3.7.x release.
+    """
+    _ = cls.__annotations__
+    cls.__annotate__ = None
+    return cls

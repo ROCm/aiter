@@ -10,12 +10,14 @@ from triton.experimental import gluon
 from triton.language.core import _aggregate as aggregate
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 float8_info = torch.finfo(e4m3_dtype)
 
 
 @aggregate
+@strip_annotate
 class MLAConfig:
     """Configuration for unified attention layouts and derived constants."""
 
@@ -170,7 +172,7 @@ class MLAConfig:
                 QK -> FP8-FP4 scaled WMMA (Q scales with all 1.0 in e8m0)
                 PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
             A4W4:
-                QK -> FP4-FP4 scaled WMMA 
+                QK -> FP4-FP4 scaled WMMA
                 PV -> BF16 WMMA (downcast P, unpack and upcast V and multiply with V_scales)
         """
 
@@ -473,6 +475,7 @@ class MLAConfig:
 
 
 @aggregate
+@strip_annotate
 class MLAProgram:
     """Program state and core operations for the unified attention kernel."""
 
@@ -1181,7 +1184,7 @@ class MLAProgram:
         p = p.to(gl.bfloat16, fp_downcast_rounding="rtz")
         p = gl.convert_layout(p, self.cfg.P_DOT_LAYOUT)
         for static_idx in gl.static_range(self.cfg.HEAD_SIZE_SPLIT):
-            v = gl.amd.gfx1250.local_load_packed_transposed(
+            v = gl.amd.gfx1250.load_shared_fp4_repacked(
                 self.kv_lora_shared.index(buffer_id)
                 .reshape(
                     (
@@ -2836,8 +2839,16 @@ def _mla_decode_fwd_kernel_non_pipelined(
         acc = gl.amd.gfx1250.wmma(P, KV_lora_trans, acc)
         seq_offset += TILE_SIZE
 
+    # epilogue: when NUM_SEGMENTS == 1 the reduce kernel is skipped, so
+    # normalize here; when NUM_SEGMENTS > 1 the reduce kernel combines
+    # per-segment (acc, M, L) and normalizes there.
     if kv_scale_ptr is not None:
         acc = acc * kv_scale
+    if NUM_SEGMENTS_PER_SEQ == 1:
+        one_over_L = 1.0 / L[:, None]
+        acc = acc * gl.convert_layout(one_over_L, layout=cfg.PV_WMMA_LAYOUT)
+        if out_scale_ptr is not None:
+            acc = acc * gl.load(out_scale_ptr)
 
     offs_q_m_pv = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, cfg.PV_WMMA_LAYOUT))
     offs_q_d_lora_pv = gl.arange(

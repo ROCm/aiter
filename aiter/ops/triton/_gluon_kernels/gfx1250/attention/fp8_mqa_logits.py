@@ -8,6 +8,7 @@ from triton.language.core import _aggregate as aggregate
 from aiter.ops.triton._gluon_kernels.gfx950.attention.fp8_mqa_logits import (
     _weighted_sum_fma_fold,
 )
+from aiter.ops.triton.utils.common_utils import strip_annotate
 
 _MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
 
@@ -85,6 +86,7 @@ def _store_logits_block(
 
 
 @aggregate
+@strip_annotate
 class MQATDMKVLoaderConfig:
     BLOCK_KV: gl.constexpr
     HEAD_SIZE: gl.constexpr
@@ -103,6 +105,7 @@ class MQATDMKVLoaderConfig:
 
 
 @aggregate
+@strip_annotate
 class MQATDMKVLoader:
     kv_cfg: MQATDMKVLoaderConfig
     kv_desc: gl.amd.gfx1250.tdm.tensor_descriptor
@@ -307,7 +310,7 @@ def mqa_logits_loop_double_buf(
 #   pre_dot(t)  : ds_load K[t], buffer_load scales[t], async-prefetch K[t+2]
 #   dot(t)      : scores[t] = Q @ K[t]
 #   post_dot(t) : relu -> *w (sum) -> *scales[t] -> store
-# Iter i runs pre_dot(i+2), dot(i+1), post_dot(i) — stages share no values
+# Iter i runs pre_dot(i+2), dot(i+1), post_dot(i) -- stages share no values
 # in-iter, so DS_LOAD / VALU / MFMA / global-store can interleave freely.
 # Carried regs are named by the tile they hold relative to the upcoming iter i:
 #   mfma_k_next  = K[i+1]     scores_i    = scores[i]
@@ -396,7 +399,7 @@ def mqa_logits_loop_pipelined(
         BLOCK_KV,
         mfma_layout,
     )
-    # Body: 2-unrolled (sub-iter A → buf 0, sub-iter B → buf 1). Odd leftover
+    # Body: 2-unrolled (sub-iter A -> buf 0, sub-iter B -> buf 1). Odd leftover
     # runs in the post-loop block.
     end = max(0, num_full_tiles - 1)
     odd_peel = end % 2

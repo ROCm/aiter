@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 #include <torch/all.h>
 #include <ATen/hip/HIPContext.h>
@@ -18,6 +18,13 @@ void layernorm2d(torch::Tensor &out,    // [m, n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    // The kernel reads weight/bias with the INPUT dtype (a single dtype_str is
+    // used for all buffers below), so a mismatched param dtype (e.g. fp32 params
+    // + bf16 input) is read as the wrong type and silently corrupts the output.
+    // Fail loudly instead.
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(dtype);
     int n = input.size(-1);
@@ -77,6 +84,9 @@ void layernorm2d_with_add(torch::Tensor &out,          // [m ,n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     int n = input.size(-1);
@@ -127,6 +137,9 @@ void layernorm2d_with_smoothquant(torch::Tensor &out,    // [m ,n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     std::string out_dtype_str = torchDTypeToStr(out.dtype());
@@ -182,6 +195,9 @@ void layernorm2d_with_add_smoothquant(torch::Tensor &out,          // [m ,n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     std::string out_dtype_str = torchDTypeToStr(out.dtype());
@@ -234,6 +250,9 @@ void layernorm2d_with_dynamicquant(torch::Tensor &out,    // [m ,n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     std::string out_dtype_str = torchDTypeToStr(out.dtype());
@@ -287,6 +306,9 @@ void layernorm2d_with_add_dynamicquant(torch::Tensor &out,          // [m ,n]
     auto dtype = input.dtype();
     TORCH_CHECK(dtype == torch::kFloat16 || dtype == torch::kBFloat16,
                 "ck layernorm2d only support fp16 and bf16 data type");
+    TORCH_CHECK(weight.dtype() == dtype && bias.dtype() == dtype,
+                "ck layernorm2d requires weight/bias dtype to match input dtype (",
+                dtype, "), got weight=", weight.dtype(), ", bias=", bias.dtype());
 
     std::string dtype_str = torchDTypeToStr(input.dtype());
     std::string out_dtype_str = torchDTypeToStr(out.dtype());
