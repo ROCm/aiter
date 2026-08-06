@@ -73,11 +73,16 @@ def _check_gfx1250():
         pytest.skip(f"gemm_a8w8_blockscale requires gfx1250, got {arch}")
 
 
+def _padded_k(K, tile_k=128):
+    """The wrapper zero-pads K up to a multiple of tile_k before launching."""
+    return ((K + tile_k - 1) // tile_k) * tile_k
+
+
 def _check_shape_compat(M, N, K, tile_k=128, num_buffers=3):
     """Kernel requires num_k_tiles >= num_buffers - 1."""
     _ = M
     _ = N
-    num_k_tiles = K // tile_k
+    num_k_tiles = _padded_k(K, tile_k) // tile_k
     if num_k_tiles < num_buffers - 1:
         pytest.skip(
             f"{num_buffers}-stage pipeline requires num_k_tiles >= {num_buffers - 1}, "
@@ -369,6 +374,236 @@ def test_gemm_a8w8_blockscale_large(M, N, K):
     ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
     w = shuffle_weight_gfx1250(w)
     out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+_RAGGED_M = [
+    7,
+    15,
+    17,
+    31,
+    33,
+    63,
+    65,
+    127,
+    129,
+    136,
+    144,
+    191,
+    193,
+    200,
+    255,
+    257,
+]
+
+_RAGGED_N = [16, 48, 112, 144, 240, 272, 400]
+
+_RAGGED_K = [
+    (96, 128),
+    (160, 128),
+    (288, 128),
+    (544, 128),
+    (1056, 128),
+    (384, 256),
+    (1152, 256),
+]
+
+
+@pytest.mark.parametrize("M", _RAGGED_M)
+def test_gemm_a8w8_blockscale_ragged_m(M):
+    _check_gfx1250()
+    N, K = 256, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    assert out.shape == (M, N)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M", [129, 200])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_gemm_a8w8_blockscale_ragged_m_dtype(M, dtype):
+    _check_gfx1250()
+    N, K = 256, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=dtype)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=dtype)
+
+    tol = 1e-3 if dtype == torch.float32 else 1e-2
+    _assert_close(out, ref, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("N", _RAGGED_N)
+def test_gemm_a8w8_blockscale_ragged_n(N):
+    _check_gfx1250()
+    M, K = 128, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    assert out.shape == (M, N)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M, N, K", [(129, 144, 512), (200, 240, 512), (257, 272, 512)])
+@pytest.mark.parametrize("variant", ["compute_bound", "memory_bound"])
+def test_gemm_a8w8_blockscale_ragged_mn_variant(M, N, K, variant):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x, w, x_scale, w_scale, dtype=torch.bfloat16, variant=variant
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("num_buffers", [2, 3, 4])
+def test_gemm_a8w8_blockscale_ragged_m_num_buffers(num_buffers):
+    _check_gfx1250()
+    M, N, K = 200, 256, 512
+    _check_shape_compat(M, N, K, num_buffers=num_buffers)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x, w, x_scale, w_scale, dtype=torch.bfloat16, num_buffers=num_buffers
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M", [129, 200, 255])
+@pytest.mark.parametrize("split_k", [2, 4])
+def test_gemm_a8w8_blockscale_ragged_m_split_k(M, split_k):
+    _check_gfx1250()
+    N, K = 256, 1024
+    tile_k = 128
+    num_buffers = 3
+    if (K // split_k) // tile_k < num_buffers - 1:
+        pytest.skip(f"per-split num_k_tiles < num_buffers-1 (split_k={split_k})")
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        variant="memory_bound",
+        split_k=split_k,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M, N", [(128, 144), (200, 272), (129, 16)])
+def test_gemm_a8w8_blockscale_ragged_n_split_k(M, N):
+    _check_gfx1250()
+    K, split_k = 1024, 2
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        variant="memory_bound",
+        split_k=split_k,
+    )
+    assert out.shape == (M, N)
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("K, tile_k", _RAGGED_K)
+@pytest.mark.parametrize("M", [128, 200])
+def test_gemm_a8w8_blockscale_ragged_k(M, K, tile_k):
+    _check_gfx1250()
+    N = 256
+    num_buffers = 2
+    _check_shape_compat(M, N, K, tile_k=tile_k, num_buffers=num_buffers)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(
+        x,
+        w,
+        x_scale,
+        w_scale,
+        dtype=torch.bfloat16,
+        tile_k=tile_k,
+        num_buffers=num_buffers,
+    )
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("M", [7, 129, 136, 191, 200, 255])
+def test_gemm_a8w8_blockscale_no_oob_row_writes(M):
+    _check_gfx1250()
+    N, K = 256, 512
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    canary_rows = tile_m = 128
+    big = torch.full(
+        (M + canary_rows, N), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    y = big[:M]
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16, y=y)
+
+    assert out.data_ptr() == y.data_ptr(), "kernel did not write our buffer in place"
+    _assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+    clobbered = ~big[M:].isnan()
+    n_clobbered = int(clobbered.sum())
+    assert n_clobbered == 0, (
+        f"M={M} (tile_m={tile_m}): kernel wrote {n_clobbered} element(s) past row "
+        f"{M - 1}; first clobbered row offset "
+        f"{int(clobbered.any(dim=1).nonzero()[0])}"
+    )
+
+
+@pytest.mark.parametrize("M, N, K", [(128, 144, 512), (200, 272, 512), (129, 16, 512)])
+def test_gemm_a8w8_blockscale_ragged_n_preallocated_output(M, N, K):
+    _check_gfx1250()
+    _check_shape_compat(M, N, K)
+    torch.cuda.empty_cache()
+
+    x, w, x_scale, w_scale = _generate_inputs(M, N, K)
+    y = torch.empty((M, N), dtype=torch.bfloat16, device="cuda")
+    ref = _reference_output(x, w, x_scale, w_scale, dtype=torch.bfloat16)
+    w = shuffle_weight_gfx1250(w)
+
+    out = gemm_a8w8_blockscale(x, w, x_scale, w_scale, dtype=torch.bfloat16, y=y)
+    assert out.data_ptr() == y.data_ptr(), "Output should reuse pre-allocated y"
     _assert_close(out, ref, rtol=1e-2, atol=1e-2)
 
 
