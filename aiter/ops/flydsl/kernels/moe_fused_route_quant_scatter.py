@@ -1394,10 +1394,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         # default to the same sentinel, so one predicate covers both.
         row_raw = fx.Int32(DROPPED_ROUTE_ROW)
         if route_in_range:
-            rows_rsrc = ptr_rsrc(topids_to_rows)
             # Scalar (SMEM) load: `route` is wave-uniform, and landing the row in
             # an SGPR is what makes the per-row destination descriptor uniform.
-            row = fx.Uint32(
+            row_raw = fx.Int32(
                 buffer_ops.buffer_load(rows_rsrc, route, vec_width=1, is_scalar=True)
             )
         row_is_mapped = row_raw >= fx.Int32(0)
