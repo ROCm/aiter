@@ -6,8 +6,9 @@
 ``Y[t, d] = sum_k X[t, k, d]``, optionally gated by the EP validity mask
 (``valid[t,k] = expert_mask[topk_ids[t,k]] != 0``). Epilogue of stage2
 ``mode="reduce"``, shared by every dtype's reduce path. Extracted from
-``moe_gemm_2stage.py``. Launch via ``moe_reduction`` (a ``@flyc.jit``); its
-compile-time params are ``Constexpr`` so flyc specializes per shape/dtype.
+``moe_gemm_2stage.py``. Build a per-shape launcher with ``compile_moe_reduction``
+(cached); the kernel's compile-time params are ``Constexpr`` so flyc specializes
+per shape/dtype.
 
 ``dtype_str="fp8"`` reduces MXFP8 route-out rows (a flat uint8 buffer of
 ``[model_dim fp8 bytes | model_dim/8 e8m0 scale bytes]`` per row): each fp8
@@ -15,6 +16,8 @@ value is scaled by its e8m0 microscale, accumulated in f32 and written to
 ``out_dtype_str`` (bf16/f16). The dense (f32/f16/bf16) path reduces a
 contiguous ``X[tokens, topk, model_dim]`` tensor.
 """
+
+import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -180,33 +183,49 @@ def moe_reduction_kernel(
         _reduce_tile()
 
 
-@flyc.jit
-def moe_reduction(
-    X: fx.Pointer,
-    Y: fx.Pointer,
-    expert_mask: fx.Pointer,
-    topk_ids: fx.Pointer,
-    i32_m_tokens: fx.Int32,
-    stream: fx.Stream,
-    topk: fx.Constexpr[int],
-    model_dim: fx.Constexpr[int],
-    dtype_str: fx.Constexpr[str],
-    use_mask: fx.Constexpr[bool],
-    num_experts: fx.Constexpr[int],
-    out_dtype_str: fx.Constexpr[str],
+@functools.lru_cache(maxsize=1024)
+def compile_moe_reduction(
+    *,
+    topk: int,
+    model_dim: int,
+    dtype_str: str = "f16",
+    use_mask: bool = False,
+    num_experts: int = 0,
+    out_dtype_str: str | None = None,
 ):
+    """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
+
+    Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, i32_m_tokens,
+    stream)``; dispatch it through ``moe_kernels._run_compiled``. The launcher is a
+    distinct object per shape, so the shim's per-exe ``_cf`` cache stays correct.
+    """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     gy = (model_dim + BLOCK * V - 1) // (BLOCK * V)
-    moe_reduction_kernel(
-        X,
-        Y,
-        expert_mask,
-        topk_ids,
-        i32_m_tokens,
-        topk,
-        model_dim,
-        dtype_str,
-        use_mask,
-        num_experts,
-        out_dtype_str,
-    ).launch(grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream)
+    out_tag = out_dtype_str or dtype_str
+
+    @flyc.jit
+    def launch(
+        X: fx.Pointer,
+        Y: fx.Pointer,
+        expert_mask: fx.Pointer,
+        topk_ids: fx.Pointer,
+        i32_m_tokens: fx.Int32,
+        stream: fx.Stream,
+    ):
+        moe_reduction_kernel(
+            X,
+            Y,
+            expert_mask,
+            topk_ids,
+            i32_m_tokens,
+            topk,
+            model_dim,
+            dtype_str,
+            use_mask,
+            num_experts,
+            out_tag,
+        ).launch(
+            grid=(fx.Int64(i32_m_tokens), gy, 1), block=(BLOCK, 1, 1), stream=stream
+        )
+
+    return launch

@@ -987,9 +987,6 @@ def _run_compiled(exe, args):
         raise
 
 
-_MOE_REDUCTION_CF = {}
-
-
 def _run_moe_reduction(
     target,
     out,
@@ -1027,9 +1024,7 @@ def _run_moe_reduction(
         torch.sum(target.view(token_num, topk, model_dim), dim=1, out=out)
         return
 
-    import flydsl.compiler as flyc
-
-    from .kernels.moe_reduce import moe_reduction
+    from .kernels.moe_reduce import compile_moe_reduction
 
     # fp8 route-out: X is a flat uint8 [rows, model_dim + model_dim/8] buffer,
     # reduced (fp8 * e8m0) -> out.dtype. Dense dtypes reduce the contiguous
@@ -1050,31 +1045,20 @@ def _run_moe_reduction(
         tk = torch.empty(0, device=out.device, dtype=torch.int32)
     if stream is None:
         stream = torch.cuda.current_stream()
-    # moe_reduction is a @flyc.jit whose shape/dtype params are Constexpr. Cache
-    # the compiled function per Constexpr set and fast-dispatch -- a direct jit
-    # call re-runs ~34us of dispatch per invocation on the low-token decode path.
     # expert_mask is sized by the global expert count (≠ w2.shape[0] under EP).
     num_experts = int(expert_mask.numel()) if use_mask else 0
-    args = (
-        ptr_arg(X),
-        ptr_arg(out),
-        ptr_arg(em),
-        ptr_arg(tk),
-        token_num,
-        stream,
-        topk,
-        model_dim,
-        _reduce_dtype_str,
-        use_mask,
-        num_experts,
-        out_dtype_str,
+    reduce_exe = compile_moe_reduction(
+        topk=topk,
+        model_dim=model_dim,
+        dtype_str=_reduce_dtype_str,
+        use_mask=use_mask,
+        num_experts=num_experts,
+        out_dtype_str=out_dtype_str,
     )
-    key = (topk, model_dim, _reduce_dtype_str, use_mask, num_experts, out_dtype_str)
-    cf = _MOE_REDUCTION_CF.get(key)
-    if cf is None:
-        _MOE_REDUCTION_CF[key] = flyc.compile(moe_reduction, *args)
-    else:
-        cf(*args)
+    _run_compiled(
+        reduce_exe,
+        (ptr_arg(X), ptr_arg(out), ptr_arg(em), ptr_arg(tk), token_num, stream),
+    )
 
 
 # ---------------------------------------------------------------------------
