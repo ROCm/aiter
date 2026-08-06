@@ -171,8 +171,7 @@ def _adaptive_moe_sort(
 def _match_output_buffer(output, shape, dtype, device):
     """The caller's buffer iff it can stand in for torch.empty(shape, dtype, device).
 
-    Lets a caller that already owns the destination have the MoE write there
-    directly. A mismatch is never an error -- allocate privately and copy.
+    A mismatch is never an error -- the caller allocates privately and copies.
     """
     if (
         output is not None
@@ -207,8 +206,7 @@ def _moe_sorting_impl(
     if output_aux and _MOE_SORT_BACKEND not in ("opus", "ck"):
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf,
-        # so an external destination is unvalidated; the caller copies.
+        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -234,8 +232,7 @@ def _moe_sorting_impl(
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
     #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
     #    [M, topk, model_dim] intermediate; allocate a placeholder here.
-    # The accumulate buffer is the MoE output, so a caller buffer can stand in:
-    # the sort kernel zeroes whatever it is handed, so rows are overwritten.
+    # A caller buffer can stand in: the sort kernel zeroes what it is handed.
     if (expert_mask is not None) or accumulate:
         moe_buf = _match_output_buffer(output, (M, model_dim), moebuf_dtype, device)
         if moe_buf is None:
@@ -338,8 +335,7 @@ def _flydsl_moe_sorting(
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
-    # As in _moe_sorting_impl, a caller buffer can stand in; the zero pass
-    # covers it.
+    # As in _moe_sorting_impl, a caller buffer can stand in.
     if (expert_mask is not None) or accumulate:
         moe_buf = _match_output_buffer(output, (M, model_dim), moebuf_dtype, device)
         if moe_buf is None:
@@ -401,8 +397,7 @@ def moe_sorting(
             output=output,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
-    # `output` cannot be honored: FLAT needs an extra coordination region
-    # appended to moe_buf, so it is allocated locally and the caller copies.
+    # `output` cannot be honored: FLAT needs extra bytes appended to moe_buf.
     if flat:
         return _moe_prepare_unsorted_input(
             topk_ids, topk_weights, model_dim, moebuf_dtype
@@ -614,9 +609,8 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    # Unused, but torch fills the fake's arguments positionally from the schema
-    # (generated off fused_moe_), so the lists must line up. Missing them was a
-    # TypeError for any caller passing beta, e.g. the SiTU path.
+    # Unused, but torch fills the fake positionally from fused_moe_'s schema, so
+    # the parameter lists must line up -- missing these was a TypeError.
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
@@ -2952,10 +2946,8 @@ def fused_moe_2stages(
     device = hidden_states.device
     _sort_moe_buf = moe_out
     if moe_out.numel() == 0:
-        # Reduce mode: sorting handed us a placeholder, so the real output is
-        # born here and can be the caller's buffer. Accumulate mode never gets
-        # here -- its moe_out is the sorting-zeroed buffer stage2 atomics add
-        # into, and swapping it would drop the zero pass.
+        # Reduce mode: the real output is born here, so it can be the caller's
+        # buffer. Accumulate mode is handled in moe_sorting (zeroed there).
         moe_out = _match_output_buffer(output, (token_num, model_dim), dtype, device)
         if moe_out is None:
             moe_out = torch.empty((token_num, model_dim), dtype=dtype, device=device)
