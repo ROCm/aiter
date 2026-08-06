@@ -85,7 +85,7 @@ def generate_data(
                 f"blockscale needs N%128==0 and K%128==0, got N={n}, K={k}"
             )
         sau, sbu = sa.view(torch.uint8), sb.view(torch.uint8)
-        sa_128 = sau.view(ma, k // 128, 4).amax(dim=2).contiguous()
+        sa_128 = sau.view(ma, k // 128, 4).amax(dim=2)[:m].contiguous()
         sb_128 = sbu[:n].view(n // 128, 128, k // 128, 4).amax(dim=(1, 3)).contiguous()
         a_scale = shuffle_scale_blockscale_a(sa_128, k)
         b_scale = shuffle_scale_blockscale_b(sb_128, n, k)
@@ -113,8 +113,34 @@ def generate_data(
 
 
 def run_gemm_flydsl(
-    A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype, blockscale=False
+    A, B, a_scale, b_scale, out, kernel_id, a_dtype, b_dtype, blockscale=False, gfx=None
 ):
+    if gfx == "gfx1250":
+        from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+            kernels_list as kernels_list_wmma,
+        )
+        from aiter.ops.flydsl.mxfp8_128_bpreshuffle_gemm_gfx1250 import (
+            run_mxfp8_128_preshuffle_gemm_a8_gfx1250,
+        )
+
+        ki = kernels_list_wmma[kernel_id]
+        run_mxfp8_128_preshuffle_gemm_a8_gfx1250(
+            A,
+            B,
+            a_scale,
+            b_scale,
+            out,
+            ki.tile_m,
+            ki.tile_n,
+            ki.tile_k,
+            num_buffers=ki.num_buffers,
+            split_k=ki.split_k,
+            cluster_m=ki.cluster_m,
+            cluster_n=ki.cluster_n,
+            m_warp=ki.m_warp,
+            n_warp=ki.n_warp,
+        )
+        return out
     ki = kernels_list[kernel_id]
     flydsl_mxscale_preshuffle_gemm(
         A,
@@ -157,7 +183,14 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         return super().calculate(results, bpes=bpes)
 
     def getKernelName(self, kernelId, libtype="flydsl"):
-        ki = kernels_list.get(kernelId)
+        if self.get_gfx() == "gfx1250":
+            from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+                kernels_list as kernels_list_wmma,
+            )
+
+            ki = kernels_list_wmma.get(kernelId)
+        else:
+            ki = kernels_list.get(kernelId)
         return ki.name if ki is not None else None
 
     def get_flydsl_mxscale_tune_task(self, info_keys, seed, args):
@@ -169,10 +202,10 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
             return []
         gemm_keys = ["A", "B", "a_scale", "b_scale", "out"]
         ref_keys = ["a_deq", "b_deq"]
-        # Blockscale only: it is the op's default and the only mode we tune.
-        # Non-a8w8 shapes are filtered out by tune() before reaching here.
+        # Blockscale only: it is the op's default and the only mode we tune (and
+        # the only mode gfx1250 has). Non-a8w8 shapes are filtered out by tune().
         tasks = []
-        for kid, ki in candidates_for(a_dtype, b_dtype, M, N, K):
+        for kid, ki in candidates_for(a_dtype, b_dtype, M, N, K, _gfx):
             info = (info_keys, kid, ki.split_k, ki.name, "flydsl")
             tasks.append(
                 (
@@ -180,7 +213,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                     generate_data,
                     (M, N, K, seed, a_dtype, b_dtype, True),
                     run_gemm_flydsl,
-                    (gemm_keys, kid, a_dtype, b_dtype, True),
+                    (gemm_keys, kid, a_dtype, b_dtype, True, _gfx),
                     {"num_warmup": args.warmup, "num_iters": args.iters},
                     run_torch,
                     (ref_keys, dtypes.bf16),
@@ -289,6 +322,7 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
         from aiter.test_common import checkAllclose, run_perftest
 
         untunedf = self.untunedf
+        gfx = self.get_gfx()
         results = []
         for i in range(len(untunedf)):
             row = untunedf.iloc[i]
@@ -302,6 +336,21 @@ class MxscalePreShuffleTuner(GemmCommonTuner):
                 gd = generate_data(M, N, K, 0, a_dtype, b_dtype, blockscale=True)
 
                 def _dispatch(A, B, a_scale, b_scale, out):
+                    if gfx == "gfx1250":
+                        from aiter.ops.gemm_op_a8w8 import (
+                            gemm_a8w8_mxscale_preshuffle_flydsl,
+                        )
+
+                        return gemm_a8w8_mxscale_preshuffle_flydsl(
+                            A,
+                            B,
+                            a_scale,
+                            b_scale,
+                            out.dtype,
+                            a_dtype=a_dtype,  # noqa: B023
+                            b_dtype=b_dtype,  # noqa: B023
+                            blockscale=True,
+                        )
                     return gemm_mxscale_preshuffle(
                         A,
                         B,

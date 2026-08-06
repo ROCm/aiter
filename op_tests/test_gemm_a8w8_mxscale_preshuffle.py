@@ -27,8 +27,10 @@ from aiter.utility import fp4_utils
 
 torch.set_default_device("cuda")
 
-# MFMA scaled 16x16x128 + the FlyDSL preshuffle layout are gfx950-only.
-SUPPORTED_GFX = ["gfx950"]
+# gfx950: scaled MFMA 16x16x128. gfx1250: the WMMA mxfp8_128 kernel, which has
+# the blockscale path only (no MX per-1x32).
+SUPPORTED_GFX = ["gfx950", "gfx1250"]
+BLOCKSCALE_ONLY_GFX = ["gfx1250"]
 
 
 def run_torch(codes_a, scale_a, codes_b, scale_b, group, dtype=dtypes.bf16):
@@ -67,7 +69,7 @@ def test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype):
     # Coarse blockscale (A 1x128, B 128x128) from the per-1x32 scale: block max so
     # the codes stay in range. A real blockscale quantizer emits sa_128 directly.
     sa_u, sb_u = sa.view(torch.uint8), sb.view(torch.uint8)
-    sa_128 = sa_u.view(ma, k // 128, 4).amax(dim=2).contiguous()
+    sa_128 = sa_u.view(ma, k // 128, 4).amax(dim=2)[:m].contiguous()
     sb_128 = sb_u[:n].view(n // 128, 128, k // 128, 4).amax(dim=(1, 3)).contiguous()
 
     # Scale prep is caller-side and hoisted out of the timed region, matching the
@@ -77,7 +79,7 @@ def test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype):
         "blockscale": (
             shuffle_scale_blockscale_a(sa_128, k),
             shuffle_scale_blockscale_b(sb_128, n, k),
-            (sa_128[:m], sb_128.repeat_interleave(128, dim=0), 128),
+            (sa_128, sb_128.repeat_interleave(128, dim=0), 128),
         ),
         "mx1x32": (
             shuffle_scale_a16w4(sa, 1, False),
@@ -85,6 +87,8 @@ def test_gemm_a8w8_mxscale_preshuffle(m, n, k, dtype):
             (sa[:m], sb[:n], 32),
         ),
     }
+    if get_gfx() in BLOCKSCALE_ONLY_GFX:
+        del scales["mx1x32"]
 
     # A x B^T with fp8 codes: FLOPs = 2*M*N*K; bytes = codes + out + this mode's
     # scale traffic (blockscale reads 4x less A-scale and 256x less B-scale, which

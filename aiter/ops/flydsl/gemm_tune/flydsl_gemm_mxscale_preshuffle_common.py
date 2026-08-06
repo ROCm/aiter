@@ -215,8 +215,32 @@ def _build_kernels_list():
 kernels_list = _build_kernels_list()
 
 
-def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
-    """(kernel_id, kernelInstance) that match dtypes and fit the shape."""
+def candidates_for(
+    a_dtype: str, b_dtype: str, M: int, N: int, K: int, gfx: str | None = None
+):
+    """(kernel_id, kernelInstance) that match dtypes and fit the shape.
+
+    ``gfx`` (default: the running device) picks the catalog: gfx950 mxpsh, gfx1250 wmma.
+    """
+    if gfx is None:
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+
+            gfx = get_gfx_runtime()
+        except Exception:  # noqa: BLE001
+            gfx = "gfx950"
+    if gfx == "gfx1250":
+        if (a_dtype, b_dtype) != ("fp8", "fp8"):
+            return []  # the WMMA kernel is a8w8-only
+        from aiter.ops.flydsl.gemm_tune import (
+            flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common as wc,
+        )
+
+        return [
+            (i, ki)
+            for i, ki in wc.kernels_list.items()
+            if wc.kernel_fits_shape(ki, M, N, K)
+        ]
     return [
         (i, ki)
         for i, ki in kernels_list.items()
