@@ -329,16 +329,24 @@ def build_moe_contiguous_psum_remap_module():
                 )
             )
         for route_i32 in range(tid, valid_route_count, MAX_EXPERTS_PER_BLOCK):
-            row = fx.Uint32(
-                buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
+            row_raw = buffer_ops.buffer_load(
+                rows_rsrc, route_i32, vec_width=1, dtype=i32
             )
-            m = fx.Uint32(route_max_m)
-            expert = row // m
-            slot = row - expert * m
-            start = fx.Uint32(
-                buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
-            )
-            buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
+            # An EP route with no grouped row carries moe_route_maps'
+            # DROPPED_ROUTE_ROW (negative) sentinel: masked/contiguous row math
+            # would turn it into a wild expert index (OOB starts[] read), and the
+            # sentinel has to survive for the consumers that check it, so leave
+            # the slot untouched.
+            row_is_mapped = fx.Int32(row_raw) >= fx.Int32(0)
+            if row_is_mapped:
+                row = fx.Uint32(row_raw)
+                m = fx.Uint32(route_max_m)
+                expert = row // m
+                slot = row - expert * m
+                start = fx.Uint32(
+                    buffer_ops.buffer_load(s_rsrc, expert, vec_width=1, dtype=i32)
+                )
+                buffer_ops.buffer_store(start + slot, rows_rsrc, route_i32)
 
     @flyc.jit
     def launch_psum_remap(
@@ -559,35 +567,48 @@ def build_moe_contiguous_psum_remap_ep_module():
             row = ArithValue(
                 buffer_ops.buffer_load(rows_rsrc, route_i32, vec_width=1, dtype=i32)
             )
-            m = ArithValue(route_max_m)
-            expert = ArithValue(arith.divui(row, m))
-            slot = row - expert * m
-            start = ArithValue(starts_lds[fx.Index(expert)])
-            final_row = start + slot
-            buffer_ops.buffer_store(final_row, rows_rsrc, route_i32)
-            # ep_rowmap scatter: only kept local routes (gather_w != 0).
-            route = ArithValue(route_i32)
-            w_bf = buffer_ops.buffer_load(w_rsrc, route_i32, vec_width=1, dtype=T.bf16)
-            w_f32 = ArithValue(w_bf).extf(T.f32)
-            is_kept = arith.cmpf(
-                CmpFPredicate.ONE, _raw(w_f32), arith.constant(0.0, type=T.f32)
-            )
-            kept_if = scf.IfOp(is_kept)
-            with ir.InsertionPoint(kept_if.then_block):
-                t = ArithValue(arith.divui(_raw(route), _raw(topk_v)))
-                k = route - t * topk_v
-                enc = ArithValue(
-                    buffer_ops.buffer_load(tis_rsrc, _raw(t), vec_width=1, dtype=i32)
+            # moe_route_maps' DROPPED_ROUTE_ROW (negative) marks a route with no
+            # grouped row. The masked->contiguous math would turn it into a wild
+            # expert index (OOB LDS read of starts) and there is nothing to
+            # scatter, so skip it and leave the sentinel in place for the
+            # consumers that check it.
+            row_is_mapped = arith.cmpi(CmpIPredicate.sge, _raw(row), zero)
+            mapped_if = scf.IfOp(row_is_mapped)
+            with ir.InsertionPoint(mapped_if.then_block):
+                m = ArithValue(route_max_m)
+                expert = ArithValue(arith.divui(row, m))
+                slot = row - expert * m
+                start = ArithValue(starts_lds[fx.Index(expert)])
+                final_row = start + slot
+                buffer_ops.buffer_store(final_row, rows_rsrc, route_i32)
+                # ep_rowmap scatter: only kept local routes (gather_w != 0).
+                route = ArithValue(route_i32)
+                w_bf = buffer_ops.buffer_load(
+                    w_rsrc, route_i32, vec_width=1, dtype=T.bf16
                 )
-                origin_pe = ArithValue(arith.divui(_raw(enc), _raw(max_tok_v)))
-                origin_lid = enc - origin_pe * max_tok_v
-                packed = origin_pe * slot_stride_v + origin_lid * topk_v + k
-                w_bits = ArithValue(w_f32).bitcast(T.i32)
-                ep_base = final_row * ArithValue(two)
-                buffer_ops.buffer_store(_raw(packed), ep_rsrc, _raw(ep_base))
-                buffer_ops.buffer_store(
-                    _raw(w_bits), ep_rsrc, _raw(ep_base + ArithValue(one))
+                w_f32 = ArithValue(w_bf).extf(T.f32)
+                is_kept = arith.cmpf(
+                    CmpFPredicate.ONE, _raw(w_f32), arith.constant(0.0, type=T.f32)
                 )
+                kept_if = scf.IfOp(is_kept)
+                with ir.InsertionPoint(kept_if.then_block):
+                    t = ArithValue(arith.divui(_raw(route), _raw(topk_v)))
+                    k = route - t * topk_v
+                    enc = ArithValue(
+                        buffer_ops.buffer_load(
+                            tis_rsrc, _raw(t), vec_width=1, dtype=i32
+                        )
+                    )
+                    origin_pe = ArithValue(arith.divui(_raw(enc), _raw(max_tok_v)))
+                    origin_lid = enc - origin_pe * max_tok_v
+                    packed = origin_pe * slot_stride_v + origin_lid * topk_v + k
+                    w_bits = ArithValue(w_f32).bitcast(T.i32)
+                    ep_base = final_row * ArithValue(two)
+                    buffer_ops.buffer_store(_raw(packed), ep_rsrc, _raw(ep_base))
+                    buffer_ops.buffer_store(
+                        _raw(w_bits), ep_rsrc, _raw(ep_base + ArithValue(one))
+                    )
+                    scf.YieldOp([])
                 scf.YieldOp([])
             scf.YieldOp([])
 
