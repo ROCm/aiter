@@ -416,10 +416,6 @@ def _compile_mxscale_preshuffle_to_cache(
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
         flydsl_mxscale_preshuffle_gemm,
     )
-    from aiter.ops.shuffle import (
-        shuffle_scale_blockscale_a,
-        shuffle_scale_blockscale_b,
-    )
 
     dev = torch.device("cpu")
     # fp4 packs 2 codes/byte; fp6/fp8 are 1 byte/code.
@@ -427,24 +423,19 @@ def _compile_mxscale_preshuffle_to_cache(
     b_bytes = k // 2 if b_dtype == "fp4" else k
     out_torch_dtype = _torch_dtype_for_kernel(out_dtype)
 
-    a = torch.zeros((m, a_bytes), device=dev, dtype=torch.uint8)
-    b = torch.zeros((n, b_bytes), device=dev, dtype=torch.uint8)
-    out = torch.zeros((m, n), device=dev, dtype=out_torch_dtype)
+    a = torch.empty((m, a_bytes), device=dev, dtype=torch.uint8)
+    b = torch.empty((n, b_bytes), device=dev, dtype=torch.uint8)
+    out = torch.empty((m, n), device=dev, dtype=out_torch_dtype)
     if blockscale:
-        # Caller-prepared compact scales, built from the coarse E8M0
-        # (A 1x128 [rows, K//128], B 128x128 [N//128, K//128]).
-        a_scale = shuffle_scale_blockscale_a(
-            torch.zeros(((m + 31) // 32 * 32, k // 128), device=dev, dtype=torch.uint8),
-            k,
-        )
-        b_scale = shuffle_scale_blockscale_b(
-            torch.zeros((n // 128, k // 128), device=dev, dtype=torch.uint8), n, k
-        )
+        rows = (m + 31) // 32 * 32
+        K1 = (k + 255) // 256
+        a_scale = torch.empty(rows * 2 * K1, device=dev, dtype=torch.uint8)
+        b_scale = torch.empty((n // 128) * 4 * K1, device=dev, dtype=torch.uint8)
     else:  # MX per-1x32, shuffle_scale_a16w4'd
-        a_scale = torch.zeros(
+        a_scale = torch.empty(
             ((m + 31) // 32 * 32, k // 32), device=dev, dtype=torch.uint8
         )
-        b_scale = torch.zeros(
+        b_scale = torch.empty(
             ((n + 31) // 32 * 32, k // 32), device=dev, dtype=torch.uint8
         )
 
