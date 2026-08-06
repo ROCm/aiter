@@ -711,7 +711,7 @@ def _build_kernel(
                     if const_expr(paged):
                         # paged / content-addressed SWA (DeepSeek-V4 #1417):
                         # swa_kv is the FLAT [num_pages, D] pool; the ring params
-                        # are repurposed — state_slot_mapping is block_tables
+                        # are repurposed -- state_slot_mapping is block_tables
                         # [bs, max_blocks], swa_slot_stride is max_blocks (its row
                         # stride), swa_cache_size is block_size, swa_pos_stride is
                         # D. Physical row =
@@ -1177,7 +1177,7 @@ def flydsl_qk_norm_rope_quant(
     def _ptr_arg(t):
         return flyc.from_c_void_p(fx.Uint8, t.data_ptr())
 
-    # HW grid Y is a 16-bit field on AMD HIP → cap 65535 blocks/launch. The
+    # HW grid Y is a 16-bit field on AMD HIP -> cap 65535 blocks/launch. The
     # kernel uses per-token GTensor base-shift so each chunk's resource span
     # is small (just the chunk's tokens), but the grid Y dim itself is HW-
     # bounded. We tried folding T across gridY+gridZ to do a single launch,

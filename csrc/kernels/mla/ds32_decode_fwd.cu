@@ -70,7 +70,7 @@ void mla_decode_stage1_opus_fwd_ds32(aiter_tensor_t& q_nope,
     AITER_CHECK(kv_scale.size(-1) == T::D_SCALE_SIZE,
                 "mla_decode_stage1_opus_fwd_ds32: kv_scale last dim (scale_dim) must be ",
                 T::D_SCALE_SIZE, ", got ", kv_scale.size(-1));
-    
+
     const int B            = q_nope.size(0);
     const int H            = q_nope.size(1);
     const int total_tokens = kv_nope.size(0);

@@ -356,7 +356,7 @@ struct pa_16mx8_32nx1_fp8_traits
         return 4 * smem_kv_bytes();
     }
 
-    
+
     static constexpr int kv_buffer_load_insts = (KV_TILE_SIZE * D_NOPE_PADDED_SIZE) / (BLOCK_SIZE * VEC_KV_NOPE)
                                               + (KV_TILE_SIZE * D_ROPE_SIZE) / (BLOCK_SIZE / 2 * VEC_KV_ROPE);
     static constexpr int k_nope_ds_read_insts = (GEMM0_E_N * W_N * W_K_NOPE) / (WARP_SIZE * VEC_KV_NOPE);
@@ -441,7 +441,7 @@ struct pa_16mx1_16nx4_fp8_traits
 
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
-// Device kernel templates — declared here, defined in the device pass below.
+// Device kernel templates -- declared here, defined in the device pass below.
 template <class Traits>
 __global__ void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs);
 template <class Traits>
@@ -547,7 +547,7 @@ __device__ inline auto global_load(const D* g_base, opus::index_t os) {
 }
 
 // =============================================================================
-// Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) — used when H > 32.
+// Variant 16mx8_32nx1 (T_M=NUM_WARPS, T_N=1) -- used when H > 32.
 // =============================================================================
 namespace pa_16mx8_32nx1 {
 
@@ -736,7 +736,7 @@ __device__ inline auto make_layout_kv_indices(int warp_id, int lane_id) {
         opus::number<T::smem_n_per_wave>{},
         opus::number<T::smem_n_rpt>{},
         1_I);
-    
+
     constexpr auto kv_indices_dim = opus::make_tuple(
         opus::make_tuple(opus::p_dim{}, opus::p_dim{}, opus::y_dim{}));
 
@@ -864,9 +864,9 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 template<class T, class V>
 __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx) {
     using D_ATTN = typename T::D_ATTN;
-    
+
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
-    
+
     int lane_id = opus::thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));  // break CSE
     const int base = (lane_id / T::W_N) * T::VEC_TR_V;
@@ -1137,7 +1137,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
     s_waitcnt_vmcnt(1_I);
 
     compute_qk(v_s[0], v_q_slices, v_k, s_kv[0], 0_I);
-    
+
     if (stagger) {
         __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_s_barrier();
@@ -1571,7 +1571,7 @@ __device__ void pa_prefill_accum_pipelined(pa_sparse_prefill_kargs kargs,
 
 } // namespace pa_16mx8_32nx1
 
-// ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
+// --- PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ---
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_kernel(pa_sparse_prefill_kargs kargs) {
     using namespace opus;
@@ -1608,7 +1608,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // ──── Prefix segment ────
+    // ---- Prefix segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
@@ -1628,7 +1628,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
     __builtin_amdgcn_s_barrier();
 
-    // ──── Extend segment ────
+    // ---- Extend segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
@@ -1646,7 +1646,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
     }
 
-    // ──── Sink finalization, normalize O, and store to gmem ────
+    // ---- Sink finalization, normalize O, and store to gmem ----
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
@@ -1667,7 +1667,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 }
 
 // =============================================================================
-// Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) — used when H <= 32.
+// Variant 16mx1_16nx4 (T_M=1, T_N=NUM_WARPS) -- used when H <= 32.
 // =============================================================================
 namespace pa_16mx1_16nx4 {
 
@@ -1955,9 +1955,9 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 template<class T, class V>
 __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx, int lane_id) {
     using D_ATTN = typename T::D_ATTN;
-    
+
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
-    
+
     const int base = (lane_id / T::W_N) * T::VEC_TR_V;
     const int rel  = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - base;
 
@@ -2069,7 +2069,7 @@ __device__ void pa_prefill_16mx1_16nx4_pipeline(pa_sparse_prefill_kargs kargs,
 
 } // namespace pa_16mx1_16nx4
 
-// ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
+// --- PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ---
 template<class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_kernel(pa_sparse_prefill_kargs kargs) {
     using namespace opus;
@@ -2107,7 +2107,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // ──── Prefix segment ────
+    // ---- Prefix segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
@@ -2119,7 +2119,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 
     __builtin_amdgcn_s_barrier();
 
-    // ──── Extend segment ────
+    // ---- Extend segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
@@ -2129,7 +2129,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
         pa_prefill_16mx1_16nx4_pipeline<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
     }
 
-    // ──── Sink finalization, normalize O, and store to gmem ────
+    // ---- Sink finalization, normalize O, and store to gmem ----
     const int sink_head_idx = h_block_start + lane_id % T::W_M;
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
@@ -2147,7 +2147,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 }
 
 // =============================================================================
-// Variant 16mx8_32nx1 fp8 (split NoPE fp8 / RoPE bf16, T_M=NUM_WARPS, T_N=1) — used when H > 32.
+// Variant 16mx8_32nx1 fp8 (split NoPE fp8 / RoPE bf16, T_M=NUM_WARPS, T_N=1) -- used when H > 32.
 // =============================================================================
 namespace pa_16mx8_32nx1_fp8 {
 
@@ -2656,14 +2656,14 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 template<class T, class V>
 __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx) {
     using D_ROPE = typename T::D_ROPE;
-    
+
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
-    
+
     int lane_id = opus::thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));  // break CSE
     const int base = (lane_id / T::W_N) * T::VEC_TR_V;
     const int rel  = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - base;
-    
+
     constexpr int en_stride = opus::vector_traits<V>::size() / T::GEMM1_E_N;
     opus::static_for<en_stride>([&](auto ik) {
         constexpr int k   = ik.value;
@@ -3623,7 +3623,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // ──── Prefix segment ────
+    // ---- Prefix segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
@@ -3658,7 +3658,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 
     __builtin_amdgcn_s_barrier();
 
-    // ──── Extend segment ────
+    // ---- Extend segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
@@ -3691,7 +3691,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
         }
     }
 
-    // ──── Sink finalization, normalize O, and store to gmem ────
+    // ---- Sink finalization, normalize O, and store to gmem ----
     const int sink_head_idx = h_block_start + warp_id * T::Q_TILE_SIZE + (lane_id % T::W_M);
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;
@@ -3713,7 +3713,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx8_32nx1_
 }
 
 // =============================================================================
-// Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) — split NoPE fp8 / RoPE bf16.
+// Variant 16mx1_16nx4 fp8 (T_M=1, T_N=NUM_WARPS) -- split NoPE fp8 / RoPE bf16.
 // =============================================================================
 namespace pa_16mx1_16nx4_fp8 {
 
@@ -4030,9 +4030,9 @@ __device__ inline void attn_mask_oob_score(V& v_s, int valid_kv_len, int kv_tile
 template<class T, class V>
 __device__ inline void attn_mask_oob_value(V& v_v, int valid_kv_len, int kv_tile_idx, int lane_id) {
     using D_ROPE = typename T::D_ROPE;
-    
+
     if ((kv_tile_idx + 1) * T::KV_TILE_SIZE <= valid_kv_len) return;
-    
+
     const int base = (lane_id / T::W_N) * T::VEC_TR_V;
     const int rel  = (valid_kv_len - 1) - kv_tile_idx * T::KV_TILE_SIZE - base;
 
@@ -4135,7 +4135,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
     s_waitcnt_vmcnt(0_I);
 
     for (int tile_idx = 0; tile_idx < num_kv_tiles; ++tile_idx) {
-        // ──── Load K tile (NoPE fp8 + RoPE bf16 + MX scales) ────
+        // ---- Load K tile (NoPE fp8 + RoPE bf16 + MX scales) ----
         const int next_kv_page = load_kv_page(tile_idx + 1);
         auto v_k_nope = global_load<T::VEC_KV_NOPE>(p_k_nope + kv_nope_offset(kv_page), u_rk_nope);
         auto v_k_rope = global_load<T::VEC_KV_ROPE>(p_k_rope + kv_rope_offset(kv_page), u_rk_rope);
@@ -4149,7 +4149,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         v_k_mxscl[15] = static_cast<D_NOPE>(0);
         reorder_mxscl_for_opsel<T>(v_k_mxscl);
 
-        // ──── GEMM0: S = Q·Kᵀ  (NoPE MXFP8) ────
+        // ---- GEMM0: S = Q.KT  (NoPE MXFP8) ----
         const int kblk = lane_id / T::W_M;  // lane-group g = L/W_M (0..3)
         auto& k_scl_w = reinterpret_cast<const vector_t<u32_t, T::GEMM0_NOPE_E_K>&>(v_k_mxscl);
         int scale_k = 0;
@@ -4162,8 +4162,8 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
             v_s = mma0_nope.step_k(ek, v_q_nope, v_k_nope, v_s, scale_q, scale_k, ek, ek);  // scale_op_sel = ek
         });
 
-        // ──── Dequantize K NoPE: fp8 → bf16 with per-block E8M0 scale ────
-        const int gh = kblk >> 1;                                  // g/2 ∈ {0,1}
+        // ---- Dequantize K NoPE: fp8 -> bf16 with per-block E8M0 scale ----
+        const int gh = kblk >> 1;                                  // g/2 ? {0,1}
         const u32_t k_scl_r0 = (gh ? k_scl_w[1] : k_scl_w[0]);     // rept=0: byte ek = block ek*4 + g/2
         const u32_t k_scl_r1 = (gh ? k_scl_w[3] : k_scl_w[2]);     // rept=1: byte ek = block ek*4 + 2 + g/2
         vector_t<D_ROPE, k_nope_vals> v_k_nope_bf16;
@@ -4178,14 +4178,14 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
             k_nope_bf16_pk[d.value * 2 + 1] = __builtin_amdgcn_cvt_scalef32_pk_bf16_fp8(k_nope_w[d.value], scale, true);
         });
 
-        // ──── GEMM0: S = Q·Kᵀ  (RoPE bf16) ────
+        // ---- GEMM0: S = Q.KT  (RoPE bf16) ----
         v_s = mma0_rope(v_q_rope, v_k_rope, v_s);
 
-        // ──── Stage bf16 KV into smem ────
+        // ---- Stage bf16 KV into smem ----
         store<T::VEC_KV_NOPE>(s_kv, v_k_nope_bf16, u_sk_nope);
         store<T::VEC_KV_ROPE>(s_kv, v_k_rope, u_sk_rope + T::D_NOPE_SIZE);
 
-        // ──── Cross-warp online softmax ────
+        // ---- Cross-warp online softmax ----
         attn_mask_oob_score<T>(v_s, valid_kv_len, tile_idx, warp_id, lane_id);
         D_ACC row_max   = max(m_row, attn_row_max<T>(v_s, s_m, warp_id, lane_id) * temperature_scale);
         D_ACC rescale_m = __builtin_amdgcn_exp2f(m_row - row_max);
@@ -4196,7 +4196,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
         l_row += attn_row_sum<T>(v_s, s_l, warp_id, lane_id);
         scale_output_tile<T>(v_o, rescale_m);
 
-        // ──── Broadcast P across warps ────
+        // ---- Broadcast P across warps ----
         auto v_p_seg = cast<D_ROPE>(v_s);
         store<s_len>(s_p, v_p_seg, warp_id * T::W_M * T::W_N + lane_id * s_len);
         s_waitcnt_lgkmcnt(0_I);
@@ -4205,7 +4205,7 @@ __device__ void pa_prefill_16mx1_16nx4_fp8_pipeline(
             v_p_warps[i.value] = load<s_len>(s_p, i.value * T::W_M * T::W_N + lane_id * s_len);
         });
 
-        // ──── GEMM1: O = P·V  (bf16) ────
+        // ---- GEMM1: O = P.V  (bf16) ----
         v_v = tr_load<T::VEC_TR_V>(s_kv, u_rv);
         s_waitcnt_lgkmcnt(0_I);
         __builtin_amdgcn_sched_barrier(0);
@@ -4271,7 +4271,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
-    // ──── Prefix segment ────
+    // ---- Prefix segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
@@ -4288,7 +4288,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
 
     __builtin_amdgcn_s_barrier();
 
-    // ──── Extend segment ────
+    // ---- Extend segment ----
     {
         const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
@@ -4303,7 +4303,7 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void pa_prefill_16mx1_16nx4_
             temperature_scale);
     }
 
-    // ──── Sink finalization, normalize O, and store to gmem ────
+    // ---- Sink finalization, normalize O, and store to gmem ----
     const int sink_head_idx = h_block_start + lane_id % T::W_M;
     auto g_attn_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
     D_ACC sink_log2 = load(g_attn_sink, sink_head_idx)[0] * LOG2_E;

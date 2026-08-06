@@ -552,7 +552,7 @@ def test_fused_rope_concat_and_cache_mla(
     # ret["triton_us"] = triton_us
     # ret['triton_kv_err'] = err_triton_kv
     # ret['triton_q_err'] = err_triton_q_out
-    # With compute_all_q_rope=True every token's q_out is computed → check all.
+    # With compute_all_q_rope=True every token's q_out is computed -> check all.
     # With compute_all_q_rope=False (default) padded-token q_out is left
     # uninitialized (early-return), so only check the owned (valid-slot) tokens.
     n_chk = num_tokens if compute_all_q_rope else num_valid

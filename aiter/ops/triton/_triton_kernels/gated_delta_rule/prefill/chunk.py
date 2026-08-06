@@ -248,17 +248,17 @@ def chunk_gated_delta_rule_fwd_opt_vk(
         q: [B, T, Hg, K]
         k: [B, T, Hg, K]
         v: [B, T, H, V]
-        g: [B, T, H] — raw gate (pre-cumsum)
+        g: [B, T, H] -- raw gate (pre-cumsum)
         beta: [B, T, H]
         scale: float
-        initial_state: optional [N, H, V, K] — note transposed h layout
+        initial_state: optional [N, H, V, K] -- note transposed h layout
         output_final_state: bool
         cu_seqlens: [N+1] optional
-        use_chunk_hip: bool — use HIP kernel for hidden state (K5)
-        use_chunk_flydsl: bool — use FlyDSL kernel for hidden state (K5)
+        use_chunk_hip: bool -- use HIP kernel for hidden state (K5)
+        use_chunk_flydsl: bool -- use FlyDSL kernel for hidden state (K5)
         state_dtype: optional initial/final state dtype (`fp32` or `bf16`),
             supported by both the HIP and Triton hidden-state paths
-        use_exp2: bool — use exp2 instead of exp for gate computation
+        use_exp2: bool -- use exp2 instead of exp for gate computation
         o: optional pre-allocated [B, T, H, V] output buffer (written in
             place by K6). If None, a fresh buffer is allocated.
         num_decodes / num_decode_tokens: skip a leading decode-only prefix in

@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Test-side library: TestSuite, method registry, and runners.
 
-Library code (no ``test_`` prefix) — pytest does not collect this file.
+Library code (no ``test_`` prefix) -- pytest does not collect this file.
 ``test_conv2d.py`` imports the runners and registry from here.
 
 Public surface:
@@ -28,7 +28,7 @@ Public surface:
     set and delegates to ``run_all_methods``.
 
 - ``COMMON_SHAPES``, ``get_edge_case_shapes()``
-    Shared shape data — 3x3 stride-1 shapes routable by every kernel,
+    Shared shape data -- 3x3 stride-1 shapes routable by every kernel,
     and the 12-shape edge-case list respectively.
 """
 
@@ -63,7 +63,7 @@ def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
     }.get(dtype, 2**-10)
     # rtol relaxes in steps as the reduction depth K_red (= C*R*S) grows: more
     # accumulated terms means more rounding, so the relative-error budget widens.
-    # Breakpoints (1024, 4096) and values (6e-3 / 8e-3 / 1.2e-2) are empirical —
+    # Breakpoints (1024, 4096) and values (6e-3 / 8e-3 / 1.2e-2) are empirical --
     # the lowest rtol that still holds across the fuzzer shape sweep at each depth.
     # See DESIGN.md section 8 for the full numerical model.
     rtol = 6e-3 if K_red < 1024 else (8e-3 if K_red < 4096 else 1.2e-2)
@@ -78,7 +78,7 @@ def dynamic_conv_tolerances(dtype: torch.dtype, K_red: int):
 def _winograd_tolerances(dtype, K_red, variant="f4x3"):
     """Return (rtol, atol) for Winograd F(4x4,3x3) correctness checks.
     Winograd transforms amplify fp16 rounding errors:
-    - F(4x4,3x3): coefficients up to ±8, significant amplification
+    - F(4x4,3x3): coefficients up to +-8, significant amplification
     """
     rtol, atol = dynamic_conv_tolerances(dtype, K_red)
     if variant == "f4x3":
@@ -122,7 +122,7 @@ def _3x3_guard(R, S, stride, dilation, C):
 
 
 def _wino_guard(R, S, stride, dilation, C):
-    # _is_winograd_eligible signature varies by upstream — keep the flag tight
+    # _is_winograd_eligible signature varies by upstream -- keep the flag tight
     from aiter.ops.triton.conv._utils import _is_winograd_eligible
 
     return _is_winograd_eligible(R, S, stride, dilation, C)
@@ -164,7 +164,7 @@ class TestResult:
 class TestSuite:
     """Correctness-only test runner. No bench records, no MIOpen tables."""
 
-    __test__ = False  # not a pytest TestCase — leading "Test" is incidental
+    __test__ = False  # not a pytest TestCase -- leading "Test" is incidental
 
     def __init__(
         self,
@@ -210,7 +210,7 @@ class TestSuite:
         res = TestResult(name, passed, max_abs, rel, msg)
         self.results.append(res)
         if self.verbose:
-            mark = "✓" if passed else "✗"
+            mark = "PASS" if passed else "FAIL"
             print(f"  {mark} {name:<40} | max_abs={max_abs:.3e} rel={rel:.3e}")
         return res
 

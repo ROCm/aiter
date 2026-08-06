@@ -397,7 +397,7 @@ AUTOTUNE_3x3_CBLOCKED_CONFIGS = [
         num_stages=1,
     ),
     # gfx1100 (RDNA3): smaller tiles / fewer warps. BLOCK_K kept <= Cb (64) to
-    # preserve coalesced channel loads (see DESIGN.md §5.3).
+    # preserve coalesced channel loads (see DESIGN.md ?5.3).
     triton.Config(
         {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 4},
         num_warps=2,

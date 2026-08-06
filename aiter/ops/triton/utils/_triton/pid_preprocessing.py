@@ -150,7 +150,7 @@ def remap_workgroup_spatial(
     xcd = wid % NUM_XCDS
     pos = wid // NUM_XCDS
 
-    # ── MHA path (spatial_mha) ────────────────────────────────────────────────
+    # -- MHA path (spatial_mha) ------------------------------------------------
     if NUM_QUERIES_PER_KV == 1:
         wgs_per_head = NUM_BLOCKS * BATCH
         local_head_idx = pos // wgs_per_head
@@ -165,7 +165,7 @@ def remap_workgroup_spatial(
             off_z = (wid // (NUM_BLOCKS * NUM_Q_HEADS)) % BATCH
         return off_q_head, start_m, off_z
 
-    # ── GQA path (spatial_gqa) ────────────────────────────────────────────────
+    # -- GQA path (spatial_gqa) ------------------------------------------------
     NUM_KV_HEADS: tl.constexpr = NUM_Q_HEADS // NUM_QUERIES_PER_KV
 
     if NUM_KV_HEADS >= NUM_XCDS:

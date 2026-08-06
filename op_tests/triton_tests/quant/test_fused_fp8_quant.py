@@ -451,7 +451,7 @@ def test_fused_flatten_fp8_group_quant_transpose_scale(M: int, N1: int, N2: int,
     assert y_s_transposed.stride() == (1, M)
     assert y_s_transposed.T.is_contiguous()
 
-    # Logical values at [m, n] match between the two paths element-wise — the
+    # Logical values at [m, n] match between the two paths element-wise -- the
     # flag only changes physical layout, not the per-token-group scales.
     torch.testing.assert_close(y_s_transposed, y_s_default, atol=0, rtol=0)
 

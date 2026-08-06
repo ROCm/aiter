@@ -274,7 +274,7 @@ def make_workloads(
 ) -> tuple[list[tuple], list[tuple]]:
     """Generate realistic workloads from vLLM scheduler parameters.
 
-    Prefill: batch × sq = num_tokens (token budget per step).
+    Prefill: batch x sq = num_tokens (token budget per step).
     Decode: batch = min(num_tokens, max_num_seqs), sq=1.
     Returns (prefill_workloads, decode_workloads).
     Each entry is (batch, sq, sk, causal, functions).
@@ -465,7 +465,7 @@ def _filter_by_memory(configs: list[BenchConfig]) -> list[BenchConfig]:
     for c in configs:
         if c.estimated_memory > limit:
             print(
-                f"[SKIP] {c} — {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
+                f"[SKIP] {c} -- {c.estimated_memory / 1e9:.1f}GB exceeds {vram // 1024**3}GB VRAM",
                 flush=True,
             )
         else:

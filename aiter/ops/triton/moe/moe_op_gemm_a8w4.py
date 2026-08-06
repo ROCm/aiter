@@ -98,7 +98,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 
     # Tuned dispatch: per-(block_m, N, K) winners from a sweep tuner.
     # Schema mirrors sister files like gfx950-MOE-FP8_W8A8.json (BLOCK_SIZE_N,
-    # BLOCK_SIZE_K, num_warps, …) except BLOCK_SIZE_M is omitted because block_m
+    # BLOCK_SIZE_K, num_warps, ...) except BLOCK_SIZE_M is omitted because block_m
     # is the dispatch key, not a tunable (routing decides block_m for the layer).
     tuned = _get_a8w4_dispatch(arch).get(f"bm{block_m}_n{n}_k{k}")
     if tuned is not None:
@@ -118,7 +118,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
         }
 
     # Fallback for shapes not in the tuned dispatch JSON.
-    # Look for a tuned entry with the same (N, K) but any block_m — the tile
+    # Look for a tuned entry with the same (N, K) but any block_m -- the tile
     # geometry and num_stages from that entry are a better starting point than
     # a generic default, and avoid regressing to num_stages=1 on gfx950.
     # Under CDNA4 swizzle, skip BLOCK_K<256 entries since unswizzle can't compile them.
@@ -213,7 +213,7 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
 
         else:
             # Cap by N: BN=512 wasted compute on small-N shapes (e.g. N=256
-            # → 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
+            # -> 50% pad, grid_n=1). Tuned shapes bypass this via JSON.
             block_n = min(triton.next_power_of_2(n), 256)
             # routing caps block_m at 128; nw=4 wins ~2x at block_m=128 on gpt-oss
             # shapes (MI355X) but regresses ~7% at block_m=64, so 64 stays at 8.
@@ -336,7 +336,7 @@ def moe_gemm_a8w4(
     preshuffled=False,
     unpadded_N=None,
     unpadded_K=None,
-    # Idea 1: emit (fp8 e4m3, ue8m0 per-1×32 scale) directly from the GEMM
+    # Idea 1: emit (fp8 e4m3, ue8m0 per-1x32 scale) directly from the GEMM
     # write-back. When out_mx_quant=True, returns (y_fp8, y_scale_ue8m0).
     # Requires SPLIT_K==1 and no scatter_indx (GEMM1-style).
     out_mx_quant: bool = False,
@@ -378,7 +378,7 @@ def moe_gemm_a8w4(
         N = w.shape[-1] * 16
     # Output buffer must be sized to the PADDED N: the kernel writes full
     # block_n columns per tile (grid_n * block_n cols total), which can exceed
-    # unpadded_N when block_n doesn't divide it evenly → OOB on the y buffer.
+    # unpadded_N when block_n doesn't divide it evenly -> OOB on the y buffer.
     padded_N = N
     block_m = routing_data.block_m
     if unpadded_N and block_m == 16:

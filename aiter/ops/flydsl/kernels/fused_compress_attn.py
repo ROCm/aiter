@@ -16,8 +16,8 @@ Two kernel families share this file:
     online-softmax reduce, single dispatch. Parallelizes the serial softmax
     chain that bottlenecks the latency-bound small-N decode regime. On the
     CSA Main (D=512, BF16) and CSA Indexer (D=128, FP8/FP4) shapes it
-    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4×
-    (BF16) / ~1.15-1.24× (FP8) at decode bs=1-32; it falls back to legacy at
+    auto-engages via ``csa_ksplit_num_waves(plan_capacity)`` and wins ~1.3-1.4x
+    (BF16) / ~1.15-1.24x (FP8) at decode bs=1-32; it falls back to legacy at
     high N where CU occupancy already saturates. The K-split win comes from
     parallelizing the dtype-agnostic online-softmax pool, so FP4 reuses the
     FP8 wave-count heuristic. See ``flydsl_fused_compress_attn``'s
@@ -173,16 +173,16 @@ def _build_kernel(
       - overlap: True -> K = 2*RATIO (CSA), False -> K = RATIO (HCA, no overlap)
       - state_size: ring-buffer modulo of kv_state.shape[1] (>= K)
       - k_per_block: paged cache tokens per block (= block_size // ratio)
-      - has_block_table: False → skip cache scatter (warmup path)
+      - has_block_table: False -> skip cache scatter (warmup path)
       - quant_mode: single quant selector (the booleans below are derived):
-          "none"        → bf16 paged write (Main)            → quant=False
-          "per_row_fp8" → FP8 e4m3 per-row scale (Indexer)   → quant=True
-          "group_fp8"   → FP8 1xG group scale (Main nm-asm)  → quant=True, nm_asm
-          "fp4"         → FP4 (E2M1) per-group(32) e8m0 scale → quant=True, quant_fp4
+          "none"        -> bf16 paged write (Main)            -> quant=False
+          "per_row_fp8" -> FP8 e4m3 per-row scale (Indexer)   -> quant=True
+          "group_fp8"   -> FP8 1xG group scale (Main nm-asm)  -> quant=True, nm_asm
+          "fp4"         -> FP4 (E2M1) per-group(32) e8m0 scale -> quant=True, quant_fp4
       - use_ue8m0: only for fp8 (round scale to power-of-2); the FP4 path
         always uses the MX RoundUp e8m0 scale regardless.
       - preshuffle: only when quant (MFMA 16x16 tile / FP4 KV tile layout)
-      - enable_prefetch_input: True → Phase 2 carries k+1 loads through
+      - enable_prefetch_input: True -> Phase 2 carries k+1 loads through
         scf.for iter-args so the buffer_load issue overlaps current iter's
         softmax compute. Helps long K (HCA K=128). Larger VEC pays a register
         cost (loop-carry grows by 3*VEC fp32) -- gate off if it regresses.
@@ -230,7 +230,7 @@ def _build_kernel(
         # the FP8 cache reader consumes). Reject early.
         raise ValueError("quant=True requires has_block_table=True")
     if quant_fp4:
-        # FP4 KV preshuffle: k_tile = 128 elems → 4 groups of 32; data tile is
+        # FP4 KV preshuffle: k_tile = 128 elems -> 4 groups of 32; data tile is
         # [..., kv_block_size, 16] bytes (16 bytes = 32 fp4). Require D a
         # multiple of 128 and k_per_block a multiple of the 16-token tile.
         assert not (quant and not quant_fp4), "internal: fp4/fp8 are exclusive"
@@ -989,7 +989,7 @@ def _build_kernel(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── QUANT=1: FP8 per-row scaled write + fp32 scale ──
+                    # -- QUANT=1: FP8 per-row scaled write + fp32 scale --
                     # Steps:
                     #   (a) per-lane amax over VEC values, wave-reduce-max
                     #   (b) scale = amax / FP8_MAX (with safety floor); for
@@ -1183,12 +1183,12 @@ def _build_kernel(
                         ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write ──
+                    # -- QUANT=1, FP4: per-group(32) e8m0 scale + E2M1 write --
                     # Mirrors dsv4_rotate_quant.cu's FP4 KV writer + the shared
                     # FlyDSL IR builders (emit_mx_e8m0_scale / emit_f32_to_e2m1,
                     # used by silu_and_mul_fq). Each group of 32 elements shares
                     # one e8m0 byte; NTG = 32//VEC lanes cooperate per group.
-                    #   (a) per-lane amax over VEC → group-reduce-max over NTG
+                    #   (a) per-lane amax over VEC -> group-reduce-max over NTG
                     #   (b) e8m0 = ceil_pow2(amax/6) (MX RoundUp); quant_scale =
                     #       (254 - e8m0) << 23
                     #   (c) per-element E2M1 nibble, pack VEC/2 bytes
@@ -1205,7 +1205,7 @@ def _build_kernel(
                     c16_i32 = arith.constant(16, type=i32)
                     c64_i32 = arith.constant(64, type=i32)
                     c32_i32 = arith.constant(_FP4_GROUP_SIZE, type=i32)
-                    # smallest-normal * fp4_max floor — guards all-zero groups,
+                    # smallest-normal * fp4_max floor -- guards all-zero groups,
                     # matches dsv4_rotate_quant.cu eps_amax (bit-exact w/ ref).
                     c_eps_amax = arith.constant(
                         6.0 * float.fromhex("0x1p-126"), type=f32
@@ -1322,7 +1322,7 @@ def _build_kernel(
                             cs_rsrc,
                             _to_raw(cs_off),
                         )  # e8m0 uint8
-            # else: warmup — no scatter, just consume compute.
+            # else: warmup -- no scatter, just consume compute.
 
         if fx.Int32(position) >= 0:
             _body()
@@ -1442,7 +1442,7 @@ def _build_kernel_ksplit(
     scatter (BF16, FP8, or FP4). Constexpr knobs mirror :func:`_build_kernel`
     minus ``enable_prefetch_input`` (each wave runs so few iters that prefetch
     is moot). The FP8 / FP4 / ue8m0 / preshuffle scatter is emitted in wave 0,
-    where ``lid`` (0..63) plays the single-wave ``tid`` role — pair-coop
+    where ``lid`` (0..63) plays the single-wave ``tid`` role -- pair-coop
     shuffle_xor and wave_reduce_max stay within wave 0's 64 lanes, identical
     to the legacy kernel's semantics.
 
@@ -2043,7 +2043,7 @@ def _build_kernel_ksplit(
                         fm_fast=fm_fast,
                     )
                 elif const_expr(not quant_fp4):
-                    # ── FP8 per-row scaled write + fp32 scale (mirror legacy) ──
+                    # -- FP8 per-row scaled write + fp32 scale (mirror legacy) --
                     # Wave-reduce-max over wave 0's 64 lanes; pair-coop dword
                     # store via shuffle_xor(1) within the wave.
                     def wave_reduce_max(x):
@@ -2194,12 +2194,12 @@ def _build_kernel_ksplit(
                         ) + fx.Int32(slot_in_block)
                         buffer_ops.buffer_store(scale_v, cs_rsrc, cs_off)
                 else:
-                    # ── FP4: per-group(32) e8m0 scale + E2M1 write (mirror
+                    # -- FP4: per-group(32) e8m0 scale + E2M1 write (mirror
                     # legacy _build_kernel). Emitted in wave 0 where ``lid``
                     # (0..63) is the single-wave ``tid`` equivalent; the
                     # butterfly group-reduce over NTG lanes stays within wave
                     # 0's 64 physical lanes. ``lid_x_vec`` replaces the legacy
-                    # ``tid_x_vec``. See _build_kernel for the full rationale. ──
+                    # ``tid_x_vec``. See _build_kernel for the full rationale. --
                     lid_x_vec_i = lid_x_vec
                     NTG = _FP4_GROUP_SIZE // VEC
                     LOG2_NTG = int(math.log2(NTG))
@@ -2585,9 +2585,9 @@ def flydsl_fused_compress_attn(
 
     ``quant_mode`` selects the scatter quantization (default derived from the
     legacy ``quant`` bool: ``"fp8" if quant else "none"``):
-      - ``"none"`` → BF16 paged write (CSA / HCA Main).
-      - ``"fp8"``  → FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
-      - ``"fp4"``  → FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
+      - ``"none"`` -> BF16 paged write (CSA / HCA Main).
+      - ``"fp8"``  -> FP8 e4m3 per-row e8m0 scale + MFMA 16x16 preshuffle.
+      - ``"fp4"``  -> FP4 (E2M1) per-group(32) e8m0 scale + FP4 KV preshuffle
         (``kv_cache`` uint8 [NB, k_tiles, 4, k_per_block, 16];
         ``cache_scale`` uint8 [NB, k_tiles, 4, k_per_block]).
 
@@ -2789,7 +2789,7 @@ def flydsl_fused_compress_attn(
         bt_seq_stride = block_tables.stride(0)
         kv_cache_arg = kv_cache
         # FP4 store derives byte offsets from constants (k_tiles/group/tile),
-        # not these strides — bind the outer block stride for completeness.
+        # not these strides -- bind the outer block stride for completeness.
         kv_cache_block_stride = kv_cache.stride(0)
         kv_cache_token_stride = kv_cache.stride(1) if not _fp4 else 0
     else:
@@ -2833,8 +2833,8 @@ def flydsl_fused_compress_attn(
         krope_token_stride = 0
 
     # ---- K-split fast path (BF16 + FP8 + FP4 scatter) ----
-    # k_split_num_waves: None ⟹ auto-pick (tuned geometries only); int>1 ⟹
-    # forced NW; 1 ⟹ forced legacy. Auto triggers for the CSA Main (BF16),
+    # k_split_num_waves: None => auto-pick (tuned geometries only); int>1 =>
+    # forced NW; 1 => forced legacy. Auto triggers for the CSA Main (BF16),
     # CSA Indexer (FP8), and CSA Indexer (FP4) shapes the K-split kernel
     # supports; other shapes fall through to the legacy single-wave kernel.
     _is_csa_main = (

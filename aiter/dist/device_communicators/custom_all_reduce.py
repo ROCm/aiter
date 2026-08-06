@@ -73,7 +73,7 @@ _CAR_MAX_SIZE_ENV = "AITER_CUSTOM_AR_MAX_SIZE"
 
 # Custom-AR lower size bound (bytes). Inputs at or below this run on RCCL
 # instead of the custom kernels; only inputs strictly above it are routed to
-# custom AR. Default 0 (no lower bound) — unchanged behavior. Together with
+# custom AR. Default 0 (no lower bound) -- unchanged behavior. Together with
 # _CAR_MAX_SIZE_ENV this forms the (min, max] window in which custom AR runs.
 _DEFAULT_CAR_MIN_SIZE = 0
 
@@ -192,7 +192,7 @@ def _resolve_car_min_size() -> int:
 def _should_use_vmm(is_gfx1250: bool) -> bool:
     """Decide the cross-device buffer transport for gfx1250.
 
-    VMM (fd-based) is used on gfx1250 only while hipIpc is unusable — i.e. on
+    VMM (fd-based) is used on gfx1250 only while hipIpc is unusable -- i.e. on
     ROCm older than ``_IPC_MIN_ROCM`` (or when the version can't be determined).
     On old archs hipIpc always works, so VMM is never used there.
     """
@@ -204,7 +204,7 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
         return True
     v = get_rocm_version()
     if v is None:
-        # Unknown version — keep the conservative VMM path (prior behavior).
+        # Unknown version -- keep the conservative VMM path (prior behavior).
         logger.warning(
             "Custom allreduce: ROCm version undetectable on gfx1250; "
             "using VMM transport. Set AITER_CUSTOM_AR_FORCE_IPC=1 to override."
@@ -345,7 +345,7 @@ def _validate_mxfp4_hidden_dim(n: int, element_size: int) -> None:
 class IPCBuffer:
     """A single IPC-accessible device buffer.
 
-    Pure data container — owns a pre-allocated GPU allocation with a fixed
+    Pure data container -- owns a pre-allocated GPU allocation with a fixed
     device address.  All IPC handle / broadcast / registration logic lives
     in IPCBufferPool.
 
@@ -462,7 +462,7 @@ class IPCBufferPool:
         assert isinstance(s, dist.TCPStore), (
             f"IPC metadata exchange requires a pure-TCP KV store "
             f"(torch.distributed.TCPStore), got {type(s).__name__}. "
-            f"This ensures the exchange is backend-free — no RCCL, "
+            f"This ensures the exchange is backend-free -- no RCCL, "
             f"gloo, or MPI collective is involved."
         )
 
@@ -593,7 +593,7 @@ class _GFX1250BufferProxy:
     def flush_graph_buffers(self, ar_ptr):
         # TODO: full CUDA graph support on gfx1250 requires VMM-based
         # exchange for graph-captured buffers. For now, graph capture
-        # is not supported on gfx1250 — log a warning.
+        # is not supported on gfx1250 -- log a warning.
         count = self._ca._ops_get_graph_buffer_count(ar_ptr)
         if count > 0:
             logger.warning(
@@ -649,10 +649,10 @@ class CustomAllreduce:
         """Select the ops backend.
 
         Two orthogonal dimensions:
-          * kernel — gfx1250 vs old, keyed on ``self._is_gfx1250`` (arch).
+          * kernel -- gfx1250 vs old, keyed on ``self._is_gfx1250`` (arch).
             Covers meta_size / all_reduce / all_gather / reduce_scatter / dispose
             and the graph-ptr helpers.
-          * transport — how peer pointers are shared, keyed on ``self._use_vmm``.
+          * transport -- how peer pointers are shared, keyed on ``self._use_vmm``.
             Covers init_custom_ar and register_input/output_buffer, whose
             argument shape differs (VMM: raw ptr list; IPC: handles + offsets).
 
@@ -809,7 +809,7 @@ class CustomAllreduce:
         # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
         # gfx1250 transports (VMM fd exchange, and IPC graph-meta ops). The
         # "registered" capture path bakes raw input pointers that peers would
-        # dereference at replay without ever being registered → GPU page fault
+        # dereference at replay without ever being registered -> GPU page fault
         # on the first graph replay (e.g. V4 TP=2 decode). Force the copy-in
         # "unreg" path during capture, which routes through the pre-registered
         # pool (exchanged at init, address-stable across replays). Keyed on the
@@ -851,7 +851,7 @@ class CustomAllreduce:
         from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
         meta_sz = self._ops_meta_size()
-        # gfx1250 is 1-stage only — no tmp buffer after Signal needed
+        # gfx1250 is 1-stage only -- no tmp buffer after Signal needed
         total_meta = meta_sz
         device_id = self.device.index
 
@@ -920,7 +920,7 @@ class CustomAllreduce:
 
         Shared by the old-arch kernel and the gfx1250 kernel (ROCm >= 7.15):
         both consume handle+offset init/register ops. Only the meta buffer
-        layout differs — the gfx1250 kernel is 1-stage (no trailing 2x tmp
+        layout differs -- the gfx1250 kernel is 1-stage (no trailing 2x tmp
         region), but its meta_size() now also carries the LL fast-path staging
         scratch appended after the Signal struct (see meta_size() in
         custom_all_reduce_gfx1250.cu).
@@ -959,7 +959,7 @@ class CustomAllreduce:
         # Wire the pool's graph helpers to the kernel-matching ops so that
         # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
         # `fa` through the old-arch graph ops. Graph-buffer registration itself
-        # stays disabled on gfx1250 (copy-in path → count is always 0).
+        # stays disabled on gfx1250 (copy-in path -> count is always 0).
         pool_kwargs = {}
         if self._is_gfx1250:
             pool_kwargs["graph_count_fn"] = self._ops_get_graph_buffer_count
@@ -1145,7 +1145,7 @@ class CustomAllreduce:
                 registered_input=False,
             )
 
-    # reduce_scatter split_dim enum — must match `aiter::ReduceScatterSplitDim`
+    # reduce_scatter split_dim enum -- must match `aiter::ReduceScatterSplitDim`
     # in csrc/include/custom_all_reduce.cuh.
     _RS_SPLIT_FIRST = 0
     _RS_SPLIT_LAST = 1
@@ -1246,7 +1246,7 @@ class CustomAllreduce:
                 # Warmup forward (pre-capture): run the REAL reduce_scatter via
                 # the copy-in path. Unlike custom_all_reduce, returning zeros
                 # here corrupts DeepSeek-V4 hash-routed MoE accuracy (~5pp GSM8K
-                # drop) — the warmup result feeds downstream state baked into the
+                # drop) -- the warmup result feeds downstream state baked into the
                 # captured graph. Out-of-place collective, so allocation pattern
                 # still matches the captured all_gather_reg path.
                 return self.reduce_scatter(input, output, dim, registered=False)
@@ -1346,7 +1346,7 @@ class CustomAllreduce:
             else:
                 # Warmup forward (pre-capture): run the REAL all_gather via the
                 # copy-in (unreg) path. Returning zeros here corrupts V4 MoE
-                # accuracy — see custom_reduce_scatter for the rationale.
+                # accuracy -- see custom_reduce_scatter for the rationale.
                 out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)
         else:
             out = self.all_gather_unreg(inp.view(view_dtype), dim=dim)

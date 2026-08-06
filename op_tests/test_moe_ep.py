@@ -387,7 +387,7 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     denom = (x * x + y * y).sum()
     # Under EP a single token can route entirely to non-local experts, so both
     # ref and out are all-zero and denom==0. That is a correct (empty) result,
-    # not a mismatch — guard the division so it doesn't report a spurious NaN.
+    # not a mismatch -- guard the division so it doesn't report a spurious NaN.
     if denom == 0:
         return 0.0
     return float(1 - 2 * (x * y).sum() / denom)
@@ -410,7 +410,7 @@ def test_fmoe_ep_mxfp4(
     const_init=None,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
-    quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
+    quant_label is one of {"a8w4_mxfp4", "a4w4_mxfp4"}.
 
     ep_mode selects how tokens/routing reach fused_moe:
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
@@ -697,7 +697,7 @@ def test_fmoe_ep_mxfp4(
         os.environ.setdefault("AITER_USE_GROUPED_GEMM", "1")
     elif quant_label == "a8w4_mxfp4":
         # gfx950 a8w4 (fp8 activations, mxfp4 weights): use the CK a16w4 layout
-        # — weights interleaved on N (gate/up) — paired with gate_mode=INTERLEAVE
+        # -- weights interleaved on N (gate/up) -- paired with gate_mode=INTERLEAVE
         # at the call site. The FlyDSL fp4 (16,16) shuffle is separated and
         # would mis-route gate/up here.
         w1_a = shuffle_weight_a16w4(w1_qt, 16, True)
@@ -711,7 +711,7 @@ def test_fmoe_ep_mxfp4(
         # which for Silu at ksplit<=1 has no kernel and dispatch-crashes.
         os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
     elif quant_label == "a4w4_mxfp4":
-        # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout —
+        # gfx950 a4w4 (fp4 activations, mxfp4 weights): FlyDSL fp4/fp4 layout --
         # shuffle (16,16) + e8m0 scale shuffle, gate/up separated. Matches
         # test_moe_2stage.py:251-255 and pairs with gate_mode=SEPARATED.
         w1_a = shuffle_weight(w1_qt, layout=(16, 16))

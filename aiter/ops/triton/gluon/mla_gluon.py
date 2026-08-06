@@ -109,7 +109,7 @@ def _mla_gluon(
     HAS_ATTN_SINK: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
-    # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
+    # use 2-D (batch, split) -- for batch_size=1 this is (1, NUM_KV_SPLITS).
     # MTP: an extra q_pos axis carries the query position within QLEN. bh64 packs
     # it into grid axis 1 (after the head-block index); bh16 uses grid axis 2.
     # When QLEN==1, q_pos is always 0 and the layout below is identical to before.
@@ -830,7 +830,7 @@ def mla_gluon(
     has_pe=True,
     attn_sink=None,  # [nhead] fp32 per-head sink bias, None means no sink
 ):
-    """Unified Gluon MLA entry (gfx950 / CDNA4) — decode and DeepSeek V4 sparse prefill.
+    """Unified Gluon MLA entry (gfx950 / CDNA4) -- decode and DeepSeek V4 sparse prefill.
 
     `mla_gluon` supports the full decode (stage-1 + stage-2 reduce, or the stage-1-only
     fast path when NUM_KV_SPLITS==1) and writes the final attention into the

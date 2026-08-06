@@ -3,7 +3,7 @@
 
 """Gluon (gfx1250) sparse prefill attention over two KV sources with sink.
 
-Grid: ``(T, cdiv(H, BLOCK_H))`` — each CTA handles one query token and
+Grid: ``(T, cdiv(H, BLOCK_H))`` -- each CTA handles one query token and
 BLOCK_H query heads. Same grid as the decode kernel, but iterates two KV
 regions (prefix + extend) sequentially sharing the online softmax
 accumulator. No split-K: prefill has enough tokens to fill the GPU.
@@ -47,10 +47,10 @@ def _region_prologue(
 @gluon.jit(repr=_pa_prefill_sparse_repr)
 def _pa_prefill_sparse(
     q_ptr,  # [T, H, D]
-    unified_kv_ptr,  # [total_pages, D]    — prefix source
+    unified_kv_ptr,  # [total_pages, D]    -- prefix source
     kv_indices_prefix_ptr,  # [total_prefix_indices] int32
     kv_indptr_prefix_ptr,  # [T+1] int32
-    kv_ptr,  # [total_tokens, D]     — extend source
+    kv_ptr,  # [total_tokens, D]     -- extend source
     kv_indices_extend_ptr,  # [total_extend_indices] int32
     kv_indptr_extend_ptr,  # [T+1] int32
     attn_sink_ptr,  # [H]

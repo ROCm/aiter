@@ -270,7 +270,7 @@ def _moe_gemm_a8w4_decode_persistent(
         )
     SHARED_LAYOUT_BIAS: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
 
-    # -- Map 1-D pid → (pid_m, n_group_id) --
+    # -- Map 1-D pid -> (pid_m, n_group_id) --
     # Grid is (grid_m * n_groups,) where n_groups = ceil(grid_n / N_ITERS).
     pid = gl.program_id(0)
 
@@ -1404,7 +1404,7 @@ def _moe_gemm_a8w4_decode(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
+    # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,
@@ -2065,7 +2065,7 @@ def _moe_gemm_a8w4_prefill(
     else:
         out = out.to(tl.bfloat16)
 
-    # TDM Store: accumulator → shared memory → global memory
+    # TDM Store: accumulator -> shared memory -> global memory
     Y += start_m.to(index_type) * stride_y_m
     y_buffer = gl.allocate_shared_memory(
         Y.type.element_ty,

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Triton prefill causal-conv1d (fused split q/k/v) — public host entry points.
+"""Triton prefill causal-conv1d (fused split q/k/v) -- public host entry points.
 
 This is the public Triton namespace for the Gated-Delta-Rule (GDR / Mamba)
 prefill front-end depthwise conv. It exposes two interchangeable Triton kernels;

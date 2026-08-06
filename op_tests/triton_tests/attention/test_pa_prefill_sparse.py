@@ -438,7 +438,7 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
         H,
         D,
         prefix_len,
-        0,  # extend_len — single-source path
+        0,  # extend_len -- single-source path
         total_pages,
         1,
     )
@@ -459,7 +459,7 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
         ukv,
         p_idx,
         p_indptr,
-        None,  # kv                — no extend source
+        None,  # kv                -- no extend source
         None,  # kv_indices_extend
         None,  # kv_indptr_extend
         sink,

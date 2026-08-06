@@ -52,7 +52,10 @@ from aiter.ops.flydsl.moe_kernels import (
     resolve_flydsl_stage2_tile_k,
     runtime_swiglu_limit,
 )
-from aiter.ops.flydsl.mxfp4_kname import parse_flydsl_v2_gemm2_kernel
+from aiter.ops.flydsl.mxfp4_kname import (
+    _parse_mxfp4_g1_kname,
+    parse_flydsl_v2_gemm2_kernel,
+)
 
 # Keep the default AOT coverage aligned with runtime config resolution.
 DEFAULT_CSVS = [
@@ -110,7 +113,15 @@ def parse_csv(csv_path: str):
                 if stage1_name.startswith("flydsl_")
                 else None
             )
-            stage1_out_dtype = stage1_params.get("out_dtype") if stage1_params else None
+            stage1_output_sorted = False
+            if stage1_name.startswith("flydsl_mxmoe_g1_"):
+                stage1_mx_params = _parse_mxfp4_g1_kname(stage1_name)
+                stage1_out_dtype = stage1_mx_params["out_dtype"]
+                stage1_output_sorted = True
+            else:
+                stage1_out_dtype = (
+                    stage1_params.get("out_dtype") if stage1_params else None
+                )
             stage1_v2_output_layout = stage2_name.startswith("flydsl_moe2_layout_")
             stage2_v2_params = (
                 parse_flydsl_v2_gemm2_kernel(stage2_name)
@@ -167,7 +178,7 @@ def parse_csv(csv_path: str):
                         "token_num": token,
                         "block_m": block_m,
                     }
-                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
+                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant --
                     # this changes the shape of a2_scale (sorted scale buffer
                     # vs separate quant call output).
                     if params["stage"] == 2:
@@ -176,6 +187,7 @@ def parse_csv(csv_path: str):
                             if stage1_out_dtype in ("fp4", "fp8")
                             else None
                         )
+                        job["intermediate_sorted"] = stage1_output_sorted
                     full_job = {**job, **params}
                     if params["stage"] == 1 and stage1_v2_output_layout:
                         full_job["v2_output_layout"] = True
@@ -228,6 +240,7 @@ def _precompile_to_cache(
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
+    intermediate_sorted: bool = False,
     k_wave: int = 1,
     v2_output_layout: bool = False,
     # Stage2-only kernel tuning knobs (registered by the production-variant
@@ -278,7 +291,7 @@ def _precompile_to_cache(
 
     def _alloc(shape, dtype):
         # torch.zeros doesn't support sub-byte dtypes (int4); use empty for those.
-        # Cache key only depends on shape+dtype+strides — values don't matter.
+        # Cache key only depends on shape+dtype+strides -- values don't matter.
         if dtype == getattr(torch, "int4", None):
             return torch.empty(shape, device=dev, dtype=dtype)
         return torch.zeros(shape, device=dev, dtype=dtype)
@@ -323,7 +336,7 @@ def _precompile_to_cache(
         """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
         if not use_mx_gemm:
             if is_int4_weight:
-                # a16wi4: bf16 activations, int4 weights — no activation scale.
+                # a16wi4: bf16 activations, int4 weights -- no activation scale.
                 return None
             return None
         if a_dtype == "fp8":
@@ -354,7 +367,7 @@ def _precompile_to_cache(
         """Stage2 a2_scale construction per fused_moe_2stages.
 
         When upstream stage1 fuses fp4/fp8 quant (``stage1_fuse_quant`` set),
-        stage2 receives stage1's ``out_scale_sorted`` buffer directly — that
+        stage2 receives stage1's ``out_scale_sorted`` buffer directly -- that
         buffer is padded to 256 rows and 8 cols.  Otherwise stage2 quantizes
         its own input and the resulting sorted scale uses 32-row alignment.
         """
@@ -399,7 +412,7 @@ def _precompile_to_cache(
         return None
 
     def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale — viewed as uint8 by _view_safe before kernel launch.
+        # mxfp4 e8m0 scale -- viewed as uint8 by _view_safe before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
     def _make_a_user(a_dtype_user_shape):
@@ -676,8 +689,11 @@ def _precompile_to_cache(
             # inter_dim=384), in which case runtime compiles the legal fallback.
             tile_k = resolve_flydsl_stage2_tile_k(inter_dim, tile_k)
 
-            # Stage2 input is (token_num, topk, inter_dim) in a_dtype storage.
-            if a_dtype == "fp4":
+            # MXFP4 GEMM1 can feed GEMM2 in expert-sorted layout directly.
+            if intermediate_sorted:
+                packed_inter = inter_dim // 2 if a_dtype == "fp4" else inter_dim
+                a_shape = (max_num_tokens_padded, packed_inter)
+            elif a_dtype == "fp4":
                 a_shape = (tokens, topk, inter_dim // 2)
             else:
                 a_shape = (tokens, topk, inter_dim)
@@ -768,6 +784,7 @@ def _precompile_to_cache(
                     sw_arg,
                     num_valid_ids,
                     tokens,
+                    a.shape[0] if intermediate_sorted else tokens * topk,
                     _n_in,
                     _k_in,
                     m_blocks,
@@ -819,6 +836,7 @@ def _precompile_to_cache(
                 b_nt=b_nt,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
+                a_sorted=intermediate_sorted,
             )
             _run_compiled(exe, args)
 

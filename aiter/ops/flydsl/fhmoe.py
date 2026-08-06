@@ -106,6 +106,7 @@ def compile_flydsl_fhmoe_stage2(
     inter_dim_pad: int = 0,
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
+    a_sorted: bool = False,
     shared_expert_id: int = -1,
 ):
     """Compile the heterogeneous stage2 kernel."""
@@ -113,6 +114,8 @@ def compile_flydsl_fhmoe_stage2(
 
     if b_dtype != "fp4":
         raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")
+    if a_sorted:
+        raise ValueError("FHMoE stage2 does not support sorted intermediate input")
     return compile_mixed_fhmoe_gemm2(
         model_dim=model_dim,
         inter_dim=inter_dim,
@@ -204,6 +207,7 @@ def _s2_args_fhmoe(
     sorted_weights,
     num_valid_ids,
     token_num,
+    x_rows,
     n_in,
     k_in,
     blocks,
@@ -236,6 +240,7 @@ def _s2_args_fhmoe(
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
         token_num,
+        x_rows,
         n_in,
         k_in,
         blocks,

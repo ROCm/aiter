@@ -1069,7 +1069,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
 
-    # [BV, 64] — h in [V, K] layout (transposed from opt's [64, BV])
+    # [BV, 64] -- h in [V, K] layout (transposed from opt's [64, BV])
     b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
     if K > 64:
         b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
@@ -1244,7 +1244,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_opt_vk(
                 ]
         b_v = b_v.to(k.dtype.element_ty)
 
-        # h[V,K] += v_new^T @ k  →  [BV,64] += trans(dot(k[64,BT], v[BT,BV]))
+        # h[V,K] += v_new^T @ k  ->  [BV,64] += trans(dot(k[64,BT], v[BT,BV]))
         p_k = tl.make_block_ptr(
             k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
         )

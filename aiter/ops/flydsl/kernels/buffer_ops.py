@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """AMD buffer load/store operations, vendored into aiter.
@@ -93,7 +93,7 @@ def _unwrap_value(value):
     - flyc DSL Numeric like fx.Int32 (has .ir_value() method)
     - flyc ArithValue (is already ir.Value subclass)
     """
-    # DSL Numeric (Int32, Float32, etc.) — use ir_value() to materialize
+    # DSL Numeric (Int32, Float32, etc.) -- use ir_value() to materialize
     if hasattr(value, "ir_value") and not isinstance(value, ir.Value):
         return value.ir_value()
     max_depth = 10  # Safety limit

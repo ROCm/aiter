@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
 """Vector dialect wrappers, vendored into aiter.
@@ -7,7 +7,7 @@
 flydsl deleted ``flydsl.expr.vector``; callers are now expected to use the raw
 ``flydsl._mlir.dialects.vector`` and wrap every operand in ``as_ir_value``.
 aiter has 500+ vector call sites, so the auto-unwrapping layer is kept here
-instead — a missing ``as_ir_value`` or ``kDynamic`` sentinel only surfaces at
+instead -- a missing ``as_ir_value`` or ``kDynamic`` sentinel only surfaces at
 trace time.
 
 Re-exports the whole raw dialect (``broadcast``, ``shuffle``, ``insert``,
@@ -42,10 +42,10 @@ from flydsl.expr.typing import (  # noqa: F401
     zeros_like,
 )
 
-# ═══════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
 # Dialect helper wrappers (legacy, will be deprecated)
 # Prefer using Vector methods or _mlir.dialects.vector directly.
-# ═══════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
 
 
 def _as_index_ir_value(value):

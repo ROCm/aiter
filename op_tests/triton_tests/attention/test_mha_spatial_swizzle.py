@@ -42,7 +42,7 @@ def _run(swizzle: str, B: int, Hq: int, Hk: int, S: int, D: int, causal: bool):
 
 
 # ---------------------------------------------------------------------------
-# GQA configs — spatial_gqa path
+# GQA configs -- spatial_gqa path
 # ---------------------------------------------------------------------------
 
 
@@ -99,7 +99,7 @@ def test_spatial_gqa_batched(causal):
 
 
 # ---------------------------------------------------------------------------
-# MHA configs — spatial_mha path
+# MHA configs -- spatial_mha path
 # ---------------------------------------------------------------------------
 
 

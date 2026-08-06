@@ -888,7 +888,7 @@ class AttentionProgram:
     def softmax_part0_w_split(self, S, M):
         m = reduce_max_prop_nan(S, -1)
         m_ij = elementwise_max_prop_nan(M, m)
-        # Same guard as softmax_part0 — avoid NaN from -inf - (-inf).
+        # Same guard as softmax_part0 -- avoid NaN from -inf - (-inf).
         m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
         m_ij_scaled = m_ij * self.QK_scale
         q_shifted = S * self.QK_scale - m_ij_scaled[:, None]

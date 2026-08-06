@@ -486,7 +486,7 @@ def chunk_gated_delta_rule_opt_vk(
         beta (torch.Tensor): betas of shape `[B, T, H]`.
         scale (float, optional): Scale factor. Default: `1 / sqrt(K)`.
         initial_state (torch.Tensor, optional):
-            Initial state of shape `[N, H, V, K]` — note transposed layout.
+            Initial state of shape `[N, H, V, K]` -- note transposed layout.
         output_final_state (bool): Whether to output final state `[N, H, V, K]`.
         use_qk_l2norm_in_kernel (bool): Whether to use L2 normalization.
         cu_seqlens (torch.LongTensor, optional): Cumulative sequence lengths `[N+1]`.

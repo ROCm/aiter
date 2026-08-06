@@ -450,7 +450,7 @@ def _winograd_f4x3_cblocked_input_transform_kernel(
     base = X + n * stride_x_n + cblock_idx * stride_x_cblock + c_local
     n_valid = n < N
 
-    # Load 6x6 patch — 36 values per channel
+    # Load 6x6 patch -- 36 values per channel
     d00 = tl.zeros((BLOCK_C,), dtype=INPUT_DTYPE)
     d01 = tl.zeros((BLOCK_C,), dtype=INPUT_DTYPE)
     d02 = tl.zeros((BLOCK_C,), dtype=INPUT_DTYPE)
@@ -1127,7 +1127,7 @@ AUTOTUNE_WINO4_INPUT_CONFIGS = [
 AUTOTUNE_WINO4_OUTPUT_CONFIGS = [
     triton.Config({"BLOCK_K": 64}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_K": 128}, num_warps=4, num_stages=1),
-    # gfx1100 (RDNA3): BLOCK_K=128 pegged the old ceiling on 17/19 shapes —
+    # gfx1100 (RDNA3): BLOCK_K=128 pegged the old ceiling on 17/19 shapes --
     # probe larger, plus warp-8 options.
     triton.Config({"BLOCK_K": 256}, num_warps=4, num_stages=1),
     triton.Config({"BLOCK_K": 128}, num_warps=8, num_stages=1),

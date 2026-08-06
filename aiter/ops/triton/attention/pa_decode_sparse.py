@@ -5,7 +5,7 @@
 indices. See ``_triton_kernels/attention/pa_decode_sparse.py`` for the
 kernels' caller contract.
 
-This module exposes ``pa_decode_sparse`` — a 3D split-K + widened-BLOCK_H
+This module exposes ``pa_decode_sparse`` -- a 3D split-K + widened-BLOCK_H
 + pipelined-K-loop variant suitable for sparse decode (e.g. V4 top-k gather)
 where each token's K range is an unordered subset of a unified KV pool.
 """
@@ -56,10 +56,10 @@ def pa_decode_sparse(
     Args:
         q: ``[N, H, D]`` decode queries, bf16/fp16.
         unified_kv: ``[total_pages, D]`` shared KV pool (page_size=1), same dtype as ``q``.
-        kv_indices: ``[total_indices]`` int32 — per-token slot lists, flat.
+        kv_indices: ``[total_indices]`` int32 -- per-token slot lists, flat.
             Per-token entries live in ``kv_indices[kv_indptr[t] : kv_indptr[t+1]]``.
             ``-1`` entries are skipped (sentinel for unused tail).
-        kv_indptr: ``[N+1]`` int32 — true prefix sum.
+        kv_indptr: ``[N+1]`` int32 -- true prefix sum.
         attn_sink: ``[H]`` per-head learnable softmax-denom bias (fp32).
         softmax_scale: scalar softmax scale.
         block_h: override ``BLOCK_H`` for the split kernel. Default picks
@@ -83,10 +83,10 @@ def pa_decode_sparse(
         [N, KV_SPLITS, H_padded])`` (all fp32).
 
     Optimizations targeted:
-      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA →
+      (1) Wider ``BLOCK_H`` so all heads of a token are handled by one CTA ->
           eliminates MLA-style KV re-fetch across head-block programs.
       (2) ``num_stages`` on the K loop pipelines KV gather behind the dot.
-      (3) Split the K dimension across CTAs via a third grid axis →
+      (3) Split the K dimension across CTAs via a third grid axis ->
           fixes grid undersubscription on long-context decode.
     """
     if not q.is_cuda:
@@ -306,7 +306,7 @@ def pa_decode_sparse(
         # is responsible for the log-sum-exp combine + sink fold.
         return acc_partial, m_partial, l_partial
 
-    # One reduce CTA per head. For small per-rank H (TP=8 → H ∈ {8, 16}) this
+    # One reduce CTA per head. For small per-rank H (TP=8 -> H in {8, 16}) this
     # multiplies the reduce-side CTA count by H, replacing the previous single
     # under-occupied CTA per token with a small fan-out that hides launch
     # latency. tl.arange(0, 1) is a valid power-of-2 range.

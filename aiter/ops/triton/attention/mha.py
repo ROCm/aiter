@@ -259,7 +259,7 @@ def _flash_attn_forward(
             )
         # Verify softmax_lse shape contract:
         #   non-varlen: (batch, nheads_q, seqlen_q)
-        #   varlen:     (nheads_q, total_q)  — transposed vs default impl
+        #   varlen:     (nheads_q, total_q)  -- transposed vs default impl
         if is_varlen:
             assert softmax_lse.shape == (
                 num_q_heads,

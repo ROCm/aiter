@@ -365,7 +365,7 @@ def fused_rms_fp8_group_quant(
 
 
 def get_fp8_min_max_bounds(fp8_dtype: torch.dtype) -> tuple[float, float]:
-    """Match vLLM ``quant_utils.get_fp8_min_max`` for ``fp8_dtype`` (incl. ROCm fnuz ±224)."""
+    """Match vLLM ``quant_utils.get_fp8_min_max`` for ``fp8_dtype`` (incl. ROCm fnuz +-224)."""
     fnuz = getattr(torch, "float8_e4m3fnuz", None)
     if fnuz is not None and fp8_dtype == fnuz:
         return -224.0, 224.0
@@ -567,7 +567,7 @@ def fused_flatten_fp8_group_quant(
         # (M, num_bs_cols) view with strides (1, M). The kernel writes
         # at out_scales_ptr + m * stride_m + n * stride_n, so passing
         # the natural strides of this view writes to the correct memory
-        # location regardless of layout — no special-case stride wiring
+        # location regardless of layout -- no special-case stride wiring
         # or trailing .view() needed.
         out_block_scales = torch.empty(
             (num_bs_cols, M), dtype=torch.float32, device=x.device
