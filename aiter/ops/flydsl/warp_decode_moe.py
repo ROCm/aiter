@@ -45,7 +45,15 @@ def _get_gate_up(
 
 @functools.lru_cache(maxsize=64)
 def _get_down_reduce(
-    inter, hidden, top_k, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+    inter,
+    hidden,
+    top_k,
+    kvector,
+    w_scale_mode,
+    serialize_dot2,
+    scale_bn,
+    scale_bk,
+    kh_per_warp,
 ):
     return build_down_reduce_fp8_module(
         inter,
@@ -56,6 +64,7 @@ def _get_down_reduce(
         serialize_dot2=serialize_dot2,
         scale_bn=scale_bn,
         scale_bk=scale_bk,
+        kh_per_warp=kh_per_warp,
     )
 
 
@@ -160,6 +169,7 @@ def flydsl_warp_decode_down_reduce(
     w_scale_mode: str = "pertensor",
     scale_block: tuple[int, int] | None = None,
     serialize_dot2: bool = True,
+    kh_per_warp: int | None = None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """down_reduce stage of warp-decode MoE (BF16 intermediate, FP8 e4m3 weights).
@@ -181,6 +191,8 @@ def flydsl_warp_decode_down_reduce(
             [(E*HIDDEN)//BN * INTER//BK] row-major over (row-block, K-block).
         w_scale_mode: "pertensor", "pertoken" or "block2d".
         scale_block:  (BN, BK) block dims, required when ``w_scale_mode='block2d'``.
+        kh_per_warp:  outputs per wave (memory-level parallelism / H-tiling). Defaults
+            to 2 (H2, the FP8 best) when HIDDEN is even, else 1.
         out:          optional [B, HIDDEN] bfloat16 output buffer.
 
     Returns:
@@ -205,14 +217,26 @@ def flydsl_warp_decode_down_reduce(
         assert (E * HIDDEN) % scale_bn == 0, "(E*HIDDEN) must be divisible by BN"
         assert INTER % scale_bk == 0, "INTER must be divisible by BK"
 
+    if kh_per_warp is None:
+        kh_per_warp = 2 if HIDDEN % 2 == 0 else 1
+    assert HIDDEN % kh_per_warp == 0, "HIDDEN must be divisible by kh_per_warp"
+
     kvector = pick_kvector(INTER)
     if out is None:
         out = torch.empty((B, HIDDEN), dtype=torch.bfloat16, device=intermediate.device)
 
     launcher = _get_down_reduce(
-        INTER, HIDDEN, TOPK, kvector, w_scale_mode, serialize_dot2, scale_bn, scale_bk
+        INTER,
+        HIDDEN,
+        TOPK,
+        kvector,
+        w_scale_mode,
+        serialize_dot2,
+        scale_bn,
+        scale_bk,
+        kh_per_warp,
     )
-    grid_x = B * HIDDEN
+    grid_x = B * (HIDDEN // kh_per_warp)
     _run(
         launcher,
         (

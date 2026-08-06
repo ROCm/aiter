@@ -150,13 +150,14 @@ Status legend: [ ] todo · [~] in progress · [x] done
   scales; full aiter Python entry point added now. FP8/BF16 activation-variant and Block2D
   are later.
 
-### Phase 3 — `down_reduce` FP8  [x] (1-output baseline; H2 + perf pending)
-- [x] Grid `B*HIDDEN` waves (`kHPerWarp=1`); `out_j=bid%HIDDEN`, `token_b=bid//HIDDEN`;
+### Phase 3 — `down_reduce` FP8  [x] (baseline + H2 shipped)
+- [x] Grid `B*(HIDDEN/kh)` waves; `out_j0=(bid%(HIDDEN/kh))*kh`, `token_b=bid//(HIDDEN/kh)`;
       INTER tiled in `64*kVector` (kVector from INTER: 16, →8 fallback).
 - [x] Fold `router_wt * ds` (both lane-uniform) into each expert's **per-lane** partial, then
       a **single** butterfly reduce over Σ_k — exact and avoids a reduce per k. PerTensor
-      `p[0]` / PerToken `p[e*HIDDEN+out_j]`. **lane-0-only** BF16 store to `y[B,HIDDEN]`.
-- [x] `kHPerWarp=1` shipped. **H2 (2 outputs/wave)** — the reference FP8 best — pending.
+      `p[0]` / PerToken `p[e*HIDDEN+out_j]` / Block2D per-K-block. **lane-0-only** BF16 store.
+- [x] `kh_per_warp=1` and **H2 (`kh=2`, default for even HIDDEN)** both shipped — H2 gives the
+      dual weight-stream MLP (**+15–28%**, `down` now ~peak). Generalized over `kh` (see §7.4).
 - [x] Correctness vs torch reference: **exact** (cos_sim 1.0, max_delta 0.0) across
       PerTensor + PerToken, kVector 16 (`INTER=1024`) / 8 (`INTER=512`). End-to-end
       gate_up→down_reduce vs full torch MoE: cos 0.9999998, max_delta 1.5e-5 (stages compose).
@@ -164,7 +165,8 @@ Status legend: [ ] todo · [~] in progress · [x] done
       on the realistic shape (B1 INTER2048 HIDDEN7168 E8 TOPK8). Vectorized loads give a small,
       *real* win here — interleaved A/B (12 trials, bit-identical output): **+1.3%** (pertensor,
       separable) to **0%** (pertoken) — much smaller than earlier throwaway numbers implied.
-      Remaining lever: H2 (2 outputs/wave) activation-reuse.
+      **H2 shipped** (default): +15–28% over H1, down now BW-bound at ~peak (B1 pertensor
+      7.95 TB/s / ~99%, B4 9.81 TB/s). Remaining lever: CK-Tile reference comparison (H4 maybe).
 - **Where:** kernel `build_down_reduce_fp8_module` in `kernels/warp_decode_moe.py`; entry
   `flydsl_warp_decode_down_reduce` in `ops/flydsl/warp_decode_moe.py`; tests `DOWN_CASES` /
   `test_down_reduce_fp8` in the op_test (10 pass total).
@@ -267,10 +269,16 @@ to `inter[(token_b*TOPK+expert_k)*stride + neuron_j]`.
 `INTER/kTileN`. Shared BF16 `inter` tile + FP8 weight tile → per-pair
 `cvt_scalef32_pk_bf16_fp8` + dot2; `acc += dot*(w*ds)`. Reduce; lane 0 writes `y`.
 
-**H2 = 2 outputs/wave** (`kHPerWarp=2`, the current FP8 best): `GridSize=B*ceil(HIDDEN/2)`,
-`out_j0=(block_id%ceil(HIDDEN/2))*2`, `out_j1=out_j0+1`, `token_b=block_id/ceil(HIDDEN/2)`.
-Load `inter` **once**, two weight rows (`w_row0,w_row1`), two dot accumulators
-`dot0/dot1`, `acc0/acc1 += dot*(w*ds{0,1})`. Reduce both; lane 0 writes `y[out_j0]`,`y[out_j1]`.
+**H2 = 2 outputs/wave** (`kh_per_warp=2`, **shipped, the FP8 best & default**):
+`GridSize=B*(HIDDEN/kh)`, `out_j0=(block_id%(HIDDEN/kh))*kh`, `token_b=block_id/(HIDDEN/kh)`.
+Per iter, load `inter` **once** and issue `kh` independent FP8 weight-row loads *before*
+consuming them (so both are in flight); `kh` dot accumulators; `acc[h] += dot[h]*(w*ds[h])`.
+Reduce each; lane 0 writes `y[out_j0+h]`. Generalized over `kh_per_warp` (list of accumulators,
+`range_constexpr`-unrolled so the outer expert loop doesn't try to loop-carry the list); the
+entry point auto-selects `kh=2` when `HIDDEN` is even. **Measured (gfx950, cold reads,
+interleaved A/B):** H1→H2 is **+15–28%** — B1 pertensor 6.63→7.95 TB/s (83→99% peak),
+B4 pertensor 7.66→9.81, B1 pertoken 6.49→7.44, B1 block2d 6.44→7.66, all cos 1.0. This gives
+`down` the two-stream memory-level parallelism that already puts `gate_up` at ~peak.
 The win is MLP (two weight loads in flight + activation reuse). Ship 1-output first, then H2.
 
 ### 7.5 Primitives — what to build locally vs. reuse
@@ -442,3 +450,15 @@ Primary references: `op_tests/flydsl_tests/test_flydsl_moe_a16wfp4.py`,
   **exact** (cos 1.0, max_delta 0.0). Perf sweep block2d rows: **gate_up ~8.0 TB/s (~100% peak)**,
   **down ~6.1 TB/s (~76% peak)** — same BW band as PerTensor/PerToken (scale reads negligible).
   Scale layouts now complete; remaining levers are H2 (down) and CK-Tile reference comparison.
+- _perf: H2 (down 2-outputs/wave)_ — generalized `build_down_reduce_fp8_module` over
+  `kh_per_warp`: each wave now owns `kh` adjacent outputs, loading the shared BF16 activation
+  once and issuing `kh` **independent** FP8 weight-row loads before consuming them (the same
+  dual-stream MLP that puts `gate_up` at ~peak), plus halved wave count / per-wave router+reduce
+  overhead. List-of-accumulators unrolled via `range_constexpr` (a plain `range` statement loop
+  becomes a dynamic `scf.for` that can't loop-carry a Python list — the one gotcha). Entry point
+  auto-selects `kh=2` for even HIDDEN; `_get_down_reduce` keys on it; grid = `B*(HIDDEN/kh)`.
+  All 14 op_test cases still **exact** (cos 1.0, max_delta 0.0) with H2 as default. Interleaved
+  A/B (8 trials each, cold reads, bit-identical output): **H1→H2 +15–28%** — B1 pertensor
+  **6.63→7.95 TB/s (83→99% peak)**, B4 pertensor **7.66→9.81**, B1 pertoken 6.49→7.44,
+  B1 block2d 6.44→7.66, B1 I1024/H4096 5.54→6.54. `down` now matches `gate_up`'s ~peak BW.
+  Remaining: CK-Tile reference-number comparison (possible further lever: H4).
