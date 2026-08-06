@@ -53,6 +53,12 @@ constexpr int EXP     = 0x400;
 // row sum consumes the exps. Pairing each DS_READ with its MFMA matters: dropping the
 // DS_READ group lets the solver hoist the loads and costs both a spill and ~1.5% perf.
 // Rpt should cover the region's MFMA count; groups that cannot be filled are dropped.
+//
+// The budget is deliberately flat even though the region's two halves have different
+// shadows (nope is 16x16x128 / 8 passes, rope 16x16x32 / 4 passes on a serial
+// accumulator chain). Skewing it toward the rope tail was measured: it does move the
+// fillers there, but the region only has ~36 of them for 12 MFMA, so the nope half
+// starves by exactly as much and nothing changes outside noise.
 template <int Rpt, int G>
 __device__ inline void sched_compute_qk()
 {
@@ -638,8 +644,6 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
                                                 seq<T::W_M, T::W_N, T::W_K_ROPE>{},
                                                 mfma_adaptor_swap_ab{});
 
-    constexpr int SCALE_NONE = 127;
-
     using k_nope_tile_t = vector_t<D_K, T::W_N * T::W_K_NOPE / T::WARP_SIZE>;
     using s_tile_t      = vector_t<D_ACC, T::W_M * T::W_N / T::WARP_SIZE>;
     vector_t<D_K, T::GEMM0_E_N * T::W_N * T::W_K_NOPE / T::WARP_SIZE> v_k_nope[2];
@@ -710,8 +714,8 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
             constexpr int slot = idx & 1;
             auto s_tile        = reinterpret_cast<s_tile_t*>(&s);
             auto k_nope_tile   = reinterpret_cast<k_nope_tile_t*>(&k[slot]);
-            s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], SCALE_NONE, SCALE_NONE);
-            s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], SCALE_NONE, SCALE_NONE);
+            s_tile[0] = mfma0_nope(k_nope_tile[0], q[idx], s_tile[0], 0, 0);
+            s_tile[1] = mfma0_nope(k_nope_tile[1], q[idx], s_tile[1], 0, 0);
             if constexpr(idx + 2 < T::GEMM0_NOPE_E_K)
             {
                 k[slot] = load<T::VEC_KV_NOPE>(s_k_nope,
@@ -986,7 +990,7 @@ mla_decode_fwd_pipelined(mla_kargs kargs,
     // slot and its mask were already handled by the phase (or by the prologue when the
     // request is a single tile).
     s_waitcnt_vmcnt(number<T::kv_buffer_load_insts>{});
-    stage_end();
+    // stage_end();
     stage_end_2();
     // stage0 [compute]: finish the softmax tail (the head exp ran in the phase). Only
     // this part depends on the parity; keeping the V read and the PV outside the branch
@@ -1109,7 +1113,9 @@ mla_decode_fwd_one_req(mla_kargs kargs, int w, char* smem_kv, float temperature_
         auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
         auto v_o_out            = cast<D_OUT>(v_o);
         store<T::VEC_O>(g_o, v_o_out, u_o);
-        if(lane_id < T::W_M)
+        // lse_ptr is null when the caller did not ask for LSE; lse_accum below is
+        // always allocated, so only this branch needs the guard.
+        if(kargs.lse_ptr != nullptr && lane_id < T::W_M)
         {
             const int lse_offset = q_len_ptr_s * kargs.H;
             auto g_lse           = make_gmem(reinterpret_cast<D_ACC*>(kargs.lse_ptr) + lse_offset,
