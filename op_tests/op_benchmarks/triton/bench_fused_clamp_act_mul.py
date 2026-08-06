@@ -39,14 +39,14 @@ _QUANT_MODES = {
 
 
 def get_x_vals():
-    """Default (M, N) sweep; N is n_half (the gate/up width, a multiple of 128)."""
+    """Default (M, N) sweep; N value is n_half."""
     return [
         (128, 4096), # small M, med N
-        (4096, 4096), # med-large M, med N
         (16384, 4096), # large M, med N
         (4096, 512), # med M, small N
+        (16384, 8192), # both large, but proper intermediate size
         (8192, 8192), # equal M=N, both med-large
-        (16384, 16384), # both large
+
     ]
 
 

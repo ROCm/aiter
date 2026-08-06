@@ -65,7 +65,8 @@ def _fused_clamp_silu_mul_kernel(
 ):
     # constants
     NUM_N_Q_GROUPS: gl.constexpr = BLOCK_SIZE_N // QUANT_BLOCK_SIZE  # quant groups per row
-    # 1D layouts
+    # 1D layouts for rows, 2D layouts give bad perf and buffer_load is not good for perf with llvm currently
+    # TDM is more efficient than regular load
     row_layout: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[max(1, BLOCK_SIZE_N // (num_warps * 32))], # div N over lanes, floor 1
         threads_per_warp=[32],
@@ -78,8 +79,8 @@ def _fused_clamp_silu_mul_kernel(
         warps_per_cta=[num_warps],
         order=[0],
     )
-    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])       # 1D input buffers
-    shared_out_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[1, 0])    # 2D output ACC
+
+    shared_tdm_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, order=[0])
 
     # setup
     pid = gl.program_id(0)                 
@@ -96,7 +97,7 @@ def _fused_clamp_silu_mul_kernel(
         inp_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
     )
     out_acc = gl.allocate_shared_memory(
-        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_out_layout
+        out_ptr.dtype.element_ty, [ROWS_PER_PROG, BLOCK_SIZE_N], shared_tdm_layout
     )
 
     # prologue + setup TDM
@@ -123,11 +124,7 @@ def _fused_clamp_silu_mul_kernel(
     for i in gl.static_range(ROWS_PER_PROG):
         row = m_start + i
 
-        gl.amd.gfx1250.tdm.async_wait(2 * (ROWS_PER_PROG - i - 1))
-        gate = gate_smem.index(i).load(row_layout).to(gl.float32)
-        up = up_smem.index(i).load(row_layout).to(gl.float32)
-
-        # weights
+        # weights load first, hide TDM latency
         if HAVE_WEIGHTS:
             if WEIGHT_BROADCAST:
                 w = gl.load(weights_ptr + row * weights_stride_m).to(gl.float32)  # scalar applied to all out
@@ -136,6 +133,10 @@ def _fused_clamp_silu_mul_kernel(
                     weights_ptr + row * weights_stride_m + offs * weights_stride_n,
                     mask=mask, other=0.0, cache_modifier=cache_modifier,
                 ).to(gl.float32)
+
+        gl.amd.gfx1250.tdm.async_wait(2 * (ROWS_PER_PROG - i - 1))
+        gate = gate_smem.index(i).load(row_layout).to(gl.float32)
+        up = up_smem.index(i).load(row_layout).to(gl.float32)
 
         # clamp
         if HAVE_SWIGLU_CLAMP:
@@ -221,15 +222,16 @@ def _fused_clamp_silu_mul_kernel(
             # no quant
             out_acc.index(i).store(out.to(out_ptr.dtype.element_ty))
 
-    # store
+    # epilogue
     if num_warps > 1:
         gl.barrier()
-    out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=out_ptr,
-        shape=[M, n_half],
-        strides=[out_stride_m, out_stride_n],
-        block_shape=[ROWS_PER_PROG, BLOCK_SIZE_N],
-        layout=shared_out_layout,
-    )
-    gl.amd.gfx1250.tdm.async_store(out_desc, [m_start, 0], out_acc)
+    for i in gl.static_range(ROWS_PER_PROG):
+        out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=out_ptr + (m_start + i) * out_stride_m,
+            shape=[n_half],
+            strides=[out_stride_n],
+            block_shape=[BLOCK_SIZE_N],
+            layout=shared_tdm_layout,
+        )
+        gl.amd.gfx1250.tdm.async_store(out_desc, [0], out_acc.index(i))
     gl.amd.gfx1250.tdm.async_wait(0)
