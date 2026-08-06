@@ -7,14 +7,16 @@ For each chunk of ``BT`` tokens, with ``C = (I + A)^-1`` and ``A`` the strictly
 lower-triangular gated KKT matrix
 ``A[s, r] = (k_s . k_r) * beta_s * exp(g_cumsum_s - g_cumsum_r)`` for ``s > r``:
 
-    g_cumsum : [B, T, H]    fp32   in-chunk inclusive prefix sum of g
-    w_bar    : [B, T, H, K] bf16   = C @ (k * beta * exp(g_cumsum))
-    u_bar    : [B, T, H, V] bf16   = C @ (v * beta)
+    g_cumsum : [B, H, T]    fp32   in-chunk inclusive prefix sum of g
+    w_bar    : [B, H, T, K] bf16   = C @ (k * beta * exp(g_cumsum))
+    u_bar    : [B, H, T, V] bf16   = C @ (v * beta)
 
 This is the single-kernel equivalent of the Triton
 ``fused_chunk_local_cumsum_scaled_dot_kkt_fwd`` + ``fused_solve_tril_recompute_w_u``
-pair, and keeps that pair's token-major output layout and natural-log
-``g_cumsum`` domain.
+pair, and reproduces that pair's contract: the inputs stay token-major while all
+three outputs are published head-major (stride 1 along T within a head, as K5
+and K6 require), and the ``g_cumsum`` domain follows ``g_scale`` -- natural log
+by default, log2 for downstream ``exp2`` consumers.
 
 Single production build: MFMA bf16 16x16x16 for the hot GEMMs and the
 triangular inverse, on the Opus-style LDS layout (full-K staging, fp32 ``s_A``,
@@ -38,28 +40,22 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import (
-    arith,
-    buffer_ops,
     const_expr,
     gpu,
     range_constexpr,
     rocdl,
-    vector,
 )
-from flydsl.expr.numeric import Numeric
-from flydsl.expr.typing import T as Tir  # MLIR type helpers
-from flydsl.runtime.device import get_rocm_arch
-from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-
-from .tensor_shim import GTensor, STensor
 
 
 def _exp2_f32(x):
-    """Base-2 exponential lowering to a single ``v_exp_f32``."""
-    return fx.Float32(rocdl.exp2(Tir.f32, x.ir_value()))
+    """Base-2 exponential lowering to a single ``v_exp_f32``.
+
+    The ``rocdl`` intrinsic rather than ``fx.exp2``: both keep the 17 ``v_exp_f32``
+    but routing through ``math.exp2`` adds 83 instructions of range handling this
+    kernel's inputs (a non-positive decay exponent) never need.
+    """
+    return fx.Float32(rocdl.exp2(fx.Float32.ir_type, x.ir_value()))
 
 
 WARP_SIZE = 64
@@ -88,45 +84,135 @@ BLOCK_THREADS = 256  # 4 warps
 #   accumulator C[m,n]: m = (lane//16)*4 + p (p in 0..3), n = lane % 16
 # ---------------------------------------------------------------------------
 def _F32X4():
-    return arith.constant_vector(0.0, Tir.vec(4, Tir.f32))
+    return fx.Vector.filled(4, 0.0, fx.Float32).ir_value()
 
 
 def _BF16X4():
-    return arith.constant_vector(0.0, Tir.vec(4, Tir.bf16))
+    return fx.Vector.filled(4, 0.0, fx.BFloat16).ir_value()
 
 
-def _I(x):
-    """Cast an i32 (or python int) index to MLIR ``index`` for STensor vector ops."""
-    return fx.Index(x)
+class _LTensor:
+    """A row-major LDS region addressed through its layout view.
+
+    Scalar access goes through the view's ``(row, col)`` coordinate, so the
+    layout -- not the caller -- does the index math.  Vector access takes a
+    narrower view of ``n`` contiguous elements at that coordinate.
+
+    A dynamic row offset carries no divisibility, so ``fly.add_offset`` drops the
+    base pointer's ``align`` and the access is lowered at the *value type's*
+    natural alignment -- an over-promise on a row stride that does not provide
+    it, and 0.3.0 cannot declare a weaker alignment on a view.  :meth:`vec_store`
+    therefore narrows the value to the widest chunk the stride does guarantee;
+    for ``KS`` a vec8 bf16 becomes 2 x vec4, which the backend re-fuses into one
+    ``ds_write2_b64``.
+    """
+
+    __slots__ = ("row_stride", "view")
+
+    def __init__(self, arr, rows, row_stride=0):
+        self.row_stride = row_stride
+        self.view = arr.view(
+            fx.make_layout((rows, row_stride), (row_stride, 1))
+            if row_stride
+            else fx.make_layout(rows, 1)
+        )
+
+    def _sub(self, off, n):
+        """A view of ``n`` contiguous elements at element offset ``off``."""
+        return fx.make_view(fx.get_iter(self.view) + off, fx.make_layout(n, 1))
+
+    def _off(self, idx):
+        if isinstance(idx, tuple):
+            row, col = idx
+            return row * fx.Int32(self.row_stride) + col
+        return idx
+
+    def __getitem__(self, idx):
+        return self.view[idx]
+
+    def __setitem__(self, idx, val):
+        self.view[idx] = val
+
+    def vec_load(self, idx, n):
+        return self._sub(self._off(idx), n).load()
+
+    def vec_store(self, idx, val, n):
+        base = self._off(idx)
+        # Widest chunk the row stride keeps naturally aligned (its 2-adic part).
+        chunk = min(n, self.row_stride & -self.row_stride) if self.row_stride else n
+        if chunk == n:
+            self._sub(base, n).store(val)
+            return
+        v = fx.Vector(val)
+        for c in range(0, n, chunk):
+            self._sub(base + fx.Int32(c), chunk).store(
+                v.shuffle(v, list(range(c, c + chunk)))
+            )
 
 
 def _ext(v, i):
     """Extract lane ``i`` from a vector at a statically known position."""
-    return vector.extract(v, static_position=[i], dynamic_position=[])
+    return fx.Vector(v)[i]
 
 
 def _mfma16(a_bf16x4, b_bf16x4, c_f32x4):
-    """D[m,n] = sum_k A[m,k]*B[n,k] + C  (bf16 in, fp32 acc)."""
-    a16 = vector.bitcast(Tir.vec(4, Tir.i16), a_bf16x4)
-    b16 = vector.bitcast(Tir.vec(4, Tir.i16), b_bf16x4)
-    return rocdl.mfma_f32_16x16x16bf16_1k(
-        Tir.vec(4, Tir.f32), [a16, b16, c_f32x4, 0, 0, 0]
-    )
+    """D[m,n] = sum_k A[m,k]*B[n,k] + C  (bf16 in, fp32 acc).
+
+    The atom takes memrefs, so the vectors go through register fragments;
+    ``fly-promote-regmem-to-vectorssa`` folds them back to the intrinsic's own ISA.
+    """
+    frag_a = fx.make_rmem_tensor(4, fx.BFloat16)
+    frag_b = fx.make_rmem_tensor(4, fx.BFloat16)
+    frag_c = fx.make_rmem_tensor(4, fx.Float32)
+    frag_a.store(fx.Vector(a_bf16x4))
+    frag_b.store(fx.Vector(b_bf16x4))
+    frag_c.store(fx.Vector(c_f32x4))
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    fx.mma_atom_call(mma, frag_c, frag_a, frag_b, frag_c)
+    return frag_c.load().ir_value()
+
+
+def _acc16_n4():
+    """A zeroed accumulator over four N tiles, shaped for :func:`_gemm16_n4`."""
+    frag = fx.make_rmem_tensor((4, 1, 4), fx.Float32)
+    frag.store(fx.Vector.filled(16, 0.0, fx.Float32))
+    return frag
+
+
+def _gemm16_n4(frag_c, a_bf16x4, bs):
+    """frag_c[:, 0, n] += A @ B[n] for the four N tiles, as one atom loop.
+
+    ``fx.gemm`` takes the tile counts off mode 1 of A (M) and of B (N), and off
+    modes 1/2 of C (M, N); mode 0 is the atom's own fragment.  A and B must stay
+    rank 2 -- a rank-3 operand selects the lowering's K-loop path instead.
+
+    The fragment fill has to stay in a helper: in the kernel body the AST
+    rewriter turns these loops into ``scf.for``, and the dynamic element offsets
+    then stop ``fly-promote-regmem-to-vectorssa`` from lifting the fragments,
+    leaving them in scratch.
+    """
+    frag_a = fx.make_rmem_tensor((4, 1), fx.BFloat16)
+    frag_b = fx.make_rmem_tensor((4, 4), fx.BFloat16)
+    a_v = fx.Vector(a_bf16x4)
+    for p in range(4):
+        frag_a[p, 0] = a_v[p]
+        for en in range(4):
+            frag_b[p, en] = fx.Vector(bs[en])[p]
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.BFloat16))
+    fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
 
 
 def _accum_to_bf16x4(d_f32x4):
     """v4f32 accumulator -> v4bf16 operand (element-wise truncf), for MFMA chaining."""
-    elems = [
-        Numeric.from_python_value(_ext(d_f32x4, p)).to(fx.BFloat16) for p in range(4)
-    ]
-    return vector.from_elements(Tir.vec(4, Tir.bf16), elems)
+    elems = [_ext(d_f32x4, p).to(fx.BFloat16) for p in range(4)]
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _load_mfma_tile(s_t, row_base, col_base, lane):
     """bf16 LDS -> v4bf16 fragment: 4 contiguous along the inner (K) dim."""
     row = row_base + (lane % fx.Int32(16))
     col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    return s_t.vec_load((_I(row), _I(col)), 4)
+    return s_t.vec_load((row, col), 4)
 
 
 # --- coupled XOR bank-swizzle (s_vT only) -----------------------------------
@@ -157,13 +243,13 @@ def _load_mfma_tile_vt_tiled(s_t, row_tile, col_tile, n16, mb4):
     """
     row = fx.Int32(row_tile * 16) + n16
     col = fx.Int32(col_tile * 16) + (mb4 ^ fx.Int32(row_tile * 4))
-    return s_t.vec_load((_I(row), _I(col)), 4)
+    return s_t.vec_load((row, col), 4)
 
 
 def _sst2_vt(s_t, n, j, val):
     """s_vT scalar scatter write with the matching coupled col-group XOR swizzle."""
     cg = (j // fx.Int32(4)) ^ _swz_vt(n)
-    s_t[_I(n), _I(cg * fx.Int32(4) + (j % fx.Int32(4)))] = val
+    s_t[n, cg * fx.Int32(4) + (j % fx.Int32(4))] = val
 
 
 # --- s_out is deliberately left unswizzled and unpadded ---------------------
@@ -179,9 +265,12 @@ def _load_fp32_tile(s_t, row_base, col_base, lane):
     """fp32 LDS -> v4bf16 fragment (same lane map as _load_mfma_tile, cast to bf16)."""
     row = row_base + (lane % fx.Int32(16))
     col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    v = s_t.vec_load((_I(row), _I(col)), 4)
-    elems = [Numeric.from_python_value(_ext(v, p)).to(fx.BFloat16) for p in range(4)]
-    return vector.from_elements(Tir.vec(4, Tir.bf16), elems)
+    # Read the four elements singly rather than as one v4f32: ``ASA`` leaves odd
+    # rows only 4B-aligned, so a full-width load would be lowered at the v4f32's
+    # natural 16 B (see :class:`_LTensor`).  The backend still pairs the adjacent
+    # reads into ds_read2_b32.
+    elems = [s_t[row, col + fx.Int32(p)].to(fx.BFloat16) for p in range(4)]
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _load_fp32_tile_T(s_t, row_base, col_base, lane):
@@ -189,25 +278,19 @@ def _load_fp32_tile_T(s_t, row_base, col_base, lane):
     n = lane % fx.Int32(16)
     col = col_base + n
     kb4 = (lane // fx.Int32(16)) * fx.Int32(4)
-    elems = [
-        Numeric.from_python_value(s_t[_I(row_base + kb4 + fx.Int32(p)), _I(col)]).to(
-            fx.BFloat16
-        )
-        for p in range(4)
-    ]
-    return vector.from_elements(Tir.vec(4, Tir.bf16), elems)
+    elems = [s_t[row_base + kb4 + fx.Int32(p), col].to(fx.BFloat16) for p in range(4)]
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _load_neg_fp32_tile(s_t, row_base, col_base, lane):
     """fp32 LDS -> v4bf16 fragment of (-tile) with _load_mfma_tile lane map."""
     row = row_base + (lane % fx.Int32(16))
     col = col_base + (lane // fx.Int32(16)) * fx.Int32(4)
-    v = s_t.vec_load((_I(row), _I(col)), 4)
     elems = [
-        (Numeric.from_python_value(_ext(v, p)) * fx.Float32(-1.0)).to(fx.BFloat16)
+        (s_t[row, col + fx.Int32(p)] * fx.Float32(-1.0)).to(fx.BFloat16)
         for p in range(4)
     ]
-    return vector.from_elements(Tir.vec(4, Tir.bf16), elems)
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _load_neg_fp32_tile_T(s_t, row_base, col_base, lane):
@@ -222,13 +305,10 @@ def _load_neg_fp32_tile_T(s_t, row_base, col_base, lane):
     col = col_base + n
     kb4 = (lane // fx.Int32(16)) * fx.Int32(4)
     elems = [
-        (
-            Numeric.from_python_value(s_t[_I(row_base + kb4 + fx.Int32(p)), _I(col)])
-            * fx.Float32(-1.0)
-        ).to(fx.BFloat16)
+        (s_t[row_base + kb4 + fx.Int32(p), col] * fx.Float32(-1.0)).to(fx.BFloat16)
         for p in range(4)
     ]
-    return vector.from_elements(Tir.vec(4, Tir.bf16), elems)
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, lane):
@@ -236,50 +316,43 @@ def _store_fp32_tile(s_t, row_base, col_base, d_f32x4, lane):
     n = lane % fx.Int32(16)
     mb4 = (lane // fx.Int32(16)) * fx.Int32(4)
     for p in range(4):
-        s_t[_I(row_base + mb4 + fx.Int32(p)), _I(col_base + n)] = _ext(d_f32x4, p)
+        s_t[row_base + mb4 + fx.Int32(p), col_base + n] = _ext(d_f32x4, p)
 
 
 def _negate4(d_f32x4):
     """Element-wise negate a v4f32 accumulator."""
-    elems = [
-        (Numeric.from_python_value(_ext(d_f32x4, p)) * fx.Float32(-1.0))
-        for p in range(4)
-    ]
-    return vector.from_elements(Tir.vec(4, Tir.f32), elems)
+    elems = [_ext(d_f32x4, p) * fx.Float32(-1.0) for p in range(4)]
+    return fx.Vector.from_elements(elems).ir_value()
 
 
-class _SeqBoundedG:
-    """A :class:`GTensor` work-alike whose buffer descriptor is clamped to
-    ``num_records_bytes`` rather than :class:`GTensor`'s ``max_size=True``.
+class _BufG:
+    """A global tensor addressed through a buffer descriptor.
 
-    Every access past the limit is dropped by the buffer hardware -- loads
-    return zero, stores are discarded -- which is exactly the ``row < seqlen``
-    bound the callers would otherwise hand-roll as two selects per load (clamp
-    the index to 0, then substitute a zero vector) plus an ``scf.if`` per store.
-    Limits are always a whole multiple of the row stride and every access stays
-    inside one row's feature dim, so an access is either entirely in range or
-    entirely out of it -- it can never straddle the limit and come back
-    partially zeroed.
+    With ``num_records_bytes`` the descriptor is clamped, so every access past
+    the limit is dropped by the buffer hardware -- loads return zero, stores are
+    discarded -- which is exactly the ``row < seqlen`` bound the callers would
+    otherwise hand-roll as two selects per load (clamp the index to 0, then
+    substitute a zero vector) plus an ``scf.if`` per store.  Limits are always a
+    whole multiple of the row stride and every access stays inside one row's
+    feature dim, so an access is either entirely in range or entirely out of it
+    -- it can never straddle the limit and come back partially zeroed.
 
-    ``load``/``store`` mirror ``GTensor``'s; only the descriptor differs, and
-    building it directly keeps the unused ``max_size`` one out of the IR."""
+    Omitting it leaves the descriptor at its max size, i.e. unclamped, for
+    operands whose indices are already known to be in range."""
 
-    def __init__(self, t, dtype, num_records_bytes):
+    def __init__(self, t, dtype, num_records_bytes=None):
         self.dtype = dtype
-        self.cache_modifier = 0
-        self.rsrc = buffer_ops.create_buffer_resource(
-            t, num_records_bytes=num_records_bytes
-        )
+        buf = fx.rocdl.make_buffer_tensor(t, num_records_bytes=num_records_bytes)
+        self.ptr = fx.get_iter(buf)
 
     def load(self, offset, vec_size=1):
-        return buffer_ops.buffer_load(
-            self.rsrc, offset, vec_width=vec_size, dtype=self.dtype
-        )
+        p = self.ptr + offset
+        if vec_size == 1:
+            return fx.ptr_load(p)
+        return fx.ptr_load(p, result_type=fx.Vector.make_type(vec_size, self.dtype))
 
-    def store(self, offset, value, vec_size=1):
-        buffer_ops.buffer_store(
-            value, self.rsrc, offset, cache_modifier=self.cache_modifier
-        )
+    def store(self, offset, value):
+        fx.ptr_store(value, self.ptr + offset)
 
 
 def _gld(g, off):
@@ -292,36 +365,39 @@ def _gld_vec(g, off, n):
     return g.load(off, vec_size=n)
 
 
-def _sst_vec_aligned(t, i, j, val, alignment):
-    """Vector LDS store with an explicit, truthful byte alignment."""
-    off = t.linear_offset((_I(i), _I(j)))
-    vector.store(val, t.memptr, [off], alignment=alignment)
+def _sst_vec(t, i, j, val, n):
+    """Vector LDS store (``n`` contiguous elements) via a function call."""
+    t.vec_store((i, j), val, n)
 
 
 def _gst(g, off, val):
-    """Scalar global store via a function call (see :func:`_sst`)."""
+    """Global store via a function call (see :func:`_sst`).
+
+    Width comes from ``val``'s own type, so this serves both the scalar
+    ``g_cumsum`` store and the vector ``w_bar``/``u_bar`` epilogue stores.
+    """
     g.store(off, val)
 
 
 def _sst(t, idx, val):
-    """1-D STensor store via a function call.
+    """1-D LDS store via a function call.
 
     Routing LDS writes through a call (instead of ``t[i] = v`` in the kernel
-    body) keeps the FlyDSL AST rewriter from treating the shared-memory tensor
+    body) keeps the FlyDSL AST rewriter from treating the shared-memory region
     as a state variable that must be threaded through the enclosing dynamic
     ``scf.if`` (which fails for Python objects).
     """
-    t[_I(idx)] = val
+    t[idx] = val
 
 
 def _sst2(t, i, j, val):
-    """2-D STensor store via a function call (see :func:`_sst`)."""
-    t[_I(i), _I(j)] = val
+    """2-D LDS store via a function call (see :func:`_sst`)."""
+    t[i, j] = val
 
 
 def _ld(t, idx):
-    """1-D STensor scalar read (index-cast)."""
-    return t[_I(idx)]
+    """1-D LDS scalar read."""
+    return t[idx]
 
 
 def _identity_frag(lane):
@@ -332,7 +408,7 @@ def _identity_frag(lane):
         ((mb4 + fx.Int32(p)) == n).select(fx.Float32(1.0), fx.Float32(0.0))
         for p in range(4)
     ]
-    return vector.from_elements(Tir.vec(4, Tir.f32), elems)
+    return fx.Vector.from_elements(elems).ir_value()
 
 
 def _wy_prefetch(
@@ -347,7 +423,7 @@ def _wy_prefetch(
     sub-iter's MFMA (which barely stalls) -- hiding ``wait_vm`` at iso-LDS and
     iso-VGPR, i.e. without giving up any occupancy.
 
-    Rows past ``seqlen`` need no guard: ``src_g`` is a :class:`_SeqBoundedG`
+    Rows past ``seqlen`` need no guard: ``src_g`` is a :class:`_BufG`
     handle, so the buffer hardware zero-fills them."""
     regs = []
     for it in range(stage_iters):
@@ -367,9 +443,9 @@ def _wy_scatter(regs, s_vT, s_beta, gc, is_k, tid, stage_iters, svec_per_row, sv
         p = tid + fx.Int32(it * BLOCK_THREADS)
         j = p // fx.Int32(svec_per_row)
         row0 = (p % fx.Int32(svec_per_row)) * fx.Int32(svec)
-        scale_j = Numeric.from_python_value(_ld(gc if is_k else s_beta, j))
+        scale_j = _ld(gc if is_k else s_beta, j)
         for vv in range(svec):
-            val = Numeric.from_python_value(_ext(vals, vv)).to(fx.Float32)
+            val = _ext(vals, vv).to(fx.Float32)
             _sst2_vt(s_vT, row0 + fx.Int32(vv), j, (val * scale_j).to(fx.BFloat16))
 
 
@@ -386,14 +462,14 @@ def _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16):
         for p in range(4):
             s = warp16 + mb4 + fx.Int32(p)
             col = fx.Int32(en * 16) + n16
-            val = Numeric.from_python_value(_ext(wy[en], p)).to(fx.BFloat16)
+            val = wy[p, 0, en].to(fx.BFloat16)
             _sst2(s_out, s, col, val)
 
 
 def _sld_vec(s_t, i, j, n):
     """LDS vector load (``n`` contiguous elems along the inner dim) via a call
     (mirrors :func:`_gld_vec`; the readback of the WY output tile uses this)."""
-    return s_t.vec_load((_I(i), _I(j)), n)
+    return s_t.vec_load((i, j), n)
 
 
 def _k_prefetch(k_g, base_k, k_row_stride, tid, n_per, k_v, kvec):
@@ -405,7 +481,7 @@ def _k_prefetch(k_g, base_k, k_row_stride, tid, n_per, k_v, kvec):
     like the old serial k stage had.
 
     Rows past ``seqlen`` are zero-filled by the buffer hardware (see
-    :class:`_SeqBoundedG`), so no per-load guard is needed."""
+    :class:`_BufG`), so no per-load guard is needed."""
     regs = []
     for it in range(n_per):
         p = tid + fx.Int32(it * BLOCK_THREADS)
@@ -415,14 +491,14 @@ def _k_prefetch(k_g, base_k, k_row_stride, tid, n_per, k_v, kvec):
     return regs
 
 
-def _k_scatter(regs, s_k, tid, n_per, k_v, kvec, alignment=16):
+def _k_scatter(regs, s_k, tid, n_per, k_v, kvec):
     """Scatter the prefetched k regs into ``s_k`` [BT,K] (vec-``kvec`` LDS store);
     the k loads have drained during the prefix-sum, so this barely stalls."""
     for it in range(n_per):
         p = tid + fx.Int32(it * BLOCK_THREADS)
         j = p // fx.Int32(k_v)
         cv = (p % fx.Int32(k_v)) * fx.Int32(kvec)
-        _sst_vec_aligned(s_k, j, cv, regs[it], alignment)
+        _sst_vec(s_k, j, cv, regs[it], kvec)
 
 
 def _wave_inclusive_scan(val, tid, width, zero):
@@ -430,23 +506,12 @@ def _wave_inclusive_scan(val, tid, width, zero):
     Uses the **same** stride-doubling add order as the old LDS Hillis-Steele
     (lane i at step s adds lane i-2^s, masked when i<2^s), so the result is
     bit-identical -- but with 0 barriers instead of log2(width) LDS round-trips.
-    Requires width == wavefront size (here BT == WARP_SIZE == 64).
-
-    (Installed flydsl exposes only ``shuffle_xor``; build the ``mode='up'``
-    gpu.ShuffleOp directly -- lane k reads lane k-offset.)"""
-    from flydsl._mlir.dialects.gpu import ShuffleOp
-
+    Requires width == wavefront size (here BT == WARP_SIZE == 64)."""
     csum = val
     s = 1
     while s < width:
-        prev = type(val)(
-            ShuffleOp(
-                csum.ir_value(),
-                fx.Int32(s).ir_value(),
-                fx.Int32(width).ir_value(),
-                mode="up",
-            ).shuffleResult
-        )
+        # mode="up": lane k reads lane k-s.
+        prev = gpu.shuffle(csum, s, width, mode="up")
         csum = csum + (tid >= fx.Int32(s)).select(prev, zero)
         s <<= 1
     return csum
@@ -473,12 +538,11 @@ def compile_gdn_prepare(
     granule):
         s_g     fp32[BT]        in-wave scan result (g_cumsum, later the K scale)
         s_beta  fp32[BT]
-        region P0 (off_k), reused in order:
+        region P0, a union because its members are live at disjoint times:
           s_k     bf16[BT,KS]   staged k (KKT input + w_bar RHS source)  KS=K+4
           s_A     fp32[BT,ASA]  KKT result, then in-place (I+A)^-1       ASA=BT+1
           s_vT    bf16[BT,VTS]  transposed scaled WY RHS                 VTS=BT+4
-          s_out   bf16[BT,OUT_S] WY output staging, parked in P0's tail
-                                 immediately after s_vT
+          + s_out bf16[BT,OUT_S] WY output staging, live alongside s_vT
 
     ``s_vT`` (8,704 B) + ``s_out`` (8,192 B) exactly equal the dead full-K
     ``s_k`` slab (16,896 B), so the coalescing output staging costs no LDS and
@@ -490,12 +554,11 @@ def compile_gdn_prepare(
     tile, so P0 is 768 B smaller.  Occupancy is unaffected either way -- it is
     capped by VGPRs (64 -> 8 waves/SIMD) and the 32-wave/CU limit, not by LDS.
     """
-    arch = get_rocm_arch()
     assert BT == 64 and K == 128 and V == 128, "gdn_prepare targets the BT=64 main path"
     LOG2E = 1.4426950408889634
 
-    KS = K + 4  # Opus's k stride.  Odd rows are only 8B-aligned, so the
-    # vec8 LDS staging below declares a truthful alignment=8.
+    KS = K + 4  # Opus's k stride; odd rows are only 8B-aligned, which is what
+    # splits the vec8 staging store (see :class:`_LTensor`).
     VTS = BT + 4  # s_vT row stride
     ASA = BT + 1  # Opus's fp32 A stride
     BK_SUB = 64
@@ -505,23 +568,25 @@ def compile_gdn_prepare(
     # s_vT and s_out must both fit in P0 alongside the larger of s_k / s_A.
     assert BT * VTS * 2 + BT * OUT_S * 2 <= max(BT * KS * 2, BT * ASA * 4)
 
-    allocator = SmemAllocator(None, arch=arch, global_sym_name="gdn_prepare_smem")
+    @fx.struct
+    class _WYStaging:
+        s_vT: fx.Array[fx.BFloat16, BT * VTS, 16]
+        s_out: fx.Array[fx.BFloat16, BT * OUT_S, 16]
 
-    def _alloc(nbytes, align=16):
-        off = allocator._align(allocator.ptr, align)
-        allocator.ptr = off + nbytes
-        return off
+    # A union, so SharedAllocator emits one LDS object sized by the largest
+    # member instead of summing them: the overlap of the three phases is the
+    # layout, not an accident of adjacent struct leaves.
+    @fx.union
+    class _P0:
+        s_k: fx.Array[fx.BFloat16, BT * KS, 16]
+        s_A: fx.Array[fx.Float32, BT * ASA, 16]
+        wy: _WYStaging
 
-    off_g = _alloc(BT * 4)
-    off_beta = _alloc(BT * 4)
-    off_k = _alloc(
-        max(
-            BT * KS * 2,
-            BT * ASA * 4,
-            BT * VTS * 2,
-            BT * OUT_S * 2,
-        )
-    )
+    @fx.struct
+    class _SharedStorage:
+        s_g: fx.Array[fx.Float32, BT, 16]
+        s_beta: fx.Array[fx.Float32, BT, 16]
+        p0: _P0
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1], name="gdn_prepare_kernel")
     def gdn_prepare_kernel(
@@ -537,7 +602,7 @@ def compile_gdn_prepare(
         H: fx.Int32,
         Hg: fx.Int32,
     ):
-        tid = fx.thread_idx.x
+        tid = fx.Int32(gpu.thread_id("x"))
         rep = H // Hg
 
         lane = tid % fx.Int32(WARP_SIZE)
@@ -545,14 +610,14 @@ def compile_gdn_prepare(
         warp16 = warp * fx.Int32(16)
 
         # --- workgroup -> (sequence, chunk) mapping + sequence bounds ---
-        i_t = fx.block_idx.x
-        i_bh = fx.block_idx.y
+        i_t = fx.Int32(gpu.block_id("x"))
+        i_bh = fx.Int32(gpu.block_id("y"))
         i_b = i_bh // H
         i_h = i_bh % H
         if const_expr(is_varlen):
-            cu_g = GTensor(cu_t, dtype=Tir.i32, shape=(-1,))
-            bos = Numeric.from_python_value(_gld(cu_g, i_b))
-            nxt = Numeric.from_python_value(_gld(cu_g, i_b + fx.Int32(1)))
+            cu_g = _BufG(cu_t, fx.Int32)
+            bos = fx.Int32(_gld(cu_g, i_b))
+            nxt = fx.Int32(_gld(cu_g, i_b + fx.Int32(1)))
             seqlen = nxt - bos
         else:
             bos = i_b * T
@@ -594,43 +659,23 @@ def compile_gdn_prepare(
             lim_gcs = (hm_end * fx.Int32(4)).ir_value()
             lim_ub = (hm_end * fx.Int32(V * 2)).ir_value()
             lim_wb = (hm_end * fx.Int32(K * 2)).ir_value()
-            k_g = _SeqBoundedG(k_t, Tir.bf16, lim_k)
-            v_g = _SeqBoundedG(v_t, Tir.bf16, lim_v)
-            g_g = _SeqBoundedG(g_t, Tir.f32, lim_gb)
-            beta_g = _SeqBoundedG(beta_t, Tir.f32, lim_gb)
-            gcs_g = _SeqBoundedG(gcs_t, Tir.f32, lim_gcs)
-            wbar_g = _SeqBoundedG(wbar_t, Tir.bf16, lim_wb)
-            ubar_g = _SeqBoundedG(ubar_t, Tir.bf16, lim_ub)
+            k_g = _BufG(k_t, fx.BFloat16, lim_k)
+            v_g = _BufG(v_t, fx.BFloat16, lim_v)
+            g_g = _BufG(g_t, fx.Float32, lim_gb)
+            beta_g = _BufG(beta_t, fx.Float32, lim_gb)
+            gcs_g = _BufG(gcs_t, fx.Float32, lim_gcs)
+            wbar_g = _BufG(wbar_t, fx.BFloat16, lim_wb)
+            ubar_g = _BufG(ubar_t, fx.BFloat16, lim_ub)
 
-            base = allocator.get_base()
-            s_g = STensor(
-                SmemPtr(base, off_g, Tir.f32, shape=(BT,)), Tir.f32, shape=(BT,)
-            )
-            s_beta = STensor(
-                SmemPtr(base, off_beta, Tir.f32, shape=(BT,)), Tir.f32, shape=(BT,)
-            )
-            s_k = STensor(
-                SmemPtr(base, off_k, Tir.bf16, shape=(BT * KS,)),
-                Tir.bf16,
-                shape=(BT, KS),
-            )
-            s_A = STensor(
-                SmemPtr(base, off_k, Tir.f32, shape=(BT * ASA,)),
-                Tir.f32,
-                shape=(BT, ASA),
-            )
-            s_vT = STensor(
-                SmemPtr(base, off_k, Tir.bf16, shape=(BT * VTS,)),
-                Tir.bf16,
-                shape=(BT, VTS),
-            )
-            # WY output staging in P0's free tail after s_vT, read back coalesced
-            # (vec8) for wide global stores.
-            s_out = STensor(
-                SmemPtr(base, off_k + BT * VTS * 2, Tir.bf16, shape=(BT * OUT_S,)),
-                Tir.bf16,
-                shape=(BT, OUT_S),
-            )
+            lds = fx.SharedAllocator().allocate(_SharedStorage)
+            s_g = _LTensor(lds.s_g.peek(), BT)
+            s_beta = _LTensor(lds.s_beta.peek(), BT)
+            s_k = _LTensor(lds.p0.s_k.peek(), BT, KS)
+            s_A = _LTensor(lds.p0.s_A.peek(), BT, ASA)
+            s_vT = _LTensor(lds.p0.wy.s_vT.peek(), BT, VTS)
+            # WY output staging alongside s_vT in P0, read back coalesced (vec8)
+            # for wide global stores.
+            s_out = _LTensor(lds.p0.wy.s_out.peek(), BT, OUT_S)
 
             base_gb = (bos + chunk_start) * H + i_h  # [.,H]      (g/beta in)
             base_k = ((bos + chunk_start) * Hg + i_hg) * fx.Int32(K)  # [.,Hg,K]
@@ -649,8 +694,8 @@ def compile_gdn_prepare(
                 # Rows past seqlen read as zero and their g_cumsum store is
                 # dropped, both in hardware (bounded descriptors above).
                 gi = base_gb + tid * H
-                gv = Numeric.from_python_value(_gld(g_g, gi))
-                bv = Numeric.from_python_value(_gld(beta_g, gi))
+                gv = fx.Float32(_gld(g_g, gi))
+                bv = fx.Float32(_gld(beta_g, gi))
                 csum = _wave_inclusive_scan(gv, tid, BT, zero_f)
                 _sst(s_g, tid, csum)  # g_cumsum -> LDS (random-access by KKT)
                 _sst(s_beta, tid, bv)
@@ -664,7 +709,7 @@ def compile_gdn_prepare(
             # prefix-sum and the k-scatter below. iso-LDS.
             KVEC = 8
             k_row = Hg * fx.Int32(K)
-            kkt = [_F32X4() for _ in range(4)]
+            kkt = _acc16_n4()
             K_V = K // KVEC  # 16
             KKv = BT * K_V  # 1024 (== n_per*BLOCK_THREADS, no tail)
             n_per = (KKv + BLOCK_THREADS - 1) // BLOCK_THREADS  # 4
@@ -672,14 +717,14 @@ def compile_gdn_prepare(
             kregs = _k_prefetch(k_g, base_k, k_row, tid, n_per, K_V, KVEC)
             gc = s_g  # final g_cumsum in LDS
             # ---- Phase 1b: scatter the prefetched k regs -> s_k [BT,K] (vec8) ----
-            # No barrier between the scan and here: s_g/s_beta live in their own LDS
-            # region (off_g/off_beta), disjoint from P0 (off_k) that s_k occupies, and
+            # No barrier between the scan and here: s_g/s_beta are their own LDS
+            # objects, disjoint from the P0 union that s_k occupies, and
             # nothing before the next barrier reads them -- Phase 1c is their first
             # reader, so the s_k barrier below publishes g_cumsum too.  Dropping the
             # extra barrier lets waves 1-3 scatter k *during* wave 0's g/beta load
             # latency + prefix-sum instead of idling through it (ATT: that barrier
             # alone was 14.2% of all kernel stall cycles, per-wave [8, ~7k, ~7k, ~7k]).
-            _k_scatter(kregs, s_k, tid, n_per, K_V, KVEC, alignment=8)
+            _k_scatter(kregs, s_k, tid, n_per, K_V, KVEC)
             gpu.barrier()  # publish s_k + g_cumsum/beta
             # ---- Phase 1c: KKT via MFMA (1x4x8), gate-scaled strict-lower -> s_A ----
             for ek in range_constexpr(K // 16):
@@ -688,7 +733,7 @@ def compile_gdn_prepare(
                     _load_mfma_tile(s_k, fx.Int32(en * 16), fx.Int32(ek * 16), lane)
                     for en in range(4)
                 ]
-                kkt = [_mfma16(a, bs[en], kkt[en]) for en in range(4)]
+                _gemm16_n4(kkt, a, bs)
             # s_A aliases s_k's LDS region: ensure every warp has finished
             # reading s_k (B-operand spans all 64 rows) before any post-scale
             # store overwrites the region as s_A.
@@ -699,10 +744,10 @@ def compile_gdn_prepare(
                 for p in range_constexpr(4):
                     s = warp16 + mb4 + fx.Int32(p)
                     r = fx.Int32(en * 16) + n16
-                    cval = Numeric.from_python_value(_ext(kkt[en], p))
-                    beta_s = Numeric.from_python_value(_ld(s_beta, s))
-                    gc_s = Numeric.from_python_value(_ld(gc, s))
-                    gc_r = Numeric.from_python_value(_ld(gc, r))
+                    cval = kkt[p, 0, en]
+                    beta_s = _ld(s_beta, s)
+                    gc_s = _ld(gc, s)
+                    gc_r = _ld(gc, r)
                     decay = _exp2_f32((gc_s - gc_r) * fx.Float32(LOG2E))
                     aval = (s > r).select(cval * beta_s * decay, zero_f)
                     _sst2(s_A, s, r, aval)
@@ -712,8 +757,8 @@ def compile_gdn_prepare(
             # beta*exp(g) scale in-place; later inverse/Schur barriers publish it
             # before the first K WY scatter.
             if is_lane:
-                gc_j = Numeric.from_python_value(_ld(gc, tid))
-                beta_j = Numeric.from_python_value(_ld(s_beta, tid))
+                gc_j = _ld(gc, tid)
+                beta_j = _ld(s_beta, tid)
                 _sst(gc, tid, beta_j * _exp2_f32(gc_j * fx.Float32(LOG2E)))
 
             # ---- Phase 2: C = (I + A)^{-1} via MFMA ----
@@ -952,14 +997,14 @@ def compile_gdn_prepare(
                         SVEC,
                     )
                 gpu.barrier()
-                wy = [_F32X4() for _ in range(4)]
+                wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
                     a = cached_C[ek]
                     bs = [
                         _load_mfma_tile_vt_tiled(s_vT, en, ek, n16, mb4)
                         for en in range(4)
                     ]
-                    wy = [_mfma16(a, bs[en], wy[en]) for en in range(4)]
+                    _gemm16_n4(wy, a, bs)
                 # Epilogue: accumulator -> s_out (LDS) -> coalesced vec8 global store.
                 # Unfenced on purpose (see the fence at the top of the loop).
                 _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16)
@@ -992,14 +1037,14 @@ def compile_gdn_prepare(
                         SVEC,
                     )
                 gpu.barrier()
-                wy = [_F32X4() for _ in range(4)]
+                wy = _acc16_n4()
                 for ek in range_constexpr(BT // 16):
                     a = cached_C[ek]
                     bs = [
                         _load_mfma_tile_vt_tiled(s_vT, en, ek, n16, mb4)
                         for en in range(4)
                     ]
-                    wy = [_mfma16(a, bs[en], wy[en]) for en in range(4)]
+                    _gemm16_n4(wy, a, bs)
                 # Unfenced, as in the v loop.  The final K tile needs no trailing
                 # fence at all: nothing overwrites s_vT afterwards.
                 _wy_epilogue_to_lds(wy, s_out, warp16, mb4, n16)
@@ -1028,10 +1073,6 @@ def compile_gdn_prepare(
         grid_y: fx.Int32,
         stream: fx.Stream,
     ):
-        allocator.finalized = False
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            allocator.finalize()
         gdn_prepare_kernel(
             k_t, v_t, g_t, beta_t, cu_t, wbar_t, ubar_t, gcs_t, T, H, Hg
         ).launch(
