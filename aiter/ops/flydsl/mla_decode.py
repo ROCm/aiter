@@ -11,17 +11,21 @@ from .kernels.mla_decode_shuffled_gfx1250 import (
     compile_mla_decode_main,
     compile_mla_decode_reduce,
 )
+from .kernels.tensor_shim import _run_compiled
+
 
 # returns (num_segs, num_warps, kv_compute_block_size, warp_token_split, warp_head_split)
 def _resolve_mla_config(num_q_heads, num_seqs, max_seqlen):
 
-    warp_token_split = num_q_heads <= 32
+    warp_token_split = num_q_heads <= 16
     warp_head_split = not warp_token_split
 
     kvc = 32 if num_q_heads >= 128 else 64
 
     if warp_token_split:
-        num_warps = min(2, max(1, kvc // 32))   # WMMA_K=32 so can't have num_warps > kvc//32
+        num_warps = min(
+            2, max(1, kvc // 32)
+        )  # WMMA_K=32 so can't have num_warps > kvc//32
     else:
         # num_warps should be power of two and divide 16 head tile count
         # n & -n gives the largest power of 2 dividing n
@@ -30,9 +34,7 @@ def _resolve_mla_config(num_q_heads, num_seqs, max_seqlen):
 
     wgs_to_fill = 1024 // min(num_warps, 4)
     num_segs = (wgs_to_fill + num_seqs - 1) // num_seqs
-    
-    # A segment past the last KV tile does no work but still writes a partial.
-    num_segs = min(num_segs, (max_seqlen + kvc - 1) // kvc)
+    num_segs = min(num_segs, (max_seqlen + kvc - 1) // kvc, 64)
     return num_segs, num_warps, kvc, warp_token_split, warp_head_split
 
 
@@ -119,7 +121,7 @@ def flydsl_mla_decode(
     # --- Architecture check ---
     try:
         arch = torch.cuda.get_device_properties(query.device.index).gcnArchName
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure to read the arch means "not gfx1250"
         arch = ""
     if not (arch.lower().split(":")[0] if arch else "").startswith("gfx1250"):
         raise ValueError(f"flydsl_mla_decode requires gfx1250, got {arch!r}")
@@ -204,14 +206,15 @@ def flydsl_mla_decode(
                 f"partials[1:] (max_logits, exp_sums) must be {lse_shape}, got "
                 f"{tuple(max_logits.shape)} and {tuple(exp_sums.shape)}"
             )
-        for nm, t in (("tmp_out", tmp_out), ("max_logits", max_logits),
-                      ("exp_sums", exp_sums)):
+        for nm, t in (
+            ("tmp_out", tmp_out),
+            ("max_logits", max_logits),
+            ("exp_sums", exp_sums),
+        ):
             if t.dtype != torch.float32:
                 raise ValueError(f"partials {nm} must be float32, got {t.dtype}")
             if t.device != device:
-                raise ValueError(
-                    f"partials {nm} must be on {device}, got {t.device}"
-                )
+                raise ValueError(f"partials {nm} must be on {device}, got {t.device}")
 
     if stream is None:
         stream = torch.cuda.current_stream(device=device)
@@ -244,7 +247,8 @@ def flydsl_mla_decode(
                 WARP_TOKEN_SPLIT=warp_token_split,
             )
 
-        main_launch(
+        _run_compiled(
+            main_launch,
             tmp_out.view(-1),
             max_logits.view(-1),
             exp_sums.view(-1),
@@ -259,7 +263,8 @@ def flydsl_mla_decode(
         )
         if write_final_output:
             return output
-        reduce_launch(
+        _run_compiled(
+            reduce_launch,
             output.view(-1),
             tmp_out.view(-1),
             max_logits.view(-1),
