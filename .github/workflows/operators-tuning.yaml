@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [aiter-1gpu-runner] # TODO: add more runners
+        runner: [linux-aiter-oci-mi300x-1] # TODO: add more runners
     name: Operators tuning
     runs-on: ${{ matrix.runner }}
 
@@ -52,7 +52,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name operators_tuning_test \
-          rocm/pytorch:latest
+          rocm/pytorch:latest@sha256:4449f856653602317e4101a76fce599c7fcd58ccec2e539951fce5f73083179e
 
       - name: Setup Aiter and Triton
         run: |
