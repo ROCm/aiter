@@ -205,9 +205,7 @@ def make_dispatch_kernel(
                 if do_publish:
                     wt_src_off = src_tok * experts_per_token + lane
                     wt_val = buffer_load(_r_wts, wt_src_off, vec_width=1, dtype=T.f32)
-                    idx_val = buffer_load(
-                        _r_idx, wt_src_off, vec_width=1, dtype=T.i32
-                    )
+                    idx_val = buffer_load(_r_idx, wt_src_off, vec_width=1, dtype=T.i32)
                     dest_slot = dest_tok_id * experts_per_token + lane
                     _r_wts_remote = create_buffer_resource_from_addr(
                         buffer_load(_r_p2p_out_wts, dest_pe, vec_width=1, dtype=T.i64)
@@ -226,9 +224,7 @@ def make_dispatch_kernel(
                     _r_scales = create_buffer_resource_from_addr(addr_inp_scales)
                     _r_sc_remote = create_buffer_resource_from_addr(
                         buffer_load(
-                            create_buffer_resource_from_addr(
-                                addr_p2p_out_scales
-                            ),
+                            create_buffer_resource_from_addr(addr_p2p_out_scales),
                             dest_pe,
                             vec_width=1,
                             dtype=T.i64,
@@ -553,6 +549,7 @@ def make_combine_kernel(
             return Vec.filled(2, 0.0, fx.Float32)
 
     elif hidden_elem_size == 4:  # f32
+
         def _to_accum(i32_val):
             return i32_val.bitcast(fx.Float32)
 
@@ -706,13 +703,8 @@ def make_combine_kernel(
             # weight copy kept so Stage 3b reads shmem_comb_inp_wts[recv_tok_id].
             if const_expr(enable_weights):
                 for recv_tok_id in range(global_warp_id, total_recv, global_warp_num):
-                    wt_src_addr = (
-                        addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
-                    )
-                    wt_dst_addr = (
-                        addr_shmem_wts
-                        + fx.Int64(recv_tok_id) * weight_bytes
-                    )
+                    wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
+                    wt_dst_addr = addr_shmem_wts + fx.Int64(recv_tok_id) * weight_bytes
                     rsrc_wt_src = create_buffer_resource_from_addr(wt_src_addr)
                     rsrc_wt_dst = create_buffer_resource_from_addr(wt_dst_addr)
                     if lane < wt_n_i32:
@@ -740,9 +732,7 @@ def make_combine_kernel(
                         fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
                     )
                     wt_dest_addr = wt_pe_base + wt_dest_off
-                    wt_src_addr = (
-                        addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
-                    )
+                    wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
                     rsrc_wt_src = create_buffer_resource_from_addr(wt_src_addr)
                     rsrc_wt_dst = create_buffer_resource_from_addr(wt_dest_addr)
                     if lane < wt_n_i32:
@@ -829,9 +819,7 @@ def make_combine_kernel(
                             fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
                         )
                         wt_dest_addr = wt_pe_base + wt_dest_off
-                    wt_src_addr = (
-                        addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
-                    )
+                    wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
                     rsrc_wt_src = create_buffer_resource_from_addr(wt_src_addr)
                     rsrc_wt_dst = create_buffer_resource_from_addr(wt_dest_addr)
                     if lane < wt_n_i32:
@@ -896,9 +884,7 @@ def make_combine_kernel(
                         fx.Int64(rank * max_tok_per_rank + dest_lid) * weight_bytes
                     )
                     wt_dest_addr = wt_pe_base + wt_dest_off
-                    wt_src_addr = (
-                        addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
-                    )
+                    wt_src_addr = addr_inp_wts + fx.Int64(recv_tok_id) * weight_bytes
                     rsrc_wt_src = create_buffer_resource_from_addr(wt_src_addr)
                     rsrc_wt_dst = create_buffer_resource_from_addr(wt_dest_addr)
                     if lane < wt_n_i32:
